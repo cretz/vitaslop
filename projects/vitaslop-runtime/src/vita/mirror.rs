@@ -189,11 +189,24 @@ pub const SLOT_RTC_HI: u32 = 8;
 /// every resume, so a table that started inside that range would have entry 0's `id` word
 /// zeroed on every switch - the mutex that hashes there would silently lose its inline home
 /// mid-run, and a later `claim` could hand the same entry to a second uid.
-pub const SLOT_MUTEX_TABLE: u32 = 10;
+pub const SLOT_MUTEX_TABLE: u32 = 12;
 
 /// How many slots the SCHEDULER writes - the mirrored values, which is everything up to the
 /// mutex table. Refreshing further would clobber live lock state with a snapshot of nothing.
-pub const SLOT_COUNT: usize = 10;
+/// Slot 10: whether a `sceKernelDelayThread(<=1)` from the thread about to run has NOBODY
+/// to yield to - the host's own elide predicate ([`VitaState::yield_would_repick_this_thread`])
+/// as one word, so the emitted [`vitaslop_transpiler::InlineOp::DelayYield`] can answer it
+/// without a crossing. Refreshed at every resume like the rest of the block, AND cleared in
+/// guest memory by the host on the first host call of the slice that wakes or spawns a
+/// thread (`VitaState::publish_yield_free_change`) - that is what keeps a value a host call
+/// CAN change inside the block's contract.
+pub const SLOT_YIELD_FREE: u32 = 10;
+/// Slot 11: how many yields this slice has elided so far - the host's `elided_run`, which the
+/// emitted code increments in place and tests against the same cap the handler applies. A
+/// spin that waits on something outside the scheduler's reasoning therefore still gives the
+/// loop back after the cap, exactly as it does through the handler.
+pub const SLOT_ELIDE_RUN: u32 = 11;
+pub const SLOT_COUNT: usize = 12;
 
 /// Total slots the block must hold: the mirrored values plus the mutex table behind them.
 pub const BLOCK_SLOTS: u32 = SLOT_MUTEX_TABLE + super::kmutex::SLOTS;
@@ -225,6 +238,8 @@ pub fn snapshot(st: &VitaState) -> [u32; SLOT_COUNT] {
         // record": a guest address of 0 is not one any `LDREX` can legitimately hold, since
         // the guest image starts far above it.
         0,
+        st.yield_free_word(),
+        st.elided_run_word(),
     ]
 }
 
@@ -324,6 +339,8 @@ mod tests {
             SLOT_CURRENT_THREAD,
             SLOT_THREAD_ID,
             SLOT_SPIN_BUDGET,
+            SLOT_YIELD_FREE,
+            SLOT_ELIDE_RUN,
         ] {
             assert!((slot as usize) < SLOT_COUNT, "slot {slot} is outside the block");
         }
@@ -423,7 +440,10 @@ mod tests {
     fn libkernel_calls_with_behaviour_are_not_inlined() {
         use crate::nid::libkernel as lk;
         for nid in [
-            crate::vita::tm_nid::DELAY_THREAD, // blocks: that IS the behaviour
+            // Blocks: that IS the behaviour. Its ELIDED-YIELD form lives in `threadmgr`, and
+            // falls through to this handler for every call that sleeps or has someone to
+            // yield to - the libkernel table still has no entry for it.
+            crate::vita::tm_nid::DELAY_THREAD,
             lk::CREATE_THREAD,                 // spawns
             lk::EXIT_PROCESS,                  // halts the run
             lk::GET_TLS_ADDR,                  // per-thread host state

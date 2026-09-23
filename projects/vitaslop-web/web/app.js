@@ -10,6 +10,7 @@ import { removeTitle } from "./opfs.js";
 import { writeZip, readZip } from "./zipstore.js";
 import { createPlayer } from "./player.js";
 import { renderVita } from "./vita.js";
+import * as navpad from "./navpad.js";
 
 const $ = (id) => document.getElementById(id);
 const view = $("view");
@@ -19,8 +20,15 @@ const fmtDate = (ms) => (ms ? new Date(ms).toLocaleString() : "never");
 
 let features = [];
 let playable = false;
-const player = createPlayer({ onExit: () => go(current.titleId ? `#/title/${current.titleId}` : "#/") });
+const player = createPlayer({
+  onExit: () => go(current.titleId ? `#/title/${current.titleId}` : "#/"),
+  onRestart: (id, fullscreen) => play(id, fullscreen),
+});
 let current = { screen: "library", titleId: null };
+
+/// A controller moves around every screen but the game (where gamepad.js has the pad):
+/// east is back, start is the settings.
+const padPages = () => navpad.attach(document, { onBack: () => history.back(), onStart: () => go("#/settings") });
 
 /// Breadcrumbs: where you are and the way back. Every screen under a title carries them.
 function crumbs(parts) {
@@ -56,15 +64,23 @@ function route() {
   const screen = (m && m[1]) || "library";
   const id = (m && m[2]) || null;
   if (player.isRunning() && screen !== "play") player.stop();
+  // A NEW object per route: a renderer that is still awaiting when the screen has
+  // moved on (a controller's back is quick) sees `current` change and must not write.
   current = { screen, titleId: id };
+  const me = current;
   document.body.dataset.screen = screen;
+  if (screen === "play") navpad.detach();
+  else padPages();
   document.title = { library: "Library", settings: "Settings", import: "Add games", about: "About" }[screen] ? `${{ library: "Library", settings: "Settings", import: "Add games", about: "About" }[screen]} - vitaslop` : "vitaslop";
   const fn = { library: renderLibrary, title: renderTitle, settings: renderSettings, import: renderImport, about: renderAbout, play: renderPlay }[screen];
   fn(id).catch((e) => {
+    if (current !== me) return;
     view.innerHTML = `<div class="card error"><h2>Something went wrong</h2><pre>${esc(e && e.stack ? e.stack : e)}</pre></div>`;
   });
 }
 window.addEventListener("hashchange", route);
+/// True once the router has moved on from the screen `me` was rendering.
+const stale = (me) => current !== me;
 
 // ------------------------------- library -------------------------------
 
@@ -72,7 +88,9 @@ let sortMode = "recent";
 let query = "";
 
 async function renderLibrary() {
+  const me = current;
   const titles = await store.listTitles();
+  if (stale(me)) return;
   view.innerHTML = `
     <div class="toolbar">
       <input id="search" type="search" placeholder="Search ${titles.length} title${titles.length === 1 ? "" : "s"}" value="${esc(query)}" autocomplete="off" />
@@ -150,7 +168,9 @@ function browserBlock() {
 // ------------------------------- title -------------------------------
 
 async function renderTitle(id) {
+  const me = current;
   const meta = await store.readTitle(id);
+  if (stale(me)) return;
   if (!meta) {
     view.innerHTML = `<div class="card"><h2>${esc(id)}</h2><p>This title is not in the library.</p><p><a class="btn" href="#/import">Add it</a></p></div>`;
     return;
@@ -159,6 +179,7 @@ async function renderTitle(id) {
   gamedata.setProfile(eff.profile);
   document.title = `${meta.title} - vitaslop`;
   const [icon, pic, bytes] = await Promise.all([store.titleImage(id), store.titleImage(id, "pic0.png"), store.titleBytes(id)]);
+  if (stale(me)) return;
   view.innerHTML = `
     ${crumbs([{ text: "Library", href: "#/" }, { text: meta.title }])}
     <div class="hero">
@@ -187,7 +208,12 @@ async function renderTitle(id) {
       </div>
       <p class="dim">What the game saved - its save files and trophies - and nothing of the game itself. A download is a file you own; upload it on another device to continue there.</p>
     </div>`;
-  $("play").addEventListener("click", () => play(id, wantsFullscreen(eff)));
+  $("play").addEventListener("click", () => {
+    // Inside the tap, before any await - see `askFullscreenNow`.
+    const full = wantsFullscreen(eff);
+    if (full) player.askFullscreenNow();
+    play(id, full);
+  });
   // The backdrop goes on through the element's style property: a `style="..."` attribute
   // in the markup is an inline style the page's Content-Security-Policy refuses.
   if (pic) view.querySelector(".hero").style.backgroundImage = `url('${pic}')`;
@@ -272,6 +298,7 @@ async function play(id, fullscreen) {
   current = { screen: "play", titleId: id };
   history.replaceState(null, "", `#/play/${id}`);
   document.body.dataset.screen = "play";
+  navpad.detach();
   view.innerHTML = "";
   await player.start(meta, eff, {
     fullscreen,
@@ -298,11 +325,13 @@ function deepMerge(a, b) {
 // ------------------------------- settings -------------------------------
 
 async function renderSettings(id) {
+  const me = current;
   const vocab = await store.vocabulary();
   const global = await store.effective(null);
   const eff = id ? await store.effective(id) : global;
   const meta = id ? await store.readTitle(id) : null;
   const profiles = await gamedata.listProfiles();
+  if (stale(me)) return;
   if (!profiles.includes(eff.profile)) profiles.push(eff.profile);
   const knobsText = Object.entries(eff.knobs).map(([k, v]) => `${k}=${v}`).join("\n");
   const opt = (v, cur, label) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(label ?? v)}</option>`;
@@ -340,6 +369,7 @@ async function renderSettings(id) {
         <p class="dim" id="ctl-hint">Click a control on the picture, then press the key for it.</p>
         <div id="vita"></div>
         <div class="actions"><button type="button" id="ctl-reset" class="btn small">Reset to defaults</button></div>
+        <p class="dim">In a game, a controller's home button (button 16 where the pad and browser expose one) opens the menu; so does holding Start and Select together for a second, on any pad. Outside a game the controller moves around this site: the d-pad or left stick moves, the south button (A or Cross) picks, the east button (B or Circle) goes back, Start (Options) opens the settings, and left/right change a choice, checkbox or slider.</p>
       </section>
       <details class="card"><summary><h2>Advanced</h2></summary>
         <label class="col"><span>Knobs<small>One VITASLOP_NAME=value per line. The browser has no environment; this is the only way to reach one.</small></span><textarea name="knobs" rows="4" spellcheck="false">${esc(knobsText)}</textarea></label>
@@ -454,8 +484,12 @@ async function renderSettings(id) {
 
   if (!meta) {
     gamedata.setProfile(eff.profile);
+    // The tails below land after an await; by then the screen may have moved on (a
+    // controller's back is quick), and a write to a null element here would surface as
+    // the router's "Something went wrong" card over the NEW screen.
     const refreshAll = async () => {
       const ids = await gamedata.listSaved();
+      if (!$("gd-all-info")) return;
       $("gd-all-info").textContent = ids.length ? `${ids.length} game${ids.length === 1 ? "" : "s"} have saved data in profile "${eff.profile}".` : `no saved data in profile "${eff.profile}".`;
       $("gd-all-dl").disabled = $("gd-all-rm").disabled = !ids.length;
     };
@@ -486,12 +520,14 @@ async function renderSettings(id) {
       for (const tid of ids) await gamedata.clear(tid);
       refreshAll();
     });
+    let storageText;
     try {
       const est = await navigator.storage.estimate();
-      $("storage").textContent = `${store.fmtBytes(est.usage)} used of ${store.fmtBytes(est.quota)} this browser will give this site.`;
+      storageText = `${store.fmtBytes(est.usage)} used of ${store.fmtBytes(est.quota)} this browser will give this site.`;
     } catch {
-      $("storage").textContent = "this browser does not report storage use.";
+      storageText = "this browser does not report storage use.";
     }
+    if ($("storage")) $("storage").textContent = storageText;
   }
 }
 

@@ -98,7 +98,11 @@ pub const FRONT_FACING_DECL: &str = "  let gxp_front_facing: bool = in.front_fac
 
 /// The GLOBAL (SPECIAL hardware register) index whose meaning is established: the per-fragment
 /// facing flag, read as `GLOBAL[16] & 1`.
-const GLOBAL_FACING: u8 = 16;
+///
+/// Public because the REFERENCE has to answer for the same register, and the index is the whole
+/// of what "this global is the one we know" means - a second copy of the number in `interp` is a
+/// second place for it to be wrong.
+pub const GLOBAL_FACING: u8 = 16;
 
 /// The WGSL `u32` expression for a read of an established GLOBAL hardware register, or `None`
 /// when this register's contents are not established (the caller then hard-fails naming it).
@@ -253,6 +257,41 @@ pub fn cnst6_value(sel: u8) -> f32 {
     f32::from_bits(CNST6_F32_BANK0[(sel & 0x3f) as usize])
 }
 
+/// The value the constant arm of [`src_channel`] materialises for ONE channel: the operand's
+/// `index` selects the table entry, the channel's SWIZZLE SELECTOR selects which table (and
+/// carries the four inline constants), and `half` picks the F16 view.
+///
+/// >>> THIS EXISTS BECAUSE THE TWO HALVES DISAGREED, AND ONLY ONE OF THEM WAS RIGHT.
+///
+/// The emitter read the selector. The reference interpreter called [`cnst6_value`] with the
+/// operand's index alone - so for every constant operand whose channel selects anything but
+/// bank 0 it returned a DIFFERENT NUMBER than the shader the GPU runs. The corpus-wide
+/// execution differential (`tests/execcases.rs`) found it on a four-instruction vertex program
+/// where the emitter reads `1.0` and the reference read `0.0`, turning `pos * 1.0` into
+/// `pos * 0.0` - a clip position of zero, i.e. a collapsed mesh.
+///
+/// That is not only a test-oracle fault: `interp` decides the per-pass DEPTH FIT and the clip-`w`
+/// sign that sets the negative-projection correction, so a constant it read wrong is a
+/// projection decided wrong on the shipped path.
+///
+/// `None` for the 8-bit view, which has no established constant table - refusing is exact, and
+/// it mirrors the emitter, which refuses the same case rather than pick a float table.
+pub fn cnst6_channel_value(index: u8, sel: u8, half: bool, fx8: bool) -> Option<f32> {
+    Some(match (half, sel) {
+        // The four INLINE constants are a property of the selector alone and are available in
+        // every precision, the 8-bit view included - which is why the refusal below comes after
+        // them, exactly as it does in `src_channel`.
+        (_, 4) => 0.0,
+        (_, 5) => 1.0,
+        (_, 6) => 2.0,
+        (_, 7) => 0.5,
+        _ if fx8 => return None,
+        (true, _) => cnst6_f16_value(sel, index),
+        (false, 1) => f32::from_bits(CNST6_F32_BANK1[(index & 0x3f) as usize]),
+        (false, _) => cnst6_value(index),
+    })
+}
+
 /// The exact value of an F16-mode CNST6 constant: bank `sel` (the channel's swizzle
 /// selector, 0..3), entry `index`. The reference interpreter's counterpart to the F16 arm of
 /// [`src_channel`].
@@ -303,11 +342,37 @@ pub enum Prec {
 
 impl Prec {
     /// The precision an instruction WRITES its destination at (`half_precision`).
-    fn of(instr: &Instr) -> Prec {
+    pub fn of(instr: &Instr) -> Prec {
         // The normalized U8 convert writes PACKED BYTES when that is the direction it runs
         // in - four channels in one register, not one float per lane. `half_precision`
         // cannot say so: it describes a float destination, and here there is not one.
         if let Op::PackUnorm8 { to_unorm8: true, .. } | Op::CopyFx8 = instr.op {
+            return Prec::Fx8;
+        }
+        // The 8-bit COMBINER writes packed unorm bytes for the same reason, and `emit_sop2`
+        // has always passed `Prec::Fx8` by hand - so this is the two agreeing rather than a
+        // change of behaviour. It is load-bearing for anything that asks an instruction what
+        // it writes WITHOUT going through that emitter: the reference interpreter's generic
+        // store path, and the constant fold's unknown-lane marking, both of which were
+        // addressing a sop2 destination as whole float lanes - claiming three registers it
+        // never writes while leaving stale known values in the bytes it does.
+        //
+        // MEASURED EMISSION-NEUTRAL, because the fold can move generated code: the corpus WGSL
+        // hash over all 1,151 blobs is BYTE-IDENTICAL with this arm and with
+        // `from_half(half_precision)` in its place. Nothing in the emitter asks `Prec::of`
+        // about these two ops (its own call sites are per-op, and the two generic ones are for
+        // `DepthF` and the derivatives), and the fold has no folded value to lose where it
+        // never modelled the op. Re-run that hash if either of those changes.
+        if let Op::Sop2 { .. } = instr.op {
+            return Prec::Fx8;
+        }
+        // A VTST on the 8-BIT ALU reads and writes bytes, which `emit_test` already says with
+        // its own local override (`wp`). Same rule as `Op::Sop2` above: the general answer must
+        // match the emitter's hand-written one, or anything that asks the instruction directly
+        // addresses its destination as whole float lanes. VTSTMSK is deliberately NOT here -
+        // the decoder does not produce the 8-bit ALU for that group and `emit_test_mask`
+        // refuses it, so naming it would claim a form that does not exist.
+        if let Op::Test { alu: crate::ir::TestAlu::Fx8Sub, .. } = instr.op {
             return Prec::Fx8;
         }
         Prec::from_half(instr.half_precision)
@@ -319,9 +384,11 @@ impl Prec {
     /// holding two halves and interpret it as one 32-bit float, i.e. a denormal instead of the
     /// value. (A texture sample also carries independent coordinate/result precisions, but it
     /// gets them from its own decoded fields - see [`emit_tex`].)
-    fn src_of(instr: &Instr) -> Prec {
-        // ...and it READS packed bytes in the other direction, for the same reason.
-        if let Op::PackUnorm8 { to_unorm8: false, .. } | Op::CopyFx8 = instr.op {
+    pub fn src_of(instr: &Instr) -> Prec {
+        // ...and it READS packed bytes in the other direction, for the same reason. The 8-bit
+        // combiner reads them at BOTH ends: its sources and its destination are the same
+        // four-bytes-in-one-register view.
+        if let Op::PackUnorm8 { to_unorm8: false, .. } | Op::CopyFx8 | Op::Sop2 { .. } = instr.op {
             return Prec::Fx8;
         }
         Prec::from_half(instr.source_half_precision())
@@ -357,7 +424,7 @@ impl Prec {
 /// This is also what the emitter's own undefined-internal-lane guard has always assumed: it
 /// marks and checks lane `index + selector`, the four-lane layout, with no precision term in
 /// it. The two were simply inconsistent, and the guard is the half that was right.
-fn bank_prec(bank: Bank, prec: Prec) -> Prec {
+pub fn bank_prec(bank: Bank, prec: Prec) -> Prec {
     if matches!(bank, Bank::Internal) {
         Prec::F32
     } else {
@@ -487,18 +554,7 @@ fn store_stmt(op: &Operand, c: usize, expr: &str, prec: Prec) -> Option<String> 
         Prec::F32 => {
             format!("  {prefix}[{}] = bitcast<u32>({expr});\n", op.index as u32 + c as u32)
         }
-        Prec::F16 => {
-            let reg = op.index as u32 + (c as u32 >> 1);
-            if c & 1 == 0 {
-                format!(
-                    "  {prefix}[{reg}] = ({prefix}[{reg}] & 0xffff0000u) | (pack2x16float(vec2<f32>({expr}, 0.0)) & 0x0000ffffu);\n"
-                )
-            } else {
-                format!(
-                    "  {prefix}[{reg}] = ({prefix}[{reg}] & 0x0000ffffu) | (pack2x16float(vec2<f32>(0.0, {expr})) & 0xffff0000u);\n"
-                )
-            }
-        }
+        Prec::F16 => half_stmt(prefix, op.index as u32 + (c as u32 >> 1), c & 1 == 1, expr, false),
         // One BYTE of one register, read-modify-write so the other three channels keep their
         // bytes. Rounded, not truncated: the value is a `byte/255` unorm coming back the way
         // it went out, and truncating loses the last representable step on every round trip.
@@ -607,15 +663,35 @@ impl Dest<'_> {
     /// separately.
     fn store_raw_half(&mut self, op: &Operand, c: usize, expr: &str) -> Option<()> {
         let prefix = bank_prefix(op.bank)?;
-        let reg = op.index as u32 + (c as u32 >> 1);
+        // The placement is `ir::packed_dest_slot`, not a fifth copy of `c >> 1` and `c & 1`.
+        let (reg_off, shift) = crate::ir::packed_dest_slot(16, c as u32);
+        let reg = op.index as u32 + reg_off;
+        let stmt = |v: &str| half_stmt(prefix, reg, shift == 16, v, true);
+        if !self.stage {
+            self.body.push_str(&stmt(expr));
+            return Some(());
+        }
+        let tmp = format!("g{c}");
+        let _ = writeln!(self.body, "  let {tmp} = {expr};");
+        self.deferred.push(stmt(&tmp));
+        Some(())
+    }
+
+    /// [`Self::store_raw_half`] one element down: lane `c` is BYTE `c` of register `index`.
+    ///
+    /// Four bytes fit in one register where four halves need two, so there is no register
+    /// stride here - the whole four-channel span is `index` alone. That is the same rule
+    /// [`emit_pack_from_int`]'s 8-bit source reads by, and the reason both of them answer
+    /// [`crate::ir::Instr::source_packed_bytes`] rather than the two-way precision question.
+    fn store_raw_byte(&mut self, op: &Operand, c: usize, expr: &str) -> Option<()> {
+        let prefix = bank_prefix(op.bank)?;
+        // As in `store_raw_half`: the placement is stated once, in `ir::packed_dest_slot`.
+        let (reg_off, sh) = crate::ir::packed_dest_slot(8, c as u32);
+        let reg = op.index as u32 + reg_off;
+        let keep = !(0xffu32 << sh);
         let stmt = |v: &str| {
-            if c & 1 == 0 {
-                format!("  {prefix}[{reg}] = ({prefix}[{reg}] & 0xffff0000u) | ({v} & 0x0000ffffu);
+            format!("  {prefix}[{reg}] = ({prefix}[{reg}] & {keep:#010x}u) | (({v} & 0xffu) << {sh}u);
 ")
-            } else {
-                format!("  {prefix}[{reg}] = ({prefix}[{reg}] & 0x0000ffffu) | (({v} & 0x0000ffffu) << 16u);
-")
-            }
         };
         if !self.stage {
             self.body.push_str(&stmt(expr));
@@ -632,6 +708,269 @@ impl Dest<'_> {
         for stmt in std::mem::take(&mut self.deferred) {
             self.body.push_str(&stmt);
         }
+    }
+}
+
+/// [`Op::CmovU8`]: `dest.byte[c] = test(src0.byte[c]) ? src1.byte[c] : src2.byte[c]`.
+///
+/// Every read is a raw byte of the operand's own register - the same addressing
+/// [`Dest::store_raw_byte`] writes by - so nothing here goes through a float or half view.
+fn emit_cmov_u8(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    mask: [bool; 4],
+    test: CompareMethod,
+) -> Option<()> {
+    let s1 = instr.srcs.first()?;
+    let s2 = instr.srcs.get(1)?;
+    let s0 = instr.srcs.get(2)?;
+    // >>> ONE TEST, ON ONE BYTE - not four, and the corpus cannot tell the two apart.
+    //
+    // "U8" names how the TEST reads its operand: as an unsigned byte. Whether the instruction
+    // then tests each of the four bytes SEPARATELY or tests one and moves the masked bytes on
+    // its answer is not visible in any captured word, because every one of them carries the
+    // full mask `0b1111` - and with a full mask the two readings differ only where src0's four
+    // bytes DISAGREE. They agree everywhere else, which is why this takes the reading that
+    // cannot produce a value neither source holds: a per-byte test over a source whose bytes
+    // differ SPLICES the two sources together, and the value this instruction feeds is a bone
+    // index that is then multiplied and used as a memory offset, where a spliced index
+    // addresses neither matrix.
+    //
+    // `VITASLOP_GXP_CMOVU8=byte` is the ARM BACK to the per-byte test, so both readings are
+    // reachable from ONE build [[vitaslop-browser-ab-needs-a-negative-control]].
+    let per_byte = crate::module::cmov_u8_tests_each_byte();
+    let elem = |o: &Operand, lo: u32, signed: bool| -> Option<String> {
+        Some(raw_elem_expr(&format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32), lo, 8, signed))
+    };
+    for c in 0..4 {
+        if !mask[c] {
+            continue;
+        }
+        let lo = c as u32 * 8;
+        let test_lo = if per_byte { lo } else { 0 };
+        // The test is on the UNSIGNED byte, which is what the form is named for. `LtZero` and
+        // `LteZero` therefore need the SIGNED view of that byte, so the comparison means what
+        // it says rather than always failing.
+        let cond = match test {
+            CompareMethod::EqZero => format!("({} == 0u)", elem(s0, test_lo, false)?),
+            CompareMethod::NeZero => format!("({} != 0u)", elem(s0, test_lo, false)?),
+            CompareMethod::LtZero => format!("({} < 0i)", elem(s0, test_lo, true)?),
+            CompareMethod::LteZero => format!("({} <= 0i)", elem(s0, test_lo, true)?),
+        };
+        let e = format!(
+            "select({}, {}, {cond})",
+            elem(s2, lo, false)?,
+            elem(s1, lo, false)?,
+            cond = cond
+        );
+        body.store_raw_byte(dest, c, &e)?;
+    }
+    Some(())
+}
+
+/// >>> EVERY f32 -> f16 NARROWING THIS CRATE EMITS GOES THROUGH ONE FUNCTION, AND THE MODULE
+/// >>> PREAMBLE - NOT THE BODY - DECIDES HOW IT ROUNDS.
+///
+/// # The defect this exists to fix
+/// Every half-precision store used to be spelled `pack2x16float(...)` inline. That builtin
+/// lowers to SPIR-V `PackHalf2x16`, **whose rounding mode the language does not specify**, and
+/// the device this project is developed on TRUNCATES: `probe-f16round.mjs`, 48 chosen inputs
+/// sitting at known places between two representable halves, matched round-toward-zero 48/48
+/// and round-to-nearest-even 28/48. The CPU reference rounds to nearest even (checked
+/// exhaustively against a third-party oracle over 674,872 values), so every f16 store the
+/// recompiler emitted disagreed with it by up to one ULP **in a direction that biases**, and a
+/// chain of them drifts. Fragment programs on real titles are 70-90% F16, so this was
+/// essentially all fragment arithmetic.
+///
+/// MEASURED, by making the reference truncate to match: corpus divergences **126 -> 21**, exact
+/// **607 -> 834**, 105 cleared and 0 new. That measurement is what says the mode is the cause;
+/// the reference was reverted, because adopting an implementation-defined mode as the spec is
+/// not a fix.
+///
+/// It is also a PORTABILITY defect and not only an accuracy one: two devices may lower the same
+/// builtin two different ways, so the same title renders differently on each and a desktop
+/// number cannot predict the phone's.
+///
+/// # Why the body calls a function instead of spelling the conversion
+/// The emitted body is HASHED AND CACHED - the hash is the identity of a recompiled program -
+/// so it must not depend on the device. The body therefore calls [`HALF_LO_FN`]/[`HALF_HI_FN`]/
+/// [`HALF_PK_FN`] and the MODULE PREAMBLE, assembled after the adapter is known, supplies the
+/// definitions. Both definitions round to nearest even; which one is chosen is a speed
+/// question, never a numeric one, and [`half_helper_text`]'s two arms must agree bit for bit.
+pub const HALF_LO_FN: &str = "gxp_hlo";
+
+/// The high-half store helper. See [`HALF_LO_FN`].
+pub const HALF_HI_FN: &str = "gxp_hhi";
+
+/// The WHOLE-register store helper: both halves at once, the shape [`fold_halves`] produces.
+/// See [`HALF_LO_FN`].
+pub const HALF_PK_FN: &str = "gxp_hpk";
+
+/// The f32 -> f16 narrowing itself, as a 16-bit pattern in the low half of a `u32`. Every other
+/// helper is written in terms of this one, so the rounding mode is stated in ONE place.
+///
+/// The four arms' WGSL lives in `src/f16rounding/*.wgsl` rather than in Rust string literals,
+/// because `probe-f16round.mjs` runs the SHIPPED text on a real device - and a probe that
+/// carried its own copy would be measuring a transcription, which is the one thing a probe
+/// must not do. Rust `include_str!`s the same bytes the probe reads.
+pub const HALF_BITS_FN: &str = "gxp_f16b";
+
+/// The f16 ROUND TRIP - narrow and widen again, leaving an `f32` holding a value the 16-bit
+/// register can hold. What [`crate::link`]'s unpacked half-register home rounds through.
+pub const HALF_QUANT_FN: &str = "gxp_hq";
+
+/// Whether the device this build talks to offers `shader-f16`, so the preamble may use the
+/// language's own narrowing instead of the portable bit arithmetic. Set by the renderer from
+/// the adapter ([`set_native_f16`]); OFF until it says so, because `enable f16;` does not
+/// compile on a device that was not created with the feature - and OFF is the arm that is
+/// correct everywhere.
+static NATIVE_F16: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Set by the renderer once it knows the device. See [`NATIVE_F16`].
+pub fn set_native_f16(on: bool) {
+    NATIVE_F16.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the preamble will use the native narrowing. See [`NATIVE_F16`].
+pub fn native_f16() -> bool {
+    NATIVE_F16.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The portable round-to-nearest-even narrowing: no extension, correct on every device.
+///
+/// Written as the cases the format actually has rather than as bit tricks, because this is the
+/// one function whose wrongness would be invisible - it would round *nearly* right and the
+/// residue would read as a different defect.
+///
+/// * `0x477ff000` is the exact TIE that rounds up out of the f16 range (its 10-bit significand
+///   is odd, so ties-to-even carries out of the exponent), which is why the overflow test is
+///   `>=`. A finite value that overflows **SATURATES to 65504** rather than becoming an
+///   infinity: that is what the guest's hardware does, what the CPU reference models
+///   ([`crate::fold::f32_to_f16_bits_saturating`]) and what the corpus differential measured on
+///   the device - 200 diverging lanes where the reference held an infinity or a NaN and the GPU
+///   repeatedly held 65504. An infinity that arrives as one stays one.
+/// * `0x33000000` is 2^-25, the tie between zero and the smallest subnormal half; its
+///   significand is even, so it rounds to ZERO and the underflow test is `<`.
+/// * A carry out of the rounded significand is left to propagate into the exponent field on its
+///   own - which is what turns the largest subnormal into the smallest normal, with no case of
+///   its own. It can never carry past 65504, because the saturation test already returned.
+const HALF_HELPERS_PORTABLE: &str = include_str!("f16rounding/portable.wgsl");
+
+/// The same helpers over the language's own `f16`, for a device that has the feature.
+///
+/// The pair form is ONE conversion instruction here rather than two narrowings and a shift,
+/// which is why [`fold_halves`] is worth as much as it is: a four-channel 16-bit store is one
+/// of these.
+///
+/// `f16(v)` is the VALUE conversion, a different operation from `pack2x16float` in the language
+/// and measured round-to-nearest-even 48/48 by `probe-f16round.mjs` on the same inputs the pack
+/// builtin truncated. That is a MEASUREMENT of one device, not a guarantee from the spec, which
+/// is why the probe is a CI job and why [`HALF_HELPERS_PORTABLE`] is the default.
+///
+/// What the language does NOT leave open is that a conversion of an out-of-range value gives an
+/// INDETERMINATE result - so the saturation the hardware performs cannot be left to it, and
+/// `gxp_f16c` clamps first. `0x477fe000` is 65504, the largest finite half; a value between it
+/// and the tie rounds to 65504 anyway, so clamping there changes nothing a round would not.
+/// The test is on the BIT PATTERN rather than on `abs(v)` so that a NaN - which no comparison
+/// answers usefully - falls through untouched instead of being clamped into a number.
+///
+/// >>> AND THE BITS COME OUT THROUGH `pack2x16float`, WHICH IS THE TRUNCATING BUILTIN THIS
+/// >>> WHOLE CHANGE EXISTS TO STOP USING. That is not a contradiction, it is the point: its
+/// argument has ALREADY been rounded to a value f16 holds exactly, and every rounding mode
+/// agrees on a value that needs no rounding. So the mode stops mattering and the pack becomes a
+/// pure bit move.
+///
+/// The obvious spelling - `bitcast<u32>(vec2<f16>(f16(lo), f16(hi)))` - is what the probe uses
+/// and Tint accepts it, but **naga rejects it**: it reads the bitcast as componentwise and
+/// types the result `vec2<u16>`, so the mask that follows is a vector-scalar `&` and the module
+/// fails validation. The desktop is naga and the browser is Tint, so a form only one of them
+/// takes is a module that builds here and refuses there. `every_f16_rounding_arm_parses_and_validates`
+/// is what caught it, and is why all three arms are validated on every machine rather than only
+/// the one this adapter happens to choose.
+const HALF_HELPERS_NATIVE: &str = include_str!("f16rounding/native.wgsl");
+
+/// The two helpers written in terms of [`HALF_BITS_FN`], the same in both arms.
+const HALF_HELPERS_COMMON: &str = include_str!("f16rounding/common.wgsl");
+
+/// The NEGATIVE CONTROL arm: `pack2x16float` under the same helper names, which is bit for bit
+/// what every build before this one emitted. See [`crate::link::F16_ROUND_ARM`].
+const HALF_HELPERS_PACK: &str = include_str!("f16rounding/pack.wgsl");
+
+/// The helper definitions a module needs, in the arm this run is on.
+///
+/// All five are emitted together whenever any is called. WGSL has no dead-function warning and
+/// a backend drops what nothing calls, so splitting them per call site would buy nothing and
+/// would be five more ways for the text to disagree with itself.
+fn half_helper_text() -> (String, bool) {
+    let (narrow, enable) = match (crate::link::arm(crate::link::F16_ROUND_ARM), native_f16()) {
+        (Some("0"), _) => (HALF_HELPERS_PACK, false),
+        // `native` / `portable` FORCE an arm, which is what lets the case harnesses check both
+        // on one device: the two must agree bit for bit, and only a run of each can say so.
+        (Some("native"), _) => (HALF_HELPERS_NATIVE, true),
+        (Some("portable"), _) => (HALF_HELPERS_PORTABLE, false),
+        (_, true) => (HALF_HELPERS_NATIVE, true),
+        (_, false) => (HALF_HELPERS_PORTABLE, false),
+    };
+    (format!("{narrow}{HALF_HELPERS_COMMON}"), enable)
+}
+
+/// Whether this run rounds f16 stores to nearest even - false only under the negative-control
+/// arm. Reported by the renderer, because "which rounding mode did this picture use" is not
+/// answerable from a screenshot [[vitaslop-a-device-dump-must-name-its-own-build]].
+pub fn f16_round_to_nearest() -> bool {
+    crate::link::arm(crate::link::F16_ROUND_ARM) != Some("0")
+}
+
+/// Whether `module` calls any of the f16 helpers, and therefore needs their definitions.
+fn calls_half_helpers(module: &str) -> bool {
+    [HALF_LO_FN, HALF_HI_FN, HALF_PK_FN, HALF_QUANT_FN, HALF_BITS_FN]
+        .iter()
+        .any(|f| module.contains(&format!("{f}(")))
+}
+
+/// Give an assembled module the f16 helper definitions its body calls, and - in the native arm -
+/// the `enable f16;` that lets them compile.
+///
+/// # Why the definitions go after the directives and the `enable` goes at byte zero
+/// A WGSL module's `enable`/`requires`/`diagnostic` directives must all precede every
+/// declaration. A dual-source fragment pair already carries `enable dual_source_blending;`, so
+/// inserting a FUNCTION at byte zero would put that directive after a declaration, the device
+/// would refuse the pipeline, and the frame would go black - which is exactly what happened
+/// when the rounding helper was first added [[vitaslop-a-diagnostic-at-debug-is-a-diagnostic-that-does-not-exist]].
+/// So the `enable` goes first and the functions go after whatever directives are there.
+///
+/// Idempotent: a module that already carries the definitions is returned unchanged, so a
+/// builder that wraps another builder's output cannot emit them twice.
+pub fn add_half_helpers(module: String) -> String {
+    if !calls_half_helpers(&module) || module.contains(&format!("fn {HALF_BITS_FN}(")) {
+        return module;
+    }
+    let mut out = module;
+    let (text, needs_enable) = half_helper_text();
+    out.insert_str(crate::link::directives_end(&out), &text);
+    if needs_enable {
+        out.insert_str(0, "enable f16;\n");
+    }
+    out
+}
+
+/// The read-modify-write of ONE half of a 16-bit-packed register - the form a half with no
+/// partner beside it needs. See [`fold_halves`] for the pair.
+fn half_stmt(prefix: &str, reg: u32, high: bool, expr: &str, raw: bool) -> String {
+    match (high, raw) {
+        (false, false) => {
+            format!("  {prefix}[{reg}] = {HALF_LO_FN}({prefix}[{reg}], {expr});\n")
+        }
+        (true, false) => {
+            format!("  {prefix}[{reg}] = {HALF_HI_FN}({prefix}[{reg}], {expr});\n")
+        }
+        (false, true) => format!(
+            "  {prefix}[{reg}] = ({prefix}[{reg}] & 0xffff0000u) | ({expr} & 0x0000ffffu);\n"
+        ),
+        (true, true) => format!(
+            "  {prefix}[{reg}] = ({prefix}[{reg}] & 0x0000ffffu) | (({expr} & 0x0000ffffu) << 16u);\n"
+        ),
     }
 }
 
@@ -688,10 +1027,54 @@ pub fn emit_fragment(shader: &Shader) -> Result<String, EmitError> {
 /// outputs are surfaced (fragment: o0/pa0 colour; vertex: o position + varyings), which the
 /// module wrapper handles, not the body.
 pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
+    Ok(strip_split_markers(&emit_body_marked(shader)?))
+}
+
+/// A WGSL comment naming a TOP-LEVEL instruction boundary in an emitted body, so a module
+/// builder can cut the body there. See the emission in [`emit_range`].
+/// The prefix must not be a prefix of `link::BANKS_MARKER` (`  //@@GXP_REGISTER_BANKS`):
+/// [`strip_split_markers`] drops every line that starts with it, and when the two shared
+/// `  //@@` it dropped the bank DECLARATIONS too - a module whose every stage then referred to
+/// register arrays that did not exist, which the device refuses, which drops every draw.
+pub const SPLIT_MARKER: &str = "  //@@GXP_SPLIT ";
+
+/// The marker line for instruction `index`, as [`emit_body_marked`] writes it - INCLUDING the
+/// trailing newline, so a caller searching for it cuts between whole lines.
+pub fn split_marker(index: usize) -> String {
+    format!("{SPLIT_MARKER}{index}\n")
+}
+
+/// Remove every [`SPLIT_MARKER`] line.
+///
+/// Pre-sized, because this runs on EVERY recompile and the result is within a marker line or two
+/// of the input: collecting into a `String` from an iterator of `&str` gets no useful size hint,
+/// so it grew from zero and copied the whole text about a dozen times on the way. `emit_body` is
+/// 94% of this crate's per-program CPU cost (p50 110 us, max 1.4 ms over a 1,151-blob corpus,
+/// `where_the_shader_pipeline_spends_its_cpu_time_per_program`), and it builds the text once and
+/// then rebuilds it here - so the copying in this four-line function is a real share of it.
+pub fn strip_split_markers(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        if line.starts_with(SPLIT_MARKER) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// [`emit_body`] with the top-level instruction boundaries still marked.
+pub fn emit_body_marked(shader: &Shader) -> Result<String, EmitError> {
     if shader.instrs.is_empty() {
         return Err(EmitError::Empty);
     }
-    let mut body = String::new();
+    // Pre-sized from the instruction count rather than grown from zero. Over a 1,151-blob
+    // corpus the emitted bodies average about 9 KB, which is roughly a hundred bytes an
+    // instruction; a `String` growing from nothing to that copies the whole text a dozen times.
+    // The figure is a HINT and nothing depends on it - a program that emits more simply grows
+    // once or twice, exactly as before.
+    let mut body = String::with_capacity(shader.instrs.len() * 128);
     // >>> THE DERIVATIVE PRELUDE, and why the function needs one.
     //
     // `dpdx`/`dpdy` may only be called from UNIFORM control flow, and a program is entitled to
@@ -707,7 +1090,26 @@ pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
     // scratch - so an unwritten read there is a defined 0.0 (a benign over-read of a padding lane
     // the fragment stage ignores, e.g. moving a computed vec3's absent w into an unused output
     // lane); the guard would wrongly reject those, so it applies to fragment programs only.
-    let guard_internal_reads = shader.kind == ProgramKind::Fragment;
+    //
+    // >>> AND ONLY WHERE THE VALUE IS LIVE. The guard as first written refused on the read
+    // ALONE, and that is what dropped fifteen of Madden's twenty-one unrecompilable fragment
+    // blobs - a dropped pair means its mesh is ABSENT from the frame. MEASURED over every
+    // captured corpus (`undefined_internal_reads_that_are_actually_live`): 57 fragment reads of
+    // an unwritten internal lane, and **not one of them is live** - every single one is a
+    // channel the program computes and then throws away. The idiom is ordinary: an F32 op
+    // writes lane 0 of an internal register, and the F16 conditional move that consumes it
+    // carries a two-channel write mask, so the guard counts a read of lane 1 whose destination
+    // channel nothing downstream reads (e.g. `frag_9227e300` #11-#15, where the surviving
+    // multiply takes `.x` from both operands).
+    //
+    // So the refusal stands exactly where it earns its keep - an unmodeled pre-load that
+    // REACHES THE OUTPUT is still a hard failure, naming the lane - and a dead over-read
+    // translates as the zero the vertex path has always given it. This is the same lesson the
+    // SA bank already taught: refusing an unwritten scratch register dropped 39 of 40 pairs,
+    // and zero was faithful.
+    let live = live_instructions(shader);
+    let guard_internal_reads: &[bool] =
+        if shader.kind == ProgramKind::Fragment { &live } else { &[] };
     let mut internal_written = [false; INTERNAL_LANES];
     emit_range(
         &mut body,
@@ -721,6 +1123,7 @@ pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
         1,
         &mut prelude,
         None,
+        &[],
     )?;
     Ok(format!("{prelude}{body}"))
 }
@@ -761,6 +1164,88 @@ pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
 /// branch answers that question, so intersecting at the join would reject shaders that are fine.
 ///
 /// `depth` is only the indentation of the generated WGSL.
+/// One enclosing conditional region of the body being emitted, innermost LAST.
+///
+/// Threaded so a DERIVATIVE can be given a uniform gap where it stands - see
+/// [`uniform_gap`]. `cond_start` alone says a derivative is inside a block; this says what the
+/// block IS, which is what closing and re-entering it needs.
+#[derive(Clone, Debug)]
+struct Enclosing {
+    /// The WGSL condition the region's `if` tests, exactly as it was written. Always a read of
+    /// a predicate register (`p[n]` / `!p[n]`), so re-testing it is free of side effects - the
+    /// gap still checks that nothing has WRITTEN that register since.
+    cond: String,
+    /// This region is the ELSE arm of that `if`, so re-entering it tests the negation.
+    else_arm: bool,
+    /// The indentation of the region's own `if` line.
+    pad: String,
+    /// A `loop`, which cannot be closed and re-entered at all: leaving it would run its
+    /// remaining iterations outside the loop. See [`uniform_gap`].
+    is_loop: bool,
+}
+
+/// Close every enclosing region so control flow is UNIFORM, and re-enter them all - the text
+/// either side of a derivative that cannot be hoisted out of its block.
+///
+/// # Why a gap rather than a hoist
+/// `dpdx`/`dpdy` difference a value across the rasteriser's 2x2 quad, so WGSL requires them in
+/// uniform control flow. The hoist above handles the common case by computing the derivative
+/// ABOVE the block - which is exact only while nothing in the block has rewritten the register
+/// it reads. A football title's three world fragment programs compute the value they then
+/// difference INSIDE the branch, and for those the hoist reads a different number; they were
+/// refused, and a refused pair's mesh is absent from the frame.
+///
+/// Closing the block, calling the builtin, and re-entering is not a workaround for the
+/// restriction - it is what the hardware does. The USSE does not predicate the DIFFERENCING at
+/// all: a predicated `dsx` computes the quad derivative from the register file as it stands and
+/// only the WRITE-BACK is conditional. In the emitted WGSL the register banks are function-scope
+/// `var`s, so in the gap every lane of the quad holds exactly what the hardware's register file
+/// would - the branch's value for the lanes that took it, the older value for the lanes that did
+/// not - and differencing them there is the same operation. A hoist, by contrast, would compute
+/// it as if every lane had taken the branch.
+///
+/// Refuses two shapes rather than emitting something else:
+///   * an enclosing LOOP - closing it would run the rest of its iterations outside it;
+///   * a PREDICATE REGISTER written inside the region before this point, which would make the
+///     re-entry test a different condition than the one that let control in.
+fn uniform_gap(
+    shader: &Shader,
+    enclosing: &[Enclosing],
+    from: usize,
+    index: usize,
+    at: usize,
+) -> Result<(String, String), EmitError> {
+    let blocked = |reason| {
+        Err(EmitError::Blocked { index: at, byte_offset: at * 8, reason, raw: shader.instrs[at].raw })
+    };
+    if enclosing.is_empty() {
+        return blocked("a derivative reported as inside a block with no enclosing region to                         cut a uniform gap into");
+    }
+    if enclosing.iter().any(|e| e.is_loop) {
+        return blocked("a derivative inside a LOOP whose source register the loop body writes -                         a loop cannot be closed and re-entered to reach uniform control flow");
+    }
+    // A write to ANY predicate register in the region counts: the conditions of the enclosing
+    // ifs are predicate reads, and re-testing one the region has rewritten would admit a
+    // different set of lanes to the rest of the block.
+    let hi = index.min(shader.instrs.len());
+    if shader.instrs[from.min(hi)..hi]
+        .iter()
+        .any(|i| matches!(i.op, Op::Test { .. } | Op::TestMask { .. }))
+    {
+        return blocked("a derivative inside a branch that rewrites a predicate register before                         it - the block cannot be re-entered on the same condition");
+    }
+    let mut close = String::new();
+    let mut reopen = String::new();
+    for e in enclosing.iter().rev() {
+        let _ = writeln!(close, "{}}}", e.pad);
+    }
+    for e in enclosing {
+        let c = if e.else_arm { format!("!({})", e.cond) } else { e.cond.clone() };
+        let _ = writeln!(reopen, "{}if ({c}) {{", e.pad);
+    }
+    Ok((close, reopen))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_range(
     body: &mut String,
@@ -768,7 +1253,7 @@ fn emit_range(
     start: usize,
     end: usize,
     exit: usize,
-    guard_internal_reads: bool,
+    guard_internal_reads: &[bool],
     internal_written: &mut [bool; INTERNAL_LANES],
     open_loop: Option<usize>,
     depth: usize,
@@ -777,9 +1262,21 @@ fn emit_range(
     // or `None` at the top level. A derivative hoisted out of a block is placed immediately
     // above that region, so this is where the "was the source written in between" check starts.
     cond_start: Option<usize>,
+    // The conditional regions this range is INSIDE, outermost first - what a derivative that
+    // cannot be hoisted needs in order to close them and re-enter. See [`uniform_gap`].
+    enclosing: &[Enclosing],
 ) -> Result<(), EmitError> {
     let mut index = start;
     while index < end {
+        // A TOP-LEVEL instruction boundary, named by index. It is a comment, so it costs the
+        // emitted shader nothing, and [`strip_split_markers`] removes it for every caller but
+        // the one that wants it - the dual-source module builder, which cuts the body in two
+        // here (see [`split_marker`]). Only depth 1 is marked because only a top-level boundary
+        // is a place a body can be CUT: a position inside an `if` or a loop would put the brace
+        // on one side of the cut and its match on the other.
+        if depth == 1 {
+            let _ = writeln!(body, "{SPLIT_MARKER}{index}");
+        }
         // A loop is recognised by its BACK EDGE, and the instruction the back edge lands on is
         // this one - so the check belongs here, before the instruction is emitted as ordinary
         // straight-line code.
@@ -806,6 +1303,7 @@ fn emit_range(
                     depth,
                     prelude,
                     cond_start,
+                    enclosing,
                 )?;
                 index = tail + 1;
                 continue;
@@ -818,10 +1316,13 @@ fn emit_range(
             return Err(EmitError::Blocked { index, byte_offset, reason, raw: instr.raw });
         }
         let Op::Branch { rel } = instr.op else {
-            if guard_internal_reads {
+            // `guard_internal_reads` is empty for a vertex program (no guard at all) and
+            // otherwise the per-instruction liveness mask: an undefined read whose result
+            // reaches nothing is translated, not refused. See `emit_body_marked`.
+            if guard_internal_reads.get(index).copied().unwrap_or(false) {
                 check_internal_reads(instr, index, byte_offset, internal_written)?;
             }
-            emit_instr(body, instr, index, byte_offset, shader.kind, shader, prelude, cond_start)?;
+            emit_instr(body, instr, index, byte_offset, shader.kind, shader, prelude, cond_start, enclosing)?;
             emit_probe_snapshot(body, index, depth);
             record_internal_writes(instr, internal_written);
             index += 1;
@@ -955,6 +1456,22 @@ fn emit_range(
                     let inner: &mut String =
                         if cond_start.is_some() { &mut *prelude } else { &mut block_prelude };
                     let _ = writeln!(arms, "{pad}if ({c}) {{");
+                    // This range's own regions plus the arm being emitted, so an instruction
+                    // inside it knows every block it would have to leave.
+                    let mut inner_then: Vec<Enclosing> = enclosing.to_vec();
+                    inner_then.push(Enclosing {
+                        cond: c.clone(),
+                        else_arm: false,
+                        pad: pad.clone(),
+                        is_loop: false,
+                    });
+                    let mut inner_else: Vec<Enclosing> = enclosing.to_vec();
+                    inner_else.push(Enclosing {
+                        cond: c.clone(),
+                        else_arm: true,
+                        pad: pad.clone(),
+                        is_loop: false,
+                    });
                     emit_range(
                         &mut arms,
                         shader,
@@ -967,6 +1484,7 @@ fn emit_range(
                         depth + 1,
                         inner,
                         inner_start,
+                        &inner_then,
                     )?;
                     match else_arm {
                         None => {
@@ -986,6 +1504,7 @@ fn emit_range(
                                 depth + 1,
                                 inner,
                                 inner_start,
+                                &inner_else,
                             )?;
                             let _ = writeln!(arms, "{pad}}}");
                         }
@@ -1068,11 +1587,12 @@ fn emit_loop(
     shader: &Shader,
     head: usize,
     tail: usize,
-    guard_internal_reads: bool,
+    guard_internal_reads: &[bool],
     internal_written: &mut [bool; INTERNAL_LANES],
     depth: usize,
     prelude: &mut String,
     cond_start: Option<usize>,
+    enclosing: &[Enclosing],
 ) -> Result<(), EmitError> {
     let back = &shader.instrs[tail];
     let blocked = |reason| {
@@ -1110,6 +1630,14 @@ fn emit_loop(
     let mut arms = String::new();
     let mut block_prelude = String::new();
     let inner_start = cond_start.or(Some(head));
+    // A LOOP is an enclosing region a derivative cannot cut a uniform gap into: closing it
+    // would run the rest of its iterations outside it. Recorded as one so the refusal names
+    // the loop rather than emitting something the hardware does not do.
+    let inner_encl: Vec<Enclosing> = enclosing
+        .iter()
+        .cloned()
+        .chain([Enclosing { cond: String::new(), else_arm: false, pad: pad.clone(), is_loop: true }])
+        .collect();
     {
         let inner: &mut String =
             if cond_start.is_some() { &mut *prelude } else { &mut block_prelude };
@@ -1126,6 +1654,7 @@ fn emit_loop(
             depth + 1,
             inner,
             inner_start,
+            &inner_encl,
         )?;
     }
     body.push_str(&block_prelude);
@@ -1160,6 +1689,108 @@ fn read_channels(instr: &Instr) -> [bool; 4] {
         Op::MemLoad { .. } => [true, false, false, false],
         _ => instr.write_mask,
     }
+}
+
+/// Which instructions of `shader` produce a value that REACHES ITS OUTPUT, by a backward walk
+/// over the register file. Used by the undefined-internal-lane guard, which must fire on an
+/// unmodeled input that is really consumed and stay silent on one the program throws away.
+///
+/// The walk is deliberately conservative in three places:
+///
+/// * A shader carrying a BACKWARD branch - a loop - is reported entirely live. The walk is a
+///   single backward pass, which is exact only while every control-flow edge goes FORWARD (the
+///   linear order is then a topological order of the CFG, so every reader is visited before
+///   what it reads). A back edge breaks that: a read ABOVE a write can be reached AFTER it.
+/// * A CONDITIONAL instruction's write does not KILL the lane it writes. A write that may not
+///   execute does not redefine anything on the path where it is skipped, so an earlier write to
+///   the same lane can still be the value a later read sees - and calling that earlier write
+///   dead would silence a refusal that is owed. (This is the same "on EVERY path" distinction
+///   `link::conditionally_executed` was written for.)
+/// * An instruction with no destination, and any write to the OUTPUT bank, is live by
+///   definition - the output IS the result, and a sideways effect this model does not name
+///   must not be optimised away on the strength of not being named.
+///
+/// # Why "any branch at all is live" was not good enough
+/// That was the original rule, and it was fine while every program it had to judge was
+/// branch-free. It is not fine now: three of a football title's world fragment programs carry a
+/// derivative inside a branch AND an undefined internal-lane read, and the blanket rule made the
+/// second one live by fiat - so the pair stayed dropped for a reason nothing had measured. A
+/// forward-branching program gets the ordinary answer; only a loop keeps the blanket one.
+///
+/// This decides only whether to REFUSE. It never removes an instruction: every instruction is
+/// still emitted, so a wrong answer here cannot change what the shader computes.
+fn live_instructions(shader: &Shader) -> Vec<bool> {
+    let n = shader.instrs.len();
+    let backward_branch = shader.instrs.iter().enumerate().any(|(i, instr)| {
+        matches!(instr.op, Op::Branch { rel } if i as i64 + rel as i64 <= i as i64)
+    });
+    if backward_branch {
+        return vec![true; n];
+    }
+    let conditional = crate::link::conditionally_executed(shader);
+    // A register lane, keyed by bank and by `index + channel` - the same flat addressing the
+    // emitter reads and writes the banks with.
+    let key = |b: Bank, idx: u32, c: usize| -> (u8, u32) {
+        let d = match b {
+            Bank::Temp => 0u8,
+            Bank::PrimaryAttr => 1,
+            Bank::SecondaryAttr => 2,
+            Bank::Internal => 3,
+            Bank::Output => 4,
+            _ => 5,
+        };
+        (d, idx + c as u32)
+    };
+    let mut wanted: std::collections::BTreeSet<(u8, u32)> = Default::default();
+    let mut live = vec![false; n];
+    for i in (0..n).rev() {
+        let instr = &shader.instrs[i];
+        if matches!(instr.op, Op::Nop) {
+            continue;
+        }
+        let mut is_live = false;
+        match instr.dest.as_ref() {
+            // No destination named: this model cannot say what it produces, so it stays.
+            None => is_live = true,
+            Some(d) => {
+                if matches!(d.bank, Bank::Output) {
+                    is_live = true;
+                }
+                for c in 0..4 {
+                    if instr.write_mask[c] && wanted.contains(&key(d.bank, u32::from(d.index), c)) {
+                        is_live = true;
+                    }
+                }
+                // Redefined here, so reads BELOW this point no longer keep the lane live
+                // above it - but ONLY if this write happens on every path. A conditional write
+                // leaves the older value in place wherever it is skipped.
+                if is_live && !conditional.get(i).copied().unwrap_or(true) {
+                    for c in 0..4 {
+                        if instr.write_mask[c] {
+                            wanted.remove(&key(d.bank, u32::from(d.index), c));
+                        }
+                    }
+                }
+            }
+        }
+        live[i] = is_live;
+        if !is_live {
+            continue;
+        }
+        for src in &instr.srcs {
+            for c in 0..4 {
+                if !instr.write_mask[c] {
+                    continue;
+                }
+                let sel = src.swizzle[c];
+                if sel > 3 {
+                    continue; // a swizzle constant reads no register lane
+                }
+                wanted.insert(key(src.bank, u32::from(src.index), sel as usize));
+            }
+        }
+    }
+    live
 }
 
 /// Hard-fail if any source reads an internal-register lane not yet written in-stream.
@@ -1270,7 +1901,7 @@ pub fn wrap_module(body: &str, tex_units: &[TexBinding], kind: ProgramKind) -> S
         m,
         "  return FsOut(vec4<f32>(bitcast<f32>(o[0]), bitcast<f32>(o[1]), bitcast<f32>(o[2]), bitcast<f32>(o[3])), gxp_frag_depth);\n}}"
     );
-    m
+    add_half_helpers(m)
 }
 
 /// Wrap an emitted [`emit_body`] into a complete, self-contained WGSL VERTEX module: the
@@ -1327,7 +1958,1178 @@ pub fn wrap_vertex_module(body: &str, varying_vec4s: u32) -> String {
         );
     }
     let _ = writeln!(m, "  return out;\n}}");
-    m
+    add_half_helpers(m)
+}
+
+/// The number of `u32` lanes one bank occupies in a [`wrap_compute_module`] case buffer.
+pub const CASE_BANK_LANES: usize = BANK_REGS;
+
+/// Rewrite every texture SAMPLE in `body` into a call on a constant-valued stand-in, returning
+/// the rewritten body and the sampler units it replaced (ascending, deduplicated).
+///
+/// # Why a sample can be replaced by a constant and the check still means something
+///
+/// A texture unit bound to a texture whose every texel holds the SAME value returns that value
+/// for any coordinate, at any mip level, under any filter and any wrap mode. So a constant
+/// stand-in is not an approximation of that configuration - it is exactly it, and the reference
+/// interpreter can be handed the identical constant through its own fetcher. Every piece of
+/// arithmetic the sampled value feeds is then checked, across 230 corpus programs that had no
+/// execution case at all because a compute dispatch cannot call `textureSample` (it needs the
+/// implicit derivatives only a fragment stage has).
+///
+/// >>> AND WHAT IT DOES NOT CHECK, WHICH A READER MUST NOT FORGET. The coordinate is DISCARDED,
+/// so the UV arithmetic that selected the texel is not verified - only everything downstream of
+/// the fetch. A defect that computes the wrong UV is invisible here and needs a rig that varies
+/// the texture with position (a real binding in a fragment stage), which this is not.
+///
+/// The parse is exact rather than heuristic: [`emit_tex`] writes one statement per sample, of
+/// the form `let _texN = FUNC(tex, samp, vecK<f32>(...)EXTRA);`, and the coordinate always
+/// begins at a `vec2<f32>(` or `vec3<f32>(`. Anything that does not match that shape is left
+/// alone and the caller excludes the program rather than emit a module that samples a binding
+/// this wrapper never declared.
+fn substitute_constant_samples(body: &str, kind: ProgramKind) -> (String, Vec<u8>) {
+    let mut units: Vec<u8> = Vec::new();
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let rewritten = (|| {
+            let eq = line.find("= texture")?;
+            let call = &line[eq + 2..];
+            let open = call.find('(')?;
+            let func = &call[..open];
+            if !matches!(
+                func,
+                "textureSample" | "textureSampleBias" | "textureSampleLevel" | "textureSampleGrad"
+            ) {
+                return None;
+            }
+            // The first argument is the texture binding, whose name carries the unit.
+            let args = &call[open + 1..];
+            let first = args.split(',').next()?.trim();
+            let prefix = match kind {
+                ProgramKind::Vertex => "vt",
+                _ => "t",
+            };
+            let unit: u8 = first.strip_prefix(prefix)?.parse().ok()?;
+            if !units.contains(&unit) {
+                units.push(unit);
+            }
+            // >>> AND THE COORDINATE COMES WITH IT, when the varying stand-in is armed. The
+            // constant one discards it, which is precisely the gap: a program that computes the
+            // WRONG UV samples a constant texture and gets the right answer.
+            if case_tex_varies() {
+                let coord = coord_arg(args)?;
+                // >>> AND SO DOES THE LOD OPERAND, which a one-mip rig could not otherwise see at
+                // all - see `case_texture_value_at`. It is everything after the coordinate: one
+                // scalar for a bias or a level, two `vec2` derivatives for a gradient, which a
+                // `vec4` constructor takes as they stand.
+                let mode = match func {
+                    "textureSampleBias" => TexLod::Bias,
+                    "textureSampleLevel" => TexLod::Level,
+                    "textureSampleGrad" => TexLod::Gradient,
+                    _ => return Some(format!("{}= gxp_case_tex({unit}u, {coord});", &line[..eq])),
+                };
+                let (_, end, _) = coord_arg_span(args)?;
+                let extra = args[end..].trim().strip_prefix(',')?.trim().strip_suffix(");")?.trim();
+                let lod = if mode == TexLod::Gradient {
+                    format!("vec4<f32>({extra})")
+                } else {
+                    format!("vec4<f32>({extra}, 0.0, 0.0, 0.0)")
+                };
+                return Some(format!(
+                    "{}= gxp_case_texl({unit}u, {coord}, {}u, {lod});",
+                    &line[..eq],
+                    case_tex_lod_tag(mode)
+                ));
+            }
+            Some(format!("{}= gxp_case_tex({unit}u);", &line[..eq]))
+        })();
+        out.push_str(rewritten.as_deref().unwrap_or(line));
+        out.push('\n');
+    }
+    units.sort_unstable();
+    (out, units)
+}
+
+/// The COORDINATE argument of an emitted sample call, as WGSL text: the second comma-separated
+/// argument, taken by balanced parentheses so a nested call inside it cannot end it early.
+///
+/// [`emit_tex`] always writes the coordinate as a `vecK<f32>(...)` constructor, and a sample may
+/// carry a bias or level AFTER it - so the argument cannot be found by splitting on commas, and
+/// the closing parenthesis cannot be found by searching for the first `)`.
+///
+/// Normalised to three components, because a 2-coord sample and a 3-coord one must reach the
+/// same stand-in: the extra component is an exact literal zero, so it costs the comparison
+/// nothing.
+fn coord_arg(args: &str) -> Option<String> {
+    let (start, end, comps) = coord_arg_span(args)?;
+    let text = &args[start..end];
+    Some(if comps == 3 {
+        text.to_string()
+    } else {
+        format!("vec3<f32>({text}, 0.0)")
+    })
+}
+
+/// Where the coordinate argument BEGINS and ENDS within `args`, and how many components its
+/// constructor names. One statement of the rule, read by [`coord_arg`] (which normalises the
+/// text) and by [`rewrite_body_for_render`] (which splices around it and must not disturb a
+/// trailing bias, level or gradient argument).
+fn coord_arg_span(args: &str) -> Option<(usize, usize, u8)> {
+    // Past the texture and the sampler, both plain identifiers.
+    let mut at = args.find(',')? + 1;
+    at += args[at..].find(',')? + 1;
+    at += args[at..].len() - args[at..].trim_start().len();
+    let rest = &args[at..];
+    let comps = if rest.starts_with("vec2<f32>(") {
+        2
+    } else if rest.starts_with("vec3<f32>(") {
+        3
+    } else {
+        return None;
+    };
+    // The constructor's own parentheses, balanced, so a nested call inside the coordinate
+    // cannot end it early.
+    let ctor = &rest["vec2<f32>".len()..];
+    let mut depth = 0i32;
+    for (i, b) in ctor.as_bytes().iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((at, at + "vec2<f32>".len() + i + 1, comps));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// >>> DOES THE STAND-IN TEXTURE VARY WITH THE COORDINATE?
+///
+/// ON by default; `VITASLOP_GXP_CASE_TEX=const` restores the constant stand-in, which is what
+/// every measurement before 2026-09-21c used.
+///
+/// # Why it is the default, measured rather than argued
+/// It strictly covers more - it is the only thing in the rig that can see a program computing
+/// the WRONG UV - and it was run BESIDE the constant arm in one session before being made the
+/// default, because it changes the value every sample feeds and a stand-in change that moved
+/// the divergence count would have to be attributed before it could be trusted. It did not:
+/// **const 861 exact / 150 in tolerance / 18 diverged, vary 860 / 151 / 18, with the SAME 18
+/// names - none new, none fixed.** 160 of the 1,029 modules sample something, so that is 160
+/// programs whose UV arithmetic is now in the comparison and was not before.
+///
+/// It costs about four times the GPU minute (71 s against 266 s): the coordinate expression is
+/// inlined at every sample site, so the modules Tint compiles are bigger.
+pub fn case_tex_varies() -> bool {
+    crate::link::arm(crate::link::CASE_TEX_ARM) != Some("const")
+}
+
+/// The stand-in texture's RGBA at a coordinate, for BOTH sides of the differential.
+///
+/// # Why this is EXACT on both sides rather than approximately equal
+/// Every operation here is either a copy, a comparison against a literal, or a multiply/add of
+/// two f32 values - all of which IEEE-754 fixes exactly, so the interpreter and the emitted
+/// module compute the same bits without either transcribing the other's numbers. Nothing here
+/// is a texture fetch: there is no filtering, no wrap mode and no mip selection to agree about,
+/// which is the whole reason a stand-in can be exact where a real binding could not.
+///
+/// The coordinate is CLAMPED into `[-4, 4]` and scaled by a quarter before it is added to the
+/// unit's constant, for the same reason the seeded register file is tame: a coordinate computed
+/// from a seeded register can be 1e38 or a denormal, and a stand-in that fed that downstream
+/// would report IEEE corner cases as translation defects. The clamp is `min`/`max` against
+/// literals, which is exact and leaves a NaN as one of the two literals on both sides.
+///
+/// Channel 3 keeps the PURE constant for an implicit-LOD sample, so a sample whose coordinate is
+/// garbage still carries one channel the comparison can read.
+///
+/// # The LOD operand, and why it is folded in here
+/// Both rigs pin ONE mip, so at a real texture `textureSample`, `textureSampleBias` and
+/// `textureSampleLevel` return the same texel and no case could tell which builtin was emitted,
+/// or see a level read from the wrong register. So the stand-in answers the question itself:
+///
+/// ```text
+///   ch3 += 0.0625 * mode + tame(lod[0])     mode = 0 implicit, 1 bias, 2 level, 3 gradient
+///   ch2 += tame(lod[1])   ch1 += tame(lod[2])   ch0 += tame(lod[3])
+/// ```
+///
+/// where `lod` is the channels of `src2` the mode reads (one for a bias or a level; `ddx.xy`,
+/// `ddy.xy` for a gradient) and zero elsewhere. An implicit sample adds exact zeros, so its value
+/// is bit-identical to the plain stand-in. Every term is a clamp against literals times a power of
+/// two, so a fused multiply-add computes the same bits as the unfused form on either side.
+///
+/// What this gives up is the SAMPLER's reading of the level - which mip a bias of 0.5 selects.
+/// That is the hardware's arithmetic, not the translation's; what the recompiler decides (which
+/// builtin, which register, which channel in which slot) is what this checks.
+pub fn case_texture_value_at(unit: u8, coord: [f32; 3], lod: crate::interp::TexLodArg) -> [f32; 4] {
+    let k = case_texture_value(unit);
+    // NOT `clamp`, and this is not a style choice: `f32::clamp` PROPAGATES a NaN while
+    // `max().min()` returns a bound - and WGSL's `min(max(...))`, which the emitted helper
+    // spells, returns a bound too. Taking clippy's suggestion here would make the reference
+    // disagree with the module on exactly the coordinate no comparison can read.
+    #[allow(clippy::manual_clamp)]
+    let tame = |v: f32| v.max(-4.0).min(4.0) * 0.25;
+    let l = lod.args.map(tame);
+    let km = k[3] + 0.0625 * case_tex_lod_tag(lod.mode) as f32;
+    [
+        k[0] + tame(coord[0]) + l[3],
+        k[1] + tame(coord[1]) + l[2],
+        k[2] + tame(coord[2]) + l[1],
+        km + l[0],
+    ]
+}
+
+/// The stand-in's tag for a LOD mode - the number the WGSL twin receives as `mode`.
+pub fn case_tex_lod_tag(mode: TexLod) -> u32 {
+    match mode {
+        TexLod::Implicit => 0,
+        TexLod::Bias => 1,
+        TexLod::Level => 2,
+        TexLod::Gradient => 3,
+    }
+}
+
+/// The constant RGBA the stand-in texture at `unit` returns, for BOTH sides of the differential.
+///
+/// A plain function of the unit so the interpreter's fetcher and the emitted module agree
+/// without either transcribing the other's numbers. The values are tame and distinct per unit
+/// and per channel, for the same reason the seeded register file is: a divergence should mean
+/// a translation defect, not an IEEE corner case.
+pub fn case_texture_value(unit: u8) -> [f32; 4] {
+    let u = unit as f32;
+    [
+        0.125 + 0.0625 * u,
+        0.375 - 0.03125 * u,
+        0.625 + 0.015625 * u,
+        0.5 + 0.0078125 * u,
+    ]
+}
+
+/// Wrap an emitted body into a COMPUTE module that runs the program once over a register file
+/// supplied in a storage buffer and writes the resulting register file back out.
+///
+/// # Why this exists
+///
+/// [`wrap_module`] and [`wrap_vertex_module`] prove an emitted body COMPILES. They cannot say
+/// it COMPUTES THE RIGHT NUMBERS - and every graphics defect this project has chased one title
+/// at a time was a wrong number, not a refused module. This wrapper closes that gap: the same
+/// body, run on the real GPU through the real browser shader compiler, against the same inputs
+/// [`crate::interp`] evaluates on the CPU. Two independent implementations of the same USSE
+/// semantics (a string emitter and a numeric evaluator, written separately) disagreeing is a
+/// defect in one of them, and it surfaces over the WHOLE corpus in one run rather than when
+/// some title happens to draw the affected pair.
+///
+/// The buffer layout is flat and fixed so the runner needs no per-case metadata:
+///
+/// * input  `gxp_case_in`  - `pa[0..N]` then `sa[0..N]`, raw 32-bit lane bits.
+/// * output `gxp_case_out` - `r[0..N]`, `o[0..N]`, `i[0..N]` then `pa[0..N]`, raw 32-bit bits,
+///
+/// >>> AND `pa` IS AN OUTPUT BANK, WHICH IS NOT A CURIOSITY. A fragment program's colour does
+/// not have to land in `o`: `ColorOutput::NonNativePa` is a real shape and the module builder
+/// reads the result out of `pa` for it. While this wrapper wrote only three banks, such a
+/// program's ENTIRE effect was invisible - MEASURED as **176 of 1,025 cases whose expectation
+/// was an all-zero register file**, 174 of them fragment programs, most of them one to four
+/// instructions. They passed, and they checked nothing.
+///
+/// `pa` starts SEEDED rather than zero, so its baseline is the input rather than zero and the
+/// case carries the lanes the program CHANGED. See `execcases::changed_pairs`.
+///
+/// with `N` = [`CASE_BANK_LANES`]. Lanes are BITS, not floats, because the register file is a
+/// union of float and integer views (the bitwise ops read the integer one) and a comparison
+/// that went through an `f32` would lose exactly the NaN payloads a pack/unpack bug produces.
+///
+/// The wrapper declares the pipeline lets a body may reference (`gxp_front_facing`, the depth
+/// pair) as plain locals: a compute dispatch has no facing and no fragment depth, so a program
+/// that genuinely depends on either is not a case this harness can judge, and the caller
+/// excludes it rather than comparing against a substituted value.
+pub fn wrap_compute_module(body: &str) -> String {
+    wrap_compute_module_for(body, ProgramKind::Fragment, &[]).0
+}
+
+/// [`wrap_compute_module`], told the program's KIND - which names its sampler bindings - and the
+/// guest-memory WINDOWS its 0xE8 loads read.
+///
+/// The windows' BYTES are not passed and are not baked in: they travel as DATA in the
+/// `gxp_mem` storage binding this declares, uploaded by the runner from the caller's own slice
+/// - so they exist in exactly one place and the reference interpreter is handed that same
+/// slice rather than a second generator that would have to agree with this one. Baking them in
+/// as literals is what this used to do, and it cost a 14-second corpus run 162 seconds in
+/// Tint's compile (384 `vec4` assignments for one 6 KB window). The `mem_words` parameter
+/// outlived that change by a session, unused, as a warning.
+///
+/// Returns the module and the sampler units whose samples were replaced by the constant stand-in
+/// (see [`substitute_constant_samples`]).
+pub fn wrap_compute_module_for(
+    body: &str,
+    kind: ProgramKind,
+    mem_windows: &[crate::module::MemWindow],
+) -> (String, Vec<u8>) {
+    wrap_compute_module_facing(body, kind, mem_windows, true)
+}
+
+/// >>> [`wrap_compute_module_for`] WITH THE FACING FLAG THE CASE DECLARES.
+///
+/// `GLOBAL[16]` is the per-fragment FACING bit, and both rigs PIN it rather than reading the
+/// real `@builtin(front_facing)`: neither side models a rasteriser, so a real facing would put
+/// a value in the comparison that the reference cannot compute. Pinned, it is an ordinary case,
+/// and 18 corpus programs read it.
+///
+/// >>> BUT EVERY ONE OF THOSE 18 RAN FRONT-FACING ONLY, so whichever way each program's facing
+/// test branches, the other arm was never executed by anything. A SECOND case at `false` runs
+/// it - and it is a second case rather than a second draw because the value is a pinned constant
+/// on both sides, so there is nothing a draw would add that a constant does not already say.
+///
+/// What this still does NOT check is that the SHIPPED module wires `@builtin(front_facing)`
+/// through correctly, because neither rig reads the builtin at all. That was true before this
+/// existed and is unchanged by it.
+pub fn wrap_compute_module_facing(
+    body: &str,
+    kind: ProgramKind,
+    mem_windows: &[crate::module::MemWindow],
+    facing: bool,
+) -> (String, Vec<u8>) {
+    let (body, units) = substitute_constant_samples(body, kind);
+    let mut m = String::new();
+    let n = CASE_BANK_LANES;
+    // A program with 0xE8 loads resolves an ADDRESS through the bound windows. The helper is
+    // the module builder's own, so the address arithmetic under test is the shipped one.
+    // WGSL has ONE global namespace, so a linked pair that loads memory in both stages needs two
+    // helpers with two names - and the fragment side's is `gxp_fmem`. The body decides which it
+    // calls, so the binding is named after what the body actually references rather than after
+    // the program kind: getting that wrong emits a helper nothing calls and leaves the call
+    // unresolved, which fails the whole command buffer.
+    let mem_binding = if body.contains("gxp_fmem_word") { "gxp_fmem" } else { "gxp_mem" };
+    if !mem_windows.is_empty() {
+        // >>> BOUND, NOT BAKED. Writing the window's words in as literals put 384 `vec4`
+        // assignments at the top of a module for a 6 KB window, and Tint's compile of those took
+        // a 14-second corpus run to 162 - with single batches at 42 and 48 seconds. The words
+        // are the same either way, so they travel as data.
+        let _ = writeln!(
+            m,
+            "@group(0) @binding(2) var<storage, read> {mem_binding}: array<vec4<u32>>;"
+        );
+        m.push_str(&crate::module::mem_window_helper_named(mem_windows, mem_binding));
+    }
+    // The stand-in sampler: one constant per unit, the same values [`case_texture_value`] hands
+    // the reference interpreter.
+    if !units.is_empty() {
+        let varies = case_tex_varies();
+        let sig = if varies { "unit: u32, c: vec3<f32>" } else { "unit: u32" };
+        // The tame coordinate, computed ONCE and spelled exactly as
+        // `case_texture_value_at` computes it - min/max against literals, then a quarter.
+        let _ = writeln!(m, "fn gxp_case_tex({sig}) -> vec4<f32> {{");
+        if varies {
+            let _ = writeln!(
+                m,
+                "  let t = min(max(c, vec3<f32>(-4.0)), vec3<f32>(4.0)) * 0.25;"
+            );
+        }
+        let _ = writeln!(m, "  switch unit {{");
+        for &u in &units {
+            let v = case_texture_value(u);
+            let body = if varies {
+                format!(
+                    "vec4<f32>({:?} + t.x, {:?} + t.y, {:?} + t.z, {:?})",
+                    v[0], v[1], v[2], v[3]
+                )
+            } else {
+                format!("vec4<f32>({:?}, {:?}, {:?}, {:?})", v[0], v[1], v[2], v[3])
+            };
+            let _ = writeln!(m, "    case {u}u: {{ return {body}; }}");
+        }
+        let _ = writeln!(m, "    default: {{ return vec4<f32>(0.0); }}");
+        let _ = writeln!(m, "  }}\n}}");
+        // The LOD-carrying form, spelled term for term as `case_texture_value_at` adds them.
+        if varies {
+            let _ = writeln!(
+                m,
+                "fn gxp_case_texl(unit: u32, c: vec3<f32>, mode: u32, lod: vec4<f32>) -> vec4<f32> {{\n\
+                 \x20 let b = gxp_case_tex(unit, c);\n\
+                 \x20 let l = min(max(lod, vec4<f32>(-4.0)), vec4<f32>(4.0)) * 0.25;\n\
+                 \x20 let km = b.w + 0.0625 * f32(mode);\n\
+                 \x20 return vec4<f32>(b.x + l.w, b.y + l.z, b.z + l.y, km + l.x);\n\
+                 }}"
+            );
+        }
+    }
+    let _ = writeln!(m, "@group(0) @binding(0) var<storage, read> gxp_case_in: array<u32>;");
+    let _ = writeln!(
+        m,
+        "@group(0) @binding(1) var<storage, read_write> gxp_case_out: array<u32>;"
+    );
+    for bank in ["r", "pa", "sa", "o", "i"] {
+        let _ = writeln!(m, "var<private> {bank}: array<u32, {BANK_REGS}>;");
+    }
+    let _ = writeln!(m, "var<private> p: array<bool, 4>;");
+    let _ = writeln!(m, "var<private> idx: array<i32, 2>;");
+    let _ = writeln!(m, "\n@compute @workgroup_size(1)\nfn cs_main() {{");
+    let _ = writeln!(
+        m,
+        "  for (var n: u32 = 0u; n < {n}u; n = n + 1u) {{ pa[n] = gxp_case_in[n]; sa[n] = gxp_case_in[{n}u + n]; }}"
+    );
+    // The bound window's bytes, then its guest base address into the SA register the driver
+    // places it in - the same two steps, in the same order, the shipped module builder emits.
+    // The base must land AFTER the seeded register load or the seed would overwrite it.
+    for (i, win) in mem_windows.iter().enumerate() {
+        let _ = writeln!(m, "  sa[{}] = {mem_binding}[{i}u].x;", win.base_sa);
+    }
+    // A body emitted for a FRAGMENT program may read either of these. Neither exists in a
+    // compute dispatch; they are declared so such a body still COMPILES here (the caller
+    // excludes any program whose result depends on one - see the module doc).
+    let _ = writeln!(m, "  let gxp_front_facing: bool = {facing};");
+    let _ = writeln!(m, "  let gxp_interp_depth: f32 = 0.0;");
+    let _ = writeln!(m, "  var gxp_frag_depth: f32 = gxp_interp_depth;");
+    m.push_str(&body);
+    let _ = writeln!(
+        m,
+        "  for (var n: u32 = 0u; n < {n}u; n = n + 1u) {{ gxp_case_out[n] = r[n]; gxp_case_out[{n}u + n] = o[n]; gxp_case_out[{}u + n] = i[n]; gxp_case_out[{}u + n] = pa[n]; }}",
+        n * 2,
+        n * 3
+    );
+    // Keep the declared-but-unread locals live: WGSL does not warn, but a future emitter change
+    // that stops reading them must not silently turn this wrapper into a different program.
+    let _ = writeln!(m, "  if (gxp_front_facing && gxp_frag_depth < -1.0e30) {{ gxp_case_out[0] = 1u; }}");
+    let _ = writeln!(m, "}}");
+    (add_half_helpers(m), units)
+}
+
+// =====================================================================================
+// >>> THE FRAGMENT-STAGE CASE RIG
+//
+// Everything above runs an emitted body in a COMPUTE dispatch, which is what lets one
+// differential cover a thousand programs cheaply. Three families of instruction cannot be run
+// there at all, and they were excluded BY NAME rather than checked - 93 of the corpus's 1,151
+// blobs, every one of them shader code that ships:
+//
+//  * `tex.gather4` (56 blobs). Its whole point is that four NEIGHBOURING TEXELS differ, so no
+//    constant-valued or coordinate-valued stand-in can represent it: it needs a real texture.
+//  * `dsx`/`dsy` (8 blobs). A screen-space derivative differences a value across the
+//    rasteriser's 2x2 quad, which a compute dispatch has not got.
+//  * `kill` and `depthf` (29 blobs). Discard and fragment depth are pipeline state.
+//
+// A RENDER pipeline has all three. This wrapper puts the same emitted body in a fragment
+// entry point, drawing one triangle over a 1x1 target so exactly one invocation writes the
+// register file back.
+//
+// >>> WHAT A REAL BINDING CAN AND CANNOT CHECK, because the difference decides the whole design.
+//
+// A sampler's result is NOT a pure function of the coordinate at the precision this
+// differential compares at. Hardware quantises the texture coordinate to a few subtexel bits
+// before it selects a texel, and WebGPU's own specification permits an implementation to
+// APPROXIMATE the level-of-detail computation. So a rig that fed arbitrary coordinates to a
+// filtered, mipped sampler and held the GPU to a CPU model of it would report the device's
+// permitted freedom as a translation defect - on a corpus whose coordinates come from a seeded
+// register file and therefore land on texel boundaries by chance.
+//
+// This rig pins the ONE configuration that is exact, and says plainly what that leaves out:
+//
+//  * NEAREST filtering, CLAMP-TO-EDGE addressing, ONE mip level. The sampled value is then the
+//    texel at `floor(uv * size)` with the index clamped - an exact integer selection with no
+//    interpolation, no wrap arithmetic and no level to choose.
+//  * the coordinate is QUANTISED TO A TEXEL POSITION by [`CASE_UV_FNS`] before it reaches the
+//    sampler, on both sides, so the selection is a quarter of a texel away from any boundary
+//    the hardware's subtexel rounding could tip. Without it a coordinate that landed on a
+//    boundary would flip a texel and the difference would be reported as a defect.
+//  * FILTERING, WRAP MODES and MIP SELECTION are consequently NOT checked by this rig, and
+//    cannot be by any rig that compares bit patterns. They are also not what this differential
+//    is for: they are sampler state the runtime sets, not arithmetic the recompiler emits.
+//    What IS checked is everything the recompiler decides - which unit, which coordinate
+//    components in which order, the gather's footprint and its bilinear coefficients, and where
+//    the four returned channels land.
+//
+// >>> AND THE UV SENSITIVITY IS COARSER HERE THAN ON THE STAND-IN, which is why the stand-in
+// stays. Quantising to one of `CASE_TEX_SIZE` positions per axis means a UV error smaller than
+// one texel is invisible, while [`case_texture_value_at`] varies continuously and sees every
+// bit. So an ordinary sampling program stays on the compute rig, and only a program that needs
+// a fragment stage comes here.
+// =====================================================================================
+
+/// The width and height of every stand-in texture the render rig binds, in texels.
+///
+/// A power of two, so `(i + k) / CASE_TEX_SIZE` and the sampler's own `uv * size` are EXACT
+/// float operations and the coordinate the reference quantises to is the coordinate the
+/// hardware receives, bit for bit.
+pub const CASE_TEX_SIZE: u32 = 64;
+
+/// How many sampler units the rig's texture set covers. The GXM unit numbering is 4 bits.
+pub const CASE_TEX_UNITS: usize = 16;
+
+/// One texel of the render rig's stand-in texture set, as its four stored bytes.
+///
+/// >>> NEIGHBOURING TEXELS MUST DIFFER, which is the one property a gather needs and the one
+/// property a stand-in cannot have. An avalanche of `(unit, x, y)` gives it without any
+/// structure a program could accidentally satisfy.
+///
+/// The bytes travel to the runner as a FILE (`casetex.bin`), not as a second generator to keep
+/// in step - the same discipline the guest-memory windows follow.
+/// `layer` is 0 for the flat 2D texture of a unit and 1..=6 for the six faces of its CUBE, so
+/// one avalanche covers both sets and no two of them can collide.
+pub fn case_texel(unit: u8, layer: u32, x: u32, y: u32) -> [u8; 4] {
+    let mut h: u32 = 2166136261;
+    for b in [u32::from(unit), layer, x, y] {
+        h = (h ^ b).wrapping_mul(16777619);
+        h ^= h >> 13;
+    }
+    h.to_le_bytes()
+}
+
+/// How many layers the texel file carries per unit: the flat texture and the cube's six faces.
+pub const CASE_TEX_LAYERS: u32 = 7;
+
+/// Every unit's texels, in the layout the runner uploads: the whole FLAT set first (unit-major,
+/// row-major RGBA8), then the whole CUBE set (unit-major, then face 0..5, then row-major).
+///
+/// Two blocks rather than seven interleaved layers per unit, because the runner uploads them as
+/// two different kinds of texture and a contiguous block per kind is one `subarray` each.
+pub fn case_tex_bytes() -> Vec<u8> {
+    let n = CASE_TEX_SIZE;
+    let per = (n * n * 4) as usize;
+    let mut out = Vec::with_capacity(CASE_TEX_UNITS * per * CASE_TEX_LAYERS as usize);
+    let plane = |unit: usize, layer: u32, out: &mut Vec<u8>| {
+        for y in 0..n {
+            for x in 0..n {
+                out.extend_from_slice(&case_texel(unit as u8, layer, x, y));
+            }
+        }
+    };
+    for unit in 0..CASE_TEX_UNITS {
+        plane(unit, 0, &mut out);
+    }
+    // A cube's six faces are contiguous PER UNIT, so the runner uploads one unit's whole cube in
+    // a single `writeTexture` of depth 6 rather than six of depth 1.
+    for unit in 0..CASE_TEX_UNITS {
+        for face in 0..6 {
+            plane(unit, face + 1, &mut out);
+        }
+    }
+    out
+}
+
+/// The texel index one coordinate component names, and the fraction left over inside it.
+///
+/// The Rust twin of `gxp_case_ti` in [`CASE_UV_FNS`]; every step is a copy, a comparison
+/// against a literal, a multiply by a power of two or a `floor`, all of which IEEE-754 fixes
+/// exactly, so the two compute the same bits.
+///
+/// A NaN is mapped to zero EXPLICITLY rather than left to `min`/`max`, whose result WGSL leaves
+/// indeterminate when an operand is NaN - and a coordinate computed from a seeded register is
+/// a NaN often enough for that to decide cases.
+pub fn case_tex_index_frac(c: f32) -> (u32, f32) {
+    let s = if c.is_nan() { 0.0 } else { c };
+    #[allow(clippy::manual_clamp)]
+    let t = (s.max(-4.0).min(4.0) + 4.0) * 0.125;
+    let fi = t * CASE_TEX_SIZE as f32;
+    let fl = fi.floor();
+    let i = fl.min((CASE_TEX_SIZE - 1) as f32);
+    (i as u32, fi - fl)
+}
+
+/// The texel at `(x, y)` of `unit` as the sampler delivers it: each stored byte divided by 255.
+///
+/// The unorm decode is `byte / 255`, correctly rounded, which is what a WebGPU `rgba8unorm`
+/// fetch produces and what an f32 division of two exact values produces - the same number, not
+/// two numbers within a tolerance.
+pub fn case_texel_value(unit: u8, layer: u32, x: u32, y: u32) -> [f32; 4] {
+    let t = case_texel(unit, layer, x.min(CASE_TEX_SIZE - 1), y.min(CASE_TEX_SIZE - 1));
+    [
+        f32::from(t[0]) / 255.0,
+        f32::from(t[1]) / 255.0,
+        f32::from(t[2]) / 255.0,
+        f32::from(t[3]) / 255.0,
+    ]
+}
+
+/// What a NEAREST sample of the rig's texture returns for a shader coordinate - the reference's
+/// side of every `Op::Tex` in a render case.
+pub fn case_render_sample(unit: u8, coord: [f32; 4]) -> [f32; 4] {
+    let (x, _) = case_tex_index_frac(coord[0]);
+    let (y, _) = case_tex_index_frac(coord[1]);
+    case_texel_value(unit, 0, x, y)
+}
+
+/// What a NEAREST sample of the rig's CUBE texture returns for a shader coordinate.
+///
+/// >>> A CUBE COORDINATE IS A DIRECTION, and which face it names is the hardware's decision -
+/// so the rig does not hand it an arbitrary one. `gxp_case_uv3c` turns the program's three
+/// components into a FACE and a texel position, then builds the direction that selects exactly
+/// that face and that texel, and this computes the same pair directly. The reference therefore
+/// never has to model the major-axis selection or the face's `u = 0.5 * (sc / |ma| + 1)`: the
+/// direction it constructs makes both exact, with the major component exactly +-1 and the other
+/// two at most `1 - 1/size` - so no tie is possible and the recovered `u` is the one that went
+/// in, bit for bit (every value is a small multiple of `1/size`, which f32 holds exactly).
+///
+/// What this gives up is the face-selection ARITHMETIC itself, which is the hardware's and not
+/// this translation's. What it keeps is everything the recompiler decides: that all three
+/// components reach the sampler, in order, and that the four channels land where they should.
+pub fn case_render_sample_cube(unit: u8, coord: [f32; 4]) -> [f32; 4] {
+    let (x, _) = case_tex_index_frac(coord[0]);
+    let (y, _) = case_tex_index_frac(coord[1]);
+    let (z, _) = case_tex_index_frac(coord[2]);
+    case_texel_value(unit, z % 6 + 1, x, y)
+}
+
+/// The quantised GATHER coordinate, as the shader's `gxp_case_uv2g` computes it. The footprint
+/// below is derived from this same uv rather than from a second reading of the rule.
+fn case_gather_uv(c: f32) -> f32 {
+    let (i, f) = case_tex_index_frac(c);
+    (i as f32 + 0.75 + f * 0.5) * (1.0 / CASE_TEX_SIZE as f32)
+}
+
+/// What `textureGather` returns for a shader coordinate, and the two bilinear fractions the
+/// instruction's coefficients are built from.
+///
+/// >>> THE FOOTPRINT AND THE FRACTIONS COME FROM ONE QUANTISED uv, and the quantiser
+/// deliberately lands it a quarter of a texel from the boundary `floor(uv * size - 0.5)` turns
+/// on - the gather's own rounding - while leaving the FRACTION free to move over `[0.25, 0.75]`
+/// so the bilinear coefficients still vary with the program's coordinate. A quantiser that
+/// pinned the sample to a texel CENTRE (which is right for a nearest sample) would make every
+/// coefficient the constant 0.75 and check nothing.
+///
+/// The returned order is the platform's: the texels at `(x0,y1)`, `(x1,y1)`, `(x1,y0)`,
+/// `(x0,y0)`. `emit_tex_gather` states the same order and pairs coefficient `k` with texel
+/// `3 - k`; both are read from that one statement of the rule.
+pub fn case_render_gather(unit: u8, coord: [f32; 2]) -> ([f32; 4], [f32; 2]) {
+    let n = CASE_TEX_SIZE as f32;
+    let (ux, uy) = (case_gather_uv(coord[0]), case_gather_uv(coord[1]));
+    // The emitted statement is `fract(uv * vec2<f32>(textureDimensions(t, 0u)) - vec2<f32>(0.5))`,
+    // and the footprint the sampler takes is the same expression's floor. Spelled in that order
+    // here so the two sides round identically.
+    let (sx, sy) = (ux * n - 0.5, uy * n - 0.5);
+    let (bx, by) = (sx.floor(), sy.floor());
+    let (fx, fy) = (sx - bx, sy - by);
+    let at = |x: f32, y: f32| {
+        #[allow(clippy::manual_clamp)]
+        let cl = |v: f32| v.max(0.0).min((CASE_TEX_SIZE - 1) as f32) as u32;
+        // Gather reads ONE component, and `emit_tex_gather` asks for component 0.
+        case_texel_value(unit, 0, cl(x), cl(y))[0]
+    };
+    (
+        [
+            at(bx, by + 1.0),
+            at(bx + 1.0, by + 1.0),
+            at(bx + 1.0, by),
+            at(bx, by),
+        ],
+        [fx, fy],
+    )
+}
+
+/// The coordinate quantisers the render rig's modules carry - the WGSL twins of
+/// [`case_tex_index_frac`] and `case_gather_uv`. `CASE_TEX_SIZEf` is substituted with the
+/// texture size as a float literal, so the constant exists once.
+pub const CASE_UV_FNS: &str = "
+fn gxp_case_ti(c: f32) -> vec2<f32> {
+  let s = select(c, 0.0, c != c);
+  let t = (min(max(s, -4.0), 4.0) + 4.0) * 0.125;
+  let fi = t * CASE_TEX_SIZEf;
+  let fl = floor(fi);
+  return vec2<f32>(min(fl, CASE_TEX_SIZEf - 1.0), fi - fl);
+}
+fn gxp_case_uv2(c: vec2<f32>) -> vec2<f32> {
+  let a = gxp_case_ti(c.x);
+  let b = gxp_case_ti(c.y);
+  return vec2<f32>((a.x + 0.5) * (1.0 / CASE_TEX_SIZEf), (b.x + 0.5) * (1.0 / CASE_TEX_SIZEf));
+}
+fn gxp_case_uv2g(c: vec2<f32>) -> vec2<f32> {
+  let a = gxp_case_ti(c.x);
+  let b = gxp_case_ti(c.y);
+  return vec2<f32>((a.x + 0.75 + a.y * 0.5) * (1.0 / CASE_TEX_SIZEf),
+                   (b.x + 0.75 + b.y * 0.5) * (1.0 / CASE_TEX_SIZEf));
+}
+fn gxp_case_uv3c(c: vec3<f32>) -> vec3<f32> {
+  let a = gxp_case_ti(c.x);
+  let b = gxp_case_ti(c.y);
+  let f = gxp_case_ti(c.z);
+  let sc = 2.0 * ((a.x + 0.5) * (1.0 / CASE_TEX_SIZEf)) - 1.0;
+  let tc = 2.0 * ((b.x + 0.5) * (1.0 / CASE_TEX_SIZEf)) - 1.0;
+  switch (u32(f.x) % 6u) {
+CASE_CUBE_SWITCH  }
+}
+";
+
+/// One term of a cube face's direction: a signed `1`, `sc` or `tc`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CubeTerm {
+    One,
+    Sc,
+    Tc,
+}
+
+/// >>> THE INVERSE OF THE CUBE MAPPING, STATED ONCE. For each face, the direction whose major
+/// axis selects that face and whose face coordinates are exactly `(sc, tc)`.
+///
+/// The forward rule - which face a direction names, and the `sc`/`tc` it yields - is the
+/// hardware's, and is the same in every graphics API:
+///
+/// ```text
+///   +X: sc = -z  tc = -y  ma = x      -X: sc = +z  tc = -y  ma = x
+///   +Y: sc = +x  tc = +z  ma = y      -Y: sc = +x  tc = -z  ma = y
+///   +Z: sc = +x  tc = -y  ma = z      -Z: sc = -x  tc = -y  ma = z
+///   u = 0.5 * (sc / |ma| + 1)         v = 0.5 * (tc / |ma| + 1)
+/// ```
+///
+/// This table is that rule solved for the direction, with `|ma| = 1`. The WGSL helper is
+/// GENERATED from it and `the_cube_direction_selects_the_face_and_texel_it_names` checks it
+/// against the forward rule written out independently - so there is one statement of the
+/// inverse and it is tested, rather than two transcriptions that agree until they do not.
+const CASE_CUBE_FACES: [[(i8, CubeTerm); 3]; 6] = [
+    [(1, CubeTerm::One), (-1, CubeTerm::Tc), (-1, CubeTerm::Sc)],
+    [(-1, CubeTerm::One), (-1, CubeTerm::Tc), (1, CubeTerm::Sc)],
+    [(1, CubeTerm::Sc), (1, CubeTerm::One), (1, CubeTerm::Tc)],
+    [(1, CubeTerm::Sc), (-1, CubeTerm::One), (-1, CubeTerm::Tc)],
+    [(1, CubeTerm::Sc), (-1, CubeTerm::Tc), (1, CubeTerm::One)],
+    [(-1, CubeTerm::Sc), (-1, CubeTerm::Tc), (-1, CubeTerm::One)],
+];
+
+/// The direction that selects `face` at face coordinates `(sc, tc)` - the Rust twin of the
+/// generated `gxp_case_uv3c` switch, read from the same table.
+pub fn case_cube_direction(face: usize, sc: f32, tc: f32) -> [f32; 3] {
+    let mut d = [0.0f32; 3];
+    for (k, (sign, term)) in CASE_CUBE_FACES[face % 6].iter().enumerate() {
+        let v = match term {
+            CubeTerm::One => 1.0,
+            CubeTerm::Sc => sc,
+            CubeTerm::Tc => tc,
+        };
+        d[k] = f32::from(*sign) * v;
+    }
+    d
+}
+
+/// The `switch` arms of `gxp_case_uv3c`, generated from [`CASE_CUBE_FACES`].
+fn case_cube_switch() -> String {
+    let mut out = String::new();
+    for (f, face) in CASE_CUBE_FACES.iter().enumerate() {
+        let terms: Vec<String> = face
+            .iter()
+            .map(|(sign, term)| {
+                let neg = if *sign < 0 { "-" } else { "" };
+                match term {
+                    CubeTerm::One => format!("{neg}1.0"),
+                    CubeTerm::Sc => format!("{neg}sc"),
+                    CubeTerm::Tc => format!("{neg}tc"),
+                }
+            })
+            .collect();
+        let label = if f == 5 { "default".to_string() } else { format!("case {f}u") };
+        let _ = writeln!(out, "    {label}: {{ return vec3<f32>({}); }}", terms.join(", "));
+    }
+    out
+}
+
+/// [`CASE_UV_FNS`] with the texture size substituted in.
+pub fn case_uv_fns() -> String {
+    CASE_UV_FNS
+        .replace("CASE_CUBE_SWITCH", &case_cube_switch())
+        .replace("CASE_TEX_SIZEf", &format!("{:?}", CASE_TEX_SIZE as f32))
+}
+
+/// What a render case's wrapper had to rewrite, so the caller can require that it rewrote
+/// EVERYTHING the program contains rather than trust a textual parse.
+///
+/// A sample left unrewritten is not a compile error - it is a real `textureSample` on an
+/// unquantised coordinate, which would pass through boundary rounding and report the device as
+/// wrong. The counts are checked against the instruction stream by the case writer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RenderRewrites {
+    pub samples: usize,
+    pub gathers: usize,
+    pub kills: usize,
+}
+
+/// Wrap an emitted FRAGMENT body into a RENDER module whose fragment entry runs it once and
+/// writes the register file back, with REAL texture bindings.
+///
+/// See the section comment above for what this rig can and cannot check. The output buffer
+/// extends the compute rig's four banks with two words:
+///
+/// ```text
+///   [4N]     1 if the program executed a `kill`, else 0
+///   [4N + 1] the fragment depth, as bits
+/// ```
+///
+/// >>> `kill` IS MODELLED, NOT EXECUTED, AND THAT IS THE ONLY HONEST CHOICE. WGSL's `discard`
+/// demotes the invocation to a helper, and a helper's stores DO NOT LAND - so a case whose
+/// program discards would read its output buffer back untouched and compare as "the GPU
+/// computed zero" on every lane. The wrapper rewrites the discard into "record the kill, write
+/// the register file, leave the shader", which is the state the hardware's pixel ends with, and
+/// the reference's `Op::Kill` arm ends its walk at the same instruction.
+///
+/// >>> THE DEPTH REMAP IS PINNED TO ITS DEFAULT ARM. `gxp_depth_to_window` in a shipped module
+/// chooses between four forward maps from a per-draw uniform the renderer fills; which one is
+/// in force is a property of the DRAW, not of the translation, so the rig defines the helper as
+/// the default (`range.w >= 2.5`) arm - a clamp - and the reference applies the same clamp.
+/// What is under test is the value the program computed, not which map the renderer picked.
+///
+/// Returns `None` when a sampled unit is not a plain 2D float texture: a cube, a 3D or a raw
+/// integer binding needs a texture set and a coordinate quantiser this rig does not have, and
+/// emitting the module anyway would bind something else's texture. The caller skips the blob
+/// and the skip is counted.
+pub fn wrap_render_case_module_for(
+    body: &str,
+    kind: ProgramKind,
+    mem_windows: &[crate::module::MemWindow],
+    units: &[TexBinding],
+) -> Result<(String, RenderRewrites), &'static str> {
+    wrap_render_case_module_facing(body, kind, mem_windows, units, true)
+}
+
+/// [`wrap_render_case_module_for`] with the facing flag the case declares - see
+/// [`wrap_compute_module_facing`], which makes the same substitution for the same reason.
+pub fn wrap_render_case_module_facing(
+    body: &str,
+    kind: ProgramKind,
+    mem_windows: &[crate::module::MemWindow],
+    units: &[TexBinding],
+    facing: bool,
+) -> Result<(String, RenderRewrites), &'static str> {
+    wrap_render_case_module_ramped(body, kind, mem_windows, units, facing, false)
+}
+
+/// The PA lane the render rig's optional SCREEN RAMP rides on - high enough that no program
+/// under test reads it by accident, low enough that a doubled six-bit operand field can name it.
+pub const CASE_RAMP_LANE: usize = 100;
+/// The ramp's step per pixel in x and y. Powers of two far below the seeded lane's own
+/// magnitude, so `x + step` stays in `x`'s binade and is EXACT, and the quad's difference is
+/// exactly the step (Sterbenz) whether the device takes a coarse or a fine derivative.
+pub const CASE_RAMP_DX: f32 = 1.0 / 1024.0;
+pub const CASE_RAMP_DY: f32 = 1.0 / 2048.0;
+
+/// [`wrap_render_case_module_facing`], optionally with the SCREEN RAMP on [`CASE_RAMP_LANE`] -
+/// the one input that varies across the quad, so a derivative has something to measure. See
+/// `interp::RegFile::ramp` for what the reference does with it. The ramp is zero at the real
+/// pixel (`pos = (0.5, 0.5)`), so no value the program reads there changes.
+pub fn wrap_render_case_module_ramped(
+    body: &str,
+    kind: ProgramKind,
+    mem_windows: &[crate::module::MemWindow],
+    units: &[TexBinding],
+    facing: bool,
+    ramp: bool,
+) -> Result<(String, RenderRewrites), &'static str> {
+    // NAME THE KIND. A census that says "an unsupported texture" 35 times tells a reader
+    // nothing about what to build next, while naming the dimensionality turns the same census
+    // into a ranked work list - the same rule the interpreter's refusals follow.
+    if let Some(b) = units.iter().find(|b| b.raw || (b.coords >= 3 && !b.cube)) {
+        return Err(if b.raw { "a raw 64-bit integer texture" } else { "a 3D texture" });
+    }
+    let (body, rewrites) = rewrite_body_for_render(body, kind);
+    let n = CASE_BANK_LANES;
+    let mut m = String::new();
+
+    let mem_binding = if body.contains("gxp_fmem_word") { "gxp_fmem" } else { "gxp_mem" };
+    if !mem_windows.is_empty() {
+        let _ = writeln!(
+            m,
+            "@group(0) @binding(2) var<storage, read> {mem_binding}: array<vec4<u32>>;"
+        );
+        m.push_str(&crate::module::mem_window_helper_named(mem_windows, mem_binding));
+    }
+    let _ = writeln!(m, "@group(0) @binding(0) var<storage, read> gxp_case_in: array<u32>;");
+    let _ = writeln!(
+        m,
+        "@group(0) @binding(1) var<storage, read_write> gxp_case_out: array<u32>;"
+    );
+    // Textures from binding 4 up, leaving 2 to the guest-memory window and 3 to the trace
+    // buffer the compute rig uses - one binding numbering across both rigs, so a reader of the
+    // runner does not have to hold two.
+    for (k, b) in units.iter().enumerate() {
+        let (tex, samp) = sampler_names(kind, b.unit);
+        // The binding's TYPE is the one the shipped pipeline builder would declare
+        // ([`TexBinding::wgsl_type`]), because the body was emitted against it: a cube sampled
+        // with three components must be a `texture_cube` or the call does not type-check.
+        let _ = writeln!(m, "@group(0) @binding({}) var {tex}: {};", 4 + 2 * k, b.wgsl_type());
+        let _ = writeln!(m, "@group(0) @binding({}) var {samp}: sampler;", 5 + 2 * k);
+    }
+    for bank in ["r", "pa", "sa", "o", "i"] {
+        let _ = writeln!(m, "var<private> {bank}: array<u32, {BANK_REGS}>;");
+    }
+    let _ = writeln!(m, "var<private> p: array<bool, 4>;");
+    let _ = writeln!(m, "var<private> idx: array<i32, 2>;");
+    // The two fragment-stage outputs. `gxp_frag_depth` is module scope rather than a local
+    // because the emitted body assigns to it by name and the epilogue below must read it.
+    let _ = writeln!(m, "var<private> gxp_killed: u32 = 0u;");
+    let _ = writeln!(m, "var<private> gxp_frag_depth: f32 = 0.0;");
+    if !units.is_empty() {
+        m.push_str(&case_uv_fns());
+    }
+    // See the doc above: the default forward map, so the value under test is the one the
+    // program computed.
+    m.push_str(
+        "fn gxp_depth_to_window(d: f32, interpolated: f32) -> f32 { return clamp(d, 0.0, 1.0); }\n",
+    );
+    let _ = writeln!(m, "fn gxp_case_store() {{");
+    let _ = writeln!(
+        m,
+        "  for (var n: u32 = 0u; n < {n}u; n = n + 1u) {{ gxp_case_out[n] = r[n]; gxp_case_out[{n}u + n] = o[n]; gxp_case_out[{}u + n] = i[n]; gxp_case_out[{}u + n] = pa[n]; }}",
+        n * 2,
+        n * 3
+    );
+    let _ = writeln!(m, "  gxp_case_out[{}u] = gxp_killed;", n * 4);
+    let _ = writeln!(m, "  gxp_case_out[{}u] = bitcast<u32>(gxp_frag_depth);", n * 4 + 1);
+    let _ = writeln!(m, "}}");
+    // ONE triangle over the whole clip square. The target is 1x1, so exactly one invocation is
+    // real and the other three lanes of its quad are helpers - whose stores do not land, which
+    // is what keeps the single output buffer unraced.
+    m.push_str(
+        "@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {\n  \
+         var xy = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));\n  \
+         return vec4<f32>(xy[vi], 0.0, 1.0);\n}\n",
+    );
+    if ramp {
+        let _ = writeln!(m, "@fragment fn fs_main(@builtin(position) gxp_pos: vec4<f32>) -> @location(0) vec4<f32> {{");
+    } else {
+        let _ = writeln!(m, "@fragment fn fs_main() -> @location(0) vec4<f32> {{");
+    }
+    let _ = writeln!(
+        m,
+        "  for (var n: u32 = 0u; n < {n}u; n = n + 1u) {{ pa[n] = gxp_case_in[n]; sa[n] = gxp_case_in[{n}u + n]; }}"
+    );
+    if ramp {
+        let _ = writeln!(
+            m,
+            "  pa[{CASE_RAMP_LANE}] = bitcast<u32>(bitcast<f32>(pa[{CASE_RAMP_LANE}]) + (gxp_pos.x - 0.5) * {:?} + (gxp_pos.y - 0.5) * {:?});",
+            CASE_RAMP_DX, CASE_RAMP_DY
+        );
+    }
+    for (i, win) in mem_windows.iter().enumerate() {
+        let _ = writeln!(m, "  sa[{}] = {mem_binding}[{i}u].x;", win.base_sa);
+    }
+    // >>> FACING AND INTERPOLATED DEPTH ARE PINNED, exactly as the compute rig pins them, and
+    // for the same reason: NEITHER SIDE MODELS THEM. The reference has no facing input and no
+    // interpolated depth, so reading the real `@builtin(front_facing)` here would put a value
+    // in the comparison that one side cannot compute. A program whose result depends on either
+    // is still not a case this harness can judge.
+    let _ = writeln!(m, "  let gxp_front_facing: bool = {facing};");
+    let _ = writeln!(m, "  let gxp_interp_depth: f32 = 0.0;");
+    let _ = writeln!(m, "  gxp_frag_depth = gxp_interp_depth;");
+    m.push_str(&body);
+    let _ = writeln!(m, "  gxp_case_store();");
+    let _ = writeln!(m, "  return vec4<f32>(0.0);");
+    let _ = writeln!(m, "}}");
+    Ok((add_half_helpers(m), rewrites))
+}
+
+/// Quantise every sample coordinate and turn every `discard` into a recorded kill.
+///
+/// The parse is exact rather than heuristic, like [`substitute_constant_samples`]: `emit_tex`
+/// writes one `FUNC(tex, samp, vecK<f32>(...)EXTRA)` per sample and `emit_tex_gather` writes
+/// one `let _guvN = vec2<f32>(...);`, and anything not of that shape is left alone and NOT
+/// counted, so the caller can refuse the blob rather than ship a module that samples an
+/// unquantised coordinate.
+fn rewrite_body_for_render(body: &str, kind: ProgramKind) -> (String, RenderRewrites) {
+    let mut n = RenderRewrites::default();
+    let mut out = String::with_capacity(body.len());
+    let prefix = match kind {
+        ProgramKind::Vertex => "vt",
+        _ => "t",
+    };
+    for line in body.lines() {
+        // A gather's coordinate is bound to its own `let` and read twice - once by the gather
+        // and once by the coefficients - so quantising it at the binding covers both.
+        if line.trim_start().starts_with("let _guv")
+            && let Some(eq) = line.find("= vec2<f32>(")
+        {
+            let (head, tail) = line.split_at(eq + 1);
+            let _ = writeln!(out, "{head} gxp_case_uv2g({});", tail.trim().trim_end_matches(';'));
+            n.gathers += 1;
+            continue;
+        }
+        if line.trim() == "discard;" {
+            out.push_str("  { gxp_killed = 1u; gxp_case_store(); return vec4<f32>(0.0); }\n");
+            n.kills += 1;
+            continue;
+        }
+        let rewritten = (|| {
+            let eq = line.find("= texture")?;
+            let call = &line[eq + 2..];
+            let open = call.find('(')?;
+            let func = &call[..open];
+            if !matches!(
+                func,
+                "textureSample" | "textureSampleBias" | "textureSampleLevel" | "textureSampleGrad"
+            ) {
+                return None;
+            }
+            let args = &call[open + 1..];
+            // The binding must be one this rig declared, or the rewrite would wrap a
+            // coordinate for a texture nothing bound.
+            let tex = args.split(',').next()?.trim();
+            let _unit: u8 = tex.strip_prefix(prefix)?.parse().ok()?;
+            let samp = args.split(',').nth(1)?.trim();
+            let (start, end, comps) = coord_arg_span(args)?;
+            // Two components go to the flat texture's quantiser and three to the cube's, which
+            // is exactly the split the binding's own type makes - a 3D texture is refused
+            // before this runs, so a three-component coordinate here is a cube direction.
+            let quant = if comps == 3 { "gxp_case_uv3c" } else { "gxp_case_uv2" };
+            let coord = &args[start..end];
+            // >>> AN IMPLICIT OR BIASED SAMPLE BECOMES AN EXPLICIT LEVEL-0 ONE, AND NOT BECAUSE
+            // >>> IT IS CONVENIENT.
+            //
+            // `textureSample` and `textureSampleBias` take the quad's derivatives, so WGSL
+            // requires them in UNIFORM control flow - and this rig's prologue makes every
+            // predicate non-uniform where the shipped module's is not. In the module the
+            // product builds, `sa` is a UNIFORM BUFFER, so `if (!p[0])` on an `sa` value is
+            // provably uniform and Tint accepts the sample inside it. Here `sa` is a
+            // `var<private>` array filled per invocation from a storage buffer, so the same
+            // condition is "possibly non-uniform" and Tint refuses the same sample.
+            //
+            // MEASURED, and the measurement is the whole point: `tintcheck` over all **596
+            // shipped modules reports 0 failures**, while three of these cases were refused. So
+            // the refusal was the RIG's, and "fixing" the emitter's hoisting would have been a
+            // change to the product to satisfy an artefact of its test harness.
+            //
+            // The rig binds ONE mip level, so level 0 is the only level any of the four sample
+            // forms can return - the substitution changes no value. What it gives up is the LOD
+            // argument's plumbing, which a single-mip rig could not check either way, and the
+            // UNIFORMITY property, which this rig cannot check at all and `tintcheck` over the
+            // shipped modules can and does.
+            if matches!(func, "textureSample" | "textureSampleBias") {
+                return Some(format!(
+                    "{}= textureSampleLevel({tex}, {samp}, {quant}({coord}), 0.0);",
+                    &line[..eq]
+                ));
+            }
+            let at = eq + 2 + open + 1;
+            Some(format!(
+                "{}{quant}({}){}",
+                &line[..at + start],
+                coord,
+                &line[at + end..]
+            ))
+        })();
+        match rewritten {
+            Some(r) => {
+                n.samples += 1;
+                out.push_str(&r);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    (out, n)
+}
+
+/// The FNV-1a checksum of the whole register file, as a WGSL function and as a Rust one that
+/// must agree with it bit for bit.
+///
+/// >>> WHY A CHECKSUM AND NOT THE REGISTERS THEMSELVES. A trace that carried the file at every
+/// instruction would be `instrs * 4 * 512` words - about a megabyte for a 115-instruction
+/// program, and a loop of 2,048 stores emitted per instruction, which is a module Tint spends
+/// real time on. One word per checkpoint answers the question this instrument is for ("where do
+/// the two sides first differ?"), and once the step is known the ordinary differential names
+/// the lanes.
+///
+/// It hashes BIT PATTERNS in a fixed order with integer arithmetic only, so there is nothing
+/// for the two implementations to round differently.
+///
+/// >>> AND IT COVERS THE PREDICATE AND INDEX REGISTERS, WHICH THE FIRST VERSION DID NOT.
+/// A state a trace omits is a state whose disagreement the trace cannot see - and it does not
+/// merely miss it, it MISLOCATES it. MEASURED on `cw-rr-corpus__frag_8668a340`: the two sides
+/// disagreed about `p[0]`, set by the TEST at instruction 1, and the checksum covering only the
+/// four register banks agreed at instruction 2 and first differed at 3 - so the trace named the
+/// predicated MOVE, which is downstream and innocent. A predicate is one bit and it decides
+/// which of two arms runs, so it is the most consequential state in the file per bit.
+pub const GXP_TRACE_CK: &str = "
+fn gxp_ck() -> u32 {
+  var h: u32 = 2166136261u;
+  for (var n: u32 = 0u; n < GXP_LANESu; n = n + 1u) {
+    h = (h ^ r[n]) * 16777619u;
+    h = (h ^ o[n]) * 16777619u;
+    h = (h ^ i[n]) * 16777619u;
+    h = (h ^ pa[n]) * 16777619u;
+  }
+  for (var k: u32 = 0u; k < 4u; k = k + 1u) {
+    h = (h ^ select(0u, 1u, p[k])) * 16777619u;
+  }
+  for (var k: u32 = 0u; k < 2u; k = k + 1u) {
+    h = (h ^ bitcast<u32>(idx[k])) * 16777619u;
+  }
+  return h;
+}
+";
+
+/// The Rust twin of `gxp_ck`. The lane ORDER, the bank order and the trailing predicate and
+/// index registers are all part of the agreement.
+pub fn trace_checksum(
+    r: &[f32],
+    o: &[f32],
+    i: &[f32],
+    pa: &[f32],
+    p: &[bool],
+    idx: &[i32],
+) -> u32 {
+    let mut h: u32 = 2166136261;
+    let at = |v: &[f32], n: usize| v.get(n).map(|x| x.to_bits()).unwrap_or(0);
+    for n in 0..CASE_BANK_LANES {
+        for bank in [r, o, i, pa] {
+            h = (h ^ at(bank, n)).wrapping_mul(16777619);
+        }
+    }
+    for k in 0..4 {
+        h = (h ^ u32::from(p.get(k).copied().unwrap_or(false))).wrapping_mul(16777619);
+    }
+    for k in 0..2 {
+        h = (h ^ idx.get(k).copied().unwrap_or(0) as u32).wrapping_mul(16777619);
+    }
+    h
+}
+
+/// Wrap a MARKED body into a compute module that records a register-file checksum at every
+/// top-level instruction boundary, keyed by instruction index.
+///
+/// # What this is for
+/// [`wrap_compute_module_for`] says WHETHER two register files agree at the end. On a
+/// 183-instruction program that is not enough to fix anything: the disagreement has to be
+/// located first, and reading a hundred instructions by eye is the guess-and-check this
+/// project's notes keep recording as the expensive way.
+///
+/// # Keyed by INDEX, not by a step counter, and last write wins
+/// The reference follows branches, so its execution ORDER is not the emitted order and a step
+/// counter would put the two traces out of phase at the first taken branch. Indexing by the
+/// instruction means both sides record "the state on last arriving at instruction k", which is
+/// the same statement on both and needs no agreement about control flow. In a loop both record
+/// the final iteration.
+///
+/// Only DEPTH-1 boundaries carry a marker ([`emit_range`]), so an instruction inside an `if`
+/// or a loop body has no checkpoint of its own and the trace narrows to the enclosing top-level
+/// region. That is a limit worth knowing, not a defect: it is where a body can be cut.
+pub fn wrap_trace_module_for(
+    marked_body: &str,
+    kind: ProgramKind,
+    mem_windows: &[crate::module::MemWindow],
+) -> (String, Vec<u8>, Vec<usize>) {
+    // The checkpoints, in place of the markers, and the indices they name.
+    let mut indices = Vec::new();
+    let mut body = String::with_capacity(marked_body.len());
+    for line in marked_body.lines() {
+        if let Some(rest) = line.strip_prefix(SPLIT_MARKER)
+            && let Ok(index) = rest.trim().parse::<usize>()
+        {
+            indices.push(index);
+            let _ = writeln!(body, "  gxp_trace[{index}u] = gxp_ck();");
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    // One past the last instruction: the FINAL state, which is what the ordinary differential
+    // compares. Without it a program whose only disagreement is in its last instruction traces
+    // as identical the whole way.
+    let end = indices.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+    let _ = writeln!(body, "  gxp_trace[{end}u] = gxp_ck();");
+    indices.push(end);
+
+    let (module, units) = wrap_compute_module_for(&body, kind, mem_windows);
+    // The buffer and the checksum go in ahead of the entry point, after the directives.
+    let decl = format!(
+        "@group(0) @binding(3) var<storage, read_write> gxp_trace: array<u32>;\n{}",
+        GXP_TRACE_CK.replace("GXP_LANES", &CASE_BANK_LANES.to_string())
+    );
+    let mut out = module;
+    out.insert_str(crate::link::directives_end(&out), &decl);
+    (out, units, indices)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1340,6 +3142,9 @@ fn emit_instr(
     shader: &Shader,
     prelude: &mut String,
     cond_start: Option<usize>,
+    // The conditional regions this instruction sits inside, outermost first - see
+    // [`uniform_gap`], which a derivative uses to reach uniform control flow where it stands.
+    enclosing: &[Enclosing],
 ) -> Result<(), EmitError> {
     // Reject an op the emitter has not wired before touching operands, so the error names
     // the op (what to implement next) rather than a missing-operand symptom.
@@ -1478,27 +3283,46 @@ fn emit_instr(
     {
         let func = if matches!(instr.op, Op::Dsx) { "dpdx" } else { "dpdy" };
         let s1 = instr.srcs.first().ok_or_else(unmapped)?;
-        if let Some(from) = cond_start
-            && writes_between(shader, from, index, s1)
-        {
-            return Err(EmitError::Blocked {
-                index,
-                byte_offset,
-                reason: "a derivative inside a BRANCH whose source register an earlier                          instruction writes - the call cannot leave the branch (WGSL requires                          uniform control flow) without reading a different value",
-                raw: instr.raw,
-            });
-        }
+        // >>> WHERE THE CALL GOES, and there are two places because there are two facts.
+        //
+        // Nothing has rewritten the source since the region began: the call is HOISTED above
+        // the region, where control flow is uniform and the register still holds the same
+        // value. That is the common case and the cheap one.
+        //
+        // The region ITSELF computes the value being differenced: no point above the region
+        // holds it, so the region is CLOSED here, the builtin called in the gap, and the region
+        // re-entered - see [`uniform_gap`] for why that is what the hardware does rather than a
+        // way around the WGSL rule. This case used to be refused outright, and a refused pair's
+        // mesh is absent from the frame: it is three of a football title's world programs.
+        let gap = match cond_start {
+            Some(from) if writes_between(shader, from, index, s1) => {
+                Some(uniform_gap(shader, enclosing, from, index, index)?)
+            }
+            _ => None,
+        };
         let p = Prec::of(instr);
         let mut names: [Option<String>; 4] = [None, None, None, None];
+        // The gap's close/re-enter brackets the WHOLE set of channel calls, so a four-channel
+        // derivative cuts one gap and not four.
+        let mut gap_calls = String::new();
         for (c, name) in names.iter_mut().enumerate() {
             if !mask[c] {
                 continue;
             }
             let e = src_channel(s1, c, p).ok_or_else(unmapped)?;
             let n = format!("gxp_deriv{index}_{c}");
-            let out = if cond_start.is_some() { &mut *prelude } else { &mut *body };
+            let out = match (&gap, cond_start) {
+                (Some(_), _) => &mut gap_calls,
+                (None, Some(_)) => &mut *prelude,
+                (None, None) => &mut *body,
+            };
             let _ = writeln!(out, "  let {n} = {func}({e});");
             *name = Some(n);
+        }
+        if let Some((close, reopen)) = gap {
+            body.push_str(&close);
+            body.push_str(&gap_calls);
+            body.push_str(&reopen);
         }
         Some(names)
     } else {
@@ -1556,6 +3380,18 @@ fn emit_instr(
         Op::PackFromInt { bits, signed } => {
             emit_pack_from_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
         }
+        Op::PackIntCopy { bits } => {
+            emit_pack_int_copy(s, instr, dest, mask, bits).ok_or_else(unmapped)
+        }
+        // The BYTE-WISE conditional move: one register, four independently selected bytes,
+        // every operand a raw lane. There is no float view anywhere in it, which is why the
+        // "cannot be represented in a float register file" refusal did not apply.
+        Op::CmovU8 { test } => emit_cmov_u8(s, instr, dest, mask, test).ok_or_else(unmapped),
+        // A LIMM's value is a RAW pattern - the corpus uses one as an integer sentinel and
+        // another as a float - so it is stored with no view applied, like an integer pack's.
+        Op::Limm { value } => s
+            .store_raw(dest, 0, &format!("{value:#010x}u"))
+            .ok_or_else(unmapped),
         Op::IntMad { signed, bits, src0_high, src1_high } => {
             emit_int_mad(s, instr, dest, signed, bits, src0_high, src1_high).ok_or_else(unmapped)
         }
@@ -1572,7 +3408,9 @@ fn emit_instr(
         Op::MemLoad { elements, offset_bytes } => {
             emit_mem_load(s, instr, dest, elements, offset_bytes, index, kind).ok_or_else(unmapped)
         }
-        Op::LoadIndex { addend } => emit_load_index(s, instr, dest, addend).ok_or_else(unmapped),
+        Op::LoadIndex { addend, to_index, stride } => {
+            emit_load_index(s, instr, dest, addend, to_index, stride).ok_or_else(unmapped)
+        }
         Op::Sop2 { color, alpha, f1, f1_complement, f2, f2_complement } => {
             emit_sop2(s, instr, dest, mask, color, alpha, (f1, f1_complement), (f2, f2_complement))
                 .ok_or_else(unmapped)
@@ -1595,10 +3433,130 @@ fn emit_instr(
 /// with another's - including across the secondary and primary streams, which are emitted
 /// separately and concatenated into one function.
 fn block(stmts: &str, staged: bool) -> String {
-    if !staged {
-        return stmts.to_string();
+    let (stmts, hoisted) = cse_unpacks(&fold_halves(stmts));
+    if !staged && !hoisted {
+        return stmts;
     }
     format!("  {{\n{stmts}  }}\n")
+}
+
+/// >>> AN INSTRUCTION THAT WRITES BOTH HALVES OF A 16-BIT REGISTER WRITES IT ONCE.
+///
+/// A half-register store has to be a read-modify-write, because the other half is a different
+/// value the shader reads back separately. Emitted per channel, the commonest instruction in a
+/// 16-bit fragment program - one writing `.xy` or `.xyzw` - spends two `pack2x16float` calls,
+/// two masks and two ORs per register where ONE pack says the same thing: the pair overwrites
+/// the whole register, so there is nothing to preserve and nothing to read back.
+///
+/// The fold is exact: [`HALF_PK_FN`] of a pair is by definition the low half [`HALF_LO_FN`]
+/// writes beside the high half [`HALF_HI_FN`] writes - the two narrowings are independent and
+/// the helpers are defined in terms of the same one.
+///
+/// >>> IT FOLDS ONLY TWO ADJACENT LINES, AND THAT IS WHAT MAKES IT SAFE.
+///
+/// Pairing the two halves anywhere in the instruction - which is the tempting version, since
+/// the stores are right there in [`Dest`] - moves a store past whatever sits between them, and
+/// what sits between them can be a READ of the same register: [`dest_aliases_source`] only
+/// looks four registers either side of the destination, and a repeated instruction reaches
+/// further than that. MEASURED: pairing structurally changed mlb's frame on 31% of its pixels.
+/// Adjacent lines cannot have anything between them, so there is nothing to move past.
+///
+/// It is worth this care because a 16-bit program pays the pack/unpack emulation on EVERY
+/// fragment: mlb's world-family blend is 54 packs and 118 unpacks per evaluation over three
+/// million samples a frame, which a desktop GPU shrugs off and a phone's does not
+/// [[phone-gpu-has-four-times-the-headroom]].
+fn fold_halves(stmts: &str) -> String {
+    // `  X[n] = gxp_hlo(X[n], LO);` followed by the HIGH half of the same register.
+    let lo_open = format!(" = {HALF_LO_FN}(");
+    let hi_open = format!(" = {HALF_HI_FN}(");
+    let mut out = String::with_capacity(stmts.len());
+    let mut lines = stmts.lines().peekable();
+    while let Some(line) = lines.next() {
+        let folded = (|| {
+            // `  X[n] = gxp_hlo(X[n], ` - the same register on both sides, spelled the same way.
+            let (dest, rest) = line.strip_prefix("  ")?.split_once(lo_open.as_str())?;
+            let lo_body = rest.strip_prefix(dest)?.strip_prefix(", ")?.strip_suffix(");")?;
+            let next = lines.peek()?;
+            let (next_dest, next_rest) = next.strip_prefix("  ")?.split_once(hi_open.as_str())?;
+            if next_dest != dest {
+                return None;
+            }
+            let hi_body = next_rest.strip_prefix(dest)?.strip_prefix(", ")?.strip_suffix(");")?;
+            Some(format!("  {dest} = {HALF_PK_FN}({lo_body}, {hi_body});"))
+        })();
+        match folded {
+            Some(one) => {
+                out.push_str(&one);
+                out.push('\n');
+                lines.next(); // the high half is folded into the line just written
+            }
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Hoist a repeated `unpack2x16float(bank[n])` in ONE instruction into a single `let`.
+///
+/// A 16-bit source operand reads one HALF of a register, so a four-channel instruction over
+/// two registers spells `unpack2x16float(pa[2])` four times for two distinct registers, and a
+/// three-source instruction spells each of its sources' registers four times over. mlb's
+/// world-family blend emits 118 unpacks per evaluation where 40-odd registers are read; the
+/// rest is the same call again. A desktop compiler folds them and the run never notices; the
+/// phone's does not, and this shader is three million fragments a frame
+/// [[phone-gpu-has-four-times-the-headroom]].
+///
+/// The rule is conservative and that is what makes it exact: a register is hoisted only when
+/// NOTHING in this instruction assigns it. `Dest` holds every store to the end of the
+/// instruction, but a handful of emitters (the integer groups) write a whole register inline,
+/// so "no assignment anywhere in the instruction" is the one test that covers both without
+/// having to know which emitter ran.
+fn cse_unpacks(stmts: &str) -> (String, bool) {
+    const CALL: &str = "unpack2x16float(";
+    // Distinct `bank[n]` arguments and how often each is unpacked.
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    let mut rest = stmts;
+    while let Some(at) = rest.find(CALL) {
+        rest = &rest[at + CALL.len()..];
+        let Some(close) = rest.find(')') else { break };
+        let arg = &rest[..close];
+        // Only a plain register read. A constant (`0x00003c00u`) is folded by any compiler and
+        // an indexed or computed argument is not a stable name to key on.
+        if !is_register_read(arg) {
+            continue;
+        }
+        match seen.iter_mut().find(|(a, _)| a == arg) {
+            Some((_, n)) => *n += 1,
+            None => seen.push((arg.to_string(), 1)),
+        }
+    }
+    let mut out = stmts.to_string();
+    let mut lets = String::new();
+    for (arg, n) in seen {
+        if n < 2 || out.contains(&format!("{arg} =")) {
+            continue;
+        }
+        let name = format!("u_{}", arg.replace(['[', ']'], ""));
+        let _ = writeln!(lets, "  let {name} = unpack2x16float({arg});");
+        out = out.replace(&format!("{CALL}{arg})"), &name);
+    }
+    if lets.is_empty() {
+        return (out, false);
+    }
+    (format!("{lets}{out}"), true)
+}
+
+/// Whether `arg` is exactly a `bank[n]` register read - the only argument [`cse_unpacks`]
+/// keys on.
+fn is_register_read(arg: &str) -> bool {
+    let Some((bank, idx)) = arg.split_once('[') else { return false };
+    let Some(idx) = idx.strip_suffix(']') else { return false };
+    matches!(bank, "r" | "o" | "pa" | "sa" | "i")
+        && !idx.is_empty()
+        && idx.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `dest.c = (src1.c OP src2.c)` for each written channel.
@@ -1744,13 +3702,47 @@ fn emit_pack_to_int(
         // whole-register store put a skinned mesh's four blend indices in four registers where
         // its four bone fetches look in two, so half the fetches read a register nothing had
         // written and the other half were taken twice.
-        if bits == 16 {
-            body.store_raw_half(dest, c, &e)?;
-        } else {
-            body.store_raw(dest, c, &e)?;
+        // >>> AND AN 8-BIT RESULT IS A QUARTER OF ONE, for the same reason and by the same
+        // rule: the four channels of an 8-bit VPCK are the four BYTES of the operand's own
+        // register, which is how `emit_pack_from_int` reads one back. A whole-register store
+        // here would put channel 1 in register `index + 1`, where its reader looks in byte 1
+        // of `index`.
+        // >>> THE PLACEMENT RULE IS `Instr::dest_raw_packed_bits`, NOT A SECOND `match` HERE.
+        // The reference interpreter's generic store path reads the same function, because it
+        // had no rule at all and placed a 16-bit result one whole register per channel - the
+        // defect this comment describes, on the oracle's side, found by the GPU differential
+        // months after the emitter got it right.
+        match instr.dest_raw_packed_bits() {
+            Some(16) => body.store_raw_half(dest, c, &e)?,
+            Some(8) => body.store_raw_byte(dest, c, &e)?,
+            _ => body.store_raw(dest, c, &e)?,
         }
     }
     Some(())
+}
+
+/// The RAW bit pattern of one packed element of `reg`: `width` bits starting at bit `lo`,
+/// sign-extended to 32 when `signed`.
+///
+/// A shift by zero and a mask that covers the whole remainder are both omitted, so the 16-bit
+/// forms read exactly as they were spelled out when this was two hand-written branches.
+fn raw_elem_expr(reg: &str, lo: u32, width: u32, signed: bool) -> String {
+    if signed {
+        let up = 32 - width - lo;
+        let down = 32 - width;
+        if up == 0 {
+            format!("(bitcast<i32>({reg}) >> {down}u)")
+        } else {
+            format!("((bitcast<i32>({reg}) << {up}u) >> {down}u)")
+        }
+    } else {
+        let m = (1u64 << width) - 1;
+        match (lo, lo + width) {
+            (0, _) => format!("({reg} & {m:#x}u)"),
+            (_, 32) => format!("({reg} >> {lo}u)"),
+            _ => format!("(({reg} >> {lo}u) & {m:#x}u)"),
+        }
+    }
 }
 
 /// The mirror of [`emit_pack_to_int`]: widen a 16-bit integer half to the destination float.
@@ -1768,7 +3760,7 @@ fn emit_pack_from_int(
     bits: u8,
     signed: bool,
 ) -> Option<()> {
-    debug_assert_eq!(bits, 16, "only the 16-bit widths decode to this op");
+    debug_assert!(bits == 16 || bits == 8, "only the 16- and 8-bit widths decode to this op");
     let s1 = instr.srcs.first()?;
     let dp = Prec::of(instr);
     for c in 0..4 {
@@ -1776,22 +3768,48 @@ fn emit_pack_from_int(
             continue;
         }
         let sel = s1.swizzle[c] as u32;
-        let reg = format!("{}[{}]", bank_prefix(s1.bank)?, s1.index as u32 + (sel >> 1));
-        let half = if signed {
-            if sel & 1 == 1 {
-                format!("(bitcast<i32>({reg}) >> 16u)")
-            } else {
-                format!("((bitcast<i32>({reg}) << 16u) >> 16u)")
-            }
-        } else if sel & 1 == 1 {
-            format!("({reg} >> 16u)")
-        } else {
-            format!("({reg} & 0xffffu)")
-        };
-        let e = if signed { format!("f32({half})") } else { format!("f32({half})") };
+        let elems_per_reg = 32 / bits as u32;
+        let reg = format!("{}[{}]", bank_prefix(s1.bank)?, s1.index as u32 + sel / elems_per_reg);
+        let lo = (sel % elems_per_reg) * bits as u32;
+        let half = raw_elem_expr(&reg, lo, bits as u32, signed);
+        let e = format!("f32({half})");
         let e = if s1.neg { format!("(-{e})") } else { e };
         let e = if s1.abs { format!("abs({e})") } else { e };
         body.store(dest, c, &e, dp)?;
+    }
+    Some(())
+}
+
+/// A 16-bit integer VPCK whose destination is 16-bit too: a swizzled copy of HALVES.
+///
+/// Neither end converts, so this is the source reader of [`emit_pack_from_int`] and the
+/// destination writer of [`emit_pack_to_int`]'s 16-bit branch with no arithmetic between them.
+/// The bits are moved unsigned because at equal widths the pattern does not depend on the
+/// labels: a sign is applied by whoever WIDENS a half later, and applying one here would
+/// sign-extend into the partner half's bits and destroy a value the shader reads back.
+fn emit_pack_int_copy(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    mask: [bool; 4],
+    bits: u8,
+) -> Option<()> {
+    debug_assert!(bits == 16 || bits == 8, "only the equal-width int copies decode to this op");
+    let s1 = instr.srcs.first()?;
+    let elems_per_reg = 32 / bits as u32;
+    for c in 0..4 {
+        if !mask[c] {
+            continue;
+        }
+        let sel = s1.swizzle[c] as u32;
+        let reg = format!("{}[{}]", bank_prefix(s1.bank)?, s1.index as u32 + sel / elems_per_reg);
+        let lo = (sel % elems_per_reg) * bits as u32;
+        let elem = raw_elem_expr(&reg, lo, bits as u32, false);
+        if bits == 16 {
+            body.store_raw_half(dest, c, &elem)?;
+        } else {
+            body.store_raw_byte(dest, c, &elem)?;
+        }
     }
     Some(())
 }
@@ -1800,10 +3818,32 @@ fn emit_pack_from_int(
 ///
 /// The source lane holds an integer bit pattern (it was produced by [`emit_pack_to_int`] and a
 /// 16-bit shift), so it is read raw rather than through a float view.
-fn emit_load_index(body: &mut Dest, instr: &Instr, dest: &Operand, addend: i32) -> Option<()> {
+fn emit_load_index(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    addend: i32,
+    to_index: bool,
+    stride: u8,
+) -> Option<()> {
     let s1 = instr.srcs.first()?;
-    let reg = dest.index.min(1) as u32;
     let bank = bank_prefix(s1.bank)?;
+    // The form whose sum goes to an ORDINARY REGISTER - see `Op::LoadIndex`. It addresses
+    // nothing indirectly, so the index register's PAIR SCALE below does not apply: the
+    // consuming IMAD32 multiplies this by the palette's own row stride.
+    if !to_index {
+        let dbank = bank_prefix(dest.bank)?;
+        let mul = crate::link::index_load_multiplier().unwrap_or(stride as i32);
+        let scaled = if mul == 1 {
+            format!("i32({bank}[{}] & 0xffffu)", s1.index as u32)
+        } else {
+            format!("i32({bank}[{}] & 0xffffu) * {mul}i", s1.index as u32)
+        };
+        writeln!(body, "  {dbank}[{}] = bitcast<u32>({scaled} + {addend}i);", dest.index as u32)
+            .ok();
+        return Some(());
+    }
+    let reg = dest.index.min(1) as u32;
     // >>> THE INDEX REGISTER COUNTS PAIRS OF REGISTERS, NOT REGISTERS.
     //
     // `idx = (src + addend) * 2`. Read as single registers, one title's particle-streak
@@ -2516,6 +4556,14 @@ fn emit_int_mad(
         if matches!(o.bank, Bank::Immediate) {
             return Some(format!("{}u", o.index as u32));
         }
+        // A hardware-constant source contributes its 32-bit table entry VERBATIM, the same way
+        // the VBW emitter reads one: these groups are bit-pattern ops, so the entry is used as
+        // stored rather than through a float view, and the channel-0 swizzle selector picks the
+        // bank exactly as it does everywhere else.
+        if matches!(o.bank, Bank::Constant) {
+            let bank = if o.swizzle[0] == 1 { &CNST6_F32_BANK1 } else { &CNST6_F32_BANK0 };
+            return Some(format!("{:#010x}u", bank[(o.index & 0x3f) as usize]));
+        }
         if matches!(o.bank, Bank::Indexed) {
             return indexed_element(o, 0);
         }
@@ -2570,14 +4618,25 @@ fn emit_int_mad_step(
     signed: bool,
     high_half: bool,
 ) -> Option<()> {
-    // The decoder blocks the signed form by name; this keeps the emitter honest if that ever
-    // changes without the sign rule for the two halves being established first.
-    if signed {
-        return None;
-    }
+    // >>> `signed` IS DECODED AND DELIBERATELY UNUSED HERE.
+    //
+    // The expression below is exactly `src0 * src1 + src2` modulo 2^32 - the `<< 16u` discards
+    // what the high product carries above bit 15 - and two's-complement multiplication agrees on
+    // the low 32 bits for signed and unsigned operands alike, so ONE emission is correct for
+    // both. `usse::validate_imad_step_pairs` is what makes the PAIR's value the only observable;
+    // see `decode_grp_imad32_step` for that and for the corpus closure behind it.
+    let _ = signed;
     let raw = |o: &Operand| -> Option<String> {
         if matches!(o.bank, Bank::Immediate) {
             return Some(format!("{}u", o.index as u32));
+        }
+        // A hardware-constant source contributes its 32-bit table entry VERBATIM, the same way
+        // the VBW emitter reads one: these groups are bit-pattern ops, so the entry is used as
+        // stored rather than through a float view, and the channel-0 swizzle selector picks the
+        // bank exactly as it does everywhere else.
+        if matches!(o.bank, Bank::Constant) {
+            let bank = if o.swizzle[0] == 1 { &CNST6_F32_BANK1 } else { &CNST6_F32_BANK0 };
+            return Some(format!("{:#010x}u", bank[(o.index & 0x3f) as usize]));
         }
         if matches!(o.bank, Bank::Indexed) {
             return indexed_element(o, 0);
@@ -2692,14 +4751,20 @@ pub struct TexBinding {
     pub unit: u8,
     pub coords: u8,
     pub cube: bool,
+    /// The bound texture is a 64-bit RAW format whose texel the sampler hands over as its two
+    /// 32-bit words UNCONVERTED, so the binding is a `texture_2d<u32>` read with `textureLoad`
+    /// and the shader's registers receive the words as stored. See
+    /// [`crate::link::LinkOptions::raw_units`].
+    pub raw: bool,
 }
 
 impl TexBinding {
     /// The WGSL texture type this binding must be declared as.
     pub fn wgsl_type(&self) -> &'static str {
-        match (self.coords >= 3, self.cube) {
-            (true, true) => "texture_cube<f32>",
-            (true, false) => "texture_3d<f32>",
+        match (self.raw, self.coords >= 3, self.cube) {
+            (true, ..) => "texture_2d<u32>",
+            (false, true, true) => "texture_cube<f32>",
+            (false, true, false) => "texture_3d<f32>",
             _ => "texture_2d<f32>",
         }
     }
@@ -2737,7 +4802,7 @@ pub fn tex_units(shader: &Shader, is_cube: impl Fn(u8) -> bool) -> Vec<TexBindin
         if let Some((unit, coords)) = sampled {
             match out.iter_mut().find(|b| b.unit == unit) {
                 Some(b) => b.coords = b.coords.max(coords),
-                None => out.push(TexBinding { unit, coords, cube: is_cube(unit) }),
+                None => out.push(TexBinding { unit, coords, cube: is_cube(unit), raw: false }),
             }
         }
     }
@@ -2755,6 +4820,69 @@ mod tests {
     use super::*;
     use crate::container::ProgramKind;
     use crate::ir::{Bank, Instr, Predicate};
+
+    /// >>> THE EMITTER'S CONSTANT AND THE REFERENCE'S CONSTANT ARE ONE FACT, AND THEY DRIFTED.
+    ///
+    /// [`src_channel`] builds a WGSL literal for a constant operand channel;
+    /// [`cnst6_channel_value`] returns the number the interpreter uses for the same channel.
+    /// They were written separately and disagreed for every selector but bank 0 - `pos * 1.0`
+    /// against `pos * 0.0` on a real vertex program, which is a collapsed mesh.
+    ///
+    /// This evaluates the emitted LITERAL and requires it to equal the value function, over
+    /// every index and selector in both precisions. It is deliberately a parse of the emitted
+    /// text rather than a shared call, because the emitted text is what the GPU runs: a change
+    /// that alters the string without altering the value function fails here.
+    #[test]
+    fn the_emitted_constant_and_the_reference_constant_are_the_same_number() {
+        /// Evaluate the exact literal forms the constant arm of `src_channel` produces.
+        fn eval(lit: &str) -> f32 {
+            if let Some(hex) = lit.strip_prefix("bitcast<f32>(").and_then(|s| s.strip_suffix("u)")) {
+                return f32::from_bits(u32::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap());
+            }
+            if let Some(hex) = lit
+                .strip_prefix("unpack2x16float(")
+                .and_then(|s| s.strip_suffix("u)[0]"))
+            {
+                let bits = u32::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap();
+                return f16_bits_to_f32(bits as u16);
+            }
+            lit.parse().unwrap_or_else(|_| panic!("unrecognised constant literal `{lit}`"))
+        }
+
+        for index in 0u8..64 {
+            for sel in 0u8..8 {
+                for (prec, half) in [(Prec::F32, false), (Prec::F16, true)] {
+                    let mut op = Operand::plain(Bank::Constant, index, 0);
+                    op.swizzle = [sel; 4];
+                    let emitted = src_channel(&op, 0, prec).expect("the float views always emit");
+                    let reference =
+                        cnst6_channel_value(index, sel, half, false).expect("the float views always have a value");
+                    let e = eval(&emitted);
+                    assert_eq!(
+                        e.to_bits(),
+                        reference.to_bits(),
+                        "constant index {index} selector {sel} half={half}: emitter `{emitted}` = {e}, reference {reference}"
+                    );
+                }
+                // The 8-bit view has no established constant TABLE and both sides must refuse a
+                // table read rather than substitute a float bank's entry - but the four inline
+                // constants (selectors 4..7) are a property of the selector alone and both
+                // sides do supply those. The agreement has to hold in either direction.
+                let mut op = Operand::plain(Bank::Constant, index, 0);
+                op.swizzle = [sel; 4];
+                let emitted = src_channel(&op, 0, Prec::Fx8);
+                let reference = cnst6_channel_value(index, sel, false, true);
+                assert_eq!(
+                    emitted.is_some(),
+                    reference.is_some(),
+                    "8-bit constant index {index} selector {sel}: emitter {emitted:?}, reference {reference:?}"
+                );
+                if let (Some(e), Some(r)) = (emitted, reference) {
+                    assert_eq!(eval(&e).to_bits(), r.to_bits(), "8-bit selector {sel}");
+                }
+            }
+        }
+    }
 
     fn instr(op: Op, dest: Option<Operand>, srcs: Vec<Operand>) -> Instr {
         Instr {
@@ -2782,6 +4910,58 @@ mod tests {
     /// An F32 register store statement as the emitter writes it.
     fn st(bank: &str, reg: u32, expr: &str) -> String {
         format!("{bank}[{reg}] = bitcast<u32>({expr});")
+    }
+
+    /// The four BYTES of one register, addressed by the component selector - the 8-bit VPCK
+    /// widths, at both ends.
+    ///
+    /// The evidence is a football title's fragment secondary: ONE `U8 -> F16` VPCK repeated
+    /// four times under an SMLSI in SWIZZLE mode, whose byte `0xe1` walks selectors 1,0,2,3
+    /// over a FIXED source register while the destination steps -2 registers a time. The
+    /// primary stream then dots the four results against one sampled RGBA, and the four
+    /// parameters the source register holds are the title's `EBR`/`EBG`/`EBB`/`EBA`, declared
+    /// `Uniform U8 comps 1` - so selector 1 must be the GREEN byte of that ONE register. Under
+    /// the 16-bit rule (`index + (sel >> 1)`) selector 1 would be the high HALF of the same
+    /// register and selector 2 a different register entirely, and the dot would be of four
+    /// values that are not those four parameters.
+    #[test]
+    fn an_eight_bit_pack_selector_counts_bytes_inside_one_register() {
+        let src = |sel: u8| {
+            let mut o = Operand::plain(Bank::SecondaryAttr, 36, 2);
+            o.swizzle = [sel; 4];
+            o
+        };
+        let dest = Operand::plain(Bank::SecondaryAttr, 60, 2);
+        for (sel, lo) in [(0u8, 0u32), (1, 8), (2, 16), (3, 24)] {
+            let mut i = instr(Op::PackFromInt { bits: 8, signed: false }, Some(dest), vec![src(sel)]);
+            i.write_mask = [true, false, false, false];
+            let wgsl = emit_fragment(&shader(vec![i])).unwrap();
+            // ONE register - the operand's own - and the byte at the selector's position.
+            assert!(wgsl.contains("sa[36]"), "selector {sel} must read the operand's register:
+{wgsl}");
+            assert!(!wgsl.contains("sa[37]"), "selector {sel} must not reach a second register:
+{wgsl}");
+            let want =
+                if lo == 0 { "(sa[36] & 0xffu)".to_string() } else { format!("(sa[36] >> {lo}u)") };
+            assert!(
+                wgsl.contains(&want) || wgsl.contains(&format!("((sa[36] >> {lo}u) & 0xffu)")),
+                "selector {sel} must read byte {} of sa[36]:
+{wgsl}",
+                lo / 8
+            );
+        }
+        // And the same-width copy writes a byte where it read one, leaving the other three
+        // alone - the byte broadcast the same title emits (`sa[2]` bytes 1 and 2 from `sa[0]`
+        // byte 0). A whole-register store would clear the partners.
+        let mut copy =
+            instr(Op::PackIntCopy { bits: 8 }, Some(Operand::plain(Bank::SecondaryAttr, 2, 2)), vec![src(0)]);
+        copy.write_mask = [false, true, false, false];
+        let wgsl = emit_fragment(&shader(vec![copy])).unwrap();
+        assert!(
+            wgsl.contains("sa[2] = (sa[2] & 0xffff00ffu) | (((sa[36] & 0xffu) & 0xffu) << 8u);"),
+            "a byte copy is a read-modify-write of ONE byte:
+{wgsl}"
+        );
     }
 
     /// A GATHER whose destination ALIASES its coordinate operand is emitted through the
@@ -2849,9 +5029,10 @@ mod tests {
         // coeff[0] weights gathered[3] = the (x0,y0) texel, coeff[3] weights gathered[0].
         assert!(wgsl.contains("(1.0 - _gf0.x) * (1.0 - _gf0.y)"), "got:\n{wgsl}");
         assert!(wgsl.contains("(1.0 - _gf0.x) * _gf0.y"), "got:\n{wgsl}");
-        // Four F16 coefficients occupy TWO registers past the four gathered texels.
-        assert!(wgsl.contains("r[4] = (r[4] &"), "coefficients start at dest + 4:\n{wgsl}");
-        assert!(wgsl.contains("r[5] = (r[5] &"), "coefficients span two registers:\n{wgsl}");
+        // Four F16 coefficients occupy TWO registers past the four gathered texels, each
+        // register's two halves folded into one write (see `Dest::flush`).
+        assert!(wgsl.contains("r[4] = gxp_hpk("), "coefficients start at dest + 4:\n{wgsl}");
+        assert!(wgsl.contains("r[5] = gxp_hpk("), "coefficients span two registers:\n{wgsl}");
         assert!(!wgsl.contains("r[6]"), "a gather writes six registers, not more:\n{wgsl}");
     }
 
@@ -3213,8 +5394,10 @@ mod tests {
     #[test]
     fn dot_reading_undefined_internal_hard_fails() {
         // A dot whose op2 is internal register i0, with nothing writing i0 first, must
-        // hard-fail rather than translate an unmodeled iterator pre-load.
-        let d = Operand::plain(Bank::Temp, 0, 0);
+        // hard-fail rather than translate an unmodeled iterator pre-load - WHEN THE RESULT
+        // REACHES THE OUTPUT. The destination is the output bank for exactly that reason: the
+        // guard is about an unmodeled input the frame can see (see `live_instructions`).
+        let d = Operand::plain(Bank::Output, 0, 1);
         let a = Operand::plain(Bank::PrimaryAttr, 4, 2);
         let i = Operand::plain(Bank::Internal, 0, 0); // i0, xxxx
         let err = emit_fragment(&shader(vec![instr(Op::Dot { components: 4 }, Some(d), vec![a, i])]))
@@ -3223,6 +5406,21 @@ mod tests {
             EmitError::UndefinedInternal { lane, .. } => assert_eq!(lane, 0),
             other => panic!("expected UndefinedInternal, got {other:?}"),
         }
+    }
+
+    /// The other half of the guard: the same read, into a temporary nothing goes on to consume,
+    /// TRANSLATES. This is the shape that was dropping fifteen of Madden's fragment blobs - an
+    /// F32 write of lane 0 followed by a narrower consumer whose second channel is thrown away -
+    /// and refusing it removed the pair's whole mesh from the frame over a value no one reads.
+    #[test]
+    fn a_dead_undefined_internal_read_translates_instead_of_refusing() {
+        let d = Operand::plain(Bank::Temp, 0, 0);
+        let a = Operand::plain(Bank::PrimaryAttr, 4, 2);
+        let i = Operand::plain(Bank::Internal, 0, 0);
+        let wgsl = emit_fragment(&shader(vec![instr(Op::Dot { components: 4 }, Some(d), vec![a, i])]))
+            .expect("a dead over-read of an internal lane must emit, not refuse");
+        assert!(wgsl.contains(&rd("i", 0)), "got:
+{wgsl}");
     }
 
     #[test]
@@ -3330,22 +5528,30 @@ mod tests {
         ins.half_precision = true;
         ins.write_mask = [true, true, true, false];
         let wgsl = emit_fragment(&shader(vec![ins])).unwrap();
-        assert!(wgsl.contains("unpack2x16float(sa[6])[0] * unpack2x16float(pa[4])[0]"), "got:
+        // sa[6] and pa[4] are each read by two channels, so `cse_unpacks` hoists them; sa[7]
+        // and pa[5] are read once and stay spelled out.
+        assert!(wgsl.contains("let u_sa6 = unpack2x16float(sa[6]);"), "got:
 {wgsl}");
-        assert!(wgsl.contains("unpack2x16float(sa[6])[1] * unpack2x16float(pa[4])[1]"), "got:
+        assert!(wgsl.contains("let u_pa4 = unpack2x16float(pa[4]);"), "got:
+{wgsl}");
+        assert!(wgsl.contains("(u_sa6[0] * u_pa4[0])"), "got:
+{wgsl}");
+        assert!(wgsl.contains("(u_sa6[1] * u_pa4[1])"), "got:
 {wgsl}");
         assert!(wgsl.contains("unpack2x16float(sa[7])[0] * unpack2x16float(pa[5])[0]"), "got:
 {wgsl}");
-        // Channel 0 writes the LOW half of r[0], preserving the high half.
-        assert!(wgsl.contains("r[0] = (r[0] & 0xffff0000u) |"), "got:
+        // Channels 0 and 1 are the two halves of r[0], so the pair FOLDS into one write with
+        // no read-modify-write left (see `Dest::flush`) - low half first.
+        assert!(
+            wgsl.contains("r[0] = gxp_hpk((u_sa6[0] * u_pa4[0]), (u_sa6[1] * u_pa4[1]));"),
+            "got:
+{wgsl}"
+        );
+        // Channel 2 moves on to the LOW half of r[1]; channel 3 is masked out, so that half has
+        // no partner and keeps the read-modify-write that preserves the high half.
+        assert!(wgsl.contains("r[1] = gxp_hlo(r[1], "), "got:
 {wgsl}");
-        // Channel 1 writes the HIGH half of the same register.
-        assert!(wgsl.contains("r[0] = (r[0] & 0x0000ffffu) |"), "got:
-{wgsl}");
-        // Channel 2 moves on to r[1]; channel 3 is masked out.
-        assert!(wgsl.contains("r[1] = (r[1] & 0xffff0000u) |"), "got:
-{wgsl}");
-        assert!(!wgsl.contains("r[1] = (r[1] & 0x0000ffffu) |"), "channel 3 masked:
+        assert!(!wgsl.contains("gxp_hhi(r[1], "), "channel 3 masked:
 {wgsl}");
         // No F32-width access anywhere in an all-F16 instruction.
         assert!(!wgsl.contains("bitcast<f32>(sa["), "got:
@@ -3547,6 +5753,102 @@ mod tests {
         }
     }
 
+    /// >>> A DERIVATIVE WHOSE SOURCE THE BRANCH ITSELF WROTE GETS A UNIFORM GAP, not a refusal.
+    ///
+    /// The hoist above the block is exact only while nothing in the block has rewritten the
+    /// register being differenced. When the block computes that value, the block is CLOSED at
+    /// the derivative, the builtin called where control flow is uniform, and the block
+    /// re-entered on the same condition - which is what the hardware does (the USSE predicates
+    /// the write-back, never the differencing). Three of a football title's world fragment
+    /// programs are this shape and every one of them was dropped.
+    #[test]
+    fn a_derivative_over_a_register_the_branch_wrote_gets_a_uniform_gap() {
+        // 0: br if p0 -> 3     (guards 1..2)
+        // 1: mov r0            <- writes the register the derivative reads
+        // 2: dsx r4 <- r0
+        let dsx = instr(
+            Op::Dsx,
+            Some(Operand::plain(Bank::Temp, 4, 0)),
+            vec![Operand::plain(Bank::Temp, 0, 0)],
+        );
+        let wgsl = emit_fragment(&shader(vec![branch(3, Predicate::IfP(0)), mov(0), dsx])).unwrap();
+        // The guarded block opens, closes BEFORE the call, and opens again on the same test.
+        assert_eq!(wgsl.matches("if (!p[0]) {").count(), 2, "the block is re-entered:
+{wgsl}");
+        let (head, tail) = wgsl.split_once("dpdx").unwrap();
+        // The write the derivative reads is INSIDE the first block, above the gap.
+        assert!(head.contains("r[0] ="), "the branch's own write comes first:
+{wgsl}");
+        // ...and the gap is OUTSIDE it: the block's closing brace stands between the write and
+        // the call, which is the whole point - `dpdx` must not be inside the `if`.
+        assert!(
+            head.lines().rev().skip(1).find(|l| !l.trim().is_empty()).is_some_and(|l| l.trim() == "}"),
+            "the call is in a uniform gap - the block closes just above it:
+{wgsl}"
+        );
+        // The STORE is back inside the re-entered block, so only the lanes the branch admitted
+        // write it - exactly the hardware's predicated write-back.
+        let store = tail.split_once("r[4] =").expect("the derivative is stored").0;
+        assert!(store.contains("if (!p[0]) {"), "the store is re-guarded:
+{wgsl}");
+    }
+
+    /// A LOOP cannot be closed and re-entered - the rest of its iterations would run outside it -
+    /// so a derivative over a register the loop body writes is still refused, by name.
+    #[test]
+    fn a_derivative_over_a_register_a_loop_body_wrote_hard_fails() {
+        // 0: mov r0            <- loop head, and the write
+        // 1: dsx r4 <- r0
+        // 2: br if p0 -> 0     (the back edge)
+        let dsx = instr(
+            Op::Dsx,
+            Some(Operand::plain(Bank::Temp, 4, 0)),
+            vec![Operand::plain(Bank::Temp, 0, 0)],
+        );
+        let err = emit_fragment(&shader(vec![mov(0), dsx, branch(-2, Predicate::IfP(0))])).unwrap_err();
+        match err {
+            EmitError::Blocked { reason, .. } => {
+                assert!(reason.contains("inside a LOOP"), "{reason}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    /// A branch that rewrites a PREDICATE register before the derivative cannot be re-entered on
+    /// the same condition - the re-test would admit a different set of lanes - so it is refused.
+    #[test]
+    fn a_derivative_in_a_branch_that_rewrites_a_predicate_hard_fails() {
+        // 0: br if p0 -> 4     (guards 1..3)
+        // 1: mov r0
+        // 2: vtst              (writes a predicate)
+        // 3: dsx r4 <- r0
+        let mut test = instr(
+            Op::Test {
+                alu: crate::ir::TestAlu::Sub,
+                cmp: crate::ir::TestCmp::Ne,
+                reduce: crate::ir::TestReduce::Channel(0),
+                pdst: 0,
+                write_back: false,
+            },
+            None,
+            vec![Operand::plain(Bank::Temp, 8, 0), Operand::plain(Bank::Temp, 9, 0)],
+        );
+        test.write_mask = [false; 4];
+        let dsx = instr(
+            Op::Dsx,
+            Some(Operand::plain(Bank::Temp, 4, 0)),
+            vec![Operand::plain(Bank::Temp, 0, 0)],
+        );
+        let err = emit_fragment(&shader(vec![branch(4, Predicate::IfP(0)), mov(0), test, dsx]))
+            .unwrap_err();
+        match err {
+            EmitError::Blocked { reason, .. } => {
+                assert!(reason.contains("rewrites a predicate register"), "{reason}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
     /// A branch whose target leaves the block an enclosing branch opened is irreducible - no
     /// nest of `if`s expresses it - so it blocks rather than being silently clamped.
     #[test]
@@ -3608,5 +5910,529 @@ mod tests {
         let outer = wgsl.split("if (!p[0]) {").nth(1).unwrap();
         let inner = outer.split("if (!p[1]) {").nth(1).unwrap();
         assert!(inner.starts_with(|_c: char| true) && inner.contains("r[0] ="), "got:\n{wgsl}");
+    }
+    // ====================================================================================
+    // The f16 STORE ROUNDING helpers - see `HALF_LO_FN`.
+    // ====================================================================================
+
+    /// The body must name the helpers and NEVER the builtin, because the builtin's rounding
+    /// mode is the device's choice and the body is hashed and cached across devices.
+    #[test]
+    fn a_half_store_calls_the_helper_and_never_the_pack_builtin() {
+        let body = half_stmt("r", 3, false, "x", false) + &half_stmt("r", 3, true, "y", false);
+        assert_eq!(
+            body,
+            "  r[3] = gxp_hlo(r[3], x);\n  r[3] = gxp_hhi(r[3], y);\n",
+            "got:\n{body}"
+        );
+        assert!(!body.contains("pack2x16float"), "the body must not name the builtin:\n{body}");
+    }
+
+    /// ...and the two adjacent halves of one register fold into the pair form, which is ONE
+    /// native instruction where the two are two narrowings and a shift.
+    #[test]
+    fn two_adjacent_halves_of_one_register_fold_into_the_pair_helper() {
+        let stmts = half_stmt("r", 3, false, "x", false) + &half_stmt("r", 3, true, "y", false);
+        assert_eq!(fold_halves(&stmts), "  r[3] = gxp_hpk(x, y);\n", "got:\n{}", fold_halves(&stmts));
+        // A DIFFERENT register between them is not a pair, and folding across it would move a
+        // store past a statement - the thing `fold_halves` exists not to do.
+        let split = half_stmt("r", 3, false, "x", false)
+            + &half_stmt("r", 4, false, "z", false)
+            + &half_stmt("r", 3, true, "y", false);
+        assert_eq!(fold_halves(&split), split, "only adjacent lines fold:\n{split}");
+    }
+
+    /// A RAW half store moves a 16-bit BIT PATTERN, not a float, so it must not go near a
+    /// rounding helper: rounding a bone index is how a skinned mesh loses its weights.
+    #[test]
+    fn a_raw_half_store_does_not_round() {
+        let raw = half_stmt("r", 3, false, "b", true);
+        assert!(!raw.contains("gxp_h"), "a raw store converts nothing:\n{raw}");
+        assert!(raw.contains("& 0xffff0000u"), "it read-modify-writes the word:\n{raw}");
+    }
+
+    /// The three arms differ ONLY in the definition of the narrowing, so the module a title
+    /// gets is the same text with one function swapped - which is what makes a picture A/B
+    /// between them attributable.
+    #[test]
+    fn the_three_rounding_arms_swap_one_function_and_nothing_else() {
+        let body = "  r[0] = gxp_hpk(x, y);\n";
+        let module = format!("@group(0) @binding(0) var<uniform> u: vec4<u32>;\n{body}");
+
+        set_native_f16(false);
+        crate::link::set_arm(crate::link::F16_ROUND_ARM, "0");
+        let pack = add_half_helpers(module.clone());
+        crate::link::set_arm(crate::link::F16_ROUND_ARM, "1");
+        let portable = add_half_helpers(module.clone());
+        set_native_f16(true);
+        let native = add_half_helpers(module.clone());
+        set_native_f16(false);
+
+        for m in [&pack, &portable, &native] {
+            assert!(m.contains("fn gxp_hlo("), "every arm defines the store helpers:\n{m}");
+            assert!(m.contains("fn gxp_hq("), "...and the round trip:\n{m}");
+            assert!(m.ends_with(body), "the BODY is untouched by the arm:\n{m}");
+        }
+        // Only the control arm hands the builtin a value that still NEEDS rounding, which is
+        // the thing whose mode the device chooses. The portable arm never calls it at all; the
+        // native arm calls it on a value already narrowed to f16, where every mode agrees.
+        assert!(pack.contains("pack2x16float(vec2<f32>(lo, hi))"), "{pack}");
+        assert!(!portable.contains("pack2x16float(vec2"), "{portable}");
+        assert!(native.contains("pack2x16float(vec2<f32>(gxp_f16r(lo), gxp_f16r(hi)))"), "{native}");
+        assert!(native.contains("fn gxp_f16r(v: f32) -> f32 { return f32(f16(gxp_f16c(v))); }"), "{native}");
+        // `enable f16;` is legal only on a device created with the feature, so exactly one arm
+        // carries it - and it carries it FIRST, before any declaration.
+        assert!(native.starts_with("enable f16;\n"), "{native}");
+        assert!(!portable.contains("enable f16;"), "{portable}");
+        assert!(!pack.contains("enable f16;"), "{pack}");
+    }
+
+    /// A module that makes no half store at all gets no helpers - most vertex programs.
+    #[test]
+    fn a_module_with_no_half_store_carries_no_helpers() {
+        let m = "@fragment\nfn fs_main() {\n  r[0] = bitcast<u32>(1.0);\n}\n".to_string();
+        assert_eq!(add_half_helpers(m.clone()), m);
+    }
+
+    /// Wrapping an already-helped module twice must not define the functions twice, which is a
+    /// WGSL redefinition error and fails the whole module.
+    #[test]
+    fn adding_the_helpers_twice_defines_them_once() {
+        let once = add_half_helpers("  r[0] = gxp_hpk(x, y);\n".to_string());
+        assert_eq!(add_half_helpers(once.clone()), once);
+        assert_eq!(once.matches("fn gxp_f16b(").count(), 1, "{once}");
+    }
+
+    /// >>> THE PORTABLE NARROWING IS THE ONE FUNCTION WHOSE WRONGNESS WOULD BE INVISIBLE, SO
+    /// >>> ITS ALGORITHM IS CHECKED EXHAUSTIVELY HERE AGAINST THE REFERENCE'S OWN.
+    ///
+    /// This is a Rust TRANSCRIPTION of the WGSL, which is the half of the claim a Rust test can
+    /// make: it pins the algorithm - every normal, every subnormal, both overflow ties, both
+    /// underflow ties - over all 2^32 f32 patterns reachable through the f16 grid. That the
+    /// EMITTED TEXT says the same thing is the other half, and `probe-f16round.mjs` measures it
+    /// on a real device [[vitaslop-probe-the-shader-dont-simulate-it]].
+    #[test]
+    fn the_portable_narrowing_rounds_to_nearest_even_everywhere_it_can_be_asked() {
+        fn wgsl_arm(v: f32) -> u32 {
+            let f = v.to_bits();
+            let sign = (f >> 16) & 0x8000;
+            let mag = f & 0x7fff_ffff;
+            if mag > 0x7f80_0000 {
+                return sign | 0x7e00;
+            }
+            if mag == 0x7f80_0000 {
+                return sign | 0x7c00;
+            }
+            if mag >= 0x477f_f000 {
+                return sign | 0x7bff;
+            }
+            if mag < 0x3300_0000 {
+                return sign;
+            }
+            let e = mag >> 23;
+            if e >= 113 {
+                let bits = ((e - 112) << 10) | ((mag >> 13) & 0x3ff);
+                let rem = mag & 0x1fff;
+                if rem > 0x1000 || (rem == 0x1000 && bits & 1 == 1) {
+                    return sign | (bits + 1);
+                }
+                return sign | bits;
+            }
+            let shift = 126 - e;
+            let m = (mag & 0x7f_ffff) | 0x80_0000;
+            let bits = m >> shift;
+            let half = 1u32 << (shift - 1);
+            let rem = m & ((1u32 << shift) - 1);
+            if rem > half || (rem == half && bits & 1 == 1) {
+                return sign | (bits + 1);
+            }
+            sign | bits
+        }
+
+        // Every f16 pattern, and around each of them the quarter, the exact TIE and the
+        // three-quarter point on BOTH sides - the places the two candidate modes disagree.
+        // A random sweep would mostly land where every mode agrees and would say nothing.
+        let decode = |h: u32| -> f32 {
+            let (s, e, m) = (h >> 15, (h >> 10) & 0x1f, h & 0x3ff);
+            let v = if e == 0 {
+                (m as f32) * 2f32.powi(-24)
+            } else if e == 0x1f {
+                f32::INFINITY
+            } else {
+                (1.0 + m as f32 / 1024.0) * 2f32.powi(e as i32 - 15)
+            };
+            if s == 1 { -v } else { v }
+        };
+        let mut checked = 0usize;
+        for h in 0..0x7c00u32 {
+            let (v, w) = (decode(h), decode(h + 1));
+            for frac in [0.0f64, 0.25, 0.5, 0.75] {
+                for sign in [1.0f64, -1.0] {
+                    let x = (sign * (v as f64 + (w - v) as f64 * frac)) as f32;
+                    let want = crate::fold::f32_to_f16_bits_saturating(x) as u32;
+                    assert_eq!(
+                        wgsl_arm(x),
+                        want,
+                        "x={x:e} (0x{:08x}): the portable arm says 0x{:04x}, the reference 0x{want:04x}",
+                        x.to_bits(),
+                        wgsl_arm(x)
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        // Zero, the two infinities, a NaN, and the overflow boundary in both directions.
+        for x in [0.0f32, -0.0, 65504.0, -65504.0, 65520.0, -65520.0, 65519.996, 131008.0,
+                  f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 5.96e-8, -5.96e-8, 2.98e-8] {
+            assert_eq!(
+                wgsl_arm(x),
+                crate::fold::f32_to_f16_bits_saturating(x) as u32,
+                "x={x:e} (0x{:08x})",
+                x.to_bits()
+            );
+            checked += 1;
+        }
+        for x in [f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(wgsl_arm(x) & 0x7fff, 0x7c00, "an infinity stays one: {x}");
+        }
+        assert_eq!(wgsl_arm(f32::NAN) & 0x7c00, 0x7c00, "a NaN stays a NaN");
+        assert!(wgsl_arm(f32::NAN) & 0x3ff != 0, "...with a payload, so it is not an infinity");
+        assert!(checked > 100_000, "the sweep must be a sweep: {checked}");
+    }
+
+    /// And the EMITTED TEXT is the thing that ships, so it is pinned line for line against the
+    /// transcription above. A test of an algorithm that the module does not contain is a test
+    /// of nothing [[vitaslop-probe-the-shader-dont-simulate-it]].
+    #[test]
+    fn the_emitted_portable_helper_is_the_algorithm_that_was_checked() {
+        for line in [
+            "if (mag > 0x7f800000u) { return sign | 0x7e00u; }",
+            "if (mag == 0x7f800000u) { return sign | 0x7c00u; }",
+            "if (mag >= 0x477ff000u) { return sign | 0x7bffu; }",
+            "if (mag < 0x33000000u) { return sign; }",
+            "let bits = ((e - 112u) << 10u) | ((mag >> 13u) & 0x3ffu);",
+            "if (rem > 0x1000u || (rem == 0x1000u && (bits & 1u) == 1u)) { return sign | (bits + 1u); }",
+            "let shift = 126u - e;",
+            "let half = 1u << (shift - 1u);",
+            "if (rem > half || (rem == half && (bits & 1u) == 1u)) { return sign | (bits + 1u); }",
+        ] {
+            assert!(HALF_HELPERS_PORTABLE.contains(line), "missing from the emitted helper: {line}");
+        }
+    }
+    /// >>> THE VARYING STAND-IN'S TWO HALVES MUST BE THE SAME FUNCTION, and one of them is WGSL
+    /// >>> text this test cannot run - so what it pins is the SPELLING, line for line.
+    ///
+    /// The Rust half (`case_texture_value_at`) is what the reference fetches; the WGSL half is
+    /// what the module computes. If they drift, every program that samples anything diverges
+    /// and it reads as a translation defect in the shader rather than in the rig.
+    #[test]
+    fn the_varying_texture_stand_in_is_one_function_spelled_twice() {
+        crate::link::set_arm(crate::link::CASE_TEX_ARM, "vary");
+        let body = "  let _tex0 = textureSample(t3, s3, vec2<f32>(bitcast<f32>(pa[0]), bitcast<f32>(pa[1])));
+";
+        let (module, units) = wrap_compute_module_for(body, ProgramKind::Fragment, &[]);
+        assert_eq!(units, vec![3], "the unit is taken from the binding name: {module}");
+        // The COORDINATE reaches the stand-in, which is the whole point of the arm.
+        assert!(
+            module.contains("gxp_case_tex(3u, vec3<f32>(vec2<f32>(bitcast<f32>(pa[0]), bitcast<f32>(pa[1])), 0.0))"),
+            "the coordinate must be passed through verbatim:
+{module}"
+        );
+        // ...and the taming is spelled exactly as the Rust twin computes it.
+        assert!(
+            module.contains("let t = min(max(c, vec3<f32>(-4.0)), vec3<f32>(4.0)) * 0.25;"),
+            "got:
+{module}"
+        );
+        let v = case_texture_value(3);
+        assert!(
+            module.contains(&format!("{:?} + t.x", v[0])) && module.contains(&format!("{:?})", v[3])),
+            "the per-unit constants are the same ones the reference adds to:
+{module}"
+        );
+        // A 3-COORD sample keeps its third component rather than being padded.
+        let cube = "  let _tex1 = textureSample(t1, s1, vec3<f32>(a, b, c));
+";
+        let (m3, _) = wrap_compute_module_for(cube, ProgramKind::Fragment, &[]);
+        assert!(m3.contains("gxp_case_tex(1u, vec3<f32>(a, b, c))"), "got:
+{m3}");
+        // A sample carrying a BIAS after the coordinate must not swallow it into the argument -
+        // it travels as the LOD operand, tagged with the builtin it came from.
+        let biased = "  let _tex2 = textureSampleBias(t2, s2, vec2<f32>(a, b), 0.5);
+";
+        let (mb, _) = wrap_compute_module_for(biased, ProgramKind::Fragment, &[]);
+        assert!(
+            mb.contains("gxp_case_texl(2u, vec3<f32>(vec2<f32>(a, b), 0.0), 1u, vec4<f32>(0.5, 0.0, 0.0, 0.0));"),
+            "got:
+{mb}"
+        );
+        // A GRADIENT's two derivative vectors fill the four LOD channels in order.
+        let grad = "  let _tex2 = textureSampleGrad(t2, s2, vec2<f32>(a, b), vec2<f32>(d0, d1), vec2<f32>(d2, d3));
+";
+        let (mg, _) = wrap_compute_module_for(grad, ProgramKind::Fragment, &[]);
+        assert!(
+            mg.contains("gxp_case_texl(2u, vec3<f32>(vec2<f32>(a, b), 0.0), 3u, vec4<f32>(vec2<f32>(d0, d1), vec2<f32>(d2, d3)));"),
+            "got:
+{mg}"
+        );
+        // ...and the LOD form's terms are the Rust twin's, in its order.
+        for line in [
+            "let l = min(max(lod, vec4<f32>(-4.0)), vec4<f32>(4.0)) * 0.25;",
+            "let km = b.w + 0.0625 * f32(mode);",
+            "return vec4<f32>(b.x + l.w, b.y + l.z, b.z + l.y, km + l.x);",
+        ] {
+            assert!(mg.contains(line), "missing `{line}`:\n{mg}");
+        }
+
+        // And with the arm OFF the coordinate is discarded again, which is what every
+        // measurement before this arm existed used.
+        crate::link::set_arm(crate::link::CASE_TEX_ARM, "const");
+        let (off, _) = wrap_compute_module_for(body, ProgramKind::Fragment, &[]);
+        assert!(off.contains("gxp_case_tex(3u);"), "got:
+{off}");
+        assert!(!off.contains("min(max(c,"), "got:
+{off}");
+    }
+
+    /// The Rust half's taming, checked at the places it can go wrong: inside the range, at both
+    /// clamp bounds, past them, and on a value no comparison answers usefully.
+    #[test]
+    fn the_varying_stand_in_tames_its_coordinate_exactly() {
+        use crate::interp::TexLodArg;
+        let at = |c: [f32; 3]| case_texture_value_at(2, c, TexLodArg::IMPLICIT);
+        let k = case_texture_value(2);
+        // Inside the range: a quarter of the coordinate, exactly.
+        let v = at([1.0, -2.0, 0.5]);
+        assert_eq!(v[0], k[0] + 0.25);
+        assert_eq!(v[1], k[1] - 0.5);
+        assert_eq!(v[2], k[2] + 0.125);
+        // Channel 3 is the pure constant, so a garbage coordinate leaves one readable channel.
+        assert_eq!(v[3], k[3]);
+        // At and past the bounds.
+        assert_eq!(at([4.0, -4.0, 0.0])[0], k[0] + 1.0);
+        assert_eq!(at([1.0e38, -1.0e38, 0.0])[0], k[0] + 1.0);
+        assert_eq!(at([1.0e38, -1.0e38, 0.0])[1], k[1] - 1.0);
+        // A NaN lands on a bound rather than propagating - `f32::max` returns the non-NaN
+        // operand, which is the same answer WGSL's `max` gives.
+        assert!(at([f32::NAN, 0.0, 0.0])[0].is_finite());
+
+        // THE LOD FORMS: a bias and a level of the same value must DIFFER (that is the whole
+        // point), and each gradient channel must land in its own output channel.
+        let lod = |mode, args| case_texture_value_at(2, [0.0; 3], TexLodArg { mode, args });
+        let bias = lod(TexLod::Bias, [1.0, 0.0, 0.0, 0.0]);
+        let level = lod(TexLod::Level, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(bias[3], k[3] + 0.0625 + 0.25);
+        assert_eq!(level[3], k[3] + 0.125 + 0.25);
+        assert_eq!(bias[..3], level[..3]);
+        let g = lod(TexLod::Gradient, [0.5, 1.0, 2.0, -4.0]);
+        assert_eq!(g, [k[0] - 1.0, k[1] + 0.5, k[2] + 0.25, k[3] + 0.1875 + 0.125]);
+    }
+
+    /// >>> THE CUBE INVERSE, AGAINST THE FORWARD RULE WRITTEN OUT SEPARATELY.
+    ///
+    /// The render rig does not hand a cube sampler an arbitrary direction and then try to model
+    /// which face the hardware picked. It goes the other way: it decides the face and the texel,
+    /// and builds the direction that names them - so the reference reads that texel directly and
+    /// the hardware's major-axis selection never enters the comparison.
+    ///
+    /// That is only sound if the inverse is right, and a table of eighteen signed terms is
+    /// exactly the shape that is wrong in one entry and agrees with itself everywhere. So this
+    /// applies the FORWARD rule - the one the graphics specifications state, transcribed here
+    /// and nowhere else in this crate - to the direction the table builds, and requires it to
+    /// come back to the same face and the same texel.
+    ///
+    /// It also pins the two properties the exactness rests on: the major axis wins by a real
+    /// margin (no tie to break), and the recovered coordinate is EXACT rather than merely close - every
+    /// value in the chain is a small multiple of `1 / CASE_TEX_SIZE`, which f32 holds exactly.
+    #[test]
+    fn the_cube_direction_selects_the_face_and_texel_it_names() {
+        // The forward mapping, from the specification: which face a direction names, and the
+        // face coordinates it yields. Deliberately a second, independent statement.
+        fn forward(d: [f32; 3]) -> (usize, f32, f32, f32) {
+            let (x, y, z) = (d[0], d[1], d[2]);
+            let (ax, ay, az) = (x.abs(), y.abs(), z.abs());
+            if ax >= ay && ax >= az {
+                if x > 0.0 { (0, -z, -y, ax) } else { (1, z, -y, ax) }
+            } else if ay >= az {
+                if y > 0.0 { (2, x, z, ay) } else { (3, x, -z, ay) }
+            } else if z > 0.0 {
+                (4, x, -y, az)
+            } else {
+                (5, -x, -y, az)
+            }
+        }
+
+        let n = CASE_TEX_SIZE as f32;
+        for face in 0..6usize {
+            for &i in &[0u32, 1, 7, 31, CASE_TEX_SIZE - 1] {
+                for &j in &[0u32, 2, 30, CASE_TEX_SIZE - 1] {
+                    let u = (i as f32 + 0.5) / n;
+                    let v = (j as f32 + 0.5) / n;
+                    let (sc, tc) = (2.0 * u - 1.0, 2.0 * v - 1.0);
+                    let d = case_cube_direction(face, sc, tc);
+
+                    // The major axis wins outright: the other two components are at most
+                    // `1 - 1/size` in magnitude, so nothing here depends on how a tie is broken.
+                    let mag = [d[0].abs(), d[1].abs(), d[2].abs()];
+                    let major = mag.iter().cloned().fold(0.0f32, f32::max);
+                    assert_eq!(major, 1.0, "face {face} texel ({i},{j}): direction {d:?}");
+                    let others: f32 = mag.iter().cloned().filter(|m| *m != 1.0).fold(0.0, f32::max);
+                    assert!(
+                        others <= 1.0 - 1.0 / n,
+                        "face {face} texel ({i},{j}): a minor axis reached {others}, so the face \
+                         selection is a tie-break rather than a decision"
+                    );
+
+                    let (got_face, gsc, gtc, ma) = forward(d);
+                    assert_eq!(got_face, face, "texel ({i},{j}) landed on the wrong face: {d:?}");
+                    // EXACT, not within a tolerance: every value is a multiple of 1/size.
+                    let (gu, gv) = (0.5 * (gsc / ma + 1.0), 0.5 * (gtc / ma + 1.0));
+                    assert_eq!(gu, u, "face {face} texel ({i},{j}): u did not come back exactly");
+                    assert_eq!(gv, v, "face {face} texel ({i},{j}): v did not come back exactly");
+                    assert_eq!((gu * n).floor() as u32, i, "face {face}: wrong texel column");
+                    assert_eq!((gv * n).floor() as u32, j, "face {face}: wrong texel row");
+                }
+            }
+        }
+    }
+
+    /// The generated WGSL switch is the table's own text, and it is a `vec3` per face with a
+    /// `default` arm - which is what makes the helper exhaustive for a `u32` selector.
+    #[test]
+    fn the_cube_switch_is_generated_from_the_one_table() {
+        let src = case_uv_fns();
+        for f in 0..5 {
+            assert!(src.contains(&format!("case {f}u: {{ return vec3<f32>(")), "missing face {f}:\n{src}");
+        }
+        assert!(src.contains("default: { return vec3<f32>("), "no default arm:\n{src}");
+        assert!(!src.contains("CASE_CUBE_SWITCH") && !src.contains("CASE_TEX_SIZEf"), "unsubstituted:\n{src}");
+        // Face +X is `( 1.0, -tc, -sc)`. Spelled out once here so a table edited by accident
+        // has to be edited here too.
+        assert!(src.contains("case 0u: { return vec3<f32>(1.0, -tc, -sc); }"), "+X face changed:\n{src}");
+    }
+
+    /// >>> THE GATHER QUANTISER'S WHOLE REASON IS THE MARGIN, and the margin is invisible in the
+    /// values it returns unless something checks it.
+    ///
+    /// `floor(uv * size - 0.5)` is what picks a gather's 2x2 footprint, and a coordinate that
+    /// lands ON that boundary is one the hardware's subtexel rounding may take either side of -
+    /// which would move all four texels and be reported as a translation defect. So the
+    /// quantiser puts the sample a quarter of a texel clear of it, at every input.
+    ///
+    /// It must ALSO leave the fraction free to move, or the bilinear coefficients the
+    /// instruction computes would be the same four constants in every case and would check
+    /// nothing. Both properties at once is what the `+ 0.75 + frac * 0.5` form buys, and this
+    /// is what says so.
+    #[test]
+    fn the_gather_quantiser_stays_clear_of_the_footprint_boundary() {
+        let mut seen_low = false;
+        let mut seen_high = false;
+        // Inputs across the whole tamed range and past both ends, plus the shapes that break a
+        // naive quantiser: a NaN, an infinity, a denormal, an exact bound.
+        let mut inputs: Vec<f32> = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e-45, -4.0, 4.0, 0.0];
+        for k in 0..400 {
+            inputs.push(-4.5 + 9.0 * (k as f32) / 400.0);
+        }
+        for c in inputs {
+            let (_, frac) = case_render_gather(0, [c, c]);
+            for f in frac {
+                assert!(
+                    (0.25..=0.75).contains(&f),
+                    "input {c}: the gather fraction is {f}, which is not a quarter texel clear \
+                     of the boundary the footprint's floor turns on"
+                );
+                if f < 0.35 {
+                    seen_low = true;
+                }
+                if f > 0.65 {
+                    seen_high = true;
+                }
+            }
+        }
+        assert!(
+            seen_low && seen_high,
+            "the fraction never moved across its range, so the bilinear coefficients this feeds \
+             are constants and check nothing"
+        );
+    }
+
+    /// The footprint is the 2x2 at the texel the quantiser named, CLAMPED at the edges - which
+    /// is the addressing mode the rig binds, and the one place a corner texel is read twice.
+    #[test]
+    fn the_gather_footprint_is_the_two_by_two_the_quantiser_named() {
+        // A coordinate in the middle: four DISTINCT texels, in the platform's order.
+        let c = 0.0f32;
+        let (i, _) = case_tex_index_frac(c);
+        let (texels, _) = case_render_gather(3, [c, c]);
+        let at = |x: u32, y: u32| case_texel_value(3, 0, x, y)[0];
+        assert_eq!(texels, [at(i, i + 1), at(i + 1, i + 1), at(i + 1, i), at(i, i)]);
+        assert_eq!(
+            texels.iter().filter(|v| **v == texels[0]).count(),
+            1,
+            "the four texels of a gather must differ, or the instruction checks nothing"
+        );
+        // At the top edge the clamp makes two pairs equal rather than reading off the texture.
+        let (edge, _) = case_render_gather(3, [100.0, 100.0]);
+        let last = CASE_TEX_SIZE - 1;
+        assert_eq!(edge[1], at(last, last), "the clamped corner");
+        assert_eq!(edge, [at(last, last); 4], "every texel of the footprint clamps to the corner");
+    }
+
+    /// A render module is real WGSL - including the cube binding, whose type must match the
+    /// three-component coordinate the quantiser produces, and the `discard` rewrite, which sits
+    /// inside whatever block the predicate put it in.
+    #[test]
+    fn a_render_case_module_is_valid_wgsl() {
+        let body = "  let _tex0 = textureSample(t1, s1, vec2<f32>(bitcast<f32>(pa[0]), bitcast<f32>(pa[1])));\n\
+                    \x20 r[0] = bitcast<u32>(_tex0.x);\n\
+                    \x20 let _tex1 = textureSampleBias(t2, s2, vec3<f32>(bitcast<f32>(pa[2]), bitcast<f32>(pa[3]), bitcast<f32>(pa[4])), 0.5);\n\
+                    \x20 r[1] = bitcast<u32>(_tex1.y);\n\
+                    \x20 let _guv2 = vec2<f32>(bitcast<f32>(pa[5]), bitcast<f32>(pa[6]));\n\
+                    \x20 let _g2 = textureGather(0u, t1, s1, _guv2);\n\
+                    \x20 let _gf2 = fract(_guv2 * vec2<f32>(textureDimensions(t1, 0u)) - vec2<f32>(0.5));\n\
+                    \x20 r[2] = bitcast<u32>(_g2.x + _gf2.x);\n\
+                    \x20 r[3] = bitcast<u32>(dpdx(bitcast<f32>(pa[7])));\n\
+                    \x20 if (p[0]) {\n\
+                    \x20 discard;\n\
+                    \x20 }\n\
+                    \x20 gxp_frag_depth = gxp_depth_to_window(bitcast<f32>(pa[8]), gxp_interp_depth);\n";
+        let units = [
+            TexBinding { unit: 1, coords: 2, cube: false, raw: false },
+            TexBinding { unit: 2, coords: 3, cube: true, raw: false },
+        ];
+        let (module, rewrites) =
+            wrap_render_case_module_for(body, ProgramKind::Fragment, &[], &units).expect("render module");
+        assert_eq!(rewrites, RenderRewrites { samples: 2, gathers: 1, kills: 1 });
+        // The two uniformity-bearing forms became explicit level-0 samples; the cube one took
+        // the cube quantiser and the flat one the flat quantiser.
+        assert!(module.contains("textureSampleLevel(t1, s1, gxp_case_uv2("), "flat sample:\n{module}");
+        assert!(module.contains("textureSampleLevel(t2, s2, gxp_case_uv3c("), "cube sample:\n{module}");
+        assert!(!module.contains("textureSampleBias"), "a biased sample survived:\n{module}");
+        assert!(module.contains("var t2: texture_cube<f32>;"), "cube binding:\n{module}");
+        assert!(module.contains("let _guv2 = gxp_case_uv2g("), "gather coordinate:\n{module}");
+        assert!(!module.contains("discard;"), "the discard was not rewritten:\n{module}");
+        assert!(module.contains("gxp_killed = 1u;"), "the kill is not recorded:\n{module}");
+        let m = naga::front::wgsl::parse_str(&module)
+            .unwrap_or_else(|e| panic!("render module failed to parse:\n{module}\n\n{e:?}"));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&m)
+            .unwrap_or_else(|e| panic!("render module failed validation:\n{module}\n\n{e:?}"));
+    }
+
+    /// >>> AN UNREWRITTEN SAMPLE MUST BE COUNTABLE, because it is not a compile error.
+    ///
+    /// A `textureSample` the parse missed stays a real sample on an UNQUANTISED coordinate: the
+    /// module compiles, runs, and picks whichever texel the device's subtexel rounding lands on.
+    /// The only thing between that and a fabricated divergence is the caller comparing these
+    /// counts against the instruction stream, so the counts have to be honest about a miss.
+    #[test]
+    fn a_sample_the_rewrite_cannot_parse_is_not_counted() {
+        let units = [TexBinding { unit: 1, coords: 2, cube: false, raw: false }];
+        // A shape `emit_tex` never writes: the coordinate is not a `vecK<f32>` constructor.
+        let odd = "  let _tex0 = textureSample(t1, s1, someOtherCoord);\n";
+        let (module, rewrites) =
+            wrap_render_case_module_for(odd, ProgramKind::Fragment, &[], &units).expect("module");
+        assert_eq!(rewrites.samples, 0, "an unparsed sample was counted as rewritten:\n{module}");
+        assert!(module.contains("textureSample(t1, s1, someOtherCoord)"), "left alone:\n{module}");
     }
 }

@@ -48,6 +48,143 @@ pub fn live_peak_mb() -> (usize, usize) {
     (live_bytes() / (1024 * 1024), peak_bytes() / (1024 * 1024))
 }
 
+/// # The large-allocation ledger (`VITASLOP_HEAP_TRACE=<min MB>`, native only)
+///
+/// The two counters say HOW MUCH is held and never WHO holds it, and a renderer whose named
+/// caches add up to 200 MB under a 2,400 MB live figure has 2,200 MB of holders nobody can
+/// name from a cache line. MEASURED on a baseball title's stadium: the heap climbed 70-90 MB
+/// every four frames, dropped 1,658 MB in one frame with no cache reporting a clear, and
+/// climbed again - a shape no counter can attribute.
+///
+/// When armed (`trace_large`), every allocation of at least the threshold keeps its
+/// backtrace for as long as it is live, and `large_live_report` groups what is live by
+/// allocation site. Only allocations that large pay for a backtrace, which keeps it off the
+/// hot path.
+///
+/// The ledger's own allocations go through the same allocator: a thread-local guard keeps
+/// them out of the ledger (and out of a recursion).
+mod ledger {
+    use std::alloc::Layout;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Minimum size that is traced; 0 = off.
+    pub static THRESHOLD: AtomicUsize = AtomicUsize::new(0);
+
+    struct Entry {
+        size: usize,
+        trace: std::backtrace::Backtrace,
+    }
+
+    static LIVE: Mutex<Option<HashMap<usize, Entry>>> = Mutex::new(None);
+
+    thread_local! {
+        static INSIDE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Run `f` with the ledger's reentrancy guard held; `None` if it was already held.
+    fn guarded<R>(f: impl FnOnce() -> R) -> Option<R> {
+        INSIDE.with(|g| {
+            if g.get() {
+                return None;
+            }
+            g.set(true);
+            let r = f();
+            g.set(false);
+            Some(r)
+        })
+    }
+
+    pub fn record(ptr: *mut u8, size: usize) {
+        let min = THRESHOLD.load(Ordering::Relaxed);
+        if min == 0 || size < min {
+            return;
+        }
+        guarded(|| {
+            let trace = std::backtrace::Backtrace::force_capture();
+            let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            g.get_or_insert_with(HashMap::new).insert(ptr as usize, Entry { size, trace });
+        });
+    }
+
+    pub fn forget(ptr: *mut u8, layout: Layout) {
+        let min = THRESHOLD.load(Ordering::Relaxed);
+        if min == 0 || layout.size() < min {
+            return;
+        }
+        guarded(|| {
+            let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(m) = g.as_mut() {
+                m.remove(&(ptr as usize));
+            }
+        });
+    }
+
+    /// The live allocations at or above the threshold, grouped by allocation site, largest
+    /// total first: `(bytes, count, site)` where `site` is the first few workspace frames
+    /// of the backtrace.
+    pub fn report(top: usize) -> Vec<(usize, usize, String)> {
+        guarded(|| {
+            let g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(m) = g.as_ref() else { return Vec::new() };
+            let mut by_site: HashMap<String, (usize, usize)> = HashMap::new();
+            for e in m.values() {
+                let site = site_of(&e.trace);
+                let s = by_site.entry(site).or_insert((0, 0));
+                s.0 += e.size;
+                s.1 += 1;
+            }
+            let mut v: Vec<(usize, usize, String)> =
+                by_site.into_iter().map(|(k, (b, c))| (b, c, k)).collect();
+            v.sort_by_key(|x| std::cmp::Reverse(x.0));
+            v.truncate(top);
+            v
+        })
+        .unwrap_or_default()
+    }
+
+    /// The workspace frames of a backtrace, innermost first, up to six of them - the frames
+    /// of the allocator, of `alloc::` and of this module are noise on every trace.
+    fn site_of(trace: &std::backtrace::Backtrace) -> String {
+        let text = format!("{trace}");
+        let mut frames = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            // `N: symbol` lines carry the function; the `at file:line` lines follow them.
+            if !line.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let Some((_, sym)) = line.split_once(": ") else { continue };
+            if !sym.starts_with("vitaslop") || sym.contains("heap::") {
+                continue;
+            }
+            let short: String = sym.chars().take(96).collect();
+            frames.push(short);
+            if frames.len() >= 6 {
+                break;
+            }
+        }
+        if frames.is_empty() { "(no workspace frame)".to_string() } else { frames.join(" <- ") }
+    }
+}
+
+/// Arm the large-allocation ledger: every allocation of `min_bytes` or more keeps its
+/// backtrace while live. See [`ledger`]. `0` disarms it.
+pub fn trace_large(min_bytes: usize) {
+    ledger::THRESHOLD.store(min_bytes, Ordering::Relaxed);
+}
+
+/// The ledger's report as lines: the `top` sites holding the most live bytes at or above
+/// the threshold, as `"<MB> MB in <n> allocation(s): <site>"`. Empty when not armed.
+pub fn large_live_report(top: usize) -> Vec<String> {
+    ledger::report(top)
+        .into_iter()
+        .map(|(b, c, site)| format!("{} MB in {c} allocation(s): {site}", b / (1024 * 1024)))
+        .collect()
+}
+
 #[inline]
 fn took(n: usize) {
     // `fetch_max` rather than a compare-exchange loop: one instruction's worth of contention on
@@ -77,12 +214,14 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
         let p = unsafe { self.0.alloc(layout) };
         if !p.is_null() {
             took(layout.size());
+            ledger::record(p, layout.size());
         }
         p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         gave(layout.size());
+        ledger::forget(ptr, layout);
         unsafe { self.0.dealloc(ptr, layout) }
     }
 
@@ -90,13 +229,16 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
         let p = unsafe { self.0.alloc_zeroed(layout) };
         if !p.is_null() {
             took(layout.size());
+            ledger::record(p, layout.size());
         }
         p
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ledger::forget(ptr, layout);
         let p = unsafe { self.0.realloc(ptr, layout, new_size) };
         if !p.is_null() {
+            ledger::record(p, new_size);
             // Count the DELTA, and count a grow as a peak event: a realloc that grows may have
             // copied, in which case both blocks were live for the length of the copy - but the
             // allocator has already released the old one by the time it returns, so the honest

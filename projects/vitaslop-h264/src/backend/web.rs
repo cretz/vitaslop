@@ -513,7 +513,7 @@ async fn read_frame(frame: &JsVideoFrame, shared: &Rc<RefCell<Shared>>) -> Resul
         1 if reported.starts_with("RGB") || reported.starts_with("BGR") => PixelFormat::Rgba,
         n => {
             return Err(Error::unsupported(format!(
-                "VideoFrame.copyTo returned {n} plane(s) (the frame calls itself                  {reported:?}) - this decoder reads 4:2:0 in two or three planes, or one                  packed RGB plane"
+                "VideoFrame.copyTo returned {n} plane(s) (the frame calls itself {reported:?}) - this decoder reads 4:2:0 in two or three planes, or one packed RGB plane"
             )));
         }
     };
@@ -526,7 +526,7 @@ async fn read_frame(frame: &JsVideoFrame, shared: &Rc<RefCell<Shared>>) -> Resul
                 reported.clone()
             };
             let note = if planes.length() == 1 {
-                " - PACKED RGB, so the decoder converted colour before handing it over and                  a caller that wants 4:2:0 converts it back"
+                " - PACKED RGB, so the decoder converted colour before handing it over and a caller that wants 4:2:0 converts it back"
             } else {
                 ""
             };

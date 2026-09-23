@@ -45,3 +45,8 @@ region = "NTSC"
 id = "PCSA00002"
 name = "MLB 12 The Show"
 region = "NTSC"
+
+[[game]]
+id = "PCSE00084"
+name = "Madden NFL 13"
+region = "NTSC"

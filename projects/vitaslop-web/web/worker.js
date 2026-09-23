@@ -21,6 +21,7 @@ import init, {
   worker_location_unavailable,
   worker_location_note,
   flush_game_data,
+  reserve_guest_region,
 } from "./pkg/vitaslop_web.js";
 import { openTitleCached } from "./opfs.js";
 import * as gamedata from "./gamedata.js";
@@ -233,6 +234,25 @@ self.onmessage = async (e) => {
   // would otherwise lose that write. `flush_game_data` returns the container only if there
   // is something unwritten AND the guest is not mid-host-call, so this is a no-op on the
   // common path and cannot block the worker on the way out.
+  // >>> RESERVE THE GUEST'S MEMORY INSIDE THIS WORKER'S OWN, before anything is transpiled.
+  //
+  // The guest region lives in the emulator's linear memory (a host read of guest memory
+  // is then a load, not a JavaScript call - see `browser_sched::HostRegion`), and the
+  // transpiled module is emitted for the region's exact offset. So the page asks THIS
+  // worker for the offset first, hands it to the throwaway transpile worker, and only then
+  // sends the start message. The knobs are set first: `VITASLOP_BROWSER_SPLIT_MEMORY` is
+  // read by the reservation itself.
+  if (d.type === "reserve") {
+    try {
+      await ready;
+      for (const [k, v] of Object.entries(d.knobs || {})) set_knob(k, String(v));
+      self.postMessage({ type: "reserved", hostOff: reserve_guest_region() });
+    } catch (err) {
+      self.postMessage({ type: "error", message: `guest region: ${String((err && err.message) || err)}` });
+    }
+    return;
+  }
+
   if (d.type === "flush-game-data") {
     if (!saveSink) return;
     try {

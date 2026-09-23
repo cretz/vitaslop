@@ -29,10 +29,14 @@ globalThis.__vitaslopPanic = (text) => {
 const ready = init();
 
 self.onmessage = async (e) => {
-  const { titleId, files, knobs } = e.data;
+  // `hostOff` is where the RUN worker reserved the guest region in its own memory (see
+  // worker.js's "reserve" message); the module is emitted for exactly that offset. 0 means
+  // a memory of the guest's own.
+  const { titleId, files, knobs, hostOff } = e.data;
   let reader = null;
   try {
     await ready;
+    if (typeof hostOff !== "number") throw new Error("transpile worker needs the run worker's hostOff");
     // The same knobs as the run worker, and not optional: `VITASLOP_BROWSER_FUEL` is baked
     // INTO the module here. A module transpiled without it would run in a worker that
     // believes it has software fuel and does not, which livelocks on the first guest loop
@@ -49,7 +53,7 @@ self.onmessage = async (e) => {
       throw new Error("transpile worker got neither titleId nor files");
     }
 
-    const built = await transpile_title(source);
+    const built = await transpile_title(source, hostOff);
     // Release the exclusive locks BEFORE the run worker is told to start, or its own
     // `createSyncAccessHandle` will fail on every file.
     if (reader) reader.close();

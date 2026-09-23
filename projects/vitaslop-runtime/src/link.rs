@@ -37,6 +37,31 @@ pub const IMAGE_BASE: u32 = 0x8100_0000;
 /// stray in-bounds decode can never wander from one module into the next.
 const MODULE_ALIGN: u32 = 0x1_0000;
 
+/// Bytes reserved above the last module for [`host_var_exports`]. One page; the symbols
+/// there are a handful of words.
+const HOST_VARS_BYTES: u32 = 0x1000;
+
+/// The DATA symbols a system library exports that a title may import as a VARIABLE, provided
+/// by this host because no loaded module carries them. Each is laid out in the image page at
+/// `base` and registered under its (library NID, variable NID) so the ordinary fixup loop
+/// binds every referencing site to it, exactly as it binds a module's own export.
+///
+/// * ScePerf `_pLibPerfCaptureFlagPtr` (library `0x447f047d`, variable `0x936a5f31`): the
+///   symbol is a POINTER to the performance-capture flag word. An engine reads
+///   `*_pLibPerfCaptureFlagPtr` at boot to decide whether to emit capture markers; a device
+///   without a capture tool attached reads 0 there. The page holds the pointer word, and the
+///   flag word it points at, both in the image. Unresolved, the import's sites hold whatever
+///   the image left there and the engine dereferences it - a sports title trapped at frame 0
+///   right after that read.
+fn host_var_exports(image: &mut [u8], base: u32, var_exports: &mut HashMap<(u32, u32), u32>) {
+    let off = base.wrapping_sub(IMAGE_BASE) as usize;
+    let Some(page) = image.get_mut(off..off + 8) else { return };
+    let flag_addr = base + 4;
+    page[0..4].copy_from_slice(&flag_addr.to_le_bytes());
+    page[4..8].copy_from_slice(&0u32.to_le_bytes());
+    var_exports.entry((0x447f_047d, 0x936a_5f31)).or_insert(base);
+}
+
 /// Total guest memory the unified program runs in (image + heap + stack), matching
 /// the order of magnitude of a Vita game partition (the console has 512 MiB of
 /// physical LPDDR2, most of which a game may map). Allocations begin above the image
@@ -139,17 +164,24 @@ impl LinkedProgram {
     /// pointers are discovered so address-taken thread entries and callbacks are
     /// translated.
     pub fn program(&self) -> Program<'_> {
-        self.program_with(false)
+        self.program_with(false, 0)
     }
 
     /// Like [`program`](Self::program) but with an imported **shared** memory, for
     /// the preemptive multi-thread scheduler (every thread instance imports one
     /// shared linear memory - see [`vitaslop_transpiler::Program::import_memory`]).
     pub fn shared_program(&self) -> Program<'_> {
-        self.program_with(true)
+        self.program_with(true, 0)
     }
 
-    fn program_with(&self, import_memory: bool) -> Program<'_> {
+    /// [`shared_program`](Self::shared_program) laid out `host_off` bytes into the HOST'S
+    /// OWN linear memory - see [`vitaslop_transpiler::Program::host_off`]. The browser
+    /// reserves the region and hands its offset here before it transpiles.
+    pub fn shared_program_at(&self, host_off: u32) -> Program<'_> {
+        self.program_with(true, host_off)
+    }
+
+    fn program_with(&self, import_memory: bool, host_off: u32) -> Program<'_> {
         Program {
             code: &self.image,
             base: self.base,
@@ -163,6 +195,7 @@ impl LinkedProgram {
             mem_bytes: self.mem_bytes,
             discover_code_pointers: true,
             import_memory,
+            host_off,
         }
     }
 }
@@ -202,6 +235,89 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         m.rebase(cursor)?;
         cursor = align_up(cursor.wrapping_add(span), MODULE_ALIGN);
     }
+    // One page above the last module for the DATA symbols a system library exports and no
+    // module here provides - see `host_var_exports`. It is part of the image (so the fixups
+    // below can bind sites to it) and below `alloc_base` (so the heap never reuses it).
+    // >>> WHERE EACH MODULE LANDED, so a guest ADDRESS can be turned back into a MODULE and an
+    // >>> OFFSET without a run, a guess or an hour.
+    //
+    // A profile of the browser worker names its hot blocks `g_<runtime address>`, and the
+    // hottest one on a baseball title's gameplay is 12.1% of the whole worker - which is our
+    // own emitted wasm and worth reading. Turning `g_83c123b0` into "libc + 0x123b0" needed the
+    // rebase delta, and nothing printed it: I guessed a base, disassembled the wrong function,
+    // and only caught it because a recorded return address landed MID-INSTRUCTION under the
+    // guess. One line makes that a lookup instead.
+    for m in modules.iter() {
+        tracing::info!(
+            target: "vitaslop::status",
+            "link: module {:<20} at {:#010x}..{:#010x} ({} KB){}",
+            m.name,
+            m.base,
+            m.image_end(),
+            span_of(m) / 1024,
+            if m.relocatable { " (rebased)" } else { " (fixed)" },
+        );
+    }
+    // >>> `VITASLOP_WHICH_EXPORT=<hex addr>`: WHICH EXPORT IS THIS ADDRESS?
+    //
+    // The other half of turning a profile's `g_<address>` into something actionable. A worker
+    // profile's hot block is an ADDRESS; what decides whether it can be served natively instead
+    // of emulated is its NID. Searched over every module's export table, so it also says when an
+    // address is INTERNAL (no match) - which is the answer that stops you looking for a NID to
+    // intercept.
+    if let Ok(v) = crate::knobs::var("VITASLOP_WHICH_EXPORT")
+        && let Ok(want) = u32::from_str_radix(v.trim().trim_start_matches("0x"), 16)
+    {
+        let mut hit = false;
+        for m in modules.iter() {
+            for e in &m.exports {
+                if e.addr & !1 == want & !1 {
+                    hit = true;
+                    tracing::warn!(
+                        target: "vitaslop::status",
+                        "which export: {:#010x} is {} (nid {:#010x}, library {:#010x}) exported by {} at +{:#x}",
+                        want, crate::nid::name(e.func_nid), e.func_nid, e.library_nid, m.name,
+                        want.wrapping_sub(m.base),
+                    );
+                }
+            }
+        }
+        if !hit {
+            let owner = modules.iter().find(|m| want >= m.base && want < m.image_end());
+            // ...and the NEAREST PRECEDING export in the same module, which is the exported
+            // function this internal code most likely belongs to. Walking up the call chain one
+            // run at a time answers the same question in N runs instead of one; this is a
+            // guess, and it is labelled as one, but it is the guess worth checking first.
+            let near = owner.and_then(|m| {
+                m.exports
+                    .iter()
+                    .filter(|e| (e.addr & !1) <= (want & !1))
+                    .max_by_key(|e| e.addr & !1)
+                    .map(|e| (e, m))
+            });
+            tracing::warn!(
+                target: "vitaslop::status",
+                "which export: {:#010x} is NOT an export{} - module-internal code, so it cannot be \
+                 intercepted by NID directly. NEAREST PRECEDING export (a guess at the function \
+                 it belongs to): {}",
+                want,
+                match owner {
+                    Some(m) => format!(" (inside {} at +{:#x})", m.name, want.wrapping_sub(m.base)),
+                    None => " and is in no module".to_string(),
+                },
+                match near {
+                    Some((e, m)) => format!(
+                        "{} (nid {:#010x}) at {:#010x} = {}+{:#x}, {:#x} bytes before",
+                        crate::nid::name(e.func_nid), e.func_nid, e.addr & !1, m.name,
+                        (e.addr & !1).wrapping_sub(m.base), (want & !1).wrapping_sub(e.addr & !1)
+                    ),
+                    None => "none".to_string(),
+                },
+            );
+        }
+    }
+    let host_vars = cursor;
+    cursor = align_up(cursor.wrapping_add(HOST_VARS_BYTES), MODULE_ALIGN);
     let image_end = cursor;
 
     // 2. Build the global export table, keyed by (library, NID). A function is
@@ -305,6 +421,7 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
             var_exports.entry((0x5ad9_c136, 0xdf08_4dfa)).or_insert(libcparam);
         }
     }
+    host_var_exports(&mut image, host_vars, &mut var_exports);
     let mut var_fixups_applied = 0u32;
     let mut unresolved_var_imports: Vec<(u32, u32)> = Vec::new();
     // Opt-in: bind every unresolved variable-import site to a poison address well outside

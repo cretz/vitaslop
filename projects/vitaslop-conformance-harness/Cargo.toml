@@ -22,4 +22,8 @@ vitaslop-conformance-suite-arm = { path = "../vitaslop-conformance-suite-arm" }
 
 [dev-dependencies]
 vitaslop-native = { path = "../vitaslop-native" }
+# So the renderer's own `tracing::debug` diagnostics (VITASLOP_GXP_VP_TRACE and the rest)
+# are VISIBLE in a test run. A report at debug with no subscriber is a diagnostic that
+# does not exist, and a conformance failure that cannot be attributed is a guess.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 vitaslop-loader = { path = "../vitaslop-loader" }

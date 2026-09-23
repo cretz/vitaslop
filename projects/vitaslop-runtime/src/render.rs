@@ -634,8 +634,30 @@ fn shade_lit(albedo: [f32; 3], n_world: [f32; 3], mat: &crate::capture::Fragment
 /// test against a `+INF` clear), and for a well-formed projection - where `z/w = A + B/w` -
 /// it is an increasing affine function of that `z/w`, so it produces the IDENTICAL ordering
 /// a correct clip `z` would. It agrees with a conventional title and rescues this one.
-fn project(v: &Vertex, space: &Space, width: u32, height: u32, ssaa: f32) -> Option<[f32; 4]> {
+/// `vp` is the guest's VIEWPORT rectangle for this draw in RASTER pixels, or `None` for "the
+/// whole raster" - [`Viewport`], resolved once per draw by [`viewport_raster_rect`] through
+/// `vitaslop_platform::gpu::viewport_rect` so this path and both GPU arms read GXM's
+/// offset/half-scale convention from ONE place.
+///
+/// A clip-space draw (`Mvp`/`Ndc`) lands inside that rectangle instead of on the whole raster.
+/// This path ignored the viewport entirely until the GXM pipeline-conformance app asked for
+/// half the target and got all of it - `project` mapped an `Ndc` vertex straight onto
+/// `width`/`height` and read the viewport only to INFER a target extent. A `Pixel`-space draw
+/// is unaffected: it carries absolute framebuffer coordinates, which is what the viewport
+/// transform produces rather than consumes.
+fn project(
+    v: &Vertex,
+    space: &Space,
+    width: u32,
+    height: u32,
+    ssaa: f32,
+    vp: Option<[f32; 4]>,
+) -> Option<[f32; 4]> {
     let (wf, hf) = (width as f32, height as f32);
+    // Where ndc (-1, +1) maps to: the viewport rectangle when the guest set one, the whole
+    // raster otherwise. `(x0, y0, w, h)` with Y already DOWN, exactly as the rect that reaches
+    // `set_viewport` on the GPU, so the two backends place a vertex identically.
+    let [vx, vy, vw, vh] = vp.unwrap_or([0.0, 0.0, wf, hf]);
     match space {
         Space::Mvp(m) => {
             let c = transform(m, v.pos[0], v.pos[1], v.pos[2]);
@@ -643,19 +665,46 @@ fn project(v: &Vertex, space: &Space, width: u32, height: u32, ssaa: f32) -> Opt
                 return None;
             }
             let inv_w = 1.0 / c[3];
-            let sx = (c[0] * inv_w * 0.5 + 0.5) * wf;
+            let sx = vx + (c[0] * inv_w * 0.5 + 0.5) * vw;
             // Flip Y: NDC +Y is up, image +Y is down.
-            let sy = (1.0 - (c[1] * inv_w * 0.5 + 0.5)) * hf;
+            let sy = vy + (1.0 - (c[1] * inv_w * 0.5 + 0.5)) * vh;
             Some([sx, sy, -inv_w, inv_w])
         }
         Space::Ndc => {
-            let sx = (v.pos[0] * 0.5 + 0.5) * wf;
-            let sy = (1.0 - (v.pos[1] * 0.5 + 0.5)) * hf;
+            let sx = vx + (v.pos[0] * 0.5 + 0.5) * vw;
+            let sy = vy + (1.0 - (v.pos[1] * 0.5 + 0.5)) * vh;
             Some([sx, sy, 0.0, 1.0])
         }
         // Screen pixels already, Y down - scaled to the (possibly supersampled) raster.
         Space::Pixel => Some([v.pos[0] * ssaa, v.pos[1] * ssaa, 0.0, 1.0]),
     }
+}
+
+/// This draw's guest viewport as a rectangle of the RASTER, `[x, y, w, h]` with Y down, or
+/// `None` for "the whole raster".
+///
+/// `vitaslop_platform::gpu::viewport_rect` answers in pixels of the guest's `surf_w x surf_h`
+/// surface (it is the same function the GPU arms call, which is the point); `ssaa` lifts it onto
+/// a supersampled raster exactly as a `Pixel`-space vertex is lifted.
+///
+/// GEOMETRY OUTSIDE THE VIEWPORT IS DISCARDED, not merely transformed: on the GPU the clip
+/// volume maps onto the viewport rectangle, so a vertex past ndc +-1 falls outside it and the
+/// rasteriser drops it. Here that is the returned rectangle being intersected into the draw's
+/// scissor by the caller - without it the two backends would agree on where a draw LANDS and
+/// disagree on what it OVERFLOWS onto.
+fn viewport_raster_rect(d: &Draw, surf_w: u32, surf_h: u32, ssaa: f32) -> Option<[f32; 4]> {
+    // The negative control for this change - see `gpu::viewport_reaches_fixed_function`. The
+    // software rasteriser is one of the two paths it switched, so it answers to the same flag.
+    if !vitaslop_platform::gpu::viewport_reaches_fixed_function() {
+        return None;
+    }
+    let (x, y, w, h) = vitaslop_platform::gpu::viewport_rect(
+        d.render_state.viewport_enable,
+        &d.render_state.viewport,
+        surf_w,
+        surf_h,
+    )?;
+    Some([x * ssaa, y * ssaa, w * ssaa, h * ssaa])
 }
 
 /// SceGxmPrimitiveType selectors (the high-bit-encoded enum, gxm.h): triangle list,
@@ -1087,6 +1136,173 @@ fn block_encode_rate() -> EncodeRate {
 /// expanded.
 const INLINE_ENCODE_TEXEL_LIMIT: u64 = 4 << 20;
 
+/// >>> HOW MUCH OF ONE FRAME THE INLINE BLOCK ENCODE MAY SPEND, in milliseconds.
+///
+/// `VITASLOP_TEX_ENCODE_BUDGET_MS` (default 2.0; `0` removes the budget and restores the
+/// pre-2026-09-12 behaviour, which is the arm to A/B against).
+///
+/// >>> WHY A BUDGET AND NOT A SIZE LIMIT. There is already a size limit
+/// ([`INLINE_ENCODE_TEXEL_LIMIT`]), and it cannot see the defect: no SINGLE texture here is
+/// oversized, but a screen transition hands the builder dozens of small ones at once and every
+/// one of them is encoded in the SAME frame. MEASURED on a fighting title in the desktop
+/// browser, with the build phase's new per-texture timing:
+///
+///   | textures built in the frame | the frame's build | per texture |
+///   |---|---|---|
+///   | 36 | 354.3 ms, of which 354.00 is the build | 9.8 ms |
+///   | 13 | 103.2 ms, of which 102.84 | 7.9 ms |
+///   | 14 |  60.6 ms, of which  60.17 | 4.3 ms |
+///   | 56 |   3.2 ms, of which   3.12 | 0.06 ms |
+///
+/// The last row is the control: 56 textures that do NOT take this path cost nothing, so it is
+/// not the count and not the cache - it is this encode, at ~150x the cost of an ordinary build,
+/// and a title that hitches for a third of a second is hitching here.
+///
+/// A texture refused by the budget is NOT dropped and NOT approximated: it takes the ordinary
+/// RGBA8 path at full resolution, which costs memory rather than picture, and the frames after
+/// this one encode it when they have room. That is the same trade the size limit above already
+/// makes, stated per FRAME instead of per texture
+/// [[vitaslop-a-stall-must-not-buy-a-sentence]].
+fn inline_encode_budget_ms() -> f64 {
+    static MS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        vitaslop_platform::knobs::var("VITASLOP_TEX_ENCODE_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(2.0)
+    })
+}
+
+thread_local! {
+    /// Milliseconds this frame has already spent inside the inline block encode. Reset where
+    /// the decode epoch turns over, which is once per frame.
+    static ENCODE_SPENT_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+thread_local! {
+    // (A doc comment cannot sit on a `thread_local!` invocation - rustdoc drops it and the
+    // compiler warns - so what stood here is folded into the item's own doc below.)
+    /// Whether the frame still has room for an inline block encode; `true` when the budget is
+    /// off. Set when the last `transcoded_source` refusal was the frame BUDGET rather than a
+    /// property of the texture. Only a budget refusal is worth retrying on a later frame;
+    /// every other refusal is permanent and re-deciding it every frame would be pure churn.
+    static ENCODE_REFUSED_FOR_BUDGET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take the budget-refusal flag, clearing it.
+fn take_encode_refused_for_budget() -> bool {
+    ENCODE_REFUSED_FOR_BUDGET.with(|c| c.replace(false))
+}
+
+fn inline_encode_has_room() -> bool {
+    let budget = inline_encode_budget_ms();
+    budget <= 0.0 || ENCODE_SPENT_MS.with(|c| c.get()) < budget
+}
+
+fn note_inline_encode(ms: f64) {
+    ENCODE_SPENT_MS.with(|c| c.set(c.get() + ms));
+}
+
+/// A CPU block encode that stopped at a block boundary because the frame's budget ran out, with
+/// everything needed to carry on where it left off.
+///
+/// # >>> WHAT THE BUDGET ALONE COULD NOT BOUND
+/// `VITASLOP_TEX_ENCODE_BUDGET_MS` is checked BEFORE an encode and never during it, so a frame
+/// can always run ONE encode however long that one takes: the worst build frame went 226.8 ms ->
+/// 45.6, and the whole of the 45.6 that was left is a single large texture. `transcoded_source`
+/// has named a resumable encode as the fix for its own size refusal since that refusal was
+/// written. This is it - the encode stops at a block boundary, keeps its decoded chain and the
+/// blocks it has produced, and the next frame that binds the texture continues.
+///
+/// The unit is the BLOCK, which is what makes this free of any picture consequence: every 4x4
+/// block is encoded from the source image alone ([`crate::bcenc::encode_bc1_blocks`]), so the
+/// concatenation of the pieces is byte for byte the one-shot encode. Resuming cannot produce a
+/// different texture; it can only produce it later.
+struct PartialEncode {
+    /// The key the texture cache knows this texture by - see `tex_key`. A partial encode belongs
+    /// to CONTENT, not to an address: a guest texture whose bytes change is a different key and
+    /// its half-finished predecessor is worthless.
+    key: u64,
+    /// The format chosen on the first tier and kept, exactly as the whole-image path keeps it.
+    format: BlockFormat,
+    force_format: Option<BlockFormat>,
+    /// The RGBA8 mip chain, decoded ONCE. The decode is not resumable and does not need to be:
+    /// a texture refused by the budget takes the ordinary RGBA8 path, which decodes the same
+    /// bytes anyway, so this costs nothing that the refusal avoided.
+    levels: Vec<(u32, u32, Vec<u8>)>,
+    /// Blocks produced so far, in chain order.
+    data: Vec<u8>,
+    /// Where `data` ends: the level being encoded and the block index within it.
+    level: usize,
+    block: u32,
+    /// Frames since this was last advanced. A guest that stops binding a texture half way
+    /// through its encode must not leave its decoded chain resident for the rest of the run.
+    idle_frames: u32,
+}
+
+thread_local! {
+    /// The ONE encode allowed to be in flight across frames.
+    ///
+    /// One, not a map, and the bound is the point: this holds a decoded RGBA8 mip chain, which
+    /// for a 2048x2048 texture is 22 MB, and a map of them is a second unbudgeted copy of the
+    /// working set in a heap that can never hand a page back. One is also all the retry
+    /// mechanism can feed - `begin_frame` hands back a single deferred key per frame - so a
+    /// second slot would sit empty.
+    static PARTIAL_ENCODE: std::cell::RefCell<Option<PartialEncode>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// How many frames a partial encode may go untouched before its decoded chain is released.
+/// A texture the title has stopped binding is one nothing will ever come back to resume.
+const PARTIAL_ENCODE_IDLE_LIMIT: u32 = 120;
+
+/// Blocks encoded between two clock reads. The budget can only be honoured to this granularity,
+/// so it is set from the encoder's own rate: the slow (ETC2) encoder runs at about 1 Mtexel/s,
+/// where 64 blocks is a millisecond, and the fast (BC) one at 95, where the same 64 blocks would
+/// make the clock read the dominant cost of a large texture.
+fn encode_chunk_blocks() -> u32 {
+    match block_encode_rate() {
+        EncodeRate::Slow => 64,
+        EncodeRate::Fast => 4096,
+    }
+}
+
+/// `VITASLOP_TEX_ENCODE_RESUME=0` restores the OLD behaviour: an encode that starts runs to
+/// completion however long it takes. An A/B ARM, so it is VALUE-sensitive rather than
+/// presence-only [[vitaslop-knob-is-the-gate-not-the-level]].
+fn encode_resume_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_TEX_ENCODE_RESUME").ok().as_deref() != Some("0"))
+}
+
+/// `VITASLOP_GXP_INDEX16=0` restores the OLD behaviour: every index widened to u32 whatever
+/// the guest's buffer holds. An A/B ARM, so it is VALUE-sensitive rather than presence-only
+/// [[vitaslop-knob-is-the-gate-not-the-level]]. See the expansion for what it costs.
+fn gxp_index16_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_GXP_INDEX16").ok().as_deref() != Some("0"))
+}
+
+/// Called once per frame, where the decode epoch turns over.
+fn reset_inline_encode_budget() {
+    ENCODE_SPENT_MS.with(|c| c.set(0.0));
+    // AGE THE HELD ENCODE. See `PARTIAL_ENCODE_IDLE_LIMIT`: the retry mechanism drops the cache
+    // entry so a later bind resumes, but nothing guarantees the title ever binds it again, and a
+    // held chain that nobody resumes is exactly the leak this whole area has already paid for
+    // once [[vitaslop-the-inline-block-encode-is-the-browser-hitch]].
+    PARTIAL_ENCODE.with(|c| {
+        let mut g = c.borrow_mut();
+        if let Some(p) = g.as_mut() {
+            p.idle_frames += 1;
+            if p.idle_frames > PARTIAL_ENCODE_IDLE_LIMIT {
+                *g = None;
+            }
+        }
+    });
+}
+
+
+
 /// The lossless half of [`compressed_source`]: the guest's own blocks, or `None` with a report.
 fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
     let why = |reason: &'static str| -> Option<CompressedUpload> {
@@ -1467,101 +1683,211 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
              more than it needs the megabytes. It will be re-encoded if the budget tightens",
         );
     }
-    // >>> AN ENCODE TOO BIG FOR A FRAME IS REFUSED. IT IS NEVER MADE SMALLER.
+    // >>> AN ENCODE TOO BIG FOR A FRAME IS NO LONGER REFUSED - IT IS RESUMED.
     //
-    // A screen transition binds a hundred textures at once, and this encoder runs at about
-    // 1 Mtexel/s on the device it exists for, so encoding a 2048x2048 atlas inline is seconds of
-    // frozen guest. The previous answer was to encode a REDUCED-resolution version instead and
-    // grow it later. That is a quality trade and it does not belong here: on the device it never
-    // got past 128 texels a side, so an atlas rendered at a sixteenth of its resolution per axis.
+    // A screen transition binds a hundred textures at once and this encoder runs at about
+    // 1 Mtexel/s on the device it exists for, so a 2048x2048 atlas encoded inline is seconds of
+    // frozen guest. Two answers were tried before this one and both are recorded here so neither
+    // comes back. A REDUCED-resolution version grown later is a quality trade and does not
+    // belong here: on the device it never got past 128 texels a side, an atlas at a sixteenth of
+    // its resolution per axis. A flat size REFUSAL is honest but permanent - the texture spends
+    // the whole run as RGBA8, at eight times its size, on the engine that can least afford it.
     //
-    // The picture is not the variable. If an encode cannot be afforded, the texture takes the
-    // ordinary decode path at the guest's own resolution and costs memory instead - which is
-    // what the texture budget and its eviction are for. Fidelity is fixed; memory is managed.
+    // The BLOCK is what makes the third answer possible. Every 4x4 block is encoded from the
+    // source image alone, so an encode can stop on any block boundary and continue next frame,
+    // at the guest's own resolution, producing byte for byte what the one-shot encode produced.
+    // See `PartialEncode`. The picture is still not the variable; only WHEN it arrives is.
     //
-    // The real fix for the cost is a RESUMABLE encode - one texture's blocks spread over frames
-    // at full resolution - and until that exists this refusal is the honest behaviour rather
-    // than a softer picture.
+    // The SIZE limit therefore survives only as the old arm: with resumption off
+    // (`VITASLOP_TEX_ENCODE_RESUME=0`) a big encode has nothing to bound it and the refusal is
+    // still the honest behaviour.
     let full_texels = (t.width as u64 * t.height as u64 * 4) / 3;
-    if full_texels > INLINE_ENCODE_TEXEL_LIMIT && block_encode_rate() == EncodeRate::Slow {
+    if !encode_resume_enabled()
+        && full_texels > INLINE_ENCODE_TEXEL_LIMIT
+        && block_encode_rate() == EncodeRate::Slow
+    {
         return why(
             "encoding it at the guest's own resolution would stall the frame on this device's \
              CPU encoder, and a smaller version is not an option - the picture is not something \
              to trade. It takes the ordinary decode path at full resolution and costs memory \
-             instead. A resumable encode is what removes this refusal",
+             instead. Resumption is OFF (VITASLOP_TEX_ENCODE_RESUME=0), which is what would \
+             otherwise remove this refusal",
         );
     }
 
-    // Every level as RGBA8: the guest's own where it has them, box-filtered from the level
-    // above where it does not. Mixing the two would be worse than either - the chain has to be
-    // consistent, so the guest's levels are used for as long as they last.
-    let want = max_mip_levels(t.width, t.height);
-    let mut levels: Vec<(u32, u32, Vec<u8>)> = Vec::new();
-    for level in 0..want {
-        if level < t.levels
-            && let Some(view) = level_view(t, 0, level) {
-                let (w, h, rgba, seam) = decode_texture_seam(&view);
-                if seam != TexelSeam::Rgba8 {
-                    return why("it decodes onto the half seam, which is DATA and not colour");
-                }
-                levels.push((w, h, rgba));
-                continue;
-            }
-        let Some((pw, ph, prev)) = levels.last() else {
-            return why("its level 0 could not be decoded");
-        };
-        let (w, h, rgba) = halve_rgba8(*pw, *ph, prev);
-        levels.push((w, h, rgba));
-    }
-    let (tw, th) = (levels[0].0, levels[0].1);
-    // ONE format for the whole texture: a mip chain is a single GPU texture, so a level that
-    // happens to be opaque cannot be BC1 while its neighbour is BC3. Any alpha anywhere means
-    // the alpha-carrying format for all of it.
-    //
-    // >>> AND ONE FORMAT FOR THE WHOLE TEXTURE'S LIFE, ACROSS TIERS.
-    //
-    // The opacity test can only see the levels THIS tier decoded, and a preview tier decodes
-    // only the small ones. A texture whose small levels happen to be opaque while its level 0 is
-    // not would be encoded without alpha at preview and with it after promotion - so an
-    // alpha-tested surface would render as a solid block for the second or so before it was
-    // promoted, and then quietly fix itself. That is a defect that only appears during a
-    // transition and repairs itself before anyone can look at it. The first tier's decision is
-    // carried instead, so a promotion changes resolution and nothing else.
-    let format = match force_format {
-        Some(f) => f,
-        None => {
-            let opaque = levels.iter().all(|(_, _, px)| crate::bcenc::is_opaque(px));
-            // Encode for the family the ADAPTER takes. A desktop takes BC; the phone this work
-            // exists for takes ETC2 and nothing else, and encoding BC for it produced a 354 MB
-            // working set while the report claimed a win.
-            match (vitaslop_platform::gpu::block_family(), opaque) {
-                (BlockFamily::Etc2, true) => BlockFormat::Etc2Rgb8,
-                (BlockFamily::Etc2, false) => BlockFormat::Etc2Rgba8,
-                (_, true) => BlockFormat::Bc1,
-                (_, false) => BlockFormat::Bc3,
-            }
+    // The encode already under way for THIS texture, if the budget stopped one. Taken out of the
+    // slot while it is worked on, and put back only if it is still unfinished at the end.
+    let key = tex_key(t);
+    let mut held = PARTIAL_ENCODE.with(|c| {
+        let mut g = c.borrow_mut();
+        match g.as_ref() {
+            // A held encode for a DIFFERENT texture, or for a different forced format, is not
+            // this call's business and is left where it is.
+            Some(p) if p.key == key && p.force_format == force_format => g.take(),
+            _ => None,
         }
-    };
-    let mut data = Vec::new();
-    for (w, h, rgba) in &levels {
-        let block = match format {
-            BlockFormat::Bc1 => crate::bcenc::encode_bc1(*w, *h, rgba),
-            BlockFormat::Bc3 => crate::bcenc::encode_bc3(*w, *h, rgba),
-            BlockFormat::Etc2Rgb8 => crate::etcenc::encode_etc2_rgb8(*w, *h, rgba),
-            BlockFormat::Etc2Rgba8 => crate::etcenc::encode_etc2_rgba8(*w, *h, rgba),
+    });
+
+    // >>> AND ONLY WHILE THE FRAME STILL HAS ROOM FOR ONE. See `inline_encode_budget_ms`: the
+    // size limit above asks whether ONE texture is too big, and a screen transition's defect is
+    // that THIRTY-SIX small ones are encoded in the same frame.
+    //
+    // A held encode is put BACK before refusing: the budget refuses the FRAME, not the texture,
+    // and throwing away the blocks already produced would turn a defer into a restart.
+    if !inline_encode_has_room() {
+        if let Some(p) = held {
+            PARTIAL_ENCODE.with(|c| *c.borrow_mut() = Some(p));
+        }
+        ENCODE_REFUSED_FOR_BUDGET.with(|c| c.set(true));
+        return why(
+            "this frame has already spent its inline block-encode budget, and a transition that \
+             hands the builder dozens of new textures at once would otherwise encode every one \
+             of them before the frame could be presented - MEASURED at 354 ms for 36 textures. \
+             It takes the ordinary decode path at full resolution and costs memory instead; a \
+             later frame encodes it. Raise or remove the budget with \
+             VITASLOP_TEX_ENCODE_BUDGET_MS",
+        );
+    }
+    let t_encode = build_now();
+    if held.is_none() {
+        // Every level as RGBA8: the guest's own where it has them, box-filtered from the level
+        // above where it does not. Mixing the two would be worse than either - the chain has to
+        // be consistent, so the guest's levels are used for as long as they last.
+        //
+        // NOT resumable, and it does not need to be: a texture whose encode is deferred takes the
+        // ordinary RGBA8 path, which decodes exactly these bytes anyway, so the decode is work
+        // the frame was going to do either way. Only the ENCODE was ever the 354 ms.
+        let want = max_mip_levels(t.width, t.height);
+        let mut levels: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+        for level in 0..want {
+            if level < t.levels
+                && let Some(view) = level_view(t, 0, level) {
+                    let (w, h, rgba, seam) = decode_texture_seam(&view);
+                    if seam != TexelSeam::Rgba8 {
+                        return why("it decodes onto the half seam, which is DATA and not colour");
+                    }
+                    levels.push((w, h, rgba));
+                    continue;
+                }
+            let Some((pw, ph, prev)) = levels.last() else {
+                return why("its level 0 could not be decoded");
+            };
+            let (w, h, rgba) = halve_rgba8(*pw, *ph, prev);
+            levels.push((w, h, rgba));
+        }
+        // ONE format for the whole texture: a mip chain is a single GPU texture, so a level that
+        // happens to be opaque cannot be BC1 while its neighbour is BC3. Any alpha anywhere means
+        // the alpha-carrying format for all of it.
+        //
+        // >>> AND ONE FORMAT FOR THE WHOLE TEXTURE'S LIFE, ACROSS TIERS.
+        //
+        // The opacity test can only see the levels THIS tier decoded, and a preview tier decodes
+        // only the small ones. A texture whose small levels happen to be opaque while its level 0
+        // is not would be encoded without alpha at preview and with it after promotion - so an
+        // alpha-tested surface would render as a solid block for the second or so before it was
+        // promoted, and then quietly fix itself. That is a defect that only appears during a
+        // transition and repairs itself before anyone can look at it. The first tier's decision
+        // is carried instead, so a promotion changes resolution and nothing else.
+        //
+        // A RESUMED encode reads it out of `PartialEncode` rather than re-deriving it, for the
+        // same reason: the chain cannot change format half way down.
+        let format = match force_format {
+            Some(f) => f,
+            None => {
+                let opaque = levels.iter().all(|(_, _, px)| crate::bcenc::is_opaque(px));
+                // Encode for the family the ADAPTER takes. A desktop takes BC; the phone this
+                // work exists for takes ETC2 and nothing else, and encoding BC for it produced a
+                // 354 MB working set while the report claimed a win.
+                match (vitaslop_platform::gpu::block_family(), opaque) {
+                    (BlockFamily::Etc2, true) => BlockFormat::Etc2Rgb8,
+                    (BlockFamily::Etc2, false) => BlockFormat::Etc2Rgba8,
+                    (_, true) => BlockFormat::Bc1,
+                    (_, false) => BlockFormat::Bc3,
+                }
+            }
+        };
+        held = Some(PartialEncode {
+            key,
+            format,
+            force_format,
+            levels,
+            data: Vec::new(),
+            level: 0,
+            block: 0,
+            idle_frames: 0,
+        });
+    }
+    let mut st = held.expect("built above when there was nothing held");
+    st.idle_frames = 0;
+    // >>> THE BUDGET IS NOW CHECKED DURING THE ENCODE, WHICH IS THE WHOLE CHANGE.
+    //
+    // It was checked only BEFORE one, so a frame could always run a single encode however long
+    // that one took - and that single encode is exactly what survived in the 45.6 ms the budget
+    // brought the worst build frame down to.
+    let budget = inline_encode_budget_ms();
+    let chunk = encode_chunk_blocks();
+    let resume = encode_resume_enabled();
+    while st.level < st.levels.len() {
+        let (w, h, rgba) = &st.levels[st.level];
+        let total = crate::bcenc::block_count(*w, *h);
+        let n = chunk.min(total - st.block);
+        let piece = match st.format {
+            BlockFormat::Bc1 => crate::bcenc::encode_bc1_blocks(*w, *h, rgba, st.block, n),
+            BlockFormat::Bc3 => crate::bcenc::encode_bc3_blocks(*w, *h, rgba, st.block, n),
+            BlockFormat::Etc2Rgb8 => {
+                crate::etcenc::encode_etc2_rgb8_blocks(*w, *h, rgba, st.block, n)
+            }
+            BlockFormat::Etc2Rgba8 => {
+                crate::etcenc::encode_etc2_rgba8_blocks(*w, *h, rgba, st.block, n)
+            }
             // BC2 is never CHOSEN as a transcode target - its 4-bit uncompressed alpha is
             // strictly worse than BC3's interpolated block at the same size.
             BlockFormat::Bc2 => unreachable!("BC2 is a passthrough format, never a transcode one"),
         };
-        data.extend_from_slice(&block);
+        st.data.extend_from_slice(&piece);
+        st.block += n;
+        if st.block >= total {
+            st.level += 1;
+            st.block = 0;
+        }
+        // `budget <= 0` is the budget OFF, and with resumption off there is nothing to stop for:
+        // both of those arms run the whole chain here, which is what makes them the same encode
+        // as before this existed.
+        if resume
+            && budget > 0.0
+            && ENCODE_SPENT_MS.with(|c| c.get()) + (build_now() - t_encode) >= budget
+        {
+            break;
+        }
     }
+    // Charged whether it finished or not - the frame spent it either way, and a partial encode
+    // that did not charge its time would let the next texture spend the same budget again.
+    note_inline_encode(build_now() - t_encode);
+    if st.level < st.levels.len() {
+        // UNFINISHED. Held for the next frame, and reported as a BUDGET refusal so `texture()`
+        // pushes the key onto `encode_deferred` - which is what drops the cache entry so a later
+        // bind comes back here instead of hitting a cached RGBA8 texture for ever. A deferral
+        // with no retry is a LEAK, not a defer, and this area has paid for that once already.
+        PARTIAL_ENCODE.with(|c| *c.borrow_mut() = Some(st));
+        ENCODE_REFUSED_FOR_BUDGET.with(|c| c.set(true));
+        return why(
+            "its block encode ran past this frame's budget and was SUSPENDED on a block \
+             boundary; the blocks already produced are kept and a later frame continues it. \
+             Until it finishes the texture takes the ordinary RGBA8 path at full resolution, \
+             exactly as a refused one does - a half-encoded texture is never bound. Raise or \
+             remove the budget with VITASLOP_TEX_ENCODE_BUDGET_MS",
+        );
+    }
+    let (tw, th) = (st.levels[0].0, st.levels[0].1);
+    let format = st.format;
+    let levels = st.levels.len() as u32;
     report_transcoded(t.base_format, format);
     Some(CompressedUpload {
         format,
         width: tw,
         height: th,
-        data: vitaslop_platform::gpu::CompressedData::Cpu(Arc::new(data)),
-        levels: levels.len() as u32,
+        data: vitaslop_platform::gpu::CompressedData::Cpu(Arc::new(st.data)),
+        levels,
         transcoded: true,
     })
 }
@@ -2108,6 +2434,7 @@ pub fn texture_mean_rgb(t: &BoundTexture) -> Option<[f32; 3]> {
 /// an unknown format returns opaque magenta so it is visible, not silent.
 fn sample_texture(t: &BoundTexture, u: f32, v: f32) -> [u8; 4] {
     if t.width == 0 || t.height == 0 {
+        report_degenerate_texture("sample_texture", t);
         return [255, 0, 255, 255];
     }
     // Honor the guest-set magnification filter (SceGxmTextureFilter: 0 = POINT,
@@ -2275,6 +2602,13 @@ fn decode_texture_rgba8_counted(
 ) -> (u32, u32, Vec<u8>, TexelSeam) {
     let seam = seam_for_format(t.base_format);
     if t.width == 0 || t.height == 0 {
+        // >>> A 1x1 MAGENTA TEXEL STRETCHED OVER A QUAD IS A SOLID MAGENTA RECTANGLE, and this
+        // >>> path used to do it in complete silence - no report, no counter, nothing to grep.
+        // The sibling `report_undecodable_texture_format` has said which FORMAT it could not
+        // decode since it was written; a texture with no EXTENT said nothing at all, so the two
+        // indistinguishable on-screen symptoms had one diagnosable cause and one undiagnosable
+        // one [[vitaslop-fast-fail-no-silent-success]].
+        report_degenerate_texture("decode_texture_rgba8_counted", t);
         return (1, 1, vec![255, 0, 255, 255], TexelSeam::Rgba8);
     }
     if seam == TexelSeam::Rgba16Float {
@@ -2513,7 +2847,7 @@ fn report_yuv_profile_assumed(swizzle: u32) {
     let csc = if (swizzle >> 13) & 1 == 0 { "CSC0" } else { "CSC1" };
     let order = if (swizzle >> 12) & 1 == 0 { "YUV" } else { "YVU" };
     eprintln!(
-        "gxm texture: a two-plane 4:2:0 (video) texture is bound as {order}/{csc}. The channel          order is read from the format; the CONVERSION is BT.601 studio-swing, which is the          GXM default profile - if the title ever calls sceGxmSetYuvProfile, this run is          converting with the wrong one and the picture's colour is an assumption."
+        "gxm texture: a two-plane 4:2:0 (video) texture is bound as {order}/{csc}. The channel order is read from the format; the CONVERSION is BT.601 studio-swing, which is the GXM default profile - if the title ever calls sceGxmSetYuvProfile, this run is converting with the wrong one and the picture's colour is an assumption."
     );
 }
 
@@ -3119,6 +3453,28 @@ fn decode_uncompressed_at(t: &BoundTexture, off: usize) -> [u8; 4] {
 /// whose SIZE is unknown (the unit ends up unbound), this one a format that is sized but not
 /// decodable (the unit binds a magenta image). Both are silent failures otherwise, and they
 /// look nothing alike on screen.
+/// Say that a bound texture has NO EXTENT, so everything sampling it is painted magenta.
+///
+/// # Why this needs its own report
+/// A zero width or height produces exactly the same on-screen symptom as an undecodable format
+/// - a flat magenta area - and only one of the two used to say so. Deduped by
+/// `(where, format, width, height, type)` so a degenerate texture bound on every draw of a
+/// frame costs one line, not one per texel.
+pub(crate) fn report_degenerate_texture(whence: &str, t: &BoundTexture) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(String, u32, u32, u32, u32)>>> = Mutex::new(None);
+    let key = (whence.to_string(), t.base_format, t.width, t.height, t.tex_type);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(key) {
+        return;
+    }
+    eprintln!(
+        "gxm texture: a bound texture has NO EXTENT ({}x{}, base format {:#04x}, type {}) in {}          - every draw sampling it is painted MAGENTA",
+        t.width, t.height, t.base_format, t.tex_type, whence
+    );
+}
+
 pub(crate) fn report_undecodable_texture_format(base_format: u32, tex_type: u32) {
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -3559,9 +3915,12 @@ pub fn locate_scene(scene: &Scene, width: u32, height: u32) -> Vec<ObjectLoc> {
         let mut bbox = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
         let mut wsum = 0.0f64;
         let mut wcount = 0usize;
+        // The same viewport the picture is drawn through, so a reported bounding box is where
+        // the draw actually lands rather than where it would land on the whole target.
+        let vp = viewport_raster_rect(d, width, height, 1.0);
         for i in 0..nverts {
             let v = decode_vertex(d, &interp.layout, i);
-            let Some(p) = project(&v, &Space::Mvp(mvp), width, height, 1.0) else { continue };
+            let Some(p) = project(&v, &Space::Mvp(mvp), width, height, 1.0, vp) else { continue };
             bbox[0] = bbox[0].min(p[0]);
             bbox[1] = bbox[1].min(p[1]);
             bbox[2] = bbox[2].max(p[0]);
@@ -3766,9 +4125,11 @@ pub fn locate_sprites(scene: &Scene, width: u32, height: u32) -> Vec<SpriteLoc> 
         let mut bbox = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
         let mut uv = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
         let mut seen = 0usize;
+        // As in `locate_scene`: a sprite's reported rectangle is where the viewport puts it.
+        let vp = viewport_raster_rect(d, width, height, 1.0);
         for i in 0..nverts {
             let v = decode_vertex(d, &interp.layout, i);
-            if let Some(p) = project(&v, &interp.space, width, height, 1.0) {
+            if let Some(p) = project(&v, &interp.space, width, height, 1.0, vp) {
                 bbox[0] = bbox[0].min(p[0]);
                 bbox[1] = bbox[1].min(p[1]);
                 bbox[2] = bbox[2].max(p[0]);
@@ -4744,6 +5105,7 @@ pub fn render_map(
                 // This is the top-down HEIGHT-FIELD render, not the guest's screen: its
                 // projection is the tool's own, so a screen-space scissor has no meaning here.
                 None,
+                None,
             );
         }
     }
@@ -5076,6 +5438,18 @@ fn render_scene_onto(
     rtt: &HashMap<u32, Framebuffer>,
 ) {
     let (width, height) = (fb.width, fb.height);
+    // The scene's stencil buffer, allocated by the first draw that uses stencil (most scenes
+    // never do), and the value it starts at: the low byte of the depth-stencil surface's
+    // `backgroundControl`.
+    let mut stencil_buf: Vec<u8> = Vec::new();
+    let stencil_clear = scene.depth.map(|d| (d.background_control & 0xff) as u8).unwrap_or(0);
+    // The GUEST'S surface extent, which is what a region clip and a viewport are stated in
+    // pixels of. The raster is `ssaa` times that, so every guest rectangle is divided out of
+    // it here and multiplied back on the way in - the same round trip `Space::Pixel` makes.
+    let (surf_w, surf_h) = (
+        (width as f32 / ssaa).round().max(1.0) as u32,
+        (height as f32 / ssaa).round().max(1.0) as u32,
+    );
 
     // Diagnostic: VITASLOP_PIXEL_TRACE=x,y logs every draw that writes that pixel (index,
     // whether textured/depth-tested, the source RGBA) - the definitive "which draw painted
@@ -5154,13 +5528,20 @@ fn render_scene_onto(
         let depth_test = matches!(space, Space::Mvp(_))
             && d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED;
         let depth_func = d.render_state.front_depth_func;
+        // The draw's STENCIL state, and the scene's stencil buffer the first time a draw needs
+        // one - cleared to the depth-stencil surface's background value, as the GPU pass
+        // starts it. An unmasked draw leaves both alone.
+        let sw_stencil = SwStencil::of(&d.render_state);
+        if sw_stencil.is_some() && stencil_buf.is_empty() {
+            stencil_buf = vec![stencil_clear; (width * height) as usize];
+        }
         // The guest's REGION CLIP for this draw, in RASTER pixels (so it scales with `ssaa`
         // exactly as a Pixel-space vertex does). GXM states the rectangle INCLUSIVE at both
         // ends. Both enabled modes keep the INSIDE of it - see
         // `vitaslop_platform::gpu::RegionClip`, where two titles' rectangles settle which
         // reading of the mode enum is right; `ALL` clips everything and is expressed here as
         // an empty rectangle.
-        let scissor: Option<[i32; 4]> = match d.render_state.region_clip_mode & 0xC000_0000 {
+        let mut scissor: Option<[i32; 4]> = match d.render_state.region_clip_mode & 0xC000_0000 {
             0x0000_0000 => None,
             0x4000_0000 => Some([0, 0, -1, -1]),
             _ => {
@@ -5169,6 +5550,25 @@ fn render_scene_onto(
                 Some([sc(r[0]), sc(r[1]), sc(r[2].saturating_add(1)) - 1, sc(r[3].saturating_add(1)) - 1])
             }
         };
+        // The guest's VIEWPORT, which `project` below maps clip space into - and which also
+        // BOUNDS it. On the GPU the clip volume maps onto the viewport rectangle, so a vertex
+        // past ndc +-1 lands outside the rectangle and is clipped; here the rectangle is
+        // intersected into the scissor, which is the same discard. Without this the two
+        // backends would agree on where a draw lands and disagree on what it spills onto, and
+        // the hardware applies BOTH the viewport bound and the region clip.
+        let viewport = viewport_raster_rect(d, surf_w, surf_h, ssaa);
+        if let Some([vx, vy, vw, vh]) = viewport {
+            let v = [
+                vx.floor() as i32,
+                vy.floor() as i32,
+                (vx + vw).ceil() as i32 - 1,
+                (vy + vh).ceil() as i32 - 1,
+            ];
+            scissor = Some(match scissor {
+                Some(s) => [s[0].max(v[0]), s[1].max(v[1]), s[2].min(v[2]), s[3].min(v[3])],
+                None => v,
+            });
+        }
         // Back-face culling as the GPU does it, per the draw's SceGxmCullMode. Real 3D
         // titles enable it on nearly every world/vehicle mesh; without it the hidden
         // interior faces of a thin shell z-fight the outer faces into speckle. Only
@@ -5207,7 +5607,7 @@ fn render_scene_onto(
             let mut screen = [[0f32; 4]; 3]; // x, y, depth, 1/w
             let mut behind = false;
             for (k, v) in verts.iter().enumerate() {
-                match project(v, &space, width, height, ssaa) {
+                match project(v, &space, width, height, ssaa, viewport) {
                     Some(s) => screen[k] = s,
                     None => {
                         behind = true;
@@ -5240,7 +5640,8 @@ fn render_scene_onto(
                 n_culled += 1;
                 continue;
             }
-            raster_triangle(fb, depth, &screen, &verts, texture, uv_div, depth_test, depth_func, d.exposure, &d.material, &d.world, trace, di, uv_debug, scissor);
+            let sb = if sw_stencil.is_some() { Some(stencil_buf.as_mut_slice()) } else { None };
+            raster_triangle(fb, depth, &screen, &verts, texture, uv_div, depth_test, depth_func, d.exposure, &d.material, &d.world, trace, di, uv_debug, scissor, sb.zip(sw_stencil.as_ref()));
         }
         if stats {
             let wrote = fb.drawn_pixels(clear).saturating_sub(pixels_before);
@@ -5276,6 +5677,9 @@ fn raster_triangle(
     // for the whole framebuffer. An empty rectangle (`x1 < x0`) draws nothing, which is what
     // `SCE_GXM_REGION_CLIP_ALL` asks for.
     scissor: Option<[i32; 4]>,
+    // The scene's stencil buffer and this draw's stencil state, for a draw whose state is not
+    // GXM's default (ALWAYS / KEEP) - `None` keeps the fast path. See `SwStencil`.
+    mut stencil: Option<(&mut [u8], &SwStencil)>,
 ) {
     let (w, h) = (fb.width as i32, fb.height as i32);
     // World-space normals at the three vertices (constant per triangle), interpolated per
@@ -5333,7 +5737,38 @@ fn raster_triangle(
             // Splitting compare from write lets a transparent decal texel be discarded WITHOUT
             // writing depth, while occluded pixels still skip the texture sample (perf).
             let z = b0 * s[0][2] + b1 * s[1][2] + b2 * s[2][2];
-            if depth_test && !depth_passes(z, depth[idx], depth_func) {
+            // STENCIL, in GXM's order: the stencil test first (its FAIL op on a miss), then the
+            // depth test (its DEPTH-FAIL op on a miss), then the PASS op for a fragment that
+            // survives both - every op under the write mask. See `SwStencil`.
+            if let Some((sbuf, st)) = stencil.as_mut() {
+                let face = usize::from(st.two_sided && area < 0.0);
+                let stored = sbuf[idx];
+                let op = |which: usize, v: u8| -> u8 {
+                    let r = st.reference[face];
+                    let new = match st.ops[face][which] & 7 {
+                        0 => v,
+                        1 => 0,
+                        2 => r,
+                        3 => v.saturating_add(1),
+                        4 => v.saturating_sub(1),
+                        5 => !v,
+                        6 => v.wrapping_add(1),
+                        _ => v.wrapping_sub(1),
+                    };
+                    let wm = st.write_mask[face];
+                    (v & !wm) | (new & wm)
+                };
+                let cm = st.compare_mask[face];
+                if !stencil_passes(st.func[face], st.reference[face] & cm, stored & cm) {
+                    sbuf[idx] = op(0, stored);
+                    continue;
+                }
+                if depth_test && !depth_passes(z, depth[idx], depth_func) {
+                    sbuf[idx] = op(1, stored);
+                    continue;
+                }
+                sbuf[idx] = op(2, stored);
+            } else if depth_test && !depth_passes(z, depth[idx], depth_func) {
                 continue;
             }
             // Sample the albedo/detail texel. `uv_div` normalizes an atlas-in-pixels 2D coord.
@@ -5471,6 +5906,55 @@ fn edge(a: &[f32; 4], b: &[f32; 4], c: &[f32; 4]) -> f32 {
 /// the correct behaviour for the double-sided body panels a strict `LESS` would leave to
 /// whichever face happened to draw first. The full enum is honoured so an unusual pass
 /// (an ALWAYS/GREATER overlay) reproduces rather than being forced to LESS.
+/// One draw's STENCIL state for the software rasterizer, per face (`[front, back]`): the
+/// `SceGxmStencilFunc`, the three `SceGxmStencilOp`s (fail, depth-fail, depth-pass), the
+/// compare and write masks and the reference - the same words the GPU path maps in
+/// `gpu::gxm_stencil_state`.
+pub(crate) struct SwStencil {
+    pub func: [u32; 2],
+    pub ops: [[u32; 3]; 2],
+    pub compare_mask: [u8; 2],
+    pub write_mask: [u8; 2],
+    pub reference: [u8; 2],
+    pub two_sided: bool,
+}
+
+impl SwStencil {
+    /// `None` for GXM's default (ALWAYS with every op KEEP on the faces in use), which cannot
+    /// change a pixel or the buffer - so an unmasked draw keeps the fast path.
+    pub(crate) fn of(rs: &crate::capture::RenderState) -> Option<SwStencil> {
+        let two_sided = rs.two_sided != 0;
+        let st = SwStencil {
+            func: [rs.front_stencil_func, rs.back_stencil_func],
+            ops: [
+                [rs.front_stencil_op_fail, rs.front_stencil_op_depth_fail, rs.front_stencil_op_depth_pass],
+                [rs.back_stencil_op_fail, rs.back_stencil_op_depth_fail, rs.back_stencil_op_depth_pass],
+            ],
+            compare_mask: [rs.front_stencil_compare_mask as u8, rs.back_stencil_compare_mask as u8],
+            write_mask: [rs.front_stencil_write_mask as u8, rs.back_stencil_write_mask as u8],
+            reference: [rs.front_stencil_ref as u8, rs.back_stencil_ref as u8],
+            two_sided,
+        };
+        let default_face = |f: usize| (st.func[f] >> 25) & 7 == 7 && st.ops[f].iter().all(|o| o & 7 == 0);
+        (!(default_face(0) && (!two_sided || default_face(1)))).then_some(st)
+    }
+}
+
+/// The GXM stencil comparison, `(ref & mask) FUNC (stored & mask)` - the func is bits 27:25,
+/// in the depth func's order.
+fn stencil_passes(func: u32, reference: u8, stored: u8) -> bool {
+    match (func >> 25) & 7 {
+        0 => false,
+        1 => reference < stored,
+        2 => reference == stored,
+        3 => reference <= stored,
+        4 => reference > stored,
+        5 => reference != stored,
+        6 => reference >= stored,
+        _ => true,
+    }
+}
+
 fn depth_passes(z: f32, stored: f32, func: u32) -> bool {
     const NEVER: u32 = 0x0000_0000;
     const LESS: u32 = 0x0040_0000;
@@ -5598,6 +6082,33 @@ fn tex_key(t: &BoundTexture) -> u64 {
     h ^ (h >> 31)
 }
 
+/// [`tex_key`] plus WHAT WILL BE UPLOADED: the block format, its byte count, and whether it was
+/// transcoded. The identity the renderer's view cache needs - see the note at the use site for
+/// the pair that shares a decode key and cannot share a GPU texture.
+fn upload_key(key: u64, compressed: Option<&CompressedUpload>) -> u64 {
+    let tag = match compressed {
+        None => 0u64,
+        Some(c) => {
+            // The FORMAT and the SIZE, which together separate every upload this path can
+            // produce for one guest texture. A `u64` of both rather than a boolean: a texture
+            // encoded to BC1 and the same one encoded to BC3 are different GPU textures, and a
+            // tier that encoded fewer levels is a different one again.
+            1 | ((c.format as u64) << 8)
+                | ((c.transcoded as u64) << 16)
+                | ((c.levels as u64) << 24)
+                | ((c.byte_len() as u64) << 32)
+        }
+    };
+    // The same finaliser `tex_key` ends with, for the same reason: this is a cache key with
+    // nothing verifying it, and `tag` differs in low bits only.
+    let mut h = key ^ tag.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
 /// A texture's IDENTITY as a bound resource - the guest address, format and shape, WITHOUT
 /// the pixel buffer's address.
 ///
@@ -5661,9 +6172,14 @@ struct GxpTexSet {
     /// The capture's own list, held so its ADDRESS stays a valid identity.
     src: Arc<[BoundTexture]>,
     out: Arc<[vitaslop_platform::gpu::GxpTex]>,
-    /// The `decode_epoch` this was derived in. A hit is refused across frames so the stamping
-    /// `texture()` does is paid once per frame, exactly as it was before this cache existed.
-    epoch: u64,
+    /// Every [`tex_key`] this list was derived from, so a cross-frame hit can do the ONE thing
+    /// a fresh derivation would still owe: stamp each decode as used by this frame. See
+    /// [`RenderSceneBuilder::gxp_textures`] - a key that is no longer in `decode_used` is a
+    /// decode this cache's `GxmTexture` has outlived, and it is what refuses the hit.
+    keys: Box<[u64]>,
+    /// The `decode_epoch` this entry was last USED in - what bounds how long a set nothing
+    /// draws any more keeps its pixels alive. Not a validity test: see `gxp_textures`.
+    used: u64,
 }
 
 /// One derived `GxpAttr` list, and the attribute list it came from.
@@ -5785,6 +6301,16 @@ pub struct RenderSceneBuilder {
     /// counted as thrash rather than as ordinary miss traffic. Keys only - the point is
     /// identity, and holding the pixels would defeat the eviction that put them here.
     decode_evicted: crate::fasthash::FxHashSet<u64>,
+    /// Textures whose inline block encode the frame's budget REFUSED - see
+    /// `inline_encode_budget_ms`. They were built and cached as RGBA8, which is correct and
+    /// costs only memory, and a later frame drops a few of them from the cache so the next bind
+    /// rebuilds and encodes them with a fresh budget.
+    ///
+    /// >>> WITHOUT THIS THE DEFERRAL IS PERMANENT, and it silently traded a hitch for a leak: a
+    /// cache HIT returns whatever was cached, so a texture refused once is RGBA8 for the rest
+    /// of the run. MEASURED on a fighting title - the budget took the worst build frame from
+    /// 226.8 ms to 18.5, and took the texture working set from 7 MB to 30.
+    encode_deferred: Vec<u64>,
     /// The last reported "the whole scene was dropped" tally, so [`DropTally::report`]
     /// prints when the shape CHANGES rather than sixty times a second.
     last_empty: Option<DropTally>,
@@ -5844,6 +6370,53 @@ struct IndexKey {
 ///
 /// Bumped once per draw (not per vertex), so the cost of the instrument is a handful of
 /// relaxed adds per draw against the hundreds of thousands of vertices it counts.
+/// Milliseconds on a monotonic clock, on both targets - see `gpu::now_ms`. The build phase
+/// spans no host call, so it can use the plain wall clock rather than the scheduler's.
+fn build_now() -> f64 {
+    vitaslop_platform::gpu::now_ms()
+}
+
+/// Whether [`RenderSceneBuilder::texture`]'s per-lookup millisecond counters are read at all.
+///
+/// >>> THE INSTRUMENT COST SIX TIMES WHAT IT REPORTED, AND ONLY A SAMPLER COULD SAY SO.
+///
+/// `texture` took THREE clock reads for EVERY bound texture, hit or miss. A baseball title's
+/// gameplay frame binds 1,352 of them, so that is ~4,000 `performance.now()` crossings a
+/// frame - and in the browser a clock read is a wasm-to-JS crossing, not an instruction. A V8
+/// worker profile of that title's live gameplay put `now` at 1.4% of the busy thread with 437
+/// of its 480 samples under this one function, against the **0.09 ms a frame** `tex_key_ms`
+/// was reporting. The phase table could never see it: a phase's own clock reads are charged
+/// to whatever encloses them. [[vitaslop-instrument-failure-imitating-its-subject]]
+///
+/// So the key half is gated and the MISS half is not: a miss is rare (0.2 a frame in that
+/// same window) and `tex_miss_ms` is the counter that named a fighting title's whole hitch,
+/// so it keeps its two reads. The gate is `VITASLOP_PERF`, which is already what a run that
+/// wants a millisecond breakdown sets, resolved ONCE rather than per lookup.
+fn build_timing_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::perf::enabled() || !build_fastpath())
+}
+
+/// `VITASLOP_BUILD_FASTPATH=0`: the NEGATIVE CONTROL arm for what `build` stopped doing.
+///
+/// Two changes, one knob, because they are one claim - *this frame derives nothing it derived
+/// last frame, and times nothing it does not report*:
+///   * [`build_timing_on`] - the three `performance.now()` crossings every bound texture paid.
+///   * [`RenderSceneBuilder::gxp_textures`] - the per-set derived `GxpTex` list, which was
+///     thrown away at every frame boundary and rebuilt for 314 of 536 draws.
+///
+/// Both are strictly LESS WORK for the SAME OUTPUT, so the picture is identical by
+/// construction and this knob exists to price them, not to choose between them. One knob
+/// rather than two because the rig resolves ~0.4 ms and neither is worth that alone.
+fn build_fastpath() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        vitaslop_platform::knobs::var("VITASLOP_BUILD_FASTPATH").ok().as_deref() != Some("0")
+    })
+}
+
 #[derive(Default, Clone, Copy)]
 pub struct BuildWork {
     /// Vertices decoded and transformed by the MAIN loop - the fixed-function
@@ -5856,6 +6429,19 @@ pub struct BuildWork {
     pub indices_scanned: u64,
     /// Textures DECODED (a cache miss) and textures served from the decode cache.
     pub tex_decoded: u64,
+    /// >>> WHAT A TEXTURE *BUILD* ACTUALLY COSTS, IN MILLISECONDS, split from what a HIT costs.
+    ///
+    /// MEASURED on a fighting title in the desktop browser, and it is that title's whole hitch:
+    /// the window mean builds ZERO textures a frame and costs 0.1 ms of build, while single
+    /// frames build 15 and cost 43.8 ms, or build 26 and cost 217.2 ms - with `tex_expanded` at
+    /// ZERO, so it is NOT the RGBA8 decode the counters beside it already name. A count without
+    /// its price could not say that, and a price without the count could not either.
+    ///
+    /// `tex_key_ms` is charged on EVERY bound texture of every draw, hit or miss, because that
+    /// key is computed before the cache is consulted - so a cheap-looking cached frame can be
+    /// paying for it thousands of times.
+    pub tex_miss_ms: f64,
+    pub tex_key_ms: f64,
     pub tex_cached: u64,
     /// Draws served a whole `GxpTex` list from [`RenderSceneBuilder::gxp_tex_sets`] - i.e.
     /// draws that did NOT look a single bound texture up. Counted apart from `tex_cached`
@@ -5949,6 +6535,8 @@ impl BuildWork {
         self.verts_deferred += o.verts_deferred;
         self.indices_scanned += o.indices_scanned;
         self.tex_decoded += o.tex_decoded;
+        self.tex_miss_ms += o.tex_miss_ms;
+        self.tex_key_ms += o.tex_key_ms;
         self.tex_cached += o.tex_cached;
         self.tex_set_reused += o.tex_set_reused;
         self.tex_expanded += o.tex_expanded;
@@ -5976,7 +6564,7 @@ impl BuildWork {
         format!(
             "build work/frame: {:.0} draws ({:.0} fixed-function), {:.0} vertices walked \
              (+{:.0} deferred depth-range), {:.0} indices scanned, textures {:.1} built \
-             / {:.1} cached / {:.1} whole SETS reused over {:.2} MB of guest bytes, {:.1} EXPANDED to RGBA8 \
+             (COSTING {:.2} ms, key {}) / {:.1} cached / {:.1} whole SETS reused over {:.2} MB of guest bytes, {:.1} EXPANDED to RGBA8 \
              ({:.2} MB: {:.2} MB fast-path + {:.2} MB per-texel), \
              {:.2} evict passes dropping {:.1} entries, {:.1} RE-decoded after eviction, \
              {:.1} superseded in place, indices {:.1} expanded \
@@ -5988,6 +6576,14 @@ impl BuildWork {
             self.verts_deferred as f64 / n,
             self.indices_scanned as f64 / n,
             self.tex_decoded as f64 / n,
+            self.tex_miss_ms / n,
+            // NOT TIMED by default, and it says so rather than printing a zero: see
+            // `build_timing_on`. A zero here would read as "the key is free".
+            if build_timing_on() {
+                format!("{:.2} ms", self.tex_key_ms / n)
+            } else {
+                "not timed (VITASLOP_PERF=1)".to_string()
+            },
             self.tex_cached as f64 / n,
             self.tex_set_reused as f64 / n,
             self.tex_bytes as f64 / n / (1024.0 * 1024.0),
@@ -6014,6 +6610,8 @@ static BUILD_WORK: std::sync::Mutex<BuildWork> = std::sync::Mutex::new(BuildWork
     verts_deferred: 0,
     indices_scanned: 0,
     tex_decoded: 0,
+    tex_miss_ms: 0.0,
+    tex_key_ms: 0.0,
     tex_cached: 0,
     tex_set_reused: 0,
     tex_expanded: 0,
@@ -6305,10 +6903,27 @@ fn report_depth_range_reader(di: usize, d: &Draw) {
 }
 
 /// `VITASLOP_GXM_TEX_UNWRITTEN=0` - the arm back for reading ANY uniform 4-byte fill as
-/// "nothing has been written here", not only zeros. See `guest_bytes_unwritten` for what it buys.
+/// "nothing has been written here", not only zeros. `=prefix` is a second arm back, for
+/// sampling that test over a contiguous 4 KB PREFIX instead of a stride across the whole
+/// buffer - see `tex_unwritten_samples_prefix_only`. See `guest_bytes_unwritten` for what
+/// both buy.
 fn tex_unwritten_is_any_uniform_fill() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::knobs::var("VITASLOP_GXM_TEX_UNWRITTEN").as_deref() != Ok("0"))
+}
+
+/// `VITASLOP_GXM_TEX_UNWRITTEN=prefix` - the arm back for sampling the uniform-fill test over
+/// a contiguous 4 KB PREFIX rather than a stride across the whole buffer.
+///
+/// The same knob as above, a third value, because these are the two halves of one question and
+/// an operator comparing them wants one build and one name. The prefix is the OLD answer and
+/// the reason it is kept selectable is that the two can only disagree on a texture whose first
+/// 4 KB and whose whole extent give different verdicts - which is precisely the population the
+/// change is aimed at, so an A/B that cannot isolate it says nothing. See
+/// `guest_bytes_unwritten`.
+fn tex_unwritten_samples_prefix_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_GXM_TEX_UNWRITTEN").as_deref() == Ok("prefix"))
 }
 
 /// Budget for the decode cache, in BYTES of decoded RGBA8, before it is cleared wholesale.
@@ -6370,10 +6985,28 @@ fn report_color_surface_format(c: &crate::capture::ColorSurface) {
         0x6080_0000 => ("U2U10U10U10", false),
         _ => ("(unnamed)", false),
     };
-    if wide {
+    // >>> THE 64-BIT MEMBERS DO NOT GO THROUGH THE 8-BIT ATTACHMENT AT ALL, and saying they do
+    // cost a session. `F16F16F16F16` and `F32F32` match `raw64_color_format`, which renders them
+    // as RAW REGISTER PAIRS into an `Rg32Uint` target - a different path, decided before the
+    // ordinary one is reached. This warning used to tell every wide format that it was being
+    // clamped to 8-bit UNORM, so a blown-white element rendered through the RAW path read as a
+    // clamping bug, and the "fix" for it was written, built and measured before the code said
+    // otherwise. A diagnostic that names the wrong mechanism is worse than none
+    // [[vitaslop-instrument-failure-imitating-its-subject]].
+    let raw64 = matches!(c.format & 0xff80_0000, 0x0100_0000 | 0x1100_0000);
+    if wide && raw64 {
+        tracing::info!(
+            target: "vitaslop::render",
+            "gxm surface: {:#x} ({}x{}) is colour format {:#010x} = {name}, a 64-BIT floating-point target - it is rendered as RAW REGISTER PAIRS into an Rg32Uint attachment (see `raw64_color_format`), NOT through the 8-bit UNORM path, so nothing here clamps it. What reads it back has to decode those words.",
+            c.data_addr,
+            c.width,
+            c.height,
+            c.format
+        );
+    } else if wide {
         tracing::warn!(
             target: "vitaslop::render",
-            "gxm surface: {:#x} ({}x{}) is colour format {:#010x} = {name}, a FLOATING-POINT              target - values above 1.0 are what it exists to hold. We render every target in              the swapchain's 8-bit UNORM format, so every such value is CLAMPED to white here              and whatever pass tone-maps this surface reads a clamped image.",
+            "gxm surface: {:#x} ({}x{}) is colour format {:#010x} = {name}, a FLOATING-POINT target - values above 1.0 are what it exists to hold. We render every target in the swapchain's 8-bit UNORM format, so every such value is CLAMPED to white here and whatever pass tone-maps this surface reads a clamped image.",
             c.data_addr,
             c.width,
             c.height,
@@ -6472,6 +7105,7 @@ impl RenderSceneBuilder {
             decode_frame_high: 0,
             decode_frame_bytes: 0,
             decode_evicted: Default::default(),
+            encode_deferred: Vec::new(),
             last_empty: None,
             index_cache: Default::default(),
         }
@@ -6500,20 +7134,58 @@ impl RenderSceneBuilder {
             .max(self.decode_frame_high - self.decode_frame_high / 16);
         self.decode_frame_bytes = 0;
         self.decode_epoch = self.decode_epoch.wrapping_add(1);
-        // >>> THE PER-SET CACHES ARE DROPPED AT THE FRAME BOUNDARY, AND THAT IS A BOUND, NOT
-        // >>> TIDINESS.
+        reset_inline_encode_budget();
+        // >>> AND HAND A FEW DEFERRED ENCODES BACK TO THE NEW FRAME'S BUDGET.
         //
-        // A `GxpTexSet` holds `GxmTexture`s, and a `GxmTexture` holds its PIXELS. Keeping them
-        // across frames would pin texture bytes outside `decode_cache`'s budget - a second,
-        // unbudgeted copy of the working set in a wasm heap that can never hand a page back,
-        // which is precisely the shape of the last pooling change that cost the user frame
-        // rate. Cleared here, the caches can hold at most what THIS frame binds, which
-        // `decode_cache` is already holding anyway, so they add no resident bytes at all - and
-        // an entry could not be used across frames regardless, because a hit requires the
-        // current epoch (see `gxp_tex_sets`).
-        self.gxp_tex_sets.clear();
+        // Dropping the cache entry is the whole mechanism: the next draw that binds the texture
+        // misses, rebuilds it, and this time asks a budget that has not been spent. Bounded to a
+        // handful a frame so the repair is itself spread out - the defect being repaired is a
+        // burst of encodes in one frame, and repairing it with a burst of encodes in one frame
+        // would be the same stall under another name.
+        // ONE. Two was measured and it is worse: the budget is checked BEFORE an encode, not
+        // during, so a frame can always run one encode however long it takes - two retries a
+        // frame therefore buy two of them back to back. 226.8 ms -> 45.6 with two, and the only
+        // thing left in that 45.6 is a SINGLE large encode. Bounding that wants the resumable
+        // encode `transcoded_source` already names, not a smaller retry count.
+        const ENCODE_RETRIES_PER_FRAME: usize = 1;
+        for _ in 0..ENCODE_RETRIES_PER_FRAME {
+            let Some(key) = self.encode_deferred.pop() else { break };
+            if self.decode_cache.remove(&key).is_some() {
+                let bytes = self.decode_used.remove(&key).map_or(0, |(_, b)| b);
+                self.decode_cache_bytes = self.decode_cache_bytes.saturating_sub(bytes);
+            }
+        }
+        // >>> THE PER-SET CACHE IS AGED, NOT CLEARED, AND THE REASON IT USED TO BE CLEARED IS
+        // >>> STILL THE REASON IT IS BOUNDED.
+        //
+        // A `GxpTexSet` holds `GxmTexture`s, and a `GxmTexture` holds its PIXELS, so an entry
+        // nothing draws any more is an unbudgeted second copy of a texture in a wasm heap that
+        // can never hand a page back. Clearing every frame bounded that absolutely - and made
+        // the cache answer only WITHIN a frame, so a steady gameplay frame re-derived the lot:
+        // MEASURED on a baseball title, **314 of 536 draws missed** and the derivation is 2.6%
+        // of the busy worker thread, all of it re-deriving lists that were byte-identical to
+        // the previous frame's.
+        //
+        // A hit is exact across frames for two reasons together (see `gxp_textures`): the
+        // capture's binding list is compared by POINTER, and the capture rebuilds that list the
+        // moment any bound texture's bytes change; and every decode the list was built from
+        // must still be in `decode_used`, which is where eviction removes it. So an entry can
+        // only survive while `decode_cache` is holding those same pixels anyway.
+        //
+        // What is left is the entry nothing asks about again: its src pointer is never
+        // presented, so nothing refuses it, and it would sit on its pixels to the cap. That is
+        // what this ages out - a set unused for a handful of frames is dropped, which puts the
+        // extra residency at "a few frames of the working set" rather than "2,048 sets".
+        const GXP_SET_KEEP_FRAMES: u64 = 4;
+        let epoch = self.decode_epoch;
+        if build_fastpath() {
+            self.gxp_tex_sets.retain(|_, e| epoch.wrapping_sub(e.used) < GXP_SET_KEEP_FRAMES);
+        } else {
+            self.gxp_tex_sets.clear();
+        }
         // The attribute lists carry no pixels, only a handful of `u16`s per attribute, so they
-        // are kept - they are a function of the vertex PROGRAM and are the same every frame.
+        // are kept unconditionally - they are a function of the vertex PROGRAM and are the same
+        // every frame.
     }
 
     /// The recompiler's `GxpTex` list for a captured binding set, derived once per frame per
@@ -6529,26 +7201,71 @@ impl RenderSceneBuilder {
         }
         let key = (Arc::as_ptr(src) as *const BoundTexture as usize, src.len());
         let epoch = self.decode_epoch;
-        if let Some(e) = self.gxp_tex_sets.get(&key) {
-            // The pointer alone is not the identity: hold the source and compare it, so a
-            // freed set whose address was handed to a different one cannot answer here.
-            if e.epoch == epoch && Arc::ptr_eq(&e.src, src) {
-                work.tex_set_reused += 1;
-                return e.out.clone();
+        // >>> A HIT IS EXACT ACROSS FRAMES, AND IT TAKES TWO TESTS TO BE SO.
+        //
+        //  * THE POINTER, compared against the held source rather than trusted on its own: a
+        //    freed list whose address was handed to a different one cannot answer here. It is
+        //    also the CONTENT test - the capture proves every bound texture's bytes per scene
+        //    and builds a FRESH list the moment one of them differs
+        //    (`TextureSnapshots::set_validated`), so the same `Arc` means the same texels.
+        //  * EVERY DECODE STILL BEING CACHED. `decode_used` is where eviction removes a key,
+        //    so a key that is gone from it is one whose `GxmTexture` this entry is now the only
+        //    holder of - a stale view of a texture the budget has already shed. The probe that
+        //    asks is the same probe a fresh derivation would do to STAMP the decode as used by
+        //    this frame, which the cross-frame hit still owes: `decode_frame_high` is the
+        //    working-set floor under the cache's own budget, and a frame that drew everything
+        //    without stamping anything would collapse it.
+        if let Some(e) = self.gxp_tex_sets.get(&key)
+            && Arc::ptr_eq(&e.src, src)
+        {
+            // Taken out and put back: the stamp below needs `self` mutably while the key list
+            // is borrowed, and the list is a few `u64`s rather than something worth cloning.
+            let held = std::mem::take(&mut self.gxp_tex_sets.get_mut(&key).expect("just probed").keys);
+            let all_live = held.iter().all(|k| self.stamp_decode_used(*k));
+            if let Some(e) = self.gxp_tex_sets.get_mut(&key) {
+                e.keys = held;
+                if all_live {
+                    e.used = epoch;
+                    work.tex_set_reused += 1;
+                    return e.out.clone();
+                }
             }
+            // A decode this list was built from is gone. The entry is dead and holding pixels;
+            // drop it rather than leaving it to be aged out.
+            self.gxp_tex_sets.remove(&key);
         }
+        let mut keys: Vec<u64> = Vec::with_capacity(src.len());
         let out: Arc<[vitaslop_platform::gpu::GxpTex]> = src
             .iter()
-            .map(|t| vitaslop_platform::gpu::GxpTex {
-                unit: t.unit as u8,
-                tex: self.texture(t, work),
+            .map(|t| {
+                keys.push(tex_key(t));
+                vitaslop_platform::gpu::GxpTex { unit: t.unit as u8, tex: self.texture(t, work) }
             })
             .collect();
         if self.gxp_tex_sets.len() >= GXP_SET_CACHE_CAP {
             self.gxp_tex_sets.clear();
         }
-        self.gxp_tex_sets.insert(key, GxpTexSet { src: src.clone(), out: out.clone(), epoch });
+        self.gxp_tex_sets.insert(
+            key,
+            GxpTexSet { src: src.clone(), out: out.clone(), keys: keys.into_boxed_slice(), used: epoch },
+        );
         out
+    }
+
+    /// Mark the decode at `key` as used by the frame being built, exactly as [`Self::texture`]'s
+    /// cached path does, and say whether it is STILL CACHED.
+    ///
+    /// `false` means the key is not in `decode_used` at all, which is where eviction removes
+    /// it - so any derived list built from that decode is stale. See [`Self::gxp_textures`].
+    fn stamp_decode_used(&mut self, key: u64) -> bool {
+        let epoch = self.decode_epoch;
+        let Some(slot) = self.decode_used.get_mut(&key) else { return false };
+        let (used, bytes) = *slot;
+        *slot = (epoch, bytes);
+        if used != epoch {
+            self.decode_frame_bytes += bytes;
+        }
+        true
     }
 
     /// The recompiler's `GxpAttr` list for a vertex program's attributes, derived once per
@@ -6583,7 +7300,14 @@ impl RenderSceneBuilder {
 
     /// Decode (or reuse a cached) GPU-ready texture for `t`.
     fn texture(&mut self, t: &BoundTexture, work: &mut BuildWork) -> GxmTexture {
+        // See `build_timing_on`: the key half of this is the instrument, it runs once per
+        // bound texture, and in the browser it cost more than the work it was timing.
+        let timed = build_timing_on();
+        let t_key = if timed { build_now() } else { 0.0 };
         let key = tex_key(t);
+        if timed {
+            work.tex_key_ms += build_now() - t_key;
+        }
         if let Some((g, _)) = self.decode_cache.get(&key) {
             work.tex_cached += 1;
             let g = g.clone();
@@ -6617,6 +7341,12 @@ impl RenderSceneBuilder {
             return g;
         }
         work.tex_decoded += 1;
+        // >>> THE MISS CLOCK STARTS HERE, NOT ABOVE THE CACHE PROBE. It used to be read before
+        // the lookup, so every HIT paid for a stopwatch whose only reader is this path. The
+        // probe it no longer spans is a single map get; what `tex_miss_ms` is for - the decode,
+        // the encode and the eviction pass - is all below.
+        let t_miss = build_now();
+        // The miss path's own cost, charged at every exit below through `charge_miss`.
         // Was this key here before and thrown out? That, and not the number of eviction passes,
         // is what says the budget is under the working set - see `tex_redecoded_after_evict`.
         // Removed on the way past, so one eviction can only ever be blamed once.
@@ -6633,6 +7363,12 @@ impl RenderSceneBuilder {
         // What was not knowable was the ORDER - and getting it wrong meant every texture the GPU
         // was about to take as blocks was decoded first and the decode thrown away.
         let compressed = compressed_source(t, None);
+        // Refused only because the FRAME had no encode budget left: remember it, so a later
+        // frame can drop it from the cache and let the next bind encode it. See
+        // `encode_deferred` - without this the deferral is permanent.
+        if take_encode_refused_for_budget() {
+            self.encode_deferred.push(key);
+        }
         // Read before `compressed` is moved into the struct below, and read for the reason the
         // `raw` field explains: it is the test for "nothing else claimed this texture".
         let has_compressed = compressed.is_some();
@@ -6705,7 +7441,28 @@ impl RenderSceneBuilder {
         // exactly the bytes the eager decode produced, at its own expense.
         let src = t.clone();
         let g = GxmTexture {
-            key,
+            // >>> THE RENDERER'S KEY IS THE UPLOAD'S IDENTITY, NOT THE DECODE'S.
+            //
+            // This was `key` - the DECODE cache's key - and the renderer's view cache is keyed
+            // on it. `tex_key` folds everything about the guest texture and NOTHING about what
+            // is handed to the GPU, so an RGBA8 upload and a compressed upload of the same
+            // guest texture are the same key. That is exactly the pair the encode budget
+            // creates: a texture whose encode is deferred is cached as RGBA8, `begin_frame`
+            // drops the decode entry so a later frame encodes it, the rebuild produces the
+            // blocks - and the view cache HITS on the same key and goes on binding the RGBA8
+            // texture for as long as the entry lives. The retry did its work and nothing
+            // downstream could take it.
+            //
+            // MEASURED on a fighting title's desktop run: the retained figure and the sum of
+            // the entries' own recorded prices disagreed by 33 MB of 309, which is this pair -
+            // the cache holding an RGBA8 texture while every counter re-priced it as the
+            // compressed one it never uploaded. An ADDRESS IS NOT AN IDENTITY, and neither is
+            // a decode key [[vitaslop-an-address-is-not-an-identity]].
+            //
+            // Folded here rather than in `tex_key` because the decode cache is probed BEFORE
+            // `compressed_source` runs - it is what decides whether to run it at all - so the
+            // compression cannot be part of that key without asking the question twice.
+            key: upload_key(key, compressed.as_ref()),
             data_addr: t.data_addr,
             width,
             height,
@@ -6751,12 +7508,11 @@ impl RenderSceneBuilder {
             // was unbounded - the arms rendered the same content at different animation phases
             // [[vitaslop-inline-ab-moves-the-animation-phase]].
             //
-            // 4 KB is as good a witness as 4 MB for the question actually being asked: a live
-            // render target's guest memory is empty EVERYWHERE, not just past some offset (see
-            // `GxmTexture::guest_bytes_unwritten`). The one case the bound gets wrong is a real
-            // texture whose first 4 KB are zero AND whose address is also held as a render
-            // target AND whose bound extent disagrees with it - and that texture was being
-            // handed the stale target's pixels before any of this existed.
+            // 4 KB of SAMPLE is as good a witness as 4 MB for the question actually being
+            // asked: a live render target's guest memory is empty EVERYWHERE, not just past
+            // some offset (see `GxmTexture::guest_bytes_unwritten`). What that sentence does
+            // NOT license is taking those 4 KB off the FRONT - see the strided sample below
+            // for the buffer that argument let through.
             // >>> A BUFFER NOTHING HAS WRITTEN IS NOT ONLY A BUFFER OF ZEROS. A retail title
             // fills a fresh allocation with its OWN poison - MLB 12 uses `0xBAADCAFE` - and
             // such a buffer is exactly as empty as one of zeros. A test for zero alone calls
@@ -6764,15 +7520,55 @@ impl RenderSceneBuilder {
             // poison: MEASURED as the three flat salmon video boards in that title's stadium,
             // which are `0xBAADCAFE` with the scene's lighting on it.
             //
-            // The test is ONE REPEATED 4-BYTE WORD over the same bounded prefix, which is what
-            // an allocator fill and a zero fill both are, and which no real texture's first
-            // 4 KB is.
+            // The test is ONE REPEATED 4-BYTE WORD over the same bounded sample, which is what
+            // an allocator fill and a zero fill both are, and which no real texture is.
+            //
+            // >>> AND THE SAMPLE IS SPREAD OVER THE WHOLE BUFFER, NOT TAKEN OFF THE FRONT.
+            //
+            // The bound used to be a contiguous 4 KB PREFIX, on the argument quoted above that
+            // "a live render target's guest memory is empty EVERYWHERE, not just past some
+            // offset". That argument is sound for the buffer this test is trying to RECOGNISE
+            // and unsound for the ones it has to REJECT: a prefix is decided by whatever the
+            // guest happens to have put in the first 4 KB, and a 512x1024 RGBA surface is 2 MB,
+            // so a prefix reads 0.2% of it and 99.8% of the buffer never votes. MEASURED on a
+            // baseball title: with the uniform-word test armed, three stadium boards still came
+            // back flat `(255,229,198)` - the `0xBAADCAFE` poison - because the alias was
+            // REFUSED on the strength of a non-uniform first 4 KB over a buffer that is poison
+            // from there to its end.
+            //
+            // Sampling the SAME NUMBER OF WORDS at a stride costs the same reads and asks the
+            // question of the whole buffer. It is also strictly harder to fool in the other
+            // direction: a real texture now has to be uniform across its entire extent to be
+            // called unwritten, where before it only had to be uniform across its first rows -
+            // which is exactly the shape of a real texture that opens with a run of flat
+            // background. The cost bound that motivated the prefix is untouched: this reads at
+            // most `SAMPLE_WORDS` words however large the texture is, so the unbounded per-draw
+            // byte scan that moved a golf title's animation phase does not come back
+            // [[vitaslop-inline-ab-moves-the-animation-phase]].
             guest_bytes_unwritten: {
-                let p = &t.pixels[..t.pixels.len().min(4096)];
+                // 1024 words = the same 4 KB the prefix read.
+                const SAMPLE_WORDS: usize = 1024;
+                let words = t.pixels.len() / 4;
+                // The stride that spreads `SAMPLE_WORDS` over `words`, never zero: a buffer
+                // with fewer words than the sample is read whole, which is what a stride of 1
+                // does. `VITASLOP_GXM_TEX_UNWRITTEN=prefix` pins it to 1 and so reads the old
+                // contiguous prefix - see `tex_unwritten_samples_prefix_only`.
+                let stride =
+                    if tex_unwritten_samples_prefix_only() { 1 } else { (words / SAMPLE_WORDS).max(1) };
+                let mut it = (0..words).step_by(stride).take(SAMPLE_WORDS).map(|i| {
+                    let b = i * 4;
+                    &t.pixels[b..b + 4]
+                });
                 if tex_unwritten_is_any_uniform_fill() {
-                    p.len() >= 4 && p.chunks_exact(4).all(|w| w == &p[..4])
+                    match it.next() {
+                        // `all` short-circuits on the first word that differs, so a real
+                        // texture still costs one comparison in the overwhelming majority of
+                        // cases - the property the prefix bound was protecting.
+                        Some(first) => it.all(|w| w == first),
+                        None => false,
+                    }
                 } else {
-                    p.iter().all(|b| *b == 0)
+                    it.all(|w| w == [0, 0, 0, 0])
                 }
             },
             filter_linear,
@@ -6816,6 +7612,9 @@ impl RenderSceneBuilder {
             }
         self.decode_cache.insert(key, (g.clone(), t.pixels.clone()));
         self.touch_decode(key, cost);
+        // The miss path's whole cost. The cached path returns above without charging it, so
+        // this figure is per BUILD and divides straight by `tex_decoded`.
+        work.tex_miss_ms += build_now() - t_miss;
         g
     }
 
@@ -6928,7 +7727,19 @@ impl RenderSceneBuilder {
             // `gxp_only`, and the note further down. Decided here because the classifier
             // walks every vertex for it, and that walk is dead when it will not.
             let fixed_function = !self.gxp_only || d.vprog.is_empty();
+            // >>> THE LAST UNSPLIT BLOCK OF THE FRAME. See `Phase::BuildClassify`, and note the
+            // >>> warning there about reading a per-DRAW row without dividing by its entries.
+            let _classify = crate::perf::scope(crate::perf::Phase::BuildClassify);
             let interp = interpret_draw_for(d, !fixed_function);
+            // >>> THE GUARD IS DROPPED HERE, and that is the whole point of the phase.
+            //
+            // A `scope` guard lives to the end of the BLOCK, so leaving it in place timed the
+            // entire per-draw body - the texture lookups, the index expansion, everything - under
+            // a name that says "classify". It read 0.86 ms of a 1.0 ms `build` and sent a memo
+            // after `layout_of`, which turned out to be a rounding error inside it. An instrument
+            // whose label does not match its span reads as a finding.
+            drop(_classify);
+            let _body = crate::perf::scope(crate::perf::Phase::BuildBody);
             // A position-only draw whose colour lives in the guest's shader is NOT dropped
             // when the recompiler can have it: the fixed-function packing has no colour
             // source, but the recompiled pair does. It is carried through marked
@@ -7079,7 +7890,10 @@ impl RenderSceneBuilder {
                 if fixed_function && mvp.is_some() {
                     // Cull only needs the winding SIGN, so any uniform scale works; ssaa is 1
                     // here (the GPU applies supersampling itself via an enlarged render target).
-                    screen_pos.push(project(&v, &interp.space, 4096, 4096, 1.0));
+                    // No viewport for the same reason: a viewport is a positive-area affine map
+                    // of both axes, so it cannot change a triangle's winding, and this 4096
+                    // grid is not the target the guest's rectangle is stated against.
+                    screen_pos.push(project(&v, &interp.space, 4096, 4096, 1.0, None));
                 }
                 // Accumulate the visible opaque depth range (post-divide c.z/c.w over
                 // on-screen vertices) so the GPU can linearly normalize depth into [0,1]
@@ -7150,6 +7964,7 @@ impl RenderSceneBuilder {
                 // see `gxp_attributes` and `gxp_textures`. The capture already hands every
                 // draw with the same bindings one `Arc`; rebuilding a `Vec` from it per draw
                 // threw that sharing away one layer down.
+                let _binds = crate::perf::scope(crate::perf::Phase::BuildGxpBindings);
                 let attributes = self.gxp_attributes(&d.attributes);
                 let textures = self.gxp_textures(&d.textures, &mut work);
                 // The VERTEX stage's own bindings, uploaded the same way. A vertex program that
@@ -7160,6 +7975,7 @@ impl RenderSceneBuilder {
                 // index buffer (NO CPU cull - the recompiled pipeline culls on the GPU via the
                 // guest cull mode, using its own real-shader projection). Indexes into the RAW
                 // guest vertex stream `d.vertices`.
+                drop(_binds);
                 let ikey = IndexKey {
                     buffer: d.indices.as_ptr() as usize,
                     len: d.indices.len(),
@@ -7167,6 +7983,44 @@ impl RenderSceneBuilder {
                     primitive: d.primitive,
                     index_format: d.index_format,
                 };
+                // >>> A 16-BIT GUEST INDEX BUFFER STAYS 16-BIT, AND THAT HALVES THE LARGEST
+                // >>> SINGLE UPLOAD A GAMEPLAY FRAME MAKES.
+                //
+                // This expansion widened every index to u32 "so one index format serves the
+                // whole frame" - a tidiness argument, and the index arena is the bigger half of
+                // what the renderer uploads: MEASURED on a baseball title's stadium, 1.36 MB of
+                // indices a frame against 1.28 MB of vertices, and `writeBuffer` is the single
+                // hottest item in a browser profile of the worker at 8.7%. The format is per
+                // DRAW at `set_index_buffer`, so a frame carrying both costs nothing.
+                //
+                // >>> AND EVERY EMITTED INDEX FITS, BY CONSTRUCTION, whichever branch below
+                // builds it. The source values come from a 16-bit buffer, so each is already
+                // <= 65535; rebasing SUBTRACTS `first_vertex`; and the sparse compaction
+                // replaces each with its position in the sorted unique set, which cannot be
+                // larger than the number of distinct u16 values. Nothing here can produce a
+                // value the source could not hold. The guard below is belt and braces, and it
+                // REPORTS rather than truncating - a silently wrapped index draws another
+                // triangle, which is the failure this whole module is most careful about.
+                //
+                // `VITASLOP_GXP_INDEX16=0` is the OFF arm: u32 everywhere, exactly as before.
+                let idx16 = d.index_format == 0 && gxp_index16_enabled();
+                let emit = |out: &mut Vec<u8>, v: u32| {
+                    if idx16 {
+                        if v > u16::MAX as u32 {
+                            // Cannot happen - see the argument above - and if it ever does, the
+                            // wrap would draw a DIFFERENT triangle and nothing would say so.
+                            tracing::warn!(
+                                target: "vitaslop::gxm",
+                                index = v,
+                                "index expansion: a 16-bit guest index buffer produced an index                                  past 65535, which cannot fit the format it came from - it is                                  TRUNCATED here, so this draw references the wrong vertex. Run                                  with VITASLOP_GXP_INDEX16=0 and report this: the argument that                                  says it cannot happen is wrong."
+                            );
+                        }
+                        out.extend_from_slice(&(v as u16).to_le_bytes());
+                    } else {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                };
+                let _iexp = crate::perf::scope(crate::perf::Phase::BuildIndexExpand);
                 let gxp_indices = match self.index_cache.get(&ikey) {
                     Some((cached, _)) => {
                         work.index_expand_cached += 1;
@@ -7177,7 +8031,7 @@ impl RenderSceneBuilder {
                             work.index_cache_clears += 1;
                             self.index_cache.clear();
                         }
-                        let mut out = Vec::with_capacity(tri_count * 3 * 4);
+                        let mut out = Vec::with_capacity(tri_count * 3 * if idx16 { 2 } else { 4 });
                         match direct {
                             // A line or point list needs no expansion at all - the guest's
                             // own index order IS the primitive order, and the pipeline is
@@ -7189,7 +8043,7 @@ impl RenderSceneBuilder {
                             Some(n) => {
                                 let whole = (d.index_count as usize / n) * n;
                                 for i in 0..whole {
-                                    out.extend_from_slice(&(index_at(d, i) as u32).to_le_bytes());
+                                    emit(&mut out, index_at(d, i) as u32);
                                 }
                             }
                             // An edge list: groups of four words - three vertex indices
@@ -7210,8 +8064,8 @@ impl RenderSceneBuilder {
                                         [(0x100, i0, i1), (0x200, i1, i2), (0x400, i2, i0)]
                                     {
                                         if flags & bit != 0 {
-                                            out.extend_from_slice(&a.to_le_bytes());
-                                            out.extend_from_slice(&b.to_le_bytes());
+                                            emit(&mut out, a);
+                                            emit(&mut out, b);
                                         }
                                     }
                                 }
@@ -7219,7 +8073,7 @@ impl RenderSceneBuilder {
                             None => {
                                 for t in 0..tri_count {
                                     for k in tri_indices(d, t) {
-                                        out.extend_from_slice(&(k as u32).to_le_bytes());
+                                        emit(&mut out, k as u32);
                                     }
                                 }
                             }
@@ -7235,7 +8089,8 @@ impl RenderSceneBuilder {
                         out
                     }
                 };
-                let gxp_index_count = (gxp_indices.len() / 4) as u32;
+                drop(_iexp);
+                let gxp_index_count = (gxp_indices.len() / if idx16 { 2 } else { 4 }) as u32;
                 work.gxp_vertex_bytes += d.vertices.len() as u64;
                 work.gxp_sa_bytes += (d.vert_sa.len() + d.frag_sa.len()) as u64;
                 // Diagnostic (`VITASLOP_GXP_CAPSULE`): the one place a finished `Draw` and its
@@ -7255,7 +8110,7 @@ impl RenderSceneBuilder {
                     attributes,
                     indices: gxp_indices,
                     index_count: gxp_index_count,
-                    index_u32: true,
+                    index_u32: !idx16,
                     primitive: d.primitive,
                     textures,
                     vertex_textures,
@@ -7280,11 +8135,38 @@ impl RenderSceneBuilder {
                         d.blend.alpha_dst,
                     ],
                     viewport: d.render_state.viewport,
+                    viewport_enable: d.render_state.viewport_enable,
+                    stencil: {
+                        let s = &d.render_state;
+                        [
+                            s.front_stencil_func,
+                            s.front_stencil_op_fail,
+                            s.front_stencil_op_depth_fail,
+                            s.front_stencil_op_depth_pass,
+                            s.front_stencil_compare_mask,
+                            s.front_stencil_write_mask,
+                            s.front_stencil_ref,
+                            s.back_stencil_func,
+                            s.back_stencil_op_fail,
+                            s.back_stencil_op_depth_fail,
+                            s.back_stencil_op_depth_pass,
+                            s.back_stencil_compare_mask,
+                            s.back_stencil_write_mask,
+                            s.back_stencil_ref,
+                        ]
+                    },
+                    // `SCE_GXM_TWO_SIDED_DISABLED` is 0; any other value is the enabled mode.
+                    two_sided: d.render_state.two_sided != 0,
                 })
             } else {
                 None
             };
 
+            // Everything from the classification to here: the opaque decision, the texture
+            // lookups and decodes, the index expansion and the per-draw uniform work. It is
+            // the REST of the body, and on this title it is the whole of `build`.
+            drop(_body);
+            let _record = crate::perf::scope(crate::perf::Phase::BuildRecord);
             draws.push(GxmDraw {
                 space: to_draw_space(&interp.space),
                 vertices,
@@ -7305,6 +8187,28 @@ impl RenderSceneBuilder {
                     mode: d.render_state.region_clip_mode,
                     rect: d.render_state.region_clip,
                 },
+                viewport: d.render_state.viewport,
+                viewport_enable: d.render_state.viewport_enable,
+                stencil: {
+                    let s = &d.render_state;
+                    [
+                        s.front_stencil_func,
+                        s.front_stencil_op_fail,
+                        s.front_stencil_op_depth_fail,
+                        s.front_stencil_op_depth_pass,
+                        s.front_stencil_compare_mask,
+                        s.front_stencil_write_mask,
+                        s.front_stencil_ref,
+                        s.back_stencil_func,
+                        s.back_stencil_op_fail,
+                        s.back_stencil_op_depth_fail,
+                        s.back_stencil_op_depth_pass,
+                        s.back_stencil_compare_mask,
+                        s.back_stencil_write_mask,
+                        s.back_stencil_ref,
+                    ]
+                },
+                two_sided: d.render_state.two_sided != 0,
             });
         }
         // PASS TWO: a reader turned up, so the opaque MVP draws the main loop stepped over
@@ -7354,6 +8258,7 @@ impl RenderSceneBuilder {
             data_addr: c.data_addr,
             width: c.width,
             height: c.height,
+            format: c.format,
             gamma: c.gamma != 0,
             // `SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE` == 1. Anything else is NONE as far
             // as rasterisation goes - the enum's other values do not ask for a finer raster.
@@ -7431,6 +8336,7 @@ impl RenderSceneBuilder {
             depth_min,
             depth_scale,
             depth_addr,
+            stencil_clear: scene.depth.map(|d| (d.background_control & 0xff) as u8).unwrap_or(0),
             depth_extent,
             depth_extent_ambiguous,
         }
@@ -7523,7 +8429,7 @@ mod geometry_tests {
         mvp[10] = 1.0;
         mvp[11] = 1.0; // w = z
         let tri = [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]];
-        let scene = Scene { completed_early: false,
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -7562,7 +8468,7 @@ mod geometry_tests {
         // convention as the `lang=` stick directive, so a commanded bearing and a
         // measured heading are directly comparable numbers.
         let d = located_draw([0.0, 0.0, 0.0], &tri, mvp);
-        let found = locate_scene(&Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![d.clone()] }, 100, 100);
+        let found = locate_scene(&Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![d.clone()] }, 100, 100);
         let h = found[0].heading.expect("an identity rotation has a heading");
         assert!((h[0] - 0.0).abs() < 1e-3, "local +X is bearing 0, got {}", h[0]);
         assert!((h[1] + 90.0).abs() < 1e-3, "local +Z is bearing -90, got {}", h[1]);
@@ -7573,7 +8479,7 @@ mod geometry_tests {
         turned.world[2] = -1.0;
         turned.world[8] = 1.0;
         turned.world[10] = 0.0;
-        let found = locate_scene(&Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![turned] }, 100, 100);
+        let found = locate_scene(&Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![turned] }, 100, 100);
         let h = found[0].heading.unwrap();
         assert!((h[0] - 90.0).abs() < 1e-3, "expected bearing 90, got {}", h[0]);
 
@@ -7582,7 +8488,7 @@ mod geometry_tests {
         let mut flat = d;
         flat.world[0] = 0.0;
         flat.world[2] = 0.0;
-        let found = locate_scene(&Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![flat] }, 100, 100);
+        let found = locate_scene(&Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![flat] }, 100, 100);
         assert_eq!(found[0].heading, None);
     }
 
@@ -7599,9 +8505,9 @@ mod geometry_tests {
         let car = [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
         let other = [[0.0, 0.0, 2.0], [5.0, 0.0, 2.0], [0.0, 5.0, 2.0]];
 
-        let before = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
+        let before = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
         // Next frame: something new is submitted first, and the car has moved.
-        let after = Scene { completed_early: false,
+        let after = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -7779,7 +8685,7 @@ mod geometry_tests {
         let space = Space::Mvp(m);
         let at = |x: f32, y: f32, z: f32| {
             let v = Vertex { pos: [x, y, z], uv: [0.0; 2], color: [255; 4], normal: [0.0; 3] };
-            project(&v, &space, 100, 100, 1.0).expect("in front of the eye")
+            project(&v, &space, 100, 100, 1.0, None).expect("in front of the eye")
         };
 
         // Same screen position (x/w, y/w equal), different distances.
@@ -7986,7 +8892,7 @@ mod geometry_tests {
     #[test]
     fn map_keeps_the_higher_surface_and_measures_its_height() {
         // A wide floor with a small block standing on it.
-        let scene = Scene { completed_early: false,
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -8025,7 +8931,7 @@ mod geometry_tests {
     #[test]
     fn map_excludes_geometry_that_does_not_write_depth() {
         let sky = ground_quad(5000.0, -50.0, -50.0, 50.0, 50.0, false);
-        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
         let map = render_map(&scene, square_view([-50.0, -50.0, 50.0, 50.0], 40), [0, 0, 0, 255], 1, None, [0.0; 3]);
         assert_eq!(map.height_at(0.0, 0.0), Some(0.0), "the floor, not the sky");
         assert_eq!(map.ground_level(0.25), Some(0.0));
@@ -8035,7 +8941,7 @@ mod geometry_tests {
     fn map_ceiling_drops_geometry_above_it_and_reveals_the_floor_below() {
         // A depth-WRITING roof over half the floor: the ceiling option is the only way to
         // see what is under it.
-        let scene = Scene { completed_early: false,
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -8056,7 +8962,7 @@ mod geometry_tests {
 
     #[test]
     fn map_origin_shifts_every_coordinate_into_the_anchored_frame() {
-        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
         let origin = [100.0, 4.0, -200.0];
         // The same geometry, asked for in a frame measured from `origin`: the quad now
         // lives at x -110..-90, z 190..210, and its height is 0 rather than 4.
@@ -8127,7 +9033,7 @@ mod geometry_tests {
 
     #[test]
     fn sprites_are_located_on_screen_and_keep_their_identity_when_they_move() {
-        let scene = Scene { completed_early: false,
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -8144,7 +9050,7 @@ mod geometry_tests {
 
         // The SAME sprite 300 pixels along keeps its id - which a 3D geometry hash could
         // not do, because a 2D sprite's position IS its vertex data.
-        let moved = Scene { completed_early: false,
+        let moved = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -8155,7 +9061,7 @@ mod geometry_tests {
         let after = locate_sprites(&moved, 960, 544);
         assert_eq!(after[0].id, s.id, "identity must survive motion");
         // A different region of the same sheet is a DIFFERENT sprite.
-        let other = Scene { completed_early: false,
+        let other = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -8169,7 +9075,7 @@ mod geometry_tests {
     #[test]
     fn sprite_motion_removes_the_scene_scroll() {
         // A backdrop of many sprites panning left by 6px, and one that moves against it.
-        let build = |shift: f32, hero_extra: f32| Scene { completed_early: false,
+        let build = |shift: f32, hero_extra: f32| Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -8212,7 +9118,7 @@ mod geometry_tests {
     fn sprites_ignore_3d_draws_and_locate_ignores_2d_ones() {
         // The two locators must partition the scene, or an object gets counted twice - or,
         // worse, a title gets an empty report from the one that does not apply to it.
-        let scene = Scene { completed_early: false,
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -8244,7 +9150,7 @@ mod geometry_tests {
                 draws.push(ground_quad(20.0, g1, -4.0, 100.0, 4.0, true));
             }
         }
-        Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws }
+        Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws }
     }
 
     fn walled_map(gap: Option<(f32, f32)>) -> WorldMap {
@@ -8289,7 +9195,7 @@ mod geometry_tests {
             draws.push(ground_quad(i as f32 * 0.1, x, -50.0, x + 1.0, -20.0, true));
         }
         draws.push(ground_quad(6.0, 20.0, -50.0, 60.0, -20.0, true));
-        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws };
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws };
         let map = render_map(
             &scene,
             MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
@@ -8348,7 +9254,7 @@ mod geometry_tests {
 
     #[test]
     fn plan_route_simplifies_open_ground_to_two_points() {
-        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
         let map = render_map(
             &scene,
             MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
@@ -8400,7 +9306,7 @@ mod geometry_tests {
             let x = -30.0 + i as f32;
             draws.push(ground_quad(0.0, x, -30.0, x + 1.0, 30.0, true));
         }
-        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws };
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws };
         let strict = world_extent(&scene, 1.0).unwrap();
         assert!(strict[0] < -8000.0, "at keep=1.0 the backdrop sets the extent");
         let dense = world_extent(&scene, 0.90).unwrap();
@@ -8480,7 +9386,7 @@ mod supersample_tests {
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
             vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), frag_mem_windows: Vec::new(), shader_expanded: false,
         };
-        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![draw] };
+        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
         let b = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 2);
         assert_eq!((b.width, b.height), (w, h));
@@ -8540,7 +9446,7 @@ mod supersample_tests {
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
             vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), frag_mem_windows: Vec::new(), shader_expanded: false,
         };
-        let s = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![draw] };
+        let s = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
         fn h_variance(fb: &Framebuffer) -> f64 {
             let mut acc = 0f64;
@@ -8567,6 +9473,82 @@ mod texture_tests {
     //! swizzled RGBA - no game data, no fixture. These pin the format/swizzle
     //! decode that the render output depends on.
     use super::*;
+
+    /// `transcoded_source`, driven to COMPLETION the way a run drives it.
+    ///
+    /// The encode is resumable (see `PartialEncode`), so a single call can legitimately return
+    /// `None` having encoded part of the chain - which in a debug-profile test is the common
+    /// case, because the encoder is unoptimised and the default budget is 2 ms. `None` therefore
+    /// no longer means "refused"; it means "refused OR suspended", and only the caller that keeps
+    /// asking can tell those apart. Every test that wants the finished texture goes through here;
+    /// the tests that assert a PERMANENT refusal call `transcoded_source` directly, because one
+    /// call is exactly what they mean.
+    fn transcode_done(t: &BoundTexture) -> Option<CompressedUpload> {
+        // Bounded: a permanent refusal returns `None` from the first call with nothing held, and
+        // the loop is what separates that from a suspension. 4,096 frames of encoding is far
+        // more than the largest chain needs and still terminates.
+        for _ in 0..4096 {
+            super::reset_inline_encode_budget();
+            if let Some(c) = transcoded_source(t, None) {
+                return Some(c);
+            }
+            if !super::PARTIAL_ENCODE.with(|c| c.borrow().is_some()) {
+                // Nothing was held, so this was a refusal rather than a suspension.
+                return None;
+            }
+        }
+        panic!("a resumable encode that never finishes is a leak, not a defer");
+    }
+
+    /// >>> A SUSPENDED ENCODE, RESUMED, IS THE ONE-SHOT ENCODE.
+    ///
+    /// `chunked_matches_whole` proves the block RANGE is bit-identical to the whole image; this
+    /// proves the thing built out of those ranges is, through the real function, with the real
+    /// budget doing the suspending. The two arms are the same call with a different budget, which
+    /// is the only difference a resumable encode is allowed to make.
+    #[test]
+    fn a_resumed_encode_is_the_one_shot_encode() {
+        let (w, h) = (64u32, 64u32);
+        let level0 = level_layout(0x83, 0, w, h, 0).unwrap();
+        let mut t = tex(0x83, 0, w, h, level0.stride, vec![0x5Au8; level0.bytes as usize]);
+        t.tex_type = 0;
+        t.levels = 1;
+        t.face_bytes = level0.bytes;
+        // The budget is read ONCE per process (a `OnceLock`), so the arms cannot be set by the
+        // knob here. The suspension is provoked instead by spending the frame's budget down to
+        // nothing before each call, which is the same code path a transition takes.
+        // ONE SHOT: the frame is given an unreachable budget, so the in-loop check never fires
+        // and the whole chain is encoded in one call. Done by spending NEGATIVE time rather than
+        // by the knob, because `inline_encode_budget_ms` is a `OnceLock` read once per process -
+        // a test that set the environment variable would be setting it for whichever test ran
+        // first, which is the kind of A/B that reports one arm twice.
+        super::reset_inline_encode_budget();
+        super::note_inline_encode(-1.0e9);
+        let one_shot =
+            transcoded_source(&t, None).expect("an unreachable budget cannot suspend anything");
+        let resumed = {
+            super::PARTIAL_ENCODE.with(|c| *c.borrow_mut() = None);
+            let mut got = None;
+            for _ in 0..4096 {
+                super::reset_inline_encode_budget();
+                // Leave the frame with essentially no budget, so the encode stops after its
+                // first chunk every time.
+                super::note_inline_encode(super::inline_encode_budget_ms() * 0.999);
+                if let Some(c) = transcode_done(&t) {
+                    got = Some(c);
+                    break;
+                }
+            }
+            got.expect("a suspended encode must finish eventually")
+        };
+        assert_eq!(one_shot.format, resumed.format);
+        assert_eq!(one_shot.levels, resumed.levels);
+        assert_eq!(
+            one_shot.cpu_bytes().unwrap(),
+            resumed.cpu_bytes().unwrap(),
+            "a resumed encode must be the one-shot encode, byte for byte",
+        );
+    }
 
     fn tex(base_format: u32, swizzle: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
         BoundTexture {
@@ -8915,7 +9897,7 @@ mod texture_tests {
         t.tex_type = 0;
         t.levels = 1;
         t.face_bytes = level0.bytes;
-        let c = transcoded_source(&t, None).expect("PVRTC is exactly what this path is for");
+        let c = transcode_done(&t).expect("PVRTC is exactly what this path is for");
         assert_eq!(c.levels, max_mip_levels(w, h), "the chain must reach 1x1");
         assert_eq!(c.levels, 7);
         let bb = c.format.block_bytes();
@@ -8945,7 +9927,7 @@ mod texture_tests {
         t.tex_type = 0;
         t.levels = 1;
         t.face_bytes = l0.bytes;
-        let c = transcoded_source(&t, None).unwrap();
+        let c = transcode_done(&t).unwrap();
         let bb = c.format.block_bytes();
         assert!(matches!(c.format, BlockFormat::Bc1 | BlockFormat::Bc3));
         // Consistency check: the byte total is only reachable with ONE block size throughout.
@@ -8983,7 +9965,7 @@ mod texture_tests {
             t.face_bytes = total as u32;
 
             // A refusal is allowed. A SMALLER texture is not.
-            if let Some(c) = transcoded_source(&t, None) {
+            if let Some(c) = transcode_done(&t) {
                 assert_eq!((c.width, c.height), (w, h), "{w}x{h} was encoded at a reduced size");
                 assert_eq!(
                     c.levels,

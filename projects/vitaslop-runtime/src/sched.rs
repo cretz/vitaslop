@@ -278,11 +278,16 @@ struct Slot<T> {
     /// GAME CLOCK is charged for the difference; `fuel_seen` above now only feeds the fuel
     /// report and the preemption accounting.
     arm_seen: u64,
+    /// GUEST INSTRUCTIONS this thread retired, summed over its whole life - its share of the
+    /// emulated CPU, which `cpu_share_report` ranks by. `picks` says how often a thread ran;
+    /// this says how much it did, and a thread busy-polling a flag is exactly the one whose
+    /// two answers disagree.
+    retired_total: u64,
 }
 
 impl<T> Slot<T> {
     fn new(thread: T, state: ThreadState) -> Slot<T> {
-        Slot { thread, state, cooled: false, picks: 0, quanta: 0, fuel_seen: 0, arm_seen: 0 }
+        Slot { thread, state, cooled: false, picks: 0, quanta: 0, fuel_seen: 0, arm_seen: 0, retired_total: 0 }
     }
 }
 
@@ -420,7 +425,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             // Where the block IS, told to the host once: everything behind the mirrored slots
             // is shared state the host reads and writes directly - today the kernel mutex
             // table - and it needs the address, not the slot writer.
-            core.host.lock().unwrap().set_mirror_base(base as u32);
+            core.host.lock().unwrap().set_mirror_base(base);
             // >>> THE BLOCK EXISTING IS NO LONGER EVIDENCE THAT A READ WAS INLINED. It is
             // reserved UNCONDITIONALLY now, because the ARM exclusive monitor lives in it
             // (`EXCL_MIRROR_SLOT`) and every build lowers `LDREX`/`STREX` whether or not any
@@ -511,18 +516,24 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     pub fn cpu_share_report(&self) -> String {
         use std::fmt::Write;
         let total: u64 = self.threads.iter().map(|t| t.picks).sum();
-        let mut rows: Vec<(i32, i32, u64, u64, ThreadState)> = self
+        let retired: u64 = self.threads.iter().map(|t| t.retired_total).sum();
+        let mut rows: Vec<(i32, i32, u64, u64, u64, ThreadState)> = self
             .threads
             .iter()
-            .map(|t| (t.thread.thid(), t.thread.priority(), t.picks, t.quanta, t.state))
+            .map(|t| (t.thread.thid(), t.thread.priority(), t.picks, t.quanta, t.retired_total, t.state))
             .collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
-        let mut s = format!("--- scheduler CPU share: {total} resumes over {} threads ---\n", rows.len());
-        for (thid, prio, picks, quanta, state) in rows {
+        // By WORK, not by resumes - see `Slot::retired_total`.
+        rows.sort_by_key(|r| std::cmp::Reverse(r.4));
+        let mut s = format!(
+            "--- scheduler CPU share: {total} resumes, {retired} guest instructions over {} threads ---\n",
+            rows.len()
+        );
+        for (thid, prio, picks, quanta, work, state) in rows {
             let pct = if total == 0 { 0.0 } else { picks as f64 * 100.0 / total as f64 };
+            let wpct = if retired == 0 { 0.0 } else { work as f64 * 100.0 / retired as f64 };
             let _ = writeln!(
                 s,
-                "  thid={thid:#x} prio={prio:#x} {pct:6.2}%  picks={picks} whole-quanta={quanta} {state:?}"
+                "  thid={thid:#x} prio={prio:#x} work {wpct:6.2}%  resumes {pct:6.2}%  picks={picks} whole-quanta={quanta} {state:?}"
             );
         }
         s
@@ -820,7 +831,31 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // lightweight-mutex take, and a resumed thread must read its own id from the first
         // instruction - not the previous thread's until it happens to call the host.
         let thid = self.threads[idx].thread.thid();
-        self.host.lock().unwrap().set_current_thread(thid);
+        // >>> HOW MANY OTHER THREADS COULD RUN INSTEAD, told to the host AT THE PICK.
+        //
+        // A `sceKernelDelayThread(0)` is "give someone else the CPU", and with nobody to give
+        // it to the kernel returns to the caller. This scheduler could not say that: every
+        // such call took a full suspend and resume, and the scheduler then re-picked the same
+        // thread. On one football title that is **2,377 QUANTUM suspends a frame** against a
+        // baseball title's 4, from ONE guest spin, and a suspend is the most expensive thing a
+        // scheduler round does on the browser. The host cannot see the runnable set, so the
+        // pick - the one place both schedulers pass through - hands it the count.
+        //
+        // It is exact at the moment of the pick, and the only thing that can make another
+        // thread runnable while this one runs is this one's OWN host calls, which go through
+        // the same state and bump it. A timed wake needs the clock to advance, which needs a
+        // suspension - and the ENGINE's fuel preemption still forces those, so nothing this
+        // elides can be deferred longer than one preemption interval.
+        let others = self
+            .live
+            .iter()
+            .filter(|&&i| i != idx && self.threads[i].state == ThreadState::Runnable)
+            .count();
+        {
+            let mut h = self.host.lock().unwrap();
+            h.note_runnable_others(others);
+            h.set_current_thread(thid);
+        }
         // Guest code is about to run, so the host-mirror block has to be current. This
         // is the one place both schedulers (native and browser) pass through on their
         // way to a resume, which is why the refresh lives here rather than in either
@@ -864,6 +899,19 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // Count the frame and advance any frame-keyed input (a scripted TAS
                 // recipe) in lockstep with the render loop.
                 self.frames += 1;
+                // `VITASLOP_CPU_SHARE_FROM=<frame>`: start the CPU-share counters (`picks`,
+                // `quanta`, `retired_total`) afresh at that frame, so `cpu_share_report`
+                // describes gameplay rather than the boot and loading screens before it.
+                if Some(self.frames) == cpu_share_from() {
+                    for t in self.threads.iter_mut() {
+                        t.picks = 0;
+                        t.quanta = 0;
+                        t.retired_total = 0;
+                    }
+                    for h in self.runnable_hist.iter_mut() {
+                        *h = 0;
+                    }
+                }
                 // Stamp the ENGINE-AGNOSTIC frame counter beside the scheduler's own, so a
                 // diagnostic that lives outside this crate can put a frame number on its
                 // lines. Native's block tracer has always been able to; the browser's could
@@ -936,6 +984,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             Some(t) => {
                 let d = t.saturating_sub(self.threads[idx].arm_seen);
                 self.threads[idx].arm_seen = t;
+                self.threads[idx].retired_total = self.threads[idx].retired_total.saturating_add(d);
                 Some(d)
             }
             None => None,
@@ -1518,4 +1567,11 @@ mod idle_order_tests {
         // 101_000 on a clock reading 100_000, so the transfer must NOT win.
         assert!(!storage_completes_first(Some(5_000), Some(101_000), 100_000));
     }
+}
+
+/// `VITASLOP_CPU_SHARE_FROM=<frame>` - see the reset in `SchedCore::on_suspended`.
+fn cpu_share_from() -> Option<u64> {
+    use std::sync::OnceLock;
+    static AT: OnceLock<Option<u64>> = OnceLock::new();
+    *AT.get_or_init(|| crate::knobs::var("VITASLOP_CPU_SHARE_FROM").ok().and_then(|v| v.trim().parse().ok()))
 }

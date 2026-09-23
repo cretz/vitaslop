@@ -40,3 +40,9 @@ wgpu = { workspace = true, optional = true }
 # guest vertex+fragment shader pair into a live pipeline (falls back to fixed-function
 # on any LinkError). Its lib is wasm-safe, so the web build keeps working.
 vitaslop-gxp-shader = { path = "../vitaslop-gxp-shader", optional = true }
+
+# The web build writes staging uploads straight into the browser's mapped `ArrayBuffer`
+# (see `stage_upload` in gpu.rs); wgpu's own mapped view copies the whole range into the wasm
+# heap and back again. Already in the tree through wgpu, at the same version.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"

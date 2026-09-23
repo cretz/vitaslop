@@ -50,7 +50,10 @@ pub use emit::StmtKind;
 /// out at [`Artifact::dirty_off`] as `[epoch byte][map]` (see [`DIRTY_EPOCH_OFF`] and
 /// [`DIRTY_MAP_OFF`]). A host that stamps its own reads against the epoch can prove a
 /// region of guest memory unchanged without reading it.
-pub use emit::{set_dirty_tracking, DIRTY_EPOCH_OFF, DIRTY_MAP_OFF, DIRTY_SHIFT};
+pub use emit::{
+    set_dirty_run_marks, set_dirty_tracking, DIRTY_EPOCH_OFF, DIRTY_MAP_OFF, DIRTY_PAGE_BYTES,
+    DIRTY_SHIFT,
+};
 mod flags;
 mod ir;
 mod lower;
@@ -116,6 +119,18 @@ pub struct Program<'a> {
     /// scheduler (`vitaslop_native::ThreadedScheduler`) needs this; every single-
     /// instance host leaves it off and gets the original self-contained module.
     pub import_memory: bool,
+    /// >>> WHERE THE GUEST LAYOUT SITS INSIDE THE IMPORTED MEMORY, in bytes. 0 means the
+    /// layout starts at linear offset 0 (a memory of its own, the shared-memory form
+    /// above). Non-zero means the imported memory is the HOST'S OWN linear memory and the
+    /// guest region, dispatch table, dirty map and mirror block all live `host_off` bytes
+    /// into it: every emitted load and store carries the offset in its immediate
+    /// (`emit::Body::raw`), the bulk operations add it on the stack, and the module
+    /// imports `env.memory` as a plain growable memory. What that buys is a host that reads
+    /// guest memory with a load instead of a boundary crossing - the browser paid one
+    /// JavaScript call per guest read, several per draw. The artifact's offsets
+    /// (`mirror_off`, `dirty_off`) stay relative to the layout, not the memory. Requires
+    /// `import_memory`.
+    pub host_off: u32,
 }
 
 /// A guest address that dispatches to a host import (the Vita NID mechanism): a
@@ -246,6 +261,23 @@ pub enum InlineOp {
     /// See [`abi::VBLANK_PARK_SELECTOR`] for what the host does with it and what it is
     /// worth. `budget` names a slot, not a count: the count is the word in it.
     LoadMirrorParking { slot: u32, budget: u32 },
+    /// A `sceKernelDelayThread(us)` whose `us <= 1` is a YIELD, elided in guest code when the
+    /// host mirror says there is nobody to yield to: `mirror[free_slot] != 0` (no other thread
+    /// runnable at the pick, and none woken or spawned since) and `mirror[run_slot] < cap`
+    /// (the bounded run the host handler applies too). Then `mirror[run_slot] += 1` and
+    /// `r0 = 0`. Everything else - a real sleep, a yield with somewhere to go, a run past the
+    /// cap - falls through to the import, whose handler is unchanged.
+    ///
+    /// Why it qualifies for the block: `free` is a fact about the scheduler's runnable set,
+    /// which changes only at a pick or through THIS thread's own host calls - and the host
+    /// clears the word in guest memory on the first such call that wakes or spawns a thread
+    /// (`VitaState::publish_yield_free_change`), so a stale 1 is never read. The run word is
+    /// this thread's own bookkeeping, refreshed from the host's counter at each resume.
+    ///
+    /// MEASURED on a football title's browser frame: its main loop paces itself with a
+    /// lock, a clock read and a one-microsecond delay, ~2,600 iterations a frame; the clock
+    /// and the lock were already inline, and the delay was the one crossing left in it.
+    DelayYield { free_slot: u32, run_slot: u32, cap: u32 },
     /// `r0 = value` - the whole call. For a handler that returns a constant and does
     /// NOTHING else.
     ///
@@ -637,6 +669,34 @@ pub enum InlineOp {
     /// neither engine can preempt inside it ([`InlineOp::LwMutexLock`] states the whole
     /// argument).
     BindPrecomputedState { layout: BindStateLayout },
+    /// `sceGxmPrecomputed{Vertex,Fragment}StateSetAllUniformBuffers(state, array)`: copy the
+    /// non-default uniform-buffer TABLE (`layout.bytes` bytes at r1) into the state's arrays
+    /// block at `layout.table_at`, then return 0 - when the state struct (r0) carries this
+    /// stage's magic and names a non-zero arrays block. Anything else runs the handler.
+    ///
+    /// # Why this is the whole call
+    /// The handler (`VitaState::precomputed_state_set_all_nondefault_uniform_buffers`) is:
+    /// resolve the arrays block (allocating one only when the struct is unstamped), read
+    /// `bytes` of pointers from `array`, write them into the block. On a stamped struct with
+    /// a block that is one `memory.copy`, and the guest owns both ends of it. The two cases
+    /// the handler defines differently - an unstamped struct (it allocates and stamps) and an
+    /// `array` whose tail runs past guest memory (it reads zeros) - are exactly the ones the
+    /// guards send back to it.
+    ///
+    /// # Why it pays
+    /// MEASURED on a football title's browser frame: **1,027 calls a frame**, one per
+    /// `sceGxmDrawPrecomputed`, 0.75 us each - the single hottest host call left in its draw
+    /// path after the yield was inlined, and every one a crossing to move 56 bytes between two
+    /// guest buffers.
+    ///
+    /// # No dirty stamp
+    /// The destination is the state's arrays block, a heap block this engine allocates for
+    /// its own bookkeeping - never a texture's bytes - so like every other storing form it
+    /// stamps nothing (see `emit_dirty_range` in `emit` for the rule).
+    ///
+    /// # No yield point
+    /// Loads, one `memory.copy`, one store; no loop, no call.
+    SetAllUniformBuffers { layout: SetAllUniformBuffersLayout },
     /// Take a recursive lock whose state lives in the guest WORK AREA pointed to by r0,
     /// when it is uncontended. Everything else runs the real host call.
     ///
@@ -908,13 +968,42 @@ pub struct BindStateLayout {
     /// does the same: the two must leave byte-identical state, which is the whole contract the
     /// inline forms rest on.
     ///
-    /// Zero keeps the plain bulk `memory.copy` - which is what the VERTEX stage wants, because
-    /// its copy is the uniform-buffer TABLE, where a zero entry really does mean "no buffer
-    /// bound" and replacing it is correct.
+    /// >>> THE VERTEX STAGE NEEDS THIS TOO, AND USED NOT TO HAVE IT. Its copy is the
+    /// uniform-buffer TABLE, and the reading that a zero entry there "really does mean no
+    /// buffer bound" is refuted: the table lives in the SAME host-allocated, host-zeroed block
+    /// as the texture array, so a state that never received a `SetAllUniformBuffers` carries
+    /// fourteen zeros no guest call put there. MEASURED on a football title: the draws whose
+    /// windows are withheld read an EMPTY context table while a neighbouring draw reads
+    /// `0=0x953ffe10 2=0x8d599a30`. Its slot is one word.
+    ///
+    /// Zero keeps the plain bulk `memory.copy`, which nothing uses today.
     pub copy_slot_stride: u32,
     /// Context slot the program handle is stored to, when `has_prog`.
     pub ctx_prog: u32,
     pub has_prog: bool,
+}
+
+/// Where an [`InlineOp::SetAllUniformBuffers`] finds the state struct's identity, its arrays
+/// block, and the table inside that block. Both stages share the type; the fragment stage's
+/// table sits behind its texture array (`table_at` non-zero), the vertex stage's is first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetAllUniformBuffersLayout {
+    /// The state STRUCT's identity stamp (stage-specific), and the value it must hold.
+    pub st_magic_at: u32,
+    pub st_magic: u32,
+    /// Where the state struct keeps the guest address of its ARRAYS block.
+    pub st_block_at: u32,
+    /// Byte offset of the uniform-buffer table inside the arrays block.
+    pub table_at: u32,
+    /// Bytes copied: one word per possible buffer index.
+    pub bytes: u32,
+}
+
+impl SetAllUniformBuffersLayout {
+    /// The highest offset reached from the STATE STRUCT pointer.
+    pub fn st_top(self) -> u32 {
+        self.st_magic_at.max(self.st_block_at)
+    }
 }
 
 impl BindStateLayout {
@@ -1051,6 +1140,8 @@ impl InlineOp {
             }
             // The mirror word IS the answer; the host computed it.
             InlineOp::LoadMirror { .. } | InlineOp::LoadMirrorParking { .. } => word,
+            // An elided yield returns the success code, whatever the mirror said.
+            InlineOp::DelayYield { .. } => 0,
             InlineOp::LoadScaled { shl, .. } => word << shl,
             // The pair forms deliver the mirror words untouched, wherever they land.
             InlineOp::StoreMirrorPair { .. } | InlineOp::LoadMirrorPair { .. } => word,
@@ -1089,6 +1180,9 @@ impl InlineOp {
             // structures, held to its handler by the execution test and the runtime's
             // layout equivalence tests.
             InlineOp::BindPrecomputedState { .. } => 0,
+            // A successful table copy returns 0; its meaning is a byte range, held to its
+            // handler by the execution test and the runtime's layout equivalence test.
+            InlineOp::SetAllUniformBuffers { .. } => 0,
             // A bulk form's meaning is a RANGE of memory, which a one-word `eval` cannot
             // express any more than it can express the copy form's. `MemCopy` and `MemFill`
             // return the destination they were handed, so 0 here is not their r0 - the
@@ -1152,7 +1246,8 @@ impl InlineOp {
             InlineOp::CopyArgIndexed { .. } => None,
             InlineOp::LoadMirror { .. }
             | InlineOp::LoadMirrorParking { .. }
-            | InlineOp::LoadMirrorPair { .. } => None,
+            | InlineOp::LoadMirrorPair { .. }
+            | InlineOp::DelayYield { .. } => None,
             // Take no pointer and read nothing.
             InlineOp::RetConst { .. } | InlineOp::Nop | InlineOp::Fast => None,
             // Reads four words and writes two, so no single offset describes it.
@@ -1172,6 +1267,8 @@ impl InlineOp {
             InlineOp::StoreVfpRun { .. } | InlineOp::StoreArgRun { .. } => None,
             // Reads a struct and a block, writes the context; no single offset names it.
             InlineOp::BindPrecomputedState { .. } => None,
+            // Reads a struct and an array, writes a block; no single offset names it.
+            InlineOp::SetAllUniformBuffers { .. } => None,
         }
     }
 
@@ -1208,6 +1305,8 @@ impl InlineOp {
             // Names the VALUE slot; the budget slot is covered by `top_mirror_slot`, which
             // is what the layout pass sizes the block from.
             InlineOp::LoadMirrorParking { slot, .. } => Some(slot),
+            // Names the FREE slot; the run slot is covered by `top_mirror_slot`.
+            InlineOp::DelayYield { free_slot, .. } => Some(free_slot),
             InlineOp::StoreMirrorPair { slot } | InlineOp::LoadMirrorPair { slot } => Some(slot),
             // The lock forms read the mirror too - the CURRENT THREAD, which is the one
             // fact about the take that is not in the work area. Naming the slot here is
@@ -1230,6 +1329,7 @@ impl InlineOp {
             InlineOp::SetUniformData { layout } => Some(layout.bank_slot),
             // Everything it reads is in the guest structures it is handed.
             InlineOp::BindPrecomputedState { .. } => None,
+            InlineOp::SetAllUniformBuffers { .. } => None,
         }
     }
 
@@ -1244,6 +1344,8 @@ impl InlineOp {
             // BOTH its slots have to be inside the block: the budget is written by the same
             // snapshot and decremented by the emitted code.
             InlineOp::LoadMirrorParking { slot, budget } => Some(slot.max(budget)),
+            // Both words are in the block: one read, one read-and-written by the emitted code.
+            InlineOp::DelayYield { free_slot, run_slot, .. } => Some(free_slot.max(run_slot)),
             // The TABLE is part of the block: its last word has to be inside the page, or the
             // highest-numbered mutex would read and write past the end of it.
             InlineOp::KernelMutexLock { thread_slot, table_slot, entries, .. }
@@ -1614,6 +1716,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             program.mem_bytes,
             program.inline_imports,
             program.import_memory,
+            program.host_off,
         );
     Ok(Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off, expansion })
 }
@@ -1779,6 +1882,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         program.mem_bytes,
         program.inline_imports,
         program.import_memory,
+        program.host_off,
     );
     stubbed.sort_unstable();
     let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
@@ -1991,7 +2095,7 @@ mod tests {
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
-                import_memory: false,
+                import_memory: false, host_off: 0,
             })
             .expect("transpile");
             wasmparser::validate(&a.wasm).expect("valid wasm");
@@ -2088,7 +2192,7 @@ mod tests {
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
-                import_memory: false,
+                import_memory: false, host_off: 0,
             })
             .expect("transpile")
             .wasm;
@@ -2256,7 +2360,7 @@ mod tests {
             noreturn_svc: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
-            import_memory: false,
+            import_memory: false, host_off: 0,
         })
         .expect("transpile");
         assert!(!artifact.wasm.is_empty());
@@ -2319,7 +2423,7 @@ mod tests {
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
-                import_memory: false,
+                import_memory: false, host_off: 0,
             })
             .expect("transpile");
             wasmparser::validate(&artifact.wasm).expect("valid wasm");
@@ -2384,7 +2488,7 @@ mod tests {
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
-                import_memory: false,
+                import_memory: false, host_off: 0,
             })
             .expect("transpile")
         };
@@ -2480,7 +2584,7 @@ mod tests {
             noreturn_svc: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
-            import_memory: false,
+            import_memory: false, host_off: 0,
         })
         .expect("transpile indirect");
         // One guest function plus the emitted dispatcher must produce valid wasm.
@@ -2528,7 +2632,7 @@ mod tests {
             noreturn_svc: &[],
             mem_bytes: 0x1_0000,
             discover_code_pointers: false,
-            import_memory: false,
+            import_memory: false, host_off: 0,
         })
         .expect("transpile memset");
         if let Err(e) = wasmparser::validate(&artifact.wasm) {
@@ -2558,6 +2662,91 @@ mod tests {
         }
     }
 
+    /// A module emitted for a host offset (`Program::host_off`) imports a plain growable
+    /// memory whose minimum covers the layout's end, validates, and carries the offset on
+    /// EVERY memory access: each load/store immediate is at least `host_off`, and every
+    /// bulk operation is fed an `i32.add` of the offset. A memory form the shifter in
+    /// `emit::Body::raw` does not know would show up here as an immediate below the offset.
+    #[test]
+    fn host_off_shifts_every_form() {
+        use wasmparser::{Operator, Parser, Payload, TypeRef};
+        // A program with an ordinary store, a load, and an inline memcpy-shaped bulk
+        // operation is what the retail titles produce; the Thumb pair below is a store
+        // and a load through r0, and the bulk path is exercised by the dirty-range mark
+        // the emitter adds to a multi-word store.
+        let code: [u8; 12] = [
+            0x01, 0x60, // str r1, [r0]
+            0x02, 0x68, // ldr r2, [r0]
+            0x06, 0xc0, // stm r0!, {r1, r2}
+            0x00, 0xdf, // svc #0
+            0x00, 0xbf, 0x00, 0xbf, // nop nop
+        ];
+        const HOST_OFF: u32 = 0x1000_0000;
+        let wasm = transpile(&Program {
+            code: &code,
+            base: 0x10000,
+            thumb: true,
+            entries: &[0x10000],
+            arm_entries: &[],
+            externs: &[],
+            redirects: &[],
+            inline_imports: &[],
+            noreturn_svc: &[],
+            mem_bytes: 0x20000,
+            discover_code_pointers: false,
+            import_memory: true,
+            host_off: HOST_OFF,
+        })
+        .expect("transpile")
+        .wasm;
+        wasmparser::validate(&wasm).expect("host-offset module valid");
+        let mut saw_memory = false;
+        let mut accesses = 0;
+        let mut adds_of_off = 0;
+        let mut bulk = 0;
+        for payload in Parser::new(0).parse_all(&wasm) {
+            match payload.unwrap() {
+                Payload::ImportSection(reader) => {
+                    for imp in reader.into_imports() {
+                        let imp = imp.unwrap();
+                        if let TypeRef::Memory(mt) = imp.ty {
+                            saw_memory = true;
+                            assert!(!mt.shared, "a host-hosted memory is the host's own, not shared");
+                            assert!(mt.maximum.is_none(), "the host's memory declares no maximum");
+                            assert!(mt.initial >= (HOST_OFF as u64 + 0x20000) / 65536, "minimum must cover the layout's end");
+                        }
+                    }
+                }
+                Payload::CodeSectionEntry(body) => {
+                    for op in body.get_operators_reader().unwrap() {
+                        match op.unwrap() {
+                            Operator::I32Load { memarg }
+                            | Operator::I32Store { memarg }
+                            | Operator::I32Load8U { memarg }
+                            | Operator::I32Load8S { memarg }
+                            | Operator::I32Load16U { memarg }
+                            | Operator::I32Load16S { memarg }
+                            | Operator::I32Store8 { memarg }
+                            | Operator::I32Store16 { memarg }
+                            | Operator::I64Load { memarg }
+                            | Operator::I64Store { memarg } => {
+                                accesses += 1;
+                                assert!(memarg.offset >= HOST_OFF as u64, "an access immediate below the host offset: {memarg:?}");
+                            }
+                            Operator::I32Const { value } if value as u32 == HOST_OFF => adds_of_off += 1,
+                            Operator::MemoryCopy { .. } | Operator::MemoryFill { .. } => bulk += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_memory, "the module must import env.memory");
+        assert!(accesses > 0, "the program has memory accesses");
+        assert!(bulk == 0 || adds_of_off >= bulk, "every bulk operation adds the offset: {bulk} bulk ops, {adds_of_off} adds");
+    }
+
     #[test]
     fn import_memory_mode_imports_shared_memory_and_validates() {
         // Same tiny ARM program, once self-contained and once importing a shared
@@ -2581,6 +2770,7 @@ mod tests {
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
                 import_memory,
+                host_off: 0,
             })
             .expect("transpile")
             .wasm
@@ -2652,7 +2842,7 @@ mod tests {
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
-                import_memory: false,
+                import_memory: false, host_off: 0,
             })
             .expect("transpile");
             wasmparser::validate(&a.wasm).expect("valid wasm");

@@ -50,7 +50,11 @@ use crate::container::{
 };
 use crate::ir::{Bank, Instr, Op, Predicate, Shader};
 use crate::module::{plan_bindings, plan_vertex_bindings, BindingPlan, ColorOutput, VertexBindingPlan};
-use crate::wgsl::{emit_body, EmitError, TexBinding, BANK_REGS};
+use crate::ColorPrecision;
+use crate::wgsl::{
+    add_half_helpers, emit_body, emit_body_marked, split_marker, strip_split_markers, EmitError,
+    TexBinding, BANK_REGS, HALF_HI_FN, HALF_LO_FN, HALF_PK_FN, HALF_QUANT_FN,
+};
 use crate::{recompile_fragment, recompile_vertex, RecompileError};
 
 /// A vertex program linked to a fragment program: one WGSL module carrying both entry points
@@ -176,6 +180,15 @@ pub enum LinkError {
     /// GXM uniform-buffer tables, so a message naming the wrong one sends a reader to the
     /// wrong `sceGxmSet*UniformBuffer` call site.
     FragmentMemWindowUnresolved { why: &'static str },
+    /// A unit the caller named RAW ([`LinkOptions::raw_units`]) is sampled by the program's
+    /// own SMP instruction. The body was emitted before the link knew the unit is raw, so it
+    /// would `textureSample` a `texture_2d<u32>`; refuse rather than mis-type the binding.
+    RawUnitSampledInProgram { unit: u8 },
+    /// A RAW unit's prefetch is not a two-coordinate 2D sample. A raw texel is a `textureLoad`
+    /// at integer coordinates, which is established only for the 2D case.
+    RawUnitNotTwoDimensional { unit: u8 },
+    /// [`LinkOptions::raw64_output`] was asked of a program that cannot honour it.
+    Raw64OutputUnsupported { why: &'static str },
 }
 
 impl core::fmt::Display for LinkError {
@@ -258,7 +271,23 @@ impl core::fmt::Display for LinkError {
             LinkError::FragmentMemWindowUnresolved { why } => write!(
                 f,
                 "the fragment program's memory loads have no bindable guest-memory window: {why}"
-            ),        }
+            ),
+            LinkError::RawUnitSampledInProgram { unit } => write!(
+                f,
+                "texture unit {unit} holds a 64-bit RAW texture but the fragment program samples \
+                 it with its own SMP instruction, and a raw in-program sample is not emitted yet"
+            ),
+            LinkError::RawUnitNotTwoDimensional { unit } => write!(
+                f,
+                "texture unit {unit} holds a 64-bit RAW texture but its prefetch is not a \
+                 two-coordinate 2D sample, and a raw load is established only for 2D"
+            ),
+            LinkError::Raw64OutputUnsupported { why } => write!(
+                f,
+                "this pass renders into a 64-bit colour surface (raw Rg32Uint attachment) and \
+                 the fragment program cannot: {why}"
+            ),
+        }
     }
 }
 
@@ -284,12 +313,69 @@ pub const MAX_VARYINGS: u32 = 16;
 /// strict, no-guess contract as [`recompile_vertex`] / [`recompile_fragment`]; the linkage
 /// itself additionally validates the vertex output layout and every sampled varying lane.
 /// How a pair is to be linked beyond what its two programs say.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+// NOT `Copy`: `guest_attrs` is a list whose length is the guest's, and a fixed-size array with
+// a sentinel would be a worse answer than one clone per pipeline BUILD - a path that already
+// decodes two USSE programs and emits ~27 KB of WGSL text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LinkOptions {
     /// Emit the fragment stage as a DUAL-SOURCE blend (see `module::dual_source_plan`). The
     /// caller has established that the draws this module will serve satisfy the plan's gates;
     /// a program the plan refuses links the ordinary way whatever this says.
     pub dual_source: bool,
+    /// GXM fragment texture units (bit `u` = unit `u`) whose bound texture is a 64-bit RAW
+    /// format the hardware hands to the shader UNCONVERTED: the texel's two 32-bit words land
+    /// in two consecutive registers exactly as stored. A prefetch of such a unit is emitted as
+    /// a `textureLoad` off a `texture_2d<u32>` binding and stored as raw words.
+    ///
+    /// MEASURED on a baseball title's crowd: an impostor atlas is RENDERED into an
+    /// F16F16F16F16 surface by a program that packs RGBA8 bytes into its colour registers, then
+    /// SAMPLED as a U32U32 texture by the crowd program, which reads the two words back as
+    /// packed bytes (`unpack4x8unorm`) - an alpha test on byte 3 of word 0, a colour from word
+    /// 1. Sampling that as a float texture handed the byte reads the bit pattern of a float
+    /// instead, every fragment failed the alpha test, and the stands were empty.
+    pub raw_units: u64,
+    /// The pass renders into a 64-bit colour surface bound as an `Rg32Uint` attachment: the
+    /// entry point returns the colour register PAIR as raw words. Refused (the link fails,
+    /// naming why) for a program that blends for itself or is lowered to a dual-source blend,
+    /// because an integer attachment cannot blend and a raw pair has no destination colour.
+    pub raw64_output: bool,
+    /// What the GUEST bound to each vertex attribute, as `(base lane, GXM attribute format,
+    /// component count)` - the `SceGxmVertexAttribute` fields, keyed by the PA base lane the
+    /// program's own parameter table names (`resource_index`), so no ordering has to be agreed
+    /// between the two sides.
+    ///
+    /// Empty means "not told", which is what every caller outside the live renderer passes, and
+    /// then nothing below changes: every attribute keeps the `vec4<f32>` declaration and the
+    /// renderer converts on the CPU exactly as it always did. The renderer supplies it so the
+    /// link can decide [`crate::module::VertexAttribute::int_fetch`] - and it MUST be folded
+    /// into the module cache key by any caller that varies it, because two guest layouts over
+    /// one program pair are two different modules.
+    pub guest_attrs: Vec<(u32, u8, u8)>,
+    /// >>> THE CALLER ASSERTS THAT THIS DRAW'S COLOUR OUTPUT CANNOT REACH A PIXEL: its guest
+    /// >>> colour MASK is zero, or the pass it is issued into has no colour attachment.
+    ///
+    /// What it unlocks is the PASSTHROUGH treatment below (`is_passthrough`), which exists for
+    /// a program that writes no colour register because its result is *whatever the PDS left in
+    /// the primary-attribute registers*. That treatment marks the whole primary allocation read
+    /// and then demands every register of it be fed, which is right when the register file IS
+    /// the colour - and wrong for a DISCARD-ONLY program, whose entire effect is a predicated
+    /// `Kill` plus the depth write and which genuinely reads nothing.
+    ///
+    /// MEASURED: a football title's `frag_90c054e0` is `Nop`, a `Test` on two constants, a
+    /// predicated `Kill`, `Nop`, `Nop` - no varyings block (its count of 0 is TRUE, it
+    /// interpolates nothing) and no write to any colour register at all. It was refused as
+    /// "reads PA register 0 before writing it", and nothing in the SHADER can tell it from a
+    /// passthrough: both write no colour and read no PA. Only the DRAW says which, and only
+    /// because a colour that is masked off is exact whatever it holds.
+    ///
+    /// This is the same shape as the renderer's colour-no-op elision - "this draw's colour
+    /// cannot matter", decided per draw from state the shader does not carry - and like every
+    /// other per-draw option here it MUST be folded into the module cache key by any caller
+    /// that varies it.
+    ///
+    /// Default `false`, which is every caller outside the live renderer: the passthrough
+    /// treatment stands exactly as it did.
+    pub colour_output_masked_off: bool,
 }
 
 pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, LinkError> {
@@ -338,7 +424,7 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
     }
 
     // Match the two stages' own statements of the interface, by usage.
-    let iface = plan_interface(&vprog, &fprog, &frc.shader)?;
+    let iface = plan_interface(&vprog, &fprog, &frc.shader, opts.colour_output_masked_off)?;
     let varyings = &iface.components;
 
     // What each attribute lane is fed when the guest binds fewer components than the program
@@ -365,6 +451,37 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
             a.surplus_fill[c as usize] =
                 crate::attrflow::lane_fill(&vrc.shader, &frc.shader, a.base_lane, c, &lands);
         }
+    }
+
+    // >>> AND THEN, FOR EACH ATTRIBUTE THE CALLER TOLD US ABOUT, WHETHER IT CAN BE FETCHED AS
+    // >>> AN INTEGER. Both halves of that question are answered above: the guest's format comes
+    // from the caller, and the fills come from the analysis that has just run. See
+    // `VertexAttribute::int_fetch` for the measurement and for why the lane test is "unobserved"
+    // rather than "wants zero".
+    for a in &mut vplan.attributes {
+        let Some(&(_, fmt, gcomps)) = opts.guest_attrs.iter().find(|(lane, ..)| *lane == a.base_lane)
+        else {
+            continue;
+        };
+        // >>> WHAT THE GUEST ACTUALLY BINDS, so the module reads only those lanes and emits the
+        // >>> fill CONSTANT for the rest - see `VertexAttribute::guest_components`. Recorded for
+        // every attribute the caller named, whatever its format: it is what takes a stream off
+        // the repack, and it is independent of the integer question below.
+        a.guest_components = Some((gcomps as u32).clamp(1, 4));
+        // GXM 0..3 are U8 / S8 / U16 / S16 - the PLAIN integer family, delivered to the shader
+        // as the value itself. 4..7 are the normalised twins and 8/9 are float: those already
+        // have an exact float fetch and must keep it.
+        let signed = match fmt {
+            0 | 2 => false,
+            1 | 3 => true,
+            _ => continue,
+        };
+        // NO LANE TEST. The narrowest integer format is two or four components wide, so a
+        // one- or three-component attribute is FETCHED wider than the guest bound - but the
+        // module does not READ those lanes: `guest_components`, set just above, makes every one
+        // of them a baked constant. The proof the gap needs is already made, once, for both
+        // halves of this.
+        a.int_fetch = Some(signed);
     }
 
     // A PASSTHROUGH fragment program emits the PDS-loaded primary attributes verbatim (see
@@ -402,11 +519,33 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
     // the binding plan never saw it. Merge those units in so the renderer binds them.
     for pf in &iface.prefetches {
         match fplan.samplers.iter_mut().find(|b| b.unit == pf.unit) {
-            Some(b) => b.coords = b.coords.max(pf.binding().coords),
+            Some(b) => {
+                b.coords = b.coords.max(pf.binding().coords);
+                // A prefetch of a CUBE sampler types the texture, whatever the instruction walk
+                // decided from the stream - the two describe the same unit.
+                b.cube |= pf.cube;
+            }
             None => fplan.samplers.push(pf.binding()),
         }
     }
     fplan.samplers.sort_unstable_by_key(|b| b.unit);
+
+    // The units the caller has established hold a 64-bit RAW texture (see
+    // `LinkOptions::raw_units`): their bindings become `texture_2d<u32>` and their prefetches
+    // raw loads. The body was emitted from the instruction stream alone, so a unit the program
+    // samples ITSELF cannot be re-typed here - refuse it by name rather than bind a uint texture
+    // to a `textureSample`.
+    for b in fplan.samplers.iter_mut() {
+        if b.unit < 64 && opts.raw_units & (1u64 << b.unit) != 0 {
+            if frc.shader.instrs.iter().any(|i| matches!(i.op, Op::Tex { unit, .. } | Op::TexGather { unit, .. } if unit == b.unit)) {
+                return Err(LinkError::RawUnitSampledInProgram { unit: b.unit });
+            }
+            if b.coords != 2 || b.cube {
+                return Err(LinkError::RawUnitNotTwoDimensional { unit: b.unit });
+            }
+            b.raw = true;
+        }
+    }
 
     // Container literals the driver preloads into SA registers above the uniform buffer. An SA
     // read that is neither a uniform nor a literal is unmodeled texture state and hard-fails.
@@ -418,6 +557,22 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
             fprog.sa_carried_extent(),
             &fliterals,
         );
+    // In the PRIMARY stream's index space, which is what `emit_body_marked` marks. The
+    // secondary stream fills SA registers and cannot read the output bank, so a split can only
+    // fall in the primary.
+    fplan.dual_split = crate::module::first_dest_reader(&frc.shader);
+    if opts.raw64_output {
+        if fplan.reads_dest_color {
+            return Err(LinkError::Raw64OutputUnsupported {
+                why: "it reads the destination colour, and an integer attachment has none to blend with",
+            });
+        }
+        if frc.shader.instrs.iter().any(|i| i.op == Op::DepthF) {
+            return Err(LinkError::Raw64OutputUnsupported { why: "it writes its own depth" });
+        }
+        fplan.dual_source = false;
+        fplan.raw64_output = true;
+    }
 
     // Interpolated scalar components packed four per `@location` vec4. Both stages declare the
     // same interface, so the counts are equal by construction.
@@ -440,7 +595,10 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
     let fbody = format!(
         "{}{}",
         emit_secondary_body(&fprog).map_err(|e| LinkError::FragmentRecompile(e.into()))?,
-        emit_body(&frc.shader).map_err(|e: EmitError| LinkError::FragmentRecompile(e.into()))?
+        // MARKED: the dual-source module builder cuts this body at a top-level instruction
+        // boundary, and `build_linked_module` strips what it does not use.
+        emit_body_marked(&frc.shader)
+            .map_err(|e: EmitError| LinkError::FragmentRecompile(e.into()))?
     );
 
     let wgsl = build_linked_module(
@@ -496,49 +654,11 @@ fn output_written_lanes(shader: &Shader) -> Vec<bool> {
     written
 }
 
-/// The channels an instruction reads from its sources, mirroring the emitter's read model
-/// ([`crate::wgsl`]): a dot reads a fixed component prefix, a texture sample reads its
-/// coordinate prefix, and every other op reads a source channel only where it writes the
-/// destination channel.
+/// The channels an instruction reads from its sources. The model itself lives on the
+/// instruction ([`crate::ir::Instr::read_channels`]) so the linker, the module extent scan and
+/// the corpus checks cannot drift apart; this is the linker's local name for it.
 pub(crate) fn read_channels(instr: &crate::ir::Instr) -> [bool; 4] {
-    match instr.op {
-        Op::Dot { components } => {
-            let n = (components as usize).clamp(1, 4);
-            [0 < n, 1 < n, 2 < n, 3 < n]
-        }
-        Op::Tex { coords, .. } | Op::TexGather { coords, .. } => {
-            let n = (coords as usize).clamp(1, 4);
-            [0 < n, 1 < n, 2 < n, 3 < n]
-        }
-        // A memory load's only source is a scalar ADDRESS - one lane, whatever its
-        // destination spans. Its write mask is explicitly not meaningful (the written span is
-        // `elements` consecutive registers), so taking the mask as the read count claims the
-        // three registers ABOVE the pointer are read too. That is how a pointer sitting near
-        // the top of the SA bank made a program look like it read past its uniform buffer.
-        Op::MemLoad { .. } => [true, false, false, false],
-        // A PREDICATE-ONLY test (`write_back = false`) has an all-false write mask, and taking
-        // the mask as the read set therefore says it reads NOTHING. It reads two operands and
-        // compares them; what it does not do is write a register.
-        //
-        // That is not a tidy-up. The registers a test reads are exactly the ones this file's two
-        // callers have to know about - the SA literals a stage needs an initialiser for, and the
-        // PA registers a varying has to be routed into - so a test's operands were invisible to
-        // both. MEASURED on a retail title's world material: its shadow-split cascade compares a
-        // uniform against the program's own literal `sa[30] = 100.0`, that literal got no
-        // initialiser, the compare read ZERO instead, and every pixel of the course took the
-        // wrong cascade branch. The pair links, every draw renders, and the course is black.
-        //
-        // The channels are the ones the REDUCTION consults: one for `Channel(n)`, all four for
-        // an AND/OR over the vector.
-        Op::Test { reduce: crate::ir::TestReduce::Channel(n), .. } => {
-            let n = (n as usize).min(3);
-            [n == 0, n == 1, n == 2, n == 3]
-        }
-        // An AND/OR over the vector, and `TestMask`, which produces a per-channel mask: both
-        // consult every channel.
-        Op::Test { .. } | Op::TestMask { .. } => [true; 4],
-        _ => instr.write_mask,
-    }
+    instr.read_channels()
 }
 
 /// The PA-bank REGISTERS a fragment shader reads before writing them, i.e. the registers whose
@@ -597,7 +717,7 @@ pub(crate) fn read_channels(instr: &crate::ir::Instr) -> [bool; 4] {
 /// carries a predicate, if some forward branch jumps over it, or if it sits in a loop body. Only
 /// the writes of the rest may kill. This is CONSERVATIVE in the safe direction - it can only
 /// make the linker route MORE of what a fragment declares, never less.
-fn conditionally_executed(shader: &Shader) -> Vec<bool> {
+pub(crate) fn conditionally_executed(shader: &Shader) -> Vec<bool> {
     let n = shader.instrs.len();
     let mut conditional = vec![false; n];
     for (i, instr) in shader.instrs.iter().enumerate() {
@@ -634,8 +754,8 @@ fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
     let conditional = conditionally_executed(shader);
     for (index, instr) in shader.instrs.iter().enumerate() {
         // Sources and destination can be at DIFFERENT widths (a format convert), so each side
-        // resolves its own registers - see [`crate::ir::Instr::source_half_precision`].
-        let src_half = instr.source_half_precision();
+        // resolves its own registers - `source_register` answers for the sources, and `half`
+        // here is the DESTINATION's width. See [`crate::ir::Instr::source_half_precision`].
         let half = instr.half_precision;
         let read = read_channels(instr);
         for src in &instr.srcs {
@@ -646,19 +766,10 @@ fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
                 if !read[c] {
                     continue;
                 }
-                let sel = src.swizzle[c] as usize;
-                if sel > 3 {
+                let Some((reg, halves)) = instr.source_register(src, c) else {
                     continue; // a swizzle constant reads no register
-                }
-                let (reg, halves) = if instr.source_packed_bytes() {
-                    // All four channels are bytes of ONE register - see
-                    // [`crate::ir::Instr::source_packed_bytes`].
-                    (src.index as usize, 0..2)
-                } else if src_half {
-                    (src.index as usize + (sel >> 1), (sel & 1)..(sel & 1) + 1)
-                } else {
-                    (src.index as usize + sel, 0..2)
                 };
+                let reg = reg as usize;
                 if reg >= BANK_REGS {
                     continue;
                 }
@@ -733,17 +844,72 @@ struct PlannedPrefetch {
     /// vertex stage fed correctly. That is invisible in the WGSL and shows up only as a
     /// surface shading black.
     regs: u32,
-    /// Interface component indices of the sample coordinates, in order.
+    /// Interface component indices of the sample coordinates, in order. EMPTY when
+    /// [`Self::coords_unfed`] - there is no varying to take them from.
     coords: Vec<usize>,
     /// The sampler is a cube map, so the coordinate is a three-component direction.
     cube: bool,
+    /// A PROJECTIVE lookup ([`crate::container::PrefetchLookup::Projective`]): [`Self::coords`]
+    /// holds the texcoord's `x`, `y` and its fourth component `w`, and the sample is taken at
+    /// `xy / w`. The binding stays a flat 2D texture - it is the coordinate that is projective,
+    /// not the texture.
+    projective: bool,
+    /// >>> THE VERTEX PROGRAM PRODUCES NO SUCH TEXCOORD AT ALL, so the coordinate is the
+    /// >>> texture-coordinate DEFAULT and the draw is emitted anyway.
+    ///
+    /// A PDS prefetch names its coordinate by TEXCOORD index alone, and that index need not be
+    /// one of the fragment's own interpolants - a texcoord only the PDS reads costs no PA
+    /// registers. Usually the paired vertex produces it. One pair of a baseball title's 128 does
+    /// not: `vert_843374b8` writes exactly `[Color0, TexCoord(1)]` and its fragment's prefetch
+    /// names TEXCOORD 0.
+    ///
+    /// That is not a decode error - it was checked. Read as an ORDINAL into the vertex's own
+    /// texcoord list, `0` would be `TexCoord(1)` and the pair would link; but over that title's
+    /// 278 real prefetches the ordinal reading resolves 4 that the semantic reading resolves and
+    /// the ordinal cannot, and disagrees with it nowhere
+    /// (`a_prefetch_source_texcoord_read_as_an_ordinal_agrees_wherever_the_semantic_reading_works`).
+    /// The semantic reading is the right one and this pair really does ask the PDS for a
+    /// coordinate its vertex never writes.
+    ///
+    /// On the hardware the interpolator then iterates lanes the vertex never filled, which is
+    /// undefined - the same situation as an SA register that is read and never written, where
+    /// this linker already binds 0.0 and emits the pair rather than dropping the draw. Refusing
+    /// costs the whole draw: on the user's device it was SIX draws a scene, every scene, and a
+    /// draw that renders nothing is indistinguishable from one that was never issued.
+    /// `VITASLOP_GXP_PREFETCH_UNFED=0` restores the refusal.
+    coords_unfed: bool,
 }
 
 impl PlannedPrefetch {
     /// The binding this sample needs, which the shader's own SMP instructions may not mention -
     /// a prefetched unit is often sampled ONLY by the PDS.
+    /// The coordinate ARITY the emitted sample uses. ONE answer, because the module's
+    /// `textureSample` and the BINDING that types its texture have to agree or the module does
+    /// not compile - and they did not.
+    ///
+    /// # The bug this replaced, which only TINT could see
+    /// `binding()` reported `coords.len()`, and for an UNFED prefetch that list is EMPTY - there
+    /// is no varying to take the coordinates from, which is the whole meaning of
+    /// [`Self::coords_unfed`]. So an unfed CUBE prefetch declared `coords: 0`, the binding plan
+    /// typed its texture `texture_2d<f32>`, and the emission (which asks the sampler's shape, not
+    /// the list) wrote `textureSample(t1, s1, vec3<f32>(0.0, 0.0, 0.0))`. That is no overload at
+    /// all: real Chrome answers `no matching call to 'textureSample(texture_2d<f32>, sampler,
+    /// vec3<f32>)'`, the pipeline is refused, and a refused pipeline poisons its pair and drops
+    /// every draw of it [[vitaslop-a-failed-submit-loses-the-whole-frame]]. Found by compiling
+    /// every module a corpus can produce in Chrome itself
+    /// (`corpus.rs::write_every_linked_pair_wgsl` + `vitaslop-web/e2e/tintcheck.mjs`) - 1 of 595 -
+    /// which is the check the naga-based corpus tests cannot make
+    /// [[vitaslop-tint-rejects-what-naga-accepts]].
+    fn coord_arity(&self) -> u8 {
+        if self.coords_unfed || self.projective {
+            if self.cube { 3 } else { 2 }
+        } else {
+            self.coords.len() as u8
+        }
+    }
+
     fn binding(&self) -> TexBinding {
-        TexBinding { unit: self.unit, coords: self.coords.len() as u8, cube: self.cube }
+        TexBinding { unit: self.unit, coords: self.coord_arity(), cube: self.cube, raw: false }
     }
 }
 
@@ -833,6 +999,32 @@ fn report_varying_read_as_prefix(usage: VaryingUsage, vertex_components: u32, ca
     );
 }
 
+/// Say, once per (unit, texcoord), that a PDS prefetch names a texcoord the paired vertex
+/// program does not produce, so its coordinate is the texture-coordinate default.
+///
+/// A WARNING and not a status note: the sample lands at (0,0) for every pixel of the draw, which
+/// is a flat texel where the title meant a lookup. It is still the right trade - the alternative
+/// is the whole draw, and this at least paints geometry that can be seen and recognised - but it
+/// is a fix we owe [[vitaslop-a-warning-means-we-owe-a-fix]].
+fn report_prefetch_coord_unfed(unit: u8, texcoord: u8) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u8, u8)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((unit, texcoord)) {
+        return;
+    }
+    eprintln!(
+        "gxp link: unit {unit}'s PDS prefetch names TEXCOORD {texcoord}, which the paired VERTEX          program does not produce - the hardware would interpolate lanes the vertex never wrote,          so the coordinate is the texcoord DEFAULT (0,0) and the pair is emitted rather than the          draw dropped. The sample is one flat texel for the whole draw."
+    );
+}
+
+/// `VITASLOP_GXP_PREFETCH_UNFED=0` - refuse the pair again instead, which drops the draw. See
+/// [`PlannedPrefetch::coords_unfed`].
+fn prefetch_unfed_default() -> bool {
+    std::env::var("VITASLOP_GXP_PREFETCH_UNFED").as_deref() != Ok("0")
+}
+
 /// Whether this fragment program is a PASSTHROUGH: its stream neither reads a primary-attribute
 /// register nor writes a colour register, so it computes nothing and its result is whatever the
 /// PDS loaded before it ran. In the corpus that is literally a single `Nop`.
@@ -907,6 +1099,7 @@ fn resolve_ambiguous_order(
     vprog: &Program,
     fprog: &Program,
     fshader: &Shader,
+    colour_masked_off: bool,
 ) -> Result<Vec<OutputVarying>, LinkError> {
     let vout = &vprog.output_varyings;
     if vout.len() > MAX_PERMUTED_VARYINGS {
@@ -915,7 +1108,7 @@ fn resolve_ambiguous_order(
     let mut survivors: Vec<Vec<OutputVarying>> = Vec::new();
     for perm in permutations(vout.len()) {
         let candidate = permute_varyings(vout, &perm);
-        if plan_interface_with(fprog, fshader, &candidate).is_ok() {
+        if plan_interface_with(fprog, fshader, &candidate, colour_masked_off).is_ok() {
             survivors.push(candidate);
         }
     }
@@ -1668,6 +1861,13 @@ fn dead_lane_detail(iface: &Interface, written: &[bool]) -> Vec<(u32, String)> {
         .collect()
 }
 
+/// Whether a projective prefetch divides by its `w` - see `container::PrefetchLookup::Projective`.
+/// `VITASLOP_GXP_PREFETCH_PROJECTIVE=0` is the arm back to the plain lookup it used to get.
+fn projective_prefetch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VITASLOP_GXP_PREFETCH_PROJECTIVE").as_deref() != Ok("0"))
+}
+
 /// >>> A PREFETCH COORDINATE THAT LANDS ON LANES THE VERTEX NEVER WRITES IS RE-POINTED TO THE
 /// >>> LANES A FORWARDING CLAIM NAMES FOR ITS USAGE.
 ///
@@ -1734,7 +1934,9 @@ fn repoint_dead_prefetch_coords(
         else {
             continue;
         };
-        let n = pf.coords.len() as u32;
+        // The WIDTH the coordinate spans, which for a projective lookup is four lanes (its `w`
+        // is the fourth) even though it routes three.
+        let n = if pf.projective { 4 } else { pf.coords.len() as u32 };
         let Some((_, lanes)) = claims
             .iter()
             .find(|(u, lanes)| *u == usage && lanes.len() as u32 >= n && lanes.iter().all(|&l| live(l)))
@@ -1748,9 +1950,11 @@ fn repoint_dead_prefetch_coords(
         if (0..n).any(|c| !lanes.contains(&(base + c))) {
             continue;
         }
-        for (c, &i) in pf.coords.iter().enumerate() {
-            if let Some(comp) = iface.components.get_mut(i) {
-                comp.vertex_lane = base + c as u32;
+        for &i in pf.coords.iter() {
+            if let Some(comp) = iface.components.get_mut(i)
+                && let ComponentDest::SampleCoord { coord, .. } = comp.dest
+            {
+                comp.vertex_lane = base + coord;
             }
         }
         moved.push(format!("unit {} coord <- {usage:?}@{base}", pf.unit));
@@ -1764,10 +1968,15 @@ fn repoint_dead_prefetch_coords(
 /// The precedence in [`layout_by_precedence`] is unchanged and still decides first. This only
 /// acts when that choice reads a DEAD lane and another candidate does not - a case where the
 /// first choice is known wrong, so replacing it cannot cost a pair that is right today.
-fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<Interface, LinkError> {
+fn plan_interface(
+    vprog: &Program,
+    fprog: &Program,
+    fshader: &Shader,
+    colour_masked_off: bool,
+) -> Result<Interface, LinkError> {
     let vshader = crate::usse::decode_shader(vprog);
-    let chosen = layout_by_precedence(vprog, fprog, fshader, &vshader)?;
-    let mut iface = plan_interface_with(fprog, fshader, &chosen)?;
+    let chosen = layout_by_precedence(vprog, fprog, fshader, &vshader, colour_masked_off)?;
+    let mut iface = plan_interface_with(fprog, fshader, &chosen, colour_masked_off)?;
     if hand_typed_layout(vprog).is_some() {
         return Ok(iface); // an explicitly typed layout is the answer, not a candidate
     }
@@ -1811,7 +2020,7 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
         if *order == chosen {
             continue;
         }
-        let Ok(alt) = plan_interface_with(fprog, fshader, order) else { continue };
+        let Ok(alt) = plan_interface_with(fprog, fshader, order, colour_masked_off) else { continue };
         let n = unwritten_lane_reads(&alt, &written);
         if n < dead && best.as_ref().is_none_or(|(b, _, _)| n < *b) {
             best = Some((n, why, alt));
@@ -1881,6 +2090,7 @@ fn layout_by_precedence(
     fprog: &Program,
     fshader: &Shader,
     vshader: &Shader,
+    colour_masked_off: bool,
 ) -> Result<Vec<OutputVarying>, LinkError> {
     if let Some(order) = hand_typed_layout(vprog) {
         return Ok(order);
@@ -2035,7 +2245,7 @@ fn layout_by_precedence(
     if convention_agrees_with_the_code(&vprog.output_varyings, vshader) {
         return Ok(vprog.output_varyings.clone());
     }
-    resolve_ambiguous_order(vprog, fprog, fshader)
+    resolve_ambiguous_order(vprog, fprog, fshader, colour_masked_off)
 }
 
 /// [`plan_interface`] against an EXPLICIT vertex lane layout, so the permutation search can
@@ -2044,6 +2254,11 @@ fn plan_interface_with(
     fprog: &Program,
     fshader: &Shader,
     vout: &[OutputVarying],
+    // See [`LinkOptions::colour_output_masked_off`]. It reaches only the passthrough
+    // treatment below, and it has to be threaded through the permutation search as well: a
+    // candidate order must be judged under the same rule the winner will be linked under, or
+    // the search answers a different question than the link does.
+    colour_masked_off: bool,
 ) -> Result<Interface, LinkError> {
     let (mut inputs, untouched) = pa_read_before_write(fshader);
     let primary_regs = fprog.primary_reg_count as u32;
@@ -2063,7 +2278,33 @@ fn plan_interface_with(
     //
     // So treat the whole primary-attribute allocation as read. Anything the interpolants then
     // fail to cover is a hard error below, not a silent zero.
-    let passthrough = is_passthrough(fshader, &inputs);
+    // >>> A PROGRAM THAT DECLARES NO INTERPOLANTS AT ALL IS NOT A PASSTHROUGH, AND THAT IS A
+    // >>> STATEMENT THE SHADER MAKES BY ITSELF.
+    //
+    // The passthrough reading rests on the PDS having LOADED something into the primary
+    // attribute registers before the program ran - "its result is whatever the PDS left". What
+    // the PDS loads is precisely this program's DECLARED INTERPOLANTS. A program that declares
+    // none has nothing loaded, so those registers are undefined ON THE HARDWARE TOO, and
+    // demanding that every one of them be fed asks for a value that does not exist.
+    //
+    // MEASURED: a football title's `frag_90c054e0` is `Nop`, a `Test` on two constants, a
+    // predicated `Kill`, `Nop`, `Nop` - an interpolant count of 0 that is TRUE, and no write to
+    // any colour register. It was refused as "reads PA register 0 before writing it" and its
+    // draws were DROPPED (168 fallback draws in one browser run of the kickoff recipe). A real
+    // passthrough is the opposite shape: a racing title's flat vertex-coloured polygon is a
+    // single `Nop` that DECLARES a Color0, and that declaration is exactly what makes its
+    // register file meaningful. So the two are distinguishable after all.
+    //
+    // >>> A FAILED DECODE IS NOT AN EMPTY DECLARATION. An interpolant list that is empty
+    // because the varyings block did not PARSE must keep the old, conservative treatment -
+    // otherwise a decode gap would quietly start emitting zero-initialised colour, which is the
+    // silent-approximation failure this whole path exists to avoid. `varyings_error` separates
+    // the two, and it is the same field `PaReadUnfed` carries for the same reason.
+    let declares_no_interpolants = fprog.interpolants.is_empty() && fprog.varyings_error.is_none();
+    // ...and a draw whose colour is MASKED OFF is not a passthrough either, whatever the
+    // shader looks like - see [`LinkOptions::colour_output_masked_off`]. That one cannot be
+    // read from the shader: it is the guest's own per-draw blend state.
+    let passthrough = is_passthrough(fshader, &inputs) && !colour_masked_off && !declares_no_interpolants;
     if passthrough {
         inputs.resize(inputs.len().max(primary_regs as usize), false);
         inputs[..primary_regs as usize].fill(true);
@@ -2218,10 +2459,30 @@ fn plan_interface_with(
         // non-dependent and lets the PDS issue it ahead of the shader. It is often NOT one of
         // this program's own interpolants: a texcoord only the PDS reads costs no PA registers.
         let usage = VaryingUsage::TexCoord(pf.source_texcoord);
-        let source = vertex_output(usage)?;
         let cube = sampler.sampler_cube;
+        // >>> A PROJECTIVE PREFETCH READS THE TEXCOORD'S `w` TOO - see
+        // `container::PrefetchLookup::Projective`. Never on a cube sampler: every projective
+        // descriptor in every corpus names a flat one, and a projective cube is a shape nothing
+        // here has seen.
+        // `VITASLOP_GXP_PREFETCH_PROJECTIVE=0` is the arm back (the plain lookup).
+        let projective = !cube
+            && pf.lookup == crate::container::PrefetchLookup::Projective
+            && projective_prefetch_enabled();
         let coords = if cube { 3 } else { 2 };
-        if source.components < coords {
+        // >>> A COORDINATE THE VERTEX NEVER PRODUCES IS THE DEFAULT, NOT A REFUSAL. See
+        // `PlannedPrefetch::coords_unfed` for the corpus closure behind that.
+        let source = match vertex_output(usage) {
+            Ok(v) => Some(v),
+            Err(e) if prefetch_unfed_default() => {
+                report_prefetch_coord_unfed(pf.unit, pf.source_texcoord);
+                let _ = e;
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(source) = source
+            && source.components < coords
+        {
             return Err(LinkError::PrefetchCoordTooNarrow {
                 unit: pf.unit,
                 needed: coords,
@@ -2230,18 +2491,36 @@ fn plan_interface_with(
         }
         let prefetch = iface.prefetches.len();
         let first = iface.components.len();
-        for c in 0..coords {
-            iface.components.push(VaryingComponent {
-                vertex_lane: source.base_lane + c,
-                dest: ComponentDest::SampleCoord { prefetch, coord: c },
-            });
+        // The divisor is the texcoord's FOURTH component. A vertex that writes fewer leaves the
+        // iterator's texture-coordinate default there, `w = 1` (see `Interface::defaults`), and
+        // dividing by one is the plain lookup - so only a four-component source routes a lane.
+        let divisor = projective && source.is_some_and(|v| v.components >= 4);
+        if let Some(source) = source {
+            for c in 0..coords {
+                iface.components.push(VaryingComponent {
+                    vertex_lane: source.base_lane + c,
+                    dest: ComponentDest::SampleCoord { prefetch, coord: c },
+                });
+            }
+            if divisor {
+                iface.components.push(VaryingComponent {
+                    vertex_lane: source.base_lane + 3,
+                    dest: ComponentDest::SampleCoord { prefetch, coord: 3 },
+                });
+            }
         }
+        let routed = coords as usize + usize::from(divisor);
         iface.prefetches.push(PlannedPrefetch {
             unit: pf.unit,
             pa_base,
             regs: prefetch_regs,
-            coords: (first..first + coords as usize).collect(),
+            coords: match source {
+                Some(_) => (first..first + routed).collect(),
+                None => Vec::new(),
+            },
             cube,
+            projective: divisor,
+            coords_unfed: source.is_none(),
         });
         for r in pa_base..pa_base + prefetch_regs {
             fed[r as usize] = true;
@@ -2322,7 +2601,7 @@ fn report_unclaimed_scratch(reg: u32, declared_top: u32) {
     let seen = SEEN.get_or_init(Default::default);
     if seen.lock().unwrap_or_else(|e| e.into_inner()).insert((reg, declared_top)) {
         eprintln!(
-            "gxp link: sa[{reg}] is read but never written and lies ABOVE this program's whole              declared layout (which ends at sa[{declared_top}]) - no container, literal or              texture word places anything there, so on hardware it holds whatever the previous              draw left and the guest cannot depend on it. Binding it as 0.0 and emitting the              pair rather than dropping the draw."
+            "gxp link: sa[{reg}] is read but never written and lies ABOVE this program's whole declared layout (which ends at sa[{declared_top}]) - no container, literal or texture word places anything there, so on hardware it holds whatever the previous draw left and the guest cannot depend on it. Binding it as 0.0 and emitting the pair rather than dropping the draw."
         );
     }
 }
@@ -2364,7 +2643,6 @@ pub(crate) fn secondary_attr_init(
 
     // The SA registers one instruction READS, addressed exactly as the emitter addresses them.
     let sa_sources = |instr: &Instr| -> Vec<u32> {
-        let half = instr.source_half_precision();
         let read = read_channels(instr);
         let mut out = Vec::new();
         for (i, src) in instr.srcs.iter().enumerate() {
@@ -2384,20 +2662,10 @@ pub(crate) fn secondary_attr_init(
                 if !read[c] {
                     continue;
                 }
-                let sel = src.swizzle[c];
-                if sel > 3 {
+                let Some((reg, _)) = instr.source_register(src, c) else {
                     continue;
-                }
-                // A packed-byte source is one register for all four channels - see
-                // [`crate::ir::Instr::source_packed_bytes`].
-                let step = if instr.source_packed_bytes() {
-                    0
-                } else if half {
-                    (sel >> 1) as u32
-                } else {
-                    sel as u32
                 };
-                out.push(src.index as u32 + step);
+                out.push(reg);
             }
         }
         out
@@ -2500,11 +2768,11 @@ pub(crate) fn secondary_attr_init(
         //
         // Emitting a literal for a register the secondary DOES fully overwrite costs one dead
         // store, which is the right price for never suppressing a live one.
-        if let Some(&(r, v)) = program.literals.iter().find(|(r, _)| *r == reg) {
-            if sa_literal_always() || !written.contains(&reg) || needed_strict.contains(&reg) {
-                literals.push((r, v));
-                continue;
-            }
+        if let Some(&(r, v)) = program.literals.iter().find(|(r, _)| *r == reg)
+            && (sa_literal_always() || !written.contains(&reg) || needed_strict.contains(&reg))
+        {
+            literals.push((r, v));
+            continue;
         }
         let computed = written.contains(&reg) && !needed_strict.contains(&reg);
         if computed {
@@ -2572,7 +2840,7 @@ pub(crate) fn secondary_attr_init(
                 literals.push((reg, 0));
             } else if let Some((text, bits)) = unclaimed_arm_value() {
                 eprintln!(
-                    "gxp link: sa[{reg}] has no declared home and                      VITASLOP_GXP_SA_UNCLAIMED={text} is BINDING IT AS that constant - this is a                      diagnostic arm, not a reading of the slot, and any picture it produces is                      unverified"
+                    "gxp link: sa[{reg}] has no declared home and VITASLOP_GXP_SA_UNCLAIMED={text} is BINDING IT AS that constant - this is a diagnostic arm, not a reading of the slot, and any picture it produces is unverified"
                 );
                 literals.push((reg, bits));
             } else {
@@ -2583,7 +2851,7 @@ pub(crate) fn secondary_attr_init(
                 let lits: Vec<String> =
                     program.literals.iter().map(|(r, _)| format!("sa[{r}]")).collect();
                 let provenance = format!(
-                    "it is {} by the secondary program, and the read is {};                      SA-carried extent sa[0..{uniform_regs}),                      container literals at [{}], memory windows [{}]",
+                    "it is {} by the secondary program, and the read is {}; SA-carried extent sa[0..{uniform_regs}), container literals at [{}], memory windows [{}]",
                     if written.contains(&reg) { "WRITTEN" } else { "never written" },
                     if needed_strict.contains(&reg) {
                         "IN THE SECONDARY itself, ahead of any write that covers it"
@@ -2811,7 +3079,11 @@ fn build_linked_module(
     if has_inputs {
         let _ = writeln!(m, "\nstruct VsIn {{");
         for a in &vplan.attributes {
-            let _ = writeln!(m, "  @location({}) a{}: vec4<f32>,", a.location, a.location);
+            // The TYPE follows the fetch: an integer-fetched attribute is `vec4<u32>` or
+            // `vec4<i32>`, because WebGPU requires a vertex input's base type to match the
+            // format bound to it. See `VertexAttribute::int_fetch`.
+            let ty = crate::module::attribute_wgsl_type(a);
+            let _ = writeln!(m, "  @location({}) a{}: {ty},", a.location, a.location);
         }
         let _ = writeln!(m, "}};");
     }
@@ -2825,11 +3097,19 @@ fn build_linked_module(
     let _ = writeln!(m, "}};");
 
     // ---- Vertex entry point ----
+    // The position probe draws its OWN triangle (see [`POSPROBE_ARM`]) and needs the vertex
+    // index to place the three corners; nothing else in this module reads it.
+    // OFF unless asked for: `arm_on` DEFAULTS TO TRUE (it is for default-on arms), so gating
+    // this on it armed the probe in every ordinary render - which replaces the clip position of
+    // every vertex in the frame. A diagnostic that is on by default is not a diagnostic.
+    let posprobe = posprobe_on();
+    let vid = if posprobe { ", @builtin(vertex_index) gxp_vid: u32" } else { "" };
+    let sig = vid.trim_start_matches(", ");
     if has_inputs {
         m.push_str(&crate::module::probe_globals());
-        let _ = writeln!(m, "\n@vertex\nfn vs_main(in: VsIn) -> VsOut {{");
+        let _ = writeln!(m, "\n@vertex\nfn vs_main(in: VsIn{vid}) -> VsOut {{");
     } else {
-        let _ = writeln!(m, "\n@vertex\nfn vs_main() -> VsOut {{");
+        let _ = writeln!(m, "\n@vertex\nfn vs_main({sig}) -> VsOut {{");
     }
     emit_register_banks(&mut m);
     // Load PA registers from the vertex attributes (vertex inputs are plain f32 components).
@@ -2860,6 +3140,25 @@ fn build_linked_module(
         };
         let _ = writeln!(m, "  out.v{j} = vec4<f32>({}, {}, {}, {});", c(0), c(1), c(2), c(3));
     }
+    // See [`POSPROBE_ARM`]. After the varyings, because it OVERWRITES `v0`; skipped when the
+    // pair declares no varying to carry the answer.
+    if varying_locations > 0 && posprobe {
+        let _ = writeln!(m, "  {{");
+        let _ = writeln!(m, "    let gxp_pp = out.position;");
+        let _ = writeln!(m, "    let gxp_pw = max(abs(gxp_pp.w), 1e-9);");
+        // The divisor is baked as a LITERAL rather than read through a uniform: the emitted
+        // body is hashed and cached, so a probe run and an ordinary run must not be able to
+        // produce the same module with different behaviour.
+        let _ = writeln!(m, "    let gxp_nd = (gxp_pp.xy / gxp_pw) / {:?};", posprobe_divisor());
+        // A COLLAPSED MESH CANNOT DRAW ITSELF: clamping a degenerate triangle leaves it
+        // degenerate and a NaN survives every clamp. So the probe rasterises a triangle of
+        // its OWN - one full-screen triangle per primitive - and carries the answer in `v0`.
+        let _ = writeln!(m, "    let gxp_c = gxp_vid % 3u;");
+        let _ = writeln!(m, "    out.position = vec4<f32>(select(-1.0, 3.0, gxp_c == 1u), select(-1.0, 3.0, gxp_c == 2u), 0.5, 1.0);");
+        let _ = writeln!(m, "    let gxp_ok = gxp_pp.x == gxp_pp.x && gxp_pp.y == gxp_pp.y && gxp_pp.w == gxp_pp.w;");
+        let _ = writeln!(m, "    out.v0 = vec4<f32>(select(0.0, clamp(gxp_nd.x * 0.5 + 0.5, 0.0, 1.0), gxp_ok), select(0.0, clamp(gxp_nd.y * 0.5 + 0.5, 0.0, 1.0), gxp_ok), select(0.0, 1.0, gxp_pp.w > 0.0), select(0.0, 1.0, gxp_ok));");
+        let _ = writeln!(m, "  }}");
+    }
     let _ = writeln!(m, "  return out;\n}}");
 
     // ---- Fragment input struct (the same interface the vertex declares) ----
@@ -2888,11 +3187,34 @@ fn build_linked_module(
             "\nstruct FsOut {{\n  @location(0) color: vec4<f32>,\n  @builtin(frag_depth) depth: f32,\n}};"
         );
     }
-    let ret_ty = if writes_depth { "FsOut" } else { "@location(0) vec4<f32>" };
-    if fplan.dual_source {
+    // A RAW 64-bit attachment takes the colour register pair's words; the link refused the
+    // depth-writing and destination-reading shapes, so this is the plain entry only.
+    let ret_ty = match (writes_depth, fplan.raw64_output) {
+        (true, _) => "FsOut",
+        (false, true) => "@location(0) vec2<u32>",
+        (false, false) => "@location(0) vec4<f32>",
+    };
+    // >>> A DUAL-SOURCE BODY IS CUT WHERE IT STARTS DEPENDING ON THE DESTINATION.
+    //
+    // The lowering needs the body at two destinations (`module::dual_source_plan` has the
+    // algebra), and the straightforward way to get that is a function called twice. But the
+    // PREFIX - everything before the first instruction that reads the output bank - reads
+    // varyings, uniforms and textures and nothing that differs between the two calls, so
+    // running it twice is pure waste. On mlb's world-family blend, which paints 78% of the
+    // world pass's fragments, that prefix is most of the body.
+    //
+    // So when the body can be cut, `fs_main` IS the body: the prefix once, then the suffix
+    // twice over a saved copy of the register file. [`split_dual_body`] decides.
+    let dual_split = fplan.dual_source.then(|| split_dual_body(fbody, fplan.dual_split)).flatten();
+    if fplan.dual_source && dual_split.is_none() {
         // The body becomes a FUNCTION OF THE DESTINATION and the entry point below calls it
         // twice - see `module::dual_source_eligible` for the algebra.
         let _ = writeln!(m, "\nfn gxp_body(in: FsIn, gxp_dstc_in: vec4<f32>) -> vec4<f32> {{");
+    } else if fplan.dual_source {
+        // The unsplit form gets this struct from `DUAL_SOURCE_ENTRY`; the split form IS the
+        // entry point, so it declares it.
+        m.push_str(GXP_DUAL_STRUCT);
+        let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> GxpDual {{");
     } else {
         let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> {ret_ty} {{");
     }
@@ -2901,7 +3223,10 @@ fn build_linked_module(
     // A program that blends for ITSELF starts with the destination colour in the output bank,
     // because that is what the hardware seeds those registers with - see
     // `BindingPlan::reads_dest_color`. Before the body, and before anything else writes `o`.
-    if fplan.reads_dest_color {
+    // A SPLIT body seeds the output bank inside each arm instead, at the cut - see
+    // `split_dual_body`. Seeding here would put the destination in `o` before a prefix that
+    // may write `o` itself, and then the second arm's reseed would erase that write.
+    if fplan.reads_dest_color && dual_split.is_none() {
         m.push_str(&crate::module::dest_color_init(fplan.color_precision, fplan.dual_source));
     }
     if writes_depth {
@@ -2947,7 +3272,7 @@ fn build_linked_module(
                 };
                 let _ = writeln!(
                     m,
-                    "  pa[{register}] = pack2x16float(vec2<f32>({}, {}));",
+                    "  pa[{register}] = {HALF_PK_FN}({}, {});",
                     half_at(0),
                     half_at(1)
                 );
@@ -2960,7 +3285,7 @@ fn build_linked_module(
         if half {
             let _ = writeln!(
                 m,
-                "  pa[{register}] = pack2x16float(vec2<f32>({:?}, {:?}));",
+                "  pa[{register}] = {HALF_PK_FN}({:?}, {:?});",
                 halves[0], halves[1]
             );
         } else {
@@ -2975,13 +3300,38 @@ fn build_linked_module(
     // naming by unit emits two `let pf1` in one scope, which is a WGSL redefinition error that
     // fails the whole module - taking a pair that recompiled correctly straight to a hard stop.
     for (i, pf) in iface.prefetches.iter().enumerate() {
-        let coord = pf
-            .coords
-            .iter()
-            .map(|&i| at(i))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let n = pf.coords.len();
+        // The texture-coordinate DEFAULT when the vertex produces no such texcoord - see
+        // `PlannedPrefetch::coords_unfed`. Same constant the surplus-register fill uses, and
+        // the same one a GXM texcoord defaults to: zero.
+        let n = pf.coord_arity();
+        let coord = if pf.coords_unfed {
+            vec!["0.0"; usize::from(n)].join(", ")
+        } else if pf.projective {
+            // `xy / w` - see `PlannedPrefetch::projective`. Emitted as the whole vector so the
+            // `vec2` the sample below wraps it in divides both lanes by the one `w`.
+            let c: Vec<String> = pf.coords.iter().map(|&i| at(i)).collect();
+            format!("vec2<f32>({}, {}) / {}", c[0], c[1], c[2])
+        } else {
+            pf.coords.iter().map(|&i| at(i)).collect::<Vec<_>>().join(", ")
+        };
+        if fplan.samplers.iter().any(|b| b.unit == pf.unit && b.raw) {
+            // A RAW 64-bit texel: the two stored words, unconverted, into the first two of the
+            // prefetch's registers. `textureLoad` at the nearest texel of level 0 - an integer
+            // texture cannot be filtered, and the hardware hands raw data over unfiltered too.
+            // The coordinate wraps (REPEAT), which is what a prefetch off a plain texcoord
+            // does; the registers past the pair are what the allocation held, which nothing
+            // established reads before writing (the one program in the corpus overwrites them).
+            let _ = writeln!(
+                m,
+                "  let pf{i} = textureLoad(t{0}, vec2<i32>(clamp(vec2<f32>(fract(vec2<f32>({coord}))) * vec2<f32>(textureDimensions(t{0})), vec2<f32>(0.0), vec2<f32>(textureDimensions(t{0})) - vec2<f32>(1.0))), 0);",
+                pf.unit
+            );
+            let _ = writeln!(m, "  pa[{}] = pf{i}.x;", pf.pa_base);
+            if pf.regs > 1 {
+                let _ = writeln!(m, "  pa[{}] = pf{i}.y;", pf.pa_base + 1);
+            }
+            continue;
+        }
         let _ = writeln!(
             m,
             "  let pf{i} = textureSample(t{0}, s{0}, vec{n}<f32>({coord}));",
@@ -3003,8 +3353,8 @@ fn build_linked_module(
             }
         } else if pf.regs > 1 {
             // Two registers: four F16 components, packed two per register.
-            let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{i}.xy);", pf.pa_base);
-            let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{i}.zw);", pf.pa_base + 1);
+            let _ = writeln!(m, "  pa[{}] = {HALF_PK_FN}(pf{i}.x, pf{i}.y);", pf.pa_base);
+            let _ = writeln!(m, "  pa[{}] = {HALF_PK_FN}(pf{i}.z, pf{i}.w);", pf.pa_base + 1);
         } else {
             // One register: a single FULL-PRECISION component, not a packed pair.
             //
@@ -3025,13 +3375,41 @@ fn build_linked_module(
     for (i, w) in fplan.mem_windows.iter().enumerate() {
         let _ = writeln!(m, "  sa[{}] = gxp_fmem[{i}u].x;", w.base_sa);
     }
-    m.push_str(fbody);
+    // >>> AND WHEN THE POSITION PROBE IS ARMED, THE FRAGMENT BODY DOES NOT RUN AT ALL.
+    //
+    // The probe exists to answer "where did this draw send its vertices" for a draw that
+    // rasterises NOTHING, and the guest fragment can throw the answer away before it is seen:
+    // an alpha test is a `discard`, and a discarded fragment leaves no pixel and is counted by
+    // no occlusion query. `VITASLOP_GXP_SOLID` cannot help - it rewrites the final `return`
+    // and everything above it, the `discard` included, still executes - which is why a crowd
+    // pair came back empty under it and read as dead geometry when the question was open.
+    //
+    // Skipping the body makes the two outcomes distinguishable: geometry that exists now
+    // paints (its own clip position as colour, per `POSPROBE_ARM`), and geometry that is
+    // degenerate still paints nothing.
+    if posprobe_on() && varying_locations > 0 {
+        let _ = writeln!(m, "  return vec4<f32>(in.v0.x, in.v0.y, in.v0.z, 1.0);");
+        let _ = writeln!(m, "}}");
+        return size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))));
+    }
+    m.push_str(dual_split.as_ref().map_or(fbody, |(head, _)| head.as_str()));
     let (ret, base) = match fplan.color {
         ColorOutput::NativeO0 => ("o", 0),
         ColorOutput::NonNativePa(base) => ("pa", base),
     };
     let color =
         crate::module::color_return_expr(ret, base, fplan.color_precision, varying_locations);
+    if let Some((_, tail)) = dual_split.as_ref() {
+        emit_dual_split_tail(&mut m, tail, &color, fplan.color_precision);
+        return size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))));
+    }
+    if fplan.raw64_output {
+        // The register pair's bits, as the hardware stores them into a 64-bit surface. Whatever
+        // precision the program wrote them at - packed halves, packed bytes, a float - the
+        // surface holds the words, and a later raw sample reads them back unchanged.
+        let _ = writeln!(m, "  return vec2<u32>({ret}[{base}], {ret}[{}]);\n}}", base + 1);
+        return size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))));
+    }
     if let Some(spec) = depth_probe() {
         // `=<min>:<scale>` spreads the window `[min, min + 1/scale]` over the whole grey ramp.
         // A projection crams its whole scene into the far end of the depth buffer - one title's
@@ -3053,7 +3431,7 @@ fn build_linked_module(
         if fplan.dual_source {
             m.push_str(DUAL_SOURCE_ENTRY);
         }
-        return size_register_banks(&resolve_sa_init(&m));
+        return size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))));
     }
     let color = match dest_probe() {
         // `opaque` forces alpha to 1: a draw whose pipeline blend is `SrcAlpha` and whose
@@ -3081,7 +3459,7 @@ fn build_linked_module(
 
     // Last, and in this order: `resolve_sa_init` is what decides whether the SA bank is
     // subscripted dynamically at all, and `size_register_banks` sizes what comes out of it.
-    size_register_banks(&resolve_sa_init(&m))
+    size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))))
 }
 
 /// Emit a stage's SA-bank initialisation: the default uniform buffer copied verbatim into
@@ -3143,6 +3521,96 @@ const SA_INIT_MARKER: &str = "//@@GXP_SA_INIT:";
 /// The entry point of a DUAL-SOURCE module: `G` is the body at destination zero, `F` the body
 /// at destination one minus `G`, and the pipeline blend `src0 + dst * src1` reassembles
 /// `G + dst * F`. See `module::dual_source_eligible`.
+/// Cut a dual-source fragment body into (prefix, suffix) at the first instruction that reads
+/// the destination, or `None` when it cannot be cut and the body must be evaluated twice whole.
+///
+/// It refuses in four cases, each of which would make the shape below say something other than
+/// what the body says:
+///
+/// * NO SPLIT INDEX, or a split at instruction 0 - there is no prefix to save.
+/// * NO MARKER for that instruction: [`emit_body_marked`] marks only TOP-LEVEL boundaries, so a
+///   blend that begins inside an `if` or a loop has none, and cutting anywhere else would put a
+///   brace on one side of the cut and its match on the other.
+/// * THE PREFIX TOUCHES THE OUTPUT BANK. It cannot READ it (that is what the split index
+///   means), so any `o[` there is a WRITE, and the suffix's reseed would erase it. Rare enough
+///   to refuse rather than model.
+/// * A DIAGNOSTIC PROBE is armed (`VITASLOP_GXP_DEPTH_PROBE` / `VITASLOP_GXP_DEST_PROBE`): those
+///   replace the returned colour, and a probe must not also change the shape of the module it
+///   is probing [[vitaslop-instrument-failure-imitating-its-subject]].
+fn split_dual_body(fbody: &str, split: Option<usize>) -> Option<(String, String)> {
+    if depth_probe().is_some() || dest_probe().is_some() {
+        return None;
+    }
+    let at = fbody.find(&split_marker(split.filter(|&i| i > 0)?))?;
+    let (head, tail) = fbody.split_at(at);
+    if head.contains("o[") {
+        return None;
+    }
+    Some((head.to_string(), tail.to_string()))
+}
+
+/// The two evaluations of a split dual-source body's SUFFIX, and the `GxpDual` return.
+///
+/// The register file is function-scope `var` arrays, so "run the suffix again from the state
+/// the prefix left" is a save of every bank the suffix touches and a restore between the two
+/// runs. Only those banks: a bank the suffix never subscripts is one the module may not even
+/// declare, and naming it here would be a reference to nothing.
+///
+/// Each run is WRAPPED IN A BLOCK. The suffix carries `let` bindings of its own - a gather's
+/// texels, a hoisted unpack, a staged store's temporary - and two copies of the same text in
+/// one scope is a WGSL redefinition, which is a module the device refuses outright rather than
+/// a shader that renders wrong.
+fn emit_dual_split_tail(m: &mut String, tail: &str, color: &str, precision: ColorPrecision) {
+    // >>> RE-RUNNING ONLY THE DESTINATION-DEPENDENT STATEMENTS WAS TRIED 2026-09-12g AND IS A
+    // >>> NULL ON THE PAIR IT WAS AIMED AT. The suffix is cut at the first instruction that
+    // READS the destination, so "after the cut" is a POSITION and not a dependence, and on mlb's
+    // world-family blend only three of its 82 statements touch the destination. But a second
+    // evaluation that skips the other 79 is only correct if none of them overwrites a register a
+    // dependent statement wrote - and this program reuses `r[]` heavily, so every one of them
+    // does. Pulling those back in leaves nothing skipped. Shrinking this needs RENAMING (the
+    // re-run writing its own copies), not a dependence walk.
+    //
+    // `p` and `idx` are declared unconditionally by `emit_register_banks`; the five register
+    // banks are declared only if subscripted, which is exactly the test below.
+    let banks: Vec<&str> = ["r", "o", "i", "pa", "sa", "p", "idx"]
+        .into_iter()
+        .filter(|b| tail.contains(&format!("{b}[")))
+        .collect();
+    let _ = writeln!(m, "  var gxp_g: vec4<f32>;");
+    let _ = writeln!(m, "  var gxp_f: vec4<f32>;");
+    for b in &banks {
+        let _ = writeln!(m, "  let gxp_save_{b} = {b};");
+    }
+    for (pass, dst) in [("gxp_g", 0.0f32), ("gxp_f", 1.0f32)].iter().enumerate() {
+        let (name, d) = *dst;
+        if pass == 1 {
+            for b in &banks {
+                let _ = writeln!(m, "  {b} = gxp_save_{b};");
+            }
+        }
+        let _ = writeln!(m, "  {{");
+        let _ = writeln!(m, "  let gxp_dstc = vec4<f32>({d:?}, {d:?}, {d:?}, {d:?});");
+        m.push_str(&crate::module::dest_seed(precision));
+        m.push_str(tail);
+        let _ = writeln!(m, "  {name} = {color};");
+        let _ = writeln!(m, "  }}");
+    }
+    // `G` is the body at destination zero and `F` the CHANGE the destination makes, which is
+    // what the pipeline's `src0 * 1 + dst * src1` multiplies the destination by.
+    let _ = writeln!(m, "  return GxpDual(gxp_g, gxp_f - gxp_g);
+}}");
+}
+
+/// The two-colour fragment output a dual-source blend takes: `g` is the source term and `f` the
+/// factor the ROP multiplies the destination by. The unsplit entry below carries its own copy;
+/// the SPLIT entry is `fs_main` itself, so it pushes this.
+const GXP_DUAL_STRUCT: &str = "
+struct GxpDual {
+  @location(0) @blend_src(0) g: vec4<f32>,
+  @location(0) @blend_src(1) f: vec4<f32>,
+};
+";
+
 const DUAL_SOURCE_ENTRY: &str = "
 struct GxpDual {
   @location(0) @blend_src(0) g: vec4<f32>,
@@ -3153,6 +3621,587 @@ fn fs_main(in: FsIn) -> GxpDual {
   let gxp_g = gxp_body(in, vec4<f32>(0.0, 0.0, 0.0, 0.0));
   let gxp_f = gxp_body(in, vec4<f32>(1.0, 1.0, 1.0, 1.0)) - gxp_g;
   return GxpDual(gxp_g, gxp_f);
+}
+";
+
+/// Give every register the program only ever uses as a PACKED F16 PAIR an UNPACKED home, so
+/// reading half of one stops being a conversion.
+///
+/// # The bill this exists to cut
+/// WGSL has no 16-bit float without an extension, so a USSE 16-bit register is a `u32` holding
+/// two halves and the emitter spells every read `unpack2x16float(r[n])[k]` and every write
+/// `r[n] = gxp_hlo(r[n], ...)`, which is a narrowing plus a masked merge. Those are
+/// CONVERSIONS, and a fragment
+/// program runs them per fragment: mlb's world-family blend emits 466 of them, and that pair
+/// paints 78% of the samples in the pass that is the phone's most expensive
+/// [[vitaslop-f16-emulation-is-the-phones-world-pass]]. A desktop GPU's compiler folds most of
+/// them away and prices this at zero [[vitaslop-desktop-cannot-price-a-count-win]]; a tiler
+/// does not.
+///
+/// # What it does
+/// A register whose every occurrence in a stage is one of the recognised F16 forms gets a
+/// second home, `<bank>_h: array<vec2<f32>>`, holding the two halves ALREADY UNPACKED. Then
+/// - a read `unpack2x16float(r[n])` becomes `r_h[n]` - no instruction at all;
+/// - a paired write becomes `r_h[n] = gxp_q2(...)`, and a single half `r_h[n][k] = ...`, which
+///   is a component STORE rather than a read-modify-write of the packed word;
+/// - the `gxp_hq` rounding that survives is what keeps the ARITHMETIC honest: the hardware
+///   register really is 16 bits, so every store still rounds to the value the guest reads back.
+///   The conversions that disappear are the ones that only existed to move a value in and out
+///   of a packed word.
+///
+/// # Why it is a TEXT pass, and why that is the safe way round
+/// The same reason [`size_register_banks`] is: the emitted text is the only place where the
+/// decoder's register doubling, the swizzle selectors, the write masks, the half-pair packing
+/// and this file's own prologue have all already been applied. A second implementation of those
+/// rules, walking the IR, would disagree somewhere and silently corrupt a shader.
+///
+/// And the direction of the fallback is what makes it safe: a register is rewritten only when
+/// EVERY occurrence of it is recognised. An occurrence this pass does not understand - a
+/// `bitcast<f32>` of the same register, a byte view, a raw integer store, an address
+/// computation, a dynamic subscript - disqualifies that register, and a dynamic subscript
+/// disqualifies its whole bank, because there is no telling which registers it reaches. An
+/// unrecognised form therefore costs the OLD emission, never a wrong one.
+///
+/// `VITASLOP_GXP_HALF_REGS=1` turns it ON; it is OFF by default - see [`half_regs_on`].
+fn unpack_half_registers(module: &str) -> String {
+    if !half_regs_on() {
+        return module.to_string();
+    }
+    let mut out = String::with_capacity(module.len());
+    let mut rest = module;
+    while let Some(at) = rest.find(BANKS_MARKER) {
+        let after = at + BANKS_MARKER.len();
+        out.push_str(&rest[..after]);
+        let body = &rest[after..];
+        // A stage's body ends where the next stage's declarations begin - the same regions
+        // [`resolve_sa_init`] and [`size_register_banks`] walk.
+        let end = body.find(BANKS_MARKER).unwrap_or(body.len());
+        out.push_str(&unpack_half_registers_region(&body[..end]));
+        rest = &body[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The five register banks, as [`size_register_banks`] names them.
+const HALF_BANKS: [&str; 5] = ["r", "o", "i", "pa", "sa"];
+
+/// The suffix an unpacked half-register array's name takes.
+///
+/// `_h` rather than `h` so that scanning for `r[` - which [`emit_dual_split_tail`] and
+/// [`bank_extent`] both do - cannot match the half array by accident.
+const HALF_SUFFIX: &str = "_h";
+
+/// One recognised statement shape, and what the rewrite makes of it.
+enum HalfStore<'a> {
+    /// `X[n] = gxp_hpk(LO, HI);` - both halves at once (the `wgsl::fold_halves` shape). The
+    /// slice is the two ARGUMENTS, comma-separated, not a `vec2` expression.
+    Pair(&'a str),
+    /// `X[n] = gxp_hlo(X[n], ARG);` - the low half.
+    Low(&'a str),
+    /// The same for the high half.
+    High(&'a str),
+    /// `X[n] = RHS;` for an RHS that does not mention `X[n]`: a uniform word, a container
+    /// literal, a driver-placed pointer. Whatever those BITS mean, a register whose every other
+    /// occurrence is a half read is a register whose halves are what is read back, so unpacking
+    /// the word once at the store is exact and moves the conversion out of the body.
+    Word(&'a str),
+    /// `X[n] = Y[m];` or `X[n] = (Y[m] | 0u);` - a whole-WORD copy of one register into
+    /// another, which is what a `mov` of a 16-bit PAIR emits. Called out from [`HalfStore::Word`]
+    /// because both ends can then keep their unpacked homes and the copy becomes a plain
+    /// assignment: a register copied this way is the one case where a raw word read is not
+    /// evidence that the register is anything but two halves. See the fixpoint in
+    /// [`unpack_half_registers_region`] for what happens when only one end qualifies.
+    Copy(&'static str, usize),
+}
+
+/// `Y[m]` or `(Y[m] | 0u)` as a whole-word register read, and nothing else.
+fn parse_word_copy(rhs: &str) -> Option<(&'static str, usize)> {
+    let inner = rhs.strip_prefix('(').and_then(|r| r.strip_suffix(" | 0u)")).unwrap_or(rhs);
+    let (bank, reg, after) = parse_bank_subscript(inner)?;
+    after.is_empty().then_some((bank, reg))
+}
+
+/// Split `line` into the store it performs, if it is one of the recognised shapes, and the
+/// right-hand text that store did not account for.
+fn parse_half_store(line: &str) -> Option<(&'static str, usize, HalfStore<'_>)> {
+    let t = line.trim_start();
+    let (bank, reg, after) = parse_bank_subscript(t)?;
+    let rest = after.strip_prefix(" = ")?.trim_end().strip_suffix(';')?;
+    let dest = format!("{bank}[{reg}]");
+    // The two half forms, spelled exactly as `wgsl::half_stmt` writes them. These are the
+    // emitter's own helper names rather than literal text, so a change to how a half store is
+    // spelled cannot leave this pass silently matching nothing and quietly doing no work.
+    let low_mid = format!("{HALF_LO_FN}({dest}, ");
+    let high_mid = format!("{HALF_HI_FN}({dest}, ");
+    if let Some(inner) = rest.strip_prefix(&low_mid).and_then(|r| r.strip_suffix(')')) {
+        return Some((bank, reg, HalfStore::Low(inner)));
+    }
+    if let Some(inner) = rest.strip_prefix(&high_mid).and_then(|r| r.strip_suffix(')')) {
+        return Some((bank, reg, HalfStore::High(inner)));
+    }
+    if let Some(inner) =
+        rest.strip_prefix(&format!("{HALF_PK_FN}(")).and_then(|r| r.strip_suffix(')'))
+    {
+        return Some((bank, reg, HalfStore::Pair(inner)));
+    }
+    // A RAW half store (`wgsl::Dest::store_raw_half`) read-modify-writes the packed word with a
+    // 16-bit BIT PATTERN, and there is no telling a bit pattern from a float here - so a store
+    // whose right-hand side mentions its own destination and is not one of the two shapes above
+    // is left alone, and its destination is disqualified by that self-reference.
+    if rest.contains(&dest) {
+        return None;
+    }
+    if let Some(src) = parse_word_copy(rest) {
+        return Some((bank, reg, HalfStore::Copy(src.0, src.1)));
+    }
+    Some((bank, reg, HalfStore::Word(rest)))
+}
+
+/// `X[n]` at the START of `t`: the bank name, the literal index, and what follows the `]`.
+fn parse_bank_subscript(t: &str) -> Option<(&'static str, usize, &str)> {
+    let bank = HALF_BANKS
+        .into_iter()
+        .find(|b| t.starts_with(b) && t.as_bytes().get(b.len()) == Some(&b'['))?;
+    let sub = &t[bank.len() + 1..];
+    let digits = sub.len() - sub.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 || sub.as_bytes().get(digits) != Some(&b']') {
+        return None;
+    }
+    Some((bank, sub[..digits].parse().ok()?, &sub[digits + 1..]))
+}
+
+/// Every `unpack2x16float(X[n])` in `text`, as `(bank, reg, start, end)` byte offsets.
+fn half_reads(text: &str) -> Vec<(&'static str, usize, usize, usize)> {
+    const CALL: &str = "unpack2x16float(";
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(CALL) {
+        let at = from + rel + CALL.len();
+        from = at;
+        let Some((bank, reg, after)) = parse_bank_subscript(&text[at..]) else { continue };
+        if !after.starts_with(')') {
+            continue;
+        }
+        let end = text.len() - after.len() + 1;
+        out.push((bank, reg, at - CALL.len(), end));
+        from = end;
+    }
+    out
+}
+
+/// Every bank subscript in `text`: `Ok` names a register, `Err` a bank subscripted by something
+/// that is not a literal and therefore reaches anywhere in it.
+fn stray_bank_refs(text: &str) -> Vec<Result<(&'static str, usize), &'static str>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    for bank in HALF_BANKS {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(bank) {
+            let start = from + rel;
+            from = start + bank.len();
+            // A bank name is a whole identifier followed by its subscript - the same two
+            // boundary tests [`bank_extent`] makes, for the same reason.
+            if start > 0 {
+                let p = bytes[start - 1];
+                if p.is_ascii_alphanumeric() || p == b'_' {
+                    continue;
+                }
+            }
+            if bytes.get(from) != Some(&b'[') {
+                continue;
+            }
+            match parse_bank_subscript(&text[start..]) {
+                Some((b, reg, _)) => out.push(Ok((b, reg))),
+                None => out.push(Err(bank)),
+            }
+        }
+    }
+    out
+}
+
+/// Whether a 16-bit register gets an UNPACKED home. **OFF unless asked for**, and the reason is
+/// a measurement, not caution.
+///
+/// The pass removes 70% of the f16 conversions a corpus emits (mlb: 4,459 -> 1,330), and on the
+/// only engine here that can price it - the DESKTOP BROWSER, whose shader compiler is the
+/// phone's family - it is worth NOTHING: mlb's world pass reads p50 0.91 and 0.88 ms across two
+/// runs of the SAME arm, and both arms of the change land inside that. It also moves pixels on
+/// five of seven titles (a mean of 0.02-0.07 of 255, on glyph edges and stipple, where a rounding
+/// difference flips an edge blend) and grows a pair's declared register storage 228 -> 332 words,
+/// which on a phone is occupancy.
+///
+/// A change that demonstrates nothing, alters the picture and costs registers is not one to ship
+/// on a static count alone. What it IS is armed and ready for the device that can settle it: the
+/// phone is ALU-bound on this title's world pass, which is exactly where ~60 conversions a
+/// fragment over 3M fragments would be paid. `=1` takes it, `=noexact` takes it with every store
+/// rounded.
+fn half_regs_on() -> bool {
+    // Back to OPT-IN (2026-09-18): a phone run with it on by default read the world pass at
+    // 16.0 ms over 1,062 draws against 12.1 ms over 1,055 without it - no win, and the
+    // register growth is the likely cost. `=1` / `=noexact` take it.
+    matches!(arm(HALF_REGS_ARM), Some("1") | Some("noexact"))
+}
+
+/// A register's occurrences, split into the LIVE RANGES a whole-register write separates.
+///
+/// A program reuses one register at two precisions: mlb's world blend keeps a prefetched texel
+/// pair in `pa[2]` as two halves for fifty reads, then overwrites the whole register with an
+/// `f32` and uses it as a texture coordinate. Under a per-REGISTER rule that one `f32` use costs
+/// all fifty half reads their unpacked home. Under a per-RANGE rule it costs only its own range,
+/// because a write of the WHOLE register ends the previous value's life: nothing after it can
+/// read what was there before, so the two ranges can live in different homes.
+///
+/// The split is refused where it would not be sound:
+/// * a region containing a LOOP is not split at all - a back edge means a line further down the
+///   text can run before one above it, and then "the previous value is dead" is not a fact the
+///   line order establishes;
+/// * a whole-register write inside a CONDITIONAL block does not open a range, because the old
+///   value survives the path that skips it. An unconditional `{ }` - the staging block the
+///   emitter puts around one instruction - is not a conditional and does not stop a split.
+type Ranges = std::collections::HashMap<(&'static str, usize), usize>;
+
+/// Whether a region has a back edge, and so cannot be range-split at all.
+fn has_back_edge(region: &str) -> bool {
+    ["loop {", "for (", "while ("].iter().any(|k| region.contains(k))
+}
+
+/// Walk `region` line by line, handing each line the live-range id of every register at that
+/// point. Both the classification pass and the rewrite pass go through this, so the two cannot
+/// disagree about which occurrence belongs to which range.
+fn walk_half_ranges(region: &str, mut f: impl FnMut(&str, &Ranges)) {
+    let split = !has_back_edge(region);
+    let mut ranges: Ranges = Ranges::new();
+    // One entry per open `{`: whether that block is conditional.
+    let mut blocks: Vec<bool> = Vec::new();
+    // >>> THE DUAL-SOURCE SPLIT RUNS ITS TAIL TWICE OVER A SAVED REGISTER FILE, and the
+    // ranges have to be rewound with it. The second copy's reads see what the PREFIX left,
+    // not what the first copy wrote, so carrying the first copy's range ids into the second
+    // would label a read with a range that never reached it - and if one of those two ranges
+    // lives unpacked and the other packed, the second copy reads a word nothing wrote.
+    // Snapshotting at the save and rewinding at the restore is what the emitted code itself
+    // does to the registers.
+    let mut saved: Option<Ranges> = None;
+    for line in region.split_inclusive('\n') {
+        let t = line.trim_start();
+        if t.starts_with("let gxp_save_") {
+            saved.get_or_insert_with(|| ranges.clone());
+        } else if t.contains(" = gxp_save_")
+            && !t.starts_with("let ")
+            && let Some(snapshot) = saved.as_ref()
+        {
+            ranges.clone_from(snapshot);
+        }
+        let conditional = blocks.iter().any(|c| *c);
+        if split
+            && !conditional
+            && let Some((b, r, st)) = parse_half_store(line)
+            && matches!(st, HalfStore::Pair(_) | HalfStore::Word(_))
+        {
+            *ranges.entry((b, r)).or_insert(0) += 1;
+        }
+        f(line, &ranges);
+        let cond = t.starts_with("if ") || t.starts_with("if(") || t.starts_with("} else")
+            || t.starts_with("else") || t.starts_with("for ") || t.starts_with("while ")
+            || t.starts_with("switch ");
+        for c in line.chars() {
+            match c {
+                '{' => blocks.push(cond),
+                '}' => {
+                    blocks.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn unpack_half_registers_region(region: &str) -> String {
+    use std::collections::BTreeSet;
+    type Key = (&'static str, usize, usize);
+    // A value earns an unpacked home by being read or written as a half somewhere...
+    let mut half: BTreeSet<Key> = BTreeSet::new();
+    // ...and loses it to any occurrence this pass does not recognise.
+    let mut bad: BTreeSet<Key> = BTreeSet::new();
+    let mut bad_bank: BTreeSet<&str> = BTreeSet::new();
+    // A value the pass only ever sees STORED is left alone: moving it would convert at the
+    // store and save nothing at all.
+    let mut read: BTreeSet<Key> = BTreeSet::new();
+
+    // `dest <- src` for every whole-word register copy, for the fixpoint below.
+    let mut copies: Vec<(Key, Key)> = Vec::new();
+    walk_half_ranges(region, |line, ranges| {
+        let at = |b: &'static str, r: usize| (b, r, ranges.get(&(b, r)).copied().unwrap_or(0));
+        let mut residue = line;
+        if let Some((bank, reg, store)) = parse_half_store(line) {
+            match store {
+                HalfStore::Pair(inner) | HalfStore::Low(inner) | HalfStore::High(inner) => {
+                    half.insert(at(bank, reg));
+                    residue = inner;
+                }
+                // Not evidence of a half by itself, and not a disqualification either.
+                HalfStore::Word(rhs) => residue = rhs,
+                HalfStore::Copy(sb, sr) => {
+                    half.insert(at(bank, reg));
+                    half.insert(at(sb, sr));
+                    read.insert(at(sb, sr));
+                    copies.push((at(bank, reg), at(sb, sr)));
+                    residue = "";
+                }
+            }
+        }
+        let reads = half_reads(residue);
+        for (bank, reg, _, _) in &reads {
+            half.insert(at(bank, *reg));
+            read.insert(at(bank, *reg));
+        }
+        // Whatever is left once the store skeleton and the half reads are taken out.
+        let mut left = String::with_capacity(residue.len());
+        let mut from = 0usize;
+        for (_, _, s, e) in &reads {
+            left.push_str(&residue[from..*s]);
+            from = *e;
+        }
+        left.push_str(&residue[from..]);
+        for r in stray_bank_refs(&left) {
+            match r {
+                Ok((b, reg)) => {
+                    bad.insert(at(b, reg));
+                }
+                Err(b) => {
+                    bad_bank.insert(b);
+                }
+            }
+        }
+    });
+
+    // >>> A COPY WHOSE DESTINATION STAYS PACKED READS ITS SOURCE AS A WORD.
+    //
+    // The classification above took both ends of `X[n] = Y[m];` to be halves, which is true only
+    // if the statement is rewritten. If the destination turns out not to qualify - it is read as
+    // an `f32` somewhere - the line stays as it is, and then it really does read `Y[m]`'s packed
+    // word, so the source cannot live unpacked either. Marking the source bad can in turn sink
+    // another copy's destination, so this runs to a fixpoint rather than once.
+    loop {
+        let settled = |k: &Key, bad: &BTreeSet<Key>| {
+            half.contains(k) && read.contains(k) && !bad.contains(k) && !bad_bank.contains(k.0)
+        };
+        let mut changed = false;
+        for (dest, src) in &copies {
+            if !settled(dest, &bad) && bad.insert(*src) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let keep = |k: Key| half.contains(&k) && read.contains(&k) && !bad.contains(&k) && !bad_bank.contains(k.0);
+    if !half.iter().any(|k| keep(*k)) {
+        return region.to_string();
+    }
+
+    let mut out = String::with_capacity(region.len());
+    walk_half_ranges(region, |line, ranges| {
+        let live = |b: &str, r: usize| {
+            // `walk_half_ranges` only ever yields the bank names in `HALF_BANKS`, which are
+            // `'static`, so the lookup can take the caller's borrowed name.
+            let Some(bank) = HALF_BANKS.into_iter().find(|x| *x == b) else { return false };
+            keep((bank, r, ranges.get(&(bank, r)).copied().unwrap_or(0)))
+        };
+        out.push_str(&rewrite_half_line(line, &live));
+    });
+    fix_dual_split_saves(&out)
+}
+
+/// One line with every qualified register moved to its unpacked home.
+fn rewrite_half_line(line: &str, keep: &impl Fn(&str, usize) -> bool) -> String {
+    let nl = if line.ends_with('\n') { "\n" } else { "" };
+    let body = line.trim_end_matches('\n');
+    let indent: String = body.chars().take_while(|c| c.is_whitespace()).collect();
+    // The store first: its right-hand side is rewritten for reads like any other text, and its
+    // destination decides the statement's shape.
+    if let Some((bank, reg, store)) = parse_half_store(body)
+        && keep(bank, reg)
+    {
+            let h = format!("{bank}{HALF_SUFFIX}[{reg}]");
+            let stmt = match store {
+                // The pair helper takes its two halves as separate arguments (one native
+                // instruction narrows both), so the unpacked home - a `vec2<f32>` - builds the
+                // vector back up here rather than the emitter shipping one it would then strip.
+                HalfStore::Pair(inner) => {
+                    let e = format!("vec2<f32>({})", rewrite_half_reads(inner, keep));
+                    if f16_exact(&e) { format!("{h} = {e};") } else { format!("{h} = gxp_q2({e});") }
+                }
+                HalfStore::Low(inner) => half_component_store(&h, 0, &rewrite_half_reads(inner, keep)),
+                HalfStore::High(inner) => half_component_store(&h, 1, &rewrite_half_reads(inner, keep)),
+                HalfStore::Word(rhs) => {
+                    format!("{h} = unpack2x16float({});", rewrite_half_reads(rhs, keep))
+                }
+                // Both ends unpacked, and the copy is a plain assignment. A source that stayed
+                // packed still has to be unpacked here, which is the form this line had anyway.
+                HalfStore::Copy(sb, sr) if keep(sb, sr) => format!("{h} = {sb}{HALF_SUFFIX}[{sr}];"),
+                HalfStore::Copy(sb, sr) => format!("{h} = unpack2x16float({sb}[{sr}]);"),
+            };
+        return format!("{indent}{stmt}{nl}");
+    }
+    format!("{}{nl}", rewrite_half_reads(body, keep))
+}
+
+/// One half of an unpacked register, rounded only where the value is not already a 16-bit one.
+///
+/// Through [`crate::wgsl::HALF_QUANT_FN`] rather than WGSL's `quantizeToF16`, whose rounding
+/// mode the language leaves implementation-defined exactly as it does `pack2x16float`'s. A
+/// register that keeps its halves unpacked must round the same way as one that keeps them
+/// packed, or turning the pass on would change every 16-bit number in the frame.
+fn half_component_store(home: &str, component: usize, expr: &str) -> String {
+    if f16_exact(expr) {
+        format!("{home}[{component}] = {expr};")
+    } else {
+        format!("{home}[{component}] = {HALF_QUANT_FN}({expr});")
+    }
+}
+
+/// `unpack2x16float(X[n])` -> `X_h[n]`, for every qualified register in `text`.
+fn rewrite_half_reads(text: &str, keep: &impl Fn(&str, usize) -> bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0usize;
+    for (bank, reg, s, e) in half_reads(text) {
+        if !keep(bank, reg) {
+            continue;
+        }
+        out.push_str(&text[at..s]);
+        let _ = write!(out, "{bank}{HALF_SUFFIX}[{reg}]");
+        at = e;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// Whether `expr` can only ever hold a value that is ALREADY exactly a 16-bit float, so the
+/// store rounding it would round nothing.
+///
+/// The unpacked home keeps a half as an `f32` and rounds on every store, because that is what
+/// the hardware register does. But a great many USSE instructions only MOVE a value that is
+/// already in a 16-bit register - `mov`, `abs`, `min`, `max`, a predicated select - and rounding
+/// the output of one of those is two conversion instructions that cannot change a bit.
+///
+/// The test is structural and deliberately mean: an expression qualifies only if everything in
+/// it is a half-register read, one of the operations that cannot introduce a value between two
+/// f16 neighbours (`abs`, negation, `min`, `max`, `select`, vector construction), or one of the
+/// two literals that are exactly representable at every precision. Anything else at all - an
+/// add, a multiply, a texture sample, a transcendental, a literal this does not recognise -
+/// fails the test and keeps its rounding. A false NEGATIVE costs two instructions; a false
+/// positive would leave a value in a register at more precision than the guest's, so the bias
+/// is all one way.
+fn f16_exact(expr: &str) -> bool {
+    // `VITASLOP_GXP_HALF_REGS=noexact` keeps the unpacked home and rounds EVERY store, which is
+    // the control for this peephole: it is the one piece of the pass that can leave a value in a
+    // register at more precision than the guest would, so a picture difference has to be able to
+    // ask it the question directly.
+    if arm(HALF_REGS_ARM) == Some("noexact") {
+        return false;
+    }
+    // Anything left after the recognised pieces are struck out disqualifies the expression.
+    let mut rest = expr.to_string();
+    // Half-register reads, with or without a component selector: `pa_h[3]`, `r_h[0][1]`.
+    while let Some(at) = rest.find(HALF_SUFFIX).filter(|at| {
+        rest[..*at].chars().next_back().is_some_and(|c| c.is_ascii_lowercase())
+    }) {
+        let start = rest[..at].rfind(|c: char| !c.is_ascii_lowercase()).map_or(0, |i| i + 1);
+        let after = &rest[at + HALF_SUFFIX.len()..];
+        let Some(end) = after.strip_prefix('[').and_then(|r| r.find(']').map(|i| i + 2)) else {
+            return false;
+        };
+        let mut end = at + HALF_SUFFIX.len() + end;
+        if let Some(sel) = rest[end..].strip_prefix('[') {
+            let Some(close) = sel.find(']') else { return false };
+            end += close + 2;
+        }
+        rest.replace_range(start..end, " ");
+    }
+    for token in [
+        "vec2<f32>", "abs", "min", "max", "select", "(", ")", ",", "-", " ", "\t",
+        "<", ">", "=", "!", "&", "|", "0.0", "1.0", "true", "false",
+    ] {
+        rest = rest.replace(token, " ");
+    }
+    rest.trim().is_empty()
+}
+
+/// Keep the dual-source split's register-file save and restore in step with the rewrite.
+///
+/// [`emit_dual_split_tail`] decides which banks to save by scanning its tail for `<bank>[`, long
+/// before this pass moves half registers out of those arrays. So a bank that has just lost its
+/// last packed reference would be saved and restored by a name whose declaration is gone - a
+/// module that does not compile - and an unpacked array the suffix writes would not be restored
+/// at all, which is a WRONG PICTURE rather than a failure. Both are settled here, where the
+/// final text says which arrays actually exist.
+fn fix_dual_split_saves(region: &str) -> String {
+    if !region.contains("gxp_save_") {
+        return region.to_string();
+    }
+    let mut out = String::with_capacity(region.len());
+    for line in region.split_inclusive('\n') {
+        let t = line.trim();
+        let save = t
+            .strip_prefix("let gxp_save_")
+            .and_then(|r| r.split_once(" = "))
+            .map(|(b, _)| b.trim());
+        let restore = t
+            .split_once(" = gxp_save_")
+            .filter(|(lhs, _)| !lhs.contains("let "))
+            .map(|(lhs, _)| lhs.trim());
+        let Some(bank) = save.or(restore) else {
+            out.push_str(line);
+            continue;
+        };
+        if !HALF_BANKS.contains(&bank) {
+            out.push_str(line);
+            continue;
+        }
+        if region.contains(&format!("{bank}[")) {
+            out.push_str(line);
+        }
+        if region.contains(&format!("{bank}{HALF_SUFFIX}[")) {
+            let h = format!("{bank}{HALF_SUFFIX}");
+            let _ = if save.is_some() {
+                writeln!(out, "  let gxp_save_{h} = {h};")
+            } else {
+                writeln!(out, "  {h} = gxp_save_{h};")
+            };
+        }
+    }
+    out
+}
+
+/// Where a module's leading DIRECTIVES end, which is the earliest a declaration may appear.
+pub(crate) fn directives_end(module: &str) -> usize {
+    let mut at = 0usize;
+    for line in module.lines() {
+        let t = line.trim();
+        if t.is_empty()
+            || t.starts_with("//")
+            || t.starts_with("enable ")
+            || t.starts_with("requires ")
+            || t.starts_with("diagnostic")
+        {
+            at += line.len() + 1;
+            continue;
+        }
+        break;
+    }
+    at
+}
+
+/// The helper an unpacked pair store rounds through: the two halves as the hardware keeps them.
+/// One function rather than two [`crate::wgsl::HALF_QUANT_FN`] calls at every site, so the text
+/// stays readable. It is defined in terms of that one, so there is exactly one statement in the
+/// module of how an f32 narrows to a half - see [`crate::wgsl::HALF_LO_FN`].
+const GXP_Q2: &str = "
+fn gxp_q2(v: vec2<f32>) -> vec2<f32> {
+  return vec2<f32>(gxp_hq(v.x), gxp_hq(v.y));
 }
 ";
 
@@ -3415,7 +4464,7 @@ pub(crate) fn arm_on(name: &str) -> bool {
 /// Leaked deliberately and once per distinct value: this is read while emitting a shader, the
 /// set of values is the set of arms a human can type, and the alternative is threading a
 /// configuration struct through the whole emitter for a diagnostic.
-fn arm(name: &str) -> Option<&'static str> {
+pub(crate) fn arm(name: &str) -> Option<&'static str> {
     if let Some(v) = arms().lock().unwrap_or_else(|e| e.into_inner()).get(name) {
         return Some(v);
     }
@@ -3442,20 +4491,175 @@ fn arms() -> &'static std::sync::Mutex<Arms> {
 /// The names are [`SIZE_BANKS_ARM`] and [`SA_DIRECT_ARM`]; anything else is ignored on purpose,
 /// because this is called from a generic knob table and a typo there must not become an arm.
 pub fn set_arm(name: &str, value: &str) {
-    if name != SIZE_BANKS_ARM && name != SA_DIRECT_ARM && name != MEM_OFFSET16_ARM {
+    if !matches!(
+        name,
+        SIZE_BANKS_ARM
+            | SA_DIRECT_ARM
+            | MEM_OFFSET16_ARM
+            | HALF_REGS_ARM
+            | IDX_REGDEST_ARM
+            | PACK_COMP0_ARM
+            | IDX_MUL_ARM
+            | F16_ROUND_ARM
+            | CASE_TEX_ARM
+            // >>> THE SHADER PROBES, for the same reason as the arms above and more urgently.
+            //
+            // These are the only instruments that can say WHICH term of a lit material is the
+            // zero, and until now they were `std::env::var` reads - which means they could be
+            // armed on the desktop and NOWHERE ELSE. That is backwards: a football title's
+            // sideline characters render pure BLACK in the browser and are culled natively at
+            // the same recipe frame, so the engine that can be probed is the engine that does
+            // not have the defect [[vitaslop-web-is-the-product-not-the-tool]].
+            | PROBE_ARM
+            | PROBE_SCALE_ARM
+            | VPROBE_ARM
+    ) {
         return;
     }
     let v: &'static str = Box::leak(value.trim().to_string().into_boxed_str());
     arms().lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), v);
 }
 
+/// >>> WHICH EMISSION ARMS THIS RUN IS ON, FOR THE DIAGNOSTIC TO SAY OUT LOUD.
+///
+/// A capture taken on a device is read hours later, against a capture taken from a different
+/// build, and NOTHING in the file says which arm produced it - so an A/B run as two visits
+/// rests entirely on remembering which visit was which. That is not a control. Every arm set
+/// away from its default is named here, and the empty case says so rather than printing
+/// nothing, because "no line" and "no arms" have to be distinguishable in a downloaded file.
+pub fn arms_line() -> String {
+    let g = arms().lock().unwrap_or_else(|e| e.into_inner());
+    let mut set: Vec<String> = g.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    set.sort();
+    if set.is_empty() {
+        "no shader emission arm is set - this is the DEFAULT emitter".to_string()
+    } else {
+        format!("ARMED: {}", set.join(", "))
+    }
+}
+
 /// `0` declares every register bank at the full [`BANK_REGS`] - see [`size_register_banks`].
 pub const SIZE_BANKS_ARM: &str = "VITASLOP_GXP_SIZE_BANKS";
 /// `0` restores the SA copy loop, `unroll` the constant-subscript copy - see [`resolve_sa_init`].
 pub const SA_DIRECT_ARM: &str = "VITASLOP_GXP_SA_DIRECT";
+/// `1` gives a 16-bit register an UNPACKED home ([`unpack_half_registers`]); unset or `0` keeps
+/// every half read and write a conversion, which is the default and what ships. `noexact` is the
+/// middle position: the unpacked home with every store rounded (see [`f16_exact`]).
+pub const HALF_REGS_ARM: &str = "VITASLOP_GXP_HALF_REGS";
+
+/// >>> HOW AN f32 NARROWS TO AN f16 - THE NEGATIVE CONTROL FOR THE ROUNDING FIX.
+///
+/// `0` puts `pack2x16float` back under the store helpers, which is **exactly what every build
+/// before 2026-09-21c shipped**: the device's own implementation-defined mode, measured here as
+/// truncation. Unset (the default) is round-to-nearest-even, which is what the CPU reference
+/// does and what the guest's hardware does.
+///
+/// It is the arm a picture A/B needs, and it is a ONE-HUNK arm by construction: the emitted
+/// BODY is identical in both, and only the module preamble's definition of
+/// [`crate::wgsl::HALF_BITS_FN`] changes. Nothing else can drift between the two arms, which is
+/// what makes a pixel difference attributable [[vitaslop-knob-is-the-gate-not-the-level]].
+///
+/// `native` and `portable` FORCE one of the two round-to-nearest arms instead of letting the
+/// adapter choose. They exist so a case harness can run both on one device: the two arms must
+/// agree bit for bit, and the only thing that can say so is a run of each.
+pub const F16_ROUND_ARM: &str = "VITASLOP_GXP_F16_RTE";
+
+/// `const` makes the execution rig's STAND-IN TEXTURE a constant again. It is a function of the
+/// sample COORDINATE by default, which is the only thing in the differential that can see a
+/// program computing the wrong UV; the constant arm is what every measurement before
+/// 2026-09-21c used and is kept as the comparison. See [`crate::wgsl::case_tex_varies`].
+pub const CASE_TEX_ARM: &str = "VITASLOP_GXP_CASE_TEX";
+
 /// `0` reads a memory load's REGISTER offset full-width instead of as 16 bits - see
 /// `wgsl::emit_mem_load`, which carries the measurement.
 pub const MEM_OFFSET16_ARM: &str = "VITASLOP_GXP_MEM_OFFSET16";
+
+
+/// `<bank><idx>[@<instr>][:f32|:bits=<hex>]` - return that register AS the colour. See
+/// [`crate::module::ProbeSpec`].
+pub const PROBE_ARM: &str = "VITASLOP_GXP_PROBE";
+/// Divide a probed value before it is written, so an HDR term reads back under the
+/// attachment's [0,1] clamp.
+pub const PROBE_SCALE_ARM: &str = "VITASLOP_GXP_PROBE_SCALE";
+/// `<n>` - return interpolated varying `v<n>` AS the colour.
+pub const VPROBE_ARM: &str = "VITASLOP_GXP_VPROBE";
+/// `1` - WHERE DID THIS DRAW'S VERTICES GO? Draw the mesh at CLAMPED normalised coordinates and
+/// report each vertex's real clip position through varying 0.
+///
+/// A draw that rasterises no fragment at all - `VITASLOP_GXM_DRAW_COVERAGE` counts them by the
+/// thousand, and a capsule reproduces one offline - says nothing about WHY through any other
+/// instrument: every colour arm is downstream of a triangle that never existed. `SOLID` and
+/// `NODEPTH` separate shading from the depth test and both come back empty on such a draw,
+/// which leaves the vertex stage - whose output is the one value nothing here could read.
+///
+/// `v0` carries it, where `VITASLOP_GXP_VPROBE=0` already knows how to show it: `x` and `y` are
+/// the NDC mapped into [0,1] (0.5 is the centre, a saturated channel is off-screen in that
+/// axis), `z` is 1.0 when clip `w` is POSITIVE (0.0 is behind the eye, which no perspective
+/// divide brings back) and the alpha lane is 0.0 for a NaN. A collapsed mesh is then one flat
+/// colour and a merely misplaced one is a picture of where it went.
+pub const POSPROBE_ARM: &str = "VITASLOP_GXP_POSPROBE";
+
+/// Whether the vertex POSITION PROBE is armed - see [`POSPROBE_ARM`]. OFF unless asked for:
+/// `arm_on` defaults to TRUE, which is right for a default-on arm and catastrophic for a
+/// diagnostic that replaces every vertex position in the frame.
+fn posprobe_on() -> bool {
+    arm(POSPROBE_ARM).is_some_and(|v| v.trim() != "0")
+}
+
+/// >>> HOW FAR OFF-SCREEN, NOT ONLY THAT IT IS OFF-SCREEN. The probe maps NDC into `[0, 1]` and
+/// >>> CLAMPS, so every vertex past the viewport paints the same saturated channel whether it
+/// >>> overshot by a tenth or by a thousand. A picture that cannot tell those apart cannot say
+/// >>> whether the cause is a wrong offset or a wrong scale.
+///
+/// `VITASLOP_GXP_POSPROBE_DIV=<d>` divides the NDC by `d` before the map, so the first divisor
+/// at which a rail comes off names the OVERSHOOT'S ORDER OF MAGNITUDE. Run 1, 10, 100, 1000:
+/// geometry that is merely outside the frustum comes back at 10, and geometry whose transform
+/// has lost a scale does not come back at all.
+///
+/// It divides rather than taking a log because the sign has to survive - "above the viewport"
+/// and "below it" are different defects, and a log of a negative number is not a picture.
+pub const POSPROBE_DIV_ARM: &str = "VITASLOP_GXP_POSPROBE_DIV";
+
+/// [`POSPROBE_DIV_ARM`]'s value, or 1.0. A zero or a negative divisor would turn every vertex
+/// into an infinity or mirror the picture, so both fall back to 1.0 rather than being applied.
+fn posprobe_divisor() -> f32 {
+    arm(POSPROBE_DIV_ARM)
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .unwrap_or(1.0)
+}
+
+
+/// `0` sends EVERY group-0x14 index load to the index register, which is what this decoder did
+/// before the `(b8,b51)` flag was read as naming the destination - see `decode_grp_i16mad`.
+///
+/// It exists so the whole-corpus WGSL census can be taken twice on ONE build: the words the
+/// change touches live in a single title, and "no other corpus can move" is a claim that has to
+/// be MEASURED rather than argued from which bits are set.
+pub const IDX_REGDEST_ARM: &str = "VITASLOP_GXP_IDX_REGDEST";
+
+/// `0` restores bit 1 as comp0's high selector bit for a 16-bit PACK source, which is what this
+/// decoder read before the corpus said bit 7 - see `decode_grp_pack`. Here for the same reason
+/// as [`IDX_REGDEST_ARM`]: one title's picture and another's regression have to be A/B-able on
+/// ONE build.
+pub const PACK_COMP0_ARM: &str = "VITASLOP_GXP_PACK_COMP0";
+
+/// The multiplier the ORDINARY-REGISTER index load applies to its source, as a decimal string.
+/// Default 1, which is what the corpus grammar decodes today.
+///
+/// >>> IT IS A QUESTION, NOT A SETTING. Madden's matrix palette is THREE float4 rows per bone
+/// (measured: rows 0,1,2 of the bound window are one affine transform, 3,4,5 the next, and so
+/// on for every group), and its `IN.blendIndices` are plain consecutive BONE numbers - 31, 32,
+/// 33 - so the row a bone's matrix starts at is `3 * index`, not `index`. No field of the
+/// group-0x14 word has been shown to carry that 3. This arm is how the picture is asked whether
+/// the factor is real before anything is claimed about where it is encoded.
+pub const IDX_MUL_ARM: &str = "VITASLOP_GXP_IDX_MUL";
+
+/// [`IDX_MUL_ARM`]'s value as a multiplier, or `None` when it is unset - in which case the
+/// stride the program itself carries (`usse::resolve_index_load_stride`) is used.
+pub(crate) fn index_load_multiplier() -> Option<i32> {
+    arm(IDX_MUL_ARM).and_then(|v| v.parse().ok()).filter(|n: &i32| *n > 0)
+}
 
 /// The marker a stage's register-bank declarations are emitted as, resolved to real sizes by
 /// [`size_register_banks`] once the whole module is built and every subscript is known.
@@ -3522,11 +4726,31 @@ fn size_register_banks(module: &str) -> String {
                     let _ = writeln!(out, "  var {bank}: array<u32, {BANK_REGS}>;");
                 }
             }
+            // The UNPACKED half-register home, when [`unpack_half_registers`] gave this bank
+            // one. Always sized, even with the sizing arm off: this array exists only because
+            // that pass put literal subscripts in it, so it has no dynamic form to be safe
+            // about, and declaring 512 unused `vec2<f32>` would undo the cut it is part of.
+            if let Some(n @ 1..) = bank_extent(region, &format!("{bank}{HALF_SUFFIX}")) {
+                let _ = writeln!(out, "  var {bank}{HALF_SUFFIX}: array<vec2<f32>, {n}>;");
+            }
         }
         rest = body;
     }
     out.push_str(rest);
-    out
+    // WGSL wants a function declared before it is called, so the rounding helper goes at the
+    // TOP of the module rather than beside the pass that introduces its calls - but AFTER the
+    // directives, because `enable`/`requires`/`diagnostic` must precede every declaration in the
+    // module. Putting it at byte zero instead cost a whole title its picture: a dual-source pair
+    // carries `enable dual_source_blending;`, the module then read as a directive after a
+    // declaration, the device refused the pipeline, and the frame went BLACK.
+    if out.contains("gxp_q2(") {
+        out.insert_str(directives_end(&out), GXP_Q2);
+    }
+    // ...and the f16 STORE helpers, which `gxp_q2` is itself written in terms of - so they must
+    // be inserted AFTER it, because each insertion goes at the same place and the last one in
+    // ends up first. This is the last pass every linked module goes through, which is what makes
+    // it the one place the helpers can be added once rather than at each of the five returns.
+    add_half_helpers(out)
 }
 
 /// How many registers of `bank` the emitted `region` references: `Some(high_water + 1)`, or
@@ -3729,6 +4953,132 @@ mod tests {
         Interpolant, OutputVarying, ParamCategory, ParamType, Parameter, ProgramKind, SamplePrefetch,
     };
     use crate::ir::{Instr, Op, Operand, Predicate};
+
+    /// A module region as [`unpack_half_registers`] sees one: the bank marker, then statements.
+    ///
+    /// The pass is OFF by default ([`half_regs_on`]), so a test of it has to ARM it. Every test
+    /// here wants it on and none wants it off, so arming the process-wide table is enough and
+    /// cannot race with a test that expects the other arm.
+    fn half_region(body: &str) -> String {
+        set_arm(HALF_REGS_ARM, "1");
+        format!("{BANKS_MARKER}{body}")
+    }
+
+    /// A register whose every use is a 16-bit half moves to the unpacked home, and the two forms
+    /// that cost the most - the read and the single-half store - stop converting entirely.
+    #[test]
+    fn a_register_used_only_as_halves_moves_to_its_unpacked_home() {
+        let out = unpack_half_registers(&half_region(
+            "  pa[0] = gxp_hpk(in.v0.x, in.v0.y);\n\
+             \x20 r[1] = gxp_hlo(r[1], (unpack2x16float(pa[0])[0] * unpack2x16float(pa[0])[1]));\n\
+             \x20 o[0] = gxp_hpk(unpack2x16float(r[1])[0], unpack2x16float(r[1])[1]);\n\
+             \x20 let c = vec2<f32>(unpack2x16float(o[0])[0], unpack2x16float(o[0])[1]);\n",
+        ));
+        assert!(out.contains("pa_h[0] = gxp_q2(vec2<f32>(in.v0.x, in.v0.y));"), "{out}");
+        assert!(out.contains("r_h[1][0] = gxp_hq((pa_h[0][0] * pa_h[0][1]));"), "{out}");
+        // A store whose value is already a 16-bit one rounds nothing, so it does not round.
+        assert!(out.contains("o_h[0] = vec2<f32>(r_h[1][0], r_h[1][1]);"), "{out}");
+        assert!(!out.contains("unpack2x16float(pa[0])"), "no read may stay packed:\n{out}");
+    }
+
+    /// ...and a register the program ALSO reads as a 32-bit float does not, because the two
+    /// views are one word and only the packed form can hold both.
+    #[test]
+    fn a_register_read_at_two_precisions_stays_packed() {
+        let body = "  pa[0] = gxp_hpk(in.v0.x, in.v0.y);\n\
+                    \x20 r[0] = bitcast<u32>(unpack2x16float(pa[0])[0] * bitcast<f32>(pa[0]));\n";
+        let out = unpack_half_registers(&half_region(body));
+        assert_eq!(out, half_region(body), "an f32 view disqualifies the register:\n{out}");
+    }
+
+    /// A WHOLE-register write ends the previous value's life, so an f32 use after one does not
+    /// cost the half uses before it. This is the difference between moving one register and
+    /// losing fifty reads to a scratch use at the end of a shader.
+    #[test]
+    fn a_whole_register_write_splits_the_live_range() {
+        let out = unpack_half_registers(&half_region(
+            "  pa[2] = gxp_hpk(in.v0.x, in.v0.y);\n\
+             \x20 r[0] = gxp_hlo(r[0], unpack2x16float(pa[2])[1]);\n\
+             \x20 pa[2] = bitcast<u32>(in.v1.x);\n\
+             \x20 let c = bitcast<f32>(pa[2]);\n",
+        ));
+        assert!(out.contains("pa_h[2] = gxp_q2(vec2<f32>(in.v0.x, in.v0.y));"), "{out}");
+        // `r[0]` is never read here, so it stays where it is - what moved is the READ of the
+        // first range of `pa[2]`, which is the point.
+        assert!(out.contains("gxp_hlo(r[0], pa_h[2][1])"), "{out}");
+        // The second range keeps the packed word - it is the one the `f32` read needs.
+        assert!(out.contains("pa[2] = bitcast<u32>(in.v1.x);"), "{out}");
+        assert!(out.contains("let c = bitcast<f32>(pa[2]);"), "{out}");
+    }
+
+    /// A whole-register write inside a CONDITIONAL does not end anything: the path that skips it
+    /// carries the old value past, so both uses are one range and the f32 read disqualifies it.
+    #[test]
+    fn a_conditional_write_does_not_split_a_live_range() {
+        let body = "  pa[2] = gxp_hpk(in.v0.x, in.v0.y);\n\
+                    \x20 if (p[0]) {\n\
+                    \x20 pa[2] = bitcast<u32>(in.v1.x);\n\
+                    \x20 }\n\
+                    \x20 let c = bitcast<f32>(pa[2]) + unpack2x16float(pa[2])[0];\n";
+        let out = unpack_half_registers(&half_region(body));
+        assert_eq!(out, half_region(body), "a conditional write cannot open a range:\n{out}");
+    }
+
+    /// >>> THE DUAL-SOURCE SPLIT RUNS ITS TAIL TWICE AND THE RANGES REWIND WITH IT.
+    ///
+    /// The second copy reads what the PREFIX left, not what the first copy wrote. Carrying the
+    /// first copy's range ids into the second put a read in a range that never reached it, and
+    /// when one of those ranges lived unpacked and the other packed, the second copy read a word
+    /// nothing had written: mlb's whole frame came back BLACK.
+    #[test]
+    fn the_dual_source_split_rewinds_the_ranges_with_the_register_file() {
+        let out = unpack_half_registers(&half_region(
+            "  pa[0] = gxp_hpk(in.v0.x, in.v0.y);\n\
+             \x20 let gxp_save_pa = pa;\n\
+             \x20 {\n\
+             \x20 r[0] = gxp_hlo(r[0], unpack2x16float(pa[0])[0]);\n\
+             \x20 pa[0] = bitcast<u32>(in.v1.x);\n\
+             \x20 }\n\
+             \x20 pa = gxp_save_pa;\n\
+             \x20 {\n\
+             \x20 r[0] = gxp_hlo(r[0], unpack2x16float(pa[0])[0]);\n\
+             \x20 pa[0] = bitcast<u32>(in.v1.x);\n\
+             \x20 }\n",
+        ));
+        // Both copies read the same home - the prefix's - rather than one reading a word the
+        // other never wrote.
+        assert_eq!(out.matches("pa_h[0][0]").count(), 2, "{out}");
+        // And the save/restore covers the home, not just the packed array it no longer uses.
+        assert!(out.contains("let gxp_save_pa_h = pa_h;"), "{out}");
+        assert!(out.contains("pa_h = gxp_save_pa_h;"), "{out}");
+    }
+
+    /// The rounding helper is a DECLARATION, and every WGSL directive has to precede those. A
+    /// dual-source module carries `enable dual_source_blending;`, and putting the helper at byte
+    /// zero made the module unparseable, the device refuse the pipeline, and the frame go black.
+    #[test]
+    fn the_rounding_helper_goes_after_the_directives() {
+        let module = format!(
+            "enable dual_source_blending;\n\n@group(0) @binding(0) var<uniform> u: vec4<u32>;\n{}",
+            half_region("  pa[0] = gxp_hpk(in.v0.x, in.v0.y);\n  let a = unpack2x16float(pa[0])[0];\n")
+        );
+        let out = size_register_banks(&unpack_half_registers(&module));
+        let (directive, helper) = (out.find("enable dual_source_blending;"), out.find("fn gxp_q2("));
+        assert!(directive < helper, "the helper must follow the directives:\n{out}");
+        assert!(helper.is_some(), "the helper must be emitted when it is called:\n{out}");
+        assert!(out.contains("var pa_h: array<vec2<f32>, 1>;"), "the home is declared:\n{out}");
+    }
+
+    /// A bank with a DYNAMIC subscript keeps every one of its registers packed: there is no
+    /// telling which of them the index reaches, so none of them can move.
+    #[test]
+    fn a_dynamic_subscript_keeps_its_whole_bank_packed() {
+        let body = "  pa[0] = gxp_hpk(in.v0.x, in.v0.y);\n\
+                    \x20 let a = unpack2x16float(pa[0])[0];\n\
+                    \x20 let b = pa[idx[0]];\n";
+        let out = unpack_half_registers(&half_region(body));
+        assert_eq!(out, half_region(body), "a dynamic subscript disqualifies the bank:\n{out}");
+    }
 
     fn instr(op: Op, dest: Option<Operand>, srcs: Vec<Operand>, mask: [bool; 4]) -> Instr {
         Instr { op, pred: Predicate::Always, dest, write_mask: mask, srcs, half_precision: false, raw: 0, group: 0, blocked: None }
@@ -3966,7 +5316,7 @@ mod tests {
     ) -> Interpolant {
         Interpolant {
             span: register_count + PREFETCH_REGS as u8,
-            prefetch: Some(SamplePrefetch { unit, source_texcoord: source, last: true }),
+            prefetch: Some(SamplePrefetch { unit, source_texcoord: source, last: true, lookup: crate::container::PrefetchLookup::Plain }),
             prefetch_regs: 2,
             ..texcoord_in(index, pa_base, register_count, true)
         }
@@ -4025,7 +5375,7 @@ mod tests {
         let mut vprog = vertex_program(0, Vec::new(), 0);
         vprog.output_varyings = vec![texcoord_out(0, 6, 4), texcoord_out(1, 10, 4)];
         let fprog = fragment_program(vec![texcoord_in(1, 0, 2, true)], 4);
-        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap();
+        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0]), false).unwrap();
         assert_eq!(
             iface.components,
             vec![
@@ -4043,7 +5393,7 @@ mod tests {
         let mut vprog = vertex_program(0, Vec::new(), 0);
         vprog.output_varyings = vec![texcoord_out(3, 6, 4)];
         let fprog = fragment_program(vec![texcoord_in(3, 0, 4, false)], 4);
-        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap().components;
+        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0]), false).unwrap().components;
         assert_eq!(plan.len(), 4);
         assert!(plan.iter().enumerate().all(|(c, v)| v.vertex_lane == 6 + c as u32
             && v.dest == ComponentDest::Register(c as u32)));
@@ -4056,7 +5406,7 @@ mod tests {
         let mut vprog = vertex_program(0, Vec::new(), 0);
         vprog.output_varyings = vec![texcoord_out(2, 6, 3)];
         let fprog = fragment_program(vec![texcoord_in(2, 0, 2, true)], 2);
-        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap().components;
+        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0]), false).unwrap().components;
         assert_eq!(plan.len(), 3);
         assert_eq!(
             plan[2],
@@ -4075,7 +5425,7 @@ mod tests {
         let mut vprog = vertex_program(0, Vec::new(), 0);
         vprog.output_varyings = vec![texcoord_out(1, 6, 4)];
         let fprog = fragment_program(vec![texcoord_in(1, 0, 2, false)], 2);
-        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap().components;
+        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0]), false).unwrap().components;
         assert_eq!(plan.len(), 2, "only the two components the fragment declared are routed");
         assert!(
             plan.iter().all(|c| matches!(c.dest, ComponentDest::Register(r) if r < 2)),
@@ -4092,7 +5442,7 @@ mod tests {
         let mut vprog = vertex_program(0, Vec::new(), 0);
         vprog.output_varyings = vec![texcoord_out(0, 6, 4)];
         let fprog = fragment_program(vec![texcoord_in(0, 0, 1, true)], 1);
-        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap().components;
+        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0]), false).unwrap().components;
         assert_eq!(plan.len(), 2);
         assert!(
             plan.iter().all(|c| matches!(c.dest, ComponentDest::Half { register: 0, .. })),
@@ -4122,8 +5472,76 @@ mod tests {
             ],
             4,
         );
-        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap().components;
+        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0]), false).unwrap().components;
         assert_eq!(destinations(&plan), vec![(0, Some(0)), (0, Some(1)), (1, Some(0)), (1, Some(1))]);
+    }
+
+    /// >>> A PROGRAM THAT DECLARES NO INTERPOLANTS IS NOT A PASSTHROUGH - the football
+    /// >>> title's `frag_90c054e0`, whose draws were being DROPPED.
+    ///
+    /// The passthrough treatment exists for a program whose colour IS its primary-attribute
+    /// file, loaded there by the PDS. What the PDS loads is the program's DECLARED
+    /// interpolants, so a program that declares none has nothing loaded and those registers
+    /// are undefined on the hardware too. Demanding they be fed asks for a value that does
+    /// not exist, and refusing the pair drops the draw.
+    #[test]
+    fn a_program_declaring_no_interpolants_is_not_treated_as_a_passthrough() {
+        let mut vprog = vertex_program(0, Vec::new(), 0);
+        vprog.output_varyings = vec![texcoord_out(1, 6, 4)];
+        // No interpolants and NO decode error - the count of 0 is true.
+        let fprog = fragment_program(Vec::new(), 4);
+        assert_eq!(fprog.varyings_error, None, "the fixture must be an empty DECLARATION, not a failed decode");
+        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[]), false)
+            .expect("a program that interpolates nothing has nothing that needs feeding");
+        assert!(iface.components.is_empty(), "nothing declared, so nothing routed: {:?}", iface.components);
+    }
+
+    /// >>> ...BUT AN EMPTY LIST THAT IS AN EMPTY LIST BECAUSE THE BLOCK DID NOT PARSE KEEPS
+    /// >>> THE OLD, CONSERVATIVE TREATMENT.
+    ///
+    /// This is the one that makes the rule above safe. Without it a varyings-block decode gap
+    /// would quietly start emitting zero-initialised colour - a silently wrong picture with
+    /// nothing in the log - which is the exact failure the whole refusal path exists to avoid.
+    #[test]
+    fn an_interpolant_list_empty_because_the_block_did_not_decode_is_still_refused() {
+        let mut vprog = vertex_program(0, Vec::new(), 0);
+        vprog.output_varyings = vec![texcoord_out(1, 6, 4)];
+        let mut fprog = fragment_program(Vec::new(), 4);
+        fprog.varyings_error = Some("fixture: the block did not decode");
+        assert_eq!(
+            plan_interface(&vprog, &fprog, &fragment_reading(&[]), false).unwrap_err(),
+            LinkError::PaReadUnfed {
+                register: 0,
+                varyings_error: Some("fixture: the block did not decode"),
+            },
+            "an empty list from a FAILED decode must not be read as 'declares nothing'"
+        );
+    }
+
+    /// >>> A REAL PASSTHROUGH STILL DEMANDS ITS ROUTING, AND A MASKED-OFF DRAW STILL LIFTS IT.
+    ///
+    /// The program here DOES declare an interpolant, so the passthrough reading applies and
+    /// every register of the primary allocation must be fed. The declared TexCoord covers
+    /// PA0..1 and the allocation is 4, so PA2 is unfed and the pair is refused - which is the
+    /// behaviour the titles that depend on the passthrough treatment rely on.
+    ///
+    /// The second arm is [`LinkOptions::colour_output_masked_off`]: a colour that cannot reach
+    /// a pixel is exact whatever it holds, so the same program links.
+    #[test]
+    fn a_passthrough_that_declares_interpolants_is_refused_unless_the_colour_is_masked_off() {
+        let mut vprog = vertex_program(0, Vec::new(), 0);
+        vprog.output_varyings = vec![texcoord_out(1, 6, 4)];
+        let fprog = fragment_program(vec![texcoord_in(1, 0, 2, true)], 4);
+        let body = fragment_reading(&[]);
+
+        assert_eq!(
+            plan_interface(&vprog, &fprog, &body, false).unwrap_err(),
+            LinkError::PaReadUnfed { register: 2, varyings_error: None },
+            "a declared interpolant means the register file IS the colour, so it must be fed"
+        );
+
+        plan_interface(&vprog, &fprog, &body, true)
+            .expect("a colour that cannot reach a pixel is exact whatever it holds");
     }
 
     #[test]
@@ -4132,7 +5550,7 @@ mod tests {
         vprog.output_varyings = vec![texcoord_out(1, 6, 4)];
         let fprog = fragment_program(vec![texcoord_in(4, 0, 2, true)], 4);
         assert_eq!(
-            plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap_err(),
+            plan_interface(&vprog, &fprog, &fragment_reading(&[0]), false).unwrap_err(),
             LinkError::UnfedVarying { usage: VaryingUsage::TexCoord(4) }
         );
     }
@@ -4148,7 +5566,7 @@ mod tests {
         vprog.output_varyings = vec![texcoord_out(1, 6, 4)];
         let fprog = fragment_program(vec![texcoord_in(1, 0, 2, true)], 8);
         assert_eq!(
-            plan_interface(&vprog, &fprog, &fragment_reading(&[0, 4])).unwrap_err(),
+            plan_interface(&vprog, &fprog, &fragment_reading(&[0, 4]), false).unwrap_err(),
             LinkError::PaReadUnfed { register: 4, varyings_error: None }
         );
     }
@@ -4172,7 +5590,7 @@ mod tests {
             vec![Operand::plain(Bank::PrimaryAttr, 4, 2)],
             [true; 4],
         ));
-        let plan = plan_interface(&vprog, &fprog, &fshader).unwrap().components;
+        let plan = plan_interface(&vprog, &fprog, &fshader, false).unwrap().components;
         assert_eq!(destinations(&plan), vec![(0, Some(0)), (0, Some(1)), (1, Some(0)), (1, Some(1))]);
     }
 
@@ -4182,7 +5600,7 @@ mod tests {
         vprog.output_varyings = vec![texcoord_out(1, 6, 4)];
         let fprog = fragment_program(vec![texcoord_in(1, 0, 2, true)], 4);
         assert_eq!(
-            plan_interface(&vprog, &fprog, &fragment_reading(&[0, 9])).unwrap_err(),
+            plan_interface(&vprog, &fprog, &fragment_reading(&[0, 9]), false).unwrap_err(),
             LinkError::PaReadBeyondAllocation { register: 9, primary_regs: 4 }
         );
     }
@@ -4197,10 +5615,10 @@ mod tests {
         let mut fprog = fragment_program(vec![texcoord_in_prefetched(1, 0, 2, 13, 0)], 4);
         fprog.parameters = vec![sampler(13, false)];
 
-        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2])).unwrap();
+        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2]), false).unwrap();
         assert_eq!(
             iface.prefetches,
-            vec![PlannedPrefetch { unit: 13, pa_base: 2, regs: 2, coords: vec![4, 5], cube: false }]
+            vec![PlannedPrefetch { unit: 13, pa_base: 2, regs: 2, coords: vec![4, 5], cube: false, projective: false, coords_unfed: false }]
         );
         // The interface carries TEXCOORD1's four components, then the two sample coordinates
         // taken from TEXCOORD0 - which is NOT itself an interpolant of this fragment.
@@ -4222,7 +5640,7 @@ mod tests {
         let mut vprog = vertex_program(0, Vec::new(), 0);
         vprog.output_varyings = vec![texcoord_out(0, 6, 4), texcoord_out(1, 10, 4)];
         let fprog = fragment_program(vec![texcoord_in_prefetched(1, 0, 2, 13, 0)], 4);
-        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap();
+        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0]), false).unwrap();
         assert!(iface.prefetches.is_empty());
         assert_eq!(iface.components.len(), 4);
     }
@@ -4235,7 +5653,7 @@ mod tests {
         vprog.output_varyings = vec![texcoord_out(0, 6, 4), texcoord_out(1, 10, 4)];
         let fprog = fragment_program(vec![texcoord_in_prefetched(1, 0, 2, 13, 0)], 4);
         assert_eq!(
-            plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2])).unwrap_err(),
+            plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2]), false).unwrap_err(),
             LinkError::PrefetchUnitNotDeclared { unit: 13 }
         );
     }
@@ -4246,10 +5664,95 @@ mod tests {
         vprog.output_varyings = vec![texcoord_out(0, 6, 4), texcoord_out(1, 10, 4)];
         let mut fprog = fragment_program(vec![texcoord_in_prefetched(1, 0, 2, 15, 0)], 4);
         fprog.parameters = vec![sampler(15, true)];
-        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2])).unwrap();
+        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2]), false).unwrap();
         assert_eq!(iface.prefetches[0].coords.len(), 3);
         assert!(iface.prefetches[0].cube);
         assert_eq!(iface.prefetches[0].binding().wgsl_type(), "texture_cube<f32>");
+    }
+
+    fn texcoord_in_projective(index: u8, pa_base: u8, register_count: u8, unit: u8, source: u8) -> Interpolant {
+        let mut it = texcoord_in_prefetched(index, pa_base, register_count, unit, source);
+        if let Some(pf) = it.prefetch.as_mut() {
+            pf.lookup = crate::container::PrefetchLookup::Projective;
+        }
+        it
+    }
+
+    /// The fragment of `a_projective_prefetch_*`: TEXCOORD1's data in PA[0..2] and unit 4's
+    /// sample in PA[2..4], coordinated by TEXCOORD0 - mlb's grass sampling `PlayerShadowsTarget`.
+    fn projective_pair(texcoord0_width: u32) -> (Program, Program) {
+        let mut vprog = vertex_program(0, Vec::new(), 0);
+        vprog.output_varyings = vec![texcoord_out(0, 6, texcoord0_width), texcoord_out(1, 10, 4)];
+        let mut fprog = fragment_program(vec![texcoord_in_projective(1, 0, 2, 4, 0)], 4);
+        fprog.parameters = vec![sampler(4, false)];
+        (vprog, fprog)
+    }
+
+    #[test]
+    fn a_projective_prefetch_routes_the_texcoords_w_and_stays_a_2d_binding() {
+        // TEXCOORD0 is the homogeneous screen position (x', y', z, w) at lanes 6..10, so the
+        // coordinate is lanes 6 and 7 divided by lane 9 - and NOT lane 8, the depth.
+        let (vprog, fprog) = projective_pair(4);
+        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2]), false).unwrap();
+        let pf = &iface.prefetches[0];
+        assert!(pf.projective);
+        let lanes: Vec<u32> = pf.coords.iter().map(|&i| iface.components[i].vertex_lane).collect();
+        assert_eq!(lanes, vec![6, 7, 9]);
+        assert_eq!(iface.components[pf.coords[2]].dest, ComponentDest::SampleCoord { prefetch: 0, coord: 3 });
+        // The TEXTURE is flat: projection is a property of the coordinate.
+        assert_eq!(pf.binding().wgsl_type(), "texture_2d<f32>");
+        assert_eq!(pf.coord_arity(), 2);
+    }
+
+    #[test]
+    fn a_projective_prefetch_off_a_three_component_texcoord_divides_by_the_iterators_one() {
+        // The iterator fills a missing fourth component with the texcoord default w = 1, so a
+        // vertex that writes three lanes gets the plain lookup - and no lane past its varying
+        // is routed (lane 9 would be the NEXT varying's first component).
+        let (vprog, fprog) = projective_pair(3);
+        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2]), false).unwrap();
+        let pf = &iface.prefetches[0];
+        assert!(!pf.projective);
+        let lanes: Vec<u32> = pf.coords.iter().map(|&i| iface.components[i].vertex_lane).collect();
+        assert_eq!(lanes, vec![6, 7]);
+    }
+
+    #[test]
+    fn a_projective_prefetch_samples_at_xy_over_w() {
+        // The emitted sample, against the plain reading as its negative control: the same pair
+        // with the descriptor's lookup field at 1 samples the raw (x', y') - which is what wrapped
+        // `PlayerShadowsTarget` across mlb's whole infield as a grid of dark dashes.
+        let emit = |projective: bool| {
+            let (vprog, mut fprog) = projective_pair(4);
+            if !projective {
+                fprog.interpolants[0].prefetch.as_mut().unwrap().lookup = crate::container::PrefetchLookup::Plain;
+            }
+            let fsh = fragment_reading(&[0, 2]);
+            let vsh = shader(
+                ProgramKind::Vertex,
+                vec![instr(Op::Mov, Some(Operand::plain(Bank::Output, 6, 2)), vec![Operand::plain(Bank::PrimaryAttr, 0, 1)], [true; 4])],
+            );
+            let iface = plan_interface(&vprog, &fprog, &fsh, false).unwrap();
+            let fplan = plan_bindings(&fsh, 0, |_| false);
+            let mut fplan = fplan;
+            for pf in &iface.prefetches {
+                fplan.samplers.push(pf.binding());
+            }
+            let vplan = plan_vertex_bindings(&vprog, &vsh);
+            let locations = (iface.components.len() as u32).div_ceil(4);
+            build_linked_module(
+                &emit_body(&vsh).unwrap(), &vplan, &vprog, &[], &emit_body(&fsh).unwrap(), &fplan, &fprog, &[],
+                &iface, locations, false,
+            )
+        };
+        let proj = emit(true);
+        assert!(
+            proj.contains("textureSample(t4, s4, vec2<f32>(vec2<f32>(in.v1.x, in.v1.y) / in.v1.z));"),
+            "{proj}"
+        );
+        let plain = emit(false);
+        assert!(plain.contains("textureSample(t4, s4, vec2<f32>(in.v1.x, in.v1.y));"), "{plain}");
+        assert!(!plain.contains(") / in.v"), "{plain}");
     }
 
     #[test]
@@ -4260,7 +5763,7 @@ mod tests {
         let mut fprog = fragment_program(vec![texcoord_in_prefetched(1, 0, 2, 15, 0)], 4);
         fprog.parameters = vec![sampler(15, true)];
         assert_eq!(
-            plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2])).unwrap_err(),
+            plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2]), false).unwrap_err(),
             LinkError::PrefetchCoordTooNarrow { unit: 15, needed: 3, available: 2 }
         );
     }
@@ -4312,7 +5815,7 @@ mod tests {
         uprog.default_uniform_regs = 4;
         uprog.output_varyings = vec![texcoord_out(0, 6, 4)];
         let fprog = fragment_program(vec![texcoord_in(0, 0, 4, false)], 4);
-        let iface = plan_interface(&uprog, &fprog, &fsh).unwrap();
+        let iface = plan_interface(&uprog, &fprog, &fsh, false).unwrap();
         let locations = (iface.components.len() as u32).div_ceil(4);
         let wgsl = build_linked_module(
             &vbody, &vplan, &uprog, &[], &fbody, &fplan, &uprog, &[], &iface, locations, false,

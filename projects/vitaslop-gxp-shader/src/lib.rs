@@ -21,6 +21,8 @@
 
 pub mod attrflow;
 pub mod container;
+pub mod fold;
+pub mod gxpwrite;
 pub mod interp;
 pub mod ir;
 pub mod link;
@@ -71,7 +73,7 @@ impl core::fmt::Display for RecompileError {
             RecompileError::Emit(e) => write!(f, "{e}"),
             RecompileError::ColorRegisterNeverWritten => write!(
                 f,
-                "fragment writes neither OUTPUT nor PRIMATTR register 0, so the register carrying                  its colour is not established (a pass-through of an interpolated varying)"
+                "fragment writes neither OUTPUT nor PRIMATTR register 0, so the register carrying its colour is not established (a pass-through of an interpolated varying)"
             ),
             RecompileError::TooManyVaryings { needed, limit } => write!(
                 f,

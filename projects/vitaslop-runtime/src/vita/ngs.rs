@@ -463,11 +463,22 @@ pub(super) fn rack_get_voice_handle(ctx: &mut GuestCtx, st: &mut VitaState, rack
 pub(super) fn voice_get_state_data(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, module: u32, data: Ptr, size: u32) -> i32 {
     if data.addr() != 0 && size != 0 {
         ctx.write_bytes(data.addr(), &vec![0u8; size as usize]);
+        // The whole state block, not just the byte position - see `At9::state_words` for
+        // the streamer that reads word 3 before it queues anything.
         if module == NGS_PLAYER_MODULE
-            && size >= 4
-            && let Some(pos) = st.audio_state.at9.position_bytes(voice)
+            && let Some(words) = st.audio_state.at9.state_words(voice)
         {
-            ctx.write_u32(data.addr(), pos);
+            for (i, w) in words.iter().enumerate() {
+                if (i as u32 + 1) * 4 <= size {
+                    ctx.write_u32(data.addr() + i as u32 * 4, *w);
+                }
+            }
+            tracing::trace!(
+                target: "vitaslop::ngs",
+                voice = format_args!("{voice:#x}"),
+                lr = format_args!("{:#010x}", ctx.regs[14]),
+                "player state words {words:?}"
+            );
         }
     }
     0
@@ -601,6 +612,41 @@ pub(super) fn patch_create_routing(ctx: &mut GuestCtx, st: &mut VitaState, info:
     0
 }
 
+/// SceInt32 sceNgsVoiceGetOutputPatch(SceNgsHVoice voice, SceInt32 index, SceNgsHPatch *patch)
+///
+/// The reverse of [`patch_create_routing`]: which patch carries this voice's `index`-th
+/// output. `ngs_patch_voice` already records `(patch, source voice)` for every routing the
+/// title created, in creation order, so the answer is the `index`-th entry whose source is
+/// this voice. No such output writes a NULL handle and returns 0 - which is what a title
+/// asking "is anything routed here yet" expects, and is not an error.
+///
+/// >>> IT IS HERE BECAUSE REFUSING A BOGUS EVENT-FLAG WAIT UNCOVERED IT. PCSE00084's audio
+/// thread was parked forever on `sceKernelWaitEventFlag` on a uid that names nothing; once
+/// that wait returns `UNKNOWN_EVF_ID` the thread runs on and calls this, which had no
+/// implementation at all. A stall hides every gap downstream of it
+/// [[vitaslop-fast-fail-no-silent-success]].
+#[hostcall]
+pub(super) fn voice_get_output_patch(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    voice: u32,
+    index: i32,
+    patch: Ptr,
+) -> i32 {
+    let found = st
+        .audio_state
+        .ngs_patch_voice
+        .iter()
+        .filter(|(_, v)| *v == voice)
+        .nth(index.max(0) as usize)
+        .map(|(p, _)| *p)
+        .unwrap_or(0);
+    if !patch.is_null() {
+        ctx.write_u32(patch.addr(), found);
+    }
+    0
+}
+
 /// SceInt32 sceNgsVoicePatchSetVolume(SceNgsHPatch patch, SceInt32 outputChannel,
 ///                                    SceInt32 inputChannel, SceFloat32 volume)
 ///
@@ -616,11 +662,19 @@ pub(super) fn voice_patch_set_volume(
     _ctx: &mut GuestCtx,
     st: &mut VitaState,
     patch: u32,
-    _output_channel: i32,
-    _input_channel: i32,
+    output_channel: i32,
+    input_channel: i32,
     volume: f32,
 ) -> i32 {
-    st.audio_state.set_patch_volume(patch, volume);
+    // ONE cell: the source's OUTPUT channel to the destination's INPUT channel - see
+    // `At9Voice::patch`. Taking it as the whole patch gain made the LAST call win, so a title
+    // writing its cross-feed cell (L->R = 0) after its straight cells went silent.
+    st.audio_state.set_patch_cells(
+        patch,
+        Some((output_channel.clamp(0, 1) as usize, input_channel.clamp(0, 1) as usize)),
+        volume,
+        [[0.0; 2]; 2],
+    );
     0
 }
 
@@ -641,11 +695,14 @@ pub(super) fn voice_patch_set_volumes_matrix(
     // No early `return` here: `#[hostcall]` rewrites the body, so one would not mean
     // what it reads as.
     if !matrix.is_null() {
-        let loudest = (0..4u32)
-            .map(|i| f32::from_bits(ctx.read_u32(matrix.addr() + i * 4)))
-            .filter(|v| v.is_finite())
-            .fold(0.0f32, f32::max);
-        st.audio_state.set_patch_volume(patch, loudest);
+        // Four f32 in memory order `[src0->dst0, src0->dst1, src1->dst0, src1->dst1]` -
+        // `m[source][destination]`, copied whole. See `At9Voice::patch`.
+        let cell = |i: u32| f32::from_bits(ctx.read_u32(matrix.addr() + i * 4));
+        let m = [[cell(0), cell(1)], [cell(2), cell(3)]];
+        let loudest = m.iter().flatten().copied().filter(|v| v.is_finite()).fold(0.0f32, f32::max);
+        if m.iter().flatten().all(|v| v.is_finite() && *v >= 0.0) {
+            st.audio_state.set_patch_cells(patch, None, loudest, m);
+        }
     }
     0
 }

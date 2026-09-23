@@ -209,7 +209,23 @@ impl AudioState {
     /// A volume for a patch we never saw created is DROPPED rather than applied to some
     /// other voice - a misattributed gain is a voice at the wrong level, which is worse
     /// than one at unity because it looks deliberate.
+    /// Unwired today, for the same reason as [`crate::vita::at9::At9Bank::set_gain`]: the
+    /// routing call that would reach it is not implemented. The rule above is the finding.
+    #[allow(dead_code)]
     pub(crate) fn set_patch_volume(&mut self, patch: u32, volume: f32) {
+        self.set_patch_cells(patch, None, volume, [[volume, 0.0], [0.0, volume]]);
+    }
+
+    /// One cell (`Some((source channel, destination channel))`) or the whole 2x2 matrix
+    /// (`None`, `matrix`) of a patch's volume - see `At9Voice::patch`. A non-finite or
+    /// negative value is not a volume and is dropped, as the scalar form always did.
+    pub(crate) fn set_patch_cells(
+        &mut self,
+        patch: u32,
+        cell: Option<(usize, usize)>,
+        volume: f32,
+        matrix: [[f32; 2]; 2],
+    ) {
         if !volume.is_finite() || volume < 0.0 {
             return;
         }
@@ -221,9 +237,13 @@ impl AudioState {
                     patch = format_args!("{patch:#x}"),
                     voice = format_args!("{voice:#x}"),
                     volume,
+                    cell = format_args!("{cell:?}"),
                     "routing volume applied"
                 );
-                self.at9.set_gain(voice, volume);
+                match cell {
+                    Some((src, dst)) => self.at9.set_patch_cell(voice, src, dst, volume),
+                    None => self.at9.set_patch_matrix(voice, matrix),
+                }
             }
             None => tracing::debug!(
                 target: "vitaslop::at9",

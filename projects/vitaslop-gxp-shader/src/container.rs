@@ -272,6 +272,55 @@ pub struct SamplePrefetch {
     pub source_texcoord: u8,
     /// This is the last prefetch in the program's fetch sequence ([`INFO_PREFETCH_LAST`]).
     pub last: bool,
+    /// What KIND of lookup the PDS performs - see [`PrefetchLookup`].
+    pub lookup: PrefetchLookup,
+}
+
+/// The lookup a PDS prefetch performs, from `attribute_info` bits 10:8 ([`INFO_PREFETCH`]).
+///
+/// # The field is the lookup kind, and the census that says so
+/// That field was read only as "zero or not" (a prefetch rides along or it does not), with its
+/// value explicitly left unexplained. `census_prefetch_lookup_kind_against_the_sampler` tabulates
+/// it against the SAMPLER each prefetch names, over every captured fragment blob:
+///
+/// | value | sampler            | count      |
+/// |-------|--------------------|------------|
+/// | 1     | flat 2D, never cube | 1031 + 244 |
+/// | 2     | flat 2D, never cube | 10         |
+/// | 3     | CUBE, every time    | 21 + 3     |
+/// | 5     | flat 2D             | 1          |
+///
+/// So 3 is the cube lookup (the sampler's own cube bit agrees on all 24), and 2 is a 2D lookup
+/// that is NOT the plain one: all ten name a baseball title's `PlayerShadowsTarget`, a
+/// screen-space target, and every paired vertex program writes that TEXCOORD as the
+/// HOMOGENEOUS screen position `(0.5x + 0.5w, -0.5y + 0.5w, z, w)` - a coordinate that means
+/// nothing until it is divided by its `w`. It is the PROJECTIVE lookup (`tex2Dproj`). Read as a
+/// plain 2D sample it wrapped the target tens of times across the ground and painted its one
+/// shadow wedge as a grid of dark dashes over the whole field.
+///
+/// 5 is seen once and its meaning is NOT established; it keeps the plain 2D reading it has always
+/// had rather than being given one it has not earned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefetchLookup {
+    /// Value 1: a plain 2D (or, for a cube sampler, 3D) lookup at the interpolated coordinate.
+    Plain,
+    /// Value 2: `xy / w` - the coordinate is divided by its fourth component first.
+    Projective,
+    /// Value 3: a cube-map lookup (the sampler's own cube bit is the authority on the shape).
+    Cube,
+    /// Any other value, carried verbatim. Sampled as [`PrefetchLookup::Plain`].
+    Other(u8),
+}
+
+impl PrefetchLookup {
+    pub fn from_attribute_info(attribute_info: u32) -> Self {
+        match (attribute_info & INFO_PREFETCH) >> 8 {
+            1 => Self::Plain,
+            2 => Self::Projective,
+            3 => Self::Cube,
+            v => Self::Other(v as u8),
+        }
+    }
 }
 
 /// One fragment-program interpolated input, decoded from the varyings block's per-interpolant
@@ -1094,10 +1143,29 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
         return Err("the varyings count is outside the blob");
     };
     let count = count as usize;
-    // A sane fragment program has a handful of varyings; reject an absurd count rather than
-    // walk off the blob (a sign the block offset is wrong for this blob).
+    // >>> A COUNT OF ZERO IS A PROGRAM THAT INTERPOLATES NOTHING, NOT A FAILED DECODE.
+    //
+    // This used to be refused beside the absurd-count guard below, on the same reasoning - "a
+    // sane fragment program has a handful of varyings, so a strange count means the block
+    // offset is wrong for this blob". That reasoning holds for a LARGE count, which would walk
+    // the descriptor loop off the end of the blob. It does not hold for zero: the loop below
+    // simply does not run, and there is nothing to read out of bounds.
+    //
+    // MEASURED, and the corpus is unusually clear here - **exactly ONE blob of 596 declares a
+    // count of 0**, a football title's `frag_90c054e0`, and its body is the proof that the
+    // count is TRUE: `Nop`, a `Test` on constants, a predicated `Kill`, `Nop`, `Nop`. It reads
+    // no primary attribute and writes no colour register, so there is genuinely nothing for the
+    // PDS to iterate. Reporting that as a decode ERROR cost the pair its link (the fragment was
+    // treated as a PASSTHROUGH whose colour IS its register file, and then refused because
+    // nothing fed it) and DROPPED every draw of it - 168 fallback draws in one browser run of
+    // that title's kickoff.
+    //
+    // Nothing downstream is loosened by this. A count-0 program that DOES read a primary
+    // attribute still fails `PaReadUnfed` exactly as before, because nothing feeds it; the
+    // difference is only that the refusal is now reported against a list that is honestly
+    // empty rather than against a decode that supposedly failed.
     if count == 0 {
-        return Err("the varyings block declares a count of 0");
+        return Ok(Vec::new());
     }
     if count > 32 {
         return Err("the varyings count is absurd (>32), so the block offset is wrong here");
@@ -1195,6 +1263,7 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
                     unit: resource_index as u8,
                     source_texcoord: source as u8,
                     last: attribute_info & INFO_PREFETCH_LAST != 0,
+                    lookup: PrefetchLookup::from_attribute_info(attribute_info),
                 })
             }
             [true, true] => {
@@ -1205,6 +1274,7 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
                     unit: resource_index as u8,
                     source_texcoord: source as u8,
                     last: attribute_info & INFO_PREFETCH_LAST != 0,
+                    lookup: PrefetchLookup::from_attribute_info(attribute_info),
                 })
             }
             _ => {
@@ -1240,7 +1310,7 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
         // picture, which is the one outcome this decoder must not produce.
         if size & 0x80 != 0 && size & 0x40 == 0 {
             return Err(
-                "a varying descriptor sets the wide-prefetch bit without the two-register bit,                  which is not a prefetch width this decoder has ever observed",
+                "a varying descriptor sets the wide-prefetch bit without the two-register bit, which is not a prefetch width this decoder has ever observed",
             );
         }
         let prefetch_regs = if size & 0x80 != 0 {
@@ -2174,7 +2244,7 @@ mod tests {
                     register_count: 2,
                     span: 4,
                     half: true,
-                    prefetch: Some(SamplePrefetch { unit: 13, source_texcoord: 0, last: false }),
+                    prefetch: Some(SamplePrefetch { unit: 13, source_texcoord: 0, last: false, lookup: PrefetchLookup::Plain }),
                     prefetch_regs: 2,
                 },
                 Interpolant {
@@ -2183,7 +2253,7 @@ mod tests {
                     register_count: 2,
                     span: 4,
                     half: true,
-                    prefetch: Some(SamplePrefetch { unit: 0, source_texcoord: 3, last: true }),
+                    prefetch: Some(SamplePrefetch { unit: 0, source_texcoord: 3, last: true, lookup: PrefetchLookup::Plain }),
                     prefetch_regs: 2,
                 },
                 Interpolant {
@@ -2205,6 +2275,28 @@ mod tests {
     }
 
     #[test]
+    fn the_prefetch_field_names_the_lookup_kind() {
+        // mlb's infield grass (`frag_843cda78`), descriptors 2..4 verbatim: a plain prefetch of
+        // unit 3 from TEXCOORD4 (field value 1), the PROJECTIVE prefetch of unit 4 -
+        // `PlayerShadowsTarget` - from TEXCOORD0 (value 2), and a plain one of unit 5 (value 1).
+        // A cube descriptor (value 3) from a gloss material, and the one value-5 descriptor in
+        // any corpus, carried verbatim rather than guessed at.
+        let b = build_frag_with_varyings(&[
+            (0x0000_f104, 3, 0x40, 0x20),
+            (0x0000_f200, 4, 0x40, 0x20),
+            (0x0000_f905, 5, 0x40, 0x20),
+        ]);
+        let p = Program::parse(&b).expect("parse");
+        let kinds: Vec<_> = p.interpolants.iter().filter_map(|i| i.prefetch).map(|pf| (pf.unit, pf.lookup)).collect();
+        assert_eq!(
+            kinds,
+            vec![(3, PrefetchLookup::Plain), (4, PrefetchLookup::Projective), (5, PrefetchLookup::Plain)]
+        );
+        assert_eq!(PrefetchLookup::from_attribute_info(0x0ec0_0b04), PrefetchLookup::Cube);
+        assert_eq!(PrefetchLookup::from_attribute_info(0x2cc0_0d00), PrefetchLookup::Other(5));
+    }
+
+    #[test]
     fn a_wide_prefetch_descriptor_takes_four_pa_registers() {
         // frag_866a6180's only descriptor, verbatim: a retail racer's in-race composite. `size`
         // is 0xf0 - the register-count field says four data registers, bit 6 says the prefetched
@@ -2222,7 +2314,7 @@ mod tests {
                 register_count: 4,
                 span: 8,
                 half: false,
-                prefetch: Some(SamplePrefetch { unit: 0, source_texcoord: 0, last: true }),
+                prefetch: Some(SamplePrefetch { unit: 0, source_texcoord: 0, last: true, lookup: PrefetchLookup::Plain }),
                 prefetch_regs: 4,
             }]
         );

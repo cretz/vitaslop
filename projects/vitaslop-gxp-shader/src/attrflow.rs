@@ -206,17 +206,7 @@ fn propagates_per_channel(op: Op) -> bool {
 /// `index + selector`, the four F16 channels share a register PAIR, and a packed-byte operand
 /// keeps all four channels in ONE register.
 fn src_reg(instr: &Instr, src: &Operand, c: usize) -> Option<(usize, std::ops::Range<usize>)> {
-    let sel = src.swizzle[c] as usize;
-    if sel > 3 {
-        return None; // a swizzle constant reads no register
-    }
-    Some(if instr.source_packed_bytes() {
-        (src.index as usize, 0..2)
-    } else if instr.source_half_precision() {
-        (src.index as usize + (sel >> 1), (sel & 1)..(sel & 1) + 1)
-    } else {
-        (src.index as usize + sel, 0..2)
-    })
+    instr.source_register(src, c).map(|(reg, halves)| (reg as usize, halves))
 }
 
 /// The `(register, halves)` an instruction's destination channel `c` writes.

@@ -97,6 +97,21 @@ try {
   console.log("running; playing for", playMs, "ms");
   await page.waitForTimeout(playMs);
   await page.screenshot({ path: join(shotDir, "05-play.png") });
+  // Restart from the menu: a confirm, then a full teardown and a fresh start of the same
+  // title, through the one start path - the loading screen comes back and goes away again.
+  await page.click("#menubtn");
+  await page.waitForFunction(() => !document.getElementById("menu").hidden);
+  await page.click("#m-restart");
+  await page.waitForFunction(() => !document.getElementById("m-confirm").hidden);
+  await page.click("#m-confirm-yes");
+  await page.waitForFunction(() => !document.getElementById("loading").hidden || !document.getElementById("fatal").hidden, null, { timeout: 30000 });
+  await page.waitForFunction(() => document.getElementById("loading").hidden || !document.getElementById("fatal").hidden, null, { timeout: 5 * 60 * 1000 });
+  if (!(await page.evaluate(() => document.getElementById("fatal").hidden))) {
+    await fail("fatal after restart: " + (await page.$eval("#fatal-text", (e) => e.innerText)));
+  }
+  console.log("restarted; playing for", Math.min(playMs, 10000), "ms");
+  await page.waitForTimeout(Math.min(playMs, 10000));
+  await page.screenshot({ path: join(shotDir, "05b-restart.png") });
   await page.click("#menubtn");
   await page.waitForFunction(() => !document.getElementById("menu").hidden);
   await page.click("#menu details:last-of-type summary");
@@ -105,6 +120,9 @@ try {
   await writeFile(join(shotDir, "diag.txt"), diag);
   console.log(diag.split("\n").filter((l) => /^(fps|status|adapter)/.test(l)).join("\n"));
   await page.click("#m-quit");
+  // Quit asks first, inside the menu.
+  await page.waitForFunction(() => !document.getElementById("m-confirm").hidden);
+  await page.click("#m-confirm-yes");
   await page.waitForFunction(() => document.getElementById("player").hidden);
   await page.waitForSelector("#play");
   console.log("quit back to the title page");

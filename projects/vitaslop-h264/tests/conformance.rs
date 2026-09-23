@@ -34,7 +34,7 @@ fn assert_same(actual: &[u8], expected: &[u8], width: u32, height: u32, what: &s
         format!("Cr row {} col {}", at / (width as usize / 2), at % (width as usize / 2))
     };
     panic!(
-        "{what}: {differing} of {} samples differ; first at offset {first} ({plane}),          got {} expected {}",
+        "{what}: {differing} of {} samples differ; first at offset {first} ({plane}), got {} expected {}",
         expected.len(),
         actual[first],
         expected[first]
@@ -110,7 +110,7 @@ fn pollster_lite<F: std::future::Future>(mut future: F) -> F::Output {
     match future.as_mut().poll(&mut cx) {
         Poll::Ready(v) => v,
         Poll::Pending => panic!(
-            "the shared conformance suite parked on a native backend, where every                  await is supposed to be ready already"
+            "the shared conformance suite parked on a native backend, where every await is supposed to be ready already"
         ),
     }
 }

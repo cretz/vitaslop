@@ -1064,7 +1064,7 @@ fn sampler_unit_correlation() {
                 let sa = 2 * unit as u32;
                 let gxm_unit = program.sampler_unit_at(sa).unwrap_or_else(|| {
                     panic!(
-                        "{name}: SMP field {unit} -> SA reg {sa} resolves to no texture;                          control table {:?}, dubuf {}",
+                        "{name}: SMP field {unit} -> SA reg {sa} resolves to no texture; control table {:?}, dubuf {}",
                         program.texture_control, program.default_uniform_regs
                     )
                 });
@@ -1801,7 +1801,7 @@ fn interpret_one() {
         let shader = vitaslop_gxp_shader::usse::decode_shader(&program);
         // Every unit returns a mid-grey texel, so a program that samples runs to completion:
         // the question is which op stops the interpreter, not what the picture looks like.
-        let grey = |_unit: u8, _c: [f32; 4]| Some([0.5f32; 4]);
+        let grey = |_unit: u8, _c: [f32; 4], _l: vitaslop_gxp_shader::interp::TexLodArg| Some([0.5f32; 4]);
         match vitaslop_gxp_shader::interp::run_watching_for_nan_with_textures(&shader, &mut regs, &grey) {
             Ok(nan) => {
                 println!("{name}: primary interpreted ({} instrs)", shader.instrs.len());

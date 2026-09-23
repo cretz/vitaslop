@@ -1,5 +1,6 @@
 //! USSE (SGX543 Unified Scalable Shader Engine) decoding.
 
+pub mod asm;
 pub mod decode;
 
 pub use decode::{
@@ -10,28 +11,204 @@ pub use decode::{
 use crate::container::Program;
 use crate::ir::{Op, Shader};
 
-/// Whether the per-instruction SMLSI state can be read off the code stream LINEARLY, i.e. no
-/// branch can carry control across an SMLSI.
+/// The MOE (repeat) state in force on ENTRY to each code word, computed over the program's
+/// CONTROL-FLOW GRAPH.
 ///
-/// SMLSI sets state that persists until the next SMLSI, so what a repeating instruction consults
-/// is simply the last SMLSI before it - provided control actually reached it that way. A branch
-/// that jumps over an SMLSI (or into the middle of its scope) makes the state at a later
-/// instruction path-dependent, and this decoder has no dataflow to resolve that. In that case
-/// every SMLSI stays BLOCKED, which is where the model was for every program before this.
+/// An SMLSI sets state that persists until the next SMLSI, so what a repeating instruction
+/// consults is the last SMLSI that ran before it - and which SMLSI that is, is a control-flow
+/// question, not a textual one. This is the forward dataflow that answers it: entry state is
+/// [`decode::DEFAULT_REPEAT_STATE`], an SMLSI overwrites the state, everything else passes it
+/// through, and two paths carrying DIFFERENT states meet as `None` - "not determined", which is
+/// what makes the consumer block instead of picking one.
 ///
-/// The span is taken as the whole open interval between the branch and its target, in both
-/// directions. A backward branch that re-executes its own SMLSI would in fact be safe, but the
-/// corpus contains no such program, and a rule that has to reason about re-execution order is
-/// not one worth having on no evidence.
-fn smlsi_state_is_linear(code: &[u64], instrs: &[crate::ir::Instr]) -> bool {
-    let smlsi_at = |lo: i64, hi: i64| {
-        code.iter().enumerate().any(|(i, &w)| (i as i64) > lo && (i as i64) < hi && decode::is_smlsi(w))
+/// This replaces a whole-program rule ("no branch may span any SMLSI, or every SMLSI blocks"),
+/// which is sound but far coarser: in a program whose every repeat is immediately preceded by
+/// its own SMLSI, a branch landing anywhere else is harmless, and the old rule refused the
+/// program anyway.
+///
+/// # The edges, and why each is the one the hardware has
+///
+/// * FALL-THROUGH `i -> i+1` for every instruction except an UNCONDITIONAL branch. An
+///   unconditional branch does not fall through, and this is not a refinement that can be
+///   skipped "to stay conservative": a spurious fall-through edge past one manufactures a
+///   conflict at its target's successors out of nothing, which is exactly the false refusal
+///   this function exists to remove.
+/// * TAKEN `i -> i+rel` for every [`Op::Branch`]. A target outside the program is dropped here;
+///   [`remap_branch_targets`] blocks that instruction by name.
+/// * A PREDICATED branch has both.
+///
+/// A word no edge reaches is code the program cannot execute, and its state is reported as
+/// `None` rather than assumed: nothing should consult it, and a repeat that does has no
+/// established state to consult.
+fn moe_states(code: &[u64], instrs: &[crate::ir::Instr]) -> Vec<Option<[decode::SmlsiSlot; 4]>> {
+    use crate::ir::Predicate;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum St {
+        Unreached,
+        Known([decode::SmlsiSlot; 4]),
+        Conflict,
+    }
+    let join = |a: St, b: St| match (a, b) {
+        (St::Unreached, x) | (x, St::Unreached) => x,
+        (St::Known(x), St::Known(y)) if x == y => St::Known(x),
+        _ => St::Conflict,
     };
-    !instrs.iter().enumerate().any(|(at, instr)| {
-        let Op::Branch { rel } = instr.op else { return false };
-        let (at, target) = (at as i64, at as i64 + i64::from(rel));
-        smlsi_at(at.min(target), at.max(target))
-    })
+
+    let n = code.len();
+    let mut entry = vec![St::Unreached; n];
+    if n == 0 {
+        return Vec::new();
+    }
+    entry[0] = St::Known(decode::DEFAULT_REPEAT_STATE);
+    // The lattice is three levels deep and every step is monotone, so a sweep that changes
+    // nothing is the fixpoint. The bound is only a guard against a future non-monotone edit.
+    for _ in 0..=n {
+        let mut changed = false;
+        for i in 0..n {
+            let st = entry[i];
+            if st == St::Unreached {
+                continue;
+            }
+            let out = if decode::is_smlsi(code[i]) {
+                St::Known(decode::decode_smlsi(code[i]))
+            } else {
+                st
+            };
+            let mut succ = [None, None];
+            match instrs[i].op {
+                Op::Branch { rel } => {
+                    let t = i as i64 + i64::from(rel);
+                    if t >= 0 && (t as usize) < n {
+                        succ[0] = Some(t as usize);
+                    }
+                    if instrs[i].pred != Predicate::Always && i + 1 < n {
+                        succ[1] = Some(i + 1);
+                    }
+                }
+                _ => {
+                    if i + 1 < n {
+                        succ[0] = Some(i + 1);
+                    }
+                }
+            }
+            for s in succ.into_iter().flatten() {
+                let merged = join(entry[s], out);
+                if merged != entry[s] {
+                    entry[s] = merged;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    entry
+        .into_iter()
+        .map(|s| match s {
+            St::Known(k) => Some(k),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The SMBO (set-memory-base-offset) state on ENTRY to every code word, walked over the same
+/// control-flow edges [`moe_states`] walks - `None` where two paths disagree or nothing reaches.
+///
+/// # What an SMBO does, and the closure that establishes it
+/// It sets four 12-bit BASE OFFSETS that are added to the register NUMBERS of the instructions
+/// that follow, until another SMBO changes them. It exists because some operand fields are only
+/// SIX bits wide and cannot name a register above 63.
+///
+/// That is exactly what a football title uses it for, and the closure is complete rather than
+/// argued. Its skinned vertex programs come in two compilations of one shader. In the first, a
+/// LIMM loads the sentinel `0x7FFFFFFF` into a register and a byte-wise conditional move selects
+/// it. In the second there is no LIMM - the sentinel is a LITERAL in the constant table - and
+/// the same move reads it through `src1` with the field at its MAXIMUM VALUE, 63, under an SMBO:
+///
+///   * `vert_90c28c60`: base 20, `src1` field 63 -> `sa[83]`, and the blob's literal table says
+///     `sa[83] = 0x7fffffff`.
+///   * `vert_90c2e8f0`: base 38, `src1` field 63 -> `sa[101]`, and ITS literal table says
+///     `sa[101] = 0x7fffffff`.
+///
+/// Two programs, two different bases, both landing exactly on the constant the other compilation
+/// loads with a LIMM. The same two tables also carry `0xcf000000` and `0x00010000`, the other two
+/// LIMM immediates, which is a third independent check on [`crate::ir::Op::Limm`]'s assembly.
+///
+/// # What is modelled and what is refused
+/// Only the `src1` slot, at bits [23:12], is evidenced, so only it is applied - and an SMBO that
+/// programs ANY OTHER slot blocks, rather than being applied on a guessed field order. Bit 50
+/// varies between the two forms of the all-zero "reset" word the same programs emit
+/// interchangeably after a use, so it cannot change what an all-zero word does; a NON-zero word
+/// with it set has never been seen and blocks.
+fn smbo_states(code: &[u64], instrs: &[crate::ir::Instr]) -> Vec<Option<u16>> {
+    use crate::ir::Predicate;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum St {
+        Unreached,
+        Known(u16),
+        Conflict,
+    }
+    let join = |a: St, b: St| match (a, b) {
+        (St::Unreached, x) | (x, St::Unreached) => x,
+        (St::Known(x), St::Known(y)) if x == y => St::Known(x),
+        _ => St::Conflict,
+    };
+    let n = code.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut entry = vec![St::Unreached; n];
+    entry[0] = St::Known(0);
+    for _ in 0..=n {
+        let mut changed = false;
+        for i in 0..n {
+            let st = entry[i];
+            if st == St::Unreached {
+                continue;
+            }
+            let out = match decode::smbo_src1_base(code[i]) {
+                Some(base) => St::Known(base),
+                None => st,
+            };
+            let mut succ = [None, None];
+            match instrs[i].op {
+                Op::Branch { rel } => {
+                    let t = i as i64 + i64::from(rel);
+                    if t >= 0 && (t as usize) < n {
+                        succ[0] = Some(t as usize);
+                    }
+                    if instrs[i].pred != Predicate::Always && i + 1 < n {
+                        succ[1] = Some(i + 1);
+                    }
+                }
+                _ => {
+                    if i + 1 < n {
+                        succ[0] = Some(i + 1);
+                    }
+                }
+            }
+            for s in succ.into_iter().flatten() {
+                let merged = join(entry[s], out);
+                if merged != entry[s] {
+                    entry[s] = merged;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    entry
+        .into_iter()
+        .map(|s| match s {
+            St::Known(k) => Some(k),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Expand every repeating instruction into the sequence of single executions it stands for,
@@ -77,44 +254,102 @@ fn smlsi_state_is_linear(code: &[u64], instrs: &[crate::ir::Instr]) -> bool {
 enum RepeatStep {
     /// Advance the operand's register index by this much per iteration.
     Index(i32),
-    /// Hold the register and take iteration `i`'s component from `(byte >> 2i) & 3`.
-    Component(u8),
+    /// Address `base + ((byte >> 2i) & 3) * stride` on iteration `i`: the SMLSI offset table.
+    Offsets(u8, i32),
 }
 
 fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir::Instr>, Vec<usize>) {
-    let linear = smlsi_state_is_linear(code, &instrs);
-    let mut state = decode::DEFAULT_REPEAT_STATE;
+    let states = moe_states(code, &instrs);
+    let bases = smbo_states(code, &instrs);
+    let has_smbo = code.iter().any(|&w| decode::smbo_src1_base(w).is_some());
     let mut out = Vec::with_capacity(instrs.len());
     let mut starts = Vec::with_capacity(code.len() + 1);
-    for (instr, &word) in instrs.into_iter().zip(code) {
+    for (at, (mut instr, &word)) in instrs.into_iter().zip(code).enumerate() {
         starts.push(out.len());
+        // >>> AN SMBO'S BASE, APPLIED WHERE IT IS ESTABLISHED AND BLOCKING WHERE IT IS NOT.
+        //
+        // An SMBO itself emits nothing - it only sets the state - and is never blocked on its
+        // own account unless it programs a slot this does not model (`smbo_src1_base` returns
+        // the blocked word to the decoder for that). While a NON-ZERO base is in force it
+        // shifts `src1`, which is `srcs[0]` in every shape of the group-0x38 move family (the
+        // unconditional `mov`, and the conditional selects, whose source order is
+        // `[src1, src2, src0]`). Any OTHER instruction under a non-zero base is outside the
+        // closure that established this, so it blocks rather than being addressed by a rule
+        // that has not been checked for it.
+        if decode::smbo_src1_base(word).is_some() {
+            out.push(crate::ir::Instr { op: Op::Nop, blocked: instr.blocked, ..instr });
+            continue;
+        }
+        match bases[at] {
+            // A program with no SMBO at all has base zero everywhere, and an UNREACHED word
+            // reports `None` from the walk for want of an edge rather than for want of a
+            // state - so the unknown case only matters where an SMBO exists to make it real.
+            _ if !has_smbo => {}
+            Some(0) => {}
+            Some(base) if decode::opcode1(word) == 0x07 => {
+                match instr.srcs.first_mut().map(|s| (s.index as u32 + u32::from(base), s)) {
+                    Some((n, s)) if n <= u8::MAX.into() => s.index = n as u8,
+                    _ => {
+                        instr.blocked = instr
+                            .blocked
+                            .or(Some("0xF8 SMBO base pushes src1 outside the register file"))
+                    }
+                }
+            }
+            Some(_) => {
+                instr.blocked = instr.blocked.or(Some(
+                    "0xF8 SMBO: a NON-ZERO base offset is in force over an instruction outside the group-0x38 move family, where only the src1 slot is established",
+                ));
+            }
+            None => {
+                instr.blocked = instr.blocked.or(Some(
+                    "0xF8 SMBO state at this instruction is not single-valued - two control-flow paths reach it under different base offsets",
+                ));
+            }
+        }
+        // The state on ENTRY to this word, over every path that can reach it. `None` is "two
+        // paths disagree, or nothing reaches here" - only an instruction that actually CONSULTS
+        // the state is blocked by it, below.
+        let state = states[at];
 
         // SMLSI itself emits nothing - its entire effect is the state the repeats below read.
+        // It is never blocked on its own account: it SETS the state, so what reaches it cannot
+        // make it wrong, and a consumer that cannot resolve its own state blocks there instead.
         if decode::is_smlsi(word) {
-            state = decode::decode_smlsi(word);
-            out.push(crate::ir::Instr {
-                op: Op::Nop,
-                blocked: (!linear).then_some(
-                    "0xF8 SMLSI state is not linearly readable - a branch crosses its scope",
-                ),
-                ..instr
-            });
+            out.push(crate::ir::Instr { op: Op::Nop, blocked: None, ..instr });
             continue;
         }
 
         // The other half of the `moe_expand` guard in [`decode::decode_grp_mem_load`]: that
         // decoder allows a single-element memory access with bit 53 set because expansion
-        // cannot step anything on a domain of one iteration - but that argument also needs the
-        // MOE state to be its DEFAULT, and the state is only walkable here. Every captured
-        // instance is in a program with no SMLSI at all; one that ran under a programmed
-        // stride would be outside the census and must not be decoded on its strength.
+        // cannot step anything on a domain of one iteration. What that argument needs from the
+        // state is not that it is the DEFAULT but that ITERATION ZERO IS AT OFFSET ZERO, and
+        // those are different conditions:
+        //
+        //   * an INCREMENT slot advances by `n * i` per iteration, so iteration 0 contributes
+        //     `n * 0 = 0` whatever `n` is. Any increment is safe here, not just the default 1.
+        //   * an OFFSET (swizzle) slot reads a four-entry table, `(b >> 2i) & 3`, and iteration
+        //     0 takes its FIRST entry - which need not be zero. That one really does move the
+        //     address, and it stays blocked.
+        //
+        // The old test was `state != DEFAULT`, which refused both. That cost a football title
+        // TWO fragment programs whose single-element loads run under an SMLSI programmed with
+        // increments, where iteration zero is at offset zero by the arithmetic above - and a
+        // refused pair's mesh is absent from the frame. A state nothing reaches (`None`) is
+        // still refused: it has no single value to check.
+        let iteration_zero_unoffset = |st: &[decode::SmlsiSlot; 4]| {
+            st.iter().all(|slot| match slot {
+                decode::SmlsiSlot::Increment(_) => true,
+                decode::SmlsiSlot::Swizzle(b) => b & 3 == 0,
+            })
+        };
         if matches!(decode::opcode1(word), 0x1d | 0x1e)
             && (word >> 53) & 1 == 1
-            && state != decode::DEFAULT_REPEAT_STATE
+            && !state.as_ref().is_some_and(iteration_zero_unoffset)
         {
             out.push(crate::ir::Instr {
                 blocked: Some(
-                    "0xE8 memory access with moe_expand under a PROGRAMMED MOE state (an SMLSI                      is in force) is outside the census the single-element case rests on",
+                    "0xE8 memory access with moe_expand under a MOE state whose ITERATION ZERO is offset (an SMLSI programmed an offset table with a non-zero first entry, or no single state reaches here) - the single-element case rests on iteration zero being at offset zero",
                 ),
                 ..instr
             });
@@ -136,11 +371,33 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
             continue;
         };
         if extra == 0 {
-            out.push(instr);
+            push_split_pack(&mut out, instr);
             continue;
         }
         // From here the instruction really repeats, so the operand grammar has to be known
-        // exactly: which SMLSI byte governs each operand, and what one unit of it moves.
+        // exactly: which SMLSI byte governs each operand, and what one unit of it moves - and
+        // WHICH SMLSI is in force has to be a single answer. When two paths reach this word
+        // under different MOE states (or none reaches it at all) there is no state to read, and
+        // picking either one would step the operands of a real repeat by the wrong amount.
+        let Some(state) = state else {
+            out.push(crate::ir::Instr {
+                blocked: Some(
+                    "0xF8 SMLSI state at a repeating instruction is not single-valued - two control-flow paths reach it under different repeat states",
+                ),
+                ..instr
+            });
+            continue;
+        };
+        // >>> THE GROUP-0x15 GUARD: its repeat's STEPS are measured, its SLOT NUMBERS are not.
+        //
+        // The one repeating IMAD32 in any corpus runs under a state whose three non-zero slots
+        // all carry the same increment, so which of them the destination and src0 sit on cannot
+        // change the answer - see `repeat_operands`. Under a state where they DIFFER the choice
+        // would decide which register a matrix-palette pointer lands in, and that is not a
+        // thing to pick.
+        // (The IMAD32 slots-disagree guard that stood here is gone: the SMLSI byte order names
+        // each operand's byte, so a non-uniform state is no longer ambiguous - see
+        // `repeat_operands`.)
         let Some(operands) = decode::repeat_operands(word) else {
             out.push(crate::ir::Instr {
                 blocked: Some("repeat operand slots not established for this opcode group"),
@@ -148,34 +405,19 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
             });
             continue;
         };
-        // What one iteration does to each operand: step its register INDEX, or - when the MOE
-        // slot is in swizzle mode - hold the register and take the iteration's COMPONENT from
-        // the slot's byte.
-        //
-        // >>> SWIZZLE MODE IS A COMPONENT WALK, and it is the second half of how a repeat
-        // addresses its operands. The byte is four 2-bit component selectors, one per
-        // iteration (`(byte >> 2i) & 3`), and the operand's register does not move. In this
-        // IR a source operand reads `index + swizzle[channel]`, so replacing the swizzle with
-        // the iteration's selector expresses exactly that, in the same addressing every other
-        // consumer of these operands already uses.
-        //
-        // The DESTINATION's swizzle mode stays REFUSED: a destination is addressed by its
-        // write MASK here, not by a source swizzle, so the same substitution does not express
-        // it, and no program in any corpus needs it (the one corpus word that programs slot 0
-        // in swizzle mode has no repeat that consults it).
+        // What one iteration does to each operand: step its register INDEX by the slot's
+        // increment, or - when the slot is in OFFSET mode - address the register the slot's
+        // per-iteration table names (`base + entry[i] * stride`). Both are register addressing;
+        // the instruction's mask and swizzle never move (see `decode_smlsi`).
         let steps: Result<Vec<RepeatStep>, &'static str> = operands
             .iter()
-            .enumerate()
-            .map(|(i, o)| match (o.moe, state[o.slot]) {
+            .map(|o| match (o.moe, state[o.slot]) {
                 // An intrinsic advance - the DP's channel walk - is not the MOE's to program.
                 (false, _) => Ok(RepeatStep::Index(o.stride as i32)),
                 (true, decode::SmlsiSlot::Increment(n)) => {
                     Ok(RepeatStep::Index(i32::from(n) * o.stride as i32))
                 }
-                (true, decode::SmlsiSlot::Swizzle(_)) if i == 0 => {
-                    Err("0xF8 SMLSI per-iteration SWIZZLE stepping on a DESTINATION not modeled")
-                }
-                (true, decode::SmlsiSlot::Swizzle(b)) => Ok(RepeatStep::Component(b)),
+                (true, decode::SmlsiSlot::Swizzle(b)) => Ok(RepeatStep::Offsets(b, o.stride as i32)),
             })
             .collect();
         let steps = match steps {
@@ -196,31 +438,23 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
         };
         // A stepped index that leaves the 8-bit register file is not a register, and clamping it
         // would read or write the wrong one silently.
-        let advance = |index: u8, step: i32, i: u32| -> Option<u8> {
-            u8::try_from(i32::from(index) + step * i as i32).ok()
+        let advance = |index: u8, step: RepeatStep, i: u32| -> Option<u8> {
+            let delta = match step {
+                RepeatStep::Index(n) => n * i as i32,
+                RepeatStep::Offsets(b, stride) => i32::from((b >> (2 * i.min(3))) & 3) * stride,
+            };
+            u8::try_from(i32::from(index) + delta).ok()
         };
         let mut escaped = false;
         for i in 0..=extra {
             let mut it = instr.clone();
             if let Some(d) = it.dest.as_mut() {
-                let RepeatStep::Index(step) = steps[0] else {
-                    unreachable!("a destination in swizzle mode is refused above")
-                };
-                match advance(d.index, step, i) {
+                match advance(d.index, steps[0], i) {
                     Some(index) => d.index = index,
                     None => escaped = true,
                 }
             }
             for (s, &step) in it.srcs.iter_mut().zip(&steps[1..]) {
-                let step = match step {
-                    RepeatStep::Index(n) => n,
-                    // The register holds still; the iteration picks the component.
-                    RepeatStep::Component(b) => {
-                        let sel = (b >> (2 * i.min(3))) & 3;
-                        s.swizzle = [sel; 4];
-                        continue;
-                    }
-                };
                 match advance(s.index, step, i) {
                     // A register-INDIRECT operand's number is not a register index: its top two
                     // bits select the sub-bank and only the low five are the offset. Stepping it
@@ -236,7 +470,7 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
                     None => escaped = true,
                 }
             }
-            out.push(it);
+            push_split_pack(&mut out, it);
         }
         if escaped {
             let from = starts[starts.len() - 1];
@@ -255,6 +489,41 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
 /// A target that falls outside the program (before the first word, or past one-past-the-end) is
 /// not expressible in the current stream and cannot be reconstructed, so the instruction is
 /// BLOCKED naming that rather than clamped to something plausible.
+/// Push `instr`, splitting a TWO-SOURCE pack (see `decode_grp_pack`: a 32-bit source vector
+/// is `(src1.x, src1.y, src2.x, src2.y)`) into one single-source pack per source. A pack is a
+/// per-channel copy, so the channels selecting components 0..1 read `src1` and those selecting
+/// 2..3 read `src2` at component minus two, and the two halves commute. Every later stage then
+/// sees only the single-source form it already models.
+fn push_split_pack(out: &mut Vec<crate::ir::Instr>, instr: crate::ir::Instr) {
+    if !matches!(instr.op, Op::Pack { .. }) || instr.srcs.len() != 2 {
+        out.push(instr);
+        return;
+    }
+    let (s1, s2) = (instr.srcs[0], instr.srcs[1]);
+    let mut lower_mask = [false; 4];
+    let mut upper_mask = [false; 4];
+    let mut upper_src = s2;
+    for c in 0..4 {
+        if !instr.write_mask[c] {
+            continue;
+        }
+        match s1.swizzle[c] {
+            2 | 3 => {
+                upper_mask[c] = true;
+                upper_src.swizzle[c] = s1.swizzle[c] - 2;
+            }
+            // Components 0..1, and swizzle constants (which read no register either way).
+            _ => lower_mask[c] = true,
+        }
+    }
+    if lower_mask.iter().any(|&m| m) {
+        out.push(crate::ir::Instr { write_mask: lower_mask, srcs: vec![s1], ..instr.clone() });
+    }
+    if upper_mask.iter().any(|&m| m) {
+        out.push(crate::ir::Instr { write_mask: upper_mask, srcs: vec![upper_src], ..instr });
+    }
+}
+
 fn remap_branch_targets(instrs: &mut [crate::ir::Instr], starts: &[usize]) {
     // `starts` is indexed by ORIGINAL code word, and a branch never repeats (group 0xF8 carries
     // no repeat count), so word `w` is the single instruction at `starts[w]`.
@@ -288,7 +557,7 @@ fn remap_branch_targets(instrs: &mut [crate::ir::Instr], starts: &[usize]) {
 ///  * neither is predicated differently from the other, since a pair split by a predicate is
 ///    not a pair.
 fn validate_imad_step_pairs(instrs: &mut [crate::ir::Instr]) {
-    use crate::ir::{Instr, Op, Operand};
+    use crate::ir::{Instr, Op};
 
     let step = |i: &Instr| match i.op {
         Op::IntMadStep { high_half, .. } => Some(high_half),
@@ -297,36 +566,27 @@ fn validate_imad_step_pairs(instrs: &mut [crate::ir::Instr]) {
     // Bank and number together: two operands naming different banks are different operands even
     // when their numbers agree, and an inline literal is carried as an index in the IMMEDIATE
     // bank so this compares literals by value too.
-    let same = |a: &Operand, b: &Operand| a.bank == b.bank && a.index == b.index;
-
     let mut blocked_at: Vec<(usize, &'static str)> = Vec::new();
     for at in 0..instrs.len() {
-        let Some(high) = step(&instrs[at]) else { continue };
-        // Look at the partner this step's own half implies, and let the OTHER end of the pair
-        // report its own failure - so a lone step is named once from each side rather than
-        // silently half-decoded.
-        let partner = if high { at.checked_sub(1) } else { at.checked_add(1) };
-        let ok = partner
-            .and_then(|q| instrs.get(q).map(|other| (other, step(other))))
-            .is_some_and(|(other, other_half)| {
-                let (lo, hi) = if high { (other, &instrs[at]) } else { (&instrs[at], other) };
-                other_half == Some(!high)
-                    && lo.pred == hi.pred
-                    && lo.blocked.is_none()
-                    && hi.blocked.is_none()
-                    && lo.srcs.len() == 3
-                    && hi.srcs.len() == 3
-                    && same(&lo.srcs[0], &hi.srcs[0])
-                    && same(&lo.srcs[1], &hi.srcs[1])
-                    && lo.dest.is_some_and(|d| same(&d, &hi.srcs[2]))
-            });
-        if !ok {
+        let Some(_high) = step(&instrs[at]) else { continue };
+        // >>> AND A LONE STEP IS EMITTED TOO, because the pair closure DETERMINES each half.
+        //
+        // The refusal here said "only the pair's net result is established". That was true of
+        // the PAIR and not of the step: a pair composes to exactly `x * y + z` only if the high
+        // step is `((x >> 16) * y) << 16 + z` and the low one `(x & 0xffff) * y + z`, and no
+        // other placement of the `<< 16` between two half-product MADs composes to that sum. So
+        // the decomposition is unique, and each half is as established as the whole.
+        //
+        // A football title emits two of them, both HIGH halves alone, directly after a branch -
+        // the low half is not missing, it is not wanted: `pa[19] = ((sa[105] >> 16) * sa[72])
+        // << 16 + sa[23]` is the value that block computes. Six of its skinned vertex programs
+        // were refused whole for it.
+        //
+        // What stays refused is a step this decoder cannot READ, not one that is alone.
+        if instrs[at].srcs.len() != 3 {
             blocked_at.push((
                 at,
-                "0x1a IMAD32-STEP: this step is not part of a well-formed multiply-add pair \
-                 (an adjacent sn=0 / sn=1 with the same src0 and src1, the second's src2 being \
-                 the first's destination). Only the pair's net result is established, so a step \
-                 outside one is not emitted",
+                "0x1a IMAD32-STEP: the step does not carry three operands, so neither its own                  half-product nor a pair's net value can be formed",
             ));
         }
     }
@@ -383,6 +643,57 @@ pub fn written_output_lanes(shader: &Shader) -> Vec<bool> {
     }
     written
 }
+
+/// Fill in each ORDINARY-REGISTER index load's `stride` - how far apart two consecutive index
+/// values' blocks of rows are - from what the PROGRAM ITSELF fetches.
+///
+/// # The defect this exists to fix, and how the number was measured
+/// A football title's skinned meshes read a `g_aMatrixPalette` through
+/// `LoadIndex ; IntMad ; MemLoad` triples: the load turns a blend index into a row, the IMAD32
+/// multiplies the row by 16 (a float4) and adds the buffer's base, the MemLoad reads four words.
+/// Decoded as `src + addend` the rows of bone *b* come out at `b, b+1, b+2` - so bone 32's
+/// second row IS bone 33's first, every bone shears into its neighbour, and the players render
+/// as flat sheets.
+///
+/// THE PALETTE SAYS WHAT THE STRIDE IS, read straight out of a draw's own bound window
+/// (`VITASLOP_GXP_INPUTS`, 2432 bytes): rows 0, 3, 6, 9, 12 and 15 are each the FIRST row of an
+/// affine transform (`|xyz| = 1.0000`, translation in `.w`) and rows 1, 2, 4, 5, ... are second
+/// and third rows. It is a packed array of THREE-row matrices. A stride of four is refuted by
+/// the same dump - row 4 is a Y-axis row, not a matrix start. And the indices are plain
+/// consecutive BONE numbers, not pre-multiplied rows: the same report gives `IN.blendIndices`
+/// components ranging `[32,33]` and `[31,33]` on one pair and `[10,25]` over 184 vertices on
+/// another, with every histogram bucket populated, so they are not multiples of three.
+///
+/// # Why it is READ OFF THE PROGRAM rather than written here as a 3
+/// No field of the group-0x14 word has been shown to carry it, and one title cannot establish
+/// an ISA constant. What the program does establish is its own layout: the loads that share a
+/// source register are one index's run of rows, so the next index's run begins after the last
+/// of them. Over the whole corpus that is unambiguous - **all 48 programs that use this form
+/// have a maximum addend of exactly 2** (`index_load_max_addend_per_program`), and 132 of the
+/// 135 (source, addend-set) groups are exactly `{0, 1, 2}`; the three that are not (`{0}` twice
+/// and `{1, 2}` once) sit in programs whose maximum is still 2, which is why the maximum is
+/// taken over the PROGRAM and not per source group.
+///
+/// A stream with no such load, or one whose only addend is 0, keeps stride 1 - which is
+/// `src + addend`, exactly what it decoded to before. `VITASLOP_GXP_IDX_MUL` overrides the whole
+/// thing for an A/B.
+fn resolve_index_load_stride(instrs: &mut [crate::ir::Instr]) {
+    use crate::ir::Op;
+    let mut max = None;
+    for i in instrs.iter() {
+        if let Op::LoadIndex { addend, to_index: false, .. } = i.op {
+            max = Some(max.map_or(addend, |m: i32| m.max(addend)));
+        }
+    }
+    let Some(max) = max else { return };
+    let Ok(stride) = u8::try_from(max + 1) else { return };
+    for i in instrs.iter_mut() {
+        if let Op::LoadIndex { to_index: false, stride: s, .. } = &mut i.op {
+            *s = stride;
+        }
+    }
+}
+
 pub fn decode_shader(program: &Program) -> Shader {
     let mut instrs: Vec<_> = program.code.iter().map(|&w| decode(w)).collect();
     for instr in &mut instrs {
@@ -434,6 +745,7 @@ pub fn decode_shader(program: &Program) -> Shader {
         }
     }
     validate_imad_step_pairs(&mut instrs);
+    resolve_index_load_stride(&mut instrs);
     // Last, so every pass above still sees one instruction per code word.
     let (mut instrs, starts) = unroll_repeats(&program.code, instrs);
     remap_branch_targets(&mut instrs, &starts);
@@ -474,6 +786,7 @@ pub fn decode_secondary_shader(program: &Program) -> Shader {
         }
     }
     validate_imad_step_pairs(&mut instrs);
+    resolve_index_load_stride(&mut instrs);
     let (mut instrs, starts) = unroll_repeats(&program.secondary_code, instrs);
     remap_branch_targets(&mut instrs, &starts);
     Shader { kind: program.kind, instrs }
@@ -482,7 +795,7 @@ pub fn decode_secondary_shader(program: &Program) -> Shader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Bank, Instr, Operand};
+    use crate::ir::Instr;
 
     /// The two words of a golf title's address computation, which are a well-formed pair.
     const STEP0: u64 = 0xd082_8006_a01a_c080;
@@ -494,42 +807,23 @@ mod tests {
         instrs
     }
 
-    /// A well-formed pair decodes; each half on its own does not. What a single step leaves in
-    /// its destination is the one thing the corpus does not pin down (see
-    /// `decode_grp_imad32_step`), so a step outside the pair whose NET result is
-    /// reading-independent must not be emitted.
+    /// Each STEP is emitted on its own, pair or not.
+    ///
+    /// The decomposition is unique - only `((x >> 16) * y) << 16 + z` and `(x & 0xffff) * y + z`
+    /// compose to the `x * y + z` the pair produces - so a step outside a pair is as established
+    /// as one inside it. A football title emits two lone HIGH halves directly after a branch.
     #[test]
-    fn a_well_formed_step_pair_survives_and_a_lone_step_does_not() {
+    fn every_readable_step_decodes_whether_or_not_it_has_a_partner() {
         let pair = validated(&[STEP0, STEP1]);
         assert_eq!(pair[0].blocked, None, "the low step of a real pair must decode");
         assert_eq!(pair[1].blocked, None, "the high step of a real pair must decode");
-
         for lone in [STEP0, STEP1] {
             let one = validated(&[lone]);
-            assert!(
-                one[0].blocked.is_some_and(|w| w.contains("well-formed multiply-add pair")),
-                "a lone step must block: {:?}",
-                one[0].blocked
-            );
+            assert_eq!(one[0].blocked, None, "a lone step is its own half-product");
         }
+        // Two low steps in a row, and a "pair" that does not chain, are not pairs - and no
+        // longer need to be, because neither step's own value depends on the other's.
+        assert!(validated(&[STEP0, STEP0]).iter().all(|i| i.blocked.is_none()));
     }
 
-    /// A pair whose second step does not CHAIN through the first's destination is not the idiom
-    /// - its net result is not `src0 * src1 + src2` under every reading - so it blocks too.
-    #[test]
-    fn a_step_pair_that_does_not_chain_blocks() {
-        let mut instrs: Vec<Instr> = [STEP0, STEP1].iter().map(|&w| decode(w)).collect();
-        // Point the high step's src2 somewhere the low step did not write.
-        instrs[1].srcs[2] = Operand::plain(Bank::PrimaryAttr, 9, 2);
-        validate_imad_step_pairs(&mut instrs);
-        assert!(instrs[0].blocked.is_some(), "the low step of a broken pair must block");
-        assert!(instrs[1].blocked.is_some(), "the high step of a broken pair must block");
-    }
-
-    /// Two low steps in a row are not a pair either, whichever way they are read.
-    #[test]
-    fn two_low_steps_are_not_a_pair() {
-        let instrs = validated(&[STEP0, STEP0]);
-        assert!(instrs.iter().all(|i| i.blocked.is_some()), "neither step may decode");
-    }
 }

@@ -82,8 +82,20 @@ const DEFAULT_BANDWIDTH_KIBPS: u64 = 50 * 1024;
 /// round-trip a read pays whatever its size, so a stream of small reads is not free either.
 const DEFAULT_REQUEST_US: u64 = 200;
 
+/// >>> THROUGH THE KNOB SEAM, NOT `std::env` - THE BROWSER HAS NO ENVIRONMENT.
+///
+/// Every knob below (`VITASLOP_IO_BANDWIDTH_KIBPS`, `VITASLOP_IO_REQUEST_US`,
+/// `VITASLOP_IO_PARK_THRESHOLD_US`) used to read `std::env::var` directly, which on wasm32
+/// always returns nothing - so the whole storage model was UNCONFIGURABLE on the one engine
+/// where its cost was ever observed, and an A/B against it silently ran a single arm
+/// [[vitaslop-a-verdict-over-a-broken-key-is-void]]. Found when a device dump reported
+/// `sceIoPread` at 1,497 us/call: a park paid in >= 2 ms blocks is exactly this model's
+/// shape, and there was no way to switch it off there and see.
+///
+/// Identical on the desktop - `knobs::var` falls through to `std::env::var` - and identical
+/// with no knob set, which is every product run.
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(default)
+    crate::knobs::var(name).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(default)
 }
 
 /// The modelled time a read of `bytes` bytes takes, in microseconds, or `None` when the
@@ -123,16 +135,46 @@ const DEFAULT_PARK_THRESHOLD_US: u64 = 2_000;
 /// the debt is only deferred, then paid in full) while making the number of parks
 /// proportional to bytes moved rather than to reads issued.
 pub(super) fn charge_read(st: &mut VitaState, bytes: usize) -> SvcOutcome {
-    let Some(us) = read_latency_us(bytes) else { return SvcOutcome::Continue };
+    accrue_read(st, bytes);
+    park_for_debt(st)
+}
+
+/// Charge the modelled cost of `bytes` to the shared storage debt WITHOUT ever parking the
+/// caller.
+///
+/// >>> FOR A CALL THE GUEST CANNOT BE DESCHEDULED INSIDE.
+///
+/// The debt is [`VitaState`]-wide, not per thread, so nothing is discarded by accruing here
+/// and paying at the next ordinary read on any thread: the aggregate transfer rate is the
+/// same one [`charge_read`] models, only the thread that pays for it differs. That is the
+/// whole point - a caller whose guest code is not re-entrant across a deschedule can still be
+/// billed for its transfer without being the thread that sleeps for it.
+///
+/// MEASURED, and this is why the split exists: a title's movie demux loop checks its own stop
+/// flag, calls `sceMp4GetNextUnitData`, and then walks its stream list with NO second check.
+/// Its player's teardown sets that flag and FREES the list before joining the demux thread, so
+/// any deschedule inside that one call lands the thread on a freed list. A 2 ms storage park
+/// there turned a few-instruction guest race into a reliable `memory access out of bounds` -
+/// see `vita::video::mp4_get_next_unit_data`.
+pub(super) fn accrue_read(st: &mut VitaState, bytes: usize) {
+    let Some(us) = read_latency_us(bytes) else { return };
     if !st.is_preemptive() {
         // Cooperative hosts cannot park a thread at all; keep instant reads there.
+        return;
+    }
+    st.add_io_debt_us(us);
+}
+
+/// Pay the accrued storage debt if it is worth a context switch, parking the caller for it.
+pub(super) fn park_for_debt(st: &mut VitaState) -> SvcOutcome {
+    if !st.is_preemptive() {
         return SvcOutcome::Continue;
     }
-    let debt = st.add_io_debt_us(us);
     use std::sync::OnceLock;
     static THRESHOLD: OnceLock<u64> = OnceLock::new();
     let threshold =
         *THRESHOLD.get_or_init(|| env_u64("VITASLOP_IO_PARK_THRESHOLD_US", DEFAULT_PARK_THRESHOLD_US));
+    let debt = st.io_debt_us();
     if debt < threshold {
         return SvcOutcome::Continue;
     }
@@ -173,7 +215,66 @@ fn write_file_stat(ctx: &mut GuestCtx, stat_addr: u32, size: u64) {
 pub(super) fn io_open(ctx: &mut GuestCtx, st: &mut VitaState, file: Ptr, flags: u32, _mode: u32) -> i32 {
     let path = read_cstr(ctx, file.addr());
     tracing::trace!(target: "vitaslop::io", path, flags = format_args!("{flags:#x}"), lr = format_args!("{:#x}", ctx.regs[14]), "open_from");
-    st.io_open(&path, flags)
+    let fd = st.io_open(&path, flags);
+    if fd < 0 {
+        report_open_failed(&path, flags, fd, ctx.regs[14]);
+    }
+    fd
+}
+
+/// An open that FAILED, reported once per path.
+///
+/// # Why this is a warning and not a trace
+/// A refused open is the emulator's most deniable failure: the guest gets a negative fd,
+/// carries on, builds an EMPTY table out of a file it never read, and derefs something
+/// hundreds of frames later in code that has nothing to do with I/O. That has now happened
+/// twice in this project - a 404 body imported as a 2.9 GB archive gave nine bytes of `not
+/// found`, no draws and a null deref 300 frames on
+/// [[vitaslop-a-404-body-was-imported-as-the-game-archive]] - and in both cases the run's log
+/// had no line naming the file. A trace-level record is not a line in the log: nothing sets
+/// `vitaslop::io=trace` unless it is already suspected, which is the one state where it is not
+/// needed.
+///
+/// # And a probe is not a defect, so it does not read as one
+/// A title asking "does my save exist yet" gets ENOENT and is entitled to. The value here is
+/// the LIST, not the individual line, so the text says plainly that a probe belongs in it - a
+/// warning that cries wolf gets filtered, and then it is a trace again. Once per PATH keeps a
+/// title that probes every frame to one line.
+fn report_open_failed(path: &str, flags: u32, err: i32, lr: u32) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_string()) {
+        return;
+    }
+    // >>> THE RATIONALE ONCE, THEN ONE SHORT LINE PER PATH. Written the other way round first,
+    // and the first title it ran on printed five copies of a six-hundred-character paragraph -
+    // which is how a diagnostic buries the findings it was added to surface
+    // [[vitaslop-a-diagnostic-can-bury-the-findings]]. The per-path line has to stay scannable,
+    // because reading it as a LIST is the whole point: the benign probes and the title's own
+    // data look identical one line at a time.
+    static WHY: std::sync::Once = std::sync::Once::new();
+    WHY.call_once(|| {
+        tracing::warn!(
+            target: "vitaslop::warning",
+            "sceIoOpen FAILED at least once - each failure is listed below, once per path. The \
+             guest gets a negative descriptor and is free to carry on with whatever it meant to \
+             read out of that file MISSING. A title PROBING for an optional file (a save, a \
+             patch, a region variant, tty) does this deliberately and belongs in the list; a \
+             title's OWN DATA failing here is the kind of thing that surfaces hundreds of \
+             frames later as a deref in code that never touches I/O, with nothing at the crash \
+             naming the file. Read the list, not the individual line."
+        );
+    });
+    tracing::warn!(
+        target: "vitaslop::warning",
+        path,
+        flags = format_args!("{flags:#x}"),
+        err = format_args!("{:#010x}", err as u32),
+        lr = format_args!("{lr:#x}"),
+        "sceIoOpen FAILED"
+    );
 }
 
 /// int sceIoRead(SceUID fd, void *buf, SceSize size)

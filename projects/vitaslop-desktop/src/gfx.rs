@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use pollster::block_on;
-use vitaslop_platform::gpu::{CubeRenderer, DEPTH_FORMAT};
+use vitaslop_platform::gpu::{depth_format, CubeRenderer};
 use vitaslop_runtime::capture::Scene;
 use winit::window::Window;
 
@@ -126,7 +126,7 @@ fn make_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureVi
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
@@ -158,7 +158,7 @@ pub(crate) fn acquire(
 ) -> Option<wgpu::SurfaceTexture> {
     let give_up = |what: &str, n: u32| -> ! {
         panic!(
-            "the surface has not produced a texture for {n} presents in a row (last answer:              {what}). Nothing rendered since then reached the screen, so the run stops here              rather than keep paying for frames nobody will see."
+            "the surface has not produced a texture for {n} presents in a row (last answer: {what}). Nothing rendered since then reached the screen, so the run stops here rather than keep paying for frames nobody will see."
         )
     };
     match surface.get_current_texture() {
@@ -191,7 +191,7 @@ pub(crate) fn acquire(
             None
         }
         wgpu::CurrentSurfaceTexture::Validation => panic!(
-            "the surface refused to hand out a texture with a VALIDATION error, which means it              was configured with something this device will not accept. Nothing can be drawn."
+            "the surface refused to hand out a texture with a VALIDATION error, which means it was configured with something this device will not accept. Nothing can be drawn."
         ),
     }
 }

@@ -54,11 +54,21 @@
       </div>
 
       <div id="menu" hidden>
-        <div class="menu-in">
+        <!-- The Yes/No panel replaces the menu body while a restart or quit waits on an
+             answer: window.confirm is hidden or shrunk by a fullscreen phone browser. -->
+        <div id="m-confirm" class="menu-in menu-confirm" hidden>
+          <p id="m-confirm-text"></p>
+          <div class="menu-row">
+            <button id="m-confirm-yes" class="btn danger" type="button">Yes</button>
+            <button id="m-confirm-no" class="btn primary" type="button">No</button>
+          </div>
+        </div>
+        <div id="m-body" class="menu-in">
           <h2 id="m-title" class="menu-title"></h2>
           <div class="menu-row">
             <button id="m-resume" class="btn primary" type="button">Resume</button>
             <button id="m-fullscreen" class="btn" type="button">Fullscreen</button>
+            <button id="m-restart" class="btn" type="button">Restart game</button>
             <button id="m-quit" class="btn danger" type="button">Quit to library</button>
           </div>
           <label class="row"><input id="m-mute" type="checkbox" /><span>Mute</span></label>
@@ -86,7 +96,7 @@
             </div>
             <pre id="m-diag"></pre>
           </details>
-          <p class="dim">Esc or the menu button opens and closes this. The game is paused while it is open.</p>
+          <p class="dim">Esc or the menu button opens and closes this; on a controller, the home button or Start and Select held together for a second. The game is paused while it is open.</p>
         </div>
       </div>
 

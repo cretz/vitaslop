@@ -4,6 +4,19 @@ dist/
 pkg/
 *.log
 
+# >>> THE DEBRIS OF AN INVESTIGATION DOES NOT LIVE IN THE SOURCE TREE.
+#
+# A one-off probe script and the files it leaves behind belong in the scratch working area,
+# where they are thrown away with the question that prompted them. `*.log` already caught some
+# of it, which is why the rest went unnoticed for weeks: eight such files accumulated directly
+# in `projects/` - two probe scripts, their done-files and output, a 2 MB replay screenshot and
+# a stray directory holding one error message.
+#
+# Ignoring them is the smaller half of the rule. The larger half is not writing them here.
+*.done
+*.out
+capsule.png
+
 # The stand-in for the console system font, if a deployment supplies one. Never
 # committed: whichever face is dropped here belongs to whoever licensed it, and the
 # project ships no font of its own. See vitaslop-runtime/src/font/system.rs.

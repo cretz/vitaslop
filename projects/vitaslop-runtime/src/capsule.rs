@@ -444,13 +444,13 @@ impl Capsule {
         let mut mem_windows = Vec::with_capacity(n);
         for _ in 0..n {
             let addr = r_u32(i)?;
-            mem_windows.push((addr, r_bytes(i)?));
+            mem_windows.push((addr, Arc::<[u8]>::from(r_bytes(i)?)));
         }
         let n = r_u32(i)? as usize;
         let mut frag_mem_windows = Vec::with_capacity(n);
         for _ in 0..n {
             let addr = r_u32(i)?;
-            frag_mem_windows.push((addr, r_bytes(i)?));
+            frag_mem_windows.push((addr, Arc::<[u8]>::from(r_bytes(i)?)));
         }
         let shader_expanded = r_u8(i)? != 0;
 
@@ -586,8 +586,8 @@ mod tests {
             vert_sa: Arc::from(vec![0xCCu8; 7]),
             frag_sa: Arc::from(vec![0xDDu8; 8]),
             frag_sa_addr: 0x882c_aa80,
-            mem_windows: vec![(0x882c_9780, vec![1, 2, 3, 4]), (0x8e1d_2fb0, vec![5, 6])],
-            frag_mem_windows: vec![(0x8b40_0000, vec![9, 8, 7, 6])],
+            mem_windows: vec![(0x882c_9780, Arc::from(&[1u8, 2, 3, 4][..])), (0x8e1d_2fb0, Arc::from(&[5u8, 6][..]))],
+            frag_mem_windows: vec![(0x8b40_0000, Arc::from(&[9u8, 8, 7, 6][..]))],
             shader_expanded: true,
         };
         let c = Capsule {
@@ -760,7 +760,7 @@ pub fn maybe_capture(d: &Draw) {
         if n.is_power_of_two() {
             tracing::warn!(
                 target: "vitaslop::gxm",
-                "gxp capsule: {n} submissions of a named program so far, largest {} indices                  (set VITASLOP_GXP_CAPSULE_MIN_INDICES at or below that, and _SKIP below {n})",
+                "gxp capsule: {n} submissions of a named program so far, largest {} indices (set VITASLOP_GXP_CAPSULE_MIN_INDICES at or below that, and _SKIP below {n})",
                 MAX_IDX.load(Ordering::Relaxed)
             );
         }
@@ -770,7 +770,6 @@ pub fn maybe_capture(d: &Draw) {
     if d.index_count < min_indices() {
         return;
     }
-
     let mut h = std::collections::hash_map::DefaultHasher::new();
     d.vert_sa.hash(&mut h);
     d.frag_sa.hash(&mut h);

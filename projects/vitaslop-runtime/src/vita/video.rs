@@ -302,7 +302,7 @@ fn report_no_video(st: &mut crate::host::VitaState, path: &str, reason: &str) {
     tracing::warn!(
         target: "vitaslop::movie",
         %path, %reason,
-        "SceMp4: this movie will NOT play. It is reported unavailable so the title skips          it and carries on; whatever it would have shown is missing from this run."
+        "SceMp4: this movie will NOT play. It is reported unavailable so the title skips it and carries on; whatever it would have shown is missing from this run."
     );
 }
 
@@ -1127,7 +1127,7 @@ fn report_audio_backlog_dropped(dropped: u64) {
             target: "vitaslop::movie",
             dropped,
             backlog = AUDIO_BACKLOG,
-            "decoded audio frames were dropped because the title stopped collecting them -              the movie is short by that much sound from here"
+            "decoded audio frames were dropped because the title stopped collecting them - the movie is short by that much sound from here"
         );
     });
 }
@@ -1336,7 +1336,7 @@ fn report_unit_assumptions(st: &mut crate::host::VitaState, width: u32, height: 
     tracing::info!(
         target: "vitaslop::movie",
         width, height, first_unit_bytes = size,
-        "SceMp4: handing the title Annex B access units. Status, type and the          width/height pair are established from the caller's own code; +0x20 as the          elementary stream length and +0x30 as a timestamp are the most probable          reading, and +0x10/+0x14/+0x18/+0x1c are left zero because their roles are          unknown."
+        "SceMp4: handing the title Annex B access units. Status, type and the width/height pair are established from the caller's own code; +0x20 as the elementary stream length and +0x30 as a timestamp are the most probable reading, and +0x10/+0x14/+0x18/+0x1c are left zero because their roles are unknown."
     );
 }
 
@@ -1498,8 +1498,32 @@ fn do_get_next_unit_info(
 /// enough to bury the diagnostics panel and to show up as guest CPU.
 ///
 /// So the read is charged the same modelled storage cost every other guest read is, through
-/// the same accumulator, and parks the caller when the debt is worth a context switch. The
-/// pool then drains at roughly the rate the device would fill it.
+/// the same accumulator. The pool then drains at roughly the rate the device would fill it.
+///
+/// # THE CALLER IS NEVER DESCHEDULED HERE, AND THAT IS A CORRECTNESS RULE, NOT A TUNING
+///
+/// The charge used to be [`super::iofilemgr::charge_read`], which PARKS once the accrued debt
+/// is worth a context switch - roughly one unit in seven at the default model. MEASURED on a
+/// phone: a guest fault at frame 157 on the movie player's demux thread, the run over. Read
+/// off the register file at the trap and the title's own code, the chain is exact:
+///
+/// - The demux loop reads its own stop flag, allocates a buffer for the unit it was promised,
+///   calls this, and then - with NO second look at that flag - walks its stream list to find
+///   the decoder the unit belongs to (`streams[i]->...`).
+/// - The player's teardown, which is what "skip the intro" runs, sets that stop flag and then
+///   FREES every stream record and every list node **before** it waits for the demux thread to
+///   end. The join is the last thing it does, not the first.
+/// - So the guest's own window is the handful of instructions between its flag check and its
+///   list walk - narrow, and a race it does carry on hardware. A park inside this call puts a
+///   modelled two milliseconds in the middle of that window and makes it the common case: the
+///   thread woke into a freed list and dereferenced the null left in it.
+///
+/// The same trap was already recorded in [`movie_unit_wait_us`] for the PACING park, and moved
+/// out for the same reason; the storage park was left behind in the same call and reproduced
+/// it. Nothing is gained by moving this park one call earlier either - the window after
+/// `sceMp4GetNextUnit` is strictly larger, spanning an allocation and that call both - so the
+/// debt is accrued and left for the next ordinary read on any thread to pay. No modelled time
+/// is discarded; only the thread that sleeps for it changes.
 pub(super) fn mp4_get_next_unit_data(
     ctx: &mut crate::host::GuestCtx,
     st: &mut crate::host::VitaState,
@@ -1534,7 +1558,9 @@ pub(super) fn mp4_get_next_unit_data(
     if got <= 0 {
         return crate::SvcOutcome::Continue;
     }
-    super::iofilemgr::charge_read(st, got as usize)
+    // >>> THE COST IS CHARGED HERE; THE SLEEP IS NOT TAKEN HERE. See the section below.
+    super::iofilemgr::accrue_read(st, got as usize);
+    crate::SvcOutcome::Continue
 }
 
 /// How long the caller must wait before the unit at the cursor is due, or `None` if it is due
@@ -1607,7 +1633,7 @@ fn movie_unit_wait_us(st: &mut crate::host::VitaState, handle: i32) -> Option<u6
             refusals = n,
             due_us = due, now_us = now, origin_us = origin, pts_us = pts,
             ahead_us = due.saturating_sub(now),
-            "SceMp4: the demuxer has been told NOT YET {n} times in a row without taking a              single unit, so this movie is not advancing. The unit at the cursor is due at              `origin + pts`, and that moment is still ahead of the guest clock - which means              either the timeline origin is wrong or the clock this gate reads is not the one              the title's own player runs on."
+            "SceMp4: the demuxer has been told NOT YET {n} times in a row without taking a single unit, so this movie is not advancing. The unit at the cursor is due at `origin + pts`, and that moment is still ahead of the guest clock - which means either the timeline origin is wrong or the clock this gate reads is not the one the title's own player runs on."
         );
     }
     Some(due - now)

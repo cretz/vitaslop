@@ -538,8 +538,25 @@ async function main() {
     // re-running to a different fast-forward target to bisect costs minutes per guess.
     // Each shot is filed under the FRAME the run had reached, taken from the pushed
     // heartbeat, because a browser frame and a wall second are not the same axis.
+    // >>> A WALL-CLOCK CADENCE CANNOT SAMPLE A GAME EVENT, so there is a FRAME cadence too.
+    //
+    // `SHOT_EVERY_MS` samples the wall clock, which is the right axis for "is the picture
+    // still there after a minute" and the wrong one for "what does the frame after contact
+    // look like": the run's frame rate is the thing under test, so a fixed millisecond
+    // interval lands on different frames in every arm and cannot be compared with the
+    // desktop oracle's frame-keyed sequence at all.
+    //
+    // `SHOT_EVERY_FRAMES=N` (optionally bounded by `SHOT_FROM_FRAME` / `SHOT_TO_FRAME`)
+    // shoots on the GUEST's frame axis instead, so a browser sequence and a desktop sequence
+    // name the same frames. It is only as sharp as the heartbeat that publishes the frame
+    // number, so set `VITASLOP_BROWSER_HEARTBEAT_MS` low (100-250) when using it - at the
+    // 20,000 ms a perf run uses, every shot in a window lands on one frame number.
     const shotEveryMs = Number(process.env.SHOT_EVERY_MS || 0);
+    const shotEveryFrames = Number(process.env.SHOT_EVERY_FRAMES || 0);
+    const shotFromFrame = Number(process.env.SHOT_FROM_FRAME || 0);
+    const shotToFrame = Number(process.env.SHOT_TO_FRAME || Number.MAX_SAFE_INTEGER);
     let shotTimer = null;
+    let frameShotTimer = null;
     if (shotEveryMs > 0) {
       let busy = false;
       shotTimer = setInterval(async () => {
@@ -558,6 +575,38 @@ async function main() {
           busy = false;
         }
       }, shotEveryMs);
+    }
+    if (shotEveryFrames > 0) {
+      let busy = false;
+      let nextAt = -1;
+      let taken = 0;
+      // Polled rather than driven off the console handler: a screenshot is async and the
+      // handler must stay non-blocking, or the heartbeat that feeds `liveFrame` queues up
+      // behind the very thing it is timing.
+      frameShotTimer = setInterval(async () => {
+        if (busy || liveFrame < 0) return;
+        if (liveFrame < shotFromFrame || liveFrame > shotToFrame) return;
+        if (nextAt < 0) nextAt = liveFrame;
+        if (liveFrame < nextAt) return;
+        // Snap forward rather than firing once per missed multiple: at 36 fps with a 150 ms
+        // heartbeat the frame number jumps in steps, and a catch-up burst would shoot the
+        // same picture several times under different names.
+        nextAt = liveFrame + shotEveryFrames - (liveFrame % shotEveryFrames);
+        busy = true;
+        const at = liveFrame;
+        try {
+          await page.locator("#screen").screenshot({
+            path: join(shotDir, `f${String(at).padStart(6, "0")}.png`),
+            timeout: 20000,
+          });
+          taken += 1;
+          if (taken % 25 === 0) console.log(`[game] ${taken} frame-keyed shots, latest f${at}`);
+        } catch (e) {
+          console.log(`[game] frame-keyed shot at frame ${at} failed: ${e.message}`);
+        } finally {
+          busy = false;
+        }
+      }, 40);
     }
     // `HIDE_SHOW_MS=N` (optionally `HIDE_FOR_MS=M`, `HIDE_FROM_FRAME=F`): every N ms, put
     // the page in the BACKGROUND for M ms and bring it back.
@@ -643,6 +692,7 @@ async function main() {
     }
     clearInterval(ticker);
     if (shotTimer) clearInterval(shotTimer);
+    if (frameShotTimer) clearInterval(frameShotTimer);
     if (hideTimer) {
       clearInterval(hideTimer);
       console.log(`[game] ${hideCycles} hide/show cycle(s) during the run`);

@@ -672,24 +672,51 @@ fn const_operand(op: &Operand, regs: &RegConsts) -> Option<u32> {
 /// while leading somewhere else entirely - a chain of `cmp`/`b` guards selecting among
 /// SEVERAL tables is exactly that shape, and reading the wrong side either loses the
 /// bound or, worse, sizes the table wrong.
+/// Unused today: every caller wants [`reaches_status`]'s second half - whether the walk
+/// FINISHED - because "did not reach" is only evidence when it did. Kept as the plain
+/// question's name, and allowed rather than deleted so the pair reads as a pair.
+#[allow(dead_code)]
 fn reaches(
     decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
     from: u32,
     target: u32,
 ) -> bool {
+    reaches_status(decoded, from, target).0
+}
+
+/// [`reaches`], plus whether the walk FINISHED - true when it explored the whole reachable
+/// set without hitting its budget.
+///
+/// The distinction decides whether "did not reach" is evidence. A budget cut-off says
+/// nothing; an exhausted walk says the branch genuinely cannot get to the table, and a
+/// compare whose BOTH sides cannot get there is guarding something else entirely. On a
+/// football title that was a `cmp r0,#0x28` forty bytes above a `tbh` - both its sides
+/// jump away to a common tail - and taking it for the table's range check gave 40 entries
+/// for a table whose eighth already points outside the function, which failed the whole
+/// switch and left a trap in the middle of live gameplay.
+fn reaches_status(
+    decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
+    from: u32,
+    target: u32,
+) -> (bool, bool) {
     // Bounded so recovery stays linear-ish on a pathological CFG. A range check sits
     // within a few blocks of the table it guards.
     const BUDGET: usize = 256;
     let mut seen = BTreeSet::new();
     let mut stack = vec![from];
     let mut steps = 0;
+    let mut complete = true;
     while let Some(mut pc) = stack.pop() {
         loop {
             if pc == target {
-                return true;
+                return (true, complete);
             }
             steps += 1;
-            if steps > BUDGET || !seen.insert(pc) {
+            if steps > BUDGET {
+                complete = false;
+                break;
+            }
+            if !seen.insert(pc) {
                 break;
             }
             let Some((ins, len, cond, _)) = decoded.get(&pc) else { break };
@@ -707,7 +734,7 @@ fn reaches(
             pc = pc.wrapping_add(*len);
         }
     }
-    false
+    (false, complete)
 }
 
 /// One step of the `idx = switch + k` chain: given an instruction that DEFINES
@@ -718,6 +745,27 @@ fn reaches(
 /// a constant adjustment or a register copy. That is the chain's terminator: the
 /// value being indexed by IS the switch variable at that point, and walking further
 /// back would attribute unrelated arithmetic to the rebase.
+/// Does `ins` WRITE its first operand register, rather than merely read it?
+///
+/// A compare and a store both name a register first and neither assigns to it, so
+/// neither is a definition of it. This matters twice over: such an instruction must not
+/// truncate the rebase chain in [`recover_switch_bound`], and - because the chain's
+/// terminator doubles as the barrier that rejects a stale guard - taking a `cmp` for a
+/// definition would reject the very compare being looked for.
+fn writes_first_operand(ins: &Instruction) -> bool {
+    !matches!(
+        ins.opcode,
+        Opcode::CMP
+            | Opcode::CMN
+            | Opcode::TST
+            | Opcode::TEQ
+            | Opcode::STR
+            | Opcode::STRB
+            | Opcode::STRH
+            | Opcode::STM(..)
+    )
+}
+
 fn adjustment_step(ins: &Instruction, reg: u8, before: &RegConsts) -> (u8, u32) {
     match ins.opcode {
         // `idx = a +/- b`, where the label base folds into `k`. Both the two-operand
@@ -809,10 +857,36 @@ fn recover_switch_bound(
     // definition is reached that is not a constant adjustment or a register copy.
     // The walk is bounded by the snapshot window, and each step must define the
     // register the previous step read, so it cannot loop.
-    let (switch_reg, k) = {
+    // >>> AND THE DEFINITION THAT ENDS THE CHAIN IS A BARRIER, when it is a definition at
+    // all. It re-materialises the switch variable from somewhere this walk cannot see - a
+    // reload of a spilled local, most often - so a `cmp` on the same register ABOVE it is
+    // testing a value the table branch never sees, and its bound is not a bound on the
+    // index. A compiler that spills the switch variable emits the range check and the table
+    // index off two separate reloads:
+    //
+    //     ldr r1,[sp,#4] ; subs r1,#2 ; cmp r1,#8 ; bhi default
+    //     ldr r1,[sp,#4] ; subs r1,#2 ; tbh [pc, r1, lsl #1]
+    //
+    // The compare is already on the REBASED value, so folding `k = -2` into it a second time
+    // takes a 9-entry table for a 7-entry one - and the two entries that fall off the end are
+    // silently routed to the default. On this codebase's own titles that was one keyword of a
+    // query language's lexer (`fastcursor`, the longest of nine identifier lengths) degrading
+    // to a plain identifier, which left a cursor with no bound columns and faulted four
+    // hundred frames later in the caller's own index arithmetic over the row it never got.
+    // Rejecting the stale guard leaves `count = None`, and the table-extent inference below -
+    // which reads the table's own smallest offset - recovers the true count.
+    //
+    // A COMPARE IS NOT A DEFINITION, and it ends the walk only because it names the register
+    // first. That is load-bearing in the other direction: this walk is LINEAR over addresses,
+    // not over control flow, so letting it step past a compare lets it pick up an `add` from
+    // an unrelated block between the guard and the table - measured, on a football title,
+    // as 21 tables becoming 22 and their functions failing to lift at all. So the walk stays
+    // exactly as it was; only the BARRIER distinguishes a real definition from a compare.
+    let (switch_reg, k, barrier) = {
         let mut reg = index_reg;
         let mut k: u32 = 0;
         let mut from = snaps.len();
+        let mut barrier = None;
         while let Some(i) = snaps[..from]
             .iter()
             .rposition(|(_, ins, _, _)| ins.operands.first().and_then(regnum) == Some(reg))
@@ -823,21 +897,52 @@ fn recover_switch_bound(
             // A definition that is not an adjustment reports itself as the same
             // register with no step, which is where the chain ends.
             if next_reg == reg && step == 0 {
+                // >>> AND IT IS A BARRIER ONLY IF IT FALLS THROUGH TO THE TABLE BRANCH.
+                // This walk is linear over ADDRESSES, not over control flow, so the
+                // definition it lands on may belong to a block that jumps away and never
+                // reaches the table at all. Measured on a football title: a `movw r0,#0x2c6`
+                // two instructions before an unconditional `b.w` rejected the real guard of
+                // the switch that follows it, and the table-extent fallback then read 14
+                // entries as 29. Requiring an uninterrupted fall-through is conservative in
+                // the safe direction - a missed barrier is the behaviour that was already
+                // shipping.
+                let falls_through = snaps[i + 1..].iter().all(|(_, ins, _, _)| {
+                    !matches!(ins.opcode, Opcode::TBB | Opcode::TBH)
+                        && !(matches!(ins.opcode, Opcode::B | Opcode::BX)
+                            && ins.condition == ConditionCode::AL)
+                });
+                if writes_first_operand(ins) && falls_through {
+                    barrier = Some(i);
+                }
                 break;
             }
             reg = next_reg;
             from = i;
         }
-        (reg, k)
+        (reg, k, barrier)
     };
 
     // Pick the range check closest to the table branch whose in-range side is an
     // upper bound on the switch variable. A `cmp switch, bound` paired with the next
     // conditional branch; the branch's taken target tells us which side is in-range.
     let mut best: Option<(u32, u32, Option<u32>)> = None; // (cmp_addr, count, default)
+    // A guard whose BOUND cannot be trusted may still name the out-of-range block: the
+    // default is a property of the branch, not of the arithmetic. Kept separately so a
+    // rejected guard costs only the count.
+    let mut fallback_default: Option<(u32, u32)> = None; // (cmp_addr, default)
     for (i, (cmp_addr, cmp, _, before)) in snaps.iter().enumerate() {
-        if cmp.opcode != Opcode::CMP || regnum(&cmp.operands[0]) != Some(switch_reg) {
+        if cmp.opcode != Opcode::CMP {
             continue;
+        }
+        if regnum(&cmp.operands[0]) != Some(switch_reg) {
+            continue;
+        }
+        let bounds_the_index = !barrier.is_some_and(|b| i <= b);
+        if !bounds_the_index && switch_why(tb_addr) {
+            eprintln!(
+                "  guard @{cmp_addr:#x}: bound REJECTED - r{switch_reg} is REDEFINED at                  {:#x}, between this compare and the table branch, so its bound is not a                  bound on the index (its branch can still name the default)",
+                snaps[barrier.unwrap()].0,
+            );
         }
         let Some(bound) = const_operand(&cmp.operands[1], before) else { continue };
         // The conditional branch this compare feeds: the next branch in the window.
@@ -856,7 +961,24 @@ fn recover_switch_bound(
         // cut-off) fall back to position - the taken branch steers toward the table when
         // its target lands in the setup between the guard and the table.
         let fall = br_addr.wrapping_add(br_len);
-        let in_range_taken = match (reaches(decoded, gt, tb_addr), reaches(decoded, fall, tb_addr)) {
+        // >>> NEITHER SIDE OF THE BRANCH REACHES THE TABLE: it is not this table's guard.
+        //
+        // The nearest `cmp rX, #imm` above a table branch is very often inside a CASE BODY
+        // of that same switch, and a case body's own clamp bounds nothing about the index.
+        // MEASURED, on the football title's printf: `cmp r0,#0x40 ; ble` is the `%s` case
+        // clamping a copy length, 250 bytes above the `tbh` it appears to guard. Taken as
+        // the guard (with the `subs r0,#0x33` below it folded in) it gives 14 entries for a
+        // table whose own bytes hold 29 - so every conversion from the fifteenth on lands
+        // in the DEFAULT, which is that same `%s` case with no argument set up, and the
+        // title faults copying a string from address zero.
+        //
+        // The test is positive evidence, not absence: both walks must FINISH. A budget
+        // cut-off says nothing, and the walk also stops at a nested table branch, so an
+        // incomplete walk is never read as "cannot reach".
+        let (gt_reaches, gt_complete) = reaches_status(decoded, gt, tb_addr);
+        let (fall_reaches, fall_complete) = reaches_status(decoded, fall, tb_addr);
+        let guards_this_table = gt_reaches || fall_reaches || !gt_complete || !fall_complete;
+        let in_range_taken = match (gt_reaches, fall_reaches) {
             (true, false) => true,
             (false, true) => false,
             _ => gt > br_addr && gt <= tb_addr,
@@ -873,6 +995,23 @@ fn recover_switch_bound(
             continue; // implausible: a wrong pairing (wrapped) - reject
         }
         let default = if in_range_taken { br_addr.wrapping_add(br_len) } else { gt };
+        if !guards_this_table {
+            if switch_why(tb_addr) {
+                eprintln!(
+                    "  guard @{cmp_addr:#x}: bound REJECTED - neither side of its branch                      reaches the table branch, so it guards something else (its branch can                      still name the default)"
+                );
+            }
+            if fallback_default.is_none_or(|(a, _)| *cmp_addr > a) {
+                fallback_default = Some((*cmp_addr, default));
+            }
+            continue;
+        }
+        if !bounds_the_index {
+            if fallback_default.is_none_or(|(a, _)| *cmp_addr > a) {
+                fallback_default = Some((*cmp_addr, default));
+            }
+            continue;
+        }
         // Closest compare to the table branch wins (the innermost cluster's guard).
         if best.is_none_or(|(a, _, _)| *cmp_addr > a) {
             if switch_why(tb_addr) {
@@ -888,7 +1027,7 @@ fn recover_switch_bound(
     }
     match best {
         Some((_, count, default)) => (Some(count), default),
-        None => (None, None),
+        None => (None, fallback_default.map(|(_, d)| d)),
     }
 }
 
@@ -991,77 +1130,94 @@ fn resolve_switch(
             leaders.range(pc.wrapping_add(1)..).next().map(|l| format!("{l:#x}")),
         );
     }
-    let count = match cmp_count.or(abut_count) {
-        Some(c) => c,
-        None => {
-            // Infer from the table extent: grow the entry list until the next index
-            // would reach the nearest case body.
-            let mut entries: Vec<u32> = Vec::new();
-            loop {
-                let i = entries.len() as u32;
-                if let Some(&m) = entries.iter().min() {
-                    let limit = if is_tbh { m } else { 2 * m };
-                    if i >= limit {
-                        break;
-                    }
-                }
-                if i >= 1024 {
-                    return None; // runaway: not a table we understand
-                }
-                match read(i) {
-                    Some(v) => entries.push(v),
-                    None => break,
+    // The table's own EXTENT, as a last candidate: grow the entry list until the next
+    // index would reach the nearest case body.
+    let extent_count = || -> Option<u32> {
+        let mut entries: Vec<u32> = Vec::new();
+        loop {
+            let i = entries.len() as u32;
+            if let Some(&m) = entries.iter().min() {
+                let limit = if is_tbh { m } else { 2 * m };
+                if i >= limit {
+                    break;
                 }
             }
-            entries.len() as u32
+            if i >= 1024 {
+                return None; // runaway: not a table we understand
+            }
+            match read(i) {
+                Some(v) => entries.push(v),
+                None => break,
+            }
         }
+        Some(entries.len() as u32)
     };
-    if count == 0 || count > 1024 {
-        if why {
-            eprintln!("switch @{tb_addr:#x}: UNRESOLVED - entry count {count} is out of range");
-        }
-        return None;
-    }
 
     // Case bodies of one switch are local to their function; a real target lands
     // within a function's span of the table. A target further than that means the
     // count is wrong (we read code/data past the table's end as entries) - reject
-    // the whole switch rather than seed far-flung leaders that would drag unrelated
-    // code into this function (and trip the runaway span guard). Defense in depth:
-    // the range-check recovery already bounds the count, this guards a misfire.
+    // that COUNT rather than seed far-flung leaders that would drag unrelated code
+    // into this function (and trip the runaway span guard).
     const MAX_REACH: u32 = 0x1_0000; // 64 KiB, matches the discovery span guard
-    let mut targets = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        let Some(entry) = read(i) else {
-            if why {
-                eprintln!("switch @{tb_addr:#x}: UNRESOLVED - entry {i} of {count} is off the image");
-            }
-            return None;
-        };
-        let target = pc.wrapping_add(2 * entry);
-        if target.wrapping_sub(base) as usize >= code.len() {
-            if why {
-                eprintln!(
-                    "switch @{tb_addr:#x}: UNRESOLVED - entry {i} ({entry:#x}) targets \
-                     {target:#x}, outside the image: the entry count is wrong"
-                );
-            }
-            return None; // target outside the image: bound is wrong, bail cleanly
+    let targets_for = |count: u32| -> Result<Vec<u32>, String> {
+        if count == 0 || count > 1024 {
+            return Err(format!("entry count {count} is out of range"));
         }
-        if target.wrapping_sub(tb_addr).min(tb_addr.wrapping_sub(target)) > MAX_REACH {
-            if why {
-                eprintln!(
-                    "switch @{tb_addr:#x}: UNRESOLVED - entry {i} ({entry:#x}) targets \
-                     {target:#x}, more than {MAX_REACH:#x} from the table: the count is wrong"
-                );
+        let mut targets = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let Some(entry) = read(i) else {
+                return Err(format!("entry {i} of {count} is off the image"));
+            };
+            let target = pc.wrapping_add(2 * entry);
+            if target.wrapping_sub(base) as usize >= code.len() {
+                return Err(format!(
+                    "entry {i} ({entry:#x}) targets {target:#x}, outside the image"
+                ));
             }
-            return None; // implausibly far from the table: bound is wrong, bail cleanly
+            if target.wrapping_sub(tb_addr).min(tb_addr.wrapping_sub(target)) > MAX_REACH {
+                return Err(format!(
+                    "entry {i} ({entry:#x}) targets {target:#x}, more than {MAX_REACH:#x}                      from the table"
+                ));
+            }
+            targets.push(target);
         }
-        targets.push(target);
+        Ok(targets)
+    };
+
+    // >>> A RECOVERED BOUND THAT DOES NOT VALIDATE IS A WRONG BOUND, NOT A DEAD END.
+    //
+    // The range-check recovery is a heuristic over a window of instructions, and it can
+    // land on a compare that guards something else - a football title has one forty bytes
+    // above a `tbh` whose both branch arms rejoin, which no CFG test can separate. Taking
+    // its 40 for the count reads 33 entries of code past the end of a 7-entry table, and
+    // the validation below then rejected THE WHOLE SWITCH - which fails the function, and
+    // that function was on the frame path of live gameplay. The table's own extent knows
+    // better, so try the candidates in order of confidence and keep the first that
+    // validates, instead of letting the most confident one veto the others.
+    let candidates: Vec<u32> = [cmp_count, abut_count, extent_count()].into_iter().flatten().collect();
+    let mut targets = None;
+    for c in candidates {
+        match targets_for(c) {
+            Ok(t) => {
+                if why {
+                    eprintln!("switch @{tb_addr:#x}: RESOLVED {c} targets, default={default:?}");
+                }
+                targets = Some(t);
+                break;
+            }
+            Err(e) => {
+                if why {
+                    eprintln!("switch @{tb_addr:#x}: count {c} REJECTED - {e}");
+                }
+            }
+        }
     }
-    if why {
-        eprintln!("switch @{tb_addr:#x}: RESOLVED {count} targets, default={default:?}");
-    }
+    let Some(targets) = targets else {
+        if why {
+            eprintln!("switch @{tb_addr:#x}: UNRESOLVED - no candidate entry count validates");
+        }
+        return None;
+    };
     Some(SwitchInfo { index, targets, default, bias: 0, shift: 0 })
 }
 
@@ -1136,6 +1292,11 @@ pub fn discover(
     // into data / an unlifted op). Pass 2 turns each into a single trapping block, so
     // one bad target does not stub the whole function. See the decode-failure arm.
     let mut trap_leaders: BTreeSet<u32> = BTreeSet::new();
+    // Instructions that DECODE but do not LOWER - a NEON or VFP encoding this transpiler
+    // has no IR for yet. They trap exactly as a decode gap does, so they belong in the same
+    // census; collected here and merged at the end rather than into `trap_leaders` mid-pass,
+    // where the set is still being consulted to place trap blocks.
+    let mut lower_gaps: BTreeSet<u32> = BTreeSet::new();
     // Worklist carries IT state and the tracked register constants along fall-
     // through (a fresh, all-unknown set at every branch target, which may have
     // multiple predecessors).
@@ -1604,7 +1765,15 @@ pub fn discover(
                     // covered). Strict callers report it; the lenient build runs the
                     // block's valid prefix then traps, isolating the gap to this block
                     // instead of stubbing the whole function.
-                    Err(_) if isolate => break Term::Unreachable,
+                    //
+                    // >>> AND IT IS RECORDED. This was the ONLY trap the build could emit
+                    // that no census named: a run that reached one reported
+                    // `UnreachableCodeReached` at an address absent from every list the
+                    // build printed, which reads as a decode failure that is not there.
+                    Err(_) if isolate => {
+                        lower_gaps.insert(cursor);
+                        break Term::Unreachable;
+                    }
                     Err(e) => return Err(e),
                 };
             // The conditional form of a terminator: its effects run under the
@@ -1680,6 +1849,12 @@ pub fn discover(
             }
         }
         if !missing.is_empty() {
+            // >>> AND THEY ARE RECORDED AS TRAP LEADERS, so the census names them. These
+            // blocks trap exactly as a decode gap does, and leaving them out of
+            // `trap_leaders` made a run that reached one report `UnreachableCodeReached` at
+            // an address that appeared in NO list the build printed - which is a whole
+            // afternoon of looking for a decode failure that was never there.
+            trap_leaders.extend(missing.iter().copied());
             blocks.extend(
                 missing.iter().map(|&addr| Block {
                     addr,
@@ -1724,7 +1899,7 @@ pub fn discover(
 
     Ok(Discovered {
         func,
-        trap_leaders: trap_leaders.into_iter().collect(),
+        trap_leaders: trap_leaders.union(&lower_gaps).copied().collect(),
         callees: callees.into_iter().collect(),
         code_pointers: code_pointers.into_iter().collect(),
         arm_code_pointers: arm_code_pointers.into_iter().collect(),
@@ -3853,9 +4028,18 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         VADDW => NeonStmt::WideAddSub { sub: false, wide: true, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VSUBL => NeonStmt::WideAddSub { sub: true, wide: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VSUBW => NeonStmt::WideAddSub { sub: true, wide: true, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
-        VMULL => NeonStmt::WideMul { acc: false, sub: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
-        VMLAL => NeonStmt::WideMul { acc: true, sub: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
-        VMLSL => NeonStmt::WideMul { acc: true, sub: true, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VMULL => match scalar_lane(&ops[2]) {
+            Some((src, lane)) => NeonStmt::WideMulScalar { acc: false, sub: false, ty, dst: r(0)?, a: r(1)?, src, lane },
+            None => NeonStmt::WideMul { acc: false, sub: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        },
+        VMLAL => match scalar_lane(&ops[2]) {
+            Some((src, lane)) => NeonStmt::WideMulScalar { acc: true, sub: false, ty, dst: r(0)?, a: r(1)?, src, lane },
+            None => NeonStmt::WideMul { acc: true, sub: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        },
+        VMLSL => match scalar_lane(&ops[2]) {
+            Some((src, lane)) => NeonStmt::WideMulScalar { acc: true, sub: true, ty, dst: r(0)?, a: r(1)?, src, lane },
+            None => NeonStmt::WideMul { acc: true, sub: true, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        },
         VABDL => NeonStmt::WideAbd { acc: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VABAL => NeonStmt::WideAbd { acc: true, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VPADDL => NeonStmt::PairLong { acc: false, ty, dst: r(0)?, a: r(1)? },
@@ -3930,8 +4114,18 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         // the inverse of the widen: overflow becomes infinity, NaN must stay NaN, and
         // the subnormal range needs its own path.
         VCVTF16F32 => NeonStmt::CvtFloatToHalf { dst: r(0)?, src: r(1)? },
-        VCVTFtoI => NeonStmt::CvtFloatInt { to_int: true, signed: ty.signed, dst: r(0)?, src: r(1)? },
-        VCVTItoF => NeonStmt::CvtFloatInt { to_int: false, signed: ty.signed, dst: r(0)?, src: r(1)? },
+        // The third operand, when there is one, is the fixed-point FRACTIONAL BIT COUNT -
+        // see `NeonStmt::CvtFloatInt`. The plain integer form has `Operand::Nothing` there.
+        VCVTFtoI | VCVTItoF => NeonStmt::CvtFloatInt {
+            to_int: matches!(op, VCVTFtoI),
+            signed: ty.signed,
+            frac: match ops.get(2) {
+                Some(Operand::Imm(n)) => *n,
+                _ => 0,
+            },
+            dst: r(0)?,
+            src: r(1)?,
+        },
         // VCEQ/VCGT/VCGE take either a register second operand (`a <rel> b`) or a `#0`
         // immediate (`a <rel> 0`, the two-registers-misc form). VCLE/VCLT exist only as the
         // compare-against-`#0` form.
@@ -4069,7 +4263,9 @@ fn neon_emittable(s: &NeonStmt) -> bool {
             NeonBin::Abd => !ty.float && ty.bits != 64,
             NeonBin::Add | NeonBin::Sub => true,
             // wasm's saturating add/sub exist for 8- and 16-bit lanes only.
-            NeonBin::QAdd | NeonBin::QSub => !ty.float && (ty.bits == 8 || ty.bits == 16),
+            // 64-bit saturating add/sub is still unbuilt: wasm has no i64x2 min/max to
+            // build the unsigned form from, so it needs a lane-at-a-time expansion.
+            NeonBin::QAdd | NeonBin::QSub => !ty.float && ty.bits != 64,
             // The halving forms are emitted through a widening extend, which covers
             // 8/16/32-bit sources.
             NeonBin::HAdd | NeonBin::HSub | NeonBin::RHAdd => !ty.float && ty.bits != 64,
@@ -4090,6 +4286,8 @@ fn neon_emittable(s: &NeonStmt) -> bool {
         // by-scalar multiply is decoded only for 16/32-bit elements (f32 or integer), all of which
         // have a wasm lane-multiply; the 8-bit form does not exist in this encoding class.
         NeonStmt::MulScalar { ty, .. } => ty.float || ty.bits != 8,
+        // The same lane extract as `MulScalar`, then `extmul_low`: 16- and 32-bit sources only.
+        NeonStmt::WideMulScalar { ty, .. } => !ty.float && (ty.bits == 16 || ty.bits == 32),
         // `extadd_pairwise` widens only 8->16 and 16->32.
         NeonStmt::PairLong { ty, .. } => ty.bits == 8 || ty.bits == 16,
         // The saturating abs/negate need a lanewise compare and negate, which wasm has for
@@ -4354,3 +4552,108 @@ mod pc_source_operand_tests {
     }
 }
 
+
+#[cfg(test)]
+mod switch_bound_tests {
+    use super::*;
+
+    /// Decode a straight run of Thumb instructions at `base` into the map
+    /// [`recover_switch_bound`] reads.
+    fn decode_thumb_run(
+        base: u32,
+        bytes: &[u8],
+    ) -> BTreeMap<u32, (Instruction, u32, ConditionCode, bool)> {
+        let decoder = InstDecoder::default().with_thumb_mode(true);
+        let mut decoded = BTreeMap::new();
+        let mut addr = base;
+        while ((addr - base) as usize) < bytes.len() {
+            let (inst, len) = decode_at(&decoder, bytes, base, addr, true).expect("decodes");
+            let applied = inst.condition;
+            decoded.insert(addr, (inst, len, applied, false));
+            addr += len;
+        }
+        decoded
+    }
+
+    /// A RANGE CHECK AND A TABLE INDEX OFF TWO SEPARATE RELOADS OF THE SAME SPILLED
+    /// VARIABLE. The compare is already on the rebased value, so folding the table
+    /// branch's own `subs #2` into it a second time under-counts the table by exactly
+    /// the rebase - and the entries that fall off the end are silently routed to the
+    /// switch's default instead of their case bodies.
+    ///
+    /// These are the real bytes at guest `0x81c566c8` in PCSE00084's query-language
+    /// lexer, whose nine cases are identifier LENGTHS 2..10. Read as seven, the
+    /// ten-character keyword `fastcursor` degraded to a plain identifier, the cursor it
+    /// declared bound no columns, and the title faulted four hundred frames later inside
+    /// its own index arithmetic over the row it never received.
+    #[test]
+    fn a_guard_on_an_earlier_reload_is_not_a_bound_on_the_index() {
+        let base = 0x81c5_66c8;
+        let decoded = decode_thumb_run(
+            base,
+            &[
+                0x01, 0x99, // ldr  r1, [sp, #4]
+                0x02, 0x39, // subs r1, #2
+                0x08, 0x29, // cmp  r1, #8
+                0x23, 0xd8, // bhi  (out of range -> the default)
+                0x01, 0x99, // ldr  r1, [sp, #4]   <- the second reload
+                0x02, 0x39, // subs r1, #2
+                0xdf, 0xe8, 0x11, 0xf0, // tbh [pc, r1, lsl #1]
+            ],
+        );
+        let (count, _) = recover_switch_bound(&decoded, base + 12, 1);
+        assert_eq!(
+            count, None,
+            "the compare tests a definition the table branch never sees, so it bounds \
+             nothing; Some(7) here is the nine-entry table read as seven"
+        );
+    }
+
+    /// AN ADJUSTMENT ABOVE THE GUARD IS ALREADY INSIDE THE BOUND. The golf title's
+    /// thirty-case dispatch rebases `r8` and only THEN compares it, with nothing between the
+    /// compare and the table branch. Folding that rebase in a second time reads thirty
+    /// entries as twenty-nine, and the case that falls off the end took the title's
+    /// single-player menu from eighty draws to twelve - an empty list it never leaves.
+    ///
+    /// Real bytes from guest `0x811a1b3a`, with the rebase that precedes them.
+    #[test]
+    fn an_adjustment_above_the_guard_is_already_in_its_bound() {
+        let base = 0x811a_1b36;
+        let decoded = decode_thumb_run(
+            base,
+            &[
+                0xb8, 0xf1, 0x01, 0x08, // subs.w r8, r8, #1   <- ABOVE the compare
+                0xb8, 0xf1, 0x1d, 0x0f, // cmp.w  r8, #0x1d
+                0x4c, 0xd8, // bhi (out of range -> the default)
+                0xdf, 0xe8, 0x18, 0xf0, // tbh [pc, r8, lsl #1]
+            ],
+        );
+        let (count, _) = recover_switch_bound(&decoded, base + 10, 8);
+        assert_eq!(
+            count,
+            Some(30),
+            "the compare is on the REBASED value, so k must not be folded into it again"
+        );
+    }
+
+    /// The control, and the shape this recovery exists for: ONE definition of the index,
+    /// with the rebase between the guard and the table branch. Nothing redefines the
+    /// register in between, so the guard's bound really is a bound on the index and
+    /// `k` folds into it exactly once.
+    #[test]
+    fn a_guard_on_the_live_definition_still_fixes_the_count() {
+        let base = 0x81c5_66c8;
+        let decoded = decode_thumb_run(
+            base,
+            &[
+                0x01, 0x99, // ldr  r1, [sp, #4]
+                0x08, 0x29, // cmp  r1, #8
+                0x23, 0xd8, // bhi  (out of range -> the default)
+                0x02, 0x39, // subs r1, #2
+                0xdf, 0xe8, 0x11, 0xf0, // tbh [pc, r1, lsl #1]
+            ],
+        );
+        let (count, _) = recover_switch_bound(&decoded, base + 8, 1);
+        assert_eq!(count, Some(7), "switch <= 8 rebased by -2 is seven entries");
+    }
+}

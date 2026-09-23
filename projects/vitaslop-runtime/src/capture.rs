@@ -397,7 +397,22 @@ pub fn no_attributes() -> std::sync::Arc<[VertexAttribute]> {
 /// called twice per draw on the fixed-function path, where the whole point is that the
 /// recompiler payload costs nothing.
 pub fn no_program() -> std::sync::Arc<[u8]> {
+    no_bytes()
+}
+
+/// An empty byte buffer, SHARED. `Arc::<[u8]>::from(&[][..])` is not free - the reference
+/// counts live in a heap block, so every "nothing" was an allocation and a free - and a draw
+/// took three or four of them (deferred indices and vertices, an unbound bank), ~600 draws a
+/// frame. Every pointer-keyed cache also keys on the LENGTH, so one shared empty buffer
+/// cannot alias anything but another empty one.
+pub fn no_bytes() -> std::sync::Arc<[u8]> {
     static EMPTY: std::sync::OnceLock<std::sync::Arc<[u8]>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| std::sync::Arc::from(&[][..])).clone()
+}
+
+/// No bound textures, SHARED - see [`no_bytes`].
+pub fn no_textures() -> std::sync::Arc<[BoundTexture]> {
+    static EMPTY: std::sync::OnceLock<std::sync::Arc<[BoundTexture]>> = std::sync::OnceLock::new();
     EMPTY.get_or_init(|| std::sync::Arc::from(&[][..])).clone()
 }
 
@@ -535,11 +550,11 @@ pub struct Draw {
     /// needs windows but had nothing usable bound, which the renderer must DROP with a report
     /// rather than feed fabricated bytes. See `vitaslop_gxp_shader::module::MemWindow` and
     /// `VitaState::capture_mem_windows`.
-    pub mem_windows: Vec<(u32, Vec<u8>)>,
+    pub mem_windows: Vec<(u32, Arc<[u8]>)>,
     /// The FRAGMENT program's own memory windows, laid out for its `gxp_fmem` binding and
     /// snapshotted from the FRAGMENT uniform-buffer table. Empty for almost every program;
     /// one baseball title's whole menu is drawn by a pair that needs it.
-    pub frag_mem_windows: Vec<(u32, Vec<u8>)>,
+    pub frag_mem_windows: Vec<(u32, Arc<[u8]>)>,
     /// The vertex program SYNTHESIZES this draw's primitive rather than reading it: the
     /// stream holds one record per sprite (a centre plus an expansion basis - a
     /// scale/rotation, or an explicit right/up billboard axis pair) and the shader builds
@@ -594,6 +609,15 @@ pub struct Scene {
     /// (see `VitaState::complete_scene_now`). The frame render skips it: the target texture
     /// already holds the image, and rendering an accumulating target twice would double it.
     pub completed_early: bool,
+    /// The `(address, value)` of the vertex and fragment `SceGxmNotification`s the scene
+    /// was ended with (`None` where the guest passed none). A `sceGxmNotificationWait` on
+    /// one of these is a wait for this scene's GPU work - see `gxm::notification_wait`.
+    pub notifications: [Option<(u32, u32)>; 2],
+    /// Non-zero while this scene's draw geometry is still a DESCRIPTION rather than bytes:
+    /// the serial `VitaState::pending_geometry` files the read under. Resolved - the bytes
+    /// read and this reset to 0 - at the guest's GPU wait or its flip, whichever comes first.
+    /// See `VitaState::resolve_deferred_geometry`.
+    pub deferred_id: u64,
     /// Shader PAIRS the guest's patcher named since the previous scene, as
     /// `(vertex container bytes, fragment container bytes)` - see
     /// `VitaState::queue_shader_precompile`. The renderer prepares these before it encodes,
@@ -662,6 +686,9 @@ pub struct DepthSurface {
     pub stencil_addr: u32,
     /// The depth the surface clears/loads as background, as raw f32 bits (GXM's default is 1.0).
     pub background_depth: u32,
+    /// `backgroundControl`: its LOW BYTE is the stencil value the surface clears to
+    /// (`sceGxmDepthStencilSurfaceSetBackgroundStencil`), 0 after `...Init`.
+    pub background_control: u32,
 }
 
 /// Report - once per (target, from, to) - that a scene's extent was taken from its draws'
@@ -1242,7 +1269,12 @@ impl Capture {
     /// that reason rather than for any divergence, which is exactly the wrong diagnosis to hand
     /// someone chasing a browser-only bug.
     pub fn take_frame_scenes(&mut self) -> Vec<Scene> {
-        let taken = core::mem::take(&mut self.scenes);
+        // A scene whose geometry is still pending (`deferred_id != 0`) is NOT taken: its
+        // bytes are read at the guest's flip, which on some titles comes after this frame
+        // boundary. It stays for the next take - see the desktop's twin in `retail.rs`.
+        let (pending, taken): (Vec<_>, Vec<_>) =
+            core::mem::take(&mut self.scenes).into_iter().partition(|s| s.deferred_id != 0);
+        self.scenes = pending;
         for old in &taken {
             if self.fold_disabled {
                 self.signature_incomplete = true;
@@ -1531,7 +1563,7 @@ mod extent_tests {
             frag_mem_windows: Vec::new(),
             shader_expanded: false,
         };
-        Scene { completed_early: false,
+        Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: Some(ColorSurface {
                 format: 0,
@@ -1587,7 +1619,7 @@ mod retention_tests {
 
     /// A scene distinguishable by `tag` through the part of it the signature folds.
     fn scene(tag: u8) -> Scene {
-        Scene { completed_early: false,
+        Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: Some(ColorSurface {
                 format: tag as u32,

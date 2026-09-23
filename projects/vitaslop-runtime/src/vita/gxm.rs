@@ -23,6 +23,16 @@ pub(super) fn ok(ctx: &mut GuestCtx) {
     ctx.ret(0);
 }
 
+/// `sceGxmShaderPatcherGet{Buffer,VertexUsse,FragmentUsse}MemAllocated(patcher, unsigned
+/// int *out)`: this patcher takes nothing from the guest's pools, so the answer is zero.
+pub(super) fn shader_patcher_get_mem_allocated(ctx: &mut GuestCtx) {
+    let out = ctx.arg(1);
+    if out != 0 {
+        ctx.write_u32(out, 0);
+    }
+    ctx.ret(0);
+}
+
 /// int sceGxmMapMemory(void *base, SceSize size, SceGxmMemoryAttribFlags attr)
 ///
 /// The guest's pages already ARE the memory the capture reads, so nothing is mapped -
@@ -370,8 +380,8 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
     use gxmctx::off as ctxoff;
     use vitaslop_transpiler::InlineOp::{
         BindPrecomputedState, CopyArgIndexed, LoadScaled, LoadShiftMask, ReserveUniformBuffer,
-        SetUniformData, StoreArg, StoreArgField, StoreArgFieldInPlace, StoreArgIndexed,
-        StoreArgRun, StoreVfpRun,
+        SetAllUniformBuffers, SetUniformData, StoreArg, StoreArgField, StoreArgFieldInPlace,
+        StoreArgIndexed, StoreArgRun, StoreVfpRun,
     };
     // A `void sceGxmSet*(SceGxmContext *context, uint32 value)`: one word of the context
     // block, at the offset its handler writes.
@@ -598,6 +608,20 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // frame EACH on a racing title's race - the last non-draw GXM crossings it makes.
         g::SET_PRECOMPUTED_VERTEX_STATE => BindPrecomputedState { layout: bind_state_layout(false) },
         g::SET_PRECOMPUTED_FRAGMENT_STATE => BindPrecomputedState { layout: bind_state_layout(true) },
+        // `sceGxmPrecomputed{Vertex,Fragment}StateSetAllUniformBuffers(state, array)`: the
+        // non-default uniform-buffer table copied into the state's own arrays block - the
+        // handler (`precomputed_state_set_all_nondefault_uniform_buffers`) is one read of the
+        // array and one write of the table, and with the state in guest memory both ends are
+        // the guest's. MEASURED on a football title's browser frame: **1,027 calls a frame**,
+        // one per `sceGxmDrawPrecomputed` - the hottest host call left in its draw path once
+        // the yield was inlined. An unstamped struct (the handler allocates its block) and an
+        // array whose tail leaves guest memory (the handler reads zeros) both fall back.
+        g::PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS => {
+            SetAllUniformBuffers { layout: set_all_uniform_buffers_layout(false) }
+        }
+        g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS => {
+            SetAllUniformBuffers { layout: set_all_uniform_buffers_layout(true) }
+        }
         g::SET_FRONT_VISIBILITY_TEST_ENABLE => store(ctxoff::FRONT_VISIBILITY_TEST_ENABLE),
         g::SET_FRONT_VISIBILITY_TEST_INDEX => store(ctxoff::FRONT_VISIBILITY_TEST_INDEX),
         g::SET_FRONT_VISIBILITY_TEST_OP => store(ctxoff::FRONT_VISIBILITY_TEST_OP),
@@ -701,6 +725,20 @@ fn uniform_ring_layout(record: u32) -> vitaslop_transpiler::UniformRingLayout {
     }
 }
 
+/// `VITASLOP_GXM_PVS_BULK_TABLE=1` - restore the VERTEX bind's old WHOLESALE table copy, zeros
+/// and all. The control arm for the per-slot change, so both arms are one binary on one machine
+/// [[vitaslop-compare-against-the-same-build-twice]].
+///
+/// Read at TRANSPILE time (the bind is an inlined form), so it must be set for the whole run.
+/// The only title this can distinguish is one that both binds precomputed vertex states and
+/// binds a vertex uniform buffer directly - four of seven captured titles never call
+/// `sceGxmSetPrecomputedVertexState` at all and cannot tell the arms apart.
+fn vertex_table_copied_wholesale() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VITASLOP_GXM_PVS_BULK_TABLE").is_ok_and(|v| v != "0"))
+}
+
 /// Where `InlineOp::BindPrecomputedState` finds everything, per stage - the one place the
 /// context, state-struct and arrays-block offsets meet the emitter. Pinned to the handlers
 /// by the `precomputed_state_binds` tests.
@@ -728,13 +766,36 @@ fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
             // behind it stay behind, see `gxmstate::VERTEX_BLOCK_BYTES`.
             gxmstate::VERTEX_BLOCK_TEXTURES
         },
-        // The fragment copy is the texture array, and an empty slot there is this engine's own
-        // zero rather than the guest's - see `BindStateLayout::copy_slot_stride` and the
-        // handler's matching loop in `VitaState::bind_precomputed_fragment_state`. The vertex
-        // copy is the uniform-buffer table, where a zero entry IS the guest's "no buffer".
-        copy_slot_stride: if fragment { gxmctx::TEXTURE_STRIDE } else { 0 },
+        // An empty slot is this engine's own zero rather than the guest's in BOTH stages, so
+        // both copies skip one - see `BindStateLayout::copy_slot_stride` and the handlers'
+        // matching loops. The vertex table was exempted from this until its zeros were measured
+        // erasing live bindings on a football title (the drops read `none` where a neighbouring
+        // draw read `0=0x953ffe10 2=0x8d599a30`); a slot there is ONE WORD.
+        copy_slot_stride: if fragment {
+            gxmctx::TEXTURE_STRIDE
+        } else if vertex_table_copied_wholesale() {
+            0
+        } else {
+            4
+        },
         ctx_prog: gxmctx::off::FRAGMENT_PROGRAM,
         has_prog: fragment,
+    }
+}
+
+/// Where `InlineOp::SetAllUniformBuffers` finds the state struct's stamp and block, and the
+/// table inside the block - the same constants `ensure_state_block` and
+/// `precomputed_state_set_all_nondefault_uniform_buffers` use, so the two cannot drift.
+fn set_all_uniform_buffers_layout(fragment: bool) -> vitaslop_transpiler::SetAllUniformBuffersLayout {
+    use crate::vita::gxmstate;
+    vitaslop_transpiler::SetAllUniformBuffersLayout {
+        st_magic_at: gxmstate::off::MAGIC,
+        st_magic: if fragment { gxmstate::MAGIC_FRAGMENT } else { gxmstate::MAGIC_VERTEX },
+        st_block_at: gxmstate::off::BLOCK,
+        // The vertex block's table is first; the fragment block's sits behind its texture
+        // array - see `gxmstate::VERTEX_BLOCK_BYTES` / `FRAGMENT_BLOCK_BYTES`.
+        table_at: if fragment { gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS } else { 0 },
+        bytes: gxmctx::MAX_UNIFORM_BUFFERS as u32 * 4,
     }
 }
 
@@ -815,6 +876,53 @@ pub(super) fn param_get_component_count(ctx: &mut GuestCtx) {
 pub(super) fn param_get_container_index(ctx: &mut GuestCtx) {
     let param = ctx.arg(0);
     ctx.ret((param_word(ctx, param) >> 12) & 0xf);
+}
+
+/// SceBool sceGxmProgramParameterIsRegFormat(const SceGxmProgram *program, param)
+///
+/// Whether a vertex ATTRIBUTE parameter is fed to the program as raw untyped register words
+/// (the shader unpacks the bits itself) rather than as a typed, normalised value. The
+/// answer lives in the program's vertex-varyings block, not in the parameter: bit
+/// `resource_index` (the attribute's PA register) of the untyped-register mask at block
+/// +8. The block is found through the header's self-relative `varyings_offset` at +0x2c,
+/// the same way the recompiler's container parse finds it. Only the low 32 bits of the
+/// mask are trustworthy (the block overlays its count word on the upper half), and no
+/// program has more attribute registers than that. Every non-attribute parameter is 0.
+/// A sports title's engine asks this of each attribute while building its vertex layouts.
+pub(super) fn param_is_reg_format(ctx: &mut GuestCtx) {
+    let program = ctx.arg(0);
+    let param = ctx.arg(1);
+    let is_attribute = param_word(ctx, param) & 0xf == 0;
+    let reg = if is_attribute && program != 0 {
+        let field = program.wrapping_add(0x2c);
+        let block = field.wrapping_add(ctx.read_u32(field));
+        let mask = ctx.read_u32(block.wrapping_add(8));
+        let index = ctx.read_u32(param.wrapping_add(12));
+        if index < 32 { (mask >> index) & 1 } else { 0 }
+    } else {
+        0
+    };
+    ctx.ret(reg);
+}
+
+/// unsigned int sceGxmProgramParameterGetIndex(const SceGxmProgram *program, param)
+///
+/// The parameter's position in the program's parameter array: the array starts at the
+/// header's self-relative `parameters_offset` (+0x28, added to that field's own address)
+/// and each entry is 16 bytes, so the index is the byte distance over 16. A parameter that
+/// does not lie in the array (or a null program) answers 0, which is what the hardware's
+/// arithmetic would also give for the first entry.
+pub(super) fn param_get_index(ctx: &mut GuestCtx) {
+    let program = ctx.arg(0);
+    let param = ctx.arg(1);
+    let index = if program != 0 {
+        let field = program.wrapping_add(0x28);
+        let first = field.wrapping_add(ctx.read_u32(field));
+        param.wrapping_sub(first) / 16
+    } else {
+        0
+    };
+    ctx.ret(index);
 }
 
 /// unsigned int sceGxmProgramParameterGetArraySize(param)
@@ -1106,22 +1214,28 @@ fn report_unmapped_color_format(color_format: u32) {
 /// Read back a surface written by [`write_color_surface`], or `None` if this address
 /// does not hold one.
 pub(super) fn read_color_surface(ctx: &mut GuestCtx, addr: u32) -> Option<ColorSurface> {
-    if addr == 0 || ctx.read_u32(addr) != COLOR_SURFACE_MAGIC {
+    if addr == 0 {
+        return None;
+    }
+    // ONE 32-byte read, not eight words: every word is a boundary crossing in the browser, and
+    // this runs for BeginScene, EndScene and SetGammaMode - the sampled host-call table read
+    // w8-w13 per call on those three, ~220 calls a frame on a baseball title.
+    let b = ctx.read_bytes(addr, 32);
+    if b.len() < 32 {
+        return None;
+    }
+    let w = |off: u32| u32::from_le_bytes(b[off as usize..off as usize + 4].try_into().expect("4 bytes"));
+    if w(0) != COLOR_SURFACE_MAGIC {
         return None;
     }
     Some(ColorSurface {
-        format: ctx.read_u32(addr + CS_FORMAT),
-        surface_type: ctx.read_u32(addr + CS_TYPE),
-        width: ctx.read_u32(addr + CS_WIDTH),
-        height: ctx.read_u32(addr + CS_HEIGHT),
-        stride_pixels: ctx.read_u32(addr + CS_STRIDE),
-        data_addr: ctx.read_u32(addr + CS_DATA),
-        scale_mode: ctx.read_u32(addr + CS_SCALE),
-        // NOT read from guest memory: a `SceGxmColorSurface` is 32 bytes (eight control words)
-        // and there is no ninth to keep this in. Writing one corrupted whatever the guest had
-        // placed after the struct - measured, and it cost this title a sampler binding, which
-        // surfaced as a shader falling back for a texture unit the guest had definitely bound.
-        // The mode lives in the host-side table and is merged in by `resolve_color_surface`.
+        format: w(CS_FORMAT),
+        surface_type: w(CS_TYPE),
+        width: w(CS_WIDTH),
+        height: w(CS_HEIGHT),
+        stride_pixels: w(CS_STRIDE),
+        data_addr: w(CS_DATA),
+        scale_mode: w(CS_SCALE),
         gamma: 0,
     })
 }
@@ -1137,6 +1251,9 @@ pub(super) fn color_surface_init(ctx: &mut GuestCtx, st: &mut VitaState) {
     let height = ctx.arg(6);
     let stride_pixels = ctx.arg(7);
     let data_addr = ctx.arg(8);
+    if data_addr != 0 {
+        st.flip_candidates.insert(data_addr);
+    }
     tracing::debug!(
         target: "vitaslop::gxm",
         surface = format_args!("{surface:#x}"),
@@ -1419,8 +1536,15 @@ fn program_rop_blend(
     program_header: u32,
 ) -> Option<crate::capture::BlendState> {
     use vitaslop_gxp_shader::RopDstFactor;
-    let blob = st.program_blob(ctx, program_header);
-    let rop = vitaslop_gxp_shader::rop_blend(&blob)?;
+    let rop = match st.rop_blend_memo.get(&program_header) {
+        Some(r) => (*r)?,
+        None => {
+            let blob = st.program_blob(ctx, program_header);
+            let r = vitaslop_gxp_shader::rop_blend(&blob);
+            st.rop_blend_memo.insert(program_header, r);
+            r?
+        }
+    };
     // `SceGxmBlendFactor`: 1 = ONE, 4 = SRC_ALPHA, 5 = ONE_MINUS_SRC_ALPHA.
     // `SceGxmBlendFunc`: 0 = NONE, 1 = ADD.
     let blend = crate::capture::BlendState {
@@ -1467,8 +1591,11 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     // draw does, and that is the whole reason this call can prepare a shader at all.
     let vertex_program = ctx.arg(5);
     let out = ctx.arg(6);
-    let program_header = st.shader_program(program_id);
-    let handle = st.new_program_handle(ctx, program_header);
+    let (program_header, handle) = {
+        let _s = crate::perf::scope(crate::perf::Phase::PatchCreateFragHandle);
+        let program_header = st.shader_program(program_id);
+        (program_header, st.new_program_handle(ctx, program_header))
+    };
     // The BLEND EQUATION arrives here - GXM has no runtime blend setter, so a program created
     // with an additive info always does. Dropping this argument is what forced every renderer
     // downstream to guess the mode from the geometry, and a guess is wrong for whole classes of
@@ -1484,12 +1611,14 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     // >>> the operator. No blob in any corpus here carries both a real `blendInfo` and an
     // >>> epilogue SOP2, so this is consulted ONLY when GXM supplied nothing and the two can
     // >>> never compound.
-    let blend = match ctx.read_bytes(blend_info, 4) {
-        b if blend_info != 0 && b.len() == 4 => {
-            crate::capture::BlendState::from_bytes([b[0], b[1], b[2], b[3]])
+    let blend = {
+        let _s = crate::perf::scope(crate::perf::Phase::PatchCreateFragBlend);
+        match ctx.read_bytes(blend_info, 4) {
+            b if blend_info != 0 && b.len() == 4 => {
+                crate::capture::BlendState::from_bytes([b[0], b[1], b[2], b[3]])
+            }
+            _ => program_rop_blend(ctx, st, program_header).unwrap_or_default(),
         }
-        _ => program_rop_blend(ctx, st, program_header)
-            .unwrap_or_default(),
     };
     report_blend_info(program_header, blend_info, blend);
     st.set_fragment_program(handle, program_header, blend);
@@ -1502,7 +1631,10 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     // a retail race, 931 ms of WGSL compile and 449 ms of pipeline creation, 160
     // pipelines built ACROSS the race, with single frames spending 50-100 ms building 2-6 of
     // them. That is not just slow, it is a different SHAPE from the hardware.
-    st.queue_shader_precompile(ctx, vertex_program, program_header);
+    {
+        let _s = crate::perf::scope(crate::perf::Phase::PatchCreateFragPrecompile);
+        st.queue_shader_precompile(ctx, vertex_program, program_header);
+    }
     // One reference, for `sceGxmShaderPatcherGetFragmentProgramRefCount`.
     st.note_program_created(handle);
     ctx.write_u32(out, handle);
@@ -1667,6 +1799,7 @@ fn read_depth_stencil_surface(
         depth_addr: ctx.read_u32(surface + DS_DEPTH_DATA),
         stencil_addr: ctx.read_u32(surface + DS_STENCIL_DATA),
         background_depth: ctx.read_u32(surface + DS_BACKGROUND_DEPTH),
+        background_control: ctx.read_u32(surface + DS_BACKGROUND_CONTROL),
     })
 }
 
@@ -1685,10 +1818,14 @@ fn report_scene_target(
     // same render target at two different sizes over a run (a 1x1 dummy while a title is
     // loading, its real size in play), and a pairing-only dedup prints the boot one and hides
     // the one the frame is actually built from.
+    // NOT the addresses: a title that creates a fresh render target for a fresh colour buffer
+    // every frame (text and sprite caches) would print this line every frame, and the panel
+    // that keeps 96 status lines would hold nothing else. The fact is the SHAPE - extent,
+    // multisample mode, scale mode; the address printed is the first sighting's.
     static SEEN: Mutex<Option<HashSet<(u32, u32, u32, u32)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let (w, h) = extent.unwrap_or((0, 0));
-    if !g.get_or_insert_with(HashSet::new).insert((color_addr, render_target, w, h)) {
+    if !g.get_or_insert_with(HashSet::new).insert((w, h, multisample_mode_of(render_target), scale_mode)) {
         return;
     }
     tracing::info!(
@@ -1739,11 +1876,13 @@ fn report_scene_extent_sources(
     // reports only the first - which reads as "that pass is 1x1" for the whole run and sent a
     // session hunting an extent bug that does not exist.
     #[allow(clippy::type_complexity)]
+    // ...and NOT on the address at all: a fresh colour buffer every frame is the same fact
+    // every frame (see `report_scene_target`).
     static SEEN: Mutex<
-        Option<HashSet<(u32, Option<(u32, u32)>, Option<(u32, u32)>, Option<(u32, u32)>)>>,
+        Option<HashSet<(Option<(u32, u32)>, Option<(u32, u32)>, Option<(u32, u32)>, Option<(u32, u32)>)>>,
     > = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((color_addr, surface, target, valid_region)) {
+    if !g.get_or_insert_with(HashSet::new).insert((surface, target, valid_region, used)) {
         return;
     }
     let fmt = |e: Option<(u32, u32)>| match e {
@@ -1774,11 +1913,22 @@ fn report_scene_depth(
     depth: Option<crate::capture::DepthSurface>,
 ) {
     use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<std::collections::HashSet<(u32, u32, u32)>>> = OnceLock::new();
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(u32, u32, bool, bool, u32, u32)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
     let d = depth.unwrap_or_default();
-    if seen.insert((color_addr, d.depth_addr, d.stencil_addr)) {
+    // Keyed on the CONFIGURATION, not the addresses - a title with a fresh colour buffer
+    // every frame is the same fact every frame. The depth's OFFSET from the colour buffer is
+    // what the anomaly below is measured against, so it is the key's stand-in for both.
+    let key = (
+        d.zls_control,
+        d.background_depth,
+        d.depth_addr != 0,
+        d.stencil_addr != 0,
+        d.depth_addr.wrapping_sub(color_addr),
+        d.stencil_addr.wrapping_sub(color_addr),
+    );
+    if seen.insert(key) {
         // The STRUCT addresses too, not just the pixel addresses they hold. On one retail racer
         // a scene reports its colour at `0x89204aa0` and its depth 256 bytes later, for buffers
         // that are two megabytes each - so they cannot both be where they say they are, and the
@@ -1810,18 +1960,30 @@ pub(super) fn end_scene(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOut
     // Before the scene is folded: did the guest write any watched vertex window between its
     // draw call and here? See `STREAM_WATCH` - a no-op without `VITASLOP_DUMP_STREAM_BYTES`.
     st.report_stream_rewrites(ctx);
-    // The draws' geometry is read HERE, which is when the GPU reads it - see `defer_geometry`.
-    st.resolve_deferred_geometry(ctx);
+    // `VITASLOP_MEM_DUMP` fires here as well as on the draw path. Its other site hangs off a
+    // draw's UNIFORM WINDOW capture, which never runs on a title whose draws carry no window -
+    // and a movie player's two draws carry none, so the knob silently did nothing on exactly
+    // the run that needed it. Every title that renders at all reaches END SCENE.
+    st.dump_guest_ranges_now(ctx);
+    // The draws' geometry is NOT read here: the scene keeps its read descriptions and the
+    // bytes are taken at the guest's GPU wait or at its flip, whichever comes first - see
+    // `VitaState::resolve_deferred_geometry` for the crowd that made EndScene too early.
     st.end_scene();
-    let blocked = complete_small_target_now(ctx, st);
     st.flush_visibility(ctx);
     let (vertex_notification, fragment_notification) = (ctx.arg(1), ctx.arg(2));
+    // The scene remembers its notifications: a `sceGxmNotificationWait` on one of them is
+    // a wait for THIS scene's GPU work, and completes it - see `notification_wait`.
+    let read = |ctx: &mut GuestCtx, n: u32| {
+        (n != 0).then(|| (ctx.read_u32(n), ctx.read_u32(n + 4))).filter(|(a, _)| *a != 0)
+    };
+    let recorded = [read(ctx, vertex_notification), read(ctx, fragment_notification)];
+    if let Some(scene) = st.capture.scenes.last_mut() {
+        scene.notifications = recorded;
+    }
     signal_notification(ctx, vertex_notification);
     signal_notification(ctx, fragment_notification);
     ctx.ret(0);
-    // The asynchronous completion parks the thread here; the frontend wakes it once the
-    // scene's pixels are in guest memory. See `VitaState::complete_scene_async`.
-    if blocked { crate::SvcOutcome::Block } else { crate::SvcOutcome::Continue }
+    crate::SvcOutcome::Continue
 }
 
 /// Write a `SceGxmNotification`'s `value` through its `address`, which is what the GPU
@@ -1867,18 +2029,31 @@ pub(super) fn wait_event(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOu
 
 /// int sceGxmNotificationWait(const SceGxmNotification *notification)
 ///
-/// Block until `*notification->address == notification->value`. Every scene completes
-/// synchronously here and signals its notifications at `sceGxmEndScene`, so by the time
-/// a title waits the value is already there and this returns at once.
+/// Block until `*notification->address == notification->value`. Every scene signals its
+/// notifications at `sceGxmEndScene`, so the value is already there and this returns at
+/// once - but the wait is also the guest's promise that the scene carrying the notification
+/// has been RENDERED, so that scene (and everything the frame ended before it) is completed
+/// here, with its CPU-readable targets written back. See [`complete_scenes_through`].
 ///
 /// A notification that is NOT already signalled means it was never attached to a scene
 /// that ended - waiting for it would hang forever, so it is signalled here instead, and
 /// reported, because a wait that silently returns without its condition holding is the
 /// kind of thing that surfaces thousands of frames away.
-pub(super) fn notification_wait(ctx: &mut GuestCtx, _st: &mut VitaState) {
+pub(super) fn notification_wait(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOutcome {
     let notification = ctx.arg(0);
     let address = ctx.read_u32(notification);
     let value = ctx.read_u32(notification + 4);
+    let carrier = st
+        .capture
+        .scenes
+        .iter()
+        .rposition(|s| s.notifications.contains(&Some((address, value))));
+    let blocked = match carrier {
+        Some(i) if !st.capture.scenes[i].completed_early => {
+            complete_scenes_through(ctx, st, i + 1)
+        }
+        _ => false,
+    };
     if address != 0 && ctx.read_u32(address) != value {
         tracing::warn!(
             target: "vitaslop::gxm",
@@ -1890,6 +2065,7 @@ pub(super) fn notification_wait(ctx: &mut GuestCtx, _st: &mut VitaState) {
         ctx.write_u32(address, value);
     }
     ctx.ret(0);
+    if blocked { crate::SvcOutcome::Block } else { crate::SvcOutcome::Continue }
 }
 
 /// void sceGxmSetVertexProgram(context, vertexProgram)
@@ -1973,25 +2149,41 @@ pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
     // nibble of `packed` - the same field `SceGxmProgramParameter` reflection reads.
     let half = parameter != 0
         && matches!(ParamType::from_bits(((ctx.read_u32(parameter + 4) >> 4) & 0xf) as u8), ParamType::F16);
-    let mut values = Vec::with_capacity(component_count as usize);
-    for i in 0..component_count {
-        values.push(ctx.read_f32(source + i * 4));
-    }
+    // ONE read of the source and ONE write of the destination run, not a word each. Every
+    // guest access from the host is a boundary crossing in the browser, and the sampled
+    // host-call table read this handler at w25 per call, ~120 calls a frame on a football
+    // title - a matrix at a time, sixteen reads and sixteen writes for 64 bytes.
+    let n = component_count as usize;
+    let src = ctx.read_bytes(source, n * 4);
+    let values: Vec<f32> = (0..n)
+        .map(|i| src.get(i * 4..i * 4 + 4).map_or(0.0, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        .collect();
     // Faithful copy into the reserved buffer (in case the guest reads it back, and because a
     // recompiled shader reads this buffer verbatim).
-    for (i, v) in values.iter().enumerate() {
-        let component = base * if half { 2 } else { 1 } + component_offset + i as u32;
-        if half {
-            // Two halves per register: read-modify-write the other half so a partial update
-            // (the common `componentOffset` case) does not clear its neighbour.
-            let addr = uniform_buffer + (component / 2) * 4;
-            let word = ctx.read_u32(addr);
-            let h = u32::from(f32_to_half(*v));
-            let merged = if component.is_multiple_of(2) { (word & 0xffff_0000) | h } else { (word & 0x0000_ffff) | (h << 16) };
-            ctx.write_u32(addr, merged);
-        } else {
-            ctx.write_u32(uniform_buffer + component * 4, v.to_bits());
+    let first = base * if half { 2 } else { 1 } + component_offset;
+    if half {
+        // Two halves per register: read-modify-write the run so a partial update (the common
+        // `componentOffset` case) does not clear a neighbouring half - the run's words are read
+        // once, merged, and written once.
+        if n > 0 {
+            let lo_word = first / 2;
+            let hi_word = (first + n as u32 - 1) / 2;
+            let addr = uniform_buffer + lo_word * 4;
+            let mut words = ctx.read_bytes(addr, ((hi_word - lo_word + 1) * 4) as usize);
+            for (i, v) in values.iter().enumerate() {
+                let component = first + i as u32;
+                let at = ((component / 2 - lo_word) * 4) as usize;
+                let h = f32_to_half(*v).to_le_bytes();
+                if at + 4 <= words.len() {
+                    let half_at = at + if component.is_multiple_of(2) { 0 } else { 2 };
+                    words[half_at..half_at + 2].copy_from_slice(&h);
+                }
+            }
+            ctx.write_bytes(addr, &words);
         }
+    } else {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        ctx.write_bytes(uniform_buffer + first * 4, &bytes);
     }
     report_uniform_write(ctx, uniform_buffer, parameter, base, component_offset, half, &values, source);
     tracing::trace!(
@@ -2116,7 +2308,7 @@ pub(super) fn draw(ctx: &mut GuestCtx, st: &mut VitaState) {
     let index_format = ctx.arg(2);
     let index_data = ctx.arg(3);
     let index_count = ctx.arg(4);
-    st.record_draw(ctx, primitive, index_format, index_data, index_count);
+    st.record_draw(ctx, primitive, index_format, index_data, index_count, 0);
     ctx.ret(0);
 }
 
@@ -2124,24 +2316,24 @@ pub(super) fn draw(ctx: &mut GuestCtx, st: &mut VitaState) {
 ///     indexType, const void *indexData, unsigned int indexCount, unsigned int
 ///     indexWrap)  -- 6 args. Same draw as `sceGxmDraw` with hardware instancing: the
 /// index buffer is replayed once per instance, incrementing the instance index every
-/// `indexWrap` indices. We capture the base geometry (the `indexCount` index run) - the
-/// per-instance transform is a vertex-program input the capture already carries, so the
-/// first instance renders correctly; broader instancing can layer on later.
+/// `indexWrap` indices. The wrap travels with the draw: the deferred geometry read expands
+/// every instance into the interleaved buffer (a per-instance stream contributes row `k` to
+/// instance `k`'s vertices) - see `TextureSnapshots::read_instanced_draw`. MEASURED before
+/// that existed on a baseball title's crowd: 466 instanced draws a frame, each rendering its
+/// FIRST instance only, and the stale rows past that instance's quad tiled the whole frame.
 pub(super) fn draw_instanced(ctx: &mut GuestCtx, st: &mut VitaState) {
     let primitive = ctx.arg(1);
     let index_format = ctx.arg(2);
     let index_data = ctx.arg(3);
     let index_count = ctx.arg(4);
     let index_wrap = ctx.arg(5);
-    // Only the first instance is captured, so record how many the guest asked for: a title
-    // that instances its scenery would otherwise silently render one copy of it.
     tracing::debug!(
         target: "vitaslop::gxm",
         index_count, index_wrap,
         instances = index_count.checked_div(index_wrap).unwrap_or(1),
         "drawInstanced"
     );
-    st.record_draw(ctx, primitive, index_format, index_data, index_count);
+    st.record_draw(ctx, primitive, index_format, index_data, index_count, index_wrap);
     ctx.ret(0);
 }
 
@@ -2264,12 +2456,31 @@ pub(super) fn texture_get_format(ctx: &mut GuestCtx, st: &mut VitaState) {
 }
 
 /// int sceGxmDisplayQueueAddEntry(oldBuffer, newBuffer, const void *callbackData)
-/// The callback data's first field is the display buffer address to present.
+///
+/// This call IS the flip request: the display queue flips to the new buffer at the vsync
+/// after its GPU work completes, by running the title's callback, whose
+/// `sceDisplaySetFrameBuf` names the buffer (see `display::set_frame_buf`, which presents
+/// too). The capture needs the flip recorded HERE as well - a frame's scenes are classified
+/// against the buffers flipped while they were captured, and the callback runs a frame
+/// later; without it a golf title's display image was retired under a draw still sampling
+/// it (155 `gxm-display-image has been destroyed` errors and 5 of 12 shots changed).
+///
+/// The callback data is the TITLE'S OWN struct. The SDK sample puts the buffer address in
+/// its first word; a baseball title passes a `SceDisplayFrameBuf`, whose first word is the
+/// struct size `0x18` and whose second is the address. So this presents the first of the
+/// data's leading words that is an address the guest has named as a display buffer or a
+/// colour surface (`VitaState::flip_candidates`), and nothing when none is. NOT "a target a
+/// scene rendered into": a golf title's final pass renders one buffer and flips another, and
+/// rejecting its flips moved its vblank pacing and with it every animation's phase.
 pub(super) fn display_queue_add_entry(ctx: &mut GuestCtx, st: &mut VitaState) {
     let callback_data = ctx.arg(2);
-    let buffer = ctx.read_u32(callback_data);
-    if buffer != 0 {
-        st.present(buffer);
+    if callback_data != 0 {
+        let words: Vec<u32> = (0..8).map(|i| ctx.read_u32(callback_data + i * 4)).collect();
+        let named = words.iter().copied().find(|w| *w != 0 && st.flip_candidates.contains(w));
+        if let Some(buffer) = named {
+            st.resolve_deferred_geometry(ctx);
+            st.present(buffer);
+        }
     }
     // Diagnostic (`RUST_LOG=vitaslop::display=trace`): WHICH BUFFER REACHES THE PANEL AT
     // EACH VSYNC is the whole question when a title's picture strobes, and it cannot be
@@ -2279,7 +2490,7 @@ pub(super) fn display_queue_add_entry(ctx: &mut GuestCtx, st: &mut VitaState) {
     tracing::trace!(
         target: "vitaslop::display",
         thid = st.current_thread(),
-        buffer = format_args!("{buffer:#010x}"),
+        callback_data = format_args!("{callback_data:#010x}"),
         old = format_args!("{:#010x}", ctx.arg(0)),
         new = format_args!("{:#010x}", ctx.arg(1)),
         us = st.now_us(),
@@ -2976,7 +3187,7 @@ pub(super) fn color_surface_get_data(ctx: &mut GuestCtx, st: &mut VitaState, sur
         let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if g.get_or_insert_with(HashSet::new).insert(surface) {
             eprintln!(
-                "gxm surface: sceGxmColorSurfaceGetData({surface:#x}) answered NULL - no colour                  surface is recorded at that address, called from lr={:#010x}",
+                "gxm surface: sceGxmColorSurfaceGetData({surface:#x}) answered NULL - no colour surface is recorded at that address, called from lr={:#010x}",
                 ctx.regs[14]
             );
         }
@@ -2998,16 +3209,24 @@ pub(super) fn color_surface_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaStat
     // `VitaState::color_surface_gamma`. Read from the struct's own contents first, exactly as
     // `resolve_color_surface` does, so a surface the guest initialised but this table has
     // never seen still contributes its data address.
-    let data_addr = read_color_surface(ctx, surface)
-        .or_else(|| st.color_surface(surface))
+    //
+    // Read ONCE. This setter is called THREE HUNDRED TIMES A FRAME by a baseball title, and
+    // every `read_color_surface` is a run of scalar reads across the guest boundary - the
+    // browser's most expensive kind of work per unit of usefulness
+    // [[vitaslop-count-calls-not-bytes-across-the-guest-boundary]]. Reading it twice for the
+    // same call was doubling that for nothing.
+    let described = read_color_surface(ctx, surface);
+    let data_addr = described
+        .as_ref()
         .map(|s| s.data_addr)
+        .or_else(|| st.color_surface(surface).map(|s| s.data_addr))
         .unwrap_or(0);
     st.set_color_surface_gamma(surface, data_addr, gamma);
     // Write it into the guest-visible surface struct too, so a scene that resolves its target
     // through `read_color_surface` carries the mode with it. Keeping the mode only in a side
     // table keyed by the SURFACE address loses it the moment the scene is described by its
     // colour surface's CONTENTS - which is how the renderer sees it.
-    if let Some(s) = read_color_surface(ctx, surface) {
+    if let Some(s) = described {
         // Name the DATA address, not the surface struct: the renderer, the chain dump and every
         // diagnostic downstream identify a pass by where its pixels land.
         tracing::debug!(
@@ -3025,7 +3244,9 @@ pub(super) fn color_surface_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaStat
         // asserted the opposite of what had happened, on the exact question - does this
         // surface hold encoded bytes - that decides how everything sampling it must decode.
         // Once per (surface data, mode) for the run - see `set_color_surface_gamma`.
-        if crate::rtt_writeback::report_once(0x6c00_0000_0000_0000 ^ ((s.data_addr as u64) << 16) ^ gamma as u64) {
+        // Keyed on the surface's SIZE and the mode, not its address (a fresh surface every
+        // frame is the same fact every frame); the address printed is the first sighting's.
+        if crate::rtt_writeback::report_once(0x6c00_0000_0000_0000 ^ ((s.width as u64) << 40) ^ ((s.height as u64) << 16) ^ gamma as u64) {
         tracing::info!(
             target: "vitaslop::status",
             "gxm surface: {} on the surface at data {:#x} ({}x{}), mode {gamma:#x}",
@@ -3151,7 +3372,7 @@ pub(super) fn precomputed_draw_set_params(
     index_data: u32,
     index_count: u32,
 ) -> i32 {
-    st.precomputed_draw_set_params(ctx, precomputed, prim_type, index_type, index_data, index_count);
+    st.precomputed_draw_set_params(ctx, precomputed, prim_type, index_type, index_data, index_count, 0);
     0
 }
 
@@ -3160,10 +3381,8 @@ pub(super) fn precomputed_draw_set_params(
 ///     unsigned int indexCount, unsigned int indexWrap)
 ///
 /// The instanced form of [`precomputed_draw_set_params`], carrying the same extra
-/// argument `sceGxmDrawInstanced` takes. The bundle stores the base geometry exactly as
-/// the non-instanced call does; the wrap is recorded in the log and not applied, which is
-/// the same coverage [`draw_instanced`] has - the first instance renders, and a title that
-/// instances its scenery says so in the log rather than silently drawing one copy.
+/// argument `sceGxmDrawInstanced` takes. The wrap is stored in the bundle (word 10) and
+/// applied when the bundle is drawn, exactly as [`draw_instanced`] applies it.
 #[hostcall]
 pub(super) fn precomputed_draw_set_params_instanced(
     ctx: &mut GuestCtx,
@@ -3181,7 +3400,7 @@ pub(super) fn precomputed_draw_set_params_instanced(
         instances = index_count.checked_div(index_wrap).unwrap_or(1),
         "precomputedDrawSetParamsInstanced"
     );
-    st.precomputed_draw_set_params(ctx, precomputed, prim_type, index_type, index_data, index_count);
+    st.precomputed_draw_set_params(ctx, precomputed, prim_type, index_type, index_data, index_count, index_wrap);
     0
 }
 
@@ -3657,7 +3876,7 @@ fn report_unaligned_palette(texture: u32, palette: u32) {
         target: "vitaslop::gxm",
         texture = format_args!("{texture:#x}"),
         palette = format_args!("{palette:#x}"),
-        "sceGxmTextureSetPalette was given a palette that is NOT 64-byte aligned - control          word 3's 26-bit field cannot represent its low six bits, so a copy of this texture          will read a palette up to 63 bytes below the one that was set"
+        "sceGxmTextureSetPalette was given a palette that is NOT 64-byte aligned - control word 3's 26-bit field cannot represent its low six bits, so a copy of this texture will read a palette up to 63 bytes below the one that was set"
     );
 }
 
@@ -3721,12 +3940,23 @@ pub(super) fn precomputed_state_set_uniform_buffer(
     // per possible index; a slot the guest's (shorter) array did not cover is only ever
     // consumed if the program declares that buffer index, in which case the array covered it.
     let state = ctx.arg(0);
+    // TEMPORARY (`VITASLOP_UBIND_TRACE`). DELETE BEFORE COMMIT.
+    if stage == "vertex" && st.ubind_trace_open() {
+        let detail = if all {
+            let arr = ctx.arg(1);
+            let words: Vec<String> = (0..14u32).map(|i| format!("{:x}", ctx.read_u32(arr.wrapping_add(i * 4)))).collect();
+            format!("ALL array={arr:#x} [{}]", words.join(" "))
+        } else {
+            format!("idx={} data={:#x}", ctx.arg(1), ctx.arg(2))
+        };
+        tracing::warn!(target: "vitaslop::gxm", "UBIND f{} stateSetUB state={state:#x} {detail}", st.cur_frame());
+    }
     if all {
-        let array = ctx.arg(1);
-        for i in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
-            let data = ctx.read_u32(array.wrapping_add(i * 4));
-            st.precomputed_state_set_nondefault_uniform_buffer(ctx, state, stage, i, data);
-        }
+        // ONE read of the array and ONE write of the table - see
+        // `VitaState::precomputed_state_set_all_nondefault_uniform_buffers` for why the
+        // per-index loop this replaces was the largest block of boundary crossings in a
+        // Madden frame.
+        st.precomputed_state_set_all_nondefault_uniform_buffers(ctx, state, stage, ctx.arg(1));
     } else {
         let (index, data) = (ctx.arg(1), ctx.arg(2));
         st.precomputed_state_set_nondefault_uniform_buffer(ctx, state, stage, index, data);
@@ -4585,11 +4815,132 @@ mod precomputed_state_binds {
         }
     }
 
-    /// The vertex bind: the state's uniform-buffer table lands over the context's,
-    /// wholesale, and the record carries the struct's memoised words - through the real
-    /// dispatch, over a state built by the real setters.
+    /// The swizzled upload's placement must be a PERMUTATION of the destination: every texel of
+    /// a `w x w` square lands at a distinct offset and together they cover exactly `[0, w*w)`.
+    ///
+    /// # Why this is the property worth pinning
+    /// A placement that is merely "plausible" collides two texels and leaves a third never
+    /// written - which is a scrambled rectangle with holes, and the exact failure the refusal
+    /// this replaces existed to avoid. Covering the range exactly is what says the transfer
+    /// writes the whole image and writes each texel once. The sizes are the ones a football
+    /// title's mip chain actually asks for.
     #[test]
-    fn vertex_bind_replaces_the_table_and_record_from_the_guest_state() {
+    fn the_swizzled_upload_places_every_texel_exactly_once() {
+        for w in [16u32, 32, 64, 128] {
+            let (xs, ys) = crate::render::morton_tables(w, w, w, w);
+            let mut seen = vec![false; (w * w) as usize];
+            for y in 0..w {
+                for x in 0..w {
+                    let at = (xs[x as usize] + ys[y as usize]) as usize;
+                    assert!(at < seen.len(), "{w}x{w}: texel {x},{y} lands outside the image at {at}");
+                    assert!(!seen[at], "{w}x{w}: texel {x},{y} collides at {at}");
+                    seen[at] = true;
+                    // ...and the table form must be the scalar form, or the writer and the
+                    // texture DECODER are addressing two different layouts.
+                    assert_eq!(
+                        at as u32,
+                        crate::render::morton_index(x, y, w, w),
+                        "{w}x{w}: the table and scalar swizzles disagree at {x},{y}"
+                    );
+                }
+            }
+            assert!(seen.iter().all(|&b| b), "{w}x{w}: some texel is never written");
+        }
+    }
+
+    /// The PACKED downscale average must agree with the BYTE one wherever both can express the
+    /// same texel - which is what says the packed path is the same operation and not a
+    /// near-miss. Eight-bit fields are exactly that overlap.
+    #[test]
+    fn packed_averaging_agrees_with_the_byte_path_on_eight_bit_fields() {
+        let fields: &[(u32, u32)] = &[(0, 8), (8, 8), (16, 8), (24, 8)];
+        // A spread of values including the rounding boundaries (sum+2)/4 cares about.
+        let samples: [[u8; 4]; 6] = [
+            [0, 0, 0, 0],
+            [255, 255, 255, 255],
+            [1, 2, 3, 4],
+            [0, 1, 1, 1],
+            [254, 255, 255, 255],
+            [7, 200, 13, 91],
+        ];
+        for a in samples {
+            for b in samples {
+                // Four texels, each channel taken from a different corner of the two samples.
+                let t = [
+                    u32::from_le_bytes([a[0], b[1], a[2], b[3]]),
+                    u32::from_le_bytes([b[0], a[1], b[2], a[3]]),
+                    u32::from_le_bytes([a[3], b[2], a[1], b[0]]),
+                    u32::from_le_bytes([b[3], a[2], b[1], a[0]]),
+                ];
+                let packed = super::average_packed(fields, t).to_le_bytes();
+                for c in 0..4 {
+                    let sum: u32 = t.iter().map(|v| (v >> (8 * c)) & 0xff).sum();
+                    let byte_path = ((sum + 2) / 4) as u8;
+                    assert_eq!(
+                        packed[c], byte_path,
+                        "channel {c} of {t:08x?}: packed {} vs byte {}",
+                        packed[c], byte_path
+                    );
+                }
+            }
+        }
+    }
+
+    /// The SWAR `U4U4U4U4` average is the per-field one, exactly - every nibble value in every
+    /// field position, against three fixed partners that exercise each rounding residue.
+    #[test]
+    fn the_u4x4_swar_average_is_the_per_field_average() {
+        let fields = super::transfer_fields(0x0001_0000).expect("U4U4U4U4 has a field table");
+        for v in 0..=0xffffu32 {
+            let t = [v, v.rotate_left(4) & 0xffff, (v ^ 0x5a3c) & 0xffff, (!v) & 0xffff];
+            assert_eq!(super::average_u4x4(t), super::average_packed(fields, t), "{t:04x?}");
+        }
+    }
+
+    /// The packed formats this engine will now downscale, and their field partitions: every
+    /// field set must tile its texel exactly, with no overlap and no gap. A partition that
+    /// missed a bit would average three channels and leave the fourth as whatever the first
+    /// source texel happened to hold.
+    #[test]
+    fn every_packed_transfer_format_partitions_its_texel_exactly() {
+        for (kind, bpp) in [
+            (0x0001_0000u32, 2usize),
+            (0x0002_0000, 2),
+            (0x0003_0000, 2),
+            (0x000d_0000, 4),
+        ] {
+            let fields = super::transfer_fields(kind).expect("a packed format has fields");
+            assert_eq!(
+                super::transfer_bpp(kind),
+                Some(bpp),
+                "{kind:#010x}: the field table and the size table must describe one format"
+            );
+            let mut covered = 0u32;
+            for &(shift, bits) in fields {
+                let mask = (((1u64 << bits) - 1) as u32) << shift;
+                assert_eq!(covered & mask, 0, "{kind:#010x}: fields overlap at {shift}");
+                covered |= mask;
+            }
+            let want = if bpp == 2 { 0x0000_ffffu32 } else { u32::MAX };
+            assert_eq!(covered, want, "{kind:#010x}: fields leave a gap");
+        }
+    }
+
+    /// The vertex bind: the state's uniform-buffer table lands over the context's SLOT BY
+    /// SLOT, an empty slot is left alone, and the record carries the struct's memoised words -
+    /// through the real dispatch, over a state built by the real setters.
+    ///
+    /// # This test used to pin the opposite, and the premise it rested on is refuted
+    /// It asserted that a direct binding in a slot the state does not declare must NOT survive
+    /// the bind, on the reading that a zero in this table is the guest saying "no buffer". The
+    /// table lives in the same host-allocated, host-zeroed arrays block as the fragment
+    /// stage's texture array, so a state that never received a `SetAllUniformBuffers` carries
+    /// zeros no guest call put there - and copying them erased live bindings, which is the
+    /// same defect the fragment side was fixed for. MEASURED on a football title: the draws
+    /// whose guest-memory windows are withheld read an EMPTY context table, while a
+    /// neighbouring draw reads two real addresses.
+    #[test]
+    fn vertex_bind_fills_the_slots_the_state_carries_and_leaves_the_rest() {
         let mut r = Rig::new();
         r.call(g::PRECOMPUTED_VERTEX_STATE_INIT, &[VSTATE, 0, 0]);
         assert_eq!(r.word(VSTATE + gxmstate::off::MAGIC), gxmstate::MAGIC_VERTEX);
@@ -4597,7 +4948,8 @@ mod precomputed_state_binds {
         assert_ne!(block, 0, "Init attaches an arrays block from the guest heap");
         r.call(g::PRECOMPUTED_VERTEX_STATE_SET_DEFAULT_UNIFORM_BUFFER, &[VSTATE, UB]);
         r.call(g::PRECOMPUTED_VERTEX_STATE_SET_UNIFORM_BUFFER, &[VSTATE, 3, 0xAB00_0000]);
-        // A stale direct binding in a slot the state does NOT declare must not survive.
+        // A direct binding in a slot the state does NOT declare SURVIVES the bind: the
+        // state's zero there is this engine's fill, not a guest unbind.
         {
             let mut mem = SliceMemory(&mut r.bytes);
             let mut ctx = crate::host::GuestCtx::new(&mut r.regs, &mut r.vfp, &mut mem, 0);
@@ -4605,7 +4957,11 @@ mod precomputed_state_binds {
         }
         r.call(g::SET_PRECOMPUTED_VERTEX_STATE, &[CTX, VSTATE]);
         for i in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
-            let want = if i == 3 { 0xAB00_0000 } else { 0 };
+            let want = match i {
+                3 => 0xAB00_0000, // the slot the state carries
+                5 => 0xDEAD_0000, // the live direct binding, left alone
+                _ => 0,
+            };
             assert_eq!(
                 r.word(CTX + gxmctx::off::VERTEX_UNIFORM_BUFFERS + i * 4),
                 want,
@@ -4689,6 +5045,64 @@ mod precomputed_state_binds {
         r.call(g::SET_PRECOMPUTED_FRAGMENT_STATE, &[CTX, COPY]);
         assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_UNIFORM), UB, "the copy binds");
         assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_PROGRAM), 0x77);
+    }
+
+    /// The SetAll table copy: the handler lands the array in the block at the offset the
+    /// inline layout names, for both stages - the one place the emitted `memory.copy` could
+    /// silently drift from the handler's `write_bytes`. And an unstamped struct is the
+    /// handler's case: it allocates and stamps, which the inline form must never do.
+    #[test]
+    fn the_set_all_uniform_buffers_layout_matches_the_handler() {
+        const ARRAY: u32 = 0x1400;
+        for (nid, init, fragment) in [
+            (g::PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS, g::PRECOMPUTED_VERTEX_STATE_INIT, false),
+            (g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS, g::PRECOMPUTED_FRAGMENT_STATE_INIT, true),
+        ] {
+            let op = inline_op(nid).expect("the table copy has an inline form");
+            let vitaslop_transpiler::InlineOp::SetAllUniformBuffers { layout: l } = op else {
+                panic!("{} must lower to a table copy", crate::nid::name(nid));
+            };
+            assert_eq!(l, super::set_all_uniform_buffers_layout(fragment));
+            assert_eq!(l.st_magic_at, gxmstate::off::MAGIC);
+            assert_eq!(l.st_block_at, gxmstate::off::BLOCK);
+            assert_eq!(l.st_magic, if fragment { gxmstate::MAGIC_FRAGMENT } else { gxmstate::MAGIC_VERTEX });
+            assert_eq!(l.bytes, gxmctx::MAX_UNIFORM_BUFFERS as u32 * 4);
+            let mut r = Rig::new();
+            let state = if fragment { FSTATE } else { VSTATE };
+            // Fourteen distinct pointers, so a copy landing one word off cannot pass.
+            for k in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
+                let at = (ARRAY + k * 4) as usize;
+                r.bytes[at..at + 4].copy_from_slice(&(0x0B00_0000 + k).to_le_bytes());
+            }
+            // Unstamped: the struct reads as anything but our magic, and the handler must
+            // stamp it and attach a block - the inline form's guard sends this case to it.
+            assert_ne!(r.word(state + gxmstate::off::MAGIC), l.st_magic, "starts unstamped");
+            r.call(nid, &[state, ARRAY]);
+            assert_eq!(r.regs[0], 0, "{} succeeds", crate::nid::name(nid));
+            assert_eq!(r.word(state + gxmstate::off::MAGIC), l.st_magic, "the handler stamps it");
+            let block = r.word(state + gxmstate::off::BLOCK);
+            assert_ne!(block, 0, "...and attaches a block");
+            for k in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
+                assert_eq!(
+                    r.word(block + l.table_at + k * 4),
+                    0x0B00_0000 + k,
+                    "{} lands word {k} where the inline layout says the table is",
+                    crate::nid::name(nid)
+                );
+            }
+            // A stamped struct - the inline arm's case - keeps the same block and the
+            // handler overwrites the same words, so the two writers agree on every byte.
+            r.call(init, &[state, 0x77, 0]);
+            assert_eq!(r.word(state + gxmstate::off::BLOCK), block, "init keeps the block");
+            for k in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
+                let at = (ARRAY + k * 4) as usize;
+                r.bytes[at..at + 4].copy_from_slice(&(0x0C00_0000 + k).to_le_bytes());
+            }
+            r.call(nid, &[state, ARRAY]);
+            for k in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
+                assert_eq!(r.word(block + l.table_at + k * 4), 0x0C00_0000 + k);
+            }
+        }
     }
 
     /// The inline layout names exactly the offsets the state writers and binds use - the
@@ -5108,10 +5522,30 @@ mod texture_control_word_field_tests {
 }
 
 
-/// Render the scene that just ended and put its pixels back into guest memory, when the
-/// frontend can and the target is small enough to be one a title reads on the CPU. See
-/// `VitaState::complete_scene_now` for the failure this closes.
-fn complete_small_target_now(ctx: &mut GuestCtx, st: &mut VitaState) -> bool {
+/// Complete the frame's scenes ended so far, up to `through` (one past the last scene
+/// index), at a point where the GUEST WAITS FOR THE GPU: render them in submission order
+/// and put the pixels of every CPU-readable (small) target back into guest memory before
+/// the wait returns. See `VitaState::complete_scene_now` for the failure this closes.
+///
+/// >>> THIS RUNS AT THE TITLE'S OWN SYNC POINTS - `sceGxmFinish` and a
+/// `sceGxmNotificationWait` on a scene's notification - AND NOWHERE ELSE. Those are the
+/// only places the hardware promises a CPU read of a render target sees the scene, so they
+/// are the only places a completion is owed; a title reading a target without one races
+/// its own GPU on the device and reads the previous contents, which is exactly what the
+/// frame-end write-back leaves here. `sceGxmEndScene` used to complete a small target on
+/// the FIRST SIGHT of its address instead. A title that allocates fresh small targets every
+/// frame (text and sprite caches) turned that into two GPU round trips per frame, each
+/// waiting behind the whole queue: MEASURED on a phone at 1.1-4.4 ms per `sceGxmEndScene`,
+/// 353 ms and 2,120 ms of a window, the largest host cost of its gameplay.
+///
+/// Nothing happens when the batch holds no small target: a big target is not written back
+/// (see `rtt_writeback`), so completing it early is a round trip nobody can observe.
+///
+/// Returns `true` when the calling thread must BLOCK (asynchronous frontend - the batch is
+/// in `pending_early` and the run loop finishes it).
+fn complete_scenes_through(ctx: &mut GuestCtx, st: &mut VitaState, through: usize) -> bool {
+    // The guest is waiting for the GPU, so every outstanding scene's bytes are final now.
+    st.resolve_deferred_geometry(ctx);
     let cap = crate::rtt_writeback::rtt_writeback_texels();
     if cap == 0 {
         return false;
@@ -5119,35 +5553,35 @@ fn complete_small_target_now(ctx: &mut GuestCtx, st: &mut VitaState) -> bool {
     let small = |scene: &crate::capture::Scene| {
         scene.color.is_some_and(|c| c.width.max(1) * c.height.max(1) <= cap)
     };
-    let Some(last) = st.capture.scenes.last() else { return false };
-    if !small(last) {
-        return false;
-    }
-    // >>> ON A TARGET'S FIRST SIGHT ONLY. That is the read that matters - a title that reads
-    // a probe once at load caches what it read - and every later render reaches memory
-    // through the frame-end write-back, at most a frame or two behind, which a periodic
-    // re-reader tolerates and poison is not. Completing EVERY small scene early was
-    // measured on the browser at 8 GPU round trips a frame: 26 -> 17 fps.
-    if !first_sight_of_small_target(last.color.map_or(0, |c| c.data_addr)) {
-        return false;
-    }
-    if st.complete_scene_now.is_none() && !st.complete_scene_async {
-        if crate::rtt_writeback::report_once(0x6e00_0000_0000_0000) {
-            tracing::warn!(target: "vitaslop::gxm", "gxm rtt: a small target ended its scene with NO completion hook installed - a CPU read of it this frame sees the allocator's fill");
-        }
-        return false;
-    }
     // >>> IN SUBMISSION ORDER, WITH EVERYTHING THIS FRAME OWES IT. The hardware completes
     // scenes in the order they were ended, so a probe that samples a cube whose faces ended
     // earlier in the same frame samples the RENDERED faces. Completing the probe alone
     // painted it from a cube nobody had drawn yet - the poison colour, the same wrong ambient
-    // by a different route. Every not-yet-completed small scene of the frame comes with it.
-    let n = st.capture.scenes.len();
+    // by a different route. Every not-yet-completed scene of the frame comes with it.
+    let n = through.min(st.capture.scenes.len());
     let start = st.capture.scenes[..n]
         .iter()
         .rposition(|s| s.completed_early)
         .map_or(0, |i| i + 1)
-        .max(n.saturating_sub(st.capture.frame_scene_count_so_far()));
+        .max(st.capture.scenes.len().saturating_sub(st.capture.frame_scene_count_so_far()));
+    if start >= n {
+        return false;
+    }
+    // Only the DISPLAY buffer's own passes stay out (they compose the frame at its end;
+    // rendered here they would be lost) - see below.
+    let display: Vec<u32> = st.capture.presents.iter().rev().take(4).copied().collect();
+    let in_batch = |s: &crate::capture::Scene| {
+        s.color.is_none_or(|c| !display.contains(&c.data_addr))
+    };
+    if !st.capture.scenes[start..n].iter().any(|s| in_batch(s) && small(s)) {
+        return false;
+    }
+    if st.complete_scene_now.is_none() && !st.complete_scene_async {
+        if crate::rtt_writeback::report_once(0x6e00_0000_0000_0000) {
+            tracing::warn!(target: "vitaslop::gxm", "gxm rtt: the guest waited for the GPU with a small target's scene outstanding and NO completion hook installed - a CPU read of it this frame sees the allocator's fill");
+        }
+        return false;
+    }
     if st.complete_scene_now.is_none() {
         // Asynchronous frontend: park the thread on the batch; the run loop finishes it.
         st.pending_early = Some((st.current_thread(), start, n));
@@ -5159,10 +5593,6 @@ fn complete_small_target_now(ctx: &mut GuestCtx, st: &mut VitaState) -> bool {
     // the small scenes alone changed two frames of a racer and of a hover title - their
     // blur targets sampled the previous frame's world. Only the DISPLAY buffer's own passes
     // stay out (they compose the frame at its end; rendered here they would be lost).
-    let display: Vec<u32> = st.capture.presents.iter().rev().take(4).copied().collect();
-    let in_batch = |s: &crate::capture::Scene| {
-        s.color.is_none_or(|c| !display.contains(&c.data_addr))
-    };
     let batch: Vec<crate::capture::Scene> =
         st.capture.scenes[start..n].iter().filter(|s| in_batch(s)).cloned().collect();
     let readbacks = {
@@ -5202,29 +5632,473 @@ fn complete_small_target_now(ctx: &mut GuestCtx, st: &mut VitaState) -> bool {
         }
     }
     if written > 0 {
-        let c = st.capture.scenes[n - 1].color.expect("small target");
-        report_completed_early(c.data_addr, c.width, c.height);
+        for s in st.capture.scenes[start..n].iter().rev() {
+            if let Some(c) = s.color.filter(|_| in_batch(s) && small(s)) {
+                report_completed_early(c.data_addr, c.width, c.height);
+                break;
+            }
+        }
     }
     false
 }
 
-/// Whether this is the first scene ever ended into `addr` - see `complete_small_target_now`.
-fn first_sight_of_small_target(addr: u32) -> bool {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
-    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(HashSet::new).insert(addr)
-}
-
-/// Once per address: this target is completed at its own `sceGxmEndScene`.
+/// Once per target SHAPE: a small target was rendered and written back at the guest's own
+/// GPU wait. Keyed on the shape rather than the address because a title that allocates a
+/// fresh small target every frame would otherwise print one line per frame.
 pub fn report_completed_early(addr: u32, w: u32, h: u32) {
-    if crate::rtt_writeback::report_once(0x6d00_0000_0000_0000 ^ addr as u64) {
+    if crate::rtt_writeback::report_once(0x6d00_0000_0000_0000 ^ ((w as u64) << 32 | h as u64)) {
         tracing::info!(
             target: "vitaslop::status",
-            "gxm rtt: target {addr:#010x} ({w}x{h}) is now rendered and written back AT ITS OWN \
-             sceGxmEndScene - a CPU read of it in the same frame sees the picture, not the \
-             allocator's fill"
+            "gxm rtt: target {addr:#010x} ({w}x{h}) is rendered and written back AT THE \
+             GUEST'S OWN GPU WAIT (sceGxmFinish / sceGxmNotificationWait) - a CPU read of it \
+             after the wait sees the picture, not the allocator's fill"
+        );
+    }
+}
+
+/// int sceGxmFinish(context)
+///
+/// Block until every scene ended on the context has been rendered. The frame's scenes are
+/// completed here - and the CPU-readable ones written back to guest memory - so a read of a
+/// render target after this call sees its pixels. See [`complete_scenes_through`].
+pub(super) fn finish(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOutcome {
+    let n = st.capture.scenes.len();
+    let blocked = complete_scenes_through(ctx, st, n);
+    ctx.ret(0);
+    if blocked { crate::SvcOutcome::Block } else { crate::SvcOutcome::Continue }
+}
+
+// --- the TRANSFER ENGINE ---------------------------------------------------------
+//
+// A second, fixed-function path beside the 3D pipeline: it moves a rectangle of pixels
+// between two guest allocations with no scene, no shader and no render target. A title
+// reaches for it exactly where a draw would be overkill - a thumbnail of the frame it just
+// presented, a half-resolution copy to seed a blur, a decoded video plane into a texture.
+// Both calls here are SYNCHRONOUS in this engine: the pixels are moved on the CPU before
+// the call returns, so the notification is signalled immediately and the sync object has
+// nothing left to wait for.
+
+/// Bytes per pixel of a `SceGxmTransferFormat`, or `None` for one this engine cannot size.
+fn transfer_bpp(format: u32) -> Option<usize> {
+    match format & 0x003f_0000 {
+        0x0000_0000 => Some(1), // U8_R
+        // U4U4U4U4 / U1U5U5U5 / U5U6U5 / U8U8_GR
+        0x0001_0000 | 0x0002_0000 | 0x0003_0000 | 0x0004_0000 => Some(2),
+        0x0005_0000 => Some(3), // U8U8U8_BGR
+        0x0006_0000 => Some(4), // U8U8U8U8_ABGR
+        // the four 4:2:2 YUV packings, two bytes a pixel
+        0x0007_0000 | 0x0008_0000 | 0x0009_0000 | 0x000a_0000 => Some(2),
+        0x000d_0000 => Some(4),  // U2U10U10U10_ABGR
+        0x000f_0000 => Some(2),  // RAW16
+        0x0011_0000 => Some(4),  // RAW32
+        0x0012_0000 => Some(8),  // RAW64
+        0x0013_0000 => Some(16), // RAW128
+        _ => None,
+    }
+}
+
+/// The BIT FIELDS of a packed transfer format, as `(shift, bits)` per channel, or `None` for
+/// one whose channels are not packed bit fields.
+///
+/// # Why the channel ORDER does not matter here
+/// The only thing done with these is averaging four texels channel by channel, and averaging is
+/// per FIELD: it needs each field's position and width, not which colour it carries. So a
+/// downscale can be exact for `U4U4U4U4` without this engine having to commit to whether the
+/// low nibble is alpha or blue - a commitment that would need a render oracle to settle and
+/// that nothing here depends on.
+fn transfer_fields(kind: u32) -> Option<&'static [(u32, u32)]> {
+    Some(match kind {
+        0x0001_0000 => &[(0, 4), (4, 4), (8, 4), (12, 4)],   // U4U4U4U4
+        0x0002_0000 => &[(0, 5), (5, 5), (10, 5), (15, 1)],  // U1U5U5U5
+        0x0003_0000 => &[(0, 5), (5, 6), (11, 5)],           // U5U6U5
+        0x000d_0000 => &[(0, 10), (10, 10), (20, 10), (30, 2)], // U2U10U10U10_ABGR
+        _ => return None,
+    })
+}
+
+/// The 2x2 mean of four PACKED texels, field by field, rounded the way the byte path rounds.
+///
+/// Pure and separate from [`transfer_downscale`] so the claim that it agrees with the
+/// byte-per-channel path is a TEST rather than a comment - see
+/// `packed_averaging_agrees_with_the_byte_path_on_eight_bit_fields`.
+/// [`average_packed`] for `U4U4U4U4` - four 4-bit fields - done four fields at once in byte
+/// lanes. Each lane sums four nibbles (at most 60), so no lane carries into the next, and
+/// `(sum + 2) >> 2` masked to four bits is exactly the per-field `(sum + 2) / 4`.
+fn average_u4x4(t: [u32; 4]) -> u32 {
+    let spread = |v: u32| (v & 0x0f0f) | ((v & 0xf0f0) << 12);
+    let sum = spread(t[0]) + spread(t[1]) + spread(t[2]) + spread(t[3]);
+    let r = ((sum + 0x0202_0202) >> 2) & 0x0f0f_0f0f;
+    (r & 0x0f0f) | ((r >> 12) & 0xf0f0)
+}
+
+fn average_packed(fields: &[(u32, u32)], t: [u32; 4]) -> u32 {
+    let mut out = 0u32;
+    for &(shift, bits) in fields {
+        let mask = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+        let sum: u32 = t.iter().map(|v| (v >> shift) & mask).sum();
+        out |= (((sum + 2) / 4) & mask) << shift;
+    }
+    out
+}
+
+/// The layout bits of a `SceGxmTransferType`. Only `SCE_GXM_TRANSFER_LINEAR` (zero) is
+/// moved here: the tiled and swizzled layouts hold the same pixels in a different order,
+/// and copying them as if they were linear would scramble the rectangle.
+const TRANSFER_TYPE_MASK: u32 = 0x00c0_0000;
+
+/// The `SceGxmTransferType` layout, by name, for a report that would otherwise say only that
+/// the layout was refused.
+fn transfer_layout_name(ty: u32) -> &'static str {
+    match ty & TRANSFER_TYPE_MASK {
+        0x0000_0000 => "LINEAR",
+        0x0040_0000 => "TILED",
+        0x0080_0000 => "SWIZZLED",
+        _ => "UNKNOWN",
+    }
+}
+
+/// The format field of a `SceGxmTransferFormat`, without the layout bits a caller may or
+/// may not have folded into the same word.
+fn transfer_kind(format: u32) -> u32 {
+    format & 0x003f_0000
+}
+
+/// Signal a `SceGxmNotification` if the call was given one: `*address = value`.
+///
+/// Immediately, because the transfer has already happened by the time the guest gets
+/// control back. A notification the guest then waits on with `sceGxmNotificationWait` must
+/// already be satisfied, or the wait is a park with nothing behind it to release it.
+fn transfer_notify(ctx: &mut GuestCtx, notification: u32) {
+    if notification == 0 {
+        return;
+    }
+    let addr = ctx.read_u32(notification);
+    let value = ctx.read_u32(notification + 4);
+    if addr != 0 {
+        ctx.write_u32(addr, value);
+    }
+}
+
+/// int sceGxmTransferCopy(width, height, colorKeyValue, colorKeyMask, colorKeyMode,
+///     srcFormat, srcType, srcAddress, srcX, srcY, srcStride,
+///     destFormat, destType, destAddress, destX, destY, destStride,
+///     syncObject, syncFlags, notification)  -- 20 args, 16 of them on the stack.
+pub(super) fn transfer_copy(ctx: &mut GuestCtx) {
+    let (width, height) = (ctx.arg(0), ctx.arg(1));
+    let color_key_mode = ctx.arg(4);
+    let (src_format, src_type, src_addr) = (ctx.arg(5), ctx.arg(6), ctx.arg(7));
+    let (src_x, src_y, src_stride) = (ctx.arg(8), ctx.arg(9), ctx.arg(10) as i32);
+    let (dst_format, dst_type, dst_addr) = (ctx.arg(11), ctx.arg(12), ctx.arg(13));
+    let (dst_x, dst_y, dst_stride) = (ctx.arg(14), ctx.arg(15), ctx.arg(16) as i32);
+    let notification = ctx.arg(19);
+    let (Some(sbpp), Some(dbpp)) = (transfer_bpp(src_format), transfer_bpp(dst_format)) else {
+        report_transfer_unsupported("sceGxmTransferCopy", "a format it cannot size", src_format, dst_format);
+        ctx.ret(0);
+        return;
+    };
+    let linear = src_type & TRANSFER_TYPE_MASK == 0 && dst_type & TRANSFER_TYPE_MASK == 0;
+    let same = sbpp == dbpp && transfer_kind(src_format) == transfer_kind(dst_format);
+    // >>> A LINEAR SOURCE INTO A SWIZZLED DESTINATION, where the destination's extent is
+    // >>> DETERMINED rather than assumed.
+    //
+    // A swizzled destination is addressed by `morton_index(x, y, pw, ph)`, which needs the
+    // destination IMAGE's padded extent - and this call passes only a rectangle and a stride.
+    // Reading the extent off `destStride` would be a guess, and a wrong one places every texel
+    // somewhere plausible and wrong: a SCRAMBLED rectangle instead of a stale one, which is
+    // worse and much harder to see. So this arm takes only the shape where the RECTANGLE
+    // itself settles the extent - it starts at the origin and is a square power of two, so the
+    // image can be nothing but `width x width` - and everything else keeps the refusal.
+    //
+    // MEASURED on a football title, which is why the guard is this shape and not a guess: its
+    // four refused copies are `128x128, 64x64, 32x32, 16x16`, every one at `dst 0,0`, square,
+    // power of two, with `dst_stride / bpp` equal to the width exactly. That is a MIP CHAIN
+    // being uploaded into a swizzled texture, and under the old refusal none of it was written.
+    let swizzled_upload = !linear
+        && same
+        && src_type & TRANSFER_TYPE_MASK == 0
+        && dst_type & TRANSFER_TYPE_MASK == 0x0080_0000
+        && dst_x == 0
+        && dst_y == 0
+        && width == height
+        && width.is_power_of_two()
+        && color_key_mode == 0;
+    if swizzled_upload {
+        // `morton_tables` splits the index into a per-column and a per-row term, asserted to be
+        // the same function as `morton_index` - one add per texel instead of its per-bit loop.
+        let (xs, ys) = crate::render::morton_tables(width, height, width, height);
+        let s = src_addr
+            .wrapping_add(src_y.wrapping_mul(src_stride as u32))
+            .wrapping_add(src_x * sbpp as u32);
+        for y in 0..height {
+            let from = s.wrapping_add(src_stride.wrapping_mul(y as i32) as u32);
+            let row = ctx.read_bytes(from, width as usize * sbpp);
+            for x in 0..width {
+                let at = (xs[x as usize] + ys[y as usize]) as usize * dbpp;
+                let o = x as usize * sbpp;
+                ctx.write_bytes(dst_addr.wrapping_add(at as u32), &row[o..o + sbpp]);
+            }
+        }
+        transfer_notify(ctx, notification);
+        ctx.ret(0);
+        return;
+    }
+    if !linear || !same {
+        let reason = if linear { "a format CONVERSION" } else { "a TILED or SWIZZLED layout" };
+        report_transfer_unsupported_typed(
+            "sceGxmTransferCopy", reason, src_format, dst_format, Some(src_type), Some(dst_type),
+        );
+        // >>> AND THE GEOMETRY, because that is what a FIX for this needs and what the report
+        // >>> cannot be written without asking for twice.
+        //
+        // A swizzled destination is addressed by `morton_index(x, y, pw, ph)`, which needs the
+        // destination IMAGE's power-of-two-padded extent - and this call passes only a
+        // rectangle and a stride. Whether `destStride` carries the image width (so `pw, ph`
+        // follow from it) or is ignored for a swizzled surface is NOT established here, and a
+        // wrong reading would place every texel somewhere plausible and wrong: a SCRAMBLED
+        // rectangle instead of a stale one, which is strictly worse and much harder to see.
+        // So the numbers are printed and the copy is still refused, rather than guessed
+        // [[vitaslop-a-claim-must-fit-the-width-it-names]].
+        report_transfer_geometry(
+            width, height, src_x, src_y, src_stride, dst_x, dst_y, dst_stride, sbpp, dbpp,
+        );
+        ctx.ret(0);
+        return;
+    }
+    if color_key_mode != 0 {
+        report_transfer_unsupported("sceGxmTransferCopy", "a COLOR KEY", src_format, dst_format);
+    }
+    if width != 0 && height != 0 {
+        let s = src_addr
+            .wrapping_add(src_y.wrapping_mul(src_stride as u32))
+            .wrapping_add(src_x * sbpp as u32);
+        let d = dst_addr
+            .wrapping_add(dst_y.wrapping_mul(dst_stride as u32))
+            .wrapping_add(dst_x * dbpp as u32);
+        let row_bytes = width as usize * sbpp;
+        for y in 0..height {
+            let from = s.wrapping_add(src_stride.wrapping_mul(y as i32) as u32);
+            let to = d.wrapping_add(dst_stride.wrapping_mul(y as i32) as u32);
+            let row = ctx.read_bytes(from, row_bytes);
+            ctx.write_bytes(to, &row);
+        }
+    }
+    transfer_notify(ctx, notification);
+    ctx.ret(0);
+}
+
+/// int sceGxmTransferDownscale(srcFormat, srcAddress, srcX, srcY, srcWidth, srcHeight,
+///     srcStride, destFormat, destAddress, destX, destY, destStride,
+///     syncObject, syncFlags, notification)  -- 15 args, 11 of them on the stack.
+///
+/// The hardware halves the rectangle by averaging each 2x2 source block, which is what a
+/// title wants for a thumbnail or the first step of a blur chain. Only the formats whose
+/// channels are single bytes can be averaged component-wise here; a packed 16-bit or YUV
+/// one would need its own unpack and is refused rather than smeared.
+pub(super) fn transfer_downscale(ctx: &mut GuestCtx) {
+    let (src_format, src_addr) = (ctx.arg(0), ctx.arg(1));
+    let (src_x, src_y) = (ctx.arg(2), ctx.arg(3));
+    let (src_w, src_h, src_stride) = (ctx.arg(4), ctx.arg(5), ctx.arg(6) as i32);
+    let (dst_format, dst_addr) = (ctx.arg(7), ctx.arg(8));
+    let (dst_x, dst_y, dst_stride) = (ctx.arg(9), ctx.arg(10), ctx.arg(11) as i32);
+    let notification = ctx.arg(14);
+    let (Some(sbpp), Some(dbpp)) = (transfer_bpp(src_format), transfer_bpp(dst_format)) else {
+        report_transfer_unsupported("sceGxmTransferDownscale", "a format it cannot size", src_format, dst_format);
+        ctx.ret(0);
+        return;
+    };
+    // U8_R, U8U8_GR, U8U8U8_BGR and U8U8U8U8_ABGR are exactly the byte-per-channel family.
+    let byte_channels = matches!(transfer_kind(src_format), 0x0000_0000 | 0x0004_0000 | 0x0005_0000 | 0x0006_0000);
+    let same_kind = sbpp == dbpp && transfer_kind(src_format) == transfer_kind(dst_format);
+    // >>> A PACKED format is averaged PER BIT FIELD rather than refused.
+    //
+    // This used to take the byte-per-channel family and refuse everything else, so a title
+    // downscaling a `U4U4U4U4` or `U5U6U5` surface got its destination left UNTOUCHED and a
+    // success code - a stale rectangle with nothing to say so. Averaging a packed texel needs
+    // only each field's position and width (see `transfer_fields`), which the format gives
+    // exactly, so the result is the same 2x2 mean the byte path produces and not an
+    // approximation. MEASURED on a football title: its `sceGxmTransferDownscale` is
+    // `0x00010000` (U4U4U4U4) on both sides, which this refused outright.
+    let packed = (!byte_channels && same_kind)
+        .then(|| transfer_fields(transfer_kind(src_format)))
+        .flatten();
+    if (!byte_channels && packed.is_none()) || !same_kind {
+        report_transfer_unsupported(
+            "sceGxmTransferDownscale",
+            "a format whose channels are neither single bytes nor packed bit fields",
+            src_format,
+            dst_format,
+        );
+        ctx.ret(0);
+        return;
+    }
+    let (out_w, out_h) = (src_w / 2, src_h / 2);
+    if out_w != 0 && out_h != 0 {
+        let s0 = src_addr
+            .wrapping_add(src_y.wrapping_mul(src_stride as u32))
+            .wrapping_add(src_x * sbpp as u32);
+        let d0 = dst_addr
+            .wrapping_add(dst_y.wrapping_mul(dst_stride as u32))
+            .wrapping_add(dst_x * dbpp as u32);
+        let mut row = vec![0u8; out_w as usize * dbpp];
+        // One texel as a little-endian word, for the packed path. `sbpp` is 2 or 4 there.
+        let word = |buf: &[u8], at: usize| -> u32 {
+            let mut v = 0u32;
+            for k in 0..sbpp {
+                v |= (buf[at + k] as u32) << (8 * k);
+            }
+            v
+        };
+        // >>> THE SOURCE BLOCK IN ONE READ, not two per output row.
+        //
+        // MEASURED in the desktop browser on a football title: this handler was 3.3% of the busy
+        // worker - three calls a frame, each reading its source two rows at a time. Every
+        // `read_bytes` is an allocation and, in the browser, a crossing into guest memory, and
+        // a 256-row downscale made 512 of each. With a positive stride the whole block is one
+        // contiguous span, so it is read once and the rows are sliced out of it; a negative
+        // stride keeps the per-row reads.
+        let row_bytes = out_w as usize * 2 * sbpp;
+        let span = (src_stride > 0)
+            .then(|| (2 * out_h as usize - 1) * src_stride as usize + row_bytes);
+        let block = span.map(|n| ctx.read_bytes(s0, n));
+        // The packed FORMAT this title measured - U4U4U4U4, four 4-bit fields - averaged four
+        // fields at once in byte lanes (SWAR). Each lane sums four nibbles (at most 60), so no
+        // lane carries into the next, and `(sum + 2) >> 2` masked to four bits is exactly the
+        // per-field `(sum + 2) / 4` of `average_packed`.
+        let u4x4 = packed.is_some() && transfer_kind(src_format) == 0x0001_0000 && sbpp == 2 && dbpp == 2;
+        for y in 0..out_h {
+            let (a_owned, b_owned);
+            let (a, b): (&[u8], &[u8]) = match block.as_ref() {
+                Some(blk) => {
+                    let top = 2 * y as usize * src_stride as usize;
+                    let bot = top + src_stride as usize;
+                    (&blk[top..top + row_bytes], &blk[bot..bot + row_bytes])
+                }
+                None => {
+                    let top = s0.wrapping_add(src_stride.wrapping_mul(2 * y as i32) as u32);
+                    let bottom = top.wrapping_add(src_stride as u32);
+                    a_owned = ctx.read_bytes(top, row_bytes);
+                    b_owned = ctx.read_bytes(bottom, row_bytes);
+                    (&a_owned, &b_owned)
+                }
+            };
+            for x in 0..out_w as usize {
+                let (left, right) = (x * 2 * sbpp, (x * 2 + 1) * sbpp);
+                if u4x4 {
+                    let h = |buf: &[u8], at: usize| u32::from(buf[at]) | (u32::from(buf[at + 1]) << 8);
+                    let out = average_u4x4([h(a, left), h(a, right), h(b, left), h(b, right)]);
+                    row[x * 2] = out as u8;
+                    row[x * 2 + 1] = (out >> 8) as u8;
+                    continue;
+                }
+                match packed {
+                    // Packed: average each BIT FIELD of the four texels and repack. The
+                    // rounding is the byte path's `(sum + 2) / 4`, so the two agree on any
+                    // value they can both represent.
+                    Some(fields) => {
+                        let out = average_packed(
+                            fields,
+                            [word(a, left), word(a, right), word(b, left), word(b, right)],
+                        );
+                        for k in 0..dbpp {
+                            row[x * dbpp + k] = (out >> (8 * k)) as u8;
+                        }
+                    }
+                    None => {
+                        for c in 0..dbpp {
+                            let sum = a[left + c] as u32
+                                + a[right + c] as u32
+                                + b[left + c] as u32
+                                + b[right + c] as u32;
+                            row[x * dbpp + c] = ((sum + 2) / 4) as u8;
+                        }
+                    }
+                }
+            }
+            let d = d0.wrapping_add(dst_stride.wrapping_mul(y as i32) as u32);
+            ctx.write_bytes(d, &row);
+        }
+    }
+    transfer_notify(ctx, notification);
+    ctx.ret(0);
+}
+
+/// Once per (reason, format pair): a transfer this engine does not move faithfully.
+///
+/// It reports success and copies NOTHING rather than guessing, because a scrambled
+/// rectangle is a picture defect that reads like a shader bug, while an untouched
+/// destination reads like what it is - and the line says which one is on screen.
+/// The rectangle and strides of a refused transfer, printed once, so the layout a fix would
+/// need can be read off real values instead of assumed. See the call site for why the copy is
+/// refused rather than placed.
+#[allow(clippy::too_many_arguments)]
+fn report_transfer_geometry(
+    width: u32,
+    height: u32,
+    src_x: u32,
+    src_y: u32,
+    src_stride: i32,
+    dst_x: u32,
+    dst_y: u32,
+    dst_stride: i32,
+    sbpp: usize,
+    dbpp: usize,
+) {
+    if !crate::rtt_writeback::report_once(0x7467_0000_0000_0000 ^ ((width as u64) << 32) ^ height as u64)
+    {
+        return;
+    }
+    // If the destination stride DOES carry the image width, this is that width - the single
+    // number a swizzled placement turns on. Printed beside the rectangle so the two can be
+    // compared rather than one of them assumed.
+    let dst_row_texels = if dbpp > 0 { dst_stride.unsigned_abs() / dbpp as u32 } else { 0 };
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        rect = format_args!("{width}x{height}"),
+        src_at = format_args!("{src_x},{src_y}"),
+        dst_at = format_args!("{dst_x},{dst_y}"),
+        src_stride,
+        dst_stride,
+        src_bpp = sbpp,
+        dst_bpp = dbpp,
+        dst_row_texels,
+        dst_row_texels_is_pow2 = dst_row_texels.is_power_of_two(),
+        "gxm transfer: the refused copy's GEOMETRY - if dst_stride carries the destination          IMAGE width then a swizzled placement is `morton_index(x, y, pw, ph)` over it, and          `dst_row_texels` is that width; that reading is NOT established and is why the copy          is refused rather than placed"
+    );
+}
+
+fn report_transfer_unsupported(call: &str, reason: &str, src_format: u32, dst_format: u32) {
+    report_transfer_unsupported_typed(call, reason, src_format, dst_format, None, None)
+}
+
+/// [`report_transfer_unsupported`] that also names the TYPE words.
+///
+/// # The deciding field has to be in the report
+/// The layout refusal is decided by `src_type`/`dst_type`, and the report printed only the
+/// FORMATS - so "a TILED or SWIZZLED layout" named neither WHICH layout nor WHICH SIDE carried
+/// it, and the reader's next step was to go and add the field. A report that names a reason it
+/// cannot evidence costs a round trip every time it fires.
+fn report_transfer_unsupported_typed(
+    call: &str,
+    reason: &str,
+    src_format: u32,
+    dst_format: u32,
+    src_type: Option<u32>,
+    dst_type: Option<u32>,
+) {
+    let key = ((src_format as u64) << 32) ^ dst_format as u64 ^ ((reason.len() as u64) << 8);
+    if crate::rtt_writeback::report_once(0x7472_0000_0000_0000 ^ key) {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            call,
+            src_format = format_args!("{src_format:#010x}"),
+            dst_format = format_args!("{dst_format:#010x}"),
+            src_type = format_args!("{:?}", src_type.map(|t| format!("{t:#010x}"))),
+            dst_type = format_args!("{:?}", dst_type.map(|t| format!("{t:#010x}"))),
+            src_layout = format_args!("{}", src_type.map_or("-", |t| transfer_layout_name(t))),
+            dst_layout = format_args!("{}", dst_type.map_or("-", |t| transfer_layout_name(t))),
+            "gxm transfer: {call} asks for {reason}, which this transfer engine does not \
+             move - the destination is left UNTOUCHED and the call reports success, so \
+             whatever reads that rectangle next sees STALE pixels rather than scrambled ones"
         );
     }
 }

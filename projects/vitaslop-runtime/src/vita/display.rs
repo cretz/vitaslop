@@ -220,11 +220,11 @@ fn report_geometry_once(pitch: u32, fmt: u32, w: u32, h: u32) {
     let note = if w == crate::host::VitaState::PANEL_W && h == crate::host::VitaState::PANEL_H {
         "the full panel, so nothing is scaled"
     } else {
-        "NOT THE PANEL - the display controller stretches this onto 960x544, so the frame is          rendered at this size and scaled up to present. Everything in it, text included,          carries only this much detail"
+        "NOT THE PANEL - the display controller stretches this onto 960x544, so the frame is rendered at this size and scaled up to present. Everything in it, text included, carries only this much detail"
     };
     tracing::info!(
         target: "vitaslop::status",
-        "display: sceDisplaySetFrameBuf declares a {w}x{h} buffer (pitch {pitch}, format          {fmt:#x}) - {note}."
+        "display: sceDisplaySetFrameBuf declares a {w}x{h} buffer (pitch {pitch}, format {fmt:#x}) - {note}."
     );
 }
 
@@ -282,6 +282,9 @@ pub(super) fn set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr, 
         "set frame buf"
     );
     if base != 0 {
+        st.flip_candidates.insert(base);
+        // The flip is the latest moment the GPU can still be reading this frame's buffers.
+        st.resolve_deferred_geometry(ctx);
         st.present(base);
     }
     // Kept whole so `sceDisplayGetFrameBuf` can report the scanout: the `pitch` and `fmt`

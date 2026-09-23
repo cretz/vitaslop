@@ -4,14 +4,23 @@
 //! policy - only the "resume a guest thread to its next switch point" primitive is
 //! reimplemented here on the browser's own WebAssembly engine.
 //!
-//! # One worker, instance-per-thread, one shared memory
+//! # One worker, instance-per-thread, one memory
 //! Every guest thread is its own `WebAssembly.Instance` (its ARM register file lives
 //! in wasm globals, which are per-instance, so each thread's registers are naturally
-//! private), and all instances import ONE shared linear memory (the transpiler emits
+//! private), and all instances import ONE linear memory (the transpiler emits
 //! `env.memory` when `import_memory` is set) - one guest address space, private
 //! registers, exactly the native model. Everything runs on one thread: the single
 //! owner of [`VitaEnv`], the scheduler, and all guest instances. Because the host
 //! (`VitaEnv`) lives here too, a guest host call needs no cross-thread hop.
+//!
+//! # The guest lives inside the host's memory
+//! That one memory is THIS MODULE'S OWN linear memory: the run worker reserves the guest
+//! region from its heap ([`reserve_guest_region`]), the module is transpiled for that
+//! offset (`vitaslop_transpiler::Program::host_off`), and every instance imports the
+//! host's `WebAssembly.Memory`. A host read of guest memory is then a load and a borrow
+//! is a slice - see [`HostRegion`]. The earlier form, a memory of the guest's own reached
+//! through typed arrays ([`SharedView`]), cost a JavaScript call per read and remains as
+//! the diagnostic arm (`VITASLOP_BROWSER_SPLIT_MEMORY=1`).
 //!
 //! # JSPI is how a mid-stack thread suspends
 //! A guest thread blocks deep inside its wasm call stack (inside game logic that
@@ -189,6 +198,18 @@ mod hostcalls {
         static SAMPLED_SELECTOR_MS: std::cell::RefCell<Vec<f64>> =
             std::cell::RefCell::new(vec![0.0; MAX_SELECTOR]);
         static SAMPLED_SELECTOR_N: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        /// Guest-memory READS made by the sampled calls, per selector: single words and bulk
+        /// ranges (`perf::guest_accesses`). Each is a `copy_range` crossing, and the panel's
+        /// per-frame word count had no owner: the draw phases held 2 of 3,500 a frame on a
+        /// football title, so the rest are inside handlers, and this names which.
+        static SAMPLED_SELECTOR_WORDS: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        static SAMPLED_SELECTOR_BULK: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        static PREV_SAMPLED_WORDS: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        static PREV_SAMPLED_BULK: std::cell::RefCell<Vec<u64>> =
             std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
         /// The previous panel window's readings, so the ranking can be a WINDOW rather than a
         /// run total.
@@ -373,11 +394,23 @@ mod hostcalls {
     ///
     /// The same scaling as [`sampled_selectors_by_ms`], over one panel window's deltas. Taken
     /// rather than read, because a window is defined by the previous take.
-    pub fn take_sampled_selector_window(n: usize) -> Vec<(u32, u64, f64, u64)> {
+    pub fn take_sampled_selector_window(n: usize) -> Vec<(u32, u64, f64, u64, f64, f64)> {
         let calls = PER_SELECTOR.with(|v| v.borrow().clone());
         let ms = SAMPLED_SELECTOR_MS.with(|v| v.borrow().clone());
         let samples = SAMPLED_SELECTOR_N.with(|v| v.borrow().clone());
-        let mut out: Vec<(u32, u64, f64, u64)> = Vec::new();
+        let words = SAMPLED_SELECTOR_WORDS.with(|v| v.borrow().clone());
+        let bulk = SAMPLED_SELECTOR_BULK.with(|v| v.borrow().clone());
+        let (d_words, d_bulk): (Vec<u64>, Vec<u64>) = PREV_SAMPLED_WORDS.with(|pw| {
+            PREV_SAMPLED_BULK.with(|pb| {
+                let (mut pw, mut pb) = (pw.borrow_mut(), pb.borrow_mut());
+                let dw: Vec<u64> = (0..words.len()).map(|i| words[i] - pw[i]).collect();
+                let db: Vec<u64> = (0..bulk.len()).map(|i| bulk[i] - pb[i]).collect();
+                pw.copy_from_slice(&words);
+                pb.copy_from_slice(&bulk);
+                (dw, db)
+            })
+        });
+        let mut out: Vec<(u32, u64, f64, u64, f64, f64)> = Vec::new();
         PREV_SAMPLED_MS.with(|pm| {
             PREV_SAMPLED_N.with(|pn| {
                 PREV_SELECTOR_CALLS.with(|pc| {
@@ -397,6 +430,8 @@ mod hostcalls {
                                 d_calls,
                                 d_ms * d_calls as f64 / d_n as f64,
                                 d_n,
+                                d_words[i] as f64 / d_n as f64,
+                                d_bulk[i] as f64 / d_n as f64,
                             ));
                         }
                     }
@@ -572,7 +607,32 @@ mod hostcalls {
         true
     }
 
-    pub fn note_sample(ms: f64, selector: u32) {
+    thread_local! {
+        static BULK_MANY: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    /// One `copy_ranges` crossing carrying `n` ranges.
+    pub fn note_bulk_many(n: usize) {
+        BULK_MANY.with(|c| {
+            let (calls, ranges) = c.get();
+            c.set((calls + 1, ranges + n as u64));
+        });
+    }
+    /// `(copy_ranges crossings, ranges they carried)` so far.
+    pub fn bulk_many() -> (u64, u64) {
+        BULK_MANY.with(|c| c.get())
+    }
+
+    pub fn note_sample(ms: f64, selector: u32, words: u64, bulk: u64) {
+        SAMPLED_SELECTOR_WORDS.with(|v| {
+            if let Some(slot) = v.borrow_mut().get_mut(selector as usize) {
+                *slot += words;
+            }
+        });
+        SAMPLED_SELECTOR_BULK.with(|v| {
+            if let Some(slot) = v.borrow_mut().get_mut(selector as usize) {
+                *slot += bulk;
+            }
+        });
         SAMPLE_MS.with(|m| m.set(m.get() + ms));
         SAMPLE_N.with(|n| n.set(n.get() + 1));
         SAMPLED_SELECTOR_MS.with(|v| {
@@ -781,7 +841,13 @@ pub fn host_calls_by_sampled_ms(n: usize) -> Vec<(u32, u64, f64, u64)> {
 
 /// The costliest host calls of the last panel window, by the sampled estimate - see
 /// [`hostcalls::take_sampled_selector_window`].
-pub fn take_host_calls_by_sampled_ms_window(n: usize) -> Vec<(u32, u64, f64, u64)> {
+/// `(copy_ranges crossings, ranges carried)` since the run started - see
+/// [`hostcalls::note_bulk_many`] and `PrefetchedMemory`.
+pub fn bulk_many_totals() -> (u64, u64) {
+    hostcalls::bulk_many()
+}
+
+pub fn take_host_calls_by_sampled_ms_window(n: usize) -> Vec<(u32, u64, f64, u64, f64, f64)> {
     hostcalls::take_sampled_selector_window(n)
 }
 
@@ -1067,6 +1133,38 @@ impl GuestMemory for SharedView {
     fn len(&self) -> usize {
         self.bytes.length() as usize
     }
+    fn read_many(&self, ranges: &[(usize, usize)], out: &mut Vec<u8>) {
+        let total: usize = ranges.iter().map(|&(_, l)| l).sum();
+        out.clear();
+        out.resize(total, 0);
+        if total == 0 {
+            return;
+        }
+        hostcalls::note_bulk_many(ranges.len());
+        let mut table: Vec<u32> = Vec::with_capacity(ranges.len() * 2);
+        for &(off, len) in ranges {
+            table.push(off as u32);
+            table.push(len as u32);
+        }
+        // SAFETY: both views borrow this module's linear memory for the duration of one
+        // synchronous JS call that cannot grow it; nothing else holds `out` or `table`.
+        unsafe {
+            let t = js_sys::Uint32Array::view(&table);
+            let dst = js_sys::Uint8Array::view_mut_raw(out.as_mut_ptr(), out.len());
+            copy_ranges(&self.bytes, &t, &dst);
+        }
+    }
+    fn dirty_stamps(&self) -> Option<(Vec<u8>, u32)> {
+        let block = self.dirty_off?;
+        let pages = self.pages();
+        let mut v = vec![0u8; pages];
+        // SAFETY: as in `read`.
+        unsafe {
+            let dst = js_sys::Uint8Array::view_mut_raw(v.as_mut_ptr(), v.len());
+            copy_range(&self.bytes, self.stamp_at(block, 0), &dst);
+        }
+        Some((v, vitaslop_transpiler::DIRTY_SHIFT))
+    }
     fn read(&self, off: usize, buf: &mut [u8]) {
         // SAFETY: the view borrows this module's linear memory for the duration of the call
         // below. `copy_range` is synchronous JS that cannot grow it, and nothing else holds a
@@ -1097,6 +1195,12 @@ impl GuestMemory for SharedView {
 // `SharedArrayBuffer` - so a `&SharedView` is as capable as an owned one, and the call site
 // passes `&mut &rt.view`.
 impl GuestMemory for &'_ SharedView {
+    fn read_many(&self, ranges: &[(usize, usize)], out: &mut Vec<u8>) {
+        (**self).read_many(ranges, out)
+    }
+    fn dirty_stamps(&self) -> Option<(Vec<u8>, u32)> {
+        (**self).dirty_stamps()
+    }
     fn len(&self) -> usize {
         (**self).len()
     }
@@ -1138,6 +1242,390 @@ impl GuestMemory for &'_ SharedView {
     }
     fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
         (**self).borrow(off, len)
+    }
+}
+
+/// >>> THE GUEST REGION INSIDE THIS MODULE'S OWN LINEAR MEMORY.
+///
+/// The other form, [`SharedView`], is a memory of the guest's own that the host reaches
+/// through JavaScript typed arrays: every read the host makes - a struct field, a pointer, a
+/// vertex buffer - is a boundary crossing, several per draw and thousands per frame, and on a
+/// phone that was the single biggest CPU item of a frame (`sceGxmDisplayQueueAddEntry` at
+/// 3.5-10 ms, re-reading every pending draw's geometry a crossing at a time). Here the guest
+/// runs INSIDE the host's memory instead: the region is reserved from the host's own heap
+/// ([`crate::reserve_guest_region`]), every guest instance imports the host module's memory,
+/// and the transpiler folds the region's offset into every emitted access
+/// (`vitaslop_transpiler::Program::host_off`). A host read is then a load, `borrow` is a
+/// slice, and the dirty map is a byte array - the native engine's shape exactly.
+///
+/// # Aliasing
+/// The guest writes these bytes behind Rust's back, so the region is only ever reached
+/// through the raw pointer, never through a `&mut [u8]` that outlives a host call. The
+/// scheduler is cooperative on one thread: no guest code runs while a host call holds a
+/// borrow, which is the same argument the native `SharedView` makes.
+///
+/// # Bounds
+/// Host-side accesses are bounds-checked against `len` here and in `GuestCtx`. The GUEST'S
+/// accesses are checked by the wasm engine against the whole host memory, not this region:
+/// a guest pointer past the region reads or writes the host's heap instead of trapping. A
+/// title that does that is already broken on hardware; `VITASLOP_BROWSER_SPLIT_MEMORY=1`
+/// restores the separate, exactly-sized memory for diagnosing one.
+#[derive(Clone, Copy)]
+struct HostRegion {
+    ptr: *mut u8,
+    len: usize,
+    /// Offset of the guest-store dirty block within the region, when the module carries one.
+    dirty_off: Option<u64>,
+}
+
+impl HostRegion {
+    /// The dirty block's `[epoch byte][page map]`, as one mutable slice. SAFETY of the caller's
+    /// use: see the aliasing note on the type - no guest code runs while this is held.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn dirty_block(&self) -> Option<&mut [u8]> {
+        let off = self.dirty_off? as usize;
+        let end = self.len.min(off + vitaslop_transpiler::DIRTY_MAP_OFF as usize + self.pages() + 1);
+        // SAFETY: the block lies inside the region and nothing else holds it (see the type).
+        Some(unsafe { std::slice::from_raw_parts_mut(self.ptr.add(off), end - off) })
+    }
+
+    fn pages(&self) -> usize {
+        self.len >> vitaslop_transpiler::DIRTY_SHIFT
+    }
+
+    /// Stamp every page `[off, off + len)` touches with the current epoch - the host's half
+    /// of the dirty map, exactly as [`SharedView::stamp_written`] owes it.
+    fn stamp_written(&self, off: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let Some(block) = (unsafe { self.dirty_block() }) else { return };
+        let epoch = block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize];
+        let map = &mut block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..];
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        let first = off >> shift;
+        let last = ((off + len - 1) >> shift).min(map.len().saturating_sub(1));
+        map[first..=last].fill(epoch);
+    }
+
+    fn in_bounds(&self, off: usize, len: usize) -> bool {
+        off.checked_add(len).is_some_and(|end| end <= self.len)
+    }
+}
+
+impl GuestMemory for HostRegion {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn direct(&self) -> bool {
+        true
+    }
+    fn read(&self, off: usize, buf: &mut [u8]) {
+        // Out-of-range reads answer zeros, as the typed-array form's `subarray` did: a short
+        // range copies what exists and leaves the rest. Never a slice past the region.
+        let n = buf.len().min(self.len.saturating_sub(off));
+        if n > 0 {
+            // SAFETY: `off + n <= len`, and nothing else writes the region during a host call.
+            unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(off), buf.as_mut_ptr(), n) };
+        }
+        buf[n..].fill(0);
+    }
+    fn write(&mut self, off: usize, bytes: &[u8]) {
+        if !self.in_bounds(off, bytes.len()) {
+            return;
+        }
+        // SAFETY: bounds checked; see `read`.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(off), bytes.len()) };
+        self.stamp_written(off, bytes.len());
+    }
+    fn read_u32(&self, off: usize) -> u32 {
+        if !self.in_bounds(off, 4) {
+            return 0;
+        }
+        // SAFETY: bounds checked; `read_unaligned` because a guest word need not be aligned.
+        unsafe { std::ptr::read_unaligned(self.ptr.add(off) as *const u32) }
+    }
+    fn read_u16(&self, off: usize) -> u16 {
+        if !self.in_bounds(off, 2) {
+            return 0;
+        }
+        // SAFETY: as `read_u32`.
+        unsafe { std::ptr::read_unaligned(self.ptr.add(off) as *const u16) }
+    }
+    fn write_u32(&mut self, off: usize, v: u32) {
+        if !self.in_bounds(off, 4) {
+            return;
+        }
+        // SAFETY: as `write`.
+        unsafe { std::ptr::write_unaligned(self.ptr.add(off) as *mut u32, v) };
+        self.stamp_written(off, 4);
+    }
+    fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+        if !self.in_bounds(off, len) {
+            return None;
+        }
+        // SAFETY: bounds checked, and the lifetime is `&self`'s, which lives only for the
+        // host call - no guest code runs meanwhile (see the type).
+        Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off), len) })
+    }
+    fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+        if len == 0 {
+            return Some(false);
+        }
+        let block = unsafe { self.dirty_block()? };
+        let map = &block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..];
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        // One page BELOW the range too - a store is stamped against the page it STARTS in.
+        // See `GuestMemory::dirty_since`.
+        let first = (off >> shift).saturating_sub(1);
+        let last = ((off + len - 1) >> shift).min(map.len().saturating_sub(1)).max(first);
+        Some(map[first..=last].iter().any(|&s| s >= stamp))
+    }
+    fn dirty_runs_since(&self, off: usize, len: usize, stamp: u8, out: &mut Vec<(usize, usize)>) -> Option<()> {
+        if len == 0 {
+            return Some(());
+        }
+        let block = unsafe { self.dirty_block()? };
+        let map = &block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..];
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        let first = off >> shift;
+        let last = (off + len - 1) >> shift;
+        if last >= map.len() {
+            return None;
+        }
+        vitaslop_runtime::host::dirty_runs_from_pages(first, last, off, len, stamp, |p| map[p], out);
+        Some(())
+    }
+    fn dirty_epoch(&self) -> Option<u8> {
+        let block = unsafe { self.dirty_block()? };
+        Some(block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize])
+    }
+    fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
+        let block = unsafe { self.dirty_block()? };
+        for p in block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..].iter_mut() {
+            *p = if *p >= floor { *p - floor + 1 } else { 0 };
+        }
+        let at = vitaslop_transpiler::DIRTY_EPOCH_OFF as usize;
+        let next = if block[at] >= floor { block[at] - floor + 1 } else { 1 };
+        block[at] = next;
+        Some(next)
+    }
+    fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        let block = unsafe { self.dirty_block()? };
+        let next = block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize].wrapping_add(1);
+        // The same wrap rule as the typed-array form: a one-byte epoch compared with `>=`
+        // may not wrap silently, so the map is zeroed and every stamp starts over.
+        if next == 0 || next == u8::MAX {
+            block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..].fill(0);
+            block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize] = 1;
+            return Some((1, true));
+        }
+        block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize] = next;
+        Some((next, false))
+    }
+    // `dirty_stamps` stays `None` on purpose: a copy of the map exists to answer
+    // `dirty_since` without crossings, and here the map is already a byte array.
+}
+
+/// The guest memory as the engine and every thread hold it: a typed-array view over a
+/// memory of the guest's own, or the region inside this module's memory. One run uses one
+/// form throughout; the enum is so the engine's code has a single type to carry.
+#[derive(Clone)]
+enum GuestMem {
+    Js(SharedView),
+    Host(HostRegion),
+}
+
+impl GuestMem {
+    fn stamp_written(&self, off: usize, len: usize) {
+        match self {
+            GuestMem::Js(v) => v.stamp_written(off, len),
+            GuestMem::Host(r) => r.stamp_written(off, len),
+        }
+    }
+
+    /// Write `bytes` at `off` (a host write, so the dirty map is stamped). False if out of range.
+    fn write_at(&self, off: usize, bytes: &[u8]) -> bool {
+        match self {
+            GuestMem::Js(v) => {
+                if off + bytes.len() > v.bytes.length() as usize {
+                    return false;
+                }
+                v.bytes.subarray(off as u32, (off + bytes.len()) as u32).copy_from(bytes);
+                v.stamp_written(off, bytes.len());
+                true
+            }
+            GuestMem::Host(r) => {
+                if !r.in_bounds(off, bytes.len()) {
+                    return false;
+                }
+                let mut r = *r;
+                r.write(off, bytes);
+                true
+            }
+        }
+    }
+
+    /// Read `out.len()` bytes at `off`. False if out of range.
+    fn read_into(&self, off: usize, out: &mut [u8]) -> bool {
+        match self {
+            GuestMem::Js(v) => {
+                if off.checked_add(out.len()).is_none_or(|end| end > v.bytes.length() as usize) {
+                    return false;
+                }
+                v.bytes.subarray(off as u32, (off + out.len()) as u32).copy_to(out);
+                true
+            }
+            GuestMem::Host(r) => {
+                if !r.in_bounds(off, out.len()) {
+                    return false;
+                }
+                r.read(off, out);
+                true
+            }
+        }
+    }
+
+    /// Copy `len` bytes from `src` to `dst` inside the guest memory (the TLS template into a
+    /// new thread's block). Not stamped: it runs before the thread exists to the guest.
+    fn copy_within(&self, src: usize, dst: usize, len: usize) {
+        match self {
+            GuestMem::Js(v) => {
+                let head = v.bytes.subarray(src as u32, (src + len) as u32).to_vec();
+                v.bytes.subarray(dst as u32, (dst + len) as u32).copy_from(&head);
+            }
+            GuestMem::Host(r) => {
+                if r.in_bounds(src, len) && r.in_bounds(dst, len) {
+                    // SAFETY: both ranges are inside the region; `copy` allows overlap.
+                    unsafe { std::ptr::copy(r.ptr.add(src), r.ptr.add(dst), len) };
+                }
+            }
+        }
+    }
+}
+
+macro_rules! guest_mem_delegate {
+    ($self:ident, $m:ident $(, $a:expr)*) => {
+        match $self {
+            GuestMem::Js(v) => v.$m($($a),*),
+            GuestMem::Host(r) => r.$m($($a),*),
+        }
+    };
+}
+
+impl GuestMemory for GuestMem {
+    fn len(&self) -> usize {
+        guest_mem_delegate!(self, len)
+    }
+    fn direct(&self) -> bool {
+        guest_mem_delegate!(self, direct)
+    }
+    fn read(&self, off: usize, buf: &mut [u8]) {
+        guest_mem_delegate!(self, read, off, buf)
+    }
+    fn write(&mut self, off: usize, bytes: &[u8]) {
+        match self {
+            GuestMem::Js(v) => v.write(off, bytes),
+            GuestMem::Host(r) => r.write(off, bytes),
+        }
+    }
+    fn read_u32(&self, off: usize) -> u32 {
+        guest_mem_delegate!(self, read_u32, off)
+    }
+    fn read_u16(&self, off: usize) -> u16 {
+        guest_mem_delegate!(self, read_u16, off)
+    }
+    fn write_u32(&mut self, off: usize, v: u32) {
+        match self {
+            GuestMem::Js(m) => m.write_u32(off, v),
+            GuestMem::Host(r) => r.write_u32(off, v),
+        }
+    }
+    fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+        guest_mem_delegate!(self, borrow, off, len)
+    }
+    fn read_many(&self, ranges: &[(usize, usize)], out: &mut Vec<u8>) {
+        guest_mem_delegate!(self, read_many, ranges, out)
+    }
+    fn dirty_stamps(&self) -> Option<(Vec<u8>, u32)> {
+        guest_mem_delegate!(self, dirty_stamps)
+    }
+    fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+        guest_mem_delegate!(self, dirty_since, off, len, stamp)
+    }
+    fn dirty_runs_since(&self, off: usize, len: usize, stamp: u8, out: &mut Vec<(usize, usize)>) -> Option<()> {
+        guest_mem_delegate!(self, dirty_runs_since, off, len, stamp, out)
+    }
+    fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
+        guest_mem_delegate!(self, rebase_dirty_epoch, floor)
+    }
+    fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        guest_mem_delegate!(self, bump_dirty_epoch)
+    }
+    fn dirty_epoch(&self) -> Option<u8> {
+        guest_mem_delegate!(self, dirty_epoch)
+    }
+}
+
+// The borrowed form a host call uses - see `impl GuestMemory for &SharedView` for why it is
+// a borrow and not a clone.
+impl GuestMemory for &'_ GuestMem {
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+    fn direct(&self) -> bool {
+        (**self).direct()
+    }
+    fn read(&self, off: usize, buf: &mut [u8]) {
+        (**self).read(off, buf)
+    }
+    fn write(&mut self, off: usize, bytes: &[u8]) {
+        match **self {
+            GuestMem::Js(ref v) => SharedView::write_at(v, off, bytes),
+            GuestMem::Host(r) => {
+                let mut r = r;
+                r.write(off, bytes)
+            }
+        }
+    }
+    fn read_u32(&self, off: usize) -> u32 {
+        (**self).read_u32(off)
+    }
+    fn read_u16(&self, off: usize) -> u16 {
+        (**self).read_u16(off)
+    }
+    fn write_u32(&mut self, off: usize, v: u32) {
+        match **self {
+            GuestMem::Js(ref m) => SharedView::write_word(m, off, v),
+            GuestMem::Host(r) => {
+                let mut r = r;
+                r.write_u32(off, v)
+            }
+        }
+    }
+    fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+        (**self).borrow(off, len)
+    }
+    fn read_many(&self, ranges: &[(usize, usize)], out: &mut Vec<u8>) {
+        (**self).read_many(ranges, out)
+    }
+    fn dirty_stamps(&self) -> Option<(Vec<u8>, u32)> {
+        (**self).dirty_stamps()
+    }
+    fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+        (**self).dirty_since(off, len, stamp)
+    }
+    fn dirty_runs_since(&self, off: usize, len: usize, stamp: u8, out: &mut Vec<(usize, usize)>) -> Option<()> {
+        (**self).dirty_runs_since(off, len, stamp, out)
+    }
+    fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
+        (**self).rebase_dirty_epoch(floor)
+    }
+    fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        (**self).bump_dirty_epoch()
+    }
+    fn dirty_epoch(&self) -> Option<u8> {
+        (**self).dirty_epoch()
     }
 }
 
@@ -1242,31 +1730,13 @@ impl SharedView {
         }
         let mut pages = vec![0u8; (end - map) as usize];
         self.bytes.subarray(map, end).copy_to(&mut pages);
-        // `pages[0]` is the page below when there is one, so the range's own pages start at
-        // `skip`, and the overhang makes page 0 of the range dirty if that one is.
-        let skip = (first - below) as usize;
-        let overhang = skip == 1 && pages[0] >= stamp;
-        let mut run: Option<(usize, usize)> = None;
-        for (i, &p) in pages[skip..].iter().enumerate() {
-            let dirty = p >= stamp || (i == 0 && overhang);
-            if !dirty {
-                if let Some(r) = run.take() {
-                    out.push(r);
-                }
-                continue;
-            }
-            // Page i of the range, clipped to the range itself: the first page starts part
-            // way in and the last one ends part way through.
-            let page_start = ((first + i) << shift).max(off) - off;
-            let page_end = (((first + i) << shift) + page_bytes).min(off + len) - off;
-            match run.as_mut() {
-                Some(r) => r.1 = page_end,
-                None => run = Some((page_start, page_end)),
-            }
-        }
-        if let Some(r) = run {
-            out.push(r);
-        }
+        // `pages[0]` is the page below when there is one, so page `p` of the map is
+        // `pages[p - below]`. The rule, and the loop, live in
+        // `vitaslop_runtime::host::dirty_runs_from_pages` - both engines answer this and a copy
+        // each is how they came to disagree about the page-below overhang.
+        vitaslop_runtime::host::dirty_runs_from_pages(first, last, off, len, stamp, |p| {
+            pages[p - below]
+        }, out);
         Some(())
     }
 
@@ -1410,10 +1880,22 @@ export function any_ge(u8, from, to, stamp) {
   for (let i = from; i < to; i++) if (u8[i] >= stamp) return true;
   return false;
 }
+export function copy_ranges(src, table, dst) {
+  let at = 0;
+  for (let i = 0; i < table.length; i += 2) {
+    const off = table[i], len = table[i + 1];
+    const end = Math.min(off + len, src.length);
+    if (end > off) dst.set(src.subarray(off, end), at);
+    at += len;
+  }
+}
 ")]
 extern "C" {
     /// `dst[..] = src[off .. off + dst.len()]`.
     fn copy_range(src: &js_sys::Uint8Array, off: u32, dst: &js_sys::Uint8Array);
+    /// For each `(off, len)` pair of `table`, `dst[at..at+len] = src[off..off+len]` with `at`
+    /// running over the pairs in order - a whole table of reads in ONE crossing.
+    fn copy_ranges(src: &js_sys::Uint8Array, table: &js_sys::Uint32Array, dst: &js_sys::Uint8Array);
     /// `dst[off .. off + src.len()] = src[..]`.
     fn write_range(dst: &js_sys::Uint8Array, off: u32, src: &js_sys::Uint8Array);
     /// Whether any byte of `u8[from..to]` is `>= stamp`.
@@ -1440,9 +1922,9 @@ struct ThreadRt {
     /// a browser trap could ever say `pc=0`: the ARM `pc` register a translated module keeps
     /// is never live, so the address of the faulting block has to come from here.
     guest_pc: Option<WebAssembly::Global>,
-    /// The whole shared memory as one typed array, built once. See [`SharedView`] for
-    /// why caching it is both sound and load-bearing.
-    view: SharedView,
+    /// The guest memory - see [`GuestMem`]: a typed-array view built once, or the region
+    /// inside this module's own memory.
+    view: GuestMem,
     base: u32,
 }
 
@@ -1536,7 +2018,7 @@ impl ThreadRt {
         let g = self.guest_pc.as_ref()?;
         Some(g.value().as_f64().unwrap_or(0.0) as i64 as u32)
     }
-    fn view(&self) -> SharedView {
+    fn view(&self) -> GuestMem {
         self.view.clone()
     }
 }
@@ -1949,10 +2431,12 @@ fn deliver(signal: &Rc<RefCell<Option<Function>>>, ev: &Ev) {
 /// [`GuestEngine`] so it stands up threads for [`SchedCore`].
 pub struct BrowserEngine {
     module: WebAssembly::Module,
+    /// The memory every guest instance imports: a memory of the guest's own, or THIS
+    /// MODULE'S memory when the guest region lives inside it (see [`HostRegion`]).
     shared_mem: WebAssembly::Memory,
-    /// The one cached typed-array view over `shared_mem`, handed to every thread and to
-    /// every host call. See [`SharedView`].
-    view: SharedView,
+    /// The guest memory as the host reaches it, handed to every thread and to every host
+    /// call. See [`GuestMem`].
+    view: GuestMem,
     host: Host,
     base: u32,
     /// `WebAssembly.promising` (not in the wasm-bindgen bindings; fetched by name).
@@ -2013,11 +2497,9 @@ impl BrowserEngine {
         let (tp, tls_src, tls_len) = self.host.lock().unwrap().thread_tls_base(thid);
         if tp != 0 {
             if tls_len != 0 {
-                let view = &self.view.bytes;
                 let src = tls_src.wrapping_sub(self.base);
                 let dst = tp.wrapping_sub(self.base);
-                let head = view.subarray(src, src + tls_len).to_vec();
-                view.subarray(dst, dst + tls_len).copy_from(&head);
+                self.view.copy_within(src as usize, dst as usize, tls_len as usize);
             }
             let tp_global = Reflect::get(&engine.exports, &JsValue::from_str(abi::TP_EXPORT))?
                 .dyn_into::<WebAssembly::Global>()?;
@@ -2102,6 +2584,7 @@ impl BrowserEngine {
                 let sampling = hostcalls::start_sample();
                 let clock = || if timed { hostcalls::now() } else { 0.0 };
                 let t_sample = if sampling && !timed { hostcalls::now() } else { 0.0 };
+                let acc0 = if sampling { vitaslop_runtime::perf::guest_accesses() } else { (0, 0) };
                 let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
                 let (mut regs, mut vfp) = rt.read_file();
@@ -2110,7 +2593,7 @@ impl BrowserEngine {
                 let d0 = clock();
                 let outcome = {
                     // BORROWED, not cloned - see `impl GuestMemory for &SharedView`.
-                    let mut mem: &SharedView = &rt.view;
+                    let mut mem: &GuestMem = &rt.view;
                     let mut host = host.lock().unwrap();
                     host.set_current_thread(thid);
                     host.dispatch(selector as u32, &mut regs, &mut vfp, &mut mem, rt.base)
@@ -2123,7 +2606,8 @@ impl BrowserEngine {
                 let total_ms = clock() - t0;
                 if sampling {
                     let sample_ms = if timed { total_ms } else { hostcalls::now() - t_sample };
-                    hostcalls::note_sample(sample_ms, selector as u32);
+                    let acc1 = vitaslop_runtime::perf::guest_accesses();
+                    hostcalls::note_sample(sample_ms, selector as u32, acc1.0 - acc0.0, acc1.1 - acc0.1);
                 }
                 hostcalls::note_selector(selector as u32, thid, total_ms);
                 if hostcalls::record(total_ms, d1 - d0) {
@@ -2237,13 +2721,14 @@ impl BrowserEngine {
                 let sampling = hostcalls::start_sample();
                 let clock = || if timed { hostcalls::now() } else { 0.0 };
                 let t_sample = if sampling && !timed { hostcalls::now() } else { 0.0 };
+                let acc0 = if sampling { vitaslop_runtime::perf::guest_accesses() } else { (0, 0) };
                 let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
                 let (mut regs, mut vfp) = rt.read_file();
                 let before = (regs, vfp);
                 let d0 = clock();
                 let outcome = {
-                    let mut mem: &SharedView = &rt.view;
+                    let mut mem: &GuestMem = &rt.view;
                     let mut host = host.lock().unwrap();
                     host.set_current_thread(thid);
                     host.dispatch(selector as u32, &mut regs, &mut vfp, &mut mem, rt.base)
@@ -2253,7 +2738,8 @@ impl BrowserEngine {
                 let total_ms = clock() - t0;
                 if sampling {
                     let sample_ms = if timed { total_ms } else { hostcalls::now() - t_sample };
-                    hostcalls::note_sample(sample_ms, selector as u32);
+                    let acc1 = vitaslop_runtime::perf::guest_accesses();
+                    hostcalls::note_sample(sample_ms, selector as u32, acc1.0 - acc0.0, acc1.1 - acc0.1);
                 }
                 hostcalls::note_selector(selector as u32, thid, total_ms);
                 hostcalls::note_fast_call();
@@ -2438,23 +2924,14 @@ impl GuestEngine for BrowserEngine {
 
     fn write_mem(&mut self, addr: u32, bytes: &[u8]) {
         let off = addr.wrapping_sub(self.base) as usize;
-        let view = &self.view.bytes;
-        if off + bytes.len() <= view.length() as usize {
-            view.subarray(off as u32, (off + bytes.len()) as u32).copy_from(bytes);
-            // A scheduler-side write is a host write like any other - see
-            // `SharedView::stamp_written`.
-            self.view.stamp_written(off, bytes.len());
-        }
+        // A scheduler-side write is a host write like any other - `write_at` stamps the
+        // dirty map, see `SharedView::stamp_written`.
+        self.view.write_at(off, bytes);
     }
 
     fn read_mem(&self, addr: u32, out: &mut [u8]) -> bool {
         let off = addr.wrapping_sub(self.base) as usize;
-        let view = &self.view.bytes;
-        if off.checked_add(out.len()).is_none_or(|end| end > view.length() as usize) {
-            return false;
-        }
-        view.subarray(off as u32, (off + out.len()) as u32).copy_to(out);
-        true
+        self.view.read_into(off, out)
     }
 
     fn mirror_base(&self) -> Option<u32> {
@@ -2975,7 +3452,9 @@ pub async fn run_frames(
         // makes it runnable again.
         let pending = core.host().lock().unwrap().state.pending_early.take();
         if let Some((thid, start, n)) = pending {
+            let early = vitaslop_runtime::perf::scope(vitaslop_runtime::perf::Phase::SchedEarlyBatch);
             complete_early_batch(core, completer.as_mut().map(|c| &mut **c), thid, start, n).await;
+            drop(early);
         }
         core.drain();
         drop(book);
@@ -3008,12 +3487,13 @@ impl BrowserSched {
         mem_pages: u32,
         mirror_off: Option<u64>,
         dirty_off: Option<u64>,
+        host_off: u32,
         entry: u32,
         main_sp: u32,
         env: VitaEnv,
     ) -> Result<BrowserSched, JsValue> {
         let (engine, host) =
-            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, env)?;
+            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env)?;
         let main = engine.make_thread(
             vitaslop_runtime::host::MAIN_THID,
             &[entry & !1],
@@ -3039,12 +3519,13 @@ impl BrowserSched {
         mem_pages: u32,
         mirror_off: Option<u64>,
         dirty_off: Option<u64>,
+        host_off: u32,
         entries: &[u32],
         main_sp: u32,
         env: VitaEnv,
     ) -> Result<BrowserSched, JsValue> {
         let (engine, host) =
-            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, env)?;
+            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env)?;
         let main = engine.make_thread(
             vitaslop_runtime::host::MAIN_THID,
             entries,
@@ -3059,6 +3540,49 @@ impl BrowserSched {
     }
 }
 
+/// The guest region this worker reserved inside its own linear memory: `(offset, bytes)`.
+/// See [`reserve_guest_region`].
+static RESERVED_REGION: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+/// >>> RESERVE THE GUEST REGION IN THIS MODULE'S OWN MEMORY, ONCE, and return its offset.
+///
+/// The page calls this on the RUN worker before it transpiles, and hands the offset to the
+/// transpile worker, whose module is then emitted for exactly this region
+/// (`vitaslop_transpiler::Program::host_off`) - see [`HostRegion`] for what that buys. The
+/// reservation is `len` bytes, page-aligned, taken from the host allocator and never freed:
+/// it is the guest's whole address space for the life of the worker, and a worker runs one
+/// title. A second call returns the same offset; a call with a different length after the
+/// first is an error, because the module built for the first is already on its way.
+pub fn reserve_guest_region(len: usize) -> Result<u32, JsValue> {
+    if let Some(&(ptr, have)) = RESERVED_REGION.get() {
+        if have != len {
+            return Err(JsValue::from_str(&format!(
+                "guest region already reserved at {have} bytes; asked again for {len}"
+            )));
+        }
+        return Ok(ptr as u32);
+    }
+    let page = vitaslop_transpiler::abi::PAGE_SIZE as usize;
+    let layout = std::alloc::Layout::from_size_align(len, page)
+        .map_err(|e| JsValue::from_str(&format!("guest region layout: {e}")))?;
+    // SAFETY: a non-zero, page-aligned layout. Zeroed so the guest sees the fresh memory
+    // a `WebAssembly.Memory` would have given it.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return Err(JsValue::from_str(&format!(
+            "could not reserve a {} MB guest region in the emulator's memory",
+            len / (1024 * 1024)
+        )));
+    }
+    let _ = RESERVED_REGION.set((ptr as usize, len));
+    Ok(ptr as u32)
+}
+
+/// The reservation [`reserve_guest_region`] made in this worker, if any: `(offset, bytes)`.
+pub fn reserved_region() -> Option<(usize, usize)> {
+    RESERVED_REGION.get().copied()
+}
+
 /// Build the browser engine (JSPI primitives, module, a fresh seeded shared memory) and
 /// the shared host - the common setup both [`BrowserSched`] constructors share.
 fn build_engine(
@@ -3068,9 +3592,26 @@ fn build_engine(
     mem_pages: u32,
     mirror_off: Option<u64>,
     dirty_off: Option<u64>,
+    host_off: u32,
     env: VitaEnv,
 ) -> Result<(BrowserEngine, Host), JsValue> {
     {
+        // A module transpiled for a host offset runs ONLY in the region reserved at that
+        // offset in this worker; anything else is a module reading the wrong bytes. `0`
+        // is the separate-memory form.
+        let host_region = if host_off == 0 {
+            None
+        } else {
+            let (ptr, len) = reserved_region().ok_or_else(|| {
+                JsValue::from_str("the module was transpiled for a host guest region but this worker reserved none")
+            })?;
+            if ptr as u32 != host_off {
+                return Err(JsValue::from_str(&format!(
+                    "the module was transpiled for guest region offset {host_off:#x} but this worker's region is at {ptr:#x}"
+                )));
+            }
+            Some(HostRegion { ptr: ptr as *mut u8, len, dirty_off })
+        };
         let wasm_global =
             Reflect::get(&js_sys::global(), &JsValue::from_str("WebAssembly"))?;
         let promising = Reflect::get(&wasm_global, &JsValue::from_str("promising"))?
@@ -3080,29 +3621,54 @@ fn build_engine(
             .dyn_into::<Function>()
             .map_err(|_| JsValue::from_str("WebAssembly.Suspending missing (needs JSPI)"))?;
 
-        // One shared memory of exactly the transpiler's declared size, imported into
-        // every instance. A shared memory needs a maximum and a cross-origin-isolated
-        // page (COOP/COEP).
-        let desc = Object::new();
-        Reflect::set(&desc, &JsValue::from_str("initial"), &JsValue::from_f64(mem_pages as f64))?;
-        Reflect::set(&desc, &JsValue::from_str("maximum"), &JsValue::from_f64(mem_pages as f64))?;
-        Reflect::set(&desc, &JsValue::from_str("shared"), &JsValue::TRUE)?;
-        let shared_mem = WebAssembly::Memory::new(&desc)?;
-        // The one view over it, for the life of the run. Sound because `initial ==
-        // maximum` above makes this memory non-growable and its SharedArrayBuffer never
-        // detaches - see [`SharedView`] for why rebuilding it per access was the whole
-        // browser performance problem.
-        let buffer = shared_mem.buffer();
-        let view = SharedView {
-            bytes: Uint8Array::new(&buffer),
-            // Over the SAME buffer from offset 0, so a rebased byte offset indexes as
-            // `off >> 2` / `off >> 1`. Built once, for the reason the byte view is.
-            words: js_sys::Uint32Array::new(&buffer),
-            halves: js_sys::Uint16Array::new(&buffer),
-            dirty_off,
+        let (shared_mem, view) = if let Some(region) = host_region {
+            // >>> THE GUEST RUNS INSIDE THIS MODULE'S MEMORY. The module was transpiled for
+            // exactly this region (`Program::host_off` = its offset), every instance imports
+            // the host's own `WebAssembly.Memory`, and the host reads the guest with loads.
+            // See [`HostRegion`].
+            let need = mem_pages as usize * vitaslop_transpiler::abi::PAGE_SIZE as usize;
+            if region.len < need {
+                return Err(JsValue::from_str(&format!(
+                    "the reserved guest region is {} bytes but this module's layout needs {need}",
+                    region.len
+                )));
+            }
+            if image.len() > region.len {
+                return Err(JsValue::from_str("the guest image is larger than the reserved region"));
+            }
+            // SAFETY: the region is this module's own leaked allocation (see
+            // `reserve_guest_region`), nothing else reaches it, and no guest code runs yet.
+            unsafe { std::ptr::copy_nonoverlapping(image.as_ptr(), region.ptr, image.len()) };
+            let mem = wasm_bindgen::memory()
+                .dyn_into::<WebAssembly::Memory>()
+                .map_err(|_| JsValue::from_str("wasm_bindgen::memory() is not a WebAssembly.Memory"))?;
+            (mem, GuestMem::Host(HostRegion { ptr: region.ptr, len: need, dirty_off }))
+        } else {
+            // One shared memory of exactly the transpiler's declared size, imported into
+            // every instance. A shared memory needs a maximum and a cross-origin-isolated
+            // page (COOP/COEP).
+            let desc = Object::new();
+            Reflect::set(&desc, &JsValue::from_str("initial"), &JsValue::from_f64(mem_pages as f64))?;
+            Reflect::set(&desc, &JsValue::from_str("maximum"), &JsValue::from_f64(mem_pages as f64))?;
+            Reflect::set(&desc, &JsValue::from_str("shared"), &JsValue::TRUE)?;
+            let shared_mem = WebAssembly::Memory::new(&desc)?;
+            // The one view over it, for the life of the run. Sound because `initial ==
+            // maximum` above makes this memory non-growable and its SharedArrayBuffer never
+            // detaches - see [`SharedView`] for why rebuilding it per access was the whole
+            // browser performance problem.
+            let buffer = shared_mem.buffer();
+            let view = SharedView {
+                bytes: Uint8Array::new(&buffer),
+                // Over the SAME buffer from offset 0, so a rebased byte offset indexes as
+                // `off >> 2` / `off >> 1`. Built once, for the reason the byte view is.
+                words: js_sys::Uint32Array::new(&buffer),
+                halves: js_sys::Uint16Array::new(&buffer),
+                dirty_off,
+            };
+            // Seed the image at offset 0.
+            view.bytes.subarray(0, image.len() as u32).copy_from(image);
+            (shared_mem, GuestMem::Js(view))
         };
-        // Seed the image at offset 0.
-        view.bytes.subarray(0, image.len() as u32).copy_from(image);
 
         // Shared non-suspending env stubs. svc is unused on the Vita path; a dispatch
         // miss (an indirect call to an untranslated target) throws a clear error.

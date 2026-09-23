@@ -143,6 +143,26 @@ impl Default for Settings {
 /// player should be shown. A product run names no filter; a person debugging one names it
 /// themselves.
 pub fn base_knobs() -> BTreeMap<String, String> {
+    // >>> NOTHING DIAGNOSTIC IS ARMED HERE, AND ONE MEASUREMENT IS WHY.
+    //
+    // `VITASLOP_PREPARE_SPLIT=1` and `VITASLOP_AMBIENT_PROBE=all` were both put in this list to
+    // make the next device dump answer two open questions. Neither writes anything, neither
+    // touches a pipeline, and both are documented as changing no rendering. On the desktop
+    // BROWSER, same bundle, same recipe, same frame, they change the PICTURE: without them the
+    // frame mean is 121,101,97 and with them it is 215,199,161 - the washed-out frame the user
+    // is reporting from the device.
+    //
+    // They do it by being SLOW. mlb drives its exposure from a light probe the renderer copies
+    // back into guest memory asynchronously, and that loop is marginal: add a few hundred
+    // microseconds a frame and the copies land late, the probe is read stale or unwritten, and
+    // the auto-exposure pins itself. So a diagnostic armed by default here would have shipped
+    // the very defect it was added to diagnose, and the device dump would have confirmed a bug
+    // the dump itself caused.
+    //
+    // The lesson is not "those two knobs are bad" - it is that on this title the product build
+    // must carry NO per-frame instrumentation, and that the wash is a LATENCY fault. Running the
+    // desktop browser WITH these knobs is now the local reproduction of the device's wash, which
+    // is where the fix is being tested [[vitaslop-instrument-failure-imitating-its-subject]].
     [("VITASLOP_FRAME_TOPUP", "0"), ("VITASLOP_GXP_LIVE", "1")]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))

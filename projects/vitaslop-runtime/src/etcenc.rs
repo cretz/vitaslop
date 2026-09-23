@@ -1091,12 +1091,20 @@ fn gather(w: u32, h: u32, rgba: &[u8], bx: u32, by: u32) -> Block {
 
 /// Encode a whole RGBA8 image to ETC2 RGB8 (4 bpp, alpha discarded).
 pub fn encode_etc2_rgb8(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
-    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
-    let mut out = Vec::with_capacity((bw * bh * 8) as usize);
-    for by in 0..bh {
-        for bx in 0..bw {
-            out.extend_from_slice(&encode_etc2_rgb8_block(&gather(w, h, rgba, bx, by)));
-        }
+    encode_etc2_rgb8_blocks(w, h, rgba, 0, u32::MAX)
+}
+
+/// `count` blocks of [`encode_etc2_rgb8`] starting at linear block index `first`. See
+/// [`crate::bcenc::encode_bc1_blocks`] for why a range is bit-identical to the whole image, and
+/// [`crate::render::transcoded_source`] for what needs one. THIS is the encoder that needed it:
+/// ETC2 is the family the target device takes and the only one whose encoder was ever the
+/// frame's cost.
+pub fn encode_etc2_rgb8_blocks(w: u32, h: u32, rgba: &[u8], first: u32, count: u32) -> Vec<u8> {
+    let bw = w.div_ceil(4);
+    let end = first.saturating_add(count).min(crate::bcenc::block_count(w, h));
+    let mut out = Vec::with_capacity((end.saturating_sub(first) * 8) as usize);
+    for b in first..end {
+        out.extend_from_slice(&encode_etc2_rgb8_block(&gather(w, h, rgba, b % bw, b / bw)));
     }
     out
 }
@@ -1104,14 +1112,19 @@ pub fn encode_etc2_rgb8(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 /// Encode a whole RGBA8 image to ETC2 RGBA8 (8 bpp): the EAC alpha block first, then the colour
 /// block, which is the order the format stores them in.
 pub fn encode_etc2_rgba8(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
-    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
-    let mut out = Vec::with_capacity((bw * bh * 16) as usize);
-    for by in 0..bh {
-        for bx in 0..bw {
-            let block = gather(w, h, rgba, bx, by);
-            out.extend_from_slice(&encode_eac_alpha_block(&block));
-            out.extend_from_slice(&encode_etc2_rgb8_block(&block));
-        }
+    encode_etc2_rgba8_blocks(w, h, rgba, 0, u32::MAX)
+}
+
+/// `count` blocks of [`encode_etc2_rgba8`] starting at linear block index `first`. See
+/// [`encode_etc2_rgb8_blocks`].
+pub fn encode_etc2_rgba8_blocks(w: u32, h: u32, rgba: &[u8], first: u32, count: u32) -> Vec<u8> {
+    let bw = w.div_ceil(4);
+    let end = first.saturating_add(count).min(crate::bcenc::block_count(w, h));
+    let mut out = Vec::with_capacity((end.saturating_sub(first) * 16) as usize);
+    for b in first..end {
+        let block = gather(w, h, rgba, b % bw, b / bw);
+        out.extend_from_slice(&encode_eac_alpha_block(&block));
+        out.extend_from_slice(&encode_etc2_rgb8_block(&block));
     }
     out
 }
@@ -1119,6 +1132,38 @@ pub fn encode_etc2_rgba8(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same bit-identity the BC encoder asserts, for the encoder that actually needed it:
+    /// see `crate::bcenc::tests::chunked_matches_whole`. ETC2 is the family the target device
+    /// takes, and the resumable encode exists for its 1 Mtexel/s.
+    #[test]
+    fn chunked_matches_whole() {
+        for (w, h) in [(16u32, 16u32), (13, 7), (64, 4), (37, 21)] {
+            let rgba: Vec<u8> = (0..(w * h * 4))
+                .map(|i| ((i.wrapping_mul(2654435761u32)) >> 13) as u8)
+                .collect();
+            for chunk in [1u32, 3, 64, u32::MAX] {
+                for alpha in [false, true] {
+                    let whole = if alpha {
+                        encode_etc2_rgba8(w, h, &rgba)
+                    } else {
+                        encode_etc2_rgb8(w, h, &rgba)
+                    };
+                    let mut got = Vec::new();
+                    let mut b = 0;
+                    while b < crate::bcenc::block_count(w, h) {
+                        got.extend_from_slice(&if alpha {
+                            encode_etc2_rgba8_blocks(w, h, &rgba, b, chunk)
+                        } else {
+                            encode_etc2_rgb8_blocks(w, h, &rgba, b, chunk)
+                        });
+                        b += chunk.min(crate::bcenc::block_count(w, h) - b);
+                    }
+                    assert_eq!(got, whole, "{w}x{h} in chunks of {chunk}, alpha={alpha}");
+                }
+            }
+        }
+    }
 
     fn flat(rgba: [u8; 4]) -> Block {
         [rgba; 16]

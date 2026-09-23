@@ -242,6 +242,50 @@ jobs:
         working-directory: projects/vitaslop-web/e2e
         run: node h264-conformance.mjs
 
+      # >>> THE AUTHORED SHADER ORACLE, ON A REAL GPU STACK, WITH NO PRIVATE FIXTURE.
+      #
+      # There are three oracles for the GXP shader pipeline and only one of them can run here.
+      # The CORPUS differential (`execcases`) needs captured game blobs, which cannot live in a
+      # public runner. The GXM pipeline suite runs in the native job, from a committed velf.
+      # The AUTHORED cases are the third, and they are the only one whose inputs this repo
+      # writes from nothing: `usse::asm` assembles each program and `gxpwrite` builds the
+      # container, so the whole case set is generated on the runner.
+      #
+      # `cargo test --workspace` above already runs the Rust half of them - the emitted program
+      # against the CPU reference. What it cannot do is run the EMITTED WGSL, and every defect
+      # this suite was written for was a wrong number in a module that compiled perfectly. That
+      # needs a GPU, which is what this job has (SwiftShader, and for these cases a software
+      # rasteriser is not a compromise: they check arithmetic, not pixels).
+      - name: Write the authored shader conformance cases
+        working-directory: projects
+        env:
+          VITASLOP_GXP_CASES_OUT: ${{ github.workspace }}/confcases
+        run: |
+          cargo test --locked --release -p vitaslop-gxp-shader --test conformance -- \
+            --ignored --nocapture write_every_conformance_case_for_the_gpu_runner
+          test -n "$(ls ${{ github.workspace }}/confcases/*.json 2>/dev/null)" \
+            || { echo "no cases were written - the runner below would grade nothing"; exit 1; }
+
+      - name: Authored shader cases on the real GPU compiler
+        working-directory: projects/vitaslop-web/e2e
+        run: node gxpexec.mjs ${{ github.workspace }}/confcases
+
+      # >>> WHICH WAY DOES THIS DEVICE ROUND f32 -> f16?
+      #
+      # Every half-precision store the recompiler emits rounds to nearest even, because the
+      # guest's hardware and the CPU reference both do. One of the two ways it can be spelled
+      # uses the language's own `f16()` conversion, whose rounding mode the WGSL spec does NOT
+      # fix - it was MEASURED round-to-nearest-even on the development machine's adapter, and a
+      # measurement of one device is not a guarantee about the next one.
+      #
+      # So the measurement is a CI job. It reads the shipped helper text off disk and runs it,
+      # so it cannot pass while the emitter ships something else, and it fails if either
+      # rounding arm disagrees with round-to-nearest-even or if the two arms disagree with each
+      # other - which would mean a title rendering differently on two devices.
+      - name: f32 -> f16 rounding, on this runner's GPU
+        working-directory: projects/vitaslop-web/e2e
+        run: node probe-f16round.mjs
+
       - name: Cube through WebGPU (software rasteriser)
         working-directory: projects/vitaslop-web/e2e
         env:

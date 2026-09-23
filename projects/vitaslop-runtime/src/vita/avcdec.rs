@@ -740,7 +740,7 @@ fn deliver_pictures(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, array: 
         tracing::warn!(
             target: "vitaslop::movie",
             submitted = PICTURES_OWED_BEFORE_REPORTING, %backend,
-            "the host decoder has been given {PICTURES_OWED_BEFORE_REPORTING} access units              and has produced NO pictures yet. Every call succeeded and reported zero outputs,              which is what a decoder answers while it fills its pipeline - but not usually              this many times. If the movie never appears, this is why; if it appears late,              the host decoder was slow to start."
+            "the host decoder has been given {PICTURES_OWED_BEFORE_REPORTING} access units and has produced NO pictures yet. Every call succeeded and reported zero outputs, which is what a decoder answers while it fills its pipeline - but not usually this many times. If the movie never appears, this is why; if it appears late, the host decoder was slow to start."
         );
     }
     0
@@ -1022,7 +1022,7 @@ fn report_repeated_picture(st: &mut VitaState, dest: u32, from: u32) {
     tracing::warn!(
         target: "vitaslop::movie",
         dest = format_args!("{dest:#010x}"), from = format_args!("{from:#010x}"),
-        "sceAvcdecDecode: the decoder had NO picture ready, so the last one was copied into the          destination the title offered. That is a DROPPED FRAME of the movie - the console's          decoder would have had one - but the title advances its own buffer rotation whether or          not a picture comes back, so without this it shows a buffer nothing ever wrote. Judge          the shortfall by `pictures delivered` against `access units submitted` in the MOVIE          panel, not by the picture, which now looks continuous either way."
+        "sceAvcdecDecode: the decoder had NO picture ready, so the last one was copied into the destination the title offered. That is a DROPPED FRAME of the movie - the console's decoder would have had one - but the title advances its own buffer rotation whether or not a picture comes back, so without this it shows a buffer nothing ever wrote. Judge the shortfall by `pictures delivered` against `access units submitted` in the MOVIE panel, not by the picture, which now looks continuous either way."
     );
 }
 
@@ -1131,7 +1131,7 @@ fn write_picture(
             visible = format_args!("{}x{}", pic.width, pic.height),
             dest = format_args!("{dest:#010x}"),
             %backend,
-            "the movie's FIRST PICTURE reached guest memory. `packed raster` is taken to              be luma then INTERLEAVED chroma (NV12) - one buffer is the only thing the              caller's single pointer can describe, but the chroma ORDER within it is an              assumption until the texture the title binds over this buffer says otherwise."
+            "the movie's FIRST PICTURE reached guest memory. `packed raster` is taken to be luma then INTERLEAVED chroma (NV12) - one buffer is the only thing the caller's single pointer can describe, but the chroma ORDER within it is an assumption until the texture the title binds over this buffer says otherwise."
         );
     }
 }

@@ -936,7 +936,7 @@ fn mspace_alloc(st: &mut VitaState, msp: Ptr, size: u32, align: u32, what: &str)
                     align,
                     used,
                     capacity,
-                    "{what}: memory space exhausted -> NULL. This is the guest's OWN pool                      and a NULL is an outcome it handles, so this says it ONCE per space;                      a run that does it constantly is a pool the guest is filling faster                      than it drains, which shows as guest CPU, not as an error."
+                    "{what}: memory space exhausted -> NULL. This is the guest's OWN pool and a NULL is an outcome it handles, so this says it ONCE per space; a run that does it constantly is a pool the guest is filling faster than it drains, which shows as guest CPU, not as an error."
                 );
             }
             0

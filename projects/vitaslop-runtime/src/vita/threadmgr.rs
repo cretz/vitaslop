@@ -124,6 +124,24 @@ pub(super) fn change_thread_priority(st: &mut VitaState, thid: i32, priority: i3
     }
 }
 
+/// The inline form of `sceKernelDelayThread`: a yield (`delay <= 1`) with nobody to yield to
+/// is answered in guest code from the host-mirror block, and everything else reaches
+/// [`delay_thread`] unchanged. Both spellings, as the dispatch routes both to one handler.
+/// See [`vitaslop_transpiler::InlineOp::DelayYield`] for the argument and the measurement.
+pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
+    use crate::vita::mirror::{SLOT_ELIDE_RUN, SLOT_YIELD_FREE};
+    match func_nid {
+        crate::vita::tm_nid::DELAY_THREAD | crate::vita::tm_nid::DELAY_THREAD_CB => {
+            Some(vitaslop_transpiler::InlineOp::DelayYield {
+                free_slot: SLOT_YIELD_FREE,
+                run_slot: SLOT_ELIDE_RUN,
+                cap: VitaState::ELIDE_RUN_CAP,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// int sceKernelDelayThread(SceUInt delay)
 ///
 /// Preemptive: a REAL timed sleep - park the caller until the virtual clock
@@ -141,13 +159,40 @@ pub(super) fn delay_thread(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome
     if !st.is_preemptive() {
         return SvcOutcome::Continue;
     }
+    // >>> THE CENSUS RUNS FIRST, BECAUSE THE CASE IT COULD NOT SEE IS THE COMMON ONE.
+    //
+    // It used to sit below the early return, so every `delay(0)` and `delay(1)` was invisible
+    // to it - and those are the ones a polling loop makes. On a football title the call-site
+    // profiler put 10.4 MILLION calls at one address and the delay census listed that address
+    // NOWHERE, which reads as "that site does not sleep" rather than "this instrument cannot
+    // see it" [[vitaslop-instrument-failure-imitating-its-subject]].
+    delay_census(delay_us, ctx.regs[14]);
     // A zero/one-us delay is "give someone else the CPU", not a real sleep - and not
     // a display frame either (see [`SvcOutcome::Flip`]). A worker polling in a
     // delay(0) loop hits this thousands of times per rendered frame.
+    //
+    // >>> AND WITH NOBODY TO GIVE IT TO, THE KERNEL RETURNS TO THE CALLER. Suspending anyway
+    // costs a full fiber suspend and resume for a scheduler round that re-picks this same
+    // thread - 2,377 of them a frame on that title, against 4 on another. See
+    // [`VitaState::yield_would_repick_this_thread`] for why the answer is exact.
     if delay_us <= 1 {
+        // >>> A YIELD THAT REACHED THE HOST FROM THE INLINE FORM AT ITS CAP IS DUE A SUSPEND.
+        //
+        // The emitted `DelayYield` elides up to `ELIDE_RUN_CAP` yields a slice in guest code and
+        // falls through here for the next one. Eliding THAT one through the handler's own
+        // (still-zero) count would spend another whole cap of crossings before the suspend
+        // the cap exists to force. MEASURED on a football title's browser frame: 5.0 million
+        // host-elided yields remained after the inline form landed, one crossing each, for
+        // exactly this reason. Reading the run word costs one guest-memory read on this path
+        // only, which is one per cap rather than one per yield.
+        if st.inline_elide_run_at_cap(ctx) {
+            return SvcOutcome::Reschedule;
+        }
+        if st.yield_would_repick_this_thread() {
+            return SvcOutcome::Continue;
+        }
         return SvcOutcome::Reschedule;
     }
-    delay_census(delay_us, ctx.regs[14]);
     st.sleep_park(delay_us as u64);
     SvcOutcome::Block
 }

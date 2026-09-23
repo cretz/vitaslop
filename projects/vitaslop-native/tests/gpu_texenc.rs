@@ -629,7 +629,7 @@ fn round_trip_one(
         {
             assert_eq!(
                 a, e,
-                "{label} level {i} ({lw}x{lh}) block {b} differs\n  gpu texture {a:02x?}\n  cpu        {e:02x?}"
+                "{label} level {i} ({lw}x{lh}) block {b} differs\n  gpu texture {a:02x?}\n  cpu {e:02x?}"
             );
         }
     }
@@ -1113,7 +1113,7 @@ fn gpu_bc_expand_matches_the_cpu_decoder() {
                     let mine = read_back_rgba8_level(&device, &queue, &got, level, sw, sh);
                     assert_eq!(
                         mine, want,
-                        "{label} level {level} ({sw}x{sh}): the GPU block expansion and the CPU                          decoder disagree, and they are supposed to be one function",
+                        "{label} level {level} ({sw}x{sh}): the GPU block expansion and the CPU decoder disagree, and they are supposed to be one function",
                     );
                 }
             }

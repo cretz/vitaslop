@@ -51,6 +51,7 @@ fn newlib_memcpy_copies_every_length_and_alignment() {
             mem_bytes: DEFAULT_MEM_BYTES,
             discover_code_pointers: false,
             import_memory: false,
+            host_off: 0,
         };
         eprintln!("{}", vitaslop_transpiler::dump_func(&program, func).unwrap_or_default());
     }

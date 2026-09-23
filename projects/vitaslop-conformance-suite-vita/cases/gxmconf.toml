@@ -1,0 +1,68 @@
+category = "vita"
+description = "GXM pipeline-state conformance: one offscreen scene per feature, each asserted as a rectangle - RUNNABLE"
+
+# Source: ../gxmconf-src/gxmconf.c (clean-room, MIT vita-headers, -nostdlib, placeholder
+# shaders). A real Vita executable that drives libgxm through EIGHT offscreen scenes, one
+# per pipeline feature, each drawing axis-aligned NDC quads so that what should appear is
+# a statement about a RECTANGLE - which the harness asserts with no reference image, no
+# golden capture and no tolerance on the geometry.
+#
+#   scene 0  BASELINE           one full-viewport quad; every pixel painted
+#   scene 1  REGION CLIP        the same quad clipped to the left half
+#   scene 2  ABOVE THE VIEWPORT a quad entirely past y = +1; NOTHING painted
+#   scene 3  DEPTH TEST         a far quad, then a near quad over its right half
+#   scene 4  ALPHA BLEND        opaque, then half-alpha over the right half, via
+#                               a real SceGxmBlendInfo on the fragment program
+#   scene 5  VIEWPORT           the full quad through a half-width viewport
+#   scene 6  VIEWPORT + CLIP    both at once over DIFFERENT rectangles - viewport
+#                               the left half, clip the top half - so only the
+#                               top-left QUARTER may paint. A renderer that
+#                               implements one bound and drops the other on the
+#                               same draw passes scenes 1 and 5 and fails here.
+#   scene 7  STENCIL MASK       a NEVER quad whose stencil FAIL op REPLACEs bit 0
+#                               over the bottom-right quarter (no colour), then a
+#                               full-viewport EQUAL ref=1 mask=0x1 fill - only the
+#                               bottom-right QUARTER may paint. A football title's
+#                               HUD, whose masked quads all painted whole (white
+#                               boxes over the scoreboard) before stencil existed.
+#                               Asserted on BOTH backends.
+#
+# WHY IT EXISTS BESIDE THE SHADER CONFORMANCE SUITE. That suite
+# (vitaslop-gxp-shader/tests/conformance.rs) authors USSE programs and checks that the
+# shader the GPU runs computes what the program MEANS. It says nothing about the state
+# machine AROUND the shader - which pixels a draw may touch, what the depth test does,
+# how the result is combined with what is there - and each of those has cost a
+# title-level debugging session:
+#
+#   * a fighting title's main screen rendered grey because a REGION CLIP set for a
+#     128x128 atlas was still in force for the frame buffer, and it FIT (scene 1);
+#   * a football title's stadium crowd rasterised nothing for three sessions - 23 draws
+#     and 59,202 indices a frame - with the sampler, the alpha test, the depth test and
+#     the geometry each measured and refused in turn, before a position probe showed the
+#     vertices were simply above the top of the screen (scene 2).
+#
+# WHY THE SHADERS ARE PLACEHOLDERS, AND WHY THAT IS RIGHT HERE. Same blob-free stance as
+# cube.c and gxmtri.c: the draws need no shader reflection (NDC vertices, no uniform
+# buffer), so the capture recovers each one from the app-declared vertex ATTRIBUTES and
+# the vertex/index streams. That is not a shortcut - a container this project WROTE would
+# be read back through this project's own reading of the format, so the test would agree
+# with itself. With no blob in the path, everything these scenes assert comes from real
+# vita-headers API calls and nothing else.
+#
+# Executable form: vitaslop-conformance-harness/tests/vita_gxmconf.rs - one test per
+# scene, plus one that requires the wgpu renderer and the software oracle to agree on
+# every scene within a mean-abs-diff of 6.
+#
+# WHAT THIS APP HAS ACTUALLY CAUGHT, so the next reader knows what it is for. Two REAL
+# gaps: the guest VIEWPORT was not applied on the software rasteriser or on the GPU's
+# fixed-function arm (scene 5, both backends at once), which no single title could show
+# because a title setting a fullscreen viewport and a title setting none are both
+# unaffected. And two rounds of FALSE ones, both the same shape - an aliased buffer read
+# as a renderer defect: first the app's own single vertex buffer refilled per scene, then
+# the harness driving all seven scenes through ONE renderer, whose kept per-target image
+# composited them (a render target LOADS across frames, deliberately). Each round
+# reported four and then two clipping gaps that did not exist. A picture cannot tell "the
+# app did not issue it" from "the renderer ignored it" - which is why
+# `what_the_capture_holds_per_scene` prints the captured state, `shape` prints WHERE each
+# backend painted, and the harness installs a tracing subscriber so the renderer's own
+# per-draw viewport/scissor trace is visible at all.

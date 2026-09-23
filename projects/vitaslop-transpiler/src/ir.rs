@@ -168,6 +168,10 @@ pub enum NeonStmt {
     /// Widening multiply[-accumulate]: `dst(Q) = [dst -/+] widen(a(D)) * widen(b(D))`
     /// (`vmull`/`vmlal`/`vmlsl`). `acc` enables the accumulate, `sub` its sign.
     WideMul { acc: bool, sub: bool, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// `vmull`/`vmlal`/`vmlsl` by a scalar lane: the widening product of `a` and
+    /// `broadcast(D[src].lane)`, [accumulated into `dst`]. A football title's texture
+    /// filter kernel is `vmlal.s16 q11, d3, d2[0]` in its inner loop.
+    WideMulScalar { acc: bool, sub: bool, ty: NeonType, dst: NeonReg, a: NeonReg, src: u8, lane: u8 },
     /// Widening absolute difference[-accumulate]: `dst(Q) = [dst +] |widen(a) - widen(b)|`
     /// (`vabdl`/`vabal`). `acc` enables the accumulate. `ty` is the narrow element.
     WideAbd { acc: bool, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
@@ -206,7 +210,11 @@ pub enum NeonStmt {
     /// Vector convert between f32 and 32-bit integer lanes (`vcvt`). `to_int` picks
     /// the direction (f32->int when true, int->f32 when false); `signed` picks the
     /// integer signedness. Float->int rounds toward zero (saturating).
-    CvtFloatInt { to_int: bool, signed: bool, dst: NeonReg, src: NeonReg },
+    /// `vcvt` between f32 and s32/u32 lanes. `frac` is the FIXED-POINT fractional bit
+    /// count of the integer side (0 for the plain integer form): the value is scaled by
+    /// `2^frac` on the way to fixed point and by `2^-frac` on the way back, which is the
+    /// whole difference between `vcvt.s32.f32 q0,q0` and `vcvt.s32.f32 q0,q0,#16`.
+    CvtFloatInt { to_int: bool, signed: bool, frac: u32, dst: NeonReg, src: NeonReg },
     /// Vector compare (`vceq`/`vcgt`/`vcge`): each `dst` lane is all-ones when the
     /// relation holds and zero otherwise, matching wasm SIMD compare semantics.
     /// `ty.float`/`ty.signed`/`ty.bits` select the lane type.

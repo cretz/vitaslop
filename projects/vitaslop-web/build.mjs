@@ -55,3 +55,28 @@ console.log(`Running wasm-bindgen -> ${out}`);
 run("wasm-bindgen", ["--target", "web", "--out-dir", out, "--out-name", "vitaslop_web", wasm]);
 
 console.log("Done. Serve projects/vitaslop-web/web over HTTP and open the page.");
+
+// >>> THE BUNDLE STAMPS ITSELF, so a diagnostic taken on a phone says WHICH BUILD produced it.
+//
+// This was written after a night's three separate renderer fixes all read as "still broken" in a
+// phone dump, and nothing in that dump could say whether the device had actually loaded the
+// bundle those fixes were in. A stale service-worker copy, a cached wasm, a page left open from
+// before the rebuild, or simply the wrong host all produce the same evidence as a fix that did
+// not work - and the second reading is the expensive one, because it sends a night at the wrong
+// problem. The stamp is written HERE, beside the wasm-bindgen output, so it cannot drift from
+// the bytes it names: whatever wrote `vitaslop_web_bg.wasm` wrote this in the same breath.
+{
+  const { writeFileSync, statSync } = await import("node:fs");
+  const git = (args) => {
+    const r = spawnSync("git", args, { cwd: projects, encoding: "utf8" });
+    return r.status === 0 ? r.stdout.trim() : "?";
+  };
+  const rev = git(["rev-parse", "--short", "HEAD"]);
+  const dirty = git(["status", "--porcelain"]).split("\n").filter((l) => l.trim()).length;
+  const wasmBytes = statSync(join(out, "vitaslop_web_bg.wasm")).size;
+  const stamp =
+    `${new Date().toISOString()} ${profile} ${rev}` +
+    `${dirty ? `+${dirty}dirty` : ""} ${wasmBytes} bytes`;
+  writeFileSync(join(out, "build-stamp.txt"), stamp + "\n");
+  console.log(`build stamp: ${stamp}`);
+}

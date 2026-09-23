@@ -202,6 +202,27 @@ pub fn report_fatal(text: &str) {
     }
 }
 
+/// Say - once per address - that a deferred render-target write-back was DROPPED because the
+/// guest had unmapped its destination before the readback landed.
+///
+/// At `warn`, unconditionally, because both readings matter and they need opposite fixes: a
+/// target a CPU-reading title still wants has silently lost its pixels, and a target it does
+/// not is one we were about to corrupt. Counting rather than repeating - a pooled target cycles
+/// through many addresses and one line each is the index, not a flood.
+pub fn report_writeback_into_unmapped(addr: u32, w: u32, h: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(addr) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        "gxm rtt writeback: DROPPED the readback of {addr:#010x} ({w}x{h}) - the guest had          `sceGxmUnmapMemory`d that memory before the copy landed, so those bytes are no longer          a render target and writing pixels over them would corrupt whatever the allocator has          since put there. A title that reads this target on the CPU loses this frame's pixels."
+    );
+}
+
 /// The default filter when `VITASLOP_LOG` is unset: warnings and errors only.
 ///
 /// A player's browser should be quiet. Everything below `warn` here is diagnostic - the

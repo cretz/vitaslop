@@ -187,6 +187,7 @@ impl Scheduler {
             discover_code_pointers: true,
             // The single-worker scheduler is one instance with its own memory.
             import_memory: false,
+            host_off: 0,
         })?;
         wasmparser::validate(&artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;

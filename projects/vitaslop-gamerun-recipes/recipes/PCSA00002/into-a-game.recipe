@@ -1,0 +1,163 @@
+@title  PCSA00002 - boot, walk the front end, and reach a LIVE GAME
+@game   PCSA00002
+@shot-every 200
+
+# WHAT THIS RECIPE IS FOR
+# ----------------------
+# The GAMEPLAY recipe for this title. `boot-user-settings.recipe` beside it stops at the
+# first interactive screen and exercises only the boot path; this one carries on through
+# the title screen, the mode list and the stadium options and arrives at a LIVE GAME.
+#
+# LIVE GAMEPLAY IS FRAMES 11700-11800. The frame at f011800 is a wide shot of the field
+# with the batter up: 8 scenes / ~681 draws, the world pass, the three 128x128 probe
+# atlases, the jumbotron boards and the HUD. That is the frame every render question about
+# this title is asked at, so keep it reachable.
+#
+# HOW THE TITLE SCREEN IS DISMISSED, because it is not a button
+# -------------------------------------------------------------
+# This title's title screen wants a TOUCH, not a press, and it does not say where. The
+# sweep at 2200-2356 walks a row of touch points across y=560 in both directions, which
+# hits whatever the live rectangle is without anyone having to know it. Do not "tidy" it
+# into a single touch: the coordinates have never been confirmed, and a single point that
+# misses leaves the run sitting on the title screen with a plausible-looking log.
+#
+# RUNNING IT WITHOUT PAYING FOR 11,810 RENDERED FRAMES
+# ---------------------------------------------------
+# Rendering is what costs. `VITASLOP_HEADLESS_SHOT_FROM/TO` bound the window that is
+# rendered at all, so
+#
+#   VITASLOP_HEADLESS_FRAMES=11810 SHOT_FROM=11700 SHOT_TO=11800 SHOT_EVERY=20
+#
+# is about a minute against fifteen, and the composition at f011800 is IDENTICAL to the
+# full replay's. What a narrow window CAN change is a target painted once long before it
+# and sampled during it - so read a picture from a windowed run against ANOTHER windowed
+# run, never against a full replay. `working-area/mlbfast.sh` is that rig.
+#
+# There is deliberately no @sig: this has never been run twice on one build to see whether
+# it folds the same number, and a pinned signature nobody has confirmed is a test that
+# fails for the wrong reason.
+
+0: @section boot
+1900: @section accept-user-settings
+1900: cross
+1910:
+2100: @section title-screen
+2200: touch=400,560
+2203: touch=470,560
+2206: touch=540,560
+2209: touch=610,560
+2212: touch=680,560
+2215: touch=750,560
+2218: touch=820,560
+2221: touch=890,560
+2224: touch=960,560
+2227: touch=1030,560
+2230: touch=1100,560
+2233: touch=1170,560
+2236: touch=1240,560
+2239: touch=1310,560
+2242: touch=1380,560
+2245: touch=1450,560
+2248:
+2308: touch=1500,560
+2311: touch=1430,560
+2314: touch=1360,560
+2317: touch=1290,560
+2320: touch=1220,560
+2323: touch=1150,560
+2326: touch=1080,560
+2329: touch=1010,560
+2332: touch=940,560
+2335: touch=870,560
+2338: touch=800,560
+2341: touch=730,560
+2344: touch=660,560
+2347: touch=590,560
+2350: touch=520,560
+2353: touch=450,560
+2356:
+3200: cross
+3210:
+3500: cross
+3510:
+3800: start
+3810:
+4500: @section game-modes
+4500: cross
+4510:
+4800: cross
+4810:
+5100: cross
+5110:
+5400: cross
+5410:
+5700: cross
+5710:
+6000: cross
+6010:
+6300: cross
+6310:
+6600: cross
+6610:
+6900: cross
+6910:
+7200: cross
+7210:
+7500: cross
+7510:
+7800: cross
+7810:
+8100: cross
+8110:
+8400: cross
+8410:
+9200: @section stadium-options
+9200: down
+9210:
+9260: down
+9270:
+9320: down
+9330:
+9380: cross
+9390:
+9780: @section into-the-game
+9780: cross
+9790:
+10180: cross
+10190:
+10580: cross
+10590:
+10980: cross
+10990:
+11380: cross
+11390:
+11780: cross
+11790:
+12180: cross
+12190:
+12580: cross
+12590:
+12980: cross
+12990:
+13380: cross
+13390:
+13780: cross
+13790:
+14180: cross
+14190:
+14580: cross
+14590:
+14980: cross
+14990:
+15380: cross
+15390:
+15780: cross
+15790:
+16180: cross
+16190:
+16580: cross
+16590:
+16980: cross
+16990:
+17380: cross
+17390:

@@ -295,6 +295,9 @@ pub(super) enum DialogFamily {
     /// reports zero for the same reason), so it opens and closes with nobody chosen. Same
     /// shape as [`DialogFamily::NpProfile`], which needs the same two absent things.
     NpFriendList = 10,
+    /// The camera picker - "take a picture for your player". There is no camera here, so
+    /// it opens and closes with nothing captured, the same shape as the photo picker.
+    CameraImport = 11,
 }
 
 /// `SceImeDialogButton`: which button dismissed the text-entry dialog.
@@ -392,6 +395,19 @@ pub(super) fn rtc_get_current_tick(ctx: &mut GuestCtx, st: &mut VitaState, tick:
         ctx.write_u32(tick.addr() + 4, (t >> 32) as u32);
     }
     0
+}
+
+/// SceUInt64 sceRtcGetAccumulativeTime(void)
+///
+/// The PSP-era form of [`rtc_get_current_tick`]: the same microsecond tick, but RETURNED as a
+/// 64-bit value in r0:r1 instead of written through a pointer. A sports title's engine reads
+/// it at boot as its time base; the `#[hostcall]` macro cannot express a 64-bit return, so it
+/// is marshalled by hand like `sceIoLseek`. There is no argument to validate and no failure
+/// path, so nothing but the two halves is written.
+pub(super) fn rtc_get_accumulative_time(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let t = RTC_UNIX_EPOCH_TICKS + st.guest_wall_us();
+    ctx.regs[0] = t as u32;
+    ctx.regs[1] = (t >> 32) as u32;
 }
 
 /// Which of this module's NIDs the transpiler may emit INLINE.
@@ -1175,6 +1191,7 @@ pub(super) fn shared_fb_end(ctx: &mut GuestCtx, st: &mut VitaState) {
             // The guest drew the buffer that was NOT on screen; show it and swap.
             let drawn = if cur == 0 { base + SHARED_FB_BYTES } else { base };
             st.shared_fb = Some((u, base, cur ^ 1));
+            st.resolve_deferred_geometry(ctx);
             st.present(drawn);
             // The shared framebuffer's End is the title's flip: pace it to the scanout
             // exactly as `sceGxmDisplayQueueAddEntry` does (see `pace_flip`), which is

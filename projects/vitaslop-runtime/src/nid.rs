@@ -51,6 +51,14 @@ pub mod gxm {
     pub const PROGRAM_CHECK: u32 = 0xED8B_6C69;
     pub const SHADER_PATCHER_REGISTER_PROGRAM: u32 = 0x2B52_8462;
     pub const SHADER_PATCHER_UNREGISTER_PROGRAM: u32 = 0xF103_AF8A;
+    /// The same teardown, with the patcher's "this program is still referenced" check
+    /// skipped: a title that drops a whole shader set at once uses it so it need not
+    /// release every derived program first. Nothing here reference-counts registrations,
+    /// so it is exactly the unforced form.
+    pub const SHADER_PATCHER_FORCE_UNREGISTER_PROGRAM: u32 = 0x630D_4B2E;
+    /// The TRANSFER ENGINE: a fixed-function rectangle move with no scene and no shader.
+    pub const TRANSFER_COPY: u32 = 0x6231_2BF8;
+    pub const TRANSFER_DOWNSCALE: u32 = 0xD10F_7EAD;
     pub const SHADER_PATCHER_CREATE_VERTEX_PROGRAM: u32 = 0xB7BB_A6D5;
     pub const SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM: u32 = 0x4ED2_E49D;
     pub const SHADER_PATCHER_RELEASE_VERTEX_PROGRAM: u32 = 0xAC1F_F2DA;
@@ -70,6 +78,8 @@ pub mod gxm {
     pub const PROGRAM_PARAMETER_GET_CONTAINER_INDEX: u32 = 0xBB58_267D;
     pub const PROGRAM_PARAMETER_GET_ARRAY_SIZE: u32 = 0xDBA8_D061;
     pub const PROGRAM_PARAMETER_GET_NAME: u32 = 0x6AF8_8A5D;
+    pub const PROGRAM_PARAMETER_IS_REG_FORMAT: u32 = 0x871E_5009;
+    pub const PROGRAM_PARAMETER_GET_INDEX: u32 = 0x6E61_DDF5;
     pub const BEGIN_SCENE: u32 = 0x8734_FF4E;
     pub const END_SCENE: u32 = 0xFE30_0E2F;
     pub const SET_VERTEX_PROGRAM: u32 = 0x31FF_8ABD;
@@ -213,6 +223,19 @@ pub mod gxm {
     pub const NOTIFICATION_WAIT: u32 = 0x9F44_8E79;
     // Vertex-stage texture bind, cube-arbitrary init, paletted textures.
     pub const SET_VERTEX_TEXTURE: u32 = 0x16C9_D339;
+    /// `sceGxmSetVertexTexture` under its PUBLIC NID (a football title imports this one;
+    /// `_sceGxmSetVertexTexture` above is the underscored export). Same handler.
+    pub const SET_VERTEX_TEXTURE_PUBLIC: u32 = 0x9EB4_380F;
+    /// `sceGxmShaderPatcherGet{Buffer,VertexUsse,FragmentUsse}MemAllocated(patcher,
+    /// unsigned int *out)`: how much of the patcher's pools is in use. This patcher
+    /// allocates nothing from the guest's pools, so zero is its truthful answer.
+    pub const SHADER_PATCHER_GET_BUFFER_MEM_ALLOCATED: u32 = 0xC694_D039;
+    pub const SHADER_PATCHER_GET_VERTEX_USSE_MEM_ALLOCATED: u32 = 0x7D2F_83C1;
+    pub const SHADER_PATCHER_GET_FRAGMENT_USSE_MEM_ALLOCATED: u32 = 0x3C9D_DB4A;
+    /// `sceGxmTransferFinish(void)`: wait for every transfer-unit job. `sceGxmTransferCopy`
+    /// / `Downscale` are NOT implemented (a call is a hard failure that names it), so there
+    /// is never a job to wait for and 0 is exact.
+    pub const TRANSFER_FINISH: u32 = 0x4522_9C39;
     pub const TEXTURE_INIT_CUBE_ARBITRARY: u32 = 0xE3DF_5E3B;
     pub const TEXTURE_SET_PALETTE: u32 = 0xDD6A_ABFA;
     pub const TEXTURE_GET_PALETTE: u32 = 0x0D18_9C30;
@@ -347,6 +370,7 @@ pub mod libkernel {
     // Thread and semaphore introspection.
     pub const GET_THREAD_INFO: u32 = 0x8D9C_5461;
     pub const GET_SEMA_INFO: u32 = 0x595D_3FA6;
+    pub const GET_MUTEX_INFO: u32 = 0x9A6C_43CA;
     // Per-thread signals (sceKernelSendSignal's counterpart).
     pub const WAIT_SIGNAL: u32 = 0xADCA_94E5;
     // Callback-processing variants of the blocking waits. Same wait, plus a point at
@@ -443,6 +467,7 @@ pub mod net {
     pub const RESOLVER_START_NTOA: u32 = 0x1EB1_1857;
     pub const RESOLVER_START_ATON: u32 = 0x0424_AE26;
     pub const RESOLVER_GET_ERROR: u32 = 0x874E_F500;
+    pub const RESOLVER_ABORT: u32 = 0x38EB_BD57;
     pub const EPOLL_CREATE: u32 = 0xF9D1_02AE;
     pub const EPOLL_DESTROY: u32 = 0x7915_CAF3;
     pub const EPOLL_CONTROL: u32 = 0x4C87_64AC;
@@ -614,6 +639,9 @@ pub mod services {
     pub const RTC_GET_CURRENT_CLOCK: u32 = 0x70FD_E8F1;
     pub const RTC_GET_CURRENT_CLOCK_LOCAL_TIME: u32 = 0x0572_EDDC;
     pub const RTC_GET_CURRENT_TICK: u32 = 0x23F7_9274;
+    /// `sceRtcGetAccumulativeTime`: the current tick returned as a 64-bit VALUE in r0:r1,
+    /// no pointer - the PSP-era form of `RTC_GET_CURRENT_TICK`, same unit and epoch.
+    pub const RTC_GET_ACCUMULATIVE_TIME: u32 = 0x258B_E8EC;
     /// `sceRtcGetTickResolution`: ticks per second in the unit every other SceRtc
     /// entry point speaks. Ours must agree with what `RTC_GET_CURRENT_TICK` writes.
     pub const RTC_GET_TICK_RESOLUTION: u32 = 0x8113_13B3;
@@ -763,6 +791,12 @@ pub mod services {
     pub const PHOTO_IMPORT_DIALOG_GET_STATUS: u32 = 0x0322_06D8;
     pub const PHOTO_IMPORT_DIALOG_GET_RESULT: u32 = 0xD855_414C;
     pub const PHOTO_IMPORT_DIALOG_TERM: u32 = 0x7FE5_BD77;
+    /// `sceCameraImportDialog{Init,GetStatus,GetResult,Term}`: a football title opens the
+    /// camera picker at boot to offer a face capture.
+    pub const CAMERA_IMPORT_DIALOG_INIT: u32 = 0xE525_BDB0;
+    pub const CAMERA_IMPORT_DIALOG_GET_STATUS: u32 = 0x86AE_7314;
+    pub const CAMERA_IMPORT_DIALOG_GET_RESULT: u32 = 0x7B33_9AA2;
+    pub const CAMERA_IMPORT_DIALOG_TERM: u32 = 0x8ED0_C83C;
     pub const NET_CHECK_DIALOG_INIT: u32 = 0xA38A_4A0D;
     pub const NET_CHECK_DIALOG_GET_STATUS: u32 = 0x8027_292A;
     pub const NET_CHECK_DIALOG_GET_RESULT: u32 = 0xB05F_CE9E;
@@ -1177,6 +1211,10 @@ pub mod threadmgr {
     /// `int sceKernelStartTimer(SceUID timerId)`: begin counting. A timer is created
     /// stopped, so a title that never calls this must read a count of zero.
     pub const START_TIMER: u32 = 0x4809_1E0C;
+    /// `SceUInt64 sceKernelGetTimerTimeWide(SceUID timerId)`: the count in microseconds
+    /// RETURNED as a 64-bit value in r0:r1, not written through a pointer. A football
+    /// title reads its frame timer this way at boot.
+    pub const GET_TIMER_TIME_WIDE: u32 = 0x3EFD_3165;
     /// `int sceKernelStopTimer(SceUID timerId)`: stop counting, banking what it counted.
     /// `int sceKernelDeleteTimer(SceUID timerId)`: release the uid.
     ///
@@ -1288,6 +1326,10 @@ pub mod sync {
     pub const WAIT_SEMA: u32 = 0x0C7B_834B;
     pub const SIGNAL_SEMA: u32 = 0xE6B7_61D1;
     pub const DELETE_SEMA: u32 = 0xDB32_948A;
+    /// `int sceKernelCancelSema(SceUID semaId, int setCount, int *numWaitThreads)`: reset
+    /// the count (`setCount` < 0 means the initial count) and release every waiter with
+    /// `SCE_KERNEL_ERROR_WAIT_CANCEL`.
+    pub const CANCEL_SEMA: u32 = 0x66D6_BF05;
     /// The virtual timer family. A timer is a stopwatch the guest starts, stops and
     /// reads; the two spellings below are the SceLibKernel ones, and `SceThreadmgr`
     /// exports its own NIDs for `Open` and `Start` (see [`super::threadmgr`]).
@@ -1374,6 +1416,7 @@ pub mod ngs {
     pub const VOICE_KILL: u32 = 0x0E29_1AAD;
     pub const VOICE_INIT: u32 = 0x1DDB_EBEB;
     pub const VOICE_GET_INFO: u32 = 0x5551_410D;
+    pub const VOICE_GET_OUTPUT_PATCH: u32 = 0x01A5_2E3A;
     pub const RACK_RELEASE: u32 = 0xDD5C_A10B;
     pub const VOICE_DEF_GET_COMPRESSOR_BUSS: u32 = 0x0E0A_CB68;
     pub const VOICE_DEF_GET_DELAY_BUSS: u32 = 0x4D70_5E3E;
@@ -1563,6 +1606,7 @@ pub fn name(func_nid: u32) -> &'static str {
         ng::VOICE_KILL => "sceNgsVoiceKill",
         ng::VOICE_INIT => "sceNgsVoiceInit",
         ng::VOICE_GET_INFO => "sceNgsVoiceGetInfo",
+        ng::VOICE_GET_OUTPUT_PATCH => "sceNgsVoiceGetOutputPatch",
         ng::RACK_RELEASE => "sceNgsRackRelease",
         ng::VOICE_DEF_GET_COMPRESSOR_BUSS => "sceNgsVoiceDefGetCompressorBuss",
         ng::VOICE_DEF_GET_DELAY_BUSS => "sceNgsVoiceDefGetDelayBuss",
@@ -1606,6 +1650,9 @@ pub fn name(func_nid: u32) -> &'static str {
         g::PROGRAM_CHECK => "sceGxmProgramCheck",
         g::SHADER_PATCHER_REGISTER_PROGRAM => "sceGxmShaderPatcherRegisterProgram",
         g::SHADER_PATCHER_UNREGISTER_PROGRAM => "sceGxmShaderPatcherUnregisterProgram",
+        g::SHADER_PATCHER_FORCE_UNREGISTER_PROGRAM => "sceGxmShaderPatcherForceUnregisterProgram",
+        g::TRANSFER_COPY => "sceGxmTransferCopy",
+        g::TRANSFER_DOWNSCALE => "sceGxmTransferDownscale",
         g::SHADER_PATCHER_CREATE_VERTEX_PROGRAM => "sceGxmShaderPatcherCreateVertexProgram",
         g::SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM => "sceGxmShaderPatcherCreateFragmentProgram",
         g::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM => "sceGxmShaderPatcherReleaseVertexProgram",
@@ -1619,6 +1666,8 @@ pub fn name(func_nid: u32) -> &'static str {
         g::PROGRAM_GET_PARAMETER => "sceGxmProgramGetParameter",
         g::PROGRAM_PARAMETER_GET_CATEGORY => "sceGxmProgramParameterGetCategory",
         g::PROGRAM_PARAMETER_GET_TYPE => "sceGxmProgramParameterGetType",
+        g::PROGRAM_PARAMETER_IS_REG_FORMAT => "sceGxmProgramParameterIsRegFormat",
+        g::PROGRAM_PARAMETER_GET_INDEX => "sceGxmProgramParameterGetIndex",
         g::PROGRAM_PARAMETER_GET_COMPONENT_COUNT => "sceGxmProgramParameterGetComponentCount",
         g::PROGRAM_PARAMETER_GET_CONTAINER_INDEX => "sceGxmProgramParameterGetContainerIndex",
         g::PROGRAM_PARAMETER_GET_ARRAY_SIZE => "sceGxmProgramParameterGetArraySize",
@@ -1780,6 +1829,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_BASIC_GET_FRIEND_LIST_ENTRY_COUNT => "sceNpBasicGetFriendListEntryCount",
         sv::RTC_GET_CURRENT_CLOCK => "sceRtcGetCurrentClock",
         sv::RTC_GET_CURRENT_TICK => "sceRtcGetCurrentTick",
+        sv::RTC_GET_ACCUMULATIVE_TIME => "sceRtcGetAccumulativeTime",
         sv::RTC_GET_TICK_RESOLUTION => "sceRtcGetTickResolution",
         sv::RTC_SET_TIME64_T => "sceRtcSetTime64_t",
         sv::APPUTIL_SAVEDATA_DATA_REMOVE => "sceAppUtilSaveDataDataRemove",
@@ -1995,6 +2045,7 @@ pub fn name(func_nid: u32) -> &'static str {
         tm::OPEN_TIMER => "sceKernelOpenTimer",
         tm::DELETE_TIMER => "sceKernelDeleteTimer",
         tm::START_TIMER => "sceKernelStartTimer",
+        tm::GET_TIMER_TIME_WIDE => "sceKernelGetTimerTimeWide",
         tm::STOP_TIMER => "sceKernelStopTimer",
         tm::DELAY_THREAD => "sceKernelDelayThread",
         tm::DELETE_MSG_PIPE => "sceKernelDeleteMsgPipe",
@@ -2012,6 +2063,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sy::WAIT_SEMA => "sceKernelWaitSema",
         sy::SIGNAL_SEMA => "sceKernelSignalSema",
         sy::DELETE_SEMA => "sceKernelDeleteSema",
+        sy::CANCEL_SEMA => "sceKernelCancelSema",
         sy::CREATE_TIMER => "sceKernelCreateTimer",
         sy::GET_TIMER_TIME => "sceKernelGetTimerTime",
         sy::CREATE_EVENT_FLAG => "sceKernelCreateEventFlag",
@@ -2119,6 +2171,11 @@ pub fn name(func_nid: u32) -> &'static str {
         g::RENDER_TARGET_GET_DRIVER_MEM_BLOCK => "sceGxmRenderTargetGetDriverMemBlock",
         g::NOTIFICATION_WAIT => "sceGxmNotificationWait",
         g::SET_VERTEX_TEXTURE => "_sceGxmSetVertexTexture",
+        g::SET_VERTEX_TEXTURE_PUBLIC => "sceGxmSetVertexTexture",
+        g::SHADER_PATCHER_GET_BUFFER_MEM_ALLOCATED => "sceGxmShaderPatcherGetBufferMemAllocated",
+        g::SHADER_PATCHER_GET_VERTEX_USSE_MEM_ALLOCATED => "sceGxmShaderPatcherGetVertexUsseMemAllocated",
+        g::SHADER_PATCHER_GET_FRAGMENT_USSE_MEM_ALLOCATED => "sceGxmShaderPatcherGetFragmentUsseMemAllocated",
+        g::TRANSFER_FINISH => "sceGxmTransferFinish",
         g::TEXTURE_INIT_CUBE_ARBITRARY => "sceGxmTextureInitCubeArbitrary",
         g::TEXTURE_SET_PALETTE => "sceGxmTextureSetPalette",
         g::TEXTURE_GET_PALETTE => "sceGxmTextureGetPalette",
@@ -2306,6 +2363,10 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::PHOTO_IMPORT_DIALOG_GET_STATUS => "scePhotoImportDialogGetStatus",
         sv::PHOTO_IMPORT_DIALOG_GET_RESULT => "scePhotoImportDialogGetResult",
         sv::PHOTO_IMPORT_DIALOG_TERM => "scePhotoImportDialogTerm",
+        sv::CAMERA_IMPORT_DIALOG_INIT => "sceCameraImportDialogInit",
+        sv::CAMERA_IMPORT_DIALOG_GET_STATUS => "sceCameraImportDialogGetStatus",
+        sv::CAMERA_IMPORT_DIALOG_GET_RESULT => "sceCameraImportDialogGetResult",
+        sv::CAMERA_IMPORT_DIALOG_TERM => "sceCameraImportDialogTerm",
         sv::MSG_DIALOG_GET_RESULT => "sceMsgDialogGetResult",
         sv::MSG_DIALOG_ABORT => "sceMsgDialogAbort",
         sv::MSG_DIALOG_TERM => "sceMsgDialogTerm",
@@ -2348,6 +2409,7 @@ pub fn name(func_nid: u32) -> &'static str {
         s::SET_GPO => "sceKernelSetGPO",
         lk::GET_THREAD_INFO => "sceKernelGetThreadInfo",
         lk::GET_SEMA_INFO => "sceKernelGetSemaInfo",
+        lk::GET_MUTEX_INFO => "sceKernelGetMutexInfo",
         lk::WAIT_SIGNAL => "sceKernelWaitSignal",
         lk::WAIT_SEMA_CB => "sceKernelWaitSemaCB",
         lk::WAIT_THREAD_END_CB => "sceKernelWaitThreadEndCB",

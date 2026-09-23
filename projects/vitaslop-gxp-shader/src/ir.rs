@@ -359,10 +359,85 @@ pub enum Op {
     /// group-0x15 IMAD32s read it back through their own `src0_high` bit - so this reads the
     /// pairs those two already agree on rather than introducing a third packing.
     ///
-    /// ONLY the 16-bit widths, for the same reason [`Op::PackUnorm8`] covers only U8: those are
-    /// the ones a packing already exists for. An 8-bit integer source would be a quarter of a
-    /// register and no part of this model carries that, so it stays blocked and named.
+    /// `bits` is the SOURCE width, 16 or 8.
+    ///
+    /// >>> THE 8-BIT WIDTH IS THE SAME RULE, NOT A SECOND ONE. A component selector always
+    /// names the c-th element of the source's stream starting at the operand's own register,
+    /// and the only thing the width changes is how many of them a register holds: four 16-bit
+    /// halves span TWO registers (`index + (sel >> 1)`, half `sel & 1`), four 8-bit BYTES fit
+    /// in ONE (`index`, byte `sel`). A football title's fragment secondaries establish it
+    /// directly - four consecutive `U8 -> F16` packs read selectors 0,1,2,3 off ONE `sa[36]`
+    /// and the primary stream then dots the four results against one sampled RGBA, which is
+    /// the title's own `EBR`/`EBG`/`EBB`/`EBA` parameters, declared `Uniform U8 comps 1` and
+    /// four to a register. A per-register reading would have made all four the same byte.
+    ///
+    /// This is a QUARTER of a register, which is the reason the width was refused - and the
+    /// model does carry that quarter: [`Self::source_packed_bytes`] already describes an
+    /// operand as four channels in one register for the `fx8` ops, and every span computation
+    /// asks it.
     PackFromInt { bits: u8, signed: bool },
+    /// LIMM (group 0xF8, `op2 = 100`, `opcat = 10`): `dest = <32-bit immediate>`.
+    ///
+    /// The value is a RAW 32-bit pattern, typed by whoever reads it - the corpus carries it
+    /// used both as an integer (`0x7FFFFFFF` selected into an INT32 conditional move) and as a
+    /// float (`0xCF000000`, i.e. `-2^31`, as the identity a running maximum starts from). So it
+    /// is stored through `Dest::store_raw` with no view applied, exactly as `Op::PackToInt`'s
+    /// result is.
+    ///
+    /// # The layout, and what would refute it
+    /// DESTINATION: bank `[33:32]` (the 2-bit selector every other group uses) plus number
+    /// `[27:21]`, UNDOUBLED - the ordinary seven-bit destination. Established by liveness over
+    /// every LIMM in a football title's corpus: a brute-force sweep of every 7-bit window in
+    /// the word, scored by whether the register it names is READ before anything overwrites it,
+    /// leaves `[27:21]` undoubled well clear of every rival (`limm_layout_candidates_by_liveness`).
+    /// Two closures pin it directly, one instruction apart in both cases:
+    ///   * `#45 LIMM number 5` then `#46 pa[0] = IntMad(pa[0], 16, pa[5])`. Five is ODD, so no
+    ///     doubled field can name it.
+    ///   * `#18 LIMM number 7` then `#19 VMOVCU8 ... ? pa[7] : pa[12]`, where `pa[12]` is the
+    ///     register the two `PackToInt16` instructions just above wrote. The whole triple only
+    ///     lines up with both operands undoubled.
+    ///
+    /// IMMEDIATE: three fields, `[20:0]` low, `[40:36]` next, `[48:44]` next, and bit 54 as the
+    /// TOP bit - which is what the ISA note means when it says the value is assembled from
+    /// three fields at positions that collide with the opcode discriminant. It is not fitted:
+    /// the corpus's three distinct immediates all come out canonical under it and under no
+    /// other split tried - `0x7FFFFFFF` (INT_MAX, selected into an integer move), `0xCF000000`
+    /// (`-2^31` as a float, broadcast to four registers and then used as the floor of a `>=`
+    /// running maximum), and `0x00010000` (65,536, added as a byte offset into a bound buffer
+    /// one instruction before the load that reads it).
+    ///
+    /// WHAT WOULD REFUTE IT: an immediate whose top bit is set where the value is plainly
+    /// meant to be positive, or any LIMM whose destination under this reading is written again
+    /// before it is read.
+    Limm { value: u32 },
+    /// VMOVCU8 (group 0x38, `move_type = 2`): a BYTE-WISE conditional move.
+    ///
+    /// `dest.byte[c] = test(src0.byte[c]) ? src1.byte[c] : src2.byte[c]` for each byte the
+    /// write mask names - the four mask bits are the four bytes of ONE register, not four
+    /// registers, and every operand is a raw lane read undoubled. See `decode_grp_38` for the
+    /// three one-instruction-apart closures in a football title's skinned vertex programs that
+    /// establish the channel count and the numbering, and why neither depends on the data type
+    /// field (nothing here is read through a float view).
+    ///
+    /// The sources are ordered `[src1, src2, src0]`, the same order [`Op::Cmov`] uses.
+    CmovU8 { test: CompareMethod },
+    /// VPCK whose SOURCE and DESTINATION are both 16-BIT INTEGERS with `scale` clear - a
+    /// same-width integer copy, which converts nothing at all. There is no numeric reading to
+    /// establish here and nothing to invent: the bits of the source half ARE the bits of the
+    /// destination half, and both ends already exist - the source is read exactly as
+    /// [`Op::PackFromInt`] reads one and the destination written exactly as [`Op::PackToInt`]'s
+    /// 16-bit form writes one (`crate::wgsl::Dest::store_raw_half`), so this introduces no
+    /// third packing.
+    ///
+    /// Signedness is not carried because at equal widths it cannot matter: the two's-complement
+    /// pattern is the same whichever way each end is labelled, and the sign is applied by
+    /// whoever later WIDENS the half ([`Op::PackFromInt`], the group-0x15 IMAD32s), not here.
+    ///
+    /// `bits` is that shared width - 16, or 8 for the BYTE form, which is the same statement
+    /// one element down: the source byte's bits are the destination byte's bits, read as
+    /// [`Op::PackFromInt`]'s 8-bit source reads one and written as [`Op::PackToInt`]'s 8-bit
+    /// destination writes one.
+    PackIntCopy { bits: u8 },
     /// VPCK converting between a FLOAT and a U8 with `scale` SET - the NORMALIZED
     /// conversion, where the byte range 0..255 maps onto 0.0..1.0. This is how a fragment
     /// program that computes in F16 writes an 8-bit-per-channel surface, and how it reads
@@ -427,7 +502,18 @@ pub enum Op {
     /// register and nothing else. `addend` is fixed instead by ARITHMETIC CLOSURE against the
     /// container's own parameter table - see the decoder - and any group-0x14 word that is not
     /// this exact encoding must hard-fail rather than inherit that assumption.
-    LoadIndex { addend: i32 },
+    /// `to_index` says WHERE the sum goes, and the two destinations are different instructions
+    /// wearing one opcode. Set: the INDEX REGISTER, for a later register-indirect read - the
+    /// form the particle title establishes and the one this doc paragraph describes. Clear: an
+    /// ORDINARY REGISTER named by the word itself, which is the form a football title's
+    /// skinning uses - `LoadIndex ; IntMad ; MemLoad`, where the IMAD32 reads that register as
+    /// its `src0` and turns the blend index into a byte offset into the matrix palette. The
+    /// two are told apart by the `(b8, b51)` flag; see `decode_grp_i16mad`.
+    /// `stride` is how far apart two consecutive INDEX values' blocks of rows are, in rows.
+    /// Meaningful only when `to_index` is clear; see `resolve_index_load_stride`, which reads it
+    /// off the program. 1 leaves the value `src + addend`, which is what an unresolved stream
+    /// decodes to.
+    LoadIndex { addend: i32, to_index: bool, stride: u8 },
     /// Texture sample (group 0xE0). `unit` is the GXM texture unit, which
     /// [`crate::usse::decode_shader`] resolves from the instruction's raw sampler-register
     /// field through the container's texture-control table; `coords` is the number of
@@ -532,6 +618,9 @@ impl Op {
                 | Op::Rcp | Op::Rsq | Op::Log | Op::Exp | Op::Mov | Op::Cmov { .. }
                 | Op::Nop | Op::Tex { .. } | Op::TexGather { .. }
                 | Op::Pack { .. } | Op::PackToInt { .. } | Op::PackFromInt { .. }
+                | Op::PackIntCopy { .. }
+                | Op::Limm { .. }
+                | Op::CmovU8 { .. }
                 | Op::PackUnorm8 { .. } | Op::CopyFx8
                 | Op::Bitwise { .. }
                 | Op::Sop2 { .. }
@@ -577,6 +666,9 @@ impl Op {
             Op::Pack { .. } => "pack",
             Op::PackToInt { .. } => "pack.int",
             Op::PackFromInt { .. } => "unpack.int",
+            Op::PackIntCopy { .. } => "pack.int.copy",
+            Op::Limm { .. } => "limm",
+            Op::CmovU8 { .. } => "cmov.u8",
             Op::PackUnorm8 { to_unorm8, .. } => {
                 if to_unorm8 {
                     "pack.unorm8"
@@ -593,7 +685,13 @@ impl Op {
                     "imad.step0"
                 }
             }
-            Op::LoadIndex { .. } => "loadidx",
+            Op::LoadIndex { to_index, .. } => {
+                if to_index {
+                    "loadidx"
+                } else {
+                    "idxadd"
+                }
+            }
             Op::MemLoad { .. } => "ldmem",
             Op::Bitwise { .. } => "bitwise",
             Op::Sop2 { .. } => "sop2.fx8",
@@ -636,6 +734,30 @@ pub struct Instr {
     pub blocked: Option<&'static str>,
 }
 
+/// >>> WHERE CHANNEL `c` OF A PACKED-ELEMENT DESTINATION LANDS: the register offset from the
+/// >>> destination's base register, and the bit shift within that register.
+///
+/// `bits` is the element width - 16 for a half pair, 8 for four bytes - and the rule is the
+/// obvious one: `32 / bits` elements per register, channels in order, low element first.
+///
+/// # Why this is a function and not four lines written out four times
+/// It WAS four lines written out four times, and the arithmetic is small enough that nobody
+/// looked at it twice: the emitter's `store_raw_half` and `store_raw_byte`, the reference's
+/// generic raw store, and the reference's `PackIntCopy` arm each carried its own copy. The
+/// session that found `PackToInt` placing a 16-bit result one whole register per channel
+/// cleared 69 corpus cases and stated in its own notes that the placement now had ONE
+/// statement - which was true of the width and not of the arithmetic. Three copies were still
+/// there, and an authored case for the partial write mask (the shape every corpus
+/// `PackIntCopy` actually carries, and which no case covered) is what made that visible.
+///
+/// A rule with one statement cannot drift; a rule with four copies drifts silently, because
+/// three of them agreeing is indistinguishable from all four being right.
+pub fn packed_dest_slot(bits: u32, c: u32) -> (u32, u32) {
+    debug_assert!(bits == 8 || bits == 16, "only the 8- and 16-bit packed widths land this way");
+    let per_reg = 32 / bits;
+    (c / per_reg, (c % per_reg) * bits)
+}
+
 impl Instr {
     /// True when the emitter can translate this instruction to WGSL today (operation is
     /// wired AND nothing about this instance is blocked).
@@ -659,7 +781,14 @@ impl Instr {
             // same way an F16 operand does - so the read maps that size a varying or a uniform
             // from this flag get the right span by reporting the packed width, not the
             // destination float's.
-            Op::PackFromInt { .. } => true,
+            // The 8-bit width is neither of the two this flag can say, and it is not a half
+            // pair: `source_packed_bytes` is what describes it, and reporting F16 here would
+            // size the read two registers wide where it is one.
+            Op::PackFromInt { bits, .. } => bits == 16,
+            // Both ends are 16-bit halves, so the packed width is the right span at both ends -
+            // the same reason the integer->float convert reports it. The byte form is packed
+            // bytes at both ends instead, and answers below.
+            Op::PackIntCopy { bits } => bits == 16,
             // The normalized U8 convert reads its source at the FLOAT precision only when the
             // float is the source; in the other direction the source is the packed byte
             // register, whose four channels live in one word and are read through
@@ -686,13 +815,122 @@ impl Instr {
     /// reading `pa[1]`, a register nothing in it names. Another title's version of the same
     /// shader survived only because it happened to allocate four.
     pub fn source_packed_bytes(&self) -> bool {
-        matches!(self.op, Op::CopyFx8 | Op::PackUnorm8 { to_unorm8: false, .. })
+        matches!(
+            self.op,
+            Op::CopyFx8
+                | Op::PackUnorm8 { to_unorm8: false, .. }
+                // The 8-bit VPCK widths are the same shape: four selectable BYTES in one
+                // register. Their `f32(byte)` is a numeric cast rather than `fx8`'s
+                // `byte/255`, but that is the VALUE, and this asks about the SPAN.
+                | Op::PackFromInt { bits: 8, .. }
+                | Op::PackIntCopy { bits: 8 }
+        )
+    }
+
+    /// The width in bits of the RAW element this instruction writes to each destination
+    /// CHANNEL, or `None` when a channel is a whole 32-bit lane.
+    ///
+    /// This is the DESTINATION half of the question [`Self::source_packed_bytes`] asks about a
+    /// source, and it exists because [`crate::wgsl::Prec`] cannot answer it: `Prec` describes a
+    /// FLOAT view, and a float->integer convert's destination is not a float at all. Reading
+    /// `half_precision` there returns `Prec::F32`, which places channel `c` in register
+    /// `index + c` - a whole register each.
+    ///
+    /// That is wrong, and the emitter has always known it: `emit_pack_to_int` writes a 16-bit
+    /// result through `store_raw_half` (`index + c/2`, half `c & 1`) and an 8-bit one through
+    /// `store_raw_byte` (`index`, byte `c`), because a whole-register store put a skinned
+    /// mesh's four blend indices in four registers where its four bone fetches look in two.
+    /// The reference interpreter's generic store path had no such rule and so disagreed with
+    /// the shipped shader on every program that reads a packed integer back - MEASURED as 22 of
+    /// the 33 corpus programs carrying an equal-width 16-bit repack, which is the instruction
+    /// that reads one back.
+    ///
+    /// Both of those callers read THIS function, so the placement has one statement. Note that
+    /// `Prec::F16` is not the answer for a 16-bit integer: its store re-encodes the value as an
+    /// f16 float, and what a pack leaves in the lane is a bit PATTERN.
+    pub fn dest_raw_packed_bits(&self) -> Option<u32> {
+        match self.op {
+            Op::PackToInt { bits: 16, .. } => Some(16),
+            Op::PackToInt { bits: 8, .. } => Some(8),
+            // The equal-width integer repacks write the same shapes, and say so HERE so that
+            // "which width does this instruction place at" has one answer too. They never
+            // reach the reference's generic store - each has its own arm, which reads this -
+            // so naming them changes no behaviour and removes a place to disagree.
+            Op::PackIntCopy { bits: 16 } => Some(16),
+            Op::PackIntCopy { bits: 8 } => Some(8),
+            // A byte-select moves one RAW BYTE per channel, four to a register.
+            Op::CmovU8 { .. } => Some(8),
+            _ => None,
+        }
     }
 
     /// True when the instruction's operation is known from the ISA (may not be emittable
     /// yet). Useful for coverage reporting - decode/classify is far ahead of emit.
     pub fn is_classified(&self) -> bool {
         self.op.is_classified()
+    }
+
+    /// The channels this instruction reads from its sources, mirroring the emitter's read
+    /// model ([`crate::wgsl`]): a dot reads a fixed component prefix, a texture sample reads
+    /// its coordinate prefix, a memory load reads ONE scalar address lane, a predicate-only
+    /// test reads the channels its reduction consults, and every other op reads a source
+    /// channel only where it writes the destination channel.
+    ///
+    /// This is the ONE answer. It used to be copied into the linker, the module extent scan
+    /// and the corpus checks, and the copies drifted: the extent scan's lacked the test cases
+    /// and a corpus check used the raw write mask, which is how 48 vertex programs read as
+    /// reading past their declared attributes when none of them does.
+    pub fn read_channels(&self) -> [bool; 4] {
+        match self.op {
+            Op::Dot { components } => {
+                let n = (components as usize).clamp(1, 4);
+                [0 < n, 1 < n, 2 < n, 3 < n]
+            }
+            Op::Tex { coords, .. } | Op::TexGather { coords, .. } => {
+                let n = (coords as usize).clamp(1, 4);
+                [0 < n, 1 < n, 2 < n, 3 < n]
+            }
+            // A memory load's only source is a scalar ADDRESS - one lane, whatever its
+            // destination spans. Its write mask is explicitly not meaningful (the written span
+            // is `elements` consecutive registers), so taking the mask as the read count claims
+            // the three registers ABOVE the pointer are read too. That is how a pointer sitting
+            // near the top of the SA bank made a program look like it read past its buffer.
+            Op::MemLoad { .. } => [true, false, false, false],
+            // A PREDICATE-ONLY test (`write_back = false`) has an all-false write mask, and
+            // taking the mask as the read set therefore says it reads NOTHING. It reads two
+            // operands and compares them; what it does not do is write a register. The channels
+            // are the ones the REDUCTION consults: one for `Channel(n)`, all four for an AND/OR
+            // over the vector.
+            Op::Test { reduce: TestReduce::Channel(n), .. } => {
+                let n = (n as usize).min(3);
+                [n == 0, n == 1, n == 2, n == 3]
+            }
+            Op::Test { .. } | Op::TestMask { .. } => [true; 4],
+            _ => self.write_mask,
+        }
+    }
+
+    /// The register `src`'s channel `c` reads, and which 16-bit HALVES of it, at this
+    /// instruction's own source precision - or `None` when the channel names no register
+    /// (a swizzle constant, selector >= 4).
+    ///
+    /// An F32 channel reads register `index + selector`; the four F16 channels share a
+    /// register PAIR (`index + selector/2`, one half each); a packed-byte operand keeps all
+    /// four channels in ONE register. The SELECTOR is what addresses, never the channel
+    /// ordinal - a source swizzled `[0,0,0,0]` reads one register four times, not four
+    /// consecutive ones.
+    pub fn source_register(&self, src: &Operand, c: usize) -> Option<(u32, std::ops::Range<usize>)> {
+        let sel = *src.swizzle.get(c)? as usize;
+        if sel > 3 {
+            return None; // a swizzle constant reads no register
+        }
+        Some(if self.source_packed_bytes() {
+            (u32::from(src.index), 0..2)
+        } else if self.source_half_precision() {
+            (u32::from(src.index) + (sel >> 1) as u32, (sel & 1)..(sel & 1) + 1)
+        } else {
+            (u32::from(src.index) + sel as u32, 0..2)
+        })
     }
 }
 
@@ -718,5 +956,130 @@ impl Shader {
     /// True when every instruction is emittable - the precondition for emitting WGSL.
     pub fn fully_supported(&self) -> bool {
         !self.instrs.is_empty() && self.instrs.iter().all(Instr::is_supported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instr(op: Op, write_mask: [bool; 4], srcs: Vec<Operand>, half: bool) -> Instr {
+        Instr {
+            op,
+            pred: Predicate::Always,
+            dest: Some(Operand::plain(Bank::Output, 0, 1)),
+            write_mask,
+            srcs,
+            half_precision: half,
+            raw: 0,
+            group: 0,
+            blocked: None,
+        }
+    }
+
+    /// A source channel is addressed by its SWIZZLE SELECTOR, never by its channel ordinal.
+    ///
+    /// This is the rule a corpus check got wrong by adding the ordinal, which made a source
+    /// swizzled `[0,0,0,0]` near the top of the bank look like it spanned four registers and
+    /// reported 43 vertex programs as reading past attributes they never leave. The emitter has
+    /// always addressed by selector (`wgsl::read_lane`), so the check was the half that was
+    /// wrong - and a broadcast operand is the commonest shape there is.
+    #[test]
+    fn a_source_channel_is_addressed_by_its_selector_not_its_ordinal() {
+        let mut broadcast = Operand::plain(Bank::PrimaryAttr, 10, 2);
+        broadcast.swizzle = [0, 0, 0, 0];
+        let i = instr(Op::Mad, [true, true, true, false], vec![broadcast], false);
+        for c in 0..3 {
+            assert_eq!(
+                i.source_register(&i.srcs[0], c).map(|(r, _)| r),
+                Some(10),
+                "channel {c} of a broadcast reads pa[10], not pa[10 + {c}]"
+            );
+        }
+    }
+
+    /// The three widths span differently, and the span is what decides whether a program reads
+    /// past its declared registers: an F32 channel is one register per selector, four F16
+    /// channels share a register PAIR, and a packed-byte operand is ONE register for all four.
+    #[test]
+    fn each_source_width_spans_its_own_number_of_registers() {
+        let plain = Operand::plain(Bank::PrimaryAttr, 4, 2);
+
+        let f32_ = instr(Op::Mad, [true; 4], vec![plain], false);
+        let regs: Vec<_> =
+            (0..4).filter_map(|c| f32_.source_register(&f32_.srcs[0], c).map(|(r, _)| r)).collect();
+        assert_eq!(regs, vec![4, 5, 6, 7], "an F32 operand is one register per selector");
+
+        let f16 = instr(Op::Mad, [true; 4], vec![plain], true);
+        let regs: Vec<_> =
+            (0..4).filter_map(|c| f16.source_register(&f16.srcs[0], c).map(|(r, _)| r)).collect();
+        assert_eq!(regs, vec![4, 4, 5, 5], "four F16 channels share a register pair");
+
+        let fx8 = instr(Op::CopyFx8, [true; 4], vec![plain], false);
+        let regs: Vec<_> =
+            (0..4).filter_map(|c| fx8.source_register(&fx8.srcs[0], c).map(|(r, _)| r)).collect();
+        assert_eq!(regs, vec![4, 4, 4, 4], "four bytes of ONE register");
+    }
+
+    /// A swizzle CONSTANT (selector 4..7 - the 0.0/1.0/2.0/0.5 literals) names no register, so
+    /// it must not contribute a read. Counting it would charge the operand's base register to
+    /// a channel that never touches the register file.
+    #[test]
+    fn a_swizzle_constant_reads_no_register() {
+        let mut lit = Operand::plain(Bank::PrimaryAttr, 4, 2);
+        lit.swizzle = [5, 4, 2, 7];
+        let i = instr(Op::Mad, [true; 4], vec![lit], false);
+        let regs: Vec<_> =
+            (0..4).map(|c| i.source_register(&i.srcs[0], c).map(|(r, _)| r)).collect();
+        assert_eq!(regs, vec![None, None, Some(6), None]);
+    }
+
+    /// A predicate-only test writes no channel, and its read set is the channels its REDUCTION
+    /// consults - not its (empty) write mask. Taking the mask says a comparison reads nothing,
+    /// which is how the registers a test reads became invisible to the code that has to route
+    /// them.
+    #[test]
+    fn a_predicate_only_test_reads_the_channels_its_reduction_consults() {
+        let src = Operand::plain(Bank::PrimaryAttr, 0, 2);
+        let chan = instr(
+            Op::Test {
+                alu: TestAlu::Sub,
+                cmp: TestCmp::Ne,
+                reduce: TestReduce::Channel(2),
+                pdst: 0,
+                write_back: false,
+            },
+            [false; 4],
+            vec![src],
+            false,
+        );
+        assert_eq!(chan.read_channels(), [false, false, true, false]);
+
+        let vector = instr(
+            Op::Test {
+                alu: TestAlu::Sub,
+                cmp: TestCmp::Ne,
+                reduce: TestReduce::AndAll,
+                pdst: 0,
+                write_back: false,
+            },
+            [false; 4],
+            vec![src],
+            false,
+        );
+        assert_eq!(vector.read_channels(), [true; 4]);
+    }
+
+    /// A memory load's one source is a scalar ADDRESS, whatever its destination spans. Reading
+    /// the write mask instead claims the three registers ABOVE the pointer are read too.
+    #[test]
+    fn a_memory_load_reads_one_address_lane() {
+        let i = instr(
+            Op::MemLoad { elements: 3, offset_bytes: 16 },
+            [true; 4],
+            vec![Operand::plain(Bank::PrimaryAttr, 4, 1)],
+            false,
+        );
+        assert_eq!(i.read_channels(), [true, false, false, false]);
     }
 }

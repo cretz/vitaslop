@@ -119,61 +119,167 @@ pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
                 .or_else(|| (!no_inline_mutex()).then(|| sync::inline_op(func_nid, preemptive)).flatten())
         })
         .or_else(|| (!no_inline_lwmutex()).then(|| lwsync::inline_op(func_nid)).flatten())
+        .or_else(|| (!no_inline_delay()).then(|| threadmgr::inline_op(func_nid)).flatten())
         .or_else(|| (!no_inline_stubs()).then(|| stub_inline_op(func_nid)).flatten())
 }
+
+/// `VITASLOP_NO_INLINE_DELAY`: route every `sceKernelDelayThread` through the host, leaving
+/// every other inline form on. The scoped A/B arm for the elided-yield form
+/// ([`vitaslop_transpiler::InlineOp::DelayYield`]), and the way to see every yield in the
+/// host-call histogram again - an inlined one never reaches the host.
+fn no_inline_delay() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_DELAY"))
+}
+
+// The NIDs whose `dispatch` arm is exactly `cont!(..)`, DERIVED from the dispatch table
+// itself by `build.rs`: `DISPATCH_CONT_ONLY`, `DISPATCH_CONT_ONLY_ARMS` and
+// `dispatch_arm_is_cont_only`. See that script for why the set is generated, not written.
+include!(concat!(env!("OUT_DIR"), "/dispatch_cont_only.rs"));
 
 /// Whether `func_nid`'s handler can only ever CONTINUE, so the transpiler may route the
 /// call through the non-suspending trap ([`vitaslop_transpiler::abi::IMPORT_FAST_NAME`]).
 ///
-/// # Why this list is written out rather than derived
-/// The admissibility test is the SHAPE of the dispatch arm: every NID here is dispatched
-/// as `cont!(handler(..))` in [`dispatch`], an unconditional `Continue` around a handler
-/// that returns nothing - so it cannot block, reschedule, flip or exit whatever the guest
-/// passes it. (`sceKernelTryLockLwMutex` is the one arm here that returns an outcome, and
-/// both of its paths are `Continue`: a contended try-lock fails rather than parks.) A
-/// handler that later grows a parking path must leave this list in the same edit; the
-/// browser turns a fast call that suspends into a loud run-ending error, never a thread
-/// left unparked.
+/// # This list is DERIVED, not written
+/// The admissibility test is the SHAPE of the dispatch arm: `cont!(handler(..))` in
+/// [`dispatch`] is an unconditional `Continue` around a handler that returns NOTHING, so it
+/// cannot block, reschedule, flip or exit whatever the guest passes it - a handler returning
+/// `()` has no channel through which to ask for a suspension, because the `SvcOutcome` IS
+/// that channel. `build.rs` reads that shape off `src/vita/mod.rs` and generates
+/// `dispatch_arm_is_cont_only`, so the fast set and the dispatch table cannot disagree.
 ///
-/// The list is the race's own host-call profile: draws and scene boundaries are ~90% of a
-/// retail race frame's calls, and the rest of it is the allocator, the mixer, the
-/// lightweight signal/unlock side of the title's thread handoffs, and input polling.
-/// `VITASLOP_NO_FAST_IMPORT=1` routes every call through the suspending trap again (the
-/// A/B arm).
+/// That closes the footgun the hand-written list documented and could not enforce: a handler
+/// that grows a parking path has to start returning its own `SvcOutcome`, which takes its arm
+/// out of the `cont!` shape, which takes it out of this set - one edit, mechanically. And it
+/// closes the other direction, which cost more: the written list named 23 NIDs drawn from ONE
+/// racing title's profile, while 684 arms (873 NIDs) qualify. On a device capture of a fighting title
+/// 318 of 456 host calls a frame took the suspending path; nearly all of them are `cont!`
+/// arms that no profile had ever put in front of anyone.
+///
+/// # What is NOT in the set, and why nothing has to be excluded by name
+/// Every handler that can park returns its outcome, so the shape test already refuses it:
+/// `sceGxmFinish` and `sceGxmNotificationWait` (a small target's completion parks the thread
+/// there in the browser - `VitaState::complete_scene_async`), `sceGxmDisplayQueueAddEntry` and
+/// `sceSharedFbEnd` (`Flip`), every wait (sema, cond, event flag, thread end, vblank,
+/// framebuffer), `sceKernelDelayThread`, the thread and process exits, the blocking IO reads,
+/// the fibers, and the audio/camera inputs. [`FAST_EXCLUDED`] exists for a handler that IS
+/// `cont!` yet must not be fast anyway; it is empty, and an entry there needs a named reason.
+///
+/// `sceGxmEndScene` is out for the same structural reason - its arm returns an `SvcOutcome` -
+/// and it is worth saying why that is still right now that the arm happens to return
+/// `Continue` on every path: the completion this area parks for has moved between EndScene
+/// and the guest's own GPU wait twice, and the arm shape is where that choice is expressed.
+///
+/// The one scheduler path that does NOT go through `SvcOutcome` is `VitaState::pending_early`
+/// (the browser drains it after a suspension). It is written in exactly one function,
+/// `gxm::complete_scenes_through`, reached only from those same three handlers - so it cannot
+/// be raised by anything the shape test admits. That is the whole argument for an empty
+/// exclusion list, and it is the thing to re-check if a new handler ever sets that field.
+///
+/// # Preemption, which is the one thing a fast call cannot do
+/// The fast trap cannot suspend, so a host-call quantum that expires on one only raises a flag
+/// for the next suspending call. That is not the browser's only preemption mechanism and never
+/// was: the transpiler emits a SOFTWARE FUEL counter on guest loop BACK EDGES, which is what
+/// reaches a loop making no suspending call at all (see `browser_sched::preempt_note`). A spin
+/// waiting on another thread still yields there.
+///
+/// # The A/B arms, and why the DEFAULT is still the old list
+/// Three points from ONE build, chosen at run time:
+/// - `VITASLOP_NO_FAST_IMPORT=1` - nothing is fast, every call takes the suspending trap;
+/// - the default - the hand-written 23 ([`CURATED_FAST_NIDS`]), i.e. today's behaviour;
+/// - `VITASLOP_FAST_IMPORT_CURATED=1` - the old hand-written 23 (the falsifier; derived is now the default).
+///
+/// The derived set is not the default YET, and that is deliberate: it is one of three
+/// independent guest-CPU changes in flight, and they are being priced in ONE batch against a
+/// SHARED baseline of today's defaults - on a machine whose control spread at the median is
+/// 2.6 ms, three separate batches means three warm-ups and three control spreads for one
+/// question. Flip the default here when that batch has priced it; the derivation, the tests
+/// and the exclusion list do not change when it does.
 pub fn fast_nid(func_nid: u32) -> bool {
     if no_fast_import() {
         return false;
     }
-    matches!(
-        func_nid,
-        gxm_nid::DRAW
-            | gxm_nid::DRAW_PRECOMPUTED
-            | gxm_nid::BEGIN_SCENE
-            // NOT `END_SCENE`: a small target's completion PARKS the thread there in the
-            // browser (`VitaState::complete_scene_async`), and the fast trap cannot suspend.
-            | gxm_nid::SET_VISIBILITY_BUFFER
-            | gxm_nid::COLOR_SURFACE_GET_DATA
-            | gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS
-            | gxm_nid::PAD_HEARTBEAT
-            | lw_nid::SIGNAL_LW_COND
-            // (the lightweight-mutex lock/unlock pair is INLINED - `lwsync::inline_op` - so
-            // it never reaches a trap and is not named here)
-            | lw_nid::TRY_LOCK_LW_MUTEX
-            | sync_nid::UNLOCK_MUTEX
-            | sync_nid::SIGNAL_COND
-            | lk_nid::CLIB_MSPACE_MALLOC
-            | lk_nid::CLIB_MSPACE_MEMALIGN
-            | lk_nid::CLIB_MSPACE_FREE
-            | lk_nid::GET_TLS_ADDR
-            | ngs_nid::VOICE_GET_STATE_DATA
-            | ngs_nid::SYSTEM_UPDATE
-            | ngs_nid::VOICE_SET_PARAMS_BLOCK
-            | pm_nid::POWER_TICK
-            | sv_nid::APP_MGR_GET_APP_STATE
-            | sv_nid::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER
-            | sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT
-            | sv_nid::TOUCH_READ
-    )
+    if fast_import_derived() {
+        return fast_admissible(func_nid);
+    }
+    CURATED_FAST_NIDS.contains(&func_nid)
+}
+
+/// Whether the DERIVED rule admits `func_nid`: its dispatch arm is exactly `cont!(..)` and it
+/// is not held back by name. Separate from [`fast_nid`] because the knob decides which SET is
+/// in use and this decides what is IN the derived one - and the tests have to reach the second
+/// question whatever the first is answering today.
+fn fast_admissible(func_nid: u32) -> bool {
+    dispatch_arm_is_cont_only(func_nid) && !FAST_EXCLUDED.iter().any(|(n, _)| *n == func_nid)
+}
+
+/// A NID whose dispatch arm IS `cont!(..)` and which must still not be routed through the
+/// non-suspending trap, with the reason it is held back.
+///
+/// EMPTY, and that is a finding rather than an oversight: the parking handlers all return
+/// their own `SvcOutcome` already, so the shape test refuses them without help. The list
+/// exists because the next one will not be like that - a handler that returns nothing but
+/// whose fast form is wrong for a reason outside the type system needs somewhere to be
+/// written down with its reason, and a reason in a list beats a reason in a commit message.
+pub const FAST_EXCLUDED: &[(u32, &str)] = &[];
+
+/// The hand-written fast list as it stood before the set was derived, and still the DEFAULT
+/// until the derived set is priced - it is the middle point of the A/B, so one build can hold
+/// "today's 23" against "all-slow" and "derived" without a second binary in the comparison.
+///
+/// `the_curated_list_is_a_subset_of_the_derived_one` holds it to the derivation: every name
+/// here must still be admitted by the shape test, so this cannot quietly become a second,
+/// divergent opinion about what may suspend.
+pub const CURATED_FAST_NIDS: &[u32] = &[
+    gxm_nid::DRAW,
+    gxm_nid::DRAW_PRECOMPUTED,
+    gxm_nid::BEGIN_SCENE,
+    gxm_nid::SET_VISIBILITY_BUFFER,
+    gxm_nid::COLOR_SURFACE_GET_DATA,
+    gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS,
+    gxm_nid::PAD_HEARTBEAT,
+    lw_nid::SIGNAL_LW_COND,
+    lw_nid::TRY_LOCK_LW_MUTEX,
+    sync_nid::UNLOCK_MUTEX,
+    sync_nid::SIGNAL_COND,
+    lk_nid::CLIB_MSPACE_MALLOC,
+    lk_nid::CLIB_MSPACE_MEMALIGN,
+    lk_nid::CLIB_MSPACE_FREE,
+    lk_nid::GET_TLS_ADDR,
+    ngs_nid::VOICE_GET_STATE_DATA,
+    ngs_nid::SYSTEM_UPDATE,
+    ngs_nid::VOICE_SET_PARAMS_BLOCK,
+    pm_nid::POWER_TICK,
+    sv_nid::APP_MGR_GET_APP_STATE,
+    sv_nid::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER,
+    sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT,
+    sv_nid::TOUCH_READ,
+];
+
+/// Whether to use the DERIVED fast set - every `cont!` dispatch arm, 873 NIDs over 684 arms -
+/// rather than the 23 hand-picked ones. **DERIVED IS THE DEFAULT**;
+/// `VITASLOP_FAST_IMPORT_CURATED=1` is the falsifier that restores the hand-written list.
+/// Read at LINK time, so it must be set for the whole run.
+///
+/// # Why the default moved, and what it rests on
+/// The old list was hand-written from ONE racing title's host-call profile, so every other
+/// title paid a JSPI stack switch on calls that provably cannot suspend. The derivation is
+/// not a judgement: a handler that returns `()` has no channel through which to ask for a
+/// suspension, because `SvcOutcome` IS that channel - so `cont!(handler(..))` is the whole
+/// admissibility test, and a handler that later grows a parking path must start returning an
+/// outcome, which takes its arm out of the shape and out of the set in the same edit.
+///
+/// MEASURED, desktop browser, a fighting title, seven sampled frames per arm: the share of
+/// host calls taking the NON-SUSPENDING trap goes from a median of ~21% to ~45%, with six of
+/// the seven derived samples above the curated median. The frames are not paired, so that is
+/// a direction and a magnitude rather than a precise figure - but the mechanism is not in
+/// doubt (a suspending call is a stack switch; a fast one is a direct call), and the picture
+/// is unchanged: 72 of 72 shots bit-identical across three titles, one build, a knob per arm.
+/// The wall-clock effect is UNMEASURED - this rig's browser timing could not resolve effects
+/// of this size - so do not quote a millisecond figure for it.
+fn fast_import_derived() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::knobs::flag("VITASLOP_FAST_IMPORT_CURATED"))
 }
 
 fn no_fast_import() -> bool {
@@ -541,10 +647,31 @@ static BACKTRACE_AT: LazyLock<Option<(u32, u64, u64)>> = LazyLock::new(|| {
     let nid_ = u32::from_str_radix(nid_s.trim().trim_start_matches("0x"), 16).ok()?;
     Some((nid_, win.0, win.1))
 });
-/// (nid, thread) pairs already reported, so the backtrace prints once per thread
-/// instead of every frame.
-static BACKTRACE_DONE: Mutex<std::collections::BTreeSet<(u32, i32)>> =
+/// (nid, thread, CALL SITE) triples already reported, so the backtrace prints once per
+/// distinct site instead of every frame.
+///
+/// >>> THE SITE BELONGS IN THE KEY, and leaving it out cost a whole investigation. Keyed on
+/// (nid, thread) alone, the diagnostic reports whichever call a thread happens to make FIRST -
+/// and for a call as common as `sceKernelGetSemaInfo` that is almost never the one being
+/// hunted. The line it prints looks exactly like the line it would print for the right call,
+/// so its registers get read as the right object's.
+///
+/// >>> AND THE IMMEDIATE `lr` IS NOT THE SITE when the title routes the call through a
+/// WRAPPER, which is the normal shape: one game wraps every semaphore operation in a
+/// `GetSemaInfo`-then-`SignalSema` helper, so every signal a thread makes - nine different
+/// semaphores, from nine unrelated subsystems - shares the one `lr` and the key collapses to
+/// (nid, thread). MEASURED: a run hunting which site signals one particular uid got exactly
+/// ONE line for the whole main thread, naming a different uid, and the collapse is invisible
+/// because a single plausible line is what a working instrument prints too. So the key is a
+/// fold of the whole CHAIN, which separates callers that share a wrapper; the cost is one
+/// stack scan per call of the chosen NID, which is env-gated to begin with.
+static BACKTRACE_DONE: Mutex<std::collections::BTreeSet<(u32, i32, u64)>> =
     Mutex::new(std::collections::BTreeSet::new());
+
+/// How many distinct chains one `VITASLOP_BACKTRACE` run may print. A stack SCAN can pick up
+/// stale slots, so two calls from one site can fold differently and the report is no longer
+/// bounded by the number of sites; past this it stops and says so rather than filling the log.
+const BACKTRACE_CAP: usize = 200;
 
 /// Ordered-timeline trace (env `VITASLOP_TRACE_ORDER`): print every *meaningful*
 /// host call live, in global order, with a monotonic index and thread id. Unlike
@@ -779,6 +906,22 @@ pub fn dispatch(
     ctx: &mut GuestCtx,
     st: &mut VitaState,
 ) -> SvcOutcome {
+    let outcome = dispatch_inner(library_nid, func_nid, ctx, st);
+    // The one mirror word a host call can change, kept current for the inlined yield - see
+    // `VitaState::publish_yield_free_change`. A thread that is about to suspend gets a fresh
+    // block at its next pick anyway, so only a continuing thread can read a stale word.
+    if matches!(outcome, SvcOutcome::Continue) {
+        st.publish_yield_free_change(ctx);
+    }
+    outcome
+}
+
+fn dispatch_inner(
+    library_nid: u32,
+    func_nid: u32,
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+) -> SvcOutcome {
     // A handler that returns `()` leaves the guest running; wrap its call so the arm
     // yields `Continue`. Handlers that can suspend a thread (blocking waits, the
     // frame flip, process/thread exit) return the `SvcOutcome` directly instead.
@@ -817,19 +960,52 @@ pub fn dispatch(
     // may contain stale slots; it is a set of candidates ordered by depth, not proof.
     if let Some((want_nid, lo_f, hi_f)) = *BACKTRACE_AT
         && func_nid == want_nid && (lo_f..=hi_f).contains(&st.cur_frame()) {
-            let key = (want_nid, st.current_thread());
-            if BACKTRACE_DONE.lock().unwrap().insert(key) {
-                let (lo, hi) = *CALLSITE_CODE_RANGE;
-                let sp = ctx.regs[13];
-                let mut chain = vec![format!("{:#010x}", ctx.regs[14])];
-                for i in 0..256u32 {
-                    let v = ctx.read_u32(sp.wrapping_add(i * 4));
-                    if (lo..hi).contains(&v) {
-                        chain.push(format!("{v:#010x}"));
-                    }
+            let (lo, hi) = *CALLSITE_CODE_RANGE;
+            let sp = ctx.regs[13];
+            // The chain first, because it is the KEY as well as the output: see
+            // [`BACKTRACE_DONE`] for why the immediate `lr` is not enough.
+            let mut fold = (0xcbf2_9ce4_8422_2325u64 ^ ctx.regs[14] as u64)
+                .wrapping_mul(0x100_0000_01b3);
+            let mut chain = vec![format!("{:#010x}", ctx.regs[14])];
+            for i in 0..256u32 {
+                let v = ctx.read_u32(sp.wrapping_add(i * 4));
+                if (lo..hi).contains(&v) {
+                    fold = (fold ^ v as u64).wrapping_mul(0x100_0000_01b3);
+                    chain.push(format!("{v:#010x}"));
                 }
+            }
+            let key = (want_nid, st.current_thread(), fold);
+            let fresh = {
+                let mut done = BACKTRACE_DONE.lock().unwrap();
+                match done.len() {
+                    n if n > BACKTRACE_CAP => false,
+                    n if n == BACKTRACE_CAP => {
+                        done.insert(key);
+                        eprintln!(
+                            "backtrace: {BACKTRACE_CAP} distinct call chains reported for this NID; further \
+                             ones are dropped. A stack SCAN can fold differently for one site when a \
+                             stale slot lands in the code range, so this cap is reached by noise as \
+                             readily as by real callers - narrow VITASLOP_BACKTRACE's frame window."
+                        );
+                        false
+                    }
+                    _ => done.insert(key),
+                }
+            };
+            if fresh {
+                // >>> AND THE REGISTER FILE, because the chain alone names CODE and the
+                // question is usually about an OBJECT. A stalled state machine is read through
+                // a field of a heap object this diagnostic's caller cannot name: `findref`
+                // reaches a global, a store watchpoint reaches an address you already have, and
+                // neither reaches `r4` [[vitaslop-a-store-watch-prints-registers-so-it-reaches-
+                // heap-objects]]. The `this` pointer a wrapper was handed is sitting in a
+                // register at the moment of the call, and printing it costs one line.
+                let regs = (0..13)
+                    .map(|i| format!("r{i}={:#x}", ctx.regs[i]))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 eprintln!(
-                    "backtrace f{} t{} {}: lr+stack candidates [{}]",
+                    "backtrace f{} t{} {}: lr+stack candidates [{}] | sp={sp:#010x} {regs}",
                     st.cur_frame(),
                     st.current_thread(),
                     nid::name(func_nid),
@@ -868,13 +1044,17 @@ pub fn dispatch(
     // boot sequence and its flatline-into-spin are legible. Zero cost when unset.
     if TRACE_ORDER.is_some_and(|(lo, hi)| (lo..=hi).contains(&st.cur_frame())) {
         let nm = nid::name(func_nid);
-        let noise = nm.contains("LwMutex")
+        // `VITASLOP_TRACE_ORDER_FULL=1` keeps the GXM setters and draws: the question "which
+        // calls set up THIS draw" is exactly the one the noise filter would hide.
+        static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let full = *FULL.get_or_init(|| std::env::var("VITASLOP_TRACE_ORDER_FULL").is_ok());
+        let noise = !full && (nm.contains("LwMutex")
             || nm.contains("LockMutex")
             || nm.contains("UnlockMutex")
             || nm.starts_with("sceGxmProgram")
             || nm.starts_with("sceGxmSet")
             || nm == "sceGxmDraw"
-            || nm == "sceKernelGetTLSAddr";
+            || nm == "sceKernelGetTLSAddr");
         if !noise {
             let seq = TRACE_ORDER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let label = if nm == "<unknown>" {
@@ -925,8 +1105,8 @@ pub fn dispatch(
         // exclusion (keyed by its guest work-area address). The `_CB` lock variant
         // additionally processes pending callbacks - none are queued in this model, so
         // it takes the same path.
-        lw_nid::LOCK_LW_MUTEX | lw_nid::LOCK_LW_MUTEX_CB => lwsync::lock_lw_mutex(ctx, st, false),
-        lw_nid::TRY_LOCK_LW_MUTEX => lwsync::lock_lw_mutex(ctx, st, true),
+        lw_nid::LOCK_LW_MUTEX | lw_nid::LOCK_LW_MUTEX_CB => lwsync::lock_lw_mutex(ctx, st),
+        lw_nid::TRY_LOCK_LW_MUTEX => cont!(lwsync::try_lock_lw_mutex(ctx, st)),
         lw_nid::UNLOCK_LW_MUTEX | lw_nid::UNLOCK_LW_MUTEX2 => {
             cont!(lwsync::unlock_lw_mutex(ctx, st))
         }
@@ -974,9 +1154,11 @@ pub fn dispatch(
         // Virtual timers: a stopwatch the guest starts and reads. `Open`/`Start`/`Stop`
         // are SceThreadmgr spellings, `Create`/`GetTime` SceLibKernel ones - one family,
         // two exporting libraries, which is why the arms sit together.
+        sync_nid::CANCEL_SEMA => cont!(sync::cancel_sema(ctx, st)),
         sync_nid::CREATE_TIMER => cont!(sync::create_timer(ctx, st)),
         tm_nid::OPEN_TIMER => cont!(sync::open_timer(ctx, st)),
         tm_nid::START_TIMER => cont!(sync::start_timer(ctx, st)),
+        tm_nid::GET_TIMER_TIME_WIDE => cont!(sync::get_timer_time_wide(ctx, st)),
         tm_nid::STOP_TIMER => cont!(sync::stop_timer(ctx, st)),
         tm_nid::DELETE_TIMER => cont!(sync::delete_timer(ctx, st)),
         sync_nid::GET_TIMER_TIME => cont!(sync::get_timer_time(ctx, st)),
@@ -1205,6 +1387,7 @@ pub fn dispatch(
         net_nid::ERRNO_LOC => cont!(net::errno_loc(ctx, st)),
         net_nid::RESOLVER_CREATE => cont!(net::resolver_create(ctx, st)),
         net_nid::RESOLVER_DESTROY => cont!(net::resolver_destroy(ctx, st)),
+        net_nid::RESOLVER_ABORT => cont!(net::resolver_abort(ctx, st)),
         net_nid::RESOLVER_START_NTOA | net_nid::RESOLVER_START_ATON => {
             cont!(net::resolver_start(ctx, st))
         }
@@ -1235,8 +1418,8 @@ pub fn dispatch(
 
         // --- gxm: graphics ------------------------------------------------------
         gxm_nid::INITIALIZE | gxm_nid::VSH_INITIALIZE => cont!(gxm::initialize(ctx, st)),
-        gxm_nid::FINISH
-        | gxm_nid::PAD_HEARTBEAT
+        gxm_nid::FINISH => gxm::finish(ctx, st),
+        gxm_nid::PAD_HEARTBEAT
         | gxm_nid::DISPLAY_QUEUE_FINISH
         | gxm_nid::PROGRAM_CHECK
         | gxm_nid::DESTROY_CONTEXT
@@ -1256,7 +1439,11 @@ pub fn dispatch(
             st.invalidate_program_reflection();
             cont!(gxm::ok(ctx))
         }
-        gxm_nid::SHADER_PATCHER_DESTROY | gxm_nid::SHADER_PATCHER_UNREGISTER_PROGRAM => {
+        gxm_nid::TRANSFER_COPY => cont!(gxm::transfer_copy(ctx)),
+        gxm_nid::TRANSFER_DOWNSCALE => cont!(gxm::transfer_downscale(ctx)),
+        gxm_nid::SHADER_PATCHER_DESTROY
+        | gxm_nid::SHADER_PATCHER_UNREGISTER_PROGRAM
+        | gxm_nid::SHADER_PATCHER_FORCE_UNREGISTER_PROGRAM => {
             st.invalidate_program_reflection();
             cont!(gxm::ok(ctx))
         }
@@ -1303,6 +1490,8 @@ pub fn dispatch(
         gxm_nid::PROGRAM_PARAMETER_GET_COMPONENT_COUNT => cont!(gxm::param_get_component_count(ctx)),
         gxm_nid::PROGRAM_PARAMETER_GET_CONTAINER_INDEX => cont!(gxm::param_get_container_index(ctx)),
         gxm_nid::PROGRAM_PARAMETER_GET_ARRAY_SIZE => cont!(gxm::param_get_array_size(ctx)),
+        gxm_nid::PROGRAM_PARAMETER_IS_REG_FORMAT => cont!(gxm::param_is_reg_format(ctx)),
+        gxm_nid::PROGRAM_PARAMETER_GET_INDEX => cont!(gxm::param_get_index(ctx)),
         gxm_nid::PROGRAM_PARAMETER_GET_NAME => cont!(gxm::param_get_name(ctx)),
         gxm_nid::COLOR_SURFACE_INIT => cont!(gxm::color_surface_init(ctx, st)),
         gxm_nid::COLOR_SURFACE_INIT_DISABLED => cont!(gxm::color_surface_init_disabled(ctx, st)),
@@ -1339,7 +1528,13 @@ pub fn dispatch(
         gxm_nid::TEXTURE_SET_MIP_FILTER => cont!(gxm::texture_set_mip_filter(ctx)),
         gxm_nid::TEXTURE_SET_GAMMA_MODE => cont!(gxm::texture_set_gamma_mode(ctx, st)),
         gxm_nid::SET_FRAGMENT_UNIFORM_BUFFER => cont!(gxm::set_uniform_buffer(ctx, "fragment")),
-        gxm_nid::SET_VERTEX_UNIFORM_BUFFER => cont!(gxm::set_uniform_buffer(ctx, "vertex")),
+        gxm_nid::SET_VERTEX_UNIFORM_BUFFER => {
+            // TEMPORARY (`VITASLOP_UBIND_TRACE`). DELETE BEFORE COMMIT.
+            if st.ubind_trace_open() {
+                tracing::warn!(target: "vitaslop::gxm", "UBIND f{} setVUB ctx={:#x} idx={} data={:#x}", st.cur_frame(), ctx.arg(0), ctx.arg(1), ctx.arg(2));
+            }
+            cont!(gxm::set_uniform_buffer(ctx, "vertex"))
+        }
         // Texture getters: pure field reads of the guest's control word 0. Every one of these
         // ALSO has an inline form (`gxm::inline_op`), so on a build that inlines its imports the
         // guest never reaches these at all - which is the point, since `GetLodBias` alone was the
@@ -1451,8 +1646,12 @@ pub fn dispatch(
         gxm_nid::RENDER_TARGET_GET_DRIVER_MEM_BLOCK => {
             cont!(gxm::render_target_get_driver_mem_block(ctx, st))
         }
-        gxm_nid::NOTIFICATION_WAIT => cont!(gxm::notification_wait(ctx, st)),
-        gxm_nid::SET_VERTEX_TEXTURE => cont!(gxm::set_vertex_texture(ctx, st)),
+        gxm_nid::NOTIFICATION_WAIT => gxm::notification_wait(ctx, st),
+        gxm_nid::SET_VERTEX_TEXTURE | gxm_nid::SET_VERTEX_TEXTURE_PUBLIC => cont!(gxm::set_vertex_texture(ctx, st)),
+        gxm_nid::SHADER_PATCHER_GET_BUFFER_MEM_ALLOCATED
+        | gxm_nid::SHADER_PATCHER_GET_VERTEX_USSE_MEM_ALLOCATED
+        | gxm_nid::SHADER_PATCHER_GET_FRAGMENT_USSE_MEM_ALLOCATED => cont!(gxm::shader_patcher_get_mem_allocated(ctx)),
+        gxm_nid::TRANSFER_FINISH => cont!(gxm::ok(ctx)),
         gxm_nid::TEXTURE_INIT_CUBE_ARBITRARY => {
             cont!(gxm::texture_init(ctx, st, gxm::TYPE_CUBE_ARBITRARY))
         }
@@ -1545,6 +1744,7 @@ pub fn dispatch(
         // --- thread and semaphore introspection, signals, module queries ---------
         lk_nid::GET_THREAD_INFO => cont!(libkernel::get_thread_info(ctx, st)),
         lk_nid::GET_SEMA_INFO => cont!(sync::get_sema_info(ctx, st)),
+        lk_nid::GET_MUTEX_INFO => cont!(sync::get_mutex_info(ctx, st)),
         sync_nid::OPEN_SEMA => cont!(sync::open_sema(ctx, st)),
         tm_nid::CHANGE_THREAD_PRIORITY => cont!(threadmgr::change_thread_priority(ctx, st)),
         tm_nid::SEND_SIGNAL => cont!(libkernel::send_signal(ctx, st)),
@@ -1661,6 +1861,7 @@ pub fn dispatch(
             SvcOutcome::Continue
         }
         ngs_nid::PATCH_CREATE_ROUTING => cont!(ngs::patch_create_routing(ctx, st)),
+        ngs_nid::VOICE_GET_OUTPUT_PATCH => cont!(ngs::voice_get_output_patch(ctx, st)),
         // The remaining NGS calls are state transitions / per-frame pumps that
         // succeed silently: update/flags/release, voice play/keyoff/kill/pause/
         // resume, param unlock, callbacks, bypass, patch info, AT9 details,
@@ -1792,6 +1993,7 @@ pub fn dispatch(
             cont!(services::rtc_get_current_clock_local_time(ctx, st))
         }
         sv_nid::RTC_GET_CURRENT_TICK => cont!(services::rtc_get_current_tick(ctx, st)),
+        sv_nid::RTC_GET_ACCUMULATIVE_TIME => cont!(services::rtc_get_accumulative_time(ctx, st)),
         sv_nid::RTC_GET_TICK_RESOLUTION => cont!(services::rtc_get_tick_resolution(ctx, st)),
         sv_nid::RTC_CONVERT_UTC_TO_LOCAL_TIME | sv_nid::RTC_CONVERT_LOCAL_TIME_TO_UTC => {
             cont!(services::rtc_convert_time_zone(ctx, st))
@@ -2302,10 +2504,20 @@ pub fn dispatch(
         sv_nid::PHOTO_IMPORT_DIALOG_TERM => {
             cont!(services::dialog_term(ctx, st, services::DialogFamily::PhotoImport))
         }
+        sv_nid::CAMERA_IMPORT_DIALOG_INIT => {
+            cont!(services::dialog_init(ctx, st, services::DialogFamily::CameraImport))
+        }
+        sv_nid::CAMERA_IMPORT_DIALOG_GET_STATUS => {
+            cont!(services::dialog_get_status(ctx, st, services::DialogFamily::CameraImport))
+        }
+        sv_nid::CAMERA_IMPORT_DIALOG_TERM => {
+            cont!(services::dialog_term(ctx, st, services::DialogFamily::CameraImport))
+        }
         // Their result reads, and the trophy-setup one, all write a zeroed result -
         // which for each of these families is "completed, nothing selected".
         sv_nid::NP_PROFILE_DIALOG_GET_RESULT
         | sv_nid::PHOTO_IMPORT_DIALOG_GET_RESULT
+        | sv_nid::CAMERA_IMPORT_DIALOG_GET_RESULT
         | sv_nid::NP_FRIEND_LIST_DIALOG_GET_RESULT => {
             cont!(services::dialog_ok(ctx, st))
         }
@@ -2442,60 +2654,151 @@ mod frame_boundary_tests {
         }
     }
 
+    /// >>> THE HANDLERS THAT CAN PARK ARE NOT IN THE DERIVED FAST SET.
+    ///
+    /// The generated table is only as good as the shape test `build.rs` applies to the arms,
+    /// and the failure that would matter is silent: a mis-parse that admitted a PARKING
+    /// handler makes the browser end the run the first time that call blocks. So every
+    /// suspending handler this engine has is named here with the outcome it owes, and
+    /// required to be absent. `sceGxmEndScene` is the one the old hand-written list called
+    /// out in prose; it is here with the other eighteen, and it is excluded now for a
+    /// structural reason rather than a remembered one - its arm returns an `SvcOutcome`.
+    #[test]
+    fn no_parking_handler_is_fast() {
+        let parks: &[(u32, &str)] = &[
+            (gxm_nid::END_SCENE, "a small target's completion parks the thread in the browser"),
+            (gxm_nid::FINISH, "completes the frame's scenes at the guest's own GPU wait"),
+            (gxm_nid::NOTIFICATION_WAIT, "the same completion, on one notification"),
+            (gxm_nid::DISPLAY_QUEUE_ADD_ENTRY, "Flip - the frame ends here"),
+            (gxm_nid::WAIT_EVENT, "waits on the GXM event"),
+            (sv_nid::SHARED_FB_END, "Flip - a SceSharedFb title's present"),
+            (lw_nid::WAIT_LW_COND, "parks until signalled"),
+            (lw_nid::LOCK_LW_MUTEX, "parks behind the owner"),
+            (sync_nid::LOCK_MUTEX, "parks behind the owner"),
+            (sync_nid::WAIT_SEMA, "parks until signalled"),
+            (sync_nid::WAIT_COND, "parks until signalled"),
+            (sync_nid::WAIT_EVENT_FLAG, "parks until the pattern is satisfied"),
+            (tm_nid::DELAY_THREAD, "Reschedule - that IS the call"),
+            (tm_nid::EXIT_THREAD, "ThreadExit"),
+            (lk_nid::EXIT_PROCESS, "Halt"),
+            (lk_nid::WAIT_THREAD_END, "parks until the thread ends"),
+            (lk_nid::START_THREAD, "hands the CPU to the new thread"),
+            (lk_nid::WAIT_SIGNAL, "parks until signalled"),
+            (display_nid::WAIT_VBLANK_START, "parks until the vblank"),
+            (display_nid::WAIT_SET_FRAME_BUF, "parks until the flip is taken"),
+            (io_nid::IO_READ, "a blocking read"),
+            (audio_nid::OUT_OUTPUT, "parks when the port's queue is full"),
+            (audioin_nid::INPUT, "parks for the capture period"),
+            (fiber_nid::RUN, "switches stacks"),
+        ];
+        for (nid_fn, why) in parks {
+            // Against the DERIVED rule, not against `fast_nid`: which SET is in use is a knob,
+            // and a test that only asked the knob would go quiet on the day the default flips.
+            assert!(
+                !fast_admissible(*nid_fn),
+                "{} is admitted by the derived rule but {why} - a fast call that suspends ENDS \
+                 the run in the browser. Its dispatch arm must return its own SvcOutcome.",
+                nid::name(*nid_fn)
+            );
+            assert!(!fast_nid(*nid_fn), "{} is in the fast set in use but {why}", nid::name(*nid_fn));
+            assert!(
+                !DISPATCH_CONT_ONLY.contains(nid_fn),
+                "{} was read off the dispatch table as a `cont!` arm and it is not one - \
+                 build.rs has mis-parsed the match",
+                nid::name(*nid_fn)
+            );
+        }
+    }
+
     /// >>> EVERY NID [`fast_nid`] ROUTES THROUGH THE NON-SUSPENDING TRAP REALLY CANNOT SUSPEND.
     ///
     /// The browser binds that trap to a plain function: a handler that returned anything but
-    /// `Continue` there would end the run. So every name on the list is dispatched here with
-    /// zeroed registers and required to CONTINUE - the arm shape (`cont!`) is what admits it,
-    /// and this is that shape asserted at the one place a grown parking path would show.
-    /// The list is also required to be DISJOINT from the inline forms: a NID with an inline
-    /// lowering never reaches either trap, so naming it fast would be a lie the link step
-    /// silently drops.
+    /// `Continue` there would end the run. So the WHOLE derived set is dispatched here with
+    /// zeroed registers over zeroed memory and required to CONTINUE. The arm shape (`cont!`)
+    /// is what admits a NID and the shape makes this true by construction - which is the
+    /// point: this is that construction checked against the real dispatch, so a generated
+    /// table that named the wrong arm shows up here rather than on a device.
     ///
-    /// The blocking primitives the race also makes - a cond wait, a plain lock - are held to
-    /// the opposite: not fast, so a copy-paste that widened the list would fail here.
+    /// A handler is allowed to PANIC on zeroed arguments (several read a guest struct the
+    /// test never builds); that is not what is under test, so it is caught and counted. What
+    /// is not allowed is returning an outcome that suspends.
     #[test]
     fn the_fast_nids_only_continue() {
-        let fast = [
-            gxm_nid::DRAW,
-            gxm_nid::DRAW_PRECOMPUTED,
-            gxm_nid::BEGIN_SCENE,
-            gxm_nid::SET_VISIBILITY_BUFFER,
-            gxm_nid::COLOR_SURFACE_GET_DATA,
-            gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS,
-            gxm_nid::PAD_HEARTBEAT,
-            lw_nid::SIGNAL_LW_COND,
-            lw_nid::TRY_LOCK_LW_MUTEX,
-            sync_nid::UNLOCK_MUTEX,
-            sync_nid::SIGNAL_COND,
-            lk_nid::CLIB_MSPACE_MALLOC,
-            lk_nid::CLIB_MSPACE_MEMALIGN,
-            lk_nid::CLIB_MSPACE_FREE,
-            lk_nid::GET_TLS_ADDR,
-            ngs_nid::VOICE_GET_STATE_DATA,
-            ngs_nid::SYSTEM_UPDATE,
-            ngs_nid::VOICE_SET_PARAMS_BLOCK,
-            pm_nid::POWER_TICK,
-            sv_nid::APP_MGR_GET_APP_STATE,
-            sv_nid::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER,
-            sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT,
-            sv_nid::TOUCH_READ,
-        ];
-        for nid_fn in fast {
-            let name = nid::name(nid_fn);
-            assert!(fast_nid(nid_fn), "{name} is on the fast list but fast_nid() refuses it");
+        let mut checked = 0usize;
+        let mut panicked = Vec::new();
+        for &nid_fn in DISPATCH_CONT_ONLY {
+            if !fast_admissible(nid_fn) {
+                continue;
+            }
+            let run = std::panic::catch_unwind(|| outcome_of(0, nid_fn, [0, 0, 0, 0]));
+            match run {
+                Ok(outcome) => {
+                    assert_eq!(
+                        outcome,
+                        "Continue",
+                        "{} is routed through the non-suspending trap but did not CONTINUE",
+                        nid::name(nid_fn)
+                    );
+                    checked += 1;
+                }
+                Err(_) => panicked.push(nid::name(nid_fn)),
+            }
+        }
+        assert!(
+            checked > DISPATCH_CONT_ONLY.len() / 2,
+            "only {checked} of {} fast NIDs actually ran - too many panicked on zeroed \
+             arguments for this to be evidence of anything ({panicked:?})",
+            DISPATCH_CONT_ONLY.len()
+        );
+    }
+
+    /// >>> THE DERIVED SET IS THE DISPATCH TABLE'S `cont!` ARMS, AND IT COVERS THE OLD LIST.
+    ///
+    /// Three claims. That the derivation actually ran (a parse that came adrift would leave a
+    /// tiny set, and a tiny set is a silent performance regression). That the set has no
+    /// duplicate NID, which would mean two arms claim one call. And that every NID the
+    /// hand-written list named is still fast - the derived set must be a superset of what it
+    /// replaced, or this change is a regression on the title that list came from.
+    #[test]
+    fn the_curated_list_is_a_subset_of_the_derived_one() {
+        assert!(
+            DISPATCH_CONT_ONLY_ARMS > 600 && DISPATCH_CONT_ONLY.len() > DISPATCH_CONT_ONLY_ARMS,
+            "the derived set is {} NIDs over {DISPATCH_CONT_ONLY_ARMS} arms, which is far \
+             short of the dispatch table - build.rs has come adrift from the source",
+            DISPATCH_CONT_ONLY.len()
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for &n in DISPATCH_CONT_ONLY {
+            assert!(seen.insert(n), "{} appears twice in the dispatch table", nid::name(n));
+        }
+        for &n in CURATED_FAST_NIDS {
             assert!(
-                inline_op(nid_fn).is_none(),
-                "{name} has an inline form, so routing it through a trap is unreachable"
+                seen.contains(&n),
+                "{} was on the hand-written fast list but its arm is not `cont!` - the \
+                 derived set would drop it, which is a regression on the title that list \
+                 came from",
+                nid::name(n)
             );
-            assert_eq!(
-                outcome_of(0, nid_fn, [0, 0, 0, 0]),
-                "Continue",
-                "{name} is routed through the non-suspending trap but did not CONTINUE"
+            assert!(
+                fast_admissible(n),
+                "{} is no longer admitted by the derived rule",
+                nid::name(n)
+            );
+            assert!(fast_nid(n), "{} is no longer fast at today's default", nid::name(n));
+            assert!(
+                inline_op(n).is_none(),
+                "{} has an inline form, so routing it through a trap is unreachable",
+                nid::name(n)
             );
         }
-        for nid_fn in [lw_nid::WAIT_LW_COND, lw_nid::LOCK_LW_MUTEX, tm_nid::DELAY_THREAD] {
-            assert!(!fast_nid(nid_fn), "{} can park and must not be fast", nid::name(nid_fn));
+        for (n, why) in FAST_EXCLUDED {
+            assert!(
+                seen.contains(n),
+                "{} is on the exclusion list ({why}) but its arm is not `cont!` anyway - an \
+                 exclusion that excludes nothing reads as a fact and is not one",
+                nid::name(*n)
+            );
+            assert!(!fast_admissible(*n), "{} is excluded but still admitted", nid::name(*n));
         }
     }
 
@@ -2586,9 +2889,12 @@ mod frame_boundary_tests {
     /// the guest handing a finished frame to scanout - ends a frame.
     #[test]
     fn only_a_display_queue_entry_counts_as_a_frame_boundary() {
+        // A yield with NOBODY TO YIELD TO returns to the caller - see
+        // `VitaState::yield_would_repick_this_thread`. The probe's state has one thread and no
+        // pending wake, so this is that case; what the test is about is that it is not a FRAME.
         assert_eq!(
             outcome_of(nid::lib::SCE_THREADMGR, tm_nid::DELAY_THREAD, [0, 0, 0, 0]),
-            "Reschedule",
+            "Continue",
             "delayThread(0) is a plain yield, not a frame"
         );
         assert_eq!(

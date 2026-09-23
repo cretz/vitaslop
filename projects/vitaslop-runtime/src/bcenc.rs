@@ -330,28 +330,52 @@ pub fn is_opaque(rgba: &[u8]) -> bool {
     rgba.chunks_exact(4).all(|p| p[3] == 255)
 }
 
+/// How many 4x4 blocks an image of this size is made of, in the linear order every encoder here
+/// walks them in. The unit a RESUMABLE encode counts progress in - see
+/// [`crate::render::transcoded_source`].
+pub fn block_count(w: u32, h: u32) -> u32 {
+    w.div_ceil(4) * h.div_ceil(4)
+}
+
 /// Encode an RGBA8 image to BC1, block-packed in linear block rows.
 pub fn encode_bc1(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
-    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
-    let mut out = Vec::with_capacity((bw * bh * 8) as usize);
-    for by in 0..bh {
-        for bx in 0..bw {
-            out.extend_from_slice(&encode_bc1_block(&gather(w, h, rgba, bx, by)));
-        }
+    encode_bc1_blocks(w, h, rgba, 0, u32::MAX)
+}
+
+/// `count` blocks of [`encode_bc1`] starting at linear block index `first`.
+///
+/// # Why a RANGE, and why it is bit-identical to the whole image
+/// The resumable encode ([`crate::render::transcoded_source`]) has to be able to stop when the
+/// frame's budget is spent and continue on the next frame, and a block codec is exactly the
+/// thing that can: every 4x4 block is encoded from `gather`, which reads the SOURCE image and
+/// clamps at its edges, so a block's bytes do not depend on any other block or on where the walk
+/// started. Concatenating the ranges therefore gives the same bytes as one call, and that is
+/// asserted rather than argued - see the `chunked_matches_whole` tests.
+pub fn encode_bc1_blocks(w: u32, h: u32, rgba: &[u8], first: u32, count: u32) -> Vec<u8> {
+    let bw = w.div_ceil(4);
+    let end = first.saturating_add(count).min(block_count(w, h));
+    let mut out = Vec::with_capacity((end.saturating_sub(first) * 8) as usize);
+    for b in first..end {
+        out.extend_from_slice(&encode_bc1_block(&gather(w, h, rgba, b % bw, b / bw)));
     }
     out
 }
 
 /// Encode an RGBA8 image to BC3 (an alpha block then a colour block per 4x4).
 pub fn encode_bc3(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
-    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
-    let mut out = Vec::with_capacity((bw * bh * 16) as usize);
-    for by in 0..bh {
-        for bx in 0..bw {
-            let block = gather(w, h, rgba, bx, by);
-            out.extend_from_slice(&encode_bc3_alpha_block(&block));
-            out.extend_from_slice(&encode_bc1_block(&block));
-        }
+    encode_bc3_blocks(w, h, rgba, 0, u32::MAX)
+}
+
+/// `count` blocks of [`encode_bc3`] starting at linear block index `first`. See
+/// [`encode_bc1_blocks`].
+pub fn encode_bc3_blocks(w: u32, h: u32, rgba: &[u8], first: u32, count: u32) -> Vec<u8> {
+    let bw = w.div_ceil(4);
+    let end = first.saturating_add(count).min(block_count(w, h));
+    let mut out = Vec::with_capacity((end.saturating_sub(first) * 16) as usize);
+    for b in first..end {
+        let block = gather(w, h, rgba, b % bw, b / bw);
+        out.extend_from_slice(&encode_bc3_alpha_block(&block));
+        out.extend_from_slice(&encode_bc1_block(&block));
     }
     out
 }
@@ -359,6 +383,44 @@ pub fn encode_bc3(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// >>> THE RESUMABLE ENCODE PRODUCES THE ONE-SHOT ENCODE'S BYTES, IN EVERY CHUNKING.
+    ///
+    /// This is the whole picture argument for `PartialEncode`: an encode that stops on a block
+    /// boundary and continues next frame changes WHEN a texture arrives compressed and nothing
+    /// about what it contains. That holds only because a block is encoded from the source image
+    /// alone, which is a property of `gather` (it reads `rgba` and clamps at the image edge) and
+    /// not something the range functions can be trusted to have preserved on their own. So it is
+    /// asserted over awkward chunk sizes AND over a non-multiple-of-4 image, which is the shape
+    /// where the edge clamp is the only thing keeping the last block row honest.
+    #[test]
+    fn chunked_matches_whole() {
+        for (w, h) in [(16u32, 16u32), (13, 7), (64, 4), (4, 64), (37, 21)] {
+            let rgba: Vec<u8> = (0..(w * h * 4))
+                .map(|i| ((i.wrapping_mul(2654435761u32)) >> 13) as u8)
+                .collect();
+            for chunk in [1u32, 2, 3, 7, 64, u32::MAX] {
+                for bc3 in [false, true] {
+                    let whole = if bc3 {
+                        encode_bc3(w, h, &rgba)
+                    } else {
+                        encode_bc1(w, h, &rgba)
+                    };
+                    let mut got = Vec::new();
+                    let mut b = 0;
+                    while b < block_count(w, h) {
+                        got.extend_from_slice(&if bc3 {
+                            encode_bc3_blocks(w, h, &rgba, b, chunk)
+                        } else {
+                            encode_bc1_blocks(w, h, &rgba, b, chunk)
+                        });
+                        b += chunk.min(block_count(w, h) - b);
+                    }
+                    assert_eq!(got, whole, "{w}x{h} in chunks of {chunk}, bc3={bc3}");
+                }
+            }
+        }
+    }
 
     /// Decode what we encoded, through the DECODER THIS PROJECT ALREADY HAD.
     ///

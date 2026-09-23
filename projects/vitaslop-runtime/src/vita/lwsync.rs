@@ -14,7 +14,7 @@
 //! The COND keeps its waiter list host-side (a list of parked thread ids is not something
 //! guest memory holds usefully), identified by the id stamped in its own work area.
 
-use crate::host::{GuestCtx, VitaState};
+use crate::host::{GuestCtx, VitaState, SCE_KERNEL_ERROR_WAIT_TIMEOUT};
 use crate::vita::lwwork;
 use crate::SvcOutcome;
 
@@ -56,8 +56,11 @@ fn resolve_cond(ctx: &GuestCtx, st: &VitaState, work: u32) -> Option<u32> {
 pub(super) fn wait_lw_cond(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let work = ctx.arg(0);
     let timeout_ptr = ctx.arg(1);
-    let timeout = if timeout_ptr != 0 { ctx.read_u32(timeout_ptr) } else { 0 };
-    sample_wait(st, work, timeout_ptr, timeout);
+    // Null is "wait forever"; a pointer to 0 is "do not wait at all". Carried as an `Option`
+    // because `lwcond_wait` reads a zero as INFINITE, so collapsing the two parked every
+    // polling caller forever - see `sync::report_zero_timeout_poll`.
+    let timeout = (timeout_ptr != 0).then(|| ctx.read_u32(timeout_ptr));
+    sample_wait(st, work, timeout_ptr, timeout.unwrap_or(0));
     if !st.is_preemptive() {
         // Single-thread model: uncontended, immediate success.
         ctx.ret(0);
@@ -76,7 +79,16 @@ pub(super) fn wait_lw_cond(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome
         ctx.ret(ERR_UNKNOWN_LW_COND_ID);
         return SvcOutcome::Continue;
     };
-    let parked = st.lwcond_wait(ctx, canonical, timeout);
+    if timeout == Some(0) {
+        // A POLL. Like the heavyweight cond, a timed-out `WaitLwCond` re-acquires its bound
+        // lightweight mutex before resuming, so a wait that never RELEASED it is already in
+        // the right state: answer WAIT_TIMEOUT without calling `lwcond_wait`, which is the
+        // call that would have unlocked the mutex.
+        super::sync::report_zero_timeout_poll("lwcond", canonical as i32, st.current_thread());
+        ctx.ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+        return SvcOutcome::Continue;
+    }
+    let parked = st.lwcond_wait(ctx, canonical, timeout.unwrap_or(0));
     debug_assert!(parked, "canonical cond is known, so the wait must park");
     // A satisfied/woken wait returns 0.
     ctx.ret(0);
@@ -251,6 +263,41 @@ const NOT_INLINABLE: &[(u32, &str)] = &[
     (crate::nid::lwsync::SIGNAL_LW_COND, "wakes a parked thread, which only the host can do"),
 ];
 
+/// int sceKernelTryLockLwMutex(SceKernelLwMutexWork *pWork, int lockCount)
+///
+/// The non-blocking spelling, and it is SEPARATE from [`lock_lw_mutex`] for one reason: this
+/// is the only member of the family that cannot park, and a handler that returns NOTHING is
+/// how that is said in a way `fast_nid` can read. Folded into the blocking handler behind a
+/// `try_lock` flag it returned an `SvcOutcome` like its parking sibling, and the old
+/// hand-written fast list had to make an exception for it in prose.
+///
+/// It cannot park because the refusal below is the SAME predicate the park is: `lwmutex_lock`
+/// queues the caller exactly when the work area is held by another thread
+/// (`VitaState::lwmutex_lock`), which is exactly what [`VitaState::lwmutex_contended`]
+/// answers - so past that check the take always succeeds, and it is asked with no timeout, so
+/// there is no deadline to overwrite the answer later either.
+pub(super) fn try_lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let work = resolve_mutex(ctx, st, ctx.arg(0));
+    if st.lwmutex_contended(ctx, work) {
+        ctx.ret(ERR_LW_MUTEX_FAILED_TO_OWN);
+        return;
+    }
+    let acquired = st.lwmutex_lock(ctx, work, None);
+    if acquired {
+        ctx.ret(0);
+        return;
+    }
+    // Unreachable by the argument above. If the two predicates ever part company, FAIL the
+    // try-lock: the caller has been queued behind an owner, and handing it a success would
+    // let two threads into one critical section - silently, and a long way from here.
+    tracing::error!(
+        target: "vitaslop::sema",
+        work = format_args!("{work:#010x}").to_string(),
+        "sceKernelTryLockLwMutex found an uncontended mutex it could not take -          `lwmutex_contended` and `lwmutex_lock` disagree; failing the try-lock"
+    );
+    ctx.ret(ERR_LW_MUTEX_FAILED_TO_OWN);
+}
+
 /// int sceKernelLockLwMutex(SceKernelLwMutexWork *pWork, int lockCount,
 ///     unsigned int *pTimeout), and (with `try_lock`) sceKernelTryLockLwMutex.
 ///
@@ -281,11 +328,13 @@ const NOT_INLINABLE: &[(u32, &str)] = &[
 /// A timeout of ZERO means do not wait at all, which is `sceKernelTryLockLwMutex`'s answer
 /// (`ERR_LW_MUTEX_FAILED_TO_OWN`), not an infinite wait - reading it as one is the same
 /// mistake as ignoring the pointer, one value narrower.
-pub(super) fn lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool) -> SvcOutcome {
+pub(super) fn lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let work = resolve_mutex(ctx, st, ctx.arg(0));
     let timeout_ptr = ctx.arg(2);
-    let timeout_us = (!try_lock && timeout_ptr != 0).then(|| ctx.read_u32(timeout_ptr));
-    if (try_lock || timeout_us == Some(0)) && st.lwmutex_contended(ctx, work) {
+    let timeout_us = (timeout_ptr != 0).then(|| ctx.read_u32(timeout_ptr));
+    // A zero timeout is a try-lock spelled the other way; the non-blocking spelling itself is
+    // [`try_lock_lw_mutex`], which returns nothing because it cannot park.
+    if timeout_us == Some(0) && st.lwmutex_contended(ctx, work) {
         ctx.ret(ERR_LW_MUTEX_FAILED_TO_OWN);
         return SvcOutcome::Continue;
     }
@@ -375,7 +424,7 @@ mod tests {
                 lwwork::init(ctx, WORK);
                 ctx.regs[0] = WORK;
                 ctx.regs[1] = 1;
-                assert!(matches!(lock_lw_mutex(ctx, st, false), SvcOutcome::Continue), "uncontended");
+                assert!(matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue), "uncontended");
                 assert_eq!(ctx.regs[0], 0, "success");
                 assert_eq!(lwwork::count(ctx, WORK), 1);
                 assert_eq!(lwwork::owner(ctx, WORK), 3);
@@ -409,7 +458,7 @@ mod tests {
             assert!(!lwwork::fast_lock(ctx, WORK, 1, 1), "so the fast path refuses it");
             ctx.regs[0] = WORK;
             ctx.regs[1] = 1;
-            assert!(matches!(lock_lw_mutex(ctx, st, false), SvcOutcome::Continue), "uncontended");
+            assert!(matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue), "uncontended");
             assert!(lwwork::is_mutex(ctx, WORK), "the handler adopted it");
             assert_eq!(lwwork::count(ctx, WORK), 1, "and took it");
             // Released, the next take is inline.
@@ -436,7 +485,7 @@ mod tests {
             assert!(!lwwork::fast_lock(ctx, copy, 1, 1), "the fast path will not serve a copy");
             ctx.regs[0] = copy;
             ctx.regs[1] = 1;
-            assert!(matches!(lock_lw_mutex(ctx, st, false), SvcOutcome::Continue), "uncontended");
+            assert!(matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue), "uncontended");
             assert_eq!(lwwork::count(ctx, WORK), 1, "the ORIGINAL is the one that got locked");
             assert_eq!(lwwork::count(ctx, copy), 0, "and the copy is untouched");
         });
@@ -469,7 +518,56 @@ mod tests {
         }
     }
 
-    /// Run `sceKernelCreateLwMutex(work, ...)` the way the dispatch would.
+    /// A lightweight-cond POLL (`*pTimeout == 0`) must time out rather than park, and must
+    /// leave the bound lightweight mutex HELD - `lwcond_wait` is the call that unlocks it, so
+    /// a poll has to answer before reaching it. Asserted on the outcome, not on a log line.
+    #[test]
+    fn an_lwcond_poll_times_out_and_keeps_its_mutex() {
+        const COND: u32 = 0x820;
+        const TIMEOUT_PTR: u32 = 0x900;
+        with(|ctx, st| {
+            st.set_current(3);
+            create(ctx, st, WORK);
+            ctx.regs[0] = COND;
+            ctx.regs[3] = WORK;
+            create_lw_cond(ctx, st);
+            // Take the bound mutex, the way a caller of WaitLwCond always has.
+            ctx.regs[0] = WORK;
+            ctx.regs[1] = 1;
+            assert!(matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue));
+            assert_eq!(lwwork::owner(ctx, WORK), 3, "held going in");
+
+            ctx.write_u32(TIMEOUT_PTR, 0);
+            ctx.regs[0] = COND;
+            ctx.regs[1] = TIMEOUT_PTR;
+            let out = wait_lw_cond(ctx, st);
+            assert!(matches!(out, SvcOutcome::Continue), "a poll must NOT park");
+            assert_eq!(ctx.regs[0], SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+            assert_eq!(lwwork::owner(ctx, WORK), 3, "and must not have unlocked the mutex");
+            assert_eq!(lwwork::count(ctx, WORK), 1);
+        });
+    }
+
+    /// The NEGATIVE CONTROL: a null `pTimeout` still parks, and still releases the mutex on
+    /// the way in. Without this the poll fix could pass by never blocking at all.
+    #[test]
+    fn an_lwcond_wait_with_a_null_timeout_still_parks() {
+        const COND: u32 = 0x820;
+        with(|ctx, st| {
+            st.set_current(3);
+            create(ctx, st, WORK);
+            ctx.regs[0] = COND;
+            ctx.regs[3] = WORK;
+            create_lw_cond(ctx, st);
+            ctx.regs[0] = WORK;
+            ctx.regs[1] = 1;
+            assert!(matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue));
+            ctx.regs[0] = COND;
+            ctx.regs[1] = 0; // NULL - wait forever
+            assert!(matches!(wait_lw_cond(ctx, st), SvcOutcome::Block), "null still parks");
+        });
+    }
+
     fn create(ctx: &mut GuestCtx, st: &mut VitaState, work: u32) {
         ctx.regs[0] = work;
         create_lw_mutex(ctx, st);

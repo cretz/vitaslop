@@ -143,6 +143,7 @@ async fn run_cube_scheduled() -> Result<CpuRun, JsValue> {
         artifact.mem_pages,
         artifact.mirror_off,
         artifact.dirty_off,
+        0,
         m.entry & !1,
         main_sp,
         venv,
@@ -375,7 +376,7 @@ impl FpsMeter {
                 * 100.0;
             let text = if self.last_guest_fps > self.last_fps + 0.5 {
                 format!(
-                    "fps: {:.0} shown of {:.0} run ({speed:.0}% speed - {:.0}% of the frames                      the emulator computed were DISCARDED unpresented)",
+                    "fps: {:.0} shown of {:.0} run ({speed:.0}% speed - {:.0}% of the frames the emulator computed were DISCARDED unpresented)",
                     self.last_fps,
                     self.last_guest_fps,
                     100.0 * (1.0 - self.last_fps / self.last_guest_fps),
@@ -521,7 +522,7 @@ fn make_depth(device: &wgpu::Device) -> wgpu::TextureView {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: vitaslop_platform::gpu::DEPTH_FORMAT,
+        format: vitaslop_platform::gpu::depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
@@ -577,20 +578,111 @@ fn main_stack_top(base: u32, mem_bytes: u32) -> u32 {
 /// SUBMIT for that (`used in submit while mapped`), which is how the target probe once killed
 /// the run it was watching.
 struct RttWriteback {
-    /// Per guest address: the readback buffer, its byte size, and whether the map has landed.
-    bufs: std::collections::HashMap<u32, (wgpu::Buffer, u64, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
-    /// Copies encoded this present, awaiting their map: `(addr, w, h, padded row, surface)`.
-    pending: Vec<(u32, u32, u32, u32, vitaslop_runtime::capture::ColorSurface)>,
+    /// Per `(guest address, ring slot)`: the readback buffer, its byte size, and whether the map
+    /// has landed.
+    bufs: std::collections::HashMap<
+        (u32, u8),
+        (wgpu::Buffer, u64, std::sync::Arc<std::sync::atomic::AtomicBool>),
+    >,
+    /// The NEXT ring slot to try for each address. See [`RttWriteback::RING`].
+    next_slot: std::collections::HashMap<u32, u8>,
+    /// The sequence number the next copy of each address gets, and the newest sequence already
+    /// HANDED TO THE GUEST for it.
+    ///
+    /// >>> WITHOUT THIS THE RING CAN GO BACKWARDS. With one buffer per target the copies were
+    /// serialised by construction, so "the map that landed" was always the newest. With three in
+    /// flight they can complete in any order the implementation likes, and a slot from two
+    /// presents ago landing last would write STALE pixels over fresher ones - a light probe that
+    /// occasionally jumps back in time, which is worse than one that updates slowly and is
+    /// exactly the kind of fault that would be blamed on the guest. Deliveries are therefore
+    /// dropped when they are older than one already applied.
+    next_seq: std::collections::HashMap<u32, u64>,
+    newest_delivered: std::collections::HashMap<u32, u64>,
+    /// Copies encoded this present, awaiting their map:
+    /// `(addr, slot, w, h, padded row, surface, seq)`.
+    pending: Vec<(u32, u8, u32, u32, u32, vitaslop_runtime::capture::ColorSurface, u64)>,
     /// Copies whose map is outstanding from an earlier present.
-    in_flight: Vec<(u32, u32, u32, u32, vitaslop_runtime::capture::ColorSurface)>,
+    in_flight: Vec<(u32, u8, u32, u32, u32, vitaslop_runtime::capture::ColorSurface, u64)>,
     /// Whether the surface the targets are held in is BGRA, so the bytes are swapped to the
     /// memory-order RGBA the guest expects.
     bgra: bool,
+    /// >>> WHETHER THE GUEST IS ACTUALLY BEING FED: copies encoded, copies handed to the guest,
+    /// and copies SKIPPED because every slot for that target was still in flight. Cumulative;
+    /// the panel prints and the reader divides.
+    ///
+    /// This exists because a washed-out picture could not be told apart from a STARVED
+    /// writeback. MEASURED on this machine, one build, one recipe, one frame: turning the
+    /// writeback off entirely takes mlb's at-bat from a frame mean of 135,132,124 to
+    /// 203,180,144 - the device's exact look - because the guest's auto-exposure reads its
+    /// light probe out of guest memory and raises the exposure until it clamps when that probe
+    /// is dark. So "is the probe being written back, and how often" is the question the whole
+    /// picture turns on, and no dump could answer it.
+    captured: u64,
+    delivered: u64,
+    skipped_in_flight: u64,
+    /// Copies that landed AFTER a newer copy of the same target had already been applied. See
+    /// `next_seq`. Not an error - it is the ring doing its job - but a large share means the
+    /// slots are completing badly out of order and is worth seeing.
+    dropped_stale: u64,
 }
 
 impl RttWriteback {
+    /// Readback buffers kept PER TARGET, rotated.
+    ///
+    /// # One was not enough, and the failure is invisible
+    /// With a single buffer per address, a target whose previous map has not landed is SKIPPED
+    /// this present - the copy cannot be re-encoded into a buffer whose map is outstanding
+    /// (WebGPU refuses the WHOLE SUBMIT for a buffer used while mapped, which is how this probe
+    /// once killed the run it was watching). That is harmless at 8 ms a frame, where the map
+    /// lands in one. At 43 ms a frame behind a two-deep queue it is not: the map lands two or
+    /// three presents later, so the slot is busy on most presents and the guest's light probe is
+    /// refreshed a fraction of the time - the same starvation as no writeback at all, arriving
+    /// slowly.
+    ///
+    /// Three slots, because the queue-depth bound admits at most two submits in flight and the
+    /// present that requests the map is a third. Cheap: a probe target is 128x128 or smaller, so
+    /// three slots is under 200 KB for it.
+    const RING: u8 = 3;
+
+    /// Slots for a target whose copy is `bytes` long.
+    ///
+    /// >>> MEASURED: THREE WAS NOT ENOUGH. On the desktop browser, with a three-slot ring,
+    /// **32% of the copies this writeback wanted to make were still skipped** because every slot
+    /// for that target was mapped. The device is five times slower per frame, so its share can
+    /// only be worse - and a skipped copy of the LIGHT PROBE is the whole wash-out.
+    ///
+    /// Depth is chosen by SIZE because the memory is not free and the targets that matter are
+    /// the small ones: the probe faces are 128x128 (64 KB a copy), so eight slots costs half a
+    /// megabyte for the target whose starvation costs the picture, while a 256x256 or a 512x64
+    /// keeps three. The cap on a writeback copy is 65,536 texels, so nothing here is unbounded.
+    fn ring_for(bytes: u64) -> u8 {
+        if bytes <= 64 * 1024 {
+            8
+        } else {
+            Self::RING
+        }
+    }
+
     fn new(bgra: bool) -> Self {
-        RttWriteback { bufs: Default::default(), pending: Vec::new(), in_flight: Vec::new(), bgra }
+        RttWriteback {
+            bufs: Default::default(),
+            next_slot: Default::default(),
+            next_seq: Default::default(),
+            newest_delivered: Default::default(),
+            pending: Vec::new(),
+            in_flight: Vec::new(),
+            bgra,
+            captured: 0,
+            delivered: 0,
+            skipped_in_flight: 0,
+            dropped_stale: 0,
+        }
+    }
+
+    /// `(captured, delivered, skipped because every slot was in flight, dropped as stale)`
+    /// since the run began.
+    fn counts(&self) -> (u64, u64, u64, u64) {
+        (self.captured, self.delivered, self.skipped_in_flight, self.dropped_stale)
     }
 
     /// Encode the copies. Call before the submit that carries `encoder`.
@@ -615,12 +707,21 @@ impl RttWriteback {
             let Some(surface) = vitaslop_runtime::rtt_writeback::surface_for(scenes, addr) else {
                 continue;
             };
-            if self.in_flight.iter().chain(self.pending.iter()).any(|p| p.0 == addr) {
-                continue;
-            }
             let padded = (w * 4).div_ceil(ALIGN) * ALIGN;
             let size = (padded * h) as u64;
-            let entry = self.bufs.entry(addr).or_insert_with(|| {
+            // A FREE SLOT for this target, rather than "is this target busy at all". See `RING`
+            // and `ring_for`, which is why the size is computed first.
+            let busy = |slot: u8| {
+                self.in_flight.iter().chain(self.pending.iter()).any(|p| p.0 == addr && p.1 == slot)
+            };
+            let ring = Self::ring_for(size);
+            let start = *self.next_slot.get(&addr).unwrap_or(&0) % ring;
+            let Some(slot) = (0..ring).map(|k| (start + k) % ring).find(|s| !busy(*s)) else {
+                self.skipped_in_flight += 1;
+                continue;
+            };
+            self.next_slot.insert(addr, (slot + 1) % ring);
+            let entry = self.bufs.entry((addr, slot)).or_insert_with(|| {
                 (
                     device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("gxm-rtt-writeback"),
@@ -659,7 +760,11 @@ impl RttWriteback {
                 },
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
-            self.pending.push((addr, w, h, padded, surface));
+            let seq = self.next_seq.entry(addr).or_insert(0);
+            *seq += 1;
+            let seq = *seq;
+            self.captured += 1;
+            self.pending.push((addr, slot, w, h, padded, surface, seq));
         }
     }
 
@@ -667,9 +772,9 @@ impl RttWriteback {
     /// buffer.
     fn begin_map(&mut self) {
         for p in self.pending.drain(..) {
-            if let Some((buf, size, ready)) = self.bufs.get(&p.0) {
+            if let Some((buf, size, ready)) = self.bufs.get(&(p.0, p.1)) {
                 let ready = ready.clone();
-                let want = (p.3 * p.2) as u64;
+                let want = (p.4 * p.3) as u64;
                 buf.slice(..want.min(*size)).map_async(wgpu::MapMode::Read, move |r| {
                     // A failed map still has to release the slot, or the target is never
                     // written again; the flag means "the cycle is over", not "the bytes are
@@ -688,17 +793,25 @@ impl RttWriteback {
         let mut out = Vec::new();
         let mut i = 0;
         while i < self.in_flight.len() {
-            let (addr, w, h, padded, _) = self.in_flight[i];
+            let (addr, slot, w, h, padded, _, seq) = self.in_flight[i];
             let landed = self
                 .bufs
-                .get(&addr)
+                .get(&(addr, slot))
                 .is_some_and(|(_, _, r)| r.load(std::sync::atomic::Ordering::Relaxed));
             if !landed {
                 i += 1;
                 continue;
             }
-            let (_, _, _, _, surface) = self.in_flight.swap_remove(i);
-            let Some((buf, size, _)) = self.bufs.get(&addr) else { continue };
+            let (_, _, _, _, _, surface, _) = self.in_flight.swap_remove(i);
+            // Older than one already applied: unmap it and let it go. See `next_seq`.
+            if self.newest_delivered.get(&addr).is_some_and(|newest| *newest >= seq) {
+                self.dropped_stale += 1;
+                if let Some((buf, _, _)) = self.bufs.get(&(addr, slot)) {
+                    buf.unmap();
+                }
+                continue;
+            }
+            let Some((buf, size, _)) = self.bufs.get(&(addr, slot)) else { continue };
             let want = (padded * h) as u64;
             if let Ok(view) = buf.slice(..want.min(*size)).get_mapped_range() {
                 let tight = (w * 4) as usize;
@@ -713,6 +826,8 @@ impl RttWriteback {
                     }
                 }
                 drop(view);
+                self.delivered += 1;
+                self.newest_delivered.insert(addr, seq);
                 out.push((addr, w, h, rgba, surface));
             }
             buf.unmap();
@@ -1006,7 +1121,7 @@ fn vivid_report() -> Option<String> {
         })
         .collect();
     Some(format!(
-        "the THREE biggest SUDDEN APPEARANCES of a vivid colour this run has presented - for          each frame, the colour that gained the most screen against the PREVIOUS probed frame:          {}. >>> WHAT TO READ: this is a measure of CHANGE, so a title's own art contributes          nothing however saturated it is - the stage was already there. Ordinary motion, a          camera cut or a fade moves a few per cent. A single frame where one vivid colour          appears over a tenth or more of the screen, especially a saturated primary, is the          stray flat shape, and its FRAME NUMBER is what a repro needs. It never resets, so it          survives a defect seen minutes before the dump was taken. It only sees frames the          PRESENT PROBE sampled - `VITASLOP_PRESENT_PROBE=1` samples every present and must be          set BEFORE the title starts, because it changes the surface usage at configuration          time.",
+        "the THREE biggest SUDDEN APPEARANCES of a vivid colour this run has presented - for each frame, the colour that gained the most screen against the PREVIOUS probed frame: {}. >>> WHAT TO READ: this is a measure of CHANGE, so a title's own art contributes nothing however saturated it is - the stage was already there. Ordinary motion, a camera cut or a fade moves a few per cent. A single frame where one vivid colour appears over a tenth or more of the screen, especially a saturated primary, is the stray flat shape, and its FRAME NUMBER is what a repro needs. It never resets, so it survives a defect seen minutes before the dump was taken. It only sees frames the PRESENT PROBE sampled - `VITASLOP_PRESENT_PROBE=1` samples every present and must be set BEFORE the title starts, because it changes the surface usage at configuration time.",
         worst.join("
     ")
     ))
@@ -1416,8 +1531,8 @@ impl PresentProbe {
                 // >>> THE FLICKER DETECTOR, RUN ON THE DEVICE THAT HAS THE FLICKER.
                 //
                 // The user sees stray flat SATURATED shapes with hard polygon edges, on two
-                // titles, only in the browser. `working-area/satscan.py` finds those offline by
-                // ranking shots on exactly this measure - and offline is the one place the
+                // titles, only in the browser. An offline scan over captured shots finds them by
+                // ranking on exactly this measure - and offline is the one place the
                 // defect does not occur. Every attempt to sample it through the browser harness
                 // failed for a mechanical reason: `page.locator().screenshot()` takes a large
                 // fraction of a second and the harness refuses to overlap them, so a 3,600-frame
@@ -1583,9 +1698,32 @@ struct RenderSplit {
     retire_ms: f64,
     resident_ms: f64,
     pass_ms: f64,
+    /// The four wall times that CLOSE the encode instead of adding another name to it - see
+    /// `EncodePhases::chain_head_ms`. `CHAIN`, above, is a residual with no internal structure;
+    /// these say which of head / per-scene setup / in-pass-but-unnamed / tail it is, and on this
+    /// engine that residual is most of the encode.
+    chain_head_ms: f64,
+    scene_loop_ms: f64,
+    pass_wall_ms: f64,
+    chain_tail_ms: f64,
+    negw_ms: f64,
+    clip_measures: u64,
+    head_sweep_ms: f64,
+    head_scan_ms: f64,
+    head_rtt_ms: f64,
     gxp_draws: u64,
     fixed_draws: u64,
     submit_ms: f64,
+    /// `submit_ms` broken into its five parts - see the write site in `present`. `capture` is
+    /// the probe/write-back copies encoded after the chain, `finish` is `encoder.finish()`,
+    /// `submit` is `queue.submit`, `maps` is the map/poll/backpressure bookkeeping and
+    /// `present` is `queue.present`. They have different fixes, so a combined number named
+    /// none of them.
+    sub_capture_ms: f64,
+    sub_finish_ms: f64,
+    sub_submit_ms: f64,
+    sub_maps_ms: f64,
+    sub_present_ms: f64,
     scenes: u64,
     draws: u64,
     presents: u64,
@@ -1679,6 +1817,23 @@ fn fastforward_to() -> u64 {
     }
 }
 
+/// Frame from which a FAST-FORWARD still RENDERS (`VITASLOP_BROWSER_RENDER_FROM`), even though
+/// it is still unpaced and nobody is watching. The browser's half of
+/// `VITASLOP_HEADLESS_RENDER_FROM`; see the use site for the measurement that asked for it.
+///
+/// Default (`ff_to`, i.e. unset) is the old behaviour: render nothing below the target. `0`
+/// renders every frame of the fast-forward, which is a faithful dense sequence at one full
+/// replay's render cost - the arm for "is this defect the title's or my rig's".
+fn fastforward_render_from(ff_to: u64) -> u64 {
+    match vitaslop_runtime::knobs::var("VITASLOP_BROWSER_RENDER_FROM") {
+        Err(_) => ff_to,
+        Ok(v) => v
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("VITASLOP_BROWSER_RENDER_FROM={v} is not a frame number"))
+            .min(ff_to),
+    }
+}
+
 /// Whether a run may proceed on a software rasteriser (`VITASLOP_ALLOW_SOFTWARE_GPU`).
 ///
 /// OFF by default, and the default is the point. SwiftShader renders a plausible picture
@@ -1744,6 +1899,18 @@ struct AdapterProbe {
     summary: String,
     /// True when the adapter is a CPU rasteriser rather than a GPU.
     software: bool,
+    /// True when this is a WebGPU COMPATIBILITY-MODE adapter - see
+    /// [`vitaslop_platform::gpu::set_compat_mode`], whose whole rule set this decides.
+    ///
+    /// >>> THIS IS READ HERE BECAUSE NOTHING WAS READING IT ANYWHERE.
+    /// `gpu::compat_mode()` gates four sRGB-twin declarations, and the note beside it records a
+    /// device measurement - Chrome blocklisted the Imagination driver and left only the
+    /// compatibility adapter, on which a texture carrying a view of another format fails to
+    /// create, taking 5 targets, 4,776 bind groups and 1,173 render passes down with it and
+    /// producing a BLACK FRAME. The gate was written; `set_compat_mode` was never called from
+    /// anywhere in the tree, so the flag was permanently false and the whole provision was dead
+    /// code. A switch nobody throws is not a safeguard, it is a comment.
+    compat: bool,
 }
 
 /// Names a software WebGPU implementation goes by, lowercased. Chrome reports SwiftShader
@@ -1964,12 +2131,26 @@ async fn probe_webgpu_adapter() -> Option<AdapterProbe> {
         !software && MOBILE_ADAPTER_MARKERS.iter().any(|m| mobile_haystack.contains(m)),
         std::sync::atomic::Ordering::Relaxed,
     );
+    // `featureLevel` is the adapter's own word for which validation regime it is under
+    // ("core" or "compatibility"). Read through reflection like every other field here, so a
+    // browser that does not expose it yet returns `None` and is treated as core - which is what
+    // it was before this existed.
+    let feature_level = Reflect::get(&adapter, &JsValue::from_str("featureLevel"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .or_else(|| {
+            Reflect::get(&info, &JsValue::from_str("featureLevel")).ok().and_then(|v| v.as_string())
+        });
+    let compat = feature_level.as_deref() == Some("compatibility");
     Some(AdapterProbe {
         summary: format!(
-            "vendor={vendor} arch={architecture} device={device} desc={description}{}",
+            "vendor={vendor} arch={architecture} device={device} desc={description} featureLevel={}{}{}",
+            feature_level.as_deref().unwrap_or("(not reported)"),
+            if compat { " COMPATIBILITY-MODE" } else { "" },
             if is_fallback { " FALLBACK" } else { "" }
         ),
         software,
+        compat,
     })
 }
 
@@ -2016,6 +2197,15 @@ impl LivePlayback {
         // adapter, which that probe catches by name.
         let probe = probe_webgpu_adapter().await;
         let software = probe.as_ref().is_some_and(|p| p.software);
+        // >>> AND TELL THE RENDERER, BEFORE IT CREATES ITS FIRST TEXTURE. See `AdapterProbe`'s
+        // `compat` field: every sRGB twin in the renderer is gated on this and nothing was ever
+        // setting it.
+        if probe.as_ref().is_some_and(|p| p.compat) {
+            vitaslop_platform::gpu::set_compat_mode(true);
+            logging::note(
+                "adapter: this is a WebGPU COMPATIBILITY-MODE adapter, so no render target                  declares an sRGB twin view - such a texture cannot be created at all under                  compat validation, and one that fails takes every view, bind group, pass and                  submit built on it down with it.",
+            );
+        }
         let summary = format!(
             "adapter: {} | {}{}",
             probe.as_ref().map(|p| p.summary.as_str()).unwrap_or("navigator.gpu unreadable"),
@@ -2062,6 +2252,39 @@ impl LivePlayback {
         // DROPPED on every run this line has ever existed for. The one fact that decides whether
         // any compressed-texture work reaches a device has never been visible on a device.
         report.emit("adapter-compression", &compressed);
+        // >>> AND THE OTHER FEATURES THAT DECIDE WHAT THIS RENDERER DOES, by name, because a
+        // phone dump cannot otherwise say which of two renderers it is describing.
+        //
+        // `depth-clip-control` is the one that motivated this. mlb's post-hit "wedge" was
+        // diagnosed and fixed on the DESKTOP as a near-plane clamp (`unclipped_depth`), and the
+        // next phone dump still showed a wedge. Those two facts only compose into a diagnosis if
+        // it is known whether the phone's adapter offers the feature at all: with it absent the
+        // device ALWAYS clipped, the desktop fix could never have been its bug, and the wedge on
+        // the phone is a different draw wanting a different investigation. Without this line
+        // that question costs a round trip to a sleeping user.
+        //
+        // `timestamp-query` decides whether GPU TIME is a measurement or an apology, and the
+        // panel's own text already depends on which.
+        let features = [
+            (wgpu::Features::DEPTH_CLIP_CONTROL, "depth-clip-control"),
+            (wgpu::Features::TIMESTAMP_QUERY, "timestamp-query"),
+            (wgpu::Features::DUAL_SOURCE_BLENDING, "dual-source-blending"),
+            (wgpu::Features::FLOAT32_FILTERABLE, "float32-filterable"),
+            (wgpu::Features::SHADER_F16, "shader-f16"),
+        ];
+        let have: Vec<&str> =
+            features.iter().filter(|(b, _)| f.contains(*b)).map(|(_, n)| *n).collect();
+        let missing: Vec<&str> =
+            features.iter().filter(|(b, _)| !f.contains(*b)).map(|(_, n)| *n).collect();
+        let feature_line = format!(
+            "adapter features OFFERED: {} | NOT offered: {} >>> `depth-clip-control` ABSENT means \
+             this device clips at the near AND far planes whatever the renderer asks for, so no \
+             near-plane diagnosis taken on a desktop that HAS it transfers here.",
+            if have.is_empty() { "none of the ones that matter".to_string() } else { have.join(", ") },
+            if missing.is_empty() { "none".to_string() } else { missing.join(", ") },
+        );
+        logging::note(&feature_line);
+        report.emit("adapter-features", &feature_line);
         if software && !allow_software_gpu() {
             return Err(JsValue::from_str(&format!(
                 "{summary}\nRefusing to run: this is a CPU rasteriser, not a GPU. A frame rate \
@@ -2596,7 +2819,7 @@ impl LivePlayback {
             // a defect, and a warning means we owe a fix [[vitaslop-a-warning-means-we-owe-a-fix]].
             tracing::info!(
                 target: "vitaslop::status",
-                "present with {draws} draw(s): display {dw}x{dh}, surface texture {sw}x{sh},                  scene colour target(s) [{}]",
+                "present with {draws} draw(s): display {dw}x{dh}, surface texture {sw}x{sh}, scene colour target(s) [{}]",
                 targets.join(", "),
             );
         }
@@ -2643,21 +2866,44 @@ impl LivePlayback {
             self.writeback.capture(&self.device, &mut encoder, &list, all_scenes);
         }
         self.gxm.ts_finish_chain(&mut encoder);
-        self.queue.submit([encoder.finish()]);
+        // >>> `submit` IS FIVE DIFFERENT THINGS AND THEY HAVE FIVE DIFFERENT FIXES.
+        //
+        // MEASURED on the user's phone, one gameplay window: `submit 3.7 ms` of a 5.7 ms
+        // render, with `arena write 0.2 ms` and the GPU's own timestamp query reading 11.5 ms
+        // against a 20.4 ms period - so the GPU was idle 44% of the period and the renderer
+        // was still spending 3.7 ms a frame in a term with NO breakdown at all. A number that
+        // large with no parts cannot name a fix. The span covers the probe/write-back copies,
+        // `encoder.finish()` (Dawn's validation of the whole command buffer),
+        // `queue.submit` (the crossing that hands it over), the map/poll bookkeeping, and
+        // `queue.present` (which on a FIFO surface is where a vsync wait would land). Each is
+        // two clock reads once per present, so the split is always on.
+        let ts_cap = clock(&self.perf);
+        let cmd = encoder.finish();
+        let ts_fin = clock(&self.perf);
+        self.queue.submit([cmd]);
+        let ts_sub = clock(&self.perf);
         // >>> THE DEPTH COUNTER GOES UP HERE AND COMES DOWN IN A CALLBACK, and this promise is
         // >>> registered on EVERY submit - unlike the latency one below, which deliberately
         // >>> does not stack. A counter that skipped a submit would under-count the queue and
         // >>> the bound would let it grow again. See `gpu_in_flight`.
         {
             use std::sync::atomic::Ordering::Relaxed;
-            self.gpu_in_flight.fetch_add(1, Relaxed);
+            let depth = self.gpu_in_flight.fetch_add(1, Relaxed) + 1;
+            // >>> PUBLISH THE DEPTH WHERE THE STALL REPORT CAN READ IT. A blocked
+            // `queue.write_buffer` is explained one way if two submits are outstanding and a
+            // completely different way if none are, and the platform layer that times the write
+            // cannot see this counter. See `gpu::GPU_SUBMITS_IN_FLIGHT`.
+            vitaslop_platform::gpu::GPU_SUBMITS_IN_FLIGHT.store(depth as u64, Relaxed);
             let inflight = self.gpu_in_flight.clone();
             self.queue.on_submitted_work_done(move || {
                 // `fetch_update` rather than `fetch_sub`: the safety valve above can zero the
                 // counter while promises are still outstanding, and an unsigned wrap there
                 // would put the depth at four billion and decline every present for the rest
                 // of the run - the exact failure the valve exists to prevent.
-                let _ = inflight.fetch_update(Relaxed, Relaxed, |d| Some(d.saturating_sub(1)));
+                let left = inflight
+                    .fetch_update(Relaxed, Relaxed, |d| Some(d.saturating_sub(1)))
+                    .map_or(0, |d| d.saturating_sub(1));
+                vitaslop_platform::gpu::GPU_SUBMITS_IN_FLIGHT.store(left as u64, Relaxed);
             });
         }
         // >>> ARM OR DECAY THE QUEUE-DEPTH BOUND, from the writes THIS frame actually made.
@@ -2672,7 +2918,7 @@ impl LivePlayback {
                 if self.stall_armed_for == 0 {
                     tracing::warn!(
                         target: "vitaslop::gxm",
-                        "GPU BACKPRESSURE ARMED: a single `queue.write_buffer` blocked for                          {:.1} ms. A copy of this size costs microseconds, so the thread was                          waiting on the staging ring to retire - which means the GPU queue is                          deep enough that the worker stops turning its event loop. Presents                          beyond {} in flight will be declined for the next {} presents.",
+                        "GPU BACKPRESSURE ARMED: a single `queue.write_buffer` blocked for {:.1} ms. A copy of this size costs microseconds, so the thread was waiting on the staging ring to retire - which means the GPU queue is deep enough that the worker stops turning its event loop. Presents beyond {} in flight will be declined for the next {} presents.",
                         worst_us as f64 / 1000.0,
                         self.queue_depth_limit,
                         STALL_ARM_PRESENTS,
@@ -2742,8 +2988,14 @@ impl LivePlayback {
         // non-blocking and is a no-op when there is nothing pending, so it is safe to call
         // every present rather than only when a probe is in flight.
         let _ = self.device.poll(wgpu::PollType::Poll);
+        let ts_map = clock(&self.perf);
         self.queue.present(frame);
         let t3 = clock(&self.perf);
+        self.split.sub_capture_ms += ts_cap - t2;
+        self.split.sub_finish_ms += ts_fin - ts_cap;
+        self.split.sub_submit_ms += ts_sub - ts_fin;
+        self.split.sub_maps_ms += ts_map - ts_sub;
+        self.split.sub_present_ms += t3 - ts_map;
         // `encode_chain` already splits itself over every pass of the frame - prepare (the
         // scene walk, which for a recompiled draw creates its bind groups), upload (the
         // arena writes) and pass (command encoding). Take that rather than reporting one
@@ -2783,6 +3035,15 @@ impl LivePlayback {
         self.split.retire_ms += ph.retire_ms;
         self.split.resident_ms += ph.resident_ms;
         self.split.pass_ms += ph.pass_ms;
+        self.split.chain_head_ms += ph.chain_head_ms;
+        self.split.scene_loop_ms += ph.scene_loop_ms;
+        self.split.pass_wall_ms += ph.pass_wall_ms;
+        self.split.chain_tail_ms += ph.chain_tail_ms;
+        self.split.negw_ms += ph.negw_ms;
+        self.split.clip_measures += ph.clip_measures as u64;
+        self.split.head_sweep_ms += ph.head_sweep_ms;
+        self.split.head_scan_ms += ph.head_scan_ms;
+        self.split.head_rtt_ms += ph.head_rtt_ms;
         self.split.gxp_draws += ph.gxp_draws as u64;
         self.split.fixed_draws += ph.fixed_draws as u64;
         self.split.submit_ms += t3 - t2;
@@ -2857,6 +3118,12 @@ impl LivePlayback {
     /// How full the renderer's growing caches are - see `GxmRenderer::cache_sizes`.
     fn cache_sizes(&self) -> String {
         self.gxm.cache_sizes()
+    }
+
+    /// `(captured, delivered, skipped, dropped stale)` render-target writebacks - see
+    /// [`RttWriteback`].
+    fn writeback_counts(&self) -> (u64, u64, u64, u64) {
+        self.writeback.counts()
     }
 
     fn surface_line(&self) -> &str {
@@ -3381,6 +3648,9 @@ struct Prebuilt {
     ///
     /// It is ~88 KB for a retail title (one u32 per function), transferred once at setup.
     func_addrs: Vec<u32>,
+    /// The guest region offset the module was emitted for (`Program::host_off`); 0 for a
+    /// memory of its own. The run worker refuses a module built for another offset.
+    host_off: u32,
 }
 
 impl Prebuilt {
@@ -3420,7 +3690,12 @@ impl Prebuilt {
             v if v.is_undefined() || v.is_null() => Vec::new(),
             v => js_sys::Uint32Array::new(&v).to_vec(),
         };
-        Ok(Some(Prebuilt { module, mem_pages, mirror_off, dirty_off, func_addrs }))
+        // Required: a module built for a host region run against a separate memory (or
+        // the reverse) reads the wrong bytes from its first instruction.
+        let host_off = get("hostOff")?
+            .as_f64()
+            .ok_or_else(|| JsValue::from_str("prebuilt.hostOff missing"))? as u32;
+        Ok(Some(Prebuilt { module, mem_pages, mirror_off, dirty_off, func_addrs, host_off }))
     }
 }
 
@@ -3440,6 +3715,7 @@ struct Transpiled {
 fn transpile_here(
     linked: &vitaslop_runtime::link::LinkedProgram,
     perf: &web_sys::Performance,
+    host_off: u32,
 ) -> Result<Transpiled, JsValue> {
     // Ask the transpiler for software fuel BEFORE it emits. The browser's WebAssembly
     // engine has no fuel counter of its own, so without this a guest loop that makes no
@@ -3453,6 +3729,15 @@ fn transpile_here(
     // game clock cannot tell the difference. Native does not do this either: wasmtime
     // bills every operator it executes, so the stamps would speed its clock up.
     vitaslop_transpiler::set_dirty_tracking(true);
+    // And whether a run of stores off one base register shares ONE mark. This is the
+    // engine that has to answer it - the coalescer removes operators and adds none, so the
+    // clock and the expansion factor cannot see it, and V8 wall-clock on matched frames is
+    // the only instrument that can. VALUE-sensitive (`=0` is the OFF arm), like
+    // `VITASLOP_DIRTY_PAGES` and for the same reason.
+    vitaslop_transpiler::set_dirty_run_marks(!matches!(
+        vitaslop_runtime::knobs::var("VITASLOP_DIRTY_RUN_MARK").as_deref(),
+        Ok("0")
+    ));
     // Hand the engine-agnostic runtime this engine's clock, so its per-phase timers work
     // HERE. They are `#[cfg]`-inert on wasm without one - there is no `Instant` - which is
     // why a browser frame could only ever report one undifferentiated number while the
@@ -3508,13 +3793,13 @@ fn transpile_here(
     if let Ok(spec) = vitaslop_runtime::knobs::var("VITASLOP_TRACE_BLOCKS") {
         let ranges = vitaslop_transpiler::parse_trace_blocks(&spec);
         tracing::warn!(
-            "VITASLOP_TRACE_BLOCKS: tracing {} guest block range(s) - every block entry in              them calls the svc hook",
+            "VITASLOP_TRACE_BLOCKS: tracing {} guest block range(s) - every block entry in them calls the svc hook",
             ranges.len()
         );
         vitaslop_transpiler::set_trace_blocks(ranges);
     }
     let t = perf.now();
-    let built = vitaslop_transpiler::transpile_lenient(&linked.shared_program());
+    let built = vitaslop_transpiler::transpile_lenient(&linked.shared_program_at(host_off));
     let ms = perf.now() - t;
     // >>> THE EXPANSION FACTOR IS REPORTED, because the emulated CPU's SPEED depends on
     // it. The game clock is charged per unit of fuel and a unit of fuel is one executed
@@ -3562,6 +3847,26 @@ fn transpile_here(
     })
 }
 
+/// Bytes reserved for the guest region inside the emulator's memory: the guest's own
+/// address space plus room for what the transpiler lays out above it (the dispatch table,
+/// the mirror block, the dirty map, the diagnostics word). The layout's real size is
+/// checked against this when the engine is built.
+const GUEST_REGION_BYTES: usize = vitaslop_runtime::link::GUEST_MEM_BYTES as usize + 4 * 1024 * 1024;
+
+/// >>> RESERVE THE GUEST REGION IN THIS WORKER'S MEMORY and return its offset - the page
+/// calls it on the run worker before transpiling, and the transpile worker builds the
+/// module for that offset. See `browser_sched::HostRegion` for why the guest lives here.
+/// Returns 0 under `VITASLOP_BROWSER_SPLIT_MEMORY=1`, which keeps the separate,
+/// exactly-sized guest memory of before (a guest pointer past its region then TRAPS
+/// instead of reaching the emulator's heap - the diagnostic arm for a wild pointer).
+#[wasm_bindgen]
+pub fn reserve_guest_region() -> Result<u32, JsValue> {
+    if matches!(vitaslop_runtime::knobs::var("VITASLOP_BROWSER_SPLIT_MEMORY").as_deref(), Ok("1")) {
+        return Ok(0);
+    }
+    browser_sched::reserve_guest_region(GUEST_REGION_BYTES)
+}
+
 /// Mount the title, link it, and transpile+compile the guest module - and NOTHING else.
 ///
 /// Runs in a throwaway worker whose whole point is to be terminated afterwards: the
@@ -3569,15 +3874,19 @@ fn transpile_here(
 /// way to stop paying for it is for the heap it happened in to cease to exist. Returns
 /// `{ module, memPages, mirrorOff }` for [`run_game_worker`] to run against.
 #[wasm_bindgen]
-pub async fn transpile_title(source: JsValue) -> Result<JsValue, JsValue> {
+pub async fn transpile_title(source: JsValue, host_off: u32) -> Result<JsValue, JsValue> {
     crate::logging::install_panic_hook();
     logging::init();
     let perf = global_performance().ok_or_else(|| JsValue::from_str("no performance clock"))?;
     let Mounted { linked, .. } = mount_and_link(source).await?;
-    let built = transpile_here(&linked, &perf)?;
+    // `host_off` is the RUN worker's reservation (`reserve_guest_region`), which this
+    // throwaway worker never sees itself: the module is emitted for where the guest will
+    // live, not where this worker could put it.
+    let built = transpile_here(&linked, &perf, host_off)?;
     let module = browser_sched::compile_module(&built.wasm).await?;
     let out = js_sys::Object::new();
     js_sys::Reflect::set(&out, &JsValue::from_str("module"), &module)?;
+    js_sys::Reflect::set(&out, &JsValue::from_str("hostOff"), &JsValue::from_f64(host_off as f64))?;
     js_sys::Reflect::set(&out, &JsValue::from_str("memPages"), &JsValue::from_f64(built.mem_pages as f64))?;
     // The wasm-index -> guest-address table, so the RUN worker can name guest functions in
     // a fault backtrace. See `Prebuilt::func_addrs`.
@@ -3799,20 +4108,24 @@ async fn setup_game(
     //
     // Built in a throwaway worker instead, the peak dies with that worker and only the
     // compiled `WebAssembly.Module` crosses over (it is structured-cloneable).
-    let (module, mem_pages, mirror_off, dirty_off, transpile_ms) = match prebuilt {
+    let (module, mem_pages, mirror_off, dirty_off, host_off, transpile_ms) = match prebuilt {
         Some(p) => {
             logging::note(&format!(
                 "[setup] using a PREBUILT module (transpiled in a throwaway worker); \
-                 emulator heap {} MB",
-                wasm_heap_mb()
+                 emulator heap {} MB; guest region {}",
+                wasm_heap_mb(),
+                if p.host_off == 0 { "a memory of its own".to_string() } else { format!("inside the emulator's memory at {:#x}", p.host_off) }
             ));
             browser_sched::record_function_addresses(p.func_addrs);
-            (p.module, p.mem_pages, p.mirror_off, p.dirty_off, 0.0)
+            (p.module, p.mem_pages, p.mirror_off, p.dirty_off, p.host_off, 0.0)
         }
         None => {
-            let built = transpile_here(&linked, &perf)?;
+            // Transpiling here: reserve the region here too, so this path and the prebuilt
+            // one run the same memory layout.
+            let host_off = reserve_guest_region()?;
+            let built = transpile_here(&linked, &perf, host_off)?;
             let module = browser_sched::compile_module(&built.wasm).await?;
-            (module, built.mem_pages, built.mirror_off, built.dirty_off, built.ms)
+            (module, built.mem_pages, built.mirror_off, built.dirty_off, host_off, built.ms)
         }
     };
 
@@ -3824,6 +4137,7 @@ async fn setup_game(
         mem_pages,
         mirror_off,
         dirty_off,
+        host_off,
         &linked.module_inits,
         main_sp,
         env,
@@ -4253,6 +4567,24 @@ async fn live_loop(
     const PERF_WINDOW: u32 = 30;
     let mut cpu_ms = 0.0f64;
     let mut cpu_frames = 0u32;
+    // >>> THE WINDOW'S WORST FRAME, WITH THE GUEST WORK IT DID - because a mean cannot see a
+    // >>> DIP and a wall-clock spike alone cannot say whose it is.
+    //
+    // The panel reports a thirty-frame mean, so a frame that costs twice the mean is averaged
+    // into a number that still looks healthy, and the frame rate the person holding the phone
+    // reports is the one the panel cannot show. MEASURED on a fighting title in the desktop
+    // browser: a steady 6.0 ms/frame at 197 draws, spiking to 13.4 ms at 145 draws with host
+    // calls at 1.0 ms and render at 0.7 - so 12 ms of the spike had no owner on the panel at
+    // all, and nothing here could say whether the GUEST did more work or WE stalled.
+    //
+    // The fuel delta is what separates those, and it is the whole reason this exists: fuel
+    // counts executed guest instructions, so a spike with fuel UP is the title doing more and a
+    // spike with fuel FLAT is ours - a collection, an allocation, a blocking call. Those are
+    // opposite fixes, and reading a wall-clock spike without this number has to guess between
+    // them [[vitaslop-a-count-needs-its-window]].
+    let mut worst_cpu: (f64, u64, u64, u64) = (0.0, 0, 0, 0);
+    let mut fuel_prev = 0u64;
+    let mut fuel_win = 0u64;
     let mut render_ms = 0.0f64;
     let mut presents = 0u32;
     // >>> THE HOST-CALL SHARE OVER THE SAME WINDOW AS `cpu_ms`, BECAUSE THAT IS THE
@@ -4326,6 +4658,10 @@ async fn live_loop(
     // Cumulative guest-store epoch wraps at the start of the current perf window, so the
     // window's own count is a difference rather than a running total that only grows.
     let mut epoch_wraps_at_window_start = 0u64;
+    let mut many_calls_at_window_start = 0u64;
+    let mut many_ranges_at_window_start = 0u64;
+    let mut pf_fetched_at_window_start = 0u64;
+    let mut pf_skipped_at_window_start = 0u64;
     let mut epoch_rebases_at_window_start = 0u64;
     // >>> THE MOST EXPENSIVE FRAMES OF THE WHOLE RUN, AND THE FRAME/PRESENT TOTALS.
     //
@@ -4355,6 +4691,7 @@ async fn live_loop(
     // that stops responding while it burns CPU is indistinguishable from a dead one.
     const FF_TICK_BUDGET_MS: f64 = 250.0;
     let ff_to = fastforward_to();
+    let ff_render_from = fastforward_render_from(ff_to);
     let mut was_fast = false;
     // Host-call totals at the end of the previous frame, so each frame can report its own.
     let (mut last_hc_calls, mut last_hc_ms) = browser_sched::host_call_totals();
@@ -4458,6 +4795,11 @@ async fn live_loop(
         } else if was_fast {
             cpu_ms = 0.0;
             cpu_frames = 0;
+            // With the rest of the window: a fast-forward frame is unpaced and presents
+            // nothing, so carrying its cost into the first paced window reports a spike that
+            // belongs to a different regime entirely.
+            worst_cpu = (0.0, 0, 0, 0);
+            fuel_win = 0;
             hc_win_ms = 0.0;
             hc_win_est_ms = 0.0;
             hc_win_calls = 0;
@@ -4823,6 +5165,17 @@ async fn live_loop(
             if frames > WARMUP_FRAMES {
                 cpu_ms += c1 - c0;
                 cpu_frames += 1;
+                // Fuel is CUMULATIVE, so the frame's own figure is a delta. One read a frame.
+                let fuel_now = sched.core.fuel_report().0;
+                let fuel_frame = fuel_now.saturating_sub(fuel_prev);
+                fuel_prev = fuel_now;
+                fuel_win += fuel_frame;
+                if c1 - c0 > worst_cpu.0 {
+                    // `last_hc_calls` still holds the PREVIOUS frame's total here - it is
+                    // updated below - so this difference is this frame's own call count.
+                    let calls = browser_sched::host_call_totals().0 - last_hc_calls;
+                    worst_cpu = (c1 - c0, fuel_frame, calls, frames);
+                }
             }
             // The per-frame split, in the one line that is always visible. "This frame
             // took 900 ms" cannot be acted on; "900 ms, of which 40,000 host calls took
@@ -4963,12 +5316,16 @@ async fn live_loop(
                 let (fuel_total, fuel_samples, fuel_max) = sched.core.fuel_report();
                 let (raw_last, raw_min) = browser_sched::raw_fuel_stats();
                 let (unbilled_none, unbilled_idle) = sched.core.unbilled_report();
+                // What the `delay(0)` yield elision did. On the running line because this is
+                // the engine where a suspend is a JSPI round trip, and because a guard that
+                // never fires and a build where it is switched off look identical otherwise.
+                let (yield_elided, yield_taken) = vitaslop_runtime::host::yield_report();
                 logging::note(&format!(
                     "[live] {status} | clock {:.2}s over {flips} flips ({quanta} quanta, \
                      {:.1} us/frame; {:.2}s quanta + {:.2}s idle) \
                      | preempt {preempts} ({on_fuel} on fuel, {vparks} vblank spins PARKED) \
                      | fuel {fuel_total} over {fuel_samples} (max {fuel_max}, \
-                     raw {raw_last}/min {raw_min}, unbilled {unbilled_none}+{unbilled_idle})                      | wasm heap {} MB \
+                     raw {raw_last}/min {raw_min}, unbilled {unbilled_none}+{unbilled_idle})                      | yields {yield_elided} host-elided (inline elides uncounted) / {yield_taken} suspended                      | wasm heap {} MB \
                      | jspi {susp} susp ({stop_q} quantum / {stop_b} blocked / {stop_f} flip), \
                      {starts} stacks, {abandoned} abandoned, \
                      {released} released | instances {inst_new} new, {inst_reused} reused \
@@ -5125,9 +5482,29 @@ async fn live_loop(
         // NOT while fast-forwarding: nobody is watching a fast-forward, and every present
         // is a full GXM->WebGPU encode of a scene that is discarded a moment later. It is
         // pure cost on the one path whose entire purpose is to reach a later frame
-        // quickly. Real-time pacing resumes presenting the moment the target is crossed,
-        // so the screenshot and the published rate are unaffected.
-        if fast {
+        // quickly.
+        //
+        // >>> "THE SCREENSHOT IS UNAFFECTED" IS FALSE FOR A TITLE THAT PAINTS A TARGET AND
+        // >>> SAMPLES IT LATER, AND THE DESKTOP ALREADY KNEW THIS.
+        //
+        // RENDER HISTORY IS STATE. A render target is guest memory the GPU wrote, so a pass
+        // sampling one the run never rendered falls through to decoding the guest bytes -
+        // which are zero - and multiplies its whole output by nothing
+        // [[vitaslop-a-render-target-reads-empty-in-guest-memory]]. MEASURED on PCSE00084
+        // fast-forwarded to 3400: every sideline character shades to rgb(18,19,19), and the
+        // per-draw chain trace shows **2,046 draws a frame** sampling `0x95880100` (the
+        // title's 960x544 world shadow/AO map, a scene colour surface) with NO residency
+        // mark at all, plus 159 sampling its 128x128 environment cube. Both are painted
+        // once, long before the window.
+        //
+        // This is the same defect `VITASLOP_HEADLESS_RENDER_FROM` was added to the desktop
+        // headless rig for (PCSA00002's blown-out players, a 128x128 ambient probe atlas
+        // painted at a screen transition) - and the browser, which is the engine the
+        // pictures are actually judged on, had no equivalent. `VITASLOP_BROWSER_RENDER_FROM`
+        // is it: frames from there on are RENDERED even though the loop is still unpaced, so
+        // a fast-forward that stops short of the window still leaves the render state the
+        // window needs. Default = the fast-forward target, i.e. exactly the old behaviour.
+        if fast && sched.core.frames() < ff_render_from {
             latest = None;
         }
         if let Some(scene) = latest {
@@ -5148,6 +5525,20 @@ async fn live_loop(
             // copies that landed since the last present, one or two frames behind the picture.
             // See `RttWriteback`.
             for (addr, w, h, rgba, surface) in playback.take_writebacks() {
+                // >>> NEVER WRITE INTO MEMORY THE GUEST HAS UNMAPPED.
+                //
+                // This write-back is ASYNCHRONOUS: the GPU copy is encoded on one frame and the
+                // mapped bytes land one or two frames later (see `RttWriteback::RING`), and in
+                // that window the destination can stop being a render target. `sceGxmUnmapMemory`
+                // is the guest saying so in its own words, and a write into memory it has taken
+                // back is a write into somebody else's data.
+                //
+                // >>> KEPT BECAUSE IT IS CORRECT AND PROVEN INERT, NOT BECAUSE IT IS PROVEN
+                // >>> USEFUL. It was built first on the reading that the unmap is what happens
+                // here, and that reading is REFUTED: on PCSE00084 it fires **0 times** and fixed
+                // nothing. The corruption that kills that title at frame 1263 is a target the
+                // guest RECYCLES without unmapping, which `apply_one`'s own fingerprint guard
+                // catches instead.
                 // The "is this memory ours" probe is read up front, so the two closures
                 // borrow different things (the probe, and the core for the write).
                 let mut probe = vec![0u8; 4096];
@@ -5237,7 +5628,7 @@ async fn live_loop(
                     // [[vitaslop-prepare-split-reports-its-own-residual]].
                     let named = s.prepare_ms + s.upload_ms + s.pass_ms;
                     format!(
-                        " (prepare {:.1}, upload {:.1} [arena {:.1} = create {:.1} + write {:.1}, ubo-bg {:.1}], pass {:.1}, CHAIN {:.1} [precompile {:.1}, retire {:.1}, resident-heap {:.1}])",
+                        " (prepare {:.1}, upload {:.1} [arena {:.1} = create {:.1} + write {:.1}, ubo-bg {:.1}], pass {:.1}, CHAIN {:.1} [precompile {:.1}, retire {:.1}, resident-heap {:.1}] :: head {:.1} (sweeps {:.1} + scans {:.1} + rtt {:.1}, other {:.1}), scene-loop {:.1} (outside passes {:.1}), passes-wall {:.1} (clip-verdict {:.1} over {:.0} programs INTERPRETED, other unnamed {:.1}), tail {:.1})",
                         s.prepare_ms / np,
                         s.upload_ms / np,
                         s.arena_ms / np,
@@ -5249,6 +5640,25 @@ async fn live_loop(
                         s.precompile_ms / np,
                         s.retire_ms / np,
                         s.resident_ms / np,
+                        // The residual BROKEN DOWN - see `Split::chain_head_ms`. Printed beside
+                        // `CHAIN` rather than instead of it, because the two are derived
+                        // differently (that one from `encode_ms`, these from spans inside
+                        // `encode_chain`) and a disagreement between them is itself the finding.
+                        s.chain_head_ms / np,
+                        s.head_sweep_ms / np,
+                        s.head_scan_ms / np,
+                        s.head_rtt_ms / np,
+                        (s.chain_head_ms
+                            - (s.precompile_ms + s.retire_ms + s.resident_ms)
+                            - (s.head_sweep_ms + s.head_scan_ms + s.head_rtt_ms))
+                            / np,
+                        s.scene_loop_ms / np,
+                        (s.scene_loop_ms - s.pass_wall_ms) / np,
+                        s.pass_wall_ms / np,
+                        s.negw_ms / np,
+                        s.clip_measures as f64 / np,
+                        (s.pass_wall_ms - named - s.negw_ms) / np,
+                        s.chain_tail_ms / np,
                     )
                 };
                 // Guest frames per PRESENT, stated rather than left to be inferred.
@@ -5313,15 +5723,56 @@ async fn live_loop(
                     "cpu {cpu_avg:.1} ms/frame ({cpu_fps:.0} fps uncapped, {per_present:.1} \
                      guest frames per present){hc_line} | render \
                      {render_avg:.1} ms = build {:.1} + encode {:.1}{inner} + submit {:.1} \
+                     [capture {:.1}, finish {:.1}, queue-submit {:.1}, maps {:.1}, present {:.1}] \
                      over {:.0} scenes / {:.0} draws ({:.0} gxp, {:.0} fixed)",
                     s.build_ms / np,
                     s.encode_ms / np,
                     s.submit_ms / np,
+                    s.sub_capture_ms / np,
+                    s.sub_finish_ms / np,
+                    s.sub_submit_ms / np,
+                    s.sub_maps_ms / np,
+                    s.sub_present_ms / np,
                     s.scenes as f64 / np,
                     s.draws as f64 / np,
                     s.gxp_draws as f64 / np,
                     s.fixed_draws as f64 / np,
                 );
+                // >>> AND THE WORST FRAME OF THE WINDOW, WITH ITS GUEST WORK. See `worst_cpu`.
+                //
+                // Appended to `perf_line` rather than emitted under an id of its own: a report id
+                // names a DOM ELEMENT on the page, so an id the page does not define is written
+                // to nothing at all and the line is silently lost. It cost a whole run to find
+                // that, and the lesson is the one this file keeps relearning - an instrument that
+                // fails by going quiet is indistinguishable from one with nothing to say.
+                //
+                // Ratios rather than raw fuel: "1.9x the mean frame for 1.0x the mean guest work"
+                // is the whole diagnosis in two numbers, and a reader should not have to divide
+                // two ten-digit counters to get it.
+                let perf_line = if worst_cpu.0 > 0.0 && cpu_frames > 0 {
+                    let fuel_mean = fuel_win as f64 / cpu_frames as f64;
+                    let fuel_ratio = if fuel_mean > 0.0 { worst_cpu.1 as f64 / fuel_mean } else { 0.0 };
+                    let cpu_ratio = if cpu_avg > 0.0 { worst_cpu.0 / cpu_avg } else { 0.0 };
+                    // >>> THE VERDICT IS THE GAP BETWEEN THE TWO RATIOS, not a threshold on
+                    // >>> either alone. A frame costing 1.4x the mean and burning 1.4x the guest
+                    // instructions is the title doing more work and there is nothing here to fix;
+                    // the same 1.4x frame burning 1.0x the instructions is OURS. Those two are
+                    // one division apart, and a fixed threshold on fuel alone calls the first one
+                    // ours as soon as the spike is small.
+                    let verdict = if cpu_ratio < 1.25 {
+                        "no spike in this window"
+                    } else if fuel_ratio >= cpu_ratio * 0.8 {
+                        "the GUEST did proportionally more work - the title, not us"
+                    } else {
+                        "OURS - the guest work did not rise with the frame"
+                    };
+                    format!(
+                        "{perf_line} | WORST frame f{} {:.1} ms = {:.1}x the mean for {:.1}x the                          guest fuel ({} calls) -> {verdict}",
+                        worst_cpu.3, worst_cpu.0, cpu_ratio, fuel_ratio, worst_cpu.2,
+                    )
+                } else {
+                    perf_line
+                };
                 report.emit("perf", &perf_line);
                 last_perf = perf_line.clone();
                 // Everything below also goes to a `diag` element on the PAGE, not only to the
@@ -5463,7 +5914,7 @@ async fn live_loop(
                             &mut diag,
                             "GPU BACKPRESSURE",
                             &format!(
-                                "the queue-depth bound is {} right now; it was ARMED {arms}                                  time(s) this run and DECLINED {n} present(s) while armed.                                  >>> READ THE ARM COUNT FIRST: at zero the bound has never                                  engaged, the declines are zero with it, and NOTHING here                                  touched the run - so a low frame rate beside `ARMED 0 time(s)`                                  is not this. The bound arms only when a single                                  `queue.write_buffer` BLOCKS for {:.1} ms or more, which no copy                                  of a few hundred KB does (a healthy run's worst over the whole                                  run was 0.6 ms for 288 KB); a blocking write means the thread                                  is waiting on the staging ring to retire, and a worker parked                                  there turns no event loop at all - no decoder callback, no                                  input, no pacing. Each arming declines AT MOST {} present(s) - and only                                  one whose queue already holds {limit} submit(s) - because a                                  declined present is a whole event-loop turn with no encode                                  and no submit, which is what lets the staging ring retire.                                  If the ring is still stuck the next frame's write blocks                                  again and arms again, so the rate settles on measurement                                  rather than on a fixed sentence: this WAS 180 presents, and                                  one 117.8 ms write then cost 215 frames on a GPU whose own                                  timestamp query read 4.1 ms. It is deliberately NOT gated on                                  `on_submitted_work_done`: that promise read 897 ms on a window                                  whose timestamp query measured 3.9 ms of GPU work, so it is                                  callback dispatch latency, and arming on it throttled a healthy                                  run to a third of its rate. `VITASLOP_GPU_QUEUE_DEPTH=0`                                  disables the bound entirely; the default is 2.",
+                                "the queue-depth bound is {} right now; it was ARMED {arms} time(s) this run and DECLINED {n} present(s) while armed. >>> READ THE ARM COUNT FIRST: at zero the bound has never engaged, the declines are zero with it, and NOTHING here touched the run - so a low frame rate beside `ARMED 0 time(s)` is not this. The bound arms only when a single `queue.write_buffer` BLOCKS for {:.1} ms or more, which no copy of a few hundred KB does (a healthy run's worst over the whole run was 0.6 ms for 288 KB); a blocking write means the thread is waiting on the staging ring to retire, and a worker parked there turns no event loop at all - no decoder callback, no input, no pacing. Each arming declines AT MOST {} present(s) - and only one whose queue already holds {limit} submit(s) - because a declined present is a whole event-loop turn with no encode and no submit, which is what lets the staging ring retire. If the ring is still stuck the next frame's write blocks again and arms again, so the rate settles on measurement rather than on a fixed sentence: this WAS 180 presents, and one 117.8 ms write then cost 215 frames on a GPU whose own timestamp query read 4.1 ms. It is deliberately NOT gated on `on_submitted_work_done`: that promise read 897 ms on a window whose timestamp query measured 3.9 ms of GPU work, so it is callback dispatch latency, and arming on it throttled a healthy run to a third of its rate. `VITASLOP_GPU_QUEUE_DEPTH=0` disables the bound entirely; the default is 2.",
                                 if armed { "ARMED" } else { "idle" },
                                 STALL_WRITE_US as f64 / 1000.0,
                                 STALL_ARM_PRESENTS,
@@ -5473,7 +5924,33 @@ async fn live_loop(
                 }
                 // >>> THE GPU'S OWN CLOCK, which the latency above cannot separate from the
                 // event loop. See `GpuTimestamps`.
-                line(&mut diag, "GPU TIME", &playback.gxm.take_gpu_time_report());
+                // >>> AND SAY THE SATURATION VERDICT IN THE LINE ITSELF, because it is the one
+                // question the whole section exists to answer and reading it used to mean
+                // cross-referencing PACING two sections further down and dividing by hand.
+                // A GPU busy for a SMALL share of the period is a GPU that is NOT the limit -
+                // and then a large `arena write` or `submit` is this thread waiting on a queue
+                // the GPU has already drained, which wants the opposite fix from less GPU work.
+                {
+                    let mut gt = playback.gxm.take_gpu_time_report();
+                    let period = if ticks > 0 { tick_span_ms / ticks as f64 } else { 0.0 };
+                    // `busy` is 0.0 when the window measured no frame at all, and then there
+                    // is no share to state - appending one would put a confident percentage on
+                    // a report whose own text says it measured nothing.
+                    let busy = playback.gxm.last_gpu_ms_per_frame();
+                    if busy > 0.0 && period > 0.0 {
+                        let share = busy * 100.0 / period;
+                        gt = format!(
+                            "{gt} >>> AGAINST THIS WINDOW'S PERIOD OF {period:.1} ms THE GPU WAS \
+                             BUSY {share:.0}% OF IT. Near 100% the GPU is the limit and the fix \
+                             is less GPU work (target sizes, multisampling, pass splits, draws). \
+                             Well under it the GPU is IDLE while this thread waits, and then \
+                             `arena write`, `queue-submit` or `present` in the render split is \
+                             where that wait surfaces - fix the depth and the staging path, not \
+                             the GPU work."
+                        );
+                    }
+                    line(&mut diag, "GPU TIME", &gt);
+                }
                 // >>> AND THE PACING, WHICH IS WHAT DECIDES HOW MANY OF THOSE FRAMES ANYONE SEES.
                 //
                 // `frames/tick` above 1.0 is the loop computing pictures and discarding them:
@@ -5706,7 +6183,7 @@ async fn live_loop(
                         &mut diag,
                         "STORAGE (this window)",
                         &format!(
-                            "{reads} OPFS reads moving {:.2} MB ({:.1} KB each), {hits} more calls                              served from the 64 KB read-ahead window | cumulative {} reads, {:.1} MB,                              {} window hits",
+                            "{reads} OPFS reads moving {:.2} MB ({:.1} KB each), {hits} more calls served from the 64 KB read-ahead window | cumulative {} reads, {:.1} MB, {} window hits",
                             bytes as f64 / (1024.0 * 1024.0),
                             if reads > 0 { bytes as f64 / reads as f64 / 1024.0 } else { 0.0 },
                             now.0,
@@ -5839,7 +6316,7 @@ async fn live_loop(
                         &format!(
                             "{frames_total} guest frames, {presents_total} presented ({:.2} \
                              frames per present) | worst: {} | WORST write_buffer OF THE RUN \
-                             {:.1} ms for {:.0} KB",
+                             {:.1} ms for {:.0} KB | {}",
                             frames_total as f64 / presents_total.max(1) as f64,
                             worst.join(", "),
                             // >>> ON THIS LINE BECAUSE THIS LINE SURVIVES THE HANG. The windowed
@@ -5847,11 +6324,57 @@ async fn live_loop(
                             // can be read - see `gpu::BUFFER_WRITE_WORST_RUN`.
                             vitaslop_platform::gpu::buffer_write_worst_run_us_kb().0,
                             vitaslop_platform::gpu::buffer_write_worst_run_us_kb().1,
+                            // >>> AND HOW MANY THERE WERE. A single worst is the number a
+                            // maximum can give; whether the run stalled ONCE or forty times,
+                            // and what the frame had queued ahead of the worst one, is the
+                            // question - and the per-stall warning that carries it is dropped
+                            // by the warnings panel. See `gpu::write_stall_census`.
+                            vitaslop_platform::gpu::write_stall_census()
+                                .unwrap_or_else(|| "no write_buffer stall over 100 ms".into()),
                         ),
                     );
                 }
+                // >>> THE DEVICE BUDGET, ON THE DEVICE.
+                //
+                // These rows were built to be read on the DESKTOP - the argument being that the
+                // device owns the rate while this code's BYTES and COUNTS are the same on both,
+                // so a phone question can be answered without a phone. That argument is intact,
+                // and it is exactly why the rows belong in a device capture too: the desktop run
+                // says what this build CHOSE to upload, and this line says the device agrees it
+                // did. Without it a capture carries only `WORST write_buffer OF THE RUN`, which
+                // the staging belt drives to zero by moving the same megabytes down another
+                // path - a serene reading over undiminished traffic. The volume row is the one
+                // that cannot be fooled that way, and it is only printed here.
+                {
+                    let rows = vitaslop_platform::gpu::device_budget_rows();
+                    let mut s = format!(
+                        "arena upload transport: {}\n",
+                        vitaslop_platform::gpu::upload_transport()
+                    );
+                    for r in &rows {
+                        s.push_str(&format!(
+                            "  {:<28} {:>24}   budget {:<10} {}\n",
+                            r.name,
+                            r.reading,
+                            r.budget,
+                            if r.pass { "ok" } else { ">>> BREACH" }
+                        ));
+                    }
+                    for r in rows.iter().filter(|r| !r.pass) {
+                        s.push_str(&format!("  >>> {}: {}\n", r.name, r.why));
+                    }
+                    line(&mut diag, "DEVICE BUDGET", &s);
+                }
                 // The surface's format, alpha mode and present mode. Every one is chosen from
                 // what the platform offers, so every one can differ between desktop and phone.
+                // >>> AND WHICH EMITTER THIS CAPTURE CAME OUT OF. A device A/B is two visits
+                // with a rebuild between them, so the file has to say which arm it is, or the
+                // pair rests on somebody's memory of which visit was which.
+                line(
+                    &mut diag,
+                    "SHADER ARMS",
+                    &vitaslop_platform::knobs::shader_arms_line(),
+                );
                 line(&mut diag, "SURFACE", playback.surface_line());
                 // ...and WHAT `build` did to cost that, in counts rather than milliseconds.
                 // `build` is the largest part of the render half here and there is no
@@ -5863,7 +6386,7 @@ async fn live_loop(
                     &mut diag,
                     "BUILD, window mean",
                     &format!(
-                        "{build_mean} | sampler bind groups {:.1} reused ({:.1} from the previous                          draw, {:.1} from earlier in the pass) / {:.1} BUILT",
+                        "{build_mean} | sampler bind groups {:.1} reused ({:.1} from the previous draw, {:.1} from earlier in the pass) / {:.1} BUILT",
                         bg_hit as f64 / np,
                         vitaslop_platform::gpu::take_sampler_bg_prev() as f64 / np,
                         vitaslop_platform::gpu::take_sampler_bg_pass() as f64 / np,
@@ -5880,6 +6403,57 @@ async fn live_loop(
                 // here describes the frame; this one is the only one that can explain a cost
                 // which appears only after an hour of play. See `GxmRenderer::cache_sizes`.
                 line(&mut diag, "RENDERER CACHES", &playback.cache_sizes());
+                // >>> IS THE GUEST'S LIGHT PROBE ACTUALLY BEING FED. See `RttWriteback`'s
+                // counters: a dark probe and a probe that is never written back look identical
+                // from here, and one of them raises the guest's exposure until it clamps.
+                {
+                    let (cap, del, skip, stale) = playback.writeback_counts();
+                    // >>> A SHARE, NOT A RATE. These four are CUMULATIVE over the run and
+                    // `s.presents` is this WINDOW's - dividing one by the other produced
+                    // "326.90 delivered per present", which is not a quantity that exists. The
+                    // skip SHARE needs no denominator from outside and is the number that
+                    // matters.
+                    let share = if cap + skip > 0 {
+                        100.0 * skip as f64 / (cap + skip) as f64
+                    } else {
+                        0.0
+                    };
+                    line(
+                        &mut diag,
+                        "RTT WRITEBACK",
+                        &format!(
+                            "{cap} copies encoded, {del} handed to the guest, {skip} SKIPPED \
+                             because every ring slot for that target was still mapped, {stale} \
+                             dropped as older than a copy already applied - all four \
+                             CUMULATIVE over the run, and {share:.0}% of the copies this \
+                             run wanted to make were SKIPPED. >>> A \
+                             SKIP SHARE THAT IS NOT NEAR ZERO IS THE DEFECT: the guest reads its \
+                             light probe out of guest memory every frame, and a probe that is \
+                             not written back stays at whatever its allocator left there - \
+                             measured on the desktop, disabling the writeback entirely moves a \
+                             baseball at-bat's frame mean from 135,132,124 to 203,180,144, i.e. \
+                             the auto-exposure pins itself and the picture washes out. \
+                             `delivered` well under `encoded` means the copies are landing later \
+                             than they are being made and the ring is too short for this \
+                             device's queue depth.",
+                        ),
+                    );
+                }
+                // >>> AND THE GUEST'S OWN NUMBER FOR IT, when the probe is armed. One line, the
+                // newest reading - see `last_ambient_report` for what a fed probe reads and what
+                // a starved one reads, both measured.
+                if let Some(amb) = vitaslop_runtime::last_ambient_report() {
+                    line(&mut diag, "AMBIENT PROBE (guest's own exposure input)", &amb);
+                }
+                // >>> WHICH VERTEX PLAN THE PIPELINES GOT. The per-pair reports for this go to
+                // panels that keep 96 distinct lines and drop the rest, so on a title with
+                // hundreds of pairs they answer a question about the panel. See
+                // `vitaslop_platform::gpu::gxm::vertex_plan_census_line`.
+                line(
+                    &mut diag,
+                    "VERTEX PLANS",
+                    &vitaslop_platform::gpu::vertex_plan_census_line(),
+                );
                 // ...and the GUEST-MEMORY side of the same question. `RENDERER CACHES` covers
                 // what the renderer holds; this covers what the capture holds, which is where
                 // the largest budget in the project lives (192 MB of texture snapshots) and
@@ -5902,12 +6476,13 @@ async fn live_loop(
                     &mut diag,
                     "MEMORY",
                     &format!(
-                        "emulator wasm heap {} MB (shared with the guest, never returned to the                          OS - this one only goes UP), of which the RUST HEAP holds {} MB LIVE                          and has held {} MB at its peak - the peak is what took the pages, the                          live figure is what is still held, and a gap between them is a                          TRANSIENT that cost the device its address space anyway | GPU texture                          working set {} MB of a {} MB texture cache budget | device reports {} |                          cache budgets scaled x{:.2}{}",
+                        "emulator wasm heap {} MB (shared with the guest, never returned to the OS - this one only goes UP), of which the RUST HEAP holds {} MB LIVE and has held {} MB at its peak - the peak is what took the pages, the live figure is what is still held, and a gap between them is a TRANSIENT that cost the device its address space anyway | GPU texture working set {} MB of a {} MB texture cache budget, of which at most {} MB is RETAINED across frames (the budget gates the BC -> ETC2 re-encode and cannot be lowered without trading picture; the retention bound can, and does not) | device reports {} | cache budgets scaled x{:.2}{}",
                         wasm_heap_mb(),
                         vitaslop_platform::heap::live_peak_mb().0,
                         vitaslop_platform::heap::live_peak_mb().1,
                         vitaslop_platform::gpu::texture_working_set_bytes() / (1024 * 1024),
                         vitaslop_platform::gpu::tex_cache_budget_now() / (1024 * 1024),
+                        vitaslop_platform::gpu::tex_retain_budget_now() / (1024 * 1024),
                         match vitaslop_platform::knobs::device_memory_gb() {
                             Some(gb) => format!("{gb} GB"),
                             None => "nothing (no navigator.deviceMemory)".to_string(),
@@ -5918,7 +6493,7 @@ async fn live_loop(
                         // acted on - see `ADAPTER_LOOKS_MOBILE` for why wiring this to the
                         // budgets would spend picture quality.
                         if ADAPTER_LOOKS_MOBILE.load(std::sync::atomic::Ordering::Relaxed) {
-                            " | NOTE the GPU adapter is a MOBILE part, which deviceMemory (capped                          at 8 GB by its own spec) cannot see. Budgets are deliberately NOT                          scaled from this: the texture budget gates the BC->ETC2 re-encode,                          so tightening it here would trade picture quality silently"
+                            " | NOTE the GPU adapter is a MOBILE part, which deviceMemory (capped at 8 GB by its own spec) cannot see. Budgets are deliberately NOT scaled from this: the texture budget gates the BC->ETC2 re-encode, so tightening it here would trade picture quality silently"
                         } else {
                             ""
                         },
@@ -6050,6 +6625,16 @@ async fn live_loop(
                     // structure a word at a time.
                     let (words, bulk) = vitaslop_runtime::perf::guest_accesses();
                     let draws = np.max(1.0);
+                    let (many_calls, many_ranges) = browser_sched::bulk_many_totals();
+                    let many_calls_w = many_calls - many_calls_at_window_start;
+                    let many_ranges_w = many_ranges - many_ranges_at_window_start;
+                    many_calls_at_window_start = many_calls;
+                    many_ranges_at_window_start = many_ranges;
+                    let (pf_fetched, pf_skipped) = vitaslop_runtime::perf::prefetch_ranges();
+                    let pf_fetched_w = pf_fetched - pf_fetched_at_window_start;
+                    let pf_skipped_w = pf_skipped - pf_skipped_at_window_start;
+                    pf_fetched_at_window_start = pf_fetched;
+                    pf_skipped_at_window_start = pf_skipped;
                     let total_wraps = vitaslop_runtime::perf::epoch_wraps();
                     let epoch_wraps_window = total_wraps - epoch_wraps_at_window_start;
                     epoch_wraps_at_window_start = total_wraps;
@@ -6060,10 +6645,15 @@ async fn live_loop(
                         &mut diag,
                         "GUEST CPU, guest-memory accesses per frame",
                         &format!(
-                            "{:.0} single-WORD reads, {:.0} bulk reads - a word count that \
+                            "{:.0} single-WORD reads, {:.0} bulk reads, {:.1} batched crossings carrying {:.0} ranges (the flip-time prefetch \
+                             fetched {:.0} and left {:.0} to the caches) - a word count that \
                              scales with DRAWS is a structure being read a word at a time{}",
                             words as f64 / draws,
                             bulk as f64 / draws,
+                            many_calls_w as f64 / draws,
+                            many_ranges_w as f64 / draws,
+                            pf_fetched_w as f64 / draws,
+                            pf_skipped_w as f64 / draws,
                             // >>> ...UNLESS THE PROFILER IS ON, IN WHICH CASE MOST OF THEM ARE
                             // ITS OWN. `vita::dispatch`'s call-site attribution walks up to
                             // FORTY words of the guest stack per host call to find the caller,
@@ -6081,6 +6671,27 @@ async fn live_loop(
                             },
                         ),
                     );
+                    // >>> AND WHO MAKES THE WORD READS. The count above says a structure is
+                    // being read a word at a time; this says which phase holds it. A word read
+                    // is a boundary crossing (`copy_range`), and a crossing is what a phone
+                    // pays for - the desktop prices one at ~0.16 us and hides a few thousand
+                    // of them in a frame. Nested scopes double-count (see `perf::WORD_BY_PHASE`),
+                    // so read a child's share out of its parent rather than summing the rows.
+                    {
+                        let mut rows: Vec<(u64, &'static str)> = vitaslop_runtime::perf::Phase::all()
+                            .into_iter()
+                            .map(|ph| (vitaslop_runtime::perf::word_reads(ph), ph.label()))
+                            .filter(|(w, _)| *w > 0)
+                            .collect();
+                        rows.sort_by(|a, b| b.0.cmp(&a.0));
+                        let text = rows
+                            .iter()
+                            .take(10)
+                            .map(|(w, l)| format!("{:.1} {l}", *w as f64 / draws))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        line(&mut diag, "GUEST CPU, single-WORD reads per frame by phase", &text);
+                    }
                     // >>> AND HOW OFTEN THE GUEST-STORE EPOCH WRAPPED IN THIS WINDOW, because
                     // a wrap is a CLIFF and the byte counter above only shows its average.
                     //
@@ -6092,7 +6703,7 @@ async fn live_loop(
                         &mut diag,
                         "GUEST CPU, guest-store epoch wraps",
                         &format!(
-                            "{} in this window ({:.2} per presented frame) - each one drops                              every snapshot stamp, so the whole texture working set is                              re-compared over the frames that follow",
+                            "{} in this window ({:.2} per presented frame) - each one drops every snapshot stamp, so the whole texture working set is re-compared over the frames that follow",
                             epoch_wraps_window,
                             epoch_wraps_window as f64 / draws,
                         ),
@@ -6101,7 +6712,7 @@ async fn live_loop(
                         &mut diag,
                         "GUEST CPU, guest-store epoch renumberings",
                         &format!(
-                            "{} in this window - each one is a wrap AVOIDED by handing back                              the unused low half of the range",
+                            "{} in this window - each one is a wrap AVOIDED by handing back the unused low half of the range",
                             epoch_rebases_window,
                         ),
                     );
@@ -6122,7 +6733,7 @@ async fn live_loop(
                             &mut diag,
                             "GUEST CPU, single-WORD reads by phase, per frame",
                             &format!(
-                                "{} | NESTED SCOPES DOUBLE COUNT; what these do not account                                  for is in no named phase",
+                                "{} | NESTED SCOPES DOUBLE COUNT; what these do not account for is in no named phase",
                                 rows.iter()
                                     .map(|(l, n)| format!("{l} {:.0}", *n as f64 / draws))
                                     .collect::<Vec<_>>()
@@ -6261,7 +6872,7 @@ async fn live_loop(
                         let host = sched.host.lock().unwrap();
                         browser_sched::take_host_calls_by_sampled_ms_window(12)
                             .into_iter()
-                            .map(|(sel, calls, ms, samples)| {
+                            .map(|(sel, calls, ms, samples, words, bulk)| {
                                 let name = match host.import_at(sel) {
                                     Some((_, func_nid)) => {
                                         let n = vitaslop_runtime::nid::name(func_nid);
@@ -6273,8 +6884,11 @@ async fn live_loop(
                                     }
                                     None => format!("selector {sel}"),
                                 };
+                                // `w`/`b` = single-word / bulk guest reads PER CALL: each is a
+                                // `copy_range` crossing, so a handler with w>4 is reading a
+                                // structure a word at a time.
                                 format!(
-                                    "~{ms:>8.0} ms {:>7.2} us/call x{calls:<9} ({samples} sampled) {name}",
+                                    "~{ms:>8.0} ms {:>7.2} us/call x{calls:<9} ({samples} sampled, w{words:.1} b{bulk:.1}/call) {name}",
                                     if calls > 0 { ms * 1000.0 / calls as f64 } else { 0.0 }
                                 )
                             })
@@ -6390,6 +7004,8 @@ async fn live_loop(
                 report.emit("diag", &diag);
                 cpu_ms = 0.0;
                 cpu_frames = 0;
+                worst_cpu = (0.0, 0, 0, 0);
+                fuel_win = 0;
                 hc_win_ms = 0.0;
                 hc_win_est_ms = 0.0;
                 hc_win_calls = 0;

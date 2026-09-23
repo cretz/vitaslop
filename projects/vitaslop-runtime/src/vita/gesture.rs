@@ -630,7 +630,7 @@ pub(super) fn get_touch_recognizer_information(
 fn note_information_not_filled() {
     report_once(
         "gesture-information-not-filled",
-        "sceSystemGestureGetTouchRecognizerInformation: the recognizer is validated and          success is reported, but the SceSystemGestureTouchRecognizerInformation struct is          LEFT UNTOUCHED - its field layout is published nowhere and the calling title never          reads the buffer back, so there is no evidence to write from. A title that DOES          read it will see whatever it passed in.",
+        "sceSystemGestureGetTouchRecognizerInformation: the recognizer is validated and success is reported, but the SceSystemGestureTouchRecognizerInformation struct is LEFT UNTOUCHED - its field layout is published nowhere and the calling title never reads the buffer back, so there is no evidence to write from. A title that DOES read it will see whatever it passed in.",
     );
 }
 

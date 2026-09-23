@@ -99,6 +99,19 @@
         //
         // It must finish and CLOSE its OPFS handles before the run worker opens its own:
         // a sync access handle is an exclusive lock.
+        // The run worker first: it reserves the guest region in its own memory and reports
+        // the offset the module has to be built for (see worker.js's "reserve" message).
+        const worker = new Worker("../worker.js", { type: "module" });
+        status.textContent = "reserving the guest region in the run worker...";
+        const hostOff = await new Promise((resolve, reject) => {
+          worker.onmessage = (e) => {
+            const d = e.data;
+            if (d.type === "reserved") resolve(d.hostOff);
+            else if (d.type === "error" || d.type === "panic") reject(new Error(d.message));
+          };
+          worker.onerror = (e) => reject(new Error(e.message || "run worker failed to start"));
+          worker.postMessage({ type: "reserve", knobs: knobs || {} });
+        });
         status.textContent = "transpiling (throwaway worker)...";
         const prebuilt = await new Promise((resolve, reject) => {
           const tw = new Worker("../transpile-worker.js", { type: "module" });
@@ -110,11 +123,10 @@
             tw.terminate();
             reject(new Error(e.message || "transpile worker failed to start"));
           };
-          tw.postMessage({ titleId, knobs: knobs || {} });
+          tw.postMessage({ titleId, knobs: knobs || {}, hostOff });
         });
         status.textContent = "transpiled; starting run worker...";
 
-        const worker = new Worker("../worker.js", { type: "module" });
         worker.onmessage = (e) => {
           const d = e.data;
           if (d.type === "report") {

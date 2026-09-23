@@ -213,6 +213,7 @@ impl Vm {
                 discover_code_pointers: true,
                 // The single-instance `Vm` defines its own memory.
                 import_memory: false,
+                host_off: 0,
             },
             host_abi,
         )
@@ -319,6 +320,7 @@ impl Vm {
             mem_bytes,
             discover_code_pointers: true,
             import_memory: false,
+                host_off: 0,
         });
 
         wasmparser::validate(&built.artifact.wasm)

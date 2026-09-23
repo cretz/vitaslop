@@ -51,7 +51,7 @@ fn dump_sa_requested() -> bool {
 /// (the driver copies the default buffer's registers into the register file) and a MEMORY
 /// WINDOW (the driver plants the bound buffer's address and the program chases it). A dump
 /// that showed only one of them would be silent about half of every lit material.
-fn dump_named_uniforms(stage: &str, prog_bytes: &[u8], sa: &[u8], windows: &[(u32, Vec<u8>)]) {
+fn dump_named_uniforms(stage: &str, prog_bytes: &[u8], sa: &[u8], windows: &[(u32, std::sync::Arc<[u8]>)]) {
     use vitaslop_gxp_shader::container::{ParamCategory, ParamType, Program};
     let Ok(prog) = Program::parse(prog_bytes) else {
         eprintln!("  {stage} uniforms: program does not parse");
@@ -61,12 +61,29 @@ fn dump_named_uniforms(stage: &str, prog_bytes: &[u8], sa: &[u8], windows: &[(u3
     let mem = vitaslop_gxp_shader::module::resolve_mem_windows(&prog, &shader).unwrap_or_default();
     // The window a uniform is read through is decided by its CONTAINER, and a container's
     // index is the buffer index. Container 14 is the default buffer, which is the SA bank.
-    let source_for = |container_index: u8| -> Option<(&str, &[u8])> {
+    //
+    // >>> A CONTAINER'S HOME IS ITS OWN `base_sa`, NOT THE NUMBER 14.
+    //
+    // This mapped ONLY container 14 onto the SA bank and everything else onto a memory window,
+    // and it is wrong for every program whose header sets `sa_base_from_container`: there each
+    // container names the SA register its block is loaded at, and a title's world matrices
+    // routinely live in container 2 at `base_sa` 0 with the DEFAULT buffer above them. Reading
+    // it the old way printed `gWorldViewProjectionXform ... container 2 NOT FED` for a draw
+    // whose matrix is plainly present three lines further up in the same dump - a diagnostic
+    // announcing a defect that is not there, which cost this session a whole wrong diagnosis
+    // of a skinned mesh [[vitaslop-instrument-failure-imitating-its-subject]].
+    let source_for = |container_index: u8| -> Option<(&str, &[u8], usize)> {
+        if prog.sa_base_from_container
+            && let Some(c) = prog.containers.iter().find(|c| c.index == u16::from(container_index))
+        {
+            let at = c.base_sa as usize * 4;
+            return Some(("sa", sa.get(at..)?, at / 4));
+        }
         if container_index == 14 {
-            return Some(("sa", sa));
+            return Some(("sa", sa, 0));
         }
         let w = mem.iter().position(|w| w.buffer_index == u32::from(container_index))?;
-        Some(("mem", windows.get(w)?.1.as_slice()))
+        Some(("mem", &windows.get(w)?.1[..], 0))
     };
     let mut any = false;
     let mut params: Vec<_> = prog
@@ -83,7 +100,7 @@ fn dump_named_uniforms(stage: &str, prog_bytes: &[u8], sa: &[u8], windows: &[(u3
         // register. Reading an F16 block as f32 gives numbers that look like garbage and,
         // worse, occasionally look plausible.
         let f16 = p.ptype == ParamType::F16;
-        let (src_name, bytes) = match source_for(p.container_index) {
+        let (src_name, bytes, sa_base) = match source_for(p.container_index) {
             Some(v) => v,
             None => {
                 eprintln!(
@@ -98,7 +115,7 @@ fn dump_named_uniforms(stage: &str, prog_bytes: &[u8], sa: &[u8], windows: &[(u3
                 let reg = scalar / 2;
                 let off = reg * 4 + (scalar % 2) * 2;
                 let b = bytes.get(off..off + 2)?;
-                Some(f32::from(half_from_bits(u16::from_le_bytes([b[0], b[1]]))))
+                Some(half_from_bits(u16::from_le_bytes([b[0], b[1]])))
             } else {
                 let off = scalar * 4;
                 let b = bytes.get(off..off + 4)?;
@@ -120,8 +137,16 @@ fn dump_named_uniforms(stage: &str, prog_bytes: &[u8], sa: &[u8], windows: &[(u3
         if arr > 8 {
             elems.push(format!("... {} more", arr - 8));
         }
+        // The container's own SA base is printed beside the source, because "via sa" alone does
+        // not say WHERE: two containers can both live in the SA bank at different bases, and a
+        // parameter read at the wrong base is a plausible-looking number rather than an error.
+        let via = if src_name == "sa" && sa_base != 0 {
+            format!("sa+{sa_base}")
+        } else {
+            src_name.to_string()
+        };
         eprintln!(
-            "    {stage} {:<32} reg {:<4} {:?}x{comps}[{arr}] via {src_name} = {}",
+            "    {stage} {:<32} reg {:<4} {:?}x{comps}[{arr}] via {via} = {}",
             p.name,
             p.resource_index,
             p.ptype,
@@ -196,6 +221,10 @@ fn main() {
     // on a captured draw, and a knob that rewrites texels in a live run is a foot-gun with no
     // matching question.
     let mut tex_fill: Vec<(u32, [u8; 4])> = Vec::new();
+    // `--tex <unit>=@<file>`: replace the unit's RAW GUEST BYTES with a file's, byte for byte,
+    // so a capsule can be replayed against a texture the live run produced (a cube assembled
+    // from six rendered faces, dumped and re-swizzled) rather than a constant. TEMPORARY.
+    let mut tex_file: Vec<(u32, Vec<u8>)> = Vec::new();
     // `--fmem <window>:<f16 lane>=<value>` - rewrite one HALF of the fragment memory window
     // before the draw runs. This is the `--tex` idea aimed at the other input a lit material
     // reads: the uniform block. A material whose output is over by a factor is answered by
@@ -233,6 +262,14 @@ fn main() {
                 eprintln!("--tex wants <unit>=<r>,<g>,<b>,<a> or <unit>=<float>");
                 std::process::exit(2);
             }
+            if let Some(path) = rgba.strip_prefix('@') {
+                let Ok(bytes) = std::fs::read(path) else {
+                    eprintln!("--tex: cannot read {path}");
+                    std::process::exit(2);
+                };
+                tex_file.push((u.trim().parse().unwrap(), bytes));
+                continue;
+            }
             // No comma: one FLOAT, written as its four little-endian bytes. This is the form a
             // depth or any other float-format target wants, and it is the one that stops a fill
             // meant as "fully lit" from landing as a NaN.
@@ -259,7 +296,15 @@ fn main() {
     }
     let [path, out] = match positional.as_slice() {
         [p, o] => [p.clone(), o.clone()],
-        [p] => [p.clone(), "capsule.png".to_string()],
+        // >>> THE DEFAULT OUTPUT GOES BESIDE THE CAPSULE, NOT INTO THE WORKING DIRECTORY.
+        // A bare `capsule.png` lands wherever this was run from, which for a cargo example is
+        // the workspace root - and a 2 MB replay screenshot sat there untracked for two days
+        // before anyone noticed. Naming it after the input also means two replays of different
+        // capsules no longer overwrite each other's picture.
+        [p] => {
+            let out = std::path::Path::new(p).with_extension("png");
+            [p.clone(), out.to_string_lossy().into_owned()]
+        }
         _ => {
             eprintln!("usage: capsule-replay [--tex <unit>=<r>,<g>,<b>,<a>] <file.capsule> [out.png]");
             std::process::exit(2);
@@ -283,11 +328,14 @@ fn main() {
             std::process::exit(2);
         };
         let off = lane * 2;
-        let Some(dst) = bytes.get_mut(off..off + 2) else {
+        // The window is a SHARED snapshot now; substitute into a private copy of it.
+        let mut owned = bytes.to_vec();
+        let Some(dst) = owned.get_mut(off..off + 2) else {
             eprintln!("  --fmem: lane {lane} is past this window's {} bytes", bytes.len());
             std::process::exit(2);
         };
         dst.copy_from_slice(&f32_to_half_bits(val).to_le_bytes());
+        *bytes = std::sync::Arc::from(owned);
         eprintln!("  --fmem SUBSTITUTED window {w} F16 lane {lane} (byte {off}) = {val}");
     }
 
@@ -345,10 +393,11 @@ fn main() {
             }
         }
         eprintln!(
-            "  texture unit {} format {:#06x} swizzle {:#x} type {} {}x{} stride {} mips {}              faces {} at {:#010x}: {} bytes, mean {:.1}/255, {:.1}% non-zero; DECODED {}x{}              mean {dmean:.1}/255",
+            "  texture unit {} format {:#06x} swizzle {:#x} gamma {:#x} type {} {}x{} stride {} mips {} faces {} at {:#010x}: {} bytes, mean {:.1}/255, {:.1}% non-zero; DECODED {}x{} mean {dmean:.1}/255",
             t.unit,
             t.base_format,
             t.swizzle,
+            t.gamma,
             t.tex_type,
             t.width,
             t.height,
@@ -373,7 +422,7 @@ fn main() {
     // engine has seen. Formats other than F32/F16 print as raw bytes rather than a guess.
     {
         let stride = cap.draw.vertex_stride as usize;
-        let n = if stride > 0 { cap.draw.vertices.len() / stride } else { 0 };
+        let n = cap.draw.vertices.len().checked_div(stride).unwrap_or(0);
         eprintln!("  vertex stride {stride}, so {n} vertices; attributes:");
         for a in cap.draw.attributes.iter() {
             eprintln!(
@@ -408,7 +457,7 @@ fn main() {
                         f32::from_le_bytes([b[0], b[1], b[2], b[3]])
                     } else {
                         // F16, unpacked the same way the emitted shader unpacks it.
-                        f32::from(half_from_bits(u16::from_le_bytes([b[0], b[1]])))
+                        half_from_bits(u16::from_le_bytes([b[0], b[1]]))
                     });
                 }
                 if vals.len() == comps {
@@ -448,7 +497,7 @@ fn main() {
                     .collect();
                 let f16s: Vec<String> = row
                     .chunks_exact(2)
-                    .map(|b| format!("{:.3}", f32::from(half_from_bits(u16::from_le_bytes([b[0], b[1]])))))
+                    .map(|b| format!("{:.3}", half_from_bits(u16::from_le_bytes([b[0], b[1]]))))
                     .collect();
                 eprintln!("    row {v}: f32 [{}]", f32s.join(", "));
                 eprintln!("           f16 [{}]", f16s.join(", "));
@@ -565,6 +614,21 @@ fn main() {
     };
 
     let mut draw = cap.draw.clone();
+    if !tex_file.is_empty() {
+        let mut texs: Vec<_> = draw.textures.iter().cloned().collect();
+        for (unit, bytes) in &tex_file {
+            let Some(t) = texs.iter_mut().find(|t| t.unit == *unit) else {
+                eprintln!("  --tex @file: this draw binds NO sampler unit {unit}");
+                std::process::exit(2);
+            };
+            eprintln!(
+                "  --tex @file: unit {unit} ({}x{} faces {} type {}) pixels {} -> {} bytes - NOT the guest's texels",
+                t.width, t.height, t.faces, t.tex_type, t.pixels.len(), bytes.len()
+            );
+            t.pixels = std::sync::Arc::from(bytes.clone());
+        }
+        draw.textures = std::sync::Arc::from(texs);
+    }
     if !tex_fill.is_empty() {
         let mut texs: Vec<_> = draw.textures.iter().cloned().collect();
         for (unit, rgba) in &tex_fill {
@@ -578,7 +642,7 @@ fn main() {
                     // to it, and both readings are printed so a fill can never be mistaken for
                     // a colour it is not in this texture's format.
                     eprintln!(
-                        "  --tex: unit {unit} ({}x{}) base_format {:#04x} filled with bytes                          {rgba:?} - reads as rgba8({},{},{},{}) or f32 {} - NOT the guest's texels",
+                        "  --tex: unit {unit} ({}x{}) base_format {:#04x} filled with bytes {rgba:?} - reads as rgba8({},{},{},{}) or f32 {} - NOT the guest's texels",
                         t.width,
                         t.height,
                         t.base_format,
@@ -603,7 +667,7 @@ fn main() {
         draw.textures = std::sync::Arc::from(texs);
     }
 
-    let scene = Scene { completed_early: false,
+    let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
         precompile: std::sync::Arc::new(Vec::new()),
         color: None,
         depth: None,
@@ -614,9 +678,21 @@ fn main() {
         draws: vec![draw],
     };
 
-    let fb = gpu.render_scene(&scene, cap.width, cap.height, cap.clear);
+    // `VITASLOP_CAPSULE_EXTENT=<w>x<h>`: replay into the GUEST'S SURFACE size rather than the
+    // extent inferred from the viewport. A draw that renders one cell of a strip (a viewport and
+    // region clip at x 256.. of a 1024-wide surface) falls entirely outside a viewport-sized
+    // target, so without this the replay reports "covered nothing" for a reason that is the
+    // replay's own. The surface size comes from the run's `gxm chain` line for the pass.
+    let (cap_w, cap_h) = std::env::var("VITASLOP_CAPSULE_EXTENT")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.trim().split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((cap.width, cap.height));
+    let fb = gpu.render_scene(&scene, cap_w, cap_h, cap.clear);
     match std::fs::write(&out, fb.to_png()) {
-        Ok(()) => eprintln!("  -> {out} ({}x{})", cap.width, cap.height),
+        Ok(()) => eprintln!("  -> {out} ({cap_w}x{cap_h})"),
         Err(e) => {
             eprintln!("capsule-replay: cannot write {out}: {e}");
             std::process::exit(1);

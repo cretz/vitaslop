@@ -33,12 +33,15 @@ import { dirname, join, extname, relative, sep, basename } from "node:path";
 const crateDir = dirname(fileURLToPath(import.meta.url));
 const webDir = join(crateDir, "web");
 const projects = dirname(crateDir);
-// Device diagnostics land in the SCRATCH area, never in the repo - see the sink endpoints in
-// the handler, and `no-repo-scratch-artifacts`. `projects` is <repo>/projects, so the repo root
-// is one level up and the scratch area is one level above THAT - writing to
-// `<repo>/working-area` (one `dirname` short) drops 44 files inside the git tree, which is
-// exactly what this comment exists to prevent and exactly what it did on the first attempt.
-const diagDir = join(dirname(dirname(projects)), "working-area", "device-diag");
+// Device diagnostics never land in the repo - see the sink endpoints in the handler. WHERE they
+// land is the caller's to say (`--diag-dir`, or `VITASLOP_DIAG_DIR`), because this file cannot
+// know it: it once walked up from its own location to a sibling scratch directory, which named
+// a path outside the repository from inside it AND assumed a checkout layout that only held on
+// one machine. One `dirname` short of that walk dropped 44 files inside the git tree.
+//
+// The default is the OS temporary directory, which is nobody's source tree on any platform. The
+// resolved path is PRINTED at startup, because a diagnostic sink whose location is a guess is
+// one nobody goes looking in - and this one exists to be collected from.
 
 // --- args ---
 const args = process.argv.slice(2);
@@ -51,6 +54,8 @@ const singleGame = opt("--game") || process.env.GAME_DIR;
 const recipesDir = opt("--recipes") || join(projects, "vitaslop-gamerun-recipes", "recipes");
 const host = opt("--host") || process.env.HOST || "0.0.0.0";
 const port = Number(opt("--port") || process.env.PORT || 8080);
+const diagDir =
+  opt("--diag-dir") || process.env.VITASLOP_DIAG_DIR || join(tmpdir(), "vitaslop-device-diag");
 const useHttps = args.includes("--https");
 const noBuild = args.includes("--no-build");
 const doOpen = args.includes("--open");
@@ -292,12 +297,12 @@ const handler = async (req, res) => {
     //                       served from anywhere else (the product, static hosting) never phones
     //                       home and needs no flag to stop it. See
     //                       [[vitaslop-web-is-the-product-not-the-tool]].
-    //   POST /diag        - one snapshot of the panel, appended under working-area.
+    //   POST /diag        - one snapshot of the panel, appended under the diagnostic sink.
     if (path === "/diag-sink") {
       res.writeHead(200, { "content-type": "text/plain", ...coi });
       return res.end("ok");
     }
-    //   POST /diag        - one snapshot of the panel, appended under working-area.
+    //   POST /diag        - one snapshot of the panel, appended under the diagnostic sink.
     //   POST /diag-shot   - the canvas at that same moment, as a PNG beside it.
     if ((path === "/diag" || path === "/diag-shot") && req.method === "POST") {
       const chunks = [];
@@ -409,6 +414,10 @@ console.log("");
 console.log(`serving ${titles.length} title(s) at:`);
 console.log(`  ${scheme}://localhost:${port}/`);
 for (const a of lanAddresses()) console.log(`  ${scheme}://${a}:${port}/     <- open this on your phone`);
+// The diagnostic sink's location, every run. It is where a device's dumps and shots are
+// collected FROM, so it has to be printed rather than inferred - see the note beside `diagDir`.
+console.log("");
+console.log(`device diagnostics -> ${diagDir}   (--diag-dir, or VITASLOP_DIAG_DIR)`);
 if (host === "0.0.0.0") {
   console.log("");
   console.log("NOTE bound to 0.0.0.0: any device on this network can reach these titles' bytes.");

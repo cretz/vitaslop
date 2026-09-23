@@ -243,7 +243,15 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
     // `VITASLOP_SIGNATURE=1` asks for one deliberately, which is what a run whose POINT is
     // to learn the signature and bless it into a recipe wants. Same spelling as the browser,
     // so the two engines decide this the same way.
-    let want_sig = recipe.meta.sig.is_some() || vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE");
+    //
+    // >>> AND `VITASLOP_SIGNATURE_EVERY` COUNTS AS ASKING. Setting the trace interval alone
+    // used to produce a run with no signature computed and therefore not one `sigtrace` line
+    // - a silent nothing, from a knob whose entire purpose is to print them. That cost a pair
+    // of 13,600-frame runs here before anyone read this line. A knob that is set and has no
+    // effect must not be a quiet no-op.
+    let want_sig = recipe.meta.sig.is_some()
+        || vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE")
+        || signature_trace_interval() != 0;
     sched.host().state.capture.set_signature_wanted(want_sig);
 
     // The guest's own saved state, BEFORE a single guest instruction runs: `restore_game_data`
@@ -258,7 +266,7 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
             crate::gamedata_disk::SaveStore::title_for(game_dir, sfo.as_deref());
         if !from_container {
             println!(
-                "[gamedata] this container names no title id; saves are filed under {title:?}                  (its directory name), which another title extracted the same way would share"
+                "[gamedata] this container names no title id; saves are filed under {title:?} (its directory name), which another title extracted the same way would share"
             );
         }
         crate::gamedata_disk::SaveStore::new(root, &title)

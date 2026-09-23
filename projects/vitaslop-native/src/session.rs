@@ -1036,7 +1036,7 @@ impl Session {
             if gpu.is_none() {
                 self.gpu_refused = true;
                 eprintln!(
-                    "session: no GPU adapter, so `shot` falls back to the SOFTWARE                      rasteriser - which cannot run a recompiled fragment program, so on a                      shader-driven title the image will be missing everything the guest's                      own shaders draw."
+                    "session: no GPU adapter, so `shot` falls back to the SOFTWARE rasteriser - which cannot run a recompiled fragment program, so on a shader-driven title the image will be missing everything the guest's own shaders draw."
                 );
                 return None;
             }
@@ -2604,7 +2604,7 @@ impl Session {
         let worth_us = self.frame() * 1_000_000 / 60;
         let rate = if worth_us > 0 { clock_us as f64 / worth_us as f64 } else { 0.0 };
         format!(
-            "frame      {}\nrun        {:?}\nguest mem  {base:#010x}+{len:#x}\nheld input buttons={:#06x} lx={} ly={} rx={} ry={} touch={}\nwatches    {}\nscan       {scan}\nshots      {}\nclock      {:.3}s = {rate:.2}x the {:.1}s these frames are worth\nsig        {:#018x}",
+            "frame {}\nrun {:?}\nguest mem  {base:#010x}+{len:#x}\nheld input buttons={:#06x} lx={} ly={} rx={} ry={} touch={}\nwatches    {}\nscan {scan}\nshots {}\nclock {:.3}s = {rate:.2}x the {:.1}s these frames are worth\nsig {:#018x}",
             self.frame(),
             self.last,
             input.buttons,
