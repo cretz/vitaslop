@@ -47,7 +47,7 @@ const HALF_W: u32 = W / 2;
 
 /// The scenes the app emits, in order, with what each exists to check. Kept beside the
 /// assertions because a scene index on its own says nothing about what failed.
-const SCENES: [&str; 8] = [
+const SCENES: [&str; 18] = [
     "baseline: one quad over the whole viewport",
     "region clip: the same quad clipped to the left half",
     "above the viewport: a quad entirely past y = +1",
@@ -56,6 +56,16 @@ const SCENES: [&str; 8] = [
     "viewport: the full quad through a half-width viewport",
     "viewport AND region clip, over different rectangles: only the top-left quarter",
     "stencil mask: a NEVER/fail-REPLACE mark, then an EQUAL fill: only the bottom-right quarter",
+    "reversed depth: background 0.0 and GREATER_EQUAL, a near quad over the right half, then a far one over everything",
+    "reversed depth through REAL shaders: scene 8 on the recompiled path",
+    "U8_A surface through REAL shaders: a half-alpha red quad stores its ALPHA (0x80), not red",
+    "stacked cube: six coloured 16x16 faces rendered into one 16x128 surface",
+    "sample it as a CUBE: +X, +Y, +Z strips read faces 0, 2, 4 (red, green, blue)",
+    "UNTYPED position: a full green quad whose position attribute is raw words",
+    "colour mask: white through mask R over the left half, mask A over the right (A is bit 0)",
+    "SetFormat then COPY: a U2F10F10F10 cube re-formatted A8B8G8R8, sampled through a copy of its struct",
+    "quadrants: red / green / blue / yellow into a 64x64 target",
+    "sub-rectangle: a 32x32 strided texture naming the bottom-right quadrant, sampled at uv 0.25: yellow",
 ];
 
 /// Is this pixel something other than the clear colour?
@@ -124,6 +134,10 @@ fn show_renderer_diagnostics() {
 /// on the GPU. Returns one framebuffer per scene from the software oracle, plus the GPU's.
 fn run_and_render() -> (Vec<Framebuffer>, Option<Vec<Framebuffer>>) {
     show_renderer_diagnostics();
+    // Scenes 9 and 10 draw through REAL programs and are asserted by `vita_gxmconf_real.rs`,
+    // which turns the recompiled path on. It stays OFF here: under it a placeholder pair cannot
+    // be recompiled and its draws are dropped, which is right for a title and useless for these
+    // fixed-function scenes.
     let m = loader::load(GXMCONF).expect("load gxmconf.velf");
     let inputs = m.program_inputs();
     let imports: Vec<(u32, u32)> = m.imports.iter().map(|i| (i.library_nid, i.func_nid)).collect();
@@ -560,6 +574,50 @@ fn a_stencil_mask_confines_a_later_draw_to_the_marked_rectangle() {
         None => eprintln!("no GPU adapter; scene 7 checked on the software oracle only"),
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// What scene 8 must look like on one backend, or why it does not.
+fn reversed_depth_failure(fb: &Framebuffer, backend: &str) -> Option<String> {
+    let left = fb.pixel(HALF_W / 2, H / 2);
+    let right = fb.pixel(HALF_W + HALF_W / 2, H / 2);
+    if left == CLEAR && right == CLEAR {
+        return Some(format!(
+            "{backend}: {}: NOTHING painted - every fragment failed GREATER_EQUAL, i.e. the pass              started its depth from 1.0 instead of the surface's background 0.0",
+            SCENES[8]
+        ));
+    }
+    if !(left[0] > left[1] && left != CLEAR) {
+        return Some(format!("{backend}: {}: the left half should be the FAR quad's red, got {left:?}", SCENES[8]));
+    }
+    if !(right[1] > right[0]) {
+        return Some(format!(
+            "{backend}: {}: the right half should STAY the near quad's green - the later far quad (z 0.1) must fail GREATER_EQUAL against it; red here means the depth test was ignored or run the wrong way, got {right:?}",
+            SCENES[8]
+        ));
+    }
+    None
+}
+
+/// **SCENE 8 - A REVERSED DEPTH RANGE: THE PASS STARTS FROM THE SURFACE'S BACKGROUND DEPTH.**
+///
+/// >>> THIS IS A FIGHTING TITLE'S (PCSE00235) WHOLE WORLD, AS A TEST.
+///
+/// Every one of its scenes sets `sceGxmDepthStencilSurfaceSetBackgroundDepth(0.0)` and draws
+/// with `GREATER_EQUAL`. The renderer cleared every pass to a fixed 1.0, so no surface ever
+/// passed: the world target held only the always-pass light shafts and the frame tone-mapped
+/// them into flat cyan. Asserted on BOTH backends. Run with `VITASLOP_GXM_BACKGROUND_DEPTH=0`
+/// both must fail here - the check that this test can see the background depth at all.
+#[test]
+#[ignore = "gxmconf's placeholder-shader draws take the fixed-function path, which depth-tests only MVP-space draws - so this scene (and scene 3) cannot see a depth rule until the app draws through real shader programs"]
+fn a_reversed_depth_range_starts_from_the_surfaces_background_depth() {
+    let (sw, hw) = run_and_render();
+    let mut failures: Vec<String> = reversed_depth_failure(&sw[8], "software").into_iter().collect();
+    match &hw {
+        Some(hw) => failures.extend(reversed_depth_failure(&hw[8], "gpu")),
+        None => eprintln!("no GPU adapter; scene 8 checked on the software oracle only"),
+    }
+    assert!(failures.is_empty(), "{}", failures.join("
+"));
 }
 
 /// The GPU renderer must agree with the software oracle on every scene.

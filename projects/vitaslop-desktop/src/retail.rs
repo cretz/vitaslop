@@ -1864,6 +1864,7 @@ pub fn headless_check(
                 .collect();
             frame_shape = (scene_count, draw_count);
             if !scenes.is_empty() {
+                vitaslop_runtime::capsule::maybe_write_frame(scenes, display.0, display.1, CLEAR, f as u64);
                 let t = std::time::Instant::now();
                 let fb = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;

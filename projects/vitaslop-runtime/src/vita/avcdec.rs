@@ -712,6 +712,14 @@ fn deliver_pictures(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, array: 
     }
     if written == 0 {
         EMPTY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // WHERE the owed pictures are, as the backend sees it, for the panel - see
+        // `LAST_EMPTY_DECODER`.
+        if let Some(sess) = st.avcdec.session_mut(handle) {
+            let d = sess.decoder.describe();
+            if let Ok(mut g) = LAST_EMPTY_DECODER.lock() {
+                *g = d;
+            }
+        }
         repeat_last_picture(ctx, st, handle, list, capacity);
     }
     let session = st.avcdec.session_mut(handle).expect("caller checked the handle");
@@ -794,6 +802,12 @@ static DELIVERY_DIGEST: std::sync::atomic::AtomicU64 =
 static DECODE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SLOTS_OFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EMPTY_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The decoder's own description at the most recent call that handed back NOTHING - on the web
+/// backend that is where every owed picture sits (inside the decoder, mid-copy, or ready). A
+/// movie that stalls with pictures "still owed" reads identically from the guest side in all
+/// three cases; this is the line that tells them apart.
+static LAST_EMPTY_DECODER: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 /// The distinct guest buffers the title has offered as a destination, up to four, and how
 /// many it has offered in total. One buffer means a call that delivers nothing leaves the
 /// LAST picture on screen (a held frame); two or more mean it can show a buffer that was
@@ -929,6 +943,10 @@ pub fn movie_report(frames: u64) -> Vec<String> {
              picture; more than one and an empty call shows a buffer this engine may never \
              have written, which is the black half of a flicker",
             if buffers >= 5 { "4+".to_string() } else { buffers.to_string() },
+        ),
+        format!(
+            "movie decoder at the last EMPTY call: {}",
+            LAST_EMPTY_DECODER.lock().map(|g| g.clone()).unwrap_or_default()
         ),
     ]
 }
@@ -1706,6 +1724,17 @@ pub(super) fn videodec_term_library(
     codec: u32,
 ) -> i32 {
     do_videodec_term_library(_ctx, st, codec)
+}
+
+/// int sceAvcdecDecodeAvailableSize(SceAvcdecCtrl *decoder)
+///
+/// Undocumented: no header or wiki gives its meaning. DOA5, its one caller, passes the
+/// decoder control block and prints the result as `"Available size: %d"` - nothing reads
+/// it otherwise. Answered with the size of the frame buffer the title gave the decoder
+/// (`SceAvcdecCtrl.frameBuf.size`, the one "size" this call can see), never an error.
+#[hostcall]
+pub(super) fn avcdec_decode_available_size(ctx: &mut GuestCtx, _st: &mut VitaState, decoder: Ptr) -> i32 {
+    if decoder.is_null() { 0 } else { ctx.read_u32(decoder.addr() + 8) as i32 }
 }
 
 #[hostcall]

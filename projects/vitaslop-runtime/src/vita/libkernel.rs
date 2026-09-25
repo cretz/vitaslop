@@ -562,11 +562,17 @@ pub(super) fn get_random_number(ctx: &mut GuestCtx, st: &mut VitaState, buf: Ptr
     }
 }
 
+/// `SCE_KERNEL_MSG_PIPE_MODE_*` bits of a send/receive's mode word, as DOA5's own call sites
+/// use them (a FULL receive of one 4-byte message that dereferences what it got with no
+/// error check; a send of mode `0x11` from a path that must not stall). The low bit asks for
+/// the WHOLE size (FULL) rather than whatever is there (ASAP), and `0x10` is DONT_WAIT.
+const MPP_MODE_FULL: u32 = 0x01;
+const MPP_MODE_DONT_WAIT: u32 = 0x10;
+
 /// SceUID sceKernelCreateMsgPipe(const char *name, int type, int attr, unsigned int bufSize, void *opt)
-/// A byte FIFO between threads. Sends and receives here are the non-blocking
-/// semantics: a receive on an empty pipe reports a timeout rather than parking the
-/// thread. A guest that needs the blocking form will show up as a spin here, and that
-/// is the moment to wire it into the scheduler.
+/// A byte FIFO between threads. Receives BLOCK (see [`msg_pipe_receive`]); sends always
+/// complete at once, because the buffer is not bounded here - a sender that relies on a full
+/// pipe parking it is not modelled, and would show up as a pipe that only ever grows.
 pub(super) fn msg_pipe_create(ctx: &mut GuestCtx, st: &mut VitaState) {
     let uid = st.new_uid();
     st.msg_pipes.insert(uid, std::collections::VecDeque::new());
@@ -580,6 +586,8 @@ pub(super) fn msg_pipe_delete(ctx: &mut GuestCtx, st: &mut VitaState) {
 }
 
 /// int sceKernelSendMsgPipe(SceUID uid, const void *buf, unsigned int size, int mode, unsigned int *result, unsigned int *timeout)
+///
+/// Appends the bytes, then hands them to any receiver parked on the pipe.
 pub(super) fn msg_pipe_send(ctx: &mut GuestCtx, st: &mut VitaState) {
     let uid = ctx.arg(0) as i32;
     let (buf, size, result) = (ctx.arg(1), ctx.arg(2), ctx.arg(4));
@@ -592,29 +600,48 @@ pub(super) fn msg_pipe_send(ctx: &mut GuestCtx, st: &mut VitaState) {
     if result != 0 {
         ctx.write_u32(result, size);
     }
+    st.msgpipe_service(ctx, uid);
     ctx.ret(0);
 }
 
 /// int sceKernelReceiveMsgPipe(SceUID uid, void *buf, unsigned int size, int mode, unsigned int *result, unsigned int *timeout)
-pub(super) fn msg_pipe_receive(ctx: &mut GuestCtx, st: &mut VitaState) {
+/// int sceKernelTryReceiveMsgPipe(SceUID uid, void *buf, unsigned int size, int mode, unsigned int *result)
+///
+/// Satisfied at once when the pipe holds what the mode asks for (FULL: `size` bytes; ASAP:
+/// any). Otherwise the TRY form, a DONT_WAIT mode, or the single-thread model report
+/// WAIT_TIMEOUT with nothing received; the blocking form PARKS until a send satisfies it
+/// (or its `*timeout`, in microseconds, passes).
+pub(super) fn msg_pipe_receive(ctx: &mut GuestCtx, st: &mut VitaState, try_form: bool) -> SvcOutcome {
     let uid = ctx.arg(0) as i32;
-    let (buf, size, result) = (ctx.arg(1), ctx.arg(2), ctx.arg(4));
+    let (buf, size, mode, result) = (ctx.arg(1), ctx.arg(2), ctx.arg(3), ctx.arg(4));
+    let timeout_ptr = if try_form { 0 } else { ctx.arg(5) };
+    let full = mode & MPP_MODE_FULL != 0;
     let Some(pipe) = st.msg_pipes.get_mut(&uid) else {
         ctx.ret(0x8002_0005);
-        return;
+        return SvcOutcome::Continue;
     };
-    if pipe.is_empty() {
-        tracing::warn!(target: "vitaslop::kernel", uid, "sceKernelReceiveMsgPipe on an EMPTY pipe: reported as a timeout (the blocking form is not modelled)");
+    let ready = if full { pipe.len() >= size as usize } else { !pipe.is_empty() };
+    if ready {
+        let n = (size as usize).min(pipe.len());
+        let bytes: Vec<u8> = pipe.drain(..n).collect();
+        ctx.write_bytes(buf, &bytes);
+        if result != 0 {
+            ctx.write_u32(result, n as u32);
+        }
+        ctx.ret(0);
+        return SvcOutcome::Continue;
+    }
+    let timeout = (timeout_ptr != 0).then(|| ctx.read_u32(timeout_ptr));
+    if try_form || mode & MPP_MODE_DONT_WAIT != 0 || !st.is_preemptive() || timeout == Some(0) {
+        if result != 0 {
+            ctx.write_u32(result, 0);
+        }
         ctx.ret(0x8002_8005); // SCE_KERNEL_ERROR_WAIT_TIMEOUT
-        return;
+        return SvcOutcome::Continue;
     }
-    let n = (size as usize).min(pipe.len());
-    let bytes: Vec<u8> = pipe.drain(..n).collect();
-    ctx.write_bytes(buf, &bytes);
-    if result != 0 {
-        ctx.write_u32(result, n as u32);
-    }
+    st.msgpipe_block(uid, buf, size, full, result, timeout);
     ctx.ret(0);
+    SvcOutcome::Block
 }
 
 /// int sceClibPrintf(const char *fmt, ...)

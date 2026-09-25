@@ -1090,9 +1090,14 @@ fn dispatch_inner(
             "call"
         );
     }
+    // Every `sceNgsVoice*` call, against the voice it names - see `ngs::report_silent_play`.
+    if crate::nid::name(func_nid).starts_with("sceNgsVoice") {
+        ngs::trace_voice_call(st, func_nid, [ctx.arg(0), ctx.arg(1), ctx.arg(2), ctx.arg(3)]);
+    }
     let outcome = match func_nid {
         // --- lwsync: lightweight mutex / cond (the hottest surface) --------------
         lw_nid::CREATE_LW_MUTEX => cont!(lwsync::create_lw_mutex(ctx, st)),
+        lw_nid::GET_LW_MUTEX_INFO => cont!(lwsync::get_lw_mutex_info(ctx, st)),
         lw_nid::CREATE_LW_COND => cont!(lwsync::create_lw_cond(ctx, st)),
         lw_nid::WAIT_LW_COND | lw_nid::WAIT_LW_COND_CB => lwsync::wait_lw_cond(ctx, st),
         lw_nid::SIGNAL_LW_COND => cont!(lwsync::signal_lw_cond(ctx, st, false)),
@@ -1207,7 +1212,8 @@ fn dispatch_inner(
         lk_nid::CREATE_MSG_PIPE => cont!(libkernel::msg_pipe_create(ctx, st)),
         tm_nid::DELETE_MSG_PIPE => cont!(libkernel::msg_pipe_delete(ctx, st)),
         lk_nid::SEND_MSG_PIPE | lk_nid::TRY_SEND_MSG_PIPE => cont!(libkernel::msg_pipe_send(ctx, st)),
-        lk_nid::RECEIVE_MSG_PIPE | lk_nid::TRY_RECEIVE_MSG_PIPE => cont!(libkernel::msg_pipe_receive(ctx, st)),
+        lk_nid::RECEIVE_MSG_PIPE => libkernel::msg_pipe_receive(ctx, st, false),
+        lk_nid::TRY_RECEIVE_MSG_PIPE => libkernel::msg_pipe_receive(ctx, st, true),
         lk_nid::GET_THREAD_TLS_ADDR => cont!(libkernel::get_thread_tls_addr(ctx, st)),
         lk_nid::GET_RANDOM_NUMBER => cont!(libkernel::get_random_number(ctx, st)),
         lk_nid::GET_PROCESS_TIME => libkernel::get_process_time(ctx, st),
@@ -1246,7 +1252,27 @@ fn dispatch_inner(
         // Closing a semaphore invalidates its id, same as deleting it in this model.
         tm_nid::CLOSE_SEMA => cont!(sync::delete_object(ctx, st)),
         tm_nid::CHANGE_THREAD_VFP_EXCEPTION => cont!(threadmgr::change_thread_vfp_exception(ctx, st)),
-        tm_nid::CHECK_CALLBACK => cont!(threadmgr::check_callback(ctx, st)),
+        sync_nid::CREATE_SIMPLE_EVENT => cont!(sync::create_simple_event(ctx, st)),
+        sync_nid::DELETE_SIMPLE_EVENT => cont!(sync::delete_simple_event(ctx, st)),
+        sync_nid::SET_EVENT => cont!(sync::set_event(ctx, st)),
+        sync_nid::WAIT_EVENT | sync_nid::WAIT_EVENT_CB => sync::wait_event(ctx, st),
+        tm_nid::CHECK_CALLBACK => threadmgr::check_callback(ctx, st),
+        tm_nid::CREATE_CALLBACK => cont!(threadmgr::create_callback(ctx, st)),
+        tm_nid::CLEAR_EVENT => cont!(sync::clear_event(ctx, st)),
+        tm_nid::DELETE_CALLBACK => cont!(threadmgr::delete_callback(ctx, st)),
+        tm_nid::NOTIFY_CALLBACK => cont!(threadmgr::notify_callback(ctx, st)),
+        tm_nid::CANCEL_CALLBACK => cont!(threadmgr::cancel_callback(ctx, st)),
+        tm_nid::GET_CALLBACK_COUNT => cont!(threadmgr::get_callback_count(ctx, st)),
+        display_nid::REGISTER_VBLANK_START_CALLBACK => {
+            let uid = ctx.arg(0) as i32;
+            ctx.ret(threadmgr::vblank_start_callback_raw(st, uid, true) as u32);
+            SvcOutcome::Continue
+        }
+        display_nid::UNREGISTER_VBLANK_START_CALLBACK => {
+            let uid = ctx.arg(0) as i32;
+            ctx.ret(threadmgr::vblank_start_callback_raw(st, uid, false) as u32);
+            SvcOutcome::Continue
+        }
 
         // --- net: BSD sockets, modelled OFFLINE (see `vita::net`) ---------------
         // --- SceMotion: a device AT REST, flat. The two sampling switches are real
@@ -1427,16 +1453,19 @@ fn dispatch_inner(
         | gxm_nid::SYNC_OBJECT_DESTROY => cont!(gxm::ok(ctx)),
         gxm_nid::MAP_MEMORY => cont!(gxm::map_memory(ctx, st)),
         gxm_nid::DEPTH_STENCIL_SURFACE_INIT => cont!(gxm::depth_stencil_surface_init(ctx, st)),
-        // Nothing to tear down for these, but the guest is now free to reuse the
-        // program's memory, so the reflected constants cached against its header
-        // address must not outlive it.
+        gxm_nid::DEPTH_STENCIL_SURFACE_INIT_DISABLED => cont!(gxm::depth_stencil_surface_init_disabled(ctx, st)),
+        // Drop one reference: after its last, the handle must stop reading as a live program
+        // to `...GetProgramRefCount`.
+        //
+        // >>> NO REFLECTION INVALIDATION HERE. A release gives back the patcher's program
+        // >>> OBJECT; the `SceGxmProgram` header the reflection is keyed by stays registered,
+        // >>> and only UNREGISTER (below) can make that address mean a different program. This
+        // >>> used to clear every reflection table on each release - harmless while the patcher
+        // >>> never shared (a title that releases on "the create found an existing program"
+        // >>> never released anything), and ~40 whole-table clears a frame once it did.
         gxm_nid::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM
         | gxm_nid::SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM => {
-            // Drop the reference before the reflection cache goes: the handle is the
-            // program the guest is giving back, and after this it must stop reading as
-            // a live program to `...GetProgramRefCount`.
             st.note_program_released(ctx.arg(1));
-            st.invalidate_program_reflection();
             cont!(gxm::ok(ctx))
         }
         gxm_nid::TRANSFER_COPY => cont!(gxm::transfer_copy(ctx)),
@@ -1497,6 +1526,8 @@ fn dispatch_inner(
         gxm_nid::COLOR_SURFACE_INIT_DISABLED => cont!(gxm::color_surface_init_disabled(ctx, st)),
         gxm_nid::SHADER_PATCHER_CREATE_VERTEX_PROGRAM => cont!(gxm::create_vertex_program(ctx, st)),
         gxm_nid::SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM => cont!(gxm::create_fragment_program(ctx, st)),
+        gxm_nid::VERTEX_PROGRAM_GET_PROGRAM => cont!(gxm::vertex_program_get_program(ctx, st)),
+        gxm_nid::FRAGMENT_PROGRAM_GET_PROGRAM => cont!(gxm::fragment_program_get_program(ctx, st)),
         gxm_nid::BEGIN_SCENE => cont!(gxm::begin_scene(ctx, st)),
         gxm_nid::END_SCENE => gxm::end_scene(ctx, st),
         gxm_nid::SET_VERTEX_PROGRAM => cont!(gxm::set_vertex_program(ctx, st)),
@@ -1528,13 +1559,7 @@ fn dispatch_inner(
         gxm_nid::TEXTURE_SET_MIP_FILTER => cont!(gxm::texture_set_mip_filter(ctx)),
         gxm_nid::TEXTURE_SET_GAMMA_MODE => cont!(gxm::texture_set_gamma_mode(ctx, st)),
         gxm_nid::SET_FRAGMENT_UNIFORM_BUFFER => cont!(gxm::set_uniform_buffer(ctx, "fragment")),
-        gxm_nid::SET_VERTEX_UNIFORM_BUFFER => {
-            // TEMPORARY (`VITASLOP_UBIND_TRACE`). DELETE BEFORE COMMIT.
-            if st.ubind_trace_open() {
-                tracing::warn!(target: "vitaslop::gxm", "UBIND f{} setVUB ctx={:#x} idx={} data={:#x}", st.cur_frame(), ctx.arg(0), ctx.arg(1), ctx.arg(2));
-            }
-            cont!(gxm::set_uniform_buffer(ctx, "vertex"))
-        }
+        gxm_nid::SET_VERTEX_UNIFORM_BUFFER => cont!(gxm::set_uniform_buffer(ctx, "vertex")),
         // Texture getters: pure field reads of the guest's control word 0. Every one of these
         // ALSO has an inline form (`gxm::inline_op`), so on a build that inlines its imports the
         // guest never reaches these at all - which is the point, since `GetLodBias` alone was the
@@ -1544,7 +1569,11 @@ fn dispatch_inner(
         }
         gxm_nid::TEXTURE_GET_STRIDE => cont!(gxm::texture_get_stride(ctx, st)),
         gxm_nid::TEXTURE_GET_LOD_BIAS => cont!(gxm::texture_get_lod_bias(ctx)),
-        gxm_nid::TEXTURE_GET_U_ADDR_MODE_SAFE => cont!(gxm::texture_get_u_addr_mode(ctx)),
+        gxm_nid::TEXTURE_GET_U_ADDR_MODE_SAFE | gxm_nid::TEXTURE_GET_U_ADDR_MODE => {
+            cont!(gxm::texture_get_u_addr_mode(ctx))
+        }
+        gxm_nid::TEXTURE_GET_V_ADDR_MODE => cont!(gxm::texture_get_v_addr_mode(ctx)),
+        gxm_nid::TEXTURE_GET_MIP_FILTER => cont!(gxm::texture_get_mip_filter(ctx)),
         gxm_nid::TEXTURE_GET_V_ADDR_MODE_SAFE => cont!(gxm::texture_get_v_addr_mode(ctx)),
         gxm_nid::TEXTURE_GET_MIN_FILTER => cont!(gxm::texture_get_min_filter(ctx)),
         gxm_nid::TEXTURE_GET_MAG_FILTER => cont!(gxm::texture_get_mag_filter(ctx)),
@@ -1683,8 +1712,15 @@ fn dispatch_inner(
         gxm_nid::COLOR_SURFACE_GET_FORMAT => cont!(gxm::color_surface_get_format(ctx, st)),
         gxm_nid::COLOR_SURFACE_GET_TYPE => cont!(gxm::color_surface_get_type(ctx, st)),
         gxm_nid::COLOR_SURFACE_SET_CLIP => cont!(gxm::color_surface_set_clip(ctx, st)),
+        gxm_nid::COLOR_SURFACE_GET_CLIP => cont!(gxm::color_surface_get_clip(ctx, st)),
+        gxm_nid::COLOR_SURFACE_SET_FORMAT => cont!(gxm::color_surface_set_format(ctx, st)),
+        gxm_nid::COLOR_SURFACE_GET_GAMMA_MODE => cont!(gxm::color_surface_get_gamma_mode(ctx, st)),
+        gxm_nid::COLOR_SURFACE_SET_DITHER_MODE => cont!(gxm::color_surface_set_dither_mode(ctx, st)),
+        gxm_nid::COLOR_SURFACE_GET_DITHER_MODE => cont!(gxm::color_surface_get_dither_mode(ctx, st)),
         gxm_nid::TEXTURE_GET_TYPE => cont!(gxm::texture_get_type(ctx, st)),
-        gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC => cont!(gxm::param_get_semantic(ctx, st)),
+        gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC | gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC_PUBLIC => {
+            cont!(gxm::param_get_semantic(ctx, st))
+        }
         gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC_INDEX => {
             cont!(gxm::param_get_semantic_index(ctx, st))
         }
@@ -1824,6 +1860,7 @@ fn dispatch_inner(
             display::wait_set_frame_buf_multi(ctx, st)
         }
         display_nid::GET_VCOUNT => cont!(display::get_vcount(ctx, st)),
+        display_nid::GET_REFRESH_RATE => cont!(display::get_refresh_rate(ctx, st)),
 
         // --- ctrl: input --------------------------------------------------------
         ctrl_nid::PEEK_BUFFER_POSITIVE => cont!(ctrl::peek_buffer_positive(ctx, st)),
@@ -2095,6 +2132,8 @@ fn dispatch_inner(
         sv_nid::MP4_CLOSE_FILE => cont!(video::mp4_close_file(ctx, st)),
         sv_nid::MP4_RELEASE_BUFFER_7B4832FE => cont!(video::mp4_release_buffer(ctx, st)),
         sv_nid::MP4_GET_NEXT_UNIT_8BE0E3D3 => cont!(video::mp4_get_next_unit(ctx, st)),
+        sv_nid::MP4_GET_STREAM_INFO => cont!(video::mp4_get_stream_info(ctx, st)),
+        sv_nid::MP4_STOP_FILE_STREAMING_C05DFF01 => cont!(video::mp4_stop_file_streaming(ctx, st)),
         sv_nid::MP4_ENABLE_STREAM_609E57AD => cont!(video::mp4_enable_stream(ctx, st)),
         // NOT `cont!`: a unit that is not due yet parks the caller briefly rather than being
         // refused into a spin. See `video::mp4_get_next_unit_info`.
@@ -2114,6 +2153,7 @@ fn dispatch_inner(
         }
         vd_nid::AVCDEC_CREATE_DECODER => cont!(avcdec::avcdec_create_decoder(ctx, st)),
         vd_nid::AVCDEC_DELETE_DECODER => cont!(avcdec::avcdec_delete_decoder(ctx, st)),
+        vd_nid::AVCDEC_DECODE_AVAILABLE_SIZE => cont!(avcdec::avcdec_decode_available_size(ctx, st)),
         // NOT `cont!`: a decode that produced nothing parks its caller, which is what lets
         // a browser's decoder answer at all. See `avcdec::avcdec_decode`.
         vd_nid::AVCDEC_DECODE => avcdec::avcdec_decode(ctx, st),

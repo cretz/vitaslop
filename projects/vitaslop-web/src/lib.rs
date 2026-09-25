@@ -624,6 +624,23 @@ struct RttWriteback {
     /// `next_seq`. Not an error - it is the ring doing its job - but a large share means the
     /// slots are completing badly out of order and is worth seeing.
     dropped_stale: u64,
+    /// `VITASLOP_RTT_WRITEBACK_DELAY_MS`: a copy is not handed over, and its slot stays mapped,
+    /// until this long after it was CAPTURED - the desktop rig for a device whose GPU runs
+    /// hundreds of milliseconds behind (the phone's mlb read ~400 ms), so the ring's pressure
+    /// and the probe's staleness can be measured here. 0 = off.
+    delay_ms: f64,
+    /// When each `(addr, slot)` copy was captured - for `delay_ms`, and for the AGE of every
+    /// delivery below.
+    captured_at: std::collections::HashMap<(u32, u8), f64>,
+    /// >>> HOW LATE THE GUEST GETS ITS PIXELS: capture-to-hand-over age of every delivery,
+    /// summed, counted and maxed. MEASURED with `delay_ms`: mlb's auto-exposure reads a 32x32
+    /// target it rendered itself, and handing it pixels 400 ms old washes the whole picture out
+    /// (frame mean 152,146,137 -> 247,214,124) while every copy is still delivered. So on a
+    /// device whose GPU runs far behind, the SKIP share can look fine and the picture still
+    /// wash - this is the number that says whether that is happening.
+    age_sum_ms: f64,
+    age_n: u64,
+    age_max_ms: f64,
 }
 
 impl RttWriteback {
@@ -676,7 +693,67 @@ impl RttWriteback {
             delivered: 0,
             skipped_in_flight: 0,
             dropped_stale: 0,
+            delay_ms: vitaslop_runtime::knobs::var("VITASLOP_RTT_WRITEBACK_DELAY_MS").ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0),
+            captured_at: Default::default(),
+            age_sum_ms: 0.0,
+            age_n: 0,
+            age_max_ms: 0.0,
         }
+    }
+
+
+    /// Copies whose map has not landed yet. See `writeback_sync_ms` in `live_loop`.
+    fn unlanded(&self) -> usize {
+        self.in_flight
+            .iter()
+            .filter(|p| {
+                !self
+                    .bufs
+                    .get(&(p.0, p.1))
+                    .is_some_and(|(_, _, r)| r.load(std::sync::atomic::Ordering::Relaxed))
+            })
+            .count()
+    }
+
+    /// Age in ms of the OLDEST copy still waiting for its map, or 0 with none in flight.
+    ///
+    /// A copy whose map has LANDED is excluded: it is handed over at the next `take`, so its
+    /// age says nothing about how far behind the GPU is - and counting it declined 140 presents
+    /// of a healthy desktop run's paced play.
+    fn oldest_in_flight_ms(&self) -> f64 {
+        self.oldest_in_flight().map_or(0.0, |(_, _, _, a)| a)
+    }
+
+    /// The oldest not-yet-landed copy as `(addr, w, h, age ms)` - what the age bound declined
+    /// on, for the panel. See [`Self::oldest_in_flight_ms`].
+    fn oldest_in_flight(&self) -> Option<(u32, u32, u32, f64)> {
+        let now = Self::now_ms();
+        self.in_flight
+            .iter()
+            .filter(|p| {
+                !self
+                    .bufs
+                    .get(&(p.0, p.1))
+                    .is_some_and(|(_, _, r)| r.load(std::sync::atomic::Ordering::Relaxed))
+            })
+            .filter_map(|p| self.captured_at.get(&(p.0, p.1)).map(|t| (p.0, p.2, p.3, now - t)))
+            .max_by(|a, b| a.3.total_cmp(&b.3))
+    }
+
+    /// `(mean, max)` capture-to-hand-over age in ms since the last call, then reset - so the
+    /// panel reads it per WINDOW. See `age_sum_ms`.
+    fn take_ages(&mut self) -> (f64, f64) {
+        let r = (self.age_sum_ms / self.age_n.max(1) as f64, self.age_max_ms);
+        self.age_sum_ms = 0.0;
+        self.age_n = 0;
+        self.age_max_ms = 0.0;
+        r
+    }
+
+    fn now_ms() -> f64 {
+        global_performance().map(|p| p.now()).unwrap_or(0.0)
     }
 
     /// `(captured, delivered, skipped because every slot was in flight, dropped as stale)`
@@ -764,6 +841,7 @@ impl RttWriteback {
             *seq += 1;
             let seq = *seq;
             self.captured += 1;
+            self.captured_at.insert((addr, slot), Self::now_ms());
             self.pending.push((addr, slot, w, h, padded, surface, seq));
         }
     }
@@ -779,7 +857,11 @@ impl RttWriteback {
                     // A failed map still has to release the slot, or the target is never
                     // written again; the flag means "the cycle is over", not "the bytes are
                     // good" - `take` checks the range itself.
-                    let _ = r;
+                    if let Err(e) = &r {
+                        web_sys::console::warn_1(&JsValue::from_str(&format!(
+                            "rtt writeback: a readback map FAILED: {e:?}"
+                        )));
+                    }
                     ready.store(true, std::sync::atomic::Ordering::Relaxed);
                 });
                 self.in_flight.push(p);
@@ -791,13 +873,16 @@ impl RttWriteback {
     /// and free for the next cycle.
     fn take(&mut self) -> Vec<(u32, u32, u32, Vec<u8>, vitaslop_runtime::capture::ColorSurface)> {
         let mut out = Vec::new();
+        let now = Self::now_ms();
         let mut i = 0;
         while i < self.in_flight.len() {
             let (addr, slot, w, h, padded, _, seq) = self.in_flight[i];
             let landed = self
                 .bufs
                 .get(&(addr, slot))
-                .is_some_and(|(_, _, r)| r.load(std::sync::atomic::Ordering::Relaxed));
+                .is_some_and(|(_, _, r)| r.load(std::sync::atomic::Ordering::Relaxed))
+                && (self.delay_ms <= 0.0
+                    || self.captured_at.get(&(addr, slot)).is_none_or(|t| now - t >= self.delay_ms));
             if !landed {
                 i += 1;
                 continue;
@@ -826,6 +911,12 @@ impl RttWriteback {
                     }
                 }
                 drop(view);
+                if let Some(t) = self.captured_at.get(&(addr, slot)) {
+                    let age = (now - t).max(0.0);
+                    self.age_sum_ms += age;
+                    self.age_n += 1;
+                    self.age_max_ms = self.age_max_ms.max(age);
+                }
                 self.delivered += 1;
                 self.newest_delivered.insert(addr, seq);
                 out.push((addr, w, h, rgba, surface));
@@ -970,6 +1061,87 @@ struct LivePlayback {
     /// diagnostics window - a probe cadence driven off that one restarts at zero each window,
     /// so it fires on the same relative frame forever and every report is labelled "frame 0".
     presents_total: u64,
+    /// >>> THE WRITEBACK AGE BOUND: a present DECLINES while the oldest render-target copy
+    /// still in flight is older than this many ms (`VITASLOP_RTT_WRITEBACK_MAX_AGE_MS`,
+    /// DEFAULT 0 = OFF - an arm for the phone, see the last paragraph).
+    ///
+    /// MEASURED on the desktop browser with `VITASLOP_RTT_WRITEBACK_DELAY_MS`: mlb's
+    /// auto-exposure loop reads a target it rendered itself and is correct with its pixels up to
+    /// 200 ms old, and WASHES the whole picture out at 400 ms (frame mean 149,142,132 ->
+    /// 247,214,124) - the phone's exact look, on a device whose GPU runs at 239% of its period
+    /// and whose 8-slot ring still skipped 59% of copies. A frame queued behind that backlog
+    /// is worse than no frame: it deepens the queue every copy waits in. So the bound reads the
+    /// ONE latency that decides the picture, the copies' own age - never
+    /// `on_submitted_work_done`, whose dispatch alone read 897 ms on the phone (see
+    /// `stall_armed_for`). A healthy run never reaches it: desktop ~7 ms, and a phone-cost CPU
+    /// (`VITASLOP_SLOW_FRAME_US=25000`) ~120-130 ms.
+    ///
+    /// >>> OFF BY DEFAULT, BECAUSE ON THE DESKTOP IT DECLINED FRAMES AND FED NOTHING. At 150 it
+    /// declined ~70-160 presents in a row of a healthy run's paced play (a ~2 s freeze at the
+    /// swing) and ~4 s at boot, and the copy it waited on did NOT land while it declined: the
+    /// `rtt writeback STUCK` report shows a map requested and unanswered for 3.7 s across the
+    /// declines. A timer turn per tick (null) and an empty submit per decline (null) did not
+    /// unstick it either. Whether it helps a device whose queue is genuinely deep is a phone
+    /// question; the age line above is what that run must be read by.
+    wb_max_age_ms: f64,
+    /// Consecutive presents declined by `wb_max_age_ms`, capped by `BACKPRESSURE_SKIP_CAP` so a
+    /// map callback that never lands cannot stop the picture; and the run's total, for the panel.
+    wb_age_skips: u32,
+    wb_age_skips_total: u64,
+    /// Per target the bound declined on: `(declines, worst age ms, copies in flight then)`.
+    wb_age_why: std::collections::BTreeMap<(u32, u32, u32), (u64, f64, usize)>,
+    /// >>> THE GPU BUDGET: a present costs the GPU milliseconds the newest timestamp query
+    /// >>> measured for a frame, and is made only when that much wall time has accrued.
+    ///
+    /// # THE QUEUE GREW WITHOUT BOUND ON A GPU THAT COULD NOT KEEP UP, AND IT HUNG THE PHONE
+    /// MEASURED on the user's phone (2026-09-23e, this build): Madden `GPU WORK-DONE LATENCY
+    /// 7085 ms`, mlb `1442.9 ms`, with the depth bound `ARMED 0 time(s)` - the whole phone
+    /// stopped responding and the browser had to be killed. The GPU's own clock read 27.4 ms
+    /// of a 34.5 ms period (one 960x544 pass, 735 draws, 28 ms of it): a device running at its
+    /// ceiling, so any heavier scene outruns it and every frame after queues behind.
+    ///
+    /// The depth bound could not see it: it arms only on a BLOCKED `write_buffer`, because the
+    /// work-done promise it would otherwise read is dispatched hundreds of ms late on a busy
+    /// worker (897 ms against 3.9 ms of GPU work on a healthy run - see `stall_armed_for`).
+    /// The timestamp query has neither problem: it is the GPU's own clock. And the one way it
+    /// is wrong helps: under a backlog the FIRST pass of a frame absorbs the queue wait, so the
+    /// measured cost INFLATES exactly while the queue is deep - the budget throttles harder
+    /// then, and lets go as the queue drains.
+    ///
+    /// On a device that keeps up (desktop ~4 ms of a 16.7 ms period, the healthy phone run
+    /// 3.9 of 19.4) credit always exceeds the cost and not one present is declined.
+    /// `VITASLOP_GPU_BUDGET=0` is the arm back.
+    gpu_budget: bool,
+    gpu_credit_ms: f64,
+    gpu_credit_at: f64,
+    /// The measurement sequence last seen, and the wall time it last moved. A readback stuck
+    /// behind the queue is itself the backlog - see `GPU_STALE_MS`.
+    gpu_seen_seq: u64,
+    gpu_seq_at: f64,
+    /// Consecutive declines (capped by `BACKPRESSURE_SKIP_CAP`) and the run's total.
+    gpu_budget_skips: u32,
+    gpu_budget_skips_total: u64,
+    /// >>> THE FEEDBACK HALF OF THE BUDGET: `(wall ms, worker_yielded_ms())` at every present's
+    /// submit whose work-done callback has not fired yet, oldest first (callbacks resolve in
+    /// submit order). The lag is judged on the second - see the check in `present`.
+    ///
+    /// The timestamp estimate alone is FEED-FORWARD and it runs the GPU at 100% of what it
+    /// measures, so any GPU work it does not measure - the browser compositing the canvas, the
+    /// write-back copies, a tiler's resolves - accrues as a backlog that never drains.
+    /// MEASURED (`ec1-burn`, mlb intro, desktop browser with the slow-GPU rig): timestamps read
+    /// 28 ms a frame, a present every ~29 ms was admitted, and the work-done latency climbed to
+    /// 1,568 ms; the phone's own mlb diag read 35.6 ms measured against a 42 ms period - 85%
+    /// busy by the GPU's clock - and a 14,149 ms queue. The oldest unfinished submit's AGE is
+    /// the queue itself, measured rather than estimated. See `GPU_LAG_MS`.
+    gpu_submits: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(f64, f64)>>>,
+    /// Presents declined by the lag rule alone, for the panel.
+    gpu_lag_skips_total: u64,
+    /// `VITASLOP_GPU_BURN=<n>`: the desktop test rig - see `GxmRenderer::gpu_burn`.
+    gpu_burn: u32,
+    /// >>> EARLY COMPLETIONS, per panel window: the GPU work the budget above does NOT gate.
+    /// An early batch renders every offscreen scene of the frame so far, at the guest's own GPU
+    /// wait, whether or not the frame is ever presented. See `EarlyCompleter for LivePlayback`.
+    early: EarlyStats,
     /// Set by the device-lost callback installed in [`LivePlayback::new`]. `Some` means every
     /// GPU object this renderer holds is invalid and the run is over - see that callback.
     lost: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -984,6 +1156,22 @@ struct LivePlayback {
     occluded: bool,
 }
 
+/// See `LivePlayback::early`. Window counters, cleared by the panel read.
+#[derive(Default, Clone, Copy)]
+struct EarlyStats {
+    batches: u64,
+    scenes: u64,
+    draws: u64,
+    /// Wall ms spent before the submit (a present's copy of a batch target still in flight).
+    pre_wait_ms: f64,
+    /// Wall ms from the submit to the batch's readbacks landing - GPU backlog + this batch.
+    post_wait_ms: f64,
+    worst_ms: f64,
+    gave_up: u64,
+    /// Batches whose targets produced no readback to wait on (so no GPU round trip at all).
+    unwaited: u64,
+}
+
 /// Consecutive queue-depth declines after which the bound overrides itself - see
 /// [`LivePlayback::backpressure_skips`].
 ///
@@ -992,6 +1180,39 @@ struct LivePlayback {
 /// which is exactly when a queue drains), short enough that a dropped promise costs a second
 /// of picture rather than the rest of the run.
 const BACKPRESSURE_SKIP_CAP: u32 = 60;
+
+/// Wall milliseconds with no new GPU timestamp after which a GPU measured HEAVY is taken to be
+/// behind - see `LivePlayback::gpu_budget`. A readback is one round trip, so a second without
+/// one is a queue, not a slow callback.
+///
+/// WALL TIME, NOT PRESENTS: it was 30 presents, and the desktop browser's fast-forward presents
+/// many times a real frame, so 30 of them passed in a fraction of a second and a HEALTHY run
+/// declined 110 presents at the hand-off out of fast-forward (`burnab2` bb-none, f3435-3570).
+const GPU_STALE_MS: f64 = 1000.0;
+
+/// A frame costing less GPU than this is never held on a stale readback: a light frame cannot
+/// be the backlog, and a late callback on a light frame is the dispatch latency the depth bound
+/// learned not to trust.
+const GPU_HEAVY_MS: f64 = 10.0;
+
+/// A present is declined while the oldest present-submit the GPU has not reported finished is
+/// older than this - see `LivePlayback::gpu_submits`. A healthy desktop run's work-done latency
+/// is 17-61 ms (`ec1-none`, 113 windows, FIFO at 60 Hz), so this never binds there; on a device
+/// behind by a second it holds the queue near this depth instead of letting it reach 14 s.
+const GPU_LAG_MS: f64 = 150.0;
+
+thread_local! {
+    /// Total wall ms this worker has spent YIELDED at the live loop's tick await - the only
+    /// time a work-done callback can be delivered to it. See the lag check in `present`.
+    static WORKER_YIELDED_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+fn worker_yielded_ms() -> f64 {
+    WORKER_YIELDED_MS.with(|y| y.get())
+}
+
+/// ...and only while at least this many present-submits are unfinished - see the lag check.
+const GPU_LAG_DEPTH: usize = 3;
 
 /// A `queue.write_buffer` at or above this many MICROSECONDS is taken as a BLOCKING call and
 /// arms the queue-depth bound. See [`LivePlayback::stall_armed_for`].
@@ -2531,6 +2752,10 @@ impl LivePlayback {
         // to a `surface` element that only the desktop test pages define, so on a phone the
         // one report built for device-only render defects was invisible.
         let fps = FpsMeter::new(perf, report);
+        let wb_max_age_ms = vitaslop_runtime::knobs::var("VITASLOP_RTT_WRITEBACK_MAX_AGE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0);
         Ok(LivePlayback {
             surface,
             device,
@@ -2558,6 +2783,10 @@ impl LivePlayback {
             gpu_done_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             gpu_done_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gpu_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            wb_max_age_ms,
+            wb_age_skips: 0,
+            wb_age_skips_total: 0,
+            wb_age_why: Default::default(),
             stall_armed_for: 0,
             queue_depth_limit: vitaslop_platform::knobs::var("VITASLOP_GPU_QUEUE_DEPTH")
                 .ok()
@@ -2565,6 +2794,20 @@ impl LivePlayback {
                 .unwrap_or(2),
             backpressure_skips: 0,
             backpressure_skips_total: 0,
+            gpu_budget: vitaslop_platform::knobs::var("VITASLOP_GPU_BUDGET").map_or(true, |v| v.trim() != "0"),
+            gpu_credit_ms: 0.0,
+            gpu_credit_at: 0.0,
+            gpu_seen_seq: 0,
+            gpu_seq_at: 0.0,
+            gpu_budget_skips: 0,
+            gpu_budget_skips_total: 0,
+            gpu_submits: Default::default(),
+            gpu_lag_skips_total: 0,
+            early: EarlyStats::default(),
+            gpu_burn: vitaslop_platform::knobs::var("VITASLOP_GPU_BURN")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(0),
             stall_arms_total: 0,
             presents_total: 0,
             lost,
@@ -2681,6 +2924,76 @@ impl LivePlayback {
             } else {
                 self.backpressure_skips = 0;
             }
+        }
+        // >>> THE GPU BUDGET - see `gpu_budget`. Same place and same reason as the depth bound:
+        // a frame we will not submit must cost nothing.
+        if self.gpu_budget && !self.fps.paused {
+            // Collect a readback that landed since the last present - including one that landed
+            // while presents were being declined, which is what lets a hold on a stale reading end.
+            self.gxm.ts_poll();
+            // AGE AND DEPTH, not age alone: a worker that blocked for a while (the fast-forward
+            // hand-off, a load's shader builds) dispatches no callbacks meanwhile, so its one or
+            // two outstanding submits AGE with the GPU idle. MEASURED (`ec3-none`, Madden): the
+            // age rule alone declined 304 presents of a healthy run, 259 of them in the 300
+            // frames after fast-forward. A real backlog is many submits deep.
+            // >>> THE AGE IS YIELDED TIME, NOT WALL TIME. A callback reaches this worker only
+            // while it is yielded, so a worker that ran 150 ms ticks (the fast-forward hand-off,
+            // a load's shader builds) saw its submits "age" with the GPU idle: MEASURED on a
+            // healthy Madden run with the GPU at 15 ms a frame, wall-time age (even with depth
+            // and a persist-across-a-yield rule) declined 144 presents at the hand-off and ~100
+            // at a load. Yielded time since the submit is the delivery opportunity the callback
+            // has had; if it has had 150 ms of it and still not come, the queue is deep.
+            let yielded = worker_yielded_ms();
+            let lag = self.gpu_submits.lock().ok().is_some_and(|q| {
+                q.len() >= GPU_LAG_DEPTH
+                    && q.front().is_some_and(|&(_, y)| yielded - y > GPU_LAG_MS)
+            });
+            if lag && self.gxm.ts_latest().is_none() && self.gpu_budget_skips < BACKPRESSURE_SKIP_CAP {
+                self.gpu_budget_skips += 1;
+                self.gpu_budget_skips_total += 1;
+                self.gpu_lag_skips_total += 1;
+                return PresentOutcome::Skipped;
+            }
+            if let (Some((ms, seq)), Some(now)) = (self.gxm.ts_latest(), now_ms()) {
+                let dt = if self.gpu_credit_at > 0.0 { now - self.gpu_credit_at } else { 0.0 };
+                self.gpu_credit_at = now;
+                // Capped, so an idle stretch (a load, a pause) cannot bank a burst of frames.
+                self.gpu_credit_ms = (self.gpu_credit_ms + dt).min((2.0 * ms).max(40.0));
+                if seq != self.gpu_seen_seq || self.gpu_seq_at == 0.0 {
+                    self.gpu_seen_seq = seq;
+                    self.gpu_seq_at = now;
+                }
+                let over = ms > 0.0 && self.gpu_credit_ms < ms;
+                let stuck = ms >= GPU_HEAVY_MS && now - self.gpu_seq_at > GPU_STALE_MS;
+                if (over || stuck || lag) && self.gpu_budget_skips < BACKPRESSURE_SKIP_CAP {
+                    self.gpu_budget_skips += 1;
+                    self.gpu_budget_skips_total += 1;
+                    if lag && !over && !stuck {
+                        self.gpu_lag_skips_total += 1;
+                    }
+                    return PresentOutcome::Skipped;
+                }
+                self.gpu_budget_skips = 0;
+                self.gpu_credit_ms -= ms;
+            }
+        }
+        // >>> THE WRITEBACK AGE BOUND - see `wb_max_age_ms`. Same place and same reason as the
+        // depth bound above: a frame we will not submit must cost nothing.
+        if self.wb_max_age_ms > 0.0 && !self.fps.paused {
+            if let Some((addr, w, h, age)) =
+                self.writeback.oldest_in_flight().filter(|o| o.3 > self.wb_max_age_ms)
+            {
+                if self.wb_age_skips < BACKPRESSURE_SKIP_CAP {
+                    self.wb_age_skips += 1;
+                    self.wb_age_skips_total += 1;
+                    let e = self.wb_age_why.entry((addr, w, h)).or_insert((0, 0.0, 0));
+                    e.0 += 1;
+                    e.1 = f64::max(e.1, age);
+                    e.2 = self.writeback.in_flight.len();
+                    return PresentOutcome::Skipped;
+                }
+            }
+            self.wb_age_skips = 0;
         }
         let t0 = clock(&self.perf);
         // Tell the builder a new frame starts here. Its texture cache needs the boundary to
@@ -2865,6 +3178,7 @@ impl LivePlayback {
             let list = self.gxm.rtt_targets();
             self.writeback.capture(&self.device, &mut encoder, &list, all_scenes);
         }
+        self.gxm.gpu_burn(&self.device, &mut encoder, self.gpu_burn);
         self.gxm.ts_finish_chain(&mut encoder);
         // >>> `submit` IS FIVE DIFFERENT THINGS AND THEY HAVE FIVE DIFFERENT FIXES.
         //
@@ -2895,7 +3209,18 @@ impl LivePlayback {
             // cannot see this counter. See `gpu::GPU_SUBMITS_IN_FLIGHT`.
             vitaslop_platform::gpu::GPU_SUBMITS_IN_FLIGHT.store(depth as u64, Relaxed);
             let inflight = self.gpu_in_flight.clone();
+            let submits = self.gpu_submits.clone();
+            if let (Ok(mut q), Some(t)) = (submits.lock(), now_ms()) {
+                // Bounded: a device whose callbacks stop would otherwise grow this forever.
+                if q.len() >= 64 {
+                    q.pop_front();
+                }
+                q.push_back((t, worker_yielded_ms()));
+            }
             self.queue.on_submitted_work_done(move || {
+                if let Ok(mut q) = submits.lock() {
+                    q.pop_front();
+                }
                 // `fetch_update` rather than `fetch_sub`: the safety valve above can zero the
                 // counter while promises are still outstanding, and an unsigned wrap there
                 // would put the depth at four billion and decline every present for the rest
@@ -3126,6 +3451,23 @@ impl LivePlayback {
         self.writeback.counts()
     }
 
+    fn writeback_unlanded(&self) -> usize {
+        self.writeback.unlanded()
+    }
+
+    fn writeback_ages(&mut self) -> (f64, f64) {
+        self.writeback.take_ages()
+    }
+
+    fn writeback_age_skips(&self) -> (f64, u64, String) {
+        let why: Vec<String> = self
+            .wb_age_why
+            .iter()
+            .map(|((a, w, h), (n, age, inf))| format!("{a:#010x} {w}x{h}: {n} (worst {age:.0} ms, {inf} in flight)"))
+            .collect();
+        (self.wb_max_age_ms, self.wb_age_skips_total, why.join(", "))
+    }
+
     fn surface_line(&self) -> &str {
         &self.surface_line
     }
@@ -3136,6 +3478,13 @@ impl LivePlayback {
     /// ARM count is the one that says whether the bound touched this run at all, and without it
     /// a reader cannot tell "the bound never engaged" from "the bound engaged and declined
     /// nothing". Cumulative, not windowed - see [`Self::backpressure_skips_total`].
+    /// `(budget on, presents declined this run, newest measured GPU ms per frame, burn)` -
+    /// see `gpu_budget`.
+    fn gpu_budget_report(&self) -> (bool, u64, f64, u32, u64) {
+        let ms = self.gxm.ts_latest().map_or(0.0, |(ms, _)| ms);
+        (self.gpu_budget, self.gpu_budget_skips_total, ms, self.gpu_burn, self.gpu_lag_skips_total)
+    }
+
     fn backpressure_report(&self) -> (u64, u32, u64, bool) {
         (
             self.backpressure_skips_total,
@@ -4736,6 +5085,29 @@ async fn live_loop(
     // here: it decides whether the expensive instruments record for the whole run, and a run that
     // changed its own instrumentation part-way would publish two incomparable halves.
     let debug_capture = vitaslop_runtime::knobs::flag("VITASLOP_DEBUG_CAPTURE");
+    // `VITASLOP_RTT_WRITEBACK_SYNC_MS` (DEFAULT 0 = OFF, see the last paragraph): after a present that copied render
+    // targets back for the guest, yield until those copies land - at most this long - before
+    // the next guest frame runs.
+    //
+    // MEASURED on the desktop browser: mlb washed out for a moment at an at-bat's camera cut
+    // (`mlbw24h` f12767) where native - whose writeback is synchronous - never does; the
+    // asynchronous hand-over feeds the title's auto-exposure a probe two or more frames old,
+    // and at a cut that is the previous camera's light. And on a device whose GPU runs far
+    // behind (the phone read ~400 ms) the copies arrive later still, which is the wash-out
+    // `VITASLOP_RTT_WRITEBACK_DELAY_MS=400` reproduces. Waiting keeps the queue as shallow as
+    // the title's own reads require, which is what the console's guest does when it waits on
+    // its GPU work. A title with no CPU-read target copies nothing and never waits.
+    //
+    // >>> OFF BY DEFAULT, BECAUSE THE A/B REFUTED THE FIRST HALF. `mlbsync-on/off` (desktop
+    // browser, one build): the wait cut the copies' age from ~50 ms to ~8 ms and cost 98% ->
+    // 78% speed - and the at-bat wash appeared in BOTH arms (frame means 218,203,163 and
+    // 220,204,165), so that transient is not writeback latency. What remains is the phone's
+    // ~400 ms, which only a device run can say this fixes; this is the knob for that run.
+    let writeback_sync_ms = vitaslop_runtime::knobs::var("VITASLOP_RTT_WRITEBACK_SYNC_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let mut writeback_wait_ms = 0.0f64;
     if debug_capture {
         browser_sched::set_host_call_timing(true);
         vitaslop_runtime::vita::set_callsite_profiling(true);
@@ -4768,6 +5140,7 @@ async fn live_loop(
         let sleep_from = now();
         next_tick_in(due_in).await;
         let t = now();
+        WORKER_YIELDED_MS.with(|y| y.set(y.get() + (t - sleep_from).max(0.0)));
         // The pacing's own accounting, before `acc` is consumed by the frames below - see
         // the declarations. `due_in` is what was ASKED for and `t - sleep_from` what the
         // host gave, and the gap between them is the tick floor this loop cannot go under.
@@ -5521,6 +5894,17 @@ async fn live_loop(
             // shadowing it here silently retyped it.
             let (scene, flips) = scene;
             let outcome = playback.present(&scene, display, &flips);
+            // >>> AND THE GUEST WAITS FOR THEM, AS IT WOULD FOR ITS OWN GPU WORK. See
+            // `writeback_sync_ms`: yield until this present's copies have landed (or the cap),
+            // so the next guest frame reads pixels ONE frame old - the console's latency - and
+            // not the two or more an asynchronous hand-over gives.
+            if writeback_sync_ms > 0.0 && !fast {
+                let t_wait = now();
+                while playback.writeback_unlanded() > 0 && now() - t_wait < writeback_sync_ms {
+                    next_tick().await;
+                }
+                writeback_wait_ms += now() - t_wait;
+            }
             // A render target the title reads on the CPU gets its pixels back here - the
             // copies that landed since the last present, one or two frames behind the picture.
             // See `RttWriteback`.
@@ -5921,6 +6305,37 @@ async fn live_loop(
                             ),
                         );
                     }
+                }
+                {
+                    let e = std::mem::take(&mut playback.early);
+                    let b = e.batches.max(1) as f64;
+                    line(
+                        &mut diag,
+                        "EARLY COMPLETION",
+                        &format!(
+                            "{} batch(es) this window ({:.1} scenes, {:.0} draws each), {} with no readback to wait on, {} GAVE UP; wall per batch {:.1} ms before the submit + {:.1} ms submit-to-landed, worst {:.0} ms. An early batch renders every offscreen scene of the frame so far at the guest's own GPU wait (sceGxmFinish / notification wait), PRESENTED OR NOT - so this GPU work is outside the GPU BUDGET, and a large submit-to-landed figure is the queue ahead of it.",
+                            e.batches,
+                            e.scenes as f64 / b,
+                            e.draws as f64 / b,
+                            e.unwaited,
+                            e.gave_up,
+                            e.pre_wait_ms / b,
+                            e.post_wait_ms / b,
+                            e.worst_ms,
+                        ),
+                    );
+                }
+                {
+                    let (on, n, ms, burn, lag_n) = playback.gpu_budget_report();
+                    line(
+                        &mut diag,
+                        "GPU BUDGET",
+                        &format!(
+                            "{} - declined {n} present(s) this run to keep the GPU queue bounded ({lag_n} of them by the LAG rule alone: the oldest unfinished submit older than {GPU_LAG_MS} ms); newest measured frame {ms:.1} ms of GPU.{} A present is made only when that much wall time has accrued since the last, and none is made while a readback of a HEAVY frame (>= {GPU_HEAVY_MS} ms) has been stuck for {GPU_STALE_MS} ms - the queue itself. A device that keeps up declines none. `VITASLOP_GPU_BUDGET=0` is the arm back.",
+                            if on { "ON" } else { "OFF (VITASLOP_GPU_BUDGET=0)" },
+                            if burn > 0 { format!(" >>> TEST RIG ARMED: VITASLOP_GPU_BURN={burn}.") } else { String::new() },
+                        ),
+                    );
                 }
                 // >>> THE GPU'S OWN CLOCK, which the latency above cannot separate from the
                 // event loop. See `GpuTimestamps`.
@@ -6408,6 +6823,8 @@ async fn live_loop(
                 // from here, and one of them raises the guest's exposure until it clamps.
                 {
                     let (cap, del, skip, stale) = playback.writeback_counts();
+                    let (age_mean, age_max) = playback.writeback_ages();
+                    let (age_bound, age_declines, age_why) = playback.writeback_age_skips();
                     // >>> A SHARE, NOT A RATE. These four are CUMULATIVE over the run and
                     // `s.presents` is this WINDOW's - dividing one by the other produced
                     // "326.90 delivered per present", which is not a quantity that exists. The
@@ -6422,7 +6839,20 @@ async fn live_loop(
                         &mut diag,
                         "RTT WRITEBACK",
                         &format!(
-                            "{cap} copies encoded, {del} handed to the guest, {skip} SKIPPED \
+                            "copies reach the guest {age_mean:.0} ms after capture on average, \
+                             {age_max:.0} ms at worst, this window. >>> AGE IS THE WASH, NOT \
+                             ONLY THE SKIPS: measured on the desktop browser with \
+                             `VITASLOP_RTT_WRITEBACK_DELAY_MS`, a baseball at-bat is correct at \
+                             200 ms (frame mean 149,142,132) and WASHED at 400 ms \
+                             (247,214,124) with every copy still delivered, because the \
+                             guest's auto-exposure loop is fed pixels that old. The AGE BOUND \
+                             (`VITASLOP_RTT_WRITEBACK_MAX_AGE_MS`={age_bound:.0}, 0 = off) \
+                             DECLINED {age_declines} present(s) this run while the oldest copy \
+                             in flight was older than that [by target: {age_why}]. The loop \
+                             has WAITED {writeback_wait_ms:.0} ms in total this run for copies \
+                             to land before the next guest frame \
+                             (`VITASLOP_RTT_WRITEBACK_SYNC_MS`={writeback_sync_ms:.0}, 0 = off). | \
+                             {cap} copies encoded, {del} handed to the guest, {skip} SKIPPED \
                              because every ring slot for that target was still mapped, {stale} \
                              dropped as older than a copy already applied - all four \
                              CUMULATIVE over the run, and {share:.0}% of the copies this \
@@ -6438,12 +6868,6 @@ async fn live_loop(
                              device's queue depth.",
                         ),
                     );
-                }
-                // >>> AND THE GUEST'S OWN NUMBER FOR IT, when the probe is armed. One line, the
-                // newest reading - see `last_ambient_report` for what a fed probe reads and what
-                // a starved one reads, both measured.
-                if let Some(amb) = vitaslop_runtime::last_ambient_report() {
-                    line(&mut diag, "AMBIENT PROBE (guest's own exposure input)", &amb);
                 }
                 // >>> WHICH VERTEX PLAN THE PIPELINES GOT. The per-pair reports for this go to
                 // panels that keep 96 distinct lines and drop the rest, so on a title with
@@ -7073,6 +7497,9 @@ impl browser_sched::EarlyCompleter for LivePlayback {
             }
             let view = self.scratch.clone().expect("created above");
             let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
+            self.early.batches += 1;
+            self.early.scenes += scenes.len() as u64;
+            self.early.draws += built.iter().map(|b| b.draws.len() as u64).sum::<u64>();
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("early-completion") });
@@ -7092,26 +7519,47 @@ impl browser_sched::EarlyCompleter for LivePlayback {
                 None,
             );
             self.gxm.set_offscreen_only(false);
+            // >>> BOUNDED BY WALL CLOCK, NOT BY TURNS. A turn is a MessageChannel post - a few
+            // microseconds - so the old `0..2000` gave up after tens of milliseconds, while at a
+            // scene load the GPU queue is seconds deep (mlb: maps unanswered for 1.3-3.3 s). The
+            // guest was then woken onto its allocator's poison, read its ambient probe ONCE, and
+            // played ~40 s washed out. The bound only exists for a device that stops answering.
+            const EARLY_WAIT_MS: f64 = 10_000.0;
+            let t0 = RttWriteback::now_ms();
+            let lost = |s: &Self| s.lost.lock().ok().and_then(|l| l.clone()).is_some();
+            // Everything that lands while this waits goes back to the caller, which writes a
+            // non-batch target's pixels too (see `complete_early_batch`) - dropping them lost a
+            // present's copy.
+            let mut out = Vec::new();
             // A readback of one of these targets may still be in flight from a present; the
             // capture would skip it, and the guest would be woken with nothing. Let it land.
-            for _ in 0..2000 {
+            loop {
                 let busy = self.writeback.in_flight.iter().chain(self.writeback.pending.iter()).any(|p| want.contains(&p.0));
-                if !busy {
+                if !busy || lost(self) || RttWriteback::now_ms() - t0 > EARLY_WAIT_MS {
                     break;
                 }
-                let _ = self.writeback.take();
+                for (addr, tw, th, rgba, _) in self.writeback.take() {
+                    out.push((addr, tw, th, rgba));
+                }
                 browser_sched::event_loop_turn().await;
             }
             {
                 let list = self.gxm.rtt_targets();
                 self.writeback.capture(&self.device, &mut encoder, &list, &scenes);
             }
+            // The rig models a slow GPU on EVERY submit that renders the frame's scenes, not
+            // only on presents - an early batch is the same passes.
+            self.gxm.gpu_burn(&self.device, &mut encoder, self.gpu_burn);
+            let t_sub = RttWriteback::now_ms();
+            self.early.pre_wait_ms += t_sub - t0;
+            if !self.writeback.pending.iter().any(|p| want.contains(&p.0)) {
+                self.early.unwaited += 1;
+            }
             self.queue.submit([encoder.finish()]);
             self.writeback.begin_map();
             // Wait for the batch's targets to land. Bounded: a map that never resolves (a
             // lost device) must not park the guest forever.
-            let mut out = Vec::new();
-            for _ in 0..2000 {
+            loop {
                 for (addr, tw, th, rgba, _) in self.writeback.take() {
                     out.push((addr, tw, th, rgba));
                 }
@@ -7119,8 +7567,21 @@ impl browser_sched::EarlyCompleter for LivePlayback {
                 if !outstanding {
                     break;
                 }
+                if lost(self) || RttWriteback::now_ms() - t0 > EARLY_WAIT_MS {
+                    self.early.gave_up += 1;
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "gxm early completion: GAVE UP after {:.0} ms with a batch target's readback \
+                         still unanswered - the guest is woken onto guest memory that does not hold \
+                         the picture yet",
+                        RttWriteback::now_ms() - t0
+                    )));
+                    break;
+                }
                 browser_sched::event_loop_turn().await;
             }
+            let t_end = RttWriteback::now_ms();
+            self.early.post_wait_ms += t_end - t_sub;
+            self.early.worst_ms = self.early.worst_ms.max(t_end - t0);
             out
         })
     }

@@ -160,10 +160,23 @@ export function createPlayer({ onExit, onRestart }) {
       if (root.requestFullscreen) await root.requestFullscreen({ navigationUI: "hide" });
       else if (root.webkitRequestFullscreen) root.webkitRequestFullscreen();
     } catch {}
-    // The lock is a setting: a phone held in portrait is a legitimate way to play with
-    // the pad below the screen, and the lock takes that away.
+    await applyOrientationLock();
+  };
+  // The lock is a setting: a phone held in portrait is a legitimate way to play with
+  // the pad below the screen, and the lock takes that away.
+  //
+  // >>> UNKNOWN SETTINGS LOCK, BECAUSE LOCKING IS THE DEFAULT. Play asks for fullscreen inside
+  // the tap (see `askFullscreenNow`), before `start` has read the title's settings, so this
+  // runs with `settings` still null on every Play. Gating the lock on `settings &&` skipped it
+  // there every time - fullscreen, but held in portrait. `start` calls this again once the
+  // settings are known, which is what lets a player who turned the lock OFF get it released.
+  // A lock needs fullscreen, not a gesture, so that second call is allowed.
+  const applyOrientationLock = async () => {
+    if (!coarse || !screen.orientation) return;
     try {
-      if (coarse && settings && settings.lockLandscape !== false && screen.orientation && screen.orientation.lock) {
+      if (settings && settings.lockLandscape === false) {
+        if (screen.orientation.unlock) screen.orientation.unlock();
+      } else if (isFull() && screen.orientation.lock) {
         await screen.orientation.lock("landscape");
       }
     } catch {}
@@ -441,6 +454,7 @@ export function createPlayer({ onExit, onRestart }) {
     applyLayout();
     // Already fullscreen (a restart keeps it): no second request, no second toast.
     if (fullscreen && !isFull() && !fullscreenAsked) enterFullscreen();
+    else applyOrientationLock();
     fullscreenAsked = false;
     holdWake();
 

@@ -475,6 +475,9 @@ pub enum VfpOp {
     /// S`sd` (`vcvtb`/`vcvtt.f32.f16`). `top` selects the top half (`vcvtt`) over the
     /// bottom (`vcvtb`). Emitted as the branchless bit/float conversion.
     CvtF32FromHalf { sd: u8, sm: u8, top: bool },
+    /// Narrow f32 in S`sm` to IEEE half precision (round to nearest, ties to even) in one
+    /// 16-bit half of S`sd`, keeping the other half (`vcvtb`/`vcvtt.f16.f32`).
+    CvtHalfFromF32 { sd: u8, sm: u8, top: bool },
     /// `vmov Rt, Rt2, Dm`: copy D`d`'s low 32 bits to `rt`, high 32 to `rt2`.
     DoubleToCore { rt: u8, rt2: u8, d: u8 },
     /// `vmov Dm, Rt, Rt2`: assemble D`d` from `rt` (low) and `rt2` (high).

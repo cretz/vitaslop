@@ -71,7 +71,8 @@
 //! - `<frame>: @assert egress <Kind> [field<op>value ...]` - assert the OS-egress
 //!   ledger recorded an event of `Kind` (`SaveWrite`/`Trophy`/`ScoreSubmit`) at or
 //!   before this frame, optionally matching fields (`path=...`, `ascii~substr`,
-//!   `bytes>=N`, `id=N`, `board=N`, `score>=N`). This is the content-free "the game
+//!   `bytes>=N`, `id=N`, `board=N`, `score>=N`, and on any kind `at>=N` - the frame the
+//!   event was recorded at). This is the content-free "the game
 //!   did the thing" surface.
 //! - `<frame>: @shot <name>` - render the current frame to a screenshot named
 //!   `<name>` for human review.
@@ -291,11 +292,31 @@ impl Timeline {
 }
 
 /// A `@watch <name> <type> <addr>` declaration: a live memory value to sample.
+///
+/// `<addr>` may also be `*<slot>+<offset>` (the offset optional): read the 32-bit POINTER at
+/// `slot`, add `offset`, and sample the value THERE. A value that lives in a pooled or allocated
+/// block moves between runs that load differently - a fighting title's health block sits in a
+/// different pool slot on the desktop and in the browser, because the two load the stage at
+/// different speeds - while the pointer to it does not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchDecl {
     pub name: String,
     pub ty: ValType,
+    /// The value's address, or - with `deref` - the address of the pointer to it.
     pub addr: u32,
+    /// `Some(offset)`: `addr` holds a pointer; the value is at `pointer + offset`.
+    pub deref: Option<u32>,
+}
+
+impl WatchDecl {
+    /// The address spelled as the recipe writes it: `0x...` or `*0x...+0x...`.
+    pub fn addr_text(&self) -> String {
+        match self.deref {
+            None => format!("{:#x}", self.addr),
+            Some(0) => format!("*{:#x}", self.addr),
+            Some(o) => format!("*{:#x}+{o:#x}", self.addr),
+        }
+    }
 }
 
 /// A memory assertion: `@assert <watch> <op> <value> [+-<tol>]`.
@@ -508,11 +529,15 @@ impl Recipe {
                     line: line_no,
                     reason: format!("@watch bad type {ty:?} (u8|u16|u32|i32|f32)"),
                 })?;
-                let addr = parse_hex(addr).ok_or_else(|| RecipeError {
-                    line: line_no,
-                    reason: format!("@watch bad address {addr:?}"),
-                })?;
-                self.watches.push(WatchDecl { name: name.to_string(), ty, addr });
+                let bad = || RecipeError { line: line_no, reason: format!("@watch bad address {addr:?}") };
+                let (addr, deref) = match addr.strip_prefix('*') {
+                    Some(p) => match p.split_once('+') {
+                        Some((slot, off)) => (parse_hex(slot).ok_or_else(bad)?, Some(parse_hex(off).ok_or_else(bad)?)),
+                        None => (parse_hex(p).ok_or_else(bad)?, Some(0)),
+                    },
+                    None => (parse_hex(addr).ok_or_else(bad)?, None),
+                };
+                self.watches.push(WatchDecl { name: name.to_string(), ty, addr, deref });
             }
             other => {
                 return Err(RecipeError {
@@ -607,7 +632,7 @@ impl Recipe {
             s.push_str(&format!("@sig {sig:#018x}\n"));
         }
         for w in &self.watches {
-            s.push_str(&format!("@watch {} {} {:#x}\n", w.name, w.ty.keyword(), w.addr));
+            s.push_str(&format!("@watch {} {} {}\n", w.name, w.ty.keyword(), w.addr_text()));
         }
         s.push('\n');
 
@@ -1094,7 +1119,7 @@ mod tests {
         assert_eq!(r.meta.sig, Some(0x3f9a_1c04));
         assert_eq!(r.meta.shot_every, None);
         assert_eq!(r.watches.len(), 1);
-        assert_eq!(r.watches[0], WatchDecl { name: "vpos".into(), ty: ValType::I32, addr: 0x8150_2058 });
+        assert_eq!(r.watches[0], WatchDecl { name: "vpos".into(), ty: ValType::I32, addr: 0x8150_2058, deref: None });
         // The input timeline still parses alongside the metadata.
         assert_eq!(r.segment_count(), 1);
     }
@@ -1156,6 +1181,12 @@ mod tests {
     fn rejects_bad_meta_directives() {
         assert_eq!(Recipe::parse("@sig zzz\n").unwrap_err().line, 1);
         assert_eq!(Recipe::parse("@watch vpos i32\n").unwrap_err().line, 1);
+        // A pointer-chased watch: `*slot+offset`, the offset optional; it round-trips.
+        let r = Recipe::parse("@watch hp u16 *0x81c47d30+0x3c\n@watch p u32 *0x81c47d30\n").unwrap();
+        assert_eq!(r.watches[0], WatchDecl { name: "hp".into(), ty: ValType::U16, addr: 0x81c4_7d30, deref: Some(0x3c) });
+        assert_eq!(r.watches[1].deref, Some(0));
+        assert_eq!(r.watches[0].addr_text(), "*0x81c47d30+0x3c");
+        assert!(Recipe::parse("@watch hp u16 *zz+0x3c\n").is_err());
         assert_eq!(Recipe::parse("@bogus x\n").unwrap_err().line, 1);
         assert_eq!(Recipe::parse("0: @assert vpos !! 3\n").unwrap_err().line, 1);
         assert_eq!(Recipe::parse("0: @nope x\n").unwrap_err().line, 1);

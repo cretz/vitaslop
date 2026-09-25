@@ -725,6 +725,101 @@ pub(super) fn wait_event_flag(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutc
     }
 }
 
+/// SceUID sceKernelCreateSimpleEvent(const char *name, SceUInt32 attr, SceUInt32 initPattern,
+///     const void *opt)
+///
+/// # Where the prototypes come from
+/// No allowed source publishes them; these are read off DOA5's own call sites (the first
+/// title to CALL them): create `(name "Task::Event", 0x100, 0, NULL)`; set
+/// `(uid, 0xff000000, r2:r3 = 0)` - a u64 user data in the aligned register pair; wait
+/// `(uid, 0xff000000, NULL, NULL, [sp] = NULL)` - result-pattern, user-data and timeout
+/// pointers. See `VitaState::create_simple_event` for the semantics.
+pub(super) fn create_simple_event(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let (name_ptr, attr, init) = (ctx.arg(0), ctx.arg(1), ctx.arg(2));
+    let uid = st.create_simple_event(attr, init);
+    if name_ptr != 0 {
+        let name = ctx.read_cstr(name_ptr, 31);
+        st.name_event_flag(uid, &name);
+    }
+    ctx.ret(uid as u32);
+}
+
+/// int sceKernelDeleteSimpleEvent(SceUID uid)
+pub(super) fn delete_simple_event(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = ctx.arg(0) as i32;
+    ctx.ret(if st.delete_simple_event(uid) { 0 } else { SCE_KERNEL_ERROR_UNKNOWN_EVF_ID });
+}
+
+/// int sceKernelSetEvent(SceUID uid, SceUInt32 setPattern, SceUInt64 userData)
+pub(super) fn set_event(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = ctx.arg(0) as i32;
+    let bits = ctx.arg(1);
+    let data = ctx.arg(2) as u64 | (ctx.arg(3) as u64) << 32;
+    if st.simple_event_mode(uid).is_none() {
+        ctx.ret(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+        return;
+    }
+    st.set_simple_event_data(uid, data);
+    if st.is_preemptive() {
+        st.event_set_wake(uid, bits);
+    } else {
+        st.event_set(uid, bits);
+    }
+    ctx.ret(0);
+}
+
+/// int sceKernelClearEvent(SceUID uid, SceUInt32 pattern)
+///
+/// Read like `sceKernelClearEventFlag`: the bits KEPT are `pattern` (`pattern &= arg`). DOA5's
+/// one call site clears with 0 right after creating the event with pattern 0, where both
+/// readings agree - so the choice is consistency with the event flag, not evidence.
+pub(super) fn clear_event(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = ctx.arg(0) as i32;
+    let keep = ctx.arg(1);
+    if st.simple_event_mode(uid).is_none() {
+        ctx.ret(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+        return;
+    }
+    st.event_clear(uid, keep);
+    ctx.ret(0);
+}
+
+/// int sceKernelWaitEvent(SceUID uid, SceUInt32 waitPattern, SceUInt32 *pResultPattern,
+///     SceUInt64 *pUserData, SceUInt32 *pTimeout)  (also the CB spelling)
+pub(super) fn wait_event(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let uid = ctx.arg(0) as i32;
+    let bits = ctx.arg(1);
+    let (out, user_data, timeout_ptr) = (ctx.arg(2), ctx.arg(3), ctx.arg(4));
+    let Some(mode) = st.simple_event_mode(uid) else {
+        ctx.ret(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+        return SvcOutcome::Continue;
+    };
+    ctx.ret(0);
+    let write_data = |ctx: &mut GuestCtx, d: u64| {
+        if user_data != 0 {
+            ctx.write_u32(user_data, d as u32);
+            ctx.write_u32(user_data + 4, (d >> 32) as u32);
+        }
+    };
+    if let Some(at_match) = st.evf_try_wait(uid, bits, mode) {
+        if out != 0 {
+            ctx.write_u32(out, at_match);
+        }
+        write_data(ctx, st.simple_event_data(uid));
+        return SvcOutcome::Continue;
+    }
+    let timeout_us = (timeout_ptr != 0).then(|| ctx.read_u32(timeout_ptr));
+    if !st.is_preemptive() || timeout_us == Some(0) {
+        if out != 0 {
+            ctx.write_u32(out, st.event_pattern(uid));
+        }
+        ctx.ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+        return SvcOutcome::Continue;
+    }
+    st.simple_event_block(uid, bits, mode, out, user_data, timeout_us.unwrap_or(0));
+    SvcOutcome::Block
+}
+
 /// `SCE_KERNEL_ERROR_EVF_COND` (`psp2/kernel/error.h`): a POLL whose condition the current
 /// pattern does not satisfy. This is the whole difference between poll and wait - the wait
 /// parks, the poll says "not yet" - so it must be a real error rather than a success with a

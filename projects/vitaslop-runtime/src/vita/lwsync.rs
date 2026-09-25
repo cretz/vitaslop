@@ -134,8 +134,50 @@ pub(super) fn sample_wait(st: &mut VitaState, work: u32, timeout_ptr: u32, timeo
 /// an uninitialised read look like state.
 pub(super) fn create_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) {
     let work = ctx.arg(0);
+    let (name_ptr, attr, init) = (ctx.arg(1), ctx.arg(2), ctx.arg(3) as i32);
+    let name = if name_ptr != 0 { ctx.read_cstr(name_ptr, 31) } else { String::new() };
     ctx.write_bytes(work, &[0u8; lwwork::WORK_SIZE as usize]);
     st.lwmutex_register(ctx, work);
+    st.lwmutex_set_meta(work, name, attr, init);
+    ctx.ret(0);
+}
+
+/// `SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID`.
+const ERR_UNKNOWN_LW_MUTEX_ID: u32 = 0x8002_8181;
+
+/// int sceKernelGetLwMutexInfo(SceKernelLwMutexWork *pWork, SceKernelLwMutexInfo *pInfo)
+///
+/// `SceKernelLwMutexInfo` (0x40 bytes): size, uid, name[0x20], attr, work, initCount,
+/// currentCount, currentOwnerId, numWaitThreads. The uid of a lightweight mutex here is its
+/// canonical work address (the identity stamped in the work area). Owner and count are the
+/// work area's own words - the same ones the inline lock updates - and the waiter count is
+/// the host's parked queue.
+pub(super) fn get_lw_mutex_info(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let work = ctx.arg(0);
+    let info = ctx.arg(1);
+    let canonical = resolve_mutex(ctx, st, work);
+    let Some((name, attr, init, waiting)) = st.lwmutex_meta(canonical) else {
+        ctx.ret(ERR_UNKNOWN_LW_MUTEX_ID);
+        return;
+    };
+    if info == 0 {
+        ctx.ret(ERR_UNKNOWN_LW_MUTEX_ID);
+        return;
+    }
+    let count = lwwork::count(ctx, canonical);
+    let owner = if count != 0 { lwwork::owner(ctx, canonical) } else { 0 };
+    let mut name_buf = [0u8; 32];
+    let n = name.len().min(31);
+    name_buf[..n].copy_from_slice(&name.as_bytes()[..n]);
+    ctx.write_u32(info, 0x40);
+    ctx.write_u32(info + 0x04, canonical);
+    ctx.write_bytes(info + 0x08, &name_buf);
+    ctx.write_u32(info + 0x28, attr);
+    ctx.write_u32(info + 0x2c, canonical);
+    ctx.write_u32(info + 0x30, init as u32);
+    ctx.write_u32(info + 0x34, count);
+    ctx.write_u32(info + 0x38, owner as u32);
+    ctx.write_u32(info + 0x3c, waiting as u32);
     ctx.ret(0);
 }
 

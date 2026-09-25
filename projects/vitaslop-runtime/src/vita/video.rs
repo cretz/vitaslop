@@ -473,7 +473,34 @@ pub(super) fn mp4_get_next_unit(
     stream: u32,
     out: crate::host::Ptr,
 ) -> i32 {
-    do_get_next_unit(ctx, st, handle, stream, out.addr())
+    do_get_next_unit(ctx, st, handle, stream, out.addr(), StreamInfoLayout::Wide)
+}
+
+/// `sceMp4GetStreamInfo` under the NID DOA5 links (`0xd5b26179`) - the same call as
+/// [`mp4_get_next_unit`] from a later library build whose struct is SMALLER (the caller zeroes
+/// 0x140 bytes, not 0x158) and whose AUDIO form moved: DOA5's consumer reads the sample rate
+/// as a word from +0x08 and the channel count from +0x1c (stored as a halfword into its
+/// `SceAudiodecInfoAac`), where the first title reads +0x38 and +0x4c. The video form is
+/// identical in both. Answered with the first title's layout, DOA5 opened its AAC decoder
+/// with 0 channels at 0 Hz and its player stalled after 7 audio units.
+#[hostcall]
+pub(super) fn mp4_get_stream_info(
+    ctx: &mut crate::host::GuestCtx,
+    st: &mut crate::host::VitaState,
+    handle: i32,
+    stream: u32,
+    out: crate::host::Ptr,
+) -> i32 {
+    do_get_next_unit(ctx, st, handle, stream, out.addr(), StreamInfoLayout::Compact)
+}
+
+/// Which build's stream-info struct the caller holds - see [`mp4_get_stream_info`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamInfoLayout {
+    /// 0x158 bytes; audio rate at +0x38, channels (halfword) at +0x4c.
+    Wide,
+    /// 0x140 bytes; audio rate at +0x08, channels at +0x1c.
+    Compact,
 }
 
 /// Field offsets of the AUDIO form of the stream-information struct - see
@@ -493,6 +520,10 @@ mod stream_info {
     /// not established - nothing that consumes them has been found - so they are left zero
     /// rather than guessed.
     pub const UNKNOWN_BYTES: u32 = 0x50;
+    /// The compact build's sample rate - see `mp4_get_stream_info`.
+    pub const COMPACT_SAMPLE_RATE: u32 = 0x08;
+    /// The compact build's channel count (a word; the consumer keeps its low half).
+    pub const COMPACT_CHANNELS: u32 = 0x1c;
 }
 
 /// The channel count an `AudioSpecificConfig` declares, or `None` when it uses the escape
@@ -511,6 +542,9 @@ fn asc_channels(asc: &[u8]) -> Option<u32> {
     let ch = (b1 >> 3) & 0xf;
     (ch != 0).then_some(u32::from(ch))
 }
+
+/// Bytes of the stream-info struct this defines (the last field is `UNKNOWN_BYTES`, a word).
+const STREAM_INFO_DEFINED: u32 = stream_info::UNKNOWN_BYTES + 4;
 
 /// Field offsets in the 0x158-byte unit struct, as recovered above.
 mod unit {
@@ -549,6 +583,7 @@ fn do_get_next_unit(
     handle: i32,
     stream: u32,
     out: u32,
+    layout: StreamInfoLayout,
 ) -> i32 {
     if out == 0 {
         return -1;
@@ -581,14 +616,25 @@ fn do_get_next_unit(
             );
             return -1;
         };
-        for word in 0..(0x158 / 4) {
+        // Only as far as the fields this defines. The struct's SIZE differs by title (0x158
+        // on the first, a 0x140-byte STACK buffer on DOA5) and both callers zero it
+        // themselves - clearing 0x158 there overwrote 0x18 bytes of the caller's frame.
+        for word in 0..(STREAM_INFO_DEFINED / 4) {
             ctx.write_u32(out + word * 4, 0);
         }
         ctx.write_u32(out + unit::STATUS, stream_info::KIND_AUDIO);
         ctx.write_u32(out + unit::KIND, stream_info::CODEC_AAC);
-        ctx.write_u32(out + stream_info::SAMPLE_RATE, sample_rate);
-        ctx.write_bytes(out + stream_info::CHANNELS, &(channels as u16).to_le_bytes());
-        ctx.write_u32(out + stream_info::UNKNOWN_BYTES, 0);
+        match layout {
+            StreamInfoLayout::Wide => {
+                ctx.write_u32(out + stream_info::SAMPLE_RATE, sample_rate);
+                ctx.write_bytes(out + stream_info::CHANNELS, &(channels as u16).to_le_bytes());
+                ctx.write_u32(out + stream_info::UNKNOWN_BYTES, 0);
+            }
+            StreamInfoLayout::Compact => {
+                ctx.write_u32(out + stream_info::COMPACT_SAMPLE_RATE, sample_rate);
+                ctx.write_u32(out + stream_info::COMPACT_CHANNELS, channels);
+            }
+        }
         tracing::debug!(
             target: "vitaslop::movie",
             stream, track, sample_rate, channels,
@@ -1606,6 +1652,16 @@ fn movie_unit_wait_us(st: &mut crate::host::VitaState, handle: i32) -> Option<u6
     // elementary stream - tens of kilobytes and an allocation, thrown away, on a call the title
     // makes 175 times a run and which usually says "not yet". The table has the timestamp
     // already.
+    // >>> A PLAYER THAT TOOK THE SOUND GETS A DEEPER READ-AHEAD.
+    //
+    // It pre-buffers audio before it runs. MEASURED on DOA5's intro (`ninja_vi.mp4`, AAC +
+    // AVC): the two-frame read-ahead let its audio decoder see 4 units, the player dropped into
+    // its buffering state (flow state 12) with the demux's memory full of video it would not
+    // decode while paused - a black screen for good. See `AUDIO_READ_AHEAD_US`.
+    let audio_enabled = movie.enabled_streams.iter().any(|&s| {
+        movie.mp4.tracks.get(s as usize).is_some_and(|t| t.kind == crate::mp4::TrackKind::Audio)
+    });
+    let read_ahead = if audio_enabled { audio_read_ahead_us() } else { read_ahead_us() };
     let (track_index, at) = next_unit_track(movie)?;
     let track = movie.mp4.tracks.get(track_index)?;
     if track.timescale == 0 {
@@ -1614,7 +1670,7 @@ fn movie_unit_wait_us(st: &mut crate::host::VitaState, handle: i32) -> Option<u6
     let pts = track.samples.get(at)?.pts;
     let pts_us = pts.saturating_mul(1_000_000) / track.timescale as u64;
     let origin = *movie.timeline_origin_us.get_or_insert(now.saturating_sub(pts_us));
-    let due = origin.saturating_add(pts_us).saturating_sub(READ_AHEAD_US);
+    let due = origin.saturating_add(pts_us).saturating_sub(read_ahead);
     if due <= now {
         return None;
     }
@@ -1651,6 +1707,42 @@ const GATE_STALL_REFUSALS: u64 = 2_000;
 /// one - and it has to be small enough that "ahead" cannot become "the whole file", which is
 /// the state this pacing exists to prevent.
 const READ_AHEAD_US: u64 = 66_667;
+
+/// Read-ahead for a player that ENABLED an audio stream - see `movie_unit_wait_us`.
+/// `VITASLOP_MP4_AUDIO_READ_AHEAD_MS` overrides it.
+fn audio_read_ahead_us() -> u64 {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<u64> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        crate::knobs::var("VITASLOP_MP4_AUDIO_READ_AHEAD_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(AUDIO_READ_AHEAD_US, |ms| ms * 1000)
+    })
+}
+
+/// How far ahead of the movie's clock a player that took the SOUND may read.
+///
+/// Such a player pre-buffers audio before it will run: MEASURED on DOA5's intro (AAC + AVC,
+/// `doa-ra*`), 100 and 150 ms leave its audio decoder starved and the player parks in its
+/// buffering state for good (a black screen), while 250 and 500 ms play the whole movie - so
+/// its prebuffer is about 200 ms. 500 ms is that with margin for a hitch. Still a GATE, not an
+/// open tap: the same player also presents video as fast as units arrive, and with no gate
+/// its 20 s movie was over in 8 s.
+const AUDIO_READ_AHEAD_US: u64 = 500_000;
+
+/// [`READ_AHEAD_US`], or `VITASLOP_MP4_READ_AHEAD_MS` - the arm for a player that keeps its
+/// own clock and wants a deeper prebuffer than two frames.
+fn read_ahead_us() -> u64 {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<u64> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        crate::knobs::var("VITASLOP_MP4_READ_AHEAD_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(READ_AHEAD_US, |ms| ms * 1000)
+    })
+}
 
 fn do_get_next_unit_data(
     ctx: &mut crate::host::GuestCtx,
@@ -1795,6 +1887,28 @@ pub(super) fn mp4_close_file(
     handle: i32,
 ) -> i32 {
     do_close_file(st, handle)
+}
+
+/// SceMp4 `0xc05dff01(handle)` - unnamed; read as STOP STREAMING, the counterpart of
+/// `sceMp4StartFileStreaming`. Evidence (DOA5, the only title that links it; P4G's older build
+/// has no such export): its one caller is the reader object's vtable slot +0x44, reached on
+/// the player's teardown after it has released every unit buffer, and only while the reader's
+/// own state word says STREAMING (2); `sceMp4CloseFile` follows. So from here the session
+/// hands over no more units: every cursor is moved to its track's end. Returns 0.
+#[hostcall]
+pub(super) fn mp4_stop_file_streaming(
+    _ctx: &mut crate::host::GuestCtx,
+    st: &mut crate::host::VitaState,
+    handle: i32,
+) -> i32 {
+    if let Some(movie) = st.movie.as_mut().filter(|m| m.handle == handle) {
+        let ends: Vec<usize> =
+            movie.cursors.iter().map(|&(t, _)| movie.mp4.tracks.get(t).map_or(0, |t| t.samples.len())).collect();
+        for (c, end) in movie.cursors.iter_mut().zip(ends) {
+            c.1 = end;
+        }
+    }
+    0
 }
 
 fn do_close_file(st: &mut crate::host::VitaState, handle: i32) -> i32 {

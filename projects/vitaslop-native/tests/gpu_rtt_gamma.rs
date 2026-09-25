@@ -101,6 +101,7 @@ fn quad_inset(color: [u8; 4], tex: Option<BoundTexture>, inset: f32) -> Draw {
         // Fixed-function parity path: no recompiled GXP payload.
         vprog: vitaslop_runtime::capture::no_program(),
         fprog: vitaslop_runtime::capture::no_program(),
+        fprog_patched_vprog: vitaslop_runtime::capture::no_program(),
         vert_sa: std::sync::Arc::from(&[][..]),
         frag_sa: std::sync::Arc::from(&[][..]),
         frag_sa_addr: 0,

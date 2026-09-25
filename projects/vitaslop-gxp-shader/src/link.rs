@@ -376,6 +376,25 @@ pub struct LinkOptions {
     /// Default `false`, which is every caller outside the live renderer: the passthrough
     /// treatment stands exactly as it did.
     pub colour_output_masked_off: bool,
+    /// The pass renders into a single-channel surface that stores the fragment's ALPHA
+    /// (`U8_A`/`S8_A`), held by the renderer as an RGBA8 target whose RED channel is the one
+    /// channel. The fragment's colour is returned with its alpha SPLATTED into every channel -
+    /// both dual-source terms too - and a destination read sees the stored value (the host's
+    /// red) as its alpha. Default `false`: nothing changes.
+    pub alpha_to_red: bool,
+    /// The vertex program the fragment was PATCHED against at
+    /// `sceGxmShaderPatcherCreateFragmentProgram`, when that is a different program from the
+    /// one being linked. `None` (the default, and every caller outside the live renderer)
+    /// links by usage against the bound vertex exactly as before.
+    ///
+    /// The patcher builds a fragment's varying iteration from THAT program's output layout,
+    /// and the hardware then reads the bound vertex's output buffer at those lane POSITIONS -
+    /// the buffer is the vertex's `o` registers, and nothing re-matches usages at draw time. So
+    /// the interface is planned against the patched-against program and the bound program's
+    /// stage simply writes its own lanes: each varying is read from the lane the patched-against
+    /// layout names, whatever the bound program keeps there. A lane the bound program never
+    /// writes holds a stale value on hardware and zero here; it is reported.
+    pub patched_against: Option<std::sync::Arc<[u8]>>,
 }
 
 pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, LinkError> {
@@ -423,8 +442,24 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
         return Err(LinkError::VertexVaryingsUndecoded { why });
     }
 
-    // Match the two stages' own statements of the interface, by usage.
-    let iface = plan_interface(&vprog, &fprog, &frc.shader, opts.colour_output_masked_off)?;
+    // Match the two stages' own statements of the interface, by usage - against the vertex
+    // program the fragment was PATCHED against when the caller names one (see
+    // `LinkOptions::patched_against`), whose lanes the bound program then fills by position.
+    let iface = match opts.patched_against.as_deref() {
+        Some(pbytes) if pbytes != vbytes => {
+            let pprog = Program::parse(pbytes).map_err(LinkError::VertexParse)?;
+            if pprog.kind != ProgramKind::Vertex {
+                return Err(LinkError::WrongKind);
+            }
+            if let Some(why) = pprog.varyings_error {
+                return Err(LinkError::VertexVaryingsUndecoded { why });
+            }
+            let iface = plan_interface(&pprog, &fprog, &frc.shader, opts.colour_output_masked_off)?;
+            report_patched_against_link(vprog.hash, pprog.hash, fprog.hash, &iface, &written);
+            iface
+        }
+        _ => plan_interface(&vprog, &fprog, &frc.shader, opts.colour_output_masked_off)?,
+    };
     let varyings = &iface.components;
 
     // What each attribute lane is fed when the guest binds fewer components than the program
@@ -573,6 +608,7 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
         fplan.dual_source = false;
         fplan.raw64_output = true;
     }
+    fplan.alpha_to_red = opts.alpha_to_red && !opts.raw64_output;
 
     // Interpolated scalar components packed four per `@location` vec4. Both stages declare the
     // same interface, so the counts are equal by construction.
@@ -600,6 +636,10 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
         emit_body_marked(&frc.shader)
             .map_err(|e: EmitError| LinkError::FragmentRecompile(e.into()))?
     );
+    // Loads at a window's own base plus a constant, resolved now rather than searched for in
+    // the shader - see `resolve_static_mem_reads`.
+    let vbody = crate::module::resolve_static_mem_reads(&vbody, &vplan.mem_windows, "gxp_mem");
+    let fbody = crate::module::resolve_static_mem_reads(&fbody, &fplan.mem_windows, "gxp_fmem");
 
     let wgsl = build_linked_module(
         &vbody,
@@ -957,6 +997,27 @@ struct Interface {
 /// default is a modelling decision about hardware, not a fact read off the blob, and a shader
 /// that actually depends on the value would go wrong quietly. Naming it is what makes it
 /// findable.
+/// Whether a texcoord the vertex program does not write at all is fed the iterator's default
+/// rather than refusing the pair. `VITASLOP_GXP_UNFED_TEXCOORD_DEFAULT=0` is the arm back.
+fn unfed_texcoord_default() -> bool {
+    std::env::var("VITASLOP_GXP_UNFED_TEXCOORD_DEFAULT").map(|v| v.trim() != "0").unwrap_or(true)
+}
+
+/// Report, once per usage, that a fragment reads a texcoord no vertex output feeds and gets the
+/// iterator's default for all of it.
+fn report_unfed_texcoord_defaulted(usage: VaryingUsage) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<VaryingUsage>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(usage) {
+        return;
+    }
+    eprintln!(
+        "gxp link: a fragment reads {usage:?}, which its vertex program does not write at all -          fed the iterator's default (0, 0, 0, 1) instead of refusing the pair"
+    );
+}
+
 fn report_unfilled_varying_registers(usage: VaryingUsage, vertex_components: u32, declared: u32) {
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -1257,19 +1318,8 @@ fn fragment_declared_order(vprog: &Program, fprog: &Program) -> Option<Vec<Outpu
 ///
 /// Only `Mov` counts. A value that is computed with says nothing about which varying it IS.
 fn forwarding_claims(vprog: &Program, vshader: &Shader) -> Vec<(VaryingUsage, Vec<u32>)> {
-    use crate::container::{ParamCategory, SEMANTIC_COLOR, SEMANTIC_FOGCOORD, SEMANTIC_TEXCOORD};
-    // The varying an attribute's semantic names. POSITION, normals, tangents and blend weights
-    // are consumed rather than forwarded and name no varying.
-    let usage_of = |p: &crate::container::Parameter| match p.semantic {
-        SEMANTIC_FOGCOORD => Some(VaryingUsage::Fog),
-        SEMANTIC_COLOR => match p.semantic_index {
-            0 => Some(VaryingUsage::Color0),
-            1 => Some(VaryingUsage::Color1),
-            _ => None,
-        },
-        SEMANTIC_TEXCOORD => Some(VaryingUsage::TexCoord(p.semantic_index)),
-        _ => None,
-    };
+    use crate::container::ParamCategory;
+    let usage_of = attribute_varying;
     let mut by_attr: Vec<(i32, VaryingUsage, Vec<u32>)> = Vec::new();
     for instr in &vshader.instrs {
         if !matches!(instr.op, Op::Mov) {
@@ -1306,6 +1356,133 @@ fn forwarding_claims(vprog: &Program, vshader: &Shader) -> Vec<(VaryingUsage, Ve
     }
     for (_, _, lanes) in &mut by_attr {
         lanes.sort_unstable();
+    }
+    by_attr.into_iter().map(|(_, u, lanes)| (u, lanes)).collect()
+}
+
+/// The varying an attribute's semantic names. POSITION, normals, tangents and blend weights are
+/// consumed rather than forwarded and name no varying.
+fn attribute_varying(p: &crate::container::Parameter) -> Option<VaryingUsage> {
+    use crate::container::{SEMANTIC_COLOR, SEMANTIC_FOGCOORD, SEMANTIC_TEXCOORD};
+    match p.semantic {
+        SEMANTIC_FOGCOORD => Some(VaryingUsage::Fog),
+        SEMANTIC_COLOR => match p.semantic_index {
+            0 => Some(VaryingUsage::Color0),
+            1 => Some(VaryingUsage::Color1),
+            _ => None,
+        },
+        SEMANTIC_TEXCOORD => Some(VaryingUsage::TexCoord(p.semantic_index)),
+        _ => None,
+    }
+}
+
+/// Is the DERIVATION reading in force (`VITASLOP_GXP_DERIVED_CLAIMS=0` turns it off)? An A/B
+/// arm, so both layouts are reachable from one build.
+fn derived_claims_enabled() -> bool {
+    std::env::var("VITASLOP_GXP_DERIVED_CLAIMS").as_deref() != Ok("0")
+}
+
+/// Output lanes whose value is COMPUTED from exactly one varying-naming attribute and nothing
+/// else that varies per vertex: `(the varying that attribute's semantic names, the lanes)`.
+///
+/// # Why this is evidence where a computed value otherwise is not
+/// [`forwarding_claims`] counts only `mov`s, because "a value that is computed with says nothing
+/// about which varying it IS" - in general. It is asked here of ONE narrow case: a
+/// [`VaryingOrder::Known`] layout, which was read off the attributes on the premise that the
+/// program is a PASSTHROUGH (its outputs are its inputs, in `resource_index` order). A program
+/// whose output run is built from the COLOR attribute alone, scaled by uniforms, and whose next
+/// run is built from the TEXCOORD attribute alone, run through a uniform matrix, is not a
+/// passthrough in the order the attributes sit - the premise is refuted by the code, and the
+/// same derivations are then the best statement of the order.
+///
+/// MEASURED on a fighting title's 2D sprite program (`624410e18249e17f`, its logo, title and
+/// menu layer): attributes `POSITION@pa0, TEXCOORD0@pa4, COLOR0@pa8`, so the attribute reading
+/// put `TexCoord(0)` at lane 4. The code writes `o[4..8] = gColor * pa[8..12]` and
+/// `o[8..12] = gUVTranslate * pa[4..8]`. Linked the attribute way, the fragment sampled its
+/// texture at the vertex COLOUR (1,1) - a black corner texel - and multiplied by the UV, so the
+/// company logo, the title screen and every menu drew as a flat black quad.
+///
+/// A lane counts only when its ancestry is exactly ONE attribute: POSITION, a normal or a
+/// second attribute anywhere in it names no single varying, and an indexed read the walk cannot
+/// resolve poisons the lane rather than guess.
+fn derivation_claims(vprog: &Program, vshader: &Shader) -> Vec<(VaryingUsage, Vec<u32>)> {
+    use crate::container::ParamCategory;
+    // Bit `i` = attribute `attrs[i]`; the top bit = "an unresolvable indexed read reached this".
+    const UNKNOWN: u64 = 1 << 63;
+    let attrs: Vec<&crate::container::Parameter> = vprog
+        .parameters
+        .iter()
+        .filter(|p| p.category == ParamCategory::Attribute && p.resource_index >= 0)
+        .take(63)
+        .collect();
+    let slot = |b: Bank| match b {
+        Bank::Temp => Some(0usize),
+        Bank::PrimaryAttr => Some(1),
+        Bank::Output => Some(2),
+        Bank::Internal => Some(3),
+        _ => None,
+    };
+    let at = |bank: usize, reg: usize| (reg < BANK_REGS).then_some(bank * BANK_REGS + reg);
+    let mut m = vec![0u64; 4 * BANK_REGS];
+    for (i, a) in attrs.iter().enumerate() {
+        let base = a.resource_index as usize;
+        for r in base..base + (a.component_count as usize).max(1) {
+            if let Some(k) = at(1, r) {
+                m[k] |= 1 << i;
+            }
+        }
+    }
+    for instr in &vshader.instrs {
+        let read = instr.read_channels();
+        let mut acc = 0u64;
+        for src in &instr.srcs {
+            if src.bank == Bank::Indexed {
+                if let Some(b) = slot(crate::ir::indexed_sub_bank(src.index))
+                    && m[b * BANK_REGS..(b + 1) * BANK_REGS].iter().any(|&x| x != 0)
+                {
+                    acc |= UNKNOWN;
+                }
+                continue;
+            }
+            let Some(b) = slot(src.bank) else { continue };
+            for c in 0..4 {
+                if !read[c] {
+                    continue;
+                }
+                if let Some((reg, _)) = instr.source_register(src, c)
+                    && let Some(k) = at(b, reg as usize)
+                {
+                    acc |= m[k];
+                }
+            }
+        }
+        let Some(d) = instr.dest.as_ref() else { continue };
+        let Some(db) = slot(d.bank) else { continue };
+        // A conditional write leaves the old value live on the other path, and a half-precision
+        // write fills one half of its register - both keep what was there.
+        let keep = instr.pred != Predicate::Always || instr.half_precision;
+        for c in 0..4 {
+            if !instr.write_mask[c] {
+                continue;
+            }
+            let reg = d.index as usize + if instr.half_precision { c >> 1 } else { c };
+            if let Some(k) = at(db, reg) {
+                m[k] = if keep { m[k] | acc } else { acc };
+            }
+        }
+    }
+    let mut by_attr: Vec<(usize, VaryingUsage, Vec<u32>)> = Vec::new();
+    for lane in crate::container::VERTEX_POSITION_LANES as usize..BANK_REGS {
+        let mask = m[2 * BANK_REGS + lane];
+        if mask.count_ones() != 1 || mask & UNKNOWN != 0 {
+            continue;
+        }
+        let i = mask.trailing_zeros() as usize;
+        let Some(u) = attribute_varying(attrs[i]) else { continue };
+        match by_attr.iter_mut().find(|(a, _, _)| *a == i) {
+            Some((_, _, lanes)) => lanes.push(lane as u32),
+            None => by_attr.push((i, u, vec![lane as u32])),
+        }
     }
     by_attr.into_iter().map(|(_, u, lanes)| (u, lanes)).collect()
 }
@@ -2040,6 +2217,31 @@ fn plan_interface(
     }
 }
 
+/// Report - once per (bound vertex, patched-against vertex, fragment) - a link planned against
+/// the vertex the fragment was PATCHED against, and which of the lanes it reads the BOUND vertex
+/// never writes (zero here, stale on hardware).
+fn report_patched_against_link(bound: u64, patched: u64, frag: u64, iface: &Interface, written: &[bool]) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u64, u64, u64)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((bound, patched, frag)) {
+        return;
+    }
+    if std::env::var_os("VITASLOP_LOG").is_none() && std::env::var_os("RUST_LOG").is_none() {
+        return;
+    }
+    let dead = dead_lane_detail(iface, written);
+    let lanes = dead.iter().map(|(l, w)| format!("o[{l}]->{w}")).collect::<Vec<_>>().join(" ");
+    eprintln!(
+        "gxp link: fragment {frag:016x} linked by the lane layout of vertex {patched:016x} (the one \
+         it was PATCHED against) under bound vertex {bound:016x}; {} read(s) land on lanes the bound \
+         vertex never writes{}",
+        dead.len(),
+        if dead.is_empty() { String::new() } else { format!(" [{lanes}]") }
+    );
+}
+
 /// Report - once per vertex program - that a prefetch coordinate was re-pointed off dead lanes.
 fn report_repointed_prefetch(hash: u64, moved: &[String]) {
     use std::collections::HashSet;
@@ -2168,6 +2370,30 @@ fn layout_by_precedence(
             );
             return Ok(order);
         }
+    // >>> A `Known` order's PASSTHROUGH PREMISE, tested against what the code COMPUTES. Only
+    // when no move spoke at all - a move is the stronger witness and has already been heard.
+    // See [`derivation_claims`].
+    if vprog.output_order == VaryingOrder::Known
+        && claims.is_empty()
+        && derived_claims_enabled()
+        && std::env::var("VITASLOP_GXP_VARYING_RESOLVE").as_deref() != Ok("0")
+    {
+        let derived = derivation_claims(vprog, vshader);
+        if let Some(why) = forwarding_contradicts(&vprog.output_varyings, &derived)
+            && let Some(order) = layout_from_forwarding_claims(&vprog.output_varyings, &derived, true)
+        {
+            let shown: Vec<String> = order
+                .iter()
+                .map(|v| format!("{:?}@{}..{}", v.usage, v.base_lane, v.base_lane + v.components))
+                .collect();
+            report_forwarding_contradiction(
+                vprog.hash,
+                &format!("COMPUTED, not forwarded: {why}"),
+                &format!("RESOLVED from the vertex's derivations -> {}", shown.join(" ")),
+            );
+            return Ok(order);
+        }
+    }
     // >>> WHAT EACH READING SAYS, for every pair that gets this far. A layout question is
     // settled by comparing the readings, and until now that comparison needed a rebuild with a
     // hand-typed layout: nothing printed the candidates.
@@ -2364,7 +2590,24 @@ fn plan_interface_with(
                 fed[r as usize] = true;
             }
         } else if reads(data_base..data_base + it.register_count as u32) {
-            let vertex = vertex_output(it.usage)?;
+            // >>> A TEXCOORD THE VERTEX DOES NOT WRITE AT ALL IS THE ZERO-COMPONENT CASE OF THE
+            // >>> FILL BELOW: every register gets the iterator's default (0, 0, 0, 1).
+            //
+            // The fill for registers a vertex output does not reach is established below (a
+            // shipping title's draws, correct on the device); a texcoord with NO vertex output is
+            // that rule with nothing written. MEASURED need: a fighting title (PCSE00235) creates
+            // a character-cloth fragment reading TEXCOORD5/9 against a vertex program declaring
+            // neither - created by the title itself with that pairing - and refusing it dropped
+            // the garment from every frame. Colours and fog keep the refusal: no default is
+            // established for them. `VITASLOP_GXP_UNFED_TEXCOORD_DEFAULT=0` is the arm back.
+            let vertex = match vertex_output(it.usage) {
+                Ok(v) => *v,
+                Err(_) if matches!(it.usage, VaryingUsage::TexCoord(_)) && unfed_texcoord_default() => {
+                    report_unfed_texcoord_defaulted(it.usage);
+                    OutputVarying { usage: it.usage, base_lane: 0, components: 0 }
+                }
+                Err(e) => return Err(e),
+            };
             let n = vertex.components;
             let expected = if it.half { n.div_ceil(2) } else { n };
             let declared = it.register_count as u32;
@@ -2711,7 +2954,27 @@ pub(crate) fn secondary_attr_init(
     // Reads that MUST be backed by the uniform buffer or a container literal: a secondary read
     // that no earlier secondary write has covered.
     let mut needed_strict = std::collections::BTreeSet::new();
-    for instr in &secondary.instrs {
+    // >>> A SECONDARY INSTRUCTION WHOSE SA RESULT NOTHING READS OWES NOTHING. Its inputs cannot
+    // reach a pixel, so demanding a source for them refuses a program over a value it throws
+    // away. MEASURED on a fighting title (PCSE00235): its image-based-lighting program's
+    // secondary computes the per-thread LOCAL-memory base `sa[0] = special * 2304 + sa[0]` from
+    // the driver's thread-buffer slot - a base the local-memory model does not add (the area is
+    // private to the invocation), so no instruction reads the result, and the pass that lights
+    // every character was refused for the slot's unknown value.
+    let primary_reads: std::collections::BTreeSet<u32> =
+        shader.instrs.iter().flat_map(|i| sa_sources(i)).collect();
+    let is_dead = |at: usize, instr: &Instr| -> bool {
+        let dests = sa_dests(instr);
+        !dests.is_empty()
+            && dests.iter().all(|d| {
+                !primary_reads.contains(d)
+                    && !secondary.instrs[at + 1..].iter().any(|later| sa_sources(later).contains(d))
+            })
+    };
+    for (at, instr) in secondary.instrs.iter().enumerate() {
+        if is_dead(at, instr) {
+            continue;
+        }
         for reg in sa_sources(instr) {
             if !written.contains(&reg) {
                 needed_strict.insert(reg);
@@ -3227,7 +3490,7 @@ fn build_linked_module(
     // `split_dual_body`. Seeding here would put the destination in `o` before a prefix that
     // may write `o` itself, and then the second arm's reseed would erase that write.
     if fplan.reads_dest_color && dual_split.is_none() {
-        m.push_str(&crate::module::dest_color_init(fplan.color_precision, fplan.dual_source));
+        m.push_str(&crate::module::dest_color_init(fplan.color_precision, fplan.dual_source, fplan.alpha_to_red));
     }
     if writes_depth {
         let _ = writeln!(m, "  let gxp_interp_depth = in.frag_coord.z;");
@@ -3399,6 +3662,9 @@ fn build_linked_module(
     };
     let color =
         crate::module::color_return_expr(ret, base, fplan.color_precision, varying_locations);
+    // A single-channel ALPHA target stores the alpha - see `LinkOptions::alpha_to_red`. Splatted
+    // here, before every return site, so the dual-source terms (`G`, `F`) carry it too.
+    let color = if fplan.alpha_to_red { format!("({color}).aaaa") } else { color };
     if let Some((_, tail)) = dual_split.as_ref() {
         emit_dual_split_tail(&mut m, tail, &color, fplan.color_precision);
         return size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))));
@@ -4496,12 +4762,14 @@ pub fn set_arm(name: &str, value: &str) {
         SIZE_BANKS_ARM
             | SA_DIRECT_ARM
             | MEM_OFFSET16_ARM
+            | STATIC_MEM_ARM
             | HALF_REGS_ARM
             | IDX_REGDEST_ARM
             | PACK_COMP0_ARM
             | IDX_MUL_ARM
             | F16_ROUND_ARM
             | CASE_TEX_ARM
+            | DP_MOE_BIT47_ARM
             // >>> THE SHADER PROBES, for the same reason as the arms above and more urgently.
             //
             // These are the only instruments that can say WHICH term of a lit material is the
@@ -4573,6 +4841,11 @@ pub const CASE_TEX_ARM: &str = "VITASLOP_GXP_CASE_TEX";
 /// `0` reads a memory load's REGISTER offset full-width instead of as 16 bits - see
 /// `wgsl::emit_mem_load`, which carries the measurement.
 pub const MEM_OFFSET16_ARM: &str = "VITASLOP_GXP_MEM_OFFSET16";
+
+/// `0` sends every memory load through the address-dispatching window helper instead of
+/// resolving a load whose address is a window's own base register plus a constant at emit
+/// time - see [`crate::module::resolve_static_mem_reads`], which carries the measurement.
+pub const STATIC_MEM_ARM: &str = "VITASLOP_GXP_STATIC_MEM";
 
 
 /// `<bank><idx>[@<instr>][:f32|:bits=<hex>]` - return that register AS the colour. See
@@ -4655,6 +4928,10 @@ pub const PACK_COMP0_ARM: &str = "VITASLOP_GXP_PACK_COMP0";
 /// the factor is real before anything is claimed about where it is encoded.
 pub const IDX_MUL_ARM: &str = "VITASLOP_GXP_IDX_MUL";
 
+/// `0` sends every repeating DP back to the intrinsic four-register source walk, bit 47 or not
+/// - the arm back for the bit-47 rule in `usse::decode::repeat_operands`.
+pub const DP_MOE_BIT47_ARM: &str = "VITASLOP_GXP_DP_MOE_BIT47";
+
 /// [`IDX_MUL_ARM`]'s value as a multiplier, or `None` when it is unset - in which case the
 /// stride the program itself carries (`usse::resolve_index_load_stride`) is used.
 pub(crate) fn index_load_multiplier() -> Option<i32> {
@@ -4716,6 +4993,15 @@ fn size_register_banks(module: &str) -> String {
             Some(next) => &body[..next],
             None => body,
         };
+        // The per-invocation LOCAL memory, when this stage's code addresses it.
+        if region.contains(&format!("{}[", crate::wgsl::LOCAL_MEM_NAME)) {
+            let _ = writeln!(
+                out,
+                "  var {}: array<u32, {}>;",
+                crate::wgsl::LOCAL_MEM_NAME,
+                crate::wgsl::LOCAL_MEM_WORDS
+            );
+        }
         for bank in BANKS {
             match if sized { bank_extent(region, bank) } else { None } {
                 Some(0) => {} // never referenced - declaring it would be dead storage
@@ -4750,7 +5036,8 @@ fn size_register_banks(module: &str) -> String {
     // be inserted AFTER it, because each insertion goes at the same place and the last one in
     // ends up first. This is the last pass every linked module goes through, which is what makes
     // it the one place the helpers can be added once rather than at each of the five returns.
-    add_half_helpers(out)
+    // The derivative directive last, so it lands at byte zero, above everything.
+    crate::wgsl::with_derivative_directive(add_half_helpers(out))
 }
 
 /// How many registers of `bank` the emitted `region` references: `Some(high_water + 1)`, or
@@ -4953,6 +5240,54 @@ mod tests {
         Interpolant, OutputVarying, ParamCategory, ParamType, Parameter, ProgramKind, SamplePrefetch,
     };
     use crate::ir::{Instr, Op, Operand, Predicate};
+
+    /// Every vertex program in the captured corpora (`VITASLOP_GXP_CORPUS`, `;`-separated
+    /// directories of `.gxp` blobs) that [`derivation_claims`] RE-LAYS OUT, with both layouts - so
+    /// the titles a picture A/B has to cover are named by the containers, not guessed.
+    #[test]
+    #[ignore = "needs captured corpora (game bytes); set VITASLOP_GXP_CORPUS"]
+    fn corpus_programs_the_derivation_reading_moves() {
+        let Ok(dirs) = std::env::var("VITASLOP_GXP_CORPUS") else { return };
+        let (mut known, mut moved) = (0usize, 0usize);
+        for dir in dirs.split(';') {
+            let Ok(rd) = std::fs::read_dir(dir) else { continue };
+            let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for p in paths {
+                let Ok(b) = std::fs::read(&p) else { continue };
+                let Ok(v) = Program::parse(&b) else { continue };
+                if v.kind != ProgramKind::Vertex || v.output_order != VaryingOrder::Known {
+                    continue;
+                }
+                known += 1;
+                let sh = crate::usse::decode_shader(&v);
+                if !forwarding_claims(&v, &sh).is_empty() {
+                    continue;
+                }
+                let d = derivation_claims(&v, &sh);
+                let Some(why) = forwarding_contradicts(&v.output_varyings, &d) else { continue };
+                let Some(order) = layout_from_forwarding_claims(&v.output_varyings, &d, true) else {
+                    eprintln!("CONTRADICTED, UNRESOLVED {} ({:016x}): {why}", p.display(), v.hash);
+                    continue;
+                };
+                moved += 1;
+                let show = |vs: &[OutputVarying]| {
+                    vs.iter()
+                        .map(|o| format!("{:?}@{}x{}", o.usage, o.base_lane, o.components))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                eprintln!(
+                    "MOVED {} ({:016x}): {} -> {}",
+                    p.display(),
+                    v.hash,
+                    show(&v.output_varyings),
+                    show(&order)
+                );
+            }
+        }
+        eprintln!("{moved} of {known} Known-order vertex programs re-laid out");
+    }
 
     /// A module region as [`unpack_half_registers`] sees one: the bank marker, then statements.
     ///
@@ -5544,15 +5879,18 @@ mod tests {
             .expect("a colour that cannot reach a pixel is exact whatever it holds");
     }
 
+    /// A TEXCOORD the vertex does not write at all is the zero-component case of the iterator's
+    /// default fill: every register the fragment declares for it gets (0, 0, 0, 1), as halves
+    /// here - `(0, 0)` then `(0, 1)`.
     #[test]
-    fn a_read_interpolant_the_vertex_does_not_produce_is_a_hard_failure() {
+    fn a_read_texcoord_the_vertex_does_not_produce_gets_the_iterator_default() {
         let mut vprog = vertex_program(0, Vec::new(), 0);
         vprog.output_varyings = vec![texcoord_out(1, 6, 4)];
         let fprog = fragment_program(vec![texcoord_in(4, 0, 2, true)], 4);
-        assert_eq!(
-            plan_interface(&vprog, &fprog, &fragment_reading(&[0]), false).unwrap_err(),
-            LinkError::UnfedVarying { usage: VaryingUsage::TexCoord(4) }
-        );
+        let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0]), false)
+            .expect("an unfed texcoord is fed the default");
+        assert!(iface.components.is_empty());
+        assert_eq!(iface.defaults, vec![(0, [0.0, 0.0], true), (1, [0.0, 1.0], true)]);
     }
 
     #[test]
@@ -5766,6 +6104,58 @@ mod tests {
             plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2]), false).unwrap_err(),
             LinkError::PrefetchCoordTooNarrow { unit: 15, needed: 3, available: 2 }
         );
+    }
+
+    /// The fighting title's sprite program (`624410e18249e17f`) in miniature: attributes
+    /// `POSITION@pa0, TEXCOORD0@pa4, COLOR0@pa8`, so the attribute reading lays out
+    /// `TexCoord(0)@4 Color0@8` - but the code COMPUTES `o[4..8] = uniform * COLOR` and
+    /// `o[8..12]` from TEXCOORD through a temp. Linked the attribute way its logo sampled the
+    /// vertex colour as a UV and drew black.
+    #[test]
+    fn a_computed_run_refutes_the_passthrough_reading() {
+        use crate::container::{SEMANTIC_COLOR, SEMANTIC_POSITION, SEMANTIC_TEXCOORD};
+        let with = |mut p: Parameter, s: u8| {
+            p.semantic = s;
+            p
+        };
+        let mut v = vertex_program(
+            16,
+            vec![
+                with(attribute("aPos", 0, 3), SEMANTIC_POSITION),
+                with(attribute("aUV", 4, 4), SEMANTIC_TEXCOORD),
+                with(attribute("aColor", 8, 4), SEMANTIC_COLOR),
+            ],
+            0x6244,
+        );
+        v.output_varyings = vec![texcoord_out(0, 4, 4), OutputVarying { usage: VaryingUsage::Color0, base_lane: 8, components: 4 }];
+        let sa = Operand::plain(Bank::SecondaryAttr, 0, 3);
+        let code = |uv_extra: Option<Operand>| {
+            let mut uv_srcs = vec![Operand::plain(Bank::PrimaryAttr, 4, 1), sa];
+            uv_srcs.extend(uv_extra);
+            shader(
+                ProgramKind::Vertex,
+                vec![
+                    instr(Op::Mul, Some(Operand::plain(Bank::Output, 4, 2)), vec![sa, Operand::plain(Bank::PrimaryAttr, 8, 1)], [true; 4]),
+                    instr(Op::Mad, Some(Operand::plain(Bank::Temp, 0, 0)), uv_srcs, [true; 4]),
+                    instr(Op::Mov, Some(Operand::plain(Bank::Output, 8, 2)), vec![Operand::plain(Bank::Temp, 0, 0)], [true; 4]),
+                ],
+            )
+        };
+        let sh = code(None);
+        assert!(forwarding_claims(&v, &sh).is_empty(), "nothing is MOVED from an attribute");
+        let d = derivation_claims(&v, &sh);
+        assert!(forwarding_contradicts(&v.output_varyings, &d).is_some(), "{d:?}");
+        assert_eq!(
+            layout_from_forwarding_claims(&v.output_varyings, &d, true),
+            Some(vec![
+                OutputVarying { usage: VaryingUsage::Color0, base_lane: 4, components: 4 },
+                texcoord_out(0, 8, 4),
+            ])
+        );
+        // A run whose ancestry is TWO attributes names neither: the UV mixed with the position
+        // is no longer a claim, and the colour's claim alone is what is left.
+        let mixed = derivation_claims(&v, &code(Some(Operand::plain(Bank::PrimaryAttr, 0, 1))));
+        assert_eq!(mixed, vec![(VaryingUsage::Color0, vec![4, 5, 6, 7])]);
     }
 
     fn attribute(name: &str, resource_index: i32, component_count: u8) -> Parameter {

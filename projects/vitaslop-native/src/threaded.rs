@@ -361,6 +361,7 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
             reentry.arg_len,
             reentry.arg_ptr,
             reentry.r2,
+            reentry.r3,
             reentry.stack_top,
             reentry.priority,
         )
@@ -554,6 +555,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         let main = engine.instantiate_thread(
             vitaslop_runtime::host::MAIN_THID,
             entry & !1,
+            0,
             0,
             0,
             0,
@@ -907,6 +909,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             arg_len,
             arg_ptr,
             0,
+            0,
             sp,
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
         )?;
@@ -1145,10 +1148,11 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         r0: u32,
         r1: u32,
         r2: u32,
+        r3: u32,
         sp: u32,
         priority: i32,
     ) -> Result<WasmtimeThread, RunError> {
-        self.instantiate_thread_seq(thid, vec![entry], r0, r1, r2, sp, priority)
+        self.instantiate_thread_seq(thid, vec![entry], r0, r1, r2, r3, sp, priority)
     }
 
     /// Build one thread that runs `entries` in sequence on a single fiber, resetting
@@ -1165,6 +1169,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         r0: u32,
         r1: u32,
         r2: u32,
+        r3: u32,
         sp: u32,
         priority: i32,
     ) -> Result<WasmtimeThread, RunError> {
@@ -1249,6 +1254,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                 set_reg_store(&mut store, &instance, 0, if carries_args { r0 } else { 0 });
                 set_reg_store(&mut store, &instance, 1, if carries_args { r1 } else { 0 });
                 set_reg_store(&mut store, &instance, 2, if carries_args { r2 } else { 0 });
+                set_reg_store(&mut store, &instance, 3, if carries_args { r3 } else { 0 });
                 let func = match instance
                     .get_typed_func::<(), ()>(&mut store, &abi::func_export(entry))
                 {

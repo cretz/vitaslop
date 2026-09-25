@@ -372,6 +372,9 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
         };
         if extra == 0 {
             push_split_pack(&mut out, instr);
+            // A group-0x20/0x28 word is DUAL-ISSUE: its second operation follows the first, in
+            // the order `decode::decode_dual_rest` documents. Never repeated.
+            out.extend(decode::decode_dual_rest(word));
             continue;
         }
         // From here the instruction really repeats, so the operand grammar has to be known

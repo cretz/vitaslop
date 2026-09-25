@@ -4754,6 +4754,26 @@ fn emit_vfp(f: &mut Body, op: &crate::ir::VfpOp) {
             f.instruction(&W::I32Or);
             f.instruction(&W::GlobalSet(abi::vfp_s_global(*sd)));
         }
+        CvtHalfFromF32 { sd, sm, top } => {
+            // f32 -> f16 (RNE) into ONE 16-bit half of S`sd`; the other half is kept, as the
+            // architecture specifies for `vcvtb`/`vcvtt`. The rounding is the vector
+            // narrow's own, on a splat, so scalar and NEON cannot disagree.
+            f.instruction(&W::GlobalGet(abi::vfp_s_global(*sm)));
+            f.instruction(&W::I32x4Splat);
+            f32x4_to_f16_lanes(f);
+            f.instruction(&W::I32x4ExtractLane(0));
+            f.instruction(&W::I32Const(0xffff));
+            f.instruction(&W::I32And);
+            if *top {
+                f.instruction(&W::I32Const(16));
+                f.instruction(&W::I32Shl);
+            }
+            f.instruction(&W::GlobalGet(abi::vfp_s_global(*sd)));
+            f.instruction(&W::I32Const(if *top { 0x0000_ffff } else { 0xffff_0000u32 as i32 }));
+            f.instruction(&W::I32And);
+            f.instruction(&W::I32Or);
+            f.instruction(&W::GlobalSet(abi::vfp_s_global(*sd)));
+        }
         DoubleToCore { rt, rt2, d } => {
             get_d_bits(f, *d);
             f.instruction(&W::LocalTee(L_D64));
@@ -4957,6 +4977,97 @@ fn neon_get(f: &mut Body, reg: crate::ir::NeonReg) {
             f.instruction(&W::I64x2Splat);
         }
     }
+}
+
+/// IEEE f32 -> f16, round-to-nearest-even, on four lanes at once and branchless (Giesen
+/// float_to_half_fast3_rtne, restated in SIMD). Expects the four f32 lanes' BITS on the
+/// stack and leaves an i32x4 whose low 16 bits per lane are the halves. Shared by the NEON
+/// `vcvt.f16.f32` and the scalar VFP `vcvtb/vcvtt.f16.f32` (lane 0 of a splat) so the two
+/// cannot round differently. Uses `L_V128A..C`.
+fn f32x4_to_f16_lanes(f: &mut Body) {
+    const F16MAX: i32 = 0x4780_0000u32 as i32; // (127 + 16) << 23, overflows a half
+    const F32INFTY: i32 = 0x7f80_0000u32 as i32; // 255 << 23, above it is NaN
+    const DENORM_CUTOFF: i32 = 0x3880_0000u32 as i32; // 113 << 23, below it is subnormal
+    const DENORM_MAGIC: i32 = 0x3f00_0000u32 as i32; // 126 << 23, which is 0.5f
+    const EXP_REBIAS: i32 = 0xc800_0000u32 as i32; // (15 - 127) << 23
+    const SIGN_BIT: i32 = 0x8000_0000u32 as i32;
+
+    // a = |x| bits, kept in A; the sign is spliced back in at the end.
+    f.instruction(&W::LocalTee(L_V128C)); // x, for the sign
+    f.instruction(&W::I32Const(!SIGN_BIT));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::V128And);
+    f.instruction(&W::LocalSet(L_V128A)); // a
+
+    // --- candidate 1: inf/NaN. A NaN keeps a payload bit so it stays a NaN
+    // rather than becoming an infinity.
+    f.instruction(&W::I32Const(0x7e00));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32Const(0x7c00));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(F32INFTY));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4GtU); // a > infinity, so it is a NaN
+    f.instruction(&W::V128Bitselect);
+    f.instruction(&W::LocalSet(L_V128B)); // the inf/NaN candidate
+
+    // --- candidate 2: normal. `mant_odd` is the round-to-EVEN tie-break.
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(EXP_REBIAS));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4Add);
+    f.instruction(&W::I32Const(0xfff));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4Add);
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(13));
+    f.instruction(&W::I32x4ShrU);
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::V128And); // mant_odd
+    f.instruction(&W::I32x4Add);
+    f.instruction(&W::I32Const(13));
+    f.instruction(&W::I32x4ShrU);
+
+    // --- candidate 3: subnormal, by adding 0.5f and taking the difference of the
+    // bit patterns. Zero falls out of it correctly, since 0.5f - 0.5f is 0.
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(DENORM_MAGIC));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::F32x4Add);
+    f.instruction(&W::I32Const(DENORM_MAGIC));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4Sub);
+    // `bitselect` keeps the FIRST-pushed vector where the mask bit is 1, and the
+    // normal candidate was pushed first - so the mask is the NORMAL condition,
+    // `a >= cutoff`, and the subnormal one is what is left.
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(DENORM_CUTOFF));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4GeU);
+    f.instruction(&W::V128Bitselect); // normal where at or above the cutoff
+
+    // --- inf/NaN wins over both, wherever a reaches the half's maximum. Same
+    // rule as above: the finite result was pushed first, so the mask is the
+    // FINITE condition and the inf/NaN candidate is what is left.
+    f.instruction(&W::LocalGet(L_V128B));
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(F16MAX));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4GeU);
+    f.instruction(&W::V128Not);
+    f.instruction(&W::V128Bitselect);
+
+    // The sign, back in at bit 15 of each lane.
+    f.instruction(&W::LocalGet(L_V128C));
+    f.instruction(&W::I32Const(SIGN_BIT));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::V128And);
+    f.instruction(&W::I32Const(16));
+    f.instruction(&W::I32x4ShrU);
+    f.instruction(&W::V128Or);
+
 }
 
 /// Push a 16-byte `vtbl` table half: the low 8 bytes of D`lo` followed by the low 8
@@ -6288,90 +6399,8 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             // "close enough" is not available: the goldens in
             // `vitaslop-conformance-suite-arm` come from qemu and pin the tie-breaking,
             // the overflow to infinity, the NaN preservation and the subnormal boundary.
-            const F16MAX: i32 = 0x4780_0000u32 as i32; // (127 + 16) << 23, overflows a half
-            const F32INFTY: i32 = 0x7f80_0000u32 as i32; // 255 << 23, above it is NaN
-            const DENORM_CUTOFF: i32 = 0x3880_0000u32 as i32; // 113 << 23, below it is subnormal
-            const DENORM_MAGIC: i32 = 0x3f00_0000u32 as i32; // 126 << 23, which is 0.5f
-            const EXP_REBIAS: i32 = 0xc800_0000u32 as i32; // (15 - 127) << 23
-            const SIGN_BIT: i32 = 0x8000_0000u32 as i32;
-
-            // a = |x| bits, kept in A; the sign is spliced back in at the end.
             neon_get(f, *src);
-            f.instruction(&W::LocalTee(L_V128C)); // x, for the sign
-            f.instruction(&W::I32Const(!SIGN_BIT));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::V128And);
-            f.instruction(&W::LocalSet(L_V128A)); // a
-
-            // --- candidate 1: inf/NaN. A NaN keeps a payload bit so it stays a NaN
-            // rather than becoming an infinity.
-            f.instruction(&W::I32Const(0x7e00));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::I32Const(0x7c00));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::LocalGet(L_V128A));
-            f.instruction(&W::I32Const(F32INFTY));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::I32x4GtU); // a > infinity, so it is a NaN
-            f.instruction(&W::V128Bitselect);
-            f.instruction(&W::LocalSet(L_V128B)); // the inf/NaN candidate
-
-            // --- candidate 2: normal. `mant_odd` is the round-to-EVEN tie-break.
-            f.instruction(&W::LocalGet(L_V128A));
-            f.instruction(&W::I32Const(EXP_REBIAS));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::I32x4Add);
-            f.instruction(&W::I32Const(0xfff));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::I32x4Add);
-            f.instruction(&W::LocalGet(L_V128A));
-            f.instruction(&W::I32Const(13));
-            f.instruction(&W::I32x4ShrU);
-            f.instruction(&W::I32Const(1));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::V128And); // mant_odd
-            f.instruction(&W::I32x4Add);
-            f.instruction(&W::I32Const(13));
-            f.instruction(&W::I32x4ShrU);
-
-            // --- candidate 3: subnormal, by adding 0.5f and taking the difference of the
-            // bit patterns. Zero falls out of it correctly, since 0.5f - 0.5f is 0.
-            f.instruction(&W::LocalGet(L_V128A));
-            f.instruction(&W::I32Const(DENORM_MAGIC));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::F32x4Add);
-            f.instruction(&W::I32Const(DENORM_MAGIC));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::I32x4Sub);
-            // `bitselect` keeps the FIRST-pushed vector where the mask bit is 1, and the
-            // normal candidate was pushed first - so the mask is the NORMAL condition,
-            // `a >= cutoff`, and the subnormal one is what is left.
-            f.instruction(&W::LocalGet(L_V128A));
-            f.instruction(&W::I32Const(DENORM_CUTOFF));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::I32x4GeU);
-            f.instruction(&W::V128Bitselect); // normal where at or above the cutoff
-
-            // --- inf/NaN wins over both, wherever a reaches the half's maximum. Same
-            // rule as above: the finite result was pushed first, so the mask is the
-            // FINITE condition and the inf/NaN candidate is what is left.
-            f.instruction(&W::LocalGet(L_V128B));
-            f.instruction(&W::LocalGet(L_V128A));
-            f.instruction(&W::I32Const(F16MAX));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::I32x4GeU);
-            f.instruction(&W::V128Not);
-            f.instruction(&W::V128Bitselect);
-
-            // The sign, back in at bit 15 of each lane.
-            f.instruction(&W::LocalGet(L_V128C));
-            f.instruction(&W::I32Const(SIGN_BIT));
-            f.instruction(&W::I32x4Splat);
-            f.instruction(&W::V128And);
-            f.instruction(&W::I32Const(16));
-            f.instruction(&W::I32x4ShrU);
-            f.instruction(&W::V128Or);
-
+            f32x4_to_f16_lanes(f);
             // Pack the four 16-bit results into the low 8 bytes - the `Dd` destination.
             f.instruction(&W::LocalTee(L_V128A));
             f.instruction(&W::LocalGet(L_V128A));

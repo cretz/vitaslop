@@ -44,6 +44,7 @@ pub mod gxm {
     /// what a depth-only pass (a shadow map, a z-prepass) binds.
     pub const COLOR_SURFACE_INIT_DISABLED: u32 = 0x6136_39FA;
     pub const DEPTH_STENCIL_SURFACE_INIT: u32 = 0xCA9D_41D1;
+    pub const DEPTH_STENCIL_SURFACE_INIT_DISABLED: u32 = 0xA41D_B0D6;
     pub const SYNC_OBJECT_CREATE: u32 = 0x6A60_13E1;
     pub const SYNC_OBJECT_DESTROY: u32 = 0x889A_E88C;
     pub const SHADER_PATCHER_CREATE: u32 = 0x0503_2658;
@@ -67,6 +68,9 @@ pub mod gxm {
     pub const SHADER_PATCHER_GET_VERTEX_PROGRAM_REF_COUNT: u32 = 0xA1A1_6FF6;
     pub const SHADER_PATCHER_GET_FRAGMENT_PROGRAM_REF_COUNT: u32 = 0x2C55_50F0;
     pub const SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM: u32 = 0xBE27_43D1;
+    /// The `SceGxmProgram*` a patched program was created from.
+    pub const VERTEX_PROGRAM_GET_PROGRAM: u32 = 0xBC52_320E;
+    pub const FRAGMENT_PROGRAM_GET_PROGRAM: u32 = 0xE0E3_B3F8;
     pub const PROGRAM_FIND_PARAMETER_BY_NAME: u32 = 0x2777_94C4;
     pub const SHADER_PATCHER_GET_PROGRAM_FROM_ID: u32 = 0xA949_A803;
     pub const PROGRAM_PARAMETER_GET_RESOURCE_INDEX: u32 = 0x5C79_D59A;
@@ -137,9 +141,16 @@ pub mod gxm {
     pub const COLOR_SURFACE_GET_FORMAT: u32 = 0xF3C1_C6C6;
     pub const COLOR_SURFACE_GET_TYPE: u32 = 0x52FD_E962;
     pub const COLOR_SURFACE_SET_CLIP: u32 = 0x8645_6F7B;
+    pub const COLOR_SURFACE_GET_CLIP: u32 = 0x07DF_EE4B;
+    pub const COLOR_SURFACE_SET_FORMAT: u32 = 0x5F9A_3A16;
+    pub const COLOR_SURFACE_GET_GAMMA_MODE: u32 = 0xEE0B_4DF0;
+    pub const COLOR_SURFACE_SET_DITHER_MODE: u32 = 0x4502_7BAB;
+    pub const COLOR_SURFACE_GET_DITHER_MODE: u32 = 0x200A_96E1;
     pub const TEXTURE_GET_TYPE: u32 = 0xF65D_4917;
     /// `_sceGxmProgramParameterGetSemantic` (the exported user variant).
     pub const PROGRAM_PARAMETER_GET_SEMANTIC: u32 = 0xAAFD_61D5;
+    /// `sceGxmProgramParameterGetSemantic` - the public spelling, same signature.
+    pub const PROGRAM_PARAMETER_GET_SEMANTIC_PUBLIC: u32 = 0xE6D9_C4CE;
     pub const PROGRAM_PARAMETER_GET_SEMANTIC_INDEX: u32 = 0xB85C_C13E;
     pub const TEXTURE_INIT_CUBE: u32 = 0x11DC_8DC9;
     pub const TEXTURE_SET_U_ADDR_MODE_SAFE: u32 = 0x8699_ECF4;
@@ -165,6 +176,10 @@ pub mod gxm {
     pub const TEXTURE_GET_STRIDE: u32 = 0xB0BD_52F3;
     pub const TEXTURE_GET_LOD_BIAS: u32 = 0x2DE5_5DA5;
     pub const TEXTURE_GET_U_ADDR_MODE_SAFE: u32 = 0xC037_DA83;
+    /// The unchecked spellings of the two getters above - same field, same answer.
+    pub const TEXTURE_GET_U_ADDR_MODE: u32 = 0x2AE2_2788;
+    pub const TEXTURE_GET_V_ADDR_MODE: u32 = 0x4613_6CA9;
+    pub const TEXTURE_GET_MIP_FILTER: u32 = 0xCE94_CA15;
     pub const TEXTURE_GET_V_ADDR_MODE_SAFE: u32 = 0xD2F0_D9C1;
     pub const TEXTURE_GET_MAG_FILTER: u32 = 0xAE7F_BB51;
     pub const TEXTURE_GET_MIN_FILTER: u32 = 0x9206_66C6;
@@ -280,6 +295,8 @@ pub mod display {
     /// `sceDisplayWaitSetFrameBuf` (SceDisplay, lib 0x5ED8F994): block until the
     /// frame buffer queued by `sceDisplaySetFrameBuf` has been latched at vblank.
     pub const WAIT_SET_FRAME_BUF: u32 = 0x9423_560C;
+    pub const REGISTER_VBLANK_START_CALLBACK: u32 = 0x6BDF_4C4D;
+    pub const UNREGISTER_VBLANK_START_CALLBACK: u32 = 0x9843_6A80;
     /// The `...Multi` and `...CB` spellings of the two waits above. `Multi` takes a vblank
     /// COUNT; `CB` additionally runs the calling thread's pending callbacks while it waits.
     /// Separate NIDs, so a title that links only one of them must not hard-fail on it.
@@ -289,6 +306,7 @@ pub mod display {
     pub const WAIT_VBLANK_START_CB: u32 = 0x78B4_1B92;
     pub const WAIT_VBLANK_START_MULTI_CB: u32 = 0x05F2_7764;
     pub const GET_VCOUNT: u32 = 0xB6FD_E0BA;
+    pub const GET_REFRESH_RATE: u32 = 0xA08C_A60D;
     /// `sceDisplayGetFrameBuf`: read back the framebuffer parameters the last
     /// [`SET_FRAME_BUF`] declared (SceDisplayUser, lib 0x4FAACD11).
     pub const GET_FRAME_BUF: u32 = 0x42AE_6BBC;
@@ -1064,6 +1082,13 @@ pub mod services {
     /// and branches on the first two words - it is the FRAME FETCH. See
     /// `vita::video::mp4_get_next_unit` for the field map and what in it is inferred.
     pub const MP4_GET_NEXT_UNIT_8BE0E3D3: u32 = 0x8BE0_E3D3;
+    /// The same function under the NID DOA5 links - the henkaku wiki names it
+    /// `sceMp4GetStreamInfo` - and DOA5's consumer copies the result field for field
+    /// exactly as the first title's does (+0x08/+0x0c -> +0x60/+0x64, +0x30 -> +0x78, the
+    /// halfwords to +0x6e/+0x70, the bytes to +0x6c/+0x6d, +0x20 -> +0x20).
+    pub const MP4_GET_STREAM_INFO: u32 = 0xD5B2_6179;
+    /// Unnamed; read as stop-streaming - see `vita::video::mp4_stop_file_streaming`.
+    pub const MP4_STOP_FILE_STREAMING_C05DFF01: u32 = 0xC05D_FF01;
     /// SceMp4, unnamed on the henkaku wiki's 3.60 NID list, but the 0.945 NAME list has a
     /// `sceMp4EnableStream` with no 3.60 NID beside it and the call sites fit it exactly:
     /// two one-line thunks that differ only in a trailing `1` and `0` over
@@ -1176,6 +1201,7 @@ pub mod lwsync {
     pub const SIGNAL_LW_COND: u32 = 0x3AC6_3B9A;
     pub const SIGNAL_LW_COND_ALL: u32 = 0xE524_1A0C;
     pub const SIGNAL_LW_COND_TO: u32 = 0xFC1A_48EB;
+    pub const GET_LW_MUTEX_INFO: u32 = 0xF7D8_F1FC;
 }
 
 /// SceThreadmgr function NIDs: thread-manager primitives not wrapped in
@@ -1229,6 +1255,12 @@ pub mod threadmgr {
     /// See `vita::threadmgr::check_callback` for why the honest answer here is "none
     /// were pending" rather than a stub.
     pub const CHECK_CALLBACK: u32 = 0xE53E_41F6;
+    pub const CREATE_CALLBACK: u32 = 0xB19C_F7E9;
+    pub const CLEAR_EVENT: u32 = 0x7B2A_4B28;
+    pub const DELETE_CALLBACK: u32 = 0xD469_676B;
+    pub const NOTIFY_CALLBACK: u32 = 0xA468_3592;
+    pub const CANCEL_CALLBACK: u32 = 0x3074_1EF2;
+    pub const GET_CALLBACK_COUNT: u32 = 0x0386_44D5;
 }
 
 /// ScePvf: the Vita font library. A title creates a lib, configures em/resolution/
@@ -1355,8 +1387,9 @@ pub mod sync {
     pub const CLEAR_EVENT_FLAG: u32 = 0x4CB8_7CA7;
     pub const DELETE_EVENT_FLAG: u32 = 0x5840_162C;
 
-    // --- SIMPLE EVENTS: the NIDs are known, the SIGNATURES are not, and that is why
-    // none of these is dispatched. ---
+    // --- SIMPLE EVENTS: create/delete/set/wait are dispatched since DOA5 CALLS them and its
+    // call sites pin the argument positions (see `vita::sync::create_simple_event`). The
+    // history below is why the rest (open/close/poll/cancel) still are not. ---
     //
     // A simple event is the kernel's other bit-pattern primitive: an object holding a
     // pattern that `SET_EVENT` ORs into and `WAIT_EVENT` blocks on. It looks like the
@@ -1473,6 +1506,7 @@ pub mod videodec {
     pub const AVCDEC_QUERY_DECODER_MEM_SIZE: u32 = 0x97E9_5EDB;
     pub const AVCDEC_CREATE_DECODER: u32 = 0xE82B_B69B;
     pub const AVCDEC_DELETE_DECODER: u32 = 0x8A0E_359E;
+    pub const AVCDEC_DECODE_AVAILABLE_SIZE: u32 = 0x4416_73E3;
     pub const AVCDEC_DECODE: u32 = 0xD619_0A06;
     pub const AVCDEC_DECODE_STOP: u32 = 0x9648_D853;
     pub const AVCDEC_DECODE_FLUSH: u32 = 0x25F3_1020;
@@ -1522,6 +1556,7 @@ pub fn name(func_nid: u32) -> &'static str {
         vd::AVCDEC_QUERY_DECODER_MEM_SIZE => "sceAvcdecQueryDecoderMemSize",
         vd::AVCDEC_CREATE_DECODER => "sceAvcdecCreateDecoder",
         vd::AVCDEC_DELETE_DECODER => "sceAvcdecDeleteDecoder",
+        vd::AVCDEC_DECODE_AVAILABLE_SIZE => "sceAvcdecDecodeAvailableSize",
         vd::AVCDEC_DECODE => "sceAvcdecDecode",
         vd::AVCDEC_DECODE_STOP => "sceAvcdecDecodeStop",
         vd::AVCDEC_DECODE_FLUSH => "sceAvcdecDecodeFlush",
@@ -1643,6 +1678,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::COLOR_SURFACE_INIT => "sceGxmColorSurfaceInit",
         g::COLOR_SURFACE_INIT_DISABLED => "sceGxmColorSurfaceInitDisabled",
         g::DEPTH_STENCIL_SURFACE_INIT => "sceGxmDepthStencilSurfaceInit",
+        g::DEPTH_STENCIL_SURFACE_INIT_DISABLED => "sceGxmDepthStencilSurfaceInitDisabled",
         g::SYNC_OBJECT_CREATE => "sceGxmSyncObjectCreate",
         g::SYNC_OBJECT_DESTROY => "sceGxmSyncObjectDestroy",
         g::SHADER_PATCHER_CREATE => "sceGxmShaderPatcherCreate",
@@ -1655,6 +1691,8 @@ pub fn name(func_nid: u32) -> &'static str {
         g::TRANSFER_DOWNSCALE => "sceGxmTransferDownscale",
         g::SHADER_PATCHER_CREATE_VERTEX_PROGRAM => "sceGxmShaderPatcherCreateVertexProgram",
         g::SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM => "sceGxmShaderPatcherCreateFragmentProgram",
+        g::VERTEX_PROGRAM_GET_PROGRAM => "sceGxmVertexProgramGetProgram",
+        g::FRAGMENT_PROGRAM_GET_PROGRAM => "sceGxmFragmentProgramGetProgram",
         g::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM => "sceGxmShaderPatcherReleaseVertexProgram",
         g::SHADER_PATCHER_GET_VERTEX_PROGRAM_REF_COUNT => "sceGxmShaderPatcherGetVertexProgramRefCount",
         g::SHADER_PATCHER_GET_FRAGMENT_PROGRAM_REF_COUNT => "sceGxmShaderPatcherGetFragmentProgramRefCount",
@@ -1698,6 +1736,9 @@ pub fn name(func_nid: u32) -> &'static str {
         g::TEXTURE_SET_MIP_FILTER => "sceGxmTextureSetMipFilter",
         g::TEXTURE_SET_U_ADDR_MODE => "sceGxmTextureSetUAddrMode",
         g::TEXTURE_SET_V_ADDR_MODE => "sceGxmTextureSetVAddrMode",
+        g::TEXTURE_GET_U_ADDR_MODE => "sceGxmTextureGetUAddrMode",
+        g::TEXTURE_GET_V_ADDR_MODE => "sceGxmTextureGetVAddrMode",
+        g::TEXTURE_GET_MIP_FILTER => "sceGxmTextureGetMipFilter",
         g::TEXTURE_GET_DATA => "sceGxmTextureGetData",
         g::TEXTURE_GET_WIDTH => "sceGxmTextureGetWidth",
         g::TEXTURE_GET_HEIGHT => "sceGxmTextureGetHeight",
@@ -1999,6 +2040,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::APPUTIL_SYSTEM_PARAM_GET_STRING => "sceAppUtilSystemParamGetString",
         lw::CREATE_LW_MUTEX => "sceKernelCreateLwMutex",
         lw::DELETE_LW_MUTEX => "sceKernelDeleteLwMutex",
+        lw::GET_LW_MUTEX_INFO => "sceKernelGetLwMutexInfo",
         lw::LOCK_LW_MUTEX => "sceKernelLockLwMutex",
         lw::LOCK_LW_MUTEX_CB => "sceKernelLockLwMutexCB",
         lw::TRY_LOCK_LW_MUTEX => "sceKernelTryLockLwMutex",
@@ -2107,9 +2149,15 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_REGION_CLIP => "sceGxmSetRegionClip",
         g::COLOR_SURFACE_GET_FORMAT => "sceGxmColorSurfaceGetFormat",
         g::COLOR_SURFACE_GET_TYPE => "sceGxmColorSurfaceGetType",
+        g::COLOR_SURFACE_GET_CLIP => "sceGxmColorSurfaceGetClip",
+        g::COLOR_SURFACE_SET_FORMAT => "sceGxmColorSurfaceSetFormat",
+        g::COLOR_SURFACE_GET_GAMMA_MODE => "sceGxmColorSurfaceGetGammaMode",
+        g::COLOR_SURFACE_SET_DITHER_MODE => "sceGxmColorSurfaceSetDitherMode",
+        g::COLOR_SURFACE_GET_DITHER_MODE => "sceGxmColorSurfaceGetDitherMode",
         g::COLOR_SURFACE_SET_CLIP => "sceGxmColorSurfaceSetClip",
         g::TEXTURE_GET_TYPE => "sceGxmTextureGetType",
-        g::PROGRAM_PARAMETER_GET_SEMANTIC => "sceGxmProgramParameterGetSemantic",
+        g::PROGRAM_PARAMETER_GET_SEMANTIC => "_sceGxmProgramParameterGetSemantic",
+        g::PROGRAM_PARAMETER_GET_SEMANTIC_PUBLIC => "sceGxmProgramParameterGetSemantic",
         g::PROGRAM_PARAMETER_GET_SEMANTIC_INDEX => "sceGxmProgramParameterGetSemanticIndex",
         g::TEXTURE_INIT_CUBE => "sceGxmTextureInitCube",
         g::TEXTURE_SET_U_ADDR_MODE_SAFE => "sceGxmTextureSetUAddrModeSafe",
@@ -2264,6 +2312,8 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::MP4_CLOSE_FILE => "sceMp4CloseFile",
         sv::MP4_RELEASE_BUFFER_7B4832FE => "sceMp4(unnamed 0x7b4832fe, buffer release)",
         sv::MP4_GET_NEXT_UNIT_8BE0E3D3 => "sceMp4(unnamed 0x8be0e3d3, stream info)",
+        sv::MP4_GET_STREAM_INFO => "sceMp4GetStreamInfo",
+        sv::MP4_STOP_FILE_STREAMING_C05DFF01 => "sceMp4(unnamed 0xc05dff01, stop streaming)",
         sv::MP4_ENABLE_STREAM_609E57AD => "sceMp4(unnamed 0x609e57ad, enable stream)",
         sv::MP4_RESET_40351E1A => "sceMp4(unnamed 0x40351e1a, reset)",
         sv::MP4_GET_NEXT_UNIT => "sceMp4GetNextUnit",
@@ -2433,6 +2483,7 @@ pub fn name(func_nid: u32) -> &'static str {
         pm::LIBC_GETTIMEOFDAY => "sceKernelLibcGettimeofday",
         pm::CALL_ABORT_HANDLER => "sceKernelCallAbortHandler",
         d::GET_VCOUNT => "sceDisplayGetVcount",
+        d::GET_REFRESH_RATE => "sceDisplayGetRefreshRate",
         dbg::ASSERTION_HANDLER => "sceDbgAssertionHandler",
         dbg::LOGGING_HANDLER => "sceDbgLoggingHandler",
 
@@ -2472,6 +2523,14 @@ pub fn name(func_nid: u32) -> &'static str {
         g::TEXTURE_SET_MIPMAP_COUNT => "sceGxmTextureSetMipmapCount",
         d::GET_FRAME_BUF => "sceDisplayGetFrameBuf",
         tm::CHECK_CALLBACK => "sceKernelCheckCallback",
+        tm::CREATE_CALLBACK => "sceKernelCreateCallback",
+        tm::CLEAR_EVENT => "sceKernelClearEvent",
+        tm::DELETE_CALLBACK => "sceKernelDeleteCallback",
+        tm::NOTIFY_CALLBACK => "sceKernelNotifyCallback",
+        tm::CANCEL_CALLBACK => "sceKernelCancelCallback",
+        tm::GET_CALLBACK_COUNT => "sceKernelGetCallbackCount",
+        d::REGISTER_VBLANK_START_CALLBACK => "sceDisplayRegisterVblankStartCallback",
+        d::UNREGISTER_VBLANK_START_CALLBACK => "sceDisplayUnregisterVblankStartCallback",
         nt::SOCKET_ABORT => "sceNetSocketAbort",
         nt::EPOLL_WAIT_CB => "sceNetEpollWaitCB",
         http::SET_COOKIE_ENABLED => "sceHttpSetCookieEnabled",

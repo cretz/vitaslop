@@ -1032,8 +1032,10 @@ pub fn tex_typed(
     lod: TexLod,
     lod_src: Option<(Bank, u8)>,
 ) -> Result<u64, AsmError> {
-    if !(1..=2).contains(&coords) {
-        return Err(AsmError::UnsupportedOp("a sample coordinate is one or two components here"));
+    // Three is a CUBE (or 3D) sample - `dim` 2, which the decoder reads as three coordinates;
+    // whether it is a cube is the SAMPLER's declaration, not the word's.
+    if !(1..=3).contains(&coords) {
+        return Err(AsmError::UnsupportedOp("a sample coordinate is one to three components here"));
     }
     if matches!(lod, TexLod::Implicit) != lod_src.is_none() {
         return Err(AsmError::UnsupportedOp("an implicit sample takes no LOD operand, and every other form takes one"));
@@ -1419,7 +1421,7 @@ pub fn dot(
     set_field(&mut hi, high, "swz_mask1", m1)?;
     set_field(&mut hi, high, "swz_en", en)?;
 
-    // >>> THE REPEAT COUNT IS BITS 46:44, AND BIT 47 RIDES ALONGSIDE IT SET. The decoder's own
+    // >>> THE REPEAT COUNT IS BITS 46:44, AND BIT 47 RIDES ALONGSIDE IT. The decoder's own
     // reading, and the field tables name those four bits `unk7 / abs_op2 / swz_en_strange1 /
     // swz_en_strange0` - so `abs_op2` above is bit 46, the middle bit of the count, and setting
     // the count after it is not an ordering accident. Writing the count through the three
@@ -1434,7 +1436,12 @@ pub fn dot(
             "a repeating DOT steps its destination one CHANNEL per iteration, so its mask must              name exactly one channel",
         ));
     }
-    set_field(&mut hi, high, "unk7", 1)?;
+    // >>> BIT 47 IS SET ONLY ON A DOT THAT DOES NOT REPEAT. With a zero count it is what keeps
+    // the field from reading as the blocked `0x0`. On a REPEATING dot it selects the
+    // MOE-governed source walk (see the DP arm of `repeat_operands`), which 234 of the corpus's
+    // 242 repeating DPs do not carry - so the intrinsic four-register walk is the default here,
+    // and a caller wanting the other ORs bit 47 in.
+    set_field(&mut hi, high, "unk7", u32::from(extra_iterations == 0))?;
     set_field(&mut hi, high, "abs_op2", (extra_iterations >> 2) & 1)?;
     set_field(&mut hi, high, "swz_en_strange1", (extra_iterations >> 1) & 1)?;
     set_field(&mut hi, high, "swz_en_strange0", extra_iterations & 1)?;
@@ -1878,7 +1885,8 @@ pub fn bitwise(
 /// a float family. `neg1` is `test_flag_2`, the source-1 negate.
 ///
 /// The destination is DIRECT (the ordinary seven-bit field) while the float sources are DOUBLED,
-/// exactly as the sibling VTST reads them.
+/// exactly as the sibling VTST reads them. That is this NUMERIC form's reading; the 8-bit-mask
+/// form is doubled (see `decode_grp_test_mask`) and is not assembled here.
 #[allow(clippy::too_many_arguments)]
 pub fn vtstmsk(
     alu: TestAlu,
@@ -1903,7 +1911,53 @@ pub fn vtstmsk(
         TestCmp::Le => (1, 1),
         TestCmp::Ge => (2, 1),
     };
-    let (dsel, dn) = r7_direct(dest.bank, dest.index, true)?;
+    vtstmsk_form(alu_op, alu, cmp, sign_test, zero_test, half, dest, src1, neg1, src2, false)
+}
+
+/// Assemble a group-0x78 VTSTMSK in its FLOAT 8-BIT-MASK form (mask type 0): the four channels'
+/// answers are bytes `0xFF`/`0x00` of ONE register, whose number is DOUBLED like the sources'
+/// (see `decode_grp_test_mask`). This is the form a byte-wise conditional move consumes.
+#[allow(clippy::too_many_arguments)]
+pub fn vtstmsk_bytes(
+    alu: TestAlu,
+    cmp: TestCmp,
+    dest: Dest,
+    src1: (Bank, u8),
+    neg1: bool,
+    src2: (Bank, u8),
+) -> Result<u64, AsmError> {
+    let alu_op = match alu {
+        TestAlu::Add => 2u64,
+        TestAlu::Mul => 13,
+        TestAlu::Sub => 14,
+        _ => return Err(AsmError::UnsupportedOp("vtstmsk_bytes: only the FLOAT families are assembled")),
+    };
+    let (sign_test, zero_test) = match cmp {
+        TestCmp::Eq => (0u64, 1u64),
+        TestCmp::Ne => (0, 2),
+        TestCmp::Lt => (1, 0),
+        TestCmp::Gt => (2, 0),
+        TestCmp::Le => (1, 1),
+        TestCmp::Ge => (2, 1),
+    };
+    vtstmsk_form(alu_op, alu, cmp, sign_test, zero_test, false, dest, src1, neg1, src2, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vtstmsk_form(
+    alu_op: u64,
+    alu: TestAlu,
+    cmp: TestCmp,
+    sign_test: u64,
+    zero_test: u64,
+    half: bool,
+    dest: Dest,
+    src1: (Bank, u8),
+    neg1: bool,
+    src2: (Bank, u8),
+    byte_mask: bool,
+) -> Result<u64, AsmError> {
+    let (dsel, dn) = if byte_mask { r7_double(dest.bank, dest.index, true)? } else { r7_direct(dest.bank, dest.index, true)? };
     let (s1sel, s1n) = r7_double(src1.0, src1.1, false)?;
     let (s2sel, s2n) = r7_double(src2.0, src2.1, false)?;
     let mut w = 0u64;
@@ -1912,7 +1966,7 @@ pub fn vtstmsk(
     put(&mut w, 47, 47, u64::from(!half), "prec")?;
     put(&mut w, 43, 42, sign_test, "sign_test")?;
     put(&mut w, 41, 40, zero_test, "zero_test")?;
-    put(&mut w, 37, 36, 2, "mask_type")?;
+    put(&mut w, 37, 36, if byte_mask { 0 } else { 2 }, "mask_type")?;
     put(&mut w, 33, 32, dsel, "dest_sel")?;
     put(&mut w, 31, 30, s1sel, "src1_sel")?;
     put(&mut w, 29, 28, s2sel, "src2_sel")?;
@@ -1925,10 +1979,10 @@ pub fn vtstmsk(
     s1.neg = neg1;
     expect_decodes_to(
         w,
-        Op::TestMask { alu, cmp },
+        Op::TestMask { alu, cmp, byte_mask },
         Predicate::Always,
         Some((dest.bank, dest.index)),
-        [true; 4],
+        if byte_mask { [true, false, false, false] } else { [true; 4] },
         &[s1, Want::reg(src2.0, src2.1)],
         half,
     )
@@ -2423,6 +2477,82 @@ fn group_tables(name: &str) -> (&'static [(&'static str, u8)], &'static [(&'stat
         .find(|(n, _, _)| *n == name)
         .unwrap_or_else(|| panic!("no decoder field table named `{name}`"));
     (high, low)
+}
+
+/// The fields of a group-0x20 (three-lane) / group-0x28 (four-lane) DUAL-ISSUE word, by the
+/// meanings `decode::decode_grp_20_pair` documents (clean-room facts,
+/// `docs-re/usse-spec-grp20-exp-forms.md`). Raw field values, because what a case authoring one
+/// of these is stating IS the field arrangement: which slot feeds which operation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DualIssue {
+    /// Group 0x28 rather than 0x20.
+    pub four_lane: bool,
+    /// Operation slot 0..13 of each issue (vector mad, dot, self-dot, mul, add, mov, rsq, rcp,
+    /// then scalar mad, add, mul, subflr, exp, log). The four-lane group reaches primary 0..7.
+    pub primary: u8,
+    pub secondary: u8,
+    /// The PRIMARY writes the register destination (and the secondary the internal one).
+    pub reg_to_primary: bool,
+    pub half: bool,
+    /// Source arrangement (17:16).
+    pub nsel: u8,
+    /// Register destination: bank selector (0 r, 1 o, 2 pa) and the RAW 7-bit number.
+    pub dst_bank: u8,
+    pub dst_num: u8,
+    /// Internal destination `i<n>` and its lanes (x, y, z; `w` only in the four-lane group).
+    pub dst_i: u8,
+    pub mask: [bool; 4],
+    /// The register operand `U`: bank selector (0 r, 1 o, 2 pa, 3 sa), RAW number, swizzle
+    /// index (0..15), negate.
+    pub u_bank: u8,
+    pub u_num: u8,
+    pub u_swz: u8,
+    pub u_neg: bool,
+    /// Internal operands `I0` (swizzle 0..15), `I1` (swizzle 0..31, negate), `I2` slot.
+    pub i0: u8,
+    pub i0_swz: u8,
+    pub i1: u8,
+    pub i1_swz: u8,
+    pub i1_neg: bool,
+    pub i2: u8,
+}
+
+/// Assemble a [`DualIssue`] word. Bit 55 (the "skip invalid" flag every corpus word carries) is
+/// set; the predicate is always.
+pub fn dual_issue(d: &DualIssue) -> Result<u64, AsmError> {
+    let fit = |field: &'static str, value: u32, width: u8| {
+        if value >> width != 0 { Err(AsmError::FieldTooWide { field, width, value }) } else { Ok(u64::from(value)) }
+    };
+    let prim_hi = if d.four_lane { 0 } else { u32::from(d.primary >> 3) };
+    if d.four_lane && d.primary > 7 {
+        return Err(AsmError::FieldTooWide { field: "primary (four-lane)", width: 3, value: u32::from(d.primary) });
+    }
+    let w = if d.four_lane { u32::from(d.mask[3]) } else { prim_hi };
+    let mut word = (if d.four_lane { 5u64 } else { 4u64 }) << 59;
+    word |= fit("i1_neg", u32::from(d.i1_neg), 1)? << 58;
+    word |= 1u64 << 55;
+    word |= fit("bit54", w, 1)? << 54;
+    word |= fit("half", u32::from(d.half), 1)? << 53;
+    word |= fit("i1_swz", u32::from(d.i1_swz), 5)? >> 4 << 52;
+    word |= fit("u_swz", u32::from(d.u_swz), 4)? << 48;
+    word |= fit("u_neg", u32::from(d.u_neg), 1)? << 47;
+    word |= fit("primary", u32::from(d.primary & 7), 3)? << 44;
+    word |= fit("secondary", u32::from(d.secondary >> 3), 1)? << 43;
+    word |= fit("reg_to_primary", u32::from(d.reg_to_primary), 1)? << 42;
+    word |= fit("i0_swz", u32::from(d.i0_swz), 4)? << 38;
+    word |= (fit("i1_swz", u32::from(d.i1_swz), 5)? & 0xf) << 34;
+    word |= fit("dst_bank", u32::from(d.dst_bank), 2)? << 32;
+    word |= fit("u_bank", u32::from(d.u_bank), 2)? << 30;
+    word |= fit("dst_i", u32::from(d.dst_i), 2)? << 28;
+    word |= fit("dst_num", u32::from(d.dst_num), 7)? << 21;
+    word |= fit("secondary", u32::from(d.secondary & 7), 3)? << 18;
+    word |= fit("nsel", u32::from(d.nsel), 2)? << 16;
+    word |= fit("i2", u32::from(d.i2), 2)? << 14;
+    word |= fit("i1", u32::from(d.i1), 2)? << 12;
+    word |= fit("i0", u32::from(d.i0), 2)? << 10;
+    word |= (u64::from(d.mask[2]) << 9) | (u64::from(d.mask[1]) << 8) | (u64::from(d.mask[0]) << 7);
+    word |= fit("u_num", u32::from(d.u_num), 7)?;
+    Ok(word)
 }
 
 #[cfg(test)]

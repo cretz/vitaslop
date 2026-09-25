@@ -601,7 +601,12 @@ impl GeneralRenderer {
         let skip_sampled = vitaslop_runtime::rtt_writeback::writeback_skips_sampled();
         // BOTH maps: the ordinary targets and the RAW 64-BIT ones, which live in their own
         // map (`GxmRenderer::rtt_raw`) and so have appeared in NO dump at all until now.
-        let targets = self.gxm.rtt_targets().into_iter().chain(self.gxm.rtt_raw_targets());
+        let targets = self
+            .gxm
+            .rtt_targets()
+            .into_iter()
+            .chain(self.gxm.rtt_raw_targets())
+            .chain(self.gxm.rtt_float_targets());
         for (addr, tex, w, h) in targets {
             // `skip=sampled`: a target the GPU consumes is not the CPU-read probe this seam
             // exists for. See `rtt_writeback::writeback_spec`.
@@ -625,7 +630,8 @@ impl GeneralRenderer {
             // [[vitaslop-a-captured-texel-dump-is-not-what-the-draw-samples]]. MEASURED need:
             // PCSA00002's crowd atlas (`0x8e20b030`, 256x256) is the last unmeasured input of
             // its washed-out close-up, and no instrument here could read it.
-            let texel_bytes = if tex.format() == vitaslop_platform::gpu::RAW64_FORMAT { 8 } else { 4 };
+            let half = tex.format() == wgpu::TextureFormat::Rgba16Float;
+            let texel_bytes = if tex.format() == vitaslop_platform::gpu::RAW64_FORMAT || half { 8 } else { 4 };
             let padded = (w * texel_bytes).div_ceil(ALIGN) * ALIGN;
             let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("gxm-rtt-readback"),
@@ -671,8 +677,10 @@ impl GeneralRenderer {
                 rgba.extend_from_slice(&padded_bytes[start..start + (w * texel_bytes) as usize]);
             }
             // The raw surface goes out as bytes, not as a picture - see above.
+            // A FLOAT target likewise: four IEEE halves a texel, verbatim.
             if texel_bytes == 8 {
-                let path = dir.join(format!("rtt_{addr:08x}_{w}x{h}_raw64.bin"));
+                let kind = if half { "f16" } else { "raw64" };
+                let path = dir.join(format!("rtt_{addr:08x}_{w}x{h}_{kind}.bin"));
                 if let Err(e) = std::fs::write(&path, &rgba) {
                     eprintln!("gpu chain dump: write {}: {e}", path.display());
                 }

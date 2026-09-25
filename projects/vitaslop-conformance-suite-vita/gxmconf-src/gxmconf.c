@@ -21,6 +21,45 @@
  *                              a full-viewport EQUAL ref=1 fill: only the
  *                              bottom-right QUARTER may paint, in the fill's
  *                              colour.
+ *   scene 8  REVERSED DEPTH    the surface's BACKGROUND depth set to 0.0 and
+ *                              both quads tested GREATER_EQUAL: a NEAR quad (z
+ *                              0.9) over the right half FIRST, then a far one
+ *                              (z 0.1) over everything. Left far, right near.
+ *   scene 9  REVERSED DEPTH, REAL SHADERS  scene 8 again, drawn through REAL
+ *                              vertex + fragment programs (gxmconf_shaders.h), so
+ *                              it takes the recompiled path every title takes.
+ *   scene 10 U8_A SURFACE      a half-alpha red quad through the real programs
+ *                              into a single-channel U8_A surface: the one
+ *                              channel stores ALPHA (0x80), never red (0xff).
+ *   scene 11 STACKED CUBE      six differently coloured 16x16 faces rendered
+ *                              into ONE 16x128 surface, face k in rows 16k..
+ *                              (the layout a fighting title renders its image-
+ *                              based lighting in).
+ *   scene 12 SAMPLE THE CUBE   the same memory bound as a 16x16 CUBE texture
+ *                              and sampled along +X, +Y and +Z in three
+ *                              vertical strips: faces 0, 2 and 4 - red, green,
+ *                              blue. Only meaningful rendered in ONE frame with
+ *                              scene 11 (the faces exist only on the GPU).
+ *   scene 13 UNTYPED POSITION  a full green quad through the real programs
+ *                              whose position attribute is declared UNTYPED -
+ *                              raw 32-bit words the fetch must pass through
+ *                              unconverted. Every pixel painted.
+ *   scene 14 COLOUR MASK       a white quad over the left half through a program
+ *                              whose colorMask is R alone, and one over the right
+ *                              half with A alone. Left: red over the clear's G/B;
+ *                              right: the clear's RGB untouched (A is bit 0).
+ *   scene 15 SET FORMAT, COPY  a CPU-filled cube texture initialised U2F10F10F10,
+ *                              re-formatted A8B8G8R8 by sceGxmTextureSetFormat,
+ *                              then COPIED and the copy bound: the scene 12
+ *                              strips must read red, green and blue.
+ *   scene 16 QUADRANTS         four coloured quadrants into a 64x64 target:
+ *                              top-left red, top-right green, bottom-left
+ *                              blue, bottom-right yellow.
+ *   scene 17 SUB-RECTANGLE     a 32x32 LINEAR_STRIDED texture naming the
+ *                              bottom-right quadrant (an INTERIOR address, the
+ *                              target's pitch), sampled at uv (0.25, 0.25):
+ *                              yellow. Binding the whole target reads red.
+ *                              Rendered in ONE frame with scene 16.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS APP EXISTS, GIVEN THE SHADER CONFORMANCE SUITE ALREADY DOES
@@ -70,6 +109,13 @@
 #define SURFACE_HEIGHT 128
 #define SURFACE_STRIDE 128
 
+/* Scene 11's stacked cube: 16x16 faces in a 16x128 surface (six faces + spare rows). */
+#define CUBE_FACE      16
+#define CUBE_SURFACE_H 128
+
+/* Scenes 16-17's quadrant target: 64x64, its bottom-right 32x32 named as a texture. */
+#define QUAD_TARGET 64
+
 /* The left half, in pixels - what scene 1 clips to and scene 5's viewport covers. */
 #define HALF_W (SURFACE_WIDTH / 2)
 
@@ -82,6 +128,15 @@ __attribute__((aligned(64)))
 static const unsigned char conf_vert_gxp[64] = { 'G', 'X', 'P', 0 };
 __attribute__((aligned(64)))
 static const unsigned char conf_frag_gxp[64] = { 'G', 'X', 'P', 0 };
+
+/* ---- REAL shaders, for the scenes that must take the recompiled path ----
+ * Placeholder programs leave a draw to the renderer's fixed-function
+ * reconstruction, which is not the path any title's draws take - and which
+ * cannot see state that only the recompiled path honours (a depth rule on an
+ * NDC draw, a single-channel target's alpha). These two containers are
+ * authored with this project's own assembler and generated into the header by
+ * `vitaslop-gxp-shader/tests/conformance.rs`, which keeps it current. */
+#include "gxmconf_shaders.h"
 
 /* ---- geometry ----------------------------------------------------------- */
 typedef struct {
@@ -167,8 +222,8 @@ static void *fragment_usse_alloc(unsigned int size, SceUID *uid, unsigned int *u
  * Which of "the capture snapshots a draw's vertices later than the draw" and "the guest may
  * not reuse a buffer inside a frame" is the real rule is a separate question, and a
  * conformance app is the wrong place to be asking it - so there is nothing to alias: eleven
- * draws, forty-four vertices, all written before the first BeginScene. */
-#define QUADS        11
+ * draws, fifty-two vertices (thirteen quads), all written before the first BeginScene. */
+#define QUADS        33
 #define MAX_VERTICES (QUADS * 4)
 /* First vertex of quad `q`, for `sceGxmSetVertexStream`. */
 #define QUAD_AT(q) ((q) * 4)
@@ -349,6 +404,164 @@ int main(void) {
 		SCE_GXM_MULTISAMPLE_NONE, &blend_info, vert_program,
 		&blend_program);
 
+	/* --- 7b. the REAL program pair (scenes 9 and 10). Same vertex layout as the
+	 * placeholder pair, but the colour attribute feeds the program's own
+	 * `IN.color` parameter at primary-attribute register 4. --- */
+	const SceGxmProgram *real_vert = (const SceGxmProgram *)conf_real_vert_gxp;
+	const SceGxmProgram *real_frag = (const SceGxmProgram *)conf_real_frag_gxp;
+	sceGxmProgramCheck(real_vert);
+	sceGxmProgramCheck(real_frag);
+	SceGxmShaderPatcherId real_vert_id, real_frag_id;
+	sceGxmShaderPatcherRegisterProgram(patcher, real_vert, &real_vert_id);
+	sceGxmShaderPatcherRegisterProgram(patcher, real_frag, &real_frag_id);
+
+	SceGxmVertexAttribute real_attributes[2];
+	rt_memset(real_attributes, 0, sizeof(real_attributes));
+	real_attributes[0] = attributes[0];
+	real_attributes[1] = attributes[1];
+	real_attributes[1].regIndex = 4;
+
+	SceGxmVertexProgram *real_vertex_program = NULL;
+	sceGxmShaderPatcherCreateVertexProgram(patcher, real_vert_id,
+		real_attributes, 2, streams, 1, &real_vertex_program);
+	/* The same program with its position declared UNTYPED (scene 13): the
+	 * floats are the same bytes, handed over as raw words. A fighting title's
+	 * engine clears its targets with exactly such a triangle. */
+	SceGxmVertexAttribute untyped_attributes[2];
+	untyped_attributes[0] = real_attributes[0];
+	untyped_attributes[1] = real_attributes[1];
+	untyped_attributes[0].format = SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED;
+	SceGxmVertexProgram *untyped_vertex_program = NULL;
+	sceGxmShaderPatcherCreateVertexProgram(patcher, real_vert_id,
+		untyped_attributes, 2, streams, 1, &untyped_vertex_program);
+	SceGxmFragmentProgram *real_fragment_program = NULL;
+	sceGxmShaderPatcherCreateFragmentProgram(patcher, real_frag_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+		SCE_GXM_MULTISAMPLE_NONE, NULL, real_vert,
+		&real_fragment_program);
+
+	/* Scene 14's two masked programs: no blending (ONE/ZERO), one channel each. */
+	SceGxmBlendInfo mask_info;
+	rt_memset(&mask_info, 0, sizeof(mask_info));
+	mask_info.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
+	mask_info.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
+	mask_info.colorSrc  = SCE_GXM_BLEND_FACTOR_ONE;
+	mask_info.colorDst  = SCE_GXM_BLEND_FACTOR_ZERO;
+	mask_info.alphaSrc  = SCE_GXM_BLEND_FACTOR_ONE;
+	mask_info.alphaDst  = SCE_GXM_BLEND_FACTOR_ZERO;
+	mask_info.colorMask = SCE_GXM_COLOR_MASK_R;
+	SceGxmFragmentProgram *mask_r_program = NULL;
+	sceGxmShaderPatcherCreateFragmentProgram(patcher, real_frag_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+		SCE_GXM_MULTISAMPLE_NONE, &mask_info, real_vert,
+		&mask_r_program);
+	mask_info.colorMask = SCE_GXM_COLOR_MASK_A;
+	SceGxmFragmentProgram *mask_a_program = NULL;
+	sceGxmShaderPatcherCreateFragmentProgram(patcher, real_frag_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+		SCE_GXM_MULTISAMPLE_NONE, &mask_info, real_vert,
+		&mask_a_program);
+
+	/* A single-channel ALPHA surface for scene 10, the size of the main one. */
+	SceUID alpha_uid;
+	void *alpha_buffer = gpu_alloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
+		SURFACE_STRIDE * SURFACE_HEIGHT, SCE_GXM_MEMORY_ATTRIB_RW, &alpha_uid);
+	SceGxmColorSurface alpha_surface;
+	sceGxmColorSurfaceInit(&alpha_surface,
+		SCE_GXM_COLOR_FORMAT_U8_A,
+		SCE_GXM_COLOR_SURFACE_LINEAR,
+		SCE_GXM_COLOR_SURFACE_SCALE_NONE,
+		SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT,
+		SURFACE_WIDTH, SURFACE_HEIGHT, SURFACE_STRIDE, alpha_buffer);
+
+	/* A 16x128 surface holding a stacked cube (scene 11), its own render
+	 * target, and the cube texture that names the same memory (scene 12). */
+	SceUID cube_uid;
+	void *cube_buffer = gpu_alloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
+		CUBE_FACE * CUBE_SURFACE_H * 4, SCE_GXM_MEMORY_ATTRIB_RW, &cube_uid);
+	SceGxmColorSurface cube_surface;
+	sceGxmColorSurfaceInit(&cube_surface,
+		SCE_GXM_COLOR_FORMAT_A8B8G8R8,
+		SCE_GXM_COLOR_SURFACE_LINEAR,
+		SCE_GXM_COLOR_SURFACE_SCALE_NONE,
+		SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT,
+		CUBE_FACE, CUBE_SURFACE_H, CUBE_FACE, cube_buffer);
+	SceGxmRenderTargetParams cube_rt_params = rt_params;
+	cube_rt_params.width  = CUBE_FACE;
+	cube_rt_params.height = CUBE_SURFACE_H;
+	SceGxmRenderTarget *cube_target = NULL;
+	sceGxmCreateRenderTarget(&cube_rt_params, &cube_target);
+	SceGxmTexture cube_texture;
+	sceGxmTextureInitCube(&cube_texture, cube_buffer,
+		SCE_GXM_TEXTURE_FORMAT_A8B8G8R8, CUBE_FACE, CUBE_FACE, 1);
+
+	const SceGxmProgram *cube_frag = (const SceGxmProgram *)conf_cube_frag_gxp;
+	sceGxmProgramCheck(cube_frag);
+	SceGxmShaderPatcherId cube_frag_id;
+	sceGxmShaderPatcherRegisterProgram(patcher, cube_frag, &cube_frag_id);
+	SceGxmFragmentProgram *cube_fragment_program = NULL;
+	sceGxmShaderPatcherCreateFragmentProgram(patcher, cube_frag_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+		SCE_GXM_MULTISAMPLE_NONE, NULL, real_vert,
+		&cube_fragment_program);
+
+	/* Scene 15's cube: CPU-filled faces (0 red, 2 green, 4 blue, the rest grey),
+	 * initialised as U2F10F10F10 - a format whose top bit lives in control word 0 -
+	 * then set to A8B8G8R8, then COPIED. The copy carries no call history, only its
+	 * control words, so it reads what SetFormat left there. A fighting title
+	 * (PCSE00235) does exactly this with its image-based-lighting cubes. */
+	SceUID setfmt_uid;
+	unsigned int *setfmt_texels = gpu_alloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
+		CUBE_FACE * CUBE_FACE * 6 * 4, SCE_GXM_MEMORY_ATTRIB_READ, &setfmt_uid);
+	{
+		static const unsigned int face_colour[6] = {
+			RED, 0xff808080u, GREEN, 0xff808080u, BLUE, 0xff808080u
+		};
+		for (int k = 0; k < 6; k++)
+			for (int t = 0; t < CUBE_FACE * CUBE_FACE; t++)
+				setfmt_texels[k * CUBE_FACE * CUBE_FACE + t] = face_colour[k];
+	}
+	SceGxmTexture setfmt_texture;
+	sceGxmTextureInitCube(&setfmt_texture, setfmt_texels,
+		SCE_GXM_TEXTURE_FORMAT_U2F10F10F10_ABGR, CUBE_FACE, CUBE_FACE, 1);
+	sceGxmTextureSetFormat(&setfmt_texture, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+	SceGxmTexture setfmt_copy = setfmt_texture;
+
+	/* Scenes 16-17: a 64x64 target, and a texture naming its bottom-right
+	 * quadrant through an INTERIOR address at the target's own pitch - how a
+	 * fighting title (PCSE00235) samples the levels of its bloom chain, all
+	 * packed into one surface. */
+	SceUID quad_uid;
+	unsigned int *quad_buffer = gpu_alloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
+		QUAD_TARGET * QUAD_TARGET * 4, SCE_GXM_MEMORY_ATTRIB_RW, &quad_uid);
+	SceGxmColorSurface quad_surface;
+	sceGxmColorSurfaceInit(&quad_surface,
+		SCE_GXM_COLOR_FORMAT_A8B8G8R8,
+		SCE_GXM_COLOR_SURFACE_LINEAR,
+		SCE_GXM_COLOR_SURFACE_SCALE_NONE,
+		SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT,
+		QUAD_TARGET, QUAD_TARGET, QUAD_TARGET, quad_buffer);
+	SceGxmRenderTargetParams quad_rt_params = rt_params;
+	quad_rt_params.width  = QUAD_TARGET;
+	quad_rt_params.height = QUAD_TARGET;
+	SceGxmRenderTarget *quad_target = NULL;
+	sceGxmCreateRenderTarget(&quad_rt_params, &quad_target);
+	SceGxmTexture subrect_texture;
+	sceGxmTextureInitLinearStrided(&subrect_texture,
+		quad_buffer + (QUAD_TARGET / 2) * QUAD_TARGET + QUAD_TARGET / 2,
+		SCE_GXM_TEXTURE_FORMAT_A8B8G8R8, QUAD_TARGET / 2, QUAD_TARGET / 2,
+		QUAD_TARGET * 4);
+
+	const SceGxmProgram *tex2d_frag = (const SceGxmProgram *)conf_tex2d_frag_gxp;
+	sceGxmProgramCheck(tex2d_frag);
+	SceGxmShaderPatcherId tex2d_frag_id;
+	sceGxmShaderPatcherRegisterProgram(patcher, tex2d_frag, &tex2d_frag_id);
+	SceGxmFragmentProgram *tex2d_fragment_program = NULL;
+	sceGxmShaderPatcherCreateFragmentProgram(patcher, tex2d_frag_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+		SCE_GXM_MULTISAMPLE_NONE, NULL, real_vert,
+		&tex2d_fragment_program);
+
 	/* --- 8. geometry buffers --- */
 	SceUID vbo_uid, ibo_uid;
 	ConfVertex *vertices = gpu_alloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
@@ -374,6 +587,37 @@ int main(void) {
 	fill_quad(&vertices[QUAD_AT(8)], -1.0f, -1.0f, 1.0f, 1.0f, 0.5f, GREEN);   /* 8: vp + clip  */
 	fill_quad(&vertices[QUAD_AT(9)],  0.0f, -1.0f, 1.0f, 0.0f, 0.5f, RED);     /* 9: stencil mark (bottom-right; its red must NEVER appear) */
 	fill_quad(&vertices[QUAD_AT(10)], -1.0f, -1.0f, 1.0f, 1.0f, 0.5f, BLUE);   /* 10: stencil fill */
+	fill_quad(&vertices[QUAD_AT(11)], -1.0f, -1.0f, 1.0f, 1.0f, 0.1f, RED);    /* 11: reversed far  */
+	fill_quad(&vertices[QUAD_AT(12)],  0.0f, -1.0f, 1.0f, 1.0f, 0.9f, GREEN);  /* 12: reversed near */
+	fill_quad(&vertices[QUAD_AT(13)], -1.0f, -1.0f, 1.0f, 1.0f, 0.1f, RED);    /* 13: real reversed far  */
+	fill_quad(&vertices[QUAD_AT(14)],  0.0f, -1.0f, 1.0f, 1.0f, 0.9f, GREEN);  /* 14: real reversed near */
+	fill_quad(&vertices[QUAD_AT(15)], -1.0f, -1.0f, 1.0f, 1.0f, 0.5f, RED_HALF); /* 15: U8_A fill */
+	/* 16..21: the six cube faces, face k over rows 16k..16k+16 of the 128-row
+	 * surface (NDC +1 is row 0), each its own colour. */
+	{
+		static const unsigned int face_colour[6] = {
+			RED, 0xff00ffffu /* yellow */, GREEN, 0xffff00ffu /* magenta */, BLUE, 0xffffff00u /* cyan */
+		};
+		for (int k = 0; k < 6; k++) {
+			float top = 1.0f - 2.0f * (float)(CUBE_FACE * k) / (float)CUBE_SURFACE_H;
+			float bottom = 1.0f - 2.0f * (float)(CUBE_FACE * (k + 1)) / (float)CUBE_SURFACE_H;
+			fill_quad(&vertices[QUAD_AT(16 + k)], -1.0f, bottom, 1.0f, top, 0.5f, face_colour[k]);
+		}
+	}
+	/* 22..24: three vertical strips whose colour attribute IS the cube direction:
+	 * +X (red), +Y (green), +Z (blue). */
+	fill_quad(&vertices[QUAD_AT(22)], -1.0f, -1.0f, -1.0f / 3.0f, 1.0f, 0.5f, RED);
+	fill_quad(&vertices[QUAD_AT(23)], -1.0f / 3.0f, -1.0f, 1.0f / 3.0f, 1.0f, 0.5f, GREEN);
+	fill_quad(&vertices[QUAD_AT(24)], 1.0f / 3.0f, -1.0f, 1.0f, 1.0f, 0.5f, BLUE);
+	fill_quad(&vertices[QUAD_AT(25)], -1.0f, -1.0f, 1.0f, 1.0f, 0.5f, GREEN);  /* 25: untyped */
+	fill_quad(&vertices[QUAD_AT(26)], -1.0f, -1.0f, 0.0f, 1.0f, 0.5f, 0xffffffffu); /* 26: mask R, left  */
+	fill_quad(&vertices[QUAD_AT(27)],  0.0f, -1.0f, 1.0f, 1.0f, 0.5f, 0xffffffffu); /* 27: mask A, right */
+	fill_quad(&vertices[QUAD_AT(28)], -1.0f,  0.0f, 0.0f, 1.0f, 0.5f, RED);   /* 28: top-left     */
+	fill_quad(&vertices[QUAD_AT(29)],  0.0f,  0.0f, 1.0f, 1.0f, 0.5f, GREEN); /* 29: top-right    */
+	fill_quad(&vertices[QUAD_AT(30)], -1.0f, -1.0f, 0.0f, 0.0f, 0.5f, BLUE);  /* 30: bottom-left  */
+	fill_quad(&vertices[QUAD_AT(31)],  0.0f, -1.0f, 1.0f, 0.0f, 0.5f, 0xff00ffffu); /* 31: bottom-right, yellow */
+	/* 32: full quad whose colour IS the uv: 0x40/255 = 0.25 in both. */
+	fill_quad(&vertices[QUAD_AT(32)], -1.0f, -1.0f, 1.0f, 1.0f, 0.5f, 0xff004040u);
 
 	/* ================================================================== *
 	 *  scene 0 - BASELINE: one quad over the whole viewport.
@@ -610,9 +854,206 @@ int main(void) {
 	sceGxmSetFrontStencilRef(context, 0);
 	sceGxmEndScene(context, NULL, NULL);
 
+	/* ================================================================== *
+	 *  scene 8 - REVERSED DEPTH: the depth surface clears to 0.0 and the
+	 *  test is GREATER_EQUAL, so LARGER z is nearer - the range a fighting
+	 *  title (PCSE00235) draws its whole world in.
+	 *
+	 *  The NEAR quad (z 0.9, green) over the right half is drawn FIRST,
+	 *  then the FAR quad (z 0.1, red) over everything. Left must be red and
+	 *  right must STAY green. Each wrong renderer leaves its own picture:
+	 *  one that starts from 1.0 fails every fragment (nothing painted), one
+	 *  that ignores the test, or tests the wrong way round, lets the later
+	 *  far quad paint the right half red. Drawing far-then-near would pass a renderer with no depth test
+	 *  at all, which is the ordering this scene exists not to have.
+	 * ================================================================== */
+	sceGxmDepthStencilSurfaceSetBackgroundDepth(&depth_surface, 0.0f);
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &color_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, vertex_program);
+	sceGxmSetFragmentProgram(context, fragment_program);
+	sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_GREATER_EQUAL);
+	sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_ENABLED);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(12)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(11)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+	sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+	sceGxmEndScene(context, NULL, NULL);
+	sceGxmDepthStencilSurfaceSetBackgroundDepth(&depth_surface, 1.0f);
+
+	/* ================================================================== *
+	 *  scene 9 - REVERSED DEPTH THROUGH REAL SHADERS: scene 8's draws,
+	 *  state and expected picture, but through the real program pair, so
+	 *  the draws take the recompiled path - which is the path a title's
+	 *  draws take, and the only one that honours a depth rule on an
+	 *  NDC-space draw.
+	 * ================================================================== */
+	sceGxmDepthStencilSurfaceSetBackgroundDepth(&depth_surface, 0.0f);
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &color_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, real_vertex_program);
+	sceGxmSetFragmentProgram(context, real_fragment_program);
+	sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_GREATER_EQUAL);
+	sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_ENABLED);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(14)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(13)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+	sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+	sceGxmEndScene(context, NULL, NULL);
+	sceGxmDepthStencilSurfaceSetBackgroundDepth(&depth_surface, 1.0f);
+
+	/* ================================================================== *
+	 *  scene 10 - A U8_A SURFACE STORES ALPHA: a half-alpha RED quad
+	 *  (0x800000ff) over the whole viewport into a single-channel U8_A
+	 *  surface. Its one byte per pixel must be the ALPHA, 0x80. A renderer
+	 *  that treats the one channel as red stores 0xff - which is what a
+	 *  fighting title's (PCSE00235) glow mask was, a solid block.
+	 * ================================================================== */
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &alpha_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, real_vertex_program);
+	sceGxmSetFragmentProgram(context, real_fragment_program);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(15)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmEndScene(context, NULL, NULL);
+
+	/* ================================================================== *
+	 *  scene 11 - A STACKED CUBE: six faces into one 16x128 surface.
+	 * ================================================================== */
+	sceGxmBeginScene(context, 0, cube_target, NULL, NULL,
+		sync, &cube_surface, NULL);
+	sceGxmSetVertexProgram(context, real_vertex_program);
+	sceGxmSetFragmentProgram(context, real_fragment_program);
+	for (int k = 0; k < 6; k++) {
+		sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(16 + k)]);
+		sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+			SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	}
+	sceGxmEndScene(context, NULL, NULL);
+
+	/* ================================================================== *
+	 *  scene 12 - SAMPLE IT AS A CUBE: +X, +Y and +Z strips must read
+	 *  faces 0, 2 and 4 - red, green and blue.
+	 * ================================================================== */
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &color_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, real_vertex_program);
+	sceGxmSetFragmentProgram(context, cube_fragment_program);
+	sceGxmSetFragmentTexture(context, 0, &cube_texture);
+	for (int k = 0; k < 3; k++) {
+		sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(22 + k)]);
+		sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+			SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	}
+	sceGxmEndScene(context, NULL, NULL);
+
+	/* ================================================================== *
+	 *  scene 13 - AN UNTYPED POSITION: a full green quad whose position
+	 *  attribute is declared UNTYPED. Every pixel must be painted; a fetch
+	 *  that does not pass raw words through collapses it to nothing.
+	 * ================================================================== */
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &color_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, untyped_vertex_program);
+	sceGxmSetFragmentProgram(context, real_fragment_program);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(25)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmEndScene(context, NULL, NULL);
+
+	/* ================================================================== *
+	 *  scene 14 - COLOUR MASK: white through colorMask R over the left
+	 *  half, white through colorMask A over the right. SceGxmColorMask
+	 *  numbers A as bit 0, then R, G, B: the left half must turn red over
+	 *  the clear's green and blue, the right keep the clear's colour. A
+	 *  reader that takes bit 0 for red paints the left GREEN and the right
+	 *  RED - a fighting title's (PCSE00235) hair pass, mask RGB-no-alpha,
+	 *  lost its red that way and came out cyan.
+	 * ================================================================== */
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &color_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, real_vertex_program);
+	sceGxmSetFragmentProgram(context, mask_r_program);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(26)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmSetFragmentProgram(context, mask_a_program);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(27)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmEndScene(context, NULL, NULL);
+
+	/* ================================================================== *
+	 *  scene 15 - SET FORMAT, THEN COPY: scene 12's three strips through
+	 *  the COPIED, re-formatted cube. They must read faces 0, 2, 4 - red,
+	 *  green, blue. A copy decoded with the init's format (or no format)
+	 *  reads black or garbage.
+	 * ================================================================== */
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &color_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, real_vertex_program);
+	sceGxmSetFragmentProgram(context, cube_fragment_program);
+	sceGxmSetFragmentTexture(context, 0, &setfmt_copy);
+	for (int k = 0; k < 3; k++) {
+		sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(22 + k)]);
+		sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+			SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	}
+	sceGxmEndScene(context, NULL, NULL);
+
+	/* ================================================================== *
+	 *  scene 16 - QUADRANTS into the 64x64 target.
+	 * ================================================================== */
+	sceGxmBeginScene(context, 0, quad_target, NULL, NULL,
+		sync, &quad_surface, NULL);
+	sceGxmSetVertexProgram(context, real_vertex_program);
+	sceGxmSetFragmentProgram(context, real_fragment_program);
+	for (int k = 0; k < 4; k++) {
+		sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(28 + k)]);
+		sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+			SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	}
+	sceGxmEndScene(context, NULL, NULL);
+
+	/* ================================================================== *
+	 *  scene 17 - SAMPLE THE SUB-RECTANGLE: the bottom-right quadrant as
+	 *  its own 32x32 texture, at uv (0.25, 0.25). Yellow everywhere.
+	 * ================================================================== */
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &color_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, real_vertex_program);
+	sceGxmSetFragmentProgram(context, tex2d_fragment_program);
+	sceGxmSetFragmentTexture(context, 0, &subrect_texture);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(32)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmEndScene(context, NULL, NULL);
+
 	sceGxmFinish(context);
 
 	/* --- teardown --- */
+	sceGxmShaderPatcherReleaseFragmentProgram(patcher, tex2d_fragment_program);
+	sceGxmShaderPatcherUnregisterProgram(patcher, tex2d_frag_id);
+	sceGxmDestroyRenderTarget(quad_target);
+	sceGxmShaderPatcherReleaseFragmentProgram(patcher, mask_a_program);
+	sceGxmShaderPatcherReleaseFragmentProgram(patcher, mask_r_program);
+	sceGxmShaderPatcherReleaseFragmentProgram(patcher, cube_fragment_program);
+	sceGxmShaderPatcherUnregisterProgram(patcher, cube_frag_id);
+	sceGxmDestroyRenderTarget(cube_target);
+	sceGxmShaderPatcherReleaseFragmentProgram(patcher, real_fragment_program);
+	sceGxmShaderPatcherReleaseVertexProgram(patcher, untyped_vertex_program);
+	sceGxmShaderPatcherReleaseVertexProgram(patcher, real_vertex_program);
+	sceGxmShaderPatcherUnregisterProgram(patcher, real_vert_id);
+	sceGxmShaderPatcherUnregisterProgram(patcher, real_frag_id);
 	sceGxmShaderPatcherReleaseFragmentProgram(patcher, blend_program);
 	sceGxmShaderPatcherReleaseFragmentProgram(patcher, fragment_program);
 	sceGxmShaderPatcherReleaseVertexProgram(patcher, vertex_program);

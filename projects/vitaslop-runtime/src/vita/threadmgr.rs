@@ -88,24 +88,64 @@ pub(super) fn change_thread_vfp_exception(_clear_mask: i32, _set_mask: i32) -> i
 
 /// int sceKernelCheckCallback(void)
 ///
-/// Run the CALLING thread's pending kernel callbacks and report how many ran. A title puts
-/// it in its main loop so that callbacks it registered with `sceKernelCreateCallback` -
-/// power/exit notifications, its own `sceKernelNotifyCallback` posts - are delivered at a
-/// point of its choosing rather than inside an arbitrary wait.
-///
-/// **ZERO here is the complete answer, not a stub.** A callback can only exist if it was
-/// created, and `sceKernelCreateCallback` has no handler in this engine at all: a title that
-/// makes one gets the unimplemented-NID hard-fail naming it, by the same rule as every other
-/// unhandled call. So a title that reaches HERE has no callback object, nothing can be
-/// pending for it, and "none ran" is what the kernel would report. There is no silent gap
-/// behind this: the moment a title actually uses the callback surface, the run stops and
-/// says so.
+/// Run the CALLING thread's pending kernel callbacks (see [`crate::host::KCallback`]). A
+/// title puts it in its main loop so callbacks it made with `sceKernelCreateCallback` -
+/// its vblank handler, its own `sceKernelNotifyCallback` posts - run at a point of its
+/// choosing. One pending callback is delivered per call: it runs on its own fiber at the
+/// caller's priority while the caller is parked, and the call returns 1; with nothing
+/// pending it returns 0 at once.
 ///
 /// The service-state pumps (`sceNpCheckCallback`, `sceNetCtlCheckCallback`) are a different
 /// mechanism with their own registration and their own deliveries - see `vita::services`.
+pub(super) fn check_callback(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    if st.kcb_deliver_one() {
+        ctx.ret(1);
+        return SvcOutcome::Block;
+    }
+    ctx.ret(0);
+    SvcOutcome::Continue
+}
+
+/// `SCE_KERNEL_ERROR_UNKNOWN_CALLBACK_ID`.
+const ERR_UNKNOWN_CALLBACK_ID: i32 = 0x8002_8190_u32 as i32;
+
+/// int sceKernelCreateCallback(const char *name, unsigned int attr,
+///     SceKernelCallbackFunction func, void *userData)
+pub(super) fn create_callback(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let (name_ptr, func, common) = (ctx.arg(0), ctx.arg(2), ctx.arg(3));
+    let name = if name_ptr != 0 { ctx.read_cstr(name_ptr, 31) } else { String::new() };
+    let uid = st.kcb_create(name, func, common);
+    ctx.ret(uid as u32);
+}
+
+/// int sceKernelDeleteCallback(SceUID cb)
 #[hostcall]
-pub(super) fn check_callback(_st: &mut VitaState) -> i32 {
-    0
+pub(super) fn delete_callback(st: &mut VitaState, uid: i32) -> i32 {
+    if st.kcb_delete(uid) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+}
+
+/// int sceKernelNotifyCallback(SceUID cb, int arg2)
+#[hostcall]
+pub(super) fn notify_callback(st: &mut VitaState, uid: i32, arg: i32) -> i32 {
+    if st.kcb_notify(uid, arg as u32) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+}
+
+/// int sceKernelCancelCallback(SceUID cb)
+#[hostcall]
+pub(super) fn cancel_callback(st: &mut VitaState, uid: i32) -> i32 {
+    if st.kcb_cancel(uid) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+}
+
+/// int sceKernelGetCallbackCount(SceUID cb)
+#[hostcall]
+pub(super) fn get_callback_count(st: &mut VitaState, uid: i32) -> i32 {
+    st.kcb_count(uid).map_or(ERR_UNKNOWN_CALLBACK_ID, |n| n as i32)
+}
+
+/// int sceDisplayRegisterVblankStartCallback(SceUID uid) / ...Unregister...: every vblank
+/// edge from here on is one notification of `uid`.
+pub(super) fn vblank_start_callback_raw(st: &mut VitaState, uid: i32, on: bool) -> i32 {
+    if st.kcb_vblank(uid, on) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
 }
 
 /// int sceKernelChangeThreadPriority(SceUID thid, int priority)

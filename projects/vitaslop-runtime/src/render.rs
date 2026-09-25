@@ -5197,7 +5197,7 @@ pub fn render_frame_chain(
     let display = last.color.as_ref().map(|c| c.data_addr);
 
     let mut fb = Framebuffer::new(rw, rh, clear);
-    let mut depth = vec![f32::INFINITY; (rw * rh) as usize];
+    let mut depth = vec![soft_depth_clear(last); (rw * rh) as usize];
     // Each offscreen target's rendered image, at its NATIVE size (that is the size a
     // later pass samples it at), keyed by the colour surface's guest address.
     let mut rendered: HashMap<u32, Framebuffer> = HashMap::new();
@@ -5326,7 +5326,7 @@ pub fn render_frame_chain(
             // An intermediate image clears to TRANSPARENT black, not to the display's
             // clear colour: a composite that blends it must see nothing where the pass
             // drew nothing.
-            (Framebuffer::new(tw, th, [0, 0, 0, 0]), vec![f32::INFINITY; (tw * th) as usize])
+            (Framebuffer::new(tw, th, [0, 0, 0, 0]), vec![soft_depth_clear(scene); (tw * th) as usize])
         });
         render_scene_onto(&mut entry.0, &mut entry.1, scene, s as f32, [0, 0, 0, 0], &rendered);
         if debug {
@@ -5415,7 +5415,7 @@ fn rtt_substitute(image: &Framebuffer, proto: &BoundTexture) -> BoundTexture {
 /// caller downsamples the result. `clear` is the background color.
 fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], ssaa: u32) -> Framebuffer {
     let mut fb = Framebuffer::new(width, height, clear);
-    let mut depth = vec![f32::INFINITY; (width * height) as usize];
+    let mut depth = vec![soft_depth_clear(scene); (width * height) as usize];
     render_scene_onto(&mut fb, &mut depth, scene, ssaa.max(1) as f32, clear, &HashMap::new());
     fb
 }
@@ -7003,6 +7003,15 @@ fn report_color_surface_format(c: &crate::capture::ColorSurface) {
             c.height,
             c.format
         );
+    } else if vitaslop_platform::gpu::float_color_format(c.format) {
+        tracing::info!(
+            target: "vitaslop::render",
+            "gxm surface: {:#x} ({}x{}) is colour format {:#010x} = {name}, a FLOATING-POINT target - it is rendered into an Rgba16Float attachment (see `float_color_format`), so values above 1.0 survive.",
+            c.data_addr,
+            c.width,
+            c.height,
+            c.format
+        );
     } else if wide {
         tracing::warn!(
             target: "vitaslop::render",
@@ -7464,6 +7473,7 @@ impl RenderSceneBuilder {
             // compression cannot be part of that key without asking the question twice.
             key: upload_key(key, compressed.as_ref()),
             data_addr: t.data_addr,
+            row_bytes: t.stride,
             width,
             height,
             faces: t.faces.max(1),
@@ -8100,6 +8110,7 @@ impl RenderSceneBuilder {
                 Some(vitaslop_platform::gpu::GxpRecompile {
                     vprog: d.vprog.clone(),
                     fprog: d.fprog.clone(),
+                    fprog_patched_vprog: d.fprog_patched_vprog.clone(),
                     vert_sa: d.vert_sa.clone(),
                     frag_sa: d.frag_sa.clone(),
                     frag_sa_addr: d.frag_sa_addr,
@@ -8267,6 +8278,7 @@ impl RenderSceneBuilder {
             // above says this surface stores a resolved image; this says what was resolved
             // into it. See `gpu::gxm_sample_count`.
             multisample: scene.multisample,
+            stride_px: c.stride_pixels,
         });
         // Where this scene's DEPTH lands, for the same reason as `target` above: a later pass
         // that samples this depth names exactly this address.
@@ -8337,6 +8349,7 @@ impl RenderSceneBuilder {
             depth_scale,
             depth_addr,
             stencil_clear: scene.depth.map(|d| (d.background_control & 0xff) as u8).unwrap_or(0),
+            depth_clear: scene_depth_clear(scene.depth.as_ref()),
             depth_extent,
             depth_extent_ambiguous,
         }
@@ -8373,6 +8386,7 @@ mod geometry_tests {
             world: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             vprog: crate::capture::no_program(),
             fprog: crate::capture::no_program(),
+            fprog_patched_vprog: crate::capture::no_program(),
             vert_sa: std::sync::Arc::from(&[][..]),
             frag_sa: std::sync::Arc::from(&[][..]),
             frag_sa_addr: 0,
@@ -9383,7 +9397,7 @@ mod supersample_tests {
             uniforms: vec![], textures: vec![tex].into(), vertex_textures: std::sync::Arc::from(&[][..]), render_state: std::sync::Arc::new(RenderState::default()),
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
-            vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
+            vprog: crate::capture::no_program(), fprog: crate::capture::no_program(), fprog_patched_vprog: crate::capture::no_program(),
             vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), frag_mem_windows: Vec::new(), shader_expanded: false,
         };
         let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![draw] };
@@ -9443,7 +9457,7 @@ mod supersample_tests {
             uniforms: vec![], textures: vec![tex].into(), vertex_textures: std::sync::Arc::from(&[][..]), render_state: std::sync::Arc::new(RenderState::default()),
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
-            vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
+            vprog: crate::capture::no_program(), fprog: crate::capture::no_program(), fprog_patched_vprog: crate::capture::no_program(),
             vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), frag_mem_windows: Vec::new(), shader_expanded: false,
         };
         let s = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![draw] };
@@ -10438,4 +10452,33 @@ mod png_tests {
         let err = png_to_rgba(&png).unwrap_err();
         assert!(err.contains("color=0"), "error should name the field: {err}");
     }
+}
+
+/// The depth a scene's pass starts from: its surface's `backgroundDepth` (see
+/// `RenderScene::depth_clear`), 1.0 with no surface, and 1.0 under
+/// `VITASLOP_GXM_BACKGROUND_DEPTH=0`. A value outside [0, 1] (or not a number) is not a depth
+/// the attachment can hold, so it is clamped rather than handed to the clear.
+fn scene_depth_clear(depth: Option<&crate::capture::DepthSurface>) -> f32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        vitaslop_platform::knobs::var("VITASLOP_GXM_BACKGROUND_DEPTH").map(|v| v.trim() != "0").unwrap_or(true)
+    });
+    match depth {
+        Some(d) if on => {
+            let v = f32::from_bits(d.background_depth);
+            if v.is_nan() { 1.0 } else { v.clamp(0.0, 1.0) }
+        }
+        _ => 1.0,
+    }
+}
+
+/// The software rasteriser's starting depth for a scene: the surface's `backgroundDepth` (see
+/// [`scene_depth_clear`]), except that the DEFAULT 1.0 stays `INFINITY`, the value this
+/// rasteriser has always started from - identical for every fragment at or inside the far
+/// plane, and it keeps a fragment the projection put past it passing a LESS test as before.
+/// MEASURED need: a fighting title clears to 0.0 and tests `GREATER_EQUAL` (a reversed range);
+/// from `INFINITY` nothing could pass, and the oracle agreed with the GPU path's wrong picture.
+fn soft_depth_clear(scene: &Scene) -> f32 {
+    let v = scene_depth_clear(scene.depth.as_ref());
+    if v >= 1.0 { f32::INFINITY } else { v }
 }

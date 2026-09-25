@@ -2114,6 +2114,7 @@ struct ThreadEngine {
     r0: u32,
     r1: u32,
     r2: u32,
+    r3: u32,
     /// The resolver for the *current* resume's step Promise. The import closure (on a
     /// block/yield) or an entry's completion fills it with the encoded event; the
     /// scheduler awaits the matching Promise. Reset each loop turn.
@@ -2472,6 +2473,7 @@ impl BrowserEngine {
         r0: u32,
         r1: u32,
         r2: u32,
+        r3: u32,
         sp: u32,
         priority: i32,
     ) -> Result<BrowserThread, JsValue> {
@@ -2521,6 +2523,7 @@ impl BrowserEngine {
         engine.r0 = r0;
         engine.r1 = r1;
         engine.r2 = r2;
+        engine.r3 = r3;
 
         Ok(BrowserThread {
             thid,
@@ -2889,6 +2892,7 @@ impl BrowserEngine {
             r0: 0,
             r1: 0,
             r2: 0,
+            r3: 0,
             signal,
             cont,
             _import: import_closure,
@@ -2918,7 +2922,7 @@ impl GuestEngine for BrowserEngine {
     type Thread = BrowserThread;
 
     fn spawn(&mut self, r: &Reentry) -> Result<BrowserThread, ()> {
-        self.make_thread(r.thid, &[r.entry], r.arg_len, r.arg_ptr, r.r2, r.stack_top, r.priority)
+        self.make_thread(r.thid, &[r.entry], r.arg_len, r.arg_ptr, r.r2, r.r3, r.stack_top, r.priority)
             .map_err(|_| ())
     }
 
@@ -3098,6 +3102,7 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
             t.rt.set_reg(0, if t.entry_idx == 0 { t.r0 } else { 0 });
             t.rt.set_reg(1, if t.entry_idx == 0 { t.r1 } else { 0 });
             t.rt.set_reg(2, if t.entry_idx == 0 { t.r2 } else { 0 });
+            t.rt.set_reg(3, if t.entry_idx == 0 { t.r3 } else { 0 });
             hostcalls::note_stack_start();
             // Which thread started a stack, and which of its entries. A count alone says
             // stacks are being created; it cannot say whether that is a handful of guest
@@ -3500,6 +3505,7 @@ impl BrowserSched {
             0,
             0,
             0,
+            0,
             main_sp,
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
         )?;
@@ -3529,6 +3535,7 @@ impl BrowserSched {
         let main = engine.make_thread(
             vitaslop_runtime::host::MAIN_THID,
             entries,
+            0,
             0,
             0,
             0,

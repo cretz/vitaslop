@@ -1215,7 +1215,18 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
         // varyings block is not the layout decoded here - bind nothing rather than a wrong PA
         // register map. (`size` bit 6 was once a third; see
         // `_SIZE_BIT6_NOT_A_PREFETCH_FLAG` for the measurement that removed it.)
-        let source = attribute_info & INFO_PREFETCH_SOURCE;
+        // >>> BIT 4 OF THE SOURCE BYTE IS A FLAG, NOT PART OF THE TEXCOORD INDEX. One title sets
+        // it on every prefetch (0x10..0x17) and no other corpus ever does. MEASURED by pairing:
+        // a fragment program whose samples name 0x10, 0x11, 0x14 and 0x15 is paired with a
+        // vertex program that outputs TEXCOORD0 and TEXCOORD1 - which the fragment never
+        // iterates for itself, so they exist ONLY to be those coordinates - and TEXCOORD4/5.
+        // So the low nibble names the texcoord. What the flag selects is not established; it
+        // does not change which interpolant is the coordinate. Refusing it threw away the whole
+        // interpolant list of every world material of that title, and its stage drew black.
+        let source = match attribute_info & INFO_PREFETCH_SOURCE {
+            s @ 0x10..=0x19 => s & 0x0f,
+            s => s,
+        };
         let flags = [
             attribute_info & INFO_PREFETCH != 0,
             // A BIT test, not equality: a retail title has a descriptor carrying 0x30 here, and

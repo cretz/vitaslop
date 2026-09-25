@@ -517,6 +517,17 @@ pub struct Draw {
     pub vprog: std::sync::Arc<[u8]>,
     /// The bound fragment `SceGxmProgram` container bytes. Empty off the recompiler path.
     pub fprog: std::sync::Arc<[u8]>,
+    /// The vertex program the fragment program was PATCHED against at
+    /// `sceGxmShaderPatcherCreateFragmentProgram`, when that is a DIFFERENT program from the
+    /// bound `vprog`; empty otherwise (the same program, a NULL `vertexProgram`, or off the
+    /// recompiler path).
+    ///
+    /// The patcher builds the fragment's varying iteration against THAT program's output
+    /// layout, and the hardware then iterates the bound vertex's output buffer by lane
+    /// POSITION. Seen on a fighting title: its character bodies bind `vert_84664360` (no
+    /// TEXCOORD5/9) with `frag_81a0d020`, which reads both, so linking the bound pair by usage
+    /// refused every one of those draws; the sibling `vert_8464bc80` outputs both.
+    pub fprog_patched_vprog: std::sync::Arc<[u8]>,
     /// Raw vertex default-uniform-buffer (SA bank) bytes exactly as the guest wrote them -
     /// the recompiled vertex shader reads these directly, NOT the MVP-stamped `uniforms`
     /// above (which the fixed-function path needs but the real shader recomputes itself).
@@ -1556,6 +1567,7 @@ mod extent_tests {
             world: [0.0; 16],
             vprog: no_program(),
             fprog: no_program(),
+            fprog_patched_vprog: no_program(),
             vert_sa: std::sync::Arc::from(&[][..]),
             frag_sa: std::sync::Arc::from(&[][..]),
             frag_sa_addr: 0,

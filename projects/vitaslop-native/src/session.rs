@@ -736,7 +736,7 @@ impl Session {
         let ty = ValType::parse(ty).ok_or_else(|| format!("bad type {ty:?}"))?;
         let addr = parse_addr(addr)?;
         self.recipe.watches.retain(|w| w.name != name);
-        self.recipe.watches.push(WatchDecl { name: name.to_string(), ty, addr });
+        self.recipe.watches.push(WatchDecl { name: name.to_string(), ty, addr, deref: None });
         // The CSV header names the watch set, so a changed set starts a new log.
         self.reset_watch_csv();
         Ok(format!("watching {name} {} at {addr:#010x} = {}", ty.keyword(), self.watch_value(name)))
@@ -804,7 +804,7 @@ impl Session {
         let mut s = String::new();
         for w in &self.recipe.watches {
             let v = sample_watch(&self.sched, w).map(format_f64).unwrap_or("oob".into());
-            s.push_str(&format!("{:<16} {:<4} {:#010x} = {v}\n", w.name, w.ty.keyword(), w.addr));
+            s.push_str(&format!("{:<16} {:<4} {:<22} = {v}\n", w.name, w.ty.keyword(), w.addr_text()));
         }
         s
     }

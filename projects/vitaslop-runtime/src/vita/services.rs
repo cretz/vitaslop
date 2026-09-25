@@ -260,21 +260,48 @@ pub(super) fn np_basic_get_friend_list_entry_count(ctx: &mut GuestCtx, _st: &mut
 // --- SceCommonDialog families -------------------------------------------------
 //
 // System-drawn dialogs (trophy setup, message boxes, the network check, savedata
-// UI, ...). Off-console there is no system UI to draw, so the faithful offline
-// model is a dialog that completes INSTANTLY: `Init` opens it, the very next
-// `GetStatus` reports FINISHED, and `Term` closes it. A title that opens one at
-// boot (e.g. the trophy-setup dialog) then busy-waits on its status proceeds
-// immediately instead of spinning forever on a dialog no one can dismiss.
-// `GetStatus` on a family that was never opened reports NONE, so a state machine
-// polling before `Init` is not tricked into seeing a phantom dialog close.
+// UI, ...). Off-console there is no system UI to draw, so the offline model is a
+// dialog that completes ON ITS OWN: `Init` opens it, `GetStatus` reports RUNNING
+// for [`dialog_running_us`] of guest time and FINISHED after that, and `Term`
+// closes it. A title that opens one at boot (e.g. the trophy-setup dialog) and
+// busy-waits on its status proceeds instead of spinning forever on a dialog no one
+// can dismiss. `GetStatus` on a family that was never opened reports NONE, so a
+// state machine polling before `Init` is not tricked into seeing a phantom close.
 
-/// SceCommonDialogStatus: no dialog open / dialog completed. (RUNNING is never
-/// reported - our dialogs finish instantly.)
+/// SceCommonDialogStatus: no dialog open / on screen / completed.
 const DIALOG_STATUS_NONE: i32 = 0;
+const DIALOG_STATUS_RUNNING: i32 = 1;
 const DIALOG_STATUS_FINISHED: i32 = 2;
 
+/// How many display flips an opened dialog reports RUNNING for before FINISHED
+/// (`VITASLOP_DIALOG_RUNNING_FRAMES`, default 2; `0` is the old instant completion).
+///
+/// # Why a dialog that finishes INSTANTLY is not faithful
+/// A console dialog is on screen for at least the frames it takes a person to press a
+/// button, and titles are written against that. MEASURED on a fighting title's boot
+/// (PCSE00235): its scene opens the autosave notice and, on the NEXT frame, waits to see
+/// its dialog manager BUSY before advancing to the state that waits for the result. With
+/// instant completion the manager opened, saw FINISHED, closed and went idle inside the
+/// frame that opened it, so the scene never saw it busy and waited on a black screen
+/// forever.
+///
+/// # Why TWO FLIPS and not a stretch of time
+/// Two flips = the rest of the frame that opened it plus the whole next one, which is the
+/// least any frame-granular observer needs. It was 100 ms of guest time first, and that
+/// MEASURABLY broke recorded recipes (`reg24b`, then the one-knob arm `att24`): six frames
+/// of delay at a boot dialog moved every later frame-pinned press, and a golf title's
+/// front end walked into the wrong menu. A person would take far longer than either, so
+/// neither is "the console's" length; the shortest one that is observable is the one that
+/// disturbs least.
+fn dialog_running_flips() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        crate::knobs::var("VITASLOP_DIALOG_RUNNING_FRAMES").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(2)
+    })
+}
+
 /// One bit per dialog family in [`VitaState::open_dialogs`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DialogFamily {
     Msg = 0,
     NetCheck = 1,
@@ -329,14 +356,51 @@ pub(super) fn ime_dialog_get_result(ctx: &mut GuestCtx, _st: &mut VitaState) {
 /// next status poll. Every family's init succeeds offline.
 pub(super) fn dialog_init(ctx: &mut GuestCtx, st: &mut VitaState, family: DialogFamily) {
     st.open_dialogs |= 1 << family as u32;
+    st.dialog_opened_flip[family as usize] = st.flip_count();
+    if family == DialogFamily::Msg {
+        report_msg_dialog(ctx);
+    }
     ctx.ret(0);
 }
 
-/// `*DialogGetStatus`: FINISHED once opened, NONE before. The return value IS the
-/// status (these calls return `SceCommonDialogStatus`, not an errno).
+/// Say what a message dialog asked, since this engine answers it instantly with YES/OK and
+/// that answer can decide which way a title's boot goes. `SceMsgDialogParam` (vitasdk,
+/// 0x88 bytes): mode at +0x50, then the user / system / error-code parameter pointers.
+fn report_msg_dialog(ctx: &mut GuestCtx) {
+    let param = ctx.arg(0);
+    if param == 0 {
+        return;
+    }
+    let mode = ctx.read_u32(param + 0x50);
+    let (user, sys, err) = (ctx.read_u32(param + 0x54), ctx.read_u32(param + 0x58), ctx.read_u32(param + 0x5c));
+    let what = match mode {
+        1 if user != 0 => {
+            let (buttons, msg) = (ctx.read_u32(user), ctx.read_u32(user + 4));
+            let text = if msg != 0 { ctx.read_cstr(msg, 200) } else { String::new() };
+            format!("USER message {text:?} (button type {buttons})")
+        }
+        2 if sys != 0 => format!("SYSTEM message type {} value {}", ctx.read_u32(sys), ctx.read_u32(sys + 4)),
+        3 if err != 0 => format!("ERROR CODE {:#010x}", ctx.read_u32(err)),
+        _ => format!("mode {mode}"),
+    };
+    tracing::info!(target: "vitaslop::status", "sceMsgDialogInit: {what} - answered at once with YES/OK");
+}
+
+/// `*DialogGetStatus`: NONE before `Init`, RUNNING for [`dialog_running_flips`] display
+/// flips after it, FINISHED from then on. The return value IS the status (these calls
+/// return `SceCommonDialogStatus`, not an errno).
 pub(super) fn dialog_get_status(ctx: &mut GuestCtx, st: &mut VitaState, family: DialogFamily) {
-    let open = st.open_dialogs & (1 << family as u32) != 0;
-    ctx.ret(if open { DIALOG_STATUS_FINISHED } else { DIALOG_STATUS_NONE } as u32);
+    // The run-to-completion host keeps the instant completion: a title there that polls
+    // the status in a loop inside one frame would never reach the flip that ends RUNNING.
+    let status = if st.open_dialogs & (1 << family as u32) == 0 {
+        DIALOG_STATUS_NONE
+    } else if st.is_preemptive()
+        && st.flip_count().saturating_sub(st.dialog_opened_flip[family as usize]) < dialog_running_flips() {
+        DIALOG_STATUS_RUNNING
+    } else {
+        DIALOG_STATUS_FINISHED
+    };
+    ctx.ret(status as u32);
 }
 
 /// `*DialogTerm`: close the family. Also the landing spot for the lifecycle

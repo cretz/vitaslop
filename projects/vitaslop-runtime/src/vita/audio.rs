@@ -70,6 +70,12 @@ pub struct AudioState {
     /// array of voices and this is a LOOKUP - see `ngs::rack_get_voice_handle` for what
     /// allocating a fresh handle per query did to the mixer.
     pub(crate) ngs_voice_handles: Vec<((u32, u32), u32)>,
+    /// Every `sceNgsVoice*` call a title made, per voice handle, as `(nid, first four args)` -
+    /// capped per voice and in voices. What a silent play is explained BY: see
+    /// `ngs::report_silent_play`.
+    pub(crate) ngs_voice_calls: std::collections::HashMap<u32, Vec<(u32, [u32; 4])>>,
+    /// Silent plays already reported, so the report stays a handful of lines.
+    pub(crate) ngs_silent_reported: u32,
     /// AT9 source voices, decoded and mixed into the output at `sceAudioOutOutput`.
     pub(crate) at9: super::at9::At9Bank,
     /// Which source voice each NGS patch handle carries, from

@@ -146,6 +146,9 @@ pub struct BindingPlan {
     /// hardware would store - instead of a converted `vec4<f32>`. Set by the link from
     /// [`crate::link::LinkOptions::raw64_output`].
     pub raw64_output: bool,
+    /// Splat the colour's alpha into every channel and read the destination's red as its
+    /// alpha. Set by the link from [`crate::link::LinkOptions::alpha_to_red`].
+    pub alpha_to_red: bool,
     /// The guest-memory windows THIS (fragment) program's 0xE8 loads read through, in the order
     /// the `gxp_fmem` binding lays them out. Empty for the overwhelming majority; a fragment
     /// that loads memory reaches its buffer through `sceGxmSetFragmentUniformBuffer`, which is
@@ -563,6 +566,7 @@ pub fn plan_bindings(shader: &Shader, uniform_regs: u32, is_cube: impl Fn(u8) ->
         dual_source: false,
         dual_split: None,
         raw64_output: false,
+        alpha_to_red: false,
         // A plan built from the SHADER alone cannot resolve a window - that needs the
         // program's containers and parameter table - so it carries none, and
         // `link_programs` fills them in. Same shape as `VertexAttribute::surplus_fill`.
@@ -659,6 +663,34 @@ pub const FORM_ALL: u32 = FORM_LERP | FORM_MODULATE | FORM_ADDITIVE | FORM_LERP_
 /// `crate::wgsl::emit_cmov_u8`.
 pub fn cmov_u8_tests_each_byte() -> bool {
     std::env::var("VITASLOP_GXP_CMOVU8").as_deref() == Ok("byte")
+}
+
+/// Which byte of the test operand a single-test byte-wise conditional move reads: byte 0 by
+/// default, the TOP byte (3) under `VITASLOP_GXP_CMOVU8=swap`. See `crate::wgsl::emit_cmov_u8`.
+pub fn cmov_u8_test_byte() -> u32 {
+    if std::env::var("VITASLOP_GXP_CMOVU8").as_deref() == Ok("swap") {
+        3
+    } else {
+        0
+    }
+}
+
+/// The byte-wise conditional move's operand ROLES as source positions:
+/// `(taken when the test holds, taken otherwise, tested)`.
+///
+/// DEFAULT `(0, 1, 2)`: test the LAST-listed source on byte 0, take the FIRST-listed when it
+/// holds, else the second. In every corpus word that is `[0x7fffffff, packed index, mask]`
+/// behind the 8-bit VTSTMSK overflow guard `(-2^31 + index) >= 0` - INT_MAX where the index
+/// overflows, the converted index otherwise: a saturating float-to-int. This reading was right
+/// all along; what made it paint red glove blobs was the MASK - decoded to the wrong register,
+/// as a float whose byte 0 is zero either way (see `decode_grp_test_mask`).
+/// `VITASLOP_GXP_CMOVU8=swap` is the 2026-09-23b reading `(1, 2, 0)` on the top byte: it tests
+/// the sentinel, which fixed the 2-bone gloves by accident and exploded the 4-bone ones.
+pub fn cmov_u8_roles() -> (usize, usize, usize) {
+    match std::env::var("VITASLOP_GXP_CMOVU8").as_deref() {
+        Ok("swap") => (1, 2, 0),
+        _ => (0, 1, 2),
+    }
 }
 
 /// How many REGISTERS one count of an index register spans - see [`crate::wgsl`]'s
@@ -1633,7 +1665,7 @@ pub fn reads_output_bank(shader: &Shader) -> bool {
 /// the same correspondence [`color_return_expr`] uses in the other direction. Reading an F16
 /// destination as four F32 registers is the denormal-black failure
 /// [[vitaslop-f16-colour-output]] records, run backwards.
-pub(crate) fn dest_color_init(precision: ColorPrecision, dual_source: bool) -> String {
+pub(crate) fn dest_color_init(precision: ColorPrecision, dual_source: bool, alpha_to_red: bool) -> String {
     let mut s = String::new();
     if dual_source {
         // The dual-source body takes the destination as a PARAMETER - it is evaluated once with
@@ -1661,7 +1693,10 @@ pub(crate) fn dest_color_init(precision: ColorPrecision, dual_source: bool) -> S
         None => {
             let _ = writeln!(
                 s,
-                "  let gxp_dstc = textureLoad(gxp_dst, vec2<i32>(in.frag_coord.xy), 0);"
+                "  let gxp_dstc = textureLoad(gxp_dst, vec2<i32>(in.frag_coord.xy), 0){};",
+                // A single-channel ALPHA target keeps its one value in RED - see
+                // `link::LinkOptions::alpha_to_red`.
+                if alpha_to_red { ".rrrr" } else { "" }
             );
         }
     }
@@ -1792,7 +1827,7 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
     // ...and the O bank starts at the DESTINATION colour for a program that blends itself,
     // because that is what the hardware seeds those registers with.
     if plan.reads_dest_color {
-        m.push_str(&dest_color_init(plan.color_precision, false));
+        m.push_str(&dest_color_init(plan.color_precision, false, false));
     }
     // Predicate registers p0..p3 (written by test ops, read by predicated instructions).
     let _ = writeln!(m, "  var p: array<bool, 4>;");
@@ -2081,6 +2116,113 @@ pub fn mem_window_helper_named(windows: &[MemWindow], binding: &str) -> String {
     s
 }
 
+/// Resolve at EMIT time every memory load whose address is a window's own base register plus a
+/// constant: `{binding}_word(gxp_aN + K)` where `gxp_aN = sa[base] + O` becomes the constant
+/// element `{binding}[G >> 2][G & 3]`, `G = first_word + ((O + K) >> 2)`, when that word lies
+/// inside the window.
+///
+/// >>> WHY: THE BROWSER'S SHADER COMPILER, NOT THE GPU. The address-dispatching helper
+/// ([`mem_window_helper_named`]) is a chain of per-window branches, and the backend inlines it
+/// at EVERY call - one fighting title's skinned-character vertex program calls it 165 times.
+/// MEASURED in Chrome (D3D12), `createRenderPipelineAsync` per module: 2.35-2.64 s for that
+/// program, 0.1 s for its fragment stage alone, 1.0 s with a branch-free stand-in for the
+/// helper; a select-based helper bought only ~20%. Fourteen such pairs stalled the queue for
+/// 10-16 s at the fight's start, the GPU budget declined every present meanwhile ("1 shown of
+/// 53"), and a title that reads its render targets back then took a different path.
+///
+/// >>> WHY IT IS EXACT. The prologue sets `sa[base] = {binding}[i].x`, the window's own guest
+/// base, and the helper computes `w = (addr - base) >> 2` and returns word `first_word + w`
+/// when `w < words` - the same element this names, with the same floor. An EARLIER window
+/// containing the same address holds the same guest bytes (every window is a snapshot of guest
+/// memory taken at the same draw), so which one answers cannot differ. It applies only when the
+/// body never writes `sa[base]` itself and never writes `sa` through a computed index; an
+/// out-of-window word keeps the helper. `VITASLOP_GXP_STATIC_MEM=0` is the arm back.
+pub fn resolve_static_mem_reads(body: &str, windows: &[MemWindow], binding: &str) -> String {
+    if windows.is_empty() || !crate::link::arm_on(crate::link::STATIC_MEM_ARM) {
+        return body.to_string();
+    }
+    // Every SA register the body assigns, and whether it assigns one through an index.
+    let bytes = body.as_bytes();
+    let mut written = std::collections::HashSet::new();
+    let mut from = 0;
+    while let Some(rel) = body[from..].find("sa[") {
+        let at = from + rel;
+        from = at + 3;
+        // Only a whole-token `sa[` (not `vs_sa[` or `fs_sa.data[`).
+        if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_' || bytes[at - 1] == b'.') {
+            continue;
+        }
+        let after = &body[at + 3..];
+        let Some(close) = after.find(']') else { continue };
+        let tail = after[close + 1..].trim_start();
+        if tail.starts_with('=') && !tail.starts_with("==") {
+            match after[..close].parse::<u32>() {
+                Ok(r) => {
+                    written.insert(r);
+                }
+                Err(_) => return body.to_string(),
+            }
+        }
+    }
+    let placements = mem_window_placements(windows);
+    let mut by_base: std::collections::HashMap<u32, MemWindowPlacement> = std::collections::HashMap::new();
+    for (w, at) in windows.iter().zip(placements.iter()) {
+        if !written.contains(&w.base_sa) {
+            by_base.entry(w.base_sa).or_insert(*at);
+        }
+    }
+    if by_base.is_empty() {
+        return body.to_string();
+    }
+    let call = format!("{binding}_word(");
+    let mut known: std::collections::HashMap<String, (MemWindowPlacement, u32)> = std::collections::HashMap::new();
+    let mut out = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        let t = line.trim();
+        if let Some(def) = t.strip_prefix("let gxp_a") {
+            // `let gxp_aN: u32 = sa[S] + Ou;` - exactly this shape, or the name is unknown.
+            let name = format!("gxp_a{}", def.split(':').next().unwrap_or(""));
+            known.remove(&name);
+            let parsed = def.split_once(": u32 = sa[").and_then(|(_, e)| {
+                let (s, o) = e.split_once("] + ")?;
+                Some((s.parse::<u32>().ok()?, o.strip_suffix("u;")?.parse::<u32>().ok()?))
+            });
+            if let Some((s, o)) = parsed {
+                if let Some(at) = by_base.get(&s) {
+                    known.insert(name, (*at, o));
+                }
+            }
+            out.push_str(line);
+            continue;
+        }
+        let mut l = line.to_string();
+        let mut scan = 0;
+        while let Some(rel) = l[scan..].find(&call) {
+            let at = scan + rel;
+            let args_at = at + call.len();
+            let Some(close) = l[args_at..].find(')') else { break };
+            let resolved = l[args_at..args_at + close].split_once(" + ").and_then(|(n, k)| {
+                let (p, o) = known.get(n)?;
+                let k = k.strip_suffix('u')?.parse::<u32>().ok()?;
+                let w = o.checked_add(k)? >> 2;
+                (w < p.words).then(|| {
+                    let g = p.first_word + w;
+                    format!("{binding}[{}u][{}u]", g >> 2, g & 3)
+                })
+            });
+            match resolved {
+                Some(r) => {
+                    l.replace_range(at..args_at + close + 1, &r);
+                    scan = at + r.len();
+                }
+                None => scan = args_at,
+            }
+        }
+        out.push_str(&l);
+    }
+    out
+}
+
 /// Bytes the driver adds to the DEFAULT uniform buffer's bound address before writing it into
 /// its DATA slot - `carried * 4`, the first register it did NOT copy into the SA file.
 /// `VITASLOP_GXP_DEFAULT_UNIFORM_OFFSET=0` restores the pre-2026-08-25c reading, in which the
@@ -2170,6 +2312,10 @@ fn pointer_use(base_sa: u32, shader: &Shader, secondary: &Shader) -> PointerUse 
     }
     if saw { PointerUse::Bounded(extent) } else { PointerUse::NotAPointer }
 }
+
+/// How many elements a SEMANTIC-1 (open-array) uniform buffer's window covers - see the
+/// sizing in [`resolve_mem_windows`]. 256 = every value of an 8-bit index.
+const OPEN_ARRAY_ELEMENTS: u32 = 256;
 
 pub fn resolve_mem_windows(
     program: &Program,
@@ -2314,6 +2460,16 @@ pub fn resolve_mem_windows(
                     && p.resource_index as u32 == u32::from(binding.buffer_index)
             });
             match declared {
+                // >>> A BUFFER DECLARED WITH SEMANTIC 1 IS AN OPEN ARRAY: its declared size is
+                // ONE element and the program indexes it at run time. MEASURED on every such
+                // buffer in any captured corpus (ten, all one fighting title's
+                // `gSkinningMatrices`): declared 48 bytes = one 3x4 bone, loaded at
+                // `u16(blend index) * 48 + pointer`. Sized as declared, every bone past the
+                // first read ZERO, each skinned vertex collapsed to the translation of the
+                // view-projection, and the characters drew nothing. The window covers
+                // `OPEN_ARRAY_ELEMENTS` elements - the reach of the 8-bit blend-index attribute
+                // every captured skinned draw of the title binds.
+                Some(ub) if ub.semantic == 1 => ub.array_size.saturating_mul(OPEN_ARRAY_ELEMENTS),
                 Some(ub) => ub.array_size,
                 // An entry for a buffer the program does not declare is INERT - nothing binds
                 // it and nothing can read it. Skipping it is exact as long as the pointer

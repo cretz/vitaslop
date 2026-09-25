@@ -1276,6 +1276,27 @@ struct LwMutexRec {
     /// retail title whose display thread holds this mutex while it idles, so the timed lock
     /// its main thread takes to post work is the only way either of them ever moves again.
     waiters: Vec<LwMutexWaiter>,
+    /// What `sceKernelCreateLwMutex` was given - `(name, attr, initCount)` - for
+    /// `sceKernelGetLwMutexInfo` to hand back. Empty/zero for an ADOPTED work area.
+    meta: (String, u32, i32),
+}
+
+/// A kernel callback object (`sceKernelCreateCallback`). It belongs to the thread that
+/// created it and runs ONLY on that thread's behalf, at a point the thread chooses
+/// (`sceKernelCheckCallback`, or a `...CB` wait): `func(uid, notifyCount, notifyArg, common)`.
+/// A notification only records - `count` accumulates and `notify_arg` is the latest - and a
+/// delivery hands both over and clears them.
+struct KCallback {
+    uid: i32,
+    owner: i32,
+    name: String,
+    func: u32,
+    common: u32,
+    count: u32,
+    notify_arg: u32,
+    /// `Some(virtual us of the last vblank accounted)` while registered with
+    /// `sceDisplayRegisterVblankStartCallback`: every vblank edge since is one notification.
+    vblank_since: Option<u64>,
 }
 
 /// One thread parked on a lightweight mutex - see [`LwMutexRec::waiters`].
@@ -1323,6 +1344,18 @@ struct SemaWaiter {
 /// wait. Released when a `sceKernelSetEventFlag` satisfies the pattern (the match
 /// pattern is then written through `out_addr` via the pending stat-write channel)
 /// or the deadline passes.
+/// A thread parked in `sceKernelReceiveMsgPipe` until the pipe holds what it asked for.
+/// `full`: the FULL mode wants all `size` bytes; otherwise (ASAP) any bytes will do.
+struct MsgPipeWaiter {
+    uid: i32,
+    thid: i32,
+    buf: u32,
+    size: u32,
+    full: bool,
+    result: u32,
+    deadline: Option<u64>,
+}
+
 struct EvfWaiter {
     uid: i32,
     thid: i32,
@@ -1330,6 +1363,9 @@ struct EvfWaiter {
     mode: u32,
     out_addr: u32,
     deadline: Option<u64>,
+    /// A SIMPLE EVENT wait's `SceUInt64 *pUserData`: the event's user data is written there
+    /// at the match. Zero for an event-flag wait.
+    user_data_addr: u32,
 }
 
 /// A request to synchronously run guest code (a thread entry) that a host call
@@ -1352,6 +1388,9 @@ pub struct Reentry {
     /// whose ABI passes a third register (e.g. an NP service-state callback thunk
     /// that takes its `this`/userdata in r2).
     pub r2: u32,
+    /// r3 for the entry - a kernel callback's fourth argument (`void *common`). Zero for
+    /// everything else.
+    pub r3: u32,
     /// sp for the entry: the top of the thread's own stack.
     pub stack_top: u32,
     /// The thread whose exit code the result becomes.
@@ -7537,7 +7576,7 @@ mod texture_snapshot_stamp_tests {
                           vfp: &mut [u32; VFP_ARG_COUNT]| {
             let ctx = ctx_over(regs, vfp, mem);
             snaps.begin_scene();
-            decode_texture(&ctx, snaps, &binding, fmt, None).expect("a P8 texture decodes")
+            decode_texture(&ctx, snaps, &binding, fmt, None, 0).expect("a P8 texture decodes")
         };
 
         let first = decode(&mut snaps, &mut mem, &mut regs, &mut vfp);
@@ -7910,6 +7949,8 @@ pub enum IdleKind {
     EventFlag,
     /// A timed `sceKernelLockLwMutex`.
     LwMutex,
+    /// A timed `sceKernelReceiveMsgPipe`.
+    MsgPipe,
 }
 
 impl IdleKind {
@@ -7921,6 +7962,7 @@ impl IdleKind {
             IdleKind::Sema => "sema",
             IdleKind::EventFlag => "evf",
             IdleKind::LwMutex => "lwmutex",
+            IdleKind::MsgPipe => "msgpipe",
         }
     }
 }
@@ -8226,9 +8268,12 @@ pub struct VitaState {
     /// than in it so no waiter/set path pays for a string it never reads.
     event_flag_names: std::collections::BTreeMap<i32, String>,
     /// One bit per open SceCommonDialog family (see `vita::services::DialogFamily`):
-    /// set by `*DialogInit`, read by `*DialogGetStatus` (open reports FINISHED -
-    /// dialogs complete instantly offline), cleared by `*DialogTerm`.
+    /// set by `*DialogInit`, read by `*DialogGetStatus` (RUNNING for a short while, then
+    /// FINISHED - see `vita::services::dialog_get_status`), cleared by `*DialogTerm`.
     pub(crate) open_dialogs: u32,
+    /// The display flip count each dialog family was opened at, indexed like
+    /// `open_dialogs`' bits.
+    pub(crate) dialog_opened_flip: [u64; 16],
     /// Registered FIOS2 path overlays, kept sorted by `order` (see
     /// [`crate::vita::fios2`]). Path resolution walks them in that order, which is
     /// what `order` is for, so sorting on insert keeps every resolve a plain scan.
@@ -8309,6 +8354,11 @@ pub struct VitaState {
     /// join. `stat` is the guest `int *` the joiner passed to `sceKernelWaitThreadEnd`
     /// (0 = NULL); the target's exit code is written there when the join completes.
     join_waiters: Vec<(i32, i32, u32)>,
+    /// Kernel callbacks (`sceKernelCreateCallback`). See [`KCallback`].
+    kcallbacks: Vec<KCallback>,
+    /// `(callback thread, callback uid)` for every callback currently being delivered, so
+    /// its return value can be applied when the delivery thread ends.
+    kcb_threads: Vec<(i32, i32)>,
     pending_spawns: Vec<Reentry>,
     pending_wakes: Vec<i32>,
     /// Guest memory writes to apply when a blocked joiner is woken: `(stat_ptr,
@@ -8371,6 +8421,12 @@ pub struct VitaState {
     /// [`program_ref_count`](Self::program_ref_count) for why a count is tracked at all
     /// when this patcher never shares a program.
     program_refs: std::collections::BTreeMap<u32, u32>,
+    /// Live vertex programs by their CREATION PARAMETERS - the `SceGxmProgram*` plus the raw
+    /// attribute and stream arrays - so an identical `CreateVertexProgram` hands back the SAME
+    /// program with one more reference, as the console's patcher does. See
+    /// `gxm::create_vertex_program`. The reverse map drops the entry at the last release.
+    program_share: std::collections::HashMap<(u32, Vec<u8>), u32>,
+    program_share_key: std::collections::HashMap<u32, (u32, Vec<u8>)>,
     /// `SceAudiodec` decoders the title created for a movie's sound - see
     /// [`crate::vita::audiodec`].
     pub(crate) audiodec: crate::vita::audiodec::AudiodecState,
@@ -8467,7 +8523,7 @@ pub struct VitaState {
     /// lets that be one reused buffer rather than a fresh allocation per draw. On this title's
     /// race that is ~644 draws a frame, and in the browser an allocation is a good deal dearer
     /// than it is here.
-    texture_unit_scratch: Vec<(TextureBinding, Option<u32>, Option<(i64, u32)>)>,
+    texture_unit_scratch: Vec<(TextureBinding, Option<u32>, Option<(i64, u32)>, u32)>,
     /// The one piece of per-texture state that cannot be packed into the guest's own control
     /// words - see [`TextureExtra`]. Everything the sampler getters used to read from here now
     /// lives in the guest's `SceGxmTexture`, where the hardware keeps it.
@@ -8515,8 +8571,11 @@ pub struct VitaState {
     /// `SceGxmFragmentProgram*` handle -> (its `SceGxmProgram*`, the blend equation it was
     /// created with), recorded at `sceGxmShaderPatcherCreateFragmentProgram` so a precomputed
     /// fragment state can size its default uniform buffer and every draw can carry its real
-    /// blend mode. (Vertex programs carry their header in `VertexProgramInfo`.)
-    fragment_programs: std::collections::HashMap<u32, (u32, crate::capture::BlendState)>,
+    /// blend mode. (Vertex programs carry their header in `VertexProgramInfo`.) The third
+    /// field is the `vertexProgram` the create call named - the program the patcher linked this
+    /// fragment's varying iteration AGAINST, which is not always the one a draw binds. See
+    /// `capture::Draw::fprog_patched_vprog`.
+    fragment_programs: std::collections::HashMap<u32, (u32, crate::capture::BlendState, u32)>,
     /// Set once, when a single scene has asked for more default-uniform bytes than the
     /// ring holds, so the wrap is reported exactly once instead of every frame.
     ///
@@ -8603,6 +8662,16 @@ pub struct VitaState {
     pub motion_angle_threshold: u32,
     /// Message pipes by uid: a byte FIFO each.
     pub msg_pipes: std::collections::BTreeMap<i32, std::collections::VecDeque<u8>>,
+    /// Simple events: `uid -> (attr, user data)`. The pattern and the waiters are the event
+    /// flag's own (`event_flags`, `evf_waiters`) - see [`Self::create_simple_event`].
+    simple_events: std::collections::HashMap<i32, (u32, u64)>,
+    /// Per colour-surface POINTER: the clip rectangle `sceGxmColorSurfaceSetClip` set
+    /// `(xMin, yMin, xMax, yMax)` and the dither mode `...SetDitherMode` set - kept only so
+    /// their getters read back what the title wrote (the renderer consumes neither).
+    pub color_surface_clip: std::collections::HashMap<u32, (u32, u32, u32, u32)>,
+    pub color_surface_dither: std::collections::HashMap<u32, u32>,
+    /// Receivers parked on a message pipe, FIFO. See [`MsgPipeWaiter`].
+    msgpipe_waiters: Vec<MsgPipeWaiter>,
     /// The shell's shared framebuffer, once a system-mode homebrew opens it:
     /// `(uid, base of two 960x544 RGBA8 buffers)`.
     pub shared_fb: Option<(i32, u32, u8)>,
@@ -8718,184 +8787,6 @@ enum ProgramStage {
     Fragment,
 }
 
-// >>> SCAFFOLDING - DELETE BEFORE COMMIT: `VITASLOP_AMBIENT_PROBE`.
-
-/// Guest global holding the pointer to the `World:SampleGlobal` object the ambient read
-/// site `f_81420414` is currently working on (`movw #0x7a88 / movt #0x81d9; ldr r0,[r0]`).
-const AMBIENT_OBJ_PTR: u32 = 0x81d9_7a88;
-/// `UFP_QuickAmbientColor` - where `f_813c5b9a` writes the decoded ambient.
-const AMBIENT_OUT: u32 = 0x8208_9010;
-/// The three 128x128 CPU-read probe targets, newest generation first.
-const AMBIENT_TARGETS: [u32; 3] = [0x8d0a_0cc0, 0x8d0b_0cd0, 0x8d0c_0ce0];
-
-/// `VITASLOP_AMBIENT_PROBE=<lo>-<hi>` (decimal display frames, or `all`) - the window the
-/// ambient probe reports in. Unset is off.
-fn ambient_probe_window() -> Option<(u64, u64)> {
-    use std::sync::OnceLock;
-    static CELL: OnceLock<Option<(u64, u64)>> = OnceLock::new();
-    *CELL.get_or_init(|| {
-        let raw = crate::knobs::var("VITASLOP_AMBIENT_PROBE").ok()?;
-        let s = raw.trim();
-        if s.is_empty() || s == "all" || s == "1" {
-            return Some((0, u64::MAX));
-        }
-        let (a, b) = s.split_once('-')?;
-        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-    })
-}
-
-/// The title's encoding, inverted: which BYTE decodes to `v` under
-/// `out = 10^(byte*3/255 - 1) - 0.1`. Reported alongside the byte the atlas holds now, so a
-/// mismatch between the two is visible without a second run.
-fn ambient_byte_of(v: f32) -> f32 {
-    ((v as f64 + 0.1).max(1e-9).log10() + 1.0) as f32 * 255.0 / 3.0
-}
-
-/// PCSA00002's AMBIENT READ, NAMED PER DRAW - does the guest read any slot but slot 1?
-///
-/// `f_81420414` takes the object at `*0x81d97a88`, reads its slot coordinates from
-/// `[obj+0x30]`/`[obj+0x34]`, forms `col = trunc(8 + 16a)` and `row = trunc(1 + 8b)`, and
-/// reads the texel at `base + col*4 + row*512`; `f_813c5b9a` decodes each byte as
-/// `10^(b*3/255 - 1) - 0.1` into `UFP_QuickAmbientColor`. A watchpoint cannot follow that
-/// (the address is built, so no immediate exists) and costs guest fuel besides. This is
-/// passive: it samples the object and the decoded output at every draw, reports each
-/// DISTINCT (object, slot, ambient) once per frame, and inverts the decode to say which
-/// slot of which probe target - if any - actually holds the bytes that ambient came from.
-fn ambient_probe(ctx: &GuestCtx, frame: u64) {
-    let Some((lo, hi)) = ambient_probe_window() else { return };
-    if frame < lo || frame > hi {
-        return;
-    }
-    type Seen = std::collections::BTreeSet<(u32, u32, u32, u32, u32, u32)>;
-    static SEEN: std::sync::Mutex<Option<(u64, Seen)>> = std::sync::Mutex::new(None);
-
-    let obj = ctx.read_u32(AMBIENT_OBJ_PTR);
-    let amb = ctx.read_f32s(AMBIENT_OUT, 3);
-    let (a, b) = if obj != 0 {
-        let v = ctx.read_f32s(obj + 0x30, 2);
-        (v[0], v[1])
-    } else {
-        (f32::NAN, f32::NAN)
-    };
-    let key = (
-        obj,
-        a.to_bits(),
-        b.to_bits(),
-        amb[0].to_bits(),
-        amb[1].to_bits(),
-        amb[2].to_bits(),
-    );
-    {
-        let mut g = SEEN.lock().expect("ambient probe");
-        match g.as_mut() {
-            Some((f, set)) if *f == frame => {
-                if !set.insert(key) {
-                    return;
-                }
-            }
-            _ => {
-                let mut set = Seen::new();
-                set.insert(key);
-                *g = Some((frame, set));
-            }
-        }
-    }
-
-    // Where the read site would look RIGHT NOW, by its own arithmetic.
-    let col = (8.0 + 16.0 * a) as i64;
-    let row = (1.0 + 8.0 * b) as i64;
-    let slot = if col >= 8 && row >= 1 && (col - 8) % 16 == 0 && (row - 1) % 8 == 0 {
-        Some((col - 8) / 16 + 8 * ((row - 1) / 8))
-    } else {
-        None
-    };
-    let mut held = String::new();
-    for (i, t) in AMBIENT_TARGETS.iter().enumerate() {
-        let name = ["A", "B", "C"][i];
-        if col < 0 || row < 0 || col >= 128 || row >= 128 {
-            held.push_str(&format!(" {name}=off-grid"));
-            continue;
-        }
-        let px = ctx.read_bytes(t + (row as u32) * 512 + (col as u32) * 4, 4);
-        if px.len() == 4 {
-            held.push_str(&format!(" {name}=({},{},{},{})", px[0], px[1], px[2], px[3]));
-        } else {
-            held.push_str(&format!(" {name}=unmapped"));
-        }
-    }
-    // The bytes the ambient in `UFP_QuickAmbientColor` was decoded FROM, and every slot of
-    // every target that holds them now. If the ambient did not come from these targets at
-    // all, this list is empty and that is the answer.
-    let want: Vec<f32> = amb.iter().map(|v| ambient_byte_of(*v)).collect();
-    let wb: Vec<i32> = want.iter().map(|v| v.round() as i32).collect();
-    let mut matches = String::new();
-    let mut nmatch = 0usize;
-    for (i, t) in AMBIENT_TARGETS.iter().enumerate() {
-        let name = ["A", "B", "C"][i];
-        let all = ctx.read_bytes(*t, 128 * 512);
-        if all.len() < 128 * 512 {
-            continue;
-        }
-        for n in 0..128i64 {
-            let (ca, cb) = (n % 8, n / 8);
-            let (x, y) = (8 + 16 * ca, 1 + 8 * cb);
-            let o = (y as usize) * 512 + (x as usize) * 4;
-            let px = &all[o..o + 4];
-            if (0..3).all(|k| (px[k] as i32 - wb[k]).abs() <= 1) {
-                // Capped: a uniformly poisoned atlas matches all 384 slots, and a line that
-                // long is a diagnostic nobody reads [[vitaslop-a-diagnostic-can-bury-the-findings]].
-                nmatch += 1;
-                if nmatch <= 8 {
-                    matches.push_str(&format!(" {name}#{n}"));
-                }
-            }
-        }
-    }
-    if nmatch > 8 {
-        matches.push_str(&format!(" ...({nmatch} of 384)"));
-    }
-    let text = format!(
-        "f={frame} obj={obj:#010x} a={a:.3} b={b:.3} col={col} row={row} slot={slot:?} \
-         ambient=({:.2},{:.2},{:.2}) <- bytes ({:.1},{:.1},{:.1}) | held{held} | holders:{}",
-        amb[0], amb[1], amb[2], want[0], want[1], want[2],
-        if matches.is_empty() { " NONE".to_string() } else { matches },
-    );
-    // >>> THE PANEL GETS THE LATEST, THE LOG GETS A SAMPLE. A `warn!` per distinct reading was
-    // the only channel this had, and on a browser that is the wrong one: the diagnostics panel
-    // keeps 96 DISTINCT lines and drops the rest, and this line's key changes every frame - so
-    // arming it on a device would push every other warning out of the dump and answer a question
-    // about the panel [[vitaslop-a-diagnostic-can-bury-the-findings]]. The newest reading is
-    // published for the panel to print ONCE, and the log keeps one line every 300 frames so a
-    // desktop run still shows the value moving.
-    *LAST_AMBIENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
-    {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static LAST_LOGGED: AtomicU64 = AtomicU64::new(u64::MAX);
-        let bucket = frame / 300;
-        if LAST_LOGGED.swap(bucket, Ordering::Relaxed) != bucket {
-            tracing::warn!(target: "vitaslop::gxm", "AMBIENT PROBE {text}");
-        }
-    }
-}
-
-/// The newest [`ambient_probe`] reading, for the diagnostics panel. `None` until the probe has
-/// run, which needs `VITASLOP_AMBIENT_PROBE` to be set.
-static LAST_AMBIENT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-/// The newest ambient-probe reading, or `None` when the probe is not armed or has not fired.
-///
-/// # What the number means, so a reader does not have to find this file
-/// mlb decodes a light probe out of GUEST MEMORY as `10^(byte*3/255 - 1) - 0.1` and drives its
-/// auto-exposure from it. MEASURED on the desktop, one build, one recipe, one frame apart:
-/// with the render-target writeback ON the guest reads `ambient=(1.53,1.82,2.62)` from bytes
-/// `(103,109,122)` and the picture is correct; with it OFF it reads `(97.23,23.69,10.75)` from
-/// bytes `(254,202,173)` - its allocator's poison, identical in all three probe targets - and
-/// every surface in the frame washes out. So an ambient in the single digits is a fed probe and
-/// one in the tens is a starved one, and no argument about the picture is needed.
-pub fn last_ambient_report() -> Option<String> {
-    LAST_AMBIENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
 impl VitaState {
     /// Tell the texture cache that the ENGINE just wrote `bytes` into guest memory at `addr`,
     /// so no draw has to discover it. See [`TextureSnapshots::author`] - the contract is that
@@ -8979,6 +8870,7 @@ impl VitaState {
             event_flags: Vec::new(),
             event_flag_names: std::collections::BTreeMap::new(),
             open_dialogs: 0,
+            dialog_opened_flip: [0; 16],
             fios_overlays: Vec::new(),
             fios_overlay_disabled: std::collections::HashSet::new(),
             gpo: 0,
@@ -9008,6 +8900,8 @@ impl VitaState {
             net_inet_cb: None,
             net_cb_delivered: false,
             join_waiters: Vec::new(),
+            kcallbacks: Vec::new(),
+            kcb_threads: Vec::new(),
             pending_spawns: Vec::new(),
             pending_wakes: Vec::new(),
             pending_stat_writes: Vec::new(),
@@ -9026,6 +8920,8 @@ impl VitaState {
             voice: crate::vita::voice::VoiceState::default(),
             jpeg: crate::vita::jpeg::JpegState::default(),
             program_refs: std::collections::BTreeMap::new(),
+            program_share: Default::default(),
+            program_share_key: Default::default(),
             audiodec: crate::vita::audiodec::AudiodecState::default(),
             location: crate::vita::location::LocationState::default(),
             halt_on_terminate: false,
@@ -9073,6 +8969,10 @@ impl VitaState {
             motion_deadband: true,
             motion_angle_threshold: 0,
             msg_pipes: std::collections::BTreeMap::new(),
+            simple_events: Default::default(),
+            color_surface_clip: Default::default(),
+            color_surface_dither: Default::default(),
+            msgpipe_waiters: Vec::new(),
             shared_fb: None,
             motion_tilt_correction: true,
             xml: Default::default(),
@@ -10165,6 +10065,7 @@ impl VitaState {
             arg_len: arg0,
             arg_ptr: arg_on_run,
             r2: 0,
+            r3: 0,
             stack_top,
             thid,
             priority: DEFAULT_THREAD_PRIORITY,
@@ -10438,6 +10339,7 @@ impl VitaState {
             arg_len,
             arg_ptr,
             r2: 0,
+            r3: 0,
             stack_top: t.stack_top,
             thid,
             priority: new_priority,
@@ -10486,6 +10388,14 @@ impl VitaState {
                 "threadEnded"
             );
             t.exit_code = Some(code);
+        }
+        // A callback's delivery thread ended: a NON-ZERO return deletes the callback, which
+        // is the kernel's contract for a one-shot handler.
+        if let Some(pos) = self.kcb_threads.iter().position(|(t, _)| *t == thid) {
+            let (_, uid) = self.kcb_threads.remove(pos);
+            if code != 0 {
+                self.kcallbacks.retain(|c| c.uid != uid);
+            }
         }
         if self.preemptive {
             let mut i = 0;
@@ -10893,7 +10803,7 @@ impl VitaState {
     /// without a distinct create call.
     fn lwmutex_rec(&mut self, work: u32) -> &mut LwMutexRec {
         if !self.lwmutexes.iter().any(|m| m.work == work) {
-            self.lwmutexes.push(LwMutexRec { work, waiters: Vec::new() });
+            self.lwmutexes.push(LwMutexRec { work, waiters: Vec::new(), meta: Default::default() });
         }
         self.lwmutexes.iter_mut().find(|m| m.work == work).expect("just inserted")
     }
@@ -10904,6 +10814,19 @@ impl VitaState {
     pub fn lwmutex_register(&mut self, w: &mut dyn GuestWords, work: u32) {
         let _ = self.lwmutex_rec(work);
         lwwork::init(w, work);
+    }
+
+    /// Record the create arguments of the lightweight mutex at `work`. See `LwMutexRec::meta`.
+    pub fn lwmutex_set_meta(&mut self, work: u32, name: String, attr: u32, init: i32) {
+        self.lwmutex_rec(work).meta = (name, attr, init);
+    }
+
+    /// `(name, attr, initCount, parked waiters)` of a KNOWN lightweight mutex.
+    pub fn lwmutex_meta(&self, work: u32) -> Option<(String, u32, i32, usize)> {
+        self.lwmutexes
+            .iter()
+            .find(|m| m.work == work)
+            .map(|m| (m.meta.0.clone(), m.meta.1, m.meta.2, m.waiters.len()))
     }
 
     /// Whether `work` is a lightweight mutex we have a record for (created, or already
@@ -12011,6 +11934,7 @@ impl VitaState {
             arg_len: data, // r0: the callback's `const void *callbackData`
             arg_ptr: 0,
             r2: 0,
+            r3: 0,
             stack_top: self.display_cb_stack + Self::DISPLAY_CB_STACK_BYTES,
             thid,
             // Above game threads, so a queued frame is presented promptly.
@@ -12097,6 +12021,7 @@ impl VitaState {
             arg_len: info, // r0: `const SceNgsCallbackInfo *`
             arg_ptr: 0,
             r2: 0,
+            r3: 0,
             stack_top: self.ngs_cb_stack + Self::NGS_CB_STACK_BYTES,
             thid,
             // Above the game's threads, as the synthesizer's own update runs: a refill that
@@ -12144,6 +12069,7 @@ impl VitaState {
             arg_len: r0,
             arg_ptr: r1,
             r2,
+            r3: 0,
             stack_top: stack + Self::SERVICE_CB_STACK_BYTES,
             thid,
             priority: DEFAULT_THREAD_PRIORITY,
@@ -12170,6 +12096,119 @@ impl VitaState {
                 self.np_cb_delivered = true;
             }
         }
+    }
+
+    /// `sceKernelCreateCallback`: a new callback owned by the calling thread.
+    pub fn kcb_create(&mut self, name: String, func: u32, common: u32) -> i32 {
+        let uid = self.new_uid();
+        let owner = self.current;
+        tracing::debug!(target: "vitaslop::cb", uid = format_args!("{uid:#x}"), owner = format_args!("{owner:#x}"), %name, func = format_args!("{func:#x}"), "sceKernelCreateCallback");
+        self.kcallbacks.push(KCallback { uid, owner, name, func, common, count: 0, notify_arg: 0, vblank_since: None });
+        uid
+    }
+
+    /// `sceKernelDeleteCallback`. False for an unknown uid.
+    pub fn kcb_delete(&mut self, uid: i32) -> bool {
+        let before = self.kcallbacks.len();
+        self.kcallbacks.retain(|c| c.uid != uid);
+        before != self.kcallbacks.len()
+    }
+
+    /// `sceKernelNotifyCallback`: one more notification, `arg` the latest argument.
+    pub fn kcb_notify(&mut self, uid: i32, arg: u32) -> bool {
+        match self.kcallbacks.iter_mut().find(|c| c.uid == uid) {
+            Some(c) => {
+                c.count = c.count.saturating_add(1);
+                c.notify_arg = arg;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `sceKernelCancelCallback`: drop the pending notifications.
+    pub fn kcb_cancel(&mut self, uid: i32) -> bool {
+        match self.kcallbacks.iter_mut().find(|c| c.uid == uid) {
+            Some(c) => {
+                c.count = 0;
+                c.notify_arg = 0;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `sceKernelGetCallbackCount`, vblank notifications included.
+    pub fn kcb_count(&mut self, uid: i32) -> Option<u32> {
+        self.kcb_account_vblanks();
+        self.kcallbacks.iter().find(|c| c.uid == uid).map(|c| c.count)
+    }
+
+    /// `sceDisplayRegisterVblankStartCallback` (`on`) / `...Unregister...` (`!on`).
+    pub fn kcb_vblank(&mut self, uid: i32, on: bool) -> bool {
+        let now = self.virtual_us;
+        match self.kcallbacks.iter_mut().find(|c| c.uid == uid) {
+            Some(c) => {
+                c.vblank_since = on.then_some(now);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Turn the vblank edges that passed since each registered callback was last accounted
+    /// into notifications. Vblanks are the virtual clock's 60 Hz grid, not events, so they
+    /// are counted when a count is wanted.
+    fn kcb_account_vblanks(&mut self) {
+        let (now, p) = (self.virtual_us, crate::vita::display::VBLANK_US);
+        for c in self.kcallbacks.iter_mut() {
+            if let Some(since) = c.vblank_since {
+                let edges = (now / p).saturating_sub(since / p);
+                if edges > 0 {
+                    c.count = c.count.saturating_add(edges as u32);
+                    c.notify_arg = 0;
+                    c.vblank_since = Some(now);
+                }
+            }
+        }
+    }
+
+    /// Deliver ONE pending callback of the calling thread: spawn it as `func(uid, count,
+    /// arg, common)` at the caller's priority and park the caller until it returns, so the
+    /// callback runs on the owner's behalf and the owner does not continue past its callback
+    /// point meanwhile. Returns whether one was delivered (the caller then returns `Block`).
+    pub fn kcb_deliver_one(&mut self) -> bool {
+        if !self.preemptive {
+            return false;
+        }
+        self.kcb_account_vblanks();
+        let owner = self.current;
+        let Some(c) = self.kcallbacks.iter_mut().find(|c| c.owner == owner && c.count > 0) else {
+            return false;
+        };
+        let (uid, func, count, arg, common) = (c.uid, c.func, c.count, c.notify_arg, c.common);
+        tracing::trace!(target: "vitaslop::cb", uid = format_args!("{uid:#x}"), name = %c.name, count, "kernel callback delivered");
+        c.count = 0;
+        c.notify_arg = 0;
+        let stack = self.galloc(Self::SERVICE_CB_STACK_BYTES, 16);
+        if stack == 0 || func == 0 {
+            return false;
+        }
+        let thid = self.new_uid();
+        let priority = self.current_priority();
+        self.pending_spawns.push(Reentry {
+            entry: func & !1,
+            arg_len: uid as u32,
+            arg_ptr: count,
+            r2: arg,
+            r3: common,
+            stack_top: stack + Self::SERVICE_CB_STACK_BYTES,
+            thid,
+            priority,
+        });
+        self.kcb_threads.push((thid, uid));
+        self.join_waiters.push((owner, thid, 0));
+        true
     }
 
     /// Deliver the net inet-state callback once with `event` (a `SceNetCtlState`).
@@ -12226,7 +12265,11 @@ impl VitaState {
         // `min_by_key` on the deadline alone: two waits can share a deadline and either is a
         // correct answer for the JUMP, but only one may be credited for the time or the
         // attribution double-counts.
-        lw.chain(sl).chain(ev).chain(sem).chain(cnd).chain(lwm).min_by_key(|&(d, _)| d)
+        let mpp = self
+            .msgpipe_waiters
+            .iter()
+            .filter_map(|w| w.deadline.map(|d| (d, own(IdleKind::MsgPipe, w.thid))));
+        lw.chain(sl).chain(ev).chain(sem).chain(cnd).chain(lwm).chain(mpp).min_by_key(|&(d, _)| d)
     }
 
     /// Where the idle-path clock time went, as `(owner, microseconds, jumps)`, largest first.
@@ -12384,6 +12427,22 @@ impl VitaState {
         // Timed event flag waits whose deadline passed: wake with WAIT_TIMEOUT and the
         // CURRENT pattern written through outBits (the caller reads the pattern back
         // and re-checks; see `vita::sync::wait_event_flag`).
+        // Timed message-pipe receives: wake with WAIT_TIMEOUT and nothing received.
+        let mut expired_mpp = Vec::new();
+        self.msgpipe_waiters.retain(|w| match w.deadline {
+            Some(d) if d <= now => {
+                expired_mpp.push((w.thid, w.result));
+                false
+            }
+            _ => true,
+        });
+        for (thid, result) in expired_mpp {
+            if result != 0 {
+                self.pending_stat_writes.push((result, 0));
+            }
+            self.pending_wakes.push(thid);
+            self.pending_resume_codes.push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+        }
         let patterns: Vec<(i32, u32)> = self.event_flags.clone();
         self.evf_waiters.retain(|w| match w.deadline {
             Some(d) if d <= now => {
@@ -12553,9 +12612,29 @@ impl VitaState {
                 *n -= 1;
                 if *n == 0 {
                     self.program_refs.remove(&handle);
+                    if let Some(key) = self.program_share_key.remove(&handle) {
+                        self.program_share.remove(&key);
+                    }
                 }
                 true
             }
+        }
+    }
+
+    /// A live program created with exactly these parameters, taking one more reference to it.
+    /// See `gxm::create_vertex_program`.
+    pub fn share_program(&mut self, key: &(u32, Vec<u8>)) -> Option<u32> {
+        let handle = *self.program_share.get(key)?;
+        let n = self.program_refs.get_mut(&handle)?;
+        *n += 1;
+        Some(handle)
+    }
+
+    /// Record a freshly created program under its creation parameters. See [`Self::share_program`].
+    pub fn remember_shared_program(&mut self, key: (u32, Vec<u8>), handle: u32) {
+        if handle != 0 {
+            self.program_share_key.insert(handle, key.clone());
+            self.program_share.insert(key, handle);
         }
     }
 
@@ -12630,12 +12709,41 @@ impl VitaState {
         Some(at_match)
     }
 
+    /// Park the current thread in a message-pipe receive. See [`MsgPipeWaiter`].
+    pub fn msgpipe_block(&mut self, uid: i32, buf: u32, size: u32, full: bool, result: u32, timeout_us: Option<u32>) {
+        let deadline = timeout_us.map(|t| self.virtual_us + t as u64);
+        self.msgpipe_waiters.push(MsgPipeWaiter { uid, thid: self.current, buf, size, full, result, deadline });
+    }
+
+    /// After bytes arrive on pipe `uid`: hand them to parked receivers in FIFO order, each
+    /// only when the pipe can satisfy its mode, and wake it. The receive buffer is written
+    /// here, straight into guest memory - the receiver is parked, so nothing races it.
+    pub fn msgpipe_service(&mut self, ctx: &mut GuestCtx, uid: i32) {
+        loop {
+            let held = self.msg_pipes.get(&uid).map_or(0, |p| p.len());
+            let Some(idx) = self.msgpipe_waiters.iter().position(|x| x.uid == uid) else { break };
+            let x = &self.msgpipe_waiters[idx];
+            let ok = if x.full { held >= x.size as usize } else { held > 0 };
+            if !ok {
+                break;
+            }
+            let x = self.msgpipe_waiters.remove(idx);
+            let n = (x.size as usize).min(held);
+            let bytes: Vec<u8> = self.msg_pipes.get_mut(&uid).expect("held > 0").drain(..n).collect();
+            ctx.write_bytes(x.buf, &bytes);
+            if x.result != 0 {
+                ctx.write_u32(x.result, n as u32);
+            }
+            self.pending_wakes.push(x.thid);
+        }
+    }
+
     /// Park the current thread on event flag `uid` until `bits` is satisfied under
     /// `mode` (or `timeout_us` passes; 0 = wait forever). `out_addr` is the guest
     /// `outBits` pointer the wake will write the match pattern through.
     pub fn evf_block(&mut self, uid: i32, bits: u32, mode: u32, out_addr: u32, timeout_us: u32) {
         let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
-        self.evf_waiters.push(EvfWaiter { uid, thid: self.current, bits, mode, out_addr, deadline });
+        self.evf_waiters.push(EvfWaiter { uid, thid: self.current, bits, mode, out_addr, deadline, user_data_addr: 0 });
     }
 
     /// Set bits on an event flag, then release every parked waiter the new pattern
@@ -12658,8 +12766,60 @@ impl VitaState {
             if w.out_addr != 0 {
                 self.pending_stat_writes.push((w.out_addr, at_match));
             }
+            if w.user_data_addr != 0 {
+                let d = self.simple_events.get(&uid).map_or(0, |e| e.1);
+                self.pending_stat_writes.push((w.user_data_addr, d as u32));
+                self.pending_stat_writes.push((w.user_data_addr + 4, (d >> 32) as u32));
+            }
             self.pending_wakes.push(w.thid);
         }
+    }
+
+    /// `sceKernelCreateSimpleEvent`: an event flag whose waits are OR waits, which with
+    /// [`Self::SIMPLE_EVENT_AUTO_RESET`] in `attr` also CLEAR the pattern when satisfied (so a
+    /// set releases one waiter). It carries 64-bit user data from the last set.
+    pub fn create_simple_event(&mut self, attr: u32, init: u32) -> i32 {
+        let uid = self.create_event_flag(init);
+        self.simple_events.insert(uid, (attr, 0));
+        uid
+    }
+
+    /// `attr` bit of a simple event read as AUTO-RESET. DOA5 creates its task events with
+    /// exactly this bit and uses each as a one-shot wake between a producer and one waiter.
+    pub const SIMPLE_EVENT_AUTO_RESET: u32 = 0x100;
+
+    /// The event-flag wait mode a simple event's wait uses, or `None` if `uid` is not one.
+    pub fn simple_event_mode(&self, uid: i32) -> Option<u32> {
+        self.simple_events.get(&uid).map(|(attr, _)| {
+            Self::EVF_WAITOR | if attr & Self::SIMPLE_EVENT_AUTO_RESET != 0 { Self::EVF_WAITCLEAR } else { 0 }
+        })
+    }
+
+    /// Record a simple event's user data (`sceKernelSetEvent`'s third argument).
+    pub fn set_simple_event_data(&mut self, uid: i32, data: u64) {
+        if let Some(e) = self.simple_events.get_mut(&uid) {
+            e.1 = data;
+        }
+    }
+
+    pub fn simple_event_data(&self, uid: i32) -> u64 {
+        self.simple_events.get(&uid).map_or(0, |e| e.1)
+    }
+
+    /// `sceKernelDeleteSimpleEvent`. False if `uid` is not a simple event.
+    pub fn delete_simple_event(&mut self, uid: i32) -> bool {
+        if self.simple_events.remove(&uid).is_none() {
+            return false;
+        }
+        self.event_flags.retain(|(u, _)| *u != uid);
+        true
+    }
+
+    /// Park the current thread on a simple event - [`Self::evf_block`] plus the user-data
+    /// out pointer.
+    pub fn simple_event_block(&mut self, uid: i32, bits: u32, mode: u32, out_addr: u32, user_data_addr: u32, timeout_us: u32) {
+        let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
+        self.evf_waiters.push(EvfWaiter { uid, thid: self.current, bits, mode, out_addr, deadline, user_data_addr });
     }
 
     /// Clear an event flag's bits: keep only the bits also set in `bits` (the
@@ -13496,7 +13656,7 @@ impl VitaState {
     }
 
     /// The `SceGxmProgram*` a vertex program handle was created from, if recorded.
-    fn vertex_program_header(&self, handle: u32) -> u32 {
+    pub(crate) fn vertex_program_header(&self, handle: u32) -> u32 {
         self.vertex_programs.get(&handle).map(|i| i.program_header).unwrap_or(0)
     }
 
@@ -13507,18 +13667,25 @@ impl VitaState {
         handle: u32,
         program_header: u32,
         blend: crate::capture::BlendState,
+        patched_vertex_header: u32,
     ) {
-        self.fragment_programs.insert(handle, (program_header, blend));
+        self.fragment_programs.insert(handle, (program_header, blend, patched_vertex_header));
     }
 
-    fn fragment_program_header(&self, handle: u32) -> u32 {
-        self.fragment_programs.get(&handle).map(|(h, _)| *h).unwrap_or(0)
+    pub(crate) fn fragment_program_header(&self, handle: u32) -> u32 {
+        self.fragment_programs.get(&handle).map(|(h, ..)| *h).unwrap_or(0)
+    }
+
+    /// The vertex `SceGxmProgram*` a fragment program handle was PATCHED against at create
+    /// (0 when the title passed NULL or the handle is unknown).
+    fn fragment_program_patched_vertex(&self, handle: u32) -> u32 {
+        self.fragment_programs.get(&handle).map(|(_, _, v)| *v).unwrap_or(0)
     }
 
     /// The blend equation a fragment program handle was created with. An unknown handle
     /// yields the GXM default (no blending), which is what a NULL `blendInfo` means.
     fn fragment_program_blend(&self, handle: u32) -> crate::capture::BlendState {
-        self.fragment_programs.get(&handle).map(|(_, b)| *b).unwrap_or_default()
+        self.fragment_programs.get(&handle).map(|(_, b, _)| *b).unwrap_or_default()
     }
 
     /// Record a color surface, keyed by its guest struct address.
@@ -13771,6 +13938,9 @@ impl VitaState {
         unit_state.clear();
         unit_state.extend(bindings.iter().map(|&b| {
             let format = self.texture_format(b.addr);
+            // The explicit row pitch `sceGxmTextureInitLinearStrided` was given - see
+            // `build_texture_template`.
+            let byte_stride = self.texture_extra(b.addr).byte_stride;
             // Only for a handle with no format of its own: is there an initialised texture
             // NEARBY? A struct the guest inits at one address and binds at another (off by a
             // fixed member offset, or copied by value) is a completely different bug from one
@@ -13778,13 +13948,13 @@ impl VitaState {
             // control words alone. Searching a window answers it in the run that hit it.
             // Resolved in the pre-pass above, for null handles only - see it for why.
             let nearby = self.nearby_texture_cache.get(&b.addr).copied().flatten();
-            (b, format, nearby)
+            (b, format, nearby, byte_stride)
         }));
         let snapshots = &mut self.texture_snapshots;
         let out = unit_state
             .iter()
-            .filter_map(|(binding, format, nearby)| {
-                decode_texture(ctx, snapshots, binding, *format, *nearby)
+            .filter_map(|(binding, format, nearby, byte_stride)| {
+                decode_texture(ctx, snapshots, binding, *format, *nearby, *byte_stride)
             })
             .collect();
         self.texture_unit_scratch = unit_state;
@@ -14852,20 +15022,6 @@ impl VitaState {
     /// This is the HOST side of `InlineOp::BindPrecomputedState` - the fallback for a
     /// pointer or magic the emitted guard declines, and the definition the inline form is
     /// held to. It writes exactly the words the inline form writes.
-    /// TEMPORARY (`VITASLOP_UBIND_TRACE=<from>-<to>`, display frames). DELETE BEFORE COMMIT.
-    /// Whether the uniform-buffer binding trace is open at this frame. Run it with
-    /// `VITASLOP_NO_INLINE_IMPORTS=1`, or the inlined setters never reach a handler.
-    pub fn ubind_trace_open(&self) -> bool {
-        use std::sync::OnceLock;
-        static W: OnceLock<Option<(u64, u64)>> = OnceLock::new();
-        let w = W.get_or_init(|| {
-            let s = crate::knobs::var("VITASLOP_UBIND_TRACE").ok()?;
-            let (a, b) = s.split_once('-')?;
-            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-        });
-        matches!(*w, Some((a, b)) if (a..=b).contains(&(self.cur_frame as u64)))
-    }
-
     pub fn bind_precomputed_vertex_state(&mut self, ctx: &mut GuestCtx, state: u32) {
         use crate::vita::{gxmctx, gxmstate};
         let inited = state != 0
@@ -14915,14 +15071,6 @@ impl VitaState {
         let mut table = [0u8; TABLE_BYTES];
         if block != 0 {
             ctx.read_into(block, &mut table);
-        }
-        // TEMPORARY (`VITASLOP_UBIND_TRACE`). DELETE BEFORE COMMIT.
-        if self.ubind_trace_open() {
-            let words: Vec<String> = table
-                .chunks_exact(4)
-                .map(|c| format!("{:x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
-                .collect();
-            tracing::warn!(target: "vitaslop::gxm", "UBIND f{} bindVState state={state:#x} inited={inited} header={header:#x} block={block:#x} table=[{}]", self.cur_frame, words.join(" "));
         }
         if self.gxm_context != 0 {
             for i in 0..gxmctx::MAX_UNIFORM_BUFFERS {
@@ -15411,6 +15559,15 @@ impl VitaState {
         if let Some(w) = self.sema_waiters.iter().find(|w| w.thid == thid) {
             return format!("blocked on sema uid={:#x} need={}", w.uid, w.need);
         }
+        if let Some(w) = self.msgpipe_waiters.iter().find(|w| w.thid == thid) {
+            return format!(
+                "blocked on msgpipe uid={:#x} want={} ({}) holding={}",
+                w.uid,
+                w.size,
+                if w.full { "FULL" } else { "ASAP" },
+                self.msg_pipes.get(&w.uid).map_or(0, |p| p.len())
+            );
+        }
         if let Some(w) = self.evf_waiters.iter().find(|w| w.thid == thid) {
             let pattern = self.event_flags.iter().find(|(u, _)| *u == w.uid).map(|(_, p)| *p).unwrap_or(0);
             return format!(
@@ -15827,8 +15984,6 @@ impl VitaState {
         index_wrap: u32,
     ) {
         let _all = crate::perf::scope(crate::perf::Phase::DrawTotal);
-        // SCAFFOLDING - DELETE BEFORE COMMIT.
-        ambient_probe(ctx, self.cur_frame);
         // A draw with no context block behind it reads the GXM DEFAULTS for every piece of
         // sticky state - no bound program, no streams, cull none, depth less-equal - which
         // renders as missing geometry rather than as an error. Nothing else would report it,
@@ -16375,9 +16530,24 @@ impl VitaState {
         // container out of guest memory ONCE and hands every later draw a shared `Arc` -
         // see there for why a per-draw read is not affordable.
         let gxp_phase = crate::perf::scope(crate::perf::Phase::DrawGxpCapture);
-        let (vprog, fprog, vert_sa, frag_sa) = if gxp_live_capture() {
+        let (vprog, fprog, fprog_patched_vprog, vert_sa, frag_sa) = if gxp_live_capture() {
             let vprog = self.program_blob(ctx, vheader);
             let fprog = self.program_blob(ctx, fheader);
+            // The vertex program the fragment was PATCHED against, when that is not the one
+            // this draw binds - see `capture::Draw::fprog_patched_vprog`.
+            let patched = self
+                .fragment_program_patched_vertex(blk.word(crate::vita::gxmctx::off::FRAGMENT_PROGRAM));
+            let fprog_patched_vprog = if patched != 0 && patched != vheader {
+                let pv = self.program_blob(ctx, patched);
+                if pv[..] == vprog[..] {
+                    crate::capture::no_program()
+                } else {
+                    report_patched_against_other_vertex(fheader, vheader, patched);
+                    pv
+                }
+            } else {
+                crate::capture::no_program()
+            };
             // >>> THE SA BANK A RECOMPILED SHADER READS IS THE REGISTER FILE, NOT ONE BUFFER.
             //
             // The bytes captured above are the DEFAULT uniform buffer - the pre-stamp raw
@@ -16401,9 +16571,10 @@ impl VitaState {
             // Into an `Arc` HERE, once, at the only place these are produced - see
             // `capture::Draw::vert_sa`. From here to the renderer they are shared, so the
             // clone `RenderSceneBuilder::build` makes is a refcount bump.
-            (vprog, fprog, vert_sa, frag_sa)
+            (vprog, fprog, fprog_patched_vprog, vert_sa, frag_sa)
         } else {
             (
+                crate::capture::no_program(),
                 crate::capture::no_program(),
                 crate::capture::no_program(),
                 crate::capture::no_bytes(),
@@ -16501,6 +16672,7 @@ impl VitaState {
             world,
             vprog,
             fprog,
+            fprog_patched_vprog,
             vert_sa,
             frag_sa,
             frag_sa_addr,
@@ -17042,10 +17214,6 @@ impl VitaState {
             // bound" into "read guest address 124" and feed the draw exactly the fabricated
             // bytes this check exists to refuse.
             if addr == 0 || addr % 4 != 0 {
-                // TEMPORARY (`VITASLOP_UBIND_TRACE`). DELETE BEFORE COMMIT.
-                if self.ubind_trace_open() {
-                    tracing::warn!(target: "vitaslop::gxm", "UBIND f{} DROP vheader={vheader:#x} stage={} idx={} addr={addr:#x} vprog_handle={:#x}", self.cur_frame, if matches!(stage, ProgramStage::Vertex) { "v" } else { "f" }, w.buffer_index, blk.word(crate::vita::gxmctx::off::VERTEX_PROGRAM));
-                }
                 // >>> THE WHOLE TABLE, NOT JUST THE SLOT THAT FAILED. Both paths that write
                 // this table are INLINED into guest code (`StoreArgIndexed` for the direct
                 // setter, `BindPrecomputedState` for the precomputed one), so neither passes
@@ -19409,7 +19577,10 @@ fn zero_texel() -> Arc<[u8]> {
 /// header states that such a texture uses its MAG filter for minification too - so reading bits
 /// 10..11 there would sample by a couple of stride bits instead of a filter mode.
 fn word0_sampler_state(w0: u32, tex_type: u32) -> (u32, u32, u32, u32, u32, u32, u32) {
-    const TYPE_LINEAR_STRIDED: u32 = 1;
+    // `SCE_GXM_TEXTURE_LINEAR_STRIDED` (0xC000_0000) as the 3-bit selector `(w1 >> 29) & 7` -
+    // see `vita::gxm::TYPE_LINEAR_STRIDED`. This was 1, which is no texture type at all, so a
+    // strided texture read two of its stride bits as its minification filter.
+    const TYPE_LINEAR_STRIDED: u32 = 6;
     let mag = (w0 >> 12) & 0x3;
     let min = if tex_type == TYPE_LINEAR_STRIDED { mag } else { (w0 >> 10) & 0x3 };
     (
@@ -19429,6 +19600,7 @@ fn decode_texture(
     binding: &TextureBinding,
     exact_format: Option<u32>,
     nearby: Option<(i64, u32)>,
+    byte_stride: u32,
 ) -> Option<crate::capture::BoundTexture> {
     let (unit, addr) = (binding.unit, binding.addr);
     if addr == 0 {
@@ -19515,7 +19687,7 @@ fn decode_texture(
     let cached = match cache.decoded_validated(ctx, key) {
         Some(d) => d,
         None => {
-            let entry = decode_texture_pixels(ctx, cache, binding, exact_format);
+            let entry = decode_texture_pixels(ctx, cache, binding, exact_format, byte_stride);
             let d = entry.res.clone();
             // The count bound, now that the memo outlives scenes. A set whose per-binding
             // entry vanishes here simply fails its next re-proof and rebuilds.
@@ -19557,6 +19729,7 @@ fn decode_texture_pixels(
     cache: &mut TextureSnapshots,
     binding: &TextureBinding,
     exact_format: Option<u32>,
+    byte_stride: u32,
 ) -> DecodedEntry {
     let unit = binding.unit;
     // >>> EVERYTHING BELOW IS A PURE FUNCTION OF THE FOUR CONTROL WORDS, SO IT IS DONE ONCE.
@@ -19571,7 +19744,7 @@ fn decode_texture_pixels(
             *t
         }
         None => {
-            let t = build_texture_template(unit, binding.words, exact_format);
+            let t = build_texture_template(unit, binding.words, exact_format, byte_stride);
             if cache.templates.len() >= TEXTURE_TEMPLATE_CAP {
                 // >>> ONLY THE TEMPLATES, and only the coldest quarter of them.
                 //
@@ -19903,6 +20076,7 @@ fn build_texture_template(
     unit: u32,
     words: [u32; 4],
     exact_format: Option<u32>,
+    byte_stride: u32,
 ) -> Option<TextureTemplate> {
     let [w0, w1, w2, w3] = words;
     let tex_type = (w1 >> 29) & 0x7;
@@ -19947,8 +20121,18 @@ fn build_texture_template(
         report_unsized_texture_format(unit, base_format, tex_type, width, height);
         return None;
     };
-    let stride = l0.stride;
-    let level0 = l0.bytes;
+    // >>> A LINEAR_STRIDED TEXTURE'S ROWS ARE `byte_stride` APART, NOT A ROW'S WIDTH.
+    //
+    // The pitch is the explicit stride `sceGxmTextureInitLinearStrided` was given (the control
+    // words spread it over three fields whose composition is not published, so it rides in the
+    // host shadow - see `vita::gxm::texture_init`). MEASURED on a fighting title (PCSE00235): its
+    // bloom samples each mip level as a 128- or 256-wide strided window onto ONE 512-wide
+    // surface. Read at the width's pitch, every row after the first came from the wrong place
+    // (four texture rows to one surface row), and a renderer resolving the window against the
+    // rendered surface saw a texture whose pitch did not match it.
+    let strided = tex_type == 6 && byte_stride != 0;
+    let stride = if strided { byte_stride } else { l0.stride };
+    let level0 = if strided { byte_stride * height } else { l0.bytes };
     // A CUBE texture stores its six faces back to back, each laid out exactly like a standalone
     // texture of the same size - so one face is `level0` bytes and the snapshot is six of them.
     let faces = if crate::render::cube_type(tex_type) { 6 } else { 1 };
@@ -19991,8 +20175,14 @@ fn build_texture_template(
     // The chain's byte extent, and the level-0 fallback the caller drops to when the guest's
     // allocation turns out not to reach that far. `level_offset` walks every level, which is
     // exactly the sort of per-draw arithmetic this memo exists to stop repeating.
-    let face_bytes = crate::render::level_offset(base_format, tex_type, width, height, want_levels)
-        .unwrap_or(level0);
+    // A strided texture has ONE level (its mip-count bits are stride bits) laid out at its own
+    // pitch, which the mip-chain arithmetic knows nothing about.
+    let want_levels = if strided { 1 } else { want_levels };
+    let face_bytes = if strided {
+        level0
+    } else {
+        crate::render::level_offset(base_format, tex_type, width, height, want_levels).unwrap_or(level0)
+    };
     Some(TextureTemplate {
         base_format,
         // >>> THE PALETTE POINTER IS IN THE CONTROL WORDS, and reading it there is what makes a
@@ -20193,9 +20383,9 @@ impl NidDigest {
         {
             tracing::info!(
                 target: "vitaslop::status",
-                "nid call: frame={frame} thid={thid:#x} #{n} nid={func_nid:#010x} {} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                "nid call: frame={frame} thid={thid:#x} #{n} nid={func_nid:#010x} {} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x} sp={:#010x}",
                 crate::nid::name(func_nid),
-                regs[0], regs[1], regs[2], regs[3],
+                regs[0], regs[1], regs[2], regs[3], regs[14], regs[13],
             );
         }
     }
@@ -22769,4 +22959,62 @@ mod dirty_runs_tests {
         let got = runs(&map, 0, 12 * PAGE, 5);
         assert_eq!(got, vec![(PAGE, 3 * PAGE), (8 * PAGE, 10 * PAGE)]);
     }
+}
+
+#[cfg(test)]
+mod strided_texture_tests {
+    use super::*;
+
+    /// Control words for a 128x64 U8U8U8U8 texture of `tex_type` at 0x1000, with the given
+    /// word-0 filter fields.
+    fn words(tex_type: u32, mag: u32, min_bits: u32) -> [u32; 4] {
+        let w0 = (mag << 12) | (min_bits << 10);
+        let w1 = (tex_type << 29) | (0x0c << 24) | ((128 - 1) << 12) | (64 - 1);
+        [w0, w1, 0x1000, 0]
+    }
+
+    /// **A LINEAR_STRIDED TEXTURE'S ROWS ARE ITS EXPLICIT STRIDE APART.** MEASURED on a fighting
+    /// title: a 128x64 window onto a 512-wide surface, sampled with a 2048-byte stride. Taken at
+    /// the width's pitch (512) every row after the first came from the wrong surface row.
+    #[test]
+    fn a_strided_texture_takes_its_recorded_byte_stride() {
+        let fmt = Some(0x0c00_0000);
+        let t = build_texture_template(0, words(6, 1, 0), fmt, 2048).expect("template");
+        assert_eq!(t.stride, 2048, "the recorded pitch");
+        assert!(t.read_len >= 2048 * 63 + 128 * 4, "reads the last row at its pitch (read_len {})", t.read_len);
+        // With no recorded stride it falls back to the width-derived pitch, as before.
+        let t0 = build_texture_template(0, words(6, 1, 0), fmt, 0).expect("template");
+        assert_eq!(t0.stride, 128 * 4);
+        // A NON-strided texture ignores a stray recorded stride.
+        let lin = build_texture_template(0, words(3, 1, 0), fmt, 2048).expect("template");
+        assert_eq!(lin.stride, 128 * 4);
+    }
+
+    /// **A STRIDED TEXTURE MINIFIES WITH ITS MAG FILTER**: its bits 10..11 are stride bits. The
+    /// type selector for LINEAR_STRIDED is 6 - it was compared against 1, no type at all.
+    #[test]
+    fn a_strided_texture_minifies_with_its_mag_filter() {
+        let (_, _, _, min, mag, _, _) = word0_sampler_state(words(6, 1, 2)[0], 6);
+        assert_eq!((min, mag), (1, 1));
+        let (_, _, _, min, mag, _, _) = word0_sampler_state(words(3, 1, 2)[0], 3);
+        assert_eq!((min, mag), (2, 1));
+    }
+}
+
+/// Report - once per (fragment, bound vertex, patched-against vertex) - a draw that binds a
+/// fragment program with a vertex program OTHER than the one the fragment was created against.
+/// The hardware feeds such a fragment by output-lane POSITION from the bound vertex, laid out
+/// as the creation-time vertex placed them; see `capture::Draw::fprog_patched_vprog`.
+fn report_patched_against_other_vertex(fheader: u32, vheader: u32, patched: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((fheader, vheader, patched)) {
+        return;
+    }
+    tracing::info!(
+        target: "vitaslop::gxm",
+        "draw binds fragment program {fheader:#010x} with vertex program {vheader:#010x}, but the          fragment was PATCHED against vertex program {patched:#010x} - its varyings are fed by          output-lane position as that program laid them out"
+    );
 }

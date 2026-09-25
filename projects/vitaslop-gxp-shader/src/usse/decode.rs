@@ -266,6 +266,8 @@ pub fn decode(word: u64) -> Instr {
         0x00 => decode_grp_mad(word, hi, lo),
         0x01 | 0x02 => decode_grp_alu(word, hi, lo, op1),
         0x03 => decode_grp_18(word, hi, lo),
+        0x04 => decode_grp_20(word, false),
+        0x05 => decode_grp_20(word, true),
         0x06 => decode_grp_30(word, hi, lo),
         0x07 => decode_grp_38(word, hi, lo),
         0x08 => decode_grp_pack(word),
@@ -278,7 +280,9 @@ pub fn decode(word: u64) -> Instr {
         0x15 => decode_grp_imad32(word),
         0x1a => decode_grp_imad32_step(word),
         0x1c => decode_grp_tex(word),
+        0x1d if bits(word, 43, 42) == 1 => decode_local_access(word),
         0x1d => decode_grp_mem_load(word),
+        0x1e => decode_local_access(word),
         0x1f => decode_grp_flow(word),
         _ => classified_stub(word, op1, hi, lo),
     }
@@ -1068,8 +1072,42 @@ fn decode_grp_test_mask(word: u64) -> Instr {
         }
     }
 
+    // >>> THE 8-BIT-MASK FORM (type 0) OF THE FLOAT FAMILY: A DOUBLED DESTINATION, AND ITS FOUR
+    // >>> ANSWERS PACKED AS BYTES OF ONE REGISTER.
+    //
+    // Every type-0 word in the corpus (48 in a football title's 17 skinning programs, 4 in a
+    // fighting title's) is the float-to-int SATURATION guard `(-2^31 + index) >= 0` feeding a
+    // byte-wise conditional move `[0x7fffffff, packed index, mask]`. Read with a DIRECT
+    // destination every one of those masks was dead - written, then overwritten or never read.
+    // Read DOUBLE-REGISTER scaled like the family's sources, each lands exactly on the LAST
+    // operand of the VMOVCU8 after it (4-bone: pa[6] -> pa[12] four times; 2-bone: pa[7] ->
+    // pa[14], pa[6] -> pa[12]; fighting: pa[4] -> pa[8], pa[7] -> pa[14]), each after the
+    // previous value there was consumed. It writes ONE register: four float lanes at a doubled
+    // pa[14] would destroy `blendIndices.xy` in pa[16..17] one block before bone 1 reads them.
+    // The byte packing is the form's own name, and what a BYTE-wise consumer can read.
+    //
+    // The NUMERIC form (type 2) is untouched: all of its instances (shadow filters in three
+    // titles) write an INTERNAL register and a DOT reads four float lanes straight back.
+    // `VITASLOP_GXP_TSTMSK_DEST=raw` is the arm back to reading type 0 as type 2.
     let dest_sel = bits(word, 33, 32) as u8;
-    let dest = match r7_dest_bank_index(dest_sel, bits(word, 27, 21)) {
+    let dest_field = bits(word, 27, 21);
+    let byte_mask = float_ty
+        && mask_type == 0
+        && std::env::var("VITASLOP_GXP_TSTMSK_DEST").as_deref() != Ok("raw");
+    let doubled = byte_mask;
+    let dest_bi = match r7_dest_bank_index(dest_sel, dest_field) {
+        Some((Bank::Internal, i)) => Some((Bank::Internal, i)),
+        Some((b, _)) if doubled => {
+            if dest_field >= 64 {
+                blocked = blocked.or(Some(
+                    "0x78 VTSTMSK float destination field >= 64: doubled, it is off the register file",
+                ));
+            }
+            Some((b, reg_index(dest_field)))
+        }
+        other => other,
+    };
+    let dest = match dest_bi {
         Some((b, i)) => Some(Operand::plain(b, i, dest_sel)),
         None => {
             blocked = blocked.or(Some("0x78 VTSTMSK destination in index mode"));
@@ -1078,7 +1116,7 @@ fn decode_grp_test_mask(word: u64) -> Instr {
     };
 
     Instr {
-        op: Op::TestMask { alu, cmp },
+        op: Op::TestMask { alu, cmp, byte_mask },
         pred,
         dest,
         // >>> THE CHANNEL COUNT IS DERIVED FROM THE ALU FAMILY, NOT FROM THE MASK TYPE.
@@ -1091,7 +1129,10 @@ fn decode_grp_test_mask(word: u64) -> Instr {
         // integer form's operands are whole raw lanes with no per-channel content to compare,
         // so four channels would be four copies of one answer written over four registers the
         // instruction was never meant to touch.
-        write_mask: if float_ty { [true; 4] } else { [true, false, false, false] },
+        //
+        // >>> EXCEPT THE 8-BIT-MASK FORM, whose four answers are the four BYTES of one register
+        // (see `byte_mask` above) - one register written, lane x.
+        write_mask: if float_ty && !byte_mask { [true; 4] } else { [true, false, false, false] },
         srcs: vec![s1, s2],
         half_precision,
         raw: word,
@@ -1858,6 +1899,485 @@ fn rswz2_dot_op2(c3_en: bool, swz_alt_op2: u32, op2_swz: u32) -> [u8; 4] {
     swz_str_const(if c3_en { T4[idx] } else { T3[idx] })
 }
 
+/// A group-0x20 three-channel swizzle table entry, as a selector triple (`h` = 0.5).
+fn grp20_swz3(s: &str) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for (i, ch) in s.chars().take(3).enumerate() {
+        out[i] = match ch {
+            'x' => 0,
+            'y' => 1,
+            'z' => 2,
+            'w' => 3,
+            '0' => 4,
+            '1' => 5,
+            '2' => 6,
+            _ => 7, // 'h' = 0.5
+        };
+    }
+    // The destination is `.xyz` only; channel w is never written, so its selector is unread.
+    out[3] = out[2];
+    out
+}
+
+/// A FOUR-lane swizzle string (group 0x28) as selectors, the constants encoded as in
+/// [`grp20_swz3`].
+fn grp20_swz4(s: &str) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for (i, ch) in s.chars().take(4).enumerate() {
+        out[i] = match ch {
+            'x' => 0,
+            'y' => 1,
+            'z' => 2,
+            'w' => 3,
+            '0' => 4,
+            '1' => 5,
+            '2' => 6,
+            _ => 7, // 'h' = 0.5
+        };
+    }
+    out
+}
+
+/// Group 0x28's (four-lane) swizzle tables, from the clean-room four-lane swizzle spec: the
+/// 16-entry STANDARD table (`opN` and `op1i`, and `op2i` with its extended bit clear) followed
+/// by the 16-entry EXTENDED one (`op2i` with bit 52 set; `opN` when the primary op has fewer
+/// than two sources and bit 15 is set). CALIBRATED on a shipped word, `0x2ce430d6d0d11388`,
+/// whose `op2i` index 5 with bit 52 set decodes as extended entry 5, `wzwz`. Conformance: `conf_a_four_lane_word_reads_its_extended_swizzle_table` (the old decoder refused that word).
+const GRP28_SWZ32: [&str; 32] = [
+    "xxxx", "yyyy", "zzzz", "wwww", "xyzw", "yzww", "xyzz", "xxyz", "xyxy", "xywz", "zxyw", "zwzw",
+    "0000", "hhhh", "1111", "2222", "yzxw", "zwxy", "xzwy", "yyww", "wyzw", "wzwz", "xyzx", "zzww",
+    "xwzx", "yyyx", "yyyz", "zwzw", "yzxz", "xxyy", "xzww", "xyz1",
+];
+
+/// Group 0x20's vector swizzle for `opN` and `op1i` (henkaku, FACT), indexed by
+/// `swz_alt << 2 | swz`. The constant rows are splats.
+
+/// Group 0x20's vector swizzle for `op2i` (henkaku, FACT), indexed by
+/// `swz_alt_op2i_2 << 4 | swz_alt_op2i_x << 2 | op2i_swz`.
+const GRP20_SWZ32: [&str; 32] = [
+    "xxx", "yyy", "zzz", "www", "xyz", "yzw", "xxy", "xyx", "yyx", "yyz", "zxy", "xzy", "000", "hhh",
+    "111", "222", "xyy", "yxy", "xxz", "yxx", "xy0", "x10", "xzy", "yzx", "zyx", "zzy", "xy1", "hhh",
+    "hhh", "hhh", "hhh", "hhh",
+];
+
+/// The SCALAR forms' (exp/log/rsq/rcp) component select for `opN` and `op1i` (henkaku, FACT):
+/// the one lane the function reads, indexed like the first 16 entries of [`GRP20_SWZ32`].
+const GRP20_SCALAR16: [u8; 16] = [0, 1, 2, 3, 0, 1, 0, 0, 1, 1, 2, 0, 0, 3, 1, 2];
+
+/// The scalar forms' component select for `op2i`, indexed like [`GRP20_SWZ32`].
+const GRP20_SCALAR32: [u8; 32] = [
+    0, 1, 2, 3, 0, 1, 0, 0, 1, 1, 2, 0, 0, 3, 1, 2, 0, 1, 0, 1, 0, 0, 0, 1, 2, 2, 0, 3, 3, 3, 3, 3,
+];
+
+/// One of the fourteen operations a group-0x20/0x28 word can carry in either of its two issue
+/// slots (see [`decode_grp_20_pair`]), indexed `extension_bit * 8 + 3-bit opcode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum G20Op {
+    VMad,
+    VDot,
+    /// A vector dotted with itself (sum of squares).
+    SelfDot,
+    VMul,
+    VAdd,
+    VMov,
+    Rsq,
+    Rcp,
+    SMad,
+    SAdd,
+    SMul,
+    /// `a - floor(b)` - no IR op; blocks.
+    SubFlr,
+    Exp,
+    Log,
+}
+
+impl G20Op {
+    fn from_index(i: u32) -> Option<Self> {
+        use G20Op::*;
+        [VMad, VDot, SelfDot, VMul, VAdd, VMov, Rsq, Rcp, SMad, SAdd, SMul, SubFlr, Exp, Log]
+            .get(i as usize)
+            .copied()
+    }
+    fn sources(self) -> usize {
+        use G20Op::*;
+        match self {
+            VMad | SMad => 3,
+            VDot | VMul | VAdd | SAdd | SMul | SubFlr => 2,
+            SelfDot | VMov | Rsq | Rcp | Exp | Log => 1,
+        }
+    }
+    /// Reads its sources as vectors (and so reads the register operand DOUBLED).
+    fn vector_load(self) -> bool {
+        use G20Op::*;
+        matches!(self, VMad | VDot | SelfDot | VMul | VAdd | VMov)
+    }
+    /// Stores a vector (and so writes a register destination DOUBLED, two lanes / four halves).
+    fn vector_store(self) -> bool {
+        use G20Op::*;
+        matches!(self, VMad | VMul | VAdd | VMov)
+    }
+}
+
+/// Decode a group-0x20 (three-lane) or group-0x28 (four-lane) word into the one or two IR
+/// instructions it issues, in an order that gives each the operand values from BEFORE the word
+/// (see "Ordering" below).
+///
+/// # THE WORD IS DUAL-ISSUE (clean-room facts, `docs-re/usse-spec-grp20-exp-forms.md`)
+/// Every word carries a PRIMARY operation (`op_sel2` (54, three-lane only) * 8 + `opcode2`
+/// (46:44)) and a SECONDARY one (`gr_sel` (43) * 8 + `opcode3` (20:18)), from one table of
+/// fourteen: vector mad, dot, self-dot, mul, add, mov, then scalar rsq, rcp, mad, add, mul,
+/// subflr, exp, log. `op_sel1` (42) decides which of the two writes the REGISTER destination
+/// (bank 33:32, number 27:21 - `1` = the primary); the other writes internal register
+/// `i<29:28>` under the mask 9:7 (plus 54 = w in the four-lane group). The henkaku page's
+/// forms name only the primary and document only its operands, which is why its "EXP"/"RR"
+/// cells looked undocumented and why the fields it calls unused held register numbers.
+///
+/// A register number is DOUBLED only for an operation that stores (destination) or loads
+/// (the register source) a VECTOR; a scalar operation's register is the field itself. The
+/// register destination writes a fixed lane count: a vector store two f32 lanes / four f16
+/// halves, a scalar store one f32 lane / two f16 halves (one register). A temp-bank code
+/// 124..127 names `i0..i3` instead, written three (four) lanes wide.
+///
+/// MEASURED, each against the program's own arithmetic in a fighting title's corpus (no other
+/// captured title uses these groups at all):
+/// * `vert_846501d0`: `log i0.x <- x`, then this word's primary `mul i0.x <- sa73.y * i0.x`,
+///   then `exp`: a pow whose exponent the UNDOUBLED `sa73.y` names - the high half of the
+///   register the secondary program loads from uniform offset 312, `gSpecularColor.w`, the
+///   specular power. Read doubled it is `sa146`, past the last register the program loads.
+/// * `frag_846ee450`: the secondary `mov pa16 <- pa2.xyz` fills the vector a later mul reads
+///   whole, where the primary alone left its y/z lanes unwritten.
+/// * the cell once read as "an rsq that is really a self-dot" is a primary rsq into a register
+///   plus a SECONDARY self-dot into `i<29:28>` - the dot the following rsq/normalize reads.
+/// * group 0x28's register moves/mads: the destination is next read as a whole f16 vector.
+///
+/// # Operands
+/// `U` = the register operand (bank 31:30, number 6:0, swizzle 51:48, negate 47; when the
+/// primary has fewer than two sources, 15 selects the extended swizzle table and 14 is abs);
+/// `I0` = `i<11:10>` swizzle 41:38; `I1` = `i<13:12>` swizzle 52,37:34, negate 58; `I2` =
+/// `i<15:14>` with the identity swizzle when the primary has two or more sources, else a fixed
+/// `i2`. `nsel` (17:16) places them, per the primary's and the secondary's source counts.
+///
+/// # Ordering
+/// Both operations read the register values from before the word. They are emitted one after
+/// the other, so the one whose destination the other reads goes SECOND; a word whose two
+/// operations each read the other's destination has no such order and blocks.
+fn decode_grp_20_pair(word: u64, four_lane: bool) -> Vec<Instr> {
+    let mut blocked: Option<&'static str> = None;
+    let group = if four_lane { 0x28 } else { 0x20 };
+    let half = bits(word, 53, 53) != 0;
+    let blocked_instr = |why: &'static str| Instr {
+        op: Op::Todo("grp20 dual-issue word"),
+        pred: Predicate::Always,
+        dest: None,
+        write_mask: [false; 4],
+        srcs: Vec::new(),
+        half_precision: half,
+        raw: word,
+        group,
+        blocked: Some(why),
+    };
+    let p_index = if four_lane { 0 } else { bits(word, 54, 54) * 8 } + bits(word, 46, 44);
+    let s_index = bits(word, 43, 43) * 8 + bits(word, 20, 18);
+    let (Some(prim), Some(sec)) = (G20Op::from_index(p_index), G20Op::from_index(s_index)) else {
+        return vec![blocked_instr("group 0x20 word naming an invalid operation slot (14/15)")];
+    };
+    if s_index == 0 {
+        return vec![blocked_instr("group 0x20 word with the invalid secondary operation 0")];
+    }
+    if bits(word, 57, 56) != 0 {
+        blocked = Some("group 0x20 predicate: this group's table is not established");
+    }
+    let prim_writes_reg = bits(word, 42, 42) == 1;
+    let (pn, sn) = (prim.sources(), sec.sources());
+    let nsel = bits(word, 17, 16);
+
+    // The register destination, for whichever operation owns it.
+    let reg_owner = if prim_writes_reg { prim } else { sec };
+    let dst_field = bits(word, 27, 21);
+    let dst_bank = bits(word, 33, 32) as u8;
+    let (reg_dest, reg_dest_internal) = match bank_rsi2(dst_bank) {
+        None => {
+            blocked = blocked.or(Some("group 0x20 register destination in indexed mode"));
+            (Operand::plain(Bank::Temp, 0, 0), false)
+        }
+        Some(Bank::Temp) if (124..=127).contains(&dst_field) => {
+            (Operand::plain(Bank::Internal, internal_base(dst_field - 124), dst_bank), true)
+        }
+        Some(b) => {
+            let index = if reg_owner.vector_store() { reg_index(dst_field) } else { dst_field as u8 };
+            (Operand::plain(b, index, dst_bank), false)
+        }
+    };
+    let reg_mask = if reg_dest_internal {
+        [true, true, true, four_lane]
+    } else {
+        match (reg_owner.vector_store(), half) {
+            (true, false) => [true, true, false, false],
+            (true, true) => [true; 4],
+            (false, false) => [true, false, false, false],
+            (false, true) => [true, true, false, false],
+        }
+    };
+    let mut int_mask = match bits(word, 9, 7) {
+        0b000 => [false, false, false, false],
+        0b001 => [true, false, false, false],
+        0b010 => [false, true, false, false],
+        0b011 => [true, true, false, false],
+        0b100 => [false, false, true, false],
+        0b101 => [true, false, true, false],
+        0b110 => [false, true, true, false],
+        _ => [true, true, true, false],
+    };
+    if four_lane {
+        int_mask[3] = bits(word, 54, 54) != 0;
+    }
+    let int_dest = Operand::plain(Bank::Internal, internal_base(bits(word, 29, 28)), 0);
+
+    // Operand builders. A source's lanes depend on the operation that reads it: a scalar
+    // operation reads one lane (the scalar tables), a vector operation the three- (four-) lane
+    // table - cut to the lanes its REGISTER destination has when it stores a vector there.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Slot {
+        U,
+        I0,
+        I1,
+        I2,
+    }
+    let u_ext = pn < 2 && bits(word, 15, 15) != 0;
+    let u_abs = pn < 2 && bits(word, 14, 14) != 0;
+    let k_u = ((bits(word, 51, 50) << 2) | bits(word, 49, 48)) as usize;
+    let k_1 = ((bits(word, 41, 40) << 2) | bits(word, 39, 38)) as usize;
+    let k_2 = ((bits(word, 52, 52) << 4) | (bits(word, 37, 36) << 2) | bits(word, 35, 34)) as usize;
+    if u_ext && k_u > 10 {
+        blocked = blocked.or(Some("group 0x20 extended register swizzle beyond the established entries"));
+    }
+    // `k` indexes the 32-entry table of the width in force (the three-lane one's first 16 are
+    // the `opN`/`op1i` table, and so are the four-lane one's).
+    let lanes = |k: usize, op: G20Op, writes_reg: bool| -> [u8; 4] {
+        let mut sw = if four_lane { grp20_swz4(GRP28_SWZ32[k]) } else { grp20_swz3(GRP20_SWZ32[k]) };
+        if writes_reg && !reg_dest_internal && op.vector_store() {
+            if half {
+                // The three-lane table's fourth half repeats x; the four-lane table has its own w.
+                if !four_lane {
+                    sw[3] = 0;
+                }
+            } else {
+                sw[2] = sw[1];
+                sw[3] = sw[1];
+            }
+        }
+        sw
+    };
+    let splat = |c: u8| [c, c, c, c];
+    let operand = |slot: Slot, op: G20Op, writes_reg: bool| -> Operand {
+        let scalar = !op.vector_load();
+        match slot {
+            Slot::U => {
+                let field = bits(word, 6, 0);
+                let bank_sel = bits(word, 31, 30) as u8;
+                let (b, i) = if op.vector_load() {
+                    r7_double_source_bank_index(bank_sel, field)
+                } else {
+                    source_bank_index(bank_sel, field, 124, |f| f as u8)
+                };
+                let mut o = Operand::plain(b, i, bank_sel);
+                let k = (if u_ext { 16 + k_u } else { k_u }).min(31);
+                o.swizzle = if scalar { splat(GRP20_SCALAR32[k]) } else { lanes(k, op, writes_reg) };
+                o.neg = bits(word, 47, 47) != 0;
+                o.abs = u_abs;
+                o
+            }
+            Slot::I0 => {
+                let mut o = Operand::plain(Bank::Internal, internal_base(bits(word, 11, 10)), 0);
+                o.swizzle = if scalar { splat(GRP20_SCALAR16[k_1]) } else { lanes(k_1, op, writes_reg) };
+                o
+            }
+            Slot::I1 => {
+                let mut o = Operand::plain(Bank::Internal, internal_base(bits(word, 13, 12)), 0);
+                o.swizzle = if scalar { splat(GRP20_SCALAR32[k_2]) } else { lanes(k_2, op, writes_reg) };
+                o.neg = bits(word, 58, 58) != 0;
+                o
+            }
+            Slot::I2 => {
+                let n = if pn >= 2 { bits(word, 15, 14) } else { 2 };
+                let mut o = Operand::plain(Bank::Internal, internal_base(n), 0);
+                // No swizzle field: identity, entry 4 of either width's table.
+                o.swizzle = if scalar { splat(0) } else { lanes(4, op, writes_reg) };
+                o
+            }
+        }
+    };
+    use Slot::*;
+    let prim_slots: Option<Vec<Slot>> = match (pn, nsel) {
+        (1, 0) => Some(vec![U]),
+        (1, 1) => Some(vec![I0]),
+        (1, 2) => Some(vec![I1]),
+        (1, _) => Some(vec![I2]),
+        (2, 0) => Some(vec![U, I1]),
+        (2, 1) => Some(vec![I0, U]),
+        (2, 2) => Some(vec![I0, I1]),
+        (3, 0) => Some(vec![U, I1, I2]),
+        (3, 1) => Some(vec![I0, U, I2]),
+        (3, 2) => Some(vec![I0, I1, U]),
+        (3, _) => Some(vec![I0, I1, I2]),
+        _ => None,
+    };
+    let sec_slots: Option<Vec<Slot>> = match (pn, sn, nsel) {
+        (1, 1, 0) => Some(vec![I0]),
+        (1, 1, _) => Some(vec![U]),
+        (1, 2, 0) => Some(vec![I0, I1]),
+        (1, 2, 1) => Some(vec![U, I1]),
+        (1, 2, 2) => Some(vec![I0, U]),
+        (1, 2, _) => Some(vec![I1, U]),
+        (1, 3, 0) => Some(vec![I0, I1, I2]),
+        (1, 3, 1) => Some(vec![U, I1, I2]),
+        (1, 3, 2) => Some(vec![I0, U, I2]),
+        (1, 3, _) => Some(vec![I0, U, I1]),
+        (2, 1, 0) => Some(vec![I0]),
+        (2, 1, 1) => Some(vec![I1]),
+        (2, 1, 2) => Some(vec![U]),
+        (2, 2, 0) => Some(vec![I0, I2]),
+        (2, 2, 1) => Some(vec![I1, I2]),
+        (2, 2, 2) => Some(vec![I2, U]),
+        (3, 1, 0) => Some(vec![I0]),
+        (3, 1, 1) => Some(vec![I1]),
+        (3, 1, 2) => Some(vec![I2]),
+        (3, 1, _) => Some(vec![U]),
+        _ => None,
+    };
+    let (Some(prim_slots), Some(sec_slots)) = (prim_slots, sec_slots) else {
+        return vec![blocked_instr("group 0x20 source arrangement invalid for this pair of operations")];
+    };
+    if four_lane {
+        // The four-lane VECTOR tables are established (`GRP28_SWZ32`); what a SCALAR operation
+        // reads from an entry beyond the splats and identity is not - the spec gives no
+        // four-lane scalar table - so a scalar read of one still blocks.
+        let scalar_reads = |slots: &[Slot], op: G20Op| -> Vec<Slot> {
+            if op.vector_load() { Vec::new() } else { slots.to_vec() }
+        };
+        let all: Vec<Slot> =
+            scalar_reads(&prim_slots, prim).into_iter().chain(scalar_reads(&sec_slots, sec)).collect();
+        if (all.contains(&U) && (k_u > 4 || u_ext)) || (all.contains(&I0) && k_1 > 4) || (all.contains(&I1) && k_2 > 4) {
+            blocked = blocked.or(Some(
+                "group 0x28 SCALAR read of a swizzle entry beyond the splats and identity, which is not established for four lanes",
+            ));
+        }
+    }
+    let components = if four_lane { 4 } else { 3 };
+    let build = |op: G20Op, slots: &[Slot], writes_reg: bool| -> Instr {
+        let mut srcs: Vec<Operand> = slots.iter().map(|&s| operand(s, op, writes_reg)).collect();
+        let ir_op = match op {
+            G20Op::VMad | G20Op::SMad => Op::Mad,
+            G20Op::VDot => Op::Dot { components },
+            G20Op::SelfDot => {
+                srcs.push(srcs[0]);
+                Op::Dot { components }
+            }
+            G20Op::VMul | G20Op::SMul => Op::Mul,
+            G20Op::VAdd | G20Op::SAdd => Op::Add,
+            G20Op::VMov => Op::Mov,
+            G20Op::Rsq => Op::Rsq,
+            G20Op::Rcp => Op::Rcp,
+            G20Op::Exp => Op::Exp,
+            G20Op::Log => Op::Log,
+            G20Op::SubFlr => Op::Todo("grp20 subflr"),
+        };
+        let this_blocked = match op {
+            G20Op::SubFlr => Some("group 0x20 SUBFLR (a - floor(b)) has no IR operation"),
+            _ => None,
+        };
+        Instr {
+            op: ir_op,
+            pred: Predicate::Always,
+            dest: Some(if writes_reg { reg_dest } else { int_dest }),
+            write_mask: if writes_reg { reg_mask } else { int_mask },
+            srcs,
+            half_precision: half,
+            raw: word,
+            group,
+            blocked: blocked.or(this_blocked),
+        }
+    };
+    let a = build(prim, &prim_slots, prim_writes_reg);
+    let b = build(sec, &sec_slots, !prim_writes_reg);
+    // An operation that writes NOTHING (an all-clear internal mask) has no effect to place.
+    let writes = |i: &Instr| i.write_mask.iter().any(|&m| m);
+    match (writes(&a), writes(&b)) {
+        (true, false) | (false, false) => return vec![a],
+        (false, true) => return vec![b],
+        _ => {}
+    }
+    match (g20_reads_dest_of(&b, &a), g20_reads_dest_of(&a, &b)) {
+        // b reads a's destination: b must run first.
+        (true, false) => vec![b, a],
+        (false, _) => vec![a, b],
+        // Each reads the other's destination (MEASURED once: `i1 <- pa6 * i0.x` beside
+        // `pa6 <- i1.x * i1.x`). `a` computes into a SCRATCH temp that no program allocates
+        // (the corpus's largest temp file is 120 registers), `b` runs on the old values, and
+        // a move lands `a`'s result - so both read what was there before the word.
+        (true, true) => {
+            let final_dest = a.dest;
+            let scratch = Operand::plain(Bank::Temp, G20_SCRATCH_TEMP, 0);
+            let mut mov_src = scratch;
+            mov_src.swizzle = [0, 1, 2, 3];
+            let land = Instr {
+                op: Op::Mov,
+                pred: Predicate::Always,
+                dest: final_dest,
+                write_mask: a.write_mask,
+                srcs: vec![mov_src],
+                half_precision: a.half_precision,
+                raw: word,
+                group,
+                blocked: a.blocked,
+            };
+            vec![Instr { dest: Some(scratch), ..a }, b, land]
+        }
+    }
+}
+
+/// The temp register a mutually dependent dual-issue word parks its first result in (see
+/// [`decode_grp_20_pair`]): past every temp any captured program allocates.
+const G20_SCRATCH_TEMP: u8 = 248;
+
+/// Whether any source of `reader` overlaps the registers `writer` stores to. Conservative:
+/// a register operand is taken to span two 32-bit registers at f16 and four at f32 (the most
+/// a group-0x20 operand reads), an internal register its whole four.
+fn g20_reads_dest_of(reader: &Instr, writer: &Instr) -> bool {
+    let Some(d) = writer.dest else { return false };
+    let span = |o: &Operand, half: bool| -> u32 {
+        if o.bank == Bank::Internal || !half {
+            4
+        } else {
+            2
+        }
+    };
+    let (d0, d1) = (u32::from(d.index), u32::from(d.index) + span(&d, writer.half_precision));
+    reader.srcs.iter().any(|s| {
+        s.bank == d.bank && {
+            let (s0, s1) = (u32::from(s.index), u32::from(s.index) + span(s, reader.half_precision));
+            s0 < d1 && d0 < s1
+        }
+    })
+}
+
+fn decode_grp_20(word: u64, four_lane: bool) -> Instr {
+    decode_grp_20_pair(word, four_lane).remove(0)
+}
+
+/// The instructions a dual-issue group-0x20/0x28 word emits AFTER the one [`decode`] returns
+/// (see [`decode_grp_20_pair`]) - empty for any other word.
+pub fn decode_dual_rest(word: u64) -> Vec<Instr> {
+    let mut v = match opcode1(word) {
+        0x04 => decode_grp_20_pair(word, false),
+        0x05 => decode_grp_20_pair(word, true),
+        0x06 => decode_grp_30_parts(word, 0, 0),
+        _ => return Vec::new(),
+    };
+    v.remove(0);
+    v
+}
+
 /// Decode a group-0x18 instruction. Its 1-bit `opcode2` (a fact) splits the group into
 /// dot.f32 (0) and mad.f32 (1); both read the same bit position (high-word bit 21).
 fn decode_grp_18(word: u64, hi: u32, lo: u32) -> Instr {
@@ -2213,7 +2733,28 @@ fn decode_grp_18_mad(word: u64, hi: u32, lo: u32) -> Instr {
 /// 10-bit packed pipeline is not modeled), an extended-bank operand (immediate/special/
 /// indexed), or an index-mode destination. F16/F32 both emit in the shared scalar-lane
 /// register model (the same convention the 0x08/0x10 groups already use).
-fn decode_grp_30(word: u64, _hi: u32, _lo: u32) -> Instr {
+fn decode_grp_30(word: u64, hi: u32, lo: u32) -> Instr {
+    decode_grp_30_parts(word, hi, lo).remove(0)
+}
+
+/// Group 0x30 (the scalar `rcp`/`rsq`/`log`/`exp`) as the IR instructions it becomes.
+///
+/// # A SOURCE AND A DESTINATION OF DIFFERENT WIDTHS
+/// The word carries a data type for its destination (54:53) AND one for its source (40:39),
+/// and they need not agree: a shader clamps a value at half precision and takes its log at full
+/// precision in one instruction. The IR op reads its source at the destination's width, so a
+/// mixed word is split, through [`G20_SCRATCH_TEMP`]:
+///
+/// * F16 source, F32 destination: `scratch.x = f32(src.c)` (a precision-converting pack), then
+///   the op on `scratch.x` at F32;
+/// * F32 source, F16 destination: the op at F32 into `scratch`, then a pack of it to F16 into
+///   the destination.
+///
+/// MEASURED on a fighting title (PCSE00235): its character vertex programs clamp `dot(N,H)` with
+/// a half-precision `max` into `pa0.x` and `log` it at full precision. Reading that half as an
+/// F32 took the packed pair's bits as a float (a tiny negative), the log was NaN, the NaN rode a
+/// varying into the fragment's colour arithmetic, and every character was drawn black.
+fn decode_grp_30_parts(word: u64, _hi: u32, _lo: u32) -> Vec<Instr> {
     let op = match bits(word, 42, 41) {
         0 => Op::Rcp,
         1 => Op::Rsq,
@@ -2294,7 +2835,7 @@ fn decode_grp_30(word: u64, _hi: u32, _lo: u32) -> Instr {
     s1.abs = abs1;
     s1.neg = neg1;
 
-    Instr {
+    let base = Instr {
         op,
         pred: ext_predicate(predicate_raw),
         dest,
@@ -2304,6 +2845,58 @@ fn decode_grp_30(word: u64, _hi: u32, _lo: u32) -> Instr {
         raw: word,
         group: 0x06,
         blocked,
+    };
+    if src_type == dest_type || blocked.is_some() {
+        return vec![base];
+    }
+    // A mixed word that also REPEATS would need both parts stepped together; not established.
+    if repeat_extra_iterations(word).is_some_and(|n| n > 0) {
+        return vec![Instr { blocked: Some("0x30 mixed source/destination width under a repeat not modeled"), ..base }];
+    }
+    let scratch = Operand::plain(Bank::Temp, G20_SCRATCH_TEMP, 0);
+    let mut scratch_x = scratch;
+    scratch_x.swizzle = [0, 0, 0, 0];
+    if src_type == 1 {
+        // F16 source -> F32: convert the one selected half first. The source modifiers stay
+        // on the op, which reads the converted value.
+        let mut plain = s1;
+        plain.abs = false;
+        plain.neg = false;
+        let convert = Instr {
+            op: Op::Pack { src_half: true },
+            pred: base.pred,
+            dest: Some(scratch),
+            write_mask: [true, false, false, false],
+            srcs: vec![plain],
+            half_precision: false,
+            raw: word,
+            group: 0x06,
+            blocked: None,
+        };
+        let mut src = scratch_x;
+        src.abs = s1.abs;
+        src.neg = s1.neg;
+        vec![convert, Instr { srcs: vec![src], half_precision: false, ..base }]
+    } else {
+        // F32 source -> F16 destination: compute at F32 into the scratch, then narrow it.
+        let compute = Instr {
+            dest: Some(scratch),
+            write_mask: [true, false, false, false],
+            half_precision: false,
+            ..base.clone()
+        };
+        let narrow = Instr {
+            op: Op::Pack { src_half: false },
+            pred: base.pred,
+            dest: base.dest,
+            write_mask: base.write_mask,
+            srcs: vec![scratch_x],
+            half_precision: true,
+            raw: word,
+            group: 0x06,
+            blocked: None,
+        };
+        vec![compute, narrow]
     }
 }
 
@@ -3960,6 +4553,16 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // would repeat several hundred instructions that demonstrably run once.
         0x03 if bits(word, 53, 53) == 1 => Some(0),
         0x03 => dot_repeat_extra(word),
+        // 0x20, the internal-register vec3 group: its documented layout has no repeat field
+        // (47:44 is neg_opN + opcode2), and the def-use chains close under single execution.
+        // MEASURED on a fighting title's fog program: `dot i1.x <- i0, i0`, `rsq i1.x`, then
+        // this group's `rcp i2.x <- i1.x`, read back as `i2.x` by the next add - while the dot
+        // after it still reads `i0` as the view vector. One scalar in, one scalar out; a repeat
+        // would have stepped the destination through i3 and beyond. The 7-bit run at 27:21 the
+        // page calls `op0 (unused)` carries register-shaped values (124 here = i0) and is NOT a
+        // destination: had this word written i0, that later dot would read the reciprocal.
+        // 0x28 is 0x20's four-lane sibling on the same field map: no repeat field either.
+        0x04 | 0x05 => Some(0),
         // 0x80 SOP2, in the fragment-epilogue form `decode_grp_sop2` establishes and only
         // there: that form pins bits 46:43 to zero, and bit 47 is the second complement flag
         // its sibling 0x90 establishes at the same position. So the four bits where a repeat
@@ -4431,6 +5034,43 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             // (rows 4 apart). A MOE-governed source would have to read a different stride out
             // of each, and there is no stride that does.
             let _ = bits(word, 52, 52);
+            // >>> EXCEPT WHEN BIT 47 IS SET: THEN THE SOURCE IS MOE-GOVERNED, TWO REGISTERS A UNIT.
+            //
+            // The intrinsic four is right for every repeating DP whose bit 47 is CLEAR - golf's
+            // `modelWorldX/Y/Z` transforms under the default state, and the crowd-atlas bake above
+            // under `SMLSI [2,2,2,2]`, which a MOE reading would have sent to pa[20]/pa[28]/pa[36].
+            // It is wrong for the two whose bit 47 is SET. mlb's crowd-PEOPLE program
+            // (`vert_843b87e4`) and its sibling (`vert_843b9ce8`) run a TWO-iteration 4-channel DP
+            // over `InstanceMatrix3x4` under `SMLSI [1,1,4,4]`, and compute row 1 with a SEPARATE
+            // dot - so the repeat must read rows 0 and 2, eight registers apart. Stepping four
+            // made world z a copy of world y, the projection then drove clip x and y from the same
+            // value, and every crowd member rasterised as a diagonal line of dots: MEASURED on the
+            // GPU with the world xy a proper 2D blob and the clip output a 14-pixel line, and by
+            // hand from the capsule's own bytes (a person at NDC x[-0.38,-0.22] y[-0.98,-0.52]).
+            //
+            // The op1 register field counts PAIRS of 32-bit registers, so one MOE unit is two
+            // registers - the same scaling every six-bit field here carries - and byte 4 gives
+            // the eight. Which of the src1/src2 bytes governs it is NOT settled: every bit-47
+            // repeating DP in the corpus has them equal. `VITASLOP_GXP_DP_MOE_BIT47=0` restores the
+            // intrinsic four for every DP.
+            //
+            // >>> AND BIT 48 SAYS WHICH SOURCE WALKS. Set (the crowd pair, mk's two bone dots):
+            // op1 steps as above. CLEAR: op1 HOLDS and the INTERNAL op2 steps one register per
+            // iteration, whatever the SMLSI says - three programs, three SMLSIs ([1,1,-2,-2],
+            // [1,1,2,2], swizzle mode), one answer, and each proven by a load that is otherwise
+            // dead. mlb's `vert_84377374` loads `i1 = sa40`, `i2 = sa36` and never reads `i2`
+            // again: the repeat is `(dot(pa8, sa40), dot(pa8, sa36))`, a planar UV projection.
+            // Madden's `frag_9091b740` loads `i1 = sa72`, `i2 = sa76`, repeats twice, then carries
+            // on BY HAND with `i2 = sa80` and `sa84` - four matrix rows against one `Temp8`.
+            // Madden's `vert_90c06100` loads `i0,i1,i2 = t0,t4,t8` and writes `i0.xyz`: a 3x3
+            // transform of `pa8`. Stepping op1 instead read the raw Normal/UV1 attributes as
+            // matrix rows (mlb) and overwrote the operand it was reading (Madden vert).
+            if bits(word, 47, 47) == 1 && crate::link::arm_on(crate::link::DP_MOE_BIT47_ARM) {
+                if bits(word, 48, 48) == 0 {
+                    return Some(vec![fixed(1), fixed(0), fixed(4)]);
+                }
+                return Some(vec![fixed(1), op(2, 2), op(3, 0)]);
+            }
             Some(vec![fixed(1), fixed(4), op(3, 0)])
         }
         // 0x30 VCOMP (`decode_grp_30`), the scalar transcendentals. Like the DOT above, its
@@ -4759,6 +5399,132 @@ fn decode_grp_flow(word: u64) -> Instr {
 /// address-space selector in some arrangement that remains unestablished - but a field that
 /// is ZERO in every shipped instance does not need its other values established to decode
 /// the zero case. Every departure from the census blocks BY NAME below; none is guessed.
+/// Decode a LOCAL-memory access: the 0x1d (load) / 0x1e (store) format with `addr_mode = 1`.
+///
+/// Local memory is a per-invocation scratch area, not guest memory - see [`Op::LocalLoad`]. The
+/// facts this rests on (the clean-room memory-access spec, local section):
+///
+/// * a STORE's address is `src0 + src1` and its DATA is src2 (bank 29:28 + ext 48, number
+///   6:0) - `dest_n` is unused on a store; a LOAD's address is `src0 + src1 + src2` into `dest`;
+/// * `src0` is the thread-buffer slot the driver fills and its value is NOT added: the area is
+///   private to the invocation;
+/// * a register offset's LOW 16 BITS are the byte offset. The one program in any corpus that
+///   uses local memory stores nine words at offsets `0x00240000 .. 0x00240020`: the low halves
+///   are nine distinct words `0..0x20`, and the constant upper half `0x24` = 36 bytes is the area
+///   size, not a displacement;
+/// * `addr_mode = 1` on every local access and 0 on every absolute one. Reading 1 as "local" is
+///   consistent with every captured word and stated by no source; 2 and 3 stay blocked.
+///
+/// Modelled: 32-bit, ONE element, unconditional, `mode = 0`, no auto-increment, `moe_expand`
+/// set (every local word in the corpus), src0 in the SA bank, immediate offsets counting
+/// elements. Every departure blocks by name.
+fn decode_local_access(word: u64) -> Instr {
+    let mut blocked: Option<&'static str> = None;
+    let set = |b: &mut Option<&'static str>, why: &'static str| *b = b.or(Some(why));
+    let store = bits(word, 60, 59) == 2;
+    if bits(word, 43, 42) != 1 {
+        set(&mut blocked, "0xF0 memory store outside the LOCAL address mode (addr_mode 1) not established");
+    }
+    if bits(word, 58, 56) != 0 {
+        set(&mut blocked, "local memory access predicate table not established");
+    }
+    if bits(word, 53, 53) == 0 {
+        set(&mut blocked, "local memory access without moe_expand not established");
+    }
+    if bits(word, 52, 52) != 0 {
+        set(&mut blocked, "local memory access sync_start not established");
+    }
+    if bits(word, 47, 44) != 0 {
+        set(&mut blocked, "multi-element local memory access not established");
+    }
+    if bits(word, 41, 40) != 0 {
+        set(&mut blocked, "local memory access mode value not established (only 0 is)");
+    }
+    if bits(word, 38, 38) != 0 {
+        set(&mut blocked, "local memory access range_enable not established");
+    }
+    if bits(word, 37, 36) != 0 {
+        set(&mut blocked, "non-32-bit local memory access not established");
+    }
+    if bits(word, 35, 35) != 0 {
+        set(&mut blocked, "local memory access auto-increment not established");
+    }
+    // src0: the thread-buffer slot, an SA register (bank bit 34 = 1 with extension 50 = 1).
+    if bits(word, 50, 50) != 1 || bits(word, 34, 34) != 1 {
+        set(&mut blocked, "local memory access whose base is not an SA register not established");
+    }
+    // The offsets (src1, and src2 on a load) and, on a store, the data (src2).
+    let mut imm_elements = 0u32;
+    let mut offset_regs: Vec<Operand> = Vec::new();
+    let mut data: Option<Operand> = None;
+    let fields: &[(u32, u32, u32, u32, u32, bool)] = &[
+        (31, 30, 49, 13, 7, false),
+        (29, 28, 48, 6, 0, store),
+    ];
+    for &(bank_hi, bank_lo, ext_bit, n_hi, n_lo, is_data) in fields {
+        let (sel, ext) = (bits(word, bank_hi, bank_lo), bits(word, ext_bit, ext_bit));
+        let n = bits(word, n_hi, n_lo);
+        match (ext, sel, is_data) {
+            (1, 2, false) => imm_elements += n,
+            (1, _, _) => set(&mut blocked, "local memory operand in an extended bank not established"),
+            (_, sel, is_data) => {
+                let op = Operand::plain(bank_rs2(sel as u8), r7_reg_index(n), sel as u8);
+                if is_data {
+                    data = Some(op);
+                } else {
+                    offset_regs.push(op);
+                }
+            }
+        }
+    }
+    let offset_bytes = imm_elements * 4;
+    if imm_elements != 0 {
+        set(&mut blocked, "local memory access with a non-zero IMMEDIATE offset not established");
+    }
+    let (op, dest, srcs) = if store {
+        let Some(d) = data else {
+            return Instr { blocked: Some("local store data operand is not a register"), ..stub(word, 0x1e) };
+        };
+        let mut srcs = vec![d];
+        srcs.append(&mut offset_regs);
+        (Op::LocalStore { offset_bytes }, None, srcs)
+    } else {
+        let dest_n = bits(word, 27, 21);
+        let dest_bank = if bits(word, 39, 39) == 0 { Bank::Temp } else { Bank::PrimaryAttr };
+        if dest_bank == Bank::Temp && dest_n >= 124 {
+            set(&mut blocked, "local load destination in the reserved TEMP range");
+        }
+        let dest = Operand::plain(dest_bank, r7_reg_index(dest_n), bits(word, 39, 39) as u8);
+        (Op::LocalLoad { offset_bytes }, Some(dest), offset_regs)
+    };
+    Instr {
+        op,
+        pred: Predicate::Always,
+        dest,
+        write_mask: if store { [false; 4] } else { [true, false, false, false] },
+        srcs,
+        half_precision: false,
+        raw: word,
+        group: if store { 0x1e } else { 0x1d },
+        blocked,
+    }
+}
+
+/// An empty instruction of `group`, for a decoder's early refusal.
+fn stub(word: u64, group: u8) -> Instr {
+    Instr {
+        op: Op::Todo("local memory"),
+        pred: Predicate::Always,
+        dest: None,
+        write_mask: [false; 4],
+        srcs: Vec::new(),
+        half_precision: false,
+        raw: word,
+        group,
+        blocked: None,
+    }
+}
+
 fn decode_grp_mem_load(word: u64) -> Instr {
     let mut blocked: Option<&'static str> = None;
     // First reason wins, matching the convention every other group decoder uses.
@@ -5468,7 +6234,7 @@ mod tests {
     fn group_78_vtstmsk_closes_on_the_word_that_established_it() {
         let instr = decode(0x78c0_8aa0_0f93_807c);
         assert_eq!(instr.group, 0x0f);
-        assert_eq!(instr.op, Op::TestMask { alu: TestAlu::Sub, cmp: TestCmp::Gt });
+        assert_eq!(instr.op, Op::TestMask { alu: TestAlu::Sub, cmp: TestCmp::Gt, byte_mask: false });
         assert_eq!(instr.pred, Predicate::Always);
         assert_eq!(instr.blocked, None, "the layout must close with nothing blocked");
         // Destination and src2 are the SAME internal register: the reference depth goes in and
@@ -5487,9 +6253,11 @@ mod tests {
     /// nothing - while the 8-BIT form on a FLOAT family no longer does.
     ///
     /// That pair was refused because the two readings of what a mask writes disagreed on both
-    /// the value and the channel count. A football title's skinned vertex programs read the
-    /// result back as a float multiplier in two different channels, which answers both - see
-    /// the `mask_ok` gate.
+    /// the value and the channel count. RESTATED 2026-09-23c: it is the BYTE MASK - four
+    /// channels as the bytes of one register, destination doubled - which a football title's
+    /// skinning programs feed straight into a byte-wise conditional move (the earlier "read back
+    /// as a float multiplier" consumer was a later DOT's result). See `byte_mask` in
+    /// `decode_grp_test_mask`.
     #[test]
     fn group_78_vtstmsk_blocks_what_it_cannot_establish() {
         let base: u64 = 0x78c0_8aa0_0f93_807c;
@@ -5500,11 +6268,12 @@ mod tests {
         ] {
             assert!(decode(word).blocked.is_some(), "{name} must block");
         }
-        // The 8-bit form on a float family is the same numeric mask in the same four channels.
+        // The 8-bit form on a float family is the BYTE mask: one register, the channels as bytes.
         let eight_bit = decode(base & !(0b11 << 36));
         assert_eq!(eight_bit.blocked, None, "8-bit mask type on a float family");
-        assert_eq!(eight_bit.op, decode(base).op, "the field changes no operation");
-        assert_eq!(eight_bit.write_mask, [true; 4], "the FAMILY decides the channel count");
+        assert_eq!(eight_bit.op, Op::TestMask { alu: TestAlu::Sub, cmp: TestCmp::Gt, byte_mask: true });
+        assert_eq!(eight_bit.write_mask, [true, false, false, false], "one register, channel x");
+        assert_eq!(decode(base).write_mask, [true; 4], "the numeric form keeps four float lanes");
         // ...and it does NOT unblock an integer family, where 0xFF and 0xFFFF differ.
         let u16_word: u64 = 0x7802_0192_71f6_a839;
         assert!(
@@ -6787,6 +7556,28 @@ mod tests {
                 RepeatOperand { slot: 3, stride: 0, moe: true },
             ])
         );
+        // With bits 47 AND 48 SET the vector source is MOE-governed instead: the SMLSI's src1
+        // slot, two registers a unit (mlb's crowd `[1,1,4,4]` reads rows 0 and 2; mk's
+        // `[1,1,-10,-10]` steps back twenty).
+        assert_eq!(
+            repeat_operands(dp | (1 << 47) | (1 << 48)),
+            Some(vec![
+                RepeatOperand { slot: 0, stride: 1, moe: false },
+                RepeatOperand { slot: 2, stride: 2, moe: true },
+                RepeatOperand { slot: 3, stride: 0, moe: true },
+            ])
+        );
+        // Bit 47 set, bit 48 CLEAR: the vector source holds and the INTERNAL source steps one
+        // register (four lanes) per iteration - a matrix's rows in i0..i3 against one vector.
+        assert_eq!(bits(dp, 48, 48), 0);
+        assert_eq!(
+            repeat_operands(dp | (1 << 47)),
+            Some(vec![
+                RepeatOperand { slot: 0, stride: 1, moe: false },
+                RepeatOperand { slot: 0, stride: 0, moe: false },
+                RepeatOperand { slot: 0, stride: 4, moe: false },
+            ])
+        );
 
         // A group with no established operand grammar must answer "unknown", never a default.
         assert_eq!(repeat_operands(0xa000_0000_0000_0000), None);
@@ -7076,11 +7867,11 @@ mod tests {
         assert!(load.blocked.is_some_and(|b| b.contains("mode value not established")));
         assert!(load.is_classified(), "load operation is known");
 
-        // Stores (0xF0) remain a stub.
+        // Stores (0xF0) decode only in the LOCAL address mode; this all-zero word is not it.
         let store = decode(word(0xF000_0000, 0));
         assert_eq!(store.group, 0x1e);
-        assert_eq!(store.op, Op::Todo("sta32/stl32/stt32"));
-        assert!(!store.is_supported(), "stores not wired for emit yet");
+        assert!(matches!(store.op, Op::LocalStore { .. }));
+        assert!(store.blocked.is_some_and(|b| b.contains("LOCAL address mode")), "{:?}", store.blocked);
 
         // The TEST group (0x48 = opcode1 0x09 = VTST) decodes to a real test operation. This
         // all-zero word has both sub-tests disabled, which names no relation against zero, so
@@ -7129,7 +7920,8 @@ mod tests {
         // Departures from the census block BY NAME rather than decode loosely: flip
         // addr_mode, the data type, and the src0 bank on the first real word.
         let base = 0xe883b004a000c000u64;
-        let addr = base | (1 << 42);
+        // addr_mode 1 is the LOCAL space (`decode_local_access`); 2 is established nowhere.
+        let addr = base | (1 << 43);
         assert!(decode(addr).blocked.is_some_and(|b| b.contains("addr_mode")));
         let half = base | (1 << 36);
         assert!(decode(half).blocked.is_some_and(|b| b.contains("data_type")));

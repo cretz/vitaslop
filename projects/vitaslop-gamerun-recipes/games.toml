@@ -50,3 +50,8 @@ region = "NTSC"
 id = "PCSE00084"
 name = "Madden NFL 13"
 region = "NTSC"
+
+[[game]]
+id = "PCSE00235"
+name = "Dead or Alive 5 Plus"
+region = "NTSC"

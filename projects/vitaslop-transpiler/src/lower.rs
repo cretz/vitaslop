@@ -3300,11 +3300,10 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         VCVTHalf { to_half, top } => {
             let (sd, sm) = (s_num(&ops[0]).ok_or_else(err)?, s_num(&ops[1]).ok_or_else(err)?);
             if to_half {
-                // f32 -> f16 (round-to-nearest-even) is a separate, more involved
-                // conversion; defer it to a safe trapping stub until needed.
-                return Err(Error::Unsupported { addr, opcode: inst.opcode });
+                out.push(Stmt::Vfp(VfpOp::CvtHalfFromF32 { sd, sm, top }));
+            } else {
+                out.push(Stmt::Vfp(VfpOp::CvtF32FromHalf { sd, sm, top }));
             }
-            out.push(Stmt::Vfp(VfpOp::CvtF32FromHalf { sd, sm, top }));
         }
         VLDR | VSTR => {
             let (size, num) = simd(&ops[0]).ok_or_else(err)?;

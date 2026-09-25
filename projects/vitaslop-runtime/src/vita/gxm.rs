@@ -1464,7 +1464,30 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     // Resolve the shader-patcher id back to its `SceGxmProgram*` so a precomputed
     // vertex state built from this vertex program can size its default uniform buffer.
     let program_header = st.shader_program(program_id);
+    // >>> AN IDENTICAL CREATE RETURNS THE LIVE PROGRAM, WITH ONE MORE REFERENCE - as the
+    // >>> console's patcher does. This handed out a fresh program every time, so every program
+    // >>> reported a reference count of ONE, and a title that asks
+    // >>> `GetVertexProgramRefCount` to learn whether a create found an existing program -
+    // >>> a football title makes 46 creates and 46 ref-count queries a frame - was told "new"
+    // >>> on every call. Keyed by the program and the RAW attribute and stream arrays, so two
+    // >>> creates share only when every byte the program was built from agrees.
+    // >>> `VITASLOP_GXM_SHARE_PROGRAMS=0` is the arm back.
+    let share = crate::knobs::var("VITASLOP_GXM_SHARE_PROGRAMS").map(|v| v.trim() != "0").unwrap_or(true);
+    let key = share.then(|| {
+        let mut raw = ctx.read_bytes(attributes_addr, (attribute_count as usize).min(64) * 8);
+        raw.extend(ctx.read_bytes(streams_addr, (stream_count as usize).min(MAX_VERTEX_STREAMS) * 4));
+        raw.extend(stream_count.to_le_bytes());
+        (program_header, raw)
+    });
+    if let Some(handle) = key.as_ref().and_then(|k| st.share_program(k)) {
+        ctx.write_u32(out, handle);
+        ctx.ret(0);
+        return;
+    }
     let handle = st.new_program_handle(ctx, program_header);
+    if let Some(k) = key {
+        st.remember_shared_program(k, handle);
+    }
     st.set_vertex_program(handle, attributes, streams, program_header);
     // Remember the program itself, not just the binding. A title that creates its FRAGMENT
     // programs with a NULL `vertexProgram` names no pair anywhere, and the only material left
@@ -1591,11 +1614,32 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     // draw does, and that is the whole reason this call can prepare a shader at all.
     let vertex_program = ctx.arg(5);
     let out = ctx.arg(6);
+    // >>> AN IDENTICAL CREATE RETURNS THE LIVE PROGRAM - the vertex path's rule, see
+    // `create_vertex_program`. MEASURED on a football title before either was shared: it
+    // releases a program only when the ref count says a create found an existing one, so a
+    // patcher that never shares grew 260,000 live programs by frame 4,450.
+    let share = crate::knobs::var("VITASLOP_GXM_SHARE_PROGRAMS").map(|v| v.trim() != "0").unwrap_or(true);
+    let key = share.then(|| {
+        let mut raw = vec![b'F'];
+        for a in [ctx.arg(2), ctx.arg(3), vertex_program] {
+            raw.extend(a.to_le_bytes());
+        }
+        raw.extend(if blend_info != 0 { ctx.read_bytes(blend_info, 4) } else { vec![0xff; 4] });
+        (st.shader_program(program_id), raw)
+    });
+    if let Some(handle) = key.as_ref().and_then(|k| st.share_program(k)) {
+        ctx.write_u32(out, handle);
+        ctx.ret(0);
+        return;
+    }
     let (program_header, handle) = {
         let _s = crate::perf::scope(crate::perf::Phase::PatchCreateFragHandle);
         let program_header = st.shader_program(program_id);
         (program_header, st.new_program_handle(ctx, program_header))
     };
+    if let Some(k) = key {
+        st.remember_shared_program(k, handle);
+    }
     // The BLEND EQUATION arrives here - GXM has no runtime blend setter, so a program created
     // with an additive info always does. Dropping this argument is what forced every renderer
     // downstream to guess the mode from the geometry, and a guess is wrong for whole classes of
@@ -1621,7 +1665,7 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
         }
     };
     report_blend_info(program_header, blend_info, blend);
-    st.set_fragment_program(handle, program_header, blend);
+    st.set_fragment_program(handle, program_header, blend, vertex_program);
     // >>> PREPARE THE SHADER HERE, WHERE THE HARDWARE DOES.
     //
     // A `.gxp` holds USSE machine code the SDK compiled offline, so the device's shader patcher
@@ -1641,6 +1685,37 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     ctx.ret(0);
 }
 
+/// const SceGxmProgram *sceGxmVertexProgramGetProgram(const SceGxmVertexProgram *vertexProgram)
+/// const SceGxmProgram *sceGxmFragmentProgramGetProgram(const SceGxmFragmentProgram *fragmentProgram)
+///
+/// The program a patched handle was created from, which the patcher records at create. A
+/// handle it never returned answers NULL - there is no program behind it - and says so,
+/// because a title that asks about a pointer we never handed out has lost track of its own
+/// programs and the NULL will surface somewhere far from here.
+pub(super) fn vertex_program_get_program(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let handle = ctx.arg(0);
+    let program = st.vertex_program_header(handle);
+    report_unknown_program_handle("sceGxmVertexProgramGetProgram", handle, program);
+    ctx.ret(program);
+}
+
+pub(super) fn fragment_program_get_program(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let handle = ctx.arg(0);
+    let program = st.fragment_program_header(handle);
+    report_unknown_program_handle("sceGxmFragmentProgramGetProgram", handle, program);
+    ctx.ret(program);
+}
+
+fn report_unknown_program_handle(call: &str, handle: u32, program: u32) {
+    if program == 0 {
+        tracing::warn!(
+            target: "vitaslop::warning",
+            handle = format_args!("{handle:#010x}").to_string(),
+            "{call}: a handle this patcher never created - answering NULL"
+        );
+    }
+}
+
 /// `SCE_GXM_ERROR_INVALID_VALUE` (`psp2/gxm.h`): an argument that is not a thing this
 /// context knows about.
 const SCE_GXM_ERROR_INVALID_VALUE: i32 = 0x805B_0003u32 as i32;
@@ -1649,8 +1724,9 @@ const SCE_GXM_ERROR_INVALID_VALUE: i32 = 0x805B_0003u32 as i32;
 /// int sceGxmShaderPatcherGetFragmentProgramRefCount(patcher, fragmentProgram, uint *count)
 ///
 /// The count is real: it is maintained by create and release (see
-/// `VitaState::note_program_created`). Because this patcher never shares a program, a
-/// live one always reads 1 - which is the truth about this model, not a placeholder.
+/// `VitaState::note_program_created`), and a create with parameters identical to a live
+/// program's returns that program with one more reference (`VitaState::share_program`), as
+/// the console's patcher does.
 ///
 /// A program the patcher does not know is `SCE_GXM_ERROR_INVALID_VALUE` rather than a
 /// count of zero. A title asking about a pointer we never returned has lost track of its
@@ -2424,9 +2500,20 @@ pub(super) fn texture_set_data(ctx: &mut GuestCtx, _st: &mut VitaState) {
 pub(super) fn texture_set_format(ctx: &mut GuestCtx, st: &mut VitaState) {
     let texture = ctx.arg(0);
     let fmt = ctx.arg(1);
-    let base_format = (fmt >> 24) & 0x1f;
-    let w1 = (ctx.read_u32(texture + 4) & !(0x1f << 24)) | (base_format << 24);
+    // >>> THE WHOLE FORMAT, IN ALL THREE PLACES `write_texture_control_words` PUTS IT: the 5-bit
+    // base in word 1, its top bit in word 0 bit 31, the swizzle in word 3. Writing only word 1
+    // left a stale extension bit behind - MEASURED on a fighting title that inits its IBL cubes
+    // as U2F10F10F10 (0x9a) and then sets F11F11F10 (0x1a): every COPY of the struct (resolved
+    // from its words, not the recorded format) sampled the F11F11F10 cube as U2F10F10F10, and
+    // the characters it lit came out cyan where they are purple.
+    let base_format = (fmt >> 24) & 0xff;
+    let w0 = (ctx.read_u32(texture) & !(1 << 31)) | (((base_format >> 7) & 1) << 31);
+    let w1 = (ctx.read_u32(texture + 4) & !(0x1f << 24)) | ((base_format & 0x1f) << 24);
+    let w3 = (ctx.read_u32(texture + 12) & !(texword3::SWIZZLE_MASK << texword3::SWIZZLE_SHIFT))
+        | (((fmt >> 12) & texword3::SWIZZLE_MASK) << texword3::SWIZZLE_SHIFT);
+    ctx.write_u32(texture, w0);
     ctx.write_u32(texture + 4, w1);
+    ctx.write_u32(texture + 12, w3);
     st.set_texture_format(texture, fmt);
     ctx.ret(0);
 }
@@ -2448,10 +2535,14 @@ pub(super) fn texture_get_dim(ctx: &mut GuestCtx, shift: u32) {
 /// SceGxmTextureFormat sceGxmTextureGetFormat(const SceGxmTexture *texture)
 pub(super) fn texture_get_format(ctx: &mut GuestCtx, st: &mut VitaState) {
     let texture = ctx.arg(0);
-    // Prefer the exact format we recorded; otherwise reconstruct the base format.
-    let fmt = st
-        .texture_format(texture)
-        .unwrap_or_else(|| ((ctx.read_u32(texture + 4) >> 24) & 0x1f) << 24);
+    // Prefer the exact format we recorded; otherwise reconstruct it from the control words the
+    // same way `write_texture_control_words` lays it down (base + word 0's extension bit + the
+    // word 3 swizzle).
+    let fmt = st.texture_format(texture).unwrap_or_else(|| {
+        let base = ((ctx.read_u32(texture + 4) >> 24) & 0x1f) | (ctx.read_u32(texture) >> 31) << 7;
+        let swizzle = (ctx.read_u32(texture + 12) >> texword3::SWIZZLE_SHIFT) & texword3::SWIZZLE_MASK;
+        (base << 24) | (swizzle << 12)
+    });
     ctx.ret(fmt);
 }
 
@@ -2775,12 +2866,69 @@ pub(super) fn color_surface_get_type(ctx: &mut GuestCtx, st: &mut VitaState, sur
 
 /// void sceGxmColorSurfaceSetClip(SceGxmColorSurface *surface, unsigned int xMin,
 ///     unsigned int yMin, unsigned int xMax, unsigned int yMax)
-/// The color-surface clip rectangle constrains where a scene writes. Our capture
-/// records the surface geometry (not a sub-clip) and the renderer draws the whole
-/// surface, so this is accepted with no state change; a title sets it and proceeds.
+/// The color-surface clip rectangle constrains where a scene writes. It is RECORDED for
+/// `GetClip`; the renderer still draws the whole surface (not yet consumed).
+pub(super) fn color_surface_set_clip(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let surface = ctx.arg(0);
+    let rect = (ctx.arg(1), ctx.arg(2), ctx.arg(3), ctx.arg(4));
+    st.color_surface_clip.insert(surface, rect);
+    ctx.ret(0);
+}
+
+/// void sceGxmColorSurfaceGetClip(const SceGxmColorSurface *surface, unsigned int *xMin,
+///     unsigned int *yMin, unsigned int *xMax, unsigned int *yMax)
+/// What `SetClip` last set on this surface, else the whole surface (the Init default).
+pub(super) fn color_surface_get_clip(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let surface = ctx.arg(0);
+    let outs = [ctx.arg(1), ctx.arg(2), ctx.arg(3), ctx.arg(4)];
+    let rect = st.color_surface_clip.get(&surface).copied().or_else(|| {
+        resolve_color_surface(ctx, st, surface)
+            .map(|s| (0, 0, s.width.saturating_sub(1), s.height.saturating_sub(1)))
+    });
+    if let Some((a, b, c, d)) = rect {
+        for (p, v) in outs.into_iter().zip([a, b, c, d]) {
+            if p != 0 {
+                ctx.write_u32(p, v);
+            }
+        }
+    }
+    ctx.ret(0);
+}
+
+/// int sceGxmColorSurfaceSetFormat(SceGxmColorSurface *surface, SceGxmColorFormat format)
+/// Written into the guest struct and the address table, like `SetData`.
 #[hostcall]
-pub(super) fn color_surface_set_clip(_context: u32) -> i32 {
+pub(super) fn color_surface_set_format(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32, format: u32) -> i32 {
+    match resolve_color_surface(ctx, st, surface) {
+        Some(mut s) => {
+            s.format = format;
+            write_color_surface(ctx, surface, &s);
+            st.set_color_surface(surface, s);
+            0
+        }
+        None => SCE_GXM_ERROR_INVALID_POINTER,
+    }
+}
+
+/// SceGxmColorSurfaceGammaMode sceGxmColorSurfaceGetGammaMode(const SceGxmColorSurface *surface)
+#[hostcall]
+pub(super) fn color_surface_get_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
+    resolve_color_surface(ctx, st, surface).map(|s| s.gamma).unwrap_or(0)
+}
+
+/// int sceGxmColorSurfaceSetDitherMode(SceGxmColorSurface *surface, SceGxmColorSurfaceDitherMode mode)
+/// Recorded for the getter. Dithering changes the low bit of an 8-bit write at most; the
+/// renderer writes undithered.
+#[hostcall]
+pub(super) fn color_surface_set_dither_mode(_ctx: &mut GuestCtx, st: &mut VitaState, surface: u32, mode: u32) -> i32 {
+    st.color_surface_dither.insert(surface, mode);
     0
+}
+
+/// SceGxmColorSurfaceDitherMode sceGxmColorSurfaceGetDitherMode(const SceGxmColorSurface *surface)
+#[hostcall]
+pub(super) fn color_surface_get_dither_mode(_ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
+    st.color_surface_dither.get(&surface).copied().unwrap_or(0)
 }
 
 /// SceGxmTextureType sceGxmTextureGetType(const SceGxmTexture *texture)
@@ -3055,11 +3203,16 @@ pub(super) fn texture_set_mip_filter(ctx: &mut GuestCtx) {
     ctx.ret(0);
 }
 
-// NOTE `sceGxmTextureSetMipmapCount` and `sceGxmTextureGetMipFilter` exist in the API and are
-// NOT implemented here, because no title in the corpus links them and this project does not
-// hand-type a NID it has not verified against a real module. They are one line
-// each over `texword0::MIP_COUNT` / `MIP_FILTER` the moment a title needs them, and until then
-// an unregistered NID hard-fails at link, which is the correct outcome rather than a guess.
+/// SceGxmTextureMipFilter sceGxmTextureGetMipFilter(const SceGxmTexture *texture)
+///
+/// The inverse of [`texture_set_mip_filter`]: the enum is the register bits in place, so the
+/// field is shifted back up. DOA5 links it (NID from the vitasdk db, called at runtime).
+pub(super) fn texture_get_mip_filter(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let (shift, _) = texword0::MIP_FILTER;
+    let v = tex_field(ctx, texture, texword0::MIP_FILTER) << shift;
+    ctx.ret(v);
+}
 
 /// int sceGxmTextureSetGammaMode(SceGxmTexture *texture, SceGxmTextureGammaMode gammaMode)
 ///
@@ -3567,6 +3720,24 @@ pub(super) fn depth_stencil_surface_init(ctx: &mut GuestCtx, _st: &mut VitaState
     ctx.ret(0);
 }
 
+/// void sceGxmDepthStencilSurfaceInitDisabled(SceGxmDepthStencilSurface *surface)
+///
+/// A surface with no depth and no stencil memory: both data pointers zero, which is what
+/// every reader of a depth surface already takes as "no depth attachment" (a scene begun
+/// with it renders without one, as with a NULL surface pointer). The background values
+/// get the same defaults `Init` writes, so a later setter/getter pair behaves identically.
+pub(super) fn depth_stencil_surface_init_disabled(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let surface = ctx.arg(0);
+    if surface != 0 {
+        ctx.write_u32(surface + DS_ZLS_CONTROL, 0);
+        ctx.write_u32(surface + DS_DEPTH_DATA, 0);
+        ctx.write_u32(surface + DS_STENCIL_DATA, 0);
+        ctx.write_u32(surface + DS_BACKGROUND_DEPTH, 1.0f32.to_bits());
+        ctx.write_u32(surface + DS_BACKGROUND_CONTROL, 0);
+    }
+    ctx.ret(0);
+}
+
 /// void sceGxmDepthStencilSurfaceSetBackgroundDepth(SceGxmDepthStencilSurface *surface,
 ///     float backgroundDepth)
 #[hostcall]
@@ -3940,17 +4111,6 @@ pub(super) fn precomputed_state_set_uniform_buffer(
     // per possible index; a slot the guest's (shorter) array did not cover is only ever
     // consumed if the program declares that buffer index, in which case the array covered it.
     let state = ctx.arg(0);
-    // TEMPORARY (`VITASLOP_UBIND_TRACE`). DELETE BEFORE COMMIT.
-    if stage == "vertex" && st.ubind_trace_open() {
-        let detail = if all {
-            let arr = ctx.arg(1);
-            let words: Vec<String> = (0..14u32).map(|i| format!("{:x}", ctx.read_u32(arr.wrapping_add(i * 4)))).collect();
-            format!("ALL array={arr:#x} [{}]", words.join(" "))
-        } else {
-            format!("idx={} data={:#x}", ctx.arg(1), ctx.arg(2))
-        };
-        tracing::warn!(target: "vitaslop::gxm", "UBIND f{} stateSetUB state={state:#x} {detail}", st.cur_frame());
-    }
     if all {
         // ONE read of the array and ONE write of the table - see
         // `VitaState::precomputed_state_set_all_nondefault_uniform_buffers` for why the
@@ -5380,6 +5540,62 @@ mod texture_inline_tests {
         }
         assert_eq!(regs[0], 0, "the handler returns success");
         assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+    }
+
+    /// `sceGxmTextureSetFormat` rewrites the WHOLE format in the words: the 5-bit base in
+    /// word 1, its extension bit in word 0 bit 31, the swizzle in word 3 - so a COPY of the
+    /// struct (no recorded format; resolved from its words) reads what was set.
+    ///
+    /// The guest sequence is a fighting title's IBL cubes: initialised as U2F10F10F10 (0x9a,
+    /// extension bit SET), then set to F11F11F10 (0x1a, the same 5-bit field). A setter that
+    /// wrote only word 1 left bit 31 standing, and every copy sampled the cube as 0x9a.
+    #[test]
+    fn set_format_rewrites_the_extension_bit_and_swizzle_a_copy_reads() {
+        let copy = PARAM + 0x40;
+        let mut bytes = vec![0u8; 4096];
+        let put = |bytes: &mut [u8], addr: u32, w: u32| {
+            bytes[addr as usize..addr as usize + 4].copy_from_slice(&w.to_le_bytes());
+        };
+        let get = |bytes: &[u8], addr: u32| {
+            u32::from_le_bytes(bytes[addr as usize..addr as usize + 4].try_into().expect("4 bytes"))
+        };
+        // What `sceGxmTextureInitCube(.., 0x9A000000 | swizzle 3, 16, 16, 0)` lays down, with a
+        // sampler field in word 0 and a palette/lod bit in word 3 that must both survive.
+        let init = [
+            (1 << 31) | (0x2 << 12),
+            (TYPE_CUBE << 29) | (0x1a << 24) | (15 << 12) | 15,
+            0x0000_1000,
+            (3 << texword3::SWIZZLE_SHIFT) | (1 << 26),
+        ];
+        for (i, w) in init.iter().enumerate() {
+            put(&mut bytes, PARAM + 4 * i as u32, *w);
+        }
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        st.set_texture_format(PARAM, 0x9A00_3000);
+        let mut call = |bytes: &mut Vec<u8>, st: &mut VitaState, nid: u32, r0: u32, r1: u32| {
+            let mut regs = [0u32; REG_COUNT];
+            regs[0] = r0;
+            regs[1] = r1;
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            let mut mem = SliceMemory(bytes);
+            let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            super::super::dispatch(crate::nid::lib::SCE_GXM, nid, &mut ctx, st);
+            regs[0]
+        };
+        call(&mut bytes, &mut st, g::TEXTURE_SET_FORMAT, PARAM, 0x1A00_1000);
+        let w: Vec<u32> = (0..4).map(|i| get(&bytes, PARAM + 4 * i)).collect();
+        assert_eq!(w[0], 0x2 << 12, "extension bit cleared, sampler field kept");
+        assert_eq!(w[1], init[1], "base 0x1a in word 1 (unchanged 5-bit field)");
+        assert_eq!(w[2], init[2]);
+        assert_eq!(w[3], (1 << texword3::SWIZZLE_SHIFT) | (1 << 26), "swizzle 1, lod bit kept");
+        // The COPY has no recorded format: GetFormat resolves it from its words alone.
+        for (i, x) in w.iter().enumerate() {
+            put(&mut bytes, copy + 4 * i as u32, *x);
+        }
+        assert_eq!(call(&mut bytes, &mut st, g::TEXTURE_GET_FORMAT, copy, 0), 0x1A00_1000);
+        // And back the other way: setting an extended format sets the bit.
+        call(&mut bytes, &mut st, g::TEXTURE_SET_FORMAT, PARAM, 0x9A00_0000);
+        assert_eq!(get(&bytes, PARAM) >> 31, 1, "0x9a carries its extension bit");
     }
 
     /// The in-place twin of [`texture_setters_write_the_field_their_inline_forms_claim`].

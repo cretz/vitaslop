@@ -393,11 +393,14 @@ fn main() {
             }
         }
         eprintln!(
-            "  texture unit {} format {:#06x} swizzle {:#x} gamma {:#x} type {} {}x{} stride {} mips {} faces {} at {:#010x}: {} bytes, mean {:.1}/255, {:.1}% non-zero; DECODED {}x{} mean {dmean:.1}/255",
+            "  texture unit {} format {:#06x} swizzle {:#x} gamma {:#x} filter min {} mag {} mip {} type {} {}x{} stride {} mips {} faces {} at {:#010x}: {} bytes, mean {:.1}/255, {:.1}% non-zero; DECODED {}x{} mean {dmean:.1}/255",
             t.unit,
             t.base_format,
             t.swizzle,
             t.gamma,
+            t.min_filter,
+            t.mag_filter,
+            t.mip_filter,
             t.tex_type,
             t.width,
             t.height,

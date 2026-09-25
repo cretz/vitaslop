@@ -47,7 +47,7 @@ pub mod vita;
 pub mod world;
 
 pub use host::{
-    last_ambient_report, GuestCtx, GuestMemory, ImportDispatch, Ptr, Reentry, SliceMemory,
+    GuestCtx, GuestMemory, ImportDispatch, Ptr, Reentry, SliceMemory,
     SvcDispatch, VitaEnv, VitaState, VFP_ARG_COUNT,
 };
 pub use audio::{AudioFormat, AudioSink, NullSink};

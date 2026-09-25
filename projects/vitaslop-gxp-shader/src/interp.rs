@@ -606,6 +606,7 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // A memory load reads GUEST MEMORY, which this register-file model does not hold; a
         // fabricated value here would defeat the oracle's whole purpose.
         Op::MemLoad { .. } => return Err("ldmem (resolved before the per-channel evaluator)"),
+        Op::LocalLoad { .. } | Op::LocalStore { .. } => return Err("local memory (resolved before the per-channel evaluator)"),
         // A TEST with write-back also stores its raw ALU result; the predicate itself was
         // written before this point. Only the float families reach here - the raw-lane ones
         // have no float result to store and the emitter refuses them too.
@@ -631,8 +632,39 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         }
         // VTSTMSK: the same compare, written out as one value per channel - NUMERIC for the
         // float families, a raw bit-pattern mask for the unsigned 16-bit integer one.
-        Op::TestMask { alu, cmp } => {
+        Op::TestMask { alu, cmp, byte_mask } => {
             use crate::ir::{TestAlu, TestCmp};
+            let held_at = |ch: usize| -> Result<bool, &'static str> {
+                let (a, b) = (s(0, ch)?, s(1, ch)?);
+                let v = match alu {
+                    TestAlu::Add => a + b,
+                    TestAlu::Sub => a - b,
+                    TestAlu::Mul => a * b,
+                    _ => return Err("vtstmsk on a raw-lane family"),
+                };
+                Ok(match cmp {
+                    TestCmp::Eq => v == 0.0,
+                    TestCmp::Ne => v != 0.0,
+                    TestCmp::Lt => v < 0.0,
+                    TestCmp::Le => v <= 0.0,
+                    TestCmp::Gt => v > 0.0,
+                    TestCmp::Ge => v >= 0.0,
+                })
+            };
+            // The 8-BIT-MASK form: all four channels' answers as the BYTES of channel x's one
+            // register - the same pattern `emit_test_mask` stores raw.
+            if byte_mask {
+                if c != 0 {
+                    return Err("vtstmsk byte mask writes channel x only");
+                }
+                let mut bits = 0u32;
+                for ch in 0..4usize {
+                    if held_at(ch)? {
+                        bits |= 0xff << (8 * ch);
+                    }
+                }
+                return Ok(f32::from_bits(bits));
+            }
             // >>> THE UNSIGNED 16-BIT FORM WRITES BITS, NOT A NUMBER.
             //
             // This register file holds `f32`, and its raw-lane readers already work in the
@@ -891,6 +923,9 @@ pub fn run_traced_env(
     // failure instead of a hung render thread.
     let mut steps = 0u32;
     const MAX_STEPS: u32 = 1 << 20;
+    // The per-invocation LOCAL memory (`Op::LocalLoad`/`LocalStore`), zero at the start of a
+    // run exactly as the emitted `var` is.
+    let mut local = vec![0u32; crate::wgsl::LOCAL_MEM_WORDS as usize];
     while let Some(instr) = shader.instrs.get(index) {
         steps += 1;
         observe(index, regs);
@@ -973,6 +1008,37 @@ pub fn run_traced_env(
             let v = read_channel_prec(regs, src, 0, Prec::of(instr))
                 .ok_or(InterpError::OutOfRange { index })?;
             regs.frag_depth = Some(v);
+            index += 1;
+            continue;
+        }
+        // LOCAL memory: one word in or out of the invocation's private array, addressed by the
+        // immediate plus the LOW 16 BITS of each register offset - `wgsl::local_address`.
+        if let Op::LocalLoad { offset_bytes } | Op::LocalStore { offset_bytes } = instr.op {
+            let raw_lane = |o: &Operand| -> Option<u32> {
+                Some(regs.bank(o.bank)?.get(o.index as usize)?.to_bits())
+            };
+            let store = matches!(instr.op, Op::LocalStore { .. });
+            let offsets = if store { &instr.srcs[1.min(instr.srcs.len())..] } else { &instr.srcs[..] };
+            let mut addr = offset_bytes;
+            for o in offsets {
+                addr = addr.wrapping_add(raw_lane(o).ok_or(InterpError::OutOfRange { index })? & 0xffff);
+            }
+            let word = (addr >> 2) as usize;
+            if store {
+                let data = instr.srcs.first().ok_or(InterpError::OutOfRange { index })?;
+                let v = raw_lane(data).ok_or(InterpError::OutOfRange { index })?;
+                if let Some(slot) = local.get_mut(word) {
+                    *slot = v;
+                }
+            } else {
+                let v = local.get(word).copied().unwrap_or(0);
+                let dest = instr.dest.as_ref().ok_or(InterpError::OutOfRange { index })?;
+                let slot = regs
+                    .bank_mut(dest.bank)
+                    .and_then(|b| b.get_mut(dest.index as usize))
+                    .ok_or(InterpError::OutOfRange { index })?;
+                *slot = f32::from_bits(v);
+            }
             index += 1;
             continue;
         }
@@ -1264,9 +1330,9 @@ pub fn run_traced_env(
         // matters - a source whose four bytes differ.
         if let Op::CmovU8 { test } = instr.op {
             use crate::ir::CompareMethod;
-            let s1 = instr.srcs.first().ok_or(InterpError::OutOfRange { index })?;
-            let s2 = instr.srcs.get(1).ok_or(InterpError::OutOfRange { index })?;
-            let s0 = instr.srcs.get(2).ok_or(InterpError::OutOfRange { index })?;
+            let at = |k: usize| instr.srcs.get(k).ok_or(InterpError::OutOfRange { index });
+            let (t, f, k) = crate::module::cmov_u8_roles();
+            let (s1, s2, s0) = (at(t)?, at(f)?, at(k)?);
             // The operand's OWN register, byte `c` of it - no swizzle selector and no abs/neg,
             // the same addressing the emitted statement uses.
             let byte = |o: &Operand, c: u32| -> Option<u32> {
@@ -1279,7 +1345,7 @@ pub fn run_traced_env(
                 if !instr.write_mask[c as usize] {
                     continue;
                 }
-                let t = byte(s0, if per_byte { c } else { 0 })
+                let t = byte(s0, if per_byte { c } else { crate::module::cmov_u8_test_byte() })
                     .ok_or(InterpError::OutOfRange { index })?;
                 // `LtZero`/`LteZero` read that byte SIGNED, which is what makes the comparison
                 // mean anything - an unsigned byte is never below zero.

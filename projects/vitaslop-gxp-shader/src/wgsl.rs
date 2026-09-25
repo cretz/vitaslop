@@ -711,7 +711,28 @@ impl Dest<'_> {
     }
 }
 
-/// [`Op::CmovU8`]: `dest.byte[c] = test(src0.byte[c]) ? src1.byte[c] : src2.byte[c]`.
+/// [`Op::CmovU8`]: `dest.byte[c] = test(A) ? B.byte[c] : C.byte[c]` over the sources in their
+/// LISTED order `[A, B, C]`, with the test on A's TOP byte.
+///
+/// # >>> THE TEST IS THE FIRST-LISTED SOURCE, AND THE OLD READING GAVE EVERY SECOND BONE INDEX 0
+///
+/// The listed order is `[src1, src2, src0]` by the decoder's field names, and this used to test
+/// the THIRD one (`src0`) on byte 0 and take the FIRST when it held. Every one of the corpus's 52
+/// byte-wise conditional moves is in a football title's skinning prologue, and every one lists a
+/// CONSTANT or a MASK first: the literal `0x7fffffff` (a `LIMM`, or an SA literal) or a
+/// `VTSTMSK` result (`index >= -2^31`, i.e. 1.0 for every real index), then two 16-bit
+/// bone-index PAIRS. Under the old reading the second pair's move tested the FIRST pair - whose
+/// low byte is the bone number, never zero - and so wrote the mask (1.0 = `0x3f800000`) as the
+/// index pair: every vertex's second bone became bone 0, and every blended vertex was pulled
+/// toward the skeleton's root. That was the jagged red spikes at every player's hands (the
+/// gloves blend 191/64 and 211/44 across bones 12, 16 and 17). Read this way, every one of the
+/// 52 tests a constant or a runtime mask and moves an index pair, which is the only data flow in
+/// which each operand is what it looks like - the saturating float-to-int guard the index
+/// conversion needs.
+///
+/// The TOP byte, because the mask is a FLOAT (1.0 / 0.0, see `decode_grp_test_mask`) whose low
+/// bytes are zero either way; the top byte is non-zero exactly when the value is, for both the
+/// mask and the `0x7fffffff` literal, and its sign bit keeps `LtZero` meaning what it says.
 ///
 /// Every read is a raw byte of the operand's own register - the same addressing
 /// [`Dest::store_raw_byte`] writes by - so nothing here goes through a float or half view.
@@ -722,9 +743,8 @@ fn emit_cmov_u8(
     mask: [bool; 4],
     test: CompareMethod,
 ) -> Option<()> {
-    let s1 = instr.srcs.first()?;
-    let s2 = instr.srcs.get(1)?;
-    let s0 = instr.srcs.get(2)?;
+    let (t, f, k) = crate::module::cmov_u8_roles();
+    let (s1, s2, s0) = (instr.srcs.get(t)?, instr.srcs.get(f)?, instr.srcs.get(k)?);
     // >>> ONE TEST, ON ONE BYTE - not four, and the corpus cannot tell the two apart.
     //
     // "U8" names how the TEST reads its operand: as an unsigned byte. Whether the instruction
@@ -737,7 +757,8 @@ fn emit_cmov_u8(
     // index that is then multiplied and used as a memory offset, where a spliced index
     // addresses neither matrix.
     //
-    // `VITASLOP_GXP_CMOVU8=byte` is the ARM BACK to the per-byte test, so both readings are
+    // `VITASLOP_GXP_CMOVU8=byte` is the ARM BACK to the per-byte test (under the OLD operand
+    // roles, as is `=old` for the single byte-0 test - see the doc comment), so both readings are
     // reachable from ONE build [[vitaslop-browser-ab-needs-a-negative-control]].
     let per_byte = crate::module::cmov_u8_tests_each_byte();
     let elem = |o: &Operand, lo: u32, signed: bool| -> Option<String> {
@@ -748,7 +769,7 @@ fn emit_cmov_u8(
             continue;
         }
         let lo = c as u32 * 8;
-        let test_lo = if per_byte { lo } else { 0 };
+        let test_lo = if per_byte { lo } else { crate::module::cmov_u8_test_byte() * 8 };
         // The test is on the UNSIGNED byte, which is what the form is named for. `LtZero` and
         // `LteZero` therefore need the SIGNED view of that byte, so the comparison means what
         // it says rather than always failing.
@@ -843,6 +864,13 @@ pub fn native_f16() -> bool {
 /// one function whose wrongness would be invisible - it would round *nearly* right and the
 /// residue would read as a different defect.
 ///
+/// >>> AND IT IS WRITTEN WITH `select`, NOT `if`. Every case is still computed as the format has
+/// it - the normal and the subnormal rounding, then the specials laid over them in the same
+/// priority the branches had - but with no control flow, because the helper is inlined at every
+/// half store and the browser's shader compiler pays per branch (see `native.wgsl`'s clamp,
+/// measured). Checked EXHAUSTIVELY against the branch form over all 2^32 inputs before it
+/// replaced it: 0 mismatches.
+///
 /// * `0x477ff000` is the exact TIE that rounds up out of the f16 range (its 10-bit significand
 ///   is odd, so ties-to-even carries out of the exponent), which is why the overflow test is
 ///   `>=`. A finite value that overflows **SATURATES to 65504** rather than becoming an
@@ -872,6 +900,9 @@ const HALF_HELPERS_PORTABLE: &str = include_str!("f16rounding/portable.wgsl");
 /// INDETERMINATE result - so the saturation the hardware performs cannot be left to it, and
 /// `gxp_f16c` clamps first. `0x477fe000` is 65504, the largest finite half; a value between it
 /// and the tie rounds to 65504 anyway, so clamping there changes nothing a round would not.
+/// It is a `select`, not an `if`: the helper is inlined at every half store (960 in one skinned
+/// vertex program), and a branch per store measured ~20% of that module's pipeline build in
+/// Chrome (0.89 s against 1.05-1.18 s) for the same result.
 /// The test is on the BIT PATTERN rather than on `abs(v)` so that a NaN - which no comparison
 /// answers usefully - falls through untouched instead of being clamped into a number.
 ///
@@ -1221,8 +1252,18 @@ fn uniform_gap(
     if enclosing.is_empty() {
         return blocked("a derivative reported as inside a block with no enclosing region to                         cut a uniform gap into");
     }
+    // >>> INSIDE A LOOP THE DERIVATIVE STAYS WHERE IT STANDS. A loop cannot be closed and
+    // re-entered, and it does not need to be: the hardware differences the quad's register file
+    // as it stands at this instruction, iteration by iteration, and an in-place `dpdx` over the
+    // function-scope register `var`s is that same operation. What WGSL objects to is only that it
+    // cannot PROVE the quad is converged here, so the module turns that one rule's diagnostic off
+    // (`diagnostic(off, derivative_uniformity)`, added by `with_derivative_directive` when this
+    // marker is present). A loop whose trip count differs across the quad would difference stale
+    // lanes on the hardware too. MEASURED need: a fighting title's image-based-lighting filter
+    // samples with gradients inside its tap loop, and refusing it left every character unlit.
     if enclosing.iter().any(|e| e.is_loop) {
-        return blocked("a derivative inside a LOOP whose source register the loop body writes -                         a loop cannot be closed and re-entered to reach uniform control flow");
+        return Ok((format!("  {DERIVATIVE_IN_LOOP_MARKER}
+"), String::new()));
     }
     // A write to ANY predicate register in the region counts: the conditions of the enclosing
     // ifs are predicate reads, and re-testing one the region has rewritten would admit a
@@ -1686,7 +1727,7 @@ fn read_channels(instr: &Instr) -> [bool; 4] {
         // `elements` consecutive registers), so taking the mask as the read count claims the
         // three registers ABOVE the pointer are read too. That is how a pointer sitting near
         // the top of the SA bank made a program look like it read past its uniform buffer.
-        Op::MemLoad { .. } => [true, false, false, false],
+        Op::MemLoad { .. } | Op::LocalLoad { .. } | Op::LocalStore { .. } => [true, false, false, false],
         _ => instr.write_mask,
     }
 }
@@ -1883,6 +1924,7 @@ pub fn wrap_module(body: &str, tex_units: &[TexBinding], kind: ProgramKind) -> S
     // The INDEX register file, for register-INDIRECT operands. Two registers, because the
     // extension row names exactly two indexed banks (INDEXED1 -> i0, INDEXED2 -> i1).
     let _ = writeln!(m, "var<private> idx: array<i32, 2>;");
+    let _ = writeln!(m, "var<private> {LOCAL_MEM_NAME}: array<u32, {LOCAL_MEM_WORDS}>;");
     // `front_facing` is declared unconditionally - see the note in `link::build_linked_module`.
     let _ = writeln!(
         m,
@@ -1901,7 +1943,7 @@ pub fn wrap_module(body: &str, tex_units: &[TexBinding], kind: ProgramKind) -> S
         m,
         "  return FsOut(vec4<f32>(bitcast<f32>(o[0]), bitcast<f32>(o[1]), bitcast<f32>(o[2]), bitcast<f32>(o[3])), gxp_frag_depth);\n}}"
     );
-    add_half_helpers(m)
+    with_derivative_directive(add_half_helpers(m))
 }
 
 /// Wrap an emitted [`emit_body`] into a complete, self-contained WGSL VERTEX module: the
@@ -1934,6 +1976,7 @@ pub fn wrap_vertex_module(body: &str, varying_vec4s: u32) -> String {
     // The INDEX register file, for register-INDIRECT operands. Two registers, because the
     // extension row names exactly two indexed banks (INDEXED1 -> i0, INDEXED2 -> i1).
     let _ = writeln!(m, "var<private> idx: array<i32, 2>;");
+    let _ = writeln!(m, "var<private> {LOCAL_MEM_NAME}: array<u32, {LOCAL_MEM_WORDS}>;");
     // Output struct: clip position builtin + one vec4 per varying location.
     let _ = writeln!(m, "\nstruct VsOut {{");
     let _ = writeln!(m, "  @builtin(position) position: vec4<f32>,");
@@ -1958,7 +2001,7 @@ pub fn wrap_vertex_module(body: &str, varying_vec4s: u32) -> String {
         );
     }
     let _ = writeln!(m, "  return out;\n}}");
-    add_half_helpers(m)
+    with_derivative_directive(add_half_helpers(m))
 }
 
 /// The number of `u32` lanes one bank occupies in a [`wrap_compute_module`] case buffer.
@@ -2363,6 +2406,7 @@ pub fn wrap_compute_module_facing(
     }
     let _ = writeln!(m, "var<private> p: array<bool, 4>;");
     let _ = writeln!(m, "var<private> idx: array<i32, 2>;");
+    let _ = writeln!(m, "var<private> {LOCAL_MEM_NAME}: array<u32, {LOCAL_MEM_WORDS}>;");
     let _ = writeln!(m, "\n@compute @workgroup_size(1)\nfn cs_main() {{");
     let _ = writeln!(
         m,
@@ -2847,6 +2891,7 @@ pub fn wrap_render_case_module_ramped(
     }
     let _ = writeln!(m, "var<private> p: array<bool, 4>;");
     let _ = writeln!(m, "var<private> idx: array<i32, 2>;");
+    let _ = writeln!(m, "var<private> {LOCAL_MEM_NAME}: array<u32, {LOCAL_MEM_WORDS}>;");
     // The two fragment-stage outputs. `gxp_frag_depth` is module scope rather than a local
     // because the emitted body assigns to it by name and the epilogue below must read it.
     let _ = writeln!(m, "var<private> gxp_killed: u32 = 0u;");
@@ -3224,9 +3269,9 @@ fn emit_instr(
         s.flush();
         return finish_predicated(body, instr, &block(&stmts, staged), index);
     }
-    if let Op::TestMask { alu, cmp } = instr.op {
+    if let Op::TestMask { alu, cmp, byte_mask } = instr.op {
         let dest = instr.dest.as_ref().ok_or_else(unmapped)?;
-        emit_test_mask(s, instr, dest, alu, cmp, kind).ok_or_else(unmapped)?;
+        emit_test_mask(s, instr, dest, alu, cmp, byte_mask, kind).ok_or_else(unmapped)?;
         s.flush();
         return finish_predicated(body, instr, &block(&stmts, staged), index);
     }
@@ -3249,6 +3294,22 @@ fn emit_instr(
         let src = instr.srcs.first().ok_or_else(unmapped)?;
         let e = src_channel(src, 0, Prec::of(instr)).ok_or_else(unmapped)?;
         let stmt = format!("  gxp_frag_depth = gxp_depth_to_window({e}, gxp_interp_depth);\n");
+        return finish_predicated(body, instr, &stmt, index);
+    }
+    // LOCAL STORE: one 32-bit word into the per-invocation local array. No register is
+    // written, so it is handled before the destination is required.
+    if let Op::LocalStore { offset_bytes } = instr.op {
+        let data = instr.srcs.first().ok_or_else(unmapped)?;
+        let data_bank = bank_prefix(data.bank).ok_or_else(unmapped)?;
+        let addr = local_address(instr.srcs.iter().skip(1), offset_bytes).ok_or_else(unmapped)?;
+        let stmt = format!(
+            "  {{
+    let gxp_l{index}: u32 = ({addr}) >> 2u;
+    if (gxp_l{index} < {LOCAL_MEM_WORDS}u) {{ {LOCAL_MEM_NAME}[gxp_l{index}] = {data_bank}[{}]; }}
+  }}
+",
+            data.index as u32
+        );
         return finish_predicated(body, instr, &stmt, index);
     }
     let dest = instr.dest.as_ref().ok_or_else(unmapped)?;
@@ -3408,6 +3469,25 @@ fn emit_instr(
         Op::MemLoad { elements, offset_bytes } => {
             emit_mem_load(s, instr, dest, elements, offset_bytes, index, kind).ok_or_else(unmapped)
         }
+        // LOCAL LOAD: one 32-bit word out of the per-invocation local array. An address past
+        // the array reads zero rather than trapping; the array's size is a model choice, see
+        // `LOCAL_MEM_WORDS`.
+        Op::LocalLoad { offset_bytes } => (|| {
+            let dest_bank = bank_prefix(dest.bank)?;
+            let addr = local_address(instr.srcs.iter(), offset_bytes)?;
+            writeln!(s, "  {{").ok()?;
+            writeln!(s, "    let gxp_l{index}: u32 = ({addr}) >> 2u;").ok()?;
+            writeln!(
+                s,
+                "    {dest_bank}[{}] = select(0u, {LOCAL_MEM_NAME}[min(gxp_l{index}, {}u)], gxp_l{index} < {LOCAL_MEM_WORDS}u);",
+                dest.index as u32,
+                LOCAL_MEM_WORDS - 1
+            )
+            .ok()?;
+            writeln!(s, "  }}").ok()?;
+            Some(())
+        })()
+        .ok_or_else(unmapped),
         Op::LoadIndex { addend, to_index, stride } => {
             emit_load_index(s, instr, dest, addend, to_index, stride).ok_or_else(unmapped)
         }
@@ -3892,6 +3972,66 @@ pub fn mem_binding_name(kind: ProgramKind) -> &'static str {
     }
 }
 
+/// A comment line [`uniform_gap`] leaves where a derivative is emitted inside a loop, which
+/// [`with_derivative_directive`] turns into the module's `derivative_uniformity` directive.
+pub const DERIVATIVE_IN_LOOP_MARKER: &str = "// gxp: derivative inside a loop";
+
+/// Add `diagnostic(off, derivative_uniformity);` to a module that carries
+/// [`DERIVATIVE_IN_LOOP_MARKER`] - at the top, where directives go.
+pub fn with_derivative_directive(module: String) -> String {
+    if module.contains(DERIVATIVE_IN_LOOP_MARKER) && !module.contains("derivative_uniformity") {
+        format!("diagnostic(off, derivative_uniformity);
+{module}")
+    } else {
+        module
+    }
+}
+
+/// Move every global directive line (`diagnostic`, `enable`, `requires`) to the top of `module`, where WGSL requires it -
+/// a pass that prepends declarations after [`with_derivative_directive`] would otherwise leave
+/// it below them, and the device refuses the whole module.
+pub fn hoist_diagnostics(module: &str) -> String {
+    if !module.contains("diagnostic(") {
+        return module.to_string();
+    }
+    // Every global directive, not only the diagnostic: a pass that locates "the end of the
+    // directives" by a prefix test can mistake where it is once a diagnostic leads, and insert
+    // declarations above an `enable` too.
+    let is_directive = |l: &&str| {
+        let t = l.trim_start();
+        t.starts_with("diagnostic(") || t.starts_with("enable ") || t.starts_with("requires ")
+    };
+    let (dirs, rest): (Vec<&str>, Vec<&str>) = module.lines().partition(is_directive);
+    let mut out = String::with_capacity(module.len() + 1);
+    for l in dirs.iter().chain(rest.iter()) {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+/// The per-invocation LOCAL memory array a program's `ldl32`/`stl32` address - see
+/// [`Op::LocalLoad`]. Declared per stage (linked modules) or at module scope (the standalone
+/// wrappers), always zero-initialised, which is what WGSL gives a `var`.
+pub const LOCAL_MEM_NAME: &str = "gxp_local";
+
+/// Words in [`LOCAL_MEM_NAME`]. The hardware's per-thread area is sized by a program-header
+/// field this parser does not read yet; the one program in any corpus that uses local memory
+/// touches 9 words. An access past the array reads zero / is dropped, never traps.
+pub const LOCAL_MEM_WORDS: u32 = 256;
+
+/// A local access's byte address: `offset_bytes` plus the LOW 16 BITS of each register offset
+/// (the upper half of such an offset is not a byte offset - in the one program that uses local
+/// memory it is the same constant, the local area's size, on every offset).
+fn local_address<'a>(regs: impl Iterator<Item = &'a Operand>, offset_bytes: u32) -> Option<String> {
+    let mut e = format!("{offset_bytes}u");
+    for o in regs {
+        let bank = bank_prefix(o.bank)?;
+        write!(e, " + ({bank}[{}] & 0xffffu)", o.index as u32).ok()?;
+    }
+    Some(e)
+}
+
 fn emit_mem_load(
     body: &mut Dest,
     instr: &Instr,
@@ -4306,6 +4446,7 @@ fn emit_test_mask(
     dest: &Operand,
     alu: TestAlu,
     cmp: TestCmp,
+    byte_mask: bool,
     kind: ProgramKind,
 ) -> Option<()> {
     let (s1, s2) = (instr.srcs.first()?, instr.srcs.get(1)?);
@@ -4345,6 +4486,7 @@ fn emit_test_mask(
         )?;
         return Some(());
     }
+    let mut bytes: Vec<String> = Vec::new();
     for c in 0..4 {
         let (a, b) = (src_channel(s1, c, p)?, src_channel(s2, c, p)?);
         let value = match alu {
@@ -4359,7 +4501,17 @@ fn emit_test_mask(
             | TestAlu::IntSub
             | TestAlu::IntSub16U => return None,
         };
-        body.store(dest, c, &format!("select(0.0, 1.0, ({value} {op} 0.0))"), p)?;
+        if byte_mask {
+            bytes.push(format!("select(0u, {:#x}u, ({value} {op} 0.0))", 0xffu32 << (8 * c)));
+        } else {
+            body.store(dest, c, &format!("select(0.0, 1.0, ({value} {op} 0.0))"), p)?;
+        }
+    }
+    // The 8-BIT-MASK form: channel c's answer is byte c of ONE register, `0xFF` or `0x00` - see
+    // `decode_grp_test_mask`. A raw store, because the register holds a bit pattern that the
+    // byte-wise conditional move after it reads byte by byte.
+    if byte_mask {
+        body.store_raw(dest, 0, &format!("({})", bytes.join(" | ")))?;
     }
     Some(())
 }
@@ -5047,7 +5199,7 @@ mod tests {
         // internal-read guard requires it: an unwritten internal lane is unmodelled input.
         let wgsl = emit_fragment(&shader(vec![
             instr(Op::Mov, Some(d), vec![Operand::plain(Bank::PrimaryAttr, 4, 2)]),
-            instr(Op::TestMask { alu: TestAlu::Sub, cmp: TestCmp::Gt }, Some(d), vec![a, b]),
+            instr(Op::TestMask { alu: TestAlu::Sub, cmp: TestCmp::Gt, byte_mask: false }, Some(d), vec![a, b]),
         ]))
         .unwrap();
         assert!(!wgsl.contains("p[0] ="), "a mask writes no predicate:\n{wgsl}");
@@ -5116,7 +5268,7 @@ mod tests {
         let g = Operand::plain(Bank::Global, 16, 1);
         let sa = Operand::plain(Bank::SecondaryAttr, 57, 3);
         let wgsl = emit_fragment(&shader(vec![instr(
-            Op::TestMask { alu: TestAlu::IntSub16U, cmp: TestCmp::Eq },
+            Op::TestMask { alu: TestAlu::IntSub16U, cmp: TestCmp::Eq, byte_mask: false },
             Some(d),
             vec![g, sa],
         )]))
@@ -5794,9 +5946,10 @@ mod tests {
     }
 
     /// A LOOP cannot be closed and re-entered - the rest of its iterations would run outside it -
-    /// so a derivative over a register the loop body writes is still refused, by name.
+    /// so a derivative over a register the loop body writes stays WHERE IT STANDS, which is what
+    /// the hardware does, and the module switches off WGSL's `derivative_uniformity` rule.
     #[test]
-    fn a_derivative_over_a_register_a_loop_body_wrote_hard_fails() {
+    fn a_derivative_over_a_register_a_loop_body_wrote_stays_in_place() {
         // 0: mov r0            <- loop head, and the write
         // 1: dsx r4 <- r0
         // 2: br if p0 -> 0     (the back edge)
@@ -5805,13 +5958,10 @@ mod tests {
             Some(Operand::plain(Bank::Temp, 4, 0)),
             vec![Operand::plain(Bank::Temp, 0, 0)],
         );
-        let err = emit_fragment(&shader(vec![mov(0), dsx, branch(-2, Predicate::IfP(0))])).unwrap_err();
-        match err {
-            EmitError::Blocked { reason, .. } => {
-                assert!(reason.contains("inside a LOOP"), "{reason}");
-            }
-            other => panic!("expected Blocked, got {other:?}"),
-        }
+        let wgsl = emit_fragment(&shader(vec![mov(0), dsx, branch(-2, Predicate::IfP(0))]))
+            .expect("a loop derivative is emitted in place");
+        assert!(wgsl.contains(DERIVATIVE_IN_LOOP_MARKER), "{wgsl}");
+        assert!(with_derivative_directive(wgsl.clone()).starts_with("diagnostic(off, derivative_uniformity);"), "{wgsl}");
     }
 
     /// A branch that rewrites a PREDICATE register before the derivative cannot be re-entered on

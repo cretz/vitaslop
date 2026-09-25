@@ -1639,6 +1639,11 @@ pub(crate) fn note_unknown_module(id: u32, module: u32, is_buss: bool, bytes: Ve
 /// Voices played with no source captured from any params path - these are SILENT sounds the
 /// title asked for. `refuse` already names each once; this is how many there were.
 static VOICES_NO_SOURCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Plays on voices with no captured source so far this run - see `ngs::voice_play`.
+pub(super) fn voices_no_source() -> u64 {
+    VOICES_NO_SOURCE.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// ...of which turned out to be BUSSES once their routing arrived. See `At9Bank::no_source`.
 static VOICES_LATE_BUSS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

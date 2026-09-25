@@ -153,6 +153,20 @@ pub(super) fn get_vcount(st: &mut VitaState) -> u32 {
     vcount(st)
 }
 
+/// int sceDisplayGetRefreshRate(float *pFps)
+///
+/// The rate of the vblank grid this engine's clock runs - one edge every [`VBLANK_US`] -
+/// rather than the panel's nominal 59.94 Hz: a title that derives its frame time from this
+/// and then counts vblanks with `sceDisplayGetVcount` must see the two agree, and they are
+/// both this one grid here.
+pub(super) fn get_refresh_rate(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let out = ctx.arg(0);
+    if out != 0 {
+        ctx.write_u32(out, (1_000_000.0f32 / VBLANK_US as f32).to_bits());
+    }
+    ctx.ret(0);
+}
+
 /// The vblank counter the display has reached: the virtual clock in units of one
 /// vblank period.
 ///

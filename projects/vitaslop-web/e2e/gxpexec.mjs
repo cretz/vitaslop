@@ -491,6 +491,11 @@ for (let i = 0; i < cases.length; i += BATCH) {
       // decimal digits, so a rounding difference there is ~1e-3, not ~1e-7.
       for (let k = 0; k < want.length; k++) {
         if (want[k] === got[k]) continue;
+        // Temps 248 and up (the `r` bank is lanes 0..c.lanes) cannot be NAMED by any encoding -
+        // the doubled field's top codes select the internal registers instead - so no program
+        // observes them. The decoder parks a dual-issue word's first result there when each of
+        // its operations reads the other's destination; the Rust suite skips them the same way.
+        if (k >= 248 && k < c.lanes) continue;
         const p = prec[k];
         if (p === 3) {
           // A FLAG. There is no tolerance to apply and no float view to read it in.

@@ -91,6 +91,8 @@ struct Shared {
     error: Option<String>,
     /// `copyTo` promises in flight, i.e. frames decoded but not yet readable.
     copies: usize,
+    /// Pictures the decoder's `output` callback has handed over, over the backend's life.
+    outputs: u64,
     /// True between `flush()` and the promise it returns settling.
     flushing: bool,
     /// A resolver for whoever is awaiting the next frame.
@@ -260,7 +262,21 @@ impl Backend for WebCodecsBackend {
     }
 
     fn detail(&self) -> Option<String> {
-        self.shared.borrow().layout.clone()
+        // The layout, plus WHERE every owed picture is: still inside the decoder
+        // (`decodeQueueSize` = chunks it has not started; the rest of `submitted - outputs` it
+        // is holding), mid-copy, or copied and waiting to be taken. A movie that stalls with
+        // pictures "still owed" looks the same from the guest side in all three cases.
+        let s = self.shared.borrow();
+        Some(format!(
+            "{} | outputs {} copying {} ready {} flushing {} queue {}{}",
+            s.layout.as_deref().unwrap_or("no frame yet"),
+            s.outputs,
+            s.copies,
+            s.ready.len(),
+            s.flushing,
+            self.decoder.decode_queue_size(),
+            s.error.as_deref().map(|e| format!(" ERROR {e}")).unwrap_or_default(),
+        ))
     }
 
     fn configure(&mut self, config: StreamConfig<'_>) -> Result<()> {
@@ -437,6 +453,7 @@ fn deliver_frame(frame: JsVideoFrame, shared: Rc<RefCell<Shared>>) {
         return;
     };
     s.copies += 1;
+    s.outputs += 1;
     drop(s);
     spawn_local(async move {
         let result = read_frame(&frame, &shared).await;

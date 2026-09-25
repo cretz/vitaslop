@@ -43,8 +43,18 @@ pub struct AssertOutcome {
 /// Sample one `@watch` from guest memory. `None` if the address is not mapped.
 pub fn sample_watch(mem: &impl GuestRead, w: &WatchDecl) -> Option<f64> {
     let mut buf = [0u8; 4];
+    let addr = match w.deref {
+        None => w.addr,
+        // `*slot+offset`: the value lives where the pointer at `slot` says, plus the offset.
+        Some(off) => {
+            if !mem.read_into(w.addr, &mut buf) {
+                return None;
+            }
+            u32::from_le_bytes(buf).wrapping_add(off)
+        }
+    };
     let width = w.ty.width();
-    if !mem.read_into(w.addr, &mut buf[..width]) {
+    if !mem.read_into(addr, &mut buf[..width]) {
         return None;
     }
     w.ty.decode(&buf[..width])
@@ -91,7 +101,7 @@ fn eval_mem_assert(
 
 fn eval_egress_assert(cap: &Capture, frame: u64, e: &EgressAssert, desc: String) -> AssertOutcome {
     // An egress event at or before this frame matching the kind and every field.
-    let hit = cap.egress.iter().filter(|ev| ev.frame <= frame).any(|ev| egress_matches(&ev.kind, e));
+    let hit = cap.egress.iter().filter(|ev| ev.frame <= frame).any(|ev| egress_matches(ev.frame, &ev.kind, e));
     AssertOutcome {
         frame,
         desc,
@@ -105,7 +115,11 @@ fn eval_egress_assert(cap: &Capture, frame: u64, e: &EgressAssert, desc: String)
 }
 
 /// Does egress event `ev` match assertion `want` (kind plus every field matcher)?
-fn egress_matches(ev: &EgressKind, want: &EgressAssert) -> bool {
+///
+/// `at<op>N` matches the FRAME the event was recorded at, on every kind: `at>=6000` is "a save
+/// written after the fight began", which a title that also saves at boot cannot otherwise
+/// express - the ledger is cumulative, so a bare `SaveWrite` is satisfied by the boot save.
+fn egress_matches(frame: u64, ev: &EgressKind, want: &EgressAssert) -> bool {
     let kind_ok = match ev {
         EgressKind::SaveWrite { .. } => want.kind == "SaveWrite",
         EgressKind::Trophy { .. } => want.kind == "Trophy",
@@ -114,7 +128,7 @@ fn egress_matches(ev: &EgressKind, want: &EgressAssert) -> bool {
     if !kind_ok {
         return false;
     }
-    want.fields.iter().all(|f| field_matches(ev, f))
+    want.fields.iter().all(|f| if f.field == "at" { num_match(frame as f64, f) } else { field_matches(ev, f) })
 }
 
 /// Evaluate one field matcher against an egress event.
@@ -329,5 +343,34 @@ impl<'a> RecipeEval<'a> {
             ),
             None => format!("{ok}/{total} assertions passed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod egress_at_tests {
+    use super::*;
+    use crate::capture::EgressEvent;
+    use crate::recipe::Recipe;
+
+    /// `at>=N` separates a save written after the fight began from the boot save: the ledger is
+    /// cumulative, so a bare `SaveWrite` at a late frame is satisfied by the boot save alone.
+    #[test]
+    fn an_at_matcher_selects_the_save_by_the_frame_it_was_written() {
+        let save = |frame| EgressEvent {
+            frame,
+            kind: EgressKind::SaveWrite { path: "savedata0:/save_sys.dat".into(), bytes: 51352, ascii: String::new() },
+        };
+        let kind = |text: &str| {
+            let r = Recipe::parse(&format!("7000: @assert egress {text}\n")).unwrap();
+            r.asserts[0].kind.clone()
+        };
+        let mut cap = Capture::default();
+        cap.egress.push(save(1997));
+        let late = kind("SaveWrite path=savedata0:/save_sys.dat at>=6000");
+        assert!(eval_assert(&cap, 7000, &kind("SaveWrite"), &HashMap::new()).passed, "the boot save alone passes a bare SaveWrite");
+        assert!(!eval_assert(&cap, 7000, &late, &HashMap::new()).passed, "the boot save does not satisfy at>=6000");
+        cap.egress.push(save(6733));
+        assert!(eval_assert(&cap, 7000, &late, &HashMap::new()).passed);
+        assert!(!eval_assert(&cap, 6700, &late, &HashMap::new()).passed, "not yet written at f6700");
     }
 }

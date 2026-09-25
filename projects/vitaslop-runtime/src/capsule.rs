@@ -47,8 +47,9 @@ use std::sync::Arc;
 /// state block. A version-1 capsule cannot be read as one of these - the block grew by a word
 /// - and a capsule is a scratch artifact recaptured in seconds, so the version is bumped
 /// rather than the reader taught two layouts. Version 3 added the FRAGMENT stage's
-/// guest-memory windows beside the vertex stage's.
-const MAGIC: &[u8; 8] = b"VSCAPS\x00\x03";
+/// guest-memory windows beside the vertex stage's. Version 4 added the vertex program the
+/// fragment was PATCHED against (`Draw::fprog_patched_vprog`).
+const MAGIC: &[u8; 8] = b"VSCAPS\x00\x04";
 
 /// What a capsule cannot answer. Printed by the replay tool every time - a limitation nobody
 /// reads is a limitation nobody applies.
@@ -348,6 +349,7 @@ impl Capsule {
         w_f32s(o, &d.world)?;
         w_bytes(o, &d.vprog)?;
         w_bytes(o, &d.fprog)?;
+        w_bytes(o, &d.fprog_patched_vprog)?;
         w_bytes(o, &d.vert_sa)?;
         w_bytes(o, &d.frag_sa)?;
         w_u32(o, d.frag_sa_addr)?;
@@ -437,6 +439,7 @@ impl Capsule {
         let world = r_f32s::<16>(i)?;
         let vprog: Arc<[u8]> = Arc::from(r_bytes(i)?);
         let fprog: Arc<[u8]> = Arc::from(r_bytes(i)?);
+        let fprog_patched_vprog: Arc<[u8]> = Arc::from(r_bytes(i)?);
         let vert_sa: Arc<[u8]> = Arc::from(r_bytes(i)?);
         let frag_sa: Arc<[u8]> = Arc::from(r_bytes(i)?);
         let frag_sa_addr = r_u32(i)?;
@@ -474,6 +477,7 @@ impl Capsule {
                 world,
                 vprog,
                 fprog,
+                fprog_patched_vprog,
                 vert_sa,
                 frag_sa,
                 frag_sa_addr,
@@ -502,6 +506,172 @@ impl Capsule {
     pub fn load(path: &std::path::Path) -> io::Result<Capsule> {
         let bytes = std::fs::read(path)?;
         Capsule::read(&mut &bytes[..])
+    }
+}
+
+// --- the FRAME capsule ---------------------------------------------------------------------
+//
+// Every scene of one displayed frame, each draw as a [`Capsule`], so a RENDERER question about
+// a whole chain (a bloom built across passes, a composite of several targets) is a
+// second-long offline render instead of a replay of the title to that frame. It holds ONE
+// frame: targets an EARLIER frame left behind are not in it, which the replay tool says.
+
+/// Frame-capsule magic + version. Bump on any field-order change.
+/// Version 2: the draw record grew with `VSCAPS` version 4.
+const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x02";
+
+/// Write every scene of one frame. `width`/`height`/`clear` are the display framebuffer the
+/// frame was rendered to; `frame` is the guest display frame, for the record.
+pub fn write_frame(
+    o: &mut impl Write,
+    scenes: &[crate::capture::Scene],
+    width: u32,
+    height: u32,
+    clear: [u8; 4],
+    frame: u64,
+) -> io::Result<()> {
+    o.write_all(FRAME_MAGIC)?;
+    w_u32(o, width)?;
+    w_u32(o, height)?;
+    o.write_all(&clear)?;
+    w_u64(o, frame)?;
+    w_u32(o, scenes.len() as u32)?;
+    for s in scenes {
+        match &s.color {
+            Some(c) => {
+                w_u8(o, 1)?;
+                for v in [c.format, c.surface_type, c.width, c.height, c.stride_pixels, c.data_addr, c.scale_mode, c.gamma] {
+                    w_u32(o, v)?;
+                }
+            }
+            None => w_u8(o, 0)?,
+        }
+        match &s.depth {
+            Some(d) => {
+                w_u8(o, 1)?;
+                for v in [d.zls_control, d.depth_addr, d.stencil_addr, d.background_depth, d.background_control] {
+                    w_u32(o, v)?;
+                }
+            }
+            None => w_u8(o, 0)?,
+        }
+        w_u32(o, s.multisample)?;
+        match s.target_extent {
+            Some((w, h)) => {
+                w_u8(o, 1)?;
+                w_u32(o, w)?;
+                w_u32(o, h)?;
+            }
+            None => w_u8(o, 0)?,
+        }
+        w_u8(o, u8::from(s.completed_early))?;
+        w_u32(o, s.draws.len() as u32)?;
+        for (i, d) in s.draws.iter().enumerate() {
+            Capsule {
+                draw: d.clone(),
+                width,
+                height,
+                clear,
+                key: 0,
+                frame,
+                draw_index: i as u32,
+                note: String::new(),
+            }
+            .write(o)?;
+        }
+    }
+    Ok(())
+}
+
+/// A frame read back: its scenes and the framebuffer it was rendered to.
+pub struct FrameCapsule {
+    pub scenes: Vec<crate::capture::Scene>,
+    pub width: u32,
+    pub height: u32,
+    pub clear: [u8; 4],
+    pub frame: u64,
+}
+
+/// Read a [`write_frame`] stream. A different version is REFUSED, as for a draw capsule.
+pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
+    let mut magic = [0u8; 8];
+    i.read_exact(&mut magic)?;
+    if &magic != FRAME_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("not a frame capsule of this version (magic {magic:?}, expected {FRAME_MAGIC:?})"),
+        ));
+    }
+    let (width, height) = (r_u32(i)?, r_u32(i)?);
+    let mut clear = [0u8; 4];
+    i.read_exact(&mut clear)?;
+    let frame = r_u64(i)?;
+    let n = r_u32(i)?;
+    let mut scenes = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let mut s = crate::capture::Scene::default();
+        if r_u8(i)? == 1 {
+            let mut v = [0u32; 8];
+            for x in &mut v {
+                *x = r_u32(i)?;
+            }
+            s.color = Some(crate::capture::ColorSurface {
+                format: v[0],
+                surface_type: v[1],
+                width: v[2],
+                height: v[3],
+                stride_pixels: v[4],
+                data_addr: v[5],
+                scale_mode: v[6],
+                gamma: v[7],
+            });
+        }
+        if r_u8(i)? == 1 {
+            let mut v = [0u32; 5];
+            for x in &mut v {
+                *x = r_u32(i)?;
+            }
+            s.depth = Some(crate::capture::DepthSurface {
+                zls_control: v[0],
+                depth_addr: v[1],
+                stencil_addr: v[2],
+                background_depth: v[3],
+                background_control: v[4],
+            });
+        }
+        s.multisample = r_u32(i)?;
+        if r_u8(i)? == 1 {
+            s.target_extent = Some((r_u32(i)?, r_u32(i)?));
+        }
+        s.completed_early = r_u8(i)? != 0;
+        let draws = r_u32(i)?;
+        for _ in 0..draws {
+            s.draws.push(Capsule::read(i)?.draw);
+        }
+        scenes.push(s);
+    }
+    Ok(FrameCapsule { scenes, width, height, clear, frame })
+}
+
+/// `VITASLOP_FRAME_CAPSULE=<dir>`: write every frame a headless run renders for a SHOT to
+/// `<dir>/f<frame>.frame`. The frame is whatever the shot rendered, so `--shot-every` and the
+/// frame count choose which frames are kept. Reported once if a write fails.
+pub fn maybe_write_frame(scenes: &[crate::capture::Scene], width: u32, height: u32, clear: [u8; 4], frame: u64) {
+    let Some(dir) = vitaslop_platform::knobs::var_os("VITASLOP_FRAME_CAPSULE") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("f{frame:06}.frame"));
+    let mut bytes = Vec::new();
+    let result = write_frame(&mut bytes, scenes, width, height, clear, frame).and_then(|()| std::fs::write(&path, &bytes));
+    match result {
+        Ok(()) => tracing::info!(
+            target: "vitaslop::gxm",
+            "frame capsule: frame {frame} ({} scenes, {} bytes) -> {}",
+            scenes.len(),
+            bytes.len(),
+            path.display()
+        ),
+        Err(e) => tracing::warn!(target: "vitaslop::gxm", "frame capsule: could NOT write {}: {e}", path.display()),
     }
 }
 
@@ -583,6 +753,7 @@ mod tests {
             world: [0.0; 16],
             vprog: Arc::from(vec![0xAAu8; 5]),
             fprog: Arc::from(vec![0xBBu8; 6]),
+            fprog_patched_vprog: Arc::from(vec![0xABu8; 3]),
             vert_sa: Arc::from(vec![0xCCu8; 7]),
             frag_sa: Arc::from(vec![0xDDu8; 8]),
             frag_sa_addr: 0x882c_aa80,

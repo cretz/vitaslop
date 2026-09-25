@@ -1145,6 +1145,86 @@ fn what_keeps_each_smlsi_blocked() {
 /// increments to support is read off rather than guessed.
 #[test]
 #[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn tabulate_vcomp_f16_runs() {
+    use vitaslop_gxp_shader::usse::opcode1;
+    // Every run of consecutive F16-destination scalar complex ops (group 0x30) that share one
+    // destination field, with the channels the run's write masks cover. A three-channel colour
+    // decoded one channel at a time is the commonest shape, so a run that covers y and z but not
+    // x - or covers x only when its destination field is zero - says the F16 lane mapping is
+    // misread, not the program.
+    let Some(dir) = corpus_dir() else { return };
+    let bits = |w: u64, hi: u32, lo: u32| (w >> lo) & ((1u64 << (hi - lo + 1)) - 1);
+    let mut shapes: BTreeMap<(bool, String), usize> = BTreeMap::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let mut run: Option<(u64, u64, Vec<u64>, usize)> = None; // (dest field, src field, masks, first index)
+        let mut flush = |run: &mut Option<(u64, u64, Vec<u64>, usize)>| {
+            if let Some((d, s, masks, at)) = run.take() {
+                if masks.len() < 2 {
+                    return;
+                }
+                let cover: String = ["x", "y", "z", "w"].iter().enumerate().filter(|(c, _)| masks.iter().any(|m| m >> c & 1 == 1)).map(|(_, n)| *n).collect();
+                *shapes.entry((d != 0, cover.clone())).or_default() += 1;
+                if d != 0 {
+                    println!("{name} #{at}: dest field {d} src field {s} covers {cover}");
+                }
+            }
+        };
+        for (i, &w) in p.code.iter().enumerate() {
+            let f16_dest = opcode1(w) == 0x06 && bits(w, 54, 53) == 1;
+            if !f16_dest {
+                flush(&mut run);
+                continue;
+            }
+            let (d, s, m) = (bits(w, 27, 21), bits(w, 13, 7), bits(w, 3, 0));
+            match &mut run {
+                Some((rd, _, masks, _)) if *rd == d => masks.push(m),
+                _ => {
+                    flush(&mut run);
+                    run = Some((d, s, vec![m], i));
+                }
+            }
+        }
+        flush(&mut run);
+    }
+    println!("\n(dest field nonzero, channels covered) -> runs");
+    for ((nz, cover), n) in shapes {
+        println!("  nonzero={nz} {cover:5} {n}");
+    }
+}
+
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn tabulate_bit47_repeating_dots() {
+    use vitaslop_gxp_shader::usse::{decode, decode_smlsi, is_smlsi, repeat_extra_iterations};
+    // Every program whose repeating DOT carries bit 47 - the ones the MOE-governed source walk in
+    // `repeat_operands` changes - with the SMLSI in force (the last one before it) and its source.
+    let Some(dir) = corpus_dir() else { return };
+    let (mut total, mut set) = (0usize, 0usize);
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let mut smlsi = None;
+        for (i, &w) in p.code.iter().enumerate() {
+            if is_smlsi(w) {
+                smlsi = Some(decode_smlsi(w));
+                continue;
+            }
+            let ins = decode(w);
+            let (Op::Dot { .. }, Some(n @ 1..)) = (&ins.op, repeat_extra_iterations(w)) else { continue };
+            total += 1;
+            if w >> 47 & 1 == 0 {
+                continue;
+            }
+            set += 1;
+            let src = ins.srcs.first().map(|s| format!("{:?}{}", s.bank, s.index)).unwrap_or_default();
+            println!("{name} #{i} {w:#018x} x{} src {src} smlsi {smlsi:?}", n + 1);
+        }
+    }
+    println!("\n{set} of {total} repeating DOTs carry bit 47");
+}
+
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
 fn tabulate_smlsi_words_and_the_repeats_that_consult_them() {
     use vitaslop_gxp_shader::usse::{decode_smlsi, is_smlsi, opcode1, repeat_extra_iterations};
     let Some(dir) = corpus_dir() else { return };
@@ -3839,7 +3919,7 @@ fn the_word_that_blocks_the_recompiler_decodes_the_way_the_panic_says() {
     //    two rules give DIFFERENT numbers are still refused - see `decode_grp_test_mask`.
     assert!(i.blocked.is_none(), "no longer blocked: {:?}", i.blocked);
     assert!(
-        matches!(i.op, Op::TestMask { alu: TestAlu::IntSub16U, cmp: TestCmp::Eq }),
+        matches!(i.op, Op::TestMask { alu: TestAlu::IntSub16U, cmp: TestCmp::Eq, .. }),
         "an unsigned 16-bit equality test, got {:?}",
         i.op
     );
@@ -4178,8 +4258,8 @@ fn print_one_blob_disassembly() {
         let Ok(p) = Program::parse(&bytes) else { continue };
         println!("\n===== {name} =====");
         println!(
-            "kind {:?}  pa_regs {}  sa_regs {}  temps {}",
-            p.kind, p.primary_reg_count, p.secondary_reg_count, p.temp_reg_count
+            "kind {:?}  pa_regs {}  sa_regs {}  temps {}  hash {:016x}",
+            p.kind, p.primary_reg_count, p.secondary_reg_count, p.temp_reg_count, p.hash
         );
         println!("-- containers (index, base_sa, size_in_f32) --");
         for c in &p.containers {

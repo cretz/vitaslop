@@ -1030,17 +1030,17 @@ fn case_transcendentals() -> Case {
 /// CONSTANT one, was checked by nothing that states it. Then a float select against `< 0`, and
 /// the byte-wise select a skinned mesh uses to pick bone indices.
 ///
-/// >>> THE BYTE SELECT PINS THE SHIPPED READING OF AN OPEN QUESTION. Whether VMOVCU8 tests EACH
-/// byte of its test operand or tests BYTE 0 and moves every masked byte on that one answer is not
-/// settled - every captured word carries the full mask, where the two agree unless the test
-/// operand's bytes differ - and the shipped default is the one-byte reading
-/// (`module::cmov_u8_tests_each_byte`, `VITASLOP_GXP_CMOVU8=byte` for the other). This case is
-/// built to SEPARATE them: its first test register is `r[7] = 1.0` from the move above, bytes
-/// `00 00 80 3f`, so the two readings disagree on bytes 2 and 3. Flipping the default must fail
-/// here, and whoever flips it restates this intent with the evidence that settled it.
+/// >>> THE BYTE SELECT PINS THE SHIPPED READING, RESTORED 2026-09-23c: VMOVCU8 TESTS ITS
+/// LAST-LISTED SOURCE ON BYTE 0 and takes the FIRST-listed when the test holds, the SECOND
+/// otherwise. In every corpus word that is `[0x7fffffff, packed index, 8-bit overflow mask]` -
+/// a saturating float-to-int - once the mask's VTSTMSK is decoded as its 8-bit form: a
+/// DOUBLED destination, the channels as bytes (`decode_grp_test_mask`). The 23b restatement
+/// (test the FIRST-listed on its top byte) tested the sentinel and exploded 4-bone meshes.
 ///
-/// The second select tests `pa[4]`, whose low byte the seed makes non-zero, so the OTHER arm is
-/// taken - under a partial mask, which is four BYTES of one register and not four registers.
+/// Both selects test a seeded `pa` float, whose bytes are all non-zero, so `=swap` (which
+/// tests `sa[9]` and takes the other two) disagrees. The second runs under a partial mask,
+/// which is four BYTES of one register and not four registers.
+/// `VITASLOP_GXP_CMOVU8=swap` must fail here.
 fn case_moves() -> Case {
     use asm::MoveKind;
     use vitaslop_gxp_shader::ir::CompareMethod;
@@ -1065,14 +1065,14 @@ fn case_moves() -> Case {
             )
             .unwrap(),
             asm::vmov(
-                MoveKind::CmovU8(CompareMethod::EqZero),
+                MoveKind::CmovU8(CompareMethod::NeZero),
                 false,
                 Dest::new(t, 13),
                 [true; 4],
-                (Bank::SecondaryAttr, 8),
+                (Bank::SecondaryAttr, 9),
                 [0, 1, 2, 3],
-                Some((Bank::SecondaryAttr, 9)),
-                Some((t, 7)),
+                Some((Bank::PrimaryAttr, 4)),
+                Some((Bank::PrimaryAttr, 5)),
             )
             .unwrap(),
             asm::vmov(
@@ -1080,10 +1080,10 @@ fn case_moves() -> Case {
                 false,
                 Dest::new(t, 14),
                 [true, false, true, false],
-                (Bank::SecondaryAttr, 8),
+                (Bank::SecondaryAttr, 9),
                 [0, 1, 2, 3],
-                Some((Bank::SecondaryAttr, 9)),
                 Some((Bank::PrimaryAttr, 4)),
+                Some((Bank::PrimaryAttr, 6)),
             )
             .unwrap(),
         ]),
@@ -1099,16 +1099,17 @@ fn case_moves() -> Case {
             for c in 0..4 {
                 out.push(f32_lane(Bank::Temp, 8 + c, if p[c] < 0.0 { s[c] } else { s[4 + c] }));
             }
-            // The ONE-BYTE reading: byte 0 of the test operand decides every masked byte.
-            let (yes, no) = (s[8].to_bits().to_le_bytes(), s[9].to_bits().to_le_bytes());
-            let select = |test: f32, mask: [bool; 4]| -> u32 {
-                let held = test.to_bits().to_le_bytes()[0] == 0;
+            // Byte 0 of the LAST-listed operand decides every masked byte: held takes the
+            // first-listed `sa[9]`, otherwise the second-listed `pa[4]`.
+            let (yes, no) = (s[9].to_bits().to_le_bytes(), p[4].to_bits().to_le_bytes());
+            let select = |held: bool, mask: [bool; 4]| -> u32 {
                 let b: [u8; 4] =
                     std::array::from_fn(|i| if !mask[i] { 0 } else if held { yes[i] } else { no[i] });
                 u32::from_le_bytes(b)
             };
-            out.push(Lane { bank: Bank::Temp, lane: 13, bits: select(1.0, [true; 4]) });
-            out.push(Lane { bank: Bank::Temp, lane: 14, bits: select(p[4], [true, false, true, false]) });
+            let low = |v: f32| v.to_bits() & 0xff;
+            out.push(Lane { bank: Bank::Temp, lane: 13, bits: select(low(p[5]) != 0, [true; 4]) });
+            out.push(Lane { bank: Bank::Temp, lane: 14, bits: select(low(p[6]) == 0, [true, false, true, false]) });
             out
         },
         fragment: None,
@@ -1420,6 +1421,149 @@ fn case_mem_load() -> Case {
             let mut out: Vec<Lane> = (0..4).map(|c| Lane { bank: Bank::Temp, lane: c, bits: at(2 + c as u32) }).collect();
             out.push(Lane { bank: Bank::Temp, lane: 4, bits: at(6) });
             out.push(Lane { bank: Bank::Temp, lane: 8, bits: 0x0001_0014 });
+            out
+        },
+        fragment: None,
+    }
+}
+
+/// **A BUFFER DECLARED WITH SEMANTIC 1 IS AN OPEN ARRAY: A LOAD PAST ITS ONE DECLARED ELEMENT
+/// READS GUEST MEMORY, NOT ZERO.**
+///
+/// A fighting title (PCSE00235) declares its skinning palette as ONE 48-byte bone under a
+/// semantic-1 uniform buffer and loads bone `n` at `pointer + n * 48`. Windowed at the declared
+/// 48 bytes, every bone past the first read zero, every skinned vertex collapsed onto the
+/// projection's translation, and its characters drew nothing. Here bone 5 (byte 240) is loaded
+/// as a four-element burst; the window the SHIPPED resolver builds must reach it.
+/// A LOCAL (per-invocation scratch) access word: the 0x1d/0x1e format with `addr_mode = 1`,
+/// base = the thread-buffer SA slot 0, offset = TEMP `off`. A store's data is PA `data`
+/// (src2); a load writes `dest` (TEMP) and its src2 is an immediate 0. Assembled here, field by
+/// field, from the clean-room memory-access spec's local section.
+fn local_word(store: bool, off: u64, data_or_dest: u64) -> u64 {
+    let mut w: u64 = 0b111 << 61;
+    w |= if store { 0b10 } else { 0b01 } << 59;
+    w |= 1 << 53; // moe_expand, set on every shipped local access
+    w |= 1 << 50; // src0 bank extension: with bit 34 = SECONDARY ATTRIBUTE
+    w |= 0b01 << 42; // addr_mode 1: local
+    w |= 1 << 34;
+    w |= off << 7; // src1: TEMP (bank 31:30 = 0, extension 49 = 0), number 13:7
+    if store {
+        w |= 0b10 << 28; // src2 bank: PRIMARY ATTRIBUTE
+        w |= data_or_dest; // src2 number: the DATA
+    } else {
+        w |= 1 << 48; // src2 extension
+        w |= 0b10 << 28; // ...selector 2 = IMMEDIATE, value 0
+        w |= data_or_dest << 21; // dest number, TEMP (bit 39 clear)
+    }
+    w
+}
+
+/// **LOCAL MEMORY: A STORE TAKES ITS DATA FROM SRC2, AND ONLY AN OFFSET'S LOW 16 BITS ADDRESS.**
+///
+/// A fighting title (PCSE00235) builds its image-based lighting in a per-invocation scratch
+/// area: nine stores to offsets `0x00240000..0x00240020` (the upper half, 0x24, is the area's
+/// size, not a displacement) and a loop reading them back by computed index. Refused, the pass
+/// that lights every character never ran.
+///
+/// Two stores to two offsets whose upper halves are that same constant, then the two loads
+/// CROSSED: each must return the other store's data. A translation that took the data from
+/// the wrong operand, added the upper half, or collapsed the two offsets fails.
+/// A group-0x30 scalar word (`rcp`/`rsq`/`log`/`exp`, op 0..3 at 42:41), assembled field by
+/// field: TEMP destination field `dest` (a DOUBLE-register field: register `2*dest`), TEMP
+/// source field `src` (also doubled), source component `comp`, destination mask x, and the two
+/// data types - destination 54:53, SOURCE 40:39 (0 = F32, 1 = F16).
+fn scalar30_word(op: u64, dest: u64, src: u64, comp: u64, dest_f16: bool, src_f16: bool) -> u64 {
+    let mut w: u64 = 0x06 << 59;
+    w |= u64::from(dest_f16) << 53;
+    w |= op << 41;
+    w |= u64::from(src_f16) << 39;
+    w |= comp << 35;
+    w |= dest << 21; // dest bank 33:32 = 0 (TEMP)
+    w |= src << 7; // src bank 31:30 = 0 (TEMP)
+    w |= 0b0001; // mask x
+    w
+}
+
+/// **A SCALAR `rcp`/`log` READS ITS SOURCE AT THE SOURCE'S OWN WIDTH, NOT THE DESTINATION'S.**
+///
+/// Group 0x30 carries a data type for its destination AND one for its source. A fighting title
+/// (PCSE00235) clamps `dot(N,H)` at half precision and takes its `log` at full precision in one
+/// word; read at the destination's width, the packed half became a tiny negative float, the
+/// log went NaN and every character rendered black.
+///
+/// `r4.x = rcp(f32(r0.x as F16))` (F16 source, F32 destination), then
+/// `r6.x = f16(rcp(pa0.x))` (F32 source, F16 destination). The split parks the intermediate in
+/// scratch temp 248, whose last value (the second word's F32 reciprocal) is part of the intent.
+fn case_scalar_mixed_width() -> Case {
+    Case {
+        name: "conf_a_scalar_op_reads_its_source_at_the_source_width",
+        checks: "group 0x30 source type 40:39 vs destination type 54:53 (F16->F32 and F32->F16)",
+        spec: vertex_spec(vec![
+            pack_f16(0, 0),                              // r0,r1 = f16(pa0..pa3)
+            scalar30_word(0, 2, 0, 0, false, true),      // r4.x = rcp(r0.x @F16)
+            scalar30_word(0, 3, 2, 0, true, false),      // r6.x = f16(rcp(r4.x @F32))
+        ]),
+        intent: |regs| {
+            let a = h(regs.pa[0]);
+            let r4 = 1.0 / a;
+            let mut v: Vec<Lane> = f16_vec(0, [a, h(regs.pa[1]), h(regs.pa[2]), h(regs.pa[3])]).to_vec();
+            v.push(f32_lane(Bank::Temp, 4, r4));
+            v.push(f16_lane(Bank::Temp, 6, 1.0 / r4, 0.0));
+            v.push(f32_lane(Bank::Temp, 248, 1.0 / r4));
+            v
+        },
+        fragment: None,
+    }
+}
+
+fn case_local_memory_round_trip() -> Case {
+    let t = Bank::Temp;
+    Case {
+        name: "conf_local_memory_stores_src2_at_the_low_half_of_the_offset",
+        checks: "0x1e local store data operand (src2), 0x1d local load, low-16-bit offsets",
+        spec: vertex_spec(vec![
+            asm::limm(Dest::new(t, 4), 0x0024_0018).unwrap(),
+            asm::limm(Dest::new(t, 5), 0x0024_0020).unwrap(),
+            local_word(true, 4, 0),  // local[0x18] = pa0
+            local_word(true, 5, 2),  // local[0x20] = pa2
+            local_word(false, 5, 0), // r0 = local[0x20]
+            local_word(false, 4, 1), // r1 = local[0x18]
+        ]),
+        intent: |regs| {
+            vec![
+                Lane { bank: Bank::Temp, lane: 0, bits: regs.pa[2].to_bits() },
+                Lane { bank: Bank::Temp, lane: 1, bits: regs.pa[0].to_bits() },
+                Lane { bank: Bank::Temp, lane: 4, bits: 0x0024_0018 },
+                Lane { bank: Bank::Temp, lane: 5, bits: 0x0024_0020 },
+            ]
+        },
+        fragment: None,
+    }
+}
+
+fn case_open_array_buffer_reaches_past_its_declared_element() -> Case {
+    use asm::IntSrc::{Imm, Reg};
+    let t = Bank::Temp;
+    Case {
+        name: "conf_an_open_array_buffer_reaches_past_its_declared_element",
+        checks: "a semantic-1 (open array) uniform buffer is windowed past its one declared element",
+        spec: vertex_spec(vec![
+            asm::limm(Dest::new(t, 8), 5 * 48).unwrap(),
+            asm::ldmem(Dest::new(t, 0), 4, (Bank::SecondaryAttr, 20), Reg(t, 8), Imm(0)).unwrap(),
+        ])
+        .with_parameters(vec![
+            gxpwrite::ParamSpec::attribute("IN.position", 0, 4),
+            gxpwrite::ParamSpec::attribute("IN.texcoord", 4, 4),
+            gxpwrite::ParamSpec { semantic: 1, ..gxpwrite::ParamSpec::uniform_buffer("g_Skinning", 0, 48) },
+        ])
+        .with_ub_bindings(vec![(0, 0)]),
+        intent: |_| {
+            // The window stated here: 256 elements of 48 bytes, pointer at sa[20].
+            let win = vitaslop_gxp_shader::module::MemWindow { buffer_index: 0, bytes: 48 * 256, base_sa: 20, base_offset: 0 };
+            let words = common::mem_words_for(SEED, std::slice::from_ref(&win));
+            let at = |word: u32| common::mem_fetch(common::window_base(0) + 4 * word, std::slice::from_ref(&win), &words);
+            let mut out: Vec<Lane> = (0..4).map(|c| Lane { bank: Bank::Temp, lane: c, bits: at(60 + c as u32) }).collect();
+            out.push(Lane { bank: Bank::Temp, lane: 8, bits: 5 * 48 });
             out
         },
         fragment: None,
@@ -1835,6 +1979,53 @@ fn case_repeating_index_add_walks_the_offset_table() -> Case {
 /// The shadow-filter idiom: compare four samples against a reference, then average the mask. Two
 /// instructions, a subtract `> 0` and an add `>= 0` with the source-1 NEGATE (`test_flag_2`), so
 /// the relation table, the negate bit and the direct destination each move a lane if misread.
+/// (This is the NUMERIC form, mask type 2. The 8-bit-mask form, type 0, is doubled and packs
+/// its channels as bytes - see `case_byte_mask_select`.)
+fn case_byte_mask_select() -> Case {
+    use asm::MoveKind;
+    use vitaslop_gxp_shader::ir::{CompareMethod, TestAlu, TestCmp};
+    let t = Bank::Temp;
+    Case {
+        name: "conf_a_byte_mask_packs_its_channels_and_drives_the_byte_select",
+        checks: "VTSTMSK's 8-bit-mask form (type 0): doubled destination, one register, channel c in byte c; VMOVCU8 reading it",
+        spec: vertex_spec(vec![
+            // `r[12] = bytes((-sa[0..4] + pa[0..4]) >= 0)` - the skinning programs' overflow guard.
+            asm::vtstmsk_bytes(TestAlu::Add, TestCmp::Ge, Dest::new(t, 12), (Bank::SecondaryAttr, 0), true, (Bank::PrimaryAttr, 0))
+                .unwrap(),
+            // `r[13] = r[12].byte0 != 0 ? sa[9] : pa[4]`, the `[sentinel, index, mask]` shape.
+            asm::vmov(
+                MoveKind::CmovU8(CompareMethod::NeZero),
+                false,
+                Dest::new(t, 13),
+                [true; 4],
+                (Bank::SecondaryAttr, 9),
+                [0, 1, 2, 3],
+                Some((Bank::PrimaryAttr, 4)),
+                Some((t, 12)),
+            )
+            .unwrap(),
+        ]),
+        intent: |regs| {
+            let (p, s) = (&regs.pa, &regs.sa);
+            let mut mask = 0u32;
+            for c in 0..4 {
+                if -s[c] + p[c] >= 0.0 {
+                    mask |= 0xff << (8 * c);
+                }
+            }
+            let pick = if mask & 0xff != 0 { s[9] } else { p[4] };
+            vec![
+                Lane { bank: Bank::Temp, lane: 12, bits: mask },
+                Lane { bank: Bank::Temp, lane: 13, bits: pick.to_bits() },
+            ]
+            .into_iter()
+            .filter(|l| l.bits != 0)
+            .collect()
+        },
+        fragment: None,
+    }
+}
+
 fn case_test_mask() -> Case {
     use vitaslop_gxp_shader::ir::{TestAlu, TestCmp};
     let t = Bank::Temp;
@@ -2346,12 +2537,291 @@ fn case_repeating_dot_is_a_matrix_transform() -> Case {
     }
 }
 
+/// **A REPEATING DOT WITH BITS 47 AND 48 SET STEPS ITS VECTOR SOURCE BY THE SMLSI's SRC1 BYTE,
+/// TWO REGISTERS A UNIT.**
+///
+/// mlb's crowd-people program runs a two-iteration 4-channel DOT over `InstanceMatrix3x4` under
+/// `SMLSI [1,1,4,4]` and computes row 1 with a separate dot, so the repeat must read rows 0 and 2
+/// - eight registers apart. The intrinsic four read row 1 twice over; world z became a copy of
+/// world y and every crowd member rasterised as a diagonal line of dots.
+///
+/// The two readings name different second vectors (`sa[8..11]` against `sa[4..7]`), and
+/// `lane_value`s never repeat, so only one of them passes.
+fn case_bit47_dot_repeat_steps_by_the_smlsi() -> Case {
+    use vitaslop_gxp_shader::usse::decode::SmlsiSlot::Increment;
+    Case {
+        name: "conf_a_bit47_repeating_dot_steps_its_source_by_the_smlsi",
+        checks: "DOT repeat with bit 47 under SMLSI [1,1,4,4]: source sa0 then sa8 (4 units x 2 \
+                 registers), not the intrinsic sa4",
+        spec: vertex_spec(bit47_dot_program([Increment(1), Increment(1), Increment(4), Increment(4)], 0)),
+        intent: |regs| bit47_dot_intent(regs, [0, 8]),
+        fragment: None,
+    }
+}
+
+/// **THE SAME RULE WALKS BACKWARDS: `SMLSI [1,1,-10,-10]` STEPS THE SOURCE MINUS TWENTY.**
+///
+/// mk's skinning program pairs bone B's rows 0 and 1 this way (`Temp36` then `Temp16`), the
+/// pairing its own MADs use. A negative byte is a signed increment, and the pair scaling applies
+/// to it just the same.
+fn case_bit47_dot_repeat_steps_backwards() -> Case {
+    use vitaslop_gxp_shader::usse::decode::SmlsiSlot::Increment;
+    Case {
+        name: "conf_a_bit47_repeating_dot_steps_its_source_backwards",
+        checks: "DOT repeat with bit 47 under SMLSI [1,1,-10,-10]: source sa20 then sa0",
+        spec: vertex_spec(bit47_dot_program([Increment(1), Increment(1), Increment(-10), Increment(-10)], 20)),
+        intent: |regs| bit47_dot_intent(regs, [20, 0]),
+        fragment: None,
+    }
+}
+
+/// `i0 = pa[0..3]`, then under `state` a two-iteration bit-47 DOT into `o[0]`, `o[1]` from
+/// `sa[first..]` and `i0`.
+fn bit47_dot_program(state: [vitaslop_gxp_shader::usse::decode::SmlsiSlot; 4], first: u8) -> Vec<u64> {
+    let define_i0 = asm::alu(
+        Op::Min,
+        false,
+        Dest::new(Bank::Internal, 0),
+        [true; 4],
+        Src::reg(Bank::PrimaryAttr, 0),
+        Src::reg(Bank::PrimaryAttr, 0),
+    )
+    .unwrap();
+    let dot = asm::dot(
+        4,
+        Dest::new(Bank::Output, 0),
+        [true, false, false, false],
+        Src::reg(Bank::SecondaryAttr, first),
+        Src::reg(Bank::Internal, 0),
+        1,
+    )
+    .unwrap()
+        | (1 << 47)
+        | (1 << 48);
+    vec![asm::smlsi(state).unwrap(), define_i0, dot]
+}
+
+/// **WITH BIT 48 CLEAR THE OTHER SOURCE WALKS: op1 HOLDS AND THE INTERNAL op2 STEPS ONE REGISTER.**
+///
+/// mlb's `vert_84377374` loads `i1 = sa40`, `i2 = sa36` and repeats a DOT against `i1` twice -
+/// `(dot(pa8, sa40), dot(pa8, sa36))`, a planar UV projection; Madden has the same idiom as a
+/// four-row matrix (fragment) and a 3x3 transform (vertex). It is intrinsic: the SMLSI here is
+/// the crowd's `[1,1,4,4]`, under which the bit-48-set reading would jump op1 eight registers.
+///
+/// `i1` and `i2` hold different vectors and the matrix row is the same in both iterations, so
+/// a reading that stepped op1 instead (or neither) names different lanes and fails.
+fn case_bit47_dot_repeat_steps_the_internal_source() -> Case {
+    use vitaslop_gxp_shader::usse::decode::SmlsiSlot::Increment;
+    let internal = |i: u8, pa: u8| {
+        asm::alu(Op::Min, false, Dest::new(Bank::Internal, i), [true; 4], Src::reg(Bank::PrimaryAttr, pa), Src::reg(Bank::PrimaryAttr, pa))
+            .unwrap()
+    };
+    let dot = asm::dot(4, Dest::new(Bank::Output, 0), [true, false, false, false], Src::reg(Bank::SecondaryAttr, 0), Src::reg(Bank::Internal, 4), 1)
+        .unwrap()
+        | (1 << 47);
+    Case {
+        name: "conf_a_bit47_bit48_clear_repeating_dot_steps_its_internal_source",
+        checks: "DOT repeat with bit 47 and bit 48 clear: op1 sa0 both times, op2 i1 then i2 - not \
+                 the SMLSI [1,1,4,4] op1 walk",
+        spec: vertex_spec(vec![
+            asm::smlsi([Increment(1), Increment(1), Increment(4), Increment(4)]).unwrap(),
+            internal(4, 0),
+            internal(8, 4),
+            dot,
+        ]),
+        intent: |regs| {
+            (0..8)
+                .map(|c| f32_lane(Bank::Internal, 4 + c, regs.pa[c]))
+                .chain((0..2).map(|k| {
+                    let acc: f32 = (0..4).map(|c| regs.sa[c] * regs.pa[4 * k + c]).sum();
+                    f32_lane(Bank::Output, k, acc)
+                }))
+                .collect()
+        },
+        fragment: None,
+    }
+}
+
+fn bit47_dot_intent(regs: &RegFile, rows: [usize; 2]) -> Vec<Lane> {
+    (0..4)
+        .map(|c| f32_lane(Bank::Internal, c, regs.pa[c]))
+        .chain(rows.iter().enumerate().map(|(k, &r)| {
+            let acc: f32 = (0..4).map(|c| regs.sa[r + c] * regs.pa[c]).sum();
+            f32_lane(Bank::Output, k, acc)
+        }))
+        .collect()
+}
+
+/// **A GROUP-0x20 WORD IS DUAL-ISSUE: BOTH OPERATIONS LAND, EACH BY ITS OWN ADDRESSING RULE.**
+///
+/// The primary (a SCALAR mul) writes the internal register; the secondary (a VECTOR mov) writes
+/// the register destination. The decoder once emitted only the primary, and doubled every
+/// register number - on a fighting title that read a specular power from past the end of the
+/// loaded uniforms and dropped every secondary result. Three things are pinned: the secondary
+/// lands at all (`o8`, `o9`); its register destination is DOUBLED because it stores a vector
+/// (field 4 -> `o8`); and the primary's scalar source is NOT doubled (field 3, lane y -> `sa[4]`,
+/// where a doubled reading would name `sa[7]`).
+/// **A FOUR-LANE (GROUP 0x28) WORD READS ITS EXTENDED SWIZZLE TABLE: `op2i` ENTRY 21 IS `wzwz`.**
+///
+/// The four-lane group has its own swizzle tables. A fighting title's (PCSE00235) fragment
+/// program carries `0x2ce430d6d0d11388`, whose `op2i` names extended entry 5 - `wzwz` - and was
+/// refused while only the splats and identity were known; its pair's surfaces were missing.
+///
+/// Primary: `r8.xy = i1.wzwz` (a vector move to a register: at F32 the doubled register pair,
+/// two lanes). Secondary: `i2 = sa6.xyzw` (identity, a vector load doubling `sa3`).
+fn case_four_lane_extended_swizzle() -> Case {
+    let word = asm::dual_issue(&asm::DualIssue {
+        four_lane: true,
+        primary: 5,   // vector mov (1 source)
+        secondary: 5, // vector mov (1 source)
+        reg_to_primary: true,
+        nsel: 2, // primary I1; secondary U
+        dst_bank: 0,
+        dst_num: 4, // vector store: doubled -> r8
+        dst_i: 2,
+        mask: [true; 4],
+        u_bank: 3,
+        u_num: 3, // vector load: doubled -> sa6
+        u_swz: 4, // xyzw
+        i0: 0,
+        i0_swz: 4,
+        i1: 1,
+        i1_swz: 16 + 5, // extended entry 5: wzwz
+        ..Default::default()
+    })
+    .unwrap();
+    Case {
+        name: "conf_a_four_lane_word_reads_its_extended_swizzle_table",
+        checks: "group 0x28: op2i extended entry 5 = wzwz, a four-lane register store, identity U",
+        spec: vertex_spec(vec![
+            asm::mov(false, Dest::new(Bank::Internal, 0), [true; 4], Src::reg(Bank::PrimaryAttr, 0)).unwrap(),
+            asm::mov(false, Dest::new(Bank::Internal, 4), [true; 4], Src::reg(Bank::PrimaryAttr, 4)).unwrap(),
+            word,
+        ]),
+        intent: |regs| {
+            let mut v: Vec<Lane> = (0..8).map(|c| f32_lane(Bank::Internal, c, regs.pa[c])).collect();
+            // i1 = pa4..pa7, read .wzwz. An F32 REGISTER store of this group writes two lanes
+            // (the doubled register pair), so the stored lanes are w and z.
+            for (c, from) in [7usize, 6].iter().enumerate() {
+                v.push(f32_lane(Bank::Temp, 8 + c, regs.pa[*from]));
+            }
+            for c in 0..4 {
+                v.push(f32_lane(Bank::Internal, 8 + c, regs.sa[6 + c]));
+            }
+            v
+        },
+        fragment: None,
+    }
+}
+
+fn case_dual_issue_both_operations_land() -> Case {
+    let word = asm::dual_issue(&asm::DualIssue {
+        primary: 10, // scalar mul
+        secondary: 5, // vector mov
+        reg_to_primary: false,
+        nsel: 0, // primary (U, I1), secondary (I0)
+        dst_bank: 1,
+        dst_num: 4,
+        dst_i: 2,
+        mask: [true, false, false, false],
+        u_bank: 3,
+        u_num: 3,
+        u_swz: 1, // y
+        i0: 0,
+        i0_swz: 4, // xyz
+        i1: 1,
+        i1_swz: 0, // x
+        ..Default::default()
+    })
+    .unwrap();
+    Case {
+        name: "conf_dual_issue_both_operations_land",
+        checks: "a group-0x20 word runs BOTH its operations; a vector store doubles its register, a scalar load does not",
+        spec: vertex_spec(vec![
+            asm::mov(false, Dest::new(Bank::Internal, 0), [true; 4], Src::reg(Bank::PrimaryAttr, 0)).unwrap(),
+            asm::mov(false, Dest::new(Bank::Internal, 4), [true; 4], Src::reg(Bank::PrimaryAttr, 4)).unwrap(),
+            word,
+            asm::mov(false, Dest::new(Bank::Output, 0), [true; 4], Src::reg(Bank::Internal, 8)).unwrap(),
+        ]),
+        intent: |regs| {
+            let product = regs.sa[4] * regs.pa[4];
+            let mut v: Vec<Lane> = (0..8).map(|c| f32_lane(Bank::Internal, c, regs.pa[c])).collect();
+            v.push(f32_lane(Bank::Internal, 8, product));
+            v.push(f32_lane(Bank::Output, 0, product));
+            v.push(f32_lane(Bank::Output, 8, regs.pa[0]));
+            v.push(f32_lane(Bank::Output, 9, regs.pa[1]));
+            v
+        },
+        fragment: None,
+    }
+}
+
+/// **BOTH OPERATIONS OF A DUAL-ISSUE WORD READ THE VALUES FROM BEFORE IT - EVEN WHEN EACH WRITES
+/// WHAT THE OTHER READS.**
+///
+/// The primary `i1.xyz = r8.xyz * i1.x` and the secondary `r8.x = i0.x * i1.x` (MEASURED shape:
+/// a fighting title's fragment program pairs `i1 <- pa6 * i0.x` with `pa6 <- i1.x * i1.x`). Run
+/// one after the other, either order feeds one of them the other's NEW value; the secondary must
+/// see the OLD `i1.x` and the primary the OLD `r8`.
+fn case_dual_issue_mutual_dependency_reads_old_values() -> Case {
+    let word = asm::dual_issue(&asm::DualIssue {
+        primary: 3,    // vector mul
+        secondary: 10, // scalar mul
+        reg_to_primary: false,
+        nsel: 0, // primary (U, I1), secondary (I0, I2)
+        dst_bank: 0,
+        dst_num: 8, // scalar store: NOT doubled -> r8
+        dst_i: 1,
+        mask: [true, true, true, false],
+        u_bank: 0,
+        u_num: 4, // vector load: doubled -> r8
+        u_swz: 4, // xyz
+        i0: 0,
+        i0_swz: 0, // x
+        i1: 1,
+        i1_swz: 0, // xxx
+        i2: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    Case {
+        name: "conf_dual_issue_mutual_dependency_reads_old_values",
+        checks: "each operation of a dual-issue word reads the pre-word registers, whatever order they are emitted in",
+        spec: vertex_spec(vec![
+            asm::mov(false, Dest::new(Bank::Internal, 0), [true; 4], Src::reg(Bank::PrimaryAttr, 0)).unwrap(),
+            asm::mov(false, Dest::new(Bank::Internal, 4), [true; 4], Src::reg(Bank::PrimaryAttr, 4)).unwrap(),
+            asm::mov(false, Dest::new(Bank::Temp, 8), [true; 4], Src::reg(Bank::PrimaryAttr, 8)).unwrap(),
+            word,
+            asm::mov(false, Dest::new(Bank::Output, 0), [true; 4], Src::reg(Bank::Internal, 4)).unwrap(),
+            asm::mov(false, Dest::new(Bank::Output, 4), [true; 4], Src::reg(Bank::Temp, 8)).unwrap(),
+        ]),
+        intent: |regs| {
+            let (p, old_i1x) = (&regs.pa, regs.pa[4]);
+            let i1 = [p[8] * old_i1x, p[9] * old_i1x, p[10] * old_i1x, p[7]];
+            let r8 = [p[0] * old_i1x, p[9], p[10], p[11]];
+            let mut v: Vec<Lane> = (0..4).map(|c| f32_lane(Bank::Internal, c, p[c])).collect();
+            v.extend((0..4).map(|c| f32_lane(Bank::Internal, 4 + c, i1[c])));
+            v.extend((0..4).map(|c| f32_lane(Bank::Temp, 8 + c, r8[c])));
+            v.extend((0..4).map(|c| f32_lane(Bank::Output, c, i1[c])));
+            v.extend((0..4).map(|c| f32_lane(Bank::Output, 4 + c, r8[c])));
+            v
+        },
+        fragment: None,
+    }
+}
+
 /// Every case in the suite.
 fn all_cases() -> Vec<Case> {
     vec![
         case_move(),
+        case_dual_issue_both_operations_land(),
+        case_four_lane_extended_swizzle(),
+        case_dual_issue_mutual_dependency_reads_old_values(),
         case_dot_reduces_four_channels(),
         case_repeating_dot_is_a_matrix_transform(),
+        case_bit47_dot_repeat_steps_by_the_smlsi(),
+        case_bit47_dot_repeat_steps_backwards(),
+        case_bit47_dot_repeat_steps_the_internal_source(),
         case_per_channel_constants(),
         case_fract(),
         case_mad_write_mask(),
@@ -2379,6 +2849,9 @@ fn all_cases() -> Vec<Case> {
         case_sop2(),
         case_gather(),
         case_mem_load(),
+        case_open_array_buffer_reaches_past_its_declared_element(),
+        case_local_memory_round_trip(),
+        case_scalar_mixed_width(),
         case_f16_alu(),
         case_f16_scalar_move_test(),
         case_f16_samples(),
@@ -2388,6 +2861,7 @@ fn all_cases() -> Vec<Case> {
         case_repeating_pack_steps_by_the_dest_byte(),
         case_repeating_index_add_walks_the_offset_table(),
         case_test_mask(),
+        case_byte_mask_select(),
         case_pack_to_int(),
         case_indexed_uniform_read(),
         case_index_addend_steps_by_one(),
@@ -2554,6 +3028,13 @@ fn every_conformance_case_computes_what_it_was_written_to_compute() {
         // instruction writing a register it had no business touching.
         for bank in [Bank::Output, Bank::Temp, Bank::Internal, Bank::PrimaryAttr] {
             for (n, v) in lanes_of(bank, &ran.regs).iter().enumerate().take(CASE_BANK_LANES) {
+                // Temps 248 and up cannot be NAMED by any encoding (the doubled field's top
+                // codes select the internal registers instead), so no program can observe them;
+                // the decoder parks a dual-issue word's first result there when each of its two
+                // operations reads the other's destination (`decode_grp_20_pair`).
+                if bank == Bank::Temp && n >= 248 {
+                    continue;
+                }
                 if v.to_bits() != unmoved_baseline(bank, n)
                     && !want.iter().any(|l| l.bank == bank && l.lane == n)
                 {
@@ -2583,7 +3064,7 @@ const EMITTABLE_KINDS: &[&str] = &[
     "mad", "mul", "add", "frc", "dsx", "dsy", "min", "max", "dot", "rcp", "rsq", "log", "exp",
     "mov", "cmov", "cmov.u8", "limm", "bitwise", "sop2.fx8", "mov.fx8", "pack", "pack.int",
     "unpack.int", "pack.int.copy", "pack.unorm8", "unpack.unorm8", "imad", "imad.step0",
-    "imad.step1", "loadidx", "idxadd", "ldmem", "vtst", "vtstmsk", "kill", "depthf", "br",
+    "imad.step1", "loadidx", "idxadd", "ldmem", "ldl32", "stl32", "vtst", "vtstmsk", "kill", "depthf", "br",
     "tex.implicit", "tex.bias", "tex.level", "tex.grad", "tex.gather4", "predicated",
 ];
 
@@ -2819,13 +3300,10 @@ fn the_seeded_inputs_make_every_case_non_vacuous() {
             "conf_a_test_mask_writes_one_or_zero_per_channel: `{name}` must be mixed: {mask:?}"
         );
     }
-    // The BYTE SELECT: its second test register must have a non-zero low byte, or both selects
-    // take the same arm and the `no` operand is never read.
+    // The BYTE SELECT: its two arms must hold different bytes, or taking the wrong one agrees.
     assert!(
-        regs.pa[4].to_bits() & 0xff != 0,
-        "conf_moves_swizzle_by_table_and_select_by_channel_and_byte needs pa[4]'s low byte \
-         non-zero: {:08x}",
-        regs.pa[4].to_bits()
+        regs.pa[4].to_bits() != regs.sa[9].to_bits(),
+        "conf_moves_swizzle_by_table_and_select_by_channel_and_byte needs pa[4] != sa[9]"
     );
     // The PREDICATE case: p0 and p1 must take DIFFERENT values, or a swapped predicate register
     // writes the same registers the right one does.
@@ -2997,3 +3475,252 @@ fn write_every_conformance_case_for_the_gpu_runner() {
     println!("\n  run them:  node vitaslop-web/e2e/gxpexec.mjs {}", out.display());
 }
 
+
+// ---------------------------------------------------------------------------------------
+// THE LINKAGE GROUP. A question about the INTERFACE between two programs, which no
+// single-program case can ask.
+// ---------------------------------------------------------------------------------------
+
+/// **A FRAGMENT PROGRAM IS FED BY THE LANE LAYOUT OF THE VERTEX PROGRAM IT WAS PATCHED AGAINST,
+/// NOT BY USAGE AGAINST THE ONE A DRAW BINDS.**
+///
+/// `sceGxmShaderPatcherCreateFragmentProgram` takes a vertex program and builds the fragment's
+/// varying iteration from ITS output layout; the hardware then reads the bound vertex's output
+/// buffer at those lane positions. A fighting title (PCSE00235) binds its character fragment
+/// with a vertex program that declares neither TEXCOORD5 nor TEXCOORD9, both of which the
+/// fragment reads - linked by usage, every one of those draws was refused.
+///
+/// Here `F` reads TEXCOORD0 and TEXCOORD1 and was patched against `V0`, which outputs both
+/// (lanes 4..8 and 8..12). The draw binds `V1`, which declares only TEXCOORD1 and writes it to
+/// lanes 4..8. By usage TEXCOORD0 is unfed (fed the iterator default); by the patched layout
+/// it must link, and its vertex stage must route exactly the lanes the (`V0`, `F`) link routes -
+/// so `F`'s TEXCOORD0 reads `V1`'s lanes 4..8 (its TEXCOORD1 values) and its TEXCOORD1 reads
+/// lanes 8..12, which `V1` never writes.
+#[test]
+fn conf_a_fragment_is_fed_by_the_layout_it_was_patched_against() {
+    use vitaslop_gxp_shader::link::{link_programs, link_programs_with, LinkOptions};
+    let (pa, o) = (Bank::PrimaryAttr, Bank::Output);
+    let mv = |dest: u8, src: u8| asm::mov(false, Dest::new(o, dest), [true; 4], Src::reg(pa, src)).unwrap();
+    let v0 = gxpwrite::write(
+        &vertex_spec(vec![mv(0, 0), mv(4, 4), mv(8, 0)])
+            .with_outputs(VertexOutputs { color0: false, texcoords: vec![(0, 4), (1, 4)] }),
+    );
+    let v1 = gxpwrite::write(
+        &vertex_spec(vec![mv(0, 0), mv(4, 4)])
+            .with_outputs(VertexOutputs { color0: false, texcoords: vec![(1, 4)] }),
+    );
+    let add = asm::alu(Op::Add, false, Dest::new(o, 0), [true; 4], Src::reg(pa, 0), Src::reg(pa, 4)).unwrap();
+    let f = gxpwrite::write(
+        &ProgramSpec::fragment(vec![add])
+            .with_interpolants(vec![
+                gxpwrite::InterpolantSpec::texcoord(0, 4),
+                gxpwrite::InterpolantSpec::texcoord(1, 4),
+            ])
+            .with_default_uniform_regs(16)
+            .with_containers(vec![
+                gxpwrite::ContainerSpec { index: 14, base_sa: 0, size_regs: 16 },
+                gxpwrite::ContainerSpec { index: 16, base_sa: 16, size_regs: 4 },
+            ])
+            .with_registers(8, 20, 8),
+    );
+
+    // Negative control: BY USAGE the bound pair routes differently - TEXCOORD0, which the bound
+    // vertex does not write, is fed the iterator's default instead of lanes 4..8.
+    let by_usage = link_programs(&v1, &f).expect("by usage the pair links, TEXCOORD0 defaulted");
+    let reference = link_programs(&v0, &f).expect("the pair the fragment was patched against links");
+    let patched = link_programs_with(
+        &v1,
+        &f,
+        LinkOptions { patched_against: Some(std::sync::Arc::from(&v0[..])), ..LinkOptions::default() },
+    )
+    .expect("the bound vertex links through the patched-against layout");
+    // The varying ROUTING - every statement that fills an inter-stage location - is the
+    // reference's, lane for lane: the interface is a fact about positions, not about who wrote them.
+    let routing = |wgsl: &str| -> Vec<String> {
+        wgsl.lines().filter(|l| l.trim_start().starts_with("out.v")).map(str::to_owned).collect()
+    };
+    let (want, got) = (routing(&reference.wgsl), routing(&patched.wgsl));
+    assert!(!want.is_empty(), "the reference module routes no varyings:\n{}", reference.wgsl);
+    assert_eq!(got, want, "the patched link must route the lanes the patched-against layout names");
+    assert_ne!(routing(&by_usage.wgsl), want, "the by-usage link must NOT route the patched-against lanes");
+    // And the bound program's own stage is what fills them: its lanes 8..12 are never written.
+    assert!(patched.wgsl.contains("o[8]"), "the TEXCOORD1 read must come from lane 8:\n{}", patched.wgsl);
+}
+
+// ---------------------------------------------------------------------------------------
+// THE GXMCONF PROGRAMS. `gxmconf.velf` (the GXM pipeline-state conformance app) draws its
+// real-shader scenes through these two containers, embedded in the app as
+// `gxmconf-src/gxmconf_shaders.h`. They are generated HERE, from the same assembler and
+// container writer every case above is built with, and the test below fails if the checked-in
+// header drifts from them. Regenerate with:
+//
+//   VITASLOP_BLESS_GXMCONF=1 cargo test -p vitaslop-gxp-shader --test conformance gxmconf
+// ---------------------------------------------------------------------------------------
+
+/// The app's vertex program: NDC position in `pa[0..4]` straight to clip position, and a U8N
+/// colour in `pa[4..8]` forwarded as TEXCOORD0.
+fn gxmconf_vertex() -> Vec<u8> {
+    let (pa, o) = (Bank::PrimaryAttr, Bank::Output);
+    let mv = |dest: u8, src: u8| asm::mov(false, Dest::new(o, dest), [true; 4], Src::reg(pa, src)).unwrap();
+    gxpwrite::write(
+        &ProgramSpec::vertex(vec![mv(0, 0), mv(4, 4)])
+            .with_parameters(vec![
+                gxpwrite::ParamSpec::attribute("IN.position", 0, 4),
+                gxpwrite::ParamSpec::attribute("IN.color", 4, 4),
+            ])
+            .with_default_uniform_regs(16)
+            .with_containers(vec![
+                gxpwrite::ContainerSpec { index: 14, base_sa: 0, size_regs: 16 },
+                gxpwrite::ContainerSpec { index: 16, base_sa: 16, size_regs: 4 },
+            ])
+            .with_registers(8, 20, 8)
+            .with_outputs(VertexOutputs { color0: false, texcoords: vec![(0, 4)] }),
+    )
+}
+
+/// The app's fragment program: the interpolated TEXCOORD0 packed to four unorm bytes in `o0`.
+fn gxmconf_fragment() -> Vec<u8> {
+    let pack = asm::pack(
+        Dest::new(Bank::Output, 0),
+        asm::PackFmt::U8,
+        Bank::PrimaryAttr,
+        0,
+        asm::PackFmt::F32,
+        [0, 1, 2, 3],
+        [true; 4],
+        true,
+    )
+    .unwrap();
+    gxpwrite::write(
+        &ProgramSpec::fragment(vec![pack])
+            .with_interpolants(vec![gxpwrite::InterpolantSpec::texcoord(0, 4)])
+            .with_default_uniform_regs(16)
+            .with_containers(vec![
+                gxpwrite::ContainerSpec { index: 14, base_sa: 0, size_regs: 16 },
+                gxpwrite::ContainerSpec { index: 16, base_sa: 16, size_regs: 4 },
+            ])
+            .with_registers(4, 20, 8),
+    )
+}
+
+/// The app's CUBE fragment program: sample the cube at unit 0 along the interpolated TEXCOORD0
+/// direction, and pack the texel to four unorm bytes in `o0`. The sampler ordinal is 12, so the
+/// instruction names SA register 24 - the DATA container starts at SA 20 and the texture-control
+/// entry for unit 0 sits at index 4 in it (see `case_texture_sample`).
+fn gxmconf_cube_fragment() -> Vec<u8> {
+    let sample = asm::tex(Dest::new(Bank::Temp, 0), 12, Bank::PrimaryAttr, 0, 3).unwrap();
+    let pack =
+        asm::pack(Dest::new(Bank::Output, 0), asm::PackFmt::U8, Bank::Temp, 0, asm::PackFmt::F32, [0, 1, 2, 3], [true; 4], true)
+            .unwrap();
+    gxpwrite::write(
+        &ProgramSpec::fragment(vec![sample, pack])
+            .with_parameters(vec![gxpwrite::ParamSpec { sampler_cube: true, ..gxpwrite::ParamSpec::sampler("cube0", 0) }])
+            .with_interpolants(vec![gxpwrite::InterpolantSpec::texcoord(0, 4)])
+            .with_texture_control(vec![(4, 0)])
+            .with_default_uniform_regs(16)
+            .with_containers(vec![
+                gxpwrite::ContainerSpec { index: 14, base_sa: 0, size_regs: 16 },
+                gxpwrite::ContainerSpec { index: 16, base_sa: 16, size_regs: 4 },
+                gxpwrite::ContainerSpec { index: 19, base_sa: 20, size_regs: 8 },
+            ])
+            .with_registers(4, 28, 8),
+    )
+}
+
+/// The app's 2D fragment program: sample the 2D texture at unit 0 at the interpolated
+/// TEXCOORD0 `.xy`, and pack the texel to four unorm bytes in `o0` - the cube program with a
+/// two-coordinate sample and an ordinary sampler.
+fn gxmconf_tex2d_fragment() -> Vec<u8> {
+    let sample = asm::tex(Dest::new(Bank::Temp, 0), 12, Bank::PrimaryAttr, 0, 2).unwrap();
+    let pack =
+        asm::pack(Dest::new(Bank::Output, 0), asm::PackFmt::U8, Bank::Temp, 0, asm::PackFmt::F32, [0, 1, 2, 3], [true; 4], true)
+            .unwrap();
+    gxpwrite::write(
+        &ProgramSpec::fragment(vec![sample, pack])
+            .with_parameters(vec![gxpwrite::ParamSpec::sampler("tex0", 0)])
+            .with_interpolants(vec![gxpwrite::InterpolantSpec::texcoord(0, 4)])
+            .with_texture_control(vec![(4, 0)])
+            .with_default_uniform_regs(16)
+            .with_containers(vec![
+                gxpwrite::ContainerSpec { index: 14, base_sa: 0, size_regs: 16 },
+                gxpwrite::ContainerSpec { index: 16, base_sa: 16, size_regs: 4 },
+                gxpwrite::ContainerSpec { index: 19, base_sa: 20, size_regs: 8 },
+            ])
+            .with_registers(4, 28, 8),
+    )
+}
+
+/// The C header `gxmconf.c` includes: every container as a 64-byte-aligned byte array.
+fn gxmconf_header() -> String {
+    let mut s = String::from(
+        "/* GENERATED by vitaslop-gxp-shader/tests/conformance.rs (`gxmconf_shader_header_is_current`)\n \
+         * from programs authored with this project's own USSE assembler and container writer.\n \
+         * Do not edit: regenerate with\n \
+         *   VITASLOP_BLESS_GXMCONF=1 cargo test -p vitaslop-gxp-shader --test conformance gxmconf\n \
+         */\n",
+    );
+    for (name, bytes) in [
+        ("conf_real_vert_gxp", gxmconf_vertex()),
+        ("conf_real_frag_gxp", gxmconf_fragment()),
+        ("conf_cube_frag_gxp", gxmconf_cube_fragment()),
+        ("conf_tex2d_frag_gxp", gxmconf_tex2d_fragment()),
+    ] {
+        s.push_str(&format!("__attribute__((aligned(64)))\nstatic const unsigned char {name}[{}] = {{\n", bytes.len()));
+        for row in bytes.chunks(16) {
+            s.push('\t');
+            s.push_str(&row.iter().map(|b| format!("0x{b:02x},")).collect::<Vec<_>>().join(" "));
+            s.push('\n');
+        }
+        s.push_str("};\n");
+    }
+    s
+}
+
+/// The two gxmconf programs LINK, and the colour is the four unorm bytes the fragment packs.
+#[test]
+fn gxmconf_programs_link_with_a_packed_unorm_colour() {
+    let l = vitaslop_gxp_shader::link::link_programs(&gxmconf_vertex(), &gxmconf_fragment())
+        .expect("the gxmconf pair links");
+    assert_eq!(
+        l.fragment_bindings.color_precision,
+        vitaslop_gxp_shader::module::ColorPrecision::Fx8,
+        "{:#?}\n{}",
+        l.fragment_bindings,
+        l.wgsl
+    );
+}
+
+/// The cube pair links, samples a CUBE at unit 0, and packs a unorm colour.
+#[test]
+fn gxmconf_cube_programs_link() {
+    let l = vitaslop_gxp_shader::link::link_programs(&gxmconf_vertex(), &gxmconf_cube_fragment())
+        .expect("the gxmconf cube pair links");
+    let s = &l.fragment_bindings.samplers;
+    assert!(s.len() == 1 && s[0].unit == 0 && s[0].cube, "{s:?}\n{}", l.wgsl);
+    assert_eq!(l.fragment_bindings.color_precision, vitaslop_gxp_shader::module::ColorPrecision::Fx8);
+}
+
+/// The 2D pair links and samples an ordinary (non-cube) texture at unit 0.
+#[test]
+fn gxmconf_tex2d_programs_link() {
+    let l = vitaslop_gxp_shader::link::link_programs(&gxmconf_vertex(), &gxmconf_tex2d_fragment())
+        .expect("the gxmconf 2D pair links");
+    let s = &l.fragment_bindings.samplers;
+    assert!(s.len() == 1 && s[0].unit == 0 && !s[0].cube, "{s:?}
+{}", l.wgsl);
+    assert_eq!(l.fragment_bindings.color_precision, vitaslop_gxp_shader::module::ColorPrecision::Fx8);
+}
+
+/// The checked-in `gxmconf_shaders.h` is exactly what these programs assemble to.
+#[test]
+fn gxmconf_shader_header_is_current() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../vitaslop-conformance-suite-vita/gxmconf-src/gxmconf_shaders.h");
+    let want = gxmconf_header();
+    if std::env::var_os("VITASLOP_BLESS_GXMCONF").is_some() {
+        std::fs::write(&path, &want).expect("write gxmconf_shaders.h");
+        return;
+    }
+    let have = std::fs::read_to_string(&path).unwrap_or_default().replace("\r\n", "\n");
+    assert_eq!(have, want, "gxmconf_shaders.h is stale - regenerate with VITASLOP_BLESS_GXMCONF=1");
+}

@@ -546,10 +546,12 @@ pub enum Op {
     /// against zero as [`Op::Test`], but instead of reducing the four booleans into one
     /// predicate bit it writes ONE VALUE PER CHANNEL into a general register.
     ///
-    /// Only the NUMERIC mask form is decoded - each channel becomes `1.0` or `0.0` at the ALU's
-    /// own precision - because that is the only `tst_mask_type` the corpus carries and the
-    /// other two encode a bit pattern whose width rule is not established.
-    TestMask { alu: TestAlu, cmp: TestCmp },
+    /// The NUMERIC mask form (type 2) writes each channel as `1.0` or `0.0` at the ALU's own
+    /// precision. `byte_mask` is the float family's 8-BIT MASK form (type 0): the four
+    /// channels' answers are packed as BYTES `0xFF`/`0x00` of ONE 32-bit register (channel x
+    /// in byte 0), which is what the byte-wise conditional move after it consumes - see
+    /// `decode_grp_test_mask`.
+    TestMask { alu: TestAlu, cmp: TestCmp, byte_mask: bool },
     /// Fragment discard (group 0xF8 KILL). Ends the fragment with no colour written; the
     /// emitter maps it to WGSL `discard`.
     Kill,
@@ -593,6 +595,15 @@ pub enum Op {
     /// WGSL has no raw pointers. A shader whose window cannot be established hard-fails at
     /// link time rather than reading fabricated bytes.
     MemLoad { elements: u8, offset_bytes: u32 },
+    /// A LOCAL (per-invocation scratch) LOAD of one 32-bit word into `dest`: the 0x1d format
+    /// with `addr_mode = 1`. The byte offset is `offset_bytes` plus the LOW 16 BITS of each
+    /// register offset in `srcs`; the base register (the driver's thread-buffer slot) is NOT
+    /// added - local memory is a private array, not guest memory. See `usse::decode`.
+    LocalLoad { offset_bytes: u32 },
+    /// A LOCAL STORE of one 32-bit word: the 0x1e format with `addr_mode = 1`. `srcs[0]` is the
+    /// DATA register (the format's src2 on a store); any further `srcs` are register offsets,
+    /// low 16 bits each, added to `offset_bytes`. Writes no register.
+    LocalStore { offset_bytes: u32 },
     /// A documented operation that is not yet wired for WGSL emit (tex, pack, the u32
     /// bitwise ops, fx8/u8 integer ops, loads/stores, complex flow). Carries a static
     /// mnemonic so an emit attempt hard-fails naming exactly what to implement next. This
@@ -629,6 +640,8 @@ impl Op {
                 | Op::LoadIndex { .. }
                 | Op::Test { .. } | Op::TestMask { .. } | Op::Kill | Op::DepthF
                 | Op::MemLoad { .. }
+                | Op::LocalLoad { .. }
+                | Op::LocalStore { .. }
                 // A branch is translated by the emitter's STRUCTURING pass rather than by
                 // `emit_instr`, so it counts as wired here. Reaching `emit_instr` with one is a
                 // bug in that pass and hard-fails there, naming itself.
@@ -693,6 +706,8 @@ impl Op {
                 }
             }
             Op::MemLoad { .. } => "ldmem",
+            Op::LocalLoad { .. } => "ldl32",
+            Op::LocalStore { .. } => "stl32",
             Op::Bitwise { .. } => "bitwise",
             Op::Sop2 { .. } => "sop2.fx8",
             Op::Test { .. } => "vtst",
@@ -895,7 +910,7 @@ impl Instr {
             // is `elements` consecutive registers), so taking the mask as the read count claims
             // the three registers ABOVE the pointer are read too. That is how a pointer sitting
             // near the top of the SA bank made a program look like it read past its buffer.
-            Op::MemLoad { .. } => [true, false, false, false],
+            Op::MemLoad { .. } | Op::LocalLoad { .. } | Op::LocalStore { .. } => [true, false, false, false],
             // A PREDICATE-ONLY test (`write_back = false`) has an all-false write mask, and
             // taking the mask as the read set therefore says it reads NOTHING. It reads two
             // operands and compares them; what it does not do is write a register. The channels

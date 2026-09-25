@@ -89,8 +89,55 @@ pub(super) fn voice_unlock_params(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// SceInt32 sceNgsVoicePlay(SceNgsHVoice voice) - begin decoding this voice's AT9.
 pub(super) fn voice_play(ctx: &mut GuestCtx, st: &mut VitaState) {
     let voice = ctx.arg(0);
+    let silent_before = super::at9::voices_no_source();
     st.audio_state.at9.play(voice);
+    if super::at9::voices_no_source() > silent_before {
+        report_silent_play(st, voice);
+    }
     ctx.ret(0);
+}
+
+/// Record one `sceNgsVoice*` call against the voice it names (argument 0) - see
+/// `AudioState::ngs_voice_calls`.
+pub(super) fn trace_voice_call(st: &mut VitaState, nid: u32, args: [u32; 4]) {
+    let calls = &mut st.audio_state.ngs_voice_calls;
+    if !calls.contains_key(&args[0]) && calls.len() >= 1024 {
+        return;
+    }
+    let v = calls.entry(args[0]).or_default();
+    if v.len() < 24 {
+        v.push((nid, args));
+    }
+}
+
+/// >>> A PLAY ON A VOICE WITH NO SOURCE, EXPLAINED BY EVERYTHING THE TITLE DID TO THAT VOICE.
+///
+/// The panel's `ngs silent voices` count says HOW MANY plays decode nothing; it cannot say why,
+/// and a title's audio path is a sequence of calls on the handle - lock/write/unlock, a params
+/// block, a module callback, a rack it came from. Printing the whole sequence for the first few
+/// silent plays names the path the source should have arrived by, in one run, rather than one
+/// hypothesis per run. Bounded to eight voices.
+fn report_silent_play(st: &mut VitaState, voice: u32) {
+    let a = &mut st.audio_state;
+    if a.ngs_silent_reported >= 8 {
+        return;
+    }
+    a.ngs_silent_reported += 1;
+    let rack = a.ngs_voice_handles.iter().find(|(_, v)| *v == voice).map(|(k, _)| *k);
+    let calls: Vec<String> = a
+        .ngs_voice_calls
+        .get(&voice)
+        .map(|v| {
+            v.iter()
+                .map(|(nid, g)| format!("{}({:#x},{:#x},{:#x},{:#x})", crate::nid::name(*nid), g[0], g[1], g[2], g[3]))
+                .collect()
+        })
+        .unwrap_or_default();
+    tracing::warn!(
+        target: "vitaslop::audio",
+        "ngs SILENT PLAY on voice {voice:#x} (rack, index) = {rack:x?}: the title's calls on this handle, oldest first: {}",
+        if calls.is_empty() { "NONE".to_string() } else { calls.join(" -> ") }
+    );
 }
 
 /// SceInt32 sceNgsVoiceInit(SceNgsHVoice voice, const SceNgsVoicePreset *preset,
