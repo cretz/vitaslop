@@ -45,68 +45,8 @@ for (const file of names) {
   const c = JSON.parse(readFileSync(join(dir, file), "utf8"));
   const src = readFileSync(join(dir, file.replace(".json", ".wgsl")), "utf8");
 
-  const got = await page.evaluate(async ({ src, c }) => {
-    const adapter = await navigator.gpu?.requestAdapter();
-    if (!adapter) return { error: "no adapter" };
-    const want = ["shader-f16"].filter((x) => adapter.features.has(x));
-    const dev = await adapter.requestDevice({ requiredFeatures: want });
-    const laneValue = globalThis.__laneValue;
-    dev.pushErrorScope("validation");
-    const mod = dev.createShaderModule({ code: src });
-    const info = await mod.getCompilationInfo();
-    const errs = info.messages.filter((m) => m.type === "error").map((m) => `${m.lineNum}: ${m.message}`);
-    if (errs.length) {
-      await dev.popErrorScope();
-      return { error: errs.slice(0, 3).join(" | ") };
-    }
-    const pipe = dev.createComputePipeline({ layout: "auto", compute: { module: mod, entryPoint: "cs_main" } });
-    const n = c.lanes;
-    const input = new Float32Array(n * 2);
-    for (let j = 0; j < n; j++) {
-      input[j] = laneValue(c.seed, j);
-      input[n + j] = laneValue(c.seed, n + j);
-    }
-    // The same per-program overrides the case carries - see `caseinputs.mjs`. A trace taken on
-    // different inputs from the reference's would locate a divergence that is not there.
-    globalThis.__applyCaseInputs(c, input);
-    const inBuf = dev.createBuffer({ size: input.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    dev.queue.writeBuffer(inBuf, 0, input);
-    const outBuf = dev.createBuffer({ size: n * 4 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const traceBytes = c.trace.length * 4;
-    const trBuf = dev.createBuffer({ size: traceBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const read = dev.createBuffer({ size: traceBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    const entries = [
-      { binding: 0, resource: { buffer: inBuf } },
-      { binding: 1, resource: { buffer: outBuf } },
-      { binding: 3, resource: { buffer: trBuf } },
-    ];
-    // A program with 0xE8 loads declares its guest-memory WINDOW at binding 2. Leaving it out
-    // fails the bind group, which fails the dispatch, which reads as "the trace module did not
-    // run" - it ran nothing at all.
-    if (c.mem && c.mem.length) {
-      const words = new Uint32Array(c.mem);
-      const memBuf = dev.createBuffer({
-        size: words.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
-      dev.queue.writeBuffer(memBuf, 0, words);
-      entries.push({ binding: 2, resource: { buffer: memBuf } });
-    }
-    const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
-    const enc = dev.createCommandEncoder();
-    const pass = enc.beginComputePass();
-    pass.setPipeline(pipe);
-    pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(1);
-    pass.end();
-    enc.copyBufferToBuffer(trBuf, 0, read, 0, traceBytes);
-    dev.queue.submit([enc.finish()]);
-    await read.mapAsync(GPUMapMode.READ);
-    const trace = Array.from(new Uint32Array(read.getMappedRange().slice(0)));
-    read.unmap();
-    const err = await dev.popErrorScope();
-    return err ? { error: err.message } : { trace };
-  }, { src, c });
+  // The GPU half is web/runner/gxptrace-run.js - shared with the device runner.
+  const got = await page.evaluate(async ({ src, c }) => (await import("/runner/gxptrace-run.js")).runTrace({ src, c }), { src, c });
 
   console.log(`\n=== ${c.name}: ${c.instrs.length} instructions, ${c.checkpoints.length} checkpoints`);
   if (got.error) {

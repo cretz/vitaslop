@@ -1255,7 +1255,7 @@ pub(super) fn shared_fb_end(ctx: &mut GuestCtx, st: &mut VitaState) {
             // The guest drew the buffer that was NOT on screen; show it and swap.
             let drawn = if cur == 0 { base + SHARED_FB_BYTES } else { base };
             st.shared_fb = Some((u, base, cur ^ 1));
-            st.resolve_deferred_geometry(ctx);
+            st.resolve_at_flip(ctx);
             st.present(drawn);
             // The shared framebuffer's End is the title's flip: pace it to the scanout
             // exactly as `sceGxmDisplayQueueAddEntry` does (see `pace_flip`), which is
@@ -2515,9 +2515,18 @@ pub(super) fn appmgr_receive_system_event(ctx: &mut GuestCtx, _st: &mut VitaStat
 /// is done, and everything after this call in its own code is unreachable. So the run
 /// ENDS, named, rather than returning a success the guest then runs on past its own
 /// point of no return - or a failure it never expects and does not handle.
-pub(super) fn appmgr_load_exec(ctx: &mut GuestCtx, _st: &mut VitaState) -> SvcOutcome {
+pub(super) fn appmgr_load_exec(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let path_ptr = ctx.arg(0);
     let path = if path_ptr == 0 { String::new() } else { ctx.read_cstr(path_ptr, 256) };
+    // >>> AN EXECUTABLE OF THIS SAME APP IS A PROCESS REPLACEMENT THIS ENGINE CAN PERFORM.
+    // The run halts with the request recorded; the host that owns the process mounts the app
+    // again with that executable as its main one (a launcher eboot whose only job is this call
+    // - a 2011 adventure title's - boots its real executable that way). Anything outside
+    // `app0:` is another application, which there is none of here.
+    if path.starts_with("app0:") {
+        st.exec_request = Some(path);
+        return SvcOutcome::Halt;
+    }
     SvcOutcome::Fatal(format!(
         "sceAppMgrLoadExec(\"{path}\"): the title asked to launch another application and \
          end itself; there is no second application to launch here"
@@ -2841,5 +2850,29 @@ mod calendar_tests {
         // The Unix epoch is day zero, which pins the offset rather than just the deltas.
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+}
+
+/// The Wi-Fi MAC this console reports. A Vita has one whether or not it is connected, so an
+/// offline answer is still an address - and, like `libkernel::OPEN_PS_ID`, what matters is that
+/// it is STABLE across boots and runs (a title may key a local profile or an ad-hoc identity on
+/// it) and plausible: a LOCALLY ADMINISTERED unicast address (first octet 0x02), so it can never
+/// collide with a vendor-assigned one. The last five octets spell "vitas".
+const NET_MAC_ADDRESS: [u8; 6] = [0x02, 0x76, 0x69, 0x74, 0x61, 0x73];
+
+/// `SCE_NET_EINVAL` - a null address to write into.
+const SCE_NET_ERROR_EINVAL: u32 = 0x8041_0116;
+
+/// int sceNetGetMacAddress(SceNetEtherAddr *addr, int flags)
+///
+/// First called by a 2011 fighting title at its title screen. `flags` selects nothing a title
+/// can observe here (there is one interface), so it is read and ignored.
+#[hostcall]
+pub(super) fn net_get_mac_address(ctx: &mut GuestCtx, _st: &mut VitaState, addr: Ptr, _flags: i32) -> i32 {
+    if addr.is_null() {
+        SCE_NET_ERROR_EINVAL as i32
+    } else {
+        ctx.write_bytes(addr.addr(), &NET_MAC_ADDRESS);
+        0
     }
 }

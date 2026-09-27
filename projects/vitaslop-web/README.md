@@ -37,11 +37,41 @@ is where it is either true or not.
 - Importing streams: the page hands the picked `File`s to `import-worker.js`, which
   reads ranges with `FileReaderSync` and writes OPFS sync handles while the Rust
   streaming ingest peels zip/pkg/PFS/SELF. Nothing is ever resident.
-- The old debug pages (`live.html`, the cube, conformance) live under `web/debug/`
+- The old debug pages (the cube, conformance) live under `web/debug/`
   and the e2e rigs drive them there.
+- The title page draws before anything slow resolves: its size is remembered in the
+  record (`storedBytes`, summed once - a title is up to ~1,300 files), and the settings
+  (which run in the emulator bundle) fill in the profile, Play and save buttons when
+  ready. The app starts loading that bundle at boot so it is usually ready already.
+
+## Storage (OPFS layout)
+
+All of it is in the origin's private file system; nothing leaves the browser.
+
+- `games/<titleId>/` - the imported title, one flat file per game path (`/` encoded as
+  `%2F`), plus `vitaslop-opfs-manifest.json` written LAST as the "import complete"
+  marker. Immutable after import; a re-import empties the directory first. Remove =
+  delete the directory (recursive), which takes everything below with it.
+- `games/<titleId>/vitaslop-transpiled/` - the TRANSPILE CACHE (`transpile-cache.js`):
+  the title's transpiled guest module (`<name>.wasm`, tens of MB) and its layout numbers
+  (`<name>.json`, written last). `<name>` = `<build>-<settings>-<hostOff>`: a hash of the
+  bundle's `build-stamp.txt` (so every new build invalidates - one re-transpile per title
+  per deploy), the transpiler's resolved emit settings for this run's knobs, and the host
+  offset the module is emitted for. One entry per title: a miss deletes the old one
+  before transpiling, and every prepare sweeps other titles' entries from older builds.
+  Only the first play after a build pays the transpile. `VITASLOP_TRANSPILE_CACHE=0`
+  bypasses it. Lives under the title so removing the game removes it.
+- `library/<titleId>/` - the library record: `meta.json` (title, sizes, dates) and the
+  `icon0.png` / `pic0.png` taken from the package at import.
+- `gamedata/<titleId>/` (default profile) and `gamedata-profiles/<profile>/<titleId>/` -
+  what the game saved. Deliberately NOT under `games/`: removing a game keeps its saves.
+- Settings are in localStorage, not OPFS (see above).
 
 ## The player
 
+- The page fetches and compiles the emulator bundle ONCE (`bundle.js`, keyed on the build
+  stamp) and posts the compiled module to the run worker and the transpile worker; each
+  used to fetch and compile its own 9 MB copy. A second play from the same page reuses it.
 - A canvas hands its drawing to a worker once, so each run gets a fresh `#screen`
   element in place of the last (`cloneNode`); no reload between games.
 - Fullscreen and the landscape lock are asked for once per run, from a gesture (Play,

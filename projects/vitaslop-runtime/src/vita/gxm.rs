@@ -1570,17 +1570,29 @@ fn program_rop_blend(
     };
     // `SceGxmBlendFactor`: 1 = ONE, 4 = SRC_ALPHA, 5 = ONE_MINUS_SRC_ALPHA.
     // `SceGxmBlendFunc`: 0 = NONE, 1 = ADD.
-    let blend = crate::capture::BlendState {
-        color_mask: 0xf,
-        color_func: 1,
-        alpha_func: 1,
-        color_src: 4,
-        color_dst: match rop.dst {
-            RopDstFactor::One => 1,
-            RopDstFactor::OneMinusSrcAlpha => 5,
+    let blend = match rop.factors {
+        // The full plain-SOP2 reading: the word's own four factors, both functions ADD.
+        Some((color_src, color_dst, alpha_src, alpha_dst)) => crate::capture::BlendState {
+            color_mask: 0xf,
+            color_func: 1,
+            alpha_func: 1,
+            color_src,
+            color_dst,
+            alpha_src,
+            alpha_dst,
         },
-        alpha_src: 1,
-        alpha_dst: 0,
+        None => crate::capture::BlendState {
+            color_mask: 0xf,
+            color_func: 1,
+            alpha_func: 1,
+            color_src: 4,
+            color_dst: match rop.dst {
+                RopDstFactor::One => 1,
+                RopDstFactor::OneMinusSrcAlpha => 5,
+            },
+            alpha_src: 1,
+            alpha_dst: 0,
+        },
     };
     report_rop_blend(program_header, rop, blend);
     Some(blend)
@@ -1847,7 +1859,12 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
     // so it is the one place that sees every scene change.
     //
     // `VITASLOP_REGION_CLIP_SCENE=0` is the arm back.
-    if crate::knobs::var("VITASLOP_REGION_CLIP_SCENE").ok().as_deref() != Some("0") {
+    // Cached: read per SCENE (hundreds a frame on some titles), and a knob read is a lock, a map
+    // lookup and an environment probe.
+    static REGION_CLIP_SCENE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *REGION_CLIP_SCENE
+        .get_or_init(|| crate::knobs::var("VITASLOP_REGION_CLIP_SCENE").ok().as_deref() != Some("0"))
+    {
         let context = ctx.arg(0);
         gxmctx::set(ctx, context, gxmctx::off::REGION_CLIP_MODE, 0); // SCE_GXM_REGION_CLIP_NONE
         for i in 0..4 {
@@ -2569,7 +2586,7 @@ pub(super) fn display_queue_add_entry(ctx: &mut GuestCtx, st: &mut VitaState) {
         let words: Vec<u32> = (0..8).map(|i| ctx.read_u32(callback_data + i * 4)).collect();
         let named = words.iter().copied().find(|w| *w != 0 && st.flip_candidates.contains(w));
         if let Some(buffer) = named {
-            st.resolve_deferred_geometry(ctx);
+            st.resolve_at_flip(ctx);
             st.present(buffer);
         }
     }
@@ -3844,6 +3861,17 @@ pub(super) fn set_front_visibility_test_index(ctx: &mut GuestCtx, _st: &mut Vita
 pub(super) fn set_front_visibility_test_op(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, op: u32) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::FRONT_VISIBILITY_TEST_OP, op);
     0
+}
+
+/// void sceGxmSetBackVisibilityTest{Enable,Index,Op}(SceGxmContext *context, unsigned int v)
+///
+/// The back-face twins of the three front setters. Kept in [`VitaState::back_visibility`] per
+/// context rather than in the context block, whose layout is fixed and shared with the inline
+/// forms. `field`: 0 enable, 1 index, 2 op. First called by a 2011 adventure title at boot.
+pub(super) fn set_back_visibility_test(ctx: &mut GuestCtx, st: &mut VitaState, field: usize) {
+    let (context, value) = (ctx.arg(0), ctx.arg(1));
+    st.back_visibility.entry(context).or_insert([0; 3])[field] = value;
+    ctx.ret(0);
 }
 
 // --- Unmapping ---------------------------------------------------------------
@@ -5760,11 +5788,24 @@ mod texture_control_word_field_tests {
 /// Returns `true` when the calling thread must BLOCK (asynchronous frontend - the batch is
 /// in `pending_early` and the run loop finishes it).
 fn complete_scenes_through(ctx: &mut GuestCtx, st: &mut VitaState, through: usize) -> bool {
-    // The guest is waiting for the GPU, so every outstanding scene's bytes are final now.
-    st.resolve_deferred_geometry(ctx);
+    // The guest is waiting for the GPU, so every outstanding scene's bytes are final now. Read
+    // on the resolver worker when one is up (the thread blocks until it is applied - see
+    // `VitaState::queue_sync_resolve`), else here.
+    let queued = st.queue_sync_resolve();
+    if !queued {
+        st.resolve_deferred_geometry(ctx);
+    }
+    // A queued resolve owes the thread a wait even when no scene needs completing: an EMPTY
+    // batch parks it until the run worker has applied the bytes, and wakes it with nothing to
+    // render.
+    let park_for_resolve = |st: &mut VitaState| {
+        let n = st.capture.scenes.len();
+        st.pending_early = Some((st.current_thread(), n, n));
+        true
+    };
     let cap = crate::rtt_writeback::rtt_writeback_texels();
     if cap == 0 {
-        return false;
+        return queued && park_for_resolve(st);
     }
     let small = |scene: &crate::capture::Scene| {
         scene.color.is_some_and(|c| c.width.max(1) * c.height.max(1) <= cap)
@@ -5781,7 +5822,7 @@ fn complete_scenes_through(ctx: &mut GuestCtx, st: &mut VitaState, through: usiz
         .map_or(0, |i| i + 1)
         .max(st.capture.scenes.len().saturating_sub(st.capture.frame_scene_count_so_far()));
     if start >= n {
-        return false;
+        return queued && park_for_resolve(st);
     }
     // Only the DISPLAY buffer's own passes stay out (they compose the frame at its end;
     // rendered here they would be lost) - see below.
@@ -5790,7 +5831,7 @@ fn complete_scenes_through(ctx: &mut GuestCtx, st: &mut VitaState, through: usiz
         s.color.is_none_or(|c| !display.contains(&c.data_addr))
     };
     if !st.capture.scenes[start..n].iter().any(|s| in_batch(s) && small(s)) {
-        return false;
+        return queued && park_for_resolve(st);
     }
     if st.complete_scene_now.is_none() && !st.complete_scene_async {
         if crate::rtt_writeback::report_once(0x6e00_0000_0000_0000) {

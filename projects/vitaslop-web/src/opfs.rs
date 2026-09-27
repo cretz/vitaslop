@@ -34,17 +34,79 @@ pub struct OpfsReader {
     /// `stats()` if the reader has a ring behind it - see [`OpfsReader::ring_stats`].
     stats: Option<Function>,
     this: Object,
+    /// The worker (wasm thread) that built this reader - the only one whose JS heap holds
+    /// the functions above. See the `Send` note below.
+    owner: std::thread::ThreadId,
+}
+
+/// A GUEST worker's own reader over the title's storage ring (`web/opfs.js`
+/// `attachTitleCached`), installed once by [`install_worker_reader`].
+///
+/// # Why a guest worker reads files itself
+/// Under `VITASLOP_SMP` a file read used to be FORWARDED to the run worker, and a forward waits
+/// for whatever that worker is doing - a present, usually. MEASURED (MLB, `tel25f`): after the
+/// audio forwards were removed, `sceIoPread` was the last per-frame forward, and every one parked
+/// its thread and blocked the idle clock for the length of a present. The ring is a
+/// SharedArrayBuffer every worker can view; only the JS handles are per worker. Its single
+/// request slot is serialised by the host lock, which every file read runs under.
+struct WorkerReader {
+    paths: Function,
+    size: Function,
+    read: Function,
+    this: Object,
+}
+
+thread_local! {
+    static WORKER_READER: std::cell::RefCell<Option<WorkerReader>> = const { std::cell::RefCell::new(None) };
+    /// On the run worker: its reader's `share()` descriptor, for the guest workers it starts.
+    static SHARE: std::cell::RefCell<Option<JsValue>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Install this worker's reader (`obj`, from `attachTitleCached`). False when `obj` is not one.
+pub fn install_worker_reader(obj: &JsValue) -> bool {
+    let Ok(this) = obj.clone().dyn_into::<Object>() else { return false };
+    let get = |name: &str| Reflect::get(&this, &JsValue::from_str(name)).ok()?.dyn_into::<Function>().ok();
+    let (Some(paths), Some(size), Some(read)) = (get("paths"), get("size"), get("read")) else {
+        return false;
+    };
+    WORKER_READER.with(|r| *r.borrow_mut() = Some(WorkerReader { paths, size, read, this }));
+    true
+}
+
+/// The run worker's storage-ring descriptor (`{ sab, paths, sizes }`), when its reader has a
+/// ring another worker can attach to - `None` for the in-memory fixture reader, whose reads
+/// must then still be forwarded.
+pub fn storage_share() -> Option<JsValue> {
+    SHARE.with(|s| s.borrow().clone())
+}
+
+/// Refuse, loudly, a JS-bound handle used from a worker that did not create it.
+///
+/// Under `VITASLOP_SMP` host calls run on several workers over one memory; a `JsValue` from
+/// another worker's heap is an index into the WRONG table there, so it would call some other
+/// function or none - silently. The calls that reach this reader are forwarded to the run
+/// worker (`vita::smp_owner_only`); this is the tripwire for one that was not.
+pub(crate) fn assert_owner(owner: std::thread::ThreadId, what: &str) {
+    if std::thread::current().id() != owner {
+        panic!(
+            "{what} was used from a worker that does not own it - a host call reached a \
+             run-worker-only resource from an SMP guest worker. Add its NID family to \
+             `vita::smp_owner_only` so the call is forwarded."
+        );
+    }
 }
 
 // SAFETY: `OpfsReader` holds JS values, which wasm-bindgen marks `!Send` because they
 // live in a per-thread heap that cannot be reached from another thread.
 //
-// This target has no other thread. `wasm32-unknown-unknown` without the atomics feature
-// is single-threaded by construction: there is no `std::thread::spawn`, and the emulator's
-// own concurrency is guest threads multiplexed onto ONE worker by the JSPI scheduler
-// (`browser_sched`), which is why its host is an `Arc<Mutex<VitaEnv>>` whose lock never
-// contends. So no `OpfsReader` can be observed from a second thread, and the assertion
-// costs nothing that could be lost.
+// The one-worker engine has no other thread: guest threads are multiplexed onto ONE worker
+// by the JSPI scheduler (`browser_sched`). The wasm-threads bundle's PARALLEL run
+// (`VITASLOP_SMP`) does have others - and there every method below uses this value's handles
+// ONLY on the worker that built it; on a guest worker it uses that worker's OWN reader over the
+// same storage ring ([`install_worker_reader`]), and on a worker with neither it panics rather
+// than touch a foreign heap (a run whose reader has no ring keeps its file calls forwarded -
+// see `smp::SmpRun::start`). So the value may MOVE (it lives inside the shared host), but its
+// JS handles are only ever USED on their own worker.
 //
 // It is asserted here, on the one type that needs it, rather than by dropping the `Send`
 // bound from `FileBacking` - because that bound IS load-bearing natively, where the
@@ -81,9 +143,17 @@ impl OpfsReader {
                 if let Some(f) = f.clone() {
                     RING.with(|r| *r.borrow_mut() = Some((f, this.clone())));
                 }
+                // ...and what a guest worker needs to read the same ring, if there is one.
+                let share = Reflect::get(&this, &JsValue::from_str("share"))
+                    .ok()
+                    .and_then(|f| f.dyn_into::<Function>().ok())
+                    .and_then(|f| f.call0(&this).ok())
+                    .filter(|v| v.is_object());
+                SHARE.with(|s| *s.borrow_mut() = share);
                 f
             },
             this,
+            owner: std::thread::current().id(),
         })
     }
 
@@ -103,17 +173,36 @@ impl OpfsReader {
         Some((num("hits")? as u64, num("misses")? as u64, num("waitMs")?))
     }
 
+    /// Run `f` with the reader functions THIS worker may call: the ones this reader was built
+    /// with on its own worker, else the worker's own view of the same storage ring
+    /// ([`install_worker_reader`]), else the tripwire - a foreign heap is never touched.
+    fn with_fns<R>(&self, f: impl FnOnce(&Function, &Function, &Function, &Object) -> R) -> R {
+        if std::thread::current().id() == self.owner {
+            return f(&self.paths, &self.size, &self.read, &self.this);
+        }
+        let mine = WORKER_READER.with(|r| {
+            r.borrow().as_ref().map(|w| (w.paths.clone(), w.size.clone(), w.read.clone(), w.this.clone()))
+        });
+        match mine {
+            Some((p, s, r, t)) => f(&p, &s, &r, &t),
+            None => {
+                assert_owner(self.owner, "the OPFS reader");
+                unreachable!("assert_owner returns only on the owning worker")
+            }
+        }
+    }
+
     /// Every stored path.
     pub fn paths(&self) -> Vec<String> {
-        let Ok(v) = self.paths.call0(&self.this) else { return Vec::new() };
+        let Ok(v) = self.with_fns(|paths, _, _, this| paths.call0(this)) else { return Vec::new() };
         js_sys::Array::from(&v).iter().filter_map(|p| p.as_string()).collect()
     }
 
     /// Byte length of `path`, or `None` when it is not stored (the JS side reports -1).
     pub fn size(&self, path: &str) -> Option<usize> {
+        let path = JsValue::from_str(path);
         let n = self
-            .size
-            .call1(&self.this, &JsValue::from_str(path))
+            .with_fns(|_, size, _, this| size.call1(this, &path))
             .ok()
             .and_then(|v| v.as_f64())?;
         if n < 0.0 {
@@ -134,10 +223,15 @@ impl OpfsReader {
         let off_js = JsValue::from_f64(off as f64);
         // A view over this call's slice, handed to JS to fill in place - no intermediate
         // JS array, no copy. From here to the call there is no allocation at all.
-        let view = unsafe { Uint8Array::view_mut_raw(buf.as_mut_ptr(), buf.len()) };
+        //
+        // The functions are fetched BEFORE the view too: on a guest worker that is a clone of
+        // its thread-local reader's handles, which is a JS call that must not land between the
+        // view's creation and its use.
         let n = self
-            .read
-            .call3(&self.this, &path, &off_js, &view)
+            .with_fns(|_, _, read, this| {
+                let view = unsafe { Uint8Array::view_mut_raw(buf.as_mut_ptr(), buf.len()) };
+                read.call3(this, &path, &off_js, &view)
+            })
             .ok()
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0) as usize;

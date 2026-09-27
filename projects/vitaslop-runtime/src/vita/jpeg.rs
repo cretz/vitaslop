@@ -67,6 +67,20 @@ const SCE_JPEG_ERROR_INVALID_STATE: i32 = 0x8065_0004u32 as i32;
 /// consume it are not implemented (see the module docs).
 #[hostcall]
 pub(super) fn init_mjpeg(_ctx: &mut GuestCtx, _st: &mut VitaState, _decoder_count: u32) -> i32 {
+    init_pool()
+}
+
+/// int sceJpegInitMJpegWithParam(const SceJpegMJpegInitParam *params)
+///
+/// [`init_mjpeg`] with its count in a struct (`psp2/jpeg.h`, asserted 0xC bytes: `size`,
+/// `decoderCount`, `options`). First called by a 2011 adventure title at boot.
+#[hostcall]
+pub(super) fn init_mjpeg_with_param(_ctx: &mut GuestCtx, _st: &mut VitaState, _params: u32) -> i32 {
+    init_pool()
+}
+
+/// The shared body of the two init spellings.
+fn init_pool() -> i32 {
     use std::sync::atomic::Ordering;
     if INITIALISED.swap(true, Ordering::Relaxed) {
         // Already initialised - a title that inits twice has a bug, and hearing about it

@@ -21,7 +21,7 @@
          The worker addresses reports BY ELEMENT ID, so without this element the headless
          page silently drops the one channel that carries blocked threads, guest heaps, idle
          attribution and the movie counters - and a harness run then has to be repeated by
-         hand on `live.html` to ask anything about a stall. Kept out of the way rather than
+         hand on the product page to ask anything about a stall. Kept out of the way rather than
          hidden: `display:none` still yields textContent, but a screenshot of this page is
          also a diagnostic and the panel does not belong on top of the frame. -->
     <pre id="diag" style="position:absolute;left:-9999px;top:0;white-space:pre-wrap"></pre>
@@ -101,7 +101,10 @@
         // a sync access handle is an exclusive lock.
         // The run worker first: it reserves the guest region in its own memory and reports
         // the offset the module has to be built for (see worker.js's "reserve" message).
-        const worker = new Worker("../worker.js", { type: "module" });
+        // `VITASLOP_SMP=1` needs the wasm-threads bundle in BOTH the run and the transpile
+        // worker - see build.mjs. The default engine keeps the single-threaded one.
+        const bundleQ = String((knobs || {}).VITASLOP_SMP ?? "") === "1" ? "?smp=1" : "";
+        const worker = new Worker("../worker.js" + bundleQ, { type: "module" });
         status.textContent = "reserving the guest region in the run worker...";
         const hostOff = await new Promise((resolve, reject) => {
           worker.onmessage = (e) => {
@@ -114,7 +117,7 @@
         });
         status.textContent = "transpiling (throwaway worker)...";
         const prebuilt = await new Promise((resolve, reject) => {
-          const tw = new Worker("../transpile-worker.js", { type: "module" });
+          const tw = new Worker("../transpile-worker.js" + bundleQ, { type: "module" });
           tw.onmessage = (e) => {
             tw.terminate();
             e.data.type === "built" ? resolve(e.data.built) : reject(new Error(e.data.message));

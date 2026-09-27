@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Same policy as the product page, jobs run in Workers. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; frame-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; base-uri 'none'; form-action 'none'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b0b12" />
+    <title>vitaslop device runner</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; background: #0b0b12; color: #d8d8e0; font: 14px/1.4 system-ui, sans-serif; }
+      main { max-width: 720px; margin: 0 auto; padding: 16px; }
+      h1 { font-size: 18px; margin: 0 0 8px; }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+      input { background: #1a1a26; color: inherit; border: 1px solid #333; border-radius: 6px; padding: 6px 8px; font: inherit; }
+      button { background: #2b4cff; color: white; border: 0; border-radius: 6px; padding: 8px 14px; font: inherit; }
+      #state { font-weight: 600; }
+      .say { color: #7fd0ff; font-weight: 600; } .ok { color: #6be38a; } .warn { color: #ffcc55; } .bad { color: #ff6b6b; }
+      #log { font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; background: #12121b; border-radius: 6px; padding: 8px; max-height: 50vh; overflow: auto; }
+      small { color: #8a8a99; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>vitaslop device runner</h1>
+      <div class="row">
+        <span id="state">starting...</span>
+      </div>
+      <div class="row">
+        <label>Device name <input id="name" size="18" /></label>
+        <small id="devid"></small>
+      </div>
+      <div class="row">
+        <button id="go">Start (keeps the screen on)</button>
+        <small id="wake"></small>
+      </div>
+      <p><small>Leave this page open and in front, plugged in. Jobs are short (seconds, never more than 90 s each; a LIVE game run, shown above the log, up to 6 min)
+        and come from the desktop. Backgrounding or locking pauses it; coming back resumes it - a job that was
+        interrupted is simply run again.</small></p>
+      <div id="log"></div>
+    </main>
+    <script type="module" src="./runner.js"></script>
+  </body>
+</html>

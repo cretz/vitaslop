@@ -953,6 +953,62 @@ pub fn f16_round_to_nearest() -> bool {
     crate::link::arm(crate::link::F16_ROUND_ARM) != Some("0")
 }
 
+/// >>> `rcp` AND `rsq` WITH THEIR ZEROES AND INFINITIES DECIDED IN INTEGERS.
+///
+/// The USSE's transcendentals are IEEE at the edges: `rsq(+-0)` is `+-inf` and `rcp(+-inf)` is
+/// `+-0`, and a compiled program leans on it - `length = rcp(rsq(x))` is how a vertex program
+/// takes a square root, and a zero-length vector goes through `rsq(0) = inf`, `rcp(inf) = 0`.
+/// WGSL does not promise either: `inverseSqrt(0)` is an indeterminate value, and an
+/// implementation "may assume that overflow, infinities and NaNs are not present". A desktop
+/// driver returns the IEEE answer; a phone's need not, and a NaN there rides a varying into the
+/// fragment stage. MEASURED on a baseball title's at-bat: two vertex programs drawing into a
+/// 960x544 offscreen target take `rsq` of an exact zero at #109 and `rcp` of it at #110.
+///
+/// `log2(+-0) = -inf`, `log2(+inf) = +inf`, `exp2(-inf) = 0` and `exp2(+inf) = +inf` are the same
+/// class, crossed by `pow(x, y) = exp2(y * log2(x))` at `x = 0`: MEASURED in a fighting title's
+/// vertex programs (`log` of an all-zero temp at #80 and #106).
+///
+/// So both edges are tested on the BITS (an integer compare no compiler may fold away as a
+/// "cannot happen") and the answer is built from bits too; every other input takes the native
+/// op. `VITASLOP_GXP_IEEE_RCP=0` is the arm back to the bare builtins.
+///
+/// >>> EVERY INFINITY IS BUILT FROM THE INPUT'S BITS, NEVER A LITERAL. `bitcast<f32>(0x7f800000u)`
+/// is a CONST-EXPRESSION, and Tint rejects it ("value inf cannot be represented as 'f32'") while
+/// naga accepts it - one such helper failed all 596 corpus modules in Chrome. So `+inf` in is
+/// returned as `x` itself, and `-inf` is `0xff800000u | b` where `b` is known to be `+-0`.
+const IEEE_HELPERS: &str = "fn gxp_rsq(x: f32) -> f32 {
+  let b = bitcast<u32>(x);
+  return select(inverseSqrt(x), bitcast<f32>(0x7f800000u | (b & 0x80000000u)), (b & 0x7fffffffu) == 0u);
+}
+fn gxp_rcp(x: f32) -> f32 {
+  let b = bitcast<u32>(x);
+  let m = b & 0x7fffffffu;
+  let r = select(1.0 / x, bitcast<f32>(b & 0x80000000u), m == 0x7f800000u);
+  return select(r, bitcast<f32>(0x7f800000u | (b & 0x80000000u)), m == 0u);
+}
+fn gxp_log2(x: f32) -> f32 {
+  let b = bitcast<u32>(x);
+  let r = select(log2(x), x, b == 0x7f800000u);
+  return select(r, bitcast<f32>(0xff800000u | b), (b & 0x7fffffffu) == 0u);
+}
+fn gxp_exp2(x: f32) -> f32 {
+  let b = bitcast<u32>(x);
+  let r = select(exp2(x), x, b == 0x7f800000u);
+  return select(r, 0.0, b == 0xff800000u);
+}
+";
+
+/// Give a module the [`IEEE_HELPERS`] its body calls, after its directives. Idempotent.
+fn add_ieee_helpers(module: String) -> String {
+    let calls = ["gxp_rsq(", "gxp_rcp(", "gxp_log2(", "gxp_exp2("].iter().any(|f| module.contains(f));
+    if !calls || module.contains("fn gxp_rsq(") {
+        return module;
+    }
+    let mut out = module;
+    out.insert_str(crate::link::directives_end(&out), IEEE_HELPERS);
+    out
+}
+
 /// Whether `module` calls any of the f16 helpers, and therefore needs their definitions.
 fn calls_half_helpers(module: &str) -> bool {
     [HALF_LO_FN, HALF_HI_FN, HALF_PK_FN, HALF_QUANT_FN, HALF_BITS_FN]
@@ -974,6 +1030,7 @@ fn calls_half_helpers(module: &str) -> bool {
 /// Idempotent: a module that already carries the definitions is returned unchanged, so a
 /// builder that wraps another builder's output cannot emit them twice.
 pub fn add_half_helpers(module: String) -> String {
+    let module = add_ieee_helpers(module);
     if !calls_half_helpers(&module) || module.contains(&format!("fn {HALF_BITS_FN}(")) {
         return module;
     }
@@ -3411,10 +3468,26 @@ fn emit_instr(
         // component, so each written channel gets the same scalar function applied. rcp/rsq/
         // log/exp map to WGSL's native reciprocal / inverse-sqrt / log2 / exp2 (the SGX USSE
         // transcendentals are base-2). VMOV (0x38) is a swizzled per-channel copy.
-        Op::Rcp => emit_unary(s, instr, dest, mask, &|a| format!("(1.0 / {a})")).ok_or_else(unmapped),
-        Op::Rsq => emit_unary(s, instr, dest, mask, &|a| format!("inverseSqrt({a})")).ok_or_else(unmapped),
-        Op::Log => emit_unary(s, instr, dest, mask, &|a| format!("log2({a})")).ok_or_else(unmapped),
-        Op::Exp => emit_unary(s, instr, dest, mask, &|a| format!("exp2({a})")).ok_or_else(unmapped),
+        // Through `gxp_rcp`/`gxp_rsq` - see [`IEEE_HELPERS`]: the hardware's `rcp(rsq(0)) = 0`
+        // length idiom rests on an infinity WGSL does not promise to keep.
+        Op::Rcp => emit_unary(s, instr, dest, mask, &|a| {
+            if crate::link::arm_on(crate::link::IEEE_RCP_ARM) { format!("gxp_rcp({a})") } else { format!("(1.0 / {a})") }
+        })
+        .ok_or_else(unmapped),
+        Op::Rsq => emit_unary(s, instr, dest, mask, &|a| {
+            if crate::link::arm_on(crate::link::IEEE_RCP_ARM) { format!("gxp_rsq({a})") } else { format!("inverseSqrt({a})") }
+        })
+        .ok_or_else(unmapped),
+        // The `pow(x, y) = exp2(y * log2(x))` idiom crosses `log2(0) = -inf` and `exp2(-inf) = 0`
+        // - the same undecided edges as `rcp`/`rsq`, under the same arm (see [`IEEE_HELPERS`]).
+        Op::Log => emit_unary(s, instr, dest, mask, &|a| {
+            if crate::link::arm_on(crate::link::IEEE_RCP_ARM) { format!("gxp_log2({a})") } else { format!("log2({a})") }
+        })
+        .ok_or_else(unmapped),
+        Op::Exp => emit_unary(s, instr, dest, mask, &|a| {
+            if crate::link::arm_on(crate::link::IEEE_RCP_ARM) { format!("gxp_exp2({a})") } else { format!("exp2({a})") }
+        })
+        .ok_or_else(unmapped),
         // A move and a float<->float pack are both swizzled copies in the f32 register model,
         // and so is the NORMALIZED U8 convert: the byte<->float scaling is not written here,
         // it is what `Prec::Fx8`'s own read and store already do (`unpack4x8unorm` one way,
@@ -4737,12 +4810,23 @@ fn emit_int_mad(
         (false, false) => format!("({a0} & 0xffffu)"),
     };
     // `src1_high` selects a 16-bit half of src1 the same way, and for the same reason: the
-    // packed pair the multiplier reads a half of is wherever the compiler put it. A CLEAR bit
-    // reads the whole register, which is what every program that recompiled before this bit
-    // was decoded did - see the decoder's note.
+    // packed pair the multiplier reads a half of is wherever the compiler put it.
+    //
+    // >>> A CLEAR BIT IS THE LOW HALF, NOT THE WHOLE REGISTER. This is a 16x16 multiply, and
+    // the two readings differ only where src1's high half is non-zero - which is exactly a
+    // PACKED PAIR, the case the select bit exists for. MEASURED (MLB, the pitcher's shadow
+    // skinning, pairs 82529743a5ff9842 / 6faa30c99e818ce2, 2026-09-25): two bone indices packed
+    // in one register, `pa[4] = 64 * (pa[3] >> 16) + base` for the high one and
+    // `64 * pa[3] + base` for the low one - which added `64 * idx_hi << 16` to every low-bone
+    // address (misses at base+0x05000000 = bone 20, base+0x07400000 = bone 29), read ZERO
+    // matrices for 38-49% of the mesh's loads, and drew the shadow as two wedges fanning out
+    // from the mound. `VITASLOP_GXP_IMAD_SRC1_WHOLE=1` is the old whole-register read.
     let b0 = raw(instr.srcs.get(1)?)?;
+    let whole = crate::link::arm(crate::link::IMAD_SRC1_WHOLE_ARM).is_some_and(|v| v.trim() == "1");
     let b = match (signed, src1_high) {
-        (_, false) => b0,
+        (_, false) if whole => b0,
+        (true, false) => format!("bitcast<u32>((bitcast<i32>({b0}) << 16u) >> 16u)"),
+        (false, false) => format!("({b0} & 0xffffu)"),
         (true, true) => format!("bitcast<u32>(bitcast<i32>({b0}) >> 16u)"),
         (false, true) => format!("({b0} >> 16u)"),
     };
@@ -6255,16 +6339,19 @@ mod tests {
     /// of nothing [[vitaslop-probe-the-shader-dont-simulate-it]].
     #[test]
     fn the_emitted_portable_helper_is_the_algorithm_that_was_checked() {
+        // The BRANCH-FREE form (2026-09-25a) - checked exhaustively over all 2^32 inputs
+        // against the branch form it replaced and against IEEE round-to-nearest-even. This pins
+        // the spelling that check covered; the list used to pin the old `if` form.
         for line in [
-            "if (mag > 0x7f800000u) { return sign | 0x7e00u; }",
-            "if (mag == 0x7f800000u) { return sign | 0x7c00u; }",
-            "if (mag >= 0x477ff000u) { return sign | 0x7bffu; }",
-            "if (mag < 0x33000000u) { return sign; }",
-            "let bits = ((e - 112u) << 10u) | ((mag >> 13u) & 0x3ffu);",
-            "if (rem > 0x1000u || (rem == 0x1000u && (bits & 1u) == 1u)) { return sign | (bits + 1u); }",
-            "let shift = 126u - e;",
-            "let half = 1u << (shift - 1u);",
-            "if (rem > half || (rem == half && (bits & 1u) == 1u)) { return sign | (bits + 1u); }",
+            "r = select(r, 0x7e00u, mag > 0x7f800000u);",
+            "r = select(r, 0x7c00u, mag == 0x7f800000u);",
+            "r = select(r, 0x7bffu, mag >= 0x477ff000u);",
+            "r = select(r, 0u, mag < 0x33000000u);",
+            "let nb = ((max(e, 112u) - 112u) << 10u) | ((mag >> 13u) & 0x3ffu);",
+            "let normal = nb + select(0u, 1u, nrem > 0x1000u || (nrem == 0x1000u && (nb & 1u) == 1u));",
+            "let sh = select(14u, 126u - e, e < 113u && e >= 102u);",
+            "let half = 1u << (sh - 1u);",
+            "let sub = sb + select(0u, 1u, srem > half || (srem == half && (sb & 1u) == 1u));",
         ] {
             assert!(HALF_HELPERS_PORTABLE.contains(line), "missing from the emitted helper: {line}");
         }

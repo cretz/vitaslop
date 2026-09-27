@@ -156,6 +156,10 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::R
     for e in fs::read_dir(dir)? {
         let p = e?.path();
         if p.is_dir() {
+            // A folder that was already played carries a compile cache; it is not the game's.
+            if dir == root && p.file_name().is_some_and(|n| n == vitaslop_native::compile_cache::DIR) {
+                continue;
+            }
             walk(root, &p, out)?;
         } else {
             let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");

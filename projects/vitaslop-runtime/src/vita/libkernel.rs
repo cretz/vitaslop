@@ -128,6 +128,12 @@ pub(super) fn start_thread(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome
     let thid = ctx.arg(0) as i32;
     let arglen = ctx.arg(1);
     let argp = ctx.arg(2);
+    // Refused before the argument block is copied: a running thread is not started again
+    // (see `VitaState::start_thread`), and the copy would be a leaked allocation per refusal.
+    if st.thread_running(thid) {
+        ctx.ret(crate::host::SCE_KERNEL_ERROR_NOT_DORMANT);
+        return SvcOutcome::Continue;
+    }
     let arg_ptr = if arglen > 0 && argp != 0 {
         let bytes = ctx.read_bytes(argp, arglen as usize);
         let buf = st.galloc(arglen, 8);
@@ -136,7 +142,13 @@ pub(super) fn start_thread(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome
     } else {
         argp
     };
-    let preempt = st.start_thread(thid, arglen, arg_ptr);
+    let preempt = match st.start_thread(thid, arglen, arg_ptr) {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.ret(e);
+            return SvcOutcome::Continue;
+        }
+    };
     ctx.ret(0);
     // The real kernel switches to the just-started thread immediately when it
     // outranks us, running it until it blocks before we continue. Reschedule so the

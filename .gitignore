@@ -1,7 +1,9 @@
 target/
+target-*/
 node_modules/
 dist/
 pkg/
+pkg-threads/
 *.log
 
 # >>> THE DEBRIS OF AN INVESTIGATION DOES NOT LIVE IN THE SOURCE TREE.

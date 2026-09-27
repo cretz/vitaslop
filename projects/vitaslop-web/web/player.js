@@ -5,12 +5,12 @@
 // the orientation and pad placement, the in-game menu and the diagnostics snapshot.
 // The emulator itself lives in the worker; this file never touches guest state.
 //
-// The boot is structurally the same as the debug launcher's (web/debug/live.html)
-// and the e2e harness page; a change to the start message or the worker's reports
-// has to land in all three.
+// The boot is structurally the same as the e2e harness page's (web/debug/game-worker.html);
+// a change to the start message or the worker's reports has to land in both.
 
 import { forwardInput } from "./worker-input.js";
 import { forwardLocation } from "./location.js";
+import { bundleModule } from "./bundle.js";
 import { startAudio } from "./audio.js";
 import { isComplete } from "./opfs.js";
 import * as gamedata from "./gamedata.js";
@@ -69,15 +69,23 @@ export function createPlayer({ onExit, onRestart }) {
   // why. Read once, here, and never blocking anything: a dump whose build line says
   // `unavailable` is still a dump, but one with no build line at all cannot be told apart from
   // a dump of yesterday's bytes.
-  let buildStamp = "not read yet";
-  fetch("./pkg/build-stamp.txt", { cache: "no-store" })
-    .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
-    .then((t) => {
-      buildStamp = t.trim();
-    })
-    .catch((e) => {
-      buildStamp = `unavailable (${e.message}) - this bundle was built before the stamp existed, or the file was not served`;
-    });
+  // BOTH bundles are stamped: `VITASLOP_SMP=1` runs pkg-threads, and a dump that named only
+  // pkg's stamp read as "this SMP run used the single bundle" (2026-09-26). `buildStampNow()` is
+  // resolved against the run's knobs when the dump is written.
+  const stamps = { single: "not read yet", threads: "not read yet" };
+  for (const [key, dir] of [["single", "pkg"], ["threads", "pkg-threads"]]) {
+    fetch(`./${dir}/build-stamp.txt`, { cache: "no-store" })
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((t) => {
+        stamps[key] = t.trim();
+      })
+      .catch((e) => {
+        stamps[key] = `unavailable (${e.message}) - this bundle was built before the stamp existed, or the file was not served`;
+      });
+  }
+  let runsThreads = false;
+  const buildStampNow = () =>
+    `${runsThreads ? stamps.threads : stamps.single} (this run's bundle: ${runsThreads ? "pkg-threads" : "pkg"}; other: ${runsThreads ? stamps.single : stamps.threads})`;
   const notes = [];
   let fatalText = "";
   let hiddenCount = 0;
@@ -137,6 +145,7 @@ export function createPlayer({ onExit, onRestart }) {
     root.classList.toggle("stretch", settings.scaling === "stretch");
     if (settings.scaling === "integer") fitInteger();
     else canvas.style.width = canvas.style.height = "";
+    postOutputSize();
   };
   const fitInteger = () => {
     const r = stage.getBoundingClientRect();
@@ -147,6 +156,47 @@ export function createPlayer({ onExit, onRestart }) {
   landscape.addEventListener("change", applyLayout);
   window.addEventListener("resize", () => settings && settings.scaling === "integer" && fitInteger());
 
+  // ----- the canvas's size in DEVICE pixels, for the renderer's crisp scale -----
+  // The renderer draws the 960x544 picture and scales it to the canvas itself, one screen pixel
+  // of blend at each source-pixel seam and exact colour everywhere else (present_scale.rs) -
+  // instead of the browser's bilinear stretch, which blurred hard-edged text on a phone's ~2x.
+  // So the canvas's backing store has to be the picture's OWN rectangle in device pixels: the
+  // letterboxed 960:544 box inside the element (`object-fit: contain`), or the whole box when
+  // stretching. Integer scaling keeps 960x544 (0x0) - the browser's pixelated scale is exact there.
+  let devicePx = null;
+  const postOutputSize = () => {
+    if (!worker || !settings) return;
+    if (settings.scaling === "integer") {
+      worker.postMessage({ type: "output-size", w: 0, h: 0 });
+      return;
+    }
+    let W, H;
+    if (devicePx) [W, H] = devicePx;
+    else {
+      const r = canvas.getBoundingClientRect();
+      W = r.width * devicePixelRatio;
+      H = r.height * devicePixelRatio;
+    }
+    if (!(W > 0 && H > 0)) return;
+    let w = W, h = H;
+    if (settings.scaling !== "stretch") {
+      const k = Math.min(W / 960, H / 544);
+      w = 960 * k;
+      h = 544 * k;
+    }
+    worker.postMessage({ type: "output-size", w: Math.round(w), h: Math.round(h) });
+  };
+  try {
+    new ResizeObserver((entries) => {
+      const e = entries[entries.length - 1];
+      const d = e.devicePixelContentBoxSize && e.devicePixelContentBoxSize[0];
+      devicePx = d ? [d.inlineSize, d.blockSize] : null;
+      postOutputSize();
+    }).observe(canvas, { box: "device-pixel-content-box" });
+  } catch {
+    window.addEventListener("resize", postOutputSize);
+  }
+
   // ----- fullscreen -----
   // Asked for ONCE per run, from Play (with its gesture) or from the menu button, and
   // never from a resize, orientation, focus or visibility handler: Chrome for Android
@@ -155,11 +205,18 @@ export function createPlayer({ onExit, onRestart }) {
   // onWindowFocusChanged -> FullscreenToast.showNotificationToast), so a re-request or
   // a dim-and-wake is a toast the page caused. The wake lock below removes the dim.
   const isFull = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+  // The browser's answer is RECORDED, not swallowed: a refused request (no activation left, an
+  // element it will not take) otherwise reads exactly like a setting that never asked. Reported
+  // (2026-09-27): after leaving fullscreen once, the next title did not go fullscreen.
   const enterFullscreen = async () => {
+    const active = navigator.userActivation ? navigator.userActivation.isActive : "?";
     try {
       if (root.requestFullscreen) await root.requestFullscreen({ navigationUI: "hide" });
       else if (root.webkitRequestFullscreen) root.webkitRequestFullscreen();
-    } catch {}
+      note(`[fullscreen] requested (tap activation live: ${active}): ${isFull() ? "granted" : "no error, but not fullscreen"}`);
+    } catch (err) {
+      note(`[fullscreen] REFUSED (tap activation live: ${active}): ${(err && (err.name + ": " + err.message)) || err}`);
+    }
     await applyOrientationLock();
   };
   // The lock is a setting: a phone held in portrait is a legitimate way to play with
@@ -338,7 +395,7 @@ export function createPlayer({ onExit, onRestart }) {
     return (
       `audio: context=${a.state} peak=${(a.peak ?? 0).toFixed(4)}${a.peak > 0 ? "" : " (nothing audible yet)"} | ` +
       `written ${s(a.written)}s read ${s(a.read)}s | underrun ${s(a.underrun)}s overrun ${s(a.overrun)}s | ` +
-      `backlog ${((1000 * (a.fill ?? 0)) / rate).toFixed(0)}ms`
+      `backlog ${((1000 * (a.fill ?? 0)) / rate).toFixed(0)}ms | rejoins ${a.rejoins ?? 0}`
     );
   };
   /// Knobs armed by the LINK - `?knobs=VITASLOP_A%3D1,VITASLOP_B%3D2` - merged OVER the ones
@@ -371,7 +428,7 @@ export function createPlayer({ onExit, onRestart }) {
       `knobs: ${JSON.stringify(window.__runKnobs || {})}`,
       hiddenCount > 0 ? `WARNING: the page was backgrounded ${hiddenCount}x - a hidden page is throttled` : `page stayed in the foreground`,
       hardPauses > 0 ? `hard-paused ${hardPauses}x for ${(hardPausedMs / 1000).toFixed(1)}s in total` : `never hard-paused`,
-      `build: ${buildStamp}`,
+      `build: ${buildStampNow()}`,
       `page loaded: ${new Date(performance.timeOrigin).toISOString()} (${((Date.now() - performance.timeOrigin) / 60000).toFixed(1)} min ago)`,
       `user agent: ${navigator.userAgent}`,
       `screen: ${screen.width}x${screen.height} dpr ${devicePixelRatio} ${landscape.matches ? "landscape" : "portrait"}${isFull() ? " fullscreen" : ""}`,
@@ -472,7 +529,14 @@ export function createPlayer({ onExit, onRestart }) {
       // The RUN worker comes first: it reserves the guest's memory inside its own and says
       // where, and the throwaway transpile worker builds the module for that place (see
       // worker.js's "reserve" message). The run worker then idles until the start message.
-      worker = new Worker("./worker.js", { type: "module" });
+      // `VITASLOP_SMP=1` runs on the wasm-threads bundle (both workers) - see build.mjs.
+      runsThreads = String(knobs.VITASLOP_SMP ?? "") === "1";
+      const bundleQ = runsThreads ? "?smp=1" : "";
+      // The emulator bundle, fetched and compiled ONCE for this page and handed to both workers
+      // below - see bundle.js. A second play from this page reuses it.
+      const module = await bundleModule(runsThreads);
+      if (!running) return;
+      worker = new Worker("./worker.js" + bundleQ, { type: "module" });
       const hostOff = await new Promise((resolve, reject) => {
         worker.onmessage = (e) => {
           const d = e.data;
@@ -481,11 +545,11 @@ export function createPlayer({ onExit, onRestart }) {
           else if (d.type === "panic") reject(new Error("RUST PANIC WHILE RESERVING\n" + d.message));
         };
         worker.onerror = (e) => reject(new Error(e.message || "the run worker failed to start"));
-        worker.postMessage({ type: "reserve", knobs });
+        worker.postMessage({ type: "reserve", knobs, module });
       });
       if (!running) return;
       const prebuilt = await new Promise((resolve, reject) => {
-        const tw = new Worker("./transpile-worker.js", { type: "module" });
+        const tw = new Worker("./transpile-worker.js" + bundleQ, { type: "module" });
         tw.onmessage = (e) => {
           if (e.data.type === "panic") {
             fatal("RUST PANIC WHILE PREPARING\n" + e.data.message);
@@ -498,9 +562,15 @@ export function createPlayer({ onExit, onRestart }) {
           tw.terminate();
           reject(new Error(e.message || "the prepare worker failed to start"));
         };
-        tw.postMessage({ titleId: m.titleId, knobs, hostOff });
+        tw.postMessage({ titleId: m.titleId, knobs, hostOff, bundleModule: module });
       });
       if (!running) return;
+      // One line per play naming where the prepare went - the transpile cache's HIT or MISS
+      // among it (see transpile-cache.js).
+      if (prebuilt && prebuilt.split) {
+        console.info(`[prepare] ${prebuilt.split}`);
+        note(`[prepare] ${prebuilt.split}`);
+      }
 
       status("starting...");
       worker.onmessage = (e) => {
@@ -581,6 +651,7 @@ export function createPlayer({ onExit, onRestart }) {
       );
       touchTitle(m.titleId, { lastPlayedAt: Date.now() });
       applyPause();
+      postOutputSize();
     } catch (err) {
       fatal("COULD NOT START\n" + ((err && (err.stack || err.message)) || err));
     }

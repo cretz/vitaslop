@@ -19,6 +19,9 @@ pub use sched::{FrameStop, Scheduler};
 pub mod threaded;
 pub use threaded::{dump_block_hist, RunReport, ThreadSpawn, ThreadedScheduler};
 
+/// The desktop's cache of compiled guest modules, beside each game - see its module docs.
+pub mod compile_cache;
+
 pub mod wgpu_render;
 pub use wgpu_render::{apply_rtt_writebacks, GeneralRenderer, RenderSplit, WgpuRenderer};
 

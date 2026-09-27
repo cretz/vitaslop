@@ -146,6 +146,12 @@ fn stmt_effect(s: &Stmt) -> (FlagMask, FlagMask) {
     match s {
         Stmt::SetReg(_, v) | Stmt::SetThreadPtr(v) | Stmt::Rbit { rm: v, .. }
         | Stmt::ExclSet(v) => (value_reads(v), FlagMask::NONE),
+        // The SMP exclusive forms read their address (and registers, which carry no flags)
+        // and write no flag; a barrier and `CLREX` touch none.
+        Stmt::LoadExcl { addr, .. } | Stmt::StoreExcl { addr, .. } => {
+            (value_reads(addr), FlagMask::NONE)
+        }
+        Stmt::ClearExcl | Stmt::Fence => (FlagMask::NONE, FlagMask::NONE),
         Stmt::Store { addr, data, .. } => {
             (value_reads(addr).union(value_reads(data)), FlagMask::NONE)
         }
@@ -223,6 +229,8 @@ fn for_each_value(s: &Stmt, f: &mut impl FnMut(&Value)) {
     match s {
         Stmt::SetReg(_, v) | Stmt::SetThreadPtr(v) | Stmt::Rbit { rm: v, .. }
         | Stmt::ExclSet(v) => f(v),
+        Stmt::LoadExcl { addr, .. } | Stmt::StoreExcl { addr, .. } => f(addr),
+        Stmt::ClearExcl | Stmt::Fence => {}
         Stmt::Store { addr, data, .. } => {
             f(addr);
             f(data);

@@ -1,7 +1,7 @@
 // Load the PRODUCT page the way a phone does - through serve.mjs, not through the e2e
 // harness - and print every console message, page error and worker error with its stack.
 //
-// The harness loads `debug/game-worker.html`. The device loads `debug/live.html`. Testing only the
+// The harness loads `debug/game-worker.html`. The device loads the product page (`player.js`). Testing only the
 // former is how a break in the latter reaches a user first.
 import { chromium } from "playwright";
 

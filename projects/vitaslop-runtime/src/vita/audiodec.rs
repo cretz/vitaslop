@@ -639,6 +639,26 @@ pub(super) fn audiodec_decode_n_frames(
     }
 }
 
+/// Whether a `sceAudiodecDecode`/`DecodeNFrames` on `p_ctrl` stays inside this crate: its
+/// handle names an ATRAC9 decoder, which `decode_at9` serves in pure Rust. An AAC handle
+/// reaches the host's WebCodecs decoder (`video::collect_decoded_audio`), which lives in ONE
+/// worker's JavaScript - so under the parallel browser scheduler only an AT9 call may run on
+/// the guest worker that made it (`vita::smp_forward_per_call`).
+///
+/// Asked with the host lock HELD and the call dispatched under the same hold, so the session
+/// it saw is the session the call finds. Handles are never reused and a session's codec never
+/// changes, so an unknown or AAC handle answers false and the call is forwarded as before.
+pub fn decode_is_self_contained(st: &VitaState, mem: &dyn crate::host::GuestMemory, base: u32, p_ctrl: u32) -> bool {
+    let Some(off) = p_ctrl.wrapping_add(ctrl::HANDLE).checked_sub(base).map(|o| o as usize) else {
+        return false;
+    };
+    if p_ctrl == 0 || off + 4 > mem.len() {
+        return false;
+    }
+    let handle = mem.read_u32(off);
+    st.audiodec.sessions.iter().any(|s| s.handle == handle && s.codec == TYPE_AT9)
+}
+
 /// SceInt32 sceAudiodecDecode(SceAudiodecCtrl *pCtrl)
 ///
 /// Fill `pPcm` with one frame of PCM. MEASURED at the call site: the caller sets `pEs` from
@@ -840,3 +860,57 @@ fn report_resynced(st: &mut VitaState, dropped: u64) {
     );
 }
 
+
+#[cfg(test)]
+mod smp_route_tests {
+    use super::*;
+    use crate::host::SliceMemory;
+
+    const BASE: u32 = 0x8100_0000;
+    const CTRL_AT: u32 = BASE + 0x100;
+
+    fn session(handle: u32, codec: u32) -> AudiodecSession {
+        AudiodecSession {
+            handle,
+            codec,
+            channels: 2,
+            sample_rate: 48_000,
+            context: 0,
+            delivered: 0,
+            refused: 0,
+            at9: None,
+            at9_config: [0; 4],
+        }
+    }
+
+    fn judged(st: &VitaState, handle_in_ctrl: u32, p_ctrl: u32) -> bool {
+        let mut mem = vec![0u8; 0x1000];
+        let off = (CTRL_AT - BASE + ctrl::HANDLE) as usize;
+        mem[off..off + 4].copy_from_slice(&handle_in_ctrl.to_le_bytes());
+        decode_is_self_contained(st, &SliceMemory(&mut mem), BASE, p_ctrl)
+    }
+
+    #[test]
+    fn only_an_at9_decode_runs_off_the_run_worker() {
+        let mut st = VitaState::new(BASE, 0x1000, Box::new(crate::world::DeterministicWorld::default()));
+        st.audiodec.sessions.push(session(1, TYPE_AT9));
+        st.audiodec.sessions.push(session(2, TYPE_AAC));
+        assert!(judged(&st, 1, CTRL_AT), "an AT9 handle is decoded in Rust, wherever it is called");
+        // Negative controls: every other answer forwards the call, which is always safe.
+        assert!(!judged(&st, 2, CTRL_AT), "an AAC handle reaches the run worker's WebCodecs");
+        assert!(!judged(&st, 3, CTRL_AT), "an unknown handle is forwarded");
+        assert!(!judged(&st, 1, 0), "a null control block is forwarded");
+        assert!(!judged(&st, 1, BASE - 0x1000), "a control block below the guest is forwarded");
+        assert!(!judged(&st, 1, BASE + 0xffe), "a control block past the guest is forwarded");
+    }
+
+    #[test]
+    fn the_per_call_route_names_only_the_decode_calls() {
+        use crate::nid::audiodec as ad;
+        assert!(crate::vita::smp_forward_per_call(ad::DECODE));
+        assert!(crate::vita::smp_forward_per_call(ad::DECODE_N_FRAMES));
+        assert!(!crate::vita::smp_forward_per_call(ad::CREATE_DECODER_EXTERNAL));
+        // Still in the forwarded family: the per-call route only ever NARROWS it.
+        assert!(crate::vita::smp_owner_only(ad::DECODE));
+    }
+}

@@ -118,7 +118,7 @@ fn window_geolocation() -> Option<web_sys::Geolocation> {
     web_sys::window()?.navigator().geolocation().ok()
 }
 
-/// The MAIN-THREAD engine's own watch. Mirrors what `web/live.html` does for the worker
+/// The MAIN-THREAD engine's own watch. Mirrors what `web/player.js` does for the worker
 /// engine, so both reach the same cell through the same conversions.
 fn start_window_watch() {
     let Some(geo) = window_geolocation() else {

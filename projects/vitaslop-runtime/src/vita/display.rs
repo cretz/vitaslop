@@ -298,7 +298,7 @@ pub(super) fn set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr, 
     if base != 0 {
         st.flip_candidates.insert(base);
         // The flip is the latest moment the GPU can still be reading this frame's buffers.
-        st.resolve_deferred_geometry(ctx);
+        st.resolve_at_flip(ctx);
         st.present(base);
     }
     // Kept whole so `sceDisplayGetFrameBuf` can report the scanout: the `pitch` and `fmt`

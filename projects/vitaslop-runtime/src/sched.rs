@@ -312,6 +312,12 @@ pub enum IdleStep {
 /// run on the guest's own stack, under a host import, where nothing is borrowable.
 static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Stamp the engine-agnostic frame counter - for a scheduler that is not [`SchedCore`] (the
+/// browser's parallel one), which reaches the same frame boundary by its own path.
+pub fn set_current_frame(frame: u64) {
+    CURRENT_FRAME.store(frame, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The display frame the run has reached (0 before the first flip), for a diagnostic with no
 /// scheduler in hand. See [`CURRENT_FRAME`].
 pub fn current_frame() -> u64 {
@@ -1500,7 +1506,7 @@ where
 /// A deadline that has already passed expired before any transfer can complete, so it
 /// goes first. That cannot starve the device: a woken poller burning its quantum charges
 /// the storage clock, as does the idle jump itself.
-fn storage_completes_first(
+pub fn storage_completes_first(
     io_remaining_us: Option<u64>,
     next_deadline_us: Option<u64>,
     now_us: u64,
@@ -1570,8 +1576,72 @@ mod idle_order_tests {
 }
 
 /// `VITASLOP_CPU_SHARE_FROM=<frame>` - see the reset in `SchedCore::on_suspended`.
-fn cpu_share_from() -> Option<u64> {
+pub fn cpu_share_from() -> Option<u64> {
     use std::sync::OnceLock;
     static AT: OnceLock<Option<u64>> = OnceLock::new();
     *AT.get_or_init(|| crate::knobs::var("VITASLOP_CPU_SHARE_FROM").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// For the parallel browser scheduler (`vitaslop-web`'s `smp`): the last [`SpinHistory::N`]
+/// MID-FRAME waits of one guest worker (the gate open: the guest is
+/// between flips, so a thread of this worker is blocked on another's work rather than on the
+/// next frame), as "did it end by a ring within the cap". Spin when at least half did.
+pub struct SpinHistory {
+    bits: u32,
+    seen: u32,
+}
+
+impl SpinHistory {
+    const N: u32 = 32;
+
+    pub fn new() -> Self {
+        SpinHistory { bits: 0, seen: 0 }
+    }
+
+    pub fn record(&mut self, short: bool) {
+        self.bits = (self.bits << 1) | short as u32;
+        self.seen = (self.seen + 1).min(Self::N);
+    }
+
+    /// Spin only on evidence: 8 waits recorded, at least half of them short.
+    pub fn should_spin(&self) -> bool {
+        let mask = if self.seen >= 32 { u32::MAX } else { (1u32 << self.seen) - 1 };
+        self.seen >= 8 && (self.bits & mask).count_ones() * 2 >= self.seen
+    }
+}
+
+impl Default for SpinHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod spin_history_tests {
+    use super::SpinHistory;
+
+    #[test]
+    fn spins_only_on_evidence_that_half_the_mid_frame_waits_were_short() {
+        let mut h = SpinHistory::new();
+        for _ in 0..7 {
+            h.record(true);
+        }
+        assert!(!h.should_spin(), "seven waits are not evidence");
+        h.record(true);
+        assert!(h.should_spin(), "eight short waits are");
+        // A worker whose waits turn long stops spinning once they are the majority of the window.
+        for _ in 0..17 {
+            h.record(false);
+        }
+        assert!(!h.should_spin(), "17 long of the last 25 is a worker that mostly sleeps");
+        let mut long = SpinHistory::new();
+        for _ in 0..100 {
+            long.record(false);
+        }
+        assert!(!long.should_spin(), "a storage worker idle for whole frames never spins");
+        for _ in 0..16 {
+            long.record(true);
+        }
+        assert!(long.should_spin(), "16 of the last 32 short is exactly half - spin");
+    }
 }

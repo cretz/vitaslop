@@ -384,7 +384,8 @@ fn decode_grp_sop2(word: u64) -> Instr {
         && bits(word, 46, 43) == 0                   // the bits SOP2M spends on its write mask
         && matches!(bits(word, 42, 41), 0 | 1)       // "aop" - the two observed values
         && bits(word, 40, 38) == 3                   // "sel1"
-        && matches!(bits(word, 37, 35), 0 | 3); // "sel2" - the two observed values
+        && matches!(bits(word, 37, 35), 0 | 3)  // "sel2" - the two observed values
+        && bits(word, 20, 14) == 0; // src1 modifier and both OPS (ADD) - the spec's fields, all zero in every observed word
     // >>> THE SAME EPILOGUE WITH ITS TWO SOURCE SLOTS THE OTHER WAY ROUND. See the SWAPPED
     // section of this function's docs: one title carries `frag_81a7f590` and `frag_81a7f798`,
     // 216 bytes each, byte-identical but for the header hash and THIS WORD - so the two
@@ -413,7 +414,22 @@ fn decode_grp_sop2(word: u64) -> Instr {
         // frame it first appears in is the title's first 3D scene. Refusing it stops that
         // title at its first scene instead.
         && matches!(bits(word, 20, 14), 16 | 20);
-    if !established && !swapped {
+    // >>> THE FULL PLAIN-SOP2 READING of the epilogue, as `crate::rop_blend` reads it: SRC2 the
+    // output register (the blend destination fed back), every factor selector and complement
+    // the spec establishes, both ops ADD. The copy of SRC1 is what a fragment shader can emit;
+    // the equation becomes the PIPELINE blend. Any selector the spec does not establish, or any
+    // op or modifier bit, keeps the refusal.
+    let general = bits(word, 58, 57) == 0
+        && bits(word, 51, 51) == 0
+        && bits(word, 49, 49) == 0
+        && bits(word, 48, 48) == 0
+        && bits(word, 46, 44) == 0
+        && bits(word, 20, 14) == 0
+        && bits(word, 33, 32) == 1 && bits(word, 27, 21) == 0      // dest o[0]
+        && bits(word, 29, 28) == 1 && bits(word, 6, 0) == 0        // src2 o[0]
+        && bits(word, 40, 38) <= 4 && bits(word, 37, 35) <= 4      // colour selectors 0-4
+        && bits(word, 53, 52) <= 2 && bits(word, 42, 41) <= 2;     // alpha selectors 0-2
+    if !established && !swapped && !general {
         blocked = blocked.or(Some(
             "0x80 SOP2 in a form outside the fragment epilogue this corpus establishes - its \
              coefficient and op fields are not read, only pinned (see `decode_grp_sop2`)",
@@ -4579,7 +4595,12 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // byte-for-byte twin of a program that ends on the `10000` word. Anything outside the
         // two shapes `decode_grp_sop2` pins still blocks there, so admitting `00000` here does
         // not admit a word on its own.
-        0x10 if matches!(bits(word, 47, 43), 0b10000 | 0b00000) => Some(0),
+        //
+        // >>> NOW READ FROM THE SPEC (`docs-re/usse-spec-sop2.md`): plain SOP2's repeat count is
+        // 46:44 ALONE - 47 is the second colour complement and 43 the first ALPHA complement - so
+        // `amod1` set (a ONE alpha factor, the fighting title's epilogues) is not a repeat. Only a
+        // zero count is admitted: no program here repeats one, and the stepping is unestablished.
+        0x10 if bits(word, 46, 44) == 0 => Some(0),
         // 0x90 SOP2M: no repeat_count field either, and the field table accounts for every bit
         // - the four bits at 47:44, where every group that HAS a repeat count puts it, are the
         // second complement bit plus the top three bits of the write mask. Both are read by
@@ -5070,6 +5091,24 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
                     return Some(vec![fixed(1), fixed(0), fixed(4)]);
                 }
                 return Some(vec![fixed(1), op(2, 2), op(3, 0)]);
+            }
+            // >>> BIT 47 CLEAR WITH BIT 48 SET: BOTH SOURCES WALK, one internal register each.
+            //
+            // The corpus holds exactly three such words (a census over 1,147 blobs: every other
+            // bit-47-clear repeating DP has bit 48 clear), and all three are the same idiom -
+            // `188118820151a23c` in two of a baseball title's vertex programs, `188118820011a23c`
+            // in a fighting title's character program - a two-iteration 3-channel DP whose BOTH
+            // operands are internal registers, followed by an `rsq` of each result and a scale of
+            // the matching vector by it. That is NORMALISING TWO VECTORS, `i0` and `i1`: the second
+            // result scales `i1`, so it must be `|i1|^2`. Holding op2 read `dot(i1, i0)` instead -
+            // for a normal and tangent a value near zero or negative - the `rsq` went to inf/NaN
+            // and the NaN rode a varying into the fragment stage. MEASURED on the fighting title:
+            // `rsq` of -4623 at #112, the light vector NaN over most of each fighter's body, and
+            // the toon ramp read at a NaN coordinate - every fighter drew BLACK. On the baseball
+            // title the same NaN feeds a varying the phone's GPU and the desktop's treat
+            // differently. `VITASLOP_GXP_DP_B48_BOTH=0` is the arm back.
+            if bits(word, 48, 48) == 1 && crate::link::arm_on(crate::link::DP_B48_BOTH_ARM) {
+                return Some(vec![fixed(1), fixed(4), fixed(4)]);
             }
             Some(vec![fixed(1), fixed(4), op(3, 0)])
         }
@@ -7038,10 +7077,21 @@ mod tests {
         // establishes and must block rather than emit a copy.
         assert!(decode(0x8190_0021_6004_0000u64 | (1 << 47)).blocked.is_some());
 
-        // One bit outside the operand fields - here the "cop" position the epilogue pins to 1
-        // - is a form nothing establishes, and it must refuse rather than emit a copy.
-        let other = 0x8090_80d9_9000_0000u64 & !(1 << 52);
-        assert!(decode(other).blocked.is_some(), "an unestablished 0x80 form must block");
+        // The plain-SOP2 field table (`docs-re/usse-spec-sop2.md`) admits the epilogue with ANY
+        // established factor pair: a fighting title's ONE-alpha and ONE,ONE words copy the shader
+        // colour too (the equation goes to the pipeline blend - see `crate::rop_blend`).
+        for word in [0x8080_88c1_9000_0000u64, 0x8080_88d9_9000_0000, 0x8180_8805_9000_0000] {
+            let ins = decode(word);
+            assert_eq!(ins.op, Op::CopyFx8, "{word:#x}");
+            assert!(ins.blocked.is_none(), "{word:#x}: {:?}", ins.blocked);
+            assert_eq!(crate::usse::decode::repeat_extra_iterations(word), Some(0), "{word:#x}");
+        }
+        // What the spec does NOT establish still refuses: a SUBTRACT colour op (bit 18) and a
+        // colour selector of 5 (40:38) - a copy would drop the equation they describe.
+        let op_sub = 0x8090_80d9_9000_0000u64 | (1 << 18);
+        assert!(decode(op_sub).blocked.is_some(), "an unestablished 0x80 op must block");
+        let sel5 = (0x8090_80d9_9000_0000u64 & !(7 << 38)) | (5 << 38);
+        assert!(decode(sel5).blocked.is_some(), "an unestablished 0x80 selector must block");
         // ...and so must one whose repeat-count position is not the pinned `1000`.
         let repeated = 0x8090_80d9_9000_0000u64 | (1 << 44);
         assert!(
@@ -7577,6 +7627,26 @@ mod tests {
                 RepeatOperand { slot: 0, stride: 0, moe: false },
                 RepeatOperand { slot: 0, stride: 4, moe: false },
             ])
+        );
+
+        // Bit 47 clear, bit 48 set: BOTH internal sources walk one internal register - the
+        // two-vector normalise (`dot(i0,i0)`, `dot(i1,i1)`) in a baseball and a fighting title.
+        // With op2 held the second iteration read `dot(i1, i0)` and its `rsq` made a NaN varying.
+        for word in [0x1881_1882_0151_a23cu64, 0x1881_1882_0011_a23c] {
+            assert_eq!(
+                repeat_operands(word),
+                Some(vec![
+                    RepeatOperand { slot: 0, stride: 1, moe: false },
+                    RepeatOperand { slot: 0, stride: 4, moe: false },
+                    RepeatOperand { slot: 0, stride: 4, moe: false },
+                ]),
+                "{word:#018x}"
+            );
+        }
+        // Bit 48 clear keeps the matrix-row reading: op1 walks, the transformed vector holds.
+        assert_eq!(
+            repeat_operands(0x1890_2882_803d_a20a).map(|v| (v[1].stride, v[1].moe, v[2].stride)),
+            Some((4, false, 0))
         );
 
         // A group with no established operand grammar must answer "unknown", never a default.

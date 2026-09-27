@@ -118,6 +118,10 @@ pub mod gxm {
     pub const SET_FRAGMENT_UNIFORM_BUFFER: u32 = 0xEA0F_C310;
     pub const SET_VERTEX_UNIFORM_BUFFER: u32 = 0xC680_15E4;
     pub const RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER: u32 = 0x7B1F_ABB6;
+    /// `sceGxmSet{Vertex,Fragment}DefaultUniformBuffer(context, bufferData)` - see
+    /// `VitaState::set_default_uniform_buffer`.
+    pub const SET_VERTEX_DEFAULT_UNIFORM_BUFFER: u32 = 0xC697_CAE5;
+    pub const SET_FRAGMENT_DEFAULT_UNIFORM_BUFFER: u32 = 0xA824_EB24;
     // Fixed-function pipeline state setters (see `vita::gxm` render-state handlers).
     pub const SET_CULL_MODE: u32 = 0xE1CA_72AE;
     pub const SET_TWO_SIDED_ENABLE: u32 = 0x0DE9_AEB7;
@@ -219,6 +223,10 @@ pub mod gxm {
     pub const SET_FRONT_VISIBILITY_TEST_ENABLE: u32 = 0x3045_9117;
     pub const SET_FRONT_VISIBILITY_TEST_INDEX: u32 = 0x1262_5C34;
     pub const SET_FRONT_VISIBILITY_TEST_OP: u32 = 0xD0E3_CD9A;
+    /// The BACK-face twins of the three above - see `VitaState::back_visibility`.
+    pub const SET_BACK_VISIBILITY_TEST_ENABLE: u32 = 0x17CF_46B9;
+    pub const SET_BACK_VISIBILITY_TEST_INDEX: u32 = 0xAE78_86FE;
+    pub const SET_BACK_VISIBILITY_TEST_OP: u32 = 0xC83F_0AB3;
     // Unmapping: the inverse of the three map calls.
     pub const UNMAP_MEMORY: u32 = 0x828C_68E8;
     pub const UNMAP_VERTEX_USSE_MEMORY: u32 = 0x0991_34F5;
@@ -247,6 +255,9 @@ pub mod gxm {
     pub const SHADER_PATCHER_GET_BUFFER_MEM_ALLOCATED: u32 = 0xC694_D039;
     pub const SHADER_PATCHER_GET_VERTEX_USSE_MEM_ALLOCATED: u32 = 0x7D2F_83C1;
     pub const SHADER_PATCHER_GET_FRAGMENT_USSE_MEM_ALLOCATED: u32 = 0x3C9D_DB4A;
+    /// `unsigned int sceGxmShaderPatcherGetHostMemAllocated(patcher)` - the RETURN value, not an
+    /// out-param. This patcher never calls the guest's host-alloc callback, so 0 is exact.
+    pub const SHADER_PATCHER_GET_HOST_MEM_ALLOCATED: u32 = 0x9DBB_C71C;
     /// `sceGxmTransferFinish(void)`: wait for every transfer-unit job. `sceGxmTransferCopy`
     /// / `Downscale` are NOT implemented (a call is a hard failure that names it), so there
     /// is never a job to wait for and 0 is exact.
@@ -638,6 +649,8 @@ pub mod services {
     // SceNet / SceNetCtl.
     pub const NET_INIT: u32 = 0xEB03_E265;
     pub const NET_CTL_INIT: u32 = 0x495C_A1DB;
+    /// `int sceNetGetMacAddress(SceNetEtherAddr *addr, int flags)` - see `services::net_get_mac_address`.
+    pub const NET_GET_MAC_ADDRESS: u32 = 0x06C0_5518;
     pub const NET_CTL_INET_GET_STATE: u32 = 0x6D26_AC68;
     pub const NET_CTL_INET_GET_INFO: u32 = 0xB26D_07F3;
     pub const NET_CTL_INET_REGISTER_CALLBACK: u32 = 0xEAEE_6185;
@@ -695,6 +708,8 @@ pub mod services {
     pub const APPUTIL_APP_PARAM_GET_INT: u32 = 0xCD7F_D67A;
     pub const LIVE_AREA_GET_STATUS: u32 = 0x7FE5_B83F;
     pub const LIVE_AREA_UPDATE_FRAME_ASYNC: u32 = 0xD330_285D;
+    /// The synchronous spelling of the tile update - same no-op off-console.
+    pub const LIVE_AREA_UPDATE_FRAME_SYNC: u32 = 0xCFCE_DE95;
     pub const APPUTIL_DRM_OPEN: u32 = 0x2DB7_BE3B;
     pub const APPUTIL_DRM_CLOSE: u32 = 0x6A14_0498;
     pub const APPUTIL_SAVEDATA_SLOT_GET_PARAM: u32 = 0x93F0_D89F;
@@ -894,12 +909,18 @@ pub mod services {
     // Encode/Csc are deliberately left unimplemented. Prototypes: `psp2/jpegenc.h`.
     pub const JPEGENC_GET_CONTEXT_SIZE: u32 = 0x2B55_844D;
     pub const JPEGENC_INIT: u32 = 0x88DA_92B4;
+    /// `sceJpegEncoderInitWithParam(context, const SceJpegEncoderInitParam *)` - `Init` with its
+    /// arguments in a 0x1C-byte struct.
+    pub const JPEGENC_INIT_WITH_PARAM: u32 = 0x2E8F_E45D;
+    /// `sceJpegEncoderSetHeaderMode(context, int mode)`.
+    pub const JPEGENC_SET_HEADER_MODE: u32 = 0x2F58_B12C;
     pub const JPEGENC_END: u32 = 0xC87A_A849;
     pub const JPEGENC_SET_OUTPUT_ADDR: u32 = 0x25D5_2D97;
     pub const JPEGENC_SET_COMPRESSION_RATIO: u32 = 0xB2B8_28EC;
     pub const JPEGENC_SET_VALID_REGION: u32 = 0x9511_F3BC;
     // SceJpeg: MJPEG decoder lifecycle only - see `vita::jpeg`.
     pub const JPEG_INIT_MJPEG: u32 = 0xB030_773B;
+    pub const JPEG_INIT_MJPEG_WITH_PARAM: u32 = 0x5181_63A7;
     pub const JPEG_FINISH_MJPEG: u32 = 0x6284_2598;
     /// `sceJpegGetOutputInfo(jpegData, jpegSize, format, mode, out)`. The DECODE half of
     /// SceJpegUser: prototypes from vitasdk `psp2/jpeg.h`, NIDs from the henkaku wiki's
@@ -1191,9 +1212,14 @@ pub mod lwsync {
     pub const DELETE_LW_MUTEX: u32 = 0x244E_76D2;
     pub const LOCK_LW_MUTEX: u32 = 0x46E7_BE7B;
     pub const LOCK_LW_MUTEX_CB: u32 = 0x3148_C6B6;
+    /// SceLibKernel's second export of the same call (Vita3K `sceKernelLockLwMutex_0`, which
+    /// forwards to the one implementation). Imported by a 2011 fighting title at its first call.
+    pub const LOCK_LW_MUTEX_0: u32 = 0xA781_9967;
     pub const TRY_LOCK_LW_MUTEX: u32 = 0xA6A2_C915;
     pub const UNLOCK_LW_MUTEX: u32 = 0x91FA_6614;
     pub const UNLOCK_LW_MUTEX2: u32 = 0x120A_FC8C;
+    /// The unlock twin of [`LOCK_LW_MUTEX_0`] (Vita3K `sceKernelUnlockLwMutex_0`).
+    pub const UNLOCK_LW_MUTEX_0: u32 = 0x499E_A781;
     pub const CREATE_LW_COND: u32 = 0x48C7_EAE6;
     pub const DELETE_LW_COND: u32 = 0x721F_6CB3;
     pub const WAIT_LW_COND: u32 = 0xE187_8282;
@@ -1480,6 +1506,9 @@ pub mod ngs {
     /// its identity matters.
     pub const VOICE_DEF_GET_TEMPLATE1: u32 = 0xE9B5_72B7;
     pub const VOICE_DEF_GET_ATRAC9_VOICE: u32 = 0x14EF_65A0;
+    /// The PSP SAS-emulation voice (vita-headers SceNgsUser 3.60). First imported by a 2011
+    /// fighting title's audio thread at boot.
+    pub const VOICE_DEF_GET_SAS_EMU_VOICE: u32 = 0x1F51_C2BA;
     pub const VOICE_SET_PARAMS_BLOCK: u32 = 0xFB81_74B1;
     pub const VOICE_PATCH_SET_VOLUME: u32 = 0xA3C8_07BC;
     pub const PATCH_REMOVE_ROUTING: u32 = 0xD0C9_AE5A;
@@ -1746,6 +1775,8 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_FRAGMENT_UNIFORM_BUFFER => "sceGxmSetFragmentUniformBuffer",
         g::SET_VERTEX_UNIFORM_BUFFER => "sceGxmSetVertexUniformBuffer",
         g::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER => "sceGxmReserveFragmentDefaultUniformBuffer",
+        g::SET_VERTEX_DEFAULT_UNIFORM_BUFFER => "sceGxmSetVertexDefaultUniformBuffer",
+        g::SET_FRAGMENT_DEFAULT_UNIFORM_BUFFER => "sceGxmSetFragmentDefaultUniformBuffer",
         d::SET_FRAME_BUF => "sceDisplaySetFrameBuf",
         c::PEEK_BUFFER_POSITIVE => "sceCtrlPeekBufferPositive",
         c::READ_BUFFER_POSITIVE => "sceCtrlReadBufferPositive",
@@ -1795,6 +1826,7 @@ pub fn name(func_nid: u32) -> &'static str {
         tm::GET_PROCESS_ID => "sceKernelGetProcessId",
         sv::SYSMODULE_IS_LOADED => "sceSysmoduleIsLoaded",
         sv::NET_INIT => "sceNetInit",
+        sv::NET_GET_MAC_ADDRESS => "sceNetGetMacAddress",
         sv::NET_CTL_INIT => "sceNetCtlInit",
         sv::NET_CTL_INET_GET_STATE => "sceNetCtlInetGetState",
         sv::NET_CTL_INET_GET_INFO => "sceNetCtlInetGetInfo",
@@ -1950,6 +1982,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::APPUTIL_APP_PARAM_GET_INT => "sceAppUtilAppParamGetInt",
         sv::LIVE_AREA_GET_STATUS => "sceLiveAreaGetStatus",
         sv::LIVE_AREA_UPDATE_FRAME_ASYNC => "sceLiveAreaUpdateFrameAsync",
+        sv::LIVE_AREA_UPDATE_FRAME_SYNC => "sceLiveAreaUpdateFrameSync",
         sv::NP_SCORE_INIT => "sceNpScoreInit",
         sv::NP_SCORE_TERM => "sceNpScoreTerm",
         sv::NP_SCORE_CREATE_TITLE_CTX => "sceNpScoreCreateTitleCtx",
@@ -2007,12 +2040,15 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::LOCATION_TERM => "sceLocationTerm",
         sv::LOCATION_SET_THREAD_PARAMETER => "sceLocationSetThreadParameter",
         sv::JPEGENC_GET_CONTEXT_SIZE => "sceJpegEncoderGetContextSize",
+        sv::JPEGENC_INIT_WITH_PARAM => "sceJpegEncoderInitWithParam",
+        sv::JPEGENC_SET_HEADER_MODE => "sceJpegEncoderSetHeaderMode",
         sv::JPEGENC_INIT => "sceJpegEncoderInit",
         sv::JPEGENC_END => "sceJpegEncoderEnd",
         sv::JPEGENC_SET_OUTPUT_ADDR => "sceJpegEncoderSetOutputAddr",
         sv::JPEGENC_SET_COMPRESSION_RATIO => "sceJpegEncoderSetCompressionRatio",
         sv::JPEGENC_SET_VALID_REGION => "sceJpegEncoderSetValidRegion",
         sv::JPEG_INIT_MJPEG => "sceJpegInitMJpeg",
+        sv::JPEG_INIT_MJPEG_WITH_PARAM => "sceJpegInitMJpegWithParam",
         sv::JPEG_FINISH_MJPEG => "sceJpegFinishMJpeg",
         sv::JPEG_GET_OUTPUT_INFO => "sceJpegGetOutputInfo",
         sv::JPEG_DECODE_MJPEG_YCBCR => "sceJpegDecodeMJpegYCbCr",
@@ -2043,9 +2079,11 @@ pub fn name(func_nid: u32) -> &'static str {
         lw::GET_LW_MUTEX_INFO => "sceKernelGetLwMutexInfo",
         lw::LOCK_LW_MUTEX => "sceKernelLockLwMutex",
         lw::LOCK_LW_MUTEX_CB => "sceKernelLockLwMutexCB",
+        lw::LOCK_LW_MUTEX_0 => "sceKernelLockLwMutex_0",
         lw::TRY_LOCK_LW_MUTEX => "sceKernelTryLockLwMutex",
         lw::UNLOCK_LW_MUTEX => "sceKernelUnlockLwMutex",
         lw::UNLOCK_LW_MUTEX2 => "sceKernelUnlockLwMutex2",
+        lw::UNLOCK_LW_MUTEX_0 => "sceKernelUnlockLwMutex_0",
         lw::CREATE_LW_COND => "sceKernelCreateLwCond",
         lw::DELETE_LW_COND => "sceKernelDeleteLwCond",
         lw::WAIT_LW_COND => "sceKernelWaitLwCond",
@@ -2207,6 +2245,9 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_FRONT_VISIBILITY_TEST_ENABLE => "sceGxmSetFrontVisibilityTestEnable",
         g::SET_FRONT_VISIBILITY_TEST_INDEX => "sceGxmSetFrontVisibilityTestIndex",
         g::SET_FRONT_VISIBILITY_TEST_OP => "sceGxmSetFrontVisibilityTestOp",
+        g::SET_BACK_VISIBILITY_TEST_ENABLE => "sceGxmSetBackVisibilityTestEnable",
+        g::SET_BACK_VISIBILITY_TEST_INDEX => "sceGxmSetBackVisibilityTestIndex",
+        g::SET_BACK_VISIBILITY_TEST_OP => "sceGxmSetBackVisibilityTestOp",
         g::UNMAP_MEMORY => "sceGxmUnmapMemory",
         g::UNMAP_VERTEX_USSE_MEMORY => "sceGxmUnmapVertexUsseMemory",
         g::UNMAP_FRAGMENT_USSE_MEMORY => "sceGxmUnmapFragmentUsseMemory",
@@ -2223,6 +2264,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SHADER_PATCHER_GET_BUFFER_MEM_ALLOCATED => "sceGxmShaderPatcherGetBufferMemAllocated",
         g::SHADER_PATCHER_GET_VERTEX_USSE_MEM_ALLOCATED => "sceGxmShaderPatcherGetVertexUsseMemAllocated",
         g::SHADER_PATCHER_GET_FRAGMENT_USSE_MEM_ALLOCATED => "sceGxmShaderPatcherGetFragmentUsseMemAllocated",
+        g::SHADER_PATCHER_GET_HOST_MEM_ALLOCATED => "sceGxmShaderPatcherGetHostMemAllocated",
         g::TRANSFER_FINISH => "sceGxmTransferFinish",
         g::TEXTURE_INIT_CUBE_ARBITRARY => "sceGxmTextureInitCubeArbitrary",
         g::TEXTURE_SET_PALETTE => "sceGxmTextureSetPalette",
@@ -2242,6 +2284,7 @@ pub fn name(func_nid: u32) -> &'static str {
         ng::VOICE_DEF_GET_SCREAM_VOICE => "sceNgsVoiceDefGetScreamVoice",
         ng::VOICE_DEF_GET_TEMPLATE1 => "sceNgsVoiceDefGetTemplate1",
         ng::VOICE_DEF_GET_ATRAC9_VOICE => "sceNgsVoiceDefGetAtrac9Voice",
+        ng::VOICE_DEF_GET_SAS_EMU_VOICE => "sceNgsVoiceDefGetSasEmuVoice",
         ng::VOICE_SET_PARAMS_BLOCK => "sceNgsVoiceSetParamsBlock",
         ng::VOICE_PATCH_SET_VOLUME => "sceNgsVoicePatchSetVolume",
         ng::PATCH_REMOVE_ROUTING => "sceNgsPatchRemoveRouting",

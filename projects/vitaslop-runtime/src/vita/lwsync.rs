@@ -278,10 +278,10 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // callbacks; we model no callback delivery for either, so inlining one and not the
         // other would make two spellings of one call behave differently - which is a worse
         // answer than the one they already share.
-        lw::LOCK_LW_MUTEX | lw::LOCK_LW_MUTEX_CB => {
+        lw::LOCK_LW_MUTEX | lw::LOCK_LW_MUTEX_CB | lw::LOCK_LW_MUTEX_0 => {
             LwMutexLock { layout, thread_slot: SLOT_CURRENT_THREAD }
         }
-        lw::UNLOCK_LW_MUTEX | lw::UNLOCK_LW_MUTEX2 => {
+        lw::UNLOCK_LW_MUTEX | lw::UNLOCK_LW_MUTEX2 | lw::UNLOCK_LW_MUTEX_0 => {
             LwMutexUnlock { layout, thread_slot: SLOT_CURRENT_THREAD }
         }
         _ => return None,
@@ -454,7 +454,7 @@ mod tests {
     /// handler to them too - so all three agree by transitivity rather than by inspection.
     #[test]
     fn the_handler_takes_exactly_what_the_inline_form_takes() {
-        for nid in [lw::LOCK_LW_MUTEX, lw::LOCK_LW_MUTEX_CB] {
+        for nid in [lw::LOCK_LW_MUTEX, lw::LOCK_LW_MUTEX_CB, lw::LOCK_LW_MUTEX_0] {
             assert!(matches!(inline_op(nid), Some(InlineOp::LwMutexLock { .. })));
             with(|ctx, st| {
                 st.set_current(3);
@@ -472,7 +472,7 @@ mod tests {
                 assert_eq!(lwwork::owner(ctx, WORK), 3);
             });
         }
-        for nid in [lw::UNLOCK_LW_MUTEX, lw::UNLOCK_LW_MUTEX2] {
+        for nid in [lw::UNLOCK_LW_MUTEX, lw::UNLOCK_LW_MUTEX2, lw::UNLOCK_LW_MUTEX_0] {
             assert!(matches!(inline_op(nid), Some(InlineOp::LwMutexUnlock { .. })));
         }
     }

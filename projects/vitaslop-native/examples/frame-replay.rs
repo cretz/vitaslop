@@ -63,14 +63,17 @@ fn main() {
         let depth = s.depth.map_or(String::new(), |d| {
             format!(", depth {:#x} (stencil {:#x}, zls {:#x})", d.depth_addr, d.stencil_addr, d.zls_control)
         });
-        eprintln!("  scene {i}: {} draw(s) into {target}{depth}", s.draws.len());
+        eprintln!("  scene {i}: {} draw(s) into {target}{depth} msaa {}", s.draws.len(), s.multisample);
         // `--list`: every draw's bound textures, as the capture decoded them.
         if list {
             for (di, d) in s.draws.iter().enumerate() {
+                let h = |b: &[u8]| vitaslop_gxp_shader::Program::parse(b).map(|p| p.hash).unwrap_or(0);
+                eprintln!("    draw {di} vprog {:016x} fprog {:016x}", h(&d.vprog), h(&d.fprog));
                 for t in d.textures.iter() {
                     eprintln!(
-                        "    draw {di} unit {} tex {:#x} {}x{} type {} fmt {:#x} stride {} faces {}",
-                        t.unit, t.data_addr, t.width, t.height, t.tex_type, t.base_format, t.stride, t.faces
+                        "    draw {di} unit {} tex {:#x} {}x{} type {} fmt {:#x} stride {} faces {} min {} mag {} mip {} mips {} addr {}/{}",
+                        t.unit, t.data_addr, t.width, t.height, t.tex_type, t.base_format, t.stride, t.faces,
+                        t.min_filter, t.mag_filter, t.mip_filter, t.levels, t.u_addr_mode, t.v_addr_mode
                     );
                 }
             }
@@ -109,6 +112,81 @@ fn main() {
                     "  tex {want:#x} {}x{} fmt {:#x} swizzle {:#x} type {} bytes {} hash {id:016x} -> {out}",
                     t.width, t.height, t.base_format, t.swizzle, t.tex_type, t.pixels.len()
                 );
+            }
+        }
+        return;
+    }
+    // `--ir <scene> <draw> [from] [to]`: that draw's VERTEX program decoded - index, raw word,
+    // op, destination and sources - the listing the NaN-site report's `#N` indexes.
+    if let Some(at) = args.iter().position(|a| a == "--ir") {
+        let si: usize = args.get(at + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let di: usize = args.get(at + 2).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let from: usize = args.get(at + 3).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let to: usize = args.get(at + 4).and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        let Some(d) = fc.scenes.get(si).and_then(|s| s.draws.get(di)) else {
+            eprintln!("frame-replay: no scene {si} draw {di}");
+            std::process::exit(2);
+        };
+        let prog = vitaslop_gxp_shader::Program::parse(&d.vprog).expect("parse the vertex program");
+        let sh = vitaslop_gxp_shader::usse::decode_shader(&prog);
+        for (i, ins) in sh.instrs.iter().enumerate().skip(from).take(to.saturating_sub(from).saturating_add(1)) {
+            println!("#{i} {:016x} g{:#04x} {:?} dest {:?} mask {:?} srcs {:?}{}", ins.raw, ins.group, ins.op, ins.dest, ins.write_mask, ins.srcs, ins.blocked.map_or(String::new(), |b| format!(" BLOCKED {b}")));
+        }
+        return;
+    }
+    // `--sa <scene> <draw>`: print that draw's captured SA banks (vertex and fragment) as floats,
+    // and its uniform windows - what a recompiled shader reads for its uniforms.
+    if let Some(at) = args.iter().position(|a| a == "--sa") {
+        let si: usize = args.get(at + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let di: usize = args.get(at + 2).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let Some(d) = fc.scenes.get(si).and_then(|s| s.draws.get(di)) else {
+            eprintln!("frame-replay: no scene {si} draw {di}");
+            std::process::exit(2);
+        };
+        let floats = |b: &[u8]| -> String {
+            b.chunks_exact(4)
+                .map(|c| format!("{:.4}", f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let h = |b: &[u8]| vitaslop_gxp_shader::Program::parse(b).map(|p| p.hash).unwrap_or(0);
+        println!("scene {si} draw {di}: vprog {:016x} fprog {:016x}", h(&d.vprog), h(&d.fprog));
+        println!("scene {si} draw {di}: vert_sa {} B: {}", d.vert_sa.len(), floats(&d.vert_sa));
+        println!("  frag_sa {} B (from {:#x}): {}", d.frag_sa.len(), d.frag_sa_addr, floats(&d.frag_sa));
+        println!(
+            "  frag_sa as f16: {}",
+            d.frag_sa.chunks_exact(2).map(|c| format!("{:.4}", half_to_f32(u16::from_le_bytes([c[0], c[1]])))).collect::<Vec<_>>().join(" ")
+        );
+        for (a, b) in d.mem_windows.iter() {
+            println!("  vwindow {a:#x} {} B: {}", b.len(), floats(b));
+        }
+        println!("  uniforms (lanes 0..16): {:?}", &d.uniforms[..d.uniforms.len().min(16)]);
+        for t in d.vertex_textures.iter() {
+            println!("  VERTEX texture unit {} {}x{} fmt {:#x} data {:#x} {} B", t.unit, t.width, t.height, t.base_format, t.data_addr, t.pixels.len());
+            let px = &t.pixels;
+            let h = |i: usize| half_to_f32(u16::from_le_bytes([px[i], px[i + 1]]));
+            let f = |i: usize| f32::from_le_bytes([px[i], px[i + 1], px[i + 2], px[i + 3]]);
+            for texel in [0usize, 1, 2, 3, 4, 5, 2048, 2049] {
+                let o = texel * 8;
+                if o + 8 <= px.len() {
+                    println!(
+                        "    texel {texel}: as f16x4 [{:.4} {:.4} {:.4} {:.4}] as f32x2 [{:.4} {:.4}]",
+                        h(o), h(o + 2), h(o + 4), h(o + 6), f(o), f(o + 4)
+                    );
+                }
+            }
+        }
+        for t in d.textures.iter() {
+            println!("  fragment texture unit {} {}x{} fmt {:#x} data {:#x} {} B", t.unit, t.width, t.height, t.base_format, t.data_addr, t.pixels.len());
+        }
+        for (stage, blob) in [("vertex", &d.vprog), ("fragment", &d.fprog)] {
+            if let Ok(p) = vitaslop_gxp_shader::Program::parse(blob) {
+                for q in &p.parameters {
+                    println!(
+                        "  {stage} param {:?} {:?} x{} [{}] at sa {}",
+                        q.name, q.category, q.component_count, q.array_size, q.resource_index
+                    );
+                }
             }
         }
         return;
@@ -154,6 +232,122 @@ fn main() {
         eprintln!("  {n} draw(s) extracted");
         return;
     }
+    // `--slim <out.frame>`: rewrite this frame as a SLIM frame (every distinct large byte field
+    // once - see `capsule::write_frame_slim`), the form a PHONE can be sent. Verified before it
+    // says so: the slim file read back and re-written in the old format must hash exactly like
+    // the input, so a conversion that lost a byte is reported, never shipped.
+    if let Some(at) = args.iter().position(|a| a == "--slim") {
+        let Some(out) = args.get(at + 1) else {
+            eprintln!("frame-replay: --slim <out.frame>");
+            std::process::exit(2);
+        };
+        struct Hash(std::collections::hash_map::DefaultHasher, u64);
+        impl std::io::Write for Hash {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                use std::hash::Hasher;
+                self.0.write(b);
+                self.1 += b.len() as u64;
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let hash_of = |scenes: &[vitaslop_runtime::capture::Scene], w, h, c, f| {
+            use std::hash::Hasher;
+            let mut hw = Hash(Default::default(), 0);
+            vitaslop_runtime::capsule::write_frame(&mut hw, scenes, w, h, c, f).expect("hash a frame");
+            (hw.0.finish(), hw.1)
+        };
+        let mut slim = Vec::new();
+        vitaslop_runtime::capsule::write_frame_slim(&mut slim, &fc.scenes, fc.width, fc.height, fc.clear, fc.frame)
+            .expect("write the slim frame");
+        let back = vitaslop_runtime::capsule::read_frame(&mut &slim[..]).expect("read the slim frame back");
+        let want = hash_of(&fc.scenes, fc.width, fc.height, fc.clear, fc.frame);
+        let got = hash_of(&back.scenes, back.width, back.height, back.clear, back.frame);
+        if want != got {
+            eprintln!("frame-replay: --slim VERIFY FAILED: the slim frame reads back as a different frame ({want:?} vs {got:?}) - not written");
+            std::process::exit(1);
+        }
+        std::fs::write(out, &slim).expect("write the slim frame file");
+        eprintln!(
+            "  slim: {} -> {} bytes ({:.1}x smaller), verified identical on read-back -> {out}",
+            bytes.len(),
+            slim.len(),
+            bytes.len() as f64 / slim.len() as f64
+        );
+        return;
+    }
+    // `--scene-only <i> <out.frame>`: a SLIM frame holding scene `i` alone, sized to its own
+    // target - so that target becomes the display a replay (or a phone frame-replay job's PNG)
+    // hands back. For judging one offscreen pass across devices from identical inputs.
+    // `--prepend-scene <other.frame> <i> <out.frame>`: a SLIM frame of scene `i` of another
+    // capsule followed by every scene of this one - a target an earlier frame painted, carried
+    // into this frame's replay on devices that cannot take `--before` (a phone job).
+    if let Some(at) = args.iter().position(|a| a == "--prepend-scene") {
+        let (Some(p), Some(i), Some(out)) =
+            (args.get(at + 1), args.get(at + 2).and_then(|v| v.parse::<usize>().ok()), args.get(at + 3))
+        else {
+            eprintln!("frame-replay: --prepend-scene <other.frame> <scene index> <out.frame>");
+            std::process::exit(2);
+        };
+        let b = std::fs::read(p).expect("read the other frame");
+        let other = vitaslop_runtime::capsule::read_frame(&mut &b[..]).expect("parse the other frame");
+        let Some(s) = other.scenes.get(i) else {
+            eprintln!("frame-replay: {p} has no scene {i}");
+            std::process::exit(2);
+        };
+        let mut scenes = vec![s.clone()];
+        scenes.extend(fc.scenes.iter().cloned());
+        let mut slim = Vec::new();
+        vitaslop_runtime::capsule::write_frame_slim(&mut slim, &scenes, fc.width, fc.height, fc.clear, fc.frame)
+            .expect("write the combined frame");
+        std::fs::write(out, &slim).expect("write the combined frame file");
+        eprintln!("  scene {i} of {p} + {} scenes -> {out}", fc.scenes.len());
+        return;
+    }
+    // `--keep-vprog <hash> <out.frame>`: a SLIM frame keeping scene 0 whole (an offscreen pass
+    // the kept draws may sample) and, in every later scene, only the draws whose VERTEX program
+    // hashes to `hash` - one shader pair's geometry alone, to judge across devices.
+    if let Some(at) = args.iter().position(|a| a == "--keep-vprog") {
+        let (Some(want), Some(out)) = (args.get(at + 1), args.get(at + 2)) else {
+            eprintln!("frame-replay: --keep-vprog <hex vprog hash> <out.frame>");
+            std::process::exit(2);
+        };
+        // `!<hash>` DROPS that program's draws instead (from every scene) - which program's
+        // removal makes an artifact vanish names the program that draws it.
+        let drop = want.starts_with('!');
+        let want = u64::from_str_radix(want.trim_start_matches('!').trim_start_matches("0x"), 16).expect("a hex vertex-program hash");
+        let mut scenes = fc.scenes.clone();
+        let mut kept = 0usize;
+        for s in scenes.iter_mut().skip(usize::from(!drop)) {
+            s.draws.retain(|d| (vitaslop_gxp_shader::Program::parse(&d.vprog).map(|p| p.hash).unwrap_or(0) == want) != drop);
+            kept += s.draws.len();
+        }
+        let mut slim = Vec::new();
+        vitaslop_runtime::capsule::write_frame_slim(&mut slim, &scenes, fc.width, fc.height, fc.clear, fc.frame)
+            .expect("write the filtered frame");
+        std::fs::write(out, &slim).expect("write the filtered frame file");
+        eprintln!("  kept {kept} draw(s) of vprog {want:016x} after scene 0 -> {out}");
+        return;
+    }
+    if let Some(at) = args.iter().position(|a| a == "--scene-only") {
+        let (Some(i), Some(out)) = (args.get(at + 1).and_then(|v| v.parse::<usize>().ok()), args.get(at + 2)) else {
+            eprintln!("frame-replay: --scene-only <scene index> <out.frame>");
+            std::process::exit(2);
+        };
+        let Some(s) = fc.scenes.get(i) else {
+            eprintln!("frame-replay: no scene {i} (the frame has {})", fc.scenes.len());
+            std::process::exit(2);
+        };
+        let (w, h) = s.color.as_ref().map_or((fc.width, fc.height), |c| (c.width, c.height));
+        let mut slim = Vec::new();
+        vitaslop_runtime::capsule::write_frame_slim(&mut slim, std::slice::from_ref(s), w, h, fc.clear, fc.frame)
+            .expect("write the scene-only frame");
+        std::fs::write(out, &slim).expect("write the scene-only frame file");
+        eprintln!("  scene {i} alone ({w}x{h}, {} draws) -> {out}", s.draws.len());
+        return;
+    }
     eprintln!(
         "  CAVEAT: one frame only - a target an EARLIER frame rendered is not in it, so a sampler \
          reaching for one reads the guest bytes captured with the draw."
@@ -186,9 +380,19 @@ fn main() {
     let t = std::time::Instant::now();
     let fb = gpu.render_frame(&fc.scenes, fc.width, fc.height, fc.clear);
     eprintln!("  rendered in {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+    // `--gpu-time <n>`: render the frame n MORE times (the first render above warmed every
+    // pipeline) and print the GPU TIME report over those n - with `VITASLOP_GPU_TIME_ALL=1` and
+    // `VITASLOP_GXP_PASS_SPLIT_EVERY=<k>`, the GPU cost of each k-draw slice of every pass.
+    if let Some(n) = args.iter().position(|a| a == "--gpu-time").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u32>().ok()) {
+        let _ = gpu.take_gpu_time_report();
+        for _ in 0..n {
+            let _ = gpu.render_frame(&fc.scenes, fc.width, fc.height, fc.clear);
+        }
+        eprintln!("  gpu time: {}", gpu.take_gpu_time_report());
+    }
     // The first positional argument after the frame, skipping every option's VALUE.
     let out = args.iter().enumerate().skip(1).find_map(|(i, a)| {
-        let is_value = matches!(args[i - 1].as_str(), "--before" | "--extract");
+        let is_value = matches!(args[i - 1].as_str(), "--before" | "--extract" | "--gpu-time");
         (!a.starts_with("--") && !is_value).then_some(a)
     });
     if let Some(out) = out {
@@ -198,4 +402,28 @@ fn main() {
         });
         eprintln!("  -> {out}");
     }
+}
+
+fn half_to_f32(h: u16) -> f32 {
+    let s = ((h >> 15) & 1) as u32;
+    let e = ((h >> 10) & 0x1f) as u32;
+    let m = (h & 0x3ff) as u32;
+    let bits = if e == 0 {
+        if m == 0 {
+            s << 31
+        } else {
+            let mut e = 127 - 15 + 1;
+            let mut m = m;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            (s << 31) | (e << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if e == 31 {
+        (s << 31) | (0xff << 23) | (m << 13)
+    } else {
+        (s << 31) | ((e + 127 - 15) << 23) | (m << 13)
+    };
+    f32::from_bits(bits)
 }

@@ -100,6 +100,9 @@ async function main() {
     const coi = {
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",
+      // Never from the HTTP cache: an A/B serves two bundles at the SAME URLs from one profile
+      // (`WEB_DIR`), and an arm that loaded the other arm's cached wasm would measure it.
+      "Cache-Control": "no-store",
     };
     try {
       const url = decodeURIComponent(req.url.split("?")[0]);
@@ -225,7 +228,7 @@ async function main() {
     channel: process.env.PWCHANNEL || "chrome",
     headless,
     viewport: { width: 1100, height: 800 },
-    deviceScaleFactor: 1,
+    deviceScaleFactor: Number(process.env.DSF || 1),
     args: [
       "--enable-unsafe-webgpu",
       `--enable-features=${features}`,
@@ -738,7 +741,7 @@ async function main() {
           // `latencySkip` is sound the worklet threw away to stop the backlog growing (heard
           // as a skip), `fill` is the backlog still standing at the end (heard as delay
           // between a button and its sound). Underrun and overrun cannot distinguish either.
-          ` latencySkip=${audio.latencySkip ?? 0} fill=${audio.fill ?? 0}`
+          ` latencySkip=${audio.latencySkip ?? 0} fill=${audio.fill ?? 0} rejoins=${audio.rejoins ?? 0}`
       );
       // >>> COUNTERS CANNOT TELL MUSIC FROM SILENCE. A frame of zeroes is written and
       // read exactly like a frame of music, and an engine that produced nothing but

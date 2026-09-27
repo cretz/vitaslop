@@ -95,7 +95,54 @@ fn w_u64(o: &mut impl Write, v: u64) -> io::Result<()> {
 fn w_f32(o: &mut impl Write, v: f32) -> io::Result<()> {
     o.write_all(&v.to_le_bytes())
 }
+/// >>> SLIM FRAMES: every byte field of [`SLIM_MIN`] bytes or more is written ONCE per frame and
+/// referenced by id after that. A frame capsule wrote each draw's textures in full, so an MLB
+/// at-bat with ~900 draws sampling the same atlases came to 2.66 GB - unshippable to a phone,
+/// which is exactly where a frame has to be replayed to see a device-only picture defect
+/// (2026-09-26, the device runner). Active only inside [`write_frame_slim`] / a
+/// [`FRAME_MAGIC_SLIM`] read; everywhere else `w_bytes`/`r_bytes` are the old format exactly.
+const SLIM_MIN: usize = 1024;
+/// The length word that marks a back-reference: the next u32 is the blob's id.
+const SLIM_REF: u32 = u32::MAX;
+#[derive(Default)]
+struct Slim {
+    /// Writing: (hash, len) -> the blobs already written under it, each with its id. The bytes
+    /// are kept so a hash collision is a compare, never a wrong reference.
+    written: std::collections::HashMap<(u64, usize), Vec<(u32, Arc<[u8]>)>>,
+    next: u32,
+    /// Reading: blob id -> its bytes, shared by every field that references it.
+    read: Vec<Arc<[u8]>>,
+}
+thread_local! {
+    static SLIM: std::cell::RefCell<Option<Slim>> = const { std::cell::RefCell::new(None) };
+}
+fn slim_hash(v: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
 fn w_bytes(o: &mut impl Write, v: &[u8]) -> io::Result<()> {
+    if v.len() >= SLIM_MIN {
+        let hit = SLIM.with(|c| {
+            let mut c = c.borrow_mut();
+            let slim = c.as_mut()?;
+            let key = (slim_hash(v), v.len());
+            let bucket = slim.written.entry(key).or_default();
+            if let Some((id, _)) = bucket.iter().find(|(_, b)| &b[..] == v) {
+                return Some(Some(*id));
+            }
+            let id = slim.next;
+            slim.next += 1;
+            bucket.push((id, Arc::from(v)));
+            Some(None)
+        });
+        if let Some(Some(id)) = hit {
+            w_u32(o, SLIM_REF)?;
+            return w_u32(o, id);
+        }
+    }
     w_u32(o, v.len() as u32)?;
     o.write_all(v)
 }
@@ -128,10 +175,28 @@ fn r_f32(i: &mut impl Read) -> io::Result<f32> {
     Ok(f32::from_bits(r_u32(i)?))
 }
 fn r_bytes(i: &mut impl Read) -> io::Result<Vec<u8>> {
-    let n = r_u32(i)? as usize;
-    let mut v = vec![0u8; n];
+    Ok(r_bytes_shared(i)?.to_vec())
+}
+/// A byte field as a SHARED buffer: in a slim frame every reference to one blob gets the same
+/// allocation, so replaying a frame costs its unique bytes, not its references.
+fn r_bytes_shared(i: &mut impl Read) -> io::Result<Arc<[u8]>> {
+    let n = r_u32(i)?;
+    let slim_on = SLIM.with(|c| c.borrow().is_some());
+    if n == SLIM_REF && slim_on {
+        let id = r_u32(i)? as usize;
+        return SLIM.with(|c| {
+            c.borrow().as_ref().and_then(|s| s.read.get(id).cloned()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("slim frame: reference to blob {id}, which was never written"))
+            })
+        });
+    }
+    let mut v = vec![0u8; n as usize];
     i.read_exact(&mut v)?;
-    Ok(v)
+    let a: Arc<[u8]> = Arc::from(v);
+    if slim_on && a.len() >= SLIM_MIN {
+        SLIM.with(|c| c.borrow_mut().as_mut().map(|s| s.read.push(a.clone())));
+    }
+    Ok(a)
 }
 fn r_f32s<const N: usize>(i: &mut impl Read) -> io::Result<[f32; N]> {
     let mut a = [0f32; N];
@@ -177,7 +242,7 @@ fn r_tex(i: &mut impl Read) -> io::Result<BoundTexture> {
     let (unit, base_format, swizzle, tex_type) = (r_u32(i)?, r_u32(i)?, r_u32(i)?, r_u32(i)?);
     let (width, height, stride, faces) = (r_u32(i)?, r_u32(i)?, r_u32(i)?, r_u32(i)?);
     let (face_bytes, levels, data_addr) = (r_u32(i)?, r_u32(i)?, r_u32(i)?);
-    let pixels: Arc<[u8]> = Arc::from(r_bytes(i)?);
+    let pixels: Arc<[u8]> = r_bytes_shared(i)?;
     Ok(BoundTexture {
         unit,
         // Replayed from a capsule: a buffer this process just built, so it is minted like any
@@ -519,6 +584,33 @@ impl Capsule {
 /// Frame-capsule magic + version. Bump on any field-order change.
 /// Version 2: the draw record grew with `VSCAPS` version 4.
 const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x02";
+/// The same frame body with every large byte field deduplicated - see [`SLIM_MIN`].
+const FRAME_MAGIC_SLIM: &[u8; 8] = b"VSFRAM\x00\x03";
+
+/// Clears the slim context when a slim write or read ends, however it ends.
+struct SlimReset;
+impl Drop for SlimReset {
+    fn drop(&mut self) {
+        SLIM.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// [`write_frame`] as a SLIM frame: identical content, each distinct large byte field once.
+pub fn write_frame_slim(
+    o: &mut impl Write,
+    scenes: &[crate::capture::Scene],
+    width: u32,
+    height: u32,
+    clear: [u8; 4],
+    frame: u64,
+) -> io::Result<()> {
+    SLIM.with(|c| *c.borrow_mut() = Some(Slim::default()));
+    let _reset = SlimReset;
+    let mut body = Vec::new();
+    write_frame(&mut body, scenes, width, height, clear, frame)?;
+    o.write_all(FRAME_MAGIC_SLIM)?;
+    o.write_all(&body[FRAME_MAGIC.len()..])
+}
 
 /// Write every scene of one frame. `width`/`height`/`clear` are the display framebuffer the
 /// frame was rendered to; `frame` is the guest display frame, for the record.
@@ -596,12 +688,17 @@ pub struct FrameCapsule {
 pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
     let mut magic = [0u8; 8];
     i.read_exact(&mut magic)?;
-    if &magic != FRAME_MAGIC {
+    let slim = &magic == FRAME_MAGIC_SLIM;
+    if &magic != FRAME_MAGIC && !slim {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("not a frame capsule of this version (magic {magic:?}, expected {FRAME_MAGIC:?})"),
+            format!("not a frame capsule of this version (magic {magic:?}, expected {FRAME_MAGIC:?} or {FRAME_MAGIC_SLIM:?})"),
         ));
     }
+    let _reset = slim.then(|| {
+        SLIM.with(|c| *c.borrow_mut() = Some(Slim::default()));
+        SlimReset
+    });
     let (width, height) = (r_u32(i)?, r_u32(i)?);
     let mut clear = [0u8; 4];
     i.read_exact(&mut clear)?;
@@ -678,6 +775,36 @@ pub fn maybe_write_frame(scenes: &[crate::capture::Scene], width: u32, height: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slim byte fields: a repeat of a large blob is a back-reference, reads back EQUAL and as
+    /// the SAME allocation; a small one and anything outside a slim context is the old format.
+    #[test]
+    fn slim_bytes_dedupe_and_share() {
+        let big: Vec<u8> = (0..4096u32).map(|i| (i * 7) as u8).collect();
+        let small = vec![1u8, 2, 3];
+        let mut plain = Vec::new();
+        w_bytes(&mut plain, &big).unwrap();
+        SLIM.with(|c| *c.borrow_mut() = Some(Slim::default()));
+        let mut out = Vec::new();
+        for b in [&big, &small, &big, &small] {
+            w_bytes(&mut out, b).unwrap();
+        }
+        SLIM.with(|c| *c.borrow_mut() = None);
+        // big + small + a 8-byte reference + small again.
+        assert_eq!(out.len(), (4 + 4096) + (4 + 3) + 8 + (4 + 3));
+        assert_eq!(&out[..4 + 4096], &plain[..], "the first occurrence is the old format exactly");
+        SLIM.with(|c| *c.borrow_mut() = Some(Slim::default()));
+        let mut r = &out[..];
+        let a = r_bytes_shared(&mut r).unwrap();
+        let s1 = r_bytes_shared(&mut r).unwrap();
+        let b = r_bytes_shared(&mut r).unwrap();
+        let s2 = r_bytes_shared(&mut r).unwrap();
+        SLIM.with(|c| *c.borrow_mut() = None);
+        assert_eq!(&a[..], &big[..]);
+        assert!(Arc::ptr_eq(&a, &b), "a reference reads back as the same buffer");
+        assert_eq!((&s1[..], &s2[..]), (&small[..], &small[..]));
+        assert!(r.is_empty());
+    }
 
     /// A capsule must ROUND-TRIP exactly. This is the whole guarantee: a replayed draw that
     /// differs from the captured one in any field is a wrong picture attributed to the shader.

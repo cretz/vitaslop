@@ -29,6 +29,8 @@ use wasm_bindgen::prelude::*;
 const CTL_WRITE: u32 = 0;
 const CTL_READ: u32 = 1;
 const CTL_OVERRUN: u32 = 3;
+/// See `web/audio.js` `CTL_REJOINS`.
+const CTL_REJOINS: u32 = 10;
 const CTL_CAPACITY: u32 = 4;
 const CTL_CHANNELS: u32 = 5;
 const CTL_SAMPLE_RATE: u32 = 6;
@@ -63,10 +65,61 @@ struct Port {
     cursor: u32,
 }
 
-/// Writes guest PCM into the page's shared audio ring.
-pub struct WebAudioSink {
+/// This worker's views over the page's audio ring, installed by [`install_ring`].
+///
+/// # Why the views are per WORKER and not in the sink
+/// A `js_sys` typed array is a handle into ONE worker's JS heap. The sink lives in the shared
+/// host (`VitaEnv`), and under `VITASLOP_SMP` the guest's audio thread may call it from any of
+/// several workers that share one wasm memory - a handle created on the run worker would name a
+/// different object, or none, anywhere else. The ring itself is a `SharedArrayBuffer`, so every
+/// worker can hold its own views over the SAME bytes; each worker installs them once, and the
+/// sink finds whichever set belongs to the thread it is running on.
+struct RingViews {
     ctl: js_sys::Int32Array,
     data: js_sys::Float32Array,
+}
+
+thread_local! {
+    static RING_VIEWS: std::cell::RefCell<Option<RingViews>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Build this worker's views over the audio ring `ring` (the page's `SharedArrayBuffer`).
+/// Returns `(capacity, channels, sample_rate)` from its header, or `None` if `ring` is not a
+/// ring. Every worker that can run the guest's audio thread calls this once.
+pub fn install_ring(ring: &JsValue) -> Option<(u32, u32, u32)> {
+    let buf: js_sys::SharedArrayBuffer = ring.clone().dyn_into().ok()?;
+    let ctl = js_sys::Int32Array::new_with_byte_offset_and_length(&buf, 0, CTL_HEADER_BYTES / 4);
+    let total_floats = (buf.byte_length() - CTL_HEADER_BYTES) / 4;
+    let data = js_sys::Float32Array::new_with_byte_offset_and_length(&buf, CTL_HEADER_BYTES, total_floats);
+    let capacity = ctl.get_index(CTL_CAPACITY) as u32;
+    let channels = ctl.get_index(CTL_CHANNELS) as u32;
+    let sample_rate = ctl.get_index(CTL_SAMPLE_RATE) as u32;
+    if capacity == 0 || channels == 0 || sample_rate == 0 {
+        return None;
+    }
+    RING_VIEWS.with(|v| *v.borrow_mut() = Some(RingViews { ctl, data }));
+    Some((capacity, channels, sample_rate))
+}
+
+/// Run `f` with this worker's ring views. A worker that never installed them has no ring to
+/// write, which is loud once rather than a silent drop: that is a worker the SMP setup forgot.
+fn with_ring<R>(f: impl FnOnce(&RingViews) -> R) -> Option<R> {
+    let out = RING_VIEWS.with(|v| v.borrow().as_ref().map(f));
+    if out.is_none() {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                target: "vitaslop::audio",
+                "audio grain submitted on a worker with no ring views installed - dropped \
+                 (every SMP worker must call audio::install_ring)"
+            );
+        }
+    }
+    out
+}
+
+/// Writes guest PCM into the page's shared audio ring.
+pub struct WebAudioSink {
     capacity: u32,
     channels: u32,
     sample_rate: u32,
@@ -85,25 +138,8 @@ impl WebAudioSink {
     /// `SharedArrayBuffer`; `None` if it is not one, which is a caller error rather than
     /// something to paper over.
     pub fn new(ring: &JsValue) -> Option<WebAudioSink> {
-        let buf: js_sys::SharedArrayBuffer = ring.clone().dyn_into().ok()?;
-        let ctl = js_sys::Int32Array::new_with_byte_offset_and_length(
-            &buf,
-            0,
-            CTL_HEADER_BYTES / 4,
-        );
-        let total_floats =
-            (buf.byte_length() - CTL_HEADER_BYTES) / 4;
-        let data =
-            js_sys::Float32Array::new_with_byte_offset_and_length(&buf, CTL_HEADER_BYTES, total_floats);
-        let capacity = ctl.get_index(CTL_CAPACITY) as u32;
-        let channels = ctl.get_index(CTL_CHANNELS) as u32;
-        let sample_rate = ctl.get_index(CTL_SAMPLE_RATE) as u32;
-        if capacity == 0 || channels == 0 || sample_rate == 0 {
-            return None;
-        }
+        let (capacity, channels, sample_rate) = install_ring(ring)?;
         Some(WebAudioSink {
-            ctl,
-            data,
             capacity,
             channels,
             sample_rate,
@@ -119,32 +155,32 @@ impl WebAudioSink {
     }
 
     /// Copy `src` into the ring at absolute frame `start`, wrapping at the end.
-    fn write_range(&self, start: u32, src: &[f32]) {
+    fn write_range(&self, ring: &RingViews, start: u32, src: &[f32]) {
         let ch = self.channels;
         let frames = (src.len() / ch as usize) as u32;
         let at = start % self.capacity;
         let first = frames.min(self.capacity - at);
-        self.data
+        ring.data
             .subarray(at * ch, (at + first) * ch)
             .copy_from(&src[..(first * ch) as usize]);
         if first < frames {
-            self.data
+            ring.data
                 .subarray(0, (frames - first) * ch)
                 .copy_from(&src[(first * ch) as usize..]);
         }
     }
 
     /// Read the ring's own samples at absolute frame `start` into `out`, wrapping.
-    fn read_range(&self, start: u32, out: &mut [f32]) {
+    fn read_range(&self, ring: &RingViews, start: u32, out: &mut [f32]) {
         let ch = self.channels;
         let frames = (out.len() / ch as usize) as u32;
         let at = start % self.capacity;
         let first = frames.min(self.capacity - at);
-        self.data
+        ring.data
             .subarray(at * ch, (at + first) * ch)
             .copy_to(&mut out[..(first * ch) as usize]);
         if first < frames {
-            self.data
+            ring.data
                 .subarray(0, (frames - first) * ch)
                 .copy_to(&mut out[(first * ch) as usize..]);
         }
@@ -177,15 +213,36 @@ impl WebAudioSink {
     /// needed. The data goes in BEFORE the index is published, which is the whole ordering
     /// requirement.
     fn publish_at(&mut self, cursor: u32, frames: u32) -> u32 {
-        let write = self.ctl.get_index(CTL_WRITE) as u32;
-        let read = js_sys::Atomics::load(&self.ctl, CTL_READ).unwrap_or(0) as u32;
+        // No ring on this worker: the grain is dropped (and said once, in `with_ring`), and the
+        // port still advances by the whole grain, exactly as a refused write does below.
+        with_ring(|ring| self.publish_into(ring, cursor, frames)).unwrap_or(cursor.wrapping_add(frames))
+    }
+
+    fn publish_into(&mut self, ring: &RingViews, cursor: u32, frames: u32) -> u32 {
+        let write = ring.ctl.get_index(CTL_WRITE) as u32;
+        let read = js_sys::Atomics::load(&ring.ctl, CTL_READ).unwrap_or(0) as u32;
         // A port that has fallen behind the consumer - it stopped submitting for a while, or
         // it is new - joins at the read cursor rather than writing into frames already played.
         let mut at = if read.wrapping_sub(cursor) as i32 > 0 { read } else { cursor };
+        // >>> ...and a port a WHOLE RING AHEAD of the consumer rejoins at the frontier.
+        //
+        // Nothing such a port submits can ever land (its free space is zero), and since a
+        // refused grain still advances the port, it never comes back: the run is SILENT from
+        // then on. MEASURED: every desktop browser run, single-worker and SMP, read
+        // `written 0.6-1.3 s` for the whole run against millions of `overrun` frames, and the
+        // user heard no audio at all in MLB and none in-game in Madden (2026-09-25). Game time
+        // outruns wall time whenever the clock jumps over idle stretches - a load, a
+        // fast-forward - and the audio thread submits by game time. Dropping the audio that
+        // ran ahead is right (it can never be played in time); losing everything after is not.
+        if at.wrapping_sub(read) >= self.capacity {
+            let frontier = if write.wrapping_sub(read) < self.capacity { write } else { read };
+            let _ = js_sys::Atomics::add(&ring.ctl, CTL_REJOINS, 1);
+            at = frontier;
+        }
         let free = self.capacity.saturating_sub(at.wrapping_sub(read));
         let take = frames.min(free);
         if take < frames {
-            let _ = js_sys::Atomics::add(&self.ctl, CTL_OVERRUN, (frames - take) as i32);
+            let _ = js_sys::Atomics::add(&ring.ctl, CTL_OVERRUN, (frames - take) as i32);
         }
         if take > 0 {
             let ch = self.channels as usize;
@@ -200,23 +257,23 @@ impl WebAudioSink {
                 self.mixbuf.clear();
                 self.mixbuf.resize(n, 0.0);
                 let mut held = std::mem::take(&mut self.mixbuf);
-                self.read_range(at, &mut held);
+                self.read_range(ring, at, &mut held);
                 for (h, s) in held.iter_mut().zip(self.scratch[..n].iter()) {
                     *h += *s;
                 }
-                self.write_range(at, &held);
+                self.write_range(ring, at, &held);
                 self.mixbuf = held;
             }
             if take > overlap {
                 let from = overlap as usize * ch;
                 let to = take as usize * ch;
                 let src = std::mem::take(&mut self.scratch);
-                self.write_range(at.wrapping_add(overlap), &src[from..to]);
+                self.write_range(ring, at.wrapping_add(overlap), &src[from..to]);
                 self.scratch = src;
             }
             let end = at.wrapping_add(take);
             if end.wrapping_sub(write) as i32 > 0 {
-                let _ = js_sys::Atomics::store(&self.ctl, CTL_WRITE, end as i32);
+                let _ = js_sys::Atomics::store(&ring.ctl, CTL_WRITE, end as i32);
             }
         }
         // Advance by the WHOLE grain even where the ring refused it: the port's position is
@@ -237,7 +294,7 @@ impl AudioSink for WebAudioSink {
         )));
         // A new port joins at the frontier: whatever is already queued belongs to the ports
         // that queued it, and this one's first grain is the next sound to be heard.
-        let cursor = self.ctl.get_index(CTL_WRITE) as u32;
+        let cursor = with_ring(|ring| ring.ctl.get_index(CTL_WRITE) as u32).unwrap_or(0);
         self.ports.push(Port {
             id,
             format,
@@ -308,9 +365,11 @@ impl AudioSink for WebAudioSink {
             pos += ratio;
         }
         let peak_i = (peak * 32767.0) as i32;
-        if peak_i > self.ctl.get_index(CTL_PEAK) {
-            let _ = js_sys::Atomics::store(&self.ctl, CTL_PEAK, peak_i);
-        }
+        with_ring(|ring| {
+            if peak_i > ring.ctl.get_index(CTL_PEAK) {
+                let _ = js_sys::Atomics::store(&ring.ctl, CTL_PEAK, peak_i);
+            }
+        });
         // Carry the leftover fraction into the next grain - see `Port::resample_pos`.
         if let Some(p) = self.port(port) {
             p.resample_pos = pos - src_frames as f64;

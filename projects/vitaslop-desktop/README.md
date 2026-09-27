@@ -43,5 +43,13 @@ in a window instead of a canvas.
 - Data lives under `VITASLOP_HOME` or the per-user data directory: `library/<id>/` (the
   decrypted dump tree plus `meta.json`, `icon0.png`, `pic0.png`), `saves/<profile>/`,
   `settings.json`, `titles/<id>.json` (per-title patches).
+- The COMPILE CACHE lives inside each game directory (library or `--game`):
+  `<game>/vitaslop-transpiled/<build>-<settings>-<exec>.cwasm` (wasmtime's serialized
+  compiled module, hundreds of MB) + `.layout` (written last). `<build>` is this
+  executable's identity (size + mtime), so every new build invalidates; `<settings>` the
+  transpiler's resolved emit settings; `<exec>` which executable of the game. Storing an
+  entry deletes other builds' entries and the same executable's older ones; deleting the
+  game deletes it. A hit skips the transpile and the Cranelift compile (MLB: 18.2 s -> 69 ms).
+  `VITASLOP_COMPILE_CACHE=0` bypasses it. See `vitaslop_native::compile_cache`.
 - `--game <dir>` is unchanged and is what the measurement rigs drive; `session.rs` is
   the loop both it and the shell share.

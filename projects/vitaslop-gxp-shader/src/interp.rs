@@ -425,9 +425,14 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
             };
             let (a0, b0, d) = (raw(0)?, raw(1)?, raw(2)?);
             // `src1_high` picks a half of src1 the same way - see the decoder's note. A clear
-            // bit reads the whole register, matching the emitter exactly.
+            // bit reads the LOW half (the old whole-register read is the
+            // `VITASLOP_GXP_IMAD_SRC1_WHOLE=1` arm), matching the emitter exactly - see
+            // `wgsl::emit_int_mad` for the measurement.
+            let whole = crate::link::arm(crate::link::IMAD_SRC1_WHOLE_ARM).is_some_and(|v| v.trim() == "1");
             let b = match (signed, src1_high) {
-                (_, false) => b0,
+                (_, false) if whole => b0,
+                (true, false) => (((b0 as i32) << 16) >> 16) as u32,
+                (false, false) => b0 & 0xffff,
                 (true, true) => ((b0 as i32) >> 16) as u32,
                 (false, true) => b0 >> 16,
             };
@@ -1646,6 +1651,30 @@ mod tests {
         i.write_mask = [true, false, false, false];
         run(&shader(vec![i]), &mut regs).unwrap();
         assert_eq!(regs.pa[2].to_bits(), 7 * 48 + 1000);
+    }
+
+    /// src1 with its half bit CLEAR is the LOW 16 bits of a packed pair, not the whole
+    /// register - two bone indices packed in one register (MLB's skinned shadow, 2026-09-25):
+    /// the whole-register read added `stride * idx_hi << 16` to the low bone's address.
+    #[test]
+    fn int_mad_reads_the_low_half_of_a_packed_src1() {
+        let mut regs = RegFile::with_lanes(32);
+        regs.pa[5] = f32::from_bits(64); // the matrix stride
+        regs.pa[3] = f32::from_bits((20 << 16) | 3); // bone 3 low, bone 20 high
+        regs.sa[9] = f32::from_bits(0x9159_5e20); // the palette base
+        let d = Operand::plain(Bank::PrimaryAttr, 7, 2);
+        let a = Operand::plain(Bank::PrimaryAttr, 5, 2);
+        let b = Operand::plain(Bank::PrimaryAttr, 3, 2);
+        let cc = Operand::plain(Bank::SecondaryAttr, 9, 3);
+        let mut i = instr(Op::IntMad { signed: true, bits: 32, src0_high: false, src1_high: false }, d, vec![a, b, cc]);
+        i.write_mask = [true, false, false, false];
+        run(&shader(vec![i.clone()]), &mut regs).unwrap();
+        assert_eq!(regs.pa[7].to_bits(), 0x9159_5e20 + 64 * 3, "the LOW bone's matrix");
+        // ...and the high half, through the select bit.
+        let mut hi = i;
+        hi.op = Op::IntMad { signed: true, bits: 32, src0_high: false, src1_high: true };
+        run(&shader(vec![hi]), &mut regs).unwrap();
+        assert_eq!(regs.pa[7].to_bits(), 0x9159_5e20 + 64 * 20, "the HIGH bone's matrix");
     }
 
     /// A width the decoder does not establish must hard-fail here too, rather than be

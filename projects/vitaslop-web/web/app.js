@@ -175,11 +175,19 @@ async function renderTitle(id) {
     view.innerHTML = `<div class="card"><h2>${esc(id)}</h2><p>This title is not in the library.</p><p><a class="btn" href="#/import">Add it</a></p></div>`;
     return;
   }
-  const eff = await store.effective(id);
-  gamedata.setProfile(eff.profile);
+  // >>> THE PAGE DRAWS BEFORE THE SETTINGS RESOLVE. `store.effective` runs in the emulator
+  // bundle (the settings logic is its Rust), and the first call of a page session loads and
+  // compiles all of it on this thread - the second or so the title page used to hang for. Only
+  // the profile name, Play and the saved-data buttons depend on it, so those wait and nothing
+  // else does. (The app also starts that load in the background at start-up - see `boot`.)
+  const effP = store.effective(id);
   document.title = `${meta.title} - vitaslop`;
-  const [icon, pic, bytes] = await Promise.all([store.titleImage(id), store.titleImage(id, "pic0.png"), store.titleBytes(id)]);
+  // The size is NOT awaited here: it can take a moment the first time (see `store.titleBytes`)
+  // and nothing else on the page depends on it, so the page draws first and the size fills in.
+  const [icon, pic] = await Promise.all([store.titleImage(id), store.titleImage(id, "pic0.png")]);
   if (stale(me)) return;
+  let bytes = typeof meta.storedBytes === "number" ? meta.storedBytes : null;
+  const sizeText = () => (bytes == null ? "size..." : store.fmtBytes(bytes));
   view.innerHTML = `
     ${crumbs([{ text: "Library", href: "#/" }, { text: meta.title }])}
     <div class="hero">
@@ -187,9 +195,9 @@ async function renderTitle(id) {
         <span class="icon big ${icon ? "" : "noicon"}">${icon ? `<img src="${icon}" alt="" />` : ""}</span>
         <div class="hero-text">
           <h1>${esc(meta.title)}</h1>
-          <p class="meta">${esc(meta.titleId)}${meta.appVersion ? " &middot; v" + esc(meta.appVersion) : ""} &middot; ${store.fmtBytes(bytes)} &middot; added ${fmtDate(meta.importedAt)} &middot; played ${fmtDate(meta.lastPlayedAt)}</p>
+          <p class="meta">${esc(meta.titleId)}${meta.appVersion ? " &middot; v" + esc(meta.appVersion) : ""} &middot; <span id="t-size">${sizeText()}</span> &middot; added ${fmtDate(meta.importedAt)} &middot; played ${fmtDate(meta.lastPlayedAt)}</p>
           <div class="actions">
-            <button id="play" class="btn primary big" ${playable ? "" : "disabled"}>Play</button>
+            <button id="play" class="btn primary big" disabled>Play</button>
             <a class="btn" href="#/settings/${esc(id)}">Settings for this title</a>
             <button id="remove" class="btn danger">Remove</button>
           </div>
@@ -198,30 +206,42 @@ async function renderTitle(id) {
     </div>
     ${playable ? "" : browserBlock()}
     <div class="card">
-      <h2>Saved data <span class="dim">profile: ${esc(eff.profile)}</span></h2>
+      <h2>Saved data <span class="dim">profile: <span id="gd-profile">...</span></span></h2>
       <p id="gd-info" class="dim">checking...</p>
       <div class="actions">
-        <button id="gd-dl" class="btn">Download</button>
-        <button id="gd-up" class="btn">Upload</button>
-        <button id="gd-rm" class="btn danger">Clear</button>
+        <button id="gd-dl" class="btn" disabled>Download</button>
+        <button id="gd-up" class="btn" disabled>Upload</button>
+        <button id="gd-rm" class="btn danger" disabled>Clear</button>
         <input id="gd-file" type="file" accept=".zip,application/zip" hidden />
       </div>
       <p class="dim">What the game saved - its save files and trophies - and nothing of the game itself. A download is a file you own; upload it on another device to continue there.</p>
     </div>`;
+  // The backdrop goes on through the element's style property: a `style="..."` attribute
+  // in the markup is an inline style the page's Content-Security-Policy refuses.
+  if (pic) view.querySelector(".hero").style.backgroundImage = `url('${pic}')`;
+  if (bytes == null) {
+    store.titleBytes(id).then((n) => {
+      bytes = n;
+      if (!stale(me) && $("t-size")) $("t-size").textContent = sizeText();
+    });
+  }
+  $("remove").addEventListener("click", async () => {
+    if (!confirm(`Remove ${meta.title} (${meta.titleId}) from this browser?\n\nThis deletes the imported game (${sizeText()}) and its prepared code. Saved data is kept; clear it separately if you want it gone.`)) return;
+    await removeTitle(id);
+    await store.removeTitleRecord(id);
+    go("#/");
+  });
+  const eff = await effP;
+  if (stale(me)) return;
+  gamedata.setProfile(eff.profile);
+  $("gd-profile").textContent = eff.profile;
+  $("play").disabled = !playable;
+  $("gd-up").disabled = false;
   $("play").addEventListener("click", () => {
     // Inside the tap, before any await - see `askFullscreenNow`.
     const full = wantsFullscreen(eff);
     if (full) player.askFullscreenNow();
     play(id, full);
-  });
-  // The backdrop goes on through the element's style property: a `style="..."` attribute
-  // in the markup is an inline style the page's Content-Security-Policy refuses.
-  if (pic) view.querySelector(".hero").style.backgroundImage = `url('${pic}')`;
-  $("remove").addEventListener("click", async () => {
-    if (!confirm(`Remove ${meta.title} (${meta.titleId}) from this browser?\n\nThis deletes the imported game (${store.fmtBytes(bytes)}). Saved data is kept; clear it separately if you want it gone.`)) return;
-    await removeTitle(id);
-    await store.removeTitleRecord(id);
-    go("#/");
   });
   const info = $("gd-info");
   const refresh = async () => {
@@ -759,4 +779,9 @@ async function renderAbout() {
     location.hash = resume;
   }
   route();
+  // The settings logic lives in the emulator bundle, and a title page needs it (see
+  // `renderTitle`). Loading it now, behind whatever page is showing, means it is usually ready
+  // by the time a title is opened. A failure here is not reported: the page that needs the
+  // bundle awaits it itself and says what went wrong.
+  store.wasm().catch(() => {});
 })();

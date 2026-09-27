@@ -1603,11 +1603,11 @@ struct UnknownModule {
 
 /// Record one write of a module this engine does not interpret. `bytes` is the head of the
 /// params block.
-pub(crate) fn note_unknown_module(id: u32, module: u32, is_buss: bool, bytes: Vec<u8>) {
+pub(crate) fn note_unknown_module(id: u32, module: u32, is_buss: bool, bytes: &[u8]) {
     let mut g = UNKNOWN_MODULES.lock().unwrap();
     let e = g.entry((id, module, is_buss)).or_insert_with(|| UnknownModule {
         writes: 0,
-        first: bytes.clone(),
+        first: bytes.to_vec(),
         word_bits: Vec::new(),
         word_f32: Vec::new(),
     });

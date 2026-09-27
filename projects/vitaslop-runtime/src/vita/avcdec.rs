@@ -1175,7 +1175,9 @@ fn report_picture_hash(st: &mut VitaState, bytes: &[u8], pitch: u32, height: u32
     let n = st.avcdec.pictures_written;
     st.avcdec.pictures_written += 1;
     dump_picture(n, bytes, pitch, height);
-    if !crate::knobs::flag("VITASLOP_MOVIE_PICTURE_HASH") {
+    // Cached: asked per movie picture.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::knobs::flag("VITASLOP_MOVIE_PICTURE_HASH")) {
         return;
     }
     // FNV-1a over the surface. Not a cryptographic question: the comparison is against the
@@ -1212,11 +1214,16 @@ fn report_picture_hash(st: &mut VitaState, bytes: &[u8], pitch: u32, height: u32
 /// planes to the wrong offsets, or a draw that never sampled the texture, and only this
 /// separates the first from the other two.
 fn dump_picture(n: u64, bytes: &[u8], pitch: u32, height: u32) {
-    let Ok(dir) = crate::knobs::var("VITASLOP_MOVIE_DUMP_DIR") else { return };
-    let every: u64 = crate::knobs::var("VITASLOP_MOVIE_DUMP_EVERY")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(30);
+    // Cached: asked per movie picture.
+    static SPEC: std::sync::OnceLock<Option<(String, u64)>> = std::sync::OnceLock::new();
+    let Some((dir, every)) = SPEC.get_or_init(|| {
+        let dir = crate::knobs::var("VITASLOP_MOVIE_DUMP_DIR").ok()?;
+        let every = crate::knobs::var("VITASLOP_MOVIE_DUMP_EVERY").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(30);
+        Some((dir, every))
+    }) else {
+        return;
+    };
+    let every = *every;
     if every == 0 || !n.is_multiple_of(every) {
         return;
     }

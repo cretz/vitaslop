@@ -641,7 +641,7 @@ pub struct Scene {
     /// `VitaState::shader_precompile`), so every scene carries the whole thing - and once a
     /// title's precomputed states name a few hundred pairs, cloning it per scene is hundreds of
     /// atomic refcount bumps eleven times a frame. One refcount says the same thing.
-    pub precompile: std::sync::Arc<Vec<(std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)>>,
+    pub precompile: std::sync::Arc<Vec<vitaslop_gxp_shader::PatcherPair>>,
     pub color: Option<ColorSurface>,
     /// The `SceGxmDepthStencilSurface` this scene rendered its depth into, when the guest
     /// passed one to `sceGxmBeginScene`.
@@ -911,6 +911,14 @@ pub struct Capture {
     /// not about order - so [`Capture::frame_scenes`] hands out the whole frame and
     /// [`Capture::world_scene`] picks by what the scene contains.
     prev_frame_scenes: usize,
+    /// Scenes ever pushed - a serial, so a position in [`Capture::scenes`] survives eviction
+    /// from its front. See [`Capture::take_scenes_through_flip`].
+    scenes_pushed: u64,
+    /// `scenes_pushed` at each display flip not yet taken, oldest first: where one frame's
+    /// scenes end and the next one's begin. Only the parallel scheduler's overlapped present
+    /// reads it - there, the next frame's scenes can already be arriving when this one is
+    /// taken - and every ordinary take clears it.
+    flip_ends: std::collections::VecDeque<u64>,
 }
 
 /// Upper bound on retained trace entries. When the trace reaches this, the oldest
@@ -1051,6 +1059,7 @@ impl Capture {
     pub fn push_scene(&mut self, scene: Scene) {
         self.scenes.push(scene);
         self.frame_scenes += 1;
+        self.scenes_pushed += 1;
         let Some(limit) = self.scene_limit else { return };
         // Never evict below ONE WHOLE FRAME - the scenes of the last completed frame
         // plus the one being built. A frame is not a scene: a title renders its world,
@@ -1280,6 +1289,8 @@ impl Capture {
     /// that reason rather than for any divergence, which is exactly the wrong diagnosis to hand
     /// someone chasing a browser-only bug.
     pub fn take_frame_scenes(&mut self) -> Vec<Scene> {
+        // Every recorded flip is covered by a take of everything.
+        self.flip_ends.clear();
         // A scene whose geometry is still pending (`deferred_id != 0`) is NOT taken: its
         // bytes are read at the guest's flip, which on some titles comes after this frame
         // boundary. It stays for the next take - see the desktop's twin in `retail.rs`.
@@ -1355,6 +1366,36 @@ impl Capture {
     pub fn end_frame(&mut self) {
         self.prev_frame_scenes = self.frame_scenes;
         self.frame_scenes = 0;
+        self.flip_ends.push_back(self.scenes_pushed);
+        // Bounded: a caller that never takes through a flip (every one-worker run) must not
+        // grow this for the life of the run. Its ordinary take clears it anyway.
+        if self.flip_ends.len() > 8 {
+            self.flip_ends.pop_front();
+        }
+    }
+
+    /// Take the scenes of the OLDEST display frame whose flip has not been taken yet, and
+    /// only those - [`Capture::take_frame_scenes`] for a run where the NEXT frame's scenes may
+    /// already be arriving (the parallel scheduler presenting frame N while its guest threads
+    /// build N+1). Falls back to the ordinary take when no flip is recorded. Scenes whose
+    /// geometry is still pending stay, exactly as the ordinary take leaves them.
+    pub fn take_scenes_through_flip(&mut self) -> Vec<Scene> {
+        let Some(end) = self.flip_ends.pop_front() else { return self.take_frame_scenes() };
+        // Serial of `scenes[0]`: everything before it was evicted or taken. (A scene left
+        // behind as pending by an earlier take keeps its slot at the front, so this reads it as
+        // one serial newer than it is and the take reaches one scene further - the one extra
+        // being the next frame's first, which is a picture one pass early, never a lost one.)
+        let first = self.scenes_pushed - self.scenes.len() as u64;
+        let n = end.saturating_sub(first).min(self.scenes.len() as u64) as usize;
+        // `self.scenes` keeps this frame's scenes; `next` holds the next frame's so far.
+        let next = self.scenes.split_off(n);
+        let flips = std::mem::take(&mut self.flip_ends);
+        // Through the ordinary path, so the fold and the pending rule are one piece of code.
+        let taken = self.take_frame_scenes();
+        // Pending scenes it left behind go back IN FRONT of the next frame's.
+        self.scenes.extend(next);
+        self.flip_ends = flips;
+        taken
     }
 
     /// The scenes of the most recently COMPLETED display frame, oldest first.
@@ -1467,6 +1508,47 @@ impl Capture {
         if !self.unimplemented.iter().any(|(l, f, _)| *l == library_nid && *f == func_nid) {
             self.unimplemented.push((library_nid, func_nid, name.to_string()));
         }
+    }
+}
+
+/// The flip-bounded take: a frame's scenes, and not the next frame's that arrived meanwhile.
+#[cfg(test)]
+mod flip_take_tests {
+    use super::*;
+
+    #[test]
+    fn a_take_through_the_flip_leaves_the_next_frames_scenes() {
+        let mut c = Capture::new();
+        c.set_signature_wanted(false);
+        for _ in 0..3 {
+            c.push_scene(Scene::default());
+        }
+        c.end_frame();
+        // The next frame is already under way when this one is presented.
+        for _ in 0..2 {
+            c.push_scene(Scene::default());
+        }
+        assert_eq!(c.take_scenes_through_flip().len(), 3, "exactly the flipped frame");
+        assert_eq!(c.scenes.len(), 2, "the next frame's scenes stay");
+        c.end_frame();
+        assert_eq!(c.take_scenes_through_flip().len(), 2);
+        assert!(c.scenes.is_empty());
+        // With no flip recorded it is the ordinary take.
+        c.push_scene(Scene::default());
+        assert_eq!(c.take_scenes_through_flip().len(), 1);
+    }
+
+    #[test]
+    fn the_ordinary_take_is_unchanged_and_forgets_the_flips() {
+        let mut c = Capture::new();
+        c.set_signature_wanted(false);
+        c.push_scene(Scene::default());
+        c.end_frame();
+        c.push_scene(Scene::default());
+        assert_eq!(c.take_frame_scenes().len(), 2, "everything, as before");
+        c.push_scene(Scene::default());
+        // The flip taken above does not bound this one.
+        assert_eq!(c.take_scenes_through_flip().len(), 1);
     }
 }
 

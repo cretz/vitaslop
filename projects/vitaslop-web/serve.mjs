@@ -25,7 +25,10 @@ import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { spawnSync } from "node:child_process";
 import { readFile, readdir, stat, mkdir, writeFile, appendFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, createReadStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import { createRunner } from "./runner-server.mjs";
+import { LANE_VALUE_SRC } from "./e2e/caseinputs.mjs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, extname, relative, sep, basename } from "node:path";
@@ -56,6 +59,10 @@ const host = opt("--host") || process.env.HOST || "0.0.0.0";
 const port = Number(opt("--port") || process.env.PORT || 8080);
 const diagDir =
   opt("--diag-dir") || process.env.VITASLOP_DIAG_DIR || join(tmpdir(), "vitaslop-device-diag");
+// The device test runner's state (see runner-server.mjs): devices, queue, results, assets.
+const runnerDir =
+  opt("--runner-dir") || process.env.VITASLOP_RUNNER_DIR || join(tmpdir(), "vitaslop-device-runner");
+let runner = null; // built on first request, once `coi` exists (it is per-request below)
 const useHttps = args.includes("--https");
 const noBuild = args.includes("--no-build");
 const doOpen = args.includes("--open");
@@ -279,10 +286,17 @@ const handler = async (req, res) => {
     // A LAN device caches aggressively and then plays a stale bundle after a rebuild, which
     // looks exactly like a change that did not work.
     "Cache-Control": "no-store",
+    // Lets a page and its workers use the JS Self-Profiling API (`new Profiler`) - how a guest
+    // worker's CPU profile is taken ON THE PHONE (VITASLOP_JS_PROFILE, web/smp-worker.js).
+    "Document-Policy": "js-profiling",
   };
   try {
     const url = new URL(req.url, "http://x");
     const path = decodeURIComponent(url.pathname);
+
+    // >>> THE DEVICE TEST RUNNER (`/runner/` page + API, `/runner-assets/`). See runner-server.mjs.
+    runner ??= createRunner({ dir: runnerDir, coi, laneSrc: LANE_VALUE_SRC, runnerWebDir: join(webDir, "runner") });
+    if (await runner(req, res, path, url)) return;
 
     // >>> THE DEVICE DIAGNOSTICS SINK.
     //
@@ -374,12 +388,36 @@ const handler = async (req, res) => {
         res.writeHead(404, { ...coi }).end("not in this title's manifest");
         return;
       }
-      const body = await readFile(join(t.dir, rel));
-      res.writeHead(200, { "content-type": "application/octet-stream", ...coi });
-      return res.end(body);
+      // >>> STREAMED, WITH ITS LENGTH. `readFile` refuses a file over 2 GiB, and the catch below
+      // then answered a 2.9 GB archive with a 9-byte `404 not found` that a phone import stored
+      // AS the archive (2026-09-26: MLB died at frame 328 on the device, every desktop arm
+      // clean). `content-length` lets the importer hold the transfer to the size promised.
+      const full = join(t.dir, rel);
+      const { size } = await stat(full);
+      res.writeHead(200, { "content-type": "application/octet-stream", "content-length": size, ...coi });
+      return await pipeline(createReadStream(full), res);
     }
 
-    const file = join(webDir, path === "/" ? "/index.html" : path);
+    // A directory path serves its index.html (`/`, `/runner/`).
+    const file = join(webDir, path.endsWith("/") ? path + "index.html" : path);
+    // >>> THE BUNDLE IS REVALIDATED, NOT RE-DOWNLOADED. `no-store` made every worker of every
+    // play fetch the 9 MB emulator wasm again, and a phone on this LAN takes ~1 MB/s - MEASURED
+    // (runner 117, MLB): `init` 9.6 s of the run worker's start, and the transpile worker pays
+    // it again. `no-cache` + an ETag of (size, mtime) still asks on every load, so a rebuild is
+    // seen at once (a changed file is a changed tag) - the stale-bundle hazard `no-store` guards
+    // against stays closed - while an unchanged bundle is a 304 and V8 can reuse its compiled
+    // code. Only the wasm: the glue beside it is small and stays `no-store`.
+    if (extname(file) === ".wasm") {
+      const st = await stat(file);
+      const etag = `"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+      const headers = { ...coi, "Cache-Control": "no-cache", ETag: etag, "content-type": MIME[".wasm"] || "application/wasm" };
+      if (req.headers["if-none-match"] === etag) {
+        res.writeHead(304, headers).end();
+        return;
+      }
+      res.writeHead(200, { ...headers, "content-length": st.size });
+      return await pipeline(createReadStream(file), res);
+    }
     let body = await readFile(file);
     // >>> THE DIAG SINK ANNOUNCES ITSELF IN THE PAGE, so the page never has to ASK.
     //
@@ -392,8 +430,16 @@ const handler = async (req, res) => {
     }
     res.writeHead(200, { "content-type": MIME[extname(file)] || "application/octet-stream", ...coi });
     res.end(body);
-  } catch {
-    res.writeHead(404, { ...coi }).end("not found");
+  } catch (e) {
+    // A failure is a 500 that names itself, never a `404 not found` body - a body is exactly
+    // what a careless client stores as the file it asked for (see `/game/` above).
+    if (e && e.code === "ENOENT") {
+      res.writeHead(404, { ...coi }).end("not found");
+    } else if (!res.headersSent) {
+      res.writeHead(500, { "content-type": "text/plain", ...coi }).end(`serve failed: ${e && e.message}`);
+    } else {
+      res.destroy(e);
+    }
   }
 };
 

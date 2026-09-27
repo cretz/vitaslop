@@ -2511,6 +2511,18 @@ pub fn decode_texture_rgba8(t: &BoundTexture) -> (u32, u32, Vec<u8>) {
                 })
                 .collect(),
         ),
+        // Two float lanes -> (r, g, 0, 1), narrowed the same way.
+        TexelSeam::Rg32Float => (
+            w,
+            h,
+            data.chunks_exact(8)
+                .flat_map(|c| {
+                    let f = |i: usize| f32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
+                    let n = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    [n(f(0)), n(f(4)), 0, 255]
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -2535,9 +2547,18 @@ pub fn decode_texture_seam(t: &BoundTexture) -> (u32, u32, Vec<u8>, TexelSeam) {
 /// decoders disagree for no exactness gained. Swapping one lossy conversion for another is not
 /// worth losing the oracle over. If a title is ever measured to store data in one of them, the
 /// answer is a third seam, not this one.
+///
+/// `0x1e` (F32F32) IS that third seam's case, and it was measured: a 2011 fighting title keeps
+/// every sprite's transform in a 2048x64 F32F32 texture its vertex programs fetch
+/// (`__tMatrixMap`), with lanes like 85.8 and -618.7. The byte path clamped them to [0,1], every
+/// sprite's matrix became garbage, and nine of the character select's thirteen shader pairs put
+/// nothing on screen. `Rg32Float` holds the two words exactly; it is not filterable in core
+/// WebGPU, so the renderer binds such a unit unfilterable with a nearest sampler - what point
+/// sampling a 32-bit float texel returns anyway.
 pub fn seam_for_format(base_format: u32) -> TexelSeam {
     match base_format {
         0x1b => TexelSeam::Rgba16Float,
+        0x1e => TexelSeam::Rg32Float,
         _ => TexelSeam::Rgba8,
     }
 }
@@ -2613,6 +2634,9 @@ fn decode_texture_rgba8_counted(
     }
     if seam == TexelSeam::Rgba16Float {
         return decode_texture_rgba16f(t, work);
+    }
+    if seam == TexelSeam::Rg32Float {
+        return decode_texture_rg32f(t, work);
     }
     if t.base_format == YUV420P2 {
         return decode_texture_yuv420p2(t, work);
@@ -2889,6 +2913,31 @@ fn decode_texture_rgba16f(
         }
     }
     (t.width, t.height, out, TexelSeam::Rgba16Float)
+}
+
+/// Decode an F32F32 texture onto the 32-bit float seam, word for word - see [`seam_for_format`].
+/// The texel's two words land in (r, g) as stored: the hardware hands a 64-bit raw-lane texel to
+/// the shader unconverted, and the sampled view reads (r, g, 0, 1).
+fn decode_texture_rg32f(t: &BoundTexture, work: &mut BuildWork) -> (u32, u32, Vec<u8>, TexelSeam) {
+    let faces = t.faces.max(1);
+    let texels = (t.width * t.height * faces) as usize;
+    let mut out = vec![0u8; texels * 8];
+    for f in 0..faces {
+        let face_len = (t.width * t.height * 8) as u64;
+        DECODE_BY_FORMAT.lock().unwrap()[(t.base_format & 0xff) as usize] += face_len;
+        work.tex_out_per_texel += face_len;
+        let mut o = (f * t.width * t.height * 8) as usize;
+        for y in 0..t.height {
+            for x in 0..t.width {
+                let base = texel_byte_offset(t, f, x, y);
+                for k in 0..8 {
+                    out[o + k] = t.pixels.get(base + k).copied().unwrap_or(0);
+                }
+                o += 8;
+            }
+        }
+    }
+    (t.width, t.height, out, TexelSeam::Rg32Float)
 }
 
 /// A texture whose texel is ONE channel, and how that channel reduces to the shared RGBA8
@@ -5463,7 +5512,7 @@ fn render_scene_onto(
     // how many framebuffer pixels it actually wrote - so a big environment mesh that renders
     // to nothing (off-screen projection, wrongly skipped, or fully culled) is visible instead
     // of a silently-missing background. Off by default (a per-draw drawn-pixel diff).
-    let stats = std::env::var("VITASLOP_DRAW_STATS").is_ok();
+    let stats = draw_stats();
 
     // Diagnostic: VITASLOP_UV_DEBUG paints each depth-tested draw by its interpolated texcoord
     // (R=u.fract, G=v.fract) - a coherent per-panel UV reads as smooth gradients, a scrambled one
@@ -6800,6 +6849,32 @@ fn strict_draws() -> bool {
 /// draw, why, and whether it had the guest's real shaders attached (a drop that did is one
 /// the recompiler could have drawn exactly, so it is the expensive kind to lose).
 fn report_drop(kind: DropKind, di: usize, d: &Draw, tri_count: usize) {
+    // A kind already reported owes nothing - decided BEFORE the strings below are built, which
+    // used to happen for every dropped draw of every frame. (Strict mode still panics on the
+    // first drop, with its full detail.)
+    let strict = strict_draws();
+    if !strict {
+        use std::sync::Mutex;
+        thread_local! {
+            static DONE: std::cell::RefCell<Vec<DropKind>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        if DONE.with(|v| v.borrow().contains(&kind)) {
+            return;
+        }
+        static SEEN: Mutex<Vec<DropKind>> = Mutex::new(Vec::new());
+        let fresh = {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let fresh = !seen.contains(&kind);
+            if fresh {
+                seen.push(kind);
+            }
+            fresh
+        };
+        DONE.with(|v| v.borrow_mut().push(kind));
+        if !fresh {
+            return;
+        }
+    }
     // The PRIMITIVE and the INDEX COUNT ride the topology drop, and they are not
     // decoration: "not a triangle topology" names a family, and lines, points and packed
     // edge lists are now DRAWN, so a drop that survives is either an edge list whose words
@@ -6836,16 +6911,9 @@ fn report_drop(kind: DropKind, di: usize, d: &Draw, tri_count: usize) {
         d.attributes.len(),
         if d.vprog.is_empty() { "none" } else { "yes (the recompiler could draw this)" },
     );
-    if strict_draws() {
+    if strict {
         panic!("{detail}\n(VITASLOP_STRICT_DRAWS is set, so a dropped draw is fatal)");
     }
-    use std::sync::Mutex;
-    static SEEN: Mutex<Vec<DropKind>> = Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap();
-    if seen.contains(&kind) {
-        return;
-    }
-    seen.push(kind);
     tracing::warn!(target: "vitaslop::render", "{detail}");
 }
 
@@ -7667,7 +7735,7 @@ impl RenderSceneBuilder {
         let mut dmax = f32::NEG_INFINITY;
         // Diagnostic: VITASLOP_DRAW_STATS also reports each opaque draw's own visible depth
         // span, which is what the GPU's normalization has to keep separable.
-        let stats = std::env::var("VITASLOP_DRAW_STATS").is_ok();
+        let stats = draw_stats();
         // Will ANY draw of this scene read `depth_min`/`depth_scale`? Only a draw that is
         // rendered FIXED-FUNCTION *and* opaque *and* MVP does, or - for every draw - the
         // recompiled path under `ZFix::Range`.
@@ -9708,7 +9776,10 @@ mod texture_tests {
             0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // 16-bit
             0x09, 0x0a, 0x0b, // 16-bit single channel
             0x0c, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x15, 0x17, 0x18, 0x19, 0x1a, // 32-bit
-            0x1b, 0x1c, 0x1d, 0x1e, 0x1f, // 64-bit
+            // 64-bit. NOT 0x1e (F32F32): it decodes through its own RAW seam
+            // (`decode_texture_rg32f`, the two words as stored), which is by design not the
+            // per-texel RGBA8 reading this test compares against.
+            0x1b, 0x1c, 0x1d, 0x1f,
             0x9a, // 32-bit packed float + 2-bit alpha
             0x98, 0x99, // 24-bit
         ];
@@ -10481,4 +10552,10 @@ fn scene_depth_clear(depth: Option<&crate::capture::DepthSurface>) -> f32 {
 fn soft_depth_clear(scene: &Scene) -> f32 {
     let v = scene_depth_clear(scene.depth.as_ref());
     if v >= 1.0 { f32::INFINITY } else { v }
+}
+
+/// `VITASLOP_DRAW_STATS` (diagnostic), cached: asked per scene and per draw batch.
+fn draw_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VITASLOP_DRAW_STATS").is_ok())
 }

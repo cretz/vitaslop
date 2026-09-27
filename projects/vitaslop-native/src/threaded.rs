@@ -579,6 +579,18 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         host: H,
         quantum_fuel: u64,
     ) -> Result<(ThreadedScheduler<H>, Vec<(u32, u32)>), RunError> {
+        Self::from_linked_with_cache(linked, host, quantum_fuel, None)
+    }
+
+    /// [`Self::from_linked`], reusing the COMPILED module from `cache` when this exact build made
+    /// one for this program under these transpile settings - see [`crate::compile_cache`]. A hit
+    /// skips the transpile, the validation and the whole Cranelift compile.
+    pub fn from_linked_with_cache(
+        linked: &vitaslop_runtime::link::LinkedProgram,
+        host: H,
+        quantum_fuel: u64,
+        cache: Option<&crate::compile_cache::CompileCache>,
+    ) -> Result<(ThreadedScheduler<H>, Vec<(u32, u32)>), RunError> {
         // >>> THE RETAIL PATH EMITS THE WORK COUNTER, AND PREEMPTS ON IT. This is what
         // lets native bill its game clock in GUEST INSTRUCTIONS like the browser does,
         // rather than in wasm operators - see `WasmtimeThread::arm_retired` for the
@@ -587,6 +599,25 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // so the preemption GRANULARITY is unchanged; what changes is that every
         // preemption is now a call through our own import, where the counter can be read.
         transpiler::set_fuel_interval(u32::try_from(quantum_fuel).unwrap_or(u32::MAX));
+        let mut cfg = Config::new();
+        cfg.wasm_threads(true);
+        cfg.shared_memory(true);
+        cfg.consume_fuel(true);
+        let engine = Engine::new(&cfg).map_err(|e| RunError::Wasm(e.to_string()))?;
+        // The cache's name for this module: this executable's build, the transpile settings in
+        // force (read now, with the fuel interval set), and the program - see `compile_cache`.
+        let cache_entry = cache.map(|c| c.entry(&transpiler::codegen_fingerprint()));
+        let t_boot = std::time::Instant::now();
+        let hit = cache_entry.as_ref().and_then(|e| e.load(&engine));
+        let (module, layout) = if let Some(hit) = hit {
+            transpiler::set_fuel_interval(u32::MAX);
+            tracing::info!(
+                target: "vitaslop::status",
+                "compile cache HIT: loaded the compiled module in {:.0} ms - no transpile, no Cranelift compile",
+                t_boot.elapsed().as_secs_f64() * 1000.0
+            );
+            hit
+        } else {
         // >>> THE TRANSPILE'S OWN PEAK, SPLIT FROM THE ENGINE COMPILE THAT FOLLOWS IT.
         //
         // Transpile is the allocation peak of the whole system and the browser does it in a
@@ -596,6 +627,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // nearest caller that can. See `vitaslop_platform::heap`.
         vitaslop_platform::heap::reset_peak();
         let built = transpiler::transpile_lenient(&linked.shared_program());
+        let t_transpiled = std::time::Instant::now();
         {
             let (live, peak) = vitaslop_platform::heap::live_peak_mb();
             // `vitaslop::status`, not `vitaslop::perf`: every documented repro command in this
@@ -612,7 +644,6 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // and every runtime reader takes it from `ThreadData`, so nothing after this
         // point should depend on a thread-local that another transpile could inherit.
         transpiler::set_fuel_interval(u32::MAX);
-        let fuel_interval = u32::try_from(quantum_fuel).unwrap_or(u32::MAX);
         // >>> THE CODE EXPANSION FACTOR, reported unconditionally on the engine that takes
         // every calibration measurement. The game clock is charged per unit of fuel and a
         // unit of fuel is one executed wasm operator, so the emulated Vita's CPU speed is
@@ -816,20 +847,37 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 p.lost_to[transpiler::promote::Ender::Exit as usize],
             );
         }
-        // Record the wasm-index -> guest-address table before anything can trap, so a
-        // backtrace names guest code instead of listing module indices.
-        record_function_addresses(built.artifact.funcs.iter().map(|f| f.addr).collect());
         wasmparser::validate(&built.artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
-
-        let mut cfg = Config::new();
-        cfg.wasm_threads(true);
-        cfg.shared_memory(true);
-        cfg.consume_fuel(true);
-        let engine = Engine::new(&cfg).map_err(|e| RunError::Wasm(e.to_string()))?;
         let module = Module::from_binary(&engine, &built.artifact.wasm)?;
+        let layout = crate::compile_cache::Layout {
+            funcs: built.artifact.funcs.iter().map(|f| f.addr).collect(),
+            mem_pages: built.artifact.mem_pages,
+            arm_word_off: built.artifact.arm_word_off,
+            mirror_off: built.artifact.mirror_off,
+            dirty_off: built.artifact.dirty_off,
+            stubbed: built.stubbed.clone(),
+            stub_wasm_indices: built.stub_wasm_indices.clone(),
+            decode_gaps: built.decode_gaps.clone(),
+        };
+        let t_compiled = std::time::Instant::now();
+        tracing::info!(
+            target: "vitaslop::status",
+            "boot: transpile {:.0} ms, validate + Cranelift compile {:.0} ms",
+            (t_transpiled - t_boot).as_secs_f64() * 1000.0,
+            (t_compiled - t_transpiled).as_secs_f64() * 1000.0
+        );
+        if let Some(e) = &cache_entry {
+            e.store(&module, &layout);
+        }
+        (module, layout)
+        };
+        // Record the wasm-index -> guest-address table before anything can trap, so a
+        // backtrace names guest code instead of listing module indices.
+        record_function_addresses(layout.funcs.clone());
+        let fuel_interval = u32::try_from(quantum_fuel).unwrap_or(u32::MAX);
 
-        let pages = built.artifact.mem_pages;
+        let pages = layout.mem_pages;
         let mem_ty = wasmtime::MemoryType::shared(pages, pages);
         let shared_mem =
             SharedMemory::new(&engine, mem_ty).map_err(|e| RunError::Wasm(e.to_string()))?;
@@ -885,7 +933,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             }));
         }
         let instance_pre =
-            build_instance_pre(&engine, &module, &shared_mem, &host, linked.base, built.artifact.dirty_off)?;
+            build_instance_pre(&engine, &module, &shared_mem, &host, linked.base, layout.dirty_off)?;
         let engine = WasmtimeEngine {
             engine,
             module,
@@ -895,9 +943,9 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             base: linked.base,
             quantum_fuel,
             fuel_interval,
-            arm_word_off: built.artifact.arm_word_off,
-            mirror_off: built.artifact.mirror_off,
-            dirty_off: built.artifact.dirty_off,
+            arm_word_off: layout.arm_word_off,
+            mirror_off: layout.mirror_off,
+            dirty_off: layout.dirty_off,
         };
 
         // The main thread runs every module_start in load order, then (as the last
@@ -923,7 +971,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // nothing anywhere naming the cause. `VITASLOP_TRANSPILE_REPORT` cannot cover
         // this - it walks the call graph, and these functions are reached only through
         // vtables - so the list is printed here, from the build that actually runs.
-        if !built.decode_gaps.is_empty() {
+        if !layout.decode_gaps.is_empty() {
             // >>> THE LIST IS MOSTLY NOISE, AND SAYING SO IS WHAT MAKES IT USABLE.
             //
             // Tentative discovery - the stored-pointer scan and the prologue sweep -
@@ -951,7 +999,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             // encodings.
             let simd = |hw1: u16| hw1 == 0xef00 || (hw1 & 0xff00) == 0xef00 || (hw1 & 0xfc00) == 0xfc00;
             let (mut likely, mut rest) = (Vec::new(), 0usize);
-            for &addr in &built.decode_gaps {
+            for &addr in &layout.decode_gaps {
                 let (hw1, hw2) = hw(addr);
                 if simd(hw1) {
                     likely.push((addr, hw1, hw2));
@@ -979,11 +1027,11 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 );
             }
         }
-        let stubs = built
+        let stubs = layout
             .stubbed
             .iter()
             .copied()
-            .zip(built.stub_wasm_indices.iter().copied())
+            .zip(layout.stub_wasm_indices.iter().copied())
             .collect();
         Ok((ThreadedScheduler { inner: Scheduler::new(engine, host, main) }, stubs))
     }

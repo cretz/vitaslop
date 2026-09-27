@@ -432,7 +432,17 @@ pub(super) fn io_getstat(ctx: &mut GuestCtx, st: &mut VitaState, file: Ptr, stat
             }
             0
         }
-        None => ENOENT,
+        None => {
+            // Named once per path, as a failed `sceIoOpen` is: a title that stats a file it
+            // cannot find often waits on the loader that was meant to produce it, and the
+            // PATH is the whole diagnosis.
+            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+            let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if g.get_or_insert_with(Default::default).insert(path.clone()) {
+                tracing::warn!(target: "vitaslop::warning", path = %path, lr = format_args!("{:#010x}", ctx.regs[14]), "sceIoGetstat: no such file or directory");
+            }
+            ENOENT
+        }
     }
 }
 

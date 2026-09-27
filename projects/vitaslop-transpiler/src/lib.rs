@@ -16,10 +16,12 @@ mod emit;
 /// writing [`Artifact::arm_word_off`] when the run reaches it.
 pub use emit::arm_at_frame;
 pub use emit::set_fuel_interval;
+pub use emit::{set_shared_host_memory, set_smp, smp};
 /// Whether emitted modules hold the ARM register file in wasm LOCALS along each
 /// straight-line run (`VITASLOP_PROMOTE_REGS`), and the per-thread override a test uses
 /// to emit both arms in one process. See [`promote`].
 pub use emit::{promote_registers, set_promote_registers};
+pub use emit::codegen_fingerprint;
 pub use emit::{neon_cache, set_neon_cache};
 /// The A/B arm for the flag carry/overflow forms - see [`emit::flags_wide_c`]. The browser
 /// has no environment, so it selects the arm through the setter.
@@ -29,6 +31,8 @@ pub use emit::{flags_wide_c, set_flags_wide_c};
 pub use emit::{parse_trace_blocks, set_trace_blocks};
 /// Guest-PC tracking, settable where there is no environment - see [`emit::set_track_pc`].
 pub use emit::set_track_pc;
+/// The on-device guest-function profiler's emit switch - see [`emit::set_guest_prof`].
+pub use emit::set_guest_prof;
 /// The emit-time diagnostic knobs (watchpoints, frame arming) on a platform with no
 /// environment - see [`emit::set_emit_knob`].
 pub use emit::{set_emit_knob, EMIT_KNOBS_OVERRIDABLE};
@@ -863,6 +867,27 @@ pub enum InlineOp {
     /// computes and what C requires the SIGN of. [`mem_compare`] is the one definition of
     /// it, called by the handler and asserted against the emitted code.
     MemCompare,
+    /// >>> SMP ONLY (`emit::set_smp`). `r0 =` this instance's thread word: the thread id the
+    /// guest is told (`cur == false`, what `LoadMirror` of the THREAD_ID slot reads on one
+    /// worker) or the scheduler's current thread (`cur == true`). Several threads run at once
+    /// under SMP, so the one shared mirror word cannot hold either; each instance carries its
+    /// own, set by the host before every resume ([`abi::THREAD_ID_EXPORT`],
+    /// [`abi::CUR_THREAD_EXPORT`]).
+    ThreadWord { cur: bool },
+    /// >>> SMP ONLY. `r0:r1 =` a 64-bit clock (`rtc == false`: the process clock, `true`: the
+    /// RTC tick) as ONE atomic, aligned 64-bit load from [`abi::SMP_CLOCK64_SLOT`] /
+    /// [`abi::SMP_RTC64_SLOT`]. The one-worker form reads two words that cannot change under it;
+    /// under SMP another worker republishes the clock while this one reads, and two word loads
+    /// could pair one refresh's low half with the next one's high half.
+    LoadClock64 { rtc: bool },
+    /// >>> SMP ONLY. `*(u64 *)r0 =` the same clock, `r0 = 0` - the pointer-out spelling of
+    /// [`InlineOp::LoadClock64`], guarded like [`InlineOp::StoreMirrorPair`].
+    StoreClock64 { rtc: bool },
+    /// >>> SMP ONLY. The elided yield ([`InlineOp::DelayYield`]) with its two per-thread words
+    /// made per-thread: "is anyone else runnable" is this instance's WORKER's runnable count
+    /// (a word beside its preempt word, see [`abi::SMP_RUNNABLE_SLOT_OFFSET`]) and the run
+    /// counter is an instance global ([`abi::ELIDE_EXPORT`]), reset by the host at each resume.
+    SmpDelayYield { cap: u32 },
 }
 
 /// The answer `sceClibMemcmp` gives for `a` and `b`: the difference of the first differing
@@ -1197,6 +1222,12 @@ impl InlineOp {
             // r0 is left ALONE, which a one-word `eval` cannot express any more than it can
             // express a store form's range. Its meaning is that nothing happens.
             InlineOp::Nop => 0,
+            // The SMP forms read per-instance or host-published state, not a guest word; what
+            // holds them to their handlers is the SMP execution runs, not a one-word `eval`.
+            InlineOp::ThreadWord { .. }
+            | InlineOp::LoadClock64 { .. }
+            | InlineOp::StoreClock64 { .. }
+            | InlineOp::SmpDelayYield { .. } => 0,
         }
     }
 
@@ -1269,6 +1300,11 @@ impl InlineOp {
             InlineOp::BindPrecomputedState { .. } => None,
             // Reads a struct and an array, writes a block; no single offset names it.
             InlineOp::SetAllUniformBuffers { .. } => None,
+            // Take no pointer (the store form writes through r0, like `StoreMirrorPair`).
+            InlineOp::ThreadWord { .. }
+            | InlineOp::LoadClock64 { .. }
+            | InlineOp::StoreClock64 { .. }
+            | InlineOp::SmpDelayYield { .. } => None,
         }
     }
 
@@ -1330,6 +1366,13 @@ impl InlineOp {
             // Everything it reads is in the guest structures it is handed.
             InlineOp::BindPrecomputedState { .. } => None,
             InlineOp::SetAllUniformBuffers { .. } => None,
+            // The SMP forms read instance globals and the fixed SMP words at the top of the
+            // block (`abi::SMP_CLOCK64_SLOT`, the runnable words), which the always-present
+            // one-page block holds whatever the slots below need - no mirrored slot to name.
+            InlineOp::ThreadWord { .. }
+            | InlineOp::LoadClock64 { .. }
+            | InlineOp::StoreClock64 { .. }
+            | InlineOp::SmpDelayYield { .. } => None,
         }
     }
 

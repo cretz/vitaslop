@@ -85,7 +85,25 @@ pub fn writeback_fill_rows() -> Option<(usize, usize)> {
 /// TEMPORARY TELEMETRY (`VITASLOP_RTT_PROBE_LOG=1`): print every written-back target's
 /// texel(24,1) EVERY frame, not once. The trajectory of that value across frames is the input
 /// side of the feedback loop the writeback closes; a once-only line shows only its first step.
-fn probe_log(addr: u32) -> bool {
+/// An entry may also be a SIZE, `<w>x<h>`: a heap target's address moves from boot to boot (MLB's
+/// 32x32 exposure probe: 0x957a3950 in one phone run, 0x957a5050 in the next), its size does not.
+fn probe_log(addr: u32, w: u32, h: u32) -> bool {
+    static SIZES: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    let sizes = SIZES.get_or_init(|| {
+        vitaslop_platform::knobs::var("VITASLOP_RTT_PROBE_LOG")
+            .map(|v| {
+                v.split('+')
+                    .filter_map(|e| {
+                        let (a, b) = e.trim().split_once('x')?;
+                        Some((a.parse().ok()?, b.parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if sizes.contains(&(w, h)) {
+        return true;
+    }
     static SPEC: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
     let spec = SPEC.get_or_init(|| {
         let v = vitaslop_platform::knobs::var("VITASLOP_RTT_PROBE_LOG").ok()?;
@@ -95,15 +113,60 @@ fn probe_log(addr: u32) -> bool {
         }
         // `=1` is every target; anything else is a `+`-separated address list, because a
         // per-frame line for every target of every frame is a log nobody can read.
+        // Only sizes given: no address list at all (an EMPTY list means every target).
+        if v != "1" && v.split('+').all(|a| a.contains('x') && !a.trim().starts_with("0x")) {
+            return Some(vec![0]);
+        }
         Some(if v == "1" {
             Vec::new()
         } else {
-            v.split('+').filter_map(|a| u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect()
+            v.split('+')
+                .filter(|a| !a.contains('x') || a.trim().starts_with("0x"))
+                .filter_map(|a| u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok())
+                .collect()
         })
     });
     match spec {
         None => false,
         Some(list) => list.is_empty() || list.contains(&addr),
+    }
+}
+
+/// TEMPORARY TELEMETRY (`VITASLOP_RTT_PROBE_FIND=<rrggbb>[+<rrggbb>...]`): name every
+/// written-back target that CONTAINS one of those colours - with the first pixel found, how many
+/// match, and the frame. For "the guest took this colour from a pixel - which target is it" (MLB's
+/// load bake clears to (24,208,107)/255 on the phone and (38,46,68)/255 on the desktop).
+fn report_probe_find(addr: u32, w: u32, h: u32, rgba: &[u8]) {
+    static SPEC: std::sync::OnceLock<Vec<[u8; 3]>> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        vitaslop_platform::knobs::var("VITASLOP_RTT_PROBE_FIND")
+            .map(|v| {
+                v.split('+')
+                    .filter_map(|e| u32::from_str_radix(e.trim().trim_start_matches("0x"), 16).ok())
+                    .map(|c| [(c >> 16) as u8, (c >> 8) as u8, c as u8])
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if spec.is_empty() {
+        return;
+    }
+    for want in spec {
+        let mut first = None;
+        let mut n = 0usize;
+        for (i, px) in rgba[..(w * h * 4) as usize].chunks_exact(4).enumerate() {
+            if px[..3] == want[..] {
+                n += 1;
+                first.get_or_insert((i as u32 % w, i as u32 / w, px[3]));
+            }
+        }
+        if let Some((x, y, a)) = first {
+            tracing::info!(
+                target: "vitaslop::status",
+                "rtt probe: FIND {:02x}{:02x}{:02x} in {addr:#010x} {w}x{h} at ({x},{y}) alpha {a}, {n} pixel(s), f{}",
+                want[0], want[1], want[2], crate::sched::current_frame()
+            );
+        }
     }
 }
 
@@ -236,6 +299,7 @@ pub fn apply_one(
     if (w as usize) * (h as usize) * 4 > rgba.len() {
         return false;
     }
+    report_probe_find(addr, w, h, rgba);
     // The guest's own row pitch, which is not the target's width: a surface is allocated at
     // its STRIDE and a writeback that ignored it would shear every row after the first.
     let stride = c.stride_pixels.max(w) as usize * bpp;
@@ -276,10 +340,36 @@ pub fn apply_one(
         writeback_fingerprints().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
         return false;
     }
+    let row_bytes = cols * bpp;
+    // The WHOLE region under the parallel scheduler - see [`set_whole_region_guard`].
+    if whole_region_guard() {
+        let span = if rows == 0 { 0 } else { (rows - 1) * stride + row_bytes };
+        let cur = read(addr, span);
+        let ok = cur.len() >= span && {
+            let mut h = FNV_BASIS;
+            let mut uniform = true;
+            let first = cur.get(..4.min(row_bytes)).map(<[u8]>::to_vec).unwrap_or_default();
+            for y in 0..rows {
+                let r = &cur[y * stride..y * stride + row_bytes];
+                h = fnv_extend(h, r);
+                uniform &= r.len() % 4 == 0 && first.len() == 4 && r.chunks_exact(4).all(|w| w == first);
+            }
+            match region_hashes().lock().unwrap_or_else(|e| e.into_inner()).get(&addr) {
+                Some(&want) => h == want,
+                None => uniform,
+            }
+        };
+        if !ok {
+            report_writeback_recycled(addr, w, h);
+            writeback_fingerprints().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+            region_hashes().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+            return false;
+        }
+    }
     // TEMPORARY TELEMETRY. The per-frame form of the line below: the probe texel EVERY frame,
     // which is the input side of the feedback loop, plus the frame's own mean so the loop can
     // be read as a trajectory rather than a first step.
-    if probe_log(addr) {
+    if probe_log(addr, w, h) {
         let t = if w > 24 && h > 1 { &rgba[(w as usize + 24) * 4..(w as usize + 24) * 4 + 4] } else { &[][..] };
         let sum: u64 = rgba.iter().map(|b| *b as u64).sum();
         // Eight ROW means down the target (rgb only), so the readback answers for the whole
@@ -301,15 +391,29 @@ pub fn apply_one(
         // whose alpha is under 0.75 (`frag_90b70060`: `pf0.w - 0.75 >= 0` or `discard`), so
         // "how much of this target would pass that test" is the whole question for it and an
         // RGB mean cannot answer it. Reported as a PERCENTAGE of texels at or above 191/255.
+        // EVERY row's rgb mean, one hex byte each, for a narrow target (MLB's 64x512 ambient-cube
+        // atlas is written one 6-row band a frame, and eight sampled rows never land on the band).
+        let all_rows: String = if w <= 64 && h <= 512 {
+            (0..h as usize)
+                .map(|y| {
+                    let r = &rgba[y * row_bytes..((y + 1) * row_bytes).min(rgba.len())];
+                    let s: u64 = r.chunks_exact(4).map(|px| px[0] as u64 + px[1] as u64 + px[2] as u64).sum();
+                    format!("{:02x}", (s / (3 * w as u64).max(1)).min(255))
+                })
+                .collect()
+        } else {
+            String::new()
+        };
         let a_sum: u64 = rgba.chunks_exact(4).map(|px| px[3] as u64).sum();
         let a_px = (rgba.len() / 4).max(1) as u64;
         let a_hi = rgba.chunks_exact(4).filter(|px| px[3] >= 191).count();
         tracing::info!(
             target: "vitaslop::status",
-            "rtt probe: {addr:#010x} {w}x{h} texel(24,1)={t:?} mean={:.2} rows={rows:?} alpha_mean={:.1} alpha_ge_191={:.1}%",
+            "rtt probe: {addr:#010x} {w}x{h} texel(24,1)={t:?} mean={:.2} rows={rows:?} alpha_mean={:.1} alpha_ge_191={:.1}% f{} allrows={all_rows}",
             sum as f64 / rgba.len().max(1) as f64,
             a_sum as f64 / a_px as f64,
             100.0 * a_hi as f64 / a_px as f64,
+            crate::sched::current_frame(),
         );
     }
     if report_once(0x7100_0000_0000_0000 ^ addr as u64) {
@@ -323,6 +427,7 @@ pub fn apply_one(
     let constant = writeback_fill(addr).map(|t| t.repeat(cols));
     let band = writeback_fill_rows();
     let mut packed: Vec<u8> = Vec::new();
+    let mut written = FNV_BASIS;
     for y in 0..rows {
         let src = y * (w as usize) * 4;
         let filled = band.is_none_or(|(lo, hi)| y >= lo && y <= hi);
@@ -345,9 +450,162 @@ pub fn apply_one(
         if y == 0 {
             writeback_remember(addr, row, fp_bytes);
         }
+        written = fnv_extend(written, &row[..row_bytes.min(row.len())]);
         write(addr.wrapping_add((y * stride) as u32), row);
     }
+    if whole_region_guard() {
+        region_hashes().lock().unwrap_or_else(|e| e.into_inner()).insert(addr, written);
+    }
     true
+}
+
+/// >>> UNDER THE PARALLEL SCHEDULER, A WRITE-BACK CHECKS THE WHOLE REGION, NOT ITS FIRST ROW.
+///
+/// [`writeback_still_ours`] fingerprints the first row, because on the one-worker engine the
+/// guest is not running while pixels land and the recycling it guards against rewrites the
+/// start of a pooled block. Under `VITASLOP_SMP` other guest threads keep running while a
+/// readback is in flight, and MEASURED (PCSE00084, `bis25a`/`bis25b`, 4 of 5 runs trapped at
+/// frame ~1255): the guest reused a 128x64 target's memory from row 8 on as a structure, the
+/// first row still held our pixels, and the next write-back painted `0xff353535` over a saved
+/// return address - the render thread then jumped to it.
+///
+/// On, a write proceeds only if EVERY byte it would overwrite is either what this module last
+/// wrote there (a hash of the whole region, kept per address) or, at first sight, one repeated
+/// word (never written). Anything else is the guest's, and the write is dropped and reported.
+/// The parallel run turns this on at start; the default engine never does, so its runs are
+/// byte-identical to before.
+pub fn set_whole_region_guard(on: bool) {
+    WHOLE_REGION.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static WHOLE_REGION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn whole_region_guard() -> bool {
+    #[cfg(test)]
+    if TEST_WHOLE_REGION.with(|c| c.get()) {
+        return true;
+    }
+    WHOLE_REGION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// The guard for ONE test thread - the global flag would change every other test running in
+// the same process at the same time.
+#[cfg(test)]
+thread_local! {
+    static TEST_WHOLE_REGION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+mod whole_region_tests {
+    use super::*;
+
+    fn surface(addr: u32) -> ColorSurface {
+        ColorSurface {
+            format: 0,
+            surface_type: 0,
+            width: 16,
+            height: 16,
+            stride_pixels: 16,
+            data_addr: addr,
+            scale_mode: 0,
+            gamma: 0,
+        }
+    }
+
+    /// Write 16x16 RGBA8 at `addr` into `mem` (a flat buffer standing for guest memory).
+    fn write_back(mem: &mut Vec<u8>, addr: u32, px: u8) -> bool {
+        let c = surface(addr);
+        let rgba = vec![px; 16 * 16 * 4];
+        let snapshot = mem.clone();
+        apply_one(
+            addr,
+            16,
+            16,
+            &rgba,
+            &c,
+            &mut |a, n| {
+                let o = (a - addr) as usize;
+                snapshot[o..(o + n).min(snapshot.len())].to_vec()
+            },
+            &mut |a, b| {
+                let o = (a - addr) as usize;
+                mem[o..o + b.len()].copy_from_slice(b);
+            },
+        )
+    }
+
+    /// The PCSE00084 frame-1255 shape: the guest reuses a written-back target from row 8 on,
+    /// the first row still holds our pixels, and the next write-back must NOT land.
+    #[test]
+    fn a_target_recycled_past_its_first_row_is_not_written_back_under_smp() {
+        TEST_WHOLE_REGION.with(|c| c.set(true));
+        let addr = 0x9f00_0000;
+        let mut mem = vec![0u8; 16 * 16 * 4];
+        assert!(write_back(&mut mem, addr, 0x35), "an untouched (uniform) region is ours to write");
+        assert!(write_back(&mut mem, addr, 0x36), "a region holding only our last write is ours");
+        // The guest stores a pointer into row 8.
+        mem[8 * 64..8 * 64 + 4].copy_from_slice(&0x8123_4567u32.to_le_bytes());
+        assert!(!write_back(&mut mem, addr, 0x37), "a region the guest wrote into is the guest's");
+        assert_eq!(&mem[8 * 64..8 * 64 + 4], &0x8123_4567u32.to_le_bytes(), "and its bytes survive");
+        TEST_WHOLE_REGION.with(|c| c.set(false));
+    }
+
+    /// The negative control: WITHOUT the guard the first-row fingerprint passes the same
+    /// recycled region, and the write lands on the guest's pointer - the defect.
+    #[test]
+    fn without_the_guard_the_first_row_check_writes_over_a_recycled_row() {
+        let addr = 0x9f10_0000;
+        let mut mem = vec![0u8; 16 * 16 * 4];
+        assert!(write_back(&mut mem, addr, 0x35));
+        mem[8 * 64..8 * 64 + 4].copy_from_slice(&0x8123_4567u32.to_le_bytes());
+        assert!(write_back(&mut mem, addr, 0x37));
+        assert_ne!(&mem[8 * 64..8 * 64 + 4], &0x8123_4567u32.to_le_bytes());
+    }
+}
+
+/// How many bytes from a target's address a caller must read for [`apply_one`]'s probe: the
+/// first-row probe's 4096, or under [`set_whole_region_guard`] the whole region it will write.
+pub fn probe_len(w: u32, h: u32, c: &ColorSurface) -> usize {
+    if !whole_region_guard() {
+        return 4096;
+    }
+    let bpp = writeback_bytes_per_pixel(c.format).unwrap_or(4);
+    let stride = c.stride_pixels.max(w) as usize * bpp;
+    let rows = h.min(c.height) as usize;
+    let row_bytes = w.min(c.width) as usize * bpp;
+    let span = if rows == 0 { 0 } else { (rows - 1) * stride + row_bytes };
+    span.max(4096)
+}
+
+/// Per address, the hash of every byte the last write-back put there (whole-region guard).
+fn region_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<u32, u64>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u64>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Fold `bytes` into the whole-region hash - EIGHT BYTES A STEP.
+///
+/// This runs twice per write-back (the bytes there now, then the bytes written) over the whole
+/// target, INSIDE the stop-the-world pause that keeps every guest thread off the CPU - MEASURED
+/// on the phone at a baseball at-bat, the writes half of that pause was 0.89 ms a frame. One
+/// multiply per BYTE was 512K of them for a 256x256 target. Both sides of the comparison come
+/// from this one function, row by row over the same rows, so the hash only has to be a change
+/// detector that agrees with itself; the tail bytes of a row are folded one at a time.
+fn fnv_extend(mut h: u64, bytes: &[u8]) -> u64 {
+    let mut words = bytes.chunks_exact(8);
+    for w in &mut words {
+        h ^= u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]);
+        h = h.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h ^= h >> 29;
+    }
+    for b in words.remainder() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
 }
 
 /// The guest's bytes per pixel for a colour format this writeback can produce, or `None` for
@@ -537,7 +795,7 @@ fn decode_ten_bit_float(bits: u16) -> u8 {
 /// scenes use when rendering into it - the viewport offset/scale and the region clip the guest
 /// itself set, against the surface's own extent.
 fn report_probe_geometry(addr: u32, c: &ColorSurface, scenes: &[Scene]) {
-    if !probe_log(addr) {
+    if !probe_log(addr, c.width, c.height) {
         return;
     }
     let mut seen: Vec<String> = Vec::new();
@@ -1068,10 +1326,24 @@ mod tests {
 /// Whether `key` has NOT been reported before in this process - the once-per-fact gate a
 /// per-frame diagnostic goes through so a title that repeats a call every frame does not
 /// repeat its line. Keys are the caller's own (fact-space tag XOR the fact's fields).
+///
+/// Called on hot paths (a gamma setter ~300 times a frame, every guest poll), so a key this
+/// THREAD has already seen answers from a thread-local set with no lock; only a key new to the
+/// thread takes the global one, which keeps the once-per-process meaning exact.
 pub fn report_once(key: u64) -> bool {
-    use std::collections::HashSet;
+    use crate::fasthash::FxHashSet;
     use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
-    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(HashSet::new).insert(key)
+    thread_local! {
+        static LOCAL: std::cell::RefCell<FxHashSet<u64>> = std::cell::RefCell::new(FxHashSet::default());
+    }
+    if LOCAL.with(|l| l.borrow().contains(&key)) {
+        return false;
+    }
+    static SEEN: Mutex<Option<FxHashSet<u64>>> = Mutex::new(None);
+    let first = {
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(FxHashSet::default).insert(key)
+    };
+    LOCAL.with(|l| l.borrow_mut().insert(key));
+    first
 }

@@ -8335,3 +8335,46 @@ fn census_repeating_pack_destinations_live_or_dead() {
     }
     println!("\nslot={slot}: later pack iterations LIVE {live}, DEAD {dead}");
 }
+
+/// Time the translation of every pair a corpus links - the in-frame cost of a first draw -
+/// split by phase (`VITASLOP_LINK_PROFILE`). Reads the pairs from a
+/// `write_every_linked_pair_wgsl` output directory (each module's first line names its pair).
+///
+/// ```text
+/// VITASLOP_GXP_CORPUS=<dir> VITASLOP_GXP_WGSL_OUT=<that output> VITASLOP_LINK_PROFILE=1 \
+///   cargo test --release -p vitaslop-gxp-shader --test corpus -- --ignored --nocapture profile_linked_pairs
+/// ```
+#[test]
+#[ignore = "needs a corpus and a write_every_linked_pair_wgsl output dir"]
+fn profile_linked_pairs() {
+    let Some(dir) = corpus_dir() else { return };
+    let Some(out) = std::env::var_os("VITASLOP_GXP_WGSL_OUT") else { return };
+    let all: std::collections::HashMap<String, Vec<u8>> = blobs(&dir).into_iter().collect();
+    let mut pairs = Vec::new();
+    for e in std::fs::read_dir(&out).expect("read the output dir").flatten() {
+        let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+        let Some(first) = text.lines().next() else { continue };
+        let Some((f, v)) = first.trim_start_matches("// ").split_once(" linked with ") else { continue };
+        if let (Some(fb), Some(vb)) = (all.get(f), all.get(v)) {
+            pairs.push((vb.clone(), fb.clone()));
+        }
+    }
+    let t = std::time::Instant::now();
+    let mut ok = 0;
+    for (v, f) in &pairs {
+        if vitaslop_gxp_shader::link_programs(v, f).is_ok() {
+            ok += 1;
+        }
+    }
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let p: Vec<f64> = vitaslop_gxp_shader::link::LINK_PROFILE_US
+        .iter()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0)
+        .collect();
+    println!(
+        "{ok}/{} pairs linked in {ms:.0} ms ({:.2} ms each) | recompile both {:.0} ms, interface+plans {:.0}, emit bodies {:.0}, assemble module {:.0} (of which text post-passes {:.0}: strip {:.0}, sa-init {:.0}, half-regs {:.0}, bank-size {:.0}, fold {:.0})",
+        pairs.len(),
+        ms / pairs.len().max(1) as f64,
+        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]
+    );
+}

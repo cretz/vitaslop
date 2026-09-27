@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self'; media-src 'self' blob:; base-uri 'none'; form-action 'none'" />
+    <title>vitaslop runner - live run</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; color: #d8d8e0; font: 12px/1.3 ui-monospace, monospace; }
+      canvas { width: 100%; height: calc(100% - 3em); object-fit: contain; display: block; }
+      #status { position: absolute; left: 0; right: 0; bottom: 0; height: 3em; overflow: hidden; padding: 0 4px; }
+    </style>
+  </head>
+  <body>
+    <canvas id="screen" width="960" height="544"></canvas>
+    <div id="status">waiting for the job...</div>
+    <!-- live.html - the runner's LIVE job: the installed title, played by a recipe, on this
+         device, exactly as the product page runs it (the settings record's knobs, the same
+         run/transpile workers, a real on-page canvas), and its diagnostics posted back.
+
+         >>> WHY A PAGE AND NOT A JOB WORKER. A live run needs a canvas the compositor shows
+         (an unattached OffscreenCanvas presents to nothing, and present pacing is part of what
+         is being measured) and it spawns workers of its own. runner.js mounts this page in an
+         iframe for a job of kind "live" and hands it the job by postMessage; the page answers
+         with {type:"progress"} and one {type:"result"}.
+
+         The run ENDS by itself: at `params.stopFrame` (or when the SMP timeline has printed,
+         if `params.waitTrace`), the page collects the diagnostics panel, the perf and fps
+         lines, every note (the SMP timeline arrives as notes - see worker.js) and posts them. -->
+    <script type="module" src="./live.js"></script>
+  </body>
+</html>

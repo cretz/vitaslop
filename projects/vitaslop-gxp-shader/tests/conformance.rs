@@ -1842,8 +1842,12 @@ fn case_imad() -> Case {
                 (0, a),
                 (1, b),
                 (2, d),
-                (4, lo_u.wrapping_mul(b).wrapping_add(d)),
-                (5, lo_s.wrapping_mul(b as i32).wrapping_add(d as i32) as u32),
+                // src1_high CLEAR reads src1's LOW half (sign-extended when signed), not the
+                // whole register: MEASURED on MLB's shadow skinning, where two bone indices share
+                // one register (`wgsl::emit_int_mad`). This case predated that and expected the
+                // whole-register read; `VITASLOP_GXP_IMAD_SRC1_WHOLE=1` is still that reading.
+                (4, lo_u.wrapping_mul(b & 0xffff).wrapping_add(d)),
+                (5, lo_s.wrapping_mul((b & 0xffff) as u16 as i16 as i32).wrapping_add(d as i32) as u32),
                 (6, (a >> 16).wrapping_mul(9).wrapping_add(d)),
                 (7, lo_u.wrapping_mul(b >> 16).wrapping_add(3)),
                 (9, a.wrapping_mul(b).wrapping_add(d)),

@@ -38,6 +38,11 @@ fn walk(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
             let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
             let path = entry.path();
             if entry.file_type().map_err(|e| format!("file type: {e}"))?.is_dir() {
+                // The compile cache lives in the game directory but is not the game's: the
+                // guest must never see it as one of its files.
+                if dir == root && entry.file_name() == vitaslop_native::compile_cache::DIR {
+                    continue;
+                }
                 stack.push(path);
             } else {
                 let rel = path

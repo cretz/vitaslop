@@ -131,10 +131,14 @@ pub enum StmtKind {
     ShiftRegFlags,
     /// Arming or clearing the exclusive monitor (`LDREX`/`STREX`).
     ExclSet,
+    /// An SMP build's atomic exclusive access or `CLREX` (`LoadExcl`/`StoreExcl`/`ClearExcl`).
+    Exclusive,
+    /// An SMP build's memory barrier.
+    Fence,
 }
 
 impl StmtKind {
-    pub const COUNT: usize = 20;
+    pub const COUNT: usize = 22;
 
     pub const ALL: [StmtKind; Self::COUNT] = [
         StmtKind::SetReg,
@@ -157,6 +161,8 @@ impl StmtKind {
         StmtKind::Sel,
         StmtKind::ShiftRegFlags,
         StmtKind::ExclSet,
+        StmtKind::Exclusive,
+        StmtKind::Fence,
     ];
 
     /// Exhaustive over [`Stmt`] on purpose - a new variant must be given a category here
@@ -168,6 +174,8 @@ impl StmtKind {
             Stmt::FlagsAdd { .. } => StmtKind::FlagsAdd,
             Stmt::FlagsLogic { .. } => StmtKind::FlagsLogic,
             Stmt::ExclSet(..) => StmtKind::ExclSet,
+            Stmt::LoadExcl { .. } | Stmt::StoreExcl { .. } | Stmt::ClearExcl => StmtKind::Exclusive,
+            Stmt::Fence => StmtKind::Fence,
             Stmt::Svc(..) => StmtKind::Svc,
             Stmt::Import(..) => StmtKind::Import,
             Stmt::Rbit { .. } => StmtKind::Rbit,
@@ -211,6 +219,8 @@ impl StmtKind {
             StmtKind::Sel => "sel",
             StmtKind::ShiftRegFlags => "shift-reg-flags",
             StmtKind::ExclSet => "excl-set",
+            StmtKind::Exclusive => "exclusive (smp)",
+            StmtKind::Fence => "fence (smp)",
         }
     }
 }
@@ -782,6 +792,15 @@ fn shift_by_host_off(i: &W) -> Option<W<'static>> {
         W::I64Store32(m) => W::I64Store32(s(m)),
         W::V128Load(m) => W::V128Load(s(m)),
         W::V128Store(m) => W::V128Store(s(m)),
+        // The SMP exclusive forms (`emit_load_excl` / `emit_store_excl`).
+        W::I32AtomicLoad(m) => W::I32AtomicLoad(s(m)),
+        W::I32AtomicLoad8U(m) => W::I32AtomicLoad8U(s(m)),
+        W::I32AtomicLoad16U(m) => W::I32AtomicLoad16U(s(m)),
+        W::I64AtomicLoad(m) => W::I64AtomicLoad(s(m)),
+        W::I32AtomicRmwCmpxchg(m) => W::I32AtomicRmwCmpxchg(s(m)),
+        W::I32AtomicRmw8CmpxchgU(m) => W::I32AtomicRmw8CmpxchgU(s(m)),
+        W::I32AtomicRmw16CmpxchgU(m) => W::I32AtomicRmw16CmpxchgU(s(m)),
+        W::I64AtomicRmwCmpxchg(m) => W::I64AtomicRmwCmpxchg(s(m)),
         W::MemoryCopy { .. } | W::MemoryFill(_) | W::MemoryInit { .. } => {
             // Stack-addressed: shifted at the site with `emit_host_off`, never here.
             return None;
@@ -974,7 +993,10 @@ fn store_extent(s: &Stmt) -> Option<(u8, i32, i32)> {
 /// mostly to SCATTERED addresses.
 fn plan_dirty_run(f: &mut Body, stmts: &[Stmt]) -> Vec<bool> {
     let mut out = vec![false; stmts.len()];
-    let on = dirty_run_marks();
+    // NOT under SMP: the argument below needs the epoch to be unable to move inside a run, and
+    // with guest threads on other workers the HOST can bump it (at a present) while this run
+    // executes. Every store then carries its own mark, read at its own moment.
+    let on = dirty_run_marks() && !smp();
     // The lowest address stamped by the run so far, as `(base register, offset)`.
     let mut anchor: Option<(u8, i32)> = None;
     for (i, s) in stmts.iter().enumerate() {
@@ -1520,6 +1542,38 @@ pub fn set_track_pc(on: bool) {
     TRACK_PC.with(|c| c.set(Some(on)));
 }
 
+/// `VITASLOP_GUEST_PROF`: mark the guest function each SMP worker is executing - see
+/// [`abi::SMP_PROF_SLOT_OFFSET`]. Emit-time, so it is set on the transpiling worker; off, the
+/// module is byte-for-byte the unprofiled one.
+pub fn set_guest_prof(on: bool) {
+    GUEST_PROF.with(|c| c.set(on));
+}
+
+fn guest_prof() -> bool {
+    GUEST_PROF.with(|c| c.get()) && smp()
+}
+
+/// One profile mark: this worker's guest-function slot := `addr`. Untolled - bookkeeping the
+/// game clock must not be billed for.
+fn emit_prof_mark(f: &mut Body, addr: u32) {
+    if !guest_prof() {
+        return;
+    }
+    let Some(base) = PROF_PREEMPT_BASE.with(|c| c.get()) else { return };
+    // slot = base + 4*OFFSET + 4*STRIDE*w, with w recovered from this instance's preempt pointer
+    // (`base + 4*w`). Masked so an instance not yet pointed (the "never" word below the base)
+    // still lands inside the mirror block instead of trapping.
+    f.untolled(&W::GlobalGet(PREEMPT_GLOBAL));
+    f.untolled(&W::I32Const(base as i32));
+    f.untolled(&W::I32Sub);
+    f.untolled(&W::I32Const(0xff));
+    f.untolled(&W::I32And);
+    f.untolled(&W::I32Const(abi::SMP_PROF_SLOT_STRIDE.trailing_zeros() as i32));
+    f.untolled(&W::I32Shl);
+    f.untolled(&W::I32Const(addr as i32));
+    f.untolled(&W::I32Store(MemArg { offset: base + 4 * u64::from(abi::SMP_PROF_SLOT_OFFSET), align: 2, memory_index: 0 }));
+}
+
 /// Function indices of the host imports (imports occupy the low function-index
 /// space, in declaration order).
 const SVC_FUNC: u32 = 0;
@@ -1799,6 +1853,16 @@ fn emit_fuel_check(f: &mut Body) {
     f.untolled(&W::I64And);
     f.untolled(&W::I64Const(i64::from(n)));
     f.untolled(&W::I64GeU);
+    if smp() {
+        // ...OR another worker asked this one for its CPU back - see `PREEMPT_GLOBAL`. A plain
+        // load: the word only ever goes 0 -> 1 behind this thread's back, and seeing the 1 a
+        // few iterations late costs a few iterations.
+        f.untolled(&W::GlobalGet(PREEMPT_GLOBAL));
+        f.untolled(&W::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.untolled(&W::I32Const(0));
+        f.untolled(&W::I32Ne);
+        f.untolled(&W::I32Or);
+    }
     f.untolled(&W::If(BlockType::Empty));
     f.untolled(&W::I32Const(abi::FUEL_SELECTOR as i32));
     f.untolled(&W::Call(IMPORT_FUNC));
@@ -2322,6 +2386,79 @@ thread_local! {
     static EXCL_OFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// >>> SMP CODEGEN, and the SHARED host memory it needs. Both thread-local for the reason
+// `FUEL_INTERVAL` is: emission is per thread, and a test binary emits several modules at
+// once on several threads.
+//
+// `SHARED_HOST_MEMORY` is a property of the HOST BUNDLE, not of the run: a host built with
+// wasm threads has a `shared` linear memory, and an import of it must say `shared` (and give a
+// maximum) or instantiation fails. It changes nothing the guest can observe.
+//
+// `SMP` is the run's choice (`VITASLOP_SMP=1`): several guest threads execute AT ONCE on
+// several workers over one memory. That makes three things this emitter otherwise assumes
+// untrue - a monitor in one shared word, a barrier that does nothing, and a dirty-mark run
+// whose epoch cannot move underneath it - and each is emitted differently under it. Off, the
+// module is byte-for-byte what it was.
+thread_local! {
+    static SHARED_HOST_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Declare that the host memory a `host_off` module imports is a SHARED memory (a wasm
+/// threads build). See [`SHARED_HOST_MEMORY`].
+pub fn set_shared_host_memory(on: bool) {
+    SHARED_HOST_MEMORY.with(|c| c.set(on));
+}
+
+/// Emit modules on this thread for PARALLEL guest execution. See [`SMP`]. Implies nothing
+/// about the memory's sharedness - that is [`set_shared_host_memory`] - but is useless
+/// without it, so [`emit_module`] refuses the combination.
+pub fn set_smp(on: bool) {
+    SMP.with(|c| c.set(on));
+}
+
+/// Whether modules emitted on this thread are SMP builds - see [`set_smp`].
+pub fn smp() -> bool {
+    SMP.with(|c| c.get())
+}
+
+fn shared_host_memory() -> bool {
+    SHARED_HOST_MEMORY.with(|c| c.get())
+}
+
+/// The largest memory a wasm32 shared import may be given: 4 GiB. The host declares its own
+/// maximum (the threads bundle links with `--max-memory=4294967296`), and an import's maximum
+/// must be at least the provided memory's, so the import states the architectural ceiling.
+const SHARED_MEMORY_MAX_PAGES: u64 = 65_536;
+
+/// >>> THE PER-INSTANCE EXCLUSIVE MONITOR of an SMP build: three globals appended after the
+/// work counter (so no existing index moves), present ONLY in an SMP module.
+///
+/// `EXCL_ADDR` is the guest address the last `LDREX` armed (0 = none), `EXCL_VAL` the 32-bit
+/// value it read, `EXCL_VAL64` the doubleword `LDREXD` read. Per instance = per guest thread,
+/// which is what the ARM LOCAL monitor is; the one shared mirror word the non-SMP build uses
+/// would let one worker's `LDREX` arm or spend another's.
+const EXCL_ADDR_GLOBAL: u32 = abi::WORK_GLOBAL + 1;
+const EXCL_VAL_GLOBAL: u32 = abi::WORK_GLOBAL + 2;
+const EXCL_VAL64_GLOBAL: u32 = abi::WORK_GLOBAL + 3;
+/// >>> SMP ONLY: the LAYOUT offset of this instance's worker's PREEMPT word, exported as
+/// [`abi::PREEMPT_EXPORT`]. The back-edge fuel check also yields when that word is non-zero,
+/// which is how another worker takes the CPU back from a thread mid-loop: the frame gate
+/// closing, or a higher-priority thread becoming runnable on the same worker. Without it such
+/// a thread gives the worker up only when its fuel runs out - MEASURED 4-5 ms of every frame
+/// waiting on spinning threads to notice the frame had ended.
+///
+/// The word lives in the host-mirror page, above every mirrored slot and the kernel mutex
+/// table ([`abi::PREEMPT_SLOT_BASE`] + worker), so an address in the layout reaches it through
+/// the ordinary host-offset shift. Initialised to a slot no worker ever sets, so an instance
+/// the host has not pointed yet never yields on it.
+const PREEMPT_GLOBAL: u32 = abi::WORK_GLOBAL + 4;
+/// >>> SMP ONLY: the per-instance thread words and elided-yield counter - see
+/// `InlineOp::ThreadWord` / `InlineOp::SmpDelayYield`. Set by the host before every resume.
+const THREAD_ID_GLOBAL: u32 = abi::WORK_GLOBAL + 5;
+const CUR_THREAD_GLOBAL: u32 = abi::WORK_GLOBAL + 6;
+const ELIDE_GLOBAL: u32 = abi::WORK_GLOBAL + 7;
+
 /// Assemble the full wasm module for `funcs`. `func_index` maps a guest function
 /// address to its wasm function index. `mem_bytes` sizes the guest linear memory;
 /// `base` is the guest image base for the address rebase.
@@ -2415,6 +2552,7 @@ pub fn emit_module(
     }
     let mirror_off =
         mirror_slots.map(|_| (guest_pages + addr_table_pages) * abi::PAGE_SIZE as u64);
+    PROF_PREEMPT_BASE.with(|c| c.set(mirror_off.map(|m| m + 4 * u64::from(abi::PREEMPT_SLOT_BASE))));
     // ONE diagnostics page carries both the "armed" word (+0) and the store-watchpoint match
     // counter (+4). It is allocated when EITHER is wanted, so a watchpoint gets a counter in
     // SHARED memory even without a frame gate - see `WATCH_COUNT_OFF` for why a wasm global
@@ -2488,21 +2626,27 @@ pub fn emit_module(
     // `env.import_fast(selector)`: the same trap as `env.import` for a NID the host has
     // named as never suspending - see `InlineOp::Fast`. Function index `IMPORT_FAST_FUNC`.
     imports.import(abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME, wasm_encoder::EntityType::Function(host_ty));
+    // An SMP module is still a valid module over an UNSHARED memory (wasm atomics are defined
+    // on one), which is what lets the single-threaded ARM conformance corpus run it to prove the
+    // exclusive forms equal to the oracle. Running it on several workers needs a shared memory,
+    // and that is the web host's check to make, not the emitter's.
     if import_memory && host_off != 0 {
         // >>> THE GUEST REGION INSIDE THE HOST'S OWN MEMORY (see `Program::host_off`).
-        // The memory is the host module's, so it is neither shared nor fixed - it grows
-        // with the host's heap. The minimum declared is the end of the guest layout, so
-        // instantiation fails by name if the host has not reserved that far; no maximum,
-        // because the host's memory declares none.
+        // The memory is the host module's, so it is not fixed - it grows with the host's
+        // heap. The minimum declared is the end of the guest layout, so instantiation fails
+        // by name if the host has not reserved that far. An unshared host memory declares no
+        // maximum, so neither does the import; a SHARED one (the wasm-threads bundle) must
+        // declare one, and so must its import - see `SHARED_HOST_MEMORY`.
         let end_pages = (host_off as u64 + total_pages * abi::PAGE_SIZE as u64).div_ceil(abi::PAGE_SIZE as u64);
+        let shared = shared_host_memory();
         imports.import(
             abi::IMPORT_MODULE,
             abi::MEMORY_EXPORT,
             wasm_encoder::EntityType::Memory(MemoryType {
                 minimum: end_pages,
-                maximum: None,
+                maximum: shared.then_some(SHARED_MEMORY_MAX_PAGES),
                 memory64: false,
-                shared: false,
+                shared,
                 page_size_log2: None,
             }),
         );
@@ -2596,6 +2740,19 @@ pub fn emit_module(
     // is at the START of its quantum rather than needing to be seeded with one.
     let i64_global = GlobalType { val_type: ValType::I64, mutable: true, shared: false };
     globals.global(i64_global, &ConstExpr::i64_const(0)); // WORK_GLOBAL
+    if smp() {
+        // The per-instance exclusive monitor - see `EXCL_ADDR_GLOBAL`.
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // EXCL_ADDR_GLOBAL
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // EXCL_VAL_GLOBAL
+        globals.global(i64_global, &ConstExpr::i64_const(0)); // EXCL_VAL64_GLOBAL
+        // The preempt word's layout offset - see `PREEMPT_GLOBAL`. The mirror page exists in
+        // every build, so the "never set" slot is always a real, zero word.
+        let never = mirror_off.map_or(0, |m| m + 4 * u64::from(abi::PREEMPT_SLOT_BASE - 1));
+        globals.global(i32_global, &ConstExpr::i32_const(never as i32)); // PREEMPT_GLOBAL
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // THREAD_ID_GLOBAL
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // CUR_THREAD_GLOBAL
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // ELIDE_GLOBAL
+    }
 
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_EXPORT, ExportKind::Memory, 0);
@@ -2627,6 +2784,12 @@ pub fn emit_module(
     // left. Always exported (like `guest_pc`) so the export list does not depend on a
     // build option; it reads 0 and never moves unless fuel was asked for.
     exports.export(abi::FUEL_EXPORT, ExportKind::Global, abi::WORK_GLOBAL);
+    if smp() {
+        exports.export(abi::PREEMPT_EXPORT, ExportKind::Global, PREEMPT_GLOBAL);
+        exports.export(abi::THREAD_ID_EXPORT, ExportKind::Global, THREAD_ID_GLOBAL);
+        exports.export(abi::CUR_THREAD_EXPORT, ExportKind::Global, CUR_THREAD_GLOBAL);
+        exports.export(abi::ELIDE_EXPORT, ExportKind::Global, ELIDE_GLOBAL);
+    }
 
     // Populate the dense funcref table: table[i] = the i-th translated function
     // (wasm index IMPORT_FUNCS + i), matching the ascending-address order of `funcs`
@@ -2816,6 +2979,16 @@ fn emit_reset() -> Function {
     // that carried its operator half would preempt the new thread almost immediately.
     f.instruction(&W::I64Const(0));
     f.instruction(&W::GlobalSet(abi::WORK_GLOBAL));
+    // An SMP build's per-instance monitor: a reused instance must not carry the previous
+    // thread's armed `LDREX` into the next thread's first `STREX`.
+    if smp() {
+        f.instruction(&W::I32Const(0));
+        f.instruction(&W::GlobalSet(EXCL_ADDR_GLOBAL));
+        f.instruction(&W::I32Const(0));
+        f.instruction(&W::GlobalSet(EXCL_VAL_GLOBAL));
+        f.instruction(&W::I64Const(0));
+        f.instruction(&W::GlobalSet(EXCL_VAL64_GLOBAL));
+    }
     f.instruction(&W::End);
     f
 }
@@ -3092,6 +3265,11 @@ thread_local! {
     static NEON_CACHE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Per-thread override of guest-PC tracking - see [`set_track_pc`].
     static TRACK_PC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// See [`set_guest_prof`].
+    static GUEST_PROF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The layout offset of worker 0's preempt word for the module being emitted - see
+    /// `emit_prof_mark`. Set by `emit_module` once the mirror block is placed.
+    static PROF_PREEMPT_BASE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     /// Per-thread override of the block-trace ranges - see [`set_trace_blocks`].
     static TRACE_BLOCKS: std::cell::RefCell<Option<Vec<(u32, u32)>>> =
         const { std::cell::RefCell::new(None) };
@@ -3142,6 +3320,41 @@ pub fn set_promote_registers(on: bool) {
     PROMOTE_REGS.with(|c| c.set(Some(on)));
 }
 
+/// Every emit setting this thread will transpile under, RESOLVED (a knob left unset reads as
+/// the value its default gives), as one string. The browser's transpile cache names a stored
+/// module by the BUILD it came from plus this (see vitaslop-web's README): the same build
+/// transpiling the same title under an equal fingerprint emits the same bytes, and a run with
+/// an instrumentation knob (the guest profiler, the block tracer) never gets a module built
+/// without it. A setting added to this file must be added here too.
+pub fn codegen_fingerprint() -> String {
+    use std::fmt::Write;
+    let mut s = format!(
+        "dirty{};runmarks{};names{};pc{};prof{};fuel{};widec{};dispatchall{};shared{};smp{};neon{};promote{}",
+        u8::from(dirty_tracking()),
+        u8::from(dirty_run_marks()),
+        u8::from(emit_wasm_names()),
+        u8::from(track_pc()),
+        u8::from(guest_prof()),
+        fuel_interval(),
+        u8::from(flags_wide_c()),
+        u8::from(dispatch_all()),
+        u8::from(shared_host_memory()),
+        u8::from(smp()),
+        u8::from(neon_cache()),
+        u8::from(promote_registers()),
+    );
+    let blocks = trace_blocks_ranges();
+    if !blocks.is_empty() {
+        let _ = write!(s, ";trace{blocks:x?}");
+    }
+    for name in EMIT_KNOBS_OVERRIDABLE {
+        if let Ok(v) = emit_var(name) {
+            let _ = write!(s, ";{name}={v}");
+        }
+    }
+    s
+}
+
 /// `VITASLOP_PROMOTE_POISON=<n>` - the FALSIFIER for register promotion. While a
 /// register is held in its local, store this constant into its global, so a read that
 /// should have gone to the local returns something impossible rather than merely stale.
@@ -3172,6 +3385,8 @@ fn emit_func_body(
         f.instruction(&W::End);
         return f;
     }
+
+    emit_prof_mark(&mut f, func.addr);
 
     // Diagnostic entry tracer (opt-in): announce this function's entry to the host
     // `svc` handler, which logs the address and incoming argument registers. Emitted
@@ -3804,6 +4019,17 @@ fn emit_stmt_inner(
             emit_value(f, value, base);
             f.instruction(&W::I32Store(MemArg { offset: EXCL_OFF.with(|c| c.get()), align: 2, memory_index: 0 }));
         }
+        Stmt::LoadExcl { rt, rt2, addr, size } => emit_load_excl(f, *rt, *rt2, addr, *size, base),
+        Stmt::StoreExcl { rd, rt, rt2, addr, size } => {
+            emit_store_excl(f, *rd, *rt, *rt2, addr, *size, base)
+        }
+        Stmt::ClearExcl => {
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(EXCL_ADDR_GLOBAL));
+        }
+        Stmt::Fence => {
+            f.instruction(&W::AtomicFence);
+        }
         Stmt::Svc(imm) => {
             f.instruction(&W::I32Const(*imm as i32));
             f.instruction(&W::Call(SVC_FUNC));
@@ -3885,6 +4111,7 @@ fn emit_stmt_inner(
             match func_index.get(target) {
                 Some(&idx) => {
                     f.instruction(&W::Call(idx));
+                    emit_prof_mark(f, func_addr);
                 }
                 None => {
                     f.instruction(&W::Unreachable);
@@ -3912,6 +4139,7 @@ fn emit_stmt_inner(
                     f.instruction(&W::LocalGet(L_T0)); // target
                     f.instruction(&W::I32Const(func_addr as i32)); // caller
                     f.instruction(&W::Call(dispatch));
+                    emit_prof_mark(f, func_addr);
                 }
                 // `bx rN` tail call: lr is untouched.
                 None => {
@@ -6973,6 +7201,114 @@ fn emit_addr(f: &mut Body, addr: &Value, base: u32) {
     }
 }
 
+/// The `MemArg` of an atomic access. Atomics REQUIRE natural alignment in the immediate
+/// (`align` = log2 of the width) and trap on a misaligned address at run time - which is also
+/// what an ARM exclusive access to a misaligned address does (an alignment fault).
+fn atomic_arg(align: u32) -> MemArg {
+    MemArg { offset: 0, align, memory_index: 0 }
+}
+
+/// SMP `LDREX{,B,H,D}` - see [`Stmt::LoadExcl`]. Arms this instance's monitor with the GUEST
+/// address and the value read, then writes the destination register(s).
+fn emit_load_excl(f: &mut Body, rt: u8, rt2: Option<u8>, addr: &Value, size: MemSize, base: u32) {
+    emit_addr(f, addr, base);
+    f.instruction(&W::LocalTee(L_T0));
+    f.instruction(&W::I32Const(base as i32));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::GlobalSet(EXCL_ADDR_GLOBAL));
+    f.instruction(&W::LocalGet(L_T0));
+    match rt2 {
+        None => {
+            f.instruction(&match size {
+                MemSize::Byte => W::I32AtomicLoad8U(atomic_arg(0)),
+                MemSize::Half => W::I32AtomicLoad16U(atomic_arg(1)),
+                MemSize::Word => W::I32AtomicLoad(atomic_arg(2)),
+            });
+            f.instruction(&W::LocalTee(L_T1));
+            f.instruction(&W::GlobalSet(EXCL_VAL_GLOBAL));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::GlobalSet(abi::reg_global(rt as usize)));
+        }
+        Some(rt2) => {
+            // One 64-bit atomic load: `LDREXD` is single-copy atomic on ARM, and two word
+            // loads would let a concurrent `STREXD` tear the pair between them.
+            f.instruction(&W::I64AtomicLoad(atomic_arg(3)));
+            f.instruction(&W::LocalTee(L_D64));
+            f.instruction(&W::GlobalSet(EXCL_VAL64_GLOBAL));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::GlobalSet(abi::reg_global(rt as usize)));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I64Const(32));
+            f.instruction(&W::I64ShrU);
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::GlobalSet(abi::reg_global(rt2 as usize)));
+        }
+    }
+}
+
+/// SMP `STREX{,B,H,D}` - see [`Stmt::StoreExcl`]. A compare-and-swap against the value the
+/// arming `LDREX` read, taken only when this instance's monitor holds THIS address; `rd` gets
+/// ARM's status (0 stored, 1 refused) and the monitor is spent either way.
+///
+/// The page is dirty-marked BEFORE the attempt and whether or not it succeeds: a refused store
+/// leaves the bytes as they were, so the extra stamp costs at most one redundant upload, while
+/// a stamp taken only on success would have to be emitted inside the branch for no gain.
+fn emit_store_excl(
+    f: &mut Body,
+    rd: u8,
+    rt: u8,
+    rt2: Option<u8>,
+    addr: &Value,
+    size: MemSize,
+    base: u32,
+) {
+    emit_addr(f, addr, base);
+    emit_dirty_mark(f, L_DIRTY);
+    f.instruction(&W::LocalSet(L_T0));
+    f.instruction(&W::GlobalGet(EXCL_ADDR_GLOBAL));
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Const(base as i32));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::I32Eq);
+    f.instruction(&W::If(BlockType::Result(ValType::I32)));
+    f.instruction(&W::LocalGet(L_T0));
+    match rt2 {
+        None => {
+            f.instruction(&W::GlobalGet(EXCL_VAL_GLOBAL));
+            f.instruction(&W::GlobalGet(abi::reg_global(rt as usize)));
+            f.instruction(&match size {
+                MemSize::Byte => W::I32AtomicRmw8CmpxchgU(atomic_arg(0)),
+                MemSize::Half => W::I32AtomicRmw16CmpxchgU(atomic_arg(1)),
+                MemSize::Word => W::I32AtomicRmwCmpxchg(atomic_arg(2)),
+            });
+            // The narrow forms return the old value ZERO-EXTENDED, and the arming load was
+            // zero-extending too, so the two compare as whole words.
+            f.instruction(&W::GlobalGet(EXCL_VAL_GLOBAL));
+            f.instruction(&W::I32Ne);
+        }
+        Some(rt2) => {
+            f.instruction(&W::GlobalGet(EXCL_VAL64_GLOBAL));
+            f.instruction(&W::GlobalGet(abi::reg_global(rt2 as usize)));
+            f.instruction(&W::I64ExtendI32U);
+            f.instruction(&W::I64Const(32));
+            f.instruction(&W::I64Shl);
+            f.instruction(&W::GlobalGet(abi::reg_global(rt as usize)));
+            f.instruction(&W::I64ExtendI32U);
+            f.instruction(&W::I64Or);
+            f.instruction(&W::I64AtomicRmwCmpxchg(atomic_arg(3)));
+            f.instruction(&W::GlobalGet(EXCL_VAL64_GLOBAL));
+            f.instruction(&W::I64Ne);
+        }
+    }
+    f.instruction(&W::Else);
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::End);
+    f.instruction(&W::GlobalSet(abi::reg_global(rd as usize)));
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::GlobalSet(EXCL_ADDR_GLOBAL));
+}
+
 fn emit_value(f: &mut Body, v: &Value, base: u32) {
     match v {
         Value::Imm(x) => {
@@ -7292,6 +7628,14 @@ enum InlineLowering {
     /// r0, then set r0 = 0. Guarded on the pointer, which must admit an EIGHT-byte
     /// store rather than the usual four.
     MirrorStorePair { off: u64, limit: u32 },
+    /// SMP: r0 = an instance global (`InlineOp::ThreadWord`).
+    SmpGlobal { global: u32 },
+    /// SMP: r0:r1 = one atomic 64-bit load at `off` (`InlineOp::LoadClock64`).
+    SmpClock64 { off: u64 },
+    /// SMP: `*(u64 *)r0` = the same, r0 = 0 (`InlineOp::StoreClock64`).
+    SmpStoreClock64 { off: u64, limit: u32 },
+    /// SMP: the elided yield over the worker's runnable word and the instance counter.
+    SmpDelayYield { cap: u32 },
     /// Store r1 at `r0 + offset` and set r0 = 0. Guarded on the pointer exactly like the
     /// reading forms; a rejected pointer runs the handler, which keeps defining what
     /// writing through it means.
@@ -7423,6 +7767,23 @@ impl InlineImports {
             crate::InlineOp::RetConst { value } => Some(InlineLowering::RetConst { value }),
             crate::InlineOp::Nop => Some(InlineLowering::Nop),
             crate::InlineOp::Fast => Some(InlineLowering::Fast),
+            // The SMP forms (see each `InlineOp`). The block is unconditional, so its offset
+            // is always there for the clock words and the runnable word's pointer.
+            crate::InlineOp::ThreadWord { cur } => Some(InlineLowering::SmpGlobal {
+                global: if cur { CUR_THREAD_GLOBAL } else { THREAD_ID_GLOBAL },
+            }),
+            crate::InlineOp::LoadClock64 { rtc } => {
+                let base = self.mirror_off.expect("SMP clock op emitted with no mirror block");
+                let slot = if rtc { abi::SMP_RTC64_SLOT } else { abi::SMP_CLOCK64_SLOT };
+                Some(InlineLowering::SmpClock64 { off: base + slot as u64 * 4 })
+            }
+            crate::InlineOp::StoreClock64 { rtc } => {
+                let base = self.mirror_off.expect("SMP clock op emitted with no mirror block");
+                let slot = if rtc { abi::SMP_RTC64_SLOT } else { abi::SMP_CLOCK64_SLOT };
+                let limit = self.mem_bytes.checked_sub(8)?;
+                Some(InlineLowering::SmpStoreClock64 { off: base + slot as u64 * 4, limit })
+            }
+            crate::InlineOp::SmpDelayYield { cap } => Some(InlineLowering::SmpDelayYield { cap }),
             crate::InlineOp::LoadMirror { slot } => {
                 // The block is reserved by the same layout pass that fills `mirror_off`
                 // from these very ops, so a mirror op without a block is a bug here, not
@@ -7897,6 +8258,87 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.untolled(&W::I32Const(0));
             f.untolled(&W::GlobalSet(abi::reg_global(0)));
             f.untolled(&W::Else);
+            f.untolled(&W::I32Const(index as i32));
+            f.untolled(&W::Call(IMPORT_FUNC));
+            f.untolled(&W::End);
+            f.charge_unbilled_work(mark);
+            return;
+        }
+        Some(InlineLowering::SmpGlobal { global }) => {
+            f.instruction(&W::GlobalGet(global));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            return;
+        }
+        Some(InlineLowering::SmpClock64 { off }) => {
+            // ONE aligned atomic 64-bit load, split into the EABI pair r0 (low) : r1 (high).
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I64AtomicLoad(MemArg { offset: off, align: 3, memory_index: 0 }));
+            f.instruction(&W::LocalTee(L_D64));
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I64Const(32));
+            f.instruction(&W::I64ShrU);
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::GlobalSet(abi::reg_global(1)));
+            return;
+        }
+        Some(InlineLowering::SmpStoreClock64 { off, limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            emit_watch_store_inline(f, base, L_T0, 0, 8, index);
+            // The guest pointer carries no alignment guarantee, so the STORE is two words -
+            // it writes guest memory the guest owns, where a torn write is the guest's own
+            // race. The LOAD is what must be single-copy atomic, and it is.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I64AtomicLoad(MemArg { offset: off, align: 3, memory_index: 0 }));
+            f.instruction(&W::LocalSet(L_D64));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::I32Store(mem_arg()));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I64Const(32));
+            f.instruction(&W::I64ShrU);
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::I32Store(MemArg { offset: 4, align: 0, memory_index: 0 }));
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::End);
+            return;
+        }
+        Some(InlineLowering::SmpDelayYield { cap }) => {
+            // if (r0 <= 1 && runnable[my worker] == 0 && elide < cap) { elide++; r0 = 0 }
+            // else { elide = 0; call the import }. The one-worker form's two mirror words made
+            // per-thread: the runnable word is found through this instance's preempt-word
+            // pointer (the two sit a fixed distance apart), the counter is an instance global
+            // the host zeroes at every resume. UNTOLLED for the reason `DelayYield` is.
+            let mark = f.unbilled_mark();
+            f.untolled(&W::GlobalGet(abi::reg_global(0)));
+            f.untolled(&W::I32Const(1));
+            f.untolled(&W::I32LeU);
+            f.untolled(&W::GlobalGet(PREEMPT_GLOBAL));
+            f.untolled(&W::I32Load(MemArg {
+                offset: 4 * u64::from(abi::SMP_RUNNABLE_SLOT_OFFSET),
+                align: 2,
+                memory_index: 0,
+            }));
+            f.untolled(&W::I32Eqz);
+            f.untolled(&W::I32And);
+            f.untolled(&W::GlobalGet(ELIDE_GLOBAL));
+            f.untolled(&W::I32Const(cap as i32));
+            f.untolled(&W::I32LtU);
+            f.untolled(&W::I32And);
+            f.untolled(&W::If(BlockType::Empty));
+            f.untolled(&W::GlobalGet(ELIDE_GLOBAL));
+            f.untolled(&W::I32Const(1));
+            f.untolled(&W::I32Add);
+            f.untolled(&W::GlobalSet(ELIDE_GLOBAL));
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::GlobalSet(abi::reg_global(0)));
+            f.untolled(&W::Else);
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::GlobalSet(ELIDE_GLOBAL));
             f.untolled(&W::I32Const(index as i32));
             f.untolled(&W::Call(IMPORT_FUNC));
             f.untolled(&W::End);

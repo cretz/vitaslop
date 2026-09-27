@@ -38,6 +38,10 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_ALLOW_SOFTWARE_GPU",
     "VITASLOP_ARENA_UPLOAD_PROBE",
     "VITASLOP_ARM_AT_FRAME",
+    // `0`: sceAudioOutOutput sleeps one grain from the call instead of following the port schedule.
+    "VITASLOP_AUDIO_SCHEDULE",
+    // `0`: sceAudioOutOutput paces on the guest's virtual clock instead of the host's wall.
+    "VITASLOP_AUDIO_WALL",
     "VITASLOP_BROWSER_FASTFORWARD",
     "VITASLOP_BROWSER_FUEL",
     "VITASLOP_BROWSER_HEARTBEAT_MS",
@@ -57,10 +61,20 @@ pub const OVERRIDABLE: &[&str] = &[
     // before it reserves, so it must be set for the run, not the link.
     "VITASLOP_BROWSER_SPLIT_MEMORY",
     "VITASLOP_BROWSER_SUPERSAMPLE",
+    // `=1`: a measurement mode - the live loop runs the next frame as soon as the last one is
+    // presented, never waiting for the wall clock, so `fps` reads capacity (speed goes past
+    // 100%). How two engines with headroom are compared; audio overruns by design.
+    "VITASLOP_BROWSER_UNPACED",
     // The negative control for what `RenderSceneBuilder` stopped re-deriving and stopped
     // timing every frame - see `render::build_fastpath`. Overridable because the only rig
     // that can price it is a browser run.
     "VITASLOP_BUILD_FASTPATH",
+    // `0` drops an unpresented frame's scenes whole instead of carrying its offscreen renders (lib.rs).
+    "VITASLOP_CARRY_UNPRESENTED",
+    // `VITASLOP_SMP`: `0` lets the game clock fall behind real time (no wall-clock floor).
+    "VITASLOP_CLOCK_WALL_FLOOR",
+    // Per-tick clamp (ms) of that floor; held (gated/paused) time is never counted.
+    "VITASLOP_CLOCK_WALL_STEP_MS",
     // `0` = the negative control for the sparse-draw compaction (the min..max window read).
     "VITASLOP_COMPACT_SPARSE",
     // Mirror the run's status notes and heartbeat to the browser console. Off by default:
@@ -68,6 +82,8 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_CONSOLE",
     // Start the scheduler CPU-share counters at this frame - see `sched::cpu_share_from`.
     "VITASLOP_CPU_SHARE_FROM",
+    // `1` = a blocking sceCtrlReadBuffer* returns only the samples since the last read.
+    "VITASLOP_CTRL_READ_NEW",
     // Hard-pause the emulator when the window loses focus or the tab is hidden. ON by
     // default; `0` keeps the guest running unfocused. Read on both engines: the desktop's
     // window event and the browser page's visibility/blur handlers.
@@ -110,6 +126,12 @@ pub const OVERRIDABLE: &[&str] = &[
     // the module carries one indirect branch per 10.5 guest instructions and nothing this
     // project usually counts can price one.
     "VITASLOP_DISPATCH_ALL",
+    // Every draw of the listed frames (program, blend, vertices, uniforms, textures) to the console (lib.rs).
+    "VITASLOP_DRAW_NOTE_AT",
+    // With VITASLOP_DRAW_NOTE_AT: only scenes whose colour target is <w>x<h> (lib.rs).
+    "VITASLOP_DRAW_NOTE_TARGET",
+    // With VITASLOP_DRAW_NOTE_AT: also every bound texture's bytes, hex (lib.rs).
+    "VITASLOP_DRAW_NOTE_TEX",
     // The A/B arm for `emit_flags_add`'s carry and overflow forms. It is here because the
     // BROWSER is the engine that has to answer: `flags-add` was 39% of every operator the
     // transpiler emitted, the closed forms cut the module 5.3% and executed operators 8.7%,
@@ -122,7 +144,11 @@ pub const OVERRIDABLE: &[&str] = &[
     // The per-draw dump of one display frame, readable from the browser's knob box.
     "VITASLOP_DUMP_DRAW_GXP",
     // The TOP arm of the non-suspending-trap A/B: the DERIVED fast set - every `cont!`
+    // `VITASLOP_SMP`: serve parked GPU waits before each present, waiting up to <ms> for one; -1 = after it.
+    "VITASLOP_EARLY_GRACE_MS",
     // dispatch arm, ~870 NIDs - instead of the 23 hand-picked ones that are still the default.
+    // `1`: an early completion waits for every in-flight readback of its targets (old rule).
+    "VITASLOP_EARLY_WAIT_ANY",
     // Browser-reachable for the same reason `VITASLOP_NO_FAST_IMPORT` is - the two traps only
     // differ there, and the JSPI stack switch this removes is what a phone pays most for - and
     // together with that knob it gives one build all three points: nothing fast, today's 23,
@@ -144,9 +170,16 @@ pub const OVERRIDABLE: &[&str] = &[
     // blocks the worker thread when the staging ring cannot retire, and a blocked worker turns
     // no event loop at all. See `LivePlayback::gpu_in_flight`.
     "VITASLOP_GPU_QUEUE_DEPTH",
+    // `1` = the GPU budget's stale rule as it was (a second without a new measurement, even
+    // with no readback in flight) - the arm back for the latch fix.
+    "VITASLOP_GPU_STALE_OLD",
+    // `1` lists every pass in the GPU TIME report, in frame order (default: the costliest five).
+    "VITASLOP_GPU_TIME_ALL",
     // The clock's core model, so a browser run can be A/B'd against native without an
     // environment to set it in.
     "VITASLOP_GUEST_CORES",
+    // `VITASLOP_SMP`: `<from frame>:<frames>` samples which guest function each worker runs (on-device profiler).
+    "VITASLOP_GUEST_PROF",
     // The per-pass arena's minimum size in KB. Browser-reachable because the only machine
     // whose `write_buffer` stalls on a growing arena is the user's phone.
     "VITASLOP_GXM_ALPHA_SINGLE",
@@ -253,6 +286,9 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_GXP_DEPTH24",
     "VITASLOP_GXP_DEST",
     "VITASLOP_GXP_DEST_BLEND",
+    // `0` = the arm back for the repeating-DP bit-48 rule (both internal sources walk when bit 47
+    // is clear) - two normalised vectors in one repeat; see `usse::decode::repeat_operands`.
+    "VITASLOP_GXP_DP_B48_BOTH",
     // `0` = the arm back for the bit-47 DP repeat rule (intrinsic four-register source walk for
     // every repeating DP). A decode rule that changes skinned meshes on three titles has to be
     // switchable where the phone runs it. Forwarded to the emitter by `set_override`.
@@ -266,6 +302,10 @@ pub const OVERRIDABLE: &[&str] = &[
     // in a GPU-bound world pass - so the arm has to be switchable where it is felt.
     "VITASLOP_GXP_ELIDE_NOOP",
     "VITASLOP_GXP_EXCLUDE",
+    // The f16 rounding arm (`vitaslop_gxp_shader::link::F16_ROUND_ARM`): `0` = the device's own
+    // `pack2x16float` mode. Missing here, setting it in the browser PANICKED the run worker at
+    // "reserving the guest region" (`guest region: unreachable`, 2026-09-25).
+    "VITASLOP_GXP_F16_RTE",
     "VITASLOP_GXP_FMEM",
     "VITASLOP_GXP_FORCE",
     // Whether a 16-bit guest index buffer stays 16-bit to the GPU. Browser-reachable because
@@ -290,6 +330,10 @@ pub const OVERRIDABLE: &[&str] = &[
     // bisected from the desktop.
     "VITASLOP_GXP_IDX_MUL",
     "VITASLOP_GXP_IDX_REGDEST",
+    // `0` = rcp/rsq as the bare WGSL builtins (their IEEE edges undecided) - see wgsl::IEEE_HELPERS.
+    "VITASLOP_GXP_IEEE_RCP",
+    // `1` = a 16-bit integer MAD's src1 read WHOLE when its half bit is clear (the old reading).
+    "VITASLOP_GXP_IMAD_SRC1_WHOLE",
     "VITASLOP_GXP_INDEX16",
     // What a draw was FED - its default uniform bank decoded per parameter, its attribute
     // ranges and its bound textures. Reachable from the browser because the defect it is
@@ -333,6 +377,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // displacement at all - see `wgsl::emit_mem_load`.
     "VITASLOP_GXP_MEM_PEEK",
     "VITASLOP_GXP_MIPS",
+    // Report the first non-finite instruction per vertex program (`count_clip_w_signs`).
+    "VITASLOP_GXP_NAN_SITES",
     // The portable f16 narrowing on a device that offers `shader-f16` - see `gpu.rs`.
     "VITASLOP_GXP_NATIVE_F16",
     "VITASLOP_GXP_NEGW",
@@ -359,6 +405,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // measurement, which is what this exists to take. Reachable from the browser because that
     // is where an in-frame shader compile costs the most.
     "VITASLOP_GXP_PRECOMPILE_CROSS",
+    // `0` = a one-register prefetch is always one full-precision component (the old reading).
+    "VITASLOP_GXP_PREFETCH_U8",
     // >>> THE SHADER PROBES. The instruments that say WHICH term of a lit material is the
     // zero, and they were desktop-only: read through `std::env::var`, which the browser does
     // not have. That is backwards - the pictures under investigation are browser pictures.
@@ -370,6 +418,10 @@ pub const OVERRIDABLE: &[&str] = &[
     // set, so a UI pair submitted a thousand times a frame almost never prints the element
     // under investigation. Browser-reachable for the same reason the other input dumps are.
     "VITASLOP_GXP_QUADS",
+    // Replace every recompiled fragment's final return with this WGSL expression (gpu.rs).
+    "VITASLOP_GXP_RETURN",
+    // With VITASLOP_GXP_RETURN: only these pair keys (`!keys` = all but these) (gpu.rs).
+    "VITASLOP_GXP_RETURN_KEYS",
     "VITASLOP_GXP_SA",
     // The SHADER EMITTER's two arms, forwarded into `vitaslop_gxp_shader::link` by
     // `set_override` below rather than read through `var` - that crate has no dependencies by
@@ -384,6 +436,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // cannot translate instead of dropping that pair's draws - see `gpu::report_fallback` for
     // the three choices and why dropping is the default.
     "VITASLOP_GXP_STRICT",
+    // Add this epsilon to every 2-D textureSample coordinate (gpu.rs `nudge_texcoords`).
+    "VITASLOP_GXP_TEXCOORD_NUDGE",
     // Restores `unclipped_depth` on every recompiled pipeline - the NEAR and FAR z clip planes
     // off together, which is what `depth-clip-control` actually buys. The default is OFF because
     // the near half of that bargain drew geometry BEHIND the eye at the plane, magnified, with
@@ -391,6 +445,7 @@ pub const OVERRIDABLE: &[&str] = &[
     // of a world pass. Browser-reachable so the far-plane half can be re-measured where it is
     // seen.
     "VITASLOP_GXP_UNCLIPPED_DEPTH",
+    "VITASLOP_GXP_VARYING_CODE_ORDER",
     // The arm back for binding the guest's own vertex row instead of repacking it to f32.
     // Browser-reachable because the browser is where its cost lives: the repack it removes was
     // most of a `prepare` stage that reached 82% of a 265 ms render frame there, so the A/B has
@@ -401,11 +456,25 @@ pub const OVERRIDABLE: &[&str] = &[
     // and never lands in a register.
     "VITASLOP_GXP_VPROBE",
     "VITASLOP_GXP_VP_TRACE",
+    // Every linked GXP module's WGSL, at WARN, as it is built (gpu.rs).
+    "VITASLOP_GXP_WGSL_LOG",
+    // A directory of hand-edited `<key>.wgsl` modules that replace the generated ones.
+    "VITASLOP_GXP_WGSL_OVERRIDE_DIR",
+    // The WGSL override as a knob string, "<hex key>\n<wgsl>" (a browser has no override dir).
+    "VITASLOP_GXP_WGSL_OVERRIDE_TEXT",
     "VITASLOP_GXP_YFLIP",
     "VITASLOP_GXP_ZFIX",
+    // Rig: spin the browser run worker `<ms>` once after frame `<frame>` (`<frame>:<ms>`).
+    "VITASLOP_HITCH_AT",
+    // Report every write a HOST CALL makes to these guest addresses / values (host.rs).
+    "VITASLOP_HOST_WRITE_WATCH",
     // The negative control for the instanced expansion memo - see
     // `vitaslop_runtime`'s `instanced_memo_enabled`.
+    // `0` skips the in-place compare of a dirty snapshot range (its exactness control).
+    "VITASLOP_INPLACE_COMPARE",
     "VITASLOP_INSTANCED_MEMO",
+    // `<start frame>:<duration ms>`: JS Self-Profiling sample of each SMP guest worker (smp-worker.js).
+    "VITASLOP_JS_PROFILE",
     "VITASLOP_LOG",
     // The SCOPED switch for the three `sceClibMem*` bulk primitives. Reachable from the
     // browser on both counts at once: they are 13% of a real title's host calls, so pricing
@@ -423,6 +492,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // from "the conversion is wrong" from "the draw never sampled it".
     "VITASLOP_MEM_DUMP",
     "VITASLOP_MEM_DUMP_AT",
+    // Scan guest memory for byte patterns at a frame (lib.rs `mem_find_at`).
+    "VITASLOP_MEM_FIND",
     "VITASLOP_MOVIE_DUMP_DIR",
     "VITASLOP_MOVIE_DUMP_EVERY",
     "VITASLOP_MOVIE_PICTURE_HASH",
@@ -502,7 +573,13 @@ pub const OVERRIDABLE: &[&str] = &[
     // where the audio path had to be priced - it decodes and mixes up to ~100 voices a grain,
     // which is guest-CPU work on the machine that has the least of it.
     "VITASLOP_NO_NGS_MIX",
+    // Canvas size in device pixels for a page that sends none (debug/runner); see present_scale.rs.
+    "VITASLOP_OUTPUT_SIZE",
     // The repacked-geometry cache's bound in MEGABYTES, and `0` is the arm back to the entry
+    // `0`: the live loop charges the wall floor's clock gain as game time (the old pacing).
+    "VITASLOP_PACE_FLOOR_FREE",
+    // `0`: the live loop charges short frames a whole period with no refund (the old pacing).
+    "VITASLOP_PACE_REFUND",
     // cap alone. Browser-reachable because the browser is where the bound is load-bearing: an
     // entry cap of 4,096 meshes let this heap grow 40-80 MB per rendered frame on one title,
     // 252 MB to 3,751 MB in a hundred frames, and wasm32's ceiling is 4,096 MB.
@@ -528,7 +605,11 @@ pub const OVERRIDABLE: &[&str] = &[
     // one instrument here that reads a CLOCK on a path making no WebGPU call - six reads a
     // draw across several hundred draws a frame would move the number they report.
     "VITASLOP_PREPARE_SPLIT",
+    // Per-present note for the first N frames: flipped buffers vs scene targets (lib.rs).
+    "VITASLOP_PRESENT_LOG",
     "VITASLOP_PRESENT_PROBE",
+    // With VITASLOP_PRESENT_PROBE: each sampled surface, half size, as a base64 console line (lib.rs).
+    "VITASLOP_PRESENT_SHOT",
     // The per-draw sample probe in the renderer's draw loop (`gpu::probe_watch`).
     "VITASLOP_PROBE_SAMPLE",
     // Hold the ARM register file in wasm LOCALS along each straight-line run instead of on
@@ -550,14 +631,22 @@ pub const OVERRIDABLE: &[&str] = &[
     // a rectangle set for one render target stays in the GXM context and scissors the next
     // scene. Browser-reachable because the picture defect it fixes was reported from a phone.
     "VITASLOP_REGION_CLIP_SCENE",
+    // `1`: the frame replay renders early-completed scenes too (frame_replay.rs).
+    "VITASLOP_REPLAY_EARLY",
+    // frame-replay (web): read back this offscreen target (hex guest address) instead of the display.
+    "VITASLOP_REPLAY_TARGET",
     "VITASLOP_RESIDENT_GEOM",
     // The byte budget for each of the two resident geometry heaps, in MB (default 48). A heap
     // that fills at its budget is RESET and says so; a reset every few frames means the working
     // set does not fit and this is the number to change.
     "VITASLOP_RESIDENT_GEOM_MB",
+    // `<draws>` the resolver reads per hold of the snapshot lock (default 64); `0` = the whole job.
+    "VITASLOP_RESOLVE_CHUNK",
     "VITASLOP_RTT_BG_CACHE",
     // The render-target CLEAR probe. Browser-reachable like the rest of the RTT diagnostics.
     "VITASLOP_RTT_CLEAR_PROBE",
+    // Stamp the early-completion grid lines with the frame, at the first completion at or after each listed frame.
+    "VITASLOP_RTT_GRID_FRAMES",
     // DIAGNOSTIC, not a shipped behaviour: cap how many runnable threads may hold the baton,
     // by priority, as the console's core count would. Unset (the default) keeps the current
     // discipline, where the spin cooldown eventually admits every runnable thread whatever its
@@ -573,6 +662,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // per draw - is only large where the engine runs at wasm speed.
     // Per-frame trace of a written-back render target's probe texel and mean - `1` for every
     // target, or a `+`-separated hex address list. See `vitaslop_runtime::rtt_writeback`.
+    // Name every written-back target containing one of these rrggbb colours (rtt_writeback.rs).
+    "VITASLOP_RTT_PROBE_FIND",
     "VITASLOP_RTT_PROBE_LOG",
     // Hold each browser RTT writeback copy this long after capture - see `RttWriteback`.
     "VITASLOP_RTT_STALE_EXTENT",
@@ -590,6 +681,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // desktop.
     "VITASLOP_SCHED_RR",
     "VITASLOP_SCHED_TRACE",
+    // Guest frames to photograph (comma list): full-size presentshot lines; the runner's params.shots.
+    "VITASLOP_SHOT_FRAMES",
     // Fold the determinism signature on a browser recipe run that does NOT declare `@sig`.
     // The fold hashes every retired scene's vertices, indices and uniforms - about 3 MB a
     // frame on a race, MEASURED at 7.7% of the guest window - and the only consumer is an
@@ -604,10 +697,52 @@ pub const OVERRIDABLE: &[&str] = &[
     // can exercise the live loop's behind-the-clock pacing. Browser-reachable because the loop
     // it tests only exists there, and because the device this models has no console.
     "VITASLOP_SLOW_FRAME_US",
+    // `=1`: run the guest's threads IN PARALLEL on several browser workers (the Vita's three
+    // cores) instead of one at a time on the run worker. OFF by default, and off is the
+    // DETERMINISTIC engine every recipe, capsule and bisection assumes: a parallel run's
+    // interleaving depends on host timing and does not replay. See `vitaslop_web::smp`.
+    "VITASLOP_SMP",
+    // `1` moves the flip's geometry resolve from the guest render thread to the run worker.
+    "VITASLOP_SMP_ASYNC_RESOLVE",
+    // `VITASLOP_SMP`: presents frame N while the guest workers build N+1 (the gate runs one
+    // frame ahead). ON by default under SMP; `=0` stops every worker for each present instead.
+    // `VITASLOP_SMP`: comma-separated NID-name prefixes to FORWARD to the run worker in addition
+    // to `vita::smp_owner_only`'s own list - bisects a defect that appears when a family runs
+    // on the guest workers.
+    "VITASLOP_SMP_DEFER_TEXTURES",
+    // `VITASLOP_SMP`: `1` pauses every guest for a small-target completion's whole render (default: only its write).
+    "VITASLOP_SMP_EARLY_PAUSE_ALL",
+    "VITASLOP_SMP_FORWARD",
+    // Spin x times each guest slice on the SMP workers: a phone-slow guest on the desktop.
+    "VITASLOP_SMP_GUEST_SLOW",
+    "VITASLOP_SMP_OVERLAP",
+    // `VITASLOP_SMP`: thread placement. `apart` (default) = fewest live threads first, never
+    // beside the main thread when the mask allows another worker; `spread` = fewest live
+    // threads first; `load` = least recent work first (the old default).
+    "VITASLOP_SMP_PLACE",
+    // `0`: a real-time (wall-parked, e.g. audio output) thread stops at a shut frame gate too.
+    "VITASLOP_SMP_RT_THROUGH_GATE",
+    // Rig: leave GXM capture time out of the VITASLOP_SMP_GUEST_SLOW spin (see perf.rs).
+    "VITASLOP_SMP_SLOW_EXCLUDE_GXM",
+    // `VITASLOP_SMP`: ceiling in microseconds on the ADAPTIVE poll a guest worker makes before
+    // sleeping, when at least half its recent mid-frame waits ended within it (default 400; 0 off).
+    "VITASLOP_SMP_SPIN_CAP_US",
+    // `VITASLOP_SMP`: microseconds a guest worker polls its doorbell before sleeping on it
+    // (default 0) - trades CPU for the wake-up latency of a cross-worker handoff.
+    "VITASLOP_SMP_SPIN_US",
+    // `VITASLOP_SMP`: `<from frame>:<frames>` records every resume span, wake, idle clock jump
+    // and flip for that window and prints it as `smptrace` console lines - the frame timeline.
+    "VITASLOP_SMP_TRACE",
+    // How many guest workers `VITASLOP_SMP` runs (default 3, one per Vita core).
+    "VITASLOP_SMP_WORKERS",
     // Byte budget for retained texture snapshots. Reachable from the browser because
     // exceeding it there costs a full re-decode of the working set in one frame.
     "VITASLOP_SNAPSHOT_BUDGET_MB",
+    // `0`: a sync point (sceGxmFinish) reads its deferred geometry inline under the host lock.
+    "VITASLOP_SYNC_RESOLVE_ASYNC",
     // Path of the font that STANDS IN for the console's system font, which is not shipped.
+    // `VITASLOP_SMP`: `0` serves a sync point's resolve-only park on the run worker, not the guest's own.
+    "VITASLOP_SYNC_RESOLVE_ON_WORKER",
     // Listed here so the name is not a browser-boot panic, though the browser cannot open a
     // path: there it supplies the bytes directly instead (`font::system::set_bytes`).
     "VITASLOP_SYSTEM_FONT",
@@ -663,6 +798,9 @@ pub const OVERRIDABLE: &[&str] = &[
     // desktop does not reproduce is the case where a wasm stack alone leaves you
     // disassembling by hand.
     "VITASLOP_TRACK_PC",
+    // Rig: hold a landed GPU timestamp readback until it has been in flight this many ms (a
+    // phone's late map callbacks, on a desktop) - see the GPU budget in the web runner.
+    "VITASLOP_TS_DELAY_MS",
     "VITASLOP_UNIFORM_WATCH",
     // The A/B arm for the vblank SPIN GUARD (`=0` restores the bare mirror read). Here
     // because the browser is where the spin costs the most - 26% of all translated guest
@@ -705,6 +843,13 @@ pub const OVERRIDABLE: &[&str] = &[
     // also takes a window with an unwritten 16-byte row, `all` is the negative control.
     // `slot` is REFUTED as a fix - see the census in `window_reread_rule`.
     "VITASLOP_WINDOW_REREAD",
+    // `1`: a draw's window capture waits for a busy snapshot lock instead of reading uncached.
+    "VITASLOP_WINDOW_WAIT",
+    // `0`: bypass the browser's transpile cache (web/transpile-cache.js) - neither read nor write.
+    "VITASLOP_TRANSPILE_CACHE",
+    // `0`: render-target write-backs go into guest memory after the present (old rule), not
+    // at the next flip - see `writeback_at_flip` in vitaslop-web.
+    "VITASLOP_WRITEBACK_AT_FLIP",
     "VITASLOP_YIELD_ELIDE",
 ];
 
@@ -715,6 +860,21 @@ fn overrides() -> &'static Mutex<HashMap<String, String>> {
 }
 
 /// Read a knob: the process-wide override if one is set, else the environment.
+/// Whether the guest's own vertex attribute layout is handed to the GXP link (so an attribute
+/// can be integer-fetched or have its surplus lanes baked). OFF under any of the three arms that
+/// convert vertex data on the CPU instead: `VITASLOP_GXP_GUEST_ATTRS=0`,
+/// `VITASLOP_GXP_VERTEX_PASSTHROUGH=0`, and `VITASLOP_GXP_ATTR_FILL`. One definition, read by the
+/// renderer's draw path AND the runtime's patcher-time prelink, so the two build the same
+/// link options.
+pub fn gxp_guest_attrs_in_link() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        var("VITASLOP_GXP_GUEST_ATTRS").ok().as_deref() != Some("0")
+            && var("VITASLOP_GXP_VERTEX_PASSTHROUGH").map(|v| v.trim() != "0").unwrap_or(true)
+            && var("VITASLOP_GXP_ATTR_FILL").is_err()
+    })
+}
+
 pub fn var(name: &str) -> Result<String, std::env::VarError> {
     if let Some(v) = overrides().lock().unwrap_or_else(|e| e.into_inner()).get(name) {
         return Ok(v.clone());

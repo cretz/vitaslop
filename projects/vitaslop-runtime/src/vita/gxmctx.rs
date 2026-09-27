@@ -744,7 +744,8 @@ impl<'a> Block<'a> {
         std::array::from_fn(|i| self.word(off::STREAMS + i as u32 * 4))
     }
 
-    /// Every BOUND sampler unit's binding. The counterpart of [`texture_bindings`].
+    /// Every BOUND sampler unit's binding. The counterpart of [`texture_bindings`], and the same
+    /// parse as [`texture_bindings_in_span`] over `self.span(off::TEXTURES, ..)`.
     pub fn texture_bindings(&self, out: &mut Vec<(u32, TexBinding)>) {
         out.clear();
         for unit in 0..MAX_TEXTURE_UNITS {
@@ -1293,5 +1294,61 @@ mod tests {
             assert_eq!(streams(ctx, CONTEXT), [0; MAX_VERTEX_STREAMS]);
             assert_eq!(stream(ctx, CONTEXT, MAX_VERTEX_STREAMS as u32), 0);
         });
+    }
+}
+
+/// Every BOUND sampler unit's binding, parsed out of a copy of the context block's sampler
+/// array (`MAX_TEXTURE_UNITS * TEXTURE_STRIDE` bytes from `off::TEXTURES`) - what a deferred
+/// draw keeps (see `host::DeferredTextures`). The same parse as [`Block::texture_bindings`].
+pub fn texture_bindings_in_span(span: &[u8], out: &mut Vec<(u32, TexBinding)>) {
+    out.clear();
+    let word = |at: usize| u32::from_le_bytes([span[at], span[at + 1], span[at + 2], span[at + 3]]);
+    for unit in 0..MAX_TEXTURE_UNITS {
+        let at = unit * TEXTURE_STRIDE as usize;
+        let addr = word(at);
+        if addr == 0 {
+            continue;
+        }
+        out.push((
+            unit as u32,
+            TexBinding {
+                addr,
+                words: [word(at + 4), word(at + 8), word(at + 12), word(at + 16)],
+                from_precomputed: word(at + 4 + TEXTURE_CONTROL_WORDS as usize * 4) != 0,
+            },
+        ));
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    /// The deferred parse and the block's own agree on every slot, bound or not.
+    #[test]
+    fn the_span_parse_is_the_block_parse() {
+        let mut bytes = [0u8; BYTES as usize];
+        let mut x: u32 = 0x1234_5678;
+        for b in bytes.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x as u8;
+        }
+        // Unbind every third unit so the skip is exercised.
+        for unit in (0..MAX_TEXTURE_UNITS).step_by(3) {
+            let at = (off::TEXTURES + unit as u32 * TEXTURE_STRIDE) as usize;
+            bytes[at..at + 4].copy_from_slice(&[0; 4]);
+        }
+        let blk = Block::Copied(bytes);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        blk.texture_bindings(&mut a);
+        texture_bindings_in_span(blk.span(off::TEXTURES, MAX_TEXTURE_UNITS * TEXTURE_STRIDE as usize), &mut b);
+        assert!(!a.is_empty());
+        assert_eq!(a.len(), b.len());
+        for ((ua, ba), (ub, bb)) in a.iter().zip(b.iter()) {
+            assert_eq!(ua, ub);
+            assert_eq!((ba.addr, ba.words, ba.from_precomputed), (bb.addr, bb.words, bb.from_precomputed));
+        }
     }
 }

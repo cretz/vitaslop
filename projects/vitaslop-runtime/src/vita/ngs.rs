@@ -68,7 +68,9 @@ pub(super) fn voice_unlock_params(ctx: &mut GuestCtx, st: &mut VitaState) {
             // these turned out to carry the master level, and it was identified from
             // exactly this report.
             let id = ctx.read_u32(addr);
-            let bytes = ctx.read_bytes(addr, 48);
+            // Onto the stack, not a `Vec`: this runs per params write (millions in a race).
+            let mut bytes = [0u8; 48];
+            ctx.read_into(addr, &mut bytes);
             tracing::debug!(
                 target: "vitaslop::at9",
                 voice = format_args!("{voice:#x}"),
@@ -80,7 +82,7 @@ pub(super) fn voice_unlock_params(ctx: &mut GuestCtx, st: &mut VitaState) {
             // one per write (millions in a race) and off by default, so the shape of what is
             // missing was only ever visible to whoever thought to turn it on.
             let is_buss = st.audio_state.at9.is_buss(voice);
-            crate::vita::at9::note_unknown_module(id, module, is_buss, bytes);
+            crate::vita::at9::note_unknown_module(id, module, is_buss, &bytes);
         }
     }
     ctx.ret(0);
@@ -452,7 +454,9 @@ pub(super) fn rack_init(ctx: &mut GuestCtx, st: &mut VitaState, _system: u32, ra
 pub(super) fn rack_get_voice_handle(ctx: &mut GuestCtx, st: &mut VitaState, rack: u32, index: u32, handle: Ptr) -> i32 {
     // The A/B arm: `VITASLOP_NGS_VOICE_HANDLE_MEMO=0` restores the fresh-handle-per-call
     // behaviour, which is the one way to put a number on what it costs on any title.
-    let memo = !matches!(crate::knobs::var("VITASLOP_NGS_VOICE_HANDLE_MEMO").as_deref(), Ok("0"));
+    // Cached: asked per call.
+    static MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let memo = *MEMO.get_or_init(|| !matches!(crate::knobs::var("VITASLOP_NGS_VOICE_HANDLE_MEMO").as_deref(), Ok("0")));
     let found = if memo {
         st.audio_state.ngs_voice_handles.iter().find(|(k, _)| *k == (rack, index)).copied()
     } else {

@@ -2383,7 +2383,15 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // Memory barriers and cache preload hints have no effect on the guest's
         // observable state in our memory model (one guest CPU worker, sequential
         // consistency at host-call sync points), so they lower to nothing.
+        // ...EXCEPT under SMP, where other guest threads really are running on other
+        // workers: a data barrier is then a real fence (`crate::emit::set_smp`).
+        DMB | DSB if crate::emit::smp() => out.push(Stmt::Fence),
         DMB | DSB | ISB | PLD | PLI => {}
+        // `CLREX`: drop the monitor record - this instance's own under SMP, the shared word
+        // otherwise. (It used to be unsupported, which made any block holding one a trap; a
+        // title that never executed it sees no difference, and one that did now runs.)
+        CLREX if crate::emit::smp() => out.push(Stmt::ClearExcl),
+        CLREX => out.push(Stmt::ExclSet(Value::Imm(0))),
 
         // Coprocessor register move: the only coprocessor a user-mode Vita title
         // touches is the thread-ID register, `MRC/MCR p15, 0, Rt, c13, c0, {2,3}`
@@ -3011,6 +3019,52 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // threads preempted between their load and their store could both claim a lock word
         // that only one of them read as free - which is how a title's own compare-and-swap
         // spinlock loses an owner.
+        // >>> SMP: the four exclusive forms become real atomics over a PER-INSTANCE monitor -
+        // see `Stmt::LoadExcl` / `Stmt::StoreExcl`. Placed ahead of the one-baton forms below,
+        // which stay exactly as they were when SMP is off.
+        LDREX | LDREXB | LDREXH | LDREXD | STREX | STREXB | STREXH | STREXD
+            if crate::emit::smp() =>
+        {
+            let size = match inst.opcode {
+                LDREXB | STREXB => MemSize::Byte,
+                LDREXH | STREXH => MemSize::Half,
+                _ => MemSize::Word,
+            };
+            match inst.opcode {
+                LDREX | LDREXB | LDREXH => {
+                    let rt = regnum(&ops[0]).ok_or_else(err)?;
+                    let a = lower_addr(&ops[1], addr, inst.thumb).ok_or_else(err)?;
+                    out.extend(a.pre);
+                    out.push(Stmt::LoadExcl { rt, rt2: None, addr: a.addr, size });
+                    out.extend(a.post);
+                }
+                LDREXD => {
+                    let rt = regnum(&ops[0]).ok_or_else(err)?;
+                    let rt2 = regnum(&ops[1]).ok_or_else(err)?;
+                    let a = lower_addr(&ops[2], addr, inst.thumb).ok_or_else(err)?;
+                    out.extend(a.pre);
+                    out.push(Stmt::LoadExcl { rt, rt2: Some(rt2), addr: a.addr, size });
+                    out.extend(a.post);
+                }
+                STREXD => {
+                    let rd = regnum(&ops[0]).ok_or_else(err)?;
+                    let rt = regnum(&ops[1]).ok_or_else(err)?;
+                    let rt2 = regnum(&ops[2]).ok_or_else(err)?;
+                    let a = lower_addr(&ops[3], addr, inst.thumb).ok_or_else(err)?;
+                    out.extend(a.pre);
+                    out.push(Stmt::StoreExcl { rd, rt, rt2: Some(rt2), addr: a.addr, size });
+                    out.extend(a.post);
+                }
+                _ => {
+                    let rd = regnum(&ops[0]).ok_or_else(err)?;
+                    let rt = regnum(&ops[1]).ok_or_else(err)?;
+                    let a = lower_addr(&ops[2], addr, inst.thumb).ok_or_else(err)?;
+                    out.extend(a.pre);
+                    out.push(Stmt::StoreExcl { rd, rt, rt2: None, addr: a.addr, size });
+                    out.extend(a.post);
+                }
+            }
+        }
         LDREX | LDREXB | LDREXH => {
             let rt = regnum(&ops[0]).ok_or_else(err)?;
             let a = lower_addr(&ops[1], addr, inst.thumb).ok_or_else(err)?;

@@ -66,17 +66,19 @@ fn buffer_count(count: i32) -> u32 {
 /// acted on by LEVEL goes through. That is the shape of the defect exactly: one class of
 /// press works, the other is read and discarded.
 ///
-/// So this keeps what the guest was actually served: one sample per display frame, up to
-/// [`CTRL_MAX_BUFFERS`] of them, pushed the first time the pad is read in a frame. Nothing
-/// here is synthesised - a sample enters the ring only when the world produced one - and a
-/// title that reads the pad several times inside a frame is served the same sample each
-/// time, exactly as it is on hardware, where the ring advances only at a vblank.
+/// So this keeps a sample per VBLANK, as the hardware ring does, up to [`CTRL_MAX_BUFFERS`] of
+/// them: the pad state is the world's, observed at each read; the vblanks between two reads
+/// carry the state held before the later one (see `push`). A title that reads the pad several
+/// times inside a vblank is served the same sample each time, exactly as it is on hardware.
 #[derive(Default)]
 pub(crate) struct CtrlHistory {
     /// One ring per port that has ever been read, newest last. A `Vec` rather than a fixed
     /// array because the port is a guest-supplied word: two ports are the real hardware and
     /// a title asking for a third must not index out of bounds.
     ports: Vec<(u32, std::collections::VecDeque<Sample>)>,
+    /// Per port, the vblank of the last BLOCKING read (`sceCtrlReadBuffer*`) - see
+    /// [`read_blocking`], which returns only the samples newer than it.
+    last_read: Vec<(u32, u64)>,
 }
 
 /// One controller sample as it was served: the VBLANK it belongs to, the guest timestamp it
@@ -109,13 +111,51 @@ impl CtrlHistory {
                 &mut self.ports.last_mut().expect("just pushed").1
             }
         };
-        if ring.back().is_some_and(|s| s.vblank == vblank && s.pad == pad) {
-            return;
+        let cap = CTRL_MAX_BUFFERS as usize;
+        let push = |ring: &mut std::collections::VecDeque<Sample>, s: Sample| {
+            if ring.len() == cap {
+                ring.pop_front();
+            }
+            ring.push_back(s);
+        };
+        match ring.back().copied() {
+            // >>> ONE SAMPLE PER VBLANK, AS THE HARDWARE RING HOLDS - never two for one vblank,
+            // >>> and no vblank missing because nobody read the pad on it.
+            //
+            // The Vita samples the pad at every vblank whether or not a title reads it, so a
+            // title polling every OTHER vblank (a 30 fps menu) that asks for 8 buffers gets 8
+            // vblanks, 2 of them new. This ring used to add a sample only per READ: each 30 fps
+            // read brought ONE new sample, and a title that takes "the last two" as new saw
+            // every press edge twice. MEASURED: Madden reads `count=8` every 2 vblanks from one
+            // site (0x8169ae05), and on the desktop browser one d-pad press moved its menu
+            // cursor twice unless the key was only tapped (the user, 2026-09-25).
+            //
+            // The vblanks nobody read carry the state held BEFORE this read (the change is
+            // observed here, so it is dated here), each stamped one vblank on.
+            Some(last) if vblank == last.vblank => {
+                // The same vblank read again after the pad moved: a vblank has one sample, and
+                // it is the state as of now.
+                if last.pad != pad {
+                    if let Some(b) = ring.back_mut() {
+                        b.pad = pad;
+                    }
+                }
+            }
+            Some(last) if vblank > last.vblank => {
+                let gap = (vblank - last.vblank - 1).min(cap as u64);
+                for k in 1..=gap {
+                    let v = vblank - gap - 1 + k;
+                    let t = last.ts + (v - last.vblank) * super::display::VBLANK_US;
+                    push(ring, Sample { vblank: v, ts: t.min(ts.saturating_sub(1)), pad: last.pad });
+                }
+                push(ring, Sample { vblank, ts, pad });
+            }
+            // First sample, or a vblank counter that went BACKWARDS (a new clock): start over.
+            _ => {
+                ring.clear();
+                push(ring, Sample { vblank, ts, pad });
+            }
         }
-        if ring.len() == CTRL_MAX_BUFFERS as usize {
-            ring.pop_front();
-        }
-        ring.push_back(Sample { vblank, ts, pad });
     }
 
     /// The sample `age` samples back from the newest for `port` (0 = the newest), or `None`
@@ -157,6 +197,8 @@ fn fill_ctrl(
             buttons = format_args!("{:#06x}", frame.buttons),
             lx = frame.lx, ly = frame.ly, rx = frame.rx, ry = frame.ry,
             negative,
+            count,
+            vblank = super::display::vcount(st),
             lr = format_args!("{:#010x}", ctx.regs[14]),
             "ctrl"
         );
@@ -254,13 +296,52 @@ pub(super) fn read_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState) -> Sv
 /// See [`read_buffer_positive`] for why it parks.
 fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) -> SvcOutcome {
     let (port, data, count) = (ctx.arg(0), ctx.arg(1), ctx.arg(2) as i32);
+    // >>> A READ RETURNS THE SAMPLES SINCE THE LAST READ, NOT `count` OF HISTORY.
+    //
+    // `Peek` hands back the newest `count` samples; `Read` hands back only the vblanks sampled
+    // since the previous `Read` on that port (at least one - it blocks for the next one
+    // otherwise), and RETURNS how many (Vita3K: `min(count, vcount - last_vcount[port])`).
+    // Returning `count` told a title that reads every 2-3 vblanks with `count = 8` that the pad
+    // had been held for 8 samples each time - MEASURED on Madden's front end (read site lr
+    // 0x8169ae05, count 8, every 2-3 vblanks): a held d-pad scrolled 4 rows in 12 frames,
+    // its hold-timer running ~3x fast. The slots keep this ring's order (oldest first, newest
+    // last), so a title reading `buf[ret - 1]` gets the current sample exactly as before.
+    // >>> OPT-IN (`VITASLOP_CTRL_READ_NEW=1`), NOT THE DEFAULT: it did NOT change Madden's
+    // held-d-pad rate (ctl26fn vs ctl26fo, team wheel, identical cadence) and it DOES change
+    // OlliOlli's pushing recipe (2 of 2 shots differ; READ_ALL restores them byte-identical),
+    // with no ground truth for which reading is the hardware's. Default = `count` samples.
+    let vblank = u64::from(super::display::vcount(st));
+    let count = if read_all() {
+        count
+    } else {
+        let h = &mut st.ctrl_history;
+        let new = match h.last_read.iter_mut().find(|(p, _)| *p == port) {
+            Some((_, last)) => {
+                let n = vblank.saturating_sub(*last);
+                *last = vblank;
+                n
+            }
+            None => {
+                h.last_read.push((port, vblank));
+                u64::from(buffer_count(count))
+            }
+        };
+        new.clamp(1, u64::from(buffer_count(count))) as i32
+    };
     let n = fill_ctrl(ctx, st, port, data, negative, count);
+    tracing::trace!(target: "vitaslop::input", port, asked = ctx.arg(2), returned = n, vblank, lr = format_args!("{:#010x}", ctx.regs[14]), "ctrl read");
     ctx.ret(n as u32);
     if !st.is_preemptive() {
         return SvcOutcome::Continue;
     }
     st.vblank_park(1, super::display::VBLANK_US);
     SvcOutcome::Block
+}
+
+/// A blocking read returns `count` samples (the default) unless `VITASLOP_CTRL_READ_NEW=1`.
+fn read_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_CTRL_READ_NEW").as_deref() != Ok("1"))
 }
 
 /// int sceCtrlPeekBufferNegative(int port, SceCtrlData *pad_data, int count)
@@ -273,4 +354,56 @@ pub(super) fn peek_buffer_negative(ctx: &mut GuestCtx, st: &mut VitaState, port:
 /// Blocks on the sampling grid exactly as [`read_buffer_positive`] does.
 pub(super) fn read_buffer_negative(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     read_blocking(ctx, st, true)
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::world::CtrlFrame;
+
+    const UP: u32 = 0x0010;
+
+    fn pad(buttons: u32) -> CtrlFrame {
+        CtrlFrame { buttons, ..CtrlFrame::default() }
+    }
+
+    fn buttons(h: &CtrlHistory, n: usize) -> Vec<u32> {
+        (0..n).rev().filter_map(|age| h.sample(0, age)).map(|s| s.pad.buttons).collect()
+    }
+
+    #[test]
+    fn a_thirty_hz_reader_gets_one_sample_per_vblank_so_an_edge_appears_once() {
+        let mut h = CtrlHistory::default();
+        let v = super::super::display::VBLANK_US;
+        // Read every OTHER vblank: neutral, neutral, then UP is pressed before the read at 6.
+        h.push(0, 2, 2 * v, pad(0));
+        h.push(0, 4, 4 * v, pad(0));
+        h.push(0, 6, 6 * v, pad(UP));
+        assert_eq!(h.depth(0), 5, "vblanks 2..=6, one sample each");
+        assert_eq!(buttons(&h, 5), vec![0, 0, 0, 0, UP], "vblank 5 holds the state before the read");
+        // The next read (vblank 8, still held): the two NEW samples are both UP - "the last
+        // two samples" contain no rising edge, which is what stops a second cursor step.
+        h.push(0, 8, 8 * v, pad(UP));
+        let last_two = buttons(&h, 2);
+        assert_eq!(last_two, vec![UP, UP]);
+        // Negative control - the old per-READ ring's last two here were [0, UP] again.
+        let edges: usize = buttons(&h, h.depth(0)).windows(2).filter(|w| w[0] & UP == 0 && w[1] & UP != 0).count();
+        assert_eq!(edges, 1, "one press is one rising edge in the history");
+    }
+
+    #[test]
+    fn a_vblank_has_one_sample_and_timestamps_stay_increasing() {
+        let mut h = CtrlHistory::default();
+        let v = super::super::display::VBLANK_US;
+        h.push(0, 10, 10 * v, pad(0));
+        h.push(0, 10, 10 * v + 5, pad(UP));
+        assert_eq!(h.depth(0), 1, "a second read in one vblank replaces, never appends");
+        assert_eq!(buttons(&h, 1), vec![UP]);
+        h.push(0, 13, 13 * v, pad(0));
+        let ts: Vec<u64> = (0..h.depth(0)).rev().filter_map(|a| h.sample(0, a)).map(|s| s.ts).collect();
+        assert!(ts.windows(2).all(|w| w[0] < w[1]), "stamps are what titles dedupe on: {ts:?}");
+        // A very long gap fills at most a ring's worth.
+        h.push(0, 10_000, 10_000 * v, pad(0));
+        assert_eq!(h.depth(0), CTRL_MAX_BUFFERS as usize);
+    }
 }

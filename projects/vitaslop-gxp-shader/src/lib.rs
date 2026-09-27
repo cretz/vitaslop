@@ -32,7 +32,7 @@ pub mod wgsl;
 
 pub use container::{Parameter, ParamCategory, ParamType, Program, ProgramKind};
 pub use ir::{Instr, Op, Shader};
-pub use link::{LinkOptions, link_programs_with, link_programs, LinkError, LinkedProgram, MAX_VARYINGS};
+pub use link::{LinkOptions, link_programs_with, link_programs, link_programs_memo, prelink, prelink_stats, guest_attr_spec, PatcherPair, LinkError, LinkedProgram, MAX_VARYINGS};
 pub use module::{
     BindingPlan, ColorOutput, ColorPrecision, FragmentModule, MemWindow, VertexAttribute,
     VertexBindingPlan, VertexModule,
@@ -344,6 +344,39 @@ pub struct RopBlend {
     /// The alpha op field (42:41) differs between titles; `true` is the second observed value.
     /// Carried so a caller can refuse rather than silently treat the two alike.
     pub alpha_op_differs: bool,
+    /// The whole equation as `SceGxmBlendFactor` values - `(color_src, color_dst, alpha_src,
+    /// alpha_dst)`, every function ADD - when the word was read through the full plain-SOP2
+    /// field table (`docs-re/usse-spec-sop2.md`) rather than the two pinned shapes. `None` for
+    /// the pinned shapes, whose callers keep their established mapping.
+    pub factors: Option<(u8, u8, u8, u8)>,
+}
+
+/// `SceGxmBlendFactor` for a plain-SOP2 factor selector, with the ORIENTATION of this reading
+/// fixed: SRC1 is the shader colour (the blend SOURCE) and SRC2 the output register (the blend
+/// DESTINATION). `colour` picks between the 3-bit colour table and the 2-bit alpha table.
+/// `None` for a selector the spec does not establish.
+fn sop2_gxm_factor(sel: u32, complement: bool, colour: bool) -> Option<u8> {
+    // SceGxmBlendFactor: 0 ZERO, 1 ONE, 2 SRC_COLOR, 3 1-SRC_COLOR, 4 SRC_ALPHA, 5 1-SRC_ALPHA,
+    // 6 DST_COLOR, 7 1-DST_COLOR, 8 DST_ALPHA, 9 1-DST_ALPHA.
+    let base = if colour {
+        match sel {
+            0 => 0, // zero
+            1 => 2, // src1 colour = the source colour
+            2 => 6, // src2 colour = the destination colour
+            3 => 4, // src1 alpha
+            4 => 8, // src2 alpha
+            _ => return None,
+        }
+    } else {
+        match sel {
+            0 => 0,
+            1 => 4,
+            2 => 8,
+            _ => return None,
+        }
+    };
+    // The complement of each factor is the next enum value; the complement of ZERO is ONE.
+    Some(if complement { base + 1 } else { base })
 }
 
 /// The blend equation a FRAGMENT program performs itself, in its epilogue, or `None`.
@@ -548,7 +581,7 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
             if found.is_some() {
                 return None;
             }
-            found = Some(RopBlend { dst: RopDstFactor::One, alpha_op_differs: false });
+            found = Some(RopBlend { dst: RopDstFactor::One, alpha_op_differs: false, factors: None });
             continue;
         }
         if !dest_is_output || !src2_is_output {
@@ -563,8 +596,41 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
             && bit(48, 48) == 0              // no src2 bank extension
             && bit(47, 47) == 1              // mod2 - the destination term IS complemented
             && bit(46, 43) == 0              // the bits SOP2M spends on its write mask
-            && bit(40, 38) == 3; // sel1 = SRC1_ALPHA, the source coefficient
+            && bit(40, 38) == 3              // sel1 = SRC1_ALPHA, the source coefficient
+            && bit(20, 14) == 0; // both ops ADD and no modifier (the plain-SOP2 spec's fields)
         if !pinned {
+            // >>> THE FULL PLAIN-SOP2 FIELD TABLE (`docs-re/usse-spec-sop2.md`), for this
+            // orientation only: SRC1 the shader colour, SRC2 the output register fed back. Both
+            // factor tables and their complements are read; the OPS are required to be ADD (bits
+            // 19:16 zero) because the spec's op fields are established only here - its reading of
+            // the swapped words' low bits as a reverse subtract contradicts what those words were
+            // measured to draw (see the swapped arm above), so the op fields stay unproven there.
+            // MEASURED on a 2011 fighting title: its sprite, portrait and menu programs end in
+            // `808088c190000000` / `808088d990000000` / `8180880590000000` - the two pinned
+            // equations with ONE alpha factors, and the ONE, ONE additive - and all three were
+            // refused, dropping 95 draws a scene (its character select drew names over black).
+            let general = bit(58, 57) == 0
+                && bit(51, 51) == 0
+                && bit(49, 49) == 0
+                && bit(48, 48) == 0
+                && bit(46, 44) == 0              // no repeat
+                && bit(20, 14) == 0;             // src1 unmodified, both ops ADD, bits 15/14 clear
+            if general {
+                let cs = sop2_gxm_factor(bit(40, 38), bit(56, 56) == 1, true);
+                let cd = sop2_gxm_factor(bit(37, 35), bit(47, 47) == 1, true);
+                let as_ = sop2_gxm_factor(bit(53, 52), bit(43, 43) == 1, false);
+                let ad = sop2_gxm_factor(bit(42, 41), bit(34, 34) == 1, false);
+                if let (Some(cs), Some(cd), Some(as_), Some(ad)) = (cs, cd, as_, ad) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    // The legacy summary fields, for the callers and reports that read them.
+                    let dst = if cd == 5 { RopDstFactor::OneMinusSrcAlpha } else { RopDstFactor::One };
+                    found = Some(RopBlend { dst, alpha_op_differs: bit(42, 41) != 0, factors: Some((cs, cd, as_, ad)) });
+                    continue;
+                }
+                return None;
+            }
             return None;
         }
         let dst = match bit(37, 35) {
@@ -581,7 +647,7 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
         if found.is_some() {
             return None;
         }
-        found = Some(RopBlend { dst, alpha_op_differs });
+        found = Some(RopBlend { dst, alpha_op_differs, factors: None });
     }
     found
 }

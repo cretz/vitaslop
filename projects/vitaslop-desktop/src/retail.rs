@@ -171,6 +171,10 @@ fn read_dir_files(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
             let path = entry.path();
             let ty = entry.file_type().map_err(|e| format!("file type: {e}"))?;
             if ty.is_dir() {
+                // Not the game's - see `diskvfs::walk`.
+                if dir.as_path() == root && entry.file_name() == vitaslop_native::compile_cache::DIR {
+                    continue;
+                }
                 stack.push(path);
             } else {
                 let rel = path
@@ -223,6 +227,18 @@ impl RetailGuest {
     /// frame-keyed TAS text) is overlaid on the live input so a recorded playthrough
     /// replays in the window.
     pub fn new(dir: &Path, input: SharedInput, recipe: Option<&str>) -> Result<RetailGuest, String> {
+        Self::new_with_exec(dir, input, recipe, None)
+    }
+
+    /// [`Self::new`] with the app's executable `main_exec` (an `sceAppMgrLoadExec` path) in
+    /// the main executable's place - the process a title's `LoadExec` asked for. See
+    /// [`Self::take_exec_request`].
+    pub fn new_with_exec(
+        dir: &Path,
+        input: SharedInput,
+        recipe: Option<&str>,
+        main_exec: Option<&str>,
+    ) -> Result<RetailGuest, String> {
         let t0 = Instant::now();
         // >>> THE DATA FILES STAY ON DISK. See `crate::diskvfs`.
         //
@@ -249,7 +265,7 @@ impl RetailGuest {
             .map(|root| vitaslop_runtime::ingest::pipeline::mount_dump_lazy(&disk, &root))
             .transpose()
             .map_err(|e| format!("mount dump: {e:?}"))?;
-        let (game_modules, mut resident, backing) = match lazy {
+        let (mut game_modules, execs, mut resident, backing) = match lazy {
             Some(dump) => {
                 let backing =
                     crate::diskvfs::DiskBacking::new(disk.under(&dump.files_prefix));
@@ -258,7 +274,7 @@ impl RetailGuest {
                     backing.file_count(),
                     backing.total_bytes() as f64 / 1e6,
                 );
-                (dump.modules, None, Some(backing))
+                (dump.modules, dump.execs, None, Some(backing))
             }
             None => {
                 let files = read_dir_files(dir)?;
@@ -267,9 +283,21 @@ impl RetailGuest {
                     vfs.insert(path, bytes);
                 }
                 let game = decrypt_container(&mut vfs).map_err(|e| format!("decrypt: {e:?}"))?;
-                (game.modules, Some(game.files), None)
+                (game.modules, game.execs, Some(game.files), None)
             }
         };
+        if let Some(path) = main_exec {
+            let rel = vitaslop_runtime::ingest::pipeline::exec_rel_path(path);
+            let exec = execs
+                .into_iter()
+                .find(|m| m.path == rel)
+                .ok_or_else(|| format!("sceAppMgrLoadExec(\"{path}\"): the app carries no executable at {rel}"))?;
+            println!("exec: {path} replaces the main executable ({} KB)", exec.elf.len() / 1024);
+            match game_modules.iter().position(|m| m.path == "eboot.bin") {
+                Some(slot) => game_modules[slot] = exec,
+                None => game_modules.push(exec),
+            }
+        }
         let modules = game_modules
             .iter()
             .map(|m| loader::load(&m.elf))
@@ -334,7 +362,12 @@ impl RetailGuest {
             vitaslop_platform::heap::trace_large(mb * 1024 * 1024);
             println!("loaded: heap ledger armed - every live allocation of {mb} MB or more keeps its backtrace");
         }
-        let (sched, _stubs) = ThreadedScheduler::from_linked(&linked, env, QUANTUM_FUEL)
+        // The compiled module is kept beside the game (see `vitaslop_native::compile_cache`), so
+        // only the first boot after a build pays the transpile and the Cranelift compile.
+        // `VITASLOP_COMPILE_CACHE=0` bypasses it (neither read nor written).
+        let cache = (std::env::var("VITASLOP_COMPILE_CACHE").as_deref() != Ok("0"))
+            .then(|| vitaslop_native::compile_cache::CompileCache::new(dir, main_exec.unwrap_or("eboot.bin")));
+        let (sched, _stubs) = ThreadedScheduler::from_linked_with_cache(&linked, env, QUANTUM_FUEL, cache.as_ref())
             .map_err(|e| format!("scheduler: {e:?}"))?;
         {
             let (live, peak) = vitaslop_platform::heap::live_peak_mb();
@@ -653,6 +686,15 @@ impl RetailGuest {
     }
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// The executable the guest's `sceAppMgrLoadExec` asked to replace this process with, if
+    /// that is how the run ended - taken, so a host acts on it once.
+    pub fn take_exec_request(&mut self) -> Option<String> {
+        if !self.finished {
+            return None;
+        }
+        self.sched.host().state.exec_request.take()
     }
     pub fn frames(&self) -> u64 {
         self.sched.frames()
@@ -1709,7 +1751,22 @@ pub fn headless_check(
     // The same counters over the window's STEADY frames only - see the drain site.
     let mut prep_steady = vitaslop_platform::gpu::PrepareSplit::default();
     let mut steady_frames = 0u64;
-    while guest.frames() < target && !guest.finished() {
+    loop {
+        // >>> A PROCESS REPLACEMENT. The guest halted on `sceAppMgrLoadExec` of one of its own
+        // app's executables: boot that one in its place, with the same input and recipe, and
+        // keep going - the new process's frames count from zero, exactly as a new process's do.
+        if guest.finished()
+            && let Some(path) = guest.take_exec_request()
+        {
+            println!("headless: frame {}: the title exec'd {path} - booting it", guest.frames());
+            guest = RetailGuest::new_with_exec(&dir, input.clone(), recipe.as_deref(), Some(&path))?;
+            if let Some(root) = save_dir.as_deref() {
+                guest.persist_to(root, &dir)?;
+            }
+        }
+        if guest.frames() >= target || guest.finished() {
+            break;
+        }
         let f = guest.frames();
         // >>> WHAT THE RUST HEAP HOLDS, EVERY 250 FRAMES, ALWAYS.
         //

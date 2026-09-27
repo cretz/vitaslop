@@ -511,6 +511,26 @@ pub enum Stmt {
     /// Record (or clear, with `Imm(0)`) the EXCLUSIVE MONITOR's address - see
     /// [`Value::ExclAddr`]. Emitted by `LDREX` to arm it and by `STREX` to spend it.
     ExclSet(Value),
+    /// >>> SMP ONLY (see `crate::emit::set_smp`). `LDREX{,B,H,D}` as a real load-exclusive:
+    /// an ATOMIC load of `addr` into `rt` (and the high word into `rt2` for the doubleword
+    /// form), recording the address AND the value read in this instance's own monitor
+    /// globals. The value is what the matching [`Stmt::StoreExcl`] compares against, which is
+    /// how a monitor that other workers cannot see still refuses a store after a concurrent
+    /// write: see [`Stmt::StoreExcl`].
+    LoadExcl { rt: u8, rt2: Option<u8>, addr: Value, size: MemSize },
+    /// >>> SMP ONLY. `STREX{,B,H,D}` as a compare-and-swap: when this instance's monitor holds
+    /// `addr`, `cmpxchg(addr, value read by the LDREX, rt[:rt2])` and `rd = 0` if memory still
+    /// held that value, else `rd = 1` with memory untouched. The monitor is spent either way.
+    /// A value-based monitor admits the ABA case (another thread wrote and restored the value
+    /// in between) - the same compromise every emulator that runs guest threads in parallel
+    /// on a host without LL/SC makes, and a correct lock-free guest algorithm tolerates it.
+    StoreExcl { rd: u8, rt: u8, rt2: Option<u8>, addr: Value, size: MemSize },
+    /// >>> SMP ONLY. `CLREX`: drop this instance's monitor record.
+    ClearExcl,
+    /// >>> SMP ONLY. `DMB`/`DSB`: a sequentially consistent fence (`atomic.fence`). Without SMP
+    /// a barrier lowers to nothing - one guest thread runs at a time and the host call that
+    /// switches threads is the synchronisation.
+    Fence,
     /// Service an ARM `svc #imm` through the host `svc` import.
     Svc(u32),
     /// Service a Vita NID call through the host `import` import, by dense index.

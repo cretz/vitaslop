@@ -210,4 +210,24 @@ mod tests {
             failures
         );
     }
+
+    /// The SAME corpus, transpiled as an SMP build (`VITASLOP_SMP`'s codegen: atomic
+    /// exclusives over a per-instance monitor, real fences, no dirty-mark coalescing). One
+    /// thread runs it, so every golden must still hold exactly - which is what proves the SMP
+    /// lowering equal to the qemu oracle before any second worker is involved.
+    #[test]
+    fn run_cases_smp() {
+        vitaslop_transpiler::set_smp(true);
+        let cases = suite::embedded_cases().expect("load arm corpus");
+        let outcomes = run_all(&mut NativeEngine, &cases);
+        vitaslop_transpiler::set_smp(false);
+        let failures: Vec<&Outcome> = outcomes.iter().filter(|o| !o.pass).collect();
+        assert!(
+            failures.is_empty(),
+            "SMP codegen: {} of {} case(s) failed: {:#?}",
+            failures.len(),
+            outcomes.len(),
+            failures
+        );
+    }
 }

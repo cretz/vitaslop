@@ -1037,7 +1037,7 @@ impl Program {
         let (literals, texture_control, sa_base_from_container) =
             parse_sa_tables(bytes, default_uniform_regs, &containers);
 
-        Ok(Program {
+        let mut program = Program {
             kind,
             major,
             minor,
@@ -1059,7 +1059,11 @@ impl Program {
             output_varyings,
             output_order,
             hash: fnv1a64(bytes),
-        })
+        };
+        if program.kind == ProgramKind::Vertex {
+            order_varyings_by_code(&mut program);
+        }
+        Ok(program)
     }
 
     /// The samplers this fragment program declares, as (unit, name). Handy for the
@@ -1687,6 +1691,80 @@ fn attribute_order(
             .map(|u| *declared.iter().find(|&&(d, _, _)| d == u).expect("cover checked above"))
             .collect(),
     )
+}
+
+/// >>> THE VERTEX PROGRAM'S OWN CODE, WHERE IT STATES THE ORDER: the output lane each varying
+/// is MOVED into, read off the moves that copy its attribute's PA register into the output bank.
+///
+/// # Why the attribute order was not enough
+/// [`attribute_order`] takes a passthrough program's outputs to sit in its inputs' PA order.
+/// That is a convention, and MLB's boot splash program refutes it: attributes position@PA0,
+/// `aUV`@PA4, `aColor`@PA8, and the code MOVES the colour to o4..o7 and the UV to o8..o9. The
+/// attribute order put TexCoord(0)@4 and Color0@6, so the fragment sampled at the COLOUR (1,1 -
+/// the texture's black corner block) and 1,400 frames of logos and the health warning were a
+/// black screen, on every device.
+///
+/// # The rule
+/// Only a COMPLETE, EXACT reading replaces the layout: every declared varying's attribute is
+/// found moved (unpredicated, unmodified) into the output bank, the lanes are distinct, and laid
+/// out in lane order with their declared widths they tile the bank from the position onward with
+/// no gap. Anything less leaves the layout exactly as the container decoded it.
+fn order_varyings_by_code(program: &mut Program) {
+    use crate::ir::{Bank, Op, Predicate};
+    if program.output_varyings.len() < 2 || !crate::link::arm_on(crate::link::VARYING_CODE_ORDER_ARM) {
+        return;
+    }
+    let shader = crate::usse::decode_shader(program);
+    // PA register -> the lowest output lane a plain move copies it to.
+    let mut moved: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for i in &shader.instrs {
+        if !matches!(i.op, Op::Mov | Op::Pack { .. }) || i.pred != Predicate::Always || i.srcs.len() != 1 {
+            continue;
+        }
+        let (Some(d), s) = (i.dest.as_ref(), &i.srcs[0]) else { continue };
+        if d.bank != Bank::Output || s.bank != Bank::PrimaryAttr || s.abs || s.neg {
+            continue;
+        }
+        let lane = moved.entry(u32::from(s.index)).or_insert(u32::from(d.index));
+        *lane = (*lane).min(u32::from(d.index));
+    }
+    let attr_reg = |u: VaryingUsage| {
+        program
+            .parameters
+            .iter()
+            .filter(|p| p.category == ParamCategory::Attribute)
+            .find(|p| semantic_usage(p) == Some(u))
+            .and_then(|p| u32::try_from(p.resource_index).ok())
+    };
+    let mut placed: Vec<(u32, OutputVarying)> = Vec::new();
+    for v in &program.output_varyings {
+        let Some(lane) = attr_reg(v.usage).and_then(|r| moved.get(&r).copied()) else { return };
+        placed.push((lane, *v));
+    }
+    placed.sort_by_key(|&(lane, _)| lane);
+    // The declared lanes each varying occupies, from the container's own layout.
+    let width = |v: &OutputVarying| {
+        let mut sorted: Vec<&OutputVarying> = program.output_varyings.iter().collect();
+        sorted.sort_by_key(|o| o.base_lane);
+        let at = sorted.iter().position(|o| o.usage == v.usage).expect("from the same list");
+        match sorted.get(at + 1) {
+            Some(n) => n.base_lane - sorted[at].base_lane,
+            None => v.components,
+        }
+    };
+    let mut lane = VERTEX_POSITION_LANES;
+    let mut out = Vec::new();
+    for (at, v) in &placed {
+        if *at != lane {
+            return;
+        }
+        out.push(OutputVarying { usage: v.usage, base_lane: lane, components: v.components });
+        lane += width(v);
+    }
+    if out.iter().zip(&program.output_varyings).any(|(a, b)| a.usage != b.usage) || program.output_order != VaryingOrder::Known {
+        program.output_varyings = out;
+        program.output_order = VaryingOrder::Known;
+    }
 }
 
 /// The varying a vertex ATTRIBUTE's declared semantic names, or `None` for a semantic that is

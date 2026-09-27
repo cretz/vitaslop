@@ -108,7 +108,9 @@ pub(super) fn overlay_add(ctx: &mut GuestCtx, st: &mut VitaState, overlay: Ptr, 
             kind = rec.kind, order = rec.order, dst = %rec.dst, src = %rec.src,
             "fios2 overlay add"
         );
+        let line = format!("fios overlay add kind {} order {} {:?} -> {:?}", rec.kind, rec.order, rec.dst, rec.src);
         let id = st.fios_overlay_add(rec);
+        st.journal(|| format!("{line} = id {id}"));
         if !out_id.is_null() {
             ctx.write_u32(out_id.addr(), id as u32);
         }
@@ -134,7 +136,9 @@ pub(super) fn overlay_add_for_process(
         EINVAL
     } else {
         let rec = read_overlay(ctx, overlay.addr());
+        let line = format!("fios overlay add kind {} order {} {:?} -> {:?}", rec.kind, rec.order, rec.dst, rec.src);
         let id = st.fios_overlay_add(rec);
+        st.journal(|| format!("{line} = id {id}"));
         if !out_id.is_null() {
             ctx.write_u32(out_id.addr(), id as u32);
         }
@@ -338,6 +342,7 @@ pub(super) fn overlay_resolve_sync(
         let path = read_cstr(ctx, in_path.addr());
         let resolved = st.fios_resolve(&path, ORDER_MIN, ORDER_MAX);
         tracing::trace!(target: "vitaslop::io", path, resolved, "fios2 resolve");
+        st.journal(|| format!("fios resolve {path:?} -> {resolved:?} (disabled here: {})", st.fios_overlay_disabled()));
         write_resolved(ctx, args.addr(), &resolved)
     }
 }
@@ -365,6 +370,7 @@ pub(super) fn overlay_resolve_with_range_sync(
         let (min_order, max_order) = (orders as u8, (orders >> 8) as u8);
         let path = read_cstr(ctx, in_path.addr());
         let resolved = st.fios_resolve(&path, min_order, max_order);
+        st.journal(|| format!("fios resolve [{min_order}..{max_order}] {path:?} -> {resolved:?}"));
         write_resolved(ctx, args.addr(), &resolved)
     }
 }
@@ -384,7 +390,9 @@ pub(super) fn overlay_thread_is_disabled(st: &mut VitaState) -> i32 {
 /// Returns the PREVIOUS setting, which is what a caller saves to restore.
 #[hostcall]
 pub(super) fn overlay_thread_set_disabled(st: &mut VitaState, disabled: i32) -> i32 {
-    i32::from(st.fios_overlay_set_disabled(disabled != 0))
+    let was = st.fios_overlay_set_disabled(disabled != 0);
+    st.journal(|| format!("fios thread overlay disabled {was} -> {}", disabled != 0));
+    i32::from(was)
 }
 
 /// int _sceFiosKernelOverlayGetRecommendedScheduler(int avail,

@@ -422,7 +422,14 @@ mod tests {
     #[test]
     fn the_lock_forms_read_the_current_thread_slot() {
         use crate::nid::lwsync as lw;
-        for nid in [lw::LOCK_LW_MUTEX, lw::LOCK_LW_MUTEX_CB, lw::UNLOCK_LW_MUTEX, lw::UNLOCK_LW_MUTEX2] {
+        for nid in [
+            lw::LOCK_LW_MUTEX,
+            lw::LOCK_LW_MUTEX_CB,
+            lw::LOCK_LW_MUTEX_0,
+            lw::UNLOCK_LW_MUTEX,
+            lw::UNLOCK_LW_MUTEX2,
+            lw::UNLOCK_LW_MUTEX_0,
+        ] {
             let op = super::super::lwsync::inline_op(nid).expect("has an inline form");
             assert_eq!(
                 op.mirror_slot(),

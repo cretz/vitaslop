@@ -179,19 +179,29 @@ export async function removeTitleRecord(id) {
 }
 
 /// Bytes used by one imported title's files, summed from OPFS.
+///
+/// >>> REMEMBERED IN THE TITLE'S RECORD, because summing it is not cheap: one `getFile()` per
+/// stored file, and a title is up to ~1,300 files at several ms each on a phone - the title page
+/// used to wait on this before drawing anything, and "hung a second" every time it opened. The
+/// stored bytes never change after an import (a re-import writes a fresh record without it), so
+/// it is summed once, in parallel, and read from `meta.storedBytes` from then on.
 export async function titleBytes(id) {
+  const meta = await readTitle(id);
+  if (meta && typeof meta.storedBytes === "number") return meta.storedBytes;
+  let n = 0;
   try {
     const root = await navigator.storage.getDirectory();
     const games = await root.getDirectoryHandle("games");
     const dir = await games.getDirectoryHandle(id);
-    let n = 0;
-    for await (const [, h] of dir.entries()) {
-      if (h.kind === "file") n += (await h.getFile()).size;
-    }
-    return n;
+    const files = [];
+    for await (const [, h] of dir.entries()) if (h.kind === "file") files.push(h);
+    const sizes = await Promise.all(files.map(async (h) => (await h.getFile()).size));
+    n = sizes.reduce((a, b) => a + b, 0);
   } catch {
     return 0;
   }
+  if (meta && n > 0) await touchTitle(id, { storedBytes: n });
+  return n;
 }
 
 /// Human sizes. 1e6-based, because that is what disks and quotas are quoted in.

@@ -163,7 +163,16 @@ pub fn base_knobs() -> BTreeMap<String, String> {
     // must carry NO per-frame instrumentation, and that the wash is a LATENCY fault. Running the
     // desktop browser WITH these knobs is now the local reproduction of the device's wash, which
     // is where the fix is being tested [[vitaslop-instrument-failure-imitating-its-subject]].
-    [("VITASLOP_FRAME_TOPUP", "0"), ("VITASLOP_GXP_LIVE", "1")]
+    [
+        ("VITASLOP_FRAME_TOPUP", "0"),
+        ("VITASLOP_GXP_LIVE", "1"),
+        // The PARALLEL engine (guest threads on three workers, the flip's geometry read on a
+        // fourth). Not instrumentation: it changes where work runs, not what is drawn, and it
+        // is what the phone needs - its frame is the title's serial main -> render chain, and
+        // the proxy measured that chain at -23% with the resolver off it. Deterministic runs
+        // (recipes, capsules, bisections) set `VITASLOP_SMP=0`.
+        ("VITASLOP_SMP", "1"),
+    ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()

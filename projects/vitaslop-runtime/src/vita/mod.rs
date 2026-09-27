@@ -94,7 +94,186 @@ pub fn set_preemptive_linking(on: bool) {
     PREEMPTIVE_LINK.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the module about to be linked will run its guest threads AT ONCE on several
+/// workers (the browser's `VITASLOP_SMP=1`). Off by default, like [`PREEMPTIVE_LINK`] and for
+/// the same reason: the linker runs before any `VitaState` exists.
+static SMP_LINK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare that the next [`link`](crate::link::link) is for a PARALLEL run. See
+/// [`smp_inline_filter`] for what that refuses.
+pub fn set_smp_linking(on: bool) {
+    SMP_LINK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the next link is for a parallel run - see [`set_smp_linking`].
+pub fn smp_linking() -> bool {
+    SMP_LINK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// >>> WHICH INLINE FORMS SURVIVE PARALLEL GUEST EXECUTION, and what the rest become.
+///
+/// Every inline form was admitted under one of the argument shapes in [`inline_op`]'s doc, and
+/// two of those shapes lean on ONE guest thread running at a time:
+///
+/// - the MIRROR block's contract is "cannot change while guest code runs". Under SMP a
+///   refresh on one worker lands while another worker's thread is mid-slice. A single GLOBAL
+///   word survives that - a vblank count or a constant is simply a newer value, as it is on
+///   hardware - but a PER-THREAD slot does not (`CURRENT_THREAD`, `THREAD_ID`, the spin
+///   budget, the yield flags: there is one block and several current threads), and a two-word
+///   PAIR can tear (the clock's low word from one refresh, its high word from the next).
+/// - the LOCK forms are check-then-store with no compare-and-swap, correct only because nothing
+///   else can run between the check and the store.
+///
+/// So under SMP: plain global mirror reads stay; the vblank read keeps its value but loses its
+/// parking budget (a spin then burns its worker until the fuel preempts it, which on a separate
+/// core costs nobody else anything); every per-thread, paired or lock form is refused and runs
+/// as the host call it always could have been - under the host mutex, which is what makes it
+/// atomic with every other host call. The guest-owned read-modify-writes (GXM context setters,
+/// the uniform ring, `sceClib` bulk ops) are untouched: on hardware those are plain userspace
+/// code too, with exactly the races the guest itself has.
+///
+/// A NID whose handler needs the RUN worker's JavaScript (see
+/// [`smp_owner_only`]) may not take the non-suspending trap either: the parallel scheduler can
+/// only forward a call it is allowed to suspend.
+fn smp_inline_filter(func_nid: u32, op: vitaslop_transpiler::InlineOp) -> Option<vitaslop_transpiler::InlineOp> {
+    use vitaslop_transpiler::InlineOp as I;
+    let global_slot = |s: u32| s == mirror::SLOT_VCOUNT || s == mirror::SLOT_SA_BANK;
+    // The per-thread and paired forms have SMP spellings (see each `InlineOp`): the thread
+    // words become instance globals, the clocks one atomic 64-bit word, the elided yield a test
+    // of THIS worker's runnable count. Measured reason they are worth it: a football title's
+    // loop threads poll `GetThreadId` / `GetProcessTimeWide` / `DelayThread(0)` ~16,000 times
+    // a frame each, and as host calls that doubled the parallel run's frame (`smp25e`).
+    let clock = |slot: u32| match slot {
+        s if s == mirror::SLOT_CLOCK_LO => Some(false),
+        s if s == mirror::SLOT_RTC_LO => Some(true),
+        _ => None,
+    };
+    match op {
+        I::LoadMirror { slot } if slot == mirror::SLOT_THREAD_ID => Some(I::ThreadWord { cur: false }),
+        I::LoadMirror { slot } if slot == mirror::SLOT_CURRENT_THREAD => Some(I::ThreadWord { cur: true }),
+        I::LoadMirror { slot } => global_slot(slot).then_some(op),
+        I::LoadMirrorParking { slot, .. } => global_slot(slot).then_some(I::LoadMirror { slot }),
+        I::LoadMirrorPair { slot } => clock(slot).map(|rtc| I::LoadClock64 { rtc }),
+        I::StoreMirrorPair { slot } => clock(slot).map(|rtc| I::StoreClock64 { rtc }),
+        I::DelayYield { cap, .. } => Some(I::SmpDelayYield { cap }),
+        I::LwMutexLock { .. }
+        | I::LwMutexUnlock { .. }
+        | I::KernelMutexLock { .. }
+        | I::KernelMutexUnlock { .. } => None,
+        I::Fast if smp_owner_only(func_nid) => None,
+        other => {
+            // Anything else that names a mirror slot is a form added after this filter was
+            // written; refuse it until someone has made the argument above for it.
+            if other.mirror_slot().is_some_and(|s| !global_slot(s)) {
+                return None;
+            }
+            Some(other)
+        }
+    }
+}
+
+/// >>> THE HOST CALLS THAT MUST RUN ON THE WORKER THAT OWNS THE EMULATOR'S JAVASCRIPT.
+///
+/// Under the parallel browser scheduler a host call normally runs on the worker whose guest
+/// thread made it, under the host mutex. These cannot: their handlers reach an object that
+/// exists in ONE worker's JavaScript heap - a WebCodecs decoder (whose pictures also arrive on
+/// that worker's event loop), the storage worker's synchronous reader, the page relay for
+/// location. From anywhere else the handle names a different object, or none. So the calling
+/// thread is suspended and the call is FORWARDED to the run worker, which dispatches it and
+/// hands the registers back.
+///
+/// Chosen by LIBRARY rather than call by call: the whole family shares the backing object,
+/// the calls are rare next to a frame's GXM traffic, and a family member left off would be a
+/// wrong object rather than a slow call. The owning backends also check the worker they run on
+/// and fail loudly, so a miss here is a panic that names itself, never silent corruption.
+pub fn smp_owner_only(func_nid: u32) -> bool {
+    smp_forwarded(func_nid, false)
+}
+
+/// [`smp_owner_only`] for a run that knows whether its guest workers each hold their own view
+/// of the title's storage ring: when they do, the pure file families (`sceIo`, `sceFios`) run
+/// where they are made. `VITASLOP_SMP_FORWARD` still wins - it is the bisection override.
+///
+/// MEASURED why (`tel25h`, MLB): with audio off the forward list, `sceIoPread` was the only
+/// per-frame forward left, and each one parked its thread and held the idle clock for the
+/// length of a present.
+pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
+    const FAMILIES: &[&str] = &[
+        "sceIo",
+        "sceFios",
+        "sceAvcdec",
+        "sceVideodec",
+        "sceMp4",
+        "sceAudiodec",
+        // NOT sceAudioOut: its sink writes a SharedArrayBuffer ring through per-WORKER views
+        // (`vitaslop_web::audio::install_ring`), so it runs on whichever worker calls it.
+        // MEASURED forwarded (tel25f/g): it was the per-frame forward that parked MLB's and
+        // Madden's audio threads behind every present.
+        "sceAudioIn",
+        "sceLocation",
+        "sceAppUtil",
+        "sceSaveData",
+        "sceNpTrophy",
+        "scePvf",
+        "sceLiveArea",
+        "scePlayer",
+    ];
+    let name = crate::nid::name(func_nid);
+    // `VITASLOP_SMP_FORWARD=<prefix>[,<prefix>...]`: forward these too - the bisection knob for
+    // a defect that appears when a family STOPS being forwarded.
+    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let extra = EXTRA.get_or_init(|| {
+        crate::knobs::var("VITASLOP_SMP_FORWARD")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    if extra.iter().any(|p| name.starts_with(p.as_str())) {
+        return true;
+    }
+    // A family's COMMON DIALOG calls (`sceSaveDataDialog*`, `sceNpTrophySetupDialog*`) are the
+    // dialog state machine in `services` - host state only, no file and no JavaScript - and a
+    // title polls their status once a frame. Forwarded, each poll parked its thread until the
+    // run worker's present was over (Madden: 62 of 158 forwards a window).
+    if name.contains("Dialog") {
+        return false;
+    }
+    // The system/app PARAMETER getters answer constants (`services::apputil_*_param_get_*`) -
+    // no state, no file, no JavaScript - and a title may poll them every frame: MEASURED DOA5
+    // (`sw25r-doa`) 96 forwards a window of `sceAppUtilSystemParamGetInt`.
+    if name.starts_with("sceAppUtilSystemParam") || name.starts_with("sceAppUtilAppParam") {
+        return false;
+    }
+    // The families whose ONLY JavaScript is the storage reader. The others that read files
+    // (`sceAppUtil`, `sceSaveData`, `sceNpTrophy`, `scePvf`, `sceLiveArea`) stay forwarded:
+    // they are rare, and not every call in them has been audited for other JS.
+    if storage_on_workers && (name.starts_with("sceIo") || name.starts_with("sceFios")) {
+        return false;
+    }
+    FAMILIES.iter().any(|f| name.starts_with(f))
+}
+
+/// The forwarded calls whose route is decided per CALL rather than per NID: the scheduler asks
+/// [`crate::host::VitaEnv::smp_call_is_self_contained`] under the host lock, runs the call
+/// locally when it says so, and forwards it otherwise.
+///
+/// `sceAudiodecDecode` serves two codecs under one NID: AT9 (pure Rust) and a movie's AAC (the
+/// run worker's WebCodecs). MEASURED (`sw25r-doa`): 200 AT9 decodes a window were forwarded,
+/// each parking its audio thread until the run worker's present was over.
+pub fn smp_forward_per_call(func_nid: u32) -> bool {
+    matches!(func_nid, ad_nid::DECODE | ad_nid::DECODE_N_FRAMES)
+}
+
 pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
+    let op = inline_op_one_baton(func_nid)?;
+    if smp_linking() {
+        return smp_inline_filter(func_nid, op);
+    }
+    Some(op)
+}
+
+/// [`inline_op`] as the one-baton scheduler has it - every form, under the arguments in the
+/// module docs. [`smp_inline_filter`] narrows this for a parallel run.
+fn inline_op_one_baton(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     if no_inline_imports() {
         return None;
     }
@@ -197,6 +376,10 @@ include!(concat!(env!("OUT_DIR"), "/dispatch_cont_only.rs"));
 /// and the exclusion list do not change when it does.
 pub fn fast_nid(func_nid: u32) -> bool {
     if no_fast_import() {
+        return false;
+    }
+    // A parallel run forwards these to the run worker, which needs a suspension to do it.
+    if smp_linking() && smp_owner_only(func_nid) {
         return false;
     }
     if fast_import_derived() {
@@ -1091,7 +1274,12 @@ fn dispatch_inner(
         );
     }
     // Every `sceNgsVoice*` call, against the voice it names - see `ngs::report_silent_play`.
-    if crate::nid::name(func_nid).starts_with("sceNgsVoice") {
+    // The library test first (a compare, where the name lookup is a large match and a string
+    // test on EVERY host call), and nothing once the silent-play reports are spent.
+    if library_nid == crate::nid::lib::SCE_NGS
+        && st.audio_state.ngs_silent_reported < 8
+        && crate::nid::name(func_nid).starts_with("sceNgsVoice")
+    {
         ngs::trace_voice_call(st, func_nid, [ctx.arg(0), ctx.arg(1), ctx.arg(2), ctx.arg(3)]);
     }
     let outcome = match func_nid {
@@ -1110,9 +1298,11 @@ fn dispatch_inner(
         // exclusion (keyed by its guest work-area address). The `_CB` lock variant
         // additionally processes pending callbacks - none are queued in this model, so
         // it takes the same path.
-        lw_nid::LOCK_LW_MUTEX | lw_nid::LOCK_LW_MUTEX_CB => lwsync::lock_lw_mutex(ctx, st),
+        lw_nid::LOCK_LW_MUTEX | lw_nid::LOCK_LW_MUTEX_CB | lw_nid::LOCK_LW_MUTEX_0 => {
+            lwsync::lock_lw_mutex(ctx, st)
+        }
         lw_nid::TRY_LOCK_LW_MUTEX => cont!(lwsync::try_lock_lw_mutex(ctx, st)),
-        lw_nid::UNLOCK_LW_MUTEX | lw_nid::UNLOCK_LW_MUTEX2 => {
+        lw_nid::UNLOCK_LW_MUTEX | lw_nid::UNLOCK_LW_MUTEX2 | lw_nid::UNLOCK_LW_MUTEX_0 => {
             cont!(lwsync::unlock_lw_mutex(ctx, st))
         }
         lw_nid::DELETE_LW_MUTEX => cont!(lwsync::delete_lw_mutex(ctx, st)),
@@ -1532,6 +1722,16 @@ fn dispatch_inner(
         gxm_nid::END_SCENE => gxm::end_scene(ctx, st),
         gxm_nid::SET_VERTEX_PROGRAM => cont!(gxm::set_vertex_program(ctx, st)),
         gxm_nid::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER => cont!(gxm::reserve_vertex_uniforms(ctx, st)),
+        gxm_nid::SET_VERTEX_DEFAULT_UNIFORM_BUFFER => {
+            let buf = ctx.arg(1);
+            st.set_default_uniform_buffer(ctx, crate::host::ProgramStage::Vertex, buf);
+            cont!(ctx.ret(0))
+        }
+        gxm_nid::SET_FRAGMENT_DEFAULT_UNIFORM_BUFFER => {
+            let buf = ctx.arg(1);
+            st.set_default_uniform_buffer(ctx, crate::host::ProgramStage::Fragment, buf);
+            cont!(ctx.ret(0))
+        }
         gxm_nid::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER => cont!(gxm::reserve_fragment_uniforms(ctx, st)),
         gxm_nid::SET_UNIFORM_DATA_F => cont!(gxm::set_uniform_data_f(ctx, st)),
         gxm_nid::SET_VERTEX_STREAM => cont!(gxm::set_vertex_stream(ctx, st)),
@@ -1664,6 +1864,9 @@ fn dispatch_inner(
         gxm_nid::SET_FRONT_VISIBILITY_TEST_ENABLE => cont!(gxm::set_front_visibility_test_enable(ctx, st)),
         gxm_nid::SET_FRONT_VISIBILITY_TEST_INDEX => cont!(gxm::set_front_visibility_test_index(ctx, st)),
         gxm_nid::SET_FRONT_VISIBILITY_TEST_OP => cont!(gxm::set_front_visibility_test_op(ctx, st)),
+        gxm_nid::SET_BACK_VISIBILITY_TEST_ENABLE => cont!(gxm::set_back_visibility_test(ctx, st, 0)),
+        gxm_nid::SET_BACK_VISIBILITY_TEST_INDEX => cont!(gxm::set_back_visibility_test(ctx, st, 1)),
+        gxm_nid::SET_BACK_VISIBILITY_TEST_OP => cont!(gxm::set_back_visibility_test(ctx, st, 2)),
         gxm_nid::UNMAP_MEMORY
         | gxm_nid::UNMAP_VERTEX_USSE_MEMORY
         | gxm_nid::UNMAP_FRAGMENT_USSE_MEMORY => cont!(gxm::unmap_memory(ctx, st)),
@@ -1677,6 +1880,7 @@ fn dispatch_inner(
         }
         gxm_nid::NOTIFICATION_WAIT => gxm::notification_wait(ctx, st),
         gxm_nid::SET_VERTEX_TEXTURE | gxm_nid::SET_VERTEX_TEXTURE_PUBLIC => cont!(gxm::set_vertex_texture(ctx, st)),
+        gxm_nid::SHADER_PATCHER_GET_HOST_MEM_ALLOCATED => cont!(ctx.ret(0)),
         gxm_nid::SHADER_PATCHER_GET_BUFFER_MEM_ALLOCATED
         | gxm_nid::SHADER_PATCHER_GET_VERTEX_USSE_MEM_ALLOCATED
         | gxm_nid::SHADER_PATCHER_GET_FRAGMENT_USSE_MEM_ALLOCATED => cont!(gxm::shader_patcher_get_mem_allocated(ctx)),
@@ -1890,7 +2094,8 @@ fn dispatch_inner(
         | ngs_nid::VOICE_DEF_GET_SCREAM_ATRAC9_VOICE
         | ngs_nid::VOICE_DEF_GET_SCREAM_VOICE
         | ngs_nid::VOICE_DEF_GET_TEMPLATE1
-        | ngs_nid::VOICE_DEF_GET_ATRAC9_VOICE => {
+        | ngs_nid::VOICE_DEF_GET_ATRAC9_VOICE
+        | ngs_nid::VOICE_DEF_GET_SAS_EMU_VOICE => {
             // One blob per definition, keyed by the NID this call arrived on - the pointer
             // is the only thing a rack description says about what it is made of.
             let addr = ngs::voice_def_get_for(st, func_nid);
@@ -2241,6 +2446,7 @@ fn dispatch_inner(
         // SceJpegEnc: context setup is real; Encode/Csc are left to the hard-fail
         // because there is no honest way to hand back a JPEG that was never encoded.
         sv_nid::JPEG_INIT_MJPEG => cont!(jpeg::init_mjpeg(ctx, st)),
+        sv_nid::JPEG_INIT_MJPEG_WITH_PARAM => cont!(jpeg::init_mjpeg_with_param(ctx, st)),
         sv_nid::JPEG_FINISH_MJPEG => cont!(jpeg::finish_mjpeg(ctx, st)),
         sv_nid::JPEG_GET_OUTPUT_INFO => cont!(jpeg::get_output_info(ctx, st)),
         sv_nid::JPEG_DECODE_MJPEG_YCBCR => cont!(jpeg::decode_mjpeg_ycbcr(ctx, st)),
@@ -2248,6 +2454,8 @@ fn dispatch_inner(
         sv_nid::JPEG_CSC => cont!(jpeg::plain_csc(ctx, st)),
         sv_nid::JPEGENC_GET_CONTEXT_SIZE => cont!(jpegenc::get_context_size(ctx, st)),
         sv_nid::JPEGENC_INIT => cont!(jpegenc::init(ctx, st)),
+        sv_nid::JPEGENC_INIT_WITH_PARAM => cont!(jpegenc::init_with_param(ctx, st)),
+        sv_nid::JPEGENC_SET_HEADER_MODE => cont!(jpegenc::set_header_mode(ctx, st)),
         sv_nid::JPEGENC_END => cont!(jpegenc::end(ctx, st)),
         sv_nid::JPEGENC_SET_OUTPUT_ADDR => cont!(jpegenc::set_output_addr(ctx, st)),
         sv_nid::JPEGENC_SET_COMPRESSION_RATIO => cont!(jpegenc::set_compression_ratio(ctx, st)),
@@ -2371,6 +2579,7 @@ fn dispatch_inner(
         | sv_nid::NP_COMMERCE2_GET_PRICE => {
             cont!(ctx.ret(services::SCE_NP_ERROR_SIGNED_OUT as u32))
         }
+        sv_nid::NET_GET_MAC_ADDRESS => cont!(services::net_get_mac_address(ctx, st)),
         // Everything else here is an init/register that simply succeeds offline.
         sv_nid::NET_INIT
         | sv_nid::NET_CTL_INIT
@@ -2503,6 +2712,7 @@ fn dispatch_inner(
         // so a frame update is an accepted no-op (the async variant has no completion
         // to deliver - there is no LiveArea state that changes).
         | sv_nid::LIVE_AREA_UPDATE_FRAME_ASYNC
+        | sv_nid::LIVE_AREA_UPDATE_FRAME_SYNC
         // Unnamed exports absent from every vita-headers revision, serviced as an
         // offline no-op success so they are handled rather than left as gaps.
         | sv_nid::NEAR_UTIL_UNKNOWN_A412E9CA
@@ -2953,6 +3163,89 @@ mod frame_boundary_tests {
             "Flip",
             "queueing a finished frame for scanout IS the frame boundary"
         );
+    }
+}
+
+/// The parallel run's two policies: which inline forms survive it, and which host calls must
+/// be forwarded to the worker that owns the emulator's JavaScript.
+#[cfg(test)]
+mod smp_policy_tests {
+    use super::*;
+    use crate::nid::{audio as au, display as d, gxm as g, iofilemgr as io, lwsync as lw, services as sv, videodec as vd};
+    use vitaslop_transpiler::{InlineOp as I, LwMutexLayout};
+
+    #[test]
+    fn the_calls_that_reach_run_worker_javascript_are_forwarded_and_the_frame_path_is_not() {
+        for n in [io::IO_READ, vd::AVCDEC_DECODE, vd::AVCDEC_CREATE_DECODER] {
+            assert!(smp_owner_only(n), "{} must run on the run worker", crate::nid::name(n));
+        }
+        // With a storage view on every guest worker, a file read runs where it is made; the
+        // decoder still needs the run worker's WebCodecs.
+        assert!(!smp_forwarded(io::IO_READ, true), "a file read is local when storage is shared");
+        assert!(smp_forwarded(vd::AVCDEC_DECODE, true), "a decode is forwarded whatever storage is");
+        // The frame's own traffic runs where it is made: forwarding it would put every draw
+        // behind a round trip to the run worker. Audio output writes a shared ring through
+        // per-worker views, and a common dialog's status is host state - both are polled
+        // every frame, and a forward parks the poller until the present is over.
+        for n in [
+            g::DRAW,
+            g::DRAW_PRECOMPUTED,
+            lw::LOCK_LW_MUTEX,
+            d::GET_VCOUNT,
+            au::OUT_OUTPUT,
+            sv::SAVEDATA_DIALOG_GET_STATUS,
+            sv::NP_TROPHY_SETUP_DIALOG_GET_STATUS,
+            sv::APPUTIL_SYSTEM_PARAM_GET_INT,
+        ] {
+            assert!(!smp_owner_only(n), "{} must not be forwarded", crate::nid::name(n));
+        }
+    }
+
+    #[test]
+    fn a_parallel_link_keeps_global_mirror_words_and_refuses_per_thread_and_lock_forms() {
+        let vcount = I::LoadMirror { slot: mirror::SLOT_VCOUNT };
+        assert_eq!(smp_inline_filter(0, vcount), Some(vcount));
+        let bank = I::LoadMirror { slot: mirror::SLOT_SA_BANK };
+        assert_eq!(smp_inline_filter(0, bank), Some(bank));
+        // The vblank read keeps its value and loses the per-thread spin budget.
+        assert_eq!(
+            smp_inline_filter(0, I::LoadMirrorParking { slot: mirror::SLOT_VCOUNT, budget: mirror::SLOT_SPIN_BUDGET }),
+            Some(vcount)
+        );
+        // Per-thread slots: one block, several current threads - so each instance carries its
+        // own word instead.
+        assert_eq!(
+            smp_inline_filter(0, I::LoadMirror { slot: mirror::SLOT_CURRENT_THREAD }),
+            Some(I::ThreadWord { cur: true })
+        );
+        assert_eq!(
+            smp_inline_filter(0, I::LoadMirror { slot: mirror::SLOT_THREAD_ID }),
+            Some(I::ThreadWord { cur: false })
+        );
+        // Pairs would tear across a refresh on another worker: one atomic 64-bit word instead.
+        assert_eq!(
+            smp_inline_filter(0, I::LoadMirrorPair { slot: mirror::SLOT_CLOCK_LO }),
+            Some(I::LoadClock64 { rtc: false })
+        );
+        assert_eq!(
+            smp_inline_filter(0, I::StoreMirrorPair { slot: mirror::SLOT_RTC_LO }),
+            Some(I::StoreClock64 { rtc: true })
+        );
+        // The elided yield asks about THIS worker's runnable threads.
+        assert_eq!(
+            smp_inline_filter(0, I::DelayYield { free_slot: 10, run_slot: 11, cap: 4 }),
+            Some(I::SmpDelayYield { cap: 4 })
+        );
+        // Check-then-store locks are not atomic across workers.
+        let layout = LwMutexLayout { id: 0, owner: 4, count: 8, waiters: 12 };
+        let thread_slot = mirror::SLOT_CURRENT_THREAD;
+        assert_eq!(smp_inline_filter(0, I::LwMutexLock { layout, thread_slot }), None);
+        assert_eq!(smp_inline_filter(0, I::LwMutexUnlock { layout, thread_slot }), None);
+        // Guest-owned reads and bulk ops are what they are on hardware: unchanged.
+        assert_eq!(smp_inline_filter(0, I::MemCopy), Some(I::MemCopy));
+        // The non-suspending trap is refused for a call that has to be forwarded.
+        assert_eq!(smp_inline_filter(io::IO_READ, I::Fast), None);
+        assert_eq!(smp_inline_filter(g::DRAW, I::Fast), Some(I::Fast));
     }
 }
 

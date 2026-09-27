@@ -397,19 +397,229 @@ pub struct LinkOptions {
     pub patched_against: Option<std::sync::Arc<[u8]>>,
 }
 
+/// The canonical guest-attribute spec a link is given: `(base lane, GXM format, component count
+/// clamped to 1..=4)`, SORTED by lane so it is a function of the layout and not of the order the
+/// guest declared it in. The renderer's draw path and the patcher-time [`prelink`] both build it
+/// here, which is what makes their [`LinkOptions`] - and so their memo keys - agree.
+pub fn guest_attr_spec(attrs: impl IntoIterator<Item = (u32, u8, u8)>) -> Vec<(u32, u8, u8)> {
+    let mut v: Vec<(u32, u8, u8)> = attrs.into_iter().map(|(r, f, c)| (r, f, c.clamp(1, 4))).collect();
+    v.sort_unstable();
+    v
+}
+
+/// A shader pair the title NAMED at `sceGxmShaderPatcherCreateFragmentProgram`, with the
+/// guest vertex layout its vertex program was created with ([`guest_attr_spec`], empty when the
+/// layout is not handed to the link) - everything the renderer needs to translate it ahead of
+/// the draw under the options that draw will compute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatcherPair {
+    pub vprog: std::sync::Arc<[u8]>,
+    pub fprog: std::sync::Arc<[u8]>,
+    pub attrs: Vec<(u32, u8, u8)>,
+}
+
+type MemoEntry = (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>, LinkOptions, Result<std::sync::Arc<LinkedProgram>, LinkError>);
+
+/// Translations by `(vertex blob, fragment blob, options)` - see [`link_programs_memo`].
+static LINK_MEMO: std::sync::Mutex<Option<std::collections::HashMap<(u64, u64), Vec<MemoEntry>>>> =
+    std::sync::Mutex::new(None);
+/// Entries across all buckets, for the bound.
+static LINK_MEMO_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Microseconds [`prelink`] spent translating, and how many pairs - the panel's "ahead" figure.
+static PRELINK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PRELINK_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Draw-time lookups the memo answered (a translation the frame did NOT pay).
+static MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Upper bound on memoised translations (~27 KB of WGSL each): a run that names more pairs than
+/// this starts over rather than growing without limit.
+const LINK_MEMO_CAP: usize = 4096;
+
+fn blob_hash(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for x in b {
+        h ^= u64::from(*x);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn memo_find(v: &[u8], f: &[u8], opts: &LinkOptions) -> Option<Result<std::sync::Arc<LinkedProgram>, LinkError>> {
+    let key = (blob_hash(v), blob_hash(f));
+    let g = LINK_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref()?.get(&key)?.iter().find(|e| &*e.0 == v && &*e.1 == f && &e.2 == opts).map(|e| e.3.clone())
+}
+
+fn memo_store(v: &[u8], f: &[u8], opts: LinkOptions, r: Result<std::sync::Arc<LinkedProgram>, LinkError>) {
+    let key = (blob_hash(v), blob_hash(f));
+    let mut g = LINK_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(Default::default);
+    if LINK_MEMO_LEN.load(std::sync::atomic::Ordering::Relaxed) >= LINK_MEMO_CAP {
+        map.clear();
+        LINK_MEMO_LEN.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    let bucket = map.entry(key).or_default();
+    if bucket.iter().any(|e| &*e.0 == v && &*e.1 == f && e.2 == opts) {
+        return;
+    }
+    bucket.push((v.into(), f.into(), opts, r));
+    LINK_MEMO_LEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// >>> A TRANSLATION IS A FUNCTION OF ITS INPUTS, SO IT IS DONE ONCE AND AHEAD WHEN IT CAN BE.
+///
+/// [`link_programs_with`], memoised on EXACTLY its inputs - both blobs by content and the whole
+/// [`LinkOptions`] - so a hit is by construction the module a fresh link would produce.
+///
+/// MEASURED: a Hot Shots session spent 731-780 ms of in-frame time in OUR translation (USSE ->
+/// IR -> WGSL), against 20-45 ms in the browser's compile and pipeline creation - every new pair
+/// a hitch in the frame that first drew it (the "new fighter appears" stall, the load stutter).
+/// On the console the equivalent work happens when the title calls
+/// `sceGxmShaderPatcherCreateFragmentProgram`, during its own load; [`prelink`] does ours there.
+pub fn link_programs_memo(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Result<std::sync::Arc<LinkedProgram>, LinkError> {
+    if std::env::var_os("VITASLOP_LINK_NO_MEMO").is_some() {
+        return link_programs_with(vbytes, fbytes, opts).map(std::sync::Arc::new);
+    }
+    if let Some(r) = memo_find(vbytes, fbytes, &opts) {
+        MEMO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return r;
+    }
+    let r = link_programs_with(vbytes, fbytes, opts.clone()).map(std::sync::Arc::new);
+    memo_store(vbytes, fbytes, opts, r.clone());
+    r
+}
+
+/// Translate a pair AHEAD of any draw - called where the title names it (the shader patcher),
+/// with the options its draws will compute. A wrong guess costs only the work: the draw's own
+/// lookup misses and translates as before. Timed for the panel's "ahead" figure with the
+/// CALLER's millisecond clock (this crate is wasm-safe and has none of its own).
+pub fn prelink(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions, now_ms: fn() -> f64) {
+    if memo_find(vbytes, fbytes, &opts).is_some() {
+        return;
+    }
+    let t0 = now_ms();
+    let r = link_programs_with(vbytes, fbytes, opts.clone()).map(std::sync::Arc::new);
+    PRELINK_US.fetch_add(((now_ms() - t0).max(0.0) * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+    PRELINK_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    memo_store(vbytes, fbytes, opts, r);
+}
+
+/// `(ms translated ahead by [`prelink`], pairs, draw-time memo hits)` - cumulative.
+pub fn prelink_stats() -> (f64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (PRELINK_US.load(Relaxed) as f64 / 1000.0, PRELINK_N.load(Relaxed), MEMO_HITS.load(Relaxed))
+}
+
+type RcMemo<T> = std::sync::Mutex<Option<std::collections::HashMap<u64, Vec<(std::sync::Arc<[u8]>, std::sync::Arc<T>)>>>>;
+/// Decoded programs by blob CONTENT - see [`recompile_memo`].
+static VERTEX_RC_MEMO: RcMemo<crate::RecompiledVertex> = std::sync::Mutex::new(None);
+static FRAGMENT_RC_MEMO: RcMemo<crate::RecompiledFragment> = std::sync::Mutex::new(None);
+
+/// A program's decode, done once per distinct blob. A title pairs one program with many (Hot
+/// Shots creates 1,087 fragment programs against a few hundred vertex programs), and every link
+/// of every pair used to decode BOTH from scratch - 22% of a link's time on a 596-pair corpus.
+/// The decode is a function of the blob's bytes alone, so the memo is exact; failures are not
+/// kept (they are rare and report on each attempt, as before).
+fn recompile_memo<T>(
+    memo: &RcMemo<T>,
+    bytes: &[u8],
+    f: fn(&[u8]) -> Result<T, crate::RecompileError>,
+) -> Result<std::sync::Arc<T>, crate::RecompileError> {
+    if std::env::var_os("VITASLOP_LINK_NO_RC_MEMO").is_some() {
+        return Ok(std::sync::Arc::new(f(bytes)?));
+    }
+    let key = blob_hash(bytes);
+    {
+        let g = memo.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = g.as_ref().and_then(|m| m.get(&key)).and_then(|b| b.iter().find(|e| &*e.0 == bytes)) {
+            return Ok(hit.1.clone());
+        }
+    }
+    let rc = std::sync::Arc::new(f(bytes)?);
+    let mut g = memo.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    if m.len() >= LINK_MEMO_CAP {
+        m.clear();
+    }
+    m.entry(key).or_default().push((bytes.into(), rc.clone()));
+    Ok(rc)
+}
+
+/// Emitted stage bodies by `(stage, blob content)` - see [`body_memo`].
+static BODY_MEMO: std::sync::Mutex<Option<std::collections::HashMap<(u8, u64), Vec<(std::sync::Arc<[u8]>, std::sync::Arc<str>)>>>> =
+    std::sync::Mutex::new(None);
+
+/// A stage body's WGSL text, emitted once per distinct program blob: the text is a function of
+/// the program alone, and a title links each program into many pairs (22% of a link was this
+/// emission, repeated for every pair). Failures are not kept.
+fn body_memo(stage: u8, bytes: &[u8], emit: impl FnOnce() -> Result<String, LinkError>) -> Result<std::sync::Arc<str>, LinkError> {
+    if std::env::var_os("VITASLOP_LINK_NO_BODY_MEMO").is_some() {
+        return Ok(emit()?.into());
+    }
+    let key = (stage, blob_hash(bytes));
+    {
+        let g = BODY_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = g.as_ref().and_then(|m| m.get(&key)).and_then(|b| b.iter().find(|e| &*e.0 == bytes)) {
+            return Ok(hit.1.clone());
+        }
+    }
+    let body: std::sync::Arc<str> = emit()?.into();
+    let mut g = BODY_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    if m.len() >= LINK_MEMO_CAP {
+        m.clear();
+    }
+    m.entry(key).or_default().push((bytes.into(), body.clone()));
+    Ok(body)
+}
+
+/// `VITASLOP_LINK_PROFILE=1` (native only): cumulative microseconds per link phase -
+/// `[recompile both, interface+plans, emit bodies, assemble module, post-passes]`.
+pub static LINK_PROFILE_US: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+#[cfg(not(target_arch = "wasm32"))]
+fn link_profile_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VITASLOP_LINK_PROFILE").is_some())
+}
+
+struct LinkPhase {
+    #[cfg(not(target_arch = "wasm32"))]
+    t: Option<std::time::Instant>,
+}
+
+impl LinkPhase {
+    fn start() -> LinkPhase {
+        LinkPhase {
+            #[cfg(not(target_arch = "wasm32"))]
+            t: link_profile_on().then(std::time::Instant::now),
+        }
+    }
+    #[allow(unused_variables)]
+    fn lap(&mut self, i: usize) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(t) = self.t {
+            LINK_PROFILE_US[i].fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.t = Some(std::time::Instant::now());
+        }
+    }
+}
+
 pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, LinkError> {
     link_programs_with(vbytes, fbytes, LinkOptions::default())
 }
 
 pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Result<LinkedProgram, LinkError> {
+    let mut prof = LinkPhase::start();
     let vprog = Program::parse(vbytes).map_err(LinkError::VertexParse)?;
     let fprog = Program::parse(fbytes).map_err(LinkError::FragmentParse)?;
     if vprog.kind != ProgramKind::Vertex || fprog.kind != ProgramKind::Fragment {
         return Err(LinkError::WrongKind);
     }
 
-    let vrc = recompile_vertex(vbytes).map_err(LinkError::VertexRecompile)?;
-    let frc = recompile_fragment(fbytes).map_err(LinkError::FragmentRecompile)?;
+    let vrc = recompile_memo(&VERTEX_RC_MEMO, vbytes, recompile_vertex).map_err(LinkError::VertexRecompile)?;
+    let frc = recompile_memo(&FRAGMENT_RC_MEMO, fbytes, recompile_fragment).map_err(LinkError::FragmentRecompile)?;
+    prof.lap(0);
 
     // Memory loads, in EITHER stage: each must resolve to a bindable window or the pair falls
     // back NAMING the gap (the plan's own resolver call swallows the reason, because a plan has
@@ -612,6 +822,7 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
 
     // Interpolated scalar components packed four per `@location` vec4. Both stages declare the
     // same interface, so the counts are equal by construction.
+    prof.lap(1);
     let fragment_varyings = (varyings.len() as u32).div_ceil(4);
     let vertex_varyings = fragment_varyings;
     if vertex_varyings > MAX_VARYINGS {
@@ -623,24 +834,31 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
     // the primary reads, so skipping it does not lose a detail - it leaves those registers
     // holding whatever the default uniform buffer had, which is how an unrelated matrix element
     // ends up scaling a surface's colour to black.
-    let vbody = format!(
-        "{}{}",
-        emit_secondary_body(&vprog).map_err(|e| LinkError::VertexRecompile(e.into()))?,
-        emit_body(&vrc.shader).map_err(|e: EmitError| LinkError::VertexRecompile(e.into()))?
-    );
-    let fbody = format!(
-        "{}{}",
-        emit_secondary_body(&fprog).map_err(|e| LinkError::FragmentRecompile(e.into()))?,
-        // MARKED: the dual-source module builder cuts this body at a top-level instruction
-        // boundary, and `build_linked_module` strips what it does not use.
-        emit_body_marked(&frc.shader)
-            .map_err(|e: EmitError| LinkError::FragmentRecompile(e.into()))?
-    );
+    // Both bodies are functions of their own program alone (its secondary program and its
+    // decoded IR), so they are emitted once per distinct blob - see `body_memo`.
+    let vbody = body_memo(0, vbytes, || {
+        Ok(format!(
+            "{}{}",
+            emit_secondary_body(&vprog).map_err(|e| LinkError::VertexRecompile(e.into()))?,
+            emit_body(&vrc.shader).map_err(|e: EmitError| LinkError::VertexRecompile(e.into()))?
+        ))
+    })?;
+    let fbody = body_memo(1, fbytes, || {
+        Ok(format!(
+            "{}{}",
+            emit_secondary_body(&fprog).map_err(|e| LinkError::FragmentRecompile(e.into()))?,
+            // MARKED: the dual-source module builder cuts this body at a top-level instruction
+            // boundary, and `build_linked_module` strips what it does not use.
+            emit_body_marked(&frc.shader)
+                .map_err(|e: EmitError| LinkError::FragmentRecompile(e.into()))?
+        ))
+    })?;
     // Loads at a window's own base plus a constant, resolved now rather than searched for in
     // the shader - see `resolve_static_mem_reads`.
     let vbody = crate::module::resolve_static_mem_reads(&vbody, &vplan.mem_windows, "gxp_mem");
     let fbody = crate::module::resolve_static_mem_reads(&fbody, &fplan.mem_windows, "gxp_fmem");
 
+    prof.lap(2);
     let wgsl = build_linked_module(
         &vbody,
         &vplan,
@@ -655,6 +873,7 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
         frc.shader.instrs.iter().any(|i| i.op == Op::DepthF),
     );
 
+    prof.lap(3);
     let dual_source = fplan.dual_source;
     let reads_dest_color = fplan.reads_dest_color && !dual_source;
     let dest_blend = frc.dest_blend;
@@ -3628,7 +3847,25 @@ fn build_linked_module(
             // the correlation is exact across the corpus. Packing halves into that register
             // instead makes the shadow compare read a denormal, every fragment tests as
             // shadowed, and the whole track surface shades black.
-            let _ = writeln!(m, "  pa[{}] = bitcast<u32>(pf{i}.x);", pf.pa_base);
+            //
+            // >>> UNLESS THE PROGRAM READS IT AS FOUR PACKED 8-BIT CHANNELS. The register holds
+            // what the fetch returns in the TEXTURE's own format, which the descriptor does not
+            // carry - a U8U8U8U8 texture fills the 32-bit register with four unorm bytes. MEASURED
+            // on a 2D skater title (capsule cap-oo, its one textured pair `c35f99b20265f3d3`):
+            // every sprite and parallax layer is a one-register prefetch read back only with
+            // `unpack4x8unorm(pa[0])`, and taking the red channel's FLOAT BITS as those four
+            // bytes drew every layer as a translucent yellow/blue wash. The program's own reads
+            // settle which it is, the same evidence the full-precision case was measured on.
+            // `VITASLOP_GXP_PREFETCH_U8=0` restores the full-precision reading everywhere.
+            let reg = format!("pa[{}]", pf.pa_base);
+            let read_u8 = fbody.contains(&format!("unpack4x8unorm({reg})"));
+            let read_f32 = fbody.contains(&format!("bitcast<f32>({reg})"))
+                || fbody.contains(&format!("unpack2x16float({reg})"));
+            if read_u8 && !read_f32 && arm(PREFETCH_U8_ARM) != Some("0") {
+                let _ = writeln!(m, "  pa[{}] = pack4x8unorm(pf{i});", pf.pa_base);
+            } else {
+                let _ = writeln!(m, "  pa[{}] = bitcast<u32>(pf{i}.x);", pf.pa_base);
+            }
         }
     }
     emit_secondary_attrs(&mut m, "fs_sa", fsa_regs, fliterals);
@@ -3653,7 +3890,7 @@ fn build_linked_module(
     if posprobe_on() && varying_locations > 0 {
         let _ = writeln!(m, "  return vec4<f32>(in.v0.x, in.v0.y, in.v0.z, 1.0);");
         let _ = writeln!(m, "}}");
-        return size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))));
+        return finish_linked_module(&m);
     }
     m.push_str(dual_split.as_ref().map_or(fbody, |(head, _)| head.as_str()));
     let (ret, base) = match fplan.color {
@@ -3667,14 +3904,14 @@ fn build_linked_module(
     let color = if fplan.alpha_to_red { format!("({color}).aaaa") } else { color };
     if let Some((_, tail)) = dual_split.as_ref() {
         emit_dual_split_tail(&mut m, tail, &color, fplan.color_precision);
-        return size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))));
+        return finish_linked_module(&m);
     }
     if fplan.raw64_output {
         // The register pair's bits, as the hardware stores them into a 64-bit surface. Whatever
         // precision the program wrote them at - packed halves, packed bytes, a float - the
         // surface holds the words, and a later raw sample reads them back unchanged.
         let _ = writeln!(m, "  return vec2<u32>({ret}[{base}], {ret}[{}]);\n}}", base + 1);
-        return size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))));
+        return finish_linked_module(&m);
     }
     if let Some(spec) = depth_probe() {
         // `=<min>:<scale>` spreads the window `[min, min + 1/scale]` over the whole grey ramp.
@@ -3697,7 +3934,7 @@ fn build_linked_module(
         if fplan.dual_source {
             m.push_str(DUAL_SOURCE_ENTRY);
         }
-        return size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))));
+        return finish_linked_module(&m);
     }
     let color = match dest_probe() {
         // `opaque` forces alpha to 1: a draw whose pipeline blend is `SrcAlpha` and whose
@@ -3725,7 +3962,7 @@ fn build_linked_module(
 
     // Last, and in this order: `resolve_sa_init` is what decides whether the SA bank is
     // subscripted dynamically at all, and `size_register_banks` sizes what comes out of it.
-    size_register_banks(&unpack_half_registers(&resolve_sa_init(&strip_split_markers(&m))))
+    finish_linked_module(&m)
 }
 
 /// Emit a stage's SA-bank initialisation: the default uniform buffer copied verbatim into
@@ -3991,13 +4228,53 @@ fn parse_word_copy(rhs: &str) -> Option<(&'static str, usize)> {
 /// Split `line` into the store it performs, if it is one of the recognised shapes, and the
 /// right-hand text that store did not account for.
 fn parse_half_store(line: &str) -> Option<(&'static str, usize, HalfStore<'_>)> {
+    if std::env::var_os("VITASLOP_LINK_OLD_PARSE").is_some() {
+        return parse_half_store_old(line);
+    }
+    let t = line.trim_start();
+    let (bank, reg, after) = parse_bank_subscript(t)?;
+    let rest = after.strip_prefix(" = ")?.trim_end().strip_suffix(';')?;
+    // The destination as the line spells it - `X[n]`, which is how the emitter writes every
+    // register - taken as a SLICE: this runs on every line of every module, and formatting the
+    // name (and the two helper prefixes around it) per line was most of this pass's cost.
+    let dest = &t[..t.len() - after.len()];
+    // The two half forms, spelled exactly as `wgsl::half_stmt` writes them. These are the
+    // emitter's own helper names rather than literal text, so a change to how a half store is
+    // spelled cannot leave this pass silently matching nothing and quietly doing no work.
+    let self_arg = |f: &str| {
+        rest.strip_prefix(f)
+            .and_then(|r| r.strip_prefix('('))
+            .and_then(|r| r.strip_prefix(dest))
+            .and_then(|r| r.strip_prefix(", "))
+            .and_then(|r| r.strip_suffix(')'))
+    };
+    if let Some(inner) = self_arg(HALF_LO_FN) {
+        return Some((bank, reg, HalfStore::Low(inner)));
+    }
+    if let Some(inner) = self_arg(HALF_HI_FN) {
+        return Some((bank, reg, HalfStore::High(inner)));
+    }
+    if let Some(inner) = rest.strip_prefix(HALF_PK_FN).and_then(|r| r.strip_prefix('(')).and_then(|r| r.strip_suffix(')')) {
+        return Some((bank, reg, HalfStore::Pair(inner)));
+    }
+    // A RAW half store (`wgsl::Dest::store_raw_half`) read-modify-writes the packed word with a
+    // 16-bit BIT PATTERN, and there is no telling a bit pattern from a float here - so a store
+    // whose right-hand side mentions its own destination and is not one of the two shapes above
+    // is left alone, and its destination is disqualified by that self-reference.
+    if rest.contains(dest) {
+        return None;
+    }
+    if let Some(src) = parse_word_copy(rest) {
+        return Some((bank, reg, HalfStore::Copy(src.0, src.1)));
+    }
+    Some((bank, reg, HalfStore::Word(rest)))
+}
+
+fn parse_half_store_old(line: &str) -> Option<(&'static str, usize, HalfStore<'_>)> {
     let t = line.trim_start();
     let (bank, reg, after) = parse_bank_subscript(t)?;
     let rest = after.strip_prefix(" = ")?.trim_end().strip_suffix(';')?;
     let dest = format!("{bank}[{reg}]");
-    // The two half forms, spelled exactly as `wgsl::half_stmt` writes them. These are the
-    // emitter's own helper names rather than literal text, so a change to how a half store is
-    // spelled cannot leave this pass silently matching nothing and quietly doing no work.
     let low_mid = format!("{HALF_LO_FN}({dest}, ");
     let high_mid = format!("{HALF_HI_FN}({dest}, ");
     if let Some(inner) = rest.strip_prefix(&low_mid).and_then(|r| r.strip_suffix(')')) {
@@ -4006,15 +4283,9 @@ fn parse_half_store(line: &str) -> Option<(&'static str, usize, HalfStore<'_>)> 
     if let Some(inner) = rest.strip_prefix(&high_mid).and_then(|r| r.strip_suffix(')')) {
         return Some((bank, reg, HalfStore::High(inner)));
     }
-    if let Some(inner) =
-        rest.strip_prefix(&format!("{HALF_PK_FN}(")).and_then(|r| r.strip_suffix(')'))
-    {
+    if let Some(inner) = rest.strip_prefix(&format!("{HALF_PK_FN}(")).and_then(|r| r.strip_suffix(')')) {
         return Some((bank, reg, HalfStore::Pair(inner)));
     }
-    // A RAW half store (`wgsl::Dest::store_raw_half`) read-modify-writes the packed word with a
-    // 16-bit BIT PATTERN, and there is no telling a bit pattern from a float here - so a store
-    // whose right-hand side mentions its own destination and is not one of the two shapes above
-    // is left alone, and its destination is disqualified by that self-reference.
     if rest.contains(&dest) {
         return None;
     }
@@ -4059,6 +4330,35 @@ fn half_reads(text: &str) -> Vec<(&'static str, usize, usize, usize)> {
 /// Every bank subscript in `text`: `Ok` names a register, `Err` a bank subscripted by something
 /// that is not a literal and therefore reaches anywhere in it.
 fn stray_bank_refs(text: &str) -> Vec<Result<(&'static str, usize), &'static str>> {
+    if std::env::var_os("VITASLOP_LINK_OLD_STRAY").is_some() {
+        return stray_bank_refs_by_name(text);
+    }
+    // ONE pass over the subscripts: at every `[`, the identifier in front of it is either one of
+    // the banks (whole - nothing identifier-like before it) or not a bank reference at all. The
+    // per-bank form this replaced searched every line five times for the bank NAMES, three of
+    // which are single letters, and so stopped at nearly every character; callers only collect
+    // the answers into sets, so the order of the list does not matter.
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find('[') {
+        let open = from + rel;
+        from = open + 1;
+        let mut start = open;
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+            start -= 1;
+        }
+        let Some(bank) = HALF_BANKS.into_iter().find(|b| *b == &text[start..open]) else { continue };
+        match parse_bank_subscript(&text[start..]) {
+            Some((b, reg, _)) => out.push(Ok((b, reg))),
+            None => out.push(Err(bank)),
+        }
+    }
+    out
+}
+
+/// The per-bank form [`stray_bank_refs`] replaced, kept as its test oracle.
+fn stray_bank_refs_by_name(text: &str) -> Vec<Result<(&'static str, usize), &'static str>> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     for bank in HALF_BANKS {
@@ -4086,8 +4386,22 @@ fn stray_bank_refs(text: &str) -> Vec<Result<(&'static str, usize), &'static str
     out
 }
 
-/// Whether a 16-bit register gets an UNPACKED home. **OFF unless asked for**, and the reason is
-/// a measurement, not caution.
+/// Whether a 16-bit register gets an UNPACKED home. **ON by default since 2026-09-27**
+/// (`VITASLOP_GXP_HALF_REGS=0` is the arm back), and the reason is a PICTURE on the phone.
+///
+/// >>> THE PACKED FORM IS COMPUTED WRONG ON THE POWERVR PHONE (img-tec d-series), DATA-DEPENDENTLY.
+/// MLB's boot light-cell blur (`frag_842e7990`/`frag_842e875c`) replayed from one captured frame
+/// halved the light on every pass on the phone (cell grid 8 -> 4 -> 2) while the desktop kept it
+/// (8 -> 8 -> 8); this arm on the phone gave 8 -> 8 -> 8. That chain feeds the players' ambient
+/// cubes through the game's own CPU-side colour pick, so the whole at-bat rendered warm and
+/// washed out (grey road uniform khaki, grey buildings salmon). NOT `unpack2x16float` - probed
+/// bit-exact on the phone (subnormals included) - and not texel-edge ties (nudged coordinates
+/// changed nothing); the packed register file's code shape is what the phone's compiler gets
+/// wrong. This arm keeps the SAME rounding (every computed value still rounds to f16, see
+/// `f16_exact`), so it is the faithful form, and on the phone it cost nothing measurable at the
+/// at-bat (31 fps at 91% speed either way, GPU 19.1 ms/frame).
+///
+/// The earlier measurements, kept because they are what the default used to rest on:
 ///
 /// The pass removes 70% of the f16 conversions a corpus emits (mlb: 4,459 -> 1,330), and on the
 /// only engine here that can price it - the DESKTOP BROWSER, whose shader compiler is the
@@ -4103,10 +4417,9 @@ fn stray_bank_refs(text: &str) -> Vec<Result<(&'static str, usize), &'static str
 /// fragment over 3M fragments would be paid. `=1` takes it, `=noexact` takes it with every store
 /// rounded.
 fn half_regs_on() -> bool {
-    // Back to OPT-IN (2026-09-18): a phone run with it on by default read the world pass at
-    // 16.0 ms over 1,062 draws against 12.1 ms over 1,055 without it - no win, and the
-    // register growth is the likely cost. `=1` / `=noexact` take it.
-    matches!(arm(HALF_REGS_ARM), Some("1") | Some("noexact"))
+    // (2026-09-18: a phone run read the world pass at 16.0 ms with it against 12.1 ms without,
+    // and it went back to opt-in; 2026-09-27 it is the default for the picture - see above.)
+    arm(HALF_REGS_ARM) != Some("0")
 }
 
 /// A register's occurrences, split into the LIVE RANGES a whole-register write separates.
@@ -4221,15 +4534,23 @@ fn unpack_half_registers_region(region: &str) -> String {
             half.insert(at(bank, *reg));
             read.insert(at(bank, *reg));
         }
-        // Whatever is left once the store skeleton and the half reads are taken out.
-        let mut left = String::with_capacity(residue.len());
-        let mut from = 0usize;
-        for (_, _, s, e) in &reads {
-            left.push_str(&residue[from..*s]);
-            from = *e;
-        }
-        left.push_str(&residue[from..]);
-        for r in stray_bank_refs(&left) {
+        // Whatever is left once the store skeleton and the half reads are taken out - the
+        // residue itself when it had no half reads, which is most lines (no copy).
+        let left_owned;
+        let left: &str = if reads.is_empty() {
+            residue
+        } else {
+            let mut l = String::with_capacity(residue.len());
+            let mut from = 0usize;
+            for (_, _, s, e) in &reads {
+                l.push_str(&residue[from..*s]);
+                from = *e;
+            }
+            l.push_str(&residue[from..]);
+            left_owned = l;
+            &left_owned
+        };
+        for r in stray_bank_refs(left) {
             match r {
                 Ok((b, reg)) => {
                     bad.insert(at(b, reg));
@@ -4276,9 +4597,25 @@ fn unpack_half_registers_region(region: &str) -> String {
             let Some(bank) = HALF_BANKS.into_iter().find(|x| *x == b) else { return false };
             keep((bank, r, ranges.get(&(bank, r)).copied().unwrap_or(0)))
         };
-        out.push_str(&rewrite_half_line(line, &live));
+        rewrite_half_line_into(&mut out, line, &live);
     });
     fix_dual_split_saves(&out)
+}
+
+/// [`rewrite_half_line`] appended to `out` - and a line with nothing to rewrite (no kept store,
+/// no half read at all) appended AS IS, with no allocation: most lines of a module.
+fn rewrite_half_line_into(out: &mut String, line: &str, keep: &impl Fn(&str, usize) -> bool) {
+    if std::env::var_os("VITASLOP_LINK_OLD_REWRITE").is_some() {
+        out.push_str(&rewrite_half_line(line, keep));
+        return;
+    }
+    let body = line.trim_end_matches('\n');
+    let kept_store = parse_half_store(body).is_some_and(|(b, r, _)| keep(b, r));
+    if !kept_store && !body.contains("unpack2x16float(") {
+        out.push_str(line);
+        return;
+    }
+    out.push_str(&rewrite_half_line(line, keep));
 }
 
 /// One line with every qualified register moved to its unpacked home.
@@ -4369,6 +4706,76 @@ fn f16_exact(expr: &str) -> bool {
     if arm(HALF_REGS_ARM) == Some("noexact") {
         return false;
     }
+    if std::env::var_os("VITASLOP_LINK_OLD_F16").is_some() {
+        return f16_exact_strike(expr);
+    }
+    f16_exact_scan(expr)
+}
+
+/// [`f16_exact`]'s test as ONE allocation-free left-to-right scan. The strike-out form below
+/// ([`f16_exact_strike`]) ran twenty-one `String::replace` passes per store, and this pass was
+/// 35% of a whole link (480 of 1,370 ms over a 596-pair corpus). Same verdict by construction on
+/// the text the emitter writes: every piece the strike-out removes is consumed here as a whole
+/// token, and anything else - an identifier, a number or a character it would have left behind
+/// - fails the scan exactly as it would have left the remainder non-empty. The strike-out stays
+/// as the test oracle (`f16_exact_scan_agrees_with_the_strike_out`).
+fn f16_exact_scan(expr: &str) -> bool {
+    let b = expr.as_bytes();
+    let mut i = 0usize;
+    // `[digits]` at `j`, returning the index after it.
+    let sub = |j: usize| -> Option<usize> {
+        if b.get(j) != Some(&b'[') {
+            return None;
+        }
+        let close = expr[j..].find(']')? + j;
+        Some(close + 1)
+    };
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b' ' | b'\t' | b'(' | b')' | b',' | b'-' | b'<' | b'>' | b'=' | b'!' | b'&' | b'|' => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let rest = &expr[i..];
+        // Whole tokens the strike-out removes.
+        if let Some(t) = ["vec2<f32>", "select", "false", "true", "abs", "min", "max", "0.0", "1.0"]
+            .into_iter()
+            .find(|t| rest.starts_with(t))
+        {
+            // A token glued to more identifier characters is not that token: the strike-out
+            // would have left the tail behind, and the tail fails the verdict - so does this.
+            let end = i + t.len();
+            let glued = t.as_bytes()[t.len() - 1].is_ascii_alphanumeric()
+                && b.get(end).is_some_and(|x| x.is_ascii_alphanumeric() || *x == b'_' || *x == b'.');
+            if !glued {
+                i = end;
+                continue;
+            }
+        }
+        // A half-register read: lowercase letters, `_h`, `[..]`, optionally `[..]`.
+        if c.is_ascii_lowercase() {
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_lowercase() {
+                j += 1;
+            }
+            if expr[j..].starts_with(HALF_SUFFIX) {
+                let Some(mut end) = sub(j + HALF_SUFFIX.len()) else { return false };
+                if let Some(e2) = sub(end) {
+                    end = e2;
+                }
+                i = end;
+                continue;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+fn f16_exact_strike(expr: &str) -> bool {
     // Anything left after the recognised pieces are struck out disqualifies the expression.
     let mut rest = expr.to_string();
     // Half-register reads, with or without a component selector: `pa_h[3]`, `r_h[0][1]`.
@@ -4770,6 +5177,11 @@ pub fn set_arm(name: &str, value: &str) {
             | F16_ROUND_ARM
             | CASE_TEX_ARM
             | DP_MOE_BIT47_ARM
+            | DP_B48_BOTH_ARM
+            | VARYING_CODE_ORDER_ARM
+            | IEEE_RCP_ARM
+            | IMAD_SRC1_WHOLE_ARM
+            | PREFETCH_U8_ARM
             // >>> THE SHADER PROBES, for the same reason as the arms above and more urgently.
             //
             // These are the only instruments that can say WHICH term of a lit material is the
@@ -4814,6 +5226,10 @@ pub const SA_DIRECT_ARM: &str = "VITASLOP_GXP_SA_DIRECT";
 /// every half read and write a conversion, which is the default and what ships. `noexact` is the
 /// middle position: the unpacked home with every store rounded (see [`f16_exact`]).
 pub const HALF_REGS_ARM: &str = "VITASLOP_GXP_HALF_REGS";
+
+/// `0` reads a one-register prefetch as one full-precision component even where the program
+/// reads it as four packed 8-bit channels - see the one-register case in `build_linked_module`.
+pub const PREFETCH_U8_ARM: &str = "VITASLOP_GXP_PREFETCH_U8";
 
 /// >>> HOW AN f32 NARROWS TO AN f16 - THE NEGATIVE CONTROL FOR THE ROUNDING FIX.
 ///
@@ -4931,6 +5347,18 @@ pub const IDX_MUL_ARM: &str = "VITASLOP_GXP_IDX_MUL";
 /// `0` sends every repeating DP back to the intrinsic four-register source walk, bit 47 or not
 /// - the arm back for the bit-47 rule in `usse::decode::repeat_operands`.
 pub const DP_MOE_BIT47_ARM: &str = "VITASLOP_GXP_DP_MOE_BIT47";
+/// `0` holds a repeating DP's internal op2 when bit 47 is clear and bit 48 is set (the old
+/// reading) instead of stepping it with op1 - see the 0x03 arm of `usse::decode::repeat_operands`.
+pub const DP_B48_BOTH_ARM: &str = "VITASLOP_GXP_DP_B48_BOTH";
+/// `0` emits `rcp`/`rsq` as the bare WGSL builtins instead of `gxp_rcp`/`gxp_rsq` - see
+/// `wgsl::IEEE_HELPERS`.
+pub const IEEE_RCP_ARM: &str = "VITASLOP_GXP_IEEE_RCP";
+/// `0` keeps a vertex program's output varyings in the container's order (attribute order or
+/// convention) instead of the order its own MOVES state - see `container::order_varyings_by_code`.
+pub const VARYING_CODE_ORDER_ARM: &str = "VITASLOP_GXP_VARYING_CODE_ORDER";
+/// `1` reads a 16-bit integer MAD's src1 as the WHOLE register when its half-select bit is clear
+/// (the old reading) instead of its LOW half - see `wgsl::emit_int_mad`.
+pub const IMAD_SRC1_WHOLE_ARM: &str = "VITASLOP_GXP_IMAD_SRC1_WHOLE";
 
 /// [`IDX_MUL_ARM`]'s value as a multiplier, or `None` when it is unset - in which case the
 /// stride the program itself carries (`usse::resolve_index_load_stride`) is used.
@@ -4980,6 +5408,180 @@ fn emit_register_banks(m: &mut String) {
 /// clamps to `BANK_REGS - 1`, and a smaller array would fold every high index onto its last
 /// element - so a bank with any dynamic subscript keeps its full size. That is the whole safety
 /// argument: constant indices are checked by the compiler, dynamic ones are not shrunk.
+/// The text passes every linked module ends with, in order - see each for what it does.
+fn finish_linked_module(m: &str) -> String {
+    let mut prof = LinkPhase::start();
+    let mut sub = LinkPhase::start();
+    let a = strip_split_markers(m);
+    sub.lap(5);
+    let b = resolve_sa_init(&a);
+    sub.lap(6);
+    let c = unpack_half_registers(&b);
+    sub.lap(7);
+    let d = size_register_banks(&c);
+    sub.lap(8);
+    let out = fold_literal_unpacks(&d);
+    sub.lap(9);
+    prof.lap(4);
+    out
+}
+
+/// The exact f32 bit pattern of an IEEE binary16 value - every f16 (subnormals, infinities, NaN
+/// payloads included) is representable in f32, so this is exact.
+fn f16_bits_to_f32_bits(h: u16) -> u32 {
+    let sign = u32::from(h >> 15) << 31;
+    let exp = u32::from((h >> 10) & 0x1f);
+    let man = u32::from(h & 0x3ff);
+    match (exp, man) {
+        (0, 0) => sign,
+        (0, _) => {
+            // Subnormal: normalise the mantissa into f32's implicit-one form.
+            let mut e: i32 = -14;
+            let mut m = man;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | (((e + 127) as u32) << 23) | ((m & 0x3ff) << 13)
+        }
+        (0x1f, _) => sign | 0x7f80_0000 | (man << 13),
+        _ => sign | ((exp + 112) << 23) | (man << 13),
+    }
+}
+
+/// `unpack2x16float` of a word known at translation time, as a WGSL `vec2<f32>` of the exact bits.
+fn folded_unpack(word: u32) -> String {
+    format!(
+        "vec2<f32>(bitcast<f32>({:#010x}u), bitcast<f32>({:#010x}u))",
+        f16_bits_to_f32_bits(word as u16),
+        f16_bits_to_f32_bits((word >> 16) as u16)
+    )
+}
+
+/// >>> A WORD KNOWN AT TRANSLATION TIME IS UNPACKED AT TRANSLATION TIME.
+///
+/// A program's container literals are written into its SA bank once, at the top of the stage
+/// (`sa[59] = 0x3c002c00u;`), and the emitter read them back like any register -
+/// `unpack2x16float(sa[59])` - so every invocation decoded a constant. Folding it is ordinary
+/// constant folding: bit-identical by construction (every f16 is exact in f32, see
+/// [`f16_bits_to_f32_bits`]) and fewer instructions in the shader.
+///
+/// It is also what a real device needs. MEASURED on the PowerVR phone (Madden's crowd,
+/// `ae75f4bf0fc3cc0c`, replayed from one captured frame): the translated module is valid and
+/// the desktop browser computes `unpack2x16float(0x3c002c00u)` as (0.0625, 1.0), while the phone
+/// returned 0.0625 for component 1 too - its crowd texcoord came out at a quarter of its value,
+/// every crowd card sampled the transparent part of the atlas and the alpha test discarded all
+/// of them (the empty grey stands). Folding only that one read restored the crowd on the phone.
+///
+/// Folded: `unpack2x16float(0x…u)` anywhere, and `unpack2x16float(sa[N])` inside a stage whose
+/// `sa[N]` is written exactly once, with a hex literal, and whose `sa` bank takes no dynamically
+/// indexed store. `VITASLOP_GXP_FOLD_LITERALS=0` is the arm back.
+fn fold_literal_unpacks(module: &str) -> String {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("VITASLOP_GXP_FOLD_LITERALS").map(|v| v.trim() != "0").unwrap_or(true)) {
+        return module.to_string();
+    }
+    const CALL: &str = "unpack2x16float(";
+    // Per top-level item: a stage's literals are that stage's own.
+    let mut out = String::with_capacity(module.len());
+    let mut items: Vec<&str> = Vec::new();
+    // Cut before every top-level `fn` or attribute line.
+    let mut cuts: Vec<usize> = module.match_indices("\nfn ").chain(module.match_indices("\n@")).map(|(i, _)| i + 1).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut prev = 0;
+    for c in cuts {
+        items.push(&module[prev..c]);
+        prev = c;
+    }
+    items.push(&module[prev..]);
+    for item in items {
+        // Every store into `sa` in this item, IN TEXT ORDER: `(offset, Some(reg) | None for a
+        // dynamically indexed store, the literal if this is a top-level `= 0x..u;`)`.
+        let mut stores: Vec<(usize, Option<u32>, Option<u32>)> = Vec::new();
+        let mut at = 0usize;
+        while let Some(rel) = item[at..].find("sa[") {
+            let p = at + rel;
+            at = p + 3;
+            if item[..p].chars().last().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            // The MATCHING bracket - an index may itself subscript (`sa[idx[0] + 1]`).
+            let mut depth = 1usize;
+            let Some(close) = item[at..].char_indices().find_map(|(i, c)| {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(i)
+            }) else {
+                break;
+            };
+            let idx = &item[at..at + close];
+            let after = item[at + close + 1..].trim_start();
+            if !(after.starts_with('=') && !after.starts_with("==")) {
+                continue;
+            }
+            // A literal counts only as a TOP-LEVEL statement of the stage - brace depth 1, the
+            // function body itself: one inside a branch or a loop does not always run.
+            let depth_here = item[..p].matches('{').count() as i64 - item[..p].matches('}').count() as i64;
+            let top = depth_here == 1;
+            let lit = after[1..]
+                .trim_start()
+                .strip_prefix("0x")
+                .and_then(|h| h.split_once("u;"))
+                .and_then(|(h, _)| u32::from_str_radix(h, 16).ok())
+                .filter(|_| top);
+            stores.push((p, idx.parse::<u32>().ok(), lit));
+        }
+        // reg -> (offset of its literal store, the literal): the LAST store to it is that literal,
+        // and no dynamically indexed store comes after it.
+        let mut literal: std::collections::HashMap<u32, (usize, u32)> = std::collections::HashMap::new();
+        for (i, &(pos, reg, lit)) in stores.iter().enumerate() {
+            let (Some(reg), Some(lit)) = (reg, lit) else { continue };
+            let clobbered = stores[i + 1..].iter().any(|&(_, r, _)| r.is_none_or(|r| r == reg));
+            if !clobbered {
+                literal.insert(reg, (pos, lit));
+            }
+        }
+        let mut s = item;
+        while let Some(p) = s.find(CALL) {
+            out.push_str(&s[..p]);
+            let arg_start = p + CALL.len();
+            let arg = &s[arg_start..];
+            let folded = if let Some(h) = arg.strip_prefix("0x") {
+                h.split_once("u)").and_then(|(hex, _)| u32::from_str_radix(hex, 16).ok().map(|w| (w, 2 + hex.len() + 2)))
+            } else if let Some(r) = arg.strip_prefix("sa[") {
+                // Only a read AFTER the literal's own store: before it the register holds
+                // whatever the uniform bank loaded.
+                let here = item.len() - s.len() + p;
+                r.split_once("])").and_then(|(n, _)| {
+                    n.parse::<u32>().ok().and_then(|n| {
+                        literal.get(&n).filter(|&&(pos, _)| pos < here).map(|&(_, w)| (w, 3 + n.to_string().len() + 2))
+                    })
+                })
+            } else {
+                None
+            };
+            let ident_char = s[..p].chars().last().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            match folded {
+                Some((w, len)) if !ident_char => {
+                    out.push_str(&folded_unpack(w));
+                    s = &s[arg_start + len..];
+                }
+                _ => {
+                    out.push_str(CALL);
+                    s = &s[arg_start..];
+                }
+            }
+        }
+        out.push_str(s);
+    }
+    out
+}
+
 fn size_register_banks(module: &str) -> String {
     const BANKS: [&str; 5] = ["r", "o", "i", "pa", "sa"];
     let sized = arm_on("VITASLOP_GXP_SIZE_BANKS");
@@ -5239,6 +5841,99 @@ mod tests {
     use crate::container::{
         Interpolant, OutputVarying, ParamCategory, ParamType, Parameter, ProgramKind, SamplePrefetch,
     };
+
+    #[test]
+    fn stray_bank_refs_one_pass_matches_the_per_bank_search() {
+        for t in [
+            "  r[0] = gxp_hlo(r[0], unpack2x16float(pa[3])[1] * bitcast<f32>(sa[12]));",
+            "  o[4] = bitcast<u32>(i[idx[0] + 2u]);",
+            "  let x = gxp_mem[g0 >> 2u][g0 & 3u] + vs_sa.data[3][1] + r_h[2][0];",
+            "  spa[1] = ior[2]; sa[x] = pa[01];",
+            "",
+        ] {
+            let mut a = stray_bank_refs(t);
+            let mut b = stray_bank_refs_by_name(t);
+            let key = |r: &Result<(&str, usize), &str>| format!("{r:?}");
+            a.sort_by_key(key);
+            b.sort_by_key(key);
+            assert_eq!(a, b, "{t:?}");
+        }
+    }
+
+    /// The scan is the strike-out's verdict on the shapes the emitter writes - the oracle stays.
+    #[test]
+    fn f16_exact_scan_agrees_with_the_strike_out() {
+        for e in [
+            "vec2<f32>(pa_h[3][0], r_h[1][1])",
+            "abs(pa_h[2][0])",
+            "-(r_h[0][1])",
+            "select(pa_h[1][0], pa_h[1][1], p[0])",
+            "select(pa_h[1][0], pa_h[1][1], true)",
+            "max(min(r_h[0][0], 1.0), 0.0)",
+            "vec2<f32>(0.0, 1.0)",
+            "pa_h[3][0] + 1.0",
+            "pa_h[3][0] * r_h[0][1]",
+            "gxp_q2(pa_h[0])",
+            "bitcast<f32>(sa[2])",
+            "pa_h[3].x",
+            "10.0",
+            "0.05",
+            "min(r_h[0][0], sa_h[2][1])",
+            "!(r_h[0][0] > 0.0)",
+            "pf0.w",
+            "",
+            "(r_h[2])",
+            "unpack2x16float(pa[1])[0]",
+        ] {
+            assert_eq!(f16_exact_scan(e), f16_exact_strike(e), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn f16_bits_widen_exactly_to_f32() {
+        for (h, want) in [
+            (0x3c00u16, 1.0f32),
+            (0x2c00, 0.0625),
+            (0xba00, -0.75),
+            (0x7bff, 65504.0),
+            (0x0001, 2f32.powi(-24)),
+            (0x03ff, 1023.0 * 2f32.powi(-24)),
+            (0x0000, 0.0),
+        ] {
+            assert_eq!(f32::from_bits(f16_bits_to_f32_bits(h)), want, "{h:#06x}");
+        }
+        assert_eq!(f16_bits_to_f32_bits(0x8000), 0x8000_0000, "-0 keeps its sign");
+        assert_eq!(f16_bits_to_f32_bits(0x7c00), 0x7f80_0000, "+inf");
+        assert_eq!(f16_bits_to_f32_bits(0xfc00), 0xff80_0000, "-inf");
+        assert!(f32::from_bits(f16_bits_to_f32_bits(0x7e00)).is_nan(), "NaN stays NaN");
+    }
+
+    /// Madden's crowd program: a literal SA register read through `unpack2x16float` folds to
+    /// its exact halves; a register written twice, or a bank with a dynamic store, does not.
+    #[test]
+    fn a_literal_register_unpack_folds_and_nothing_else_does() {
+        let m = "@vertex\nfn vs_main() {\n  sa[59] = 0x3c002c00u;\n  let u = unpack2x16float(sa[59]);\n  let w = unpack2x16float(pa[2]);\n  let k = unpack2x16float(0x0000ba00u);\n}\n";
+        let f = fold_literal_unpacks(m);
+        assert!(f.contains("let u = vec2<f32>(bitcast<f32>(0x3d800000u), bitcast<f32>(0x3f800000u));"), "{f}");
+        assert!(f.contains("let w = unpack2x16float(pa[2]);"), "a register is not a literal:\n{f}");
+        assert!(f.contains("let k = vec2<f32>(bitcast<f32>(0xbf400000u), bitcast<f32>(0x00000000u));"), "{f}");
+        let twice = "fn vs_main() {\n  sa[59] = 0x3c002c00u;\n  sa[59] = bitcast<u32>(x);\n  let u = unpack2x16float(sa[59]);\n}\n";
+        assert!(fold_literal_unpacks(twice).contains("unpack2x16float(sa[59])"), "rewritten after the literal");
+        let dynamic = "fn vs_main() {\n  sa[59] = 0x3c002c00u;\n  sa[idx[0] + 1] = 0u;\n  let u = unpack2x16float(sa[59]);\n}\n";
+        assert!(fold_literal_unpacks(dynamic).contains("unpack2x16float(sa[59])"), "an indexed store may hit it");
+        // The bank's own INIT LOOP (a dynamic store) runs BEFORE the literal and cannot clobber
+        // it - Madden's crowd stage is exactly this shape; a read BEFORE the literal is not one.
+        let init = "fn vs_main() {\n  let early = unpack2x16float(sa[59]);\n  for (var k: u32 = 0u; k < 56u; k = k + 1u) { sa[k] = vs_sa.data[k / 4u][k % 4u]; }\n  sa[59] = 0x3c002c00u;\n  let u = unpack2x16float(sa[59]);\n}\n";
+        let f = fold_literal_unpacks(init);
+        assert!(f.contains("let early = unpack2x16float(sa[59]);"), "{f}");
+        assert!(f.contains("let u = vec2<f32>(bitcast<f32>(0x3d800000u), bitcast<f32>(0x3f800000u));"), "{f}");
+        // A literal inside a branch does not always run.
+        let branch = "fn vs_main() {\n  if (c) {\n  sa[59] = 0x3c002c00u;\n  }\n  let u = unpack2x16float(sa[59]);\n}\n";
+        assert!(fold_literal_unpacks(branch).contains("unpack2x16float(sa[59])"), "{}", fold_literal_unpacks(branch));
+        // A literal of ANOTHER stage does not fold this one's read.
+        let two = "fn vs_main() {\n  sa[3] = 0x3c003c00u;\n}\nfn fs_main() {\n  let u = unpack2x16float(sa[3]);\n}\n";
+        assert!(fold_literal_unpacks(two).contains("unpack2x16float(sa[3])"), "{}", fold_literal_unpacks(two));
+    }
     use crate::ir::{Instr, Op, Operand, Predicate};
 
     /// Every vertex program in the captured corpora (`VITASLOP_GXP_CORPUS`, `;`-separated
@@ -6091,6 +6786,42 @@ mod tests {
         let plain = emit(false);
         assert!(plain.contains("textureSample(t4, s4, vec2<f32>(in.v1.x, in.v1.y));"), "{plain}");
         assert!(!plain.contains(") / in.v"), "{plain}");
+    }
+
+    #[test]
+    fn a_one_register_prefetch_read_as_four_bytes_is_packed_as_four_bytes() {
+        // The one-register prefetch holds what the fetch returns in the TEXTURE's format; a
+        // program that reads it only as `unpack4x8unorm` is reading four unorm bytes, so the
+        // sample must be packed as four bytes - not the red channel's float bits (a 2D skater
+        // title's every layer drew as a translucent wash, capsule cap-oo). A program that
+        // reads it at full precision keeps the full-precision reading: the negative control.
+        let emit = |body: &dyn Fn(u32) -> String| {
+            let (vprog, mut fprog) = projective_pair(4);
+            fprog.interpolants[0].prefetch.as_mut().unwrap().lookup = crate::container::PrefetchLookup::Plain;
+            fprog.interpolants[0].prefetch_regs = 1;
+            let fsh = fragment_reading(&[0, 2]);
+            let vsh = shader(
+                ProgramKind::Vertex,
+                vec![instr(Op::Mov, Some(Operand::plain(Bank::Output, 6, 2)), vec![Operand::plain(Bank::PrimaryAttr, 0, 1)], [true; 4])],
+            );
+            let iface = plan_interface(&vprog, &fprog, &fsh, false).unwrap();
+            let base = iface.prefetches[0].pa_base;
+            let mut fplan = plan_bindings(&fsh, 0, |_| false);
+            for pf in &iface.prefetches {
+                fplan.samplers.push(pf.binding());
+            }
+            let vplan = plan_vertex_bindings(&vprog, &vsh);
+            let locations = (iface.components.len() as u32).div_ceil(4);
+            let module = build_linked_module(
+                &emit_body(&vsh).unwrap(), &vplan, &vprog, &[], &body(base), &fplan, &fprog, &[],
+                &iface, locations, false,
+            );
+            (module, base)
+        };
+        let (bytes, b) = emit(&|b| format!("  o[0] = pack4x8unorm(unpack4x8unorm(pa[{b}]));\n"));
+        assert!(bytes.contains(&format!("pa[{b}] = pack4x8unorm(pf0);")), "{bytes}");
+        let (full, b) = emit(&|b| format!("  r[0] = bitcast<u32>(bitcast<f32>(pa[{b}]) * 2.0);\n"));
+        assert!(full.contains(&format!("pa[{b}] = bitcast<u32>(pf0.x);")), "{full}");
     }
 
     #[test]

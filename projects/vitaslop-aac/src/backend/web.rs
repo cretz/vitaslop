@@ -97,11 +97,15 @@ pub struct WebCodecsAac {
     _on_error: Closure<dyn FnMut(JsValue)>,
     channels: u32,
     sample_rate: u32,
+    /// The wasm thread (worker) that created the decoder - see the `Send` note below.
+    owner: std::thread::ThreadId,
 }
 
-// SAFETY: wasm here is single-threaded - the whole emulator, including its scheduler, runs
-// on one worker - so nothing is ever sent anywhere. The bound exists because the trait is
-// shared with the native backends, which really are moved between threads.
+// SAFETY: the one-worker engine runs everything on one worker, so nothing is ever sent
+// anywhere. The wasm-threads bundle's parallel run (`VITASLOP_SMP`) has other workers, but
+// forwards every host call that can reach a decoder to the one that made it, and `submit` and
+// `poll` check `owner` and panic rather than touch a foreign JS heap. The bound exists because
+// the trait is shared with the native backends, which really are moved between threads.
 unsafe impl Send for WebCodecsAac {}
 
 impl WebCodecsAac {
@@ -169,12 +173,25 @@ impl WebCodecsAac {
             _on_error: on_error,
             channels,
             sample_rate,
+            owner: std::thread::current().id(),
         })
+    }
+}
+
+/// Refuse, loudly, a decoder used from a worker that did not create it - see `owner`.
+fn assert_owner(owner: std::thread::ThreadId) {
+    if std::thread::current().id() != owner {
+        panic!(
+            "a WebCodecs AudioDecoder was used from a worker that does not own it - a host \
+             call reached it from an SMP guest worker; its NID family must be forwarded to \
+             the run worker (`vita::smp_owner_only`)"
+        );
     }
 }
 
 impl Backend for WebCodecsAac {
     fn submit(&mut self, es: &[u8], pts: i64) -> Result<()> {
+        assert_owner(self.owner);
         if let Some(e) = self.shared.borrow_mut().error.take() {
             return Err(Error::Stream(e));
         }
@@ -199,6 +216,7 @@ impl Backend for WebCodecsAac {
     }
 
     fn poll(&mut self) -> Result<Option<Pcm>> {
+        assert_owner(self.owner);
         let mut s = self.shared.borrow_mut();
         if let Some(pcm) = s.ready.pop_front() {
             return Ok(Some(pcm));

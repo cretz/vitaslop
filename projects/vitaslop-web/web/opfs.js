@@ -310,7 +310,6 @@ const MAX_REQ = 32;
 export async function openTitleCached(id) {
   const sab = new SharedArrayBuffer(DATA_OFF + SLOTS * PAGE);
   const h = new Int32Array(sab);
-  const data = new Uint8Array(sab, DATA_OFF, SLOTS * PAGE);
   const worker = new Worker("./storage-worker.js", { type: "module" });
   const ready = await new Promise((resolve, reject) => {
     worker.onmessage = (e) => {
@@ -330,6 +329,34 @@ export async function openTitleCached(id) {
     }
   };
   const { paths, sizes } = ready;
+  const reader = readerOverRing(sab, paths, sizes, () => workerError);
+  return {
+    ...reader,
+    /// What another worker needs to read the SAME ring (`attachTitleCached`) - the parallel
+    /// guest workers of `VITASLOP_SMP` read files themselves instead of forwarding every
+    /// read to this worker. Plain data: a SharedArrayBuffer and two arrays.
+    share: () => ({ sab, paths, sizes }),
+    close: () => {
+      Atomics.store(h, H.CLOSE, 1);
+      Atomics.store(h, H.REQ, 1);
+      Atomics.notify(h, H.REQ);
+      setTimeout(() => worker.terminate(), 2000);
+    },
+  };
+}
+
+/// A reader over a ring another worker opened (`openTitleCached(..).share()`), with the same
+/// `paths`/`size`/`read`/`stats` interface. It owns no storage worker and cannot close one;
+/// a storage failure reaches it through the ring's `H.ERR` word. Requests go through the
+/// ring's ONE request slot, so every reader of a ring must be serialised by its caller - the
+/// emulator reads only inside host calls, under the host lock.
+export function attachTitleCached({ sab, paths, sizes }) {
+  return readerOverRing(sab, paths, sizes, () => null);
+}
+
+function readerOverRing(sab, paths, sizes, workerErrorOf) {
+  const h = new Int32Array(sab);
+  const data = new Uint8Array(sab, DATA_OFF, SLOTS * PAGE);
   const ids = new Map(paths.map((p, i) => [p, i]));
 
   const tag = (slot, f) => h[H.TAGS + slot * TAG.STRIDE + f];
@@ -369,6 +396,7 @@ export async function openTitleCached(id) {
     // Bounded waits, so a worker that has died leaves an error rather than a hang.
     let waited = 0;
     while (Atomics.load(h, H.ACK) === seq) {
+      const workerError = workerErrorOf();
       if (Atomics.load(h, H.ERR) !== 0 || workerError !== null) {
         throw new Error(`storage worker failed: ${workerError || "read error"}`);
       }
@@ -415,11 +443,5 @@ export async function openTitleCached(id) {
     },
     // Read once per panel window, never per read - see ringHits above.
     stats: () => ({ hits: ringHits, misses: ringMisses, waitMs: ringWaitMs }),
-    close: () => {
-      Atomics.store(h, H.CLOSE, 1);
-      Atomics.store(h, H.REQ, 1);
-      Atomics.notify(h, H.REQ);
-      setTimeout(() => worker.terminate(), 2000);
-    },
   };
 }
