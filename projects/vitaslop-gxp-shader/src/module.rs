@@ -2187,11 +2187,10 @@ pub fn resolve_static_mem_reads(body: &str, windows: &[MemWindow], binding: &str
                 let (s, o) = e.split_once("] + ")?;
                 Some((s.parse::<u32>().ok()?, o.strip_suffix("u;")?.parse::<u32>().ok()?))
             });
-            if let Some((s, o)) = parsed {
-                if let Some(at) = by_base.get(&s) {
+            if let Some((s, o)) = parsed
+                && let Some(at) = by_base.get(&s) {
                     known.insert(name, (*at, o));
                 }
-            }
             out.push_str(line);
             continue;
         }

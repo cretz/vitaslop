@@ -5600,7 +5600,7 @@ mod texture_inline_tests {
         }
         let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
         st.set_texture_format(PARAM, 0x9A00_3000);
-        let mut call = |bytes: &mut Vec<u8>, st: &mut VitaState, nid: u32, r0: u32, r1: u32| {
+        let call = |bytes: &mut Vec<u8>, st: &mut VitaState, nid: u32, r0: u32, r1: u32| {
             let mut regs = [0u32; REG_COUNT];
             regs[0] = r0;
             regs[1] = r1;

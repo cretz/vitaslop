@@ -946,6 +946,16 @@ fn half_helper_text() -> (String, bool) {
     (format!("{narrow}{HALF_HELPERS_COMMON}"), enable)
 }
 
+/// Whether the module's store helpers are the NATIVE arm (`enable f16;` and the language's own
+/// narrowing) - the same decision [`half_helper_text`] makes.
+pub fn native_f16_arm() -> bool {
+    match crate::link::arm(crate::link::F16_ROUND_ARM) {
+        Some("0" | "portable") => false,
+        Some("native") => true,
+        _ => native_f16(),
+    }
+}
+
 /// Whether this run rounds f16 stores to nearest even - false only under the negative-control
 /// arm. Reported by the renderer, because "which rounding mode did this picture use" is not
 /// answerable from a screenshot [[vitaslop-a-device-dump-must-name-its-own-build]].

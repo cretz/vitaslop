@@ -1965,8 +1965,8 @@ const GRP28_SWZ32: [&str; 32] = [
     "xwzx", "yyyx", "yyyz", "zwzw", "yzxz", "xxyy", "xzww", "xyz1",
 ];
 
-/// Group 0x20's vector swizzle for `opN` and `op1i` (henkaku, FACT), indexed by
-/// `swz_alt << 2 | swz`. The constant rows are splats.
+// Group 0x20's vector swizzle for `opN` and `op1i` (henkaku, FACT), indexed by
+// `swz_alt << 2 | swz`. The constant rows are splats.
 
 /// Group 0x20's vector swizzle for `op2i` (henkaku, FACT), indexed by
 /// `swz_alt_op2i_2 << 4 | swz_alt_op2i_x << 2 | op2i_swz`.

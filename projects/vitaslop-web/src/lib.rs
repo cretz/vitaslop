@@ -3178,7 +3178,7 @@ impl LivePlayback {
         self.writeback.take()
     }
 
-    fn present(
+    async fn present(
         &mut self,
         scenes: &[Scene],
         display: (u32, u32),
@@ -3484,6 +3484,7 @@ impl LivePlayback {
         // cache cannot tell a texture it is about to need again from one it is finished with.
         self.builder.begin_frame();
         let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
+        self.warm_pipelines(&built, "present").await;
         let draws: usize = built.iter().map(|b| b.draws.len()).sum();
         let t1 = clock(&self.perf);
         // >>> EVERY VARIANT IS ANSWERED, AND THREE OF THEM ARE NOT "SKIP THE FRAME".
@@ -6626,7 +6627,7 @@ async fn live_loop(
                         // The run is already ending on the line below, so this last frame's
                         // outcome changes nothing - but `present` reports a lost device itself
                         // before returning, so nothing is swallowed by ignoring it here.
-                        let _ = playback.present(&scene.0, display, &scene.1);
+                        let _ = playback.present(&scene.0, display, &scene.1).await;
                     }
                     break 'run;
                 }
@@ -6752,7 +6753,7 @@ async fn live_loop(
             // shadowing it here silently retyped it.
             let (scene, flips) = scene;
             let stall_mark = StallMark::now();
-            let outcome = playback.present(&scene, display, &flips);
+            let outcome = playback.present(&scene, display, &flips).await;
             stall_note("present", &stall_mark);
             if sched.smp().is_some() {
                 smp::trace_w0(b'P', r0, now());
@@ -8424,7 +8425,7 @@ fn stall_note(what: &str, m: &StallMark) {
     let f = |a: f64, z: f64| (a - z).max(0.0);
     web_sys::console::warn_1(&JsValue::from_str(&format!(
         "STALL f{} {what} {ms:.0} ms: pipelines {} (variant {}), build ms ours {:.0} module {:.0} \
-         create {:.0}; tex up {} ({} KB, compressed {}, gpu-enc {}, refused {}), tex created {}, \
+         create {:.0}, async {} unwarmed {}; tex up {} ({} KB, compressed {}, gpu-enc {}, refused {}), tex created {}, \
          rtt created {}, snapshots {}, buffers {} ({} KB in {} writes), passes {}, draws {}",
         vitaslop_runtime::sched::current_frame(),
         d(e.pipelines_built, m.enc.pipelines_built),
@@ -8432,6 +8433,8 @@ fn stall_note(what: &str, m: &StallMark) {
         f(b.0, m.build.0),
         f(b.1, m.build.1),
         f(b.2, m.build.2),
+        d(e.pipelines_async, m.enc.pipelines_async),
+        d(e.pipelines_unwarmed, m.enc.pipelines_unwarmed),
         d(e.tex_uploaded, m.enc.tex_uploaded),
         d(e.tex_upload_bytes, m.enc.tex_upload_bytes) / 1024,
         d(e.tex_uploaded_compressed, m.enc.tex_uploaded_compressed),
@@ -8446,6 +8449,32 @@ fn stall_note(what: &str, m: &StallMark) {
         d(e.passes, m.enc.passes),
         d(e.draw_calls, m.enc.draw_calls),
     )));
+}
+
+impl LivePlayback {
+    /// >>> THE PIPELINES THIS FRAME NEEDS, CREATED ASYNC AND AWAITED BEFORE IT IS ENCODED - see
+    /// >>> `GxmRenderer::warm_pipelines` for why and `VITASLOP_ASYNC_PIPELINES` for the arm back.
+    ///
+    /// The frame waits for them, as it waited for the synchronous creates before - but the
+    /// browser's GPU main thread (its compositor) does not, so the page no longer freezes. A
+    /// wait over 50 ms is noted on the console with its pipeline count.
+    async fn warm_pipelines(&mut self, built: &[vitaslop_platform::gpu::RenderScene], what: &str) {
+        let warm = self.gxm.warm_pipelines(&self.device, built);
+        if warm.is_empty() {
+            return;
+        }
+        let n = warm.len();
+        let t = RttWriteback::now_ms();
+        let ready = warm.wait().await;
+        self.gxm.install_pipelines(ready);
+        let ms = RttWriteback::now_ms() - t;
+        if ms > 50.0 {
+            web_sys::console::log_1(&JsValue::from_str(&format!(
+                "[pipelines] f{} {what}: waited {ms:.0} ms for {n} async pipeline(s)",
+                vitaslop_runtime::sched::current_frame()
+            )));
+        }
+    }
 }
 
 impl browser_sched::EarlyCompleter for LivePlayback {
@@ -8477,6 +8506,7 @@ impl browser_sched::EarlyCompleter for LivePlayback {
             let stall_mark = StallMark::now();
             let t_build = RttWriteback::now_ms();
             let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
+            self.warm_pipelines(&built, "early batch").await;
             self.early.batches += 1;
             self.early.scenes += scenes.len() as u64;
             self.early.draws += built.iter().map(|b| b.draws.len() as u64).sum::<u64>();

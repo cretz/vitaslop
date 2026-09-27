@@ -113,7 +113,11 @@ than expected.
 <details>
 <summary><b>Games tried.</b> Not a compatibility list. Owned games the agent has played, all US releases, all playable and all still buggy. Anything not listed was never tried.</summary>
 
+- Dead or Alive 5 Plus
 - Hot Shots Golf: World Invitational
+- Madden NFL 13
+- MLB 12: The Show
+- Mortal Kombat
 - MotorStorm RC
 - OlliOlli
 - Persona 4 Golden

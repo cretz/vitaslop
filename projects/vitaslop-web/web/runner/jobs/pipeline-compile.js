@@ -54,12 +54,44 @@ async function probe(dev) {
 
 export async function run(params, { progress, asset }) {
   const dir = params.dir || "corpus-wgsl";
-  const names = (await asset(dir, "json")).filter((f) => f.endsWith(".wgsl")).slice(0, params.limit ?? 120);
+  const names = (await asset(dir, "json")).filter((f) => f.endsWith(".wgsl") && (!params.only || params.only.includes(f))).slice(params.offset ?? 0, (params.offset ?? 0) + (params.limit ?? 120));
   const adapter = await navigator.gpu.requestAdapter();
   const features = ["shader-f16", "dual-source-blending"].filter((x) => adapter.features.has(x));
   const dev = await adapter.requestDevice({ requiredFeatures: features });
   const codes = [];
   for (let i = 0; i < names.length; i++) codes.push(await asset(`${dir}/${names[i]}`));
+  // `perModule`: WHICH shaders are slow, not how slow on average - every module created on its
+  // own with `createRenderPipelineAsync` (so the page stays live) and timed to resolution, one at
+  // a time so the times do not overlap. Returned slowest first with the module's name, so the
+  // slow ones can be opened and compared against the fast ones offline.
+  if (params.perModule) {
+    const rows = [];
+    for (let i = 0; i < codes.length; i++) {
+      if (i % 10 === 0) progress(`per-module ${i}/${codes.length}`);
+      const t = performance.now();
+      let ok = true;
+      if (params.mode === "sync") {
+        // Timed to the error scope's answer, which the GPU process gives only after the create.
+        dev.pushErrorScope("validation");
+        dev.createRenderPipeline(desc(dev, codes[i]));
+        ok = !(await dev.popErrorScope());
+      } else {
+        try {
+          await dev.createRenderPipelineAsync(desc(dev, codes[i]));
+        } catch {
+          ok = false;
+        }
+      }
+      rows.push({ name: names[i], ms: Math.round((performance.now() - t) * 10) / 10, ok, bytes: codes[i].length });
+    }
+    rows.sort((a, b) => b.ms - a.ms);
+    return {
+      summary: `PER-MODULE ${stats(rows.filter((r) => r.ok).map((r) => r.ms))}; slowest: ${rows.slice(0, 8).map((r) => `${r.name} ${r.ms} ms`).join(", ")}`,
+      features,
+      rows,
+    };
+  }
+
   const half = Math.floor(codes.length / 2);
   const burst = params.burst ?? 10;
 

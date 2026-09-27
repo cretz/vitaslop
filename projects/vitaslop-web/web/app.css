@@ -398,6 +398,9 @@ details.card[open] > summary::before { content: "\25BE"; }
 #menu { background: rgba(5, 5, 10, 0.35); }
 #menu .menu-in { background: rgba(20, 20, 31, 0.82); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
 #loading[hidden], #menu[hidden], #fatal[hidden] { display: none; }
+/* Shown only when a fullscreen request was not granted - see `showFullscreenPrompt`. Above the
+   loading panel so it is reachable while the title is still preparing. */
+.fs-prompt { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 6; }
 .loading-in, .fatal-in { max-width: 520px; width: calc(100% - 32px); }
 .menu-in { max-width: 960px; width: calc(100% - 32px); }
 .menu-title { margin: 0 0 10px; font-size: 18px; color: var(--accent); }

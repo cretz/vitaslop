@@ -38,6 +38,10 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_ALLOW_SOFTWARE_GPU",
     "VITASLOP_ARENA_UPLOAD_PROBE",
     "VITASLOP_ARM_AT_FRAME",
+    // `0`: recompiled pipelines are created synchronously in the frame that first draws them
+    // (the old rule), not started with `createRenderPipelineAsync` ahead of it - see
+    // `GxmRenderer::warm_pipelines`.
+    "VITASLOP_ASYNC_PIPELINES",
     // `0`: sceAudioOutOutput sleeps one grain from the call instead of following the port schedule.
     "VITASLOP_AUDIO_SCHEDULE",
     // `0`: sceAudioOutOutput paces on the guest's virtual clock instead of the host's wall.
@@ -413,6 +417,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // Forwarded to the emitter's own arm table by `set_override`; see `link::set_arm`.
     "VITASLOP_GXP_PROBE",
     "VITASLOP_GXP_PROBE_SCALE",
+    // `0`: an unpacked pair store narrows as two scalar round trips, not one vector one.
+    "VITASLOP_GXP_Q2_VEC",
     // Every SUBMISSION of one pair that lands in a screen-space box, with its full vertex
     // record. The per-DRAW half `..._INPUTS_VERTS` cannot be: that dump dedupes by input
     // set, so a UI pair submitted a thousand times a frame almost never prints the element
@@ -780,6 +786,9 @@ pub const OVERRIDABLE: &[&str] = &[
     // the browser because `screenTintColour` - the white-out - is written there and never on
     // the desktop.
     "VITASLOP_TEX_PAGE_READ",
+    // `0`: a texture unused THIS frame is a retention-eviction candidate again, however recently
+    // it was used - see `gpu::tex_recent_frames`.
+    "VITASLOP_TEX_RECENT_FRAMES",
     // How many MB of GPU texture the recompiler's VIEW cache may retain across frames, as
     // distinct from the budget above - which also gates the BC -> ETC2 re-encode, so it cannot
     // be lowered to bound memory without silently trading picture. See
@@ -798,6 +807,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // desktop does not reproduce is the case where a wasm stack alone leaves you
     // disassembling by hand.
     "VITASLOP_TRACK_PC",
+    // `0`: bypass the browser's transpile cache (web/transpile-cache.js) - neither read nor write.
+    "VITASLOP_TRANSPILE_CACHE",
     // Rig: hold a landed GPU timestamp readback until it has been in flight this many ms (a
     // phone's late map callbacks, on a desktop) - see the GPU budget in the web runner.
     "VITASLOP_TS_DELAY_MS",
@@ -845,8 +856,6 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_WINDOW_REREAD",
     // `1`: a draw's window capture waits for a busy snapshot lock instead of reading uncached.
     "VITASLOP_WINDOW_WAIT",
-    // `0`: bypass the browser's transpile cache (web/transpile-cache.js) - neither read nor write.
-    "VITASLOP_TRANSPILE_CACHE",
     // `0`: render-target write-backs go into guest memory after the present (old rule), not
     // at the next flip - see `writeback_at_flip` in vitaslop-web.
     "VITASLOP_WRITEBACK_AT_FLIP",

@@ -352,7 +352,7 @@ pub fn apply_one(
             for y in 0..rows {
                 let r = &cur[y * stride..y * stride + row_bytes];
                 h = fnv_extend(h, r);
-                uniform &= r.len() % 4 == 0 && first.len() == 4 && r.chunks_exact(4).all(|w| w == first);
+                uniform &= r.len().is_multiple_of(4) && first.len() == 4 && r.chunks_exact(4).all(|w| w == first);
             }
             match region_hashes().lock().unwrap_or_else(|e| e.into_inner()).get(&addr) {
                 Some(&want) => h == want,
@@ -513,10 +513,10 @@ mod whole_region_tests {
     }
 
     /// Write 16x16 RGBA8 at `addr` into `mem` (a flat buffer standing for guest memory).
-    fn write_back(mem: &mut Vec<u8>, addr: u32, px: u8) -> bool {
+    fn write_back(mem: &mut [u8], addr: u32, px: u8) -> bool {
         let c = surface(addr);
         let rgba = vec![px; 16 * 16 * 4];
-        let snapshot = mem.clone();
+        let snapshot = mem.to_vec();
         apply_one(
             addr,
             16,

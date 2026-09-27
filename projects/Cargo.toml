@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
+# Vendored crates are patched in below, not workspace members.
+exclude = ["vendor"]
 members = [
     "vitaslop-aac",
     "vitaslop-atrac9",
@@ -91,12 +93,9 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
-# >>> DEV OVERRIDE, NOT FOR MERGE. The half-precision NEON conversions
-# >>> (`vcvt.f32.f16` / `vcvt.f16.f32`) are being added to the decoder fork; a retail
-# >>> title executes them and traps without them. Until that change is pushed and the
-# >>> `rev` in vitaslop-transpiler/Cargo.toml is re-pinned to it, the workspace builds
-# >>> against the sibling checkout. REMOVE THIS BEFORE MERGING - with it in place, no
-# >>> machine without that checkout can build the repo, which is exactly the failure the
-# >>> pinned rev exists to prevent.
-[patch."https://github.com/cretz/yaxpeax-arm"]
-yaxpeax-arm = { path = "../../yaxpeax-arm" }
+# >>> VENDORED wgpu 30.0.0 with one addition: `Device::create_render_pipeline_async`
+# >>> (`GPUDevice.createRenderPipelineAsync`), which wgpu's public API does not expose. A sync
+# >>> `createRenderPipeline` compiles on Chrome's GPU main thread - the compositor - and froze the
+# >>> whole browser for seconds on the phone. Every change is marked `VITASLOP PATCH`.
+[patch.crates-io]
+wgpu = { path = "vendor/wgpu" }

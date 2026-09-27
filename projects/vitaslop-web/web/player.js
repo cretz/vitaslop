@@ -217,7 +217,31 @@ export function createPlayer({ onExit, onRestart }) {
     } catch (err) {
       note(`[fullscreen] REFUSED (tap activation live: ${active}): ${(err && (err.name + ": " + err.message)) || err}`);
     }
+    if (!isFull() && wantFull) showFullscreenPrompt();
     await applyOrientationLock();
+  };
+  // >>> A REFUSED REQUEST GETS A BUTTON, NOT SILENCE. Reported twice (2026-09-27): after leaving
+  // fullscreen once, the next Play did not go fullscreen. Whatever the browser's reason, a tap
+  // on this is a fresh user activation, which a fullscreen request always gets - so the player
+  // is one tap from where the setting said it should be instead of stuck in the page.
+  let wantFull = false;
+  let fsPrompt = null;
+  const hideFullscreenPrompt = () => {
+    if (fsPrompt) fsPrompt.remove();
+    fsPrompt = null;
+  };
+  const showFullscreenPrompt = () => {
+    if (fsPrompt || !running && !fullscreenAsked) return;
+    fsPrompt = document.createElement("button");
+    fsPrompt.type = "button";
+    fsPrompt.className = "btn fs-prompt";
+    fsPrompt.textContent = "Tap for fullscreen";
+    fsPrompt.addEventListener("click", () => {
+      hideFullscreenPrompt();
+      enterFullscreen();
+    });
+    root.appendChild(fsPrompt);
+    note("[fullscreen] not granted - showing the tap-for-fullscreen button");
   };
   // The lock is a setting: a phone held in portrait is a legitimate way to play with
   // the pad below the screen, and the lock takes that away.
@@ -246,6 +270,10 @@ export function createPlayer({ onExit, onRestart }) {
   let fullscreenAsked = false;
   const askFullscreenNow = () => {
     fullscreenAsked = true;
+    wantFull = true;
+    // The element asked for is the one about to be shown: requested while still `hidden`
+    // (display: none), it is an element with no box, which is one reason a browser may give.
+    root.hidden = false;
     enterFullscreen();
   };
   const exitFullscreen = async () => {
@@ -258,6 +286,7 @@ export function createPlayer({ onExit, onRestart }) {
   };
   document.addEventListener("fullscreenchange", () => {
     $("m-fullscreen").textContent = isFull() ? "Exit fullscreen" : "Fullscreen";
+    if (isFull()) hideFullscreenPrompt();
   });
 
   // ----- screen wake lock -----
@@ -338,7 +367,11 @@ export function createPlayer({ onExit, onRestart }) {
   let vocab = null;
   $("menubtn").addEventListener("click", () => openMenu(!menuOpen));
   $("m-resume").addEventListener("click", () => openMenu(false));
-  $("m-fullscreen").addEventListener("click", () => (isFull() ? exitFullscreen() : enterFullscreen()));
+  $("m-fullscreen").addEventListener("click", () => {
+    // Leaving fullscreen from the menu is a choice: no prompt to bring it back this run.
+    wantFull = !isFull();
+    return isFull() ? exitFullscreen() : enterFullscreen();
+  });
   $("m-restart").addEventListener("click", () => askConfirm("Restart this game from the beginning? Anything not saved is lost.", restart));
   $("m-quit").addEventListener("click", () => askConfirm("Quit to the library? Anything not saved is lost.", stop));
   $("m-confirm-yes").addEventListener("click", () => {
@@ -510,9 +543,17 @@ export function createPlayer({ onExit, onRestart }) {
     $("fpsbadge").hidden = !settings.showFps;
     applyLayout();
     // Already fullscreen (a restart keeps it): no second request, no second toast.
+    wantFull = fullscreen;
     if (fullscreen && !isFull() && !fullscreenAsked) enterFullscreen();
     else applyOrientationLock();
     fullscreenAsked = false;
+    // The request made inside the Play tap can settle after this point; give it a moment
+    // before deciding it did not take.
+    if (fullscreen) {
+      setTimeout(() => {
+        if (running && wantFull && !isFull()) showFullscreenPrompt();
+      }, 1200);
+    }
     holdWake();
 
     const status = (t) => {
@@ -672,6 +713,8 @@ export function createPlayer({ onExit, onRestart }) {
   function stop(exit = true) {
     if (!running) return;
     running = false;
+    wantFull = false;
+    hideFullscreenPrompt();
     dropWake();
     if (worker) {
       try {

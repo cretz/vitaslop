@@ -3181,7 +3181,7 @@ pub(crate) fn secondary_attr_init(
     // private to the invocation), so no instruction reads the result, and the pass that lights
     // every character was refused for the slot's unknown value.
     let primary_reads: std::collections::BTreeSet<u32> =
-        shader.instrs.iter().flat_map(|i| sa_sources(i)).collect();
+        shader.instrs.iter().flat_map(&sa_sources).collect();
     let is_dead = |at: usize, instr: &Instr| -> bool {
         let dests = sa_dests(instr);
         !dests.is_empty()
@@ -4590,6 +4590,7 @@ fn unpack_half_registers_region(region: &str) -> String {
     }
 
     let mut out = String::with_capacity(region.len());
+    let mut aliases = ExactAliases::default();
     walk_half_ranges(region, |line, ranges| {
         let live = |b: &str, r: usize| {
             // `walk_half_ranges` only ever yields the bank names in `HALF_BANKS`, which are
@@ -4597,16 +4598,25 @@ fn unpack_half_registers_region(region: &str) -> String {
             let Some(bank) = HALF_BANKS.into_iter().find(|x| *x == b) else { return false };
             keep((bank, r, ranges.get(&(bank, r)).copied().unwrap_or(0)))
         };
-        rewrite_half_line_into(&mut out, line, &live);
+        let from = out.len();
+        rewrite_half_line_into(&mut out, line, &live, &aliases);
+        // Learned from the line AS WRITTEN, so a `let` whose read was just moved to its
+        // unpacked home is classified in the form the module will actually hold.
+        aliases.observe(&out[from..]);
     });
     fix_dual_split_saves(&out)
 }
 
 /// [`rewrite_half_line`] appended to `out` - and a line with nothing to rewrite (no kept store,
 /// no half read at all) appended AS IS, with no allocation: most lines of a module.
-fn rewrite_half_line_into(out: &mut String, line: &str, keep: &impl Fn(&str, usize) -> bool) {
+fn rewrite_half_line_into(
+    out: &mut String,
+    line: &str,
+    keep: &impl Fn(&str, usize) -> bool,
+    aliases: &ExactAliases,
+) {
     if std::env::var_os("VITASLOP_LINK_OLD_REWRITE").is_some() {
-        out.push_str(&rewrite_half_line(line, keep));
+        out.push_str(&rewrite_half_line(line, keep, aliases));
         return;
     }
     let body = line.trim_end_matches('\n');
@@ -4615,11 +4625,11 @@ fn rewrite_half_line_into(out: &mut String, line: &str, keep: &impl Fn(&str, usi
         out.push_str(line);
         return;
     }
-    out.push_str(&rewrite_half_line(line, keep));
+    out.push_str(&rewrite_half_line(line, keep, aliases));
 }
 
 /// One line with every qualified register moved to its unpacked home.
-fn rewrite_half_line(line: &str, keep: &impl Fn(&str, usize) -> bool) -> String {
+fn rewrite_half_line(line: &str, keep: &impl Fn(&str, usize) -> bool, aliases: &ExactAliases) -> String {
     let nl = if line.ends_with('\n') { "\n" } else { "" };
     let body = line.trim_end_matches('\n');
     let indent: String = body.chars().take_while(|c| c.is_whitespace()).collect();
@@ -4635,10 +4645,10 @@ fn rewrite_half_line(line: &str, keep: &impl Fn(&str, usize) -> bool) -> String 
                 // vector back up here rather than the emitter shipping one it would then strip.
                 HalfStore::Pair(inner) => {
                     let e = format!("vec2<f32>({})", rewrite_half_reads(inner, keep));
-                    if f16_exact(&e) { format!("{h} = {e};") } else { format!("{h} = gxp_q2({e});") }
+                    if f16_exact(&e, aliases) { format!("{h} = {e};") } else { format!("{h} = gxp_q2({e});") }
                 }
-                HalfStore::Low(inner) => half_component_store(&h, 0, &rewrite_half_reads(inner, keep)),
-                HalfStore::High(inner) => half_component_store(&h, 1, &rewrite_half_reads(inner, keep)),
+                HalfStore::Low(inner) => half_component_store(&h, 0, &rewrite_half_reads(inner, keep), aliases),
+                HalfStore::High(inner) => half_component_store(&h, 1, &rewrite_half_reads(inner, keep), aliases),
                 HalfStore::Word(rhs) => {
                     format!("{h} = unpack2x16float({});", rewrite_half_reads(rhs, keep))
                 }
@@ -4658,8 +4668,8 @@ fn rewrite_half_line(line: &str, keep: &impl Fn(&str, usize) -> bool) -> String 
 /// mode the language leaves implementation-defined exactly as it does `pack2x16float`'s. A
 /// register that keeps its halves unpacked must round the same way as one that keeps them
 /// packed, or turning the pass on would change every 16-bit number in the frame.
-fn half_component_store(home: &str, component: usize, expr: &str) -> String {
-    if f16_exact(expr) {
+fn half_component_store(home: &str, component: usize, expr: &str, aliases: &ExactAliases) -> String {
+    if f16_exact(expr, aliases) {
         format!("{home}[{component}] = {expr};")
     } else {
         format!("{home}[{component}] = {HALF_QUANT_FN}({expr});")
@@ -4698,7 +4708,7 @@ fn rewrite_half_reads(text: &str, keep: &impl Fn(&str, usize) -> bool) -> String
 /// fails the test and keeps its rounding. A false NEGATIVE costs two instructions; a false
 /// positive would leave a value in a register at more precision than the guest's, so the bias
 /// is all one way.
-fn f16_exact(expr: &str) -> bool {
+fn f16_exact(expr: &str, aliases: &ExactAliases) -> bool {
     // `VITASLOP_GXP_HALF_REGS=noexact` keeps the unpacked home and rounds EVERY store, which is
     // the control for this peephole: it is the one piece of the pass that can leave a value in a
     // register at more precision than the guest would, so a picture difference has to be able to
@@ -4709,7 +4719,122 @@ fn f16_exact(expr: &str) -> bool {
     if std::env::var_os("VITASLOP_LINK_OLD_F16").is_some() {
         return f16_exact_strike(expr);
     }
-    f16_exact_scan(expr)
+    f16_exact_scan(expr, &|name| aliases.exact(name))
+}
+
+/// >>> THE EMITTER'S BLOCK-LOCAL READS, AND WHICH OF THEM ARE ALREADY 16-BIT VALUES.
+///
+/// An instruction reads its half sources once into a `let` at the top of its block -
+/// `let u_pa5 = pa_h[5];`, `let u_sa3 = unpack2x16float(sa[3]);` - and its store names the
+/// alias, not the register. [`f16_exact`] recognised only the register form, so a plain `mov`
+/// between two half registers still rounded: MEASURED on the phone's slowest fragment program,
+/// 112 pair and 75 single roundings, and removing the rounding helpers entirely took its pipeline
+/// build from 258 to 116 ms. MEASURED what this peephole actually removes: 3% of the corpus's
+/// roundings - and it is OFF by default, see `exact`. Every alias is one of the forms below in the emitter as written,
+/// but this does not assume it: each `let` is classified from its own right-hand side, and an
+/// alias whose binding is anything else is not exact.
+///
+/// The exact forms: a half home (`X_h[n]`, which only ever holds a rounded or exact value), an
+/// `unpack2x16float(..)` of anything (its result IS a half), and a vector of two literal words
+/// that are both f16 values (a folded constant - checked on the bits).
+///
+/// Scoped by braces, so an alias does not outlive its block: shadowing can only make a name
+/// look INEXACT where it is exact (a missed skip, two instructions), never the reverse.
+#[derive(Default)]
+struct ExactAliases {
+    /// (depth at the `let`, name, exact), innermost last.
+    scope: Vec<(u32, String, bool)>,
+    depth: u32,
+}
+
+impl ExactAliases {
+    fn exact(&self, name: &str) -> bool {
+        // >>> OFF UNLESS ASKED FOR (`VITASLOP_GXP_HALF_REGS=alias`). The native regression moved
+        // a golf title's shots by ONE LEVEL on 762 and 1,822 pixels with it on (f1400/f2100 vs
+        // the reference; off = byte-identical) - so re-rounding an alias this calls exact DID
+        // change a value on that adapter (a flushed f16 denormal is the likeliest reading, not
+        // yet proven). For ~3% fewer roundings that is not a trade to make by default.
+        if arm(HALF_REGS_ARM) != Some("alias") {
+            return false;
+        }
+        self.scope.iter().rev().find(|(_, n, _)| n == name).is_some_and(|(_, _, e)| *e)
+    }
+
+    /// Take in one emitted line: its `let u_*` binding (if any), then its braces.
+    fn observe(&mut self, text: &str) {
+        for line in text.split_inclusive('\n') {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("let ")
+                && let Some((name, rhs)) = rest.split_once(" = ")
+                && name.starts_with("u_")
+                && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            {
+                let rhs = rhs.trim_end_matches(';').trim();
+                self.scope.push((self.depth, name.to_string(), exact_alias_rhs(rhs)));
+            }
+            for c in t.bytes() {
+                match c {
+                    b'{' => self.depth += 1,
+                    b'}' => {
+                        self.depth = self.depth.saturating_sub(1);
+                        let d = self.depth;
+                        self.scope.retain(|(at, _, _)| *at <= d);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Whether a `let u_*` right-hand side can only hold 16-bit values - see [`ExactAliases`].
+fn exact_alias_rhs(rhs: &str) -> bool {
+    // `X_h[n]`: a half home.
+    if let Some((bank, idx)) = rhs.split_once(HALF_SUFFIX)
+        && !bank.is_empty()
+        && bank.bytes().all(|c| c.is_ascii_lowercase())
+        && let Some(n) = idx.strip_prefix('[').and_then(|r| r.strip_suffix(']'))
+        && !n.is_empty()
+        && n.bytes().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    // `unpack2x16float(..)` as the WHOLE expression: the call's own parenthesis must close last.
+    if let Some(arg) = rhs.strip_prefix("unpack2x16float(").and_then(|r| r.strip_suffix(')')) {
+        let mut depth = 0i32;
+        for c in arg.bytes() {
+            match c {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        return depth == 0;
+    }
+    // `vec2<f32>(bitcast<f32>(0x..u), bitcast<f32>(0x..u))` with both words 16-bit values.
+    if let Some(args) = rhs.strip_prefix("vec2<f32>(").and_then(|r| r.strip_suffix(')')) {
+        let words: Vec<Option<u32>> = args
+            .split(", ")
+            .map(|a| {
+                a.strip_prefix("bitcast<f32>(0x")
+                    .and_then(|h| h.strip_suffix("u)"))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+            })
+            .collect();
+        return words.len() == 2 && words.iter().all(|w| w.is_some_and(f32_bits_are_f16));
+    }
+    false
+}
+
+/// Whether an f32 bit pattern is exactly a binary16 value (NaN excluded: it is never "exact").
+fn f32_bits_are_f16(b: u32) -> bool {
+    let v = f32::from_bits(b);
+    !v.is_nan() && f16_bits_to_f32_bits(crate::fold::f32_to_f16_bits(v)) == b
 }
 
 /// [`f16_exact`]'s test as ONE allocation-free left-to-right scan. The strike-out form below
@@ -4719,7 +4844,7 @@ fn f16_exact(expr: &str) -> bool {
 /// token, and anything else - an identifier, a number or a character it would have left behind
 /// - fails the scan exactly as it would have left the remainder non-empty. The strike-out stays
 /// as the test oracle (`f16_exact_scan_agrees_with_the_strike_out`).
-fn f16_exact_scan(expr: &str) -> bool {
+fn f16_exact_scan(expr: &str, alias_exact: &dyn Fn(&str) -> bool) -> bool {
     let b = expr.as_bytes();
     let mut i = 0usize;
     // `[digits]` at `j`, returning the index after it.
@@ -4754,6 +4879,21 @@ fn f16_exact_scan(expr: &str) -> bool {
                 i = end;
                 continue;
             }
+        }
+        // An exact block-local alias with a component selector: `u_pa5[0]` - see
+        // [`ExactAliases`].
+        if rest.starts_with("u_") {
+            let mut j = i + 2;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if alias_exact(&expr[i..j])
+                && let Some(end) = sub(j)
+            {
+                i = end;
+                continue;
+            }
+            return false;
         }
         // A half-register read: lowercase letters, `_h`, `[..]`, optionally `[..]`.
         if c.is_ascii_lowercase() {
@@ -4875,6 +5015,30 @@ pub(crate) fn directives_end(module: &str) -> usize {
 const GXP_Q2: &str = "
 fn gxp_q2(v: vec2<f32>) -> vec2<f32> {
   return vec2<f32>(gxp_hq(v.x), gxp_hq(v.y));
+}
+";
+
+/// >>> [`GXP_Q2`] ON THE NATIVE ARM: BOTH HALVES IN ONE CONVERSION, ONE PACK AND ONE UNPACK.
+///
+/// Two `gxp_hq` calls are two scalar clamps, two `f16` conversions, two packs, two masks and two
+/// unpacks; this is one of each, vector-wide. The clamp is `gxp_f16c`'s componentwise (a finite
+/// value past 65504 saturates; an infinity or a NaN goes through untouched).
+///
+/// >>> THE PACK IS LOAD-BEARING, NOT DECORATION. `vec2<f32>(vec2<f16>(c))` with no pack
+/// looks like the same round trip, and MEASURED on the phone (PowerVR, `f16-helper-equiv`
+/// probe) it is not: the compiler drops the conversion and returns `c` UNROUNDED - 0x3f801001
+/// came back 0x3f801001, not 0x3f802000. Through `pack2x16float` the conversion survives, and
+/// the packed value is exact, so the pack itself rounds nothing.
+///
+/// PROVEN bit-identical to two `gxp_hq` calls under Chrome (Tint), on the phone and on the
+/// desktop, for all 2^32 inputs (0 mismatches, NaN stays NaN) - see [`q2_vec_on`] for where it
+/// is NOT proven - and it took 5.5% off the pipeline build of the eight slowest corpus fragment
+/// programs on the phone (2,580 -> 2,438 ms). `VITASLOP_GXP_Q2_VEC=0` is the arm back.
+const GXP_Q2_VEC: &str = "
+fn gxp_q2(v: vec2<f32>) -> vec2<f32> {
+  let m = bitcast<vec2<u32>>(v) & vec2<u32>(0x7fffffffu);
+  let c = select(v, sign(v) * 65504.0, (m > vec2<u32>(0x477fe000u)) & (m < vec2<u32>(0x7f800000u)));
+  return unpack2x16float(pack2x16float(vec2<f32>(vec2<f16>(c))));
 }
 ";
 
@@ -5175,6 +5339,7 @@ pub fn set_arm(name: &str, value: &str) {
             | PACK_COMP0_ARM
             | IDX_MUL_ARM
             | F16_ROUND_ARM
+            | Q2_VEC_ARM
             | CASE_TEX_ARM
             | DP_MOE_BIT47_ARM
             | DP_B48_BOTH_ARM
@@ -5247,6 +5412,27 @@ pub const PREFETCH_U8_ARM: &str = "VITASLOP_GXP_PREFETCH_U8";
 /// adapter choose. They exist so a case harness can run both on one device: the two arms must
 /// agree bit for bit, and the only thing that can say so is a run of each.
 pub const F16_ROUND_ARM: &str = "VITASLOP_GXP_F16_RTE";
+
+/// `0` narrows an unpacked PAIR store as two scalar round trips again instead of one vector one
+/// - see [`GXP_Q2_VEC`]. Default ON in the BROWSER build only; `1` turns it on natively.
+pub const Q2_VEC_ARM: &str = "VITASLOP_GXP_Q2_VEC";
+
+/// Whether [`GXP_Q2_VEC`] is emitted.
+///
+/// >>> ON WHERE IT IS PROVEN, AND ONLY THERE. The equivalence is a measurement of a COMPILER,
+/// not an identity of the language: `f16-helper-equiv` found 0 mismatches over all 2^32 inputs
+/// under Chrome's Tint on the phone (PowerVR) AND on the desktop (D3D12), but the NATIVE
+/// renderer compiles through naga, and a native frame replay moved 12 pixels by one level
+/// (Madden kickoff f2300, 2,089,727 bytes; the alias peephole alone left it byte-identical). So
+/// the browser - the product, where the build cost is paid - takes it by default, and the
+/// native renderer, which is the regression oracle, keeps the scalar form unless asked.
+fn q2_vec_on() -> bool {
+    match arm(Q2_VEC_ARM) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => cfg!(target_arch = "wasm32"),
+    }
+}
 
 /// `const` makes the execution rig's STAND-IN TEXTURE a constant again. It is a function of the
 /// sample COORDINATE by default, which is the only thing in the differential that can see a
@@ -5631,15 +5817,25 @@ fn size_register_banks(module: &str) -> String {
     // module. Putting it at byte zero instead cost a whole title its picture: a dual-source pair
     // carries `enable dual_source_blending;`, the module then read as a directive after a
     // declaration, the device refused the pipeline, and the frame went BLACK.
+    let mut q2_vec = false;
     if out.contains("gxp_q2(") {
-        out.insert_str(directives_end(&out), GXP_Q2);
+        q2_vec = crate::wgsl::native_f16_arm() && q2_vec_on();
+        out.insert_str(directives_end(&out), if q2_vec { GXP_Q2_VEC } else { GXP_Q2 });
     }
     // ...and the f16 STORE helpers, which `gxp_q2` is itself written in terms of - so they must
     // be inserted AFTER it, because each insertion goes at the same place and the last one in
     // ends up first. This is the last pass every linked module goes through, which is what makes
     // it the one place the helpers can be added once rather than at each of the five returns.
     // The derivative directive last, so it lands at byte zero, above everything.
-    crate::wgsl::with_derivative_directive(add_half_helpers(out))
+    let mut out = add_half_helpers(out);
+    // The vector pair form names `f16` itself and calls no store helper, so a module whose ONLY
+    // rounding is pair stores would otherwise reach the device without the extension enabled -
+    // MEASURED: 83 of 596 corpus modules refused by Chrome.
+    if q2_vec && !out.contains("enable f16;") {
+        out.insert_str(0, "enable f16;
+");
+    }
+    crate::wgsl::with_derivative_directive(out)
 }
 
 /// How many registers of `bank` the emitted `region` references: `Some(high_water + 1)`, or
@@ -5885,7 +6081,7 @@ mod tests {
             "(r_h[2])",
             "unpack2x16float(pa[1])[0]",
         ] {
-            assert_eq!(f16_exact_scan(e), f16_exact_strike(e), "{e:?}");
+            assert_eq!(f16_exact_scan(e, &|_| false), f16_exact_strike(e), "{e:?}");
         }
     }
 

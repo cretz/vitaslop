@@ -736,6 +736,44 @@ pub(crate) fn tex_retain_budget_bytes() -> usize {
     crate::knobs::scale_budget(base).min(tex_cache_budget_bytes())
 }
 
+/// >>> A TEXTURE IS KEPT WHILE THE GUEST STILL HOLDS ITS BYTES - THE VITA HAS NO TEXTURE CACHE.
+///
+/// The console's GPU samples straight out of guest memory, so a texture is "resident" for
+/// exactly as long as the title keeps those bytes in place, and the title's own memory is what
+/// bounds its texture set. The faithful retention rule is the same: an entry goes when the guest
+/// OVERWRITES it (superseded - `view_dead`), and otherwise stays, with the texture BUDGET as the
+/// only byte ceiling (past it, anything this frame did not use goes, oldest first). A copy whose
+/// memory the guest reused for something else can never match again (keys are content
+/// fingerprints) and is simply the oldest thing there when the budget is reached.
+///
+/// This returns the number of frames an entry idle-but-live is protected from the 96 MB
+/// RETENTION bound: unset = forever (the rule above); `VITASLOP_TEX_RECENT_FRAMES=<n>` = `n`
+/// frames; `0` = the old rule, where anything this frame did not use was a candidate.
+///
+/// The retention bound is floored at the largest ONE-frame working set, and that is the wrong
+/// floor for a title that cycles views: MEASURED on the user's phone in a golf title
+/// (2026-09-27), `recompiler views 138 MB ... ONE FRAME needs 138 MB, learned floor 139 MB`
+/// against the 96 MB bound, with **3.8 textures RE-uploaded after eviction per frame** on
+/// average and **108 in the worst frame** (16.5 MB, 90 of them re-encoded on the GPU, 42
+/// eviction passes) - the shot camera and the player camera each fit, their union did not,
+/// and each switch threw out what the other was about to use. The desktop measurement that set
+/// the bound read 0.25 a frame.
+///
+/// An eviction here never changes a texel (every key is a content fingerprint), so this trades
+/// only memory, and only up to the texture budget: past that the old oldest-first rule applies
+/// to everything. SUPERSEDED entries stay evictable at any age, which is what the bound was
+/// introduced for (343 MB retained, 14 MB frame, more than half superseded).
+pub(crate) fn tex_recent_frames() -> u64 {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<u64> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        crate::knobs::var("VITASLOP_TEX_RECENT_FRAMES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(u64::MAX)
+    })
+}
+
 /// The default retention bound, in MiB. See [`tex_retain_budget_bytes`].
 ///
 /// Chosen from the working set rather than from the device, and it is a FLOOR on the tail rather
@@ -1193,6 +1231,22 @@ pub(crate) fn gxp_precompile() -> bool {
     static CELL: OnceLock<bool> = OnceLock::new();
     *CELL.get_or_init(|| {
         crate::knobs::var("VITASLOP_GXP_PRECOMPILE").map(|v| v.trim() != "0").unwrap_or(false)
+    })
+}
+
+/// >>> PIPELINES ARE STARTED ASYNC, AHEAD OF THE FRAME THAT DRAWS THEM - see
+/// >>> `GxmRenderer::warm_pipelines`. `VITASLOP_ASYNC_PIPELINES=0` is the arm back.
+///
+/// MEASURED on the user's phone (runner job kind `pipeline-compile`, 100 real corpus pairs): a
+/// synchronous `createRenderPipeline` compiles on Chrome's GPU MAIN thread - the compositor - so
+/// after 10 of them a submit + `onSubmittedWorkDone` probe took 2,024 ms (idle: 1.7 ms) and the
+/// whole browser froze (Hot Shots 5.6 s, MLB 7.8 s). With 10 `createRenderPipelineAsync` in
+/// flight the same probe took 193 ms.
+pub(crate) fn async_pipelines() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        crate::knobs::var("VITASLOP_ASYNC_PIPELINES").map(|v| v.trim() != "0").unwrap_or(true)
     })
 }
 
@@ -2866,7 +2920,7 @@ pub use gxm::{
     take_sampler_bg_prev,
     wasm_clock_installed,
     EncodePhases, EncodeWork, PrepareSplit,
-    GxmRenderer,
+    GxmRenderer, PipelineWarm, PipelinesReady,
     vertex_plan_census_line,
 };
 
@@ -3635,18 +3689,15 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     _ => {}
                 }
             }
-            match (end, commas.len()) {
-                (Some(e), 2) => {
-                    let coord = rest[commas[1] + 1..e].trim();
-                    if coord.starts_with("vec2<f32>") {
-                        out.push_str(&rest[..commas[1] + 1]);
-                        out.push_str(" gxp_nudge2(");
-                        out.push_str(coord);
-                        out.push(')');
-                        rest = &rest[e..];
-                    }
+            if let (Some(e), 2) = (end, commas.len()) {
+                let coord = rest[commas[1] + 1..e].trim();
+                if coord.starts_with("vec2<f32>") {
+                    out.push_str(&rest[..commas[1] + 1]);
+                    out.push_str(" gxp_nudge2(");
+                    out.push_str(coord);
+                    out.push(')');
+                    rest = &rest[e..];
                 }
-                _ => {}
             }
         }
         out.push_str(rest);
@@ -5853,6 +5904,14 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// same bytes), and one map keyed by address would recreate the target every frame and
         /// hand each reader the other's image.
         rtt_raw: HashMap<(u32, u32, u32), RawSurface>,
+        /// Every (colour format, samples, alpha-single) a pass into this target has been
+        /// ENCODED with, by the scene's target (`None` = a scene with no colour target), recorded
+        /// by `encode_pass`. It is how `warm_pipelines` knows the pass shape of a scene before
+        /// the encode decides it: the decision is spread over the display, raw-64 and RTT arms
+        /// of `encode_chain` and their side effects, and replaying it would be a second copy of
+        /// that logic to keep in step. A target never encoded before is not predicted - its
+        /// first pipelines build synchronously, as they always did, and count as UNWARMED.
+        pass_shapes: HashMap<Option<(u32, u32, u32, u32)>, Vec<(wgpu::TextureFormat, u32, bool)>>,
         /// The pipeline that unpacks a RAW 64-bit surface into its `Rgba16Float` companion
         /// (`RawSurface::float_view`), built on first use. See `convert_raw_to_float`.
         raw_to_float: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
@@ -6557,6 +6616,12 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// backend shader per pipeline. A race that keeps building these mid-lap is the case
         /// for creating the common variants ahead of the draw.
         pipelines_built_variant,
+        /// Pipelines STARTED ahead of the frame with `createRenderPipelineAsync` - see
+        /// `GxmRenderer::warm_pipelines` - and, of `pipelines_built`, those the pre-pass did NOT
+        /// predict and the encode therefore created synchronously, on the browser's GPU thread,
+        /// with async creation on. The second is the pre-pass's miss count: it should be ~0.
+        pipelines_async,
+        pipelines_unwarmed,
         /// Buffers created, and bytes written into a buffer (`write_buffer` plus the
         /// create-with-contents arenas). Vertex/index/uniform volume, separable from texture
         /// volume because the two have completely different fixes.
@@ -7629,7 +7694,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                  encodes refused, {:.1} RE-uploaded after eviction) / {:.1} cached ({:.2} view evict \
                  passes dropping {:.1} entries, {:.1} superseded in place, {:.2} WHOLESALE clears, {:.1} DESTROYED), bind groups {:.1} built \
                  / {:.1} reused, {:.2} pipelines built ({:.2} of them state variants of a pair \
-                 already built), buffers {:.1} created / {:.1} destroyed ({:.2} MB \
+                 already built; {:.2} started ASYNC ahead, {:.2} built sync UNWARMED), buffers {:.1} created / {:.1} destroyed ({:.2} MB \
                  written in {:.1} write_buffer CALLS, WORST SINGLE CALL {:.1} ms for {:.0} KB), rtt {:.2} created / {:.2} destroyed / {:.2} snapshots ({:.2} MB), {:.2} DESTINATION-COLOUR pass splits ({:.2} MB copied), {:.2} depth \
                  conversions, {:.2} depth-bind-cache clears, {:.1} draws ELIDED (colour = destination, no depth write; {} in this window - a per-frame mean that rounds to 0.0 cannot tell NEVER from RARELY, and those want opposite next steps), COLOUR-FOLD census/frame: {:.1} asks ({:.1} short-circuited by level one), {:.1} memo hits / {:.1} MISSES, {:.2} MB hashed over {:.1} windows ({:.0} B per ask) - the misses are what the FOLD costs and the bytes are what the HASH costs, and a fix that targets the wrong one has been reverted twice",
                 per(self.passes),
@@ -7655,6 +7720,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 per(self.bind_groups_reused),
                 per(self.pipelines_built),
                 per(self.pipelines_built_variant),
+                per(self.pipelines_async),
+                per(self.pipelines_unwarmed),
                 per(self.buffers_created),
                 per(self.buffers_destroyed),
                 mb(self.buffer_bytes),
@@ -8301,13 +8368,116 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         generation: u64,
     }
 
-    struct GxpPipeline {
+    /// `GxpLive::pipelines`' key: (pair, colour format, samples, cull, vertex layout, raster).
+    type PipeCacheKey = (u64, wgpu::TextureFormat, u32, u32, u64, u64);
+
+    /// What [`GxpLive::pipe_key`] computes for one draw.
+    struct PipeKey {
+        raw_units: u64,
+        f32_units: u64,
+        raster: u64,
+        cache_key: PipeCacheKey,
+    }
+
+    /// A pipeline `createRenderPipelineAsync` is compiling - see `GxmRenderer::warm_pipelines`.
+    type PipeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<wgpu::RenderPipeline, String>>>>;
+
+    /// Pipelines [`GxmRenderer::warm_pipelines`] STARTED. The browser compiles them off its GPU
+    /// main thread; [`Self::wait`] resolves them and [`GxmRenderer::install_pipelines`] puts
+    /// them where the encode looks.
+    pub struct PipelineWarm {
+        items: Vec<(PipeCacheKey, GxpPipelineOf<PipeFuture>)>,
+    }
+
+    impl PipelineWarm {
+        pub fn len(&self) -> usize {
+            self.items.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.items.is_empty()
+        }
+
+        /// Every started pipeline, resolved. One the browser REJECTS is left out and named: the
+        /// encode then builds it synchronously, which reports the validation error through the
+        /// device's error scope exactly as it always has.
+        pub async fn wait(self) -> PipelinesReady {
+            let mut items = Vec::with_capacity(self.items.len());
+            for (k, p) in self.items {
+                let (fut, shell) = p.swap(());
+                match fut.await {
+                    Ok(pipe) => items.push((k, shell.swap(pipe).1)),
+                    Err(e) => report_status!(
+                        "gxp pair {:016x}: createRenderPipelineAsync REJECTED ({e}) - the frame builds it synchronously instead",
+                        k.0
+                    ),
+                }
+            }
+            PipelinesReady { items }
+        }
+    }
+
+    /// Resolved pipelines, for [`GxmRenderer::install_pipelines`].
+    pub struct PipelinesReady {
+        items: Vec<(PipeCacheKey, GxpPipeline)>,
+    }
+
+    impl<P> GxpPipelineOf<P> {
+        /// This pair with its pipeline replaced by `q`, and the pipeline it had.
+        fn swap<Q>(self, q: Q) -> (P, GxpPipelineOf<Q>) {
+            let GxpPipelineOf {
+                pipeline,
+                layouts,
+                vsa_lanes,
+                fsa_lanes,
+                mem_bind_bytes,
+                fmem_windows,
+                fmem_bind_bytes,
+                mem_windows,
+                samplers,
+                vertex_samplers,
+                repack,
+                packed_stride,
+                packed_stride_native,
+                passthrough,
+                needs_dest,
+            } = self;
+            (
+                pipeline,
+                GxpPipelineOf {
+                    pipeline: q,
+                    layouts,
+                    vsa_lanes,
+                    fsa_lanes,
+                    mem_bind_bytes,
+                    fmem_windows,
+                    fmem_bind_bytes,
+                    mem_windows,
+                    samplers,
+                    vertex_samplers,
+                    repack,
+                    packed_stride,
+                    packed_stride_native,
+                    passthrough,
+                    needs_dest,
+                },
+            )
+        }
+    }
+
+    /// A built pair with its pipeline in hand - see [`GxpPipelineOf`].
+    type GxpPipeline = GxpPipelineOf<wgpu::RenderPipeline>;
+
+    /// Generic over the PIPELINE ONLY so one build path serves both creations: `P` is a
+    /// `wgpu::RenderPipeline` for a sync build and the pending future for an async one (see
+    /// `GxmRenderer::warm_pipelines`), which becomes the former through [`Self::with_pipeline`].
+    struct GxpPipelineOf<P> {
         /// The one pipeline for this pair. There used to be two - an "opaque" variant with
         /// LessEqual + depth write and an "overlay" variant with Always + no write - selected
         /// per draw by a HEURISTIC (see the note in `build_gxp_pipeline`). Depth now comes from
         /// the guest's own captured `SceGxmDepthFunc`/depth-write, which is part of the pair
         /// key, so the two variants would be identical by construction.
-        pipeline: wgpu::RenderPipeline,
+        pipeline: P,
         /// group0 = vertex SA uniform, group1 = fragment SA uniform, group2 = samplers.
         /// Empty layouts where the stage declares nothing, so the pipeline layout still
         /// covers every group index the WGSL might reference.
@@ -8551,7 +8721,11 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// its atlas, its alpha and its uniforms were all measured correct. It reproduced only
         /// when a menu draw of the other layout came first, which is why a shot window that
         /// starts after the menus never showed it.
-        pipelines: HashMap<(u64, wgpu::TextureFormat, u32, u32, u64, u64), Option<GxpPipeline>>,
+        pipelines: HashMap<PipeCacheKey, Option<GxpPipeline>>,
+        /// The caller warms pipelines ahead of the frame (`GxmRenderer::warm_pipelines` has run),
+        /// so a pipeline the encode still has to build synchronously is a pre-pass MISS and is
+        /// counted as `pipelines_unwarmed`. False on every path that never warms (native).
+        warm_used: bool,
         /// Compiled WGSL modules, by shader PAIR.
         ///
         /// # A pair's module does not depend on the pipeline variant, and it used to be rebuilt
@@ -9113,6 +9287,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     })
                     .unwrap_or_default(),
                 pipelines: HashMap::default(),
+                warm_used: false,
                 modules: HashMap::default(),
                 pair_keys: HashMap::default(),
                 views: HashMap::default(),
@@ -9750,6 +9925,58 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
 
         /// Prepare the GPU resources for one recompiled draw. Returns `None` (caller falls
         /// back to fixed-function) if the pair does not link or a resource cannot be built.
+        /// The pipeline CACHE KEY of one draw in a pass of this shape, and the parts of it the
+        /// prepared draw carries. The one place it is computed: `prepare` (the encode) and
+        /// `GxmRenderer::warm_pipelines` (the async pre-pass) both call this, so a pre-pass
+        /// can never start a pipeline under a key the encode would not look up.
+        ///
+        /// `is_raw` answers whether a (address, width, height) is a 64-bit target this frame
+        /// rendered as RAW words - see `GxmRenderer::rtt_rendered_raw`.
+        fn pipe_key(
+            gxp: &GxpRecompile,
+            key: u64,
+            noop_keeps_depth: bool,
+            color_format: wgpu::TextureFormat,
+            alpha_single: bool,
+            samples: u32,
+            is_raw: impl Fn(&(u32, u32, u32)) -> bool,
+        ) -> PipeKey {
+            let raw_units: u64 = gxp
+                .textures
+                .iter()
+                .filter(|t| {
+                    t.unit < 64
+                        // NOT 0x1b, F16F16F16F16: a program declaring that format samples the
+                        // words as four halves, filtered - it gets the surface's `Rgba16Float`
+                        // companion through the ordinary rendered path (`RawSurface::float_view`).
+                        && (0x1c..=0x1f).contains(&t.tex.base_format)
+                        && is_raw(&(t.tex.data_addr, t.tex.width, t.tex.height))
+                })
+                .fold(0u64, |m, t| m | (1u64 << t.unit));
+            // The units (bit u = fragment unit u, bit 32+u = vertex unit u) bound to a texture on
+            // the 32-bit float seam - see `SamplerDim::TwoF32`. Their layout entries differ, so
+            // the mask is part of the pipeline's identity; the module is the same.
+            let f32_units: u64 = gxp
+                .textures
+                .iter()
+                .filter(|t| t.unit < 32 && raw_units & (1u64 << t.unit) == 0 && t.tex.texel == TexelSeam::Rg32Float)
+                .fold(0u64, |m, t| m | (1u64 << t.unit))
+                | gxp
+                    .vertex_textures
+                    .iter()
+                    .filter(|t| t.unit < 32 && t.tex.texel == TexelSeam::Rg32Float)
+                    .fold(0u64, |m, t| m | (1u64 << (32 + t.unit)));
+            // The raster key with the raw mask folded in - the SAME value goes into the
+            // prepared draw (`GxpPrepared::raster`), which is what the encode looks the
+            // pipeline up by again.
+            let raster = Self::raster_key(gxp, noop_keeps_depth)
+                ^ raw_units.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ f32_units.wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
+                ^ if alpha_single { 0x5151_0000_0000_0008 } else { 0 };
+            let cache_key = (key, color_format, samples, gxp.cull_mode, Self::vertex_layout_key(gxp), raster);
+            PipeKey { raw_units, f32_units, raster, cache_key }
+        }
+
         fn prepare(
             &mut self,
             device: &wgpu::Device,
@@ -9905,39 +10132,15 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // raw target, so the mask is part of the pipeline's identity - the same pair over
             // an ordinary texture is another pipeline. Per DRAW, because a title binds
             // different textures to one program across a pass.
-            let raw_units: u64 = gxp
-                .textures
-                .iter()
-                .filter(|t| {
-                    t.unit < 64
-                        // NOT 0x1b, F16F16F16F16: a program declaring that format samples the
-                        // words as four halves, filtered - it gets the surface's `Rgba16Float`
-                        // companion through the ordinary rendered path (`RawSurface::float_view`).
-                        && (0x1c..=0x1f).contains(&t.tex.base_format)
-                        && rendered_raw.contains_key(&(t.tex.data_addr, t.tex.width, t.tex.height))
-                })
-                .fold(0u64, |m, t| m | (1u64 << t.unit));
-            // The units (bit u = fragment unit u, bit 32+u = vertex unit u) bound to a texture on
-            // the 32-bit float seam - see `SamplerDim::TwoF32`. Their layout entries differ, so
-            // the mask is part of the pipeline's identity; the module is the same.
-            let f32_units: u64 = gxp
-                .textures
-                .iter()
-                .filter(|t| t.unit < 32 && raw_units & (1u64 << t.unit) == 0 && t.tex.texel == TexelSeam::Rg32Float)
-                .fold(0u64, |m, t| m | (1u64 << t.unit))
-                | gxp
-                    .vertex_textures
-                    .iter()
-                    .filter(|t| t.unit < 32 && t.tex.texel == TexelSeam::Rg32Float)
-                    .fold(0u64, |m, t| m | (1u64 << (32 + t.unit)));
-            // The raster key with the raw mask folded in - the SAME value goes into the
-            // prepared draw (`GxpPrepared::raster`), which is what the encode looks the
-            // pipeline up by again.
-            let raster = Self::raster_key(gxp, noop_keeps_depth)
-                ^ raw_units.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                ^ f32_units.wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
-                ^ if alpha_single { 0x5151_0000_0000_0008 } else { 0 };
-            let cache_key = (key, color_format, samples, gxp.cull_mode, Self::vertex_layout_key(gxp), raster);
+            let PipeKey { raw_units, f32_units, raster, cache_key } = Self::pipe_key(
+                gxp,
+                key,
+                noop_keeps_depth,
+                color_format,
+                alpha_single,
+                samples,
+                |k| rendered_raw.contains_key(k),
+            );
             if !self.pipelines.contains_key(&cache_key) {
                 // Name the pair's two containers by their CONTENT hash the moment it is first
                 // seen. `Program::hash` is the same value the offline corpus computes, so this
@@ -9976,6 +10179,9 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 report_unfed_uniforms(key, "vertex", &gxp.vprog);
                 report_unfed_uniforms(key, "fragment", &gxp.fprog);
                 enc(&ENC.pipelines_built, 1);
+                if self.warm_used {
+                    enc(&ENC.pipelines_unwarmed, 1);
+                }
                 PIPELINES_BUILT_THIS_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // A variant of a pair already built under another baked state: cheap to
                 // count here (builds are rare), and the number that says whether creating
@@ -9986,7 +10192,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // Charged to `pipe_build_ns`, NOT to the key preamble it sits in the middle
                 // of - see the counter.
                 let t_build = split_start();
-                let built = build_gxp_pipeline(device, color_format, alpha_single, samples, gxp.cull_mode, gxp, key, self.zfix, self.yflip, self.solid, self.nodepth, self.noblend, noop_keeps_depth, raw_units, f32_units, &mut self.modules);
+                let built = build_gxp_pipeline(device, color_format, alpha_single, samples, gxp.cull_mode, gxp, key, self.zfix, self.yflip, self.solid, self.nodepth, self.noblend, noop_keeps_depth, raw_units, f32_units, &mut self.modules, |d, desc| d.create_render_pipeline(desc));
                 self.pipelines.insert(cache_key, built);
                 if let Some(t) = t_build {
                     build_ns = (t.ms() * 1.0e6) as u64;
@@ -11172,12 +11378,25 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                             let budget = tex_retain_budget_bytes().max(*views_frame_high);
                             if *view_cache_bytes >= budget {
                                 let epoch = *views_epoch;
+                                // >>> RECENTLY USED IS NOT A RETENTION CANDIDATE - see
+                                // `tex_recent_frames`. Under the retention bound only a
+                                // SUPERSEDED entry or one idle for `recent` frames goes; past the
+                                // texture budget itself (`over_hard`), anything this frame has
+                                // not used, oldest first, exactly as before.
+                                let recent = super::tex_recent_frames();
+                                let over_hard = *view_cache_bytes >= tex_cache_budget_bytes().max(budget);
                                 // Oldest first, so a cache under steady pressure sheds what has
                                 // gone longest unused rather than whatever the hash order
                                 // happens to yield.
                                 let mut stale: Vec<((u64, SamplerDim), u64)> = views_used
                                     .iter()
-                                    .filter(|(_, (used, ..))| *used != epoch)
+                                    .filter(|(k, (used, ..))| {
+                                        *used != epoch
+                                            && (over_hard
+                                                || recent == 0
+                                                || view_dead.contains(*k)
+                                                || used.saturating_add(recent) < epoch)
+                                    })
                                     .map(|(k, (used, ..))| (*k, *used))
                                     .collect();
                                 // SUPERSEDED entries first, then oldest first. A superseded
@@ -11243,13 +11462,14 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                                     sampler_bgs.retain(|_, (_, named, _)| {
                                         !named.iter().any(|k| just_evicted.contains(k))
                                     });
-                                } else {
+                                } else if over_hard || recent == 0 {
                                     // Nothing was evictable: every entry is in use by the
                                     // frame being encoded. Exceeding the budget is the only
                                     // way to finish it, and it is REPORTED rather than
                                     // silently done - a working set this size is the thing to
                                     // fix, and on a phone it is also how a worker gets killed
-                                    // with no error.
+                                    // with no error. (Held over the RETENTION bound by recent
+                                    // use alone is not this: that is the recency rule working.)
                                     report_texture_budget_exceeded(
                                         *view_cache_bytes,
                                         views_used,
@@ -15628,14 +15848,13 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             patched = nudge_texcoords(&patched, eps);
         }
         // `VITASLOP_GXP_RETURN_KEYS=<keys | !keys>` restricts it to those pairs (`ret`).
-        if let Some(expr) = crate::knobs::var("VITASLOP_GXP_RETURN").ok().filter(|e| ret && !e.trim().is_empty()) {
-            if let Some(at) = patched.rfind("
+        if let Some(expr) = crate::knobs::var("VITASLOP_GXP_RETURN").ok().filter(|e| ret && !e.trim().is_empty())
+            && let Some(at) = patched.rfind("
   return ") {
                 let end = patched[at + 1..].find(";
 ").map(|e| at + 1 + e + 1).unwrap_or(patched.len());
                 patched.replace_range(at + 1..end, &format!("  return {};", expr.trim()));
             }
-        }
         if let Some(k) = keycolor {
             let chan = |shift: u32| ((k >> shift) & 0xff) as f32 / 255.0;
             let (r, g, b) = (0.25 + 0.75 * chan(0), 0.25 + 0.75 * chan(21), 0.25 + 0.75 * chan(42));
@@ -17532,7 +17751,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         wgpu::BlendState { color: c, alpha: c }
     }
 
-    fn build_gxp_pipeline(
+    fn build_gxp_pipeline<P>(
         device: &wgpu::Device,
         color_format: wgpu::TextureFormat,
         // A single-channel ALPHA target - see `alpha_single_color_format`.
@@ -17565,7 +17784,10 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         f32_units: u64,
         // Compiled modules by pair - see `GxpLive::modules`.
         modules: &mut HashMap<u64, wgpu::ShaderModule>,
-    ) -> Option<GxpPipeline> {
+        // Makes the pipeline from its finished descriptor - `create_render_pipeline` for a
+        // build in the frame, `create_render_pipeline_async` for one started ahead of it.
+        create: impl FnOnce(&wgpu::Device, &wgpu::RenderPipelineDescriptor) -> P,
+    ) -> Option<GxpPipelineOf<P>> {
         // Settled before the first link: one gates a rewrite of the program, the other whether
         // the module declares a destination texture at all.
         let _ = super::gxp_dest_blend_lowering();
@@ -18582,7 +18804,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         });
         let t_pipe = Stopwatch::start();
         let make = || {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            create(device, &wgpu::RenderPipelineDescriptor {
                 // Named by PAIR for the same reason the module above is - see there. This is
                 // the label that appeared thirty-two times as a bare `"gxp"` in a device
                 // failure report, naming nothing.
@@ -18659,7 +18881,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
 
         let pipeline = make();
         super::add_build_ms(&super::PIPE_CREATE_US, t_pipe.ms());
-        Some(GxpPipeline {
+        Some(GxpPipelineOf {
             pipeline,
             layouts,
             vsa_lanes,
@@ -18876,7 +19098,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             if iterations == 0 {
                 return;
             }
-            if self.burn.as_ref().map_or(true, |b| b.0 != iterations) {
+            if self.burn.as_ref().is_none_or(|b| b.0 != iterations) {
                 let src = format!(
                     "@group(0) @binding(0) var<storage, read_write> sink: array<f32>;
                      @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
@@ -19361,6 +19583,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 subrect_keep: Vec::new(),
                 rtt_ever_rendered: HashSet::default(),
                 rtt_raw: HashMap::default(),
+                pass_shapes: HashMap::default(),
                 raw_to_float: None,
                 rtt_rendered_raw: HashMap::default(),
                 display_images: HashMap::default(),
@@ -21449,14 +21672,12 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 return;
             }
             let t = Stopwatch::start();
-            let mut walked = 0u32;
-            for p in pairs {
+            for (walked, p) in pairs.iter().enumerate() {
                 // The first pair of a call always runs, so progress cannot stall however slow
                 // the device is; after that the budget covers the whole loop body.
                 if walked > 0 && t.ms() >= PRECOMPILE_MS_PER_FRAME {
                     break;
                 }
-                walked += 1;
                 let attrs_id = p.attrs.iter().fold(0usize, |h, &(r, f, c)| {
                     h.wrapping_mul(31).wrapping_add((r as usize) << 16 | (f as usize) << 8 | c as usize)
                 });
@@ -21480,6 +21701,104 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     },
                     super::now_ms,
                 );
+            }
+        }
+
+        /// The key [`Self::pass_shapes`] is recorded and read under.
+        fn pass_id(scene: &RenderScene) -> Option<(u32, u32, u32, u32)> {
+            scene.target.map(|t| (t.data_addr, t.width, t.height, t.format))
+        }
+
+        /// >>> START, WITH `createRenderPipelineAsync`, EVERY PIPELINE THESE SCENES WILL NEED
+        /// >>> AND DO NOT HAVE - before the frame is encoded. See `async_pipelines`.
+        ///
+        /// A synchronous create compiles on the browser's GPU main thread and froze the whole
+        /// browser for seconds on the phone. The encode cannot wait for a promise halfway
+        /// through (a worker cannot block, and abandoning a half-encoded frame would undo RTT,
+        /// residency and write-back state), so the caller awaits [`PipelineWarm::wait`] BEFORE
+        /// encoding and hands the result to [`Self::install_pipelines`]: the encode then finds
+        /// every one of them in the cache.
+        ///
+        /// The keys are [`GxpLive::pipe_key`] - the same function the encode calls - under the
+        /// pass shapes this scene's target was last encoded with (`pass_shapes`). What that
+        /// cannot predict (a target never encoded before, a raw-64 target first rendered this
+        /// frame) builds synchronously in the encode as before and is counted as
+        /// `pipelines_unwarmed`, so the prediction's coverage is a number on the panel.
+        pub fn warm_pipelines(&mut self, device: &wgpu::Device, scenes: &[RenderScene]) -> PipelineWarm {
+            let mut items = Vec::new();
+            if !self.gxp.enabled || !super::async_pipelines() {
+                return PipelineWarm { items };
+            }
+            self.gxp.warm_used = true;
+            let mut started: HashSet<PipeCacheKey> = HashSet::default();
+            for scene in scenes {
+                if scene.draws.is_empty() {
+                    continue;
+                }
+                let Some(shapes) = self.pass_shapes.get(&Self::pass_id(scene)).cloned() else {
+                    continue;
+                };
+                for d in &scene.draws {
+                    let Some(g) = &d.gxp else { continue };
+                    // The same early refusals as `GxpLive::prepare`.
+                    if g.index_count == 0 || g.vertices.is_empty() {
+                        continue;
+                    }
+                    let key = self.gxp.pair_key(g);
+                    if (!self.gxp.keys.is_empty() && !self.gxp.keys.contains(&key)) || self.gxp.exclude.contains(&key) {
+                        continue;
+                    }
+                    let noop_keeps_depth = g.depth_write && draw_colour_is_noop(g);
+                    for &(fmt, samples, alpha_single) in &shapes {
+                        let rtt_raw = &self.rtt_raw;
+                        let pk = GxpLive::pipe_key(g, key, noop_keeps_depth, fmt, alpha_single, samples, |k| {
+                            rtt_raw.contains_key(k)
+                        });
+                        if self.gxp.pipelines.contains_key(&pk.cache_key) || !started.insert(pk.cache_key) {
+                            continue;
+                        }
+                        report_unfed_uniforms(key, "vertex", &g.vprog);
+                        report_unfed_uniforms(key, "fragment", &g.fprog);
+                        enc(&ENC.pipelines_built, 1);
+                        enc(&ENC.pipelines_async, 1);
+                        let l = &mut self.gxp;
+                        let built = build_gxp_pipeline(
+                            device,
+                            fmt,
+                            alpha_single,
+                            samples,
+                            g.cull_mode,
+                            g,
+                            key,
+                            l.zfix,
+                            l.yflip,
+                            l.solid,
+                            l.nodepth,
+                            l.noblend,
+                            noop_keeps_depth,
+                            pk.raw_units,
+                            pk.f32_units,
+                            &mut l.modules,
+                            |d, desc| d.create_render_pipeline_async(desc),
+                        );
+                        match built {
+                            Some(p) => items.push((pk.cache_key, p)),
+                            // Refused by our own link: cached as refused, as the encode would.
+                            None => {
+                                self.gxp.pipelines.insert(pk.cache_key, None);
+                            }
+                        }
+                    }
+                }
+            }
+            PipelineWarm { items }
+        }
+
+        /// Put what [`PipelineWarm::wait`] resolved where the encode looks for it. A key the
+        /// encode built in the meantime keeps the encode's.
+        pub fn install_pipelines(&mut self, ready: PipelinesReady) {
+            for (k, p) in ready.items {
+                self.gxp.pipelines.entry(k).or_insert(Some(p));
             }
         }
 
@@ -22974,6 +23293,18 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             let color_format = target_format;
             // A single-channel ALPHA surface - see `alpha_single_color_format`.
             let alpha_single = scene.target.is_some_and(|t| alpha_single_color_format(t.format));
+            // What `warm_pipelines` predicts the NEXT frame's passes into this target from.
+            {
+                let shapes = self.pass_shapes.entry(Self::pass_id(scene)).or_default();
+                let shape = (color_format, samples, alpha_single);
+                if !shapes.contains(&shape) {
+                    // Bounded: a target is encoded under one or two shapes in practice.
+                    if shapes.len() >= 4 {
+                        shapes.remove(0);
+                    }
+                    shapes.push(shape);
+                }
+            }
             let mut gxp_prepared: Vec<GxpPrepared> = Vec::new();
             let mut order: Vec<Enc> = Vec::with_capacity(scene.draws.len());
             // The guest's SCISSOR for each entry of `order`, in the same positions. It rides

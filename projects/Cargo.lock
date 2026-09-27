@@ -4693,8 +4693,6 @@ dependencies = [
 [[package]]
 name = "wgpu"
 version = "30.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d8f4bd44d92da5270f03409dba9f952dab24f128e05d6a554926101d1bf9114"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.0",
@@ -5290,6 +5288,7 @@ dependencies = [
 [[package]]
 name = "yaxpeax-arm"
 version = "0.4.0"
+source = "git+https://github.com/cretz/yaxpeax-arm?rev=57a5099a88647d981d611a6e5c5489a7fd0c70aa#57a5099a88647d981d611a6e5c5489a7fd0c70aa"
 dependencies = [
  "bitvec",
  "yaxpeax-arch",

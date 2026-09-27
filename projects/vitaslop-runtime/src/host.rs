@@ -17235,7 +17235,7 @@ impl VitaState {
         // this list and cannot say what the block held, which is the only thing that separates
         // the two causes.
         if frag_binds.is_empty() && fref.sampler_units != 0 {
-            self.report_draw_without_bound_textures(&blk, fheader, fref.sampler_units);
+            self.report_draw_without_bound_textures(blk, fheader, fref.sampler_units);
         }
         let texture_phase = crate::perf::scope(crate::perf::Phase::DrawTextures);
         let mut textures = match cached_set {
@@ -17333,7 +17333,7 @@ impl VitaState {
                 {
                     textures[..=pos].rotate_right(1);
                 }
-                if let Some(unit) = Self::fragment_albedo_unit(&fref)
+                if let Some(unit) = Self::fragment_albedo_unit(fref)
                     && let Some(pos) = textures.iter().position(|t| t.unit == unit) {
                         textures[..=pos].rotate_right(1);
                     }

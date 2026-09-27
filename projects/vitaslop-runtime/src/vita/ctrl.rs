@@ -135,11 +135,10 @@ impl CtrlHistory {
             Some(last) if vblank == last.vblank => {
                 // The same vblank read again after the pad moved: a vblank has one sample, and
                 // it is the state as of now.
-                if last.pad != pad {
-                    if let Some(b) = ring.back_mut() {
+                if last.pad != pad
+                    && let Some(b) = ring.back_mut() {
                         b.pad = pad;
                     }
-                }
             }
             Some(last) if vblank > last.vblank => {
                 let gap = (vblank - last.vblank - 1).min(cap as u64);
