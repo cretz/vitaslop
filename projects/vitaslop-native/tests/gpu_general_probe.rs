@@ -252,9 +252,19 @@ fn mvp_quad(
         shader_expanded: false,
     }
 }
+/// ONE GPU DEVICE AT A TIME IN THIS TEST BINARY. The harness runs tests in parallel, and on the
+/// Windows CI runner (no GPU, a software adapter) devices created concurrently crashed the whole
+/// binary with `STATUS_ACCESS_VIOLATION` (PR #4). Each test holds this for its whole run.
+static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 
 #[test]
 fn general_renderer_matches_software_oracle() {
+    let _gpu = gpu_lock();
     let Some(mut gpu) = GeneralRenderer::new() else {
         eprintln!("no GPU adapter; skipping general renderer parity probe");
         return;
@@ -624,6 +634,7 @@ color: None,
 /// exercised through the resolve, then compares at factor 2.
 #[test]
 fn general_renderer_supersample_matches_software() {
+    let _gpu = gpu_lock();
     let Some(mut gpu) = GeneralRenderer::new() else {
         eprintln!("no GPU adapter; skipping supersample parity probe");
         return;

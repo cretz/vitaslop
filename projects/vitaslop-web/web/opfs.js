@@ -165,8 +165,10 @@ export async function importTitle(id, entries, onProgress = () => {}) {
     let inFlight = 0;
     let reported = 0;
     // A source may name the length it PROMISED (a fetch's `content-length`). See below.
+    // Only a NUMBER is a promise: a `Blob` (so every `File`) has a `bytes()` METHOD, and reading
+    // that as a length failed every file of an import in current Chrome.
     const src = await entries[i].source();
-    const promised = src && typeof src === "object" && "bytes" in src ? src.bytes : null;
+    const promised = src && typeof src === "object" && typeof src.bytes === "number" ? src.bytes : null;
     const body = src && typeof src === "object" && "body" in src ? src.body : src;
     const written = await storeOne(dir, entries[i].path, body, (n) => {
       inFlight += n;

@@ -154,7 +154,7 @@ during boot.
 | `VITASLOP_GXM_ARENA_FLOOR_KB` | vitaslop-platform/src/gpu.rs:898 | `VITASLOP_GXM_DEST_SPLIT_AB=<n>`: alternate the destination-colour pass SPLIT on and off every |
 | `VITASLOP_GXM_ARENA_POOL` | vitaslop-platform/src/gpu.rs:14251 | `VITASLOP_GXM_ARENA_POOL=1` pools the six per-pass staging arenas. |
 | `VITASLOP_GXM_ARENA_REPEAT` | vitaslop-platform/src/gpu.rs:4206 | >>> REPACKS OF GEOMETRY THIS RUN HAD ALREADY EVICTED - the cache THRASHING. |
-| `VITASLOP_GXM_BACKGROUND_DEPTH` | vitaslop-conformance-harness/tests/vita_gxmconf.rs:608 | **SCENE 8 - A REVERSED DEPTH RANGE: THE PASS STARTS FROM THE SURFACE'S BACKGROUND DEPTH.** |
+| `VITASLOP_GXM_BACKGROUND_DEPTH` | vitaslop-conformance-harness/tests/vita_gxmconf.rs:621 | **SCENE 8 - A REVERSED DEPTH RANGE: THE PASS STARTS FROM THE SURFACE'S BACKGROUND DEPTH.** |
 | `VITASLOP_GXM_BUFFER_PREINIT` | vitaslop-platform/src/gpu.rs:18990 | Create through the pool: a hit is free, a miss is the allocation that was going to |
 | `VITASLOP_GXM_COLOR_MASK_ORDER` | vitaslop-conformance-harness/tests/vita_gxmconf_real.rs:167 | **SCENE 14 - THE COLOUR MASK NUMBERS ALPHA AS BIT 0.** |
 | `VITASLOP_GXM_DEPTH_ENC` | vitaslop-platform/src/gpu.rs:3586 | Which value a later pass reads out of a render target's depth |
@@ -247,7 +247,7 @@ during boot.
 | `VITASLOP_GXP_NEGW` | vitaslop-platform/src/gpu.rs:8849 | How to choose the clip-`w` sign correction (`VITASLOP_GXP_NEGW`). |
 | `VITASLOP_GXP_NOBLEND` | vitaslop-platform/src/gpu.rs:8679 | Diagnostic (`VITASLOP_GXP_NOBLEND`): force every recompiled pipeline to REPLACE with |
 | `VITASLOP_GXP_NODEPTH` | vitaslop-platform/src/gpu.rs:8671 | Diagnostic (`VITASLOP_GXP_NODEPTH`): every recompiled draw keeps its real shading and |
-| `VITASLOP_GXP_NO_STENCIL` | vitaslop-conformance-harness/tests/vita_gxmconf.rs:566 | **SCENE 7 - A STENCIL MASK CONFINES A LATER DRAW TO WHAT AN INVISIBLE DRAW MARKED.** |
+| `VITASLOP_GXP_NO_STENCIL` | vitaslop-conformance-harness/tests/vita_gxmconf.rs:579 | **SCENE 7 - A STENCIL MASK CONFINES A LATER DRAW TO WHAT AN INVISIBLE DRAW MARKED.** |
 | `VITASLOP_GXP_ONLY` | vitaslop-platform/src/gpu.rs:8651 | Render ONLY recompiled draws, skipping the fixed-function draw for any call that |
 | `VITASLOP_GXP_PACK_COMP0` | vitaslop-gxp-shader/src/link.rs:5520 | `0` restores bit 1 as comp0's high selector bit for a 16-bit PACK source, which is what this |
 | `VITASLOP_GXP_PACK_DEST_SLOT` | vitaslop-gxp-shader/src/usse/decode.rs:4833 | The SMLSI slot a repeating 0x40 VPCK's DESTINATION steps under: slot 0, the DEST byte |

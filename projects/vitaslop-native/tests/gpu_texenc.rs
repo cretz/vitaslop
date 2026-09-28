@@ -115,9 +115,19 @@ fn corpus(w: u32, h: u32) -> Vec<(&'static str, Vec<u8>)> {
     out.push(("alpha steps", make(&|x, _| [10, 200, 60, ((x % 8) * 36) as u8])));
     out
 }
+/// ONE GPU DEVICE AT A TIME IN THIS TEST BINARY. The harness runs tests in parallel, and on the
+/// Windows CI runner (no GPU, a software adapter) devices created concurrently crashed the whole
+/// binary with `STATUS_ACCESS_VIOLATION` (PR #4). Each test holds this for its whole run.
+static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 
 #[test]
 fn gpu_etc2_matches_the_cpu_encoder() {
+    let _gpu = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("no GPU adapter - skipping");
         return;
@@ -170,6 +180,7 @@ fn gpu_etc2_matches_the_cpu_encoder() {
 /// chain is compared level by level, so an error in the filter cannot hide inside a later level.
 #[test]
 fn gpu_pvrtc_matches_the_cpu_decoder() {
+    let _gpu = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("no GPU adapter - skipping");
         return;
@@ -269,6 +280,7 @@ fn gpu_pvrtc_matches_the_cpu_decoder() {
 /// endpoint is larger.
 #[test]
 fn gpu_bc_matches_the_cpu_decoder() {
+    let _gpu = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("no GPU adapter - skipping");
         return;
@@ -364,6 +376,7 @@ fn build_bc_plan(
 /// every level below it is the shader's own filter against `halve_rgba8`.
 #[test]
 fn gpu_mip_filter_matches_the_cpu() {
+    let _gpu = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("no GPU adapter - skipping");
         return;
@@ -466,6 +479,7 @@ fn build_plan(
 /// rather than passing quietly.
 #[test]
 fn the_recorded_copies_are_accepted_by_the_driver() {
+    let _gpu = gpu_lock();
     let Some((device, queue)) = device_with_block_compression() else {
         eprintln!("no GPU adapter with a block-compressed format - skipping");
         return;
@@ -520,6 +534,7 @@ fn the_recorded_copies_are_accepted_by_the_driver() {
 /// the per-level copies - by reading the finished texture's actual bytes.
 #[test]
 fn gpu_transcode_round_trips_through_a_real_etc2_texture() {
+    let _gpu = gpu_lock();
     let Some((device, queue)) = device_with_etc2() else {
         eprintln!("no adapter on this machine exposes ETC2 - skipping");
         return;
@@ -756,6 +771,7 @@ fn device_with_block_compression() -> Option<(wgpu::Device, wgpu::Queue)> {
 /// comparison would obviously explain. This is the guard for that one constant.
 #[test]
 fn gpu_eac_order_matches_the_cpu() {
+    let _gpu = gpu_lock();
     for table in 0..16 {
         let mut want: Vec<usize> = (0..8).collect();
         want.sort_by_key(|&s| vitaslop_runtime::etcenc::eac_modifier(table, s));
@@ -781,6 +797,7 @@ fn gpu_eac_order_matches_the_cpu() {
 /// cleanly with no adapter.
 #[test]
 fn gpu_yuv_conversion_matches_the_cpu() {
+    let _gpu = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("no GPU adapter; skipping");
         return;
@@ -920,6 +937,7 @@ fn read_back_rgba8(
 /// that a level-0 compare would hide.
 #[test]
 fn gpu_raw_expand_matches_the_cpu_decoder() {
+    let _gpu = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("no GPU adapter - skipping");
         return;
@@ -1053,6 +1071,7 @@ fn gpu_raw_expand_matches_the_cpu_decoder() {
 /// generated chain and the row-aligned copy-out.
 #[test]
 fn gpu_bc_expand_matches_the_cpu_decoder() {
+    let _gpu = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("no GPU adapter - skipping");
         return;
@@ -1191,6 +1210,7 @@ fn read_back_rgba8_level(
 /// alignment wrong.
 #[test]
 fn gpu_expand_batches_several_textures_into_one_submit() {
+    let _gpu = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("no GPU adapter - skipping");
         return;
