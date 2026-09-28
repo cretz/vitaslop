@@ -15,3 +15,17 @@
 *.bin  binary
 *.ttf  binary
 *.png  binary
+
+# >>> A SHELL SCRIPT MUST BE LF IN THE WORKING TREE, NOT ONLY IN THE INDEX.
+#
+# `text=auto` above normalises the INDEX, and on Windows the checkout then gets CRLF - at
+# which point bash refuses the script's own first line: `set -euo pipefail` fails with
+# "invalid option name", because the option name it sees ends in a carriage return. Every
+# guest-suite `build.sh` carries a note telling the reader to strip the endings into /tmp
+# first, and that workaround is itself broken: the scripts resolve their source directory
+# from `$BASH_SOURCE`, so a copy in /tmp compiles nothing and reports a missing source file.
+#
+# The endings are the root cause, so they are fixed here rather than worked around in
+# twenty scripts. Rebuilding a guest artifact is how a conformance app gets EXTENDED, and a
+# build step that needs an undocumented incantation is a step nobody takes.
+*.sh text eol=lf

@@ -61,6 +61,12 @@ pub struct Game {
     pub files: MemVfs,
     /// The executable modules, unwrapped to loadable ELF, shared libraries first.
     pub modules: Vec<GameModule>,
+    /// Further EXECUTABLES the app carries beside its `eboot.bin` - a root-level `*.self` -
+    /// unwrapped but NOT loaded at boot: they are what `sceAppMgrLoadExec("app0:<x>.self")`
+    /// replaces the running process with. A title whose eboot is only a launcher needs one
+    /// (a 2011 adventure title's 12 KB eboot does nothing but exec its real executable). See
+    /// [`Game::with_main_exec`].
+    pub execs: Vec<GameModule>,
 }
 
 impl Game {
@@ -73,6 +79,27 @@ impl Game {
     pub fn eboot(&self) -> Option<&GameModule> {
         self.modules.iter().find(|m| m.path == "eboot.bin")
     }
+
+    /// Make the executable at `path` (an `app0:` path as the guest passed it, or app-relative)
+    /// the process's MAIN executable, in the slot `eboot.bin` held - what `sceAppMgrLoadExec`
+    /// does to the process. Returns false (and changes nothing) when the app carries no such
+    /// executable.
+    pub fn with_main_exec(&mut self, path: &str) -> bool {
+        let rel = exec_rel_path(path);
+        let Some(i) = self.execs.iter().position(|m| m.path == rel) else { return false };
+        let exec = GameModule { path: self.execs[i].path.clone(), elf: self.execs[i].elf.clone() };
+        match self.modules.iter().position(|m| m.path == "eboot.bin") {
+            Some(slot) => self.modules[slot] = exec,
+            None => self.modules.push(exec),
+        }
+        true
+    }
+}
+
+/// The app-relative path an `sceAppMgrLoadExec` argument names: `app0:` and any leading `/`
+/// stripped (`"app0:game.self"`, `"app0:/game.self"` -> `"game.self"`).
+pub fn exec_rel_path(path: &str) -> &str {
+    path.strip_prefix("app0:").unwrap_or(path).trim_start_matches('/')
 }
 
 /// Decrypt and unwrap a mounted container into a [`Game`].
@@ -135,6 +162,9 @@ pub fn dump_entries(game: &Game) -> Vec<(String, Vec<u8>)> {
     for m in &game.modules {
         manifest.push_str(&format!("module={}\n", m.path));
     }
+    for m in &game.execs {
+        manifest.push_str(&format!("exec={}\n", m.path));
+    }
 
     let mut out = Vec::with_capacity(2 + game.files.len() + game.modules.len());
     out.push((DUMP_MANIFEST.to_string(), manifest.into_bytes()));
@@ -143,7 +173,7 @@ pub fn dump_entries(game: &Game) -> Vec<(String, Vec<u8>)> {
             out.push((format!("files/{path}"), bytes));
         }
     }
-    for m in &game.modules {
+    for m in game.modules.iter().chain(&game.execs) {
         out.push((format!("modules/{}", m.path), m.elf.clone()));
     }
     out
@@ -162,6 +192,8 @@ pub fn dump_entries(game: &Game) -> Vec<(String, Vec<u8>)> {
 pub struct LazyDump {
     pub content_id: String,
     pub modules: Vec<GameModule>,
+    /// The alternate executables - see [`Game::execs`].
+    pub execs: Vec<GameModule>,
     /// App-relative paths of the data files, and the vfs path each lives at, so the
     /// caller can wire its own storage to them without re-deriving the layout.
     pub files: Vec<(String, String)>,
@@ -177,7 +209,7 @@ pub struct LazyDump {
 
 /// Mount the decrypted dump at `root` lazily; see [`LazyDump`].
 pub fn mount_dump_lazy(vfs: &dyn Vfs, root: &str) -> Result<LazyDump, Error> {
-    let (content_id, module_paths) = read_manifest(vfs, root)?;
+    let (content_id, module_paths, exec_paths) = read_manifest(vfs, root)?;
     // Derived exactly as `load_dump` derives it, via `under`, so the two mounts agree on
     // the layout by construction rather than by two hand-written strings agreeing.
     let files_prefix = format!("{}/", under(root, "files"));
@@ -191,7 +223,12 @@ pub fn mount_dump_lazy(vfs: &dyn Vfs, root: &str) -> Result<LazyDump, Error> {
         let elf = vfs.read(&under(root, &format!("modules/{path}")))?;
         modules.push(GameModule { path, elf });
     }
-    Ok(LazyDump { content_id, modules, files, files_prefix })
+    let mut execs = Vec::with_capacity(exec_paths.len());
+    for path in exec_paths {
+        let elf = vfs.read(&under(root, &format!("modules/{path}")))?;
+        execs.push(GameModule { path, elf });
+    }
+    Ok(LazyDump { content_id, modules, execs, files, files_prefix })
 }
 
 /// Detect the container at the vfs root and return the dump root if it is a decrypted
@@ -205,7 +242,7 @@ pub fn dump_root(vfs: &dyn Vfs) -> Option<String> {
 }
 
 /// Parse a dump manifest into `(content_id, module paths)`.
-fn read_manifest(vfs: &dyn Vfs, root: &str) -> Result<(String, Vec<String>), Error> {
+fn read_manifest(vfs: &dyn Vfs, root: &str) -> Result<(String, Vec<String>, Vec<String>), Error> {
     let manifest = vfs.read(&under(root, DUMP_MANIFEST))?;
     let manifest = String::from_utf8(manifest).map_err(|_| Error::BadMagic("dump manifest"))?;
     let mut lines = manifest.lines();
@@ -214,18 +251,21 @@ fn read_manifest(vfs: &dyn Vfs, root: &str) -> Result<(String, Vec<String>), Err
     }
     let mut content_id = String::new();
     let mut module_paths: Vec<String> = Vec::new();
+    let mut exec_paths: Vec<String> = Vec::new();
     for line in lines {
         if let Some(id) = line.strip_prefix("content_id=") {
             content_id = id.to_string();
         } else if let Some(p) = line.strip_prefix("module=") {
             module_paths.push(p.to_string());
+        } else if let Some(p) = line.strip_prefix("exec=") {
+            exec_paths.push(p.to_string());
         }
     }
-    Ok((content_id, module_paths))
+    Ok((content_id, module_paths, exec_paths))
 }
 
 fn load_dump(vfs: &mut dyn Vfs, root: &str) -> Result<Game, Error> {
-    let (content_id, module_paths) = read_manifest(&*vfs, root)?;
+    let (content_id, module_paths, exec_paths) = read_manifest(&*vfs, root)?;
 
     // MOVED out of the source, one file at a time, rather than copied: a dump mount is
     // the whole title, and copying it means holding a retail container twice at once.
@@ -246,11 +286,17 @@ fn load_dump(vfs: &mut dyn Vfs, root: &str) -> Result<Game, Error> {
         let elf = vfs.take(&under(root, &format!("modules/{path}")))?;
         modules.push(GameModule { path, elf });
     }
+    let mut execs = Vec::with_capacity(exec_paths.len());
+    for path in exec_paths {
+        let elf = vfs.take(&under(root, &format!("modules/{path}")))?;
+        execs.push(GameModule { path, elf });
+    }
 
     Ok(Game {
         content_id,
         files,
         modules,
+        execs,
     })
 }
 
@@ -318,13 +364,22 @@ fn decrypt_pfs(vfs: &dyn Vfs, root: &str) -> Result<Game, Error> {
     // loop covers both encrypted files and the few stored in the clear.
     let mut files = MemVfs::new();
     let mut module_paths: Vec<String> = Vec::new();
+    let mut exec_paths: Vec<String> = Vec::new();
     for file in image.files() {
         let ciphertext = vfs.read(&under(root, &file.path))?;
         let plaintext = image.decrypt(&file.path, &ciphertext, &rif.key, &crypto)?;
         if is_executable(&file.path, &plaintext) {
             module_paths.push(file.path.clone());
+        } else if is_exec_alternate(&file.path, &plaintext) {
+            exec_paths.push(file.path.clone());
         }
         files.insert(file.path.clone(), plaintext);
+    }
+    exec_paths.sort();
+    let mut execs = Vec::with_capacity(exec_paths.len());
+    for path in exec_paths {
+        let elf = self2elf(&files.read(&path)?, &rif.key)?;
+        execs.push(GameModule { path, elf });
     }
 
     // Unwrap each executable's SELF layer to a loadable ELF. Shared libraries load
@@ -345,6 +400,7 @@ fn decrypt_pfs(vfs: &dyn Vfs, root: &str) -> Result<Game, Error> {
         content_id: rif.content_id,
         files,
         modules,
+        execs,
     })
 }
 
@@ -352,6 +408,12 @@ fn decrypt_pfs(vfs: &dyn Vfs, root: &str) -> Result<Game, Error> {
 /// `eboot.bin` or a `sce_module/*.suprx`, and carrying the SCE SELF magic. (The
 /// path check keeps a stray asset that happens to start with `SCE\0` from being
 /// treated as code.)
+/// A root-level `*.self` carrying the SELF magic: an executable the app can `LoadExec` into,
+/// not one loaded at boot (see [`Game::execs`]).
+fn is_exec_alternate(path: &str, plaintext: &[u8]) -> bool {
+    !path.contains('/') && path.ends_with(".self") && plaintext.len() >= 4 && &plaintext[..4] == SCE_MAGIC
+}
+
 fn is_executable(path: &str, plaintext: &[u8]) -> bool {
     let named_module = path == "eboot.bin"
         || (path.starts_with("sce_module/") && path.ends_with(".suprx"));
@@ -411,6 +473,7 @@ mod tests {
                 GameModule { path: "sce_module/libx.suprx".into(), elf: b"\x7fELF-lib".to_vec() },
                 GameModule { path: "eboot.bin".into(), elf: b"\x7fELF-main".to_vec() },
             ],
+            execs: vec![GameModule { path: "game.self".into(), elf: b"\x7fELF-exec".to_vec() }],
         };
 
         let mut tree = MemVfs::new();

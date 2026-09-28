@@ -33,6 +33,7 @@
 
 import init, { ingest_probe, ingest_import } from "./pkg/vitaslop_web.js";
 import { titleDir, encodeName, storageRoom } from "./opfs.js";
+import { makeFileSource } from "./read-window.js";
 
 globalThis.__vitaslopPanic = (text) => {
   try {
@@ -43,26 +44,13 @@ globalThis.__vitaslopPanic = (text) => {
 const ready = init();
 
 /// The Rust side's ByteSource over the picked files. `onRead(bytes, path)` is called
-/// for every range pulled, which is the only sign of life the identify phase has.
+/// for every range pulled from the provider, which is the only sign of life the
+/// identify phase has - and it counts PROVIDER bytes, not bytes served out of the
+/// cache, so it stays a measure of real progress.
+///
+/// The caching, and why a picked file needs any, is in `read-window.js`.
 function fileSource(files, onRead = () => {}) {
-  const byPath = new Map(files.map((f) => [f.path, f.file]));
-  const reader = new FileReaderSync();
-  return {
-    list: () => [...byPath.keys()],
-    size: (path) => {
-      const f = byPath.get(path);
-      return f ? f.size : undefined;
-    },
-    readAt: (path, off, buf) => {
-      const f = byPath.get(path);
-      if (!f || off >= f.size) return 0;
-      const end = Math.min(f.size, off + buf.length);
-      const bytes = new Uint8Array(reader.readAsArrayBuffer(f.slice(off, end)));
-      buf.set(bytes);
-      onRead(bytes.length, path);
-      return bytes.length;
-    },
-  };
+  return makeFileSource(files, { onRead });
 }
 
 /// Throttled progress out. `postMessage` is cheap but the page has to render each one.
@@ -77,6 +65,17 @@ function throttle(ms) {
     last = now;
     self.postMessage(make());
   };
+}
+
+/// Run `job` over every item with a bounded number in flight. Bounded because these
+/// are storage calls: unbounded would put 1,300 OPFS opens in flight at once, and the
+/// point is to overlap their latency, not to find the limit of the implementation.
+async function inParallel(items, job, width = 16) {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) await job(items[next++]);
+  };
+  await Promise.all(Array.from({ length: Math.min(width, items.length) }, worker));
 }
 
 /// The probe as the page needs it: `outputs` is thousands of paths the page has no
@@ -151,12 +150,31 @@ self.onmessage = async (e) => {
     const dir = await titleDir(titleId, { create: true });
     // A previous partial import leaves files behind; start from an empty directory
     // so the only entries afterwards are this import's.
-    for await (const [name] of dir.entries()) await dir.removeEntry(name, { recursive: true });
+    const stale = [];
+    for await (const [name] of dir.entries()) stale.push(name);
+    await inParallel(stale, (name) => dir.removeEntry(name, { recursive: true }).catch(() => {}));
+    // EVERY OUTPUT'S HANDLE, OPENED BEFORE THE FIRST BYTE - and on a phone one open
+    // costs 6.5 ms, so a 1,300 file title sat in "preparing storage" for 8.4 seconds
+    // doing them one after another. They do not depend on each other, so they go out
+    // in parallel, and the stage reports its own progress rather than showing a
+    // stopped bar for the whole of it.
     const handles = new Map();
-    for (const path of outputs) {
+    let opened = 0;
+    await inParallel(outputs, async (path) => {
       const fh = await dir.getFileHandle(encodeName(path), { create: true });
       handles.set(path, await fh.createSyncAccessHandle());
-    }
+      opened += 1;
+      // `unit: "files"` because these are handles, not bytes: it keeps the counter out
+      // of the byte-rate window and off the "MB/s" line.
+      post(false, () => ({
+        type: "progress",
+        stage: "preparing",
+        file: "",
+        done: opened,
+        total: outputs.length,
+        unit: "files",
+      }));
+    });
 
     let cur = null;
     let count = 0;

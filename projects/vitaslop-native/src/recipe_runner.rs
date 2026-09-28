@@ -190,7 +190,16 @@ pub fn boot_retail(
         .iter()
         .map(|m| loader::load(&m.elf).map_err(|e| format!("load module: {e:?}")))
         .collect::<Result<_, _>>()?;
-    let linked = link(modules).map_err(|e| format!("link: {e:?}"))?;
+    // This run stands up the THREADED scheduler, so the host mirror block exists and is
+    // refreshed at its resume point - which is what lets the RTC tick be read inline.
+    // See `vitaslop_runtime::vita::set_preemptive_linking`.
+    vitaslop_runtime::vita::set_preemptive_linking(true);
+    let linked = link(modules);
+    // Reset at once: the flag is process-wide and read only by `link`, so left set it would
+    // make a later link in this process (a test, a second title) inline a clock read its
+    // scheduler does not refresh.
+    vitaslop_runtime::vita::set_preemptive_linking(false);
+    let linked = linked.map_err(|e| format!("link: {e:?}"))?;
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     // >>> EVERY NATIVE TOOL DECODES VIDEO, because the one that did not could not SEE the
     // movie path at all.
@@ -239,7 +248,15 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
     // `VITASLOP_SIGNATURE=1` asks for one deliberately, which is what a run whose POINT is
     // to learn the signature and bless it into a recipe wants. Same spelling as the browser,
     // so the two engines decide this the same way.
-    let want_sig = recipe.meta.sig.is_some() || vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE");
+    //
+    // >>> AND `VITASLOP_SIGNATURE_EVERY` COUNTS AS ASKING. Setting the trace interval alone
+    // used to produce a run with no signature computed and therefore not one `sigtrace` line
+    // - a silent nothing, from a knob whose entire purpose is to print them. That cost a pair
+    // of 13,600-frame runs here before anyone read this line. A knob that is set and has no
+    // effect must not be a quiet no-op.
+    let want_sig = recipe.meta.sig.is_some()
+        || vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE")
+        || signature_trace_interval() != 0;
     sched.host().state.capture.set_signature_wanted(want_sig);
 
     // The guest's own saved state, BEFORE a single guest instruction runs: `restore_game_data`
@@ -254,7 +271,7 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
             crate::gamedata_disk::SaveStore::title_for(game_dir, sfo.as_deref());
         if !from_container {
             println!(
-                "[gamedata] this container names no title id; saves are filed under {title:?}                  (its directory name), which another title extracted the same way would share"
+                "[gamedata] this container names no title id; saves are filed under {title:?} (its directory name), which another title extracted the same way would share"
             );
         }
         crate::gamedata_disk::SaveStore::new(root, &title)

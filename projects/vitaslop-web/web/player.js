@@ -5,12 +5,12 @@
 // the orientation and pad placement, the in-game menu and the diagnostics snapshot.
 // The emulator itself lives in the worker; this file never touches guest state.
 //
-// The boot is structurally the same as the debug launcher's (web/debug/live.html)
-// and the e2e harness page; a change to the start message or the worker's reports
-// has to land in all three.
+// The boot is structurally the same as the e2e harness page's (web/debug/game-worker.html);
+// a change to the start message or the worker's reports has to land in both.
 
 import { forwardInput } from "./worker-input.js";
 import { forwardLocation } from "./location.js";
+import { bundleModule } from "./bundle.js";
 import { startAudio } from "./audio.js";
 import { isComplete } from "./opfs.js";
 import * as gamedata from "./gamedata.js";
@@ -18,13 +18,18 @@ import { mountTouchPad } from "./touchpad.js";
 import { installGamepad } from "./gamepad.js";
 import { runKnobs, vocabulary, touchTitle } from "./store.js";
 import { renderVita } from "./vita.js";
+import * as navpad from "./navpad.js";
 
 const $ = (id) => document.getElementById(id);
 const MAX_FRAMES = 0xffffffff;
 
-export function createPlayer({ onExit }) {
+/// `onExit` is called after a quit; `onRestart(titleId, fullscreen)` after a restart,
+/// with the run already torn down, to start the same title through the app's one
+/// start path.
+export function createPlayer({ onExit, onRestart }) {
   const root = $("player");
-  const canvas = $("screen");
+  // Replaced per run: a canvas hands its drawing to a worker ONCE (see start).
+  let canvas = $("screen");
   const stage = $("stage");
   let worker = null;
   let touch = null;
@@ -60,6 +65,27 @@ export function createPlayer({ onExit }) {
 
   // ----- reports from the worker, kept for the snapshot -----
   const reports = { fps: "", perf: "", adapter: "", status: "", diag: "" };
+  // >>> WHICH BUNDLE IS THIS. Written beside the wasm by `build.mjs`; see the note there for
+  // why. Read once, here, and never blocking anything: a dump whose build line says
+  // `unavailable` is still a dump, but one with no build line at all cannot be told apart from
+  // a dump of yesterday's bytes.
+  // BOTH bundles are stamped: `VITASLOP_SMP=1` runs pkg-threads, and a dump that named only
+  // pkg's stamp read as "this SMP run used the single bundle" (2026-09-26). `buildStampNow()` is
+  // resolved against the run's knobs when the dump is written.
+  const stamps = { single: "not read yet", threads: "not read yet" };
+  for (const [key, dir] of [["single", "pkg"], ["threads", "pkg-threads"]]) {
+    fetch(`./${dir}/build-stamp.txt`, { cache: "no-store" })
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((t) => {
+        stamps[key] = t.trim();
+      })
+      .catch((e) => {
+        stamps[key] = `unavailable (${e.message}) - this bundle was built before the stamp existed, or the file was not served`;
+      });
+  }
+  let runsThreads = false;
+  const buildStampNow = () =>
+    `${runsThreads ? stamps.threads : stamps.single} (this run's bundle: ${runsThreads ? "pkg-threads" : "pkg"}; other: ${runsThreads ? stamps.single : stamps.threads})`;
   const notes = [];
   let fatalText = "";
   let hiddenCount = 0;
@@ -119,6 +145,7 @@ export function createPlayer({ onExit }) {
     root.classList.toggle("stretch", settings.scaling === "stretch");
     if (settings.scaling === "integer") fitInteger();
     else canvas.style.width = canvas.style.height = "";
+    postOutputSize();
   };
   const fitInteger = () => {
     const r = stage.getBoundingClientRect();
@@ -129,20 +156,125 @@ export function createPlayer({ onExit }) {
   landscape.addEventListener("change", applyLayout);
   window.addEventListener("resize", () => settings && settings.scaling === "integer" && fitInteger());
 
+  // ----- the canvas's size in DEVICE pixels, for the renderer's crisp scale -----
+  // The renderer draws the 960x544 picture and scales it to the canvas itself, one screen pixel
+  // of blend at each source-pixel seam and exact colour everywhere else (present_scale.rs) -
+  // instead of the browser's bilinear stretch, which blurred hard-edged text on a phone's ~2x.
+  // So the canvas's backing store has to be the picture's OWN rectangle in device pixels: the
+  // letterboxed 960:544 box inside the element (`object-fit: contain`), or the whole box when
+  // stretching. Integer scaling keeps 960x544 (0x0) - the browser's pixelated scale is exact there.
+  let devicePx = null;
+  const postOutputSize = () => {
+    if (!worker || !settings) return;
+    if (settings.scaling === "integer") {
+      worker.postMessage({ type: "output-size", w: 0, h: 0 });
+      return;
+    }
+    let W, H;
+    if (devicePx) [W, H] = devicePx;
+    else {
+      const r = canvas.getBoundingClientRect();
+      W = r.width * devicePixelRatio;
+      H = r.height * devicePixelRatio;
+    }
+    if (!(W > 0 && H > 0)) return;
+    let w = W, h = H;
+    if (settings.scaling !== "stretch") {
+      const k = Math.min(W / 960, H / 544);
+      w = 960 * k;
+      h = 544 * k;
+    }
+    worker.postMessage({ type: "output-size", w: Math.round(w), h: Math.round(h) });
+  };
+  try {
+    new ResizeObserver((entries) => {
+      const e = entries[entries.length - 1];
+      const d = e.devicePixelContentBoxSize && e.devicePixelContentBoxSize[0];
+      devicePx = d ? [d.inlineSize, d.blockSize] : null;
+      postOutputSize();
+    }).observe(canvas, { box: "device-pixel-content-box" });
+  } catch {
+    window.addEventListener("resize", postOutputSize);
+  }
+
   // ----- fullscreen -----
+  // Asked for ONCE per run, from Play (with its gesture) or from the menu button, and
+  // never from a resize, orientation, focus or visibility handler: Chrome for Android
+  // shows its "swipe down to exit" toast on every fullscreen layout and again every
+  // time the window regains focus while fullscreen (FullscreenHtmlApiHandlerBase.
+  // onWindowFocusChanged -> FullscreenToast.showNotificationToast), so a re-request or
+  // a dim-and-wake is a toast the page caused. The wake lock below removes the dim.
   const isFull = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+  // The browser's answer is RECORDED, not swallowed: a refused request (no activation left, an
+  // element it will not take) otherwise reads exactly like a setting that never asked. Reported
+  // (2026-09-27): after leaving fullscreen once, the next title did not go fullscreen.
   const enterFullscreen = async () => {
+    const active = navigator.userActivation ? navigator.userActivation.isActive : "?";
     try {
       if (root.requestFullscreen) await root.requestFullscreen({ navigationUI: "hide" });
       else if (root.webkitRequestFullscreen) root.webkitRequestFullscreen();
-    } catch {}
-    // The lock is a setting: a phone held in portrait is a legitimate way to play with
-    // the pad below the screen, and the lock takes that away.
+      note(`[fullscreen] requested (tap activation live: ${active}): ${isFull() ? "granted" : "no error, but not fullscreen"}`);
+    } catch (err) {
+      note(`[fullscreen] REFUSED (tap activation live: ${active}): ${(err && (err.name + ": " + err.message)) || err}`);
+    }
+    if (!isFull() && wantFull) showFullscreenPrompt();
+    await applyOrientationLock();
+  };
+  // >>> A REFUSED REQUEST GETS A BUTTON, NOT SILENCE. Reported twice (2026-09-27): after leaving
+  // fullscreen once, the next Play did not go fullscreen. Whatever the browser's reason, a tap
+  // on this is a fresh user activation, which a fullscreen request always gets - so the player
+  // is one tap from where the setting said it should be instead of stuck in the page.
+  let wantFull = false;
+  let fsPrompt = null;
+  const hideFullscreenPrompt = () => {
+    if (fsPrompt) fsPrompt.remove();
+    fsPrompt = null;
+  };
+  const showFullscreenPrompt = () => {
+    if (fsPrompt || !running && !fullscreenAsked) return;
+    fsPrompt = document.createElement("button");
+    fsPrompt.type = "button";
+    fsPrompt.className = "btn fs-prompt";
+    fsPrompt.textContent = "Tap for fullscreen";
+    fsPrompt.addEventListener("click", () => {
+      hideFullscreenPrompt();
+      enterFullscreen();
+    });
+    root.appendChild(fsPrompt);
+    note("[fullscreen] not granted - showing the tap-for-fullscreen button");
+  };
+  // The lock is a setting: a phone held in portrait is a legitimate way to play with
+  // the pad below the screen, and the lock takes that away.
+  //
+  // >>> UNKNOWN SETTINGS LOCK, BECAUSE LOCKING IS THE DEFAULT. Play asks for fullscreen inside
+  // the tap (see `askFullscreenNow`), before `start` has read the title's settings, so this
+  // runs with `settings` still null on every Play. Gating the lock on `settings &&` skipped it
+  // there every time - fullscreen, but held in portrait. `start` calls this again once the
+  // settings are known, which is what lets a player who turned the lock OFF get it released.
+  // A lock needs fullscreen, not a gesture, so that second call is allowed.
+  const applyOrientationLock = async () => {
+    if (!coarse || !screen.orientation) return;
     try {
-      if (coarse && settings && settings.lockLandscape !== false && screen.orientation && screen.orientation.lock) {
+      if (settings && settings.lockLandscape === false) {
+        if (screen.orientation.unlock) screen.orientation.unlock();
+      } else if (isFull() && screen.orientation.lock) {
         await screen.orientation.lock("landscape");
       }
     } catch {}
+  };
+  // >>> ASKED FOR INSIDE THE TAP, NOT AFTER IT. `play` reads the title and its settings out
+  // of storage before `start` runs, and on a freshly reloaded page those reads are cold: the
+  // tap's transient activation had lapsed by the time `start` asked, so a phone that pressed
+  // Play started in portrait with no fullscreen. The Play handler calls this synchronously
+  // and `start` then skips its own request for that run.
+  let fullscreenAsked = false;
+  const askFullscreenNow = () => {
+    fullscreenAsked = true;
+    wantFull = true;
+    // The element asked for is the one about to be shown: requested while still `hidden`
+    // (display: none), it is an element with no box, which is one reason a browser may give.
+    root.hidden = false;
+    enterFullscreen();
   };
   const exitFullscreen = async () => {
     try {
@@ -154,14 +286,71 @@ export function createPlayer({ onExit }) {
   };
   document.addEventListener("fullscreenchange", () => {
     $("m-fullscreen").textContent = isFull() ? "Exit fullscreen" : "Fullscreen";
+    if (isFull()) hideFullscreenPrompt();
   });
+
+  // ----- screen wake lock -----
+  // A game is watched, not touched, for minutes at a time; without this the screen
+  // dims and every wake is a focus change (and the fullscreen toast again). The lock is
+  // dropped by the browser whenever the page is hidden, so it is re-asked for on every
+  // return to the foreground while a run is on. Denied or absent, nothing changes.
+  let wakeLock = null;
+  const holdWake = async () => {
+    if (!running || wakeLock || !navigator.wakeLock || document.visibilityState !== "visible") return;
+    try {
+      const lock = await navigator.wakeLock.request("screen");
+      if (!running) {
+        lock.release().catch(() => {});
+        return;
+      }
+      wakeLock = lock;
+      lock.addEventListener("release", () => {
+        if (wakeLock === lock) wakeLock = null;
+      });
+    } catch (e) {
+      note(`[wake] not held: ${e && e.message ? e.message : e}`);
+    }
+  };
+  const dropWake = () => {
+    const lock = wakeLock;
+    wakeLock = null;
+    if (lock) lock.release().catch(() => {});
+  };
+  document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && holdWake());
 
   // ----- the menu -----
   const menu = $("menu");
+  const confirmBox = $("m-confirm");
+  let confirmYes = null;
+  // The Yes/No panel that stands in for the menu body until it is answered: a
+  // window.confirm is what a fullscreen phone browser hides or shrinks.
+  const askConfirm = (text, yes) => {
+    confirmYes = yes;
+    $("m-confirm-text").textContent = text;
+    $("m-body").hidden = true;
+    confirmBox.hidden = false;
+    $("m-confirm-no").focus();
+  };
+  const closeConfirm = () => {
+    confirmYes = null;
+    confirmBox.hidden = true;
+    $("m-body").hidden = false;
+  };
+  const menuBack = () => (confirmYes ? closeConfirm() : openMenu(false));
   const openMenu = (open) => {
     menuOpen = open;
     menu.hidden = !open;
+    closeConfirm();
     applyPause();
+    // The pad changes hands with the menu: gamepad.js lets go first, then the
+    // navigator takes it (and the other way round on close), so no press is seen by both.
+    if (open) {
+      if (pads) pads.suspend(true);
+      navpad.attach(menu, { onBack: menuBack, onStart: () => openMenu(false) });
+    } else {
+      navpad.detach();
+      if (pads) pads.suspend(false);
+    }
     if (open) {
       $("m-fps").checked = !!settings.showFps;
       $("m-pad-mode").value = settings.pad.mode;
@@ -172,13 +361,25 @@ export function createPlayer({ onExit }) {
       $("m-settings").href = `#/settings/${meta.titleId}`;
       $("m-title").textContent = meta.title;
       if (vocab) renderVita($("m-vita"), { buttons: vocab.buttons, controls: vocab.gamepadControls, keyboard: settings.keyboard, gamepad: settings.gamepad, mode: "keyboard", readonly: true });
+      $("m-resume").focus();
     }
   };
   let vocab = null;
   $("menubtn").addEventListener("click", () => openMenu(!menuOpen));
   $("m-resume").addEventListener("click", () => openMenu(false));
-  $("m-fullscreen").addEventListener("click", () => (isFull() ? exitFullscreen() : enterFullscreen()));
-  $("m-quit").addEventListener("click", () => stop());
+  $("m-fullscreen").addEventListener("click", () => {
+    // Leaving fullscreen from the menu is a choice: no prompt to bring it back this run.
+    wantFull = !isFull();
+    return isFull() ? exitFullscreen() : enterFullscreen();
+  });
+  $("m-restart").addEventListener("click", () => askConfirm("Restart this game from the beginning? Anything not saved is lost.", restart));
+  $("m-quit").addEventListener("click", () => askConfirm("Quit to the library? Anything not saved is lost.", stop));
+  $("m-confirm-yes").addEventListener("click", () => {
+    const yes = confirmYes;
+    closeConfirm();
+    if (yes) yes();
+  });
+  $("m-confirm-no").addEventListener("click", closeConfirm);
   $("m-fps").addEventListener("change", (e) => {
     settings.showFps = e.target.checked;
     $("fpsbadge").hidden = !settings.showFps;
@@ -203,9 +404,15 @@ export function createPlayer({ onExit }) {
   $("m-download").addEventListener("click", () => download(`vitaslop-${meta.titleId}-diag.txt`, diagText(), "text/plain"));
   $("m-shot").addEventListener("click", () => screenshot());
   $("fatal-copy").addEventListener("click", () => copyText(diagText(), $("fatal-copy")));
+  // The same file the menu's Download writes, from the panel that is shown INSTEAD of the menu
+  // once the run is over - see the markup for why the clipboard alone was not enough here.
+  $("fatal-download").addEventListener("click", () =>
+    download(`vitaslop-${meta ? meta.titleId : "unknown"}-fatal.txt`, diagText(), "text/plain"));
   $("fatal-quit").addEventListener("click", () => stop());
   document.addEventListener("keydown", (e) => {
-    if (running && e.code === "Escape") openMenu(!menuOpen);
+    if (!running || e.code !== "Escape") return;
+    if (menuOpen) menuBack();
+    else openMenu(true);
   });
 
   /// A runtime change from the menu is saved as a GLOBAL setting (the person changed
@@ -221,9 +428,31 @@ export function createPlayer({ onExit }) {
     return (
       `audio: context=${a.state} peak=${(a.peak ?? 0).toFixed(4)}${a.peak > 0 ? "" : " (nothing audible yet)"} | ` +
       `written ${s(a.written)}s read ${s(a.read)}s | underrun ${s(a.underrun)}s overrun ${s(a.overrun)}s | ` +
-      `backlog ${((1000 * (a.fill ?? 0)) / rate).toFixed(0)}ms`
+      `backlog ${((1000 * (a.fill ?? 0)) / rate).toFixed(0)}ms | rejoins ${a.rejoins ?? 0}`
     );
   };
+  /// Knobs armed by the LINK - `?knobs=VITASLOP_A%3D1,VITASLOP_B%3D2` - merged OVER the ones
+  /// the settings record produces.
+  ///
+  /// A device run has to be handed over ALREADY ARMED. Typing a knob name into a text box on a
+  /// phone keyboard is where an A/B silently becomes a single arm, and a run that comes back
+  /// with a knob misspelled reads exactly like a null result. The armed names go into the
+  /// diagnostics file's `knobs:` line below, so what was actually set comes back with the
+  /// numbers rather than being taken on trust. A name no reader routes through the override
+  /// table still panics on boot, by design - loud beats a knob that did nothing.
+  const linkKnobs = () => {
+    const raw = new URLSearchParams(location.search).get("knobs");
+    if (!raw) return {};
+    const out = {};
+    for (const part of raw.split(/[,\n]/)) {
+      const t = part.trim();
+      if (!t) continue;
+      const i = t.indexOf("=");
+      out[i < 0 ? t : t.slice(0, i)] = i < 0 ? "1" : t.slice(i + 1);
+    }
+    return out;
+  };
+
   const diagText = () =>
     [
       `vitaslop diagnostics`,
@@ -232,9 +461,16 @@ export function createPlayer({ onExit }) {
       `knobs: ${JSON.stringify(window.__runKnobs || {})}`,
       hiddenCount > 0 ? `WARNING: the page was backgrounded ${hiddenCount}x - a hidden page is throttled` : `page stayed in the foreground`,
       hardPauses > 0 ? `hard-paused ${hardPauses}x for ${(hardPausedMs / 1000).toFixed(1)}s in total` : `never hard-paused`,
+      `build: ${buildStampNow()}`,
+      `page loaded: ${new Date(performance.timeOrigin).toISOString()} (${((Date.now() - performance.timeOrigin) / 60000).toFixed(1)} min ago)`,
       `user agent: ${navigator.userAgent}`,
       `screen: ${screen.width}x${screen.height} dpr ${devicePixelRatio} ${landscape.matches ? "landscape" : "portrait"}${isFull() ? " fullscreen" : ""}`,
       `adapter: ${reports.adapter}`,
+      // These two are emitted under their own ids at device creation and were being STORED and
+      // never printed, so no dump has ever carried them - see the note in `lib.rs` beside
+      // `adapter-features` for what that cost.
+      `${reports["adapter-compression"] || "adapter compressed-texture support: (not reported)"}`,
+      `${reports["adapter-features"] || "adapter features: (not reported)"}`,
       `${reports.fps}`,
       `${reports.perf}`,
       `status: ${reports.status}`,
@@ -280,11 +516,14 @@ export function createPlayer({ onExit }) {
   async function start(m, eff, { fullscreen = false, onSetting } = {}) {
     if (running) stop();
     if (!fresh) {
-      // The canvas was transferred to a previous run's worker and cannot be again:
-      // a fresh page is the only way to get a new one.
-      sessionStorage.setItem("vitaslop.resume", `#/play/${m.titleId}`);
-      location.reload();
-      return;
+      // The canvas was transferred to a previous run's worker and cannot be again, so
+      // this run gets a new element in its place: same id and size, nothing drawn yet.
+      // (A page reload was the old answer, and a reload lands on the title page with no
+      // gesture to start from - a restart needs the run to begin here.)
+      const next = canvas.cloneNode(false);
+      canvas.replaceWith(next);
+      canvas = next;
+      fresh = true;
     }
     meta = m;
     settings = eff;
@@ -297,10 +536,25 @@ export function createPlayer({ onExit }) {
     document.title = `${m.title} - vitaslop`;
     document.body.classList.add("playing");
     $("loading").hidden = false;
-    $("loading-title").textContent = m.title;
+    // Say on the screen itself what the link armed, so the arm is confirmable without
+    // opening the diagnostics file.
+    const armed = Object.entries(linkKnobs()).map(([k, v]) => `${k}=${v}`).join(" ");
+    $("loading-title").textContent = armed ? `${m.title} - ARMED ${armed}` : m.title;
     $("fpsbadge").hidden = !settings.showFps;
     applyLayout();
-    if (fullscreen) enterFullscreen();
+    // Already fullscreen (a restart keeps it): no second request, no second toast.
+    wantFull = fullscreen;
+    if (fullscreen && !isFull() && !fullscreenAsked) enterFullscreen();
+    else applyOrientationLock();
+    fullscreenAsked = false;
+    // The request made inside the Play tap can settle after this point; give it a moment
+    // before deciding it did not take.
+    if (fullscreen) {
+      setTimeout(() => {
+        if (running && wantFull && !isFull()) showFullscreenPrompt();
+      }, 1200);
+    }
+    holdWake();
 
     const status = (t) => {
       reports.status = t;
@@ -308,13 +562,35 @@ export function createPlayer({ onExit }) {
     };
     try {
       if (!(await isComplete(m.titleId))) throw new Error("this title's import is incomplete - remove it and import it again");
-      const knobs = await runKnobs(settings);
+      const knobs = { ...(await runKnobs(settings)), ...linkKnobs() };
       window.__runKnobs = knobs;
       gamedata.setProfile(settings.profile);
 
       status("preparing the title (a few seconds on a desktop, up to a minute on a phone)...");
+      // The RUN worker comes first: it reserves the guest's memory inside its own and says
+      // where, and the throwaway transpile worker builds the module for that place (see
+      // worker.js's "reserve" message). The run worker then idles until the start message.
+      // `VITASLOP_SMP=1` runs on the wasm-threads bundle (both workers) - see build.mjs.
+      runsThreads = String(knobs.VITASLOP_SMP ?? "") === "1";
+      const bundleQ = runsThreads ? "?smp=1" : "";
+      // The emulator bundle, fetched and compiled ONCE for this page and handed to both workers
+      // below - see bundle.js. A second play from this page reuses it.
+      const module = await bundleModule(runsThreads);
+      if (!running) return;
+      worker = new Worker("./worker.js" + bundleQ, { type: "module" });
+      const hostOff = await new Promise((resolve, reject) => {
+        worker.onmessage = (e) => {
+          const d = e.data;
+          if (d.type === "reserved") resolve(d.hostOff);
+          else if (d.type === "error") reject(new Error(d.message));
+          else if (d.type === "panic") reject(new Error("RUST PANIC WHILE RESERVING\n" + d.message));
+        };
+        worker.onerror = (e) => reject(new Error(e.message || "the run worker failed to start"));
+        worker.postMessage({ type: "reserve", knobs, module });
+      });
+      if (!running) return;
       const prebuilt = await new Promise((resolve, reject) => {
-        const tw = new Worker("./transpile-worker.js", { type: "module" });
+        const tw = new Worker("./transpile-worker.js" + bundleQ, { type: "module" });
         tw.onmessage = (e) => {
           if (e.data.type === "panic") {
             fatal("RUST PANIC WHILE PREPARING\n" + e.data.message);
@@ -327,12 +603,17 @@ export function createPlayer({ onExit }) {
           tw.terminate();
           reject(new Error(e.message || "the prepare worker failed to start"));
         };
-        tw.postMessage({ titleId: m.titleId, knobs });
+        tw.postMessage({ titleId: m.titleId, knobs, hostOff, bundleModule: module });
       });
       if (!running) return;
+      // One line per play naming where the prepare went - the transpile cache's HIT or MISS
+      // among it (see transpile-cache.js).
+      if (prebuilt && prebuilt.split) {
+        console.info(`[prepare] ${prebuilt.split}`);
+        note(`[prepare] ${prebuilt.split}`);
+      }
 
       status("starting...");
-      worker = new Worker("./worker.js", { type: "module" });
       worker.onmessage = (e) => {
         const d = e.data;
         if (d.type === "report") {
@@ -370,7 +651,14 @@ export function createPlayer({ onExit }) {
       touch = mountTouchPad($("pad"), worker, settings.keyboard, { vibrate: settings.pad.vibrate });
       touch.setOpacity(settings.pad.opacity);
       touch.setScale(settings.pad.scale);
-      pads = installGamepad(worker, vocab, settings, (msg) => note("[pad] " + msg), (name, down) => touch && touch.setHeld(name, down));
+      pads = installGamepad(
+        worker,
+        vocab,
+        settings,
+        (msg) => note("[pad] " + msg),
+        (name, down) => touch && touch.setHeld(name, down),
+        () => running && !menuOpen && openMenu(true)
+      );
       // Keyboard presses light the on-screen control they map to.
       const byCode = {};
       for (const [name, code] of Object.entries(settings.keyboard)) byCode[code] = name;
@@ -404,14 +692,30 @@ export function createPlayer({ onExit }) {
       );
       touchTitle(m.titleId, { lastPlayedAt: Date.now() });
       applyPause();
+      postOutputSize();
     } catch (err) {
       fatal("COULD NOT START\n" + ((err && (err.stack || err.message)) || err));
     }
   }
 
-  function stop() {
+  /// Tear the run down and start the same title again. The screen stays as it is
+  /// (fullscreen and the orientation lock included) under the loading panel; the app's
+  /// one start path does the rest.
+  function restart() {
+    if (!running) return;
+    const id = meta.titleId;
+    const full = isFull();
+    stop(false);
+    onRestart(id, full);
+  }
+
+  /// `exit` false keeps the player on screen for a restart that follows at once.
+  function stop(exit = true) {
     if (!running) return;
     running = false;
+    wantFull = false;
+    hideFullscreenPrompt();
+    dropWake();
     if (worker) {
       try {
         worker.postMessage({ type: "flush-game-data" });
@@ -430,11 +734,19 @@ export function createPlayer({ onExit }) {
     touch = pads = null;
     audioPause(true);
     openMenu(false);
-    exitFullscreen();
-    root.hidden = true;
-    document.body.classList.remove("playing");
-    onExit();
+    if (!exit) return;
+    // >>> THE PLAYER IS HIDDEN ONLY AFTER FULLSCREEN HAS ACTUALLY LET GO. Hiding the
+    // fullscreen element and navigating while the exit was still in flight left Chrome for
+    // Android routing every touch to the dead fullscreen layer: the library drew, and no
+    // link on it answered until a reload. A run started meanwhile owns the player again,
+    // so it is left alone.
+    exitFullscreen().finally(() => {
+      if (running) return;
+      root.hidden = true;
+      document.body.classList.remove("playing");
+      onExit();
+    });
   }
 
-  return { start, stop, isRunning: () => running };
+  return { start, stop, askFullscreenNow, isRunning: () => running };
 }

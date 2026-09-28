@@ -837,7 +837,7 @@ impl Shell {
         });
         ui.label(
             RichText::new(
-                "Warnings are the emulator saying it did something the console would not have                  done. A title can look and play perfectly with warnings here.",
+                "Warnings are the emulator saying it did something the console would not have done. A title can look and play perfectly with warnings here.",
             )
             .color(DIM)
             .small(),
@@ -855,7 +855,7 @@ impl Shell {
             ui.add_space(12.0);
             ui.label(RichText::new("Status").strong());
             ui.label(
-                RichText::new("What the run did rather than what went wrong: the adapter, the                                archive, the shapes it saw.")
+                RichText::new("What the run did rather than what went wrong: the adapter, the archive, the shapes it saw.")
                     .color(DIM)
                     .small(),
             );

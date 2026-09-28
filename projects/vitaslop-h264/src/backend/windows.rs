@@ -594,7 +594,7 @@ impl Backend for MediaFoundationBackend {
     fn send(&mut self, au: &AccessUnit, timestamp: i64) -> Result<()> {
         if self.d3d.is_some() && au.data.len() > self.max_hardware_picture_bytes {
             return Err(Error::unsupported(format!(
-                "a {} KB coded picture exceeds what this driver's DXVA bitstream buffer holds                  ({} KB); it would decode partially and report nothing. Recreate the decoder                  with `hardware: Some(false)`, or raise `max_hardware_picture_bytes` if this                  machine is known to take more",
+                "a {} KB coded picture exceeds what this driver's DXVA bitstream buffer holds ({} KB); it would decode partially and report nothing. Recreate the decoder with `hardware: Some(false)`, or raise `max_hardware_picture_bytes` if this machine is known to take more",
                 au.data.len() / 1024,
                 self.max_hardware_picture_bytes / 1024,
             )));

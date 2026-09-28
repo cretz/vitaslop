@@ -14,7 +14,8 @@ See the FAQ before expecting much.
 
 Your browser needs WebGPU, JSPI, shared memory, and OPFS. In practice that means a
 recent Chrome or Edge on desktop or Android. The page checks all of it on load and
-tells you what is missing. Firefox and Safari are not there yet.
+tells you what is missing. Mobile Firefox and Safari are not there yet. Desktop
+Firefox and Safari may work once they have all four; the page's check will say.
 
 Games you add are stored in the browser and stay there.
 
@@ -108,17 +109,22 @@ than expected.
   bit for bit, so a rendering change either matches the previous build exactly or
   says which draw moved.
 
-## Games tried
+<a name="games-tried"></a>
+<details>
+<summary><b>Games tried.</b> Not a compatibility list. Owned games the agent has played, all US releases, all playable and all still buggy. Anything not listed was never tried.</summary>
 
-Not a compatibility list. Owned games the agent has played, all US releases, all
-playable and all still buggy. Anything not listed was never tried.
-
+- Dead or Alive 5 Plus
 - Hot Shots Golf: World Invitational
+- Madden NFL 13
+- MLB 12: The Show
+- Mortal Kombat
 - MotorStorm RC
 - OlliOlli
 - Persona 4 Golden
 - Ridge Racer
 - WipEout 2048
+
+</details>
 
 ## Build
 
@@ -147,6 +153,8 @@ neutral references:
   Thumb-2, NEON, and VFP decode and semantics reference.
 - [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9) (MIT) as an ATRAC9
   reference.
+- [vgmstream](https://github.com/vgmstream/vgmstream) (ISC) for HE-VAG, the Vita's
+  own 4-bit ADPCM: its 128-entry predictor table and decode arithmetic.
 - [psdevwiki](https://www.psdevwiki.com/vita/) and
   [henkaku wiki](https://wiki.henkaku.xyz/) for hardware documentation.
 - The ARM Architecture Reference Manual.

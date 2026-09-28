@@ -169,11 +169,10 @@ pub fn install_panic_hook() {
         push_page_log(&text);
 
         let global = js_sys::global();
-        if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK)) {
-            if let Some(f) = sink.dyn_ref::<js_sys::Function>() {
+        if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK))
+            && let Some(f) = sink.dyn_ref::<js_sys::Function>() {
                 let _ = f.call1(&JsValue::NULL, &JsValue::from_str(&text));
             }
-        }
     }));
 }
 
@@ -195,11 +194,10 @@ pub fn report_fatal(text: &str) {
     web_sys::console::error_1(&JsValue::from_str(text));
     push_page_log(text);
     let global = js_sys::global();
-    if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK)) {
-        if let Some(f) = sink.dyn_ref::<js_sys::Function>() {
+    if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK))
+        && let Some(f) = sink.dyn_ref::<js_sys::Function>() {
             let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
         }
-    }
 }
 
 /// The default filter when `VITASLOP_LOG` is unset: warnings and errors only.

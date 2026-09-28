@@ -42,7 +42,14 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 /// Magic + format version. Bump the version on ANY field-order change.
-const MAGIC: &[u8; 8] = b"VSCAPS\x00\x01";
+///
+/// Version 2 added the BACK-face stencil REFERENCE (`sceGxmSetBackStencilRef`) to the render
+/// state block. A version-1 capsule cannot be read as one of these - the block grew by a word
+/// - and a capsule is a scratch artifact recaptured in seconds, so the version is bumped
+/// rather than the reader taught two layouts. Version 3 added the FRAGMENT stage's
+/// guest-memory windows beside the vertex stage's. Version 4 added the vertex program the
+/// fragment was PATCHED against (`Draw::fprog_patched_vprog`).
+const MAGIC: &[u8; 8] = b"VSCAPS\x00\x04";
 
 /// What a capsule cannot answer. Printed by the replay tool every time - a limitation nobody
 /// reads is a limitation nobody applies.
@@ -88,7 +95,54 @@ fn w_u64(o: &mut impl Write, v: u64) -> io::Result<()> {
 fn w_f32(o: &mut impl Write, v: f32) -> io::Result<()> {
     o.write_all(&v.to_le_bytes())
 }
+/// >>> SLIM FRAMES: every byte field of [`SLIM_MIN`] bytes or more is written ONCE per frame and
+/// referenced by id after that. A frame capsule wrote each draw's textures in full, so an MLB
+/// at-bat with ~900 draws sampling the same atlases came to 2.66 GB - unshippable to a phone,
+/// which is exactly where a frame has to be replayed to see a device-only picture defect
+/// (2026-09-26, the device runner). Active only inside [`write_frame_slim`] / a
+/// [`FRAME_MAGIC_SLIM`] read; everywhere else `w_bytes`/`r_bytes` are the old format exactly.
+const SLIM_MIN: usize = 1024;
+/// The length word that marks a back-reference: the next u32 is the blob's id.
+const SLIM_REF: u32 = u32::MAX;
+#[derive(Default)]
+struct Slim {
+    /// Writing: (hash, len) -> the blobs already written under it, each with its id. The bytes
+    /// are kept so a hash collision is a compare, never a wrong reference.
+    written: std::collections::HashMap<(u64, usize), Vec<(u32, Arc<[u8]>)>>,
+    next: u32,
+    /// Reading: blob id -> its bytes, shared by every field that references it.
+    read: Vec<Arc<[u8]>>,
+}
+thread_local! {
+    static SLIM: std::cell::RefCell<Option<Slim>> = const { std::cell::RefCell::new(None) };
+}
+fn slim_hash(v: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
 fn w_bytes(o: &mut impl Write, v: &[u8]) -> io::Result<()> {
+    if v.len() >= SLIM_MIN {
+        let hit = SLIM.with(|c| {
+            let mut c = c.borrow_mut();
+            let slim = c.as_mut()?;
+            let key = (slim_hash(v), v.len());
+            let bucket = slim.written.entry(key).or_default();
+            if let Some((id, _)) = bucket.iter().find(|(_, b)| &b[..] == v) {
+                return Some(Some(*id));
+            }
+            let id = slim.next;
+            slim.next += 1;
+            bucket.push((id, Arc::from(v)));
+            Some(None)
+        });
+        if let Some(Some(id)) = hit {
+            w_u32(o, SLIM_REF)?;
+            return w_u32(o, id);
+        }
+    }
     w_u32(o, v.len() as u32)?;
     o.write_all(v)
 }
@@ -121,10 +175,28 @@ fn r_f32(i: &mut impl Read) -> io::Result<f32> {
     Ok(f32::from_bits(r_u32(i)?))
 }
 fn r_bytes(i: &mut impl Read) -> io::Result<Vec<u8>> {
-    let n = r_u32(i)? as usize;
-    let mut v = vec![0u8; n];
+    Ok(r_bytes_shared(i)?.to_vec())
+}
+/// A byte field as a SHARED buffer: in a slim frame every reference to one blob gets the same
+/// allocation, so replaying a frame costs its unique bytes, not its references.
+fn r_bytes_shared(i: &mut impl Read) -> io::Result<Arc<[u8]>> {
+    let n = r_u32(i)?;
+    let slim_on = SLIM.with(|c| c.borrow().is_some());
+    if n == SLIM_REF && slim_on {
+        let id = r_u32(i)? as usize;
+        return SLIM.with(|c| {
+            c.borrow().as_ref().and_then(|s| s.read.get(id).cloned()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("slim frame: reference to blob {id}, which was never written"))
+            })
+        });
+    }
+    let mut v = vec![0u8; n as usize];
     i.read_exact(&mut v)?;
-    Ok(v)
+    let a: Arc<[u8]> = Arc::from(v);
+    if slim_on && a.len() >= SLIM_MIN {
+        SLIM.with(|c| c.borrow_mut().as_mut().map(|s| s.read.push(a.clone())));
+    }
+    Ok(a)
 }
 fn r_f32s<const N: usize>(i: &mut impl Read) -> io::Result<[f32; N]> {
     let mut a = [0f32; N];
@@ -170,7 +242,7 @@ fn r_tex(i: &mut impl Read) -> io::Result<BoundTexture> {
     let (unit, base_format, swizzle, tex_type) = (r_u32(i)?, r_u32(i)?, r_u32(i)?, r_u32(i)?);
     let (width, height, stride, faces) = (r_u32(i)?, r_u32(i)?, r_u32(i)?, r_u32(i)?);
     let (face_bytes, levels, data_addr) = (r_u32(i)?, r_u32(i)?, r_u32(i)?);
-    let pixels: Arc<[u8]> = Arc::from(r_bytes(i)?);
+    let pixels: Arc<[u8]> = r_bytes_shared(i)?;
     Ok(BoundTexture {
         unit,
         // Replayed from a capsule: a buffer this process just built, so it is minted like any
@@ -225,6 +297,7 @@ fn w_state(o: &mut impl Write, s: &RenderState) -> io::Result<()> {
         s.back_stencil_op_depth_pass,
         s.back_stencil_compare_mask,
         s.back_stencil_write_mask,
+        s.back_stencil_ref,
         s.viewport_enable,
     ] {
         w_u32(o, v)?;
@@ -267,6 +340,7 @@ fn r_state(i: &mut impl Read) -> io::Result<RenderState> {
     s.back_stencil_op_depth_pass = r_u32(i)?;
     s.back_stencil_compare_mask = r_u32(i)?;
     s.back_stencil_write_mask = r_u32(i)?;
+    s.back_stencil_ref = r_u32(i)?;
     s.viewport_enable = r_u32(i)?;
     s.viewport = r_f32s::<6>(i)?;
     s.region_clip_mode = r_u32(i)?;
@@ -340,11 +414,17 @@ impl Capsule {
         w_f32s(o, &d.world)?;
         w_bytes(o, &d.vprog)?;
         w_bytes(o, &d.fprog)?;
+        w_bytes(o, &d.fprog_patched_vprog)?;
         w_bytes(o, &d.vert_sa)?;
         w_bytes(o, &d.frag_sa)?;
         w_u32(o, d.frag_sa_addr)?;
         w_u32(o, d.mem_windows.len() as u32)?;
         for (addr, bytes) in &d.mem_windows {
+            w_u32(o, *addr)?;
+            w_bytes(o, bytes)?;
+        }
+        w_u32(o, d.frag_mem_windows.len() as u32)?;
+        for (addr, bytes) in &d.frag_mem_windows {
             w_u32(o, *addr)?;
             w_bytes(o, bytes)?;
         }
@@ -424,6 +504,7 @@ impl Capsule {
         let world = r_f32s::<16>(i)?;
         let vprog: Arc<[u8]> = Arc::from(r_bytes(i)?);
         let fprog: Arc<[u8]> = Arc::from(r_bytes(i)?);
+        let fprog_patched_vprog: Arc<[u8]> = Arc::from(r_bytes(i)?);
         let vert_sa: Arc<[u8]> = Arc::from(r_bytes(i)?);
         let frag_sa: Arc<[u8]> = Arc::from(r_bytes(i)?);
         let frag_sa_addr = r_u32(i)?;
@@ -431,7 +512,13 @@ impl Capsule {
         let mut mem_windows = Vec::with_capacity(n);
         for _ in 0..n {
             let addr = r_u32(i)?;
-            mem_windows.push((addr, r_bytes(i)?));
+            mem_windows.push((addr, Arc::<[u8]>::from(r_bytes(i)?)));
+        }
+        let n = r_u32(i)? as usize;
+        let mut frag_mem_windows = Vec::with_capacity(n);
+        for _ in 0..n {
+            let addr = r_u32(i)?;
+            frag_mem_windows.push((addr, Arc::<[u8]>::from(r_bytes(i)?)));
         }
         let shader_expanded = r_u8(i)? != 0;
 
@@ -455,10 +542,12 @@ impl Capsule {
                 world,
                 vprog,
                 fprog,
+                fprog_patched_vprog,
                 vert_sa,
                 frag_sa,
                 frag_sa_addr,
                 mem_windows,
+                frag_mem_windows,
                 shader_expanded,
             },
             width,
@@ -485,9 +574,237 @@ impl Capsule {
     }
 }
 
+// --- the FRAME capsule ---------------------------------------------------------------------
+//
+// Every scene of one displayed frame, each draw as a [`Capsule`], so a RENDERER question about
+// a whole chain (a bloom built across passes, a composite of several targets) is a
+// second-long offline render instead of a replay of the title to that frame. It holds ONE
+// frame: targets an EARLIER frame left behind are not in it, which the replay tool says.
+
+/// Frame-capsule magic + version. Bump on any field-order change.
+/// Version 2: the draw record grew with `VSCAPS` version 4.
+const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x02";
+/// The same frame body with every large byte field deduplicated - see [`SLIM_MIN`].
+const FRAME_MAGIC_SLIM: &[u8; 8] = b"VSFRAM\x00\x03";
+
+/// Clears the slim context when a slim write or read ends, however it ends.
+struct SlimReset;
+impl Drop for SlimReset {
+    fn drop(&mut self) {
+        SLIM.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// [`write_frame`] as a SLIM frame: identical content, each distinct large byte field once.
+pub fn write_frame_slim(
+    o: &mut impl Write,
+    scenes: &[crate::capture::Scene],
+    width: u32,
+    height: u32,
+    clear: [u8; 4],
+    frame: u64,
+) -> io::Result<()> {
+    SLIM.with(|c| *c.borrow_mut() = Some(Slim::default()));
+    let _reset = SlimReset;
+    let mut body = Vec::new();
+    write_frame(&mut body, scenes, width, height, clear, frame)?;
+    o.write_all(FRAME_MAGIC_SLIM)?;
+    o.write_all(&body[FRAME_MAGIC.len()..])
+}
+
+/// Write every scene of one frame. `width`/`height`/`clear` are the display framebuffer the
+/// frame was rendered to; `frame` is the guest display frame, for the record.
+pub fn write_frame(
+    o: &mut impl Write,
+    scenes: &[crate::capture::Scene],
+    width: u32,
+    height: u32,
+    clear: [u8; 4],
+    frame: u64,
+) -> io::Result<()> {
+    o.write_all(FRAME_MAGIC)?;
+    w_u32(o, width)?;
+    w_u32(o, height)?;
+    o.write_all(&clear)?;
+    w_u64(o, frame)?;
+    w_u32(o, scenes.len() as u32)?;
+    for s in scenes {
+        match &s.color {
+            Some(c) => {
+                w_u8(o, 1)?;
+                for v in [c.format, c.surface_type, c.width, c.height, c.stride_pixels, c.data_addr, c.scale_mode, c.gamma] {
+                    w_u32(o, v)?;
+                }
+            }
+            None => w_u8(o, 0)?,
+        }
+        match &s.depth {
+            Some(d) => {
+                w_u8(o, 1)?;
+                for v in [d.zls_control, d.depth_addr, d.stencil_addr, d.background_depth, d.background_control] {
+                    w_u32(o, v)?;
+                }
+            }
+            None => w_u8(o, 0)?,
+        }
+        w_u32(o, s.multisample)?;
+        match s.target_extent {
+            Some((w, h)) => {
+                w_u8(o, 1)?;
+                w_u32(o, w)?;
+                w_u32(o, h)?;
+            }
+            None => w_u8(o, 0)?,
+        }
+        w_u8(o, u8::from(s.completed_early))?;
+        w_u32(o, s.draws.len() as u32)?;
+        for (i, d) in s.draws.iter().enumerate() {
+            Capsule {
+                draw: d.clone(),
+                width,
+                height,
+                clear,
+                key: 0,
+                frame,
+                draw_index: i as u32,
+                note: String::new(),
+            }
+            .write(o)?;
+        }
+    }
+    Ok(())
+}
+
+/// A frame read back: its scenes and the framebuffer it was rendered to.
+pub struct FrameCapsule {
+    pub scenes: Vec<crate::capture::Scene>,
+    pub width: u32,
+    pub height: u32,
+    pub clear: [u8; 4],
+    pub frame: u64,
+}
+
+/// Read a [`write_frame`] stream. A different version is REFUSED, as for a draw capsule.
+pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
+    let mut magic = [0u8; 8];
+    i.read_exact(&mut magic)?;
+    let slim = &magic == FRAME_MAGIC_SLIM;
+    if &magic != FRAME_MAGIC && !slim {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("not a frame capsule of this version (magic {magic:?}, expected {FRAME_MAGIC:?} or {FRAME_MAGIC_SLIM:?})"),
+        ));
+    }
+    let _reset = slim.then(|| {
+        SLIM.with(|c| *c.borrow_mut() = Some(Slim::default()));
+        SlimReset
+    });
+    let (width, height) = (r_u32(i)?, r_u32(i)?);
+    let mut clear = [0u8; 4];
+    i.read_exact(&mut clear)?;
+    let frame = r_u64(i)?;
+    let n = r_u32(i)?;
+    let mut scenes = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let mut s = crate::capture::Scene::default();
+        if r_u8(i)? == 1 {
+            let mut v = [0u32; 8];
+            for x in &mut v {
+                *x = r_u32(i)?;
+            }
+            s.color = Some(crate::capture::ColorSurface {
+                format: v[0],
+                surface_type: v[1],
+                width: v[2],
+                height: v[3],
+                stride_pixels: v[4],
+                data_addr: v[5],
+                scale_mode: v[6],
+                gamma: v[7],
+            });
+        }
+        if r_u8(i)? == 1 {
+            let mut v = [0u32; 5];
+            for x in &mut v {
+                *x = r_u32(i)?;
+            }
+            s.depth = Some(crate::capture::DepthSurface {
+                zls_control: v[0],
+                depth_addr: v[1],
+                stencil_addr: v[2],
+                background_depth: v[3],
+                background_control: v[4],
+            });
+        }
+        s.multisample = r_u32(i)?;
+        if r_u8(i)? == 1 {
+            s.target_extent = Some((r_u32(i)?, r_u32(i)?));
+        }
+        s.completed_early = r_u8(i)? != 0;
+        let draws = r_u32(i)?;
+        for _ in 0..draws {
+            s.draws.push(Capsule::read(i)?.draw);
+        }
+        scenes.push(s);
+    }
+    Ok(FrameCapsule { scenes, width, height, clear, frame })
+}
+
+/// `VITASLOP_FRAME_CAPSULE=<dir>`: write every frame a headless run renders for a SHOT to
+/// `<dir>/f<frame>.frame`. The frame is whatever the shot rendered, so `--shot-every` and the
+/// frame count choose which frames are kept. Reported once if a write fails.
+pub fn maybe_write_frame(scenes: &[crate::capture::Scene], width: u32, height: u32, clear: [u8; 4], frame: u64) {
+    let Some(dir) = vitaslop_platform::knobs::var_os("VITASLOP_FRAME_CAPSULE") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("f{frame:06}.frame"));
+    let mut bytes = Vec::new();
+    let result = write_frame(&mut bytes, scenes, width, height, clear, frame).and_then(|()| std::fs::write(&path, &bytes));
+    match result {
+        Ok(()) => tracing::info!(
+            target: "vitaslop::gxm",
+            "frame capsule: frame {frame} ({} scenes, {} bytes) -> {}",
+            scenes.len(),
+            bytes.len(),
+            path.display()
+        ),
+        Err(e) => tracing::warn!(target: "vitaslop::gxm", "frame capsule: could NOT write {}: {e}", path.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slim byte fields: a repeat of a large blob is a back-reference, reads back EQUAL and as
+    /// the SAME allocation; a small one and anything outside a slim context is the old format.
+    #[test]
+    fn slim_bytes_dedupe_and_share() {
+        let big: Vec<u8> = (0..4096u32).map(|i| (i * 7) as u8).collect();
+        let small = vec![1u8, 2, 3];
+        let mut plain = Vec::new();
+        w_bytes(&mut plain, &big).unwrap();
+        SLIM.with(|c| *c.borrow_mut() = Some(Slim::default()));
+        let mut out = Vec::new();
+        for b in [&big, &small, &big, &small] {
+            w_bytes(&mut out, b).unwrap();
+        }
+        SLIM.with(|c| *c.borrow_mut() = None);
+        // big + small + a 8-byte reference + small again.
+        assert_eq!(out.len(), (4 + 4096) + (4 + 3) + 8 + (4 + 3));
+        assert_eq!(&out[..4 + 4096], &plain[..], "the first occurrence is the old format exactly");
+        SLIM.with(|c| *c.borrow_mut() = Some(Slim::default()));
+        let mut r = &out[..];
+        let a = r_bytes_shared(&mut r).unwrap();
+        let s1 = r_bytes_shared(&mut r).unwrap();
+        let b = r_bytes_shared(&mut r).unwrap();
+        let s2 = r_bytes_shared(&mut r).unwrap();
+        SLIM.with(|c| *c.borrow_mut() = None);
+        assert_eq!(&a[..], &big[..]);
+        assert!(Arc::ptr_eq(&a, &b), "a reference reads back as the same buffer");
+        assert_eq!((&s1[..], &s2[..]), (&small[..], &small[..]));
+        assert!(r.is_empty());
+    }
 
     /// A capsule must ROUND-TRIP exactly. This is the whole guarantee: a replayed draw that
     /// differs from the captured one in any field is a wrong picture attributed to the shader.
@@ -563,10 +880,12 @@ mod tests {
             world: [0.0; 16],
             vprog: Arc::from(vec![0xAAu8; 5]),
             fprog: Arc::from(vec![0xBBu8; 6]),
+            fprog_patched_vprog: Arc::from(vec![0xABu8; 3]),
             vert_sa: Arc::from(vec![0xCCu8; 7]),
             frag_sa: Arc::from(vec![0xDDu8; 8]),
             frag_sa_addr: 0x882c_aa80,
-            mem_windows: vec![(0x882c_9780, vec![1, 2, 3, 4]), (0x8e1d_2fb0, vec![5, 6])],
+            mem_windows: vec![(0x882c_9780, Arc::from(&[1u8, 2, 3, 4][..])), (0x8e1d_2fb0, Arc::from(&[5u8, 6][..]))],
+            frag_mem_windows: vec![(0x8b40_0000, Arc::from(&[9u8, 8, 7, 6][..]))],
             shader_expanded: true,
         };
         let c = Capsule {
@@ -739,7 +1058,7 @@ pub fn maybe_capture(d: &Draw) {
         if n.is_power_of_two() {
             tracing::warn!(
                 target: "vitaslop::gxm",
-                "gxp capsule: {n} submissions of a named program so far, largest {} indices                  (set VITASLOP_GXP_CAPSULE_MIN_INDICES at or below that, and _SKIP below {n})",
+                "gxp capsule: {n} submissions of a named program so far, largest {} indices (set VITASLOP_GXP_CAPSULE_MIN_INDICES at or below that, and _SKIP below {n})",
                 MAX_IDX.load(Ordering::Relaxed)
             );
         }
@@ -749,11 +1068,11 @@ pub fn maybe_capture(d: &Draw) {
     if d.index_count < min_indices() {
         return;
     }
-
     let mut h = std::collections::hash_map::DefaultHasher::new();
     d.vert_sa.hash(&mut h);
     d.frag_sa.hash(&mut h);
     d.mem_windows.hash(&mut h);
+    d.frag_mem_windows.hash(&mut h);
     d.vertices.hash(&mut h);
     let inputs = h.finish();
 

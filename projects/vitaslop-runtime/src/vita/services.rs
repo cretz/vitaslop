@@ -260,21 +260,48 @@ pub(super) fn np_basic_get_friend_list_entry_count(ctx: &mut GuestCtx, _st: &mut
 // --- SceCommonDialog families -------------------------------------------------
 //
 // System-drawn dialogs (trophy setup, message boxes, the network check, savedata
-// UI, ...). Off-console there is no system UI to draw, so the faithful offline
-// model is a dialog that completes INSTANTLY: `Init` opens it, the very next
-// `GetStatus` reports FINISHED, and `Term` closes it. A title that opens one at
-// boot (e.g. the trophy-setup dialog) then busy-waits on its status proceeds
-// immediately instead of spinning forever on a dialog no one can dismiss.
-// `GetStatus` on a family that was never opened reports NONE, so a state machine
-// polling before `Init` is not tricked into seeing a phantom dialog close.
+// UI, ...). Off-console there is no system UI to draw, so the offline model is a
+// dialog that completes ON ITS OWN: `Init` opens it, `GetStatus` reports RUNNING
+// for [`dialog_running_us`] of guest time and FINISHED after that, and `Term`
+// closes it. A title that opens one at boot (e.g. the trophy-setup dialog) and
+// busy-waits on its status proceeds instead of spinning forever on a dialog no one
+// can dismiss. `GetStatus` on a family that was never opened reports NONE, so a
+// state machine polling before `Init` is not tricked into seeing a phantom close.
 
-/// SceCommonDialogStatus: no dialog open / dialog completed. (RUNNING is never
-/// reported - our dialogs finish instantly.)
+/// SceCommonDialogStatus: no dialog open / on screen / completed.
 const DIALOG_STATUS_NONE: i32 = 0;
+const DIALOG_STATUS_RUNNING: i32 = 1;
 const DIALOG_STATUS_FINISHED: i32 = 2;
 
+/// How many display flips an opened dialog reports RUNNING for before FINISHED
+/// (`VITASLOP_DIALOG_RUNNING_FRAMES`, default 2; `0` is the old instant completion).
+///
+/// # Why a dialog that finishes INSTANTLY is not faithful
+/// A console dialog is on screen for at least the frames it takes a person to press a
+/// button, and titles are written against that. MEASURED on a fighting title's boot
+/// (PCSE00235): its scene opens the autosave notice and, on the NEXT frame, waits to see
+/// its dialog manager BUSY before advancing to the state that waits for the result. With
+/// instant completion the manager opened, saw FINISHED, closed and went idle inside the
+/// frame that opened it, so the scene never saw it busy and waited on a black screen
+/// forever.
+///
+/// # Why TWO FLIPS and not a stretch of time
+/// Two flips = the rest of the frame that opened it plus the whole next one, which is the
+/// least any frame-granular observer needs. It was 100 ms of guest time first, and that
+/// MEASURABLY broke recorded recipes (`reg24b`, then the one-knob arm `att24`): six frames
+/// of delay at a boot dialog moved every later frame-pinned press, and a golf title's
+/// front end walked into the wrong menu. A person would take far longer than either, so
+/// neither is "the console's" length; the shortest one that is observable is the one that
+/// disturbs least.
+fn dialog_running_flips() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        crate::knobs::var("VITASLOP_DIALOG_RUNNING_FRAMES").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(2)
+    })
+}
+
 /// One bit per dialog family in [`VitaState::open_dialogs`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DialogFamily {
     Msg = 0,
     NetCheck = 1,
@@ -290,6 +317,14 @@ pub(super) enum DialogFamily {
     /// The photo picker. It browses the console's own photo library, which does not
     /// exist here, so it likewise completes with nothing chosen.
     PhotoImport = 9,
+    /// The PSN friend picker - "choose someone to invite". It lists the account's friends,
+    /// and there is no account and no friend list ([`np_basic_get_friend_list_entry_count`]
+    /// reports zero for the same reason), so it opens and closes with nobody chosen. Same
+    /// shape as [`DialogFamily::NpProfile`], which needs the same two absent things.
+    NpFriendList = 10,
+    /// The camera picker - "take a picture for your player". There is no camera here, so
+    /// it opens and closes with nothing captured, the same shape as the photo picker.
+    CameraImport = 11,
 }
 
 /// `SceImeDialogButton`: which button dismissed the text-entry dialog.
@@ -321,14 +356,51 @@ pub(super) fn ime_dialog_get_result(ctx: &mut GuestCtx, _st: &mut VitaState) {
 /// next status poll. Every family's init succeeds offline.
 pub(super) fn dialog_init(ctx: &mut GuestCtx, st: &mut VitaState, family: DialogFamily) {
     st.open_dialogs |= 1 << family as u32;
+    st.dialog_opened_flip[family as usize] = st.flip_count();
+    if family == DialogFamily::Msg {
+        report_msg_dialog(ctx);
+    }
     ctx.ret(0);
 }
 
-/// `*DialogGetStatus`: FINISHED once opened, NONE before. The return value IS the
-/// status (these calls return `SceCommonDialogStatus`, not an errno).
+/// Say what a message dialog asked, since this engine answers it instantly with YES/OK and
+/// that answer can decide which way a title's boot goes. `SceMsgDialogParam` (vitasdk,
+/// 0x88 bytes): mode at +0x50, then the user / system / error-code parameter pointers.
+fn report_msg_dialog(ctx: &mut GuestCtx) {
+    let param = ctx.arg(0);
+    if param == 0 {
+        return;
+    }
+    let mode = ctx.read_u32(param + 0x50);
+    let (user, sys, err) = (ctx.read_u32(param + 0x54), ctx.read_u32(param + 0x58), ctx.read_u32(param + 0x5c));
+    let what = match mode {
+        1 if user != 0 => {
+            let (buttons, msg) = (ctx.read_u32(user), ctx.read_u32(user + 4));
+            let text = if msg != 0 { ctx.read_cstr(msg, 200) } else { String::new() };
+            format!("USER message {text:?} (button type {buttons})")
+        }
+        2 if sys != 0 => format!("SYSTEM message type {} value {}", ctx.read_u32(sys), ctx.read_u32(sys + 4)),
+        3 if err != 0 => format!("ERROR CODE {:#010x}", ctx.read_u32(err)),
+        _ => format!("mode {mode}"),
+    };
+    tracing::info!(target: "vitaslop::status", "sceMsgDialogInit: {what} - answered at once with YES/OK");
+}
+
+/// `*DialogGetStatus`: NONE before `Init`, RUNNING for [`dialog_running_flips`] display
+/// flips after it, FINISHED from then on. The return value IS the status (these calls
+/// return `SceCommonDialogStatus`, not an errno).
 pub(super) fn dialog_get_status(ctx: &mut GuestCtx, st: &mut VitaState, family: DialogFamily) {
-    let open = st.open_dialogs & (1 << family as u32) != 0;
-    ctx.ret(if open { DIALOG_STATUS_FINISHED } else { DIALOG_STATUS_NONE } as u32);
+    // The run-to-completion host keeps the instant completion: a title there that polls
+    // the status in a loop inside one frame would never reach the flip that ends RUNNING.
+    let status = if st.open_dialogs & (1 << family as u32) == 0 {
+        DIALOG_STATUS_NONE
+    } else if st.is_preemptive()
+        && st.flip_count().saturating_sub(st.dialog_opened_flip[family as usize]) < dialog_running_flips() {
+        DIALOG_STATUS_RUNNING
+    } else {
+        DIALOG_STATUS_FINISHED
+    };
+    ctx.ret(status as u32);
 }
 
 /// `*DialogTerm`: close the family. Also the landing spot for the lifecycle
@@ -373,7 +445,7 @@ pub(super) fn msg_dialog_get_result(ctx: &mut GuestCtx, _st: &mut VitaState) {
 
 /// Microseconds from the SceRtc epoch (0001-01-01) to the Unix epoch (1970-01-01):
 /// 719162 days. RTC ticks count from the former; the world clock from the latter.
-const RTC_UNIX_EPOCH_TICKS: u64 = 719_162 * 86_400 * 1_000_000;
+pub(crate) const RTC_UNIX_EPOCH_TICKS: u64 = 719_162 * 86_400 * 1_000_000;
 
 /// int sceRtcGetCurrentTick(SceRtcTick *tick)
 /// The current time as a 64-bit microsecond tick since 0001-01-01, from the world
@@ -387,6 +459,49 @@ pub(super) fn rtc_get_current_tick(ctx: &mut GuestCtx, st: &mut VitaState, tick:
         ctx.write_u32(tick.addr() + 4, (t >> 32) as u32);
     }
     0
+}
+
+/// SceUInt64 sceRtcGetAccumulativeTime(void)
+///
+/// The PSP-era form of [`rtc_get_current_tick`]: the same microsecond tick, but RETURNED as a
+/// 64-bit value in r0:r1 instead of written through a pointer. A sports title's engine reads
+/// it at boot as its time base; the `#[hostcall]` macro cannot express a 64-bit return, so it
+/// is marshalled by hand like `sceIoLseek`. There is no argument to validate and no failure
+/// path, so nothing but the two halves is written.
+pub(super) fn rtc_get_accumulative_time(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let t = RTC_UNIX_EPOCH_TICKS + st.guest_wall_us();
+    ctx.regs[0] = t as u32;
+    ctx.regs[1] = (t >> 32) as u32;
+}
+
+/// Which of this module's NIDs the transpiler may emit INLINE.
+///
+/// # `sceRtcGetCurrentTick` is a timed wait's inner loop
+/// It writes a 64-bit tick through a pointer and returns 0, which is exactly
+/// [`InlineOp::StoreMirrorPair`] - the shape `sceKernelGetProcessTime` already uses. It earns
+/// the form by COUNT: **1,094,210 calls over 800 frames of a fighting title's opening movie,
+/// 1,368 a frame, all from ONE call site** that polls the tick until an event flag fires. That
+/// is seven times the next item in that phase, and at ~20 us a crossing on the user's phone it
+/// is most of the movie's 45.8 ms frame.
+///
+/// # The single-thread arm is REFUSED, and that is the mirror contract, not caution
+/// A mirrored value must not change while guest code runs. Under the preemptive scheduler the
+/// tick is a pure function of the virtual clock, which advances only between resumes. Under the
+/// bring-up single-thread model [`VitaState::guest_wall_us`] returns the HOST's wall clock,
+/// which advances continuously - so there is no word the block could hold that is the call's
+/// answer, and the handler stays the definition.
+pub(crate) fn inline_op(
+    func_nid: u32,
+    preemptive: bool,
+) -> Option<vitaslop_transpiler::InlineOp> {
+    use crate::nid::services as sv;
+    use crate::vita::mirror::SLOT_RTC_LO;
+    match func_nid {
+        sv::RTC_GET_CURRENT_TICK if preemptive => {
+            Some(vitaslop_transpiler::InlineOp::StoreMirrorPair { slot: SLOT_RTC_LO })
+        }
+        _ => None,
+    }
 }
 
 /// unsigned int sceRtcGetTickResolution(void)
@@ -615,6 +730,140 @@ fn rtc_format_rfc3339_local_time_impl(ctx: &mut GuestCtx, out: Ptr, tick: Ptr) -
         sod % 60
     );
     ctx.write_bytes(out.addr(), text.as_bytes());
+    0
+}
+
+/// int sceRtcParseRFC3339(SceRtcTick *utc, const char *pszDateTime)
+///
+/// The exact inverse of [`rtc_format_rfc3339_local_time`]: read an RFC 3339 timestamp and
+/// produce the UTC tick it names. A title parses stamps that arrive as TEXT - a save file's
+/// header, a downloaded manifest, its own configuration - so the result feeds date
+/// arithmetic and ordering, and a wrong tick is a wrong sort order rather than a visible
+/// failure.
+///
+/// The grammar accepted is RFC 3339 section 5.6 as the console emits and consumes it:
+/// `YYYY-MM-DDTHH:MM:SS`, an OPTIONAL fractional second of any length, and an offset that is
+/// either `Z` (`z`) or `±HH:MM`. The offset is SUBTRACTED, because the tick is UTC and the
+/// text is local to whoever wrote it - dropping it would silently shift a stamp by hours.
+/// The date/time separator is accepted in either case (`T` or `t`), which the grammar allows.
+///
+/// Fractional digits beyond microseconds are TRUNCATED, not rounded: the tick's resolution is
+/// one microsecond, and rounding up could carry a stamp into the next second and reorder two
+/// events that were written in order.
+///
+/// A field that is missing, non-numeric or out of range is reported with that field's own
+/// error code - the same codes [`rtc_decode_broken_down`] uses, which are the only ones this
+/// library publishes. There is no documented "malformed string" code to return instead, and
+/// inventing one would put a value in front of a title that no console produces.
+#[hostcall]
+pub(super) fn rtc_parse_rfc3339(ctx: &mut GuestCtx, _st: &mut VitaState, tick: Ptr, text: Ptr) -> i32 {
+    rtc_parse_rfc3339_impl(ctx, tick, text)
+}
+
+fn rtc_parse_rfc3339_impl(ctx: &mut GuestCtx, tick: Ptr, text: Ptr) -> i32 {
+    if tick.is_null() || text.is_null() {
+        return SCE_RTC_ERROR_INVALID_POINTER;
+    }
+    // Long enough for the full form with a six-digit fraction and a numeric offset, plus
+    // room for a longer fraction a conforming producer may write.
+    let s = ctx.read_cstr(text.addr(), 64);
+    let b = s.as_bytes();
+    // `YYYY-MM-DDTHH:MM:SS` is 19 bytes with fixed-width fields and fixed separators, so
+    // each field is read by position; anything shorter cannot carry a date at all.
+    let num = |from: usize, len: usize| -> Option<i64> {
+        let end = from + len;
+        if end > b.len() || !b[from..end].iter().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        std::str::from_utf8(&b[from..end]).ok()?.parse::<i64>().ok()
+    };
+    let sep_ok = b.len() >= 19
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && (b[10] | 0x20) == b't'
+        && b[13] == b':'
+        && b[16] == b':';
+    let (Some(year), Some(month), Some(day)) = (num(0, 4), num(5, 2), num(8, 2)) else {
+        return SCE_RTC_ERROR_INVALID_YEAR;
+    };
+    let (Some(hour), Some(minute), Some(second)) = (num(11, 2), num(14, 2), num(17, 2)) else {
+        return SCE_RTC_ERROR_INVALID_HOUR;
+    };
+    if !sep_ok {
+        return SCE_RTC_ERROR_INVALID_YEAR;
+    }
+    // The fraction, if present: digits after a '.', truncated to microseconds.
+    let mut i = 19;
+    let mut micro = 0i64;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            if i - start < 6 {
+                micro = micro * 10 + (b[i] - b'0') as i64;
+            }
+            i += 1;
+        }
+        if i == start {
+            return SCE_RTC_ERROR_INVALID_MICROSECOND;
+        }
+        // A fraction shorter than six digits scales: ".5" is 500000 microseconds.
+        for _ in (i - start).min(6)..6 {
+            micro *= 10;
+        }
+    }
+    // The offset. RFC 3339 requires one; `Z` and `±HH:MM` are the two spellings.
+    let offset_minutes = match b.get(i) {
+        Some(&c) if (c | 0x20) == b'z' => 0,
+        Some(&c) if c == b'+' || c == b'-' => {
+            let (Some(oh), Some(om)) = (num(i + 1, 2), num(i + 4, 2)) else {
+                return SCE_RTC_ERROR_INVALID_HOUR;
+            };
+            if b.get(i + 3) != Some(&b':') {
+                return SCE_RTC_ERROR_INVALID_HOUR;
+            }
+            if oh > 23 {
+                return SCE_RTC_ERROR_INVALID_HOUR;
+            }
+            if om > 59 {
+                return SCE_RTC_ERROR_INVALID_MINUTE;
+            }
+            let magnitude = oh * 60 + om;
+            if c == b'-' {
+                -magnitude
+            } else {
+                magnitude
+            }
+        }
+        _ => return SCE_RTC_ERROR_INVALID_HOUR,
+    };
+    // Range-check the calendar fields exactly as the broken-down path does, so a date this
+    // accepts is one `sceRtcGetTick` would accept too.
+    if !(1..=9999).contains(&year) {
+        return SCE_RTC_ERROR_INVALID_YEAR;
+    }
+    if !(1..=12).contains(&month) {
+        return SCE_RTC_ERROR_INVALID_MONTH;
+    }
+    if day < 1 || day > days_in_month(year, month) {
+        return SCE_RTC_ERROR_INVALID_DAY;
+    }
+    // 23:59:60 is a leap second, which RFC 3339 permits and the RTC has no room for; it is
+    // out of range here exactly as it is for `sceRtcGetTick`.
+    if hour > 23 {
+        return SCE_RTC_ERROR_INVALID_HOUR;
+    }
+    if minute > 59 {
+        return SCE_RTC_ERROR_INVALID_MINUTE;
+    }
+    if second > 59 {
+        return SCE_RTC_ERROR_INVALID_SECOND;
+    }
+    let unix_secs = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60
+        + second
+        - offset_minutes * 60;
+    let t = unix_secs * 1_000_000 + micro + RTC_UNIX_EPOCH_TICKS as i64;
+    write_tick(ctx, tick.addr(), t);
     0
 }
 
@@ -925,7 +1174,6 @@ pub(super) fn motion_get_angle_threshold(ctx: &mut GuestCtx, st: &mut VitaState)
 /// contiguous memory and 112 MB of CDRAM. A homebrew uses them to size its heaps.
 #[hostcall]
 pub(super) fn app_mgr_get_budget_info(ctx: &mut GuestCtx, st: &mut VitaState, info: Ptr) -> i32 {
-    let _ = st;
     let a = info.addr();
     if a == 0 {
         -1
@@ -935,10 +1183,13 @@ pub(super) fn app_mgr_get_budget_info(ctx: &mut GuestCtx, st: &mut VitaState, in
         w[1] = 1; // app_mode: a game
         w[3] = 0x1000_0000; // total_user_rw_mem
         w[4] = 0x0C00_0000; // free_user_rw
-        w[11] = 0x0200_0000; // total_phycont_mem
-        w[12] = 0x0200_0000; // free_phycont_mem
-        w[23] = 0x0700_0000; // total_cdram_mem
-        w[24] = 0x0700_0000; // free_cdram_mem
+        // The SAME figures `sceKernelAllocMemBlock` enforces, and the free ones are what
+        // is actually left - a budget report that disagrees with what the allocator does
+        // is how a title sizes a pool it will never be given.
+        w[11] = super::sysmem::PHYCONT_BUDGET_BYTES; // total_phycont_mem
+        w[12] = super::sysmem::PHYCONT_BUDGET_BYTES - st.phycont_used(); // free_phycont_mem
+        w[23] = super::sysmem::CDRAM_BUDGET_BYTES; // total_cdram_mem
+        w[24] = super::sysmem::CDRAM_BUDGET_BYTES - st.cdram_used(); // free_cdram_mem
         for (i, v) in w.iter().enumerate() {
             ctx.write_u32(a + 4 * i as u32, *v);
         }
@@ -1004,6 +1255,7 @@ pub(super) fn shared_fb_end(ctx: &mut GuestCtx, st: &mut VitaState) {
             // The guest drew the buffer that was NOT on screen; show it and swap.
             let drawn = if cur == 0 { base + SHARED_FB_BYTES } else { base };
             st.shared_fb = Some((u, base, cur ^ 1));
+            st.resolve_at_flip(ctx);
             st.present(drawn);
             // The shared framebuffer's End is the title's flip: pace it to the scanout
             // exactly as `sceGxmDisplayQueueAddEntry` does (see `pace_flip`), which is
@@ -2263,9 +2515,18 @@ pub(super) fn appmgr_receive_system_event(ctx: &mut GuestCtx, _st: &mut VitaStat
 /// is done, and everything after this call in its own code is unreachable. So the run
 /// ENDS, named, rather than returning a success the guest then runs on past its own
 /// point of no return - or a failure it never expects and does not handle.
-pub(super) fn appmgr_load_exec(ctx: &mut GuestCtx, _st: &mut VitaState) -> SvcOutcome {
+pub(super) fn appmgr_load_exec(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let path_ptr = ctx.arg(0);
     let path = if path_ptr == 0 { String::new() } else { ctx.read_cstr(path_ptr, 256) };
+    // >>> AN EXECUTABLE OF THIS SAME APP IS A PROCESS REPLACEMENT THIS ENGINE CAN PERFORM.
+    // The run halts with the request recorded; the host that owns the process mounts the app
+    // again with that executable as its main one (a launcher eboot whose only job is this call
+    // - a 2011 adventure title's - boots its real executable that way). Anything outside
+    // `app0:` is another application, which there is none of here.
+    if path.starts_with("app0:") {
+        st.exec_request = Some(path);
+        return SvcOutcome::Halt;
+    }
     SvcOutcome::Fatal(format!(
         "sceAppMgrLoadExec(\"{path}\"): the title asked to launch another application and \
          end itself; there is no second application to launch here"
@@ -2455,6 +2716,74 @@ pub(super) fn np_activity_post_status(_st: &mut VitaState) -> i32 {
     SCE_NP_ERROR_SIGNED_OUT
 }
 
+/// int sceNetCtlGetNatInfo(SceNetCtlNatInfo *natinfo)
+///
+/// The NAT type the console discovered by talking STUN to a server. There is no link to
+/// carry that conversation, so there is nothing discovered and this reports NOT_CONNECTED -
+/// the same answer [`netctl_inet_get_info`] gives, which it must, since a title that asks
+/// both about one interface cannot be told it is down and then handed a NAT type.
+///
+/// The struct is left UNTOUCHED for the reason that one gives: a written `nat_type` of 0
+/// beside an error reads as a real answer to a caller that ignores the return code, and NAT
+/// type 1 (open) is the value a title would act on most eagerly.
+#[hostcall]
+pub(super) fn netctl_get_nat_info(_ctx: &mut GuestCtx, _st: &mut VitaState, _natinfo: Ptr) -> i32 {
+    SCE_NET_CTL_ERROR_NOT_CONNECTED
+}
+
+/// `SCE_APPUTIL_ERROR_NO_PERMISSION` (`psp2/apputil.h`).
+const SCE_APPUTIL_ERROR_NO_PERMISSION: i32 = 0x8010_0605u32 as i32;
+
+/// int sceAppUtilStoreBrowse(const SceAppUtilStoreBrowseParam *param)
+///
+/// Ask the SHELL to leave the game and open the PS Store at a product - the "buy the full
+/// version" button. It is not a request the title itself can carry out: the shell suspends
+/// the game, runs the Store app, and resumes it afterwards.
+///
+/// There is no shell here and no Store, so the switch cannot happen, and this reports
+/// NO_PERMISSION - the published AppUtil code for a request the system will not perform for
+/// this application. Reporting success would be the damaging answer: the title would believe
+/// it had been suspended and is being resumed, and a title that shows a "thanks for your
+/// purchase" path on return would take it having sold nothing.
+///
+/// Said once at `info`, because a button that silently does nothing is worth accounting for
+/// when someone asks why the store link is dead.
+#[hostcall]
+pub(super) fn apputil_store_browse(_st: &mut VitaState, _param: u32) -> i32 {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            target: "vitaslop::status",
+            "sceAppUtilStoreBrowse: there is no shell to switch to and no PS Store off-console, \
+             so the request is refused (SCE_APPUTIL_ERROR_NO_PERMISSION) rather than reported as \
+             a store visit that happened"
+        );
+    }
+    SCE_APPUTIL_ERROR_NO_PERMISSION
+}
+
+/// `SCE_COMMON_DIALOG_ERROR_NOT_FINISHED`: the dialog has no result to hand over
+/// (`psp2/common_dialog.h`).
+const SCE_COMMON_DIALOG_ERROR_NOT_FINISHED: i32 = 0x8002_0410u32 as i32;
+
+/// int sceNetCheckDialogGetPS3ConnectInfo(SceNetCheckDialogPS3ConnectInfo *info)
+///
+/// The net-check dialog can pair the console with a PS3 over ad-hoc; this reads back the
+/// details of that pairing. The dialog here completes without connecting to anything (there
+/// is no radio and no PS3), so there is no pairing to describe and it reports NOT_FINISHED,
+/// which is the dialog library's own code for "there is no result here".
+///
+/// The info struct is left as the caller prepared it, for the same reason
+/// [`netctl_inet_get_info`] leaves its output alone: a zeroed PS3 address is an address.
+#[hostcall]
+pub(super) fn net_check_dialog_get_ps3_connect_info(
+    _ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _info: Ptr,
+) -> i32 {
+    SCE_COMMON_DIALOG_ERROR_NOT_FINISHED
+}
+
 #[cfg(test)]
 mod calendar_tests {
     //! The proleptic-Gregorian conversions the RTC calls share. Content-free: no game
@@ -2521,5 +2850,29 @@ mod calendar_tests {
         // The Unix epoch is day zero, which pins the offset rather than just the deltas.
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+}
+
+/// The Wi-Fi MAC this console reports. A Vita has one whether or not it is connected, so an
+/// offline answer is still an address - and, like `libkernel::OPEN_PS_ID`, what matters is that
+/// it is STABLE across boots and runs (a title may key a local profile or an ad-hoc identity on
+/// it) and plausible: a LOCALLY ADMINISTERED unicast address (first octet 0x02), so it can never
+/// collide with a vendor-assigned one. The last five octets spell "vitas".
+const NET_MAC_ADDRESS: [u8; 6] = [0x02, 0x76, 0x69, 0x74, 0x61, 0x73];
+
+/// `SCE_NET_EINVAL` - a null address to write into.
+const SCE_NET_ERROR_EINVAL: u32 = 0x8041_0116;
+
+/// int sceNetGetMacAddress(SceNetEtherAddr *addr, int flags)
+///
+/// First called by a 2011 fighting title at its title screen. `flags` selects nothing a title
+/// can observe here (there is one interface), so it is read and ignored.
+#[hostcall]
+pub(super) fn net_get_mac_address(ctx: &mut GuestCtx, _st: &mut VitaState, addr: Ptr, _flags: i32) -> i32 {
+    if addr.is_null() {
+        SCE_NET_ERROR_EINVAL as i32
+    } else {
+        ctx.write_bytes(addr.addr(), &NET_MAC_ADDRESS);
+        0
     }
 }

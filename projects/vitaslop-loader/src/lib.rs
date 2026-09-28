@@ -401,6 +401,10 @@ pub struct ProgramInputs {
     /// so several instances can share the guest address space (the preemptive
     /// multi-thread scheduler). Off by default; single-instance hosts leave it so.
     pub import_memory: bool,
+    /// Where the guest layout sits inside an imported memory - see
+    /// [`vitaslop_transpiler::Program::host_off`]. 0 unless the host hosts the guest
+    /// region in its own memory.
+    pub host_off: u32,
 }
 
 /// Default guest memory for a loaded module (image + stack + host allocations).
@@ -428,6 +432,7 @@ impl ProgramInputs {
             // callbacks) that the direct-call closure alone would miss.
             discover_code_pointers: true,
             import_memory: self.import_memory,
+            host_off: self.host_off,
         }
     }
 }
@@ -493,6 +498,7 @@ impl Module {
             thumb_entry: self.entry & 1 != 0,
             mem_bytes: DEFAULT_MEM_BYTES,
             import_memory: false,
+            host_off: 0,
         }
     }
 }

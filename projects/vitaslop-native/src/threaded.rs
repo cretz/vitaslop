@@ -48,7 +48,7 @@ use vitaslop_runtime::sched::{
 use vitaslop_runtime::{ImportDispatch, Reentry, SvcOutcome, VFP_ARG_COUNT};
 use vitaslop_transpiler::abi;
 use vitaslop_transpiler::{self as transpiler};
-use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, SharedMemory, Store, Val};
+use wasmtime::{Caller, Config, Engine, Instance, InstancePre, Linker, Module, SharedMemory, Store, Val};
 
 use crate::RunError;
 
@@ -311,7 +311,26 @@ impl GuestThread for WasmtimeThread {
 /// This is the wasmtime implementation of the engine-agnostic [`GuestEngine`].
 pub struct WasmtimeEngine<H: ImportDispatch + Send + 'static> {
     engine: Engine,
+    /// The raw module. Never read: every instantiation goes through the PRE-INSTANTIATED form
+    /// below, which is the whole point of that field. Held so the module outlives the
+    /// pre-instance built from it, and allowed rather than deleted for that reason.
+    #[allow(dead_code)]
     module: Module,
+    /// The module with its imports ALREADY resolved and typechecked against the linker.
+    ///
+    /// >>> A SPAWN IS A FULL INSTANTIATION, AND A TITLE SPAWNS ONE PER FLIP.
+    ///
+    /// MEASURED with the phase table: Madden takes **3,834 spawns over 3,800 frames** - 1.009
+    /// per flip, exactly the display-queue-callback-as-a-thread shape `Phase::ThreadSpawn`'s
+    /// own doc predicts - at **507 us each**, which is 1.94 s of an 8.16 s draw budget. mlb
+    /// takes 13,233 at 224 us.
+    ///
+    /// Building a fresh `Linker`, re-wrapping its three host functions and re-resolving every
+    /// import against the module on each of those is work that does not depend on the thread
+    /// being started. `InstancePre` is wasmtime's name for hoisting exactly that: the imports
+    /// are matched to the module's import list once, here, and a spawn is left with the part
+    /// that is genuinely per-instance.
+    instance_pre: InstancePre<ThreadData<H>>,
     shared_mem: SharedMemory,
     host: Arc<Mutex<H>>,
     base: u32,
@@ -342,6 +361,7 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
             reentry.arg_len,
             reentry.arg_ptr,
             reentry.r2,
+            reentry.r3,
             reentry.stack_top,
             reentry.priority,
         )
@@ -486,6 +506,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             mem_bytes,
             discover_code_pointers: true,
             import_memory: true,
+            host_off: 0,
         })?;
         wasmparser::validate(&artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
@@ -507,9 +528,12 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         write_shared(&shared_mem, 0, code);
 
         let host = Arc::new(Mutex::new(host));
+        let instance_pre =
+            build_instance_pre(&engine, &module, &shared_mem, &host, base, artifact.dirty_off)?;
         let engine = WasmtimeEngine {
             engine,
             module,
+            instance_pre,
             shared_mem,
             host: host.clone(),
             base,
@@ -525,11 +549,13 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         };
 
         // The main thread: sp near the top of the region (with startup headroom), no
-        // entry args, its thid is whatever the host reports for the main thread (0 by
-        // convention here; the host maps it as it likes).
+        // entry args, and the host's own id for the initial thread - which is NOT zero,
+        // because the guest is told this id and no SceUID on hardware is ever zero
+        // (see `MAIN_THID`).
         let main = engine.instantiate_thread(
-            0,
+            vitaslop_runtime::host::MAIN_THID,
             entry & !1,
+            0,
             0,
             0,
             0,
@@ -553,6 +579,18 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         host: H,
         quantum_fuel: u64,
     ) -> Result<(ThreadedScheduler<H>, Vec<(u32, u32)>), RunError> {
+        Self::from_linked_with_cache(linked, host, quantum_fuel, None)
+    }
+
+    /// [`Self::from_linked`], reusing the COMPILED module from `cache` when this exact build made
+    /// one for this program under these transpile settings - see [`crate::compile_cache`]. A hit
+    /// skips the transpile, the validation and the whole Cranelift compile.
+    pub fn from_linked_with_cache(
+        linked: &vitaslop_runtime::link::LinkedProgram,
+        host: H,
+        quantum_fuel: u64,
+        cache: Option<&crate::compile_cache::CompileCache>,
+    ) -> Result<(ThreadedScheduler<H>, Vec<(u32, u32)>), RunError> {
         // >>> THE RETAIL PATH EMITS THE WORK COUNTER, AND PREEMPTS ON IT. This is what
         // lets native bill its game clock in GUEST INSTRUCTIONS like the browser does,
         // rather than in wasm operators - see `WasmtimeThread::arm_retired` for the
@@ -561,12 +599,51 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // so the preemption GRANULARITY is unchanged; what changes is that every
         // preemption is now a call through our own import, where the counter can be read.
         transpiler::set_fuel_interval(u32::try_from(quantum_fuel).unwrap_or(u32::MAX));
+        let mut cfg = Config::new();
+        cfg.wasm_threads(true);
+        cfg.shared_memory(true);
+        cfg.consume_fuel(true);
+        let engine = Engine::new(&cfg).map_err(|e| RunError::Wasm(e.to_string()))?;
+        // The cache's name for this module: this executable's build, the transpile settings in
+        // force (read now, with the fuel interval set), and the program - see `compile_cache`.
+        let cache_entry = cache.map(|c| c.entry(&transpiler::codegen_fingerprint()));
+        let t_boot = std::time::Instant::now();
+        let hit = cache_entry.as_ref().and_then(|e| e.load(&engine));
+        let (module, layout) = if let Some(hit) = hit {
+            transpiler::set_fuel_interval(u32::MAX);
+            tracing::info!(
+                target: "vitaslop::status",
+                "compile cache HIT: loaded the compiled module in {:.0} ms - no transpile, no Cranelift compile",
+                t_boot.elapsed().as_secs_f64() * 1000.0
+            );
+            hit
+        } else {
+        // >>> THE TRANSPILE'S OWN PEAK, SPLIT FROM THE ENGINE COMPILE THAT FOLLOWS IT.
+        //
+        // Transpile is the allocation peak of the whole system and the browser does it in a
+        // worker under a 4,096 MB ceiling, so "which half of the boot took 2 GB" is the
+        // question that decides whether a title can be brought up at all. The transpiler crate
+        // is deliberately dependency-light and cannot read these counters itself; this is the
+        // nearest caller that can. See `vitaslop_platform::heap`.
+        vitaslop_platform::heap::reset_peak();
         let built = transpiler::transpile_lenient(&linked.shared_program());
+        let t_transpiled = std::time::Instant::now();
+        {
+            let (live, peak) = vitaslop_platform::heap::live_peak_mb();
+            // `vitaslop::status`, not `vitaslop::perf`: every documented repro command in this
+            // project runs at `warn,vitaslop::status=info`, so a boot fact on the perf target is
+            // a boot fact nobody ever sees
+            // [[vitaslop-a-diagnostic-at-debug-is-a-diagnostic-that-does-not-exist]].
+            tracing::info!(
+                target: "vitaslop::status",
+                "transpile: RUST HEAP peaked at {peak} MB and holds {live} MB after it (the module's bytes plus whatever the lift did not give back)",
+            );
+        }
+        vitaslop_platform::heap::reset_peak();
         // Leave the thread as we found it: the emitted module carries its own interval
         // and every runtime reader takes it from `ThreadData`, so nothing after this
         // point should depend on a thread-local that another transpile could inherit.
         transpiler::set_fuel_interval(u32::MAX);
-        let fuel_interval = u32::try_from(quantum_fuel).unwrap_or(u32::MAX);
         // >>> THE CODE EXPANSION FACTOR, reported unconditionally on the engine that takes
         // every calibration measurement. The game clock is charged per unit of fuel and a
         // unit of fuel is one executed wasm operator, so the emulated Vita's CPU speed is
@@ -629,7 +706,9 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 tracing::info!(
                     target: "vitaslop::perf",
                     "bookkeeping split: work counter {} ops ({:.1}%) over {} commits \
-                     ({:.2} commits per guest instruction), dirty map {} ops ({:.1}%), \
+                     ({:.2} commits per guest instruction), dirty map {} ops ({:.1}%) over \
+                     {} marks ({} ELIDED, {:.1}% of the store sites, by the run coalescer; \
+                     {} of them ({:.1}%) are SP-relative, which is the alternative cut                      that was rejected), \
                      promotion cache {} ops ({:.1}%)",
                     x.unbilled_work_ops,
                     pct(x.unbilled_work_ops),
@@ -637,6 +716,13 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                     x.work_flushes as f64 / x.arm_instructions.max(1) as f64,
                     x.unbilled_dirty_ops,
                     pct(x.unbilled_dirty_ops),
+                    x.dirty_marks,
+                    x.dirty_marks_elided,
+                    100.0 * x.dirty_marks_elided as f64
+                        / (x.dirty_marks + x.dirty_marks_elided).max(1) as f64,
+                    x.dirty_sp_stores,
+                    100.0 * x.dirty_sp_stores as f64
+                        / (x.dirty_marks + x.dirty_marks_elided).max(1) as f64,
                     cache,
                     pct(cache),
                 );
@@ -761,20 +847,37 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 p.lost_to[transpiler::promote::Ender::Exit as usize],
             );
         }
-        // Record the wasm-index -> guest-address table before anything can trap, so a
-        // backtrace names guest code instead of listing module indices.
-        record_function_addresses(built.artifact.funcs.iter().map(|f| f.addr).collect());
         wasmparser::validate(&built.artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
-
-        let mut cfg = Config::new();
-        cfg.wasm_threads(true);
-        cfg.shared_memory(true);
-        cfg.consume_fuel(true);
-        let engine = Engine::new(&cfg).map_err(|e| RunError::Wasm(e.to_string()))?;
         let module = Module::from_binary(&engine, &built.artifact.wasm)?;
+        let layout = crate::compile_cache::Layout {
+            funcs: built.artifact.funcs.iter().map(|f| f.addr).collect(),
+            mem_pages: built.artifact.mem_pages,
+            arm_word_off: built.artifact.arm_word_off,
+            mirror_off: built.artifact.mirror_off,
+            dirty_off: built.artifact.dirty_off,
+            stubbed: built.stubbed.clone(),
+            stub_wasm_indices: built.stub_wasm_indices.clone(),
+            decode_gaps: built.decode_gaps.clone(),
+        };
+        let t_compiled = std::time::Instant::now();
+        tracing::info!(
+            target: "vitaslop::status",
+            "boot: transpile {:.0} ms, validate + Cranelift compile {:.0} ms",
+            (t_transpiled - t_boot).as_secs_f64() * 1000.0,
+            (t_compiled - t_transpiled).as_secs_f64() * 1000.0
+        );
+        if let Some(e) = &cache_entry {
+            e.store(&module, &layout);
+        }
+        (module, layout)
+        };
+        // Record the wasm-index -> guest-address table before anything can trap, so a
+        // backtrace names guest code instead of listing module indices.
+        record_function_addresses(layout.funcs.clone());
+        let fuel_interval = u32::try_from(quantum_fuel).unwrap_or(u32::MAX);
 
-        let pages = built.artifact.mem_pages;
+        let pages = layout.mem_pages;
         let mem_ty = wasmtime::MemoryType::shared(pages, pages);
         let shared_mem =
             SharedMemory::new(&engine, mem_ty).map_err(|e| RunError::Wasm(e.to_string()))?;
@@ -800,35 +903,60 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // title can hang in. Costs nothing when no watchdog is armed.
         {
             let h = host.clone();
+            // The dump reads GUEST memory too, so a lightweight mutex a stalled thread is
+            // parked on names its HOLDER (`vita::lwwork` keeps owner and count in the work
+            // area, not on the host). Reading it from here is sound for the same reason
+            // `read_mem` is: the watchdog fires when nothing has advanced, so no fiber is
+            // mid-write, and a word read that raced one would still only misreport a
+            // diagnostic - it can never disturb the run.
+            let mem = shared_mem.clone();
+            let mem_base = linked.base;
+            let read_word = move |addr: u32| -> u32 {
+                let off = addr.wrapping_sub(mem_base) as usize;
+                let data = mem.data();
+                if off.checked_add(4).is_none_or(|end| end > data.len()) {
+                    return 0;
+                }
+                // SAFETY: as `read_mem` above - a stalled run has no fiber running.
+                let mut b = [0u8; 4];
+                for (i, out) in b.iter_mut().enumerate() {
+                    *out = unsafe { *data[off + i].get() };
+                }
+                u32::from_le_bytes(b)
+            };
             crate::watchdog::register_sync_dump(Box::new(move || match h.try_lock() {
-                Ok(g) => Ok(g.sync_dump()),
+                Ok(g) => Ok(g.sync_dump_with(&read_word)),
                 Err(std::sync::TryLockError::WouldBlock) => {
                     Err("the host lock was held by a thread inside a host call")
                 }
                 Err(std::sync::TryLockError::Poisoned(_)) => Err("the host lock is poisoned"),
             }));
         }
+        let instance_pre =
+            build_instance_pre(&engine, &module, &shared_mem, &host, linked.base, layout.dirty_off)?;
         let engine = WasmtimeEngine {
             engine,
             module,
+            instance_pre,
             shared_mem,
             host: host.clone(),
             base: linked.base,
             quantum_fuel,
             fuel_interval,
-            arm_word_off: built.artifact.arm_word_off,
-            mirror_off: built.artifact.mirror_off,
-            dirty_off: built.artifact.dirty_off,
+            arm_word_off: layout.arm_word_off,
+            mirror_off: layout.mirror_off,
+            dirty_off: layout.dirty_off,
         };
 
         // The main thread runs every module_start in load order, then (as the last
         // entry) the eboot's - which is where a render loop lives.
         let sp = main_stack_top(linked.base, linked.mem_bytes);
         let main = engine.instantiate_thread_seq(
-            0,
+            vitaslop_runtime::host::MAIN_THID,
             linked.module_inits.clone(),
             arg_len,
             arg_ptr,
+            0,
             0,
             sp,
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
@@ -843,7 +971,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // nothing anywhere naming the cause. `VITASLOP_TRANSPILE_REPORT` cannot cover
         // this - it walks the call graph, and these functions are reached only through
         // vtables - so the list is printed here, from the build that actually runs.
-        if !built.decode_gaps.is_empty() {
+        if !layout.decode_gaps.is_empty() {
             // >>> THE LIST IS MOSTLY NOISE, AND SAYING SO IS WHAT MAKES IT USABLE.
             //
             // Tentative discovery - the stored-pointer scan and the prologue sweep -
@@ -871,7 +999,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             // encodings.
             let simd = |hw1: u16| hw1 == 0xef00 || (hw1 & 0xff00) == 0xef00 || (hw1 & 0xfc00) == 0xfc00;
             let (mut likely, mut rest) = (Vec::new(), 0usize);
-            for &addr in &built.decode_gaps {
+            for &addr in &layout.decode_gaps {
                 let (hw1, hw2) = hw(addr);
                 if simd(hw1) {
                     likely.push((addr, hw1, hw2));
@@ -887,7 +1015,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 target: "vitaslop::status",
                 simd_space = likely.len(),
                 other = rest,
-                "decode gaps INSIDE lifted functions. Each one TRAPS if its path runs, so a                  gap here is a hole in ISA coverage, not a crash waiting to happen. The                  SIMD/VFP-space ones are listed below and are the ones worth implementing;                  the rest are overwhelmingly tentative discovery walking into data. Confirm                  each against the decoder at its real alignment before implementing it -                  several will already decode."
+                "decode gaps INSIDE lifted functions. Each one TRAPS if its path runs, so a gap here is a hole in ISA coverage, not a crash waiting to happen. The SIMD/VFP-space ones are listed below and are the ones worth implementing; the rest are overwhelmingly tentative discovery walking into data. Confirm each against the decoder at its real alignment before implementing it - several will already decode."
             );
             // The headline above carries the COUNT at warn; the per-gap list is sixty lines on
             // one title's default run and is a detail for whoever implements them:
@@ -899,11 +1027,11 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 );
             }
         }
-        let stubs = built
+        let stubs = layout
             .stubbed
             .iter()
             .copied()
-            .zip(built.stub_wasm_indices.iter().copied())
+            .zip(layout.stub_wasm_indices.iter().copied())
             .collect();
         Ok((ThreadedScheduler { inner: Scheduler::new(engine, host, main) }, stubs))
     }
@@ -1068,10 +1196,11 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         r0: u32,
         r1: u32,
         r2: u32,
+        r3: u32,
         sp: u32,
         priority: i32,
     ) -> Result<WasmtimeThread, RunError> {
-        self.instantiate_thread_seq(thid, vec![entry], r0, r1, r2, sp, priority)
+        self.instantiate_thread_seq(thid, vec![entry], r0, r1, r2, r3, sp, priority)
     }
 
     /// Build one thread that runs `entries` in sequence on a single fiber, resetting
@@ -1088,6 +1217,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         r0: u32,
         r1: u32,
         r2: u32,
+        r3: u32,
         sp: u32,
         priority: i32,
     ) -> Result<WasmtimeThread, RunError> {
@@ -1134,16 +1264,9 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         };
         store.fuel_async_yield_interval(yield_at).map_err(|e| RunError::Wasm(e.to_string()))?;
 
-        let mut linker = Linker::new(&self.engine);
-        bind_svc(&mut linker)?;
-        bind_import(&mut linker)?;
-        bind_dispatch_miss(&mut linker)?;
-        linker
-            .define(&store, abi::IMPORT_MODULE, abi::MEMORY_EXPORT, self.shared_mem.clone())
-            .map_err(|e| RunError::Wasm(e.to_string()))?;
-
-        // No start section, so instantiation completes without suspending.
-        let instance = pollster::block_on(linker.instantiate_async(&mut store, &self.module))?;
+        // No start section, so instantiation completes without suspending. The imports were
+        // resolved once at engine construction - see `WasmtimeEngine::instance_pre`.
+        let instance = pollster::block_on(self.instance_pre.instantiate_async(&mut store))?;
         // Resolve the register-file globals once, now, so no host call ever looks one
         // up by name (see `GuestGlobals`).
         let globals = GuestGlobals::resolve(&mut store, &instance);
@@ -1179,6 +1302,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                 set_reg_store(&mut store, &instance, 0, if carries_args { r0 } else { 0 });
                 set_reg_store(&mut store, &instance, 1, if carries_args { r1 } else { 0 });
                 set_reg_store(&mut store, &instance, 2, if carries_args { r2 } else { 0 });
+                set_reg_store(&mut store, &instance, 3, if carries_args { r3 } else { 0 });
                 let func = match instance
                     .get_typed_func::<(), ()>(&mut store, &abi::func_export(entry))
                 {
@@ -1233,6 +1357,54 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
 /// address (guest addresses are always >= 0x81000000; real `svc` immediates are 24-bit),
 /// and we log the entry with its incoming argument registers. A real (small) selector is
 /// a genuine syscall and stays a no-op on this path.
+/// Resolve the module's imports against the host functions and the shared memory ONCE.
+///
+/// See [`WasmtimeEngine::instance_pre`] for the measurement. Every item defined here is
+/// store-independent - the three host functions are engine-scoped and a `SharedMemory` belongs
+/// to no store, which is what makes `instantiate_pre` legal at all. The throwaway `Store` is
+/// only there to satisfy `Linker::define`'s signature; nothing from it survives.
+fn build_instance_pre<H: ImportDispatch + Send + 'static>(
+    engine: &Engine,
+    module: &Module,
+    shared_mem: &SharedMemory,
+    host: &Arc<Mutex<H>>,
+    base: u32,
+    dirty_off: Option<u64>,
+) -> Result<InstancePre<ThreadData<H>>, RunError> {
+    let mut linker = Linker::new(engine);
+    bind_svc(&mut linker)?;
+    bind_import(&mut linker)?;
+    bind_dispatch_miss(&mut linker)?;
+    let scratch = Store::new(
+        engine,
+        ThreadData {
+            host: host.clone(),
+            thid: 0,
+            shared_mem: shared_mem.clone(),
+            base,
+            dirty_off,
+            signal: Arc::new(Mutex::new(Signal {
+                stop: Stop::Quantum,
+                fuel: 0,
+                arm: 0,
+                host_suspends: 0,
+            })),
+            process_halt: false,
+            thread_exit: false,
+            fatal: None,
+            globals: None,
+            sw_fuel: None,
+            sw_last: 0,
+            sw_wasmtime_last: 0,
+            fuel_interval: 0,
+        },
+    );
+    linker
+        .define(&scratch, abi::IMPORT_MODULE, abi::MEMORY_EXPORT, shared_mem.clone())
+        .map_err(|e| RunError::Wasm(e.to_string()))?;
+    linker.instantiate_pre(module).map_err(|e| RunError::Wasm(e.to_string()))
+}
+
 fn bind_svc<H: ImportDispatch + Send + 'static>(
     linker: &mut Linker<ThreadData<H>>,
 ) -> Result<(), RunError> {
@@ -1272,9 +1444,16 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
                             eprintln!(
                                 "[trace] frame={frame} t{thid} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} \
                                  r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} \
-                                 r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} lr={:#010x}{watched}",
+                                 r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x}{watched}",
                                 r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
-                                r[8], r[9], r[10], r[11], r[12], get_reg(&mut caller, 14),
+                                r[8], r[9], r[10], r[11], r[12],
+                                // SP, which the browser's copy of this line already carries. A
+                                // watched store names the FUNCTION and its registers, but the
+                                // value a caller is about to copy out of its own frame lives at
+                                // an address only SP gives - which is how a table pointer held in
+                                // a callee's frame is reached at all.
+                                get_reg(&mut caller, 13),
+                                get_reg(&mut caller, 14),
                             );
                         }
                         // qemu-diff capture (opt-in; see the qdiff_* helpers below). The
@@ -1348,15 +1527,27 @@ fn watch_words<H: ImportDispatch + Send + 'static>(caller: &mut Caller<'_, Threa
     // SAFETY: as in `qdiff_dump_snapshot` - `UnsafeCell<u8>` is repr(transparent) over `u8`,
     // and no other fiber runs while this svc handler executes.
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
-    let mut out = String::new();
-    for &addr in watch {
+    let word = |addr: u32| -> Option<u32> {
         let off = addr.wrapping_sub(base) as usize;
-        match bytes.get(off..off + 4) {
-            Some(w) => out.push_str(&format!(
-                " m{addr:08x}={:08x}",
-                u32::from_le_bytes([w[0], w[1], w[2], w[3]])
-            )),
-            None => out.push_str(&format!(" m{addr:08x}=oob")),
+        bytes.get(off..off + 4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+    };
+    let mut out = String::new();
+    for path in watch {
+        // A chain `a>o1>o2` reads `*(*(*a + o1) + o2)`: each hop dereferences and adds the
+        // next offset, and the LAST hop is the word printed. A plain address is a chain of one.
+        let mut at = path[0];
+        let mut value = word(at);
+        for &o in &path[1..] {
+            at = match value {
+                Some(v) => v.wrapping_add(o),
+                None => break,
+            };
+            value = word(at);
+        }
+        let label: Vec<String> = path.iter().map(|p| format!("{p:x}")).collect();
+        match value {
+            Some(v) => out.push_str(&format!(" m{}={v:08x}", label.join(">"))),
+            None => out.push_str(&format!(" m{}=oob", label.join(">"))),
         }
     }
     out
@@ -1422,15 +1613,21 @@ fn qdiff_regtrace() -> &'static Option<(u32, u32, String)> {
 /// from Rust and never goes through a lifted store at all. Sampling the word at every
 /// block entry catches the change whoever made it, and names the block it happened
 /// under.
-fn qdiff_regtrace_watch() -> &'static Vec<u32> {
+///
+/// An entry may be a POINTER CHAIN, `a>o1>o2...` (all hex): the word at `*(*a + o1) + o2`.
+/// A heap object reached through a global has no fixed address to watch, and the chain
+/// reads it where it is at each block entry instead of costing a run per hop.
+fn qdiff_regtrace_watch() -> &'static Vec<Vec<u32>> {
     use std::sync::OnceLock;
-    static CELL: OnceLock<Vec<u32>> = OnceLock::new();
+    static CELL: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
     CELL.get_or_init(|| {
+        let hex = |a: &str| u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok();
         std::env::var("VITASLOP_REGTRACE_WATCH")
             .ok()
             .map(|s| {
                 s.split(',')
-                    .filter_map(|a| u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok())
+                    .filter_map(|e| e.split('>').map(hex).collect::<Option<Vec<u32>>>())
+                    .filter(|p| !p.is_empty())
                     .collect()
             })
             .unwrap_or_default()
@@ -1570,7 +1767,9 @@ fn qdiff_regtrace_max() -> u64 {
 }
 static QDIFF_REGTRACE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Append one `pc r0..r15 n z c v` line (all hex, flags 0/1) to the register trace.
+/// Append one `pc r0..r15 n z c v [mADDR=VAL...] tTHID` line (all hex, flags 0/1) to the
+/// register trace. The watched words and the thread come AFTER the 21 fixed columns the
+/// qdiff host tool parses, so both are additive.
 fn qdiff_log_regtrace<H: ImportDispatch + Send + 'static>(
     caller: &mut Caller<'_, ThreadData<H>>,
     pc: u32,
@@ -1591,6 +1790,40 @@ fn qdiff_log_regtrace<H: ImportDispatch + Send + 'static>(
     // fixed reg+flag columns so the qdiff host tool's parser, which reads the leading
     // 21 fields, is unaffected.
     line.push_str(&watch_words(caller));
+    // `VITASLOP_REGTRACE_VFP=1`: the single-precision bank s0..s31 as raw bits, ` sN=XXXXXXXX`.
+    // A float value that goes bad lives here, and the core columns cannot show it. Read from
+    // the globals, which is what a block entry after a call holds - a low-bank NEON value
+    // still cached in a local mid-block is not visible, so read it at a block that follows a
+    // `bl`.
+    if std::env::var_os("VITASLOP_REGTRACE_VFP").is_some() {
+        for n in 0..abi::VFP_S_COUNT as u8 {
+            let v = caller
+                .get_export(&abi::vfp_s_export(n))
+                .and_then(|e| e.into_global())
+                .and_then(|g| g.get(&mut *caller).i32())
+                .unwrap_or(0) as u32;
+            line.push_str(&format!(" s{n}={v:08x}"));
+        }
+        // And the upper bank q8..q15 (d16..d31), held as v128 globals: ` qN=<16 bytes, LE>`.
+        for q in abi::VFP_Q_HI_FIRST as u8..(abi::VFP_Q_HI_FIRST + abi::VFP_Q_HI_COUNT) as u8 {
+            let v = caller
+                .get_export(&abi::vfp_qhi_export(q))
+                .and_then(|e| e.into_global())
+                .and_then(|g| g.get(&mut *caller).v128())
+                .map(|v| v.as_u128())
+                .unwrap_or(0);
+            let words: Vec<String> = (0..4).map(|k| format!("{:08x}", (v >> (32 * k)) as u32)).collect();
+            line.push_str(&format!(" q{q}={}", words.join(",")));
+        }
+    }
+    // >>> AND THE THREAD, for the same reason and in the same place - AFTER the fixed columns.
+    //
+    // The `[trace]` form of this hook has carried `t{thid}` all along; the FILE form did not,
+    // so a range traced during a multi-threaded stall came back as one undifferentiated stream
+    // and "which thread is spinning here" had to be answered from a separate backtrace run.
+    // MEASURED on a stalled title: two threads run the same engine dispatcher, and reading the
+    // file without this attributed the spin to the wrong one.
+    line.push_str(&format!(" t{}", caller.data().thid));
     line.push('\n');
     let mut guard = qdiff_regtrace_writer().lock().unwrap();
     if guard.is_none() {
@@ -2235,33 +2468,15 @@ impl vitaslop_runtime::GuestMemory for SharedView {
         let block = unsafe { self.dirty_block()? };
         let map = &block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..];
         let shift = vitaslop_transpiler::DIRTY_SHIFT;
-        let page_bytes = 1usize << shift;
         let first = off >> shift;
         let last = (off + len - 1) >> shift;
         if last >= map.len() {
             return None;
         }
-        // A store stamped against the page BELOW can reach into this range's first page.
-        let overhang = first > 0 && map[first - 1] >= stamp;
-        let mut run: Option<(usize, usize)> = None;
-        for page in first..=last {
-            let dirty = map[page] >= stamp || (page == first && overhang);
-            if !dirty {
-                if let Some(r) = run.take() {
-                    out.push(r);
-                }
-                continue;
-            }
-            let start = (page << shift).max(off) - off;
-            let end = ((page << shift) + page_bytes).min(off + len) - off;
-            match run.as_mut() {
-                Some(r) => r.1 = end,
-                None => run = Some((start, end)),
-            }
-        }
-        if let Some(r) = run {
-            out.push(r);
-        }
+        // The rule, and the loop, live in `vitaslop_runtime::host::dirty_runs_from_pages` -
+        // both engines answer this and a copy each is how they came to disagree about the
+        // page-below overhang.
+        vitaslop_runtime::host::dirty_runs_from_pages(first, last, off, len, stamp, |p| map[p], out);
         Some(())
     }
 
@@ -2329,7 +2544,23 @@ fn write_shared(mem: &SharedMemory, off: usize, bytes: &[u8]) {
 /// > > > if it is ever made the default, this dump has to spill the promoted locals first or say
 /// > > > that it cannot.
 fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
-    let mut s = String::from("regs at trap:");
+    // >>> AND SAY SO WHEN THIS DUMP CANNOT BE TRUSTED, rather than printing stale numbers
+    // that look exactly like live ones. Under `VITASLOP_PROMOTE_REGS` the register file is
+    // held in wasm LOCALS along each straight-line run and written back only at calls,
+    // branches and returns - so a trap in the middle of a run leaves these globals holding
+    // the values from the last write-back, not the faulting instruction. A dump that goes
+    // STALE is the worse failure for a diagnostic: every value is plausible and some are
+    // wrong, and nothing in the output distinguishes the two. This does not make the dump
+    // correct; it makes it honest, which is the rule this codebase applies to every other
+    // fallback. Spilling the promoted locals here would be the real fix and needs the
+    // emitter's cooperation.
+    let mut s = if vitaslop_transpiler::promote_registers() {
+        String::from(
+            "regs at trap (>>> STALE: this build promotes the register file into wasm locals,              so these globals hold the last WRITE-BACK - at the previous call, branch or              return - and NOT the faulting instruction. Re-run with VITASLOP_PROMOTE_REGS=0              for an exact dump.):",
+        )
+    } else {
+        String::from("regs at trap:")
+    };
     for i in 0..abi::REG_COUNT {
         let name = match i {
             abi::SP => "sp".to_string(),
@@ -2344,11 +2575,30 @@ fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
     }
     // Diagnostic guest-PC tracker (nonzero only when the module was emitted with
     // VITASLOP_TRACK_PC): the address of the basic block executing at the trap.
+    let mut named_a_block = false;
     if let Some(g) = instance.get_global(&mut *store, abi::GUEST_PC_EXPORT) {
         let pc = g.get(&mut *store).i32().unwrap_or(0) as u32;
         if pc != 0 {
             s.push_str(&format!("\n  guest_block={pc:#010x}"));
+            named_a_block = true;
         }
+    }
+    // >>> AND SAY WHERE THE FAULTING ADDRESS IS, RATHER THAN PRINTING `pc=0x00000000` AND
+    // >>> LEAVING IT AT THAT.
+    //
+    // `pc` above is `abi::PC`, which the lifter never maintains - a lifted block has no use
+    // for it - so it reads zero at every trap and looks exactly like a register the fault
+    // cleared. The address that DOES name the faulting instruction is the tracked block, and
+    // that is emitted only when the module was built with `VITASLOP_TRACK_PC`. Without this
+    // line the next reader gets a backtrace whose frame 0 is the whole enclosing function -
+    // 1.4 KB of Thumb on the case that prompted this - and no way to know a knob would have
+    // narrowed it to one basic block. It cost exactly that once already.
+    if !named_a_block {
+        s.push_str(
+            "\n  guest_block=<not tracked> - `pc` above is never maintained by the lifter and \
+             is not the faulting address. Re-run with VITASLOP_TRACK_PC=1 to have each basic \
+             block record its own guest start address, which names the faulting block exactly.",
+        );
     }
     s
 }

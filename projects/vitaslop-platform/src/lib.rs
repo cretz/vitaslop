@@ -16,6 +16,10 @@
 //! neutral types without pulling in wgpu.
 
 pub mod diag;
+/// What the RUST HEAP holds right now, and the most it has ever held. The only residency
+/// number in the project that is not an estimate, and the one that decides whether a title
+/// fits under wasm32's 4 GiB ceiling - see [`heap`].
+pub mod heap;
 /// A fast, non-cryptographic hasher for the per-draw maps on both sides of the seam. Here rather
 /// than in the runtime because the renderer's own caches are hit just as often as the capture's,
 /// and two copies of a hash function is exactly the kind of duplicate that drifts.

@@ -88,6 +88,10 @@ pub struct RenderState {
     pub back_stencil_op_depth_pass: u32,
     pub back_stencil_compare_mask: u32,
     pub back_stencil_write_mask: u32,
+    /// The BACK face's stencil REFERENCE value (`sceGxmSetBackStencilRef`). Separate from
+    /// the func block because GXM sets it with its own call, exactly as it does for the
+    /// front face - a title changes the reference per draw while the comparison stays put.
+    pub back_stencil_ref: u32,
     pub viewport_enable: u32,
     /// `xOffset, xScale, yOffset, yScale, zOffset, zScale` from sceGxmSetViewport.
     pub viewport: [f32; 6],
@@ -134,6 +138,7 @@ impl Default for RenderState {
             back_stencil_op_depth_pass: 0,        // SCE_GXM_STENCIL_OP_KEEP
             back_stencil_compare_mask: 0xff,
             back_stencil_write_mask: 0xff,
+            back_stencil_ref: 0,
             viewport_enable: 0x0000_0000,         // SCE_GXM_VIEWPORT_ENABLED
             viewport: [0.0; 6],
             region_clip_mode: 0x0000_0000,        // SCE_GXM_REGION_CLIP_NONE
@@ -392,7 +397,22 @@ pub fn no_attributes() -> std::sync::Arc<[VertexAttribute]> {
 /// called twice per draw on the fixed-function path, where the whole point is that the
 /// recompiler payload costs nothing.
 pub fn no_program() -> std::sync::Arc<[u8]> {
+    no_bytes()
+}
+
+/// An empty byte buffer, SHARED. `Arc::<[u8]>::from(&[][..])` is not free - the reference
+/// counts live in a heap block, so every "nothing" was an allocation and a free - and a draw
+/// took three or four of them (deferred indices and vertices, an unbound bank), ~600 draws a
+/// frame. Every pointer-keyed cache also keys on the LENGTH, so one shared empty buffer
+/// cannot alias anything but another empty one.
+pub fn no_bytes() -> std::sync::Arc<[u8]> {
     static EMPTY: std::sync::OnceLock<std::sync::Arc<[u8]>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| std::sync::Arc::from(&[][..])).clone()
+}
+
+/// No bound textures, SHARED - see [`no_bytes`].
+pub fn no_textures() -> std::sync::Arc<[BoundTexture]> {
+    static EMPTY: std::sync::OnceLock<std::sync::Arc<[BoundTexture]>> = std::sync::OnceLock::new();
     EMPTY.get_or_init(|| std::sync::Arc::from(&[][..])).clone()
 }
 
@@ -497,6 +517,17 @@ pub struct Draw {
     pub vprog: std::sync::Arc<[u8]>,
     /// The bound fragment `SceGxmProgram` container bytes. Empty off the recompiler path.
     pub fprog: std::sync::Arc<[u8]>,
+    /// The vertex program the fragment program was PATCHED against at
+    /// `sceGxmShaderPatcherCreateFragmentProgram`, when that is a DIFFERENT program from the
+    /// bound `vprog`; empty otherwise (the same program, a NULL `vertexProgram`, or off the
+    /// recompiler path).
+    ///
+    /// The patcher builds the fragment's varying iteration against THAT program's output
+    /// layout, and the hardware then iterates the bound vertex's output buffer by lane
+    /// POSITION. Seen on a fighting title: its character bodies bind `vert_84664360` (no
+    /// TEXCOORD5/9) with `frag_81a0d020`, which reads both, so linking the bound pair by usage
+    /// refused every one of those draws; the sibling `vert_8464bc80` outputs both.
+    pub fprog_patched_vprog: std::sync::Arc<[u8]>,
     /// Raw vertex default-uniform-buffer (SA bank) bytes exactly as the guest wrote them -
     /// the recompiled vertex shader reads these directly, NOT the MVP-stamped `uniforms`
     /// above (which the fixed-function path needs but the real shader recomputes itself).
@@ -530,7 +561,11 @@ pub struct Draw {
     /// needs windows but had nothing usable bound, which the renderer must DROP with a report
     /// rather than feed fabricated bytes. See `vitaslop_gxp_shader::module::MemWindow` and
     /// `VitaState::capture_mem_windows`.
-    pub mem_windows: Vec<(u32, Vec<u8>)>,
+    pub mem_windows: Vec<(u32, Arc<[u8]>)>,
+    /// The FRAGMENT program's own memory windows, laid out for its `gxp_fmem` binding and
+    /// snapshotted from the FRAGMENT uniform-buffer table. Empty for almost every program;
+    /// one baseball title's whole menu is drawn by a pair that needs it.
+    pub frag_mem_windows: Vec<(u32, Arc<[u8]>)>,
     /// The vertex program SYNTHESIZES this draw's primitive rather than reading it: the
     /// stream holds one record per sprite (a centre plus an expansion basis - a
     /// scale/rotation, or an explicit right/up billboard axis pair) and the shader builds
@@ -580,6 +615,20 @@ impl Draw {
 /// draws issued into it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
+    /// This scene was already rendered - and its target's pixels put back into guest memory
+    /// - at its own `sceGxmEndScene`, because the target is one a title reads on the CPU
+    /// (see `VitaState::complete_scene_now`). The frame render skips it: the target texture
+    /// already holds the image, and rendering an accumulating target twice would double it.
+    pub completed_early: bool,
+    /// The `(address, value)` of the vertex and fragment `SceGxmNotification`s the scene
+    /// was ended with (`None` where the guest passed none). A `sceGxmNotificationWait` on
+    /// one of these is a wait for this scene's GPU work - see `gxm::notification_wait`.
+    pub notifications: [Option<(u32, u32)>; 2],
+    /// Non-zero while this scene's draw geometry is still a DESCRIPTION rather than bytes:
+    /// the serial `VitaState::pending_geometry` files the read under. Resolved - the bytes
+    /// read and this reset to 0 - at the guest's GPU wait or its flip, whichever comes first.
+    /// See `VitaState::resolve_deferred_geometry`.
+    pub deferred_id: u64,
     /// Shader PAIRS the guest's patcher named since the previous scene, as
     /// `(vertex container bytes, fragment container bytes)` - see
     /// `VitaState::queue_shader_precompile`. The renderer prepares these before it encodes,
@@ -592,7 +641,7 @@ pub struct Scene {
     /// `VitaState::shader_precompile`), so every scene carries the whole thing - and once a
     /// title's precomputed states name a few hundred pairs, cloning it per scene is hundreds of
     /// atomic refcount bumps eleven times a frame. One refcount says the same thing.
-    pub precompile: std::sync::Arc<Vec<(std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)>>,
+    pub precompile: std::sync::Arc<Vec<vitaslop_gxp_shader::PatcherPair>>,
     pub color: Option<ColorSurface>,
     /// The `SceGxmDepthStencilSurface` this scene rendered its depth into, when the guest
     /// passed one to `sceGxmBeginScene`.
@@ -615,6 +664,24 @@ pub struct Scene {
     /// know the sample count - and reading either alone has already produced a wrong
     /// conclusion here (see `report_scene_target`).
     pub multisample: u32,
+    /// The extent of the RENDER TARGET this scene rasterises through
+    /// (`SceGxmRenderTargetParams::width/height`), when the guest's create call was seen.
+    ///
+    /// # It is the only statement of extent a COLOUR-LESS pass has
+    /// A pass with a colour surface takes its extent from the surface (corrected by this same
+    /// render target - see `beginScene: taking the scene extent from the render target`). A
+    /// DEPTH-ONLY pass has no colour surface at all, and a `SceGxmDepthStencilSurface` carries
+    /// no extent, so the size of the target we place it in had to be inferred from the draws'
+    /// own viewports. That inference is off by exactly the border a title insets: MEASURED on
+    /// one title's 2048x1024 shadow map, every draw agrees on a viewport of 2046x1022 (a
+    /// one-texel border, which is what a shadow map does to keep its clamp from bleeding), so
+    /// the target came out two texels short in each axis and every later pass sampling it read
+    /// the map through normalised coordinates scaled by 2048/2046.
+    ///
+    /// The render target's extent is the guest's own number and needs no inference, so where it
+    /// is known it decides. The viewport agreement stays as the fallback for a pass whose
+    /// render target was created before capture began.
+    pub target_extent: Option<(u32, u32)>,
     pub draws: Vec<Draw>,
 }
 
@@ -630,6 +697,9 @@ pub struct DepthSurface {
     pub stencil_addr: u32,
     /// The depth the surface clears/loads as background, as raw f32 bits (GXM's default is 1.0).
     pub background_depth: u32,
+    /// `backgroundControl`: its LOW BYTE is the stencil value the surface clears to
+    /// (`sceGxmDepthStencilSurfaceSetBackgroundStencil`), 0 after `...Init`.
+    pub background_control: u32,
 }
 
 /// Report - once per (target, from, to) - that a scene's extent was taken from its draws'
@@ -841,6 +911,14 @@ pub struct Capture {
     /// not about order - so [`Capture::frame_scenes`] hands out the whole frame and
     /// [`Capture::world_scene`] picks by what the scene contains.
     prev_frame_scenes: usize,
+    /// Scenes ever pushed - a serial, so a position in [`Capture::scenes`] survives eviction
+    /// from its front. See [`Capture::take_scenes_through_flip`].
+    scenes_pushed: u64,
+    /// `scenes_pushed` at each display flip not yet taken, oldest first: where one frame's
+    /// scenes end and the next one's begin. Only the parallel scheduler's overlapped present
+    /// reads it - there, the next frame's scenes can already be arriving when this one is
+    /// taken - and every ordinary take clears it.
+    flip_ends: std::collections::VecDeque<u64>,
 }
 
 /// Upper bound on retained trace entries. When the trace reaches this, the oldest
@@ -981,6 +1059,7 @@ impl Capture {
     pub fn push_scene(&mut self, scene: Scene) {
         self.scenes.push(scene);
         self.frame_scenes += 1;
+        self.scenes_pushed += 1;
         let Some(limit) = self.scene_limit else { return };
         // Never evict below ONE WHOLE FRAME - the scenes of the last completed frame
         // plus the one being built. A frame is not a scene: a title renders its world,
@@ -1210,7 +1289,14 @@ impl Capture {
     /// that reason rather than for any divergence, which is exactly the wrong diagnosis to hand
     /// someone chasing a browser-only bug.
     pub fn take_frame_scenes(&mut self) -> Vec<Scene> {
-        let taken = core::mem::take(&mut self.scenes);
+        // Every recorded flip is covered by a take of everything.
+        self.flip_ends.clear();
+        // A scene whose geometry is still pending (`deferred_id != 0`) is NOT taken: its
+        // bytes are read at the guest's flip, which on some titles comes after this frame
+        // boundary. It stays for the next take - see the desktop's twin in `retail.rs`.
+        let (pending, taken): (Vec<_>, Vec<_>) =
+            core::mem::take(&mut self.scenes).into_iter().partition(|s| s.deferred_id != 0);
+        self.scenes = pending;
         for old in &taken {
             if self.fold_disabled {
                 self.signature_incomplete = true;
@@ -1280,6 +1366,36 @@ impl Capture {
     pub fn end_frame(&mut self) {
         self.prev_frame_scenes = self.frame_scenes;
         self.frame_scenes = 0;
+        self.flip_ends.push_back(self.scenes_pushed);
+        // Bounded: a caller that never takes through a flip (every one-worker run) must not
+        // grow this for the life of the run. Its ordinary take clears it anyway.
+        if self.flip_ends.len() > 8 {
+            self.flip_ends.pop_front();
+        }
+    }
+
+    /// Take the scenes of the OLDEST display frame whose flip has not been taken yet, and
+    /// only those - [`Capture::take_frame_scenes`] for a run where the NEXT frame's scenes may
+    /// already be arriving (the parallel scheduler presenting frame N while its guest threads
+    /// build N+1). Falls back to the ordinary take when no flip is recorded. Scenes whose
+    /// geometry is still pending stay, exactly as the ordinary take leaves them.
+    pub fn take_scenes_through_flip(&mut self) -> Vec<Scene> {
+        let Some(end) = self.flip_ends.pop_front() else { return self.take_frame_scenes() };
+        // Serial of `scenes[0]`: everything before it was evicted or taken. (A scene left
+        // behind as pending by an earlier take keeps its slot at the front, so this reads it as
+        // one serial newer than it is and the take reaches one scene further - the one extra
+        // being the next frame's first, which is a picture one pass early, never a lost one.)
+        let first = self.scenes_pushed - self.scenes.len() as u64;
+        let n = end.saturating_sub(first).min(self.scenes.len() as u64) as usize;
+        // `self.scenes` keeps this frame's scenes; `next` holds the next frame's so far.
+        let next = self.scenes.split_off(n);
+        let flips = std::mem::take(&mut self.flip_ends);
+        // Through the ordinary path, so the fold and the pending rule are one piece of code.
+        let taken = self.take_frame_scenes();
+        // Pending scenes it left behind go back IN FRONT of the next frame's.
+        self.scenes.extend(next);
+        self.flip_ends = flips;
+        taken
     }
 
     /// The scenes of the most recently COMPLETED display frame, oldest first.
@@ -1289,6 +1405,11 @@ impl Capture {
     /// Between flips (a partially built frame) this reports the previous frame's tail
     /// rather than a mixture, because an observer asking about "this frame" during
     /// construction has no complete frame to be given.
+    /// How many scenes the frame BEING BUILT has ended so far.
+    pub fn frame_scene_count_so_far(&self) -> usize {
+        self.frame_scenes
+    }
+
     pub fn frame_scenes(&self) -> &[Scene] {
         let n = self.prev_frame_scenes.max(1).min(self.scenes.len());
         &self.scenes[self.scenes.len() - n..]
@@ -1390,6 +1511,47 @@ impl Capture {
     }
 }
 
+/// The flip-bounded take: a frame's scenes, and not the next frame's that arrived meanwhile.
+#[cfg(test)]
+mod flip_take_tests {
+    use super::*;
+
+    #[test]
+    fn a_take_through_the_flip_leaves_the_next_frames_scenes() {
+        let mut c = Capture::new();
+        c.set_signature_wanted(false);
+        for _ in 0..3 {
+            c.push_scene(Scene::default());
+        }
+        c.end_frame();
+        // The next frame is already under way when this one is presented.
+        for _ in 0..2 {
+            c.push_scene(Scene::default());
+        }
+        assert_eq!(c.take_scenes_through_flip().len(), 3, "exactly the flipped frame");
+        assert_eq!(c.scenes.len(), 2, "the next frame's scenes stay");
+        c.end_frame();
+        assert_eq!(c.take_scenes_through_flip().len(), 2);
+        assert!(c.scenes.is_empty());
+        // With no flip recorded it is the ordinary take.
+        c.push_scene(Scene::default());
+        assert_eq!(c.take_scenes_through_flip().len(), 1);
+    }
+
+    #[test]
+    fn the_ordinary_take_is_unchanged_and_forgets_the_flips() {
+        let mut c = Capture::new();
+        c.set_signature_wanted(false);
+        c.push_scene(Scene::default());
+        c.end_frame();
+        c.push_scene(Scene::default());
+        assert_eq!(c.take_frame_scenes().len(), 2, "everything, as before");
+        c.push_scene(Scene::default());
+        // The flip taken above does not bound this one.
+        assert_eq!(c.take_scenes_through_flip().len(), 1);
+    }
+}
+
 #[cfg(test)]
 mod fold_tests {
     use super::*;
@@ -1487,13 +1649,15 @@ mod extent_tests {
             world: [0.0; 16],
             vprog: no_program(),
             fprog: no_program(),
+            fprog_patched_vprog: no_program(),
             vert_sa: std::sync::Arc::from(&[][..]),
             frag_sa: std::sync::Arc::from(&[][..]),
             frag_sa_addr: 0,
             mem_windows: Vec::new(),
+            frag_mem_windows: Vec::new(),
             shader_expanded: false,
         };
-        Scene {
+        Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: Some(ColorSurface {
                 format: 0,
@@ -1507,6 +1671,7 @@ mod extent_tests {
             }),
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: vec![draw],
         }
     }
@@ -1548,7 +1713,7 @@ mod retention_tests {
 
     /// A scene distinguishable by `tag` through the part of it the signature folds.
     fn scene(tag: u8) -> Scene {
-        Scene {
+        Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: Some(ColorSurface {
                 format: tag as u32,
@@ -1562,6 +1727,7 @@ mod retention_tests {
             }),
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: Vec::new(),
         }
     }

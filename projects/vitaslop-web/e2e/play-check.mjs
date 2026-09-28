@@ -9,6 +9,8 @@
 import { chromium } from "playwright";
 import { createServer } from "node:http";
 import { readFile, readdir, stat, mkdir } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
 import { join, extname, relative, sep, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -56,9 +58,21 @@ async function main() {
         return res.end(JSON.stringify(manifest));
       }
       const file = url.startsWith("/game/") ? join(gameDir, url.slice("/game/".length)) : join(webDir, url === "/" ? "/debug/play.html" : url);
-      const body = await readFile(file);
-      res.writeHead(200, { "content-type": MIME[extname(file)] || "application/octet-stream", ...coi });
-      res.end(body);
+      // STREAMED, and with a content-length the page holds the transfer to.
+      //
+      // >>> `readFile` CANNOT READ A RETAIL CONTAINER. Node refuses a file over 2 GiB
+      // > > > (`ERR_FS_FILE_TOO_LARGE`), so one title's 2.9 GB archive threw here and the
+      // > > > catch below answered the request with a 404 whose nine-byte body - `not found` -
+      // > > > the page imported AS the archive. The title then booted with nothing loaded and
+      // > > > died three hundred frames later inside the guest. Streaming has no size limit,
+      // > > > and the length lets the client refuse a short transfer.
+      const { size } = await stat(file);
+      res.writeHead(200, {
+        "content-type": MIME[extname(file)] || "application/octet-stream",
+        "content-length": String(size),
+        ...coi,
+      });
+      await pipeline(createReadStream(file), res);
     } catch {
       res.writeHead(404).end("not found");
     }

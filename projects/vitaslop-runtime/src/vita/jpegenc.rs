@@ -65,16 +65,55 @@ pub(super) fn init(
     out_buffer: u32,
     out_size: u32,
 ) -> i32 {
+    record_init(ctx, context, in_width, in_height, pixelformat, out_buffer, out_size)
+}
+
+/// The shared body of [`init`] and [`init_with_param`]: the request, in the guest's own block.
+fn record_init(ctx: &mut crate::host::GuestCtx, context: crate::host::Ptr, w: u32, h: u32, fmt: u32, out: u32, size: u32) -> i32 {
     if context.is_null() {
         SCE_JPEGENC_ERROR_INVALID_POINTER
     } else {
         let a = context.addr();
         ctx.write_u32(a, JPEGENC_MAGIC);
-        ctx.write_u32(a + 4, in_width);
-        ctx.write_u32(a + 8, in_height);
-        ctx.write_u32(a + 12, pixelformat);
-        ctx.write_u32(a + 16, out_buffer);
-        ctx.write_u32(a + 20, out_size);
+        ctx.write_u32(a + 4, w);
+        ctx.write_u32(a + 8, h);
+        ctx.write_u32(a + 12, fmt);
+        ctx.write_u32(a + 16, out);
+        ctx.write_u32(a + 20, size);
+        0
+    }
+}
+
+/// int sceJpegEncoderInitWithParam(SceJpegEncoderContext context, const SceJpegEncoderInitParam *initParam)
+///
+/// [`init`] with its arguments in a struct (`psp2/jpegenc.h`, asserted 0x1C bytes): `size`,
+/// `inWidth`, `inHeight`, `pixelFormat`, `outBuffer`, `outSize`, `option`. The `option` (LPDDR2
+/// instead of CDRAM) names where the hardware works, which nothing here observes. First called by
+/// a 2011 adventure title at boot.
+#[hostcall]
+pub(super) fn init_with_param(ctx: &mut GuestCtx, _st: &mut VitaState, context: Ptr, param: Ptr) -> i32 {
+    if param.is_null() {
+        SCE_JPEGENC_ERROR_INVALID_POINTER
+    } else {
+        let p = param.addr();
+        let (w, h, fmt, out, size) =
+            (ctx.read_u32(p + 4), ctx.read_u32(p + 8), ctx.read_u32(p + 12), ctx.read_u32(p + 16), ctx.read_u32(p + 20));
+        record_init(ctx, context, w, h, fmt, out, size)
+    }
+}
+
+/// int sceJpegEncoderSetHeaderMode(SceJpegEncoderContext context, int mode)
+///
+/// Selects the header the encoder will emit (JPEG or MJPEG). Recorded in the context block next
+/// to the other settings; nothing is encoded here (see the module docs), so it has no effect yet.
+#[hostcall]
+pub(super) fn set_header_mode(ctx: &mut GuestCtx, _st: &mut VitaState, context: Ptr, mode: u32) -> i32 {
+    if context.is_null() {
+        SCE_JPEGENC_ERROR_INVALID_POINTER
+    } else {
+        // +36, its own slot: +28/+32 are `set_valid_region`'s width and height, and sharing +28
+        // let either call overwrite the other's setting.
+        ctx.write_u32(context.addr() + 36, mode);
         0
     }
 }

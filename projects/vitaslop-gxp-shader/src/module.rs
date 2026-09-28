@@ -39,8 +39,8 @@
 use core::fmt::Write as _;
 
 use crate::container::{ParamCategory, Program};
-use crate::ir::{Bank, Op, Shader};
-use crate::wgsl::{tex_units, TexBinding, BANK_REGS};
+use crate::ir::{Bank, Instr, Op, Operand, Predicate, Shader};
+use crate::wgsl::{tex_units, TexBinding, BANK_REGS, HALF_PK_FN};
 
 /// Where the fragment shader's final RGBA lives at program end (SGX has no explicit colour
 /// emit; the value left in a fixed register is the output - see the texflow spec F8.9).
@@ -112,6 +112,48 @@ pub struct BindingPlan {
     pub color: ColorOutput,
     /// How the four colour components are laid out across those registers.
     pub color_precision: ColorPrecision,
+    /// Whether this fragment program READS THE OUTPUT BANK - i.e. reads the DESTINATION colour
+    /// the ROP feeds back, and so performs its blending itself.
+    ///
+    /// # Why the output register is the destination
+    /// On this hardware a fragment program's output registers are the on-chip pixel data, and
+    /// the driver seeds them with the framebuffer's current colour. A program is therefore free
+    /// to blend in ordinary ALU: `pa0 = -o[0] + src; pa0 = pa0 * a + o[0]` is a source-over
+    /// lerp written out longhand, and one retail title composites its whole frame that way -
+    /// its colour-grading pass is `sa4*dst + (dot(sa8, dst) * sa2 + sa0.x)`, which no
+    /// fixed-function blend can express at all.
+    ///
+    /// [`crate::rop_blend`] already recovers the OTHER shape this takes - an epilogue group-0x80
+    /// SOP2 - as a pipeline blend state. That works because a SOP2 epilogue IS one of the two
+    /// standard equations; an arbitrary ALU chain is not, so it needs the real destination
+    /// colour and there is no way around reading it.
+    ///
+    /// A module built with this set declares a destination texture and seeds the O bank from it
+    /// at entry; the renderer owes it a copy of the attachment taken immediately before the
+    /// draw. WebGPU has no framebuffer fetch, so that copy is the whole mechanism.
+    pub reads_dest_color: bool,
+    /// Whether that read is lowered to a DUAL-SOURCE blend - see [`dual_source_eligible`].
+    /// When set, the linked module declares no destination texture and the renderer owes the
+    /// draw a dual-source pipeline blend instead of an attachment copy.
+    pub dual_source: bool,
+    /// Where a dual-source body stops being the same in both evaluations: the index of the
+    /// first instruction that reads the destination ([`first_dest_reader`]). Everything before
+    /// it is computed ONCE. `None` leaves the body evaluated twice whole, which is what a
+    /// program blending from its first instruction needs anyway.
+    pub dual_split: Option<usize>,
+    /// The pass renders into a 64-bit colour surface, so the entry point returns the colour
+    /// register pair's RAW WORDS (`vec2<u32>`) into an `Rg32Uint` attachment - the bits the
+    /// hardware would store - instead of a converted `vec4<f32>`. Set by the link from
+    /// [`crate::link::LinkOptions::raw64_output`].
+    pub raw64_output: bool,
+    /// Splat the colour's alpha into every channel and read the destination's red as its
+    /// alpha. Set by the link from [`crate::link::LinkOptions::alpha_to_red`].
+    pub alpha_to_red: bool,
+    /// The guest-memory windows THIS (fragment) program's 0xE8 loads read through, in the order
+    /// the `gxp_fmem` binding lays them out. Empty for the overwhelming majority; a fragment
+    /// that loads memory reaches its buffer through `sceGxmSetFragmentUniformBuffer`, which is
+    /// a different table from the vertex stage's, so the two windows are bound separately.
+    pub mem_windows: Vec<MemWindow>,
 }
 
 impl BindingPlan {
@@ -152,18 +194,8 @@ fn bank_read_extent(shader: &Shader, bank: Bank) -> u32 {
                 if !read_lanes[c] {
                     continue;
                 }
-                let sel = src.swizzle[c];
-                if sel <= 3 {
-                    // A packed-byte source spans ONE register whatever the channel - see
-                    // [`crate::ir::Instr::source_packed_bytes`].
-                    let step = if instr.source_packed_bytes() {
-                        0
-                    } else if instr.source_half_precision() {
-                        (sel >> 1) as u32
-                    } else {
-                        sel as u32
-                    };
-                    extent = extent.max(src.index as u32 + step + 1);
+                if let Some((reg, _)) = instr.source_register(src, c) {
+                    extent = extent.max(reg + 1);
                 }
             }
         }
@@ -171,27 +203,12 @@ fn bank_read_extent(shader: &Shader, bank: Bank) -> u32 {
     extent
 }
 
-/// The channels an instruction actually reads from its sources (mirrors
-/// `crate::wgsl`'s read model: a dot/tex reads a fixed prefix, everything else reads where it
-/// writes). Kept local so the module extent scan matches emitted reads exactly.
+/// The channels an instruction actually reads from its sources. The model lives on the
+/// instruction ([`crate::ir::Instr::read_channels`]); this local name is what the extent scan
+/// reads through. It used to be a COPY, and the copy was missing the predicate-only test cases,
+/// so a bank read only by a test sized to zero here while the linker saw it.
 fn read_lane_mask(instr: &crate::ir::Instr) -> [bool; 4] {
-    match instr.op {
-        Op::Dot { components } => {
-            let n = (components as usize).clamp(1, 4);
-            [0 < n, 1 < n, 2 < n, 3 < n]
-        }
-        Op::Tex { coords, .. } | Op::TexGather { coords, .. } => {
-            let n = (coords as usize).clamp(1, 4);
-            [0 < n, 1 < n, 2 < n, 3 < n]
-        }
-        // A memory load's only source is a scalar ADDRESS - one lane, whatever its
-        // destination spans. Its write mask is explicitly not meaningful (the written span is
-        // `elements` consecutive registers), so taking the mask as the read count claims the
-        // three registers ABOVE the pointer are read too. That is how a pointer sitting near
-        // the top of the SA bank made a program look like it read past its uniform buffer.
-        Op::MemLoad { .. } => [true, false, false, false],
-        _ => instr.write_mask,
-    }
+    instr.read_channels()
 }
 
 /// True when the fragment writes NEITHER colour register, so nothing in the stream says what it
@@ -268,11 +285,51 @@ fn color_precision(shader: &Shader, color: ColorOutput) -> ColorPrecision {
         ColorOutput::NativeO0 => (Bank::Output, 0),
         ColorOutput::NonNativePa(base) => (Bank::PrimaryAttr, base),
     };
-    let last = shader.instrs.iter().rev().find(|i| {
-        i.dest
-            .as_ref()
-            .is_some_and(|d| d.bank == bank && d.index as u32 == base && i.write_mask.iter().any(|&m| m))
-    });
+    let writer_of = |bank: Bank, index: u32, before: usize| -> Option<(usize, &crate::ir::Instr)> {
+        shader.instrs[..before].iter().enumerate().rev().find(|(_, i)| {
+            i.dest.as_ref().is_some_and(|d| {
+                d.bank == bank && d.index as u32 == index && i.write_mask.iter().any(|&m| m)
+            })
+        })
+    };
+    let mut found = writer_of(bank, base, shader.instrs.len());
+    // >>> A COPY DOES NOT CHANGE THE PRECISION OF WHAT IT COPIES, and taking it at face
+    // >>> value is a black frame that reports success - the same failure
+    // >>> [[vitaslop-f16-colour-output]] records for the F16 reading itself.
+    //
+    // The precision of the colour is the precision of the arithmetic that BUILT it. A
+    // fragment program often assembles its colour in a working register and then moves it
+    // to the colour register in one full-width copy: that copy carries `half_precision ==
+    // false` because it moves 32 bits, and reading it as the colour's precision calls a
+    // register holding two packed halves an F32 component. Bitcasting a packed pair to f32
+    // gives a denormal, so every channel comes out ~0 and the frame is black.
+    //
+    // Found on a retail title whose final gamma pass ends `o[0] = pa[0]; o[1] = pa[1];`
+    // over registers built with `pack2x16float` - the whole picture was black while every
+    // draw, pipeline and texture reported success.
+    //
+    // So a full-width move is followed back to what it copied, and that register's own
+    // writer is asked instead. Bounded, because a chain of copies is still a chain and a
+    // cycle must not hang the compiler.
+    for _ in 0..8 {
+        let Some((at, i)) = found else { break };
+        if !matches!(i.op, Op::Mov) || i.half_precision {
+            break;
+        }
+        // Only a plain register-to-register copy forwards: an immediate or a constant has
+        // no earlier writer to ask, and a swizzle that reorders halves is not a copy of
+        // one register's layout.
+        let Some(src) = i.srcs.first().filter(|s| {
+            matches!(s.bank, Bank::PrimaryAttr | Bank::Temp | Bank::Internal | Bank::Output)
+        }) else {
+            break;
+        };
+        match writer_of(src.bank, u32::from(src.index), at) {
+            Some(next) => found = Some(next),
+            None => break,
+        }
+    }
+    let last = found.map(|(_, i)| i);
     match last {
         // An 8-BIT write leaves four bytes in the one register, whatever `half_precision`
         // says - that flag describes a float view and neither of these ops has one. This has
@@ -323,7 +380,7 @@ pub(crate) struct ProbeSpec {
 /// Returns `None` when the variable is unset or does not parse, so a malformed probe leaves the
 /// shader alone rather than silently painting a wrong picture.
 pub(crate) fn probe_spec() -> Option<ProbeSpec> {
-    parse_probe_spec(&std::env::var("VITASLOP_GXP_PROBE").ok()?)
+    parse_probe_spec(crate::link::arm(crate::link::PROBE_ARM)?)
 }
 
 /// The parse itself, separated from the environment read so the tests can drive it with a
@@ -393,7 +450,7 @@ pub(crate) fn probe_read_expr(spec: &ProbeSpec, from_snapshot: bool) -> String {
     };
     if let Some(w) = spec.bits {
         return format!(
-            "vec4<f32>(select(0.0, 1.0, {a} == {w}u), select(0.0, 1.0, {b} == {w}u),              select(0.0, 1.0, {c} == {w}u), 1.0)"
+            "vec4<f32>(select(0.0, 1.0, {a} == {w}u), select(0.0, 1.0, {b} == {w}u), select(0.0, 1.0, {c} == {w}u), 1.0)"
         );
     }
     if spec.f32_lanes {
@@ -432,8 +489,8 @@ pub(crate) fn color_return_expr(
     // question with no instrument at all, which is how a composite's UV offset stayed a matter
     // of argument for a whole session. `<n>.xy` shows as red/green, so an on-screen ramp from
     // black to yellow is UV 0..1 and anything flat is a coordinate that does not vary.
-    if let Ok(n) = std::env::var("VITASLOP_GXP_VPROBE").map(|s| s.trim().to_string())
-        && let Ok(i) = n.parse::<u32>() {
+    if let Some(n) = crate::link::arm(crate::link::VPROBE_ARM)
+        && let Ok(i) = n.trim().parse::<u32>() {
             if i < varyings {
                 return format!("vec4<f32>(in.v{i}.x, in.v{i}.y, in.v{i}.z, 1.0)");
             }
@@ -445,7 +502,26 @@ pub(crate) fn color_return_expr(
     if let Some(spec) = probe_spec() {
         // An `@<instr>` probe reads the SNAPSHOT locals the emitter wrote at that instruction,
         // not the register's end value - see [`ProbeSpec`] for why those differ.
-        return probe_read_expr(&spec, spec.at.is_some());
+        let e = probe_read_expr(&spec, spec.at.is_some());
+        // >>> `VITASLOP_GXP_PROBE_SCALE=<f>`: DIVIDE the probed value before it is written.
+        //
+        // A colour attachment CLAMPS to [0,1], so every probe of an HDR term reads back as a
+        // flat 255 and a bisection down a lit material stops at the first light multiply -
+        // which on a title whose sun colour is (12.2, 11.7, 4.8) and whose ambient is
+        // (97.2, 23.7, 10.7) is the very first instruction that matters. Saturation and
+        // "exactly 1.0" are then indistinguishable, and so are 4x over and 40x over.
+        //
+        // Dividing by a known constant moves the range of interest back under the clamp and
+        // costs one multiply; the reader multiplies back. It is a DIAGNOSTIC scale and it is
+        // reported, because a frame whose colours were divided is not the frame the guest asked
+        // for and must never be mistaken for one.
+        if let Some(v) = crate::link::arm(crate::link::PROBE_SCALE_ARM)
+            && let Ok(f) = v.trim().parse::<f32>()
+            && f > 0.0
+        {
+            return format!("(({e}) / {f:?})");
+        }
+        return e;
     }
     match precision {
         ColorPrecision::F32 => format!(
@@ -485,8 +561,1198 @@ pub fn plan_bindings(shader: &Shader, uniform_regs: u32, is_cube: impl Fn(u8) ->
         samplers: tex_units(shader, is_cube),
         color,
         color_precision: color_precision(shader, color),
+        reads_dest_color: declares_dest_color(shader),
+        // Never on its own: the LINK asks for it, per draw - see `link::LinkOptions`.
+        dual_source: false,
+        dual_split: None,
+        raw64_output: false,
+        alpha_to_red: false,
+        // A plan built from the SHADER alone cannot resolve a window - that needs the
+        // program's containers and parameter table - so it carries none, and
+        // `link_programs` fills them in. Same shape as `VertexAttribute::surplus_fill`.
+        mem_windows: Vec::new(),
     }
 }
+
+/// A blend equation a fragment program performed ITSELF in ALU over the destination colour,
+/// recovered as PIPELINE state so the draw does not need the framebuffer read at all.
+///
+/// The operation is always ADD; only the two coefficients vary. See [`lower_dest_blend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DestBlend {
+    pub color: BlendTerm,
+    pub alpha: BlendTerm,
+}
+
+/// One channel group's `src * src_factor + dst * dst_factor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendTerm {
+    pub src: BlendFactor,
+    pub dst: BlendFactor,
+}
+
+/// The coefficients [`lower_dest_blend`] can produce. Every one exists in WebGPU under the same
+/// name, so the renderer maps them one for one and nothing is approximated in the mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendFactor {
+    Zero,
+    One,
+    /// The SOURCE colour, per channel - WebGPU's `Src`. What a `dst * K` modulate needs, with
+    /// the shader emitting `K`.
+    Src,
+    SrcAlpha,
+    OneMinusSrcAlpha,
+}
+
+/// Whether [`lower_dest_blend`] is allowed to run. `VITASLOP_GXP_DEST_BLEND=0` turns it off and
+/// every program keeps its ALU blend, which then needs the destination texture and a render-pass
+/// split - the A/B arm that proves a lowering equivalent by comparing the two frames.
+///
+/// A static rather than an environment read because this crate is compiled for the browser,
+/// which has no environment; the renderer sets it once from its own knob table.
+/// A MASK over the shapes, not a boolean, so a wrong picture can be bisected to one shape
+/// without a rebuild: bit 0 lerp, bit 1 modulate, bit 2 additive.
+static DEST_BLEND_LOWERING: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(FORM_DEFAULT);
+
+/// The shape bits of [`DEST_BLEND_LOWERING`].
+pub const FORM_LERP: u32 = 1;
+pub const FORM_MODULATE: u32 = 2;
+pub const FORM_ADDITIVE: u32 = 4;
+/// The LERP variant whose SOURCE TERM is not the register the colour epilogue copies, so the
+/// epilogue has to be redirected at it - see form C in [`match_dest_blend`]. Its own bit
+/// because it is newer than the other three and a whole-run pixel A/B has to be able to hold
+/// everything else fixed while turning it off.
+pub const FORM_LERP_SRC: u32 = 8;
+
+/// The shapes that are ON by default, because each has been PROVED equivalent to the ALU form
+/// it replaces:
+///
+/// * LERP - a capsule of a shipped HUD pair replayed both ways differs by a MAXIMUM CHANNEL
+///   DELTA OF 1 over 8,043 covered pixels, which is the ROP's 8-bit rounding and nothing else.
+/// * MODULATE - a 3,400-frame headless run of the same title with the shape on and off is
+///   equal to a mean absolute error of 0.01 per channel on every shot, with no pixel anywhere
+///   off by more than 36 and none at all off by more than 32 as a share of the frame.
+///
+/// * ADDITIVE - three capsules of a shipped particle pair, replayed both ways, differ by a
+///   MAXIMUM CHANNEL DELTA OF 1 over every covered pixel (278, 226 and 172 pixels differing of
+///   235,520, all by one). The rewrite is also equal term for term by inspection: the ALU form
+///   computes `src + o[]` and copies `o[].w` into the alpha lane, and the lowered form computes
+///   `src` under `One/One` colour and `Zero/One` alpha, which is `dst + src` and `dst.a`. The
+///   delta of 1 is the ROP doing that sum in the attachment's 8 bits where the shader did it in
+///   f32 - the same rounding LERP was proved to.
+///
+/// >>> ADDITIVE WAS OFF UNTIL IT WAS MEASURED, and turning it on is worth 9 of this title's 15
+/// >>> remaining destination-reading fragment programs. Each one is a RENDER-PASS SPLIT per
+/// draw - the pass ends, the whole attachment is copied, and a new pass begins with
+/// `LoadOp::Load`, which on a tiling GPU is a full store and reload of every tile. A phone
+/// measured 54 splits and 108 MB of copies in ONE frame of this title's menu; the corpus says
+/// this shape alone takes its dest-reading programs from 15 to 6. No other title in any corpus
+/// has a single destination-reading fragment program, so nothing else can be moved by it.
+pub const FORM_DEFAULT: u32 = FORM_LERP | FORM_MODULATE | FORM_ADDITIVE | FORM_LERP_SRC;
+
+/// Every shape, including the unproved one.
+pub const FORM_ALL: u32 = FORM_LERP | FORM_MODULATE | FORM_ADDITIVE | FORM_LERP_SRC;
+
+/// Whether [`crate::wgsl`]'s byte-wise conditional move tests EACH BYTE of its test operand
+/// separately (`VITASLOP_GXP_CMOVU8=byte`) rather than testing one byte and moving the masked
+/// bytes on that answer.
+///
+/// The arm back for a reading the corpus cannot separate - every captured word carries the full
+/// write mask, where the two agree unless the test operand's bytes disagree. See
+/// `crate::wgsl::emit_cmov_u8`.
+pub fn cmov_u8_tests_each_byte() -> bool {
+    std::env::var("VITASLOP_GXP_CMOVU8").as_deref() == Ok("byte")
+}
+
+/// Which byte of the test operand a single-test byte-wise conditional move reads: byte 0 by
+/// default, the TOP byte (3) under `VITASLOP_GXP_CMOVU8=swap`. See `crate::wgsl::emit_cmov_u8`.
+pub fn cmov_u8_test_byte() -> u32 {
+    if std::env::var("VITASLOP_GXP_CMOVU8").as_deref() == Ok("swap") {
+        3
+    } else {
+        0
+    }
+}
+
+/// The byte-wise conditional move's operand ROLES as source positions:
+/// `(taken when the test holds, taken otherwise, tested)`.
+///
+/// DEFAULT `(0, 1, 2)`: test the LAST-listed source on byte 0, take the FIRST-listed when it
+/// holds, else the second. In every corpus word that is `[0x7fffffff, packed index, mask]`
+/// behind the 8-bit VTSTMSK overflow guard `(-2^31 + index) >= 0` - INT_MAX where the index
+/// overflows, the converted index otherwise: a saturating float-to-int. This reading was right
+/// all along; what made it paint red glove blobs was the MASK - decoded to the wrong register,
+/// as a float whose byte 0 is zero either way (see `decode_grp_test_mask`).
+/// `VITASLOP_GXP_CMOVU8=swap` is the 2026-09-23b reading `(1, 2, 0)` on the top byte: it tests
+/// the sentinel, which fixed the 2-bone gloves by accident and exploded the 4-bone ones.
+pub fn cmov_u8_roles() -> (usize, usize, usize) {
+    match std::env::var("VITASLOP_GXP_CMOVU8").as_deref() {
+        Ok("swap") => (1, 2, 0),
+        _ => (0, 1, 2),
+    }
+}
+
+/// How many REGISTERS one count of an index register spans - see [`crate::wgsl`]'s
+/// `emit_load_index` for the frame that settled it. `VITASLOP_GXP_IDX_SCALE=1` restores the
+/// old single-register reading as the A/B arm.
+pub fn index_register_scale() -> i32 {
+    static CELL: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_GXP_IDX_SCALE")
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|v| *v > 0)
+            // >>> ONE, AND THE CENSUS IS WHY - see `which_index_scale_lands_inside_the_declared_layout`.
+            //
+            // The `* 2` PAIR SCALE was established on one title's corner table under the OLD
+            // reading of the index load's SOURCE (a four-bit field with the bank hardcoded to
+            // PrimaryAttr); that reading is refuted - see `decode_grp_i16mad` - so the
+            // arithmetic it was fitted against was about a different register.
+            //
+            // MEASURED over every indexed SA read in three titles' corpora (46 of them): scale
+            // 1 names a register the program POPULATES - a container literal, a uniform, or a
+            // window load - on 46 of 46, and scale 2 on 40, landing outside everything the
+            // program declares on the other 6. A read above the declared layout is
+            // uninitialised scratch [[vitaslop-an-unwritten-sa-register-is-uninitialised-scratch]],
+            // which no shipped shader does deliberately.
+            //
+            // And a football title's CROWD closes it exactly: its 6-vertex sprites carry their
+            // corner index 0..5 in an attribute lane, its literal block holds a SIX-entry corner
+            // table at sa[64..75] at stride 2, and `(2c + 49) * 1 + 15` is `64 + 2c` - the table
+            // end to end, with nothing left over. Under `* 2` the same read is `4c + 113`,
+            // which is past every register anything writes.
+            .unwrap_or(1)
+    })
+}
+
+/// Set by the renderer from `VITASLOP_GXP_DEST_BLEND`. See [`DEST_BLEND_LOWERING`].
+pub fn set_dest_blend_lowering(forms: u32) {
+    DEST_BLEND_LOWERING.store(forms, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn form_enabled(bit: u32) -> bool {
+    DEST_BLEND_LOWERING.load(core::sync::atomic::Ordering::Relaxed) & bit != 0
+}
+
+/// Whether a fragment program that reads the destination colour is DECLARED as reading it.
+/// `VITASLOP_GXP_DEST=0` clears this, and then such a program compiles with its output bank
+/// starting at ZERO and no destination texture is bound or copied - the behaviour every build
+/// before this mechanism had, kept as the A/B arm.
+///
+/// It gates the DECLARATION rather than the copy on purpose. Gating only the copy left the
+/// module still asking for a texture the pass no longer supplied, so every such draw was
+/// DROPPED - which is a third behaviour, neither arm of the A/B, and it silently made the arm
+/// answer a different question than the one on its label.
+static DEST_COLOR_READ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Set by the renderer from `VITASLOP_GXP_DEST`. See [`DEST_COLOR_READ`].
+pub fn set_dest_color_read(on: bool) {
+    DEST_COLOR_READ.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a destination-reading program that is LINEAR in the destination may be lowered to a
+/// DUAL-SOURCE blend instead of a pass split. Set by the renderer from the device's features
+/// (`dual-source-blending`) and `VITASLOP_GXP_DUAL_SOURCE`; off until it says so, because a
+/// module using `@blend_src` does not compile on a device without the feature.
+static DUAL_SOURCE_BLEND: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Set by the renderer once it knows the device. See [`DUAL_SOURCE_BLEND`].
+pub fn set_dual_source_blend(on: bool) {
+    DUAL_SOURCE_BLEND.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// One coefficient that GATES a cross-channel destination term: a 2- or 4-byte value the
+/// program multiplies a destination channel by, taken from per-draw data - a lane loaded out
+/// of a memory window (pointer register `base_sa`, byte `byte` from the window's base) or a
+/// register of the fragment default uniform buffer (byte `byte` of the buffer). When every
+/// gate of a term is zero in a draw's data, that term is zero and the draw can take the
+/// dual-source pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DualCoef {
+    Window { base_sa: u32, byte: u32, len: u8 },
+    Uniform { byte: u32, len: u8 },
+    /// A container LITERAL that is zero: not a per-draw gate but a term that is dead in every
+    /// draw. Never appears in a plan.
+    Zero,
+}
+
+/// Whether THIS program's destination read may be lowered to a dual-source blend, and what a
+/// DRAW has to satisfy for that lowering to be exact: the device has the feature, the program
+/// reads the destination, every use of it is linear ([`dest_is_linear`]), the program does not
+/// also write its own depth (the dual-source entry returns the two colour terms and nothing
+/// else), and every CROSS-CHANNEL destination term is gated by window coefficients
+/// ([`cross_channel_gates`]) - the returned list. Empty means the lowering is exact for every
+/// draw; `None` means the program cannot be lowered.
+///
+/// # The lowering, and why the linearity proof is not all it needs
+/// A program linear in the destination computes `out = dst * F + G` with `F` and `G` per-pixel
+/// values of its own. The body is emitted as a function of the destination and evaluated
+/// TWICE: `G` is the body with the destination forced to zero, `F` is the body with it forced
+/// to one, minus `G`. The pipeline then blends `src0 * 1 + dst * src1` - which is exactly
+/// `G + dst * F` - so the draw needs no copy of the attachment and no render-pass split. On a
+/// tiler that split is a store and reload of the whole tile; the second evaluation of a short
+/// blend body is far cheaper.
+///
+/// >>> BUT THE ROP MULTIPLIES `dst.c` BY `src1.c`, CHANNEL BY CHANNEL. A program whose red
+/// output depends on the destination's ALPHA (`out.r = ... + dst.a * CDa.r`) has a term the
+/// blend cannot express, and forcing all four channels to one at once folds it into `F.r` as
+/// if it were `dst.r * CDa.r`. MEASURED: a baseball title's generic-blend family carries exactly
+/// that term, and lowering it unconditionally drew its HUD's base-runner diamond white where
+/// the split path drew it grey - 357 pixels of a frame, every one where `dst.a != dst.r`. Its
+/// coefficient is a halfword in the draw's blend window, and for almost every draw it is zero;
+/// so the term is gated on THAT, per draw, rather than the program refused outright.
+pub fn dual_source_plan(shader: &Shader, uniform_regs: u32, literals: &[(u32, u32)]) -> Option<Vec<DualCoef>> {
+    dual_source_plan_or_why(shader, uniform_regs, literals).ok()
+}
+
+/// [`dual_source_plan`], naming the reason a program is refused - a lowering that never fires
+/// must be able to say why.
+/// `literals` are the container literals preloaded into SA registers (`(register, raw
+/// word)`): a zero literal kills the term it multiplies, a nonzero one cannot gate it.
+pub fn dual_source_plan_or_why(shader: &Shader, uniform_regs: u32, literals: &[(u32, u32)]) -> Result<Vec<DualCoef>, String> {
+    if !DUAL_SOURCE_BLEND.load(core::sync::atomic::Ordering::Relaxed) {
+        return Err("the device gate is off".into());
+    }
+    if !declares_dest_color(shader) {
+        return Err("no destination read".into());
+    }
+    if shader.instrs.iter().any(|i| i.op == Op::DepthF) {
+        return Err("writes its own depth".into());
+    }
+    dest_is_linear_or_why(shader).map_err(|why| format!("not linear in the destination: {why}"))?;
+    cross_channel_gates(shader, uniform_regs, literals)
+}
+
+/// The program as it RUNS: its secondary stream (which fills SA registers - the memory loads
+/// live there) followed by its primary stream. An analysis that follows a coefficient back to
+/// the load that fetched it has to see both.
+pub fn with_secondary(program: &crate::container::Program, primary: &Shader) -> Shader {
+    let mut instrs = crate::usse::decode_secondary_shader(program).instrs;
+    instrs.extend(primary.instrs.iter().cloned());
+    Shader { kind: primary.kind, instrs }
+}
+
+/// Whether the dual-source lowering applies to this program for SOME draw. See
+/// [`dual_source_plan`].
+pub fn dual_source_eligible(shader: &Shader, uniform_regs: u32, literals: &[(u32, u32)]) -> bool {
+    dual_source_plan(shader, uniform_regs, literals).is_some()
+}
+
+/// What a value carries of the destination: which destination channels it depends on, and
+/// per channel whether that dependence is gated by window coefficients (all of which being
+/// zero kills it) or cannot be killed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Dep {
+    /// Per destination channel 0..3: `None` = no dependence, `Some(None)` = ungated,
+    /// `Some(Some(gates))` = zero whenever every gate is zero.
+    on: [Option<Option<Vec<DualCoef>>>; 4],
+}
+
+impl Dep {
+    fn is_clean(&self) -> bool {
+        self.on.iter().all(|d| d.is_none())
+    }
+    fn union(&self, o: &Dep) -> Dep {
+        let mut r = Dep::default();
+        for c in 0..4 {
+            r.on[c] = match (&self.on[c], &o.on[c]) {
+                (None, x) | (x, None) => x.clone(),
+                (Some(None), _) | (_, Some(None)) => Some(None),
+                (Some(Some(a)), Some(Some(b))) => {
+                    let mut v = a.clone();
+                    for g in b {
+                        if !v.contains(g) {
+                            v.push(*g);
+                        }
+                    }
+                    Some(Some(v))
+                }
+            };
+        }
+        r
+    }
+    /// The dependence after multiplication by a coefficient loaded from a window: every
+    /// term now vanishes when that coefficient does.
+    fn gated_by(&self, coef: DualCoef) -> Dep {
+        let mut r = self.clone();
+        for c in 0..4 {
+            r.on[c] = match &self.on[c] {
+                None => None,
+                Some(None) => Some(Some(vec![coef])),
+                Some(Some(v)) => {
+                    let mut v = v.clone();
+                    if !v.contains(&coef) {
+                        v.push(coef);
+                    }
+                    Some(Some(v))
+                }
+            };
+        }
+        r
+    }
+}
+
+/// The per-channel destination dependence of the program's colour output, reduced to the
+/// window coefficients that gate its CROSS-channel terms - see [`dual_source_plan`].
+///
+/// Values are tracked per HALF-LANE of the register file (an F16 program addresses halves; an
+/// F32 instruction on register `i` covers halves `2i` and `2i+1`), which is the one addressing
+/// under which a 32-bit move of a register holding two halves and a half-precision read of one
+/// of them agree. Componentwise ops (the only ones the linearity proof admits) feed channel
+/// `c` of the destination from channel `c` of each source, after the source swizzle - so a
+/// cross-channel term can only enter through a swizzle, which is exactly where it is caught.
+/// A coefficient is a lane a `ldmem` wrote from the window; multiplying a destination term by
+/// one gates it. Anything this cannot follow - an indexed operand, a coefficient with no
+/// window provenance - is refused rather than guessed.
+fn cross_channel_gates(shader: &Shader, uniform_regs: u32, literals: &[(u32, u32)]) -> Result<Vec<DualCoef>, String> {
+    use crate::ir::{Bank, BitwiseKind};
+    use std::collections::HashMap;
+    fn bank_id(b: Bank) -> Option<u8> {
+        Some(match b {
+            Bank::Temp => 0,
+            Bank::PrimaryAttr => 1,
+            Bank::Output => 2,
+            Bank::SecondaryAttr => 3,
+            Bank::Internal => 4,
+            Bank::Constant => 5,
+            Bank::Global => 6,
+            Bank::Immediate => 7,
+            Bank::Indexed | Bank::Index | Bank::Raw(_) => return None,
+        })
+    }
+    // The half lanes an operand's channel `sel` (a lane selector 0..3) covers, low half first.
+    fn lanes(bank: Bank, index: u8, sel: u32, half: bool) -> Vec<u32> {
+        let half = half && !matches!(bank, Bank::Internal);
+        if half {
+            vec![2 * index as u32 + sel]
+        } else {
+            let r = index as u32 + sel;
+            vec![2 * r, 2 * r + 1]
+        }
+    }
+    let is_move = |op: &Op| matches!(op, Op::Mov | Op::Bitwise { kind: BitwiseKind::Or, imm: Some(0), .. });
+    let color = color_output(shader);
+    let precision = color_precision(shader, color);
+    let mut dep: HashMap<(u8, u32), Dep> = HashMap::new();
+    let mut prov: HashMap<(u8, u32), DualCoef> = HashMap::new();
+    // The fragment default uniform buffer: SA registers below the carried extent hold
+    // per-draw bytes the renderer captures (`frag_sa`), so a coefficient read from one is a
+    // gate the draw can be tested against. Registers above it are container LITERALS, which
+    // no draw changes - a term they multiply is refused as ungated if it crosses channels.
+    for r in 0..uniform_regs {
+        for h in 0..2u32 {
+            prov.insert((3, 2 * r + h), DualCoef::Uniform { byte: 4 * r + 2 * h, len: 2 });
+        }
+    }
+    for &(r, v) in literals {
+        for h in 0..2u32 {
+            if (v >> (16 * h)) & 0xffff == 0 {
+                prov.insert((3, 2 * r + h), DualCoef::Zero);
+            } else {
+                prov.remove(&(3, 2 * r + h));
+            }
+        }
+    }
+    // The destination seeds the O bank in the colour's own layout (`dest_color_init`).
+    for c in 0..4u32 {
+        let mut d = Dep::default();
+        d.on[c as usize] = Some(None);
+        match precision {
+            ColorPrecision::F32 => {
+                dep.insert((2, 2 * c), d.clone());
+                dep.insert((2, 2 * c + 1), d);
+            }
+            ColorPrecision::F16 => {
+                dep.insert((2, c), d);
+            }
+            ColorPrecision::Fx8 => {
+                let all = Dep { on: [Some(None), Some(None), Some(None), Some(None)] };
+                dep.insert((2, 0), all.clone());
+                dep.insert((2, 1), all);
+            }
+        }
+    }
+    let trace = std::env::var_os("VITASLOP_GXP_DUAL_TRACE").is_some();
+    if trace {
+        eprintln!("  uniform_regs={uniform_regs} literals={literals:x?}");
+    }
+    for instr in &shader.instrs {
+        let half = instr.half_precision;
+        if let Op::MemLoad { elements, offset_bytes } = instr.op {
+            if std::env::var_os("VITASLOP_GXP_DUAL_TRACE").is_some() {
+                eprintln!("  ldmem elements={elements} offset={offset_bytes} dest={:?} srcs={:?}", instr.dest.as_ref().map(|d| (d.bank, d.index)), instr.srcs.iter().map(|o| (o.bank, o.index)).collect::<Vec<_>>());
+            }
+            let (Some(d), Some(p)) = (instr.dest.as_ref(), instr.srcs.first()) else {
+                return Err("a load with no destination or pointer".into());
+            };
+            let db = bank_id(d.bank).ok_or("an indexed load destination")?;
+            for k in 0..elements as u32 {
+                for h in 0..2u32 {
+                    let lane = 2 * (d.index as u32 + k) + h;
+                    dep.remove(&(db, lane));
+                    if p.bank == Bank::SecondaryAttr && instr.srcs.len() == 1 {
+                        prov.insert(
+                            (db, lane),
+                            DualCoef::Window { base_sa: p.index as u32, byte: offset_bytes + 4 * k + 2 * h, len: 2 },
+                        );
+                    } else {
+                        prov.remove(&(db, lane));
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(d) = instr.dest.as_ref() else { continue };
+        let db = bank_id(d.bank).ok_or_else(|| format!("an indexed destination at {:?}", instr.op))?;
+        // Every channel's sources are read BEFORE any channel's lanes are written, so a
+        // swizzle reading a lane this instruction also writes sees the old value. Per source
+        // and channel: the dependence and coefficient of EACH half lane it covers.
+        let read = |op: &Operand, c: usize| -> Option<Vec<(Dep, Option<DualCoef>)>> {
+            let b = bank_id(op.bank)?;
+            let sel = op.swizzle[c] as u32;
+            if sel > 3 {
+                return Some(vec![(Dep::default(), None)]);
+            }
+            Some(
+                lanes(op.bank, op.index, sel, half)
+                    .into_iter()
+                    .map(|l| (dep.get(&(b, l)).cloned().unwrap_or_default(), prov.get(&(b, l)).copied()))
+                    .collect(),
+            )
+        };
+        let mut per_channel: Vec<Option<Vec<Vec<(Dep, Option<DualCoef>)>>>> = Vec::with_capacity(4);
+        for c in 0..4usize {
+            if !instr.write_mask[c] {
+                per_channel.push(None);
+                continue;
+            }
+            let v = instr.srcs.iter().map(|s| read(s, c)).collect::<Option<Vec<_>>>();
+            per_channel.push(Some(v.ok_or_else(|| format!("an indexed source at {:?}", instr.op))?));
+        }
+        let _ = read;
+        for c in 0..4usize {
+            let Some(srcs) = per_channel[c].take() else { continue };
+            let dlanes = lanes(d.bank, d.index, c as u32, half);
+            if trace {
+                eprintln!(
+                    "  {:?} half={} dest={:?}[{}] mask={:?} srcs={:?} deps={:?}",
+                    instr.op, half, (d.bank, d.index), c, instr.write_mask,
+                    instr.srcs.iter().map(|o| (o.bank, o.index, o.swizzle)).collect::<Vec<_>>(),
+                    srcs.iter().map(|ls| ls.iter().map(|(dd, k)| (dd.on.iter().map(|x| x.as_ref().map(|g| g.as_ref().map(|v| v.len()))).collect::<Vec<_>>(), *k)).collect::<Vec<_>>()).collect::<Vec<_>>()
+                );
+            }
+            // A 32-bit MOVE of a register holding two halves moves each half on its own; an
+            // arithmetic op on a 32-bit float consumes both halves as one value.
+            let per_lane_moves = is_move(&instr.op) && dlanes.len() == 2 && srcs.len() == 1 && srcs[0].len() == 2;
+            let combine = |lane_of_src: &dyn Fn(&Vec<(Dep, Option<DualCoef>)>) -> (Dep, Option<DualCoef>)| -> Result<Dep, String> {
+                let s: Vec<(Dep, Option<DualCoef>)> = srcs.iter().map(&lane_of_src).collect();
+                if !s.iter().any(|(d, _)| !d.is_clean()) {
+                    return Ok(Dep::default());
+                }
+                Ok(match instr.op {
+                    Op::Add | Op::Mov => s.iter().fold(Dep::default(), |a, (d, _)| a.union(d)),
+                    Op::Bitwise { kind: BitwiseKind::Or, imm: Some(0), .. } if s.len() == 1 => s[0].0.clone(),
+                    Op::Mul | Op::Mad => {
+                        let (a, b) = (&s[0], s.get(1).ok_or("a one-operand multiply")?);
+                        let product = match (a.0.is_clean(), b.0.is_clean()) {
+                            (true, true) => Dep::default(),
+                            (false, true) => match b.1 {
+                                Some(DualCoef::Zero) => Dep::default(),
+                                Some(k) => a.0.gated_by(k),
+                                None => a.0.clone(),
+                            },
+                            (true, false) => match a.1 {
+                                Some(DualCoef::Zero) => Dep::default(),
+                                Some(k) => b.0.gated_by(k),
+                                None => b.0.clone(),
+                            },
+                            (false, false) => return Err(format!("a product of two destination terms at {:?}", instr.op)),
+                        };
+                        match (instr.op, s.get(2)) {
+                            (Op::Mad, Some((cd, _))) => product.union(cd),
+                            _ => product,
+                        }
+                    }
+                    op => return Err(format!("{op:?} over a destination term")),
+                })
+            };
+            let news: Vec<Dep> = if per_lane_moves {
+                vec![combine(&|ls| ls[0].clone())?, combine(&|ls| ls[1].clone())?]
+            } else {
+                // One value over all of a source's lanes: union the deps; a coefficient only
+                // if the whole word is one (a 32-bit read of a window word or uniform register).
+                let whole = |ls: &Vec<(Dep, Option<DualCoef>)>| -> (Dep, Option<DualCoef>) {
+                    let d = ls.iter().fold(Dep::default(), |a, (x, _)| a.union(x));
+                    let k = match ls.as_slice() {
+                        [(_, k)] => *k,
+                        [(_, Some(DualCoef::Window { base_sa, byte, .. })), (_, Some(DualCoef::Window { .. }))] => {
+                            Some(DualCoef::Window { base_sa: *base_sa, byte: *byte, len: 4 })
+                        }
+                        [(_, Some(DualCoef::Uniform { byte, .. })), (_, Some(DualCoef::Uniform { .. }))] => {
+                            Some(DualCoef::Uniform { byte: *byte, len: 4 })
+                        }
+                        [(_, Some(DualCoef::Zero)), (_, Some(DualCoef::Zero))] => Some(DualCoef::Zero),
+                        _ => None,
+                    };
+                    (d, k)
+                };
+                let one = combine(&whole)?;
+                dlanes.iter().map(|_| one.clone()).collect()
+            };
+            for (l, new) in dlanes.iter().zip(news) {
+                prov.remove(&(db, *l));
+                if instr.pred == Predicate::Always {
+                    if new.is_clean() {
+                        dep.remove(&(db, *l));
+                    } else {
+                        dep.insert((db, *l), new);
+                    }
+                } else if !new.is_clean() {
+                    let merged = dep.get(&(db, *l)).map_or(new.clone(), |old| old.union(&new));
+                    dep.insert((db, *l), merged);
+                }
+            }
+        }
+    }
+    // The colour the program returns, channel by channel.
+    let (ob, base) = match color {
+        ColorOutput::NativeO0 => (2u8, 0u32),
+        ColorOutput::NonNativePa(b) => (1u8, b),
+    };
+    let mut gates: Vec<DualCoef> = Vec::new();
+    for c in 0..4u32 {
+        let ls: Vec<u32> = match precision {
+            ColorPrecision::F32 => vec![2 * (base + c), 2 * (base + c) + 1],
+            ColorPrecision::F16 => vec![2 * base + c],
+            ColorPrecision::Fx8 => vec![2 * base, 2 * base + 1],
+        };
+        let mut d = Dep::default();
+        for l in ls {
+            if let Some(x) = dep.get(&(ob, l)) {
+                d = d.union(x);
+            }
+        }
+        for (src, on) in d.on.iter().enumerate() {
+            if src as u32 == c {
+                continue;
+            }
+            match on {
+                None => {}
+                Some(None) => {
+                    return Err(format!("output channel {c} depends on destination channel {src} with no per-draw coefficient gating it"))
+                }
+                Some(Some(v)) => {
+                    for g in v {
+                        if !gates.contains(g) {
+                            gates.push(*g);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(gates)
+}
+
+/// Whether the destination read is declared at all - [`DEST_COLOR_READ`] AND the program.
+pub fn declares_dest_color(shader: &Shader) -> bool {
+    DEST_COLOR_READ.load(core::sync::atomic::Ordering::Relaxed) && reads_output_bank(shader)
+}
+
+/// Recognise a blend the fragment program performs ITSELF over the destination colour, rewrite
+/// the program to emit only its SOURCE term, and return the equation for the pipeline.
+///
+/// # Why this exists
+/// A fragment program's output registers are the ROP's destination colour fed back, and a
+/// program is free to blend in ordinary ALU. Serving that faithfully needs a copy of the colour
+/// attachment taken immediately before the draw, which costs a RENDER-PASS SPLIT - and on one
+/// retail title that was **42 splits over 145 draws in a single frame**, five shader pairs
+/// accounting for 41 of them. A tiling GPU stores and reloads its tiles at every split.
+///
+/// Most of those equations are ordinary blends written longhand, and a blend is exactly what the
+/// pipeline can do for free. This is the same move [`crate::rop_blend`] makes for the SOP2
+/// epilogue form, one level up: recover the equation, emit only the source term, let the ROP do
+/// the rest. What is left over - a colour grade that takes a DOT PRODUCT of the destination, a
+/// `max` against it - is not a blend in any hardware's sense and keeps its split.
+///
+/// # The shapes, and the algebra that says each is exact
+/// Every one was read off a shipped program; `C` is the register the colour epilogue copies,
+/// `O` the output register, `K` a uniform, `X` an ordinary value.
+///
+/// * **LERP, alpha already in the colour register** (`frag_8713c840`, `frag_8713c9a0` - a
+///   title's whole HUD, 26 of the 42 splits):
+///   ```text
+///     Add  T = -O + C          ; C.w already holds the alpha (a Pack put it there)
+///     Mad  C = T * C.wwww + O  ; = O + (C - O) * C.w
+///     Mov  O = C
+///   ```
+///   `out = C*a + O*(1-a)` with `a = C.w`: `SrcAlpha / OneMinusSrcAlpha`, shader emitting `C`.
+///   The ALPHA channel closes too - the program computes `(C.w - O.w)*C.w + O.w` and the blend
+///   computes `C.w*C.w + O.w*(1-C.w)`, the same value.
+///
+/// * **LERP, factor recomputed from the same two registers** (`frag_912c9380`, `frag_9129ebe0`):
+///   ```text
+///     Mad  T = C * K - O
+///     Mul  C = K.wwww * C.wwww ; the lerp factor, broadcast
+///     Mad  C = T * C + O
+///     Mov  O = C
+///   ```
+///   `out = O + (C*K - O) * (K.w*C.w)`, and that factor IS `(C*K).w` - so the same
+///   `SrcAlpha / OneMinusSrcAlpha` with the shader emitting `C*K`, which is what `T` becomes
+///   once its `- O` term is dropped. The epilogue is redirected to read `T`.
+///
+/// * **MODULATE** (`frag_87621c00`, 8 of the 42 splits): `Mul C = O * K; Mov O = C` is
+///   `Zero / Src` with the shader emitting `K`.
+///
+/// * **ADDITIVE, destination alpha kept** (`frag_865af860`, `frag_907b4f80`):
+///   `Mad C = X * K + O; Pack C.w = O.w; Mov O = C` is `One / One` on colour and `Zero / One`
+///   on alpha. The Pack is REQUIRED for this arm: without it the alpha equation is a different
+///   one and this returns `None` rather than guess which.
+///
+/// # What is refused, and why that matters more than what is accepted
+/// Every field is pinned: the output operand must be register 0 read whole with no modifier, the
+/// write masks must cover all four channels, the instructions must be unpredicated, and the
+/// epilogue `Mov` must be the LAST instruction. After the rewrite the program must not read the
+/// output bank AT ALL - that final check is what makes a partial match impossible, because a
+/// program still reading the destination somewhere else would be blended twice. Anything
+/// unmatched returns `None`, keeps its ALU blend, and pays for a destination copy.
+pub fn lower_dest_blend(shader: &mut Shader) -> Option<DestBlend> {
+    if DEST_BLEND_LOWERING.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    if shader.kind != crate::container::ProgramKind::Fragment {
+        return None;
+    }
+    let mut work = shader.clone();
+    let blend = match_dest_blend(&mut work)?;
+    // The whole-program guard: a rewrite that leaves ANY other read of the destination would be
+    // blended twice, once in the shader and once by the ROP.
+    if reads_output_bank(&work) {
+        return None;
+    }
+    *shader = work;
+    Some(blend)
+}
+
+/// A plain `.xyzw` operand with no modifier.
+fn ident(op: &Operand) -> bool {
+    op.swizzle == [0, 1, 2, 3] && !op.abs && !op.neg
+}
+
+/// The output register the colour epilogue writes, read whole: `o0.xyzw`, optionally negated.
+fn is_output0(op: &Operand, neg: bool) -> bool {
+    op.bank == Bank::Output
+        && op.index == 0
+        && op.swizzle == [0, 1, 2, 3]
+        && !op.abs
+        && op.neg == neg
+}
+
+/// The same register, whatever the swizzle.
+fn same_reg(a: &Operand, b: &Operand) -> bool {
+    a.bank == b.bank && a.index == b.index
+}
+
+/// `reg.wwww` - one channel broadcast, which is how a scalar alpha reaches four lanes.
+fn broadcast_w(op: &Operand) -> bool {
+    op.swizzle == [3, 3, 3, 3] && !op.abs && !op.neg
+}
+
+fn always(i: &Instr) -> bool {
+    i.pred == Predicate::Always && i.write_mask == [true; 4]
+}
+
+/// The tail-matching half of [`lower_dest_blend`], on a shader it is free to mutate.
+fn match_dest_blend(sh: &mut Shader) -> Option<DestBlend> {
+    const LERP: DestBlend = DestBlend {
+        color: BlendTerm { src: BlendFactor::SrcAlpha, dst: BlendFactor::OneMinusSrcAlpha },
+        alpha: BlendTerm { src: BlendFactor::SrcAlpha, dst: BlendFactor::OneMinusSrcAlpha },
+    };
+    const MODULATE: DestBlend = DestBlend {
+        color: BlendTerm { src: BlendFactor::Zero, dst: BlendFactor::Src },
+        alpha: BlendTerm { src: BlendFactor::Zero, dst: BlendFactor::Src },
+    };
+    const ADDITIVE: DestBlend = DestBlend {
+        color: BlendTerm { src: BlendFactor::One, dst: BlendFactor::One },
+        alpha: BlendTerm { src: BlendFactor::Zero, dst: BlendFactor::One },
+    };
+    let n = sh.instrs.len();
+    if n < 2 {
+        return None;
+    }
+    // The colour epilogue: the LAST instruction, a plain move of one register into `o0`.
+    let mov = &sh.instrs[n - 1];
+    if !matches!(mov.op, Op::Mov) || mov.pred != Predicate::Always {
+        return None;
+    }
+    let dest = mov.dest.as_ref()?;
+    if dest.bank != Bank::Output || dest.index != 0 {
+        return None;
+    }
+    let csrc = *mov.srcs.first()?;
+    if csrc.abs || csrc.neg {
+        return None;
+    }
+
+    // ---- MODULATE: `Mul C = O * K` ----
+    if let Some(prev) = sh.instrs.get(n - 2)
+        && matches!(prev.op, Op::Mul)
+        && always(prev)
+        && prev.dest.as_ref().is_some_and(|d| same_reg(d, &csrc))
+        && prev.srcs.len() == 2
+    {
+        let (a, b) = (&prev.srcs[0], &prev.srcs[1]);
+        let k = match (is_output0(a, false), is_output0(b, false)) {
+            (true, false) if ident(b) => Some(*b),
+            (false, true) if ident(a) => Some(*a),
+            _ => None,
+        };
+        if let Some(k) = k
+            && form_enabled(FORM_MODULATE)
+        {
+            let i = n - 2;
+            sh.instrs[i].op = Op::Mov;
+            sh.instrs[i].srcs = vec![k];
+            return Some(MODULATE);
+        }
+    }
+
+    // ---- LERP and ADDITIVE both end in a `Mad ... + O`. ADDITIVE may carry a `Pack C.w = O.w`
+    // ---- between that Mad and the epilogue.
+    let mut pack_at: Option<usize> = None;
+    let mut mad_at = n.checked_sub(2)?;
+    if let Some(p) = sh.instrs.get(mad_at)
+        && matches!(p.op, Op::Pack { .. })
+        && p.pred == Predicate::Always
+        && p.write_mask == [false, false, false, true]
+        && p.dest.as_ref().is_some_and(|d| same_reg(d, &csrc))
+        && p.srcs.first().is_some_and(|s| {
+            s.bank == Bank::Output && s.index == 0 && s.swizzle[3] == 3 && !s.neg && !s.abs
+        })
+    {
+        pack_at = Some(mad_at);
+        mad_at = mad_at.checked_sub(1)?;
+    }
+    let mad = sh.instrs.get(mad_at)?.clone();
+    if !matches!(mad.op, Op::Mad)
+        || !always(&mad)
+        || mad.srcs.len() != 3
+        || !is_output0(&mad.srcs[2], false)
+    {
+        return None;
+    }
+    let mad_dest = *mad.dest.as_ref()?;
+    if !same_reg(&mad_dest, &csrc) {
+        return None;
+    }
+
+    // ---- ADDITIVE: `Mad C = X * K + O` with the destination alpha packed back in ----
+    if let Some(pack) = pack_at {
+        if !ident(&mad.srcs[0]) || !ident(&mad.srcs[1]) || !form_enabled(FORM_ADDITIVE) {
+            return None;
+        }
+        sh.instrs[mad_at].op = Op::Mul;
+        sh.instrs[mad_at].srcs.truncate(2);
+        sh.instrs.remove(pack);
+        return Some(ADDITIVE);
+    }
+
+    // ---- LERP: `Mad C = T * a + O` ----
+    let t = mad.srcs[0];
+    let factor = mad.srcs[1];
+    if !ident(&t) || !form_enabled(FORM_LERP) {
+        return None;
+    }
+    let prev_at = mad_at.checked_sub(1)?;
+    let prev = sh.instrs.get(prev_at)?.clone();
+
+    // ---- Forms A and C: `Add D = -O + S` then `Mad C = D * S.wwww + O`.
+    //
+    // Both are the SAME equation - `out = S*S.w + O*(1-S.w)`, `SrcAlpha / OneMinusSrcAlpha`
+    // with the shader emitting `S`. They differ only in WHICH of the two registers the colour
+    // epilogue copies, and that decides whether the epilogue has to be redirected:
+    //
+    //   * A (`frag_8713c840`, `frag_8713c9a0`): `S` IS the register the epilogue copies, and
+    //     the difference goes to a separate one. Dropping the two instructions leaves the
+    //     epilogue reading `S` already.
+    //   * C (`frag_87140cb0`, `frag_87151ba0`): the DIFFERENCE is written back over the
+    //     register the epilogue copies, and the source term lives in another (a temp, or a
+    //     second PA register). Dropping the two would leave the epilogue reading a register
+    //     nothing writes, so it is redirected at `S` - the same move form B already makes.
+    //
+    // C is worth having on its own numbers: it is 2 of this title's 6 remaining
+    // destination-reading fragment programs, and each one is a render-pass split per draw.
+    if matches!(prev.op, Op::Add)
+        && always(&prev)
+        && prev.dest.as_ref().is_some_and(|d| same_reg(d, &t))
+        && prev.srcs.len() == 2
+        && is_output0(&prev.srcs[0], true)
+        && ident(&prev.srcs[1])
+        && broadcast_w(&factor)
+        && same_reg(&factor, &prev.srcs[1])
+    {
+        let src_term = prev.srcs[1];
+        let redirect = !same_reg(&src_term, &csrc);
+        if redirect && !form_enabled(FORM_LERP_SRC) {
+            return None;
+        }
+        sh.instrs.remove(mad_at);
+        sh.instrs.remove(prev_at);
+        if redirect {
+            let last = sh.instrs.len() - 1;
+            let sw = sh.instrs[last].srcs[0].swizzle;
+            sh.instrs[last].srcs[0] = Operand { swizzle: sw, ..src_term };
+        }
+        return Some(LERP);
+    }
+
+    // Form B: the lerp factor is recomputed as `K.w * C.w`, and `T = C * K - O`.
+    if !matches!(prev.op, Op::Mul)
+        || !always(&prev)
+        || !prev.dest.as_ref().is_some_and(|d| same_reg(d, &csrc))
+        || prev.srcs.len() != 2
+        || !broadcast_w(&prev.srcs[0])
+        || !broadcast_w(&prev.srcs[1])
+        || !same_reg(&factor, &csrc)
+        || !ident(&factor)
+    {
+        return None;
+    }
+    let src_at = prev_at.checked_sub(1)?;
+    let src_mad = sh.instrs.get(src_at)?.clone();
+    if !matches!(src_mad.op, Op::Mad)
+        || !always(&src_mad)
+        || !src_mad.dest.as_ref().is_some_and(|d| same_reg(d, &t))
+        || src_mad.srcs.len() != 3
+        || !is_output0(&src_mad.srcs[2], true)
+        || !ident(&src_mad.srcs[0])
+        || !ident(&src_mad.srcs[1])
+    {
+        return None;
+    }
+    // The two broadcasts must be the `w` of the same two registers the source term multiplies,
+    // or the factor is not `(C*K).w` and this lowering would be a guess.
+    let (p0, p1) = (&prev.srcs[0], &prev.srcs[1]);
+    let (m0, m1) = (&src_mad.srcs[0], &src_mad.srcs[1]);
+    if !((same_reg(p0, m0) && same_reg(p1, m1)) || (same_reg(p0, m1) && same_reg(p1, m0))) {
+        return None;
+    }
+    // `T` becomes the source term itself, and the epilogue is redirected to read it.
+    sh.instrs[src_at].op = Op::Mul;
+    sh.instrs[src_at].srcs.truncate(2);
+    sh.instrs.remove(mad_at);
+    sh.instrs.remove(prev_at);
+    let last = sh.instrs.len() - 1;
+    let sw = sh.instrs[last].srcs[0].swizzle;
+    sh.instrs[last].srcs[0] = Operand { swizzle: sw, ..t };
+    Some(LERP)
+}
+
+/// >>> IS THE PROGRAM LINEAR IN THE DESTINATION COLOUR - `out = dst*F + G`?
+///
+/// # Why this question, and why it needs a PROOF rather than three hand-derivations
+/// [`match_dest_blend`] recovers a blend by matching the last few instructions against known
+/// SHAPES. That works while a title's blends are the handful of idioms its compiler emits, and
+/// it ran out on a sports title: its three destination-reading fragment programs match nothing,
+/// read the destination TWICE each, and interleave the two reads through eight instructions of
+/// per-pixel arithmetic. Adding a fourth, fifth and sixth shape for them would be three more
+/// tail patterns that the next title breaks again.
+///
+/// They do have one thing in common, and it is a PROPERTY rather than a pattern: every one is
+/// LINEAR in the destination. Collect the terms of any of them and it is
+///
+/// ```text
+///   out = dst * F + G      with F and G computed per pixel from varyings and uniforms
+/// ```
+///
+/// Fixed-function blending cannot express that - it offers exactly one shader-computed factor
+/// (`BlendFactor::Src`, which is what MODULATE uses) and this needs two - but DUAL-SOURCE
+/// blending can: emit `G` as `src0` and `F` as `src1`, and the ROP computes `One*src0 +
+/// Src1*dst`. The user's phone offers `dual-source-blending`
+/// [[vitaslop-the-phone-has-dual-source-blending]].
+///
+/// # What this function proves, and what it deliberately refuses
+/// The decomposition is only sound if the program really is linear, so this TAINTS every value
+/// derived from the output bank and checks that each one is consumed only by an operation that
+/// is linear in it:
+///
+/// * `Add` - linear in both sides.
+/// * `Mul` / `Mad` - linear in a tainted operand ONLY IF the other multiplicand is untainted.
+///   `dst * dst` is quadratic and is refused, which is the whole point of tracking taint rather
+///   than pattern-matching a tail.
+/// * `Mov` - a swizzled copy, linear.
+///
+/// EVERYTHING ELSE with a tainted source is refused: `Min`/`Max`/`Cmov` are piecewise (linear
+/// on each side of a branch the destination itself can move), `Dot` multiplies lanes together,
+/// `Rcp`/`Rsq`/`Log`/`Exp` are not linear at all, and `Sop2` is a fixed-point combiner whose
+/// coefficients can BE the operand ([`SopFactor`] says so). A refusal costs a render-pass split,
+/// which is what happens today; a wrong acceptance silently paints a different picture.
+///
+/// >>> `Bitwise` IS ACCEPTED FOR ONE SPELLING ONLY, AND IT IS NOT AN INDULGENCE. All three of
+/// that title's programs read their second output register as `o1 | 0` - a 32-bit OR with an
+/// immediate ZERO, which is the identity on the bit pattern and is how this compiler spells "move
+/// these bits". A move is linear. Any other bitwise op, any other immediate, or a register second
+/// operand is refused: a shift or a mask of a float's bits is not linear in the float.
+pub fn dest_is_linear(shader: &Shader) -> bool {
+    dest_is_linear_or_why(shader).is_ok()
+}
+
+/// [`dest_is_linear`], naming the INSTRUCTION that refused it.
+///
+/// >>> A REFUSAL THAT NAMES NOTHING CANNOT BE ACTED ON. "not linear in the destination" was
+/// the whole of what a refused program said, and every fragment program in every title that
+/// keeps its pass split said exactly that sentence - so the question "what would we have to
+/// support to stop splitting" had no answer short of dumping the blob and reading it by hand.
+/// A destination read through `Min`/`Max` is a case the ROP can express natively
+/// (`BlendOperation::Min`/`Max`); one through `Frc` or a texture fetch is not. Those want
+/// completely different work and the message could not tell them apart.
+pub fn dest_is_linear_or_why(shader: &Shader) -> Result<(), String> {
+    use crate::ir::{Bank, BitwiseKind};
+    // Tainted (bank, index) pairs: values derived from the output bank. Whole registers, not
+    // lanes - a per-lane taint would be more precise and there is no evidence any program needs
+    // it, and the imprecision is on the SAFE side: it can only refuse a program, never accept a
+    // nonlinear one. Keyed by [`bank_id`], which [`first_dest_reader`] shares so the two walks
+    // cannot drift apart.
+    let key = |op: &Operand| (bank_id(op.bank), op.index);
+    let mut tainted: std::collections::HashSet<(u8, u8)> = Default::default();
+    let is_tainted = |t: &std::collections::HashSet<(u8, u8)>, op: &Operand| {
+        op.bank == Bank::Output || t.contains(&key(op))
+    };
+    let mut any = false;
+
+    for (ix, instr) in shader.instrs.iter().enumerate() {
+        let srcs = &instr.srcs;
+        let hit: Vec<bool> = srcs.iter().map(|s| is_tainted(&tainted, s)).collect();
+        let touches = hit.iter().any(|h| *h);
+        if !touches {
+            // Still have to KILL a tainted destination that is overwritten by clean data -
+            // otherwise a register reused as a scratch stays tainted for the rest of the
+            // program and the analysis refuses shaders it should accept.
+            if let Some(d) = instr.dest.as_ref()
+                && instr.write_mask == [true; 4]
+                && instr.pred == Predicate::Always
+            {
+                tainted.remove(&key(d));
+            }
+            continue;
+        }
+        any = true;
+        // `|dst|` is not linear in `dst` whatever the instruction does with it afterwards, so
+        // an absolute-value modifier on a tainted operand is refused outright (negation is
+        // linear and passes).
+        if srcs.iter().zip(&hit).any(|(s, h)| *h && s.abs) {
+            return Err(format!(
+                "instruction #{ix} {:?} takes the ABSOLUTE VALUE of a destination-derived                  operand, which is not linear in it whatever follows",
+                instr.op
+            ));
+        }
+        let linear = match instr.op {
+            Op::Add | Op::Mov => true,
+            // `Mad dest = a*b + c`: the PRODUCT must have at most one tainted side. `c` may be
+            // tainted freely - that is the `+ dst` every one of these blends ends on.
+            Op::Mad => !(hit.first() == Some(&true) && hit.get(1) == Some(&true)),
+            Op::Mul => !(hit.first() == Some(&true) && hit.get(1) == Some(&true)),
+            // See the note above: `x | 0` is a move of the bit pattern and nothing else is.
+            Op::Bitwise { kind: BitwiseKind::Or, imm: Some(0), .. } => srcs.len() == 1,
+            _ => false,
+        };
+        if !linear {
+            return Err(format!(
+                "instruction #{ix} {:?} uses a destination-derived operand non-linearly",
+                instr.op
+            ));
+        }
+        // A predicated or partially-masked write leaves the register holding a MIX of the old
+        // value and the new one. That is still linear if both are, but this analysis does not
+        // track the old value once it has been overwritten, so it taints conservatively.
+        if let Some(d) = instr.dest.as_ref() {
+            tainted.insert(key(d));
+        }
+    }
+    if any {
+        Ok(())
+    } else {
+        Err("no instruction uses the destination at all".into())
+    }
+}
+
+/// The index of the FIRST instruction that reads the destination colour, directly or through a
+/// register derived from it - or `None` when no instruction does.
+///
+/// >>> HALF OF A DUAL-SOURCE BODY DOES NOT DEPEND ON THE DESTINATION, AND IT IS EVALUATED TWICE.
+///
+/// The dual-source lowering evaluates the body once with the destination forced to zero and
+/// once with it forced to one ([`dual_source_plan`]). Everything BEFORE this index computes the
+/// same values in both passes - it reads varyings, uniforms and textures and never the output
+/// bank - so it only has to run once. In mlb's world-family blend, which is 78% of the world
+/// pass's fragments, three quarters of the body is that prefix.
+///
+/// The taint walk is [`dest_is_linear`]'s, and the two must agree by construction: the
+/// instruction this returns is the first one that walk calls `touches`. The kill rule is the
+/// same too - a register overwritten by clean data stops being tainted - because a register
+/// reused as scratch after the blend would otherwise drag the whole rest of the program into
+/// the suffix.
+pub fn first_dest_reader(shader: &Shader) -> Option<usize> {
+    use crate::ir::Bank;
+    let key = |op: &Operand| (bank_id(op.bank), op.index);
+    let mut tainted: std::collections::HashSet<(u8, u8)> = Default::default();
+    for (i, instr) in shader.instrs.iter().enumerate() {
+        let touches = instr
+            .srcs
+            .iter()
+            .any(|s| s.bank == Bank::Output || tainted.contains(&key(s)));
+        if touches {
+            return Some(i);
+        }
+        if let Some(d) = instr.dest.as_ref()
+            && instr.write_mask == [true; 4]
+            && instr.pred == Predicate::Always
+        {
+            tainted.remove(&key(d));
+        }
+    }
+    None
+}
+
+/// A small local id per [`Bank`], so the taint sets key on something `Hash`/`Ord` without the
+/// IR growing those derives for one analysis's scratch.
+fn bank_id(b: Bank) -> u8 {
+    match b {
+        Bank::Temp => 0,
+        Bank::PrimaryAttr => 1,
+        Bank::Output => 2,
+        Bank::SecondaryAttr => 3,
+        Bank::Internal => 4,
+        Bank::Constant => 5,
+        Bank::Global => 6,
+        Bank::Immediate => 7,
+        Bank::Indexed => 8,
+        Bank::Index => 9,
+        Bank::Raw(_) => 10,
+    }
+}
+
+/// Whether any instruction SOURCES the output bank - see [`BindingPlan::reads_dest_color`].
+///
+/// Conservative on purpose: a read anywhere in the program counts, without asking whether the
+/// program had already written that register. Getting it wrong the other way costs a black or
+/// stale destination on a draw that blends, which is exactly the failure this exists to end;
+/// getting it wrong this way costs one attachment copy on a draw that did not need it.
+///
+/// # The SOP2 family is excluded, and that is not an exception - it is the other answer
+/// An 8-bit SOP2 ([`Op::Sop2`]) whose second operand is the output register is the ROP blend
+/// *by construction*, and this translator already has an answer for that one:
+/// [`crate::rop_blend`] recovers the equation as PIPELINE state and the emitter renders the
+/// instruction as its source term. Counting it here as well would ask for an attachment copy
+/// the draw does not need - and on a program where `rop_blend` DID recognise the word, it would
+/// apply the destination twice, once in the shader and once in the blend.
+///
+/// MEASURED: one title's whole corpus has exactly one such program (`frag_81a7faa4`, a
+/// `PackUnorm8` + SOP2 alpha epilogue whose second coefficient is ZERO), and without this it
+/// would pay a render-pass split per draw for a term multiplied by nothing.
+pub fn reads_output_bank(shader: &Shader) -> bool {
+    shader.instrs.iter().any(|i| {
+        !matches!(i.op, Op::Sop2 { .. })
+            && i.srcs.iter().any(|s| s.bank == Bank::Output)
+    })
+}
+
+/// The WGSL that seeds the O bank with the DESTINATION colour, for a program that reads it.
+///
+/// The layout is the colour's own: the register file is untyped 32-bit storage, so the halves
+/// or bytes have to go back in exactly the way the program's arithmetic will read them out -
+/// the same correspondence [`color_return_expr`] uses in the other direction. Reading an F16
+/// destination as four F32 registers is the denormal-black failure
+/// [[vitaslop-f16-colour-output]] records, run backwards.
+pub(crate) fn dest_color_init(precision: ColorPrecision, dual_source: bool, alpha_to_red: bool) -> String {
+    let mut s = String::new();
+    if dual_source {
+        // The dual-source body takes the destination as a PARAMETER - it is evaluated once with
+        // zero and once with one, see `dual_source_eligible` - so there is no texture to load.
+        let _ = writeln!(s, "  let gxp_dstc = gxp_dstc_in;");
+        push_dest_seed(&mut s, precision);
+        return s;
+    }
+    // Diagnostic (`VITASLOP_GXP_DEST_POISON=<r,g,b,a>`): seed the output bank with a CONSTANT
+    // instead of the attachment copy. A self-blending program mixes the destination into
+    // everything it writes, so "is this draw's picture wrong because the shader is wrong or
+    // because the destination it was handed is wrong" has no answer from the frame - both
+    // produce a wrong colour everywhere the draw covers. A constant separates them in one run:
+    // with the poison in, whatever remains of the destination in the picture is the shader's
+    // own doing [[vitaslop-poison-separates-a-guest-zero-from-an-unwritten-one]].
+    match dest_poison() {
+        Some(c) => {
+            let _ = writeln!(
+                s,
+                "  let gxp_dstc = vec4<f32>({:?}, {:?}, {:?}, {:?}); // POISONED",
+                c[0], c[1], c[2], c[3]
+            );
+            let _ = writeln!(s, "  _ = textureLoad(gxp_dst, vec2<i32>(0, 0), 0);");
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "  let gxp_dstc = textureLoad(gxp_dst, vec2<i32>(in.frag_coord.xy), 0){};",
+                // A single-channel ALPHA target keeps its one value in RED - see
+                // `link::LinkOptions::alpha_to_red`.
+                if alpha_to_red { ".rrrr" } else { "" }
+            );
+        }
+    }
+    push_dest_seed(&mut s, precision);
+    s
+}
+
+/// Seed the O bank from `gxp_dstc` in the colour's own layout - see [`dest_color_init`].
+/// The output-bank seed alone, for a caller that has already bound `gxp_dstc` itself - the
+/// split dual-source entry, which seeds once per evaluation (see `link::emit_dual_split_tail`).
+pub(crate) fn dest_seed(precision: ColorPrecision) -> String {
+    let mut s = String::new();
+    push_dest_seed(&mut s, precision);
+    s
+}
+
+fn push_dest_seed(s: &mut String, precision: ColorPrecision) {
+    match precision {
+        ColorPrecision::F32 => {
+            for c in 0..4u32 {
+                let _ = writeln!(s, "  o[{c}] = bitcast<u32>(gxp_dstc.{});", comp(c));
+            }
+        }
+        ColorPrecision::F16 => {
+            // Through the STORE helper, not the builtin: seeding the output bank is an f32 to
+            // f16 narrowing like any other, and a truncating one would hand the program a
+            // destination colour the hardware never gave it. See `wgsl::HALF_LO_FN`.
+            let _ = writeln!(s, "  o[0] = {HALF_PK_FN}(gxp_dstc.x, gxp_dstc.y);");
+            let _ = writeln!(s, "  o[1] = {HALF_PK_FN}(gxp_dstc.z, gxp_dstc.w);");
+        }
+        ColorPrecision::Fx8 => {
+            let _ = writeln!(s, "  o[0] = pack4x8unorm(gxp_dstc);");
+        }
+    }
+}
+
+/// `VITASLOP_GXP_DEST_POISON=<r,g,b,a>` - the constant [`dest_color_init`] seeds the output
+/// bank with instead of the attachment copy. Off (and byte-identical) when unset.
+fn dest_poison() -> Option<[f32; 4]> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<[f32; 4]>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        let raw = std::env::var("VITASLOP_GXP_DEST_POISON").ok()?;
+        let v: Vec<f32> = raw.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
+    })
+}
+
+/// The destination-colour texture declaration, at `@group(3) @binding(1)`.
+///
+/// Group 3 because a device guarantees only FOUR bind groups and the other three are spoken for
+/// (vertex uniforms, fragment uniforms, samplers); group 3 already carries the per-draw depth
+/// block, so it is the one group whose bind group is rebuilt often enough to also carry a view
+/// that changes within a pass.
+pub(crate) const GXP_DEST_DECL: &str = "@group(3) @binding(1) var gxp_dst: texture_2d<f32>;
+";
 
 /// Assemble a complete, bindable WGSL fragment module from an emitted body + its binding
 /// plan. The body is the verbatim output of [`crate::wgsl::emit_fragment`]; this wraps it
@@ -500,6 +1766,12 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
     // too or the module does not compile at all.
     if writes_depth {
         m.push_str(crate::link::GXP_DEPTH_DECL);
+    }
+    // A program that blends for itself reads the DESTINATION colour out of the output bank -
+    // see `BindingPlan::reads_dest_color`. The texture the renderer copies the attachment into
+    // lives beside the depth block in group 3.
+    if plan.reads_dest_color {
+        m.push_str(GXP_DEST_DECL);
     }
 
     // Sampled textures + samplers at group 1 (t{unit} = binding 2*i, s{unit} = 2*i+1).
@@ -526,7 +1798,10 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
         let _ = writeln!(m, "  @location({i}) v{i}: vec4<f32>,");
     }
     let _ = writeln!(m, "  @builtin(front_facing) front_facing: bool,");
-    if writes_depth {
+    // A program that writes its own depth needs the interpolated one; a program that reads the
+    // DESTINATION colour needs the pixel to read it AT. Either way it is the same builtin, and
+    // declaring it unconditionally would defeat early-depth rejection on every other program.
+    if writes_depth || plan.reads_dest_color {
         let _ = writeln!(m, "  @builtin(position) frag_coord: vec4<f32>,");
     }
     let _ = writeln!(m, "}};");
@@ -548,6 +1823,11 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
     // The USSE register-file locals: raw 32-bit registers, matching the emitter.
     for bank in ["r", "o", "i", "pa", "sa"] {
         let _ = writeln!(m, "  var {bank}: array<u32, {BANK_REGS}>;");
+    }
+    // ...and the O bank starts at the DESTINATION colour for a program that blends itself,
+    // because that is what the hardware seeds those registers with.
+    if plan.reads_dest_color {
+        m.push_str(&dest_color_init(plan.color_precision, false, false));
     }
     // Predicate registers p0..p3 (written by test ops, read by predicated instructions).
     let _ = writeln!(m, "  var p: array<bool, 4>;");
@@ -584,7 +1864,7 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
         let _ = writeln!(m, "  return {color};\n}}");
     }
 
-    FragmentModule { wgsl: m, bindings: plan.clone() }
+    FragmentModule { wgsl: crate::wgsl::add_half_helpers(m), bindings: plan.clone() }
 }
 
 // ===================================================================================
@@ -637,6 +1917,72 @@ pub struct VertexAttribute {
     /// its vertex reads the same attribute one F32 component per register. Colours are not
     /// packed, so whatever feeds that sky's third modulate component, it is not this.
     pub components: u32,
+    /// The constant each lane is fed when the GUEST binds fewer components than the shader
+    /// declares - per lane, because two shipping titles need opposite values and no property of
+    /// the binding separates them. Decided by [`crate::attrflow`] from what each lane FEEDS;
+    /// see that module for the rule and the two frames that fix it.
+    ///
+    /// [`plan_vertex_bindings`] cannot answer it - the question spans the LINKED pair, since a
+    /// lane's only use is often a modulate in the fragment stage - so a plan on its own carries
+    /// the standing 1.0 and [`crate::link::link_programs`] overwrites it. The renderer uses it
+    /// only for lanes above the guest's binding.
+    pub surplus_fill: [crate::attrflow::Fill; 4],
+    /// >>> THE ATTRIBUTE IS DELIVERED AS AN **INTEGER** AND CONVERTED IN THE SHADER, when the
+    /// >>> guest's own format is a plain (unnormalised) integer one and the link can prove no
+    /// >>> lane above the guest's binding is read. `Some(signed)` names the WGSL scalar type:
+    /// `false` -> `vec4<u32>`, `true` -> `vec4<i32>`.
+    ///
+    /// # WHY A VERTEX INPUT'S TYPE IS A LINK-TIME QUESTION AT ALL
+    /// WebGPU has no `uint8x3`, and it also has no float format that FETCHES a plain `U8`
+    /// integer: `unorm8x4` divides by 255. So an attribute the guest declares as
+    /// `SCE_GXM_ATTRIBUTE_FORMAT_U8 x3` had no hardware fetch at all, and the renderer's only
+    /// option was to convert it on the CPU into `Float32x3` - which puts that attribute's
+    /// WHOLE STREAM back on the repack, because one buffer has one stride. MEASURED in the
+    /// desktop browser on a baseball title's gameplay: **58 pipelines, and `GXM format 0 x3`
+    /// is the ONLY reason any of them repacks** - no offset and no stride fails.
+    ///
+    /// The fetch exists, it is just integer-typed (`uint8x4`), and WebGPU requires the shader's
+    /// input to have the format's base type. So the module has to declare `vec4<u32>` and
+    /// convert with `f32()`, which reproduces [`read_attr_component`]'s `b as f32` exactly -
+    /// and that makes the attribute's WGSL TYPE depend on what the guest bound, not on the
+    /// program alone. It is decided here, once, so the module and the vertex-buffer layout
+    /// cannot disagree about it.
+    ///
+    /// # THE LANE THE WIDENED FETCH PEEKS AT IS NOT READ, AND THAT IS WHY THERE IS NO TEST HERE
+    /// The narrowest integer format is two or four components wide, so a one- or
+    /// three-component attribute is FETCHED wider than the guest bound, and the extra lane is
+    /// whatever follows in the guest's row (bound as it stands) or a zero (in a packed row).
+    /// Neither is this attribute's data - and neither reaches the program, because
+    /// [`VertexAttribute::guest_components`] makes every lane above the guest's binding a baked
+    /// CONSTANT in the module. The two are set together and the second is what licenses the
+    /// first.
+    pub int_fetch: Option<bool>,
+    /// >>> HOW MANY COMPONENTS THE **GUEST** BOUND, when the link was told - and therefore from
+    /// >>> which lane the module stops READING the attribute and emits the fill CONSTANT instead.
+    ///
+    /// # WHY BAKING A CONSTANT THE REPACK ALREADY WRITES IS A RENDERER CHANGE
+    /// A shader declares `n` components and the guest routinely binds fewer; the lanes between
+    /// are fed [`surplus_fill`]. Writing them means writing a vertex ROW, which means repacking
+    /// the guest's - one buffer has one stride, so a single such lane takes the whole stream off
+    /// the hardware fetch. MEASURED on a baseball title's gameplay once the integer fetch had
+    /// cleared the format gap: **46 pipelines, carrying ~480 of the frame's 603 draws, were held
+    /// on the repack by ONE line - `@location 1 lane 2 is filled with 1 and the hardware would
+    /// supply 0`.**
+    ///
+    /// But the fill is a CONSTANT, known here, at link time, per lane. It does not have to live
+    /// in a buffer at all: `pa[base + c] = bitcast<u32>(1.0)` is the same value the repack would
+    /// have written and the same value the fetch would have converted, with no row to write it
+    /// into. The guest's row can then be bound as it stands.
+    ///
+    /// It also settles the OTHER passthrough blocker for free. A narrow three-component
+    /// attribute is fetched four wide (WebGPU has no `x3`), and the fourth lane is whatever
+    /// follows in the guest's row - admissible only while nothing reads it. A lane the module
+    /// does not READ cannot be read, so the question stops being asked.
+    ///
+    /// `None` means the link was not told what the guest bound (every caller but the live
+    /// renderer), and then nothing changes: every declared lane is read from the attribute
+    /// exactly as before.
+    pub guest_components: Option<u32>,
 }
 
 /// One guest-memory WINDOW a vertex program's 0xE8 memory loads read through: a bound uniform
@@ -742,17 +2088,25 @@ pub fn mem_window_vec4_count(windows: &[MemWindow]) -> u32 {
 /// made (it clamped into the one window it had), it requires the guest to address outside every
 /// buffer it declared, and no window can leak another draw's data.
 pub fn mem_window_helper(windows: &[MemWindow]) -> String {
+    mem_window_helper_named(windows, "gxp_mem")
+}
+
+/// [`mem_window_helper`] over a named binding, so a module can carry ONE PER STAGE. WGSL has a
+/// single global namespace, and the two stages resolve different windows through different
+/// bindings, so a linked pair that loads memory in both needs two helpers with two names -
+/// emitting one would silently give the fragment the vertex's buffer.
+pub fn mem_window_helper_named(windows: &[MemWindow], binding: &str) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
-    let _ = writeln!(s, "fn gxp_mem_word(addr: u32) -> u32 {{");
+    let _ = writeln!(s, "fn {binding}_word(addr: u32) -> u32 {{");
     for (i, at) in mem_window_placements(windows).iter().enumerate() {
         let _ = writeln!(s, "  {{");
-        let _ = writeln!(s, "    let b{i} = gxp_mem[{i}u].x;");
+        let _ = writeln!(s, "    let b{i} = {binding}[{i}u].x;");
         let _ = writeln!(s, "    if (addr >= b{i}) {{");
         let _ = writeln!(s, "      let w{i} = (addr - b{i}) >> 2u;");
         let _ = writeln!(s, "      if (w{i} < {}u) {{", at.words);
         let _ = writeln!(s, "        let g{i} = {}u + w{i};", at.first_word);
-        let _ = writeln!(s, "        return gxp_mem[g{i} >> 2u][g{i} & 3u];");
+        let _ = writeln!(s, "        return {binding}[g{i} >> 2u][g{i} & 3u];");
         let _ = writeln!(s, "      }}");
         let _ = writeln!(s, "    }}");
         let _ = writeln!(s, "  }}");
@@ -760,6 +2114,112 @@ pub fn mem_window_helper(windows: &[MemWindow]) -> String {
     let _ = writeln!(s, "  return 0u;");
     let _ = writeln!(s, "}}");
     s
+}
+
+/// Resolve at EMIT time every memory load whose address is a window's own base register plus a
+/// constant: `{binding}_word(gxp_aN + K)` where `gxp_aN = sa[base] + O` becomes the constant
+/// element `{binding}[G >> 2][G & 3]`, `G = first_word + ((O + K) >> 2)`, when that word lies
+/// inside the window.
+///
+/// >>> WHY: THE BROWSER'S SHADER COMPILER, NOT THE GPU. The address-dispatching helper
+/// ([`mem_window_helper_named`]) is a chain of per-window branches, and the backend inlines it
+/// at EVERY call - one fighting title's skinned-character vertex program calls it 165 times.
+/// MEASURED in Chrome (D3D12), `createRenderPipelineAsync` per module: 2.35-2.64 s for that
+/// program, 0.1 s for its fragment stage alone, 1.0 s with a branch-free stand-in for the
+/// helper; a select-based helper bought only ~20%. Fourteen such pairs stalled the queue for
+/// 10-16 s at the fight's start, the GPU budget declined every present meanwhile ("1 shown of
+/// 53"), and a title that reads its render targets back then took a different path.
+///
+/// >>> WHY IT IS EXACT. The prologue sets `sa[base] = {binding}[i].x`, the window's own guest
+/// base, and the helper computes `w = (addr - base) >> 2` and returns word `first_word + w`
+/// when `w < words` - the same element this names, with the same floor. An EARLIER window
+/// containing the same address holds the same guest bytes (every window is a snapshot of guest
+/// memory taken at the same draw), so which one answers cannot differ. It applies only when the
+/// body never writes `sa[base]` itself and never writes `sa` through a computed index; an
+/// out-of-window word keeps the helper. `VITASLOP_GXP_STATIC_MEM=0` is the arm back.
+pub fn resolve_static_mem_reads(body: &str, windows: &[MemWindow], binding: &str) -> String {
+    if windows.is_empty() || !crate::link::arm_on(crate::link::STATIC_MEM_ARM) {
+        return body.to_string();
+    }
+    // Every SA register the body assigns, and whether it assigns one through an index.
+    let bytes = body.as_bytes();
+    let mut written = std::collections::HashSet::new();
+    let mut from = 0;
+    while let Some(rel) = body[from..].find("sa[") {
+        let at = from + rel;
+        from = at + 3;
+        // Only a whole-token `sa[` (not `vs_sa[` or `fs_sa.data[`).
+        if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_' || bytes[at - 1] == b'.') {
+            continue;
+        }
+        let after = &body[at + 3..];
+        let Some(close) = after.find(']') else { continue };
+        let tail = after[close + 1..].trim_start();
+        if tail.starts_with('=') && !tail.starts_with("==") {
+            match after[..close].parse::<u32>() {
+                Ok(r) => {
+                    written.insert(r);
+                }
+                Err(_) => return body.to_string(),
+            }
+        }
+    }
+    let placements = mem_window_placements(windows);
+    let mut by_base: std::collections::HashMap<u32, MemWindowPlacement> = std::collections::HashMap::new();
+    for (w, at) in windows.iter().zip(placements.iter()) {
+        if !written.contains(&w.base_sa) {
+            by_base.entry(w.base_sa).or_insert(*at);
+        }
+    }
+    if by_base.is_empty() {
+        return body.to_string();
+    }
+    let call = format!("{binding}_word(");
+    let mut known: std::collections::HashMap<String, (MemWindowPlacement, u32)> = std::collections::HashMap::new();
+    let mut out = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        let t = line.trim();
+        if let Some(def) = t.strip_prefix("let gxp_a") {
+            // `let gxp_aN: u32 = sa[S] + Ou;` - exactly this shape, or the name is unknown.
+            let name = format!("gxp_a{}", def.split(':').next().unwrap_or(""));
+            known.remove(&name);
+            let parsed = def.split_once(": u32 = sa[").and_then(|(_, e)| {
+                let (s, o) = e.split_once("] + ")?;
+                Some((s.parse::<u32>().ok()?, o.strip_suffix("u;")?.parse::<u32>().ok()?))
+            });
+            if let Some((s, o)) = parsed
+                && let Some(at) = by_base.get(&s) {
+                    known.insert(name, (*at, o));
+                }
+            out.push_str(line);
+            continue;
+        }
+        let mut l = line.to_string();
+        let mut scan = 0;
+        while let Some(rel) = l[scan..].find(&call) {
+            let at = scan + rel;
+            let args_at = at + call.len();
+            let Some(close) = l[args_at..].find(')') else { break };
+            let resolved = l[args_at..args_at + close].split_once(" + ").and_then(|(n, k)| {
+                let (p, o) = known.get(n)?;
+                let k = k.strip_suffix('u')?.parse::<u32>().ok()?;
+                let w = o.checked_add(k)? >> 2;
+                (w < p.words).then(|| {
+                    let g = p.first_word + w;
+                    format!("{binding}[{}u][{}u]", g >> 2, g & 3)
+                })
+            });
+            match resolved {
+                Some(r) => {
+                    l.replace_range(at..args_at + close + 1, &r);
+                    scan = at + r.len();
+                }
+                None => scan = args_at,
+            }
+        }
+        out.push_str(&l);
+    }
+    out
 }
 
 /// Bytes the driver adds to the DEFAULT uniform buffer's bound address before writing it into
@@ -788,6 +2248,11 @@ fn default_uniform_pointer_offset(carried_regs: u32) -> u32 {
 /// copying part of it into the SA file.
 const DEFAULT_UNIFORM_BUFFER_INDEX: u16 = 14;
 
+/// The first container index the DRIVER owns rather than the guest: 15 TEXTURE, 16 LITERAL,
+/// 17 SCRATCH, 18 THREAD, 19 DATA (see [`crate::container::Container`]). Nothing at or above
+/// this can be handed to `sceGxmSet{Vertex,Fragment}UniformBuffer`, whose index runs 0..13.
+const FIRST_DRIVER_CONTAINER: u16 = 15;
+
 /// Resolve whether (and how) a decoded VERTEX program's memory loads can be fed, per
 /// [`MemWindow`]. An empty list = the program loads no memory. `Err` names exactly what is
 /// unestablished - the caller must refuse to emit rather than let a load read fabricated
@@ -811,11 +2276,63 @@ const DEFAULT_UNIFORM_BUFFER_INDEX: u16 = 14;
 ///
 /// An entry whose buffer the program does not declare (and whose SA register it never reads) is
 /// INERT and contributes no window: the golf title's programs carry one.
+/// How a program uses the SA register a +0x78 entry would place a buffer's pointer in.
+enum PointerUse {
+    /// No memory load chases it. The entry is INERT whatever else the program does with the
+    /// register - a plain READ of it is not a pointer read, and treating it as one refuses a
+    /// program over a register that is somebody else's business.
+    NotAPointer,
+    /// A load chases it, but through a REGISTER-supplied byte offset whose value is not known
+    /// here, so no compile-time extent bounds it.
+    Unbounded,
+    /// A load chases it and every offset is constant: this is the byte extent they reach.
+    Bounded(u32),
+}
+
+/// How the program uses the pointer in SA register `base_sa`.
+///
+/// A `MemLoad`'s `srcs[0]` is the pointer and any further sources are REGISTER-supplied byte
+/// offsets ([`crate::usse::decode`]), whose value is not known here - so a load carrying one is
+/// [`PointerUse::Unbounded`] rather than a bound that happens to hold for the constant part.
+fn pointer_use(base_sa: u32, shader: &Shader, secondary: &Shader) -> PointerUse {
+    let mut extent = 0u32;
+    let mut saw = false;
+    for i in shader.instrs.iter().chain(secondary.instrs.iter()) {
+        let crate::ir::Op::MemLoad { elements, offset_bytes } = i.op else { continue };
+        let Some(ptr) = i.srcs.first() else { continue };
+        if ptr.bank != crate::ir::Bank::SecondaryAttr || u32::from(ptr.index) != base_sa {
+            continue;
+        }
+        if i.srcs.len() > 1 {
+            return PointerUse::Unbounded;
+        }
+        saw = true;
+        extent = extent.max(offset_bytes + u32::from(elements) * 4);
+    }
+    if saw { PointerUse::Bounded(extent) } else { PointerUse::NotAPointer }
+}
+
+/// How many elements a SEMANTIC-1 (open-array) uniform buffer's window covers - see the
+/// sizing in [`resolve_mem_windows`]. 256 = every value of an 8-bit index.
+const OPEN_ARRAY_ELEMENTS: u32 = 256;
+
 pub fn resolve_mem_windows(
     program: &Program,
     shader: &Shader,
 ) -> Result<Vec<MemWindow>, &'static str> {
-    if !shader.instrs.iter().any(|i| matches!(i.op, crate::ir::Op::MemLoad { .. })) {
+    // >>> THE LOAD CAN BE IN EITHER STREAM, and looking only at the primary refused a
+    // >>> whole retail title. A program that reads a bound uniform buffer by chasing its
+    // >>> pointer can issue that load from the SECONDARY (prologue) program instead - which
+    // >>> is the natural place for it, since the prologue runs once and leaves the fetched
+    // >>> registers in the SA file for the primary to read with no load at all. One title's
+    // >>> world-transform vertex program does exactly that: `MemLoad` in the secondary,
+    // >>> destination sa[20], address sa[18] from the DATA container. Scanning only the
+    // >>> primary found no load, resolved no window, and the linker then rejected the
+    // >>> address register as an SA read with nothing behind it - a message about uniform
+    // >>> buffer extents that named neither the load nor the stream it was in.
+    let secondary = crate::usse::decode_secondary_shader(program);
+    let has_mem_load = |sh: &Shader| sh.instrs.iter().any(|i| matches!(i.op, crate::ir::Op::MemLoad { .. }));
+    if !has_mem_load(shader) && !has_mem_load(&secondary) {
         return Ok(Vec::new());
     }
     let Some(data) = program.containers.iter().find(|c| c.index == 19) else {
@@ -828,8 +2345,9 @@ pub fn resolve_mem_windows(
     // all (see `Program::sa_uniform_buffers`), so it is not a window even when it also has a
     // +0x78 entry - the copy is what the program reads.
     let sa_resident = program.sa_uniform_buffers();
+    // Both streams again: the address register is read by whichever one issues the load.
     let reads_sa = |reg: u32| {
-        shader.instrs.iter().flat_map(|i| i.srcs.iter()).any(|s| {
+        shader.instrs.iter().chain(secondary.instrs.iter()).flat_map(|i| i.srcs.iter()).any(|s| {
             s.bank == crate::ir::Bank::SecondaryAttr && u32::from(s.index) == reg
         })
     };
@@ -860,7 +2378,7 @@ pub fn resolve_mem_windows(
             // which is the shape this code always assumed and is still exactly right.
             if carried > program.default_uniform_regs {
                 return Err(
-                    "container 14 carries MORE registers than the header declares for the                      default uniform buffer - the leftover the pointer names cannot be sized",
+                    "container 14 carries MORE registers than the header declares for the default uniform buffer - the leftover the pointer names cannot be sized",
                 );
             }
             base_offset = default_uniform_pointer_offset(carried);
@@ -869,6 +2387,71 @@ pub fn resolve_mem_windows(
             // the registers the old reading addressed, and the arm would be testing a third
             // thing that has never been anyone's reading.
             program.default_uniform_regs * 4 - base_offset
+        } else if binding.buffer_index >= FIRST_DRIVER_CONTAINER {
+            // >>> AN ENTRY NAMING A DRIVER BLOCK IS THE DEFAULT UNIFORM BUFFER AT ITS BASE.
+            //
+            // `Container`'s numbering is fixed by the format: 0..13 are the ordinary uniform
+            // buffers, 14 the DEFAULT one, and 15 upward (TEXTURE, LITERAL, SCRATCH, THREAD,
+            // DATA) are blocks the DRIVER owns. `sceGxmSet{Vertex,Fragment}UniformBuffer` takes
+            // an index in 0..13, so an entry naming 15 or above names something the guest
+            // CANNOT bind - and a window resolved against it can never be fed. The capture
+            // reads the guest's binding table at that index, finds nothing, withholds every
+            // window the program has, and the draw is dropped for the life of the title.
+            // `sa_uniform_buffers` already applies this rule ("14 upward are the default buffer
+            // and the driver's own blocks"); this path did not.
+            //
+            // # What the offsets say, which is the only reason this is a placement and not a guess
+            // MEASURED on the three blobs in any captured corpus that carry such an entry (all
+            // one title's; every other corpus has none). Two readings were available and the
+            // load offsets separate them:
+            //
+            // * THE LITERAL POOL, which index 16's name suggests - REFUTED. The vertex
+            //   program's pool is 62 entries (248 bytes) and its single load through this
+            //   pointer is at offset 500; the two fragment programs' pools are 4 entries (16
+            //   bytes) and their loads are at 56 and 64. Every offset is outside its own pool.
+            // * THE DEFAULT UNIFORM BUFFER AT OFFSET ZERO - fits all three. 500 + 4 = 504 lies
+            //   inside the vertex program's declared 137 registers (548 bytes), and 64 + 4 = 68
+            //   inside the fragment programs' 88 (352). The fragment offsets land on registers
+            //   14 and 16, which its own parameter table names `officialUVCoverage` and
+            //   `signatureUVOffset` - in a program that declares `officialSampler` and
+            //   `signatureSampler`. A large offset like 500 could easily have fallen outside
+            //   and did not.
+            //
+            // It is a SECOND pointer to the same buffer: a program can carry the buffer-14
+            // entry too, which points PAST the part copied into the SA file (`base_offset`),
+            // while this one points at the base. One of the three carries both.
+            //
+            // SCRATCH and THREAD would also be "a driver block", and this does not distinguish
+            // them by index - what it rests on is that every load through the pointer lands
+            // inside the declared default buffer, which is checked below rather than assumed.
+            // An entry that fails that check is REFUSED by name rather than placed somewhere
+            // plausible, which is the same discipline the rest of this function keeps.
+            match pointer_use(base_sa, shader, &secondary) {
+                // The register is never loaded through: the entry places nothing and the
+                // program does not care, exactly as for an undeclared ordinary buffer.
+                PointerUse::NotAPointer => continue,
+                PointerUse::Unbounded => {
+                    return Err(
+                        "a +0x78 entry names a DRIVER block (15 upward), which the guest cannot bind, and the program's loads through its pointer are not statically bounded",
+                    );
+                }
+                PointerUse::Bounded(reach) => {
+                    if reach > program.default_uniform_regs * 4 {
+                        return Err(
+                            "a +0x78 entry names a DRIVER block and the loads through its pointer reach past the declared default uniform buffer, so what it points at is unestablished",
+                        );
+                    }
+                    // Fed from the DEFAULT binding, not from a buffer index the guest never
+                    // bound - which is the whole of the fix.
+                    windows.push(MemWindow {
+                        buffer_index: u32::from(DEFAULT_UNIFORM_BUFFER_INDEX),
+                        bytes: reach,
+                        base_sa,
+                        base_offset: 0,
+                    });
+                    continue;
+                }
+            }
         } else {
             let declared = program.parameters.iter().find(|p| {
                 p.category == ParamCategory::UniformBuffer
@@ -876,18 +2459,49 @@ pub fn resolve_mem_windows(
                     && p.resource_index as u32 == u32::from(binding.buffer_index)
             });
             match declared {
+                // >>> A BUFFER DECLARED WITH SEMANTIC 1 IS AN OPEN ARRAY: its declared size is
+                // ONE element and the program indexes it at run time. MEASURED on every such
+                // buffer in any captured corpus (ten, all one fighting title's
+                // `gSkinningMatrices`): declared 48 bytes = one 3x4 bone, loaded at
+                // `u16(blend index) * 48 + pointer`. Sized as declared, every bone past the
+                // first read ZERO, each skinned vertex collapsed to the translation of the
+                // view-projection, and the characters drew nothing. The window covers
+                // `OPEN_ARRAY_ELEMENTS` elements - the reach of the 8-bit blend-index attribute
+                // every captured skinned draw of the title binds.
+                Some(ub) if ub.semantic == 1 => ub.array_size.saturating_mul(OPEN_ARRAY_ELEMENTS),
                 Some(ub) => ub.array_size,
                 // An entry for a buffer the program does not declare is INERT - nothing binds
                 // it and nothing can read it. Skipping it is exact as long as the pointer
                 // register really is dead, which is checked here rather than assumed.
-                None => {
-                    if reads_sa(base_sa) {
+                //
+                // >>> AND WHEN IT IS NOT DEAD, THE PROGRAM ITSELF SIZES THE WINDOW. The only
+                // thing the parameter table was supplying is a BYTE COUNT, and a window exists
+                // solely so the shader's own address arithmetic can read guest bytes - so the
+                // bytes it actually loads are an exact bound, and a tighter one than the
+                // declared size. `static_extent_through` returns it only when every load
+                // through this pointer has a constant offset; a register-supplied (runtime)
+                // offset is unbounded and still refuses by name.
+                //
+                // MEASURED on a fragment program whose +0x78 table names twelve buffers and
+                // whose parameter table declares ONE (buffer 7): it reads buffer 11's pointer
+                // at sa[14] and was refused whole for it, dropping every draw of the pair.
+                None => match pointer_use(base_sa, shader, &secondary) {
+                    PointerUse::Bounded(bytes) => bytes,
+                    PointerUse::Unbounded => {
                         return Err(
-                            "a +0x78 entry names a buffer the parameter table does not declare,                              yet the program reads the SA register it would place",
+                            "a +0x78 entry names a buffer the parameter table does not declare, and the program's loads through its pointer are not statically bounded",
                         );
                     }
-                    continue;
-                }
+                    // >>> A READ IS NOT A POINTER READ. This used to refuse whenever the
+                    // register was read AT ALL, which is a different claim: the +0x78 table is
+                    // a FULL table of where each buffer's pointer WOULD go, so an entry for a
+                    // buffer the program does not declare places nothing, and the compiler is
+                    // free to use that register for its own purposes. MEASURED on a fragment
+                    // program whose table names twelve buffers and whose parameter table
+                    // declares one: it reads sa[14] - buffer 11's would-be slot - as DATA and
+                    // never loads through it, and the pair was refused whole for it.
+                    PointerUse::NotAPointer => continue,
+                },
             }
         };
         if bytes == 0 {
@@ -912,11 +2526,38 @@ pub fn resolve_mem_windows(
     // The other direction: a DATA-container register the program READS that is neither a
     // literal, nor a texture-control word, nor one of the windows above is a POINTER nothing
     // feeds - which would read zero and load fabricated bytes with nothing to say so.
+    // A DATA register the SECONDARY program writes is a computed value, not a pointer: the
+    // prologue puts something there for the primary to read. One title's world program packs
+    // a loaded matrix row into the first DATA register and reads it from the primary, which
+    // is indistinguishable here from an unfed pointer unless the writes are counted - and
+    // calling that "a pointer nothing feeds" refused a program whose prologue feeds it.
+    let written_by_secondary = |reg: u32| {
+        secondary.instrs.iter().any(|i| {
+            i.dest.as_ref().is_some_and(|d| {
+                if d.bank != crate::ir::Bank::SecondaryAttr {
+                    return false;
+                }
+                // A memory load fills `elements` consecutive registers; everything else
+                // writes at most the four lanes of its destination.
+                let base = u32::from(d.index);
+                let span = match i.op {
+                    crate::ir::Op::MemLoad { elements, .. } => u32::from(elements),
+                    _ => 4,
+                };
+                (base..base + span).contains(&reg)
+            })
+        })
+    };
     for reg in u32::from(data.base_sa)..u32::from(data.base_sa) + u32::from(data.size_regs) {
-        if !reads_sa(reg)
+        // >>> AND THE SAME CORRECTION AS ABOVE: only a register a load actually CHASES is a
+        // pointer. Refusing on a plain read made this check fire on a DATA register the
+        // program uses as ordinary data, which is a question for the SA machinery
+        // (`link::secondary_attr_init`) and not evidence that a pointer is unfed.
+        if !matches!(pointer_use(reg, shader, &secondary), PointerUse::Bounded(_) | PointerUse::Unbounded)
             || program.literals.iter().any(|&(r, _)| r == reg)
             || program.texture_control.iter().any(|&(r, _)| r == reg)
             || windows.iter().any(|w| w.base_sa == reg)
+            || written_by_secondary(reg)
         {
             continue;
         }
@@ -995,13 +2636,36 @@ fn output_write_extent(shader: &Shader) -> u32 {
 pub(crate) fn emit_attribute_load(m: &mut String, a: &VertexAttribute) {
     const COMP: [&str; 4] = ["x", "y", "z", "w"];
     for c in 0..a.components {
-        let _ = writeln!(
-            m,
-            "  pa[{}] = bitcast<u32>(in.a{}.{});",
-            a.base_lane + c,
-            a.location,
-            COMP[(c & 3) as usize]
-        );
+        let comp = COMP[(c & 3) as usize];
+        // >>> A LANE THE GUEST DOES NOT BIND IS A CONSTANT, NOT A FETCH - see
+        // `VertexAttribute::guest_components`. Emitted as the literal `surplus_fill` decided,
+        // which is the same value the repack would have written into a row.
+        let value = match a.guest_components {
+            Some(bound) if c >= bound => {
+                // `{:?}` on an f32 always prints a decimal point, which WGSL needs to read it as
+                // a float literal - `1` would be an integer and the `bitcast` would not compile.
+                format!("{:?}", a.surplus_fill[(c & 3) as usize].value())
+            }
+            // An INTEGER-fetched attribute arrives as `u32`/`i32` lanes and the PA bank holds
+            // the bit pattern of an f32, so the conversion is explicit here - and it is the same
+            // arithmetic `read_attr_component` does for GXM formats 0..3 (`b as f32`). See
+            // `VertexAttribute::int_fetch`.
+            _ => match a.int_fetch {
+                Some(_) => format!("f32(in.a{}.{comp})", a.location),
+                None => format!("in.a{}.{comp}", a.location),
+            },
+        };
+        let _ = writeln!(m, "  pa[{}] = bitcast<u32>({value});", a.base_lane + c);
+    }
+}
+
+/// The WGSL type a vertex input is declared with, which follows its fetch - see
+/// [`VertexAttribute::int_fetch`].
+pub(crate) fn attribute_wgsl_type(a: &VertexAttribute) -> &'static str {
+    match a.int_fetch {
+        Some(true) => "vec4<i32>",
+        Some(false) => "vec4<u32>",
+        None => "vec4<f32>",
     }
 }
 
@@ -1015,6 +2679,11 @@ pub fn plan_vertex_bindings(program: &Program, shader: &Shader) -> VertexBinding
             location: 0, // assigned below in base-lane order
             base_lane: p.resource_index.max(0) as u32,
             components: (p.component_count as u32).clamp(1, 4),
+            // The standing fill; only a LINK can answer this - see `VertexAttribute::surplus_fill`.
+            surplus_fill: [crate::attrflow::Fill::Identity; 4],
+            // Only a LINK that is told what the GUEST bound can answer these - see the fields.
+            int_fetch: None,
+            guest_components: None,
         })
         .collect();
     attributes.sort_by_key(|a| a.base_lane);
@@ -1148,7 +2817,7 @@ pub fn build_vertex_module(body: &str, plan: &VertexBindingPlan) -> VertexModule
     }
     let _ = writeln!(m, "  return out;\n}}");
 
-    VertexModule { wgsl: m, bindings: plan.clone() }
+    VertexModule { wgsl: crate::wgsl::add_half_helpers(m), bindings: plan.clone() }
 }
 
 #[cfg(test)]
@@ -1247,6 +2916,347 @@ mod tests {
         Shader { kind: ProgramKind::Fragment, instrs }
     }
 
+    /// A fragment program that SOURCES the output bank is reading the ROP's destination colour
+    /// and blending itself, so the module has to declare a destination texture and seed `o[]`
+    /// from it - in the COLOUR'S OWN layout, or an F16 destination comes back as denormals.
+    /// See [`BindingPlan::reads_dest_color`].
+    #[test]
+    fn a_program_that_reads_its_output_bank_is_given_the_destination_colour() {
+        // `o0 = pa4 * sa8 + o0` - an additive blend written in ALU, the commonest shape.
+        let mut mad = instr(
+            Op::Mad,
+            Some(Operand::plain(Bank::PrimaryAttr, 0, 2)),
+            vec![
+                Operand::plain(Bank::PrimaryAttr, 4, 2),
+                Operand::plain(Bank::SecondaryAttr, 8, 3),
+                Operand::plain(Bank::Output, 0, 1),
+            ],
+            [true; 4],
+        );
+        mad.half_precision = true;
+        let mov = instr(
+            Op::Mov,
+            Some(Operand::plain(Bank::Output, 0, 1)),
+            vec![Operand::plain(Bank::PrimaryAttr, 0, 2)],
+            [true, true, false, false],
+        );
+        let sh = shader(vec![mad, mov]);
+        let plan = plan_bindings(&sh, 12, |_| false);
+        assert!(plan.reads_dest_color, "an Output-bank SOURCE is a destination read");
+        assert_eq!(plan.color_precision, ColorPrecision::F16);
+        let m = build_module("", &plan, false);
+        assert!(m.wgsl.contains("@group(3) @binding(1) var gxp_dst: texture_2d<f32>;"), "{}", m.wgsl);
+        assert!(m.wgsl.contains("textureLoad(gxp_dst, vec2<i32>(in.frag_coord.xy), 0)"), "{}", m.wgsl);
+        // F16: two halves per register, the inverse of what `color_return_expr` reads back.
+        assert!(m.wgsl.contains("o[0] = gxp_hpk(gxp_dstc.x, gxp_dstc.y);"), "{}", m.wgsl);
+        assert!(m.wgsl.contains("o[1] = gxp_hpk(gxp_dstc.z, gxp_dstc.w);"), "{}", m.wgsl);
+    }
+
+    /// The register the colour epilogue copies, in the shape every shipped program uses:
+    /// `Mov o0 = C` with the two F16-packed halves.
+    fn color_epilogue(reg: u8) -> Instr {
+        instr(
+            Op::Mov,
+            Some(Operand::plain(Bank::Output, 0, 1)),
+            vec![Operand { swizzle: [0, 1, 0, 1], ..Operand::plain(Bank::PrimaryAttr, reg, 2) }],
+            [true, true, false, false],
+        )
+    }
+
+    fn half(mut i: Instr) -> Instr {
+        i.half_precision = true;
+        i
+    }
+
+    /// A source-over lerp written longhand IS a blend, and recovering it as pipeline state is
+    /// what turns 42 render-pass splits a frame into one. The rewritten program must not read
+    /// the output bank at all afterwards - see [`lower_dest_blend`].
+    #[test]
+    fn an_alu_lerp_over_the_destination_lowers_to_a_source_over_blend() {
+        // t0 = -o0 + pa0 ; pa0 = t0 * pa0.wwww + o0 ; o0 = pa0
+        let sub = half(instr(
+            Op::Add,
+            Some(Operand::plain(Bank::Temp, 0, 0)),
+            vec![
+                Operand { neg: true, ..Operand::plain(Bank::Output, 0, 1) },
+                Operand::plain(Bank::PrimaryAttr, 0, 2),
+            ],
+            [true; 4],
+        ));
+        let lerp = half(instr(
+            Op::Mad,
+            Some(Operand::plain(Bank::PrimaryAttr, 0, 2)),
+            vec![
+                Operand::plain(Bank::Temp, 0, 0),
+                Operand { swizzle: [3, 3, 3, 3], ..Operand::plain(Bank::PrimaryAttr, 0, 2) },
+                Operand::plain(Bank::Output, 0, 1),
+            ],
+            [true; 4],
+        ));
+        let mut sh = shader(vec![sub, lerp, color_epilogue(0)]);
+        let b = lower_dest_blend(&mut sh).expect("the lerp shape lowers");
+        assert_eq!(b.color, BlendTerm { src: BlendFactor::SrcAlpha, dst: BlendFactor::OneMinusSrcAlpha });
+        assert_eq!(b.alpha, BlendTerm { src: BlendFactor::SrcAlpha, dst: BlendFactor::OneMinusSrcAlpha });
+        // Both blend instructions are gone and the epilogue still copies the same register.
+        assert_eq!(sh.instrs.len(), 1);
+        assert!(!reads_output_bank(&sh));
+        assert!(!plan_bindings(&sh, 0, |_| false).reads_dest_color);
+    }
+
+    /// >>> THE LINEARITY PROOF MUST BE ABLE TO SAY NO, or it proves nothing.
+    ///
+    /// [`dest_is_linear`] is what would authorise rewriting a program into a DUAL-SOURCE blend
+    /// (`out = dst*F + G`). Every destination-reading program in every corpus here happens to be
+    /// linear, so the corpus can only ever exercise the YES answer - and an analysis that has
+    /// never returned NO in a test is indistinguishable from `fn dest_is_linear() { true }`.
+    /// These build the nonlinear shapes by hand.
+    #[test]
+    fn the_linearity_proof_refuses_a_destination_used_nonlinearly() {
+        let dst = || Operand::plain(Bank::Output, 0, 1);
+        let uni = || Operand::plain(Bank::SecondaryAttr, 0, 3);
+        let tmp = || Operand::plain(Bank::PrimaryAttr, 0, 2);
+
+        // `dst * dst` is QUADRATIC. This is the case a tail-matching pattern cannot see and the
+        // one that would paint a silently different picture if it were accepted.
+        let sq = shader(vec![
+            half(instr(Op::Mul, Some(tmp()), vec![dst(), dst()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert!(!dest_is_linear(&sq), "dst*dst is not linear in dst");
+
+        // `min(dst, K)` is piecewise: linear on each side of a threshold the destination itself
+        // moves across, which is not the same thing as linear.
+        let clamp = shader(vec![
+            half(instr(Op::Min, Some(tmp()), vec![dst(), uni()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert!(!dest_is_linear(&clamp), "min() over the destination is piecewise");
+
+        // A reciprocal of the destination is not linear by any reading.
+        let rcp = shader(vec![
+            half(instr(Op::Rcp, Some(tmp()), vec![dst()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert!(!dest_is_linear(&rcp), "1/dst is not linear");
+
+        // >>> AND IT MUST FOLLOW THE TAINT, not just look at direct reads of `o`. Here the
+        // destination reaches a square one instruction LATER, through a temp - which is exactly
+        // how the real programs carry it, and what a tail pattern would miss.
+        let laundered = shader(vec![
+            half(instr(Op::Mov, Some(tmp()), vec![dst()], [true; 4])),
+            half(instr(Op::Mul, Some(tmp()), vec![tmp(), tmp()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert!(!dest_is_linear(&laundered), "the taint has to survive a Mov");
+        // `|dst|` through a Mov: the operand MODIFIER is the nonlinearity, not the op.
+        let absd = shader(vec![
+            half(instr(Op::Mov, Some(tmp()), vec![Operand { abs: true, ..dst() }], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert!(!dest_is_linear(&absd), "abs(dst) is not linear in dst");
+
+
+        // The YES answer, so the test is not passing by refusing everything: `dst * K + G`.
+        let mad = shader(vec![
+            half(instr(Op::Mad, Some(tmp()), vec![dst(), uni(), uni()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert!(dest_is_linear(&mad), "dst*K + G is the shape being looked for");
+
+        // A program that never touches the destination makes no claim either way, and must not
+        // report `true` - it has nothing to lower and would be a false positive in the census.
+        let clean = shader(vec![
+            half(instr(Op::Mul, Some(tmp()), vec![uni(), uni()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert!(!dest_is_linear(&clean), "no destination read is not a linear destination read");
+    }
+
+    /// The split point is the FIRST instruction that reads the destination, directly or through
+    /// a register derived from it - and a register overwritten by clean data stops counting, so
+    /// scratch reuse after the blend does not drag the rest of the program into the suffix.
+    #[test]
+    fn the_split_point_is_the_first_instruction_that_reaches_the_destination() {
+        let dst = || Operand::plain(Bank::Output, 0, 1);
+        let k = || Operand::plain(Bank::SecondaryAttr, 0, 3);
+        let tmp = || Operand::plain(Bank::PrimaryAttr, 0, 2);
+        let tmp2 = || Operand::plain(Bank::PrimaryAttr, 4, 2);
+        // Two dest-free instructions, then one that reads `o`.
+        let prog = shader(vec![
+            half(instr(Op::Mul, Some(tmp()), vec![k(), k()], [true; 4])),
+            half(instr(Op::Mul, Some(tmp2()), vec![k(), k()], [true; 4])),
+            half(instr(Op::Mad, Some(tmp()), vec![tmp2(), k(), dst()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert_eq!(first_dest_reader(&prog), Some(2));
+        // A program that never reads the destination has no split at all.
+        let clean = shader(vec![
+            half(instr(Op::Mul, Some(tmp()), vec![k(), k()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert_eq!(first_dest_reader(&clean), None);
+        // Taint PROPAGATES: instruction 1 reads a register instruction 0 filled from `o`, so the
+        // split is instruction 0 and not instruction 1.
+        let chained = shader(vec![
+            half(instr(Op::Mov, Some(tmp()), vec![dst()], [true; 4])),
+            half(instr(Op::Mul, Some(tmp2()), vec![tmp(), k()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert_eq!(first_dest_reader(&chained), Some(0));
+        // ... and taint is KILLED by a full unconditional overwrite with clean data, so the
+        // reader of the reused register is not a dest reader.
+        let reused = shader(vec![
+            half(instr(Op::Mov, Some(tmp()), vec![dst()], [true; 4])),
+            half(instr(Op::Mov, Some(tmp()), vec![k()], [true; 4])),
+            half(instr(Op::Mul, Some(tmp2()), vec![tmp(), k()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert_eq!(first_dest_reader(&reused), Some(0));
+    }
+
+    /// The dual-source lowering's second question, beyond linearity: a destination CHANNEL
+    /// feeding another output channel (`out.r = dst.a * k + ...`) is a term the ROP's
+    /// per-channel blend cannot carry, so it is either GATED on a per-draw coefficient (a
+    /// uniform register, a window load) that is zero for the draws that take the lowering, or
+    /// the program is refused. MEASURED: a baseball title's generic blend has exactly this
+    /// term on its destination alpha and drew its HUD wrong when it was folded.
+    #[test]
+    fn the_cross_channel_gates_name_the_coefficient_or_refuse() {
+        set_dual_source_blend(true);
+        let dst_w = || Operand { swizzle: [3, 3, 3, 3], ..Operand::plain(Bank::Output, 0, 1) };
+        let dst = || Operand::plain(Bank::Output, 0, 1);
+        let k = || Operand::plain(Bank::SecondaryAttr, 0, 3);
+        let tmp = || Operand::plain(Bank::PrimaryAttr, 0, 2);
+        // out = dst.a * k + dst, F16: channels 0..2 carry dst.a through k's halves.
+        let prog = shader(vec![
+            half(instr(Op::Mad, Some(tmp()), vec![dst_w(), k(), dst()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        // k in the uniform buffer (4 registers carried): gated on its first three halves.
+        let gates = dual_source_plan_or_why(&prog, 4, &[]).expect("gated on the uniform");
+        assert_eq!(
+            gates,
+            vec![
+                DualCoef::Uniform { byte: 0, len: 2 },
+                DualCoef::Uniform { byte: 2, len: 2 },
+                DualCoef::Uniform { byte: 4, len: 2 }
+            ]
+        );
+        // k a nonzero LITERAL: the term is there in every draw - refused.
+        assert!(dual_source_plan_or_why(&prog, 0, &[(0, 0x3c00_3c00)]).is_err());
+        // k a ZERO literal: the term is dead in every draw - exact with no gate.
+        assert_eq!(dual_source_plan_or_why(&prog, 0, &[(0, 0), (1, 0)]), Ok(vec![]));
+        // No provenance at all: refused, naming the channels.
+        let why = dual_source_plan_or_why(&prog, 0, &[]).unwrap_err();
+        assert!(why.contains("channel 0 depends on destination channel 3"), "{why}");
+        // The diagonal alone (`out = dst * k + tmp`) never needs a gate.
+        let diag = shader(vec![
+            half(instr(Op::Mul, Some(tmp()), vec![dst(), k()], [true; 4])),
+            color_epilogue(0),
+        ]);
+        assert_eq!(dual_source_plan_or_why(&diag, 0, &[]), Ok(vec![]));
+    }
+
+    /// `dst * K` is `Zero / Src` with the shader emitting `K` - no blend constant needed, which
+    /// is why this shape is exact rather than approximated.
+    #[test]
+    fn an_alu_modulate_of_the_destination_lowers_to_zero_over_src() {
+        let mul = half(instr(
+            Op::Mul,
+            Some(Operand::plain(Bank::PrimaryAttr, 0, 2)),
+            vec![Operand::plain(Bank::Output, 0, 1), Operand::plain(Bank::SecondaryAttr, 0, 3)],
+            [true; 4],
+        ));
+        let mut sh = shader(vec![mul, color_epilogue(0)]);
+        let b = lower_dest_blend(&mut sh).expect("the modulate shape lowers");
+        assert_eq!(b.color, BlendTerm { src: BlendFactor::Zero, dst: BlendFactor::Src });
+        // The multiply became a plain copy of the uniform: that IS the source term.
+        assert!(matches!(sh.instrs[0].op, Op::Mov));
+        assert_eq!(sh.instrs[0].srcs[0].bank, Bank::SecondaryAttr);
+        assert!(!reads_output_bank(&sh));
+    }
+
+    /// The ADDITIVE shape lowers under [`FORM_DEFAULT`] now that capsules have measured it
+    /// (see the constant's own doc for the numbers), and stays off when the knob excludes it -
+    /// which is what keeps `VITASLOP_GXP_DEST_BLEND=lerp,modulate` a usable bisect arm.
+    #[test]
+    fn the_additive_shape_lowers_by_default_and_is_off_when_excluded() {
+        let add = half(instr(
+            Op::Mad,
+            Some(Operand::plain(Bank::PrimaryAttr, 0, 2)),
+            vec![
+                Operand::plain(Bank::PrimaryAttr, 4, 2),
+                Operand::plain(Bank::SecondaryAttr, 2, 3),
+                Operand::plain(Bank::Output, 0, 1),
+            ],
+            [true; 4],
+        ));
+        let pack = half(instr(
+            Op::Pack { src_half: true },
+            Some(Operand::plain(Bank::PrimaryAttr, 0, 2)),
+            vec![Operand { swizzle: [0, 0, 0, 3], ..Operand::plain(Bank::Output, 0, 1) }],
+            [false, false, false, true],
+        ));
+        let build = || shader(vec![add.clone(), pack.clone(), color_epilogue(0)]);
+
+        // ON by default, and the destination copy it was paying for goes with it.
+        let mut sh = build();
+        let b = lower_dest_blend(&mut sh).expect("in the default set");
+        assert_eq!(b.color, BlendTerm { src: BlendFactor::One, dst: BlendFactor::One });
+        assert_eq!(b.alpha, BlendTerm { src: BlendFactor::Zero, dst: BlendFactor::One });
+        assert!(!reads_output_bank(&sh), "so it no longer needs the destination copy");
+
+        // The mask is process-wide, so this test restores it below. No other test in this
+        // module builds the additive shape, so the window cannot change another one's answer.
+        // Excluding the shape by name is the bisect arm, and it must still put the ALU form
+        // back - that is what makes `VITASLOP_GXP_DEST_BLEND=lerp,modulate` worth having.
+        set_dest_blend_lowering(FORM_LERP | FORM_MODULATE);
+        let mut sh = build();
+        assert_eq!(lower_dest_blend(&mut sh), None, "excluded by the knob");
+        assert!(reads_output_bank(&sh), "so it pays for the destination copy again");
+        set_dest_blend_lowering(FORM_DEFAULT);
+    }
+
+    /// What is NOT a blend must be refused, or the picture is a guess. A colour grade that takes
+    /// a DOT PRODUCT of the destination is the case that made this whole mechanism necessary:
+    /// no hardware blend can express it, so it keeps its ALU form and its render-pass split.
+    #[test]
+    fn an_equation_no_blend_can_express_is_refused() {
+        let dot = half(instr(
+            Op::Dot { components: 4 },
+            Some(Operand::plain(Bank::PrimaryAttr, 0, 2)),
+            vec![Operand::plain(Bank::SecondaryAttr, 8, 3), Operand::plain(Bank::Output, 0, 1)],
+            [true; 4],
+        ));
+        let mut sh = shader(vec![dot, color_epilogue(0)]);
+        assert_eq!(lower_dest_blend(&mut sh), None);
+        assert!(reads_output_bank(&sh), "so the renderer still owes it the destination colour");
+    }
+
+    /// ...but an 8-bit SOP2 whose second operand is the output register is the ROP blend by
+    /// construction, and [`crate::rop_blend`] already answers that one as PIPELINE state.
+    /// Counting it here would ask for an attachment copy for nothing and, on a word `rop_blend`
+    /// recognised, would apply the destination twice.
+    #[test]
+    fn a_sop2_reading_the_output_bank_is_not_a_destination_read() {
+        let sop = instr(
+            Op::Sop2 {
+                color: crate::ir::SopOp::Add,
+                alpha: crate::ir::SopOp::Add,
+                f1: crate::ir::SopFactor::Src1Color,
+                f1_complement: false,
+                f2: crate::ir::SopFactor::Zero,
+                f2_complement: false,
+            },
+            Some(Operand::plain(Bank::Output, 0, 1)),
+            vec![Operand::plain(Bank::PrimaryAttr, 0, 2), Operand::plain(Bank::Output, 0, 1)],
+            [false, false, false, true],
+        );
+        let plan = plan_bindings(&shader(vec![sop]), 0, |_| false);
+        assert!(!plan.reads_dest_color);
+        assert!(!build_module("", &plan, false).wgsl.contains("gxp_dst"));
+    }
+
     #[test]
     fn plan_counts_pa_sa_extents_and_samplers() {
         // o0 = pa[4..8] (varying) * sa[8..12] (uniform); then a tex sample from unit 3.
@@ -1269,7 +3279,7 @@ mod tests {
         assert_eq!(plan.pa_lane_count, 12);
         // The SA binding is exactly the declared default uniform buffer.
         assert_eq!(plan.sa_lane_count, 12);
-        assert_eq!(plan.samplers, vec![TexBinding { unit: 3, coords: 2, cube: false }]);
+        assert_eq!(plan.samplers, vec![TexBinding { unit: 3, coords: 2, cube: false, raw: false }]);
         assert_eq!(plan.color, ColorOutput::NativeO0);
         assert_eq!(plan.varying_count(), 3); // ceil(12/4)
         assert_eq!(plan.sa_vec4_count(), 3);

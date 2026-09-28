@@ -76,6 +76,21 @@ pub enum Phase {
     /// "stop copying" are both plausible from the parent's 2.63 ms/frame and only one of them is
     /// the work.
     DrawVertexInternHit,
+    /// An intern MISS whose (length, fingerprint) key was ALREADY HELD by different bytes.
+    ///
+    /// >>> THIS IS THE ONE FAILURE OF THIS CACHE THAT LOOKS LIKE ORDINARY DYNAMIC GEOMETRY.
+    /// The fingerprint reads 64 sampled words, not the whole buffer, so two meshes of the same
+    /// length that differ only between the samples share a key - and the index holds ONE buffer
+    /// per key. Two such meshes drawn every frame evict each other every frame: both miss, both
+    /// are copied, and every cache downstream that keys on the buffer's IDENTITY misses too,
+    /// while the content is in fact unchanged. A plain miss count cannot separate that from
+    /// geometry that genuinely changed.
+    DrawVertexInternCollide,
+    /// A multi-stream gather answered from the GATHER MEMO (`TextureSnapshots::gather_memo`):
+    /// the streams' pages are provably unwritten since the memoised gather, so neither the
+    /// guest reads nor the scatter nor the intern ran. Counted, because a memo that never
+    /// hits looks exactly like one that always does from the parent's time.
+    DrawVertexGatherMemoHit,
     /// Snapshotting and decoding the draw's bound textures.
     DrawTextures,
     /// The FRAGMENT stage's miss path alone: `snapshot_bound_textures` for a binding list
@@ -115,6 +130,33 @@ pub enum Phase {
     DrawRecord,
     /// Reading the default uniform buffers and reflecting the material.
     DrawUniforms,
+    /// >>> THE RENDER-SCENE BUILD, WHICH WAS THE LAST BLOCK OF THE FRAME WITH NO SPLIT AT ALL.
+    ///
+    /// `RenderSceneBuilder::build` turns the captured `Draw`s into the renderer's own scene, and
+    /// the panel reported it as ONE number: `build 1.0 ms` over 605 draws. Every other term of
+    /// `render` is broken down; this one had no parts, so "what is build doing" could only be
+    /// answered by reading the function.
+    ///
+    /// Two sub-phases, not ten, and deliberately: this runs once per DRAW, and a scope is two
+    /// clock reads, so a fine split would mostly measure itself. MEASURED that way round this
+    /// same session - `draw: gxp blob + SA bytes` read 1.20 ms/frame over 2,192 entries and the
+    /// change aimed at it was worth exactly nothing, because most of that row was the
+    /// instrument. **Divide any row here by its entry count before believing it.**
+    BuildClassify,
+    /// The REST of one draw's build body, between the classification and the record: the
+    /// opaque decision, the texture lookups and decodes, the index expansion, the per-draw
+    /// uniform work. Named separately because the classify scope originally ran to the end of
+    /// the block and swallowed all of it under the wrong name.
+    BuildBody,
+    /// Inside [`Self::BuildBody`]: resolving the recompiled draw's attribute list and its two
+    /// texture lists. All three are derived once per distinct source and shared thereafter, so
+    /// this is meant to be a map probe per draw and a large reading here means it is not.
+    BuildGxpBindings,
+    /// Inside [`Self::BuildBody`]: expanding the guest topology into a flat triangle-list index
+    /// buffer, behind the `index_cache`.
+    BuildIndexExpand,
+    /// Assembling the renderer's draw and pushing it into the scene.
+    BuildRecord,
     /// Folding a completed scene into the determinism signature.
     SceneFold,
     /// The scheduler's OWN work per round - picking the next thread, draining the
@@ -142,6 +184,11 @@ pub enum Phase {
     /// The bookkeeping AFTER a resume: charging the guest clock for the work it did, blocking
     /// or cooling the thread, and draining the spawns and wakes its host calls queued.
     SchedBook,
+    /// Inside [`Self::SchedBook`]: the EARLY scene batch - the render-target scenes a title
+    /// reads back on the CPU, encoded, submitted and WAITED FOR (a whole GPU round trip, map
+    /// included) inside the cpu frame. On a GPU-bound phone that wait is the depth of the
+    /// queue in front of it, and the desktop's idle GPU hides it entirely.
+    SchedEarlyBatch,
     /// What a display FLIP costs outside the render: closing the capture's frame, advancing
     /// the game clock and the modelled I/O by one frame, and waking everything those pass.
     /// It happens on a scheduler round, so it was charged to the scheduler - a per-FRAME cost
@@ -189,10 +236,43 @@ pub enum Phase {
     /// Inside [`Self::AudioMix`]: decoding a source into PCM (ATRAC9 superframes, PCM/ADPCM
     /// reads and resampling). The half that is per SOURCE BYTE rather than per voice.
     AudioDecode,
+    /// >>> THE WHOLE OF `sceGxmShaderPatcherCreateFragmentProgram`, the three phases below
+    /// nested inside it.
+    ///
+    /// MEASURED at 10.58 us x692 in one window of a football title, which is the second-costliest
+    /// host call of its loading stretch, and NOTHING said where it went. Two guesses have already
+    /// died against censuses (`Arc::make_mut` deep-copying the candidate list: 38 copies in 4,000
+    /// pushes; `program_rop_blend` decoding the blob: that title has no NULL-`blendInfo`
+    /// program at all), which is the argument for a timer over a third guess.
+    PatchCreateFrag,
+    /// Inside it: resolving the program and MINTING THE HANDLE - which reflects the program's
+    /// parameter table to size its uniform buffer and allocates a guest block for the handle.
+    /// The reflection is memoised per header, but `invalidate_program_reflection` clears that
+    /// table (and the blob cache with it) on every patcher registration, so how often it is
+    /// actually paid is a per-title fact rather than an argument.
+    PatchCreateFragHandle,
+    /// Inside it: the blend equation - the `SceGxmBlendInfo` read, or, for a NULL one, the
+    /// decode of the program's own epilogue (`program_rop_blend`).
+    PatchCreateFragBlend,
+    /// Inside it: queueing the named PAIR for precompilation, which reads both program blobs out
+    /// of guest memory on a cache miss.
+    PatchCreateFragPrecompile,
+    /// Inside [`Phase::DrawGxpCapture`]: reading the FRAGMENT default uniform bank's bytes.
+    DrawGxpFragSa,
+    /// Inside [`Phase::DrawGxpCapture`]: the program blobs (a cached `Arc` after the first).
+    DrawGxpBlobs,
+    /// Inside [`Phase::DrawGxpCapture`]: laying both stages' SA images out (`sa_uniform_image`).
+    DrawGxpSaImage,
+    /// Inside [`Phase::DrawGxpCapture`]: snapshotting both stages' guest-memory WINDOWS
+    /// (`capture_mem_windows`).
+    DrawGxpWindows,
+    /// Waiting for the snapshot-cache lock (`snaps!`) when another thread holds it - the resolver
+    /// worker holds it for its whole flip-time read. Entries = contended acquisitions.
+    SnapsLockWait,
 }
 
 impl Phase {
-    const COUNT: usize = 35;
+    const COUNT: usize = 52;
 
     pub(crate) fn index(self) -> usize {
         match self {
@@ -204,8 +284,16 @@ impl Phase {
             Phase::DrawVertexGatherRead => 32,
             Phase::DrawVertexGatherIntern => 33,
             Phase::DrawVertexInternHit => 34,
+            Phase::DrawVertexInternCollide => 36,
+            Phase::DrawVertexGatherMemoHit => 35,
             Phase::DrawTextures => 3,
             Phase::DrawUniforms => 4,
+            Phase::BuildClassify => 37,
+            Phase::BuildBody => 39,
+            Phase::BuildGxpBindings => 40,
+            Phase::BuildIndexExpand => 41,
+            Phase::SchedEarlyBatch => 42,
+            Phase::BuildRecord => 38,
             Phase::SceneFold => 5,
             Phase::DrawTextureCompare => 6,
             Phase::SchedOverhead => 7,
@@ -231,6 +319,15 @@ impl Phase {
             Phase::SchedIdle => 16,
             Phase::SchedBook => 17,
             Phase::FrameBoundary => 18,
+            Phase::PatchCreateFrag => 43,
+            Phase::PatchCreateFragHandle => 44,
+            Phase::PatchCreateFragBlend => 45,
+            Phase::PatchCreateFragPrecompile => 46,
+            Phase::DrawGxpFragSa => 47,
+            Phase::DrawGxpBlobs => 48,
+            Phase::DrawGxpSaImage => 49,
+            Phase::DrawGxpWindows => 50,
+            Phase::SnapsLockWait => 51,
         }
     }
 
@@ -249,6 +346,8 @@ impl Phase {
             Phase::DrawVertexGatherRead,
             Phase::DrawVertexGatherIntern,
             Phase::DrawVertexInternHit,
+            Phase::DrawVertexInternCollide,
+            Phase::DrawVertexGatherMemoHit,
             Phase::DrawTextureBind,
             Phase::DrawTexSetPrev,
             Phase::DrawTexBindDecode,
@@ -261,17 +360,32 @@ impl Phase {
             Phase::DrawTexVertex,
             Phase::DrawUniforms,
             Phase::DrawGxpCapture,
+            Phase::DrawGxpFragSa,
+            Phase::DrawGxpBlobs,
+            Phase::DrawGxpSaImage,
+            Phase::DrawGxpWindows,
+            Phase::SnapsLockWait,
             Phase::DrawRecord,
+            Phase::BuildClassify,
+            Phase::BuildBody,
+            Phase::BuildGxpBindings,
+            Phase::BuildIndexExpand,
+            Phase::BuildRecord,
             Phase::SceneFold,
             Phase::DrawTextureCompare,
             Phase::SchedOverhead,
             Phase::SchedMirror,
             Phase::SchedIdle,
             Phase::SchedBook,
+            Phase::SchedEarlyBatch,
             Phase::FrameBoundary,
             Phase::ThreadSpawn,
             Phase::AudioMix,
             Phase::AudioDecode,
+            Phase::PatchCreateFrag,
+            Phase::PatchCreateFragHandle,
+            Phase::PatchCreateFragBlend,
+            Phase::PatchCreateFragPrecompile,
         ]
     }
 
@@ -287,6 +401,8 @@ impl Phase {
             Phase::DrawVertexGatherRead => "draw:     ...of which the guest READS",
             Phase::DrawVertexGatherIntern => "draw:     ...of which the content INTERN",
             Phase::DrawVertexInternHit => "draw:       ...of which the intern HIT",
+            Phase::DrawVertexInternCollide => "draw:       ...of which a MISS ON A KEY ALREADY HELD (fingerprint collision)",
+            Phase::DrawVertexGatherMemoHit => "draw:     ...of which the gather MEMO HIT (no read, no scatter)",
             Phase::DrawTextures => "draw: snapshot textures (miss path)",
             Phase::DrawTexFragMiss => "draw:   ...fragment MISS decode",
             Phase::DrawTexRead => "draw:     ...of which get_or_read",
@@ -303,16 +419,31 @@ impl Phase {
             Phase::AudioMix => "audio: mix one grain (every playing voice)",
             Phase::AudioDecode => "audio:   ...of which decode a source",
             Phase::DrawGxpCapture => "draw: gxp blob + SA bytes",
+            Phase::DrawGxpFragSa => "draw:   ...of which the fragment bank read",
+            Phase::DrawGxpBlobs => "draw:   ...of which the program blobs",
+            Phase::DrawGxpSaImage => "draw:   ...of which the SA images",
+            Phase::DrawGxpWindows => "draw:   ...of which the memory-window snapshots",
+            Phase::SnapsLockWait => "snapshot-cache lock WAIT (any caller; entries = contended takes)",
             Phase::DrawRecord => "draw: build record + push scene",
             Phase::DrawUniforms => "draw: uniforms + material",
+            Phase::BuildClassify => "build: classify the draw (interpret + layout) ONLY",
+            Phase::BuildBody => "build: the rest of the draw body (textures, indices, uniforms)",
+            Phase::BuildGxpBindings => "build:   ...of which the recompiled draw's attribute + texture lists",
+            Phase::BuildIndexExpand => "build:   ...of which the index expansion",
+            Phase::BuildRecord => "build: assemble + push the renderer's draw",
             Phase::SceneFold => "scene: signature fold",
             Phase::DrawTextureCompare => "draw: texture snapshot compare",
             Phase::SchedOverhead => "scheduler: pick",
             Phase::SchedMirror => "scheduler:   ...of which mirror refresh",
             Phase::SchedIdle => "scheduler: idle step",
             Phase::SchedBook => "scheduler: post-resume bookkeeping",
+            Phase::SchedEarlyBatch => "scheduler:   ...of which the EARLY scene batch (encode + submit + GPU readback WAIT)",
             Phase::FrameBoundary => "flip: end frame + advance clocks",
             Phase::ThreadSpawn => "scheduler: spawn thread (instantiate)",
+            Phase::PatchCreateFrag => "patcher: createFragmentProgram TOTAL (the three below nest in it)",
+            Phase::PatchCreateFragHandle => "patcher:   ...of which reflect + mint the handle",
+            Phase::PatchCreateFragBlend => "patcher:   ...of which the blend equation",
+            Phase::PatchCreateFragPrecompile => "patcher:   ...of which queue the pair for precompile",
         }
     }
 }
@@ -338,18 +469,45 @@ static BYTES: [AtomicU64; Phase::COUNT] = [const { AtomicU64::new(0) }; Phase::C
 static WORD_READS: AtomicU64 = AtomicU64::new(0);
 static BULK_READS: AtomicU64 = AtomicU64::new(0);
 
+// >>> COUNTED PER THREAD, FLUSHED TO THE GLOBALS IN BATCHES.
+//
+// These run on EVERY guest read from every thread - the guest's render and main threads and the
+// resolver at once - and one shared atomic bumped from all of them is a cache line bouncing
+// between cores thousands of times a frame. Every reader that DIFFERENCES the counts (a phase
+// scope, the per-call sample) does so on its own thread, so the thread-local figure is exact
+// for it; only the per-frame total reads the globals, which lag each thread by under a batch.
+const ACCESS_FLUSH: u64 = 64;
+thread_local! {
+    static LOCAL_ACCESSES: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// One single-word read of guest memory through the `dyn GuestMemory` boundary.
 pub fn note_word_read() {
-    if enabled() {
-        WORD_READS.fetch_add(1, Relaxed);
-    }
+    // UNGATED: the phone's diagnostics file - taken with no knob set - read `w0.0 b0.0/call` on
+    // every row while this was behind `enabled()`, which is the instrument reading as a null.
+    LOCAL_ACCESSES.with(|c| {
+        let (w, b) = c.get();
+        c.set((w + 1, b));
+        if (w + 1).is_multiple_of(ACCESS_FLUSH) {
+            WORD_READS.fetch_add(ACCESS_FLUSH, Relaxed);
+        }
+    });
 }
 
 /// One bulk read (a borrow, or a copy of a whole structure) of guest memory.
 pub fn note_bulk_read() {
-    if enabled() {
-        BULK_READS.fetch_add(1, Relaxed);
-    }
+    LOCAL_ACCESSES.with(|c| {
+        let (w, b) = c.get();
+        c.set((w, b + 1));
+        if (b + 1).is_multiple_of(ACCESS_FLUSH) {
+            BULK_READS.fetch_add(ACCESS_FLUSH, Relaxed);
+        }
+    });
+}
+
+/// THIS thread's `(single-word reads, bulk reads)` - exact, for a caller that differences them.
+fn local_accesses() -> (u64, u64) {
+    LOCAL_ACCESSES.with(|c| c.get())
 }
 
 /// >>> HOW OFTEN THE GUEST-STORE EPOCH WRAPPED, which is a per-FRAME cliff and not a rate.
@@ -390,9 +548,40 @@ pub fn epoch_wraps() -> u64 {
     EPOCH_WRAPS.load(Relaxed)
 }
 
-/// `(single-word reads, bulk reads)` since the last [`reset`].
+/// THIS thread's `(single-word reads, bulk reads)`, exact - for a caller that differences two
+/// readings on one thread (the per-host-call sample).
 pub fn guest_accesses() -> (u64, u64) {
+    local_accesses()
+}
+
+/// Every thread's `(single-word reads, bulk reads)` since the last [`reset`], each thread's share
+/// lagging by under [`ACCESS_FLUSH`] - for a per-frame total.
+pub fn guest_accesses_total() -> (u64, u64) {
     (WORD_READS.load(Relaxed), BULK_READS.load(Relaxed))
+}
+
+/// >>> WHAT THE FLIP-TIME PREFETCH FETCHED AND WHAT IT LEFT TO THE CACHES.
+///
+/// `resolve_deferred_geometry` batches every pending draw's guest reads into two crossings
+/// (see `PrefetchedMemory`). The first cut fetched EVERY range, and the desktop - where a
+/// crossing was already cheap - paid for it: the bytes of a range the snapshot caches
+/// already held were copied twice (into the overlay, then compared against the cache) for
+/// nothing. Now a range whose cache entry the dirty map proves current is NOT put in the
+/// table. These two counters say what fraction that is, so a title where the skip earns
+/// nothing (a rotating arena, where nothing is ever a hit) reads as such instead of as a
+/// mystery cost.
+static PREFETCH_FETCHED: AtomicU64 = AtomicU64::new(0);
+static PREFETCH_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// One resolve's prefetch table: `fetched` ranges put in it, `skipped` ranges the caches held.
+pub fn note_prefetch(fetched: usize, skipped: usize) {
+    PREFETCH_FETCHED.fetch_add(fetched as u64, Relaxed);
+    PREFETCH_SKIPPED.fetch_add(skipped as u64, Relaxed);
+}
+
+/// `(ranges fetched, ranges skipped as cache hits)` by the flip-time prefetch, cumulative.
+pub fn prefetch_ranges() -> (u64, u64) {
+    (PREFETCH_FETCHED.load(Relaxed), PREFETCH_SKIPPED.load(Relaxed))
 }
 
 /// >>> WHICH PHASE THE WORD READS HAPPENED IN, because the total names the DEFECT CLASS and
@@ -509,11 +698,11 @@ pub fn scope(phase: Phase) -> Option<Scope> {
         // host had installed one, which silently disabled the COUNTERS as well as the timer -
         // and the browser spent a session with no clock in its run worker and an empty phase
         // table that read as "no phase costs anything".
-        Some(Scope { phase, start: clock(), words: WORD_READS.load(Relaxed) })
+        Some(Scope { phase, start: clock(), words: local_accesses().0 })
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        Some(Scope { phase, start: std::time::Instant::now(), words: WORD_READS.load(Relaxed) })
+        Some(Scope { phase, start: std::time::Instant::now(), words: local_accesses().0 })
     }
 }
 
@@ -540,7 +729,7 @@ impl Drop for Scope {
         let i = self.phase.index();
         NS[i].fetch_add(self.start.elapsed().as_nanos() as u64, Relaxed);
         HITS[i].fetch_add(1, Relaxed);
-        WORD_BY_PHASE[i].fetch_add(WORD_READS.load(Relaxed).saturating_sub(self.words), Relaxed);
+        WORD_BY_PHASE[i].fetch_add(local_accesses().0.saturating_sub(self.words), Relaxed);
     }
 }
 
@@ -556,7 +745,7 @@ impl Drop for Scope {
             NS[i].fetch_add(ns, Relaxed);
         }
         HITS[i].fetch_add(1, Relaxed);
-        WORD_BY_PHASE[i].fetch_add(WORD_READS.load(Relaxed).saturating_sub(self.words), Relaxed);
+        WORD_BY_PHASE[i].fetch_add(local_accesses().0.saturating_sub(self.words), Relaxed);
     }
 }
 
@@ -593,6 +782,79 @@ fn clock() -> Option<f64> {
     CLOCK.get().map(|f| f())
 }
 
+/// `VITASLOP_SMP_SLOW_EXCLUDE_GXM=1` - a MEASUREMENT RIG for the phone proxy only. The SMP
+/// guest workers' `VITASLOP_SMP_GUEST_SLOW` spin scales each guest slice; with this set, the
+/// time a slice spent in the GXM capture (`record_draw`, the deferred-geometry resolve) is left
+/// out of what is scaled - it runs at desktop speed while the guest runs phone-slow, which is
+/// what moving that work OFF the guest thread would buy the chain. Unset = no clock read.
+pub fn exclude_gxm_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_SMP_SLOW_EXCLUDE_GXM"))
+}
+
+std::thread_local! {
+    static EXCLUDED_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    static EXCLUDE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Guard for [`exclude_gxm_enabled`]: the outermost one on a thread adds its wall time to
+/// that thread's excluded total. `None` when the rig is off.
+pub struct ExcludeScope {
+    #[cfg(target_arch = "wasm32")]
+    start: Option<f64>,
+    #[cfg(not(target_arch = "wasm32"))]
+    start: std::time::Instant,
+}
+
+pub fn exclude_scope() -> Option<ExcludeScope> {
+    if !exclude_gxm_enabled() {
+        return None;
+    }
+    let outer = EXCLUDE_DEPTH.with(|d| {
+        d.set(d.get() + 1);
+        d.get() == 1
+    });
+    if !outer {
+        return Some(ExcludeScope {
+            #[cfg(target_arch = "wasm32")]
+            start: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            start: std::time::Instant::now(),
+        });
+    }
+    Some(ExcludeScope {
+        #[cfg(target_arch = "wasm32")]
+        start: clock(),
+        #[cfg(not(target_arch = "wasm32"))]
+        start: std::time::Instant::now(),
+    })
+}
+
+impl Drop for ExcludeScope {
+    fn drop(&mut self) {
+        let outer = EXCLUDE_DEPTH.with(|d| {
+            d.set(d.get() - 1);
+            d.get() == 0
+        });
+        if !outer {
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let ms = match (self.start, clock()) {
+            (Some(s), Some(n)) => (n - s).max(0.0),
+            _ => 0.0,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        EXCLUDED_MS.with(|e| e.set(e.get() + ms));
+    }
+}
+
+/// Take this thread's excluded milliseconds (see [`exclude_scope`]).
+pub fn take_excluded_ms() -> f64 {
+    EXCLUDED_MS.with(|e| e.replace(0.0))
+}
+
 /// Accumulated `(nanoseconds, times entered, bytes moved)` for `phase` since the last
 /// [`reset`]. Bytes are zero for a phase that does not report them.
 pub fn read(phase: Phase) -> (u64, u64, u64) {
@@ -600,8 +862,98 @@ pub fn read(phase: Phase) -> (u64, u64, u64) {
     (NS[i].load(Relaxed), HITS[i].load(Relaxed), BYTES[i].load(Relaxed))
 }
 
+/// The phase table as TEXT, one entry per timed phase, empty when nothing was timed.
+///
+/// >>> THIS EXISTED ONLY AS A BROWSER PANEL LINE, WHICH IS WHY THE DESKTOP COULD NOT PRINT IT.
+///
+/// The counters are engine-agnostic and native times with `Instant`, so the desktop has had
+/// this data all along and simply never rendered it - the only formatter lived in the browser's
+/// diagnostics panel. A session set `VITASLOP_PERF=1` on a headless run, got nothing, and
+/// concluded the log FILTER was wrong; the table is not emitted on that host at all.
+///
+/// Read every row as `ms / entries`, not as `ms`: a scope is two clock reads, and a row at the
+/// instrument's own floor (~0.45 us an entry) is measuring this function rather than its
+/// subject. See [`Phase`] for which rows nest inside which.
+pub fn table() -> Vec<String> {
+    let mut out = Vec::new();
+    for p in Phase::all() {
+        let (ns, hits, _) = read(p);
+        if ns == 0 && hits == 0 {
+            continue;
+        }
+        out.push(format!("{} {:.2} ms over {hits} entries", p.label(), ns as f64 / 1.0e6));
+    }
+    out
+}
+
 /// Zero every phase counter, so a benchmark measures its window and not the boot.
+/// >>> WHO HOLDS THE SNAPSHOT LOCK WHEN SOMEONE WAITS ON IT.
+///
+/// `SnapsLockWait` names the WAITER's cost and nothing about the holder, and the obvious
+/// suspect (the resolver's flip read) was chunked with no effect on the wait (phone 022/023:
+/// 2.02 -> 2.05 ms/f over ~2 contended takes a frame). Every acquisition stores its source
+/// line here; a contended take bills its wait to the line that held the lock when it started
+/// waiting. One relaxed store per take when `VITASLOP_PERF` is on, nothing when it is off.
+static SNAPS_HOLDER: AtomicU64 = AtomicU64::new(0);
+const HOLDER_SLOTS: usize = 24;
+static HOLDER_LINE: [AtomicU64; HOLDER_SLOTS] = [const { AtomicU64::new(0) }; HOLDER_SLOTS];
+static HOLDER_NS: [AtomicU64; HOLDER_SLOTS] = [const { AtomicU64::new(0) }; HOLDER_SLOTS];
+static HOLDER_HITS: [AtomicU64; HOLDER_SLOTS] = [const { AtomicU64::new(0) }; HOLDER_SLOTS];
+
+/// Record that the snapshot lock was just taken at `line` (see [`SNAPS_HOLDER`]).
+pub fn snaps_taken(line: u32) {
+    if enabled() {
+        SNAPS_HOLDER.store(u64::from(line), Relaxed);
+    }
+}
+
+/// The line holding the snapshot lock right now, read by a take that found it held.
+pub fn snaps_holder() -> u32 {
+    SNAPS_HOLDER.load(Relaxed) as u32
+}
+
+/// Bill `ns` of waiting to `holder` (see [`SNAPS_HOLDER`]).
+pub fn snaps_waited(holder: u32, ns: u64) {
+    let h = u64::from(holder);
+    for i in 0..HOLDER_SLOTS {
+        let cur = HOLDER_LINE[i].load(Relaxed);
+        if cur == h || (cur == 0 && HOLDER_LINE[i].compare_exchange(0, h, Relaxed, Relaxed).map_or_else(|v| v == h, |_| true)) {
+            HOLDER_NS[i].fetch_add(ns, Relaxed);
+            HOLDER_HITS[i].fetch_add(1, Relaxed);
+            return;
+        }
+    }
+}
+
+/// The waits by holder line, largest first: `L<line> <ms total> ms / <n>`; empty when none.
+pub fn snaps_waits_by_holder() -> Vec<(u32, f64, u64)> {
+    let mut v: Vec<(u32, f64, u64)> = (0..HOLDER_SLOTS)
+        .filter(|&i| HOLDER_HITS[i].load(Relaxed) > 0)
+        .map(|i| (HOLDER_LINE[i].load(Relaxed) as u32, HOLDER_NS[i].load(Relaxed) as f64 / 1.0e6, HOLDER_HITS[i].load(Relaxed)))
+        .collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    v
+}
+
+/// Milliseconds on the installed clock, when there is one (wasm) - for timing a wait whose
+/// bill goes somewhere other than a [`Phase`].
+pub fn now_ms() -> Option<f64> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        clock()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        Some(T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0)
+    }
+}
+
 pub fn reset() {
+    for i in 0..HOLDER_SLOTS {
+        HOLDER_NS[i].store(0, Relaxed);
+        HOLDER_HITS[i].store(0, Relaxed);
+    }
     for i in 0..Phase::COUNT {
         NS[i].store(0, Relaxed);
         HITS[i].store(0, Relaxed);

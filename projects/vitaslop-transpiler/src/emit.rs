@@ -129,10 +129,16 @@ pub enum StmtKind {
     Uadd8,
     Sel,
     ShiftRegFlags,
+    /// Arming or clearing the exclusive monitor (`LDREX`/`STREX`).
+    ExclSet,
+    /// An SMP build's atomic exclusive access or `CLREX` (`LoadExcl`/`StoreExcl`/`ClearExcl`).
+    Exclusive,
+    /// An SMP build's memory barrier.
+    Fence,
 }
 
 impl StmtKind {
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 22;
 
     pub const ALL: [StmtKind; Self::COUNT] = [
         StmtKind::SetReg,
@@ -154,6 +160,9 @@ impl StmtKind {
         StmtKind::Uadd8,
         StmtKind::Sel,
         StmtKind::ShiftRegFlags,
+        StmtKind::ExclSet,
+        StmtKind::Exclusive,
+        StmtKind::Fence,
     ];
 
     /// Exhaustive over [`Stmt`] on purpose - a new variant must be given a category here
@@ -164,6 +173,9 @@ impl StmtKind {
             Stmt::Store { .. } => StmtKind::Store,
             Stmt::FlagsAdd { .. } => StmtKind::FlagsAdd,
             Stmt::FlagsLogic { .. } => StmtKind::FlagsLogic,
+            Stmt::ExclSet(..) => StmtKind::ExclSet,
+            Stmt::LoadExcl { .. } | Stmt::StoreExcl { .. } | Stmt::ClearExcl => StmtKind::Exclusive,
+            Stmt::Fence => StmtKind::Fence,
             Stmt::Svc(..) => StmtKind::Svc,
             Stmt::Import(..) => StmtKind::Import,
             Stmt::Rbit { .. } => StmtKind::Rbit,
@@ -206,6 +218,9 @@ impl StmtKind {
             StmtKind::Uadd8 => "uadd8",
             StmtKind::Sel => "sel",
             StmtKind::ShiftRegFlags => "shift-reg-flags",
+            StmtKind::ExclSet => "excl-set",
+            StmtKind::Exclusive => "exclusive (smp)",
+            StmtKind::Fence => "fence (smp)",
         }
     }
 }
@@ -264,6 +279,21 @@ struct Body {
     unbilled_work: u64,
     unbilled_dirty: u64,
     flushes: u64,
+    /// Dirty-map marks actually EMITTED, and marks a preceding mark in the same
+    /// straight-line run already covers ([`plan_dirty_run`]). The second number is what
+    /// the run-mark change is worth, and it has to be counted rather than inferred: the
+    /// operator total moves for half a dozen reasons and none of them name this one.
+    dirty_marks: u64,
+    dirty_marks_elided: u64,
+    /// Store sites whose base register is SP (r13). Counted in both arms of the run
+    /// coalescer so the census can price the SP-skip idea - dropping the mark outright on
+    /// a stack-relative store - without building it. See [`Expansion::dirty_sp_stores`].
+    dirty_sp_stores: u64,
+    /// Whether the statement now being emitted is one [`plan_dirty_run`] says needs no
+    /// mark. Set by the statement loops immediately before each [`emit_stmt`] and read by
+    /// [`emit_dirty_mark`]. A field rather than a parameter because the mark is emitted
+    /// from five different lowerings, all of them several frames below the loop.
+    dirty_covered: bool,
     /// Operators charged to each [`StmtKind`], and how many statements of that kind were
     /// emitted. This is the answer to "which guest lowering is expensive", which no total
     /// can give: a 9.88 average over a corpus containing both `mov r0, r1` and a
@@ -378,6 +408,10 @@ impl Body {
             unbilled_work: 0,
             unbilled_dirty: 0,
             flushes: 0,
+            dirty_marks: 0,
+            dirty_marks_elided: 0,
+            dirty_sp_stores: 0,
+            dirty_covered: false,
             stmt_ops: [0; StmtKind::COUNT],
             stmt_count: [0; StmtKind::COUNT],
             stmt_child_ops: 0,
@@ -461,6 +495,22 @@ impl Body {
     /// Encode one instruction WITHOUT offering it to the register cache: the cache's own
     /// loads and write-backs, which move exactly the state it is caching.
     fn raw(&mut self, i: &W, billed: bool) -> &mut Self {
+        // >>> EVERY LOAD AND STORE IS SHIFTED BY THE HOST OFFSET HERE, AND NOWHERE ELSE.
+        // When the guest region lives inside the host's own linear memory (see
+        // `Program::host_off`) every linear address the emitter computes - a rebased guest
+        // pointer, the dirty map, the mirror block, the dispatch table - is `host_off` bytes
+        // further along. The immediate offset of a memory access is the free place to put
+        // that: it costs no operator, and this is the one function every emitted
+        // instruction passes through, so no site can be missed. Bulk operations take their
+        // addresses from the stack and are shifted at their (few) sites with `emit_host_off`.
+        let shifted;
+        let i = match shift_by_host_off(i) {
+            Some(s) => {
+                shifted = s;
+                &shifted
+            }
+            None => i,
+        };
         if billed {
             let cost = operator_cost(i);
             self.billed += u64::from(cost);
@@ -577,7 +627,7 @@ pub fn arm_at_frame() -> Option<u64> {
     use std::sync::OnceLock;
     static CELL: OnceLock<Option<u64>> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("VITASLOP_ARM_AT_FRAME").ok().and_then(|s| s.trim().parse().ok())
+        emit_var("VITASLOP_ARM_AT_FRAME").ok().and_then(|s| s.trim().parse().ok())
     })
 }
 
@@ -694,6 +744,83 @@ thread_local! {
     /// thread, or 0 when this build has none. Thread-local for the same reason as
     /// [`ARM_WORD_OFF`].
     static DIRTY_OFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Where linear offset 0 of the guest layout sits in the memory the module actually
+    /// runs in - see [`crate::Program::host_off`]. Set by `emit_module` for the module
+    /// being emitted on this thread; 0 for a self-contained module.
+    static HOST_OFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The host offset in force for the module being emitted on this thread.
+fn host_off() -> u64 {
+    HOST_OFF.with(|c| c.get())
+}
+
+/// `i` with its memory immediate moved along by the host offset, or `None` when `i` is not
+/// a memory access (or there is no offset) and is to be emitted as it is. Covers every
+/// load/store form this emitter produces; a form added later that is not listed here
+/// would read the wrong bytes under a host offset, which the `host_off_shifts_every_form`
+/// test is there to catch.
+fn shift_by_host_off(i: &W) -> Option<W<'static>> {
+    let h = host_off();
+    if h == 0 {
+        return None;
+    }
+    let s = |m: &MemArg| MemArg { offset: m.offset + h, align: m.align, memory_index: m.memory_index };
+    Some(match i {
+        W::I32Load(m) => W::I32Load(s(m)),
+        W::I64Load(m) => W::I64Load(s(m)),
+        W::F32Load(m) => W::F32Load(s(m)),
+        W::F64Load(m) => W::F64Load(s(m)),
+        W::I32Load8S(m) => W::I32Load8S(s(m)),
+        W::I32Load8U(m) => W::I32Load8U(s(m)),
+        W::I32Load16S(m) => W::I32Load16S(s(m)),
+        W::I32Load16U(m) => W::I32Load16U(s(m)),
+        W::I64Load8S(m) => W::I64Load8S(s(m)),
+        W::I64Load8U(m) => W::I64Load8U(s(m)),
+        W::I64Load16S(m) => W::I64Load16S(s(m)),
+        W::I64Load16U(m) => W::I64Load16U(s(m)),
+        W::I64Load32S(m) => W::I64Load32S(s(m)),
+        W::I64Load32U(m) => W::I64Load32U(s(m)),
+        W::I32Store(m) => W::I32Store(s(m)),
+        W::I64Store(m) => W::I64Store(s(m)),
+        W::F32Store(m) => W::F32Store(s(m)),
+        W::F64Store(m) => W::F64Store(s(m)),
+        W::I32Store8(m) => W::I32Store8(s(m)),
+        W::I32Store16(m) => W::I32Store16(s(m)),
+        W::I64Store8(m) => W::I64Store8(s(m)),
+        W::I64Store16(m) => W::I64Store16(s(m)),
+        W::I64Store32(m) => W::I64Store32(s(m)),
+        W::V128Load(m) => W::V128Load(s(m)),
+        W::V128Store(m) => W::V128Store(s(m)),
+        // The SMP exclusive forms (`emit_load_excl` / `emit_store_excl`).
+        W::I32AtomicLoad(m) => W::I32AtomicLoad(s(m)),
+        W::I32AtomicLoad8U(m) => W::I32AtomicLoad8U(s(m)),
+        W::I32AtomicLoad16U(m) => W::I32AtomicLoad16U(s(m)),
+        W::I64AtomicLoad(m) => W::I64AtomicLoad(s(m)),
+        W::I32AtomicRmwCmpxchg(m) => W::I32AtomicRmwCmpxchg(s(m)),
+        W::I32AtomicRmw8CmpxchgU(m) => W::I32AtomicRmw8CmpxchgU(s(m)),
+        W::I32AtomicRmw16CmpxchgU(m) => W::I32AtomicRmw16CmpxchgU(s(m)),
+        W::I64AtomicRmwCmpxchg(m) => W::I64AtomicRmwCmpxchg(s(m)),
+        W::MemoryCopy { .. } | W::MemoryFill(_) | W::MemoryInit { .. } => {
+            // Stack-addressed: shifted at the site with `emit_host_off`, never here.
+            return None;
+        }
+        _ => return None,
+    })
+}
+
+/// Add the host offset to the linear address on top of the stack, for a bulk memory
+/// operation (`memory.copy` / `memory.fill`), whose addresses carry no immediate. Emits
+/// nothing when there is no offset, so a self-contained module is byte-for-byte what it was.
+/// UNTOLLED: the offset is where the memory happens to sit, not guest work, and the guest
+/// clock must read the same under either memory layout.
+fn emit_host_off(f: &mut Body) {
+    let h = host_off();
+    if h == 0 {
+        return;
+    }
+    f.untolled(&W::I32Const(h as i32));
+    f.untolled(&W::I32Add);
 }
 
 /// Turn guest-store dirty tracking on or off for modules emitted on this thread after
@@ -723,6 +850,193 @@ pub fn dirty_tracking() -> bool {
 /// Log2 of the dirty map's granule. 4 KB, the wasm page, so a page index is a plain
 /// `addr >> 12` and the runtime's page arithmetic needs no second unit.
 pub const DIRTY_SHIFT: u32 = 12;
+
+/// The dirty map's granule in BYTES, and the exact ceiling on a coalesced mark's extent -
+/// see [`plan_dirty_run`].
+pub const DIRTY_PAGE_BYTES: i64 = 1 << DIRTY_SHIFT;
+
+thread_local! {
+    /// Whether modules emitted on this thread coalesce the marks of a straight-line run of
+    /// stores ([`plan_dirty_run`]). `u8::MAX` is the "never set" sentinel, exactly as for
+    /// [`DIRTY_TRACKING`].
+    static DIRTY_RUN_MARKS: std::cell::Cell<u8> = const { std::cell::Cell::new(u8::MAX) };
+}
+
+/// Turn the coalesced run-mark on or off for modules emitted on this thread after this
+/// call, overriding both the default and `VITASLOP_DIRTY_RUN_MARK`.
+pub fn set_dirty_run_marks(on: bool) {
+    DIRTY_RUN_MARKS.with(|c| c.set(u8::from(on)));
+}
+
+/// Does this build coalesce the marks of a store run? ON unless
+/// `VITASLOP_DIRTY_RUN_MARK=0` says otherwise.
+///
+/// VALUE-sensitive for the same reason [`dirty_tracking`] is: this is an A/B ARM, and one
+/// spelled `=0` that reads as ON has already cost this project a whole measurement.
+pub fn dirty_run_marks() -> bool {
+    use std::sync::OnceLock;
+    static FROM_ENV: OnceLock<bool> = OnceLock::new();
+    match DIRTY_RUN_MARKS.with(|c| c.get()) {
+        u8::MAX => *FROM_ENV.get_or_init(|| {
+            !matches!(emit_var("VITASLOP_DIRTY_RUN_MARK").as_deref(), Ok("0"))
+        }),
+        n => n != 0,
+    }
+}
+
+/// A store address of the form `Rn`, `Rn + imm` or `Rn - imm`, as `(base register, byte
+/// offset)`. Anything else - a shifted index, a register offset, a loaded pointer - has no
+/// compile-time relationship to its neighbours and gets `None`.
+fn reg_plus_imm(v: &Value) -> Option<(u8, i32)> {
+    match v {
+        Value::Reg(r) => Some((*r, 0)),
+        Value::Bin(crate::ir::BinOp::Add, a, b) => match (&**a, &**b) {
+            (Value::Reg(r), Value::Imm(i)) | (Value::Imm(i), Value::Reg(r)) => {
+                Some((*r, *i as i32))
+            }
+            _ => None,
+        },
+        Value::Bin(crate::ir::BinOp::Sub, a, b) => match (&**a, &**b) {
+            (Value::Reg(r), Value::Imm(i)) => Some((*r, (*i as i32).wrapping_neg())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `(base register, byte offset, width)` for a statement that STORES to guest memory
+/// through a base-plus-constant address. `None` for anything else, including a load.
+fn store_extent(s: &Stmt) -> Option<(u8, i32, i32)> {
+    match s {
+        Stmt::Store { addr, size, .. } => {
+            let n = match size {
+                MemSize::Byte => 1,
+                MemSize::Half => 2,
+                MemSize::Word => 4,
+            };
+            reg_plus_imm(addr).map(|(r, o)| (r, o, n))
+        }
+        Stmt::VfpMem { reg, addr, load: false } => {
+            let n = match reg {
+                crate::ir::VfpReg::S(_) => 4,
+                crate::ir::VfpReg::D(_) => 8,
+            };
+            reg_plus_imm(addr).map(|(r, o)| (r, o, n))
+        }
+        _ => None,
+    }
+}
+
+/// >>> WHICH STORES IN A STATEMENT RUN NEED NO MARK OF THEIR OWN, because a mark one of
+/// > > > their neighbours already emitted covers them exactly.
+///
+/// A `push {r4-r11,lr}` is nine `Stmt::Store`s at `sp+0 .. sp+32`, and today each one
+/// emits the seven operators of [`emit_dirty_mark`] - 63 operators to record what is at
+/// most two page stamps, and usually one. Same for `stm`, `vpush`, `vstm` and any
+/// compiler-emitted run of spills off one base.
+///
+/// # The argument, which is the READER's own overhang argument widened
+/// [`emit_dirty_mark`] stamps the page a store STARTS in, and a reader looks ONE page
+/// below its range because "the largest translated store is 8 bytes, so a store reaching
+/// into page P started in P or P-1". The only thing that number does is bound the extent a
+/// single stamp is allowed to cover. Widen it to a full page and the same sentence still
+/// holds: an extent of at most [`DIRTY_PAGE_BYTES`] starting anywhere in page P ends in P
+/// or P+1, so a reader that looks one page below still misses nothing.
+///
+/// So a store may skip its mark when an EARLIER store in the same run stamped an address
+/// at or below it and the two, plus this store's own width, span no more than a page:
+///
+/// * `d = this.offset - anchor.offset` must be `>= 0` - the stamp has to be on the LOWEST
+///   address of the covered extent, or the reader's one-page look-below is on the wrong
+///   side of it.
+/// * `d + this.width <= 4096` - the extent the one stamp stands for.
+/// * Same BASE REGISTER, and nothing between them may write it. Two offsets off two
+///   different bases have no compile-time distance at all.
+///
+/// # What breaks the run, and why the list is short on purpose
+/// The anchor is dropped by ANY statement other than a store, a VFP load or a `SetReg` of
+/// some other register. That is far more conservative than the addressing argument needs,
+/// and it is what makes the EPOCH argument hold: the stamp carries the epoch as it stood
+/// at the anchor, and the epoch changes only inside a host call
+/// ([`crate::emit::emit_dirty_mark`]'s doc, and `GuestMemory::bump_dirty_epoch`, which is
+/// reached only from an import handler). A run containing no `Import`, `Svc`, `Call`,
+/// `CallIndirect` or `Guard` cannot have crossed one, and the guest is single-executor in
+/// both engines - one OS thread with one fiber live natively, one worker with JSPI in the
+/// browser - so no OTHER thread can bump it underneath either.
+///
+/// Widen either list only with a reason. An elided mark that should not have been is a
+/// texture the host believes it has already uploaded, drawn from bytes the guest has since
+/// overwritten - the same failure [`emit_dirty_range`] exists to prevent, and it surfaces
+/// frames later as stale pixels.
+///
+/// # WHAT THIS IS INSTEAD OF, and why - because the obvious idea is the unsafe one
+/// The obvious cut is to drop the mark ENTIRELY on a store whose base is SP: a prologue, a
+/// spill, a local. It is the same population and roughly the same size - `dirty_sp_stores`
+/// says SP is the base of **21% (a fighting title), 44% (a golf title), 37% (a racer)** of
+/// the store sites this analysis can place, against the 21% / 39% / 38% the run coalescer
+/// actually elides - so it buys nothing extra, and it buys it with an argument that cannot
+/// be made from here. The claim would have to be "no GXM-visible buffer is ever on a thread
+/// stack", and the map does not only answer for textures: `TextureSnapshots` keeps
+/// `vertex_stamps` and `index_stamps` against the same pages, and a title assembling a
+/// handful of UI vertices in a stack array and handing them to `sceGxmDraw` is ordinary
+/// code. The transpiler cannot see that, the failure is silent, and it would surface as
+/// stale geometry frames later. The coalescer needs no such claim: it says only that two
+/// addresses a known distance apart are in the same page or the next one, which is
+/// arithmetic.
+///
+/// Also rejected: HOISTING the epoch load into a local per run. The epoch genuinely cannot
+/// change outside a host call, so it is sound over exactly the runs this analysis already
+/// identifies - but it replaces two operators (`i32.const 0`, `i32.load8_u`) with one
+/// (`local.get`) and costs three to set up, so it needs four unrelated stores in a run to
+/// break even and it saves 1 operator of 7 where this saves all 7. It is strictly the
+/// smaller half of the same idea; take it only if a run census ever says the long runs are
+/// mostly to SCATTERED addresses.
+fn plan_dirty_run(f: &mut Body, stmts: &[Stmt]) -> Vec<bool> {
+    let mut out = vec![false; stmts.len()];
+    // NOT under SMP: the argument below needs the epoch to be unable to move inside a run, and
+    // with guest threads on other workers the HOST can bump it (at a present) while this run
+    // executes. Every store then carries its own mark, read at its own moment.
+    let on = dirty_run_marks() && !smp();
+    // The lowest address stamped by the run so far, as `(base register, offset)`.
+    let mut anchor: Option<(u8, i32)> = None;
+    for (i, s) in stmts.iter().enumerate() {
+        match s {
+            Stmt::Store { .. } | Stmt::VfpMem { load: false, .. } => match store_extent(s) {
+                Some((b, o, n)) => {
+                    // Counted in BOTH arms, so the census can price the alternative that
+                    // was rejected - skipping the mark on an SP-relative store outright -
+                    // without a build of its own. See the report in `dirty_sp_stores`.
+                    if b == 13 {
+                        f.dirty_sp_stores += 1;
+                    }
+                    if let Some((ab, ao)) = anchor
+                        && ab == b
+                    {
+                        let d = o.wrapping_sub(ao);
+                        if on && d >= 0 && i64::from(d) + i64::from(n) <= DIRTY_PAGE_BYTES {
+                            out[i] = true;
+                            continue;
+                        }
+                    }
+                    anchor = Some((b, o));
+                }
+                // A store this analysis cannot place. It stamps its own page as always,
+                // but it says nothing about where the next one lands.
+                None => anchor = None,
+            },
+            // A VFP LOAD writes a VFP register and no core register, so the base survives.
+            Stmt::VfpMem { load: true, .. } => {}
+            // A core-register write ends the run only if it is the base itself.
+            Stmt::SetReg(r, _) => {
+                if anchor.is_some_and(|(b, _)| b == *r) {
+                    anchor = None;
+                }
+            }
+            _ => anchor = None,
+        }
+    }
+    out
+}
 
 /// Byte offset of the EPOCH within the dirty block. The block leads with it so a host
 /// that knows `dirty_off` knows both.
@@ -765,6 +1079,14 @@ fn emit_dirty_mark(f: &mut Body, addr_local: u32) {
     if off == 0 {
         return;
     }
+    // A store a preceding mark in this same run already covers ([`plan_dirty_run`]). The
+    // address is on the stack and stays there untouched, which is exactly the shape the
+    // no-map path above leaves behind.
+    if f.dirty_covered {
+        f.dirty_marks_elided += 1;
+        return;
+    }
+    f.dirty_marks += 1;
     let mark = f.unbilled_mark();
     f.untolled(&W::LocalTee(addr_local));
     f.untolled(&W::I32Const(DIRTY_SHIFT as i32));
@@ -829,7 +1151,7 @@ fn emit_dirty_range(f: &mut Body, addr_local: u32, len_local: u32) {
     f.untolled(&W::LocalGet(addr_local));
     f.untolled(&W::I32Const(DIRTY_SHIFT as i32));
     f.untolled(&W::I32ShrU);
-    f.untolled(&W::I32Const((off + DIRTY_MAP_OFF) as i32));
+    f.untolled(&W::I32Const((off + DIRTY_MAP_OFF + host_off()) as i32));
     f.untolled(&W::I32Add);
     // value = the current epoch, read from its own word just below the map.
     f.untolled(&W::I32Const(0));
@@ -852,6 +1174,59 @@ fn emit_dirty_range(f: &mut Body, addr_local: u32, len_local: u32) {
     f.untolled(&W::End);
     f.charge_unbilled_dirty(mark);
 }
+
+
+// --- emit-time diagnostic knobs on a platform with no environment -----------------
+//
+// >>> WHY THIS SEAM EXISTS AT ALL.
+// Every knob below is read at TRANSPILE time, and in the browser the transpile happens in a
+// throwaway worker with no environment: `std::env::var` there always returns `NotPresent`. So
+// the whole emit-time diagnostic family - the store and read watchpoints, the block tracer,
+// guest-PC tracking - could only ever be pointed at the DESKTOP. That is exactly backwards
+// for the questions they answer: a fault the desktop does not reproduce is the case where
+// they are the only instruments there are, and it is the case they could not be used on.
+//
+// The override is a thread-local map because emission is single-threaded per module while a
+// test binary may emit several modules at once, and a process-wide latch would let whichever
+// one ran first decide for all of them. `ANY_OVERRIDE` keeps an unset build's reads to one
+// relaxed atomic load, so an ordinary transpile pays nothing measurable and stays byte-identical.
+thread_local! {
+    static EMIT_KNOBS: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+static ANY_EMIT_KNOB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set one emit-time diagnostic knob for this thread, as if the environment carried it.
+/// The value is the same string the environment would hold, so a browser run and a desktop
+/// run spell every knob identically and a recipe copied between them cannot mean two things.
+pub fn set_emit_knob(name: &str, value: &str) {
+    ANY_EMIT_KNOB.store(true, std::sync::atomic::Ordering::Relaxed);
+    EMIT_KNOBS.with(|m| m.borrow_mut().insert(name.to_string(), value.to_string()));
+}
+
+/// Read an emit-time knob: this thread's override if one is set, else the environment.
+fn emit_var(name: &str) -> Result<String, std::env::VarError> {
+    if ANY_EMIT_KNOB.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(v) = EMIT_KNOBS.with(|m| m.borrow().get(name).cloned())
+    {
+        return Ok(v);
+    }
+    std::env::var(name)
+}
+
+/// The emit-time knobs [`set_emit_knob`] accepts, so a caller that forwards a whole table
+/// can ask for exactly the ones that mean something here - and so a typo in a run script
+/// becomes a refusal instead of a silently-off instrument.
+pub const EMIT_KNOBS_OVERRIDABLE: &[&str] = &[
+    "VITASLOP_WATCH_STORE",
+    "VITASLOP_WATCH_STORE_LOG",
+    "VITASLOP_WATCH_STORE_NZ",
+    "VITASLOP_WATCH_STORE_SKIP",
+    "VITASLOP_WATCH_STORE_ARM",
+    "VITASLOP_WATCH_READ",
+    "VITASLOP_WATCH_READ_SKIP",
+    "VITASLOP_ARM_AT_FRAME",
+];
 
 /// Diagnostic store watchpoint. When `VITASLOP_WATCH_STORE=<hex guest addr>` is set
 /// at transpile time, every word store to that exact guest address is preceded by an
@@ -882,7 +1257,7 @@ fn watch_store_addr() -> Option<u32> {
     use std::sync::OnceLock;
     static CELL: OnceLock<Option<u32>> = OnceLock::new();
     *CELL.get_or_init(|| {
-        let parsed = std::env::var("VITASLOP_WATCH_STORE").ok().and_then(|s| {
+        let parsed = emit_var("VITASLOP_WATCH_STORE").ok().and_then(|s| {
             u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
         });
         // SAY THAT IT PARSED. A run that prints nothing is the watchpoint's ONLY output when the
@@ -890,10 +1265,12 @@ fn watch_store_addr() -> Option<u32> {
         // transpiler, or was spelled in a form this parser drops. Those two readings send an
         // investigation in opposite directions, and the second one silently confirms whatever
         // the first was hoping for. [[vitaslop-instrument-failure-imitating-its-subject]]
-        match (std::env::var("VITASLOP_WATCH_STORE"), parsed) {
+        match (emit_var("VITASLOP_WATCH_STORE"), parsed) {
             (Ok(_), Some(a)) => eprintln!(
-                "watch store: ARMED at {a:#010x} - a run with no further `watch store` line means \
-                 no instrumented write covered that address"
+                "watch store: ARMED at {a:#010x}. EVERY HIT IS PRINTED AS A `[trace]` LINE, not as a \
+                 `watch store` one - grepping for the latter reads a working watchpoint as a silent \
+                 one, and it has. Silence across BOTH is what means no instrumented write covered \
+                 the address."
             ),
             (Ok(raw), None) => eprintln!(
                 "watch store: VITASLOP_WATCH_STORE={raw:?} is not a hex address - THE WATCHPOINT \
@@ -1047,7 +1424,7 @@ fn emit_watch_store_extent(f: &mut Body, base: u32, len: WatchExtent, func_addr:
 fn watch_store_nonzero() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("VITASLOP_WATCH_STORE_NZ").is_ok())
+    *CELL.get_or_init(|| emit_var("VITASLOP_WATCH_STORE_NZ").is_ok())
 }
 
 /// Diagnostic read watchpoint. When `VITASLOP_WATCH_READ=<hex guest addr>` is set at
@@ -1059,14 +1436,48 @@ fn watch_store_nonzero() -> bool {
 /// field that no static reference reveals because the object is heap-allocated). The
 /// non-zero filter skips the idle reads (a per-frame poll that sees 0) so the trap
 /// lands on the consumer that actually acts on a set value. Zero cost when unset.
-fn watch_read_addr() -> Option<u32> {
+fn watch_read_addr() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
-    static CELL: OnceLock<Option<u32>> = OnceLock::new();
+    static CELL: OnceLock<Option<(u32, u32)>> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("VITASLOP_WATCH_READ").ok().and_then(|s| {
-            u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
-        })
+        let hex = |t: &str| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok();
+        // `LO-HI` is a HALF-OPEN RANGE, and it is the form the question usually wants. A probe
+        // buffer is indexed `base + row*pitch + col*4`, and the caller rarely knows which texel
+        // a title picks - so a watch on one exact address answers "not that one", which reads
+        // far too easily as "the guest does not read this buffer". A range says whether the
+        // buffer is read AT ALL, which is the fact a CPU-read claim actually rests on.
+        let parsed = emit_var("VITASLOP_WATCH_READ").ok().and_then(|s| match s.split_once('-') {
+            Some((lo, hi)) => Some((hex(lo)?, hex(hi)?)),
+            None => hex(&s).map(|a| (a, a.wrapping_add(1))),
+        });
+        // SAY THAT IT PARSED, for the reason spelled out on the STORE watchpoint above. This
+        // side said NOTHING AT ALL - not that the knob arrived, not that codegen emitted the
+        // check - so a run that finished normally was indistinguishable from a watchpoint that
+        // was never armed, and it WAS read as an answer.
+        // [[vitaslop-instrument-failure-imitating-its-subject]]
+        match (emit_var("VITASLOP_WATCH_READ"), parsed) {
+            (Ok(_), Some((lo, hi))) => eprintln!(
+                "watch read: ARMED over {lo:#010x}..{hi:#010x} - the first matching load TRAPS, so a \
+                 run that finishes normally means no instrumented load ever read that range"
+            ),
+            (Ok(raw), None) => eprintln!(
+                "watch read: VITASLOP_WATCH_READ={raw:?} is neither a hex address nor LO-HI - THE \
+                 WATCHPOINT IS OFF, and its silence says nothing about who reads what"
+            ),
+            _ => {}
+        }
+        parsed
     })
+}
+
+/// Say ONCE that a watched LOAD site was actually emitted into the guest's code - the read
+/// watchpoint's half of [`note_watch_store_site`], and it exists for the same reason.
+fn note_watch_read_site() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        eprintln!("watch read: first guest load site instrumented - codegen is carrying the check");
+    }
 }
 
 /// When set alongside `VITASLOP_WATCH_READ`, only a load of a non-zero value from the
@@ -1115,7 +1526,52 @@ pub fn set_wasm_names(on: bool) {
 fn track_pc() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("VITASLOP_TRACK_PC").is_ok())
+    TRACK_PC.with(|c| c.get()).unwrap_or_else(|| {
+        *CELL.get_or_init(|| std::env::var("VITASLOP_TRACK_PC").is_ok())
+    })
+}
+
+/// Turn guest-PC tracking on for this thread, overriding the knob above.
+///
+/// >>> IT IS BROWSER-REACHABLE, AND A BROWSER TRAP IS WHY. The browser reports a fault as a
+/// > > > wasm stack plus a register dump, and without this the dump's `pc` reads 0 - so the
+/// > > > one thing that would end the disassembly guessing ("WHICH instruction dereferenced
+/// > > > the null") is exactly what a browser-only fault cannot say. Emitted at transpile
+/// > > > time, in a worker with no environment to read.
+pub fn set_track_pc(on: bool) {
+    TRACK_PC.with(|c| c.set(Some(on)));
+}
+
+/// `VITASLOP_GUEST_PROF`: mark the guest function each SMP worker is executing - see
+/// [`abi::SMP_PROF_SLOT_OFFSET`]. Emit-time, so it is set on the transpiling worker; off, the
+/// module is byte-for-byte the unprofiled one.
+pub fn set_guest_prof(on: bool) {
+    GUEST_PROF.with(|c| c.set(on));
+}
+
+fn guest_prof() -> bool {
+    GUEST_PROF.with(|c| c.get()) && smp()
+}
+
+/// One profile mark: this worker's guest-function slot := `addr`. Untolled - bookkeeping the
+/// game clock must not be billed for.
+fn emit_prof_mark(f: &mut Body, addr: u32) {
+    if !guest_prof() {
+        return;
+    }
+    let Some(base) = PROF_PREEMPT_BASE.with(|c| c.get()) else { return };
+    // slot = base + 4*OFFSET + 4*STRIDE*w, with w recovered from this instance's preempt pointer
+    // (`base + 4*w`). Masked so an instance not yet pointed (the "never" word below the base)
+    // still lands inside the mirror block instead of trapping.
+    f.untolled(&W::GlobalGet(PREEMPT_GLOBAL));
+    f.untolled(&W::I32Const(base as i32));
+    f.untolled(&W::I32Sub);
+    f.untolled(&W::I32Const(0xff));
+    f.untolled(&W::I32And);
+    f.untolled(&W::I32Const(abi::SMP_PROF_SLOT_STRIDE.trailing_zeros() as i32));
+    f.untolled(&W::I32Shl);
+    f.untolled(&W::I32Const(addr as i32));
+    f.untolled(&W::I32Store(MemArg { offset: base + 4 * u64::from(abi::SMP_PROF_SLOT_OFFSET), align: 2, memory_index: 0 }));
 }
 
 /// Function indices of the host imports (imports occupy the low function-index
@@ -1397,6 +1853,16 @@ fn emit_fuel_check(f: &mut Body) {
     f.untolled(&W::I64And);
     f.untolled(&W::I64Const(i64::from(n)));
     f.untolled(&W::I64GeU);
+    if smp() {
+        // ...OR another worker asked this one for its CPU back - see `PREEMPT_GLOBAL`. A plain
+        // load: the word only ever goes 0 -> 1 behind this thread's back, and seeing the 1 a
+        // few iterations late costs a few iterations.
+        f.untolled(&W::GlobalGet(PREEMPT_GLOBAL));
+        f.untolled(&W::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.untolled(&W::I32Const(0));
+        f.untolled(&W::I32Ne);
+        f.untolled(&W::I32Or);
+    }
     f.untolled(&W::If(BlockType::Empty));
     f.untolled(&W::I32Const(abi::FUEL_SELECTOR as i32));
     f.untolled(&W::Call(IMPORT_FUNC));
@@ -1417,7 +1883,7 @@ fn watch_store_skip() -> u32 {
     use std::sync::OnceLock;
     static CELL: OnceLock<u32> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("VITASLOP_WATCH_STORE_SKIP")
+        emit_var("VITASLOP_WATCH_STORE_SKIP")
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0)
@@ -1430,7 +1896,7 @@ fn watch_read_skip() -> u32 {
     use std::sync::OnceLock;
     static CELL: OnceLock<u32> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("VITASLOP_WATCH_READ_SKIP")
+        emit_var("VITASLOP_WATCH_READ_SKIP")
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0)
@@ -1539,13 +2005,41 @@ fn trace_indirect_range() -> Option<(u32, u32)> {
 /// A malformed range is a hard error rather than a silently dropped one: a typo that
 /// quietly traces nothing is indistinguishable from "the code never ran", which is
 /// exactly the reading this instrument exists to settle.
-fn trace_blocks_ranges() -> &'static [(u32, u32)] {
+fn trace_blocks_ranges() -> Vec<(u32, u32)> {
     use std::sync::OnceLock;
+    if let Some(r) = TRACE_BLOCKS.with(|c| c.borrow().clone()) {
+        return r;
+    }
     static CELL: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
     CELL.get_or_init(|| {
         let Ok(s) = std::env::var("VITASLOP_TRACE_BLOCKS") else {
             return Vec::new();
         };
+        let r = parse_trace_blocks(&s);
+        // SAY THAT IT ARMED, on this path too. The browser's wiring has announced it since it
+        // was written; the native one read the environment straight and said nothing, so a run
+        // whose ranges covered no block looked exactly like a run whose hooks never fired -
+        // and the companion knobs (`VITASLOP_REGTRACE`, `VITASLOP_SNAPSHOT`) then produce no
+        // file, which reads as "the code never ran" rather than "nothing was instrumented".
+        // Every other watchpoint in this file says it armed for exactly this reason.
+        eprintln!(
+            "trace blocks: ARMED over {} range(s) {} - every BLOCK ENTRY inside them calls the \
+             svc hook. A run with no hook output means no block STARTED in these ranges; it \
+             does not mean the code did not run, because a range landing mid-block instruments \
+             nothing.",
+            r.len(),
+            r.iter().map(|(a, b)| format!("{a:#x}-{b:#x}")).collect::<Vec<_>>().join(", ")
+        );
+        r
+    })
+    .clone()
+}
+
+/// Parse the `<lo>-<hi>[,<lo>-<hi>]` range list the block tracer takes, shared by the
+/// environment reader above and [`set_trace_blocks`] so the browser cannot be handed a
+/// spelling the desktop would reject.
+pub fn parse_trace_blocks(s: &str) -> Vec<(u32, u32)> {
+    {
         s.split(',')
             .filter(|t| !t.trim().is_empty())
             .map(|t| {
@@ -1559,7 +2053,18 @@ fn trace_blocks_ranges() -> &'static [(u32, u32)] {
                 }
             })
             .collect()
-    })
+    }
+}
+
+/// Select the block-trace ranges for this thread, overriding the knob above.
+///
+/// >>> IT IS BROWSER-REACHABLE, AND THAT IS THE POINT. The trace is emitted at TRANSPILE
+/// > > > time, and in the browser the transpile happens in a throwaway worker with no
+/// > > > environment to read. Without this seam the one instrument that answers "which path
+/// > > > did this function actually take" existed only on the desktop - and the divergences
+/// > > > worth chasing are precisely the ones where the desktop is the arm that WORKS.
+pub fn set_trace_blocks(ranges: Vec<(u32, u32)>) {
+    TRACE_BLOCKS.with(|c| *c.borrow_mut() = Some(ranges));
 }
 
 /// Diagnostic forced return. `VITASLOP_FORCE_RET=<hex addr>:<dec value>[,...]` makes each
@@ -1610,7 +2115,7 @@ const L_GUARD: u32 = L_NQ0 + NQ_COUNT;
 fn watch_store_arm_mode() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("VITASLOP_WATCH_STORE_ARM").is_ok())
+    *CELL.get_or_init(|| emit_var("VITASLOP_WATCH_STORE_ARM").is_ok())
 }
 
 /// `VITASLOP_WATCH_STORE_LOG` - LOG each store to the watched address (the storing
@@ -1630,7 +2135,7 @@ fn watch_store_arm_mode() -> bool {
 fn watch_store_log() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("VITASLOP_WATCH_STORE_LOG").is_ok())
+    *CELL.get_or_init(|| emit_var("VITASLOP_WATCH_STORE_LOG").is_ok())
 }
 
 // Scratch locals used by flag computation. Local 0 is `$bb`.
@@ -1781,6 +2286,16 @@ pub struct Expansion {
     /// mechanisms share it and each has its own ceiling.
     pub unbilled_work_ops: u64,
     pub unbilled_dirty_ops: u64,
+    /// Dirty-map marks EMITTED and marks ELIDED because a neighbour's mark in the same
+    /// straight-line run already covers them ([`plan_dirty_run`]). The elision is the only
+    /// number that prices that change on its own: the operator totals move for half a
+    /// dozen unrelated reasons and none of them name this one.
+    pub dirty_marks: u64,
+    pub dirty_marks_elided: u64,
+    /// Store sites addressed off SP (r13), of the sites this analysis can place at all.
+    /// Reported so the REJECTED alternative - skip the mark entirely on a stack-relative
+    /// store - has a measured share attached to it rather than an assumption.
+    pub dirty_sp_stores: u64,
     /// How many work-counter COMMITS the module emits. Divided by `arm_instructions` this
     /// is commits per guest instruction, which is what says whether the flush POLICY is
     /// the cost rather than the four-operator commit itself.
@@ -1856,6 +2371,94 @@ impl Expansion {
 /// abandoned rather than that the block wants growing.
 const MIRROR_SLOTS_PER_PAGE: u32 = abi::PAGE_SIZE / 4;
 
+/// The host-mirror slot holding the EXCLUSIVE MONITOR's recorded address.
+///
+/// Must equal `vitaslop_runtime::vita::mirror::SLOT_EXCL`: the host clears that slot before
+/// every resume and the emitted `LDREX`/`STREX` read and write it. The two crates do not
+/// share a header, so the agreement is asserted by
+/// `the_exclusive_monitor_slot_matches_the_host` in the runtime's mirror tests.
+const EXCL_SLOT: u32 = 9;
+
+// Linear-memory byte offset of the exclusive-monitor word, set by the layout pass. Zero only
+// in a build with no mirror block, which cannot happen - the block is now unconditional
+// precisely so `LDREX` always has somewhere to record.
+thread_local! {
+    static EXCL_OFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// >>> SMP CODEGEN, and the SHARED host memory it needs. Both thread-local for the reason
+// `FUEL_INTERVAL` is: emission is per thread, and a test binary emits several modules at
+// once on several threads.
+//
+// `SHARED_HOST_MEMORY` is a property of the HOST BUNDLE, not of the run: a host built with
+// wasm threads has a `shared` linear memory, and an import of it must say `shared` (and give a
+// maximum) or instantiation fails. It changes nothing the guest can observe.
+//
+// `SMP` is the run's choice (`VITASLOP_SMP=1`): several guest threads execute AT ONCE on
+// several workers over one memory. That makes three things this emitter otherwise assumes
+// untrue - a monitor in one shared word, a barrier that does nothing, and a dirty-mark run
+// whose epoch cannot move underneath it - and each is emitted differently under it. Off, the
+// module is byte-for-byte what it was.
+thread_local! {
+    static SHARED_HOST_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Declare that the host memory a `host_off` module imports is a SHARED memory (a wasm
+/// threads build). See [`SHARED_HOST_MEMORY`].
+pub fn set_shared_host_memory(on: bool) {
+    SHARED_HOST_MEMORY.with(|c| c.set(on));
+}
+
+/// Emit modules on this thread for PARALLEL guest execution. See [`SMP`]. Implies nothing
+/// about the memory's sharedness - that is [`set_shared_host_memory`] - but is useless
+/// without it, so [`emit_module`] refuses the combination.
+pub fn set_smp(on: bool) {
+    SMP.with(|c| c.set(on));
+}
+
+/// Whether modules emitted on this thread are SMP builds - see [`set_smp`].
+pub fn smp() -> bool {
+    SMP.with(|c| c.get())
+}
+
+fn shared_host_memory() -> bool {
+    SHARED_HOST_MEMORY.with(|c| c.get())
+}
+
+/// The largest memory a wasm32 shared import may be given: 4 GiB. The host declares its own
+/// maximum (the threads bundle links with `--max-memory=4294967296`), and an import's maximum
+/// must be at least the provided memory's, so the import states the architectural ceiling.
+const SHARED_MEMORY_MAX_PAGES: u64 = 65_536;
+
+/// >>> THE PER-INSTANCE EXCLUSIVE MONITOR of an SMP build: three globals appended after the
+/// work counter (so no existing index moves), present ONLY in an SMP module.
+///
+/// `EXCL_ADDR` is the guest address the last `LDREX` armed (0 = none), `EXCL_VAL` the 32-bit
+/// value it read, `EXCL_VAL64` the doubleword `LDREXD` read. Per instance = per guest thread,
+/// which is what the ARM LOCAL monitor is; the one shared mirror word the non-SMP build uses
+/// would let one worker's `LDREX` arm or spend another's.
+const EXCL_ADDR_GLOBAL: u32 = abi::WORK_GLOBAL + 1;
+const EXCL_VAL_GLOBAL: u32 = abi::WORK_GLOBAL + 2;
+const EXCL_VAL64_GLOBAL: u32 = abi::WORK_GLOBAL + 3;
+/// >>> SMP ONLY: the LAYOUT offset of this instance's worker's PREEMPT word, exported as
+/// [`abi::PREEMPT_EXPORT`]. The back-edge fuel check also yields when that word is non-zero,
+/// which is how another worker takes the CPU back from a thread mid-loop: the frame gate
+/// closing, or a higher-priority thread becoming runnable on the same worker. Without it such
+/// a thread gives the worker up only when its fuel runs out - MEASURED 4-5 ms of every frame
+/// waiting on spinning threads to notice the frame had ended.
+///
+/// The word lives in the host-mirror page, above every mirrored slot and the kernel mutex
+/// table ([`abi::PREEMPT_SLOT_BASE`] + worker), so an address in the layout reaches it through
+/// the ordinary host-offset shift. Initialised to a slot no worker ever sets, so an instance
+/// the host has not pointed yet never yields on it.
+const PREEMPT_GLOBAL: u32 = abi::WORK_GLOBAL + 4;
+/// >>> SMP ONLY: the per-instance thread words and elided-yield counter - see
+/// `InlineOp::ThreadWord` / `InlineOp::SmpDelayYield`. Set by the host before every resume.
+const THREAD_ID_GLOBAL: u32 = abi::WORK_GLOBAL + 5;
+const CUR_THREAD_GLOBAL: u32 = abi::WORK_GLOBAL + 6;
+const ELIDE_GLOBAL: u32 = abi::WORK_GLOBAL + 7;
+
 /// Assemble the full wasm module for `funcs`. `func_index` maps a guest function
 /// address to its wasm function index. `mem_bytes` sizes the guest linear memory;
 /// `base` is the guest image base for the address rebase.
@@ -1877,7 +2480,13 @@ pub fn emit_module(
     mem_bytes: u32,
     inline_imports: &[crate::InlineImport],
     import_memory: bool,
+    host_off: u32,
 ) -> EmitOutput {
+    // Every emitted memory access on this thread is shifted by this from here on - see
+    // `Body::raw`. A host offset only makes sense for an imported memory: a self-contained
+    // module's memory starts where its layout starts.
+    assert!(host_off == 0 || import_memory, "a host offset needs an imported memory");
+    HOST_OFF.with(|c| c.set(host_off as u64));
     // >>> THE FUNCTIONS ARE TAKEN BY VALUE AND DROPPED ONE BY ONE AS THEY ARE EMITTED.
     //
     // The lifted IR of one retail title is 7.5 million statements at 80 bytes each - about
@@ -1908,7 +2517,10 @@ pub fn emit_module(
     let n = funcs.len() as u32;
     let guest_pages = (mem_bytes as u64).div_ceil(abi::PAGE_SIZE as u64).max(1);
     let addr_table_off = guest_pages * abi::PAGE_SIZE as u64;
-    let addr_table_bytes = n as u64 * 4;
+    // The BUCKET INDEX rides directly behind the address table (see `dispatch_buckets`):
+    // one u32 per `1 << DISPATCH_BUCKET_SHIFT` bytes of guest code, plus a sentinel.
+    let buckets = dispatch_buckets(&addrs);
+    let addr_table_bytes = n as u64 * 4 + buckets.as_ref().map_or(0, |(_, b)| b.len() as u64 * 4);
     let addr_table_pages = addr_table_bytes.div_ceil(abi::PAGE_SIZE as u64);
     // One more page above the dispatch table holds the "diagnostics armed" word
     // (see `arm_at_frame`), and only when that knob is set - an ordinary build's
@@ -1921,7 +2533,17 @@ pub fn emit_module(
     // allocation can reach it and no guest store can corrupt it.
     // Sized from the TOP slot each op touches, not its base: a pair form reads two words,
     // and sizing from the base would leave its high word past the end of the page.
-    let mirror_slots = inline_imports.iter().filter_map(|i| i.op.top_mirror_slot()).max();
+    // The EXCLUSIVE MONITOR lives in this block too, and unlike every inline import it is
+    // not optional: any title may execute `LDREX`, so the block is reserved whether or not a
+    // single host call was inlined. `Some` unconditionally, therefore, sized to whichever
+    // slot is higher.
+    let mirror_slots = Some(
+        inline_imports
+            .iter()
+            .filter_map(|i| i.op.top_mirror_slot())
+            .max()
+            .map_or(EXCL_SLOT, |top| top.max(EXCL_SLOT)),
+    );
     if let Some(top) = mirror_slots {
         assert!(
             top < MIRROR_SLOTS_PER_PAGE,
@@ -1930,6 +2552,7 @@ pub fn emit_module(
     }
     let mirror_off =
         mirror_slots.map(|_| (guest_pages + addr_table_pages) * abi::PAGE_SIZE as u64);
+    PROF_PREEMPT_BASE.with(|c| c.set(mirror_off.map(|m| m + 4 * u64::from(abi::PREEMPT_SLOT_BASE))));
     // ONE diagnostics page carries both the "armed" word (+0) and the store-watchpoint match
     // counter (+4). It is allocated when EITHER is wanted, so a watchpoint gets a counter in
     // SHARED memory even without a frame gate - see `WATCH_COUNT_OFF` for why a wasm global
@@ -1941,6 +2564,8 @@ pub fn emit_module(
     });
     let arm_word_off = arm_at_frame().and(diag_off);
     ARM_WORD_OFF.with(|c| c.set(arm_word_off.unwrap_or(0)));
+    // Where the exclusive monitor's word landed, for the `LDREX`/`STREX` emission below.
+    EXCL_OFF.with(|c| c.set(mirror_off.map_or(0, |base| base + EXCL_SLOT as u64 * 4)));
     WATCH_COUNT_OFF.with(|c| {
         c.set(if watch_store_addr().is_some() { diag_off.map_or(0, |o| o + 4) } else { 0 })
     });
@@ -2001,7 +2626,31 @@ pub fn emit_module(
     // `env.import_fast(selector)`: the same trap as `env.import` for a NID the host has
     // named as never suspending - see `InlineOp::Fast`. Function index `IMPORT_FAST_FUNC`.
     imports.import(abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME, wasm_encoder::EntityType::Function(host_ty));
-    if import_memory {
+    // An SMP module is still a valid module over an UNSHARED memory (wasm atomics are defined
+    // on one), which is what lets the single-threaded ARM conformance corpus run it to prove the
+    // exclusive forms equal to the oracle. Running it on several workers needs a shared memory,
+    // and that is the web host's check to make, not the emitter's.
+    if import_memory && host_off != 0 {
+        // >>> THE GUEST REGION INSIDE THE HOST'S OWN MEMORY (see `Program::host_off`).
+        // The memory is the host module's, so it is not fixed - it grows with the host's
+        // heap. The minimum declared is the end of the guest layout, so instantiation fails
+        // by name if the host has not reserved that far. An unshared host memory declares no
+        // maximum, so neither does the import; a SHARED one (the wasm-threads bundle) must
+        // declare one, and so must its import - see `SHARED_HOST_MEMORY`.
+        let end_pages = (host_off as u64 + total_pages * abi::PAGE_SIZE as u64).div_ceil(abi::PAGE_SIZE as u64);
+        let shared = shared_host_memory();
+        imports.import(
+            abi::IMPORT_MODULE,
+            abi::MEMORY_EXPORT,
+            wasm_encoder::EntityType::Memory(MemoryType {
+                minimum: end_pages,
+                maximum: shared.then_some(SHARED_MEMORY_MAX_PAGES),
+                memory64: false,
+                shared,
+                page_size_log2: None,
+            }),
+        );
+    } else if import_memory {
         // A shared memory must declare a maximum; the guest never grows memory, so
         // pin max == min at the provisioned size (guest region + dispatch table).
         imports.import(
@@ -2091,6 +2740,19 @@ pub fn emit_module(
     // is at the START of its quantum rather than needing to be seeded with one.
     let i64_global = GlobalType { val_type: ValType::I64, mutable: true, shared: false };
     globals.global(i64_global, &ConstExpr::i64_const(0)); // WORK_GLOBAL
+    if smp() {
+        // The per-instance exclusive monitor - see `EXCL_ADDR_GLOBAL`.
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // EXCL_ADDR_GLOBAL
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // EXCL_VAL_GLOBAL
+        globals.global(i64_global, &ConstExpr::i64_const(0)); // EXCL_VAL64_GLOBAL
+        // The preempt word's layout offset - see `PREEMPT_GLOBAL`. The mirror page exists in
+        // every build, so the "never set" slot is always a real, zero word.
+        let never = mirror_off.map_or(0, |m| m + 4 * u64::from(abi::PREEMPT_SLOT_BASE - 1));
+        globals.global(i32_global, &ConstExpr::i32_const(never as i32)); // PREEMPT_GLOBAL
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // THREAD_ID_GLOBAL
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // CUR_THREAD_GLOBAL
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // ELIDE_GLOBAL
+    }
 
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_EXPORT, ExportKind::Memory, 0);
@@ -2122,6 +2784,12 @@ pub fn emit_module(
     // left. Always exported (like `guest_pc`) so the export list does not depend on a
     // build option; it reads 0 and never moves unless fuel was asked for.
     exports.export(abi::FUEL_EXPORT, ExportKind::Global, abi::WORK_GLOBAL);
+    if smp() {
+        exports.export(abi::PREEMPT_EXPORT, ExportKind::Global, PREEMPT_GLOBAL);
+        exports.export(abi::THREAD_ID_EXPORT, ExportKind::Global, THREAD_ID_GLOBAL);
+        exports.export(abi::CUR_THREAD_EXPORT, ExportKind::Global, CUR_THREAD_GLOBAL);
+        exports.export(abi::ELIDE_EXPORT, ExportKind::Global, ELIDE_GLOBAL);
+    }
 
     // Populate the dense funcref table: table[i] = the i-th translated function
     // (wasm index IMPORT_FUNCS + i), matching the ascending-address order of `funcs`
@@ -2148,7 +2816,12 @@ pub fn emit_module(
         for addr in &addrs {
             bytes.extend_from_slice(&addr.to_le_bytes());
         }
-        data.active(0, &ConstExpr::i32_const(addr_table_off as i32), bytes);
+        if let Some((_, b)) = buckets.as_ref() {
+            for i in b {
+                bytes.extend_from_slice(&i.to_le_bytes());
+            }
+        }
+        data.active(0, &ConstExpr::i32_const((addr_table_off + host_off as u64) as i32), bytes);
     }
 
     // Every section before the code, through the encoder's own builder...
@@ -2184,7 +2857,7 @@ pub fn emit_module(
         emit_func(&func, func_index, base, &inline, &mut expansion).encode(&mut wasm);
         // `func` drops here: its IR is not needed again.
     }
-    emit_dispatch(n, addr_table_off).encode(&mut wasm);
+    emit_dispatch(n, addr_table_off, buckets.as_ref().map(|(base, b)| (*base, b.len() as u32 - 1))).encode(&mut wasm);
     emit_reset().encode(&mut wasm);
     let contents_len = u32::try_from(wasm.len() - contents_at)
         .expect("a wasm code section is at most 4 GB");
@@ -2306,6 +2979,16 @@ fn emit_reset() -> Function {
     // that carried its operator half would preempt the new thread almost immediately.
     f.instruction(&W::I64Const(0));
     f.instruction(&W::GlobalSet(abi::WORK_GLOBAL));
+    // An SMP build's per-instance monitor: a reused instance must not carry the previous
+    // thread's armed `LDREX` into the next thread's first `STREX`.
+    if smp() {
+        f.instruction(&W::I32Const(0));
+        f.instruction(&W::GlobalSet(EXCL_ADDR_GLOBAL));
+        f.instruction(&W::I32Const(0));
+        f.instruction(&W::GlobalSet(EXCL_VAL_GLOBAL));
+        f.instruction(&W::I64Const(0));
+        f.instruction(&W::GlobalSet(EXCL_VAL64_GLOBAL));
+    }
     f.instruction(&W::End);
     f
 }
@@ -2323,7 +3006,36 @@ fn emit_reset() -> Function {
 /// old O(n) linear address compare. `funcs` must be in ascending-address order (it
 /// is - `emit_module` receives the functions sorted), matching both the address
 /// table and the funcref table.
-fn emit_dispatch(n: u32, addr_table_off: u64) -> Function {
+/// Guest-code bytes per dispatch bucket, as a shift. 512 bytes holds two or three functions
+/// on a retail title (22 MB of code over ~105,000 functions), so a bucket narrows the
+/// dispatcher's search from ~17 dependent loads to one or two.
+pub(crate) const DISPATCH_BUCKET_SHIFT: u32 = 9;
+
+/// The dispatcher's BUCKET INDEX over `addrs` (ascending guest function addresses): for each
+/// `1 << DISPATCH_BUCKET_SHIFT`-byte slice of guest code from `addrs[0]`, the index of the first
+/// function at or above the slice's start - plus a final sentinel of `addrs.len()` - so the
+/// functions that can start in slice `b` are exactly `buckets[b] .. buckets[b + 1]`. `None` for an
+/// empty module.
+///
+/// >>> MEASURED: the plain binary search over a retail title's ~105,000 entries was 4.3% of the
+/// busy browser worker on a football title's gameplay, ~17 dependent loads per indirect call.
+pub(crate) fn dispatch_buckets(addrs: &[u32]) -> Option<(u32, Vec<u32>)> {
+    let (&base, &last) = (addrs.first()?, addrs.last()?);
+    let nb = ((last - base) >> DISPATCH_BUCKET_SHIFT) as usize + 1;
+    let mut buckets = Vec::with_capacity(nb + 1);
+    let mut i = 0usize;
+    for b in 0..nb {
+        let start = base + ((b as u32) << DISPATCH_BUCKET_SHIFT);
+        while i < addrs.len() && addrs[i] < start {
+            i += 1;
+        }
+        buckets.push(i as u32);
+    }
+    buckets.push(addrs.len() as u32);
+    Some((base, buckets))
+}
+
+fn emit_dispatch(n: u32, addr_table_off: u64, buckets: Option<(u32, u32)>) -> Function {
     // Locals beyond the two params: lo, hi, mid, v (the loaded table entry).
     const P_TARGET: u32 = 0;
     const P_CALLER: u32 = 1;
@@ -2339,14 +3051,41 @@ fn emit_dispatch(n: u32, addr_table_off: u64) -> Function {
     f.instruction(&W::I32And);
     f.instruction(&W::LocalSet(P_TARGET));
 
-    // lo = 0; hi = n.
-    f.instruction(&W::I32Const(0));
-    f.instruction(&W::LocalSet(L_LO));
-    f.instruction(&W::I32Const(n as i32));
-    f.instruction(&W::LocalSet(L_HI));
-
     // block $done { loop $loop { ... } }  -- breaking to $done means "not found".
     f.instruction(&W::Block(BlockType::Empty));
+    match buckets {
+        // lo/hi from the bucket index: b = (target - base) >> SHIFT, and a target below the
+        // base wraps to a huge b, which the bound sends to the miss arm with every other
+        // out-of-range address.
+        Some((base, nb)) => {
+            let bucket_off = addr_table_off + n as u64 * 4;
+            f.instruction(&W::LocalGet(P_TARGET));
+            f.instruction(&W::I32Const(base as i32));
+            f.instruction(&W::I32Sub);
+            f.instruction(&W::I32Const(DISPATCH_BUCKET_SHIFT as i32));
+            f.instruction(&W::I32ShrU);
+            f.instruction(&W::LocalTee(L_MID));
+            f.instruction(&W::I32Const(nb as i32));
+            f.instruction(&W::I32GeU);
+            f.instruction(&W::BrIf(0)); // -> $done
+            f.instruction(&W::LocalGet(L_MID));
+            f.instruction(&W::I32Const(4));
+            f.instruction(&W::I32Mul);
+            f.instruction(&W::LocalTee(L_V));
+            f.instruction(&W::I32Load(MemArg { offset: bucket_off, align: 2, memory_index: 0 }));
+            f.instruction(&W::LocalSet(L_LO));
+            f.instruction(&W::LocalGet(L_V));
+            f.instruction(&W::I32Load(MemArg { offset: bucket_off + 4, align: 2, memory_index: 0 }));
+            f.instruction(&W::LocalSet(L_HI));
+        }
+        None => {
+            // lo = 0; hi = n.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::LocalSet(L_LO));
+            f.instruction(&W::I32Const(n as i32));
+            f.instruction(&W::LocalSet(L_HI));
+        }
+    }
     f.instruction(&W::Loop(BlockType::Empty));
 
     // if lo >= hi { break to $done }  (unsigned; lo/hi are small non-negative counts).
@@ -2460,6 +3199,9 @@ fn emit_func(
     expansion.unbilled_ops += f.unbilled;
     expansion.unbilled_work_ops += f.unbilled_work;
     expansion.unbilled_dirty_ops += f.unbilled_dirty;
+    expansion.dirty_marks += f.dirty_marks;
+    expansion.dirty_marks_elided += f.dirty_marks_elided;
+    expansion.dirty_sp_stores += f.dirty_sp_stores;
     expansion.work_flushes += f.flushes;
     for k in 0..StmtKind::COUNT {
         expansion.by_stmt[k].0 += f.stmt_ops[k];
@@ -2521,6 +3263,16 @@ thread_local! {
     static WASM_NAMES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Per-thread override of the low-bank NEON cache - see [`set_neon_cache`].
     static NEON_CACHE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Per-thread override of guest-PC tracking - see [`set_track_pc`].
+    static TRACK_PC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// See [`set_guest_prof`].
+    static GUEST_PROF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The layout offset of worker 0's preempt word for the module being emitted - see
+    /// `emit_prof_mark`. Set by `emit_module` once the mirror block is placed.
+    static PROF_PREEMPT_BASE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Per-thread override of the block-trace ranges - see [`set_trace_blocks`].
+    static TRACE_BLOCKS: std::cell::RefCell<Option<Vec<(u32, u32)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Whether emitted modules hold the low NEON bank in locals across a run of vector
@@ -2568,6 +3320,41 @@ pub fn set_promote_registers(on: bool) {
     PROMOTE_REGS.with(|c| c.set(Some(on)));
 }
 
+/// Every emit setting this thread will transpile under, RESOLVED (a knob left unset reads as
+/// the value its default gives), as one string. The browser's transpile cache names a stored
+/// module by the BUILD it came from plus this (see vitaslop-web's README): the same build
+/// transpiling the same title under an equal fingerprint emits the same bytes, and a run with
+/// an instrumentation knob (the guest profiler, the block tracer) never gets a module built
+/// without it. A setting added to this file must be added here too.
+pub fn codegen_fingerprint() -> String {
+    use std::fmt::Write;
+    let mut s = format!(
+        "dirty{};runmarks{};names{};pc{};prof{};fuel{};widec{};dispatchall{};shared{};smp{};neon{};promote{}",
+        u8::from(dirty_tracking()),
+        u8::from(dirty_run_marks()),
+        u8::from(emit_wasm_names()),
+        u8::from(track_pc()),
+        u8::from(guest_prof()),
+        fuel_interval(),
+        u8::from(flags_wide_c()),
+        u8::from(dispatch_all()),
+        u8::from(shared_host_memory()),
+        u8::from(smp()),
+        u8::from(neon_cache()),
+        u8::from(promote_registers()),
+    );
+    let blocks = trace_blocks_ranges();
+    if !blocks.is_empty() {
+        let _ = write!(s, ";trace{blocks:x?}");
+    }
+    for name in EMIT_KNOBS_OVERRIDABLE {
+        if let Ok(v) = emit_var(name) {
+            let _ = write!(s, ";{name}={v}");
+        }
+    }
+    s
+}
+
 /// `VITASLOP_PROMOTE_POISON=<n>` - the FALSIFIER for register promotion. While a
 /// register is held in its local, store this constant into its global, so a read that
 /// should have gone to the local returns something impossible rather than merely stale.
@@ -2598,6 +3385,8 @@ fn emit_func_body(
         f.instruction(&W::End);
         return f;
     }
+
+    emit_prof_mark(&mut f, func.addr);
 
     // Diagnostic entry tracer (opt-in): announce this function's entry to the host
     // `svc` handler, which logs the address and incoming argument registers. Emitted
@@ -2721,6 +3510,10 @@ fn emit_block(
     // Nothing here charges the software fuel counter: `Body` does it, per operator, as
     // the block below is emitted (see [`emit_fuel_check`]). The CHECK is what is placed
     // by hand, and only on back edges.
+    // Which stores in this block a neighbour's mark already covers. Computed over the
+    // whole block up front because the decision for a statement depends on the ones BEFORE
+    // it, which `emit_stmt` cannot see from inside.
+    let dirty_covered = plan_dirty_run(f, &block.stmts);
     for (i, stmt) in block.stmts.iter().enumerate() {
         // The low-bank NEON cache (see `NqState`) lives across a run of statements that
         // reach low-bank state only through the cache-aware accessors: the vector ops, a
@@ -2737,7 +3530,9 @@ fn emit_block(
             f.nq_allow = plan_neon_run(&block.stmts[i..]);
             f.nq_enabled = true;
         }
+        f.dirty_covered = dirty_covered[i];
         emit_stmt(f, stmt, func_index, base, inline, func.addr);
+        f.dirty_covered = false;
     }
     // The terminator can leave the block, the function or the thread: the globals are the
     // state it hands on.
@@ -2963,11 +3758,42 @@ fn emit_cond(f: &mut Body, cond: ConditionCode) {
 /// (and, with `VITASLOP_WATCH_READ_NZ`, the value is non-zero) once more than
 /// `VITASLOP_WATCH_READ_SKIP` earlier matches have passed, then leaves the value on the
 /// stack. Shared by the integer and VFP-single load paths.
-fn emit_read_watch_check(f: &mut Body, w: u32, base: u32) {
-    f.instruction(&W::LocalSet(L_T1)); // value -> L_T1
+/// `lo <= addr && addr < hi`, from the rebased address in `L_T0`. An equality when the knob
+/// named one address, because the parser turns `A` into `A..A+1`.
+fn emit_read_watch_range_test(f: &mut Body, w: (u32, u32), base: u32) {
+    f.instruction(&W::I32Const(w.0.wrapping_sub(base) as i32));
     f.instruction(&W::LocalGet(L_T0));
-    f.instruction(&W::I32Const(w.wrapping_sub(base) as i32));
-    f.instruction(&W::I32Eq);
+    f.instruction(&W::I32LeU);
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Const(w.1.wrapping_sub(base) as i32));
+    f.instruction(&W::I32LtU);
+    f.instruction(&W::I32And);
+}
+
+/// The read watchpoint for a load whose VALUE this emitter cannot put in `L_T1` - a 64-bit
+/// VFP/NEON load, whose value is an `i64`. Expects the rebased address in `L_T0` and leaves
+/// the loaded value untouched on the stack.
+///
+/// >>> WITHOUT THIS, A WHOLE CLASS OF READ WAS INVISIBLE. `S(n)` loads and the integer
+/// `Value::Load` both carried the check and `D(n)` carried NONE, so a guest walking a byte
+/// table with 64-bit loads never trapped - and the watchpoint's silence was then read as "the
+/// guest never reads this buffer", which is precisely the conclusion this instrument exists to
+/// support. The STORE side has instrumented `D(n)` all along, which is what makes the gap a
+/// slip rather than a policy. [[vitaslop-instrument-failure-imitating-its-subject]]
+///
+/// `VITASLOP_WATCH_READ_NZ` cannot be honoured here - there is no single `i32` to test against
+/// zero - so these loads match on ADDRESS alone, the same rule and the same reason as
+/// [`warn_watch_store_vector_predicate`] on the store side.
+fn emit_read_watch_check_addr_only(f: &mut Body, w: (u32, u32), base: u32) {
+    note_watch_read_site();
+    emit_read_watch_range_test(f, w, base);
+    emit_read_watch_trap(f);
+}
+
+fn emit_read_watch_check(f: &mut Body, w: (u32, u32), base: u32) {
+    note_watch_read_site();
+    f.instruction(&W::LocalSet(L_T1)); // value -> L_T1
+    emit_read_watch_range_test(f, w, base);
     if watch_read_nonzero() {
         f.instruction(&W::LocalGet(L_T1));
         f.instruction(&W::I32Eqz);
@@ -2986,9 +3812,15 @@ fn emit_read_watch_check(f: &mut Body, w: u32, base: u32) {
         f.instruction(&W::I32Or);
         f.instruction(&W::I32And);
     }
+    emit_read_watch_trap(f);
+    f.instruction(&W::LocalGet(L_T1)); // value back on the stack
+}
+
+/// Consume the match condition on the stack: bump the counter and trap once past the skip
+/// window. Shared by both read-watch forms.
+fn emit_read_watch_trap(f: &mut Body) {
     and_armed(f);
     f.instruction(&W::If(BlockType::Empty));
-    // Matched: bump the counter and trap once past the skip window.
     f.instruction(&W::GlobalGet(WATCH_READ_COUNT_GLOBAL));
     f.instruction(&W::I32Const(1));
     f.instruction(&W::I32Add);
@@ -3000,7 +3832,6 @@ fn emit_read_watch_check(f: &mut Body, w: u32, base: u32) {
     f.instruction(&W::Unreachable);
     f.instruction(&W::End);
     f.instruction(&W::End);
-    f.instruction(&W::LocalGet(L_T1)); // value back on the stack
 }
 
 /// Snapshot the guarded callee-saved register into [`L_GUARD`] just before a call
@@ -3183,6 +4014,22 @@ fn emit_stmt_inner(
                 }
             }
         }
+        Stmt::ExclSet(value) => {
+            f.instruction(&W::I32Const(0));
+            emit_value(f, value, base);
+            f.instruction(&W::I32Store(MemArg { offset: EXCL_OFF.with(|c| c.get()), align: 2, memory_index: 0 }));
+        }
+        Stmt::LoadExcl { rt, rt2, addr, size } => emit_load_excl(f, *rt, *rt2, addr, *size, base),
+        Stmt::StoreExcl { rd, rt, rt2, addr, size } => {
+            emit_store_excl(f, *rd, *rt, *rt2, addr, *size, base)
+        }
+        Stmt::ClearExcl => {
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(EXCL_ADDR_GLOBAL));
+        }
+        Stmt::Fence => {
+            f.instruction(&W::AtomicFence);
+        }
         Stmt::Svc(imm) => {
             f.instruction(&W::I32Const(*imm as i32));
             f.instruction(&W::Call(SVC_FUNC));
@@ -3264,6 +4111,7 @@ fn emit_stmt_inner(
             match func_index.get(target) {
                 Some(&idx) => {
                     f.instruction(&W::Call(idx));
+                    emit_prof_mark(f, func_addr);
                 }
                 None => {
                     f.instruction(&W::Unreachable);
@@ -3291,6 +4139,7 @@ fn emit_stmt_inner(
                     f.instruction(&W::LocalGet(L_T0)); // target
                     f.instruction(&W::I32Const(func_addr as i32)); // caller
                     f.instruction(&W::Call(dispatch));
+                    emit_prof_mark(f, func_addr);
                 }
                 // `bx rN` tail call: lr is untouched.
                 None => {
@@ -3304,8 +4153,14 @@ fn emit_stmt_inner(
         Stmt::Guard(cond, body) => {
             emit_cond(f, *cond);
             f.instruction(&W::If(BlockType::Empty));
-            for s in body {
+            // A guard body is its own run: every statement in it is predicated on the SAME
+            // condition, so a mark inside it covers a later store inside it, and nothing
+            // outside may lean on a mark that the condition might skip.
+            let covered = plan_dirty_run(f, body);
+            for (i, s) in body.iter().enumerate() {
+                f.dirty_covered = covered[i];
                 emit_stmt(f, s, func_index, base, inline, func_addr);
+                f.dirty_covered = false;
             }
             f.instruction(&W::End);
         }
@@ -3654,12 +4509,20 @@ fn count_neon_regs(s: &crate::ir::NeonStmt, q: &mut [u32; 8], d: &mut [u32; 8]) 
             reg(a);
             dn(*src, d);
         }
+        WideMulScalar { dst, a, src, .. } => {
+            reg(dst);
+            reg(dst);
+            reg(a);
+            dn(*src, d);
+        }
         RecipEstimate { dst, src, .. }
         | Widen { dst, a: src, .. }
         | PairLong { dst, a: src, .. }
         | Unary { dst, a: src, .. }
         | ShiftImm { dst, src, .. }
         | CvtFloatInt { dst, src, .. }
+        | CvtHalfToFloat { dst, src }
+        | CvtFloatToHalf { dst, src }
         | CmpZero { dst, src, .. }
         | Rev { dst, src, .. }
         | Not { dst, src }
@@ -4119,6 +4982,26 @@ fn emit_vfp(f: &mut Body, op: &crate::ir::VfpOp) {
             f.instruction(&W::I32Or);
             f.instruction(&W::GlobalSet(abi::vfp_s_global(*sd)));
         }
+        CvtHalfFromF32 { sd, sm, top } => {
+            // f32 -> f16 (RNE) into ONE 16-bit half of S`sd`; the other half is kept, as the
+            // architecture specifies for `vcvtb`/`vcvtt`. The rounding is the vector
+            // narrow's own, on a splat, so scalar and NEON cannot disagree.
+            f.instruction(&W::GlobalGet(abi::vfp_s_global(*sm)));
+            f.instruction(&W::I32x4Splat);
+            f32x4_to_f16_lanes(f);
+            f.instruction(&W::I32x4ExtractLane(0));
+            f.instruction(&W::I32Const(0xffff));
+            f.instruction(&W::I32And);
+            if *top {
+                f.instruction(&W::I32Const(16));
+                f.instruction(&W::I32Shl);
+            }
+            f.instruction(&W::GlobalGet(abi::vfp_s_global(*sd)));
+            f.instruction(&W::I32Const(if *top { 0x0000_ffff } else { 0xffff_0000u32 as i32 }));
+            f.instruction(&W::I32And);
+            f.instruction(&W::I32Or);
+            f.instruction(&W::GlobalSet(abi::vfp_s_global(*sd)));
+        }
         DoubleToCore { rt, rt2, d } => {
             get_d_bits(f, *d);
             f.instruction(&W::LocalTee(L_D64));
@@ -4255,6 +5138,19 @@ fn emit_vfp_mem(
         D(n) => {
             if load {
                 emit_addr(f, addr, base);
+                // A 64-bit load is a read like any other - see `emit_read_watch_check_addr_only`
+                // for what its absence here cost.
+                if let Some(w) = watch_read_addr() {
+                    // The test runs BEFORE the load, so nothing but the i32 address is ever
+                    // held on the stack across it. Holding the loaded i64 there instead was
+                    // tried and produced a guest MemoryOutOfBounds far from any watched
+                    // address - a diagnostic breaking the run it was measuring.
+                    f.instruction(&W::LocalTee(L_T0));
+                    emit_read_watch_check_addr_only(f, w, base);
+                    f.instruction(&W::I64Load(mem_arg()));
+                    set_d_bits(f, n);
+                    return;
+                }
                 f.instruction(&W::I64Load(mem_arg()));
                 set_d_bits(f, n);
             } else {
@@ -4309,6 +5205,97 @@ fn neon_get(f: &mut Body, reg: crate::ir::NeonReg) {
             f.instruction(&W::I64x2Splat);
         }
     }
+}
+
+/// IEEE f32 -> f16, round-to-nearest-even, on four lanes at once and branchless (Giesen
+/// float_to_half_fast3_rtne, restated in SIMD). Expects the four f32 lanes' BITS on the
+/// stack and leaves an i32x4 whose low 16 bits per lane are the halves. Shared by the NEON
+/// `vcvt.f16.f32` and the scalar VFP `vcvtb/vcvtt.f16.f32` (lane 0 of a splat) so the two
+/// cannot round differently. Uses `L_V128A..C`.
+fn f32x4_to_f16_lanes(f: &mut Body) {
+    const F16MAX: i32 = 0x4780_0000u32 as i32; // (127 + 16) << 23, overflows a half
+    const F32INFTY: i32 = 0x7f80_0000u32 as i32; // 255 << 23, above it is NaN
+    const DENORM_CUTOFF: i32 = 0x3880_0000u32 as i32; // 113 << 23, below it is subnormal
+    const DENORM_MAGIC: i32 = 0x3f00_0000u32 as i32; // 126 << 23, which is 0.5f
+    const EXP_REBIAS: i32 = 0xc800_0000u32 as i32; // (15 - 127) << 23
+    const SIGN_BIT: i32 = 0x8000_0000u32 as i32;
+
+    // a = |x| bits, kept in A; the sign is spliced back in at the end.
+    f.instruction(&W::LocalTee(L_V128C)); // x, for the sign
+    f.instruction(&W::I32Const(!SIGN_BIT));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::V128And);
+    f.instruction(&W::LocalSet(L_V128A)); // a
+
+    // --- candidate 1: inf/NaN. A NaN keeps a payload bit so it stays a NaN
+    // rather than becoming an infinity.
+    f.instruction(&W::I32Const(0x7e00));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32Const(0x7c00));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(F32INFTY));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4GtU); // a > infinity, so it is a NaN
+    f.instruction(&W::V128Bitselect);
+    f.instruction(&W::LocalSet(L_V128B)); // the inf/NaN candidate
+
+    // --- candidate 2: normal. `mant_odd` is the round-to-EVEN tie-break.
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(EXP_REBIAS));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4Add);
+    f.instruction(&W::I32Const(0xfff));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4Add);
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(13));
+    f.instruction(&W::I32x4ShrU);
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::V128And); // mant_odd
+    f.instruction(&W::I32x4Add);
+    f.instruction(&W::I32Const(13));
+    f.instruction(&W::I32x4ShrU);
+
+    // --- candidate 3: subnormal, by adding 0.5f and taking the difference of the
+    // bit patterns. Zero falls out of it correctly, since 0.5f - 0.5f is 0.
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(DENORM_MAGIC));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::F32x4Add);
+    f.instruction(&W::I32Const(DENORM_MAGIC));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4Sub);
+    // `bitselect` keeps the FIRST-pushed vector where the mask bit is 1, and the
+    // normal candidate was pushed first - so the mask is the NORMAL condition,
+    // `a >= cutoff`, and the subnormal one is what is left.
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(DENORM_CUTOFF));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4GeU);
+    f.instruction(&W::V128Bitselect); // normal where at or above the cutoff
+
+    // --- inf/NaN wins over both, wherever a reaches the half's maximum. Same
+    // rule as above: the finite result was pushed first, so the mask is the
+    // FINITE condition and the inf/NaN candidate is what is left.
+    f.instruction(&W::LocalGet(L_V128B));
+    f.instruction(&W::LocalGet(L_V128A));
+    f.instruction(&W::I32Const(F16MAX));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::I32x4GeU);
+    f.instruction(&W::V128Not);
+    f.instruction(&W::V128Bitselect);
+
+    // The sign, back in at bit 15 of each lane.
+    f.instruction(&W::LocalGet(L_V128C));
+    f.instruction(&W::I32Const(SIGN_BIT));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::V128And);
+    f.instruction(&W::I32Const(16));
+    f.instruction(&W::I32x4ShrU);
+    f.instruction(&W::V128Or);
+
 }
 
 /// Push a 16-byte `vtbl` table half: the low 8 bytes of D`lo` followed by the low 8
@@ -4588,6 +5575,19 @@ fn simd_shr(bits: u8, signed: bool) -> W<'static> {
         _ => unreachable!("neon shr width {bits}"),
     }
 }
+/// `2^n` as an f32, for the fixed-point `vcvt` scale. Exact for every `n` the encoding
+/// can express (a fractional bit count of 1..32, and its negation), so the scale itself
+/// contributes no rounding of its own.
+fn exp2f(n: i32) -> f32 {
+    f32::from_bits(((127 + n) as u32) << 23)
+}
+
+/// One f32 broadcast to all four lanes of a `v128` constant.
+fn f32_splat(v: f32) -> i128 {
+    let b = v.to_le_bytes();
+    i128::from_le_bytes([b[0], b[1], b[2], b[3]].repeat(4).try_into().expect("16 bytes"))
+}
+
 
 /// A v128 constant with `val`'s low `bits` bits replicated into every `bits`-wide lane, for the
 /// per-lane insert masks of `vsli`/`vsri`.
@@ -4742,9 +5742,89 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
                     });
                     neon_set(f, *dst);
                 }
+                // >>> THE 32-BIT LANE HAS NO WASM INSTRUCTION AND IS BUILT HERE.
+                //
+                // wasm SIMD carries saturating add/sub for 8- and 16-bit lanes only, in
+                // both signednesses. ARM has 8, 16, 32 and 64. The 32-bit forms are not
+                // exotic - a football title's per-frame vector maths reaches `vqsub.u32`
+                // in its first minute, and while they lifted as UNSUPPORTED the block
+                // around them was a trap that took the whole frame with it.
+                //
+                // Unsigned needs no branch and no select:
+                //   a -| b == a - min_u(a, b)      (b above a leaves zero)
+                //   a +| b == min_u(a, ~b) + b     (~b is the largest a that cannot carry)
+                // Signed needs the classic overflow test, and the saturation value is a
+                // function of the SIGN OF `a` alone:
+                //   sat  = (a >>s 31) ^ 0x7fffffff        -> INT_MIN when a < 0, else INT_MAX
+                //   add overflows when both inputs differ in sign from the sum,
+                //   sub overflows when the inputs differ from each other AND the result
+                //   differs from `a`; either test lands in the sign bit, and an arithmetic
+                //   shift by 31 spreads it to a full-lane mask for `bitselect`.
+                QAdd | QSub if ty.bits == 32 => {
+                    let add = matches!(bop, QAdd);
+                    neon_get(f, *a);
+                    f.instruction(&W::LocalSet(L_V128A));
+                    neon_get(f, *b);
+                    f.instruction(&W::LocalSet(L_V128B));
+                    if !ty.signed {
+                        if add {
+                            f.instruction(&W::LocalGet(L_V128A));
+                            f.instruction(&W::LocalGet(L_V128B));
+                            f.instruction(&W::V128Not);
+                            f.instruction(&W::I32x4MinU);
+                            f.instruction(&W::LocalGet(L_V128B));
+                            f.instruction(&W::I32x4Add);
+                        } else {
+                            f.instruction(&W::LocalGet(L_V128A));
+                            f.instruction(&W::LocalGet(L_V128A));
+                            f.instruction(&W::LocalGet(L_V128B));
+                            f.instruction(&W::I32x4MinU);
+                            f.instruction(&W::I32x4Sub);
+                        }
+                        neon_set(f, *dst);
+                    } else {
+                        // The unsaturated result, kept for both the overflow test and the
+                        // value selected when there is none.
+                        f.instruction(&W::LocalGet(L_V128A));
+                        f.instruction(&W::LocalGet(L_V128B));
+                        f.instruction(&if add { W::I32x4Add } else { W::I32x4Sub });
+                        f.instruction(&W::LocalSet(L_V128C));
+                        // sat = (a >>s 31) ^ 0x7fffffff
+                        f.instruction(&W::LocalGet(L_V128A));
+                        f.instruction(&W::I32Const(31));
+                        f.instruction(&W::I32x4ShrS);
+                        f.instruction(&W::V128Const(i128::from_le_bytes(
+                            [0xff, 0xff, 0xff, 0x7f].repeat(4).try_into().expect("16 bytes"),
+                        )));
+                        f.instruction(&W::V128Xor);
+                        // the unsaturated result
+                        f.instruction(&W::LocalGet(L_V128C));
+                        // the overflow mask, spread from the sign bit
+                        if add {
+                            f.instruction(&W::LocalGet(L_V128A));
+                            f.instruction(&W::LocalGet(L_V128C));
+                            f.instruction(&W::V128Xor);
+                            f.instruction(&W::LocalGet(L_V128B));
+                            f.instruction(&W::LocalGet(L_V128C));
+                            f.instruction(&W::V128Xor);
+                        } else {
+                            f.instruction(&W::LocalGet(L_V128A));
+                            f.instruction(&W::LocalGet(L_V128B));
+                            f.instruction(&W::V128Xor);
+                            f.instruction(&W::LocalGet(L_V128A));
+                            f.instruction(&W::LocalGet(L_V128C));
+                            f.instruction(&W::V128Xor);
+                        }
+                        f.instruction(&W::V128And);
+                        f.instruction(&W::I32Const(31));
+                        f.instruction(&W::I32x4ShrS);
+                        f.instruction(&W::V128Bitselect);
+                        neon_set(f, *dst);
+                    }
+                }
                 QAdd | QSub => {
-                    // wasm has the saturating add/sub directly, for 8- and 16-bit lanes,
-                    // in both signednesses - which is the whole of these instructions.
+                    // wasm has the saturating add/sub directly for 8- and 16-bit lanes, in
+                    // both signednesses; the 32-bit arm above builds what it does not have.
                     neon_get(f, *a);
                     neon_get(f, *b);
                     f.instruction(&match (matches!(bop, QAdd), ty.bits, ty.signed) {
@@ -4896,6 +5976,31 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             }
             neon_get(f, *a);
             neon_get(f, *b);
+            f.instruction(&simd_extmul_low(ty.bits, ty.signed));
+            if *acc {
+                f.instruction(&if *sub { simd_sub(ty.bits * 2) } else { simd_add(ty.bits * 2) });
+            }
+            neon_set(f, *dst);
+        }
+        WideMulScalar { acc, sub, ty, dst, a, src, lane } => {
+            // Like `WideMul`, with the second operand a broadcast lane (the `MulScalar`
+            // extract): `extmul_low` widens both low halves itself, so a splat of the raw
+            // lane bits is exactly the doubleword `vmlal` reads.
+            if *acc {
+                neon_get(f, *dst);
+            }
+            neon_get(f, *a);
+            neon_get(f, crate::ir::NeonReg::D(*src));
+            match ty.bits {
+                16 => {
+                    f.instruction(&W::I16x8ExtractLaneU(*lane));
+                    f.instruction(&W::I16x8Splat);
+                }
+                _ => {
+                    f.instruction(&W::I32x4ExtractLane(*lane));
+                    f.instruction(&W::I32x4Splat);
+                }
+            }
             f.instruction(&simd_extmul_low(ty.bits, ty.signed));
             if *acc {
                 f.instruction(&if *sub { simd_sub(ty.bits * 2) } else { simd_add(ty.bits * 2) });
@@ -5113,8 +6218,16 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             f.instruction(&W::I8x16Shuffle(mask));
             neon_set(f, *dst);
         }
-        CvtFloatInt { to_int, signed, dst, src } => {
+        CvtFloatInt { to_int, signed, frac, dst, src } => {
             neon_get(f, *src);
+            // The fixed-point forms differ from the integer ones by ONE multiply: the
+            // integer side counts in units of `2^-frac`, so scale before truncating and
+            // after converting. `2^frac` is exact in f32 for every frac the encoding can
+            // express (1..32), so the scale itself introduces no error.
+            if *frac != 0 && *to_int {
+                f.instruction(&W::V128Const(f32_splat(exp2f(*frac as i32))));
+                f.instruction(&W::F32x4Mul);
+            }
             f.instruction(&match (to_int, signed) {
                 // Float->int rounds toward zero; wasm's saturating trunc matches NEON's
                 // out-of-range clamping (NEON VCVT saturates rather than wrapping).
@@ -5123,6 +6236,10 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
                 (false, true) => W::F32x4ConvertI32x4S,
                 (false, false) => W::F32x4ConvertI32x4U,
             });
+            if *frac != 0 && !*to_int {
+                f.instruction(&W::V128Const(f32_splat(exp2f(-(*frac as i32)))));
+                f.instruction(&W::F32x4Mul);
+            }
             neon_set(f, *dst);
         }
         Cmp { op, ty, dst, a, b } => {
@@ -5456,6 +6573,66 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             f.instruction(&W::V128Const(splat_lane_mask(bits, min)));
             f.instruction(&simd_cmp_eq(bits));
             f.instruction(&W::V128Bitselect);
+            neon_set(f, *dst);
+        }
+        CvtHalfToFloat { dst, src } => {
+            // IEEE f16 -> f32 on four lanes at once, the same branchless conversion the
+            // scalar `CvtF32FromHalf` uses (Giesen), lifted to SIMD: scale the
+            // exponent/mantissa bits by a float multiply, force the exponent for
+            // inf/NaN, then splice the sign back in. Nothing here branches, so all four
+            // lanes take the same path whatever they hold.
+            const MAGIC: i32 = 0x7780_0000u32 as i32; // 2^112, the f16->f32 bias difference
+            const INF_NAN_THRESHOLD: i32 = 0x4780_0000u32 as i32; // 65536.0
+            // h = the four halves, zero-extended to i32 lanes. `extend_low` takes exactly
+            // the low 64 bits, which is the `Dm` operand.
+            neon_get(f, *src);
+            f.instruction(&W::I32x4ExtendLowI16x8U);
+            f.instruction(&W::LocalTee(L_V128A)); // h
+            // o = f32(((h & 0x7fff) << 13)) * 2^112
+            f.instruction(&W::I32Const(0x7fff));
+            f.instruction(&W::I32x4Splat);
+            f.instruction(&W::V128And);
+            f.instruction(&W::I32Const(13));
+            f.instruction(&W::I32x4Shl);
+            f.instruction(&W::I32Const(MAGIC));
+            f.instruction(&W::I32x4Splat);
+            f.instruction(&W::F32x4Mul);
+            f.instruction(&W::LocalTee(L_V128B)); // o.u
+            // | (o.u >=u threshold ? 0x7f80_0000 : 0)
+            f.instruction(&W::LocalGet(L_V128B));
+            f.instruction(&W::I32Const(INF_NAN_THRESHOLD));
+            f.instruction(&W::I32x4Splat);
+            f.instruction(&W::I32x4GeU); // all-ones lanes where inf/NaN
+            f.instruction(&W::I32Const(0x7f80_0000u32 as i32));
+            f.instruction(&W::I32x4Splat);
+            f.instruction(&W::V128And);
+            f.instruction(&W::V128Or);
+            // | (h & 0x8000) << 16
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::I32Const(0x8000));
+            f.instruction(&W::I32x4Splat);
+            f.instruction(&W::V128And);
+            f.instruction(&W::I32Const(16));
+            f.instruction(&W::I32x4Shl);
+            f.instruction(&W::V128Or);
+            neon_set(f, *dst);
+        }
+        CvtFloatToHalf { dst, src } => {
+            // IEEE f32 -> f16, round-to-nearest-even, four lanes at once and branchless
+            // (Giesen float_to_half_fast3_rtne, restated in SIMD). Every lane computes
+            // all three candidate results - inf/NaN, subnormal, normal - and selects
+            // between them with masks, because a vector cannot branch per lane.
+            //
+            // A retail title executes this to store animation data as half-float, so
+            // "close enough" is not available: the goldens in
+            // `vitaslop-conformance-suite-arm` come from qemu and pin the tie-breaking,
+            // the overflow to infinity, the NaN preservation and the subnormal boundary.
+            neon_get(f, *src);
+            f32x4_to_f16_lanes(f);
+            // Pack the four 16-bit results into the low 8 bytes - the `Dd` destination.
+            f.instruction(&W::LocalTee(L_V128A));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::I8x16Shuffle([0, 1, 4, 5, 8, 9, 12, 13, 0, 0, 0, 0, 0, 0, 0, 0]));
             neon_set(f, *dst);
         }
         Narrow { esize, dst, src } => {
@@ -6024,6 +7201,114 @@ fn emit_addr(f: &mut Body, addr: &Value, base: u32) {
     }
 }
 
+/// The `MemArg` of an atomic access. Atomics REQUIRE natural alignment in the immediate
+/// (`align` = log2 of the width) and trap on a misaligned address at run time - which is also
+/// what an ARM exclusive access to a misaligned address does (an alignment fault).
+fn atomic_arg(align: u32) -> MemArg {
+    MemArg { offset: 0, align, memory_index: 0 }
+}
+
+/// SMP `LDREX{,B,H,D}` - see [`Stmt::LoadExcl`]. Arms this instance's monitor with the GUEST
+/// address and the value read, then writes the destination register(s).
+fn emit_load_excl(f: &mut Body, rt: u8, rt2: Option<u8>, addr: &Value, size: MemSize, base: u32) {
+    emit_addr(f, addr, base);
+    f.instruction(&W::LocalTee(L_T0));
+    f.instruction(&W::I32Const(base as i32));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::GlobalSet(EXCL_ADDR_GLOBAL));
+    f.instruction(&W::LocalGet(L_T0));
+    match rt2 {
+        None => {
+            f.instruction(&match size {
+                MemSize::Byte => W::I32AtomicLoad8U(atomic_arg(0)),
+                MemSize::Half => W::I32AtomicLoad16U(atomic_arg(1)),
+                MemSize::Word => W::I32AtomicLoad(atomic_arg(2)),
+            });
+            f.instruction(&W::LocalTee(L_T1));
+            f.instruction(&W::GlobalSet(EXCL_VAL_GLOBAL));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::GlobalSet(abi::reg_global(rt as usize)));
+        }
+        Some(rt2) => {
+            // One 64-bit atomic load: `LDREXD` is single-copy atomic on ARM, and two word
+            // loads would let a concurrent `STREXD` tear the pair between them.
+            f.instruction(&W::I64AtomicLoad(atomic_arg(3)));
+            f.instruction(&W::LocalTee(L_D64));
+            f.instruction(&W::GlobalSet(EXCL_VAL64_GLOBAL));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::GlobalSet(abi::reg_global(rt as usize)));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I64Const(32));
+            f.instruction(&W::I64ShrU);
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::GlobalSet(abi::reg_global(rt2 as usize)));
+        }
+    }
+}
+
+/// SMP `STREX{,B,H,D}` - see [`Stmt::StoreExcl`]. A compare-and-swap against the value the
+/// arming `LDREX` read, taken only when this instance's monitor holds THIS address; `rd` gets
+/// ARM's status (0 stored, 1 refused) and the monitor is spent either way.
+///
+/// The page is dirty-marked BEFORE the attempt and whether or not it succeeds: a refused store
+/// leaves the bytes as they were, so the extra stamp costs at most one redundant upload, while
+/// a stamp taken only on success would have to be emitted inside the branch for no gain.
+fn emit_store_excl(
+    f: &mut Body,
+    rd: u8,
+    rt: u8,
+    rt2: Option<u8>,
+    addr: &Value,
+    size: MemSize,
+    base: u32,
+) {
+    emit_addr(f, addr, base);
+    emit_dirty_mark(f, L_DIRTY);
+    f.instruction(&W::LocalSet(L_T0));
+    f.instruction(&W::GlobalGet(EXCL_ADDR_GLOBAL));
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Const(base as i32));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::I32Eq);
+    f.instruction(&W::If(BlockType::Result(ValType::I32)));
+    f.instruction(&W::LocalGet(L_T0));
+    match rt2 {
+        None => {
+            f.instruction(&W::GlobalGet(EXCL_VAL_GLOBAL));
+            f.instruction(&W::GlobalGet(abi::reg_global(rt as usize)));
+            f.instruction(&match size {
+                MemSize::Byte => W::I32AtomicRmw8CmpxchgU(atomic_arg(0)),
+                MemSize::Half => W::I32AtomicRmw16CmpxchgU(atomic_arg(1)),
+                MemSize::Word => W::I32AtomicRmwCmpxchg(atomic_arg(2)),
+            });
+            // The narrow forms return the old value ZERO-EXTENDED, and the arming load was
+            // zero-extending too, so the two compare as whole words.
+            f.instruction(&W::GlobalGet(EXCL_VAL_GLOBAL));
+            f.instruction(&W::I32Ne);
+        }
+        Some(rt2) => {
+            f.instruction(&W::GlobalGet(EXCL_VAL64_GLOBAL));
+            f.instruction(&W::GlobalGet(abi::reg_global(rt2 as usize)));
+            f.instruction(&W::I64ExtendI32U);
+            f.instruction(&W::I64Const(32));
+            f.instruction(&W::I64Shl);
+            f.instruction(&W::GlobalGet(abi::reg_global(rt as usize)));
+            f.instruction(&W::I64ExtendI32U);
+            f.instruction(&W::I64Or);
+            f.instruction(&W::I64AtomicRmwCmpxchg(atomic_arg(3)));
+            f.instruction(&W::GlobalGet(EXCL_VAL64_GLOBAL));
+            f.instruction(&W::I64Ne);
+        }
+    }
+    f.instruction(&W::Else);
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::End);
+    f.instruction(&W::GlobalSet(abi::reg_global(rd as usize)));
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::GlobalSet(EXCL_ADDR_GLOBAL));
+}
+
 fn emit_value(f: &mut Body, v: &Value, base: u32) {
     match v {
         Value::Imm(x) => {
@@ -6051,6 +7336,13 @@ fn emit_value(f: &mut Body, v: &Value, base: u32) {
         }
         Value::ThreadPtr => {
             f.instruction(&W::GlobalGet(abi::TP_GLOBAL));
+        }
+        // The monitor word, read straight out of the mirror block. A LINEAR-memory address,
+        // not a guest one, so it is not rebased: the block sits outside the guest region
+        // exactly so no guest pointer can reach it.
+        Value::ExclAddr => {
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Load(MemArg { offset: EXCL_OFF.with(|c| c.get()), align: 2, memory_index: 0 }));
         }
         Value::Bin(op, a, b) => {
             emit_value(f, a, base);
@@ -6327,6 +7619,8 @@ enum InlineLowering {
     /// `budget_off`, and park the thread when it reaches zero - see
     /// [`crate::InlineOp::LoadMirrorParking`].
     MirrorParking { off: u64, budget_off: u64 },
+    /// The elided yield: see [`crate::InlineOp::DelayYield`].
+    DelayYield { free_off: u64, run_off: u64, cap: u32 },
     /// Read the 64-bit host-mirror value at this offset into r0/r1. No guard, same
     /// reason as [`InlineLowering::Mirror`].
     MirrorPair { off: u64 },
@@ -6334,6 +7628,14 @@ enum InlineLowering {
     /// r0, then set r0 = 0. Guarded on the pointer, which must admit an EIGHT-byte
     /// store rather than the usual four.
     MirrorStorePair { off: u64, limit: u32 },
+    /// SMP: r0 = an instance global (`InlineOp::ThreadWord`).
+    SmpGlobal { global: u32 },
+    /// SMP: r0:r1 = one atomic 64-bit load at `off` (`InlineOp::LoadClock64`).
+    SmpClock64 { off: u64 },
+    /// SMP: `*(u64 *)r0` = the same, r0 = 0 (`InlineOp::StoreClock64`).
+    SmpStoreClock64 { off: u64, limit: u32 },
+    /// SMP: the elided yield over the worker's runnable word and the instance counter.
+    SmpDelayYield { cap: u32 },
     /// Store r1 at `r0 + offset` and set r0 = 0. Guarded on the pointer exactly like the
     /// reading forms; a rejected pointer runs the handler, which keeps defining what
     /// writing through it means.
@@ -6367,6 +7669,18 @@ enum InlineLowering {
     /// pointer form, and on its own predicate besides - see
     /// [`crate::InlineOp::LwMutexLock`].
     LwMutex { layout: crate::LwMutexLayout, thread_off: u64, limit: u32, lock: bool },
+    /// The same take/release over a KERNEL mutex, whose state is the four words at `layout`
+    /// from entry `r0 & mask` of a table at `table_off` in the host-mirror block. No pointer
+    /// guard: the address is a constant inside a page this module reserved and the mask keeps
+    /// every index inside the table - what makes the form EXACT is the entry's own id term,
+    /// exactly as it is for the lightweight one. See [`crate::InlineOp::KernelMutexLock`].
+    KMutex {
+        layout: crate::LwMutexLayout,
+        thread_off: u64,
+        table_off: u64,
+        mask: u32,
+        lock: bool,
+    },
     /// Bump the default-uniform ring in the context block r0 points at and hand the block
     /// back through r1 - see [`crate::InlineOp::ReserveUniformBuffer`]. Three pointers are
     /// guarded (the context, the bound program handle read out of it, and the out-parameter)
@@ -6390,6 +7704,16 @@ enum InlineLowering {
     /// arrays block plus the uniform record and (fragment) the program handle. Three
     /// pointers, three bounds, two magics - see [`crate::InlineOp::BindPrecomputedState`].
     BindState { layout: crate::BindStateLayout, ctx_limit: u32, st_limit: u32, blk_limit: u32 },
+    /// Copy a uniform-buffer table (r1) into a precomputed state's (r0) arrays block: one
+    /// `memory.copy` behind the struct magic. Three bounds - the struct, the source array and
+    /// the block - each against the last byte it reaches. See
+    /// [`crate::InlineOp::SetAllUniformBuffers`].
+    SetAllUniformBuffers {
+        layout: crate::SetAllUniformBuffersLayout,
+        st_limit: u32,
+        src_limit: u32,
+        blk_limit: u32,
+    },
 }
 
 /// Which bulk operation an [`InlineLowering::Bulk`] performs. One enum rather than three
@@ -6443,6 +7767,23 @@ impl InlineImports {
             crate::InlineOp::RetConst { value } => Some(InlineLowering::RetConst { value }),
             crate::InlineOp::Nop => Some(InlineLowering::Nop),
             crate::InlineOp::Fast => Some(InlineLowering::Fast),
+            // The SMP forms (see each `InlineOp`). The block is unconditional, so its offset
+            // is always there for the clock words and the runnable word's pointer.
+            crate::InlineOp::ThreadWord { cur } => Some(InlineLowering::SmpGlobal {
+                global: if cur { CUR_THREAD_GLOBAL } else { THREAD_ID_GLOBAL },
+            }),
+            crate::InlineOp::LoadClock64 { rtc } => {
+                let base = self.mirror_off.expect("SMP clock op emitted with no mirror block");
+                let slot = if rtc { abi::SMP_RTC64_SLOT } else { abi::SMP_CLOCK64_SLOT };
+                Some(InlineLowering::SmpClock64 { off: base + slot as u64 * 4 })
+            }
+            crate::InlineOp::StoreClock64 { rtc } => {
+                let base = self.mirror_off.expect("SMP clock op emitted with no mirror block");
+                let slot = if rtc { abi::SMP_RTC64_SLOT } else { abi::SMP_CLOCK64_SLOT };
+                let limit = self.mem_bytes.checked_sub(8)?;
+                Some(InlineLowering::SmpStoreClock64 { off: base + slot as u64 * 4, limit })
+            }
+            crate::InlineOp::SmpDelayYield { cap } => Some(InlineLowering::SmpDelayYield { cap }),
             crate::InlineOp::LoadMirror { slot } => {
                 // The block is reserved by the same layout pass that fills `mirror_off`
                 // from these very ops, so a mirror op without a block is a bug here, not
@@ -6460,6 +7801,14 @@ impl InlineImports {
             crate::InlineOp::LoadMirrorPair { slot } => {
                 let base = self.mirror_off.expect("mirror op emitted with no mirror block");
                 Some(InlineLowering::MirrorPair { off: base + slot as u64 * 4 })
+            }
+            crate::InlineOp::DelayYield { free_slot, run_slot, cap } => {
+                let base = self.mirror_off.expect("mirror op emitted with no mirror block");
+                Some(InlineLowering::DelayYield {
+                    free_off: base + free_slot as u64 * 4,
+                    run_off: base + run_slot as u64 * 4,
+                    cap,
+                })
             }
             crate::InlineOp::StoreMirrorPair { slot } => {
                 let base = self.mirror_off.expect("mirror op emitted with no mirror block");
@@ -6544,6 +7893,21 @@ impl InlineImports {
                     lock,
                 })
             }
+            crate::InlineOp::KernelMutexLock { layout, thread_slot, table_slot, entries }
+            | crate::InlineOp::KernelMutexUnlock { layout, thread_slot, table_slot, entries } => {
+                let base = self.mirror_off.expect("mirror op emitted with no mirror block");
+                let lock =
+                    matches!(*self.ops.get(&index)?, crate::InlineOp::KernelMutexLock { .. });
+                Some(InlineLowering::KMutex {
+                    layout,
+                    thread_off: base + thread_slot as u64 * 4,
+                    table_off: base + table_slot as u64 * 4,
+                    // A power of two by construction (`vitaslop_runtime::vita::kmutex::ENTRIES`),
+                    // so the index is a mask rather than a division.
+                    mask: entries - 1,
+                    lock,
+                })
+            }
             crate::InlineOp::ReserveUniformBuffer { layout } => {
                 // Three pointers, three bounds, each computed against the LAST word that
                 // pointer reaches: the context block (its ring and this stage's record),
@@ -6560,6 +7924,15 @@ impl InlineImports {
                 let st_limit = self.mem_bytes.checked_sub(4)?.checked_sub(layout.st_top())?;
                 let blk_limit = self.mem_bytes.checked_sub(layout.copy_bytes)?;
                 Some(InlineLowering::BindState { layout, ctx_limit, st_limit, blk_limit })
+            }
+            crate::InlineOp::SetAllUniformBuffers { layout } => {
+                // The struct (its two words), the source array (`bytes` from r1) and the
+                // arrays block (`bytes` from `block + table_at`), each against the LAST byte
+                // it reaches.
+                let st_limit = self.mem_bytes.checked_sub(4)?.checked_sub(layout.st_top())?;
+                let src_limit = self.mem_bytes.checked_sub(layout.bytes)?;
+                let blk_limit = self.mem_bytes.checked_sub(layout.bytes)?.checked_sub(layout.table_at)?;
+                Some(InlineLowering::SetAllUniformBuffers { layout, st_limit, src_limit, blk_limit })
             }
             crate::InlineOp::SetUniformData { layout } => {
                 let base = self.mirror_off.expect("mirror op emitted with no mirror block");
@@ -6614,6 +7987,106 @@ impl InlineImports {
 /// a pointer below the image base (the subtraction wraps to a huge value, which is the
 /// null-pointer case) and one too near the end of guest memory; either way the real host
 /// call runs, so the handler keeps defining those cases.
+/// The take-or-release a lock form performs once its ENTRY is in `L_T0` as a linear-memory
+/// offset - the predicate, the two stores and the fallback call. Shared by the lightweight
+/// form (whose entry is the guest's work area, bounds-guarded) and the kernel one (whose
+/// entry is a table slot indexed by uid), because the state machine is the same four words
+/// and one of them being wrong in only one of two copies is exactly the drift a shared
+/// `LwMutexLayout` exists to prevent.
+///
+/// Leaves the emitter INSIDE the predicate's `if`; the caller emits the closing `End`s, since
+/// only it knows whether a pointer guard is open around this.
+fn emit_lock_take(
+    f: &mut Body,
+    layout: crate::LwMutexLayout,
+    thread_off: u64,
+    lock: bool,
+    base: u32,
+    index: u32,
+) {
+    // The entry is in `L_T0`, however the caller got it there. Two values are read
+    // once and used twice, so they go in locals: the current thread id from the
+    // mirror, and the recursion count (tested in the predicate, then incremented or
+    // decremented).
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::I32Load(MemArg { offset: thread_off, align: 0, memory_index: 0 }));
+    f.instruction(&W::LocalSet(L_T2));
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Load(word_at(layout.count)));
+    f.instruction(&W::LocalSet(L_T1));
+
+    // The predicate, built on the stack. Every term is a comparison, so each
+    // leaves exactly 0 or 1 and the combining `and`/`or` are bitwise-safe; a raw
+    // word used as a truth value here would AND its BITS with the terms either
+    // side and admit takes that should have fallen back.
+    //
+    // r1 == 1: the lock/unlock COUNT argument. Anything else is the handler's.
+    f.instruction(&W::GlobalGet(abi::reg_global(1)));
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::I32Eq);
+    // ...and the work area names ITSELF, so this pointer is the canonical mutex
+    // rather than a byte copy of one (which carries the original's id).
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Load(word_at(layout.id)));
+    f.instruction(&W::GlobalGet(abi::reg_global(0)));
+    f.instruction(&W::I32Eq);
+    f.instruction(&W::I32And);
+    // ...and nothing is parked on it. Only the host can wake a parked thread, so
+    // a mutex with waiters stays entirely on the host.
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Load(word_at(layout.waiters)));
+    f.instruction(&W::I32Eqz);
+    f.instruction(&W::I32And);
+    if lock {
+        // ...and it is free OR already mine (a recursive take).
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Load(word_at(layout.owner)));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::I32Or);
+        f.instruction(&W::I32And);
+    } else {
+        // ...and it is held, AND held by me. Both, not either: releasing a mutex
+        // this thread does not own is an error only the handler defines, and
+        // decrementing a zero count inline would wrap it to four billion.
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::I32And);
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Load(word_at(layout.owner)));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::I32And);
+    }
+
+    f.instruction(&W::If(BlockType::Empty));
+    emit_watch_store_inline(f, base, L_T0, layout.count, 4, index);
+    if lock {
+        emit_watch_store_inline(f, base, L_T0, layout.owner, 4, index);
+        // owner = cur. A no-op on the recursive arm, which is what lets one
+        // branch serve both cases.
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Store(word_at(layout.owner)));
+    }
+    // count += 1 (take) or -= 1 (release). The release deliberately leaves `owner`
+    // alone: every reader tests `count` first, and thid 0 is a real thread, so
+    // there is no owner value that could mean "nobody".
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::LocalGet(L_T1));
+    f.instruction(&W::I32Const(1));
+    f.instruction(if lock { &W::I32Add } else { &W::I32Sub });
+    f.instruction(&W::I32Store(word_at(layout.count)));
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::GlobalSet(abi::reg_global(0)));
+    f.instruction(&W::Else);
+    f.instruction(&W::I32Const(index as i32));
+    f.instruction(&W::Call(IMPORT_FUNC));
+}
+
 fn emit_pointer_guard(f: &mut Body, base: u32, limit: u32, index: u32) {
     emit_pointer_guard_reg(f, 0, base, limit, index);
 }
@@ -6748,6 +8221,125 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.untolled(&W::I32Eqz);
             f.untolled(&W::If(BlockType::Empty));
             f.untolled(&W::I32Const(abi::VBLANK_PARK_SELECTOR as i32));
+            f.untolled(&W::Call(IMPORT_FUNC));
+            f.untolled(&W::End);
+            f.charge_unbilled_work(mark);
+            return;
+        }
+        Some(InlineLowering::DelayYield { free_off, run_off, cap }) => {
+            // if (r0 <= 1 && mirror[free] != 0 && mirror[run] < cap) { mirror[run]++; r0 = 0 }
+            // else { call the import }. Every term is a comparison, so the `and`s are exact.
+            //
+            // UNTOLLED, like `MirrorParking`'s guard: this is the host's bookkeeping standing
+            // in for a call, and tolling it bills the guest ~18 operators an iteration that the
+            // import call it replaces did not - MEASURED to move a football title's whole intro
+            // timeline ~800 frames on the desktop (`md-sane2` vs `md-sane3`).
+            let mark = f.unbilled_mark();
+            f.untolled(&W::GlobalGet(abi::reg_global(0)));
+            f.untolled(&W::I32Const(1));
+            f.untolled(&W::I32LeU);
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::I32Load(MemArg { offset: free_off, align: 0, memory_index: 0 }));
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::I32Ne);
+            f.untolled(&W::I32And);
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::I32Load(MemArg { offset: run_off, align: 0, memory_index: 0 }));
+            f.untolled(&W::I32Const(cap as i32));
+            f.untolled(&W::I32LtU);
+            f.untolled(&W::I32And);
+            f.untolled(&W::If(BlockType::Empty));
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::I32Load(MemArg { offset: run_off, align: 0, memory_index: 0 }));
+            f.untolled(&W::I32Const(1));
+            f.untolled(&W::I32Add);
+            f.untolled(&W::I32Store(MemArg { offset: run_off, align: 0, memory_index: 0 }));
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::GlobalSet(abi::reg_global(0)));
+            f.untolled(&W::Else);
+            f.untolled(&W::I32Const(index as i32));
+            f.untolled(&W::Call(IMPORT_FUNC));
+            f.untolled(&W::End);
+            f.charge_unbilled_work(mark);
+            return;
+        }
+        Some(InlineLowering::SmpGlobal { global }) => {
+            f.instruction(&W::GlobalGet(global));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            return;
+        }
+        Some(InlineLowering::SmpClock64 { off }) => {
+            // ONE aligned atomic 64-bit load, split into the EABI pair r0 (low) : r1 (high).
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I64AtomicLoad(MemArg { offset: off, align: 3, memory_index: 0 }));
+            f.instruction(&W::LocalTee(L_D64));
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I64Const(32));
+            f.instruction(&W::I64ShrU);
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::GlobalSet(abi::reg_global(1)));
+            return;
+        }
+        Some(InlineLowering::SmpStoreClock64 { off, limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            emit_watch_store_inline(f, base, L_T0, 0, 8, index);
+            // The guest pointer carries no alignment guarantee, so the STORE is two words -
+            // it writes guest memory the guest owns, where a torn write is the guest's own
+            // race. The LOAD is what must be single-copy atomic, and it is.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I64AtomicLoad(MemArg { offset: off, align: 3, memory_index: 0 }));
+            f.instruction(&W::LocalSet(L_D64));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::I32Store(mem_arg()));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I64Const(32));
+            f.instruction(&W::I64ShrU);
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::I32Store(MemArg { offset: 4, align: 0, memory_index: 0 }));
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::End);
+            return;
+        }
+        Some(InlineLowering::SmpDelayYield { cap }) => {
+            // if (r0 <= 1 && runnable[my worker] == 0 && elide < cap) { elide++; r0 = 0 }
+            // else { elide = 0; call the import }. The one-worker form's two mirror words made
+            // per-thread: the runnable word is found through this instance's preempt-word
+            // pointer (the two sit a fixed distance apart), the counter is an instance global
+            // the host zeroes at every resume. UNTOLLED for the reason `DelayYield` is.
+            let mark = f.unbilled_mark();
+            f.untolled(&W::GlobalGet(abi::reg_global(0)));
+            f.untolled(&W::I32Const(1));
+            f.untolled(&W::I32LeU);
+            f.untolled(&W::GlobalGet(PREEMPT_GLOBAL));
+            f.untolled(&W::I32Load(MemArg {
+                offset: 4 * u64::from(abi::SMP_RUNNABLE_SLOT_OFFSET),
+                align: 2,
+                memory_index: 0,
+            }));
+            f.untolled(&W::I32Eqz);
+            f.untolled(&W::I32And);
+            f.untolled(&W::GlobalGet(ELIDE_GLOBAL));
+            f.untolled(&W::I32Const(cap as i32));
+            f.untolled(&W::I32LtU);
+            f.untolled(&W::I32And);
+            f.untolled(&W::If(BlockType::Empty));
+            f.untolled(&W::GlobalGet(ELIDE_GLOBAL));
+            f.untolled(&W::I32Const(1));
+            f.untolled(&W::I32Add);
+            f.untolled(&W::GlobalSet(ELIDE_GLOBAL));
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::GlobalSet(abi::reg_global(0)));
+            f.untolled(&W::Else);
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::GlobalSet(ELIDE_GLOBAL));
+            f.untolled(&W::I32Const(index as i32));
             f.untolled(&W::Call(IMPORT_FUNC));
             f.untolled(&W::End);
             f.charge_unbilled_work(mark);
@@ -7004,88 +8596,27 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::End); // the destination pointer guard
             return;
         }
+        Some(InlineLowering::KMutex { layout, thread_off, table_off, mask, lock }) => {
+            // The ENTRY, as a linear-memory offset: `table_off + (r0 & mask) * 16`. There is
+            // no pointer guard because there is no guest pointer - the table sits inside a
+            // page this module reserved, and the mask keeps every index inside it. What makes
+            // the form exact is the entry's own `id == r0` term, which sends a uid that
+            // collided with another mutex's entry to the handler, where that mutex's state is.
+            f.instruction(&W::GlobalGet(abi::reg_global(0)));
+            f.instruction(&W::I32Const(mask as i32));
+            f.instruction(&W::I32And);
+            f.instruction(&W::I32Const(crate::MUTEX_ENTRY_BYTES as i32));
+            f.instruction(&W::I32Mul);
+            f.instruction(&W::I32Const(table_off as i32));
+            f.instruction(&W::I32Add);
+            f.instruction(&W::LocalSet(L_T0));
+            emit_lock_take(f, layout, thread_off, lock, base, index);
+            f.instruction(&W::End); // the predicate's `if`
+            return;
+        }
         Some(InlineLowering::LwMutex { layout, thread_off, limit, lock }) => {
             emit_pointer_guard(f, base, limit, index);
-            // In range. Two values are read once and used twice, so they go in locals:
-            // the current thread id from the mirror, and the recursion count (tested in
-            // the predicate, then incremented or decremented).
-            f.instruction(&W::I32Const(0));
-            f.instruction(&W::I32Load(MemArg { offset: thread_off, align: 0, memory_index: 0 }));
-            f.instruction(&W::LocalSet(L_T2));
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::I32Load(word_at(layout.count)));
-            f.instruction(&W::LocalSet(L_T1));
-
-            // The predicate, built on the stack. Every term is a comparison, so each
-            // leaves exactly 0 or 1 and the combining `and`/`or` are bitwise-safe; a raw
-            // word used as a truth value here would AND its BITS with the terms either
-            // side and admit takes that should have fallen back.
-            //
-            // r1 == 1: the lock/unlock COUNT argument. Anything else is the handler's.
-            f.instruction(&W::GlobalGet(abi::reg_global(1)));
-            f.instruction(&W::I32Const(1));
-            f.instruction(&W::I32Eq);
-            // ...and the work area names ITSELF, so this pointer is the canonical mutex
-            // rather than a byte copy of one (which carries the original's id).
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::I32Load(word_at(layout.id)));
-            f.instruction(&W::GlobalGet(abi::reg_global(0)));
-            f.instruction(&W::I32Eq);
-            f.instruction(&W::I32And);
-            // ...and nothing is parked on it. Only the host can wake a parked thread, so
-            // a mutex with waiters stays entirely on the host.
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::I32Load(word_at(layout.waiters)));
-            f.instruction(&W::I32Eqz);
-            f.instruction(&W::I32And);
-            if lock {
-                // ...and it is free OR already mine (a recursive take).
-                f.instruction(&W::LocalGet(L_T1));
-                f.instruction(&W::I32Eqz);
-                f.instruction(&W::LocalGet(L_T0));
-                f.instruction(&W::I32Load(word_at(layout.owner)));
-                f.instruction(&W::LocalGet(L_T2));
-                f.instruction(&W::I32Eq);
-                f.instruction(&W::I32Or);
-                f.instruction(&W::I32And);
-            } else {
-                // ...and it is held, AND held by me. Both, not either: releasing a mutex
-                // this thread does not own is an error only the handler defines, and
-                // decrementing a zero count inline would wrap it to four billion.
-                f.instruction(&W::LocalGet(L_T1));
-                f.instruction(&W::I32Eqz);
-                f.instruction(&W::I32Eqz);
-                f.instruction(&W::I32And);
-                f.instruction(&W::LocalGet(L_T0));
-                f.instruction(&W::I32Load(word_at(layout.owner)));
-                f.instruction(&W::LocalGet(L_T2));
-                f.instruction(&W::I32Eq);
-                f.instruction(&W::I32And);
-            }
-
-            f.instruction(&W::If(BlockType::Empty));
-            emit_watch_store_inline(f, base, L_T0, layout.count, 4, index);
-            if lock {
-                emit_watch_store_inline(f, base, L_T0, layout.owner, 4, index);
-                // owner = cur. A no-op on the recursive arm, which is what lets one
-                // branch serve both cases.
-                f.instruction(&W::LocalGet(L_T0));
-                f.instruction(&W::LocalGet(L_T2));
-                f.instruction(&W::I32Store(word_at(layout.owner)));
-            }
-            // count += 1 (take) or -= 1 (release). The release deliberately leaves `owner`
-            // alone: every reader tests `count` first, and thid 0 is a real thread, so
-            // there is no owner value that could mean "nobody".
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::LocalGet(L_T1));
-            f.instruction(&W::I32Const(1));
-            f.instruction(if lock { &W::I32Add } else { &W::I32Sub });
-            f.instruction(&W::I32Store(word_at(layout.count)));
-            f.instruction(&W::I32Const(0));
-            f.instruction(&W::GlobalSet(abi::reg_global(0)));
-            f.instruction(&W::Else);
-            f.instruction(&W::I32Const(index as i32));
-            f.instruction(&W::Call(IMPORT_FUNC));
+            emit_lock_take(f, layout, thread_off, lock, base, index);
             f.instruction(&W::End); // the predicate's `if`
             f.instruction(&W::End); // the pointer guard's `if`
             return;
@@ -7225,6 +8756,91 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::End); // the context pointer guard
             return;
         }
+        Some(InlineLowering::SetAllUniformBuffers { layout: l, st_limit, src_limit, blk_limit }) => {
+            // >>> BILLED EXACTLY WHAT THE IMPORT CALL IT REPLACES IS BILLED: TWO OPERATORS.
+            //
+            // The fuel counter is the game clock, and an inline form that tolls its guards and
+            // its copy bills the guest ~35 operators where the `i32.const; call` it stands in
+            // for billed 2. MEASURED: the tolled `DelayYield` body moved a football title's
+            // desktop timeline ~800 frames, and the first (tolled) build of THIS form landed a
+            // baseball title's browser run at a different scene 2,700 frames off its control
+            // at the same frame index. So every guard, load and the copy are untolled host
+            // bookkeeping (attributed to the work counter, as `MirrorParking`'s guard is), and
+            // the two operators that ARE billed are the return-value store on the inline arm
+            // and the `i32.const; call` on the fallback arm - both arms bill 2, as before.
+            let mark = f.unbilled_mark();
+            // t0 = the state struct, rebased and bounded; out of range runs the handler.
+            f.untolled(&W::GlobalGet(abi::reg_global(0)));
+            f.untolled(&W::I32Const(base as i32));
+            f.untolled(&W::I32Sub);
+            f.untolled(&W::LocalTee(L_T0));
+            f.untolled(&W::I32Const(st_limit as i32));
+            f.untolled(&W::I32GtU);
+            f.untolled(&W::If(BlockType::Empty));
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.untolled(&W::Else);
+            // t1 = the source array, rebased; its bound admits the whole `bytes` read. A tail
+            // that runs past guest memory is the handler's case (it reads zeros there), so
+            // the guard sends it back rather than trapping on the load.
+            f.untolled(&W::GlobalGet(abi::reg_global(1)));
+            f.untolled(&W::I32Const(base as i32));
+            f.untolled(&W::I32Sub);
+            f.untolled(&W::LocalTee(L_T1));
+            f.untolled(&W::I32Const(src_limit as i32));
+            f.untolled(&W::I32GtU);
+            f.untolled(&W::If(BlockType::Empty));
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.untolled(&W::Else);
+            // The predicate: a state struct this engine stamped for this stage, whose
+            // arrays block is non-zero (an unstamped or blockless struct is the handler's
+            // case - it allocates) and in range for the whole table. Every term is a
+            // comparison, so the combining `and`s are bitwise-safe.
+            f.untolled(&W::LocalGet(L_T0));
+            f.untolled(&W::I32Load(word_at(l.st_magic_at)));
+            f.untolled(&W::I32Const(l.st_magic as i32));
+            f.untolled(&W::I32Eq);
+            f.untolled(&W::LocalGet(L_T0));
+            f.untolled(&W::I32Load(word_at(l.st_block_at)));
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::I32Ne);
+            f.untolled(&W::I32And);
+            // t2 = the arrays block, rebased.
+            f.untolled(&W::LocalGet(L_T0));
+            f.untolled(&W::I32Load(word_at(l.st_block_at)));
+            f.untolled(&W::I32Const(base as i32));
+            f.untolled(&W::I32Sub);
+            f.untolled(&W::LocalTee(L_T2));
+            f.untolled(&W::I32Const(blk_limit as i32));
+            f.untolled(&W::I32LeU);
+            f.untolled(&W::I32And);
+            f.untolled(&W::If(BlockType::Empty));
+            // The copy: the whole table, wholesale, exactly as the handler's one
+            // `write_bytes` lands it. No dirty-map stamp: the block is this engine's own
+            // heap bookkeeping, never a texture's bytes - see `emit_dirty_range`.
+            emit_watch_store_inline(f, base, L_T2, l.table_at, l.bytes, index);
+            f.untolled(&W::LocalGet(L_T2));
+            f.untolled(&W::I32Const(l.table_at as i32));
+            f.untolled(&W::I32Add);
+            emit_host_off(f);
+            f.untolled(&W::LocalGet(L_T1));
+            emit_host_off(f);
+            f.untolled(&W::I32Const(l.bytes as i32));
+            f.untolled(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+            // The handler returns 0, and the guarded path is the one it would have taken.
+            // These two are the inline arm's whole bill.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.untolled(&W::Else);
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.untolled(&W::End); // the predicate
+            f.untolled(&W::End); // the source guard
+            f.untolled(&W::End); // the struct guard
+            f.charge_unbilled_work(mark);
+            return;
+        }
         Some(InlineLowering::BindState { layout: l, ctx_limit, st_limit, blk_limit }) => {
             emit_pointer_guard(f, base, ctx_limit, index);
             // >>> THE NULL-STATE ARM FIRST, because on a real title it is most of the
@@ -7248,13 +8864,24 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
                 f.instruction(&W::I32Const(l.ctx_magic as i32));
                 f.instruction(&W::I32Eq);
                 f.instruction(&W::If(BlockType::Empty));
-                emit_watch_store_inline(f, base, L_T0, l.copy_dst, l.copy_bytes, index);
-                f.instruction(&W::LocalGet(L_T0));
-                f.instruction(&W::I32Const(l.copy_dst as i32));
-                f.instruction(&W::I32Add);
-                f.instruction(&W::I32Const(0));
-                f.instruction(&W::I32Const(l.copy_bytes as i32));
-                f.instruction(&W::MemoryFill(0));
+                // >>> THE TABLE IS CLEARED ONLY WHERE THE HANDLER CLEARS IT - the wholesale
+                // copy arm. Under the per-slot copy the handler's null arm copies an all-zero
+                // table slot by slot and therefore writes NOTHING, so the direct
+                // `sceGxmSetVertexUniformBuffer` bindings survive the unbind. This arm used to
+                // zero them anyway: MEASURED on a football title, every draw that followed a
+                // null state bind lost its buffers and was DROPPED (10 withheld-window drops
+                // and 14 unbound-SA draws on the inlined build, ZERO with the imports not
+                // inlined) - an inline form leaving different state from its handler.
+                if l.copy_slot_stride == 0 {
+                    emit_watch_store_inline(f, base, L_T0, l.copy_dst, l.copy_bytes, index);
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::I32Const(l.copy_dst as i32));
+                    f.instruction(&W::I32Add);
+                    emit_host_off(f);
+                    f.instruction(&W::I32Const(0));
+                    f.instruction(&W::I32Const(l.copy_bytes as i32));
+                    f.instruction(&W::MemoryFill(0));
+                }
                 emit_watch_store_inline(f, base, L_T0, l.ctx_record, 12, index);
                 for w in 0..3u32 {
                     f.instruction(&W::LocalGet(L_T0));
@@ -7317,7 +8944,9 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
                 f.instruction(&W::LocalGet(L_T0));
                 f.instruction(&W::I32Const(l.copy_dst as i32));
                 f.instruction(&W::I32Add);
+                emit_host_off(f);
                 f.instruction(&W::LocalGet(L_T2));
+                emit_host_off(f);
                 f.instruction(&W::I32Const(l.copy_bytes as i32));
                 f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
             } else {
@@ -7350,9 +8979,11 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
                 f.instruction(&W::LocalSet(L_SLOT));
                 emit_watch_store_inline(f, base, L_SLOT, 0, stride, index);
                 f.instruction(&W::LocalGet(L_SLOT));
+                emit_host_off(f);
                 f.instruction(&W::LocalGet(L_T2));
                 f.instruction(&W::LocalGet(L_T3));
                 f.instruction(&W::I32Add);
+                emit_host_off(f);
                 f.instruction(&W::I32Const(stride as i32));
                 f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
                 f.instruction(&W::End); // the non-empty test
@@ -7540,7 +9171,9 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             emit_dirty_range(f, L_T0, L_T2);
             emit_watch_store_extent(f, base, WatchExtent::Local(L_T2), BULK_WATCH_TAG | index);
             f.instruction(&W::LocalGet(L_T0));
+            emit_host_off(f);
             f.instruction(&W::LocalGet(L_T3));
+            emit_host_off(f);
             f.instruction(&W::LocalGet(L_T2));
             f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
             // ...and the same bytes into the fallback bank, which is what a draw reads when
@@ -7555,7 +9188,9 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::I32Add);
             f.instruction(&W::LocalGet(L_T1));
             f.instruction(&W::I32Add);
+            emit_host_off(f);
             f.instruction(&W::LocalGet(L_T3));
+            emit_host_off(f);
             f.instruction(&W::LocalGet(L_T2));
             f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
             // The high-water mark, in REGISTERS, raised but never lowered - two calls
@@ -7612,7 +9247,9 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
                     // is exactly what the handler's read-then-write does - so the two agree
                     // on an OVERLAPPING copy as well as on an ordinary one.
                     f.instruction(&W::LocalGet(L_T0));
+                    emit_host_off(f);
                     f.instruction(&W::LocalGet(L_T1));
+                    emit_host_off(f);
                     f.instruction(&W::LocalGet(L_T2));
                     f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
                     // r0 is left alone: it is the destination, which is what the handler
@@ -7623,6 +9260,7 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
                     // byte, which is the handler's `ch as u8`. r1 is passed raw for that
                     // reason - masking it here would be a second spelling of one rule.
                     f.instruction(&W::LocalGet(L_T0));
+                    emit_host_off(f);
                     f.instruction(&W::GlobalGet(abi::reg_global(1)));
                     f.instruction(&W::LocalGet(L_T2));
                     f.instruction(&W::MemoryFill(0));
@@ -7745,5 +9383,208 @@ fn store_op(size: MemSize) -> W<'static> {
         MemSize::Byte => W::I32Store8(mem_arg()),
         MemSize::Half => W::I32Store16(mem_arg()),
         MemSize::Word => W::I32Store(mem_arg()),
+    }
+}
+
+#[cfg(test)]
+mod dirty_run_tests {
+    use super::*;
+    use crate::ir::{MemSize, VfpReg};
+
+    fn store(base: u8, off: i32, size: MemSize) -> Stmt {
+        let addr = if off >= 0 {
+            bin_add(Value::Reg(base), Value::Imm(off as u32))
+        } else {
+            Value::Bin(
+                BinOp::Sub,
+                Box::new(Value::Reg(base)),
+                Box::new(Value::Imm(off.unsigned_abs())),
+            )
+        };
+        Stmt::Store { addr, data: Value::Imm(0), size }
+    }
+
+    fn bin_add(a: Value, b: Value) -> Value {
+        Value::Bin(BinOp::Add, Box::new(a), Box::new(b))
+    }
+
+    /// `plan_dirty_run` needs a `Body` only for its census counters; nothing it decides
+    /// depends on one.
+    fn plan(stmts: &[Stmt]) -> Vec<bool> {
+        let mut f = Body::new();
+        plan_dirty_run(&mut f, stmts)
+    }
+
+    /// A `push {r4-r11, lr}` is nine stores off sp within 36 bytes, and ONE of them has to
+    /// carry the mark. This is the whole point of the analysis, and 8 of 9 is what the
+    /// operator census is expected to show moving.
+    #[test]
+    fn a_push_marks_once() {
+        let mut stmts = vec![Stmt::SetReg(
+            13,
+            Value::Bin(BinOp::Sub, Box::new(Value::Reg(13)), Box::new(Value::Imm(36))),
+        )];
+        for i in 0..9 {
+            stmts.push(store(13, i * 4, MemSize::Word));
+        }
+        let got = plan(&stmts);
+        assert!(!got[0], "the sp adjust is not a store");
+        assert!(!got[1], "the FIRST store carries the mark");
+        assert!(got[2..].iter().all(|&c| c), "every later slot is covered by it: {got:?}");
+    }
+
+    /// An extent of at most one page is exactly what the reader's one-page look-below can
+    /// absorb - see `plan_dirty_run`. One byte past it must not be covered, because a mark
+    /// on the anchor could then be two pages below the store and a reader would miss it.
+    #[test]
+    fn the_covered_extent_stops_at_one_page() {
+        // 4096 - 4 + 4 == 4096: the last word that fits.
+        let ok = plan(&[store(4, 0, MemSize::Word), store(4, 4096 - 4, MemSize::Word)]);
+        assert_eq!(ok, vec![false, true], "a 4096-byte extent is coverable");
+        let past = plan(&[store(4, 0, MemSize::Word), store(4, 4096 - 3, MemSize::Word)]);
+        assert_eq!(past, vec![false, false], "4097 bytes is not");
+        let way_past = plan(&[store(4, 0, MemSize::Word), store(4, 65536, MemSize::Word)]);
+        assert_eq!(way_past, vec![false, false]);
+    }
+
+    /// The anchor must be the LOWEST address of the extent. A store BELOW it is not covered
+    /// - the reader looks one page down from its own range, not one page up, so a stamp
+    /// above the write is on the wrong side of the question.
+    #[test]
+    fn a_store_below_the_anchor_is_never_covered() {
+        let got = plan(&[store(4, 64, MemSize::Word), store(4, 0, MemSize::Word)]);
+        assert_eq!(got, vec![false, false], "the lower store becomes the new anchor");
+        // ...and it then covers a later store above IT.
+        let three = plan(&[
+            store(4, 64, MemSize::Word),
+            store(4, 0, MemSize::Word),
+            store(4, 8, MemSize::Word),
+        ]);
+        assert_eq!(three, vec![false, false, true]);
+    }
+
+    /// Two bases have no compile-time distance at all.
+    #[test]
+    fn a_different_base_register_is_never_covered() {
+        let got = plan(&[store(4, 0, MemSize::Word), store(5, 4, MemSize::Word)]);
+        assert_eq!(got, vec![false, false]);
+    }
+
+    /// ...and a write to the base register ends the run, even when the offsets still look
+    /// adjacent. This is the failure that would be silent: `stm r0!, {..}` writes r0 and the
+    /// next block's `str [r0, #4]` is somewhere else entirely.
+    #[test]
+    fn writing_the_base_ends_the_run() {
+        let got = plan(&[
+            store(4, 0, MemSize::Word),
+            Stmt::SetReg(4, Value::Imm(0x1234)),
+            store(4, 4, MemSize::Word),
+        ]);
+        assert_eq!(got, vec![false, false, false]);
+        // A write to some OTHER register leaves it alone.
+        let other = plan(&[
+            store(4, 0, MemSize::Word),
+            Stmt::SetReg(7, Value::Imm(0x1234)),
+            store(4, 4, MemSize::Word),
+        ]);
+        assert_eq!(other, vec![false, false, true]);
+    }
+
+    /// ANY statement that can reach the host ends the run, because the mark carries the
+    /// EPOCH as it stood at the anchor and a host call is the only thing that can advance
+    /// it. A coalesced mark across one would stamp the new page with the OLD epoch, which
+    /// is a snapshot the host believes is still current - stale pixels, frames later.
+    #[test]
+    fn a_host_reaching_statement_ends_the_run() {
+        for crosser in [
+            Stmt::Import(3),
+            Stmt::Svc(0),
+            Stmt::Call { target: 0x8100_0000 },
+            Stmt::CallIndirect { addr: Value::Reg(3), set_lr: Some(0) },
+            Stmt::Guard(ConditionCode::EQ, Vec::new()),
+        ] {
+            let got = plan(&[store(4, 0, MemSize::Word), crosser, store(4, 4, MemSize::Word)]);
+            assert_eq!(got, vec![false, false, false], "a run may not cross a host call");
+        }
+    }
+
+    /// A VFP store joins a run (`vpush {d8-d11}` is four of them), and a VFP LOAD does not
+    /// break one - it writes no core register, so the base survives it.
+    #[test]
+    fn vfp_stores_join_the_run_and_vfp_loads_do_not_break_it() {
+        let vstore = |off: u32| Stmt::VfpMem {
+            reg: VfpReg::D(8),
+            addr: bin_add(Value::Reg(13), Value::Imm(off)),
+            load: false,
+        };
+        let got = plan(&[vstore(0), vstore(8), vstore(16)]);
+        assert_eq!(got, vec![false, true, true]);
+        let with_load = plan(&[
+            store(13, 0, MemSize::Word),
+            Stmt::VfpMem {
+                reg: VfpReg::D(0),
+                addr: bin_add(Value::Reg(9), Value::Imm(0)),
+                load: true,
+            },
+            store(13, 4, MemSize::Word),
+        ]);
+        assert_eq!(with_load, vec![false, false, true]);
+    }
+
+    /// An address this analysis cannot place stamps its own page as always, and says nothing
+    /// about what follows it.
+    #[test]
+    fn an_unplaceable_address_marks_itself_and_drops_the_anchor() {
+        let dynamic = Stmt::Store {
+            addr: Value::Bin(BinOp::Add, Box::new(Value::Reg(4)), Box::new(Value::Reg(5))),
+            data: Value::Imm(0),
+            size: MemSize::Word,
+        };
+        let got = plan(&[store(4, 0, MemSize::Word), dynamic, store(4, 4, MemSize::Word)]);
+        assert_eq!(got, vec![false, false, false]);
+    }
+
+    /// The OFF arm elides nothing at all, which is what makes it a usable negative control.
+    #[test]
+    fn the_off_arm_covers_nothing() {
+        set_dirty_run_marks(false);
+        let mut stmts = Vec::new();
+        for i in 0..9 {
+            stmts.push(store(13, i * 4, MemSize::Word));
+        }
+        let got = plan(&stmts);
+        set_dirty_run_marks(true);
+        assert!(got.iter().all(|&c| !c), "VITASLOP_DIRTY_RUN_MARK=0 gives every store its own mark");
+    }
+}
+
+/// The dispatcher's bucket index names, for every slice, exactly the functions that can start
+/// in it - so the narrowed search finds every function the full search would, and nothing is
+/// ever looked for outside its own slice.
+#[cfg(test)]
+mod dispatch_bucket_tests {
+    use super::{dispatch_buckets, DISPATCH_BUCKET_SHIFT};
+
+    #[test]
+    fn every_function_lies_inside_its_buckets_range() {
+        // Irregular gaps, a run of functions inside one slice, empty slices, and an entry
+        // exactly on a slice boundary.
+        let base = 0x8100_0008u32;
+        let mut addrs = vec![base];
+        let mut a = base;
+        for step in [2u32, 6, 40, 510, 2, 2, 1024, 4096, 506, 6, 30000, 512, 1] {
+            a += step * 2;
+            addrs.push(a);
+        }
+        let (b0, buckets) = dispatch_buckets(&addrs).expect("non-empty");
+        assert_eq!(b0, base);
+        assert_eq!(*buckets.last().unwrap(), addrs.len() as u32, "sentinel");
+        for (i, &addr) in addrs.iter().enumerate() {
+            let b = ((addr - base) >> DISPATCH_BUCKET_SHIFT) as usize;
+            let (lo, hi) = (buckets[b] as usize, buckets[b + 1] as usize);
+            assert!(lo <= i && i < hi, "function {i} at {addr:#x} outside bucket {b} [{lo}, {hi})");
+        }
+        assert!(buckets.windows(2).all(|w| w[0] <= w[1]), "monotone");
+        assert!(dispatch_buckets(&[]).is_none());
     }
 }

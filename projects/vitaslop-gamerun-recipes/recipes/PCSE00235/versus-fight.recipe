@@ -1,0 +1,126 @@
+@title  PCSE00235 - title -> FIGHT -> VERSUS -> Solo Match -> a fight played to the result screen
+@game   PCSE00235
+@shot-every 120
+
+# WHAT THIS RECIPE IS FOR
+# ----------------------
+# The GAMEPLAY recipe for Dead or Alive 5 Plus: it walks the front end with the defaults, lets
+# the fight start, throws a punch/kick flurry, lets the match play out, and ASSERTS the result save.
+#
+# WHAT A RUN OF THIS LOOKS LIKE (2026-09-24, desktop headless):
+#   f000150          the Tecmo Koei logo
+#   f000600-f001500  the Team Ninja intro movie `ninja_vi.mp4`, then the Team Ninja logo
+#   ~f001663         the autosave notice (a MsgDialog, answered OK)
+#   f001800          title screen, "PRESS START"            <- start
+#   f001860          play style prompt, casual is default   <- cross, then cross on the OK
+#   f002100          main menu, cursor on STORY             <- down to FIGHT, cross
+#   f002280-f003000  VERSUS, Solo Match, character select (Kasumi vs Ryane), stage select
+#   f003120          stage select                           <- cross
+#   f003300          Ayane's intro close-up
+#   f003600          LIVE FIGHT (desktop; the browser starts it later - see the asserts)
+#   f003700-f003932  the flurry: triangle / circle alternately, every 12 frames
+#   ~f006300         Kasumi K.O.'d - the CPU wins the match
+#   ~f006600-f007050 "You got a new title! KASUMI NEWBIE", save_sys.dat written (desktop f6733)
+#   f007800          asserted: a SaveWrite at or after f6000 (the match result)
+#
+# RENDERING (2026-09-24, desktop headless, recompiled path): the stage, tigers, both fighters
+# (lit, in costume) and the HUD all draw. What it took, for the record: a depth clear from the
+# surface's background depth, U8_A targets storing alpha, strided and sub-rectangle textures,
+# UNTYPED vertex attributes, stacked cube-map targets, local memory, 4-lane swizzles, F16
+# sources on scalar ops, texcoords the vertex does not write, the colour-mask bit order (A is
+# bit 0 - the hair was cyan without it) and SetFormat's extension bit on copied textures.
+
+# Both fighters' health: u16 pairs, current then max (270 = full), 0xd8 apart, found by a
+# two-run memory diff (no input vs the flurry below, same frame; a mirror of P1's sits at
+# 0x81b0ce60). In that diff it was P1 - KASUMI, us - who lost health: pressing buttons changes
+# what the CPU does, and it landed hits on us. The addresses hold in a run that RENDERS every
+# frame (the desktop app, the browser): this title reads its render targets back, and a runner
+# that never renders (`play`, a session with no shots) takes a different path and reads 0 here.
+# Buttons (DOA5+ Vita): triangle PUNCH, circle KICK, square HOLD, cross THROW.
+# >>> DESKTOP-RUNNER OBSERVATIONS, NOT ASSERTED: the browser lays the fight data out elsewhere
+# (its render cadence differs, and this title reads its render targets back), so these read
+# leftovers there. They are kept because on the desktop they show the exchange frame by frame.
+@watch p1hp    u16 0x81b1d37c
+@watch p1hpmax u16 0x81b1d37e
+@watch p2hp    u16 0x81b1d454
+@watch p2hpmax u16 0x81b1d456
+
+0: @section boot
+1800: @section title
+1800: start
+1812:
+1860: cross
+1872:
+1980: cross
+1992:
+2100: @section main-menu
+2100: down
+2106:
+2160: cross
+2172:
+2280: @section versus-solo-select
+2280: cross
+2292:
+2400: cross
+2412:
+2520: cross
+2532:
+2640: cross
+2652:
+2760: cross
+2772:
+2880: cross
+2892:
+3000: cross
+3012:
+3120: @section stage-select
+3120: cross
+3132:
+3300: @section fight
+3700: @section flurry
+3700: triangle
+3704:
+3712: circle
+3716:
+3724: triangle
+3728:
+3736: circle
+3740:
+3748: triangle
+3752:
+3760: circle
+3764:
+3772: triangle
+3776:
+3784: circle
+3788:
+3796: triangle
+3800:
+3808: circle
+3812:
+3820: triangle
+3824:
+3832: circle
+3836:
+3844: triangle
+3848:
+3856: circle
+3860:
+3868: triangle
+3872:
+3880: circle
+3884:
+3892: triangle
+3896:
+3904: circle
+3908:
+3916: triangle
+3920:
+3928: circle
+3932:
+# THE MATCH IS PLAYED OUT, and that is what is asserted - through the OS-EGRESS ledger, which
+# does not depend on where anything lives in memory. The CPU wins the match (Kasumi is K.O.'d
+# ~f6300 on the desktop), the title shows "You got a new title! KASUMI NEWBIE" and WRITES
+# save_sys.dat (desktop f6733). The boot autosave (f1997) writes the same file, hence `at>=6000`.
+# Margin to f7800 because the fight starts later in the browser than on the desktop.
+7800: @assert egress SaveWrite path=savedata0:/save_sys.dat at>=6000

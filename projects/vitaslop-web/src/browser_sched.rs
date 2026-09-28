@@ -4,14 +4,23 @@
 //! policy - only the "resume a guest thread to its next switch point" primitive is
 //! reimplemented here on the browser's own WebAssembly engine.
 //!
-//! # One worker, instance-per-thread, one shared memory
+//! # One worker, instance-per-thread, one memory
 //! Every guest thread is its own `WebAssembly.Instance` (its ARM register file lives
 //! in wasm globals, which are per-instance, so each thread's registers are naturally
-//! private), and all instances import ONE shared linear memory (the transpiler emits
+//! private), and all instances import ONE linear memory (the transpiler emits
 //! `env.memory` when `import_memory` is set) - one guest address space, private
 //! registers, exactly the native model. Everything runs on one thread: the single
 //! owner of [`VitaEnv`], the scheduler, and all guest instances. Because the host
 //! (`VitaEnv`) lives here too, a guest host call needs no cross-thread hop.
+//!
+//! # The guest lives inside the host's memory
+//! That one memory is THIS MODULE'S OWN linear memory: the run worker reserves the guest
+//! region from its heap ([`reserve_guest_region`]), the module is transpiled for that
+//! offset (`vitaslop_transpiler::Program::host_off`), and every instance imports the
+//! host's `WebAssembly.Memory`. A host read of guest memory is then a load and a borrow
+//! is a slice - see [`HostRegion`]. The earlier form, a memory of the guest's own reached
+//! through typed arrays ([`SharedView`]), cost a JavaScript call per read and remains as
+//! the diagnostic arm (`VITASLOP_BROWSER_SPLIT_MEMORY=1`).
 //!
 //! # JSPI is how a mid-stack thread suspends
 //! A guest thread blocks deep inside its wasm call stack (inside game logic that
@@ -190,6 +199,18 @@ mod hostcalls {
             std::cell::RefCell::new(vec![0.0; MAX_SELECTOR]);
         static SAMPLED_SELECTOR_N: std::cell::RefCell<Vec<u64>> =
             std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        /// Guest-memory READS made by the sampled calls, per selector: single words and bulk
+        /// ranges (`perf::guest_accesses`). Each is a `copy_range` crossing, and the panel's
+        /// per-frame word count had no owner: the draw phases held 2 of 3,500 a frame on a
+        /// football title, so the rest are inside handlers, and this names which.
+        static SAMPLED_SELECTOR_WORDS: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        static SAMPLED_SELECTOR_BULK: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        static PREV_SAMPLED_WORDS: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        static PREV_SAMPLED_BULK: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
         /// The previous panel window's readings, so the ranking can be a WINDOW rather than a
         /// run total.
         ///
@@ -223,7 +244,7 @@ mod hostcalls {
         static FUEL_YIELDS: Cell<u64> = const { Cell::new(0) };
     }
 
-    /// Count one fuel preemption.
+    // Count one fuel preemption.
     thread_local! {
         /// Every suspension the scheduler loop saw, by what the thread stopped for:
         /// `[quantum, blocked, flip]`. The `susp` total on the running line could not say
@@ -300,7 +321,7 @@ mod hostcalls {
         /// "which thread is burning the calls" is not answerable from the totals - and
         /// that is exactly the question when one thread spins while another never runs.
         static PER_THID: std::cell::RefCell<std::collections::BTreeMap<i32, u64>> =
-            std::cell::RefCell::new(std::collections::BTreeMap::new());
+            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     }
 
     /// Count one call against `selector`, made by guest thread `thid`, and - when per-call
@@ -340,44 +361,28 @@ mod hostcalls {
         })
     }
 
-    /// The `n` costliest selectors BY THE SAMPLED ESTIMATE, as
-    /// `(selector, calls, estimated ms, samples)`, descending by estimated ms.
-    ///
-    /// Each selector's sampled milliseconds are scaled by ITS OWN sampled share - calls
-    /// divided by samples - not by the global one. A NID called 200,000 times and a NID called
-    /// twice are not sampled at the same rate, and scaling both by the run's average rate puts
-    /// the rare one wherever chance placed its single sample. The sample count rides along for
-    /// the same reason it does on the panel line: a row standing on three samples has to be
-    /// visibly standing on three samples.
-    pub fn sampled_selectors_by_ms(n: usize) -> Vec<(u32, u64, f64, u64)> {
-        let calls = PER_SELECTOR.with(|v| v.borrow().clone());
-        let samples = SAMPLED_SELECTOR_N.with(|v| v.borrow().clone());
-        SAMPLED_SELECTOR_MS.with(|v| {
-            let ms = v.borrow();
-            let mut all: Vec<(u32, u64, f64, u64)> = ms
-                .iter()
-                .enumerate()
-                .filter(|&(i, &m)| m > 0.0 && samples[i] > 0)
-                .map(|(i, &m)| {
-                    (i as u32, calls[i], m * calls[i] as f64 / samples[i] as f64, samples[i])
-                })
-                .collect();
-            all.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
-            all.truncate(n);
-            all
-        })
-    }
-
     /// The costliest selectors SINCE THIS WAS LAST CALLED, as
     /// `(selector, calls, estimated ms, samples)`, descending by estimated ms.
     ///
     /// The same scaling as [`sampled_selectors_by_ms`], over one panel window's deltas. Taken
     /// rather than read, because a window is defined by the previous take.
-    pub fn take_sampled_selector_window(n: usize) -> Vec<(u32, u64, f64, u64)> {
+    pub fn take_sampled_selector_window(n: usize) -> Vec<(u32, u64, f64, u64, f64, f64)> {
         let calls = PER_SELECTOR.with(|v| v.borrow().clone());
         let ms = SAMPLED_SELECTOR_MS.with(|v| v.borrow().clone());
         let samples = SAMPLED_SELECTOR_N.with(|v| v.borrow().clone());
-        let mut out: Vec<(u32, u64, f64, u64)> = Vec::new();
+        let words = SAMPLED_SELECTOR_WORDS.with(|v| v.borrow().clone());
+        let bulk = SAMPLED_SELECTOR_BULK.with(|v| v.borrow().clone());
+        let (d_words, d_bulk): (Vec<u64>, Vec<u64>) = PREV_SAMPLED_WORDS.with(|pw| {
+            PREV_SAMPLED_BULK.with(|pb| {
+                let (mut pw, mut pb) = (pw.borrow_mut(), pb.borrow_mut());
+                let dw: Vec<u64> = (0..words.len()).map(|i| words[i] - pw[i]).collect();
+                let db: Vec<u64> = (0..bulk.len()).map(|i| bulk[i] - pb[i]).collect();
+                pw.copy_from_slice(&words);
+                pb.copy_from_slice(&bulk);
+                (dw, db)
+            })
+        });
+        let mut out: Vec<(u32, u64, f64, u64, f64, f64)> = Vec::new();
         PREV_SAMPLED_MS.with(|pm| {
             PREV_SAMPLED_N.with(|pn| {
                 PREV_SELECTOR_CALLS.with(|pc| {
@@ -397,6 +402,8 @@ mod hostcalls {
                                 d_calls,
                                 d_ms * d_calls as f64 / d_n as f64,
                                 d_n,
+                                d_words[i] as f64 / d_n as f64,
+                                d_bulk[i] as f64 / d_n as f64,
                             ));
                         }
                     }
@@ -485,7 +492,7 @@ mod hostcalls {
             m.set(m.get() + dispatch_ms);
             m.get()
         });
-        if calls % REPORT_EVERY != 0 {
+        if !calls.is_multiple_of(REPORT_EVERY) {
             return false;
         }
         if !timing_enabled() {
@@ -572,7 +579,32 @@ mod hostcalls {
         true
     }
 
-    pub fn note_sample(ms: f64, selector: u32) {
+    thread_local! {
+        static BULK_MANY: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    /// One `copy_ranges` crossing carrying `n` ranges.
+    pub fn note_bulk_many(n: usize) {
+        BULK_MANY.with(|c| {
+            let (calls, ranges) = c.get();
+            c.set((calls + 1, ranges + n as u64));
+        });
+    }
+    /// `(copy_ranges crossings, ranges they carried)` so far.
+    pub fn bulk_many() -> (u64, u64) {
+        BULK_MANY.with(|c| c.get())
+    }
+
+    pub fn note_sample(ms: f64, selector: u32, words: u64, bulk: u64) {
+        SAMPLED_SELECTOR_WORDS.with(|v| {
+            if let Some(slot) = v.borrow_mut().get_mut(selector as usize) {
+                *slot += words;
+            }
+        });
+        SAMPLED_SELECTOR_BULK.with(|v| {
+            if let Some(slot) = v.borrow_mut().get_mut(selector as usize) {
+                *slot += bulk;
+            }
+        });
         SAMPLE_MS.with(|m| m.set(m.get() + ms));
         SAMPLE_N.with(|n| n.set(n.get() + 1));
         SAMPLED_SELECTOR_MS.with(|v| {
@@ -773,15 +805,15 @@ pub fn take_host_call_sample_max() -> f64 {
     hostcalls::take_sample_max()
 }
 
-/// The costliest host calls BY THE SAMPLED ESTIMATE - see
-/// [`hostcalls::sampled_selectors_by_ms`]. Available on any run, timed or not.
-pub fn host_calls_by_sampled_ms(n: usize) -> Vec<(u32, u64, f64, u64)> {
-    hostcalls::sampled_selectors_by_ms(n)
-}
-
 /// The costliest host calls of the last panel window, by the sampled estimate - see
 /// [`hostcalls::take_sampled_selector_window`].
-pub fn take_host_calls_by_sampled_ms_window(n: usize) -> Vec<(u32, u64, f64, u64)> {
+/// `(copy_ranges crossings, ranges carried)` since the run started - see
+/// [`hostcalls::note_bulk_many`] and `PrefetchedMemory`.
+pub fn bulk_many_totals() -> (u64, u64) {
+    hostcalls::bulk_many()
+}
+
+pub fn take_host_calls_by_sampled_ms_window(n: usize) -> Vec<(u32, u64, f64, u64, f64, f64)> {
     hostcalls::take_sampled_selector_window(n)
 }
 
@@ -980,7 +1012,7 @@ pub fn fuel_interval() -> u32 {
 /// The shared host: a single `VitaEnv` behind an `Arc<Mutex>` (single-threaded here,
 /// so the lock never contends - it just satisfies `SchedCore`'s bound, which mirrors
 /// native's `Send` host).
-type Host = Arc<Mutex<VitaEnv>>;
+pub(crate) type Host = Arc<Mutex<VitaEnv>>;
 
 /// A `Uint8Array` view over the shared linear memory, rebased so guest address `A` is
 /// byte `A - base`.
@@ -1067,6 +1099,38 @@ impl GuestMemory for SharedView {
     fn len(&self) -> usize {
         self.bytes.length() as usize
     }
+    fn read_many(&self, ranges: &[(usize, usize)], out: &mut Vec<u8>) {
+        let total: usize = ranges.iter().map(|&(_, l)| l).sum();
+        out.clear();
+        out.resize(total, 0);
+        if total == 0 {
+            return;
+        }
+        hostcalls::note_bulk_many(ranges.len());
+        let mut table: Vec<u32> = Vec::with_capacity(ranges.len() * 2);
+        for &(off, len) in ranges {
+            table.push(off as u32);
+            table.push(len as u32);
+        }
+        // SAFETY: both views borrow this module's linear memory for the duration of one
+        // synchronous JS call that cannot grow it; nothing else holds `out` or `table`.
+        unsafe {
+            let t = js_sys::Uint32Array::view(&table);
+            let dst = js_sys::Uint8Array::view_mut_raw(out.as_mut_ptr(), out.len());
+            copy_ranges(&self.bytes, &t, &dst);
+        }
+    }
+    fn dirty_stamps(&self) -> Option<(Vec<u8>, u32)> {
+        let block = self.dirty_off?;
+        let pages = self.pages();
+        let mut v = vec![0u8; pages];
+        // SAFETY: as in `read`.
+        unsafe {
+            let dst = js_sys::Uint8Array::view_mut_raw(v.as_mut_ptr(), v.len());
+            copy_range(&self.bytes, self.stamp_at(block, 0), &dst);
+        }
+        Some((v, vitaslop_transpiler::DIRTY_SHIFT))
+    }
     fn read(&self, off: usize, buf: &mut [u8]) {
         // SAFETY: the view borrows this module's linear memory for the duration of the call
         // below. `copy_range` is synchronous JS that cannot grow it, and nothing else holds a
@@ -1097,6 +1161,12 @@ impl GuestMemory for SharedView {
 // `SharedArrayBuffer` - so a `&SharedView` is as capable as an owned one, and the call site
 // passes `&mut &rt.view`.
 impl GuestMemory for &'_ SharedView {
+    fn read_many(&self, ranges: &[(usize, usize)], out: &mut Vec<u8>) {
+        (**self).read_many(ranges, out)
+    }
+    fn dirty_stamps(&self) -> Option<(Vec<u8>, u32)> {
+        (**self).dirty_stamps()
+    }
     fn len(&self) -> usize {
         (**self).len()
     }
@@ -1138,6 +1208,384 @@ impl GuestMemory for &'_ SharedView {
     }
     fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
         (**self).borrow(off, len)
+    }
+}
+
+/// >>> THE GUEST REGION INSIDE THIS MODULE'S OWN LINEAR MEMORY.
+///
+/// The other form, [`SharedView`], is a memory of the guest's own that the host reaches
+/// through JavaScript typed arrays: every read the host makes - a struct field, a pointer, a
+/// vertex buffer - is a boundary crossing, several per draw and thousands per frame, and on a
+/// phone that was the single biggest CPU item of a frame (`sceGxmDisplayQueueAddEntry` at
+/// 3.5-10 ms, re-reading every pending draw's geometry a crossing at a time). Here the guest
+/// runs INSIDE the host's memory instead: the region is reserved from the host's own heap
+/// ([`crate::reserve_guest_region`]), every guest instance imports the host module's memory,
+/// and the transpiler folds the region's offset into every emitted access
+/// (`vitaslop_transpiler::Program::host_off`). A host read is then a load, `borrow` is a
+/// slice, and the dirty map is a byte array - the native engine's shape exactly.
+///
+/// # Aliasing
+/// The guest writes these bytes behind Rust's back, so the region is only ever reached
+/// through the raw pointer, never through a `&mut [u8]` that outlives a host call. The
+/// scheduler is cooperative on one thread: no guest code runs while a host call holds a
+/// borrow, which is the same argument the native `SharedView` makes.
+///
+/// # Bounds
+/// Host-side accesses are bounds-checked against `len` here and in `GuestCtx`. The GUEST'S
+/// accesses are checked by the wasm engine against the whole host memory, not this region:
+/// a guest pointer past the region reads or writes the host's heap instead of trapping. A
+/// title that does that is already broken on hardware; `VITASLOP_BROWSER_SPLIT_MEMORY=1`
+/// restores the separate, exactly-sized memory for diagnosing one.
+#[derive(Clone, Copy)]
+struct HostRegion {
+    ptr: *mut u8,
+    len: usize,
+    /// Offset of the guest-store dirty block within the region, when the module carries one.
+    dirty_off: Option<u64>,
+}
+
+impl HostRegion {
+    /// The dirty block's `[epoch byte][page map]`, as one mutable slice. SAFETY of the caller's
+    /// use: see the aliasing note on the type - no guest code runs while this is held.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn dirty_block(&self) -> Option<&mut [u8]> {
+        let off = self.dirty_off? as usize;
+        let end = self.len.min(off + vitaslop_transpiler::DIRTY_MAP_OFF as usize + self.pages() + 1);
+        // SAFETY: the block lies inside the region and nothing else holds it (see the type).
+        Some(unsafe { std::slice::from_raw_parts_mut(self.ptr.add(off), end - off) })
+    }
+
+    fn pages(&self) -> usize {
+        self.len >> vitaslop_transpiler::DIRTY_SHIFT
+    }
+
+    /// Stamp every page `[off, off + len)` touches with the current epoch - the host's half
+    /// of the dirty map, exactly as [`SharedView::stamp_written`] owes it.
+    fn stamp_written(&self, off: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let Some(block) = (unsafe { self.dirty_block() }) else { return };
+        let epoch = block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize];
+        let map = &mut block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..];
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        let first = off >> shift;
+        let last = ((off + len - 1) >> shift).min(map.len().saturating_sub(1));
+        map[first..=last].fill(epoch);
+    }
+
+    fn in_bounds(&self, off: usize, len: usize) -> bool {
+        off.checked_add(len).is_some_and(|end| end <= self.len)
+    }
+}
+
+impl GuestMemory for HostRegion {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn direct(&self) -> bool {
+        true
+    }
+    fn read(&self, off: usize, buf: &mut [u8]) {
+        // Out-of-range reads answer zeros, as the typed-array form's `subarray` did: a short
+        // range copies what exists and leaves the rest. Never a slice past the region.
+        let n = buf.len().min(self.len.saturating_sub(off));
+        if n > 0 {
+            // SAFETY: `off + n <= len`, and nothing else writes the region during a host call.
+            unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(off), buf.as_mut_ptr(), n) };
+        }
+        buf[n..].fill(0);
+    }
+    fn write(&mut self, off: usize, bytes: &[u8]) {
+        if !self.in_bounds(off, bytes.len()) {
+            return;
+        }
+        // SAFETY: bounds checked; see `read`.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(off), bytes.len()) };
+        self.stamp_written(off, bytes.len());
+    }
+    fn read_u32(&self, off: usize) -> u32 {
+        if !self.in_bounds(off, 4) {
+            return 0;
+        }
+        // SAFETY: bounds checked; `read_unaligned` because a guest word need not be aligned.
+        unsafe { std::ptr::read_unaligned(self.ptr.add(off) as *const u32) }
+    }
+    fn read_u16(&self, off: usize) -> u16 {
+        if !self.in_bounds(off, 2) {
+            return 0;
+        }
+        // SAFETY: as `read_u32`.
+        unsafe { std::ptr::read_unaligned(self.ptr.add(off) as *const u16) }
+    }
+    fn write_u32(&mut self, off: usize, v: u32) {
+        if !self.in_bounds(off, 4) {
+            return;
+        }
+        // SAFETY: as `write`.
+        unsafe { std::ptr::write_unaligned(self.ptr.add(off) as *mut u32, v) };
+        self.stamp_written(off, 4);
+    }
+    fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+        if !self.in_bounds(off, len) {
+            return None;
+        }
+        // SAFETY: bounds checked, and the lifetime is `&self`'s, which lives only for the
+        // host call - no guest code runs meanwhile (see the type).
+        Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off), len) })
+    }
+    fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+        if len == 0 {
+            return Some(false);
+        }
+        let block = unsafe { self.dirty_block()? };
+        let map = &block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..];
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        // One page BELOW the range too - a store is stamped against the page it STARTS in.
+        // See `GuestMemory::dirty_since`.
+        let first = (off >> shift).saturating_sub(1);
+        let last = ((off + len - 1) >> shift).min(map.len().saturating_sub(1)).max(first);
+        Some(map[first..=last].iter().any(|&s| s >= stamp))
+    }
+    fn dirty_runs_since(&self, off: usize, len: usize, stamp: u8, out: &mut Vec<(usize, usize)>) -> Option<()> {
+        if len == 0 {
+            return Some(());
+        }
+        let block = unsafe { self.dirty_block()? };
+        let map = &block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..];
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        let first = off >> shift;
+        let last = (off + len - 1) >> shift;
+        if last >= map.len() {
+            return None;
+        }
+        vitaslop_runtime::host::dirty_runs_from_pages(first, last, off, len, stamp, |p| map[p], out);
+        Some(())
+    }
+    fn dirty_epoch(&self) -> Option<u8> {
+        let block = unsafe { self.dirty_block()? };
+        Some(block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize])
+    }
+    fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
+        let block = unsafe { self.dirty_block()? };
+        for p in block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..].iter_mut() {
+            *p = if *p >= floor { *p - floor + 1 } else { 0 };
+        }
+        let at = vitaslop_transpiler::DIRTY_EPOCH_OFF as usize;
+        let next = if block[at] >= floor { block[at] - floor + 1 } else { 1 };
+        block[at] = next;
+        Some(next)
+    }
+    fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        let block = unsafe { self.dirty_block()? };
+        let next = block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize].wrapping_add(1);
+        // The same wrap rule as the typed-array form: a one-byte epoch compared with `>=`
+        // may not wrap silently, so the map is zeroed and every stamp starts over.
+        if next == 0 || next == u8::MAX {
+            block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..].fill(0);
+            block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize] = 1;
+            return Some((1, true));
+        }
+        block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize] = next;
+        Some((next, false))
+    }
+    // `dirty_stamps` stays `None` on purpose: a copy of the map exists to answer
+    // `dirty_since` without crossings, and here the map is already a byte array.
+}
+
+/// The guest memory as the engine and every thread hold it: a typed-array view over a
+/// memory of the guest's own, or the region inside this module's memory. One run uses one
+/// form throughout; the enum is so the engine's code has a single type to carry.
+#[derive(Clone)]
+enum GuestMem {
+    Js(SharedView),
+    Host(HostRegion),
+}
+
+impl GuestMem {
+
+    /// Write `bytes` at `off` (a host write, so the dirty map is stamped). False if out of range.
+    fn write_at(&self, off: usize, bytes: &[u8]) -> bool {
+        match self {
+            GuestMem::Js(v) => {
+                if off + bytes.len() > v.bytes.length() as usize {
+                    return false;
+                }
+                v.bytes.subarray(off as u32, (off + bytes.len()) as u32).copy_from(bytes);
+                v.stamp_written(off, bytes.len());
+                true
+            }
+            GuestMem::Host(r) => {
+                if !r.in_bounds(off, bytes.len()) {
+                    return false;
+                }
+                let mut r = *r;
+                r.write(off, bytes);
+                true
+            }
+        }
+    }
+
+    /// Read `out.len()` bytes at `off`. False if out of range.
+    fn read_into(&self, off: usize, out: &mut [u8]) -> bool {
+        match self {
+            GuestMem::Js(v) => {
+                if off.checked_add(out.len()).is_none_or(|end| end > v.bytes.length() as usize) {
+                    return false;
+                }
+                v.bytes.subarray(off as u32, (off + out.len()) as u32).copy_to(out);
+                true
+            }
+            GuestMem::Host(r) => {
+                if !r.in_bounds(off, out.len()) {
+                    return false;
+                }
+                r.read(off, out);
+                true
+            }
+        }
+    }
+
+    /// Copy `len` bytes from `src` to `dst` inside the guest memory (the TLS template into a
+    /// new thread's block). Not stamped: it runs before the thread exists to the guest.
+    fn copy_within(&self, src: usize, dst: usize, len: usize) {
+        match self {
+            GuestMem::Js(v) => {
+                let head = v.bytes.subarray(src as u32, (src + len) as u32).to_vec();
+                v.bytes.subarray(dst as u32, (dst + len) as u32).copy_from(&head);
+            }
+            GuestMem::Host(r) => {
+                if r.in_bounds(src, len) && r.in_bounds(dst, len) {
+                    // SAFETY: both ranges are inside the region; `copy` allows overlap.
+                    unsafe { std::ptr::copy(r.ptr.add(src), r.ptr.add(dst), len) };
+                }
+            }
+        }
+    }
+}
+
+macro_rules! guest_mem_delegate {
+    ($self:ident, $m:ident $(, $a:expr)*) => {
+        match $self {
+            GuestMem::Js(v) => v.$m($($a),*),
+            GuestMem::Host(r) => r.$m($($a),*),
+        }
+    };
+}
+
+impl GuestMemory for GuestMem {
+    fn len(&self) -> usize {
+        guest_mem_delegate!(self, len)
+    }
+    fn direct(&self) -> bool {
+        guest_mem_delegate!(self, direct)
+    }
+    fn read(&self, off: usize, buf: &mut [u8]) {
+        guest_mem_delegate!(self, read, off, buf)
+    }
+    fn write(&mut self, off: usize, bytes: &[u8]) {
+        match self {
+            GuestMem::Js(v) => v.write(off, bytes),
+            GuestMem::Host(r) => r.write(off, bytes),
+        }
+    }
+    fn read_u32(&self, off: usize) -> u32 {
+        guest_mem_delegate!(self, read_u32, off)
+    }
+    fn read_u16(&self, off: usize) -> u16 {
+        guest_mem_delegate!(self, read_u16, off)
+    }
+    fn write_u32(&mut self, off: usize, v: u32) {
+        match self {
+            GuestMem::Js(m) => m.write_u32(off, v),
+            GuestMem::Host(r) => r.write_u32(off, v),
+        }
+    }
+    fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+        guest_mem_delegate!(self, borrow, off, len)
+    }
+    fn read_many(&self, ranges: &[(usize, usize)], out: &mut Vec<u8>) {
+        guest_mem_delegate!(self, read_many, ranges, out)
+    }
+    fn dirty_stamps(&self) -> Option<(Vec<u8>, u32)> {
+        guest_mem_delegate!(self, dirty_stamps)
+    }
+    fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+        guest_mem_delegate!(self, dirty_since, off, len, stamp)
+    }
+    fn dirty_runs_since(&self, off: usize, len: usize, stamp: u8, out: &mut Vec<(usize, usize)>) -> Option<()> {
+        guest_mem_delegate!(self, dirty_runs_since, off, len, stamp, out)
+    }
+    fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
+        guest_mem_delegate!(self, rebase_dirty_epoch, floor)
+    }
+    fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        guest_mem_delegate!(self, bump_dirty_epoch)
+    }
+    fn dirty_epoch(&self) -> Option<u8> {
+        guest_mem_delegate!(self, dirty_epoch)
+    }
+}
+
+// The borrowed form a host call uses - see `impl GuestMemory for &SharedView` for why it is
+// a borrow and not a clone.
+impl GuestMemory for &'_ GuestMem {
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+    fn direct(&self) -> bool {
+        (**self).direct()
+    }
+    fn read(&self, off: usize, buf: &mut [u8]) {
+        (**self).read(off, buf)
+    }
+    fn write(&mut self, off: usize, bytes: &[u8]) {
+        match **self {
+            GuestMem::Js(ref v) => SharedView::write_at(v, off, bytes),
+            GuestMem::Host(r) => {
+                let mut r = r;
+                r.write(off, bytes)
+            }
+        }
+    }
+    fn read_u32(&self, off: usize) -> u32 {
+        (**self).read_u32(off)
+    }
+    fn read_u16(&self, off: usize) -> u16 {
+        (**self).read_u16(off)
+    }
+    fn write_u32(&mut self, off: usize, v: u32) {
+        match **self {
+            GuestMem::Js(ref m) => SharedView::write_word(m, off, v),
+            GuestMem::Host(r) => {
+                let mut r = r;
+                r.write_u32(off, v)
+            }
+        }
+    }
+    fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+        (**self).borrow(off, len)
+    }
+    fn read_many(&self, ranges: &[(usize, usize)], out: &mut Vec<u8>) {
+        (**self).read_many(ranges, out)
+    }
+    fn dirty_stamps(&self) -> Option<(Vec<u8>, u32)> {
+        (**self).dirty_stamps()
+    }
+    fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+        (**self).dirty_since(off, len, stamp)
+    }
+    fn dirty_runs_since(&self, off: usize, len: usize, stamp: u8, out: &mut Vec<(usize, usize)>) -> Option<()> {
+        (**self).dirty_runs_since(off, len, stamp, out)
+    }
+    fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
+        (**self).rebase_dirty_epoch(floor)
+    }
+    fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        (**self).bump_dirty_epoch()
+    }
+    fn dirty_epoch(&self) -> Option<u8> {
+        (**self).dirty_epoch()
     }
 }
 
@@ -1226,7 +1674,7 @@ impl SharedView {
             return Some(());
         }
         let shift = vitaslop_transpiler::DIRTY_SHIFT;
-        let page_bytes = 1usize << shift;
+        let _page_bytes = 1usize << shift;
         let first = off >> shift;
         let last = (off + len - 1) >> shift;
         if last >= self.pages() {
@@ -1242,31 +1690,13 @@ impl SharedView {
         }
         let mut pages = vec![0u8; (end - map) as usize];
         self.bytes.subarray(map, end).copy_to(&mut pages);
-        // `pages[0]` is the page below when there is one, so the range's own pages start at
-        // `skip`, and the overhang makes page 0 of the range dirty if that one is.
-        let skip = (first - below) as usize;
-        let overhang = skip == 1 && pages[0] >= stamp;
-        let mut run: Option<(usize, usize)> = None;
-        for (i, &p) in pages[skip..].iter().enumerate() {
-            let dirty = p >= stamp || (i == 0 && overhang);
-            if !dirty {
-                if let Some(r) = run.take() {
-                    out.push(r);
-                }
-                continue;
-            }
-            // Page i of the range, clipped to the range itself: the first page starts part
-            // way in and the last one ends part way through.
-            let page_start = ((first + i) << shift).max(off) - off;
-            let page_end = (((first + i) << shift) + page_bytes).min(off + len) - off;
-            match run.as_mut() {
-                Some(r) => r.1 = page_end,
-                None => run = Some((page_start, page_end)),
-            }
-        }
-        if let Some(r) = run {
-            out.push(r);
-        }
+        // `pages[0]` is the page below when there is one, so page `p` of the map is
+        // `pages[p - below]`. The rule, and the loop, live in
+        // `vitaslop_runtime::host::dirty_runs_from_pages` - both engines answer this and a copy
+        // each is how they came to disagree about the page-below overhang.
+        vitaslop_runtime::host::dirty_runs_from_pages(first, last, off, len, stamp, |p| {
+            pages[p - below]
+        }, out);
         Some(())
     }
 
@@ -1410,10 +1840,22 @@ export function any_ge(u8, from, to, stamp) {
   for (let i = from; i < to; i++) if (u8[i] >= stamp) return true;
   return false;
 }
+export function copy_ranges(src, table, dst) {
+  let at = 0;
+  for (let i = 0; i < table.length; i += 2) {
+    const off = table[i], len = table[i + 1];
+    const end = Math.min(off + len, src.length);
+    if (end > off) dst.set(src.subarray(off, end), at);
+    at += len;
+  }
+}
 ")]
 extern "C" {
     /// `dst[..] = src[off .. off + dst.len()]`.
     fn copy_range(src: &js_sys::Uint8Array, off: u32, dst: &js_sys::Uint8Array);
+    /// For each `(off, len)` pair of `table`, `dst[at..at+len] = src[off..off+len]` with `at`
+    /// running over the pairs in order - a whole table of reads in ONE crossing.
+    fn copy_ranges(src: &js_sys::Uint8Array, table: &js_sys::Uint32Array, dst: &js_sys::Uint8Array);
     /// `dst[off .. off + src.len()] = src[..]`.
     fn write_range(dst: &js_sys::Uint8Array, off: u32, src: &js_sys::Uint8Array);
     /// Whether any byte of `u8[from..to]` is `>= stamp`.
@@ -1435,9 +1877,14 @@ struct ThreadRt {
     /// [`NARROW_REGS`] as a `Uint32Array`, built once per thread so the per-call read does
     /// not allocate one.
     narrow: js_sys::Uint32Array,
-    /// The whole shared memory as one typed array, built once. See [`SharedView`] for
-    /// why caching it is both sound and load-bearing.
-    view: SharedView,
+    /// The diagnostic guest-PC global (`VITASLOP_TRACK_PC`), when the module carries one.
+    /// `None` on an ordinary build, which does not export it - and that is the ONLY reason
+    /// a browser trap could ever say `pc=0`: the ARM `pc` register a translated module keeps
+    /// is never live, so the address of the faulting block has to come from here.
+    guest_pc: Option<WebAssembly::Global>,
+    /// The guest memory - see [`GuestMem`]: a typed-array view built once, or the region
+    /// inside this module's own memory.
+    view: GuestMem,
     base: u32,
 }
 
@@ -1525,9 +1972,31 @@ impl ThreadRt {
     fn read_reg(&self, i: usize) -> u32 {
         self.regs[i].value().as_f64().unwrap_or(0.0) as i64 as u32
     }
-    fn view(&self) -> SharedView {
-        self.view.clone()
+    /// The block address the guest was executing, or `None` on a build without
+    /// `VITASLOP_TRACK_PC`. See [`ThreadRt::guest_pc`].
+    fn tracked_pc(&self) -> Option<u32> {
+        let g = self.guest_pc.as_ref()?;
+        Some(g.value().as_f64().unwrap_or(0.0) as i64 as u32)
     }
+}
+
+/// Whether this run asked for the per-block execution trace. Read once: the transpile that
+/// emits the announcements has already happened by the time an instance is built, so a knob
+/// changed in between could only produce a trace with no listener or a listener with no
+/// trace.
+fn trace_blocks_on() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        // The STORE WATCHPOINT's logging form announces each write through this same import,
+        // so it needs the hook installed just as much as the block tracer does. Missing that
+        // would make `VITASLOP_WATCH_STORE_LOG` silent in the browser - and a silent
+        // watchpoint reads as "nothing ever wrote this address", which is precisely the
+        // conclusion it is usually deployed to test.
+        ["VITASLOP_TRACE_BLOCKS", "VITASLOP_WATCH_STORE"]
+            .iter()
+            .any(|k| vitaslop_platform::knobs::var(k).is_ok_and(|s| !s.trim().is_empty()))
+    })
 }
 
 /// One guest thread on the browser engine: its own instance (its register file), the
@@ -1602,6 +2071,7 @@ struct ThreadEngine {
     r0: u32,
     r1: u32,
     r2: u32,
+    r3: u32,
     /// The resolver for the *current* resume's step Promise. The import closure (on a
     /// block/yield) or an entry's completion fills it with the encoded event; the
     /// scheduler awaits the matching Promise. Reset each loop turn.
@@ -1614,6 +2084,10 @@ struct ThreadEngine {
     /// The non-suspending trap's closure - see `abi::IMPORT_FAST_NAME`. Kept for the same
     /// reason as `_import`: the instance calls it for as long as it lives.
     _import_fast: Closure<dyn FnMut(i32)>,
+    /// The per-instance block tracer bound to `env.svc`, when `VITASLOP_TRACE_BLOCKS`
+    /// asked for one. `None` on an ordinary run, which then uses the engine's shared
+    /// no-op stub and pays nothing.
+    _trace: Option<Closure<dyn FnMut(i32)>>,
     /// This instance's SOFTWARE FUEL counter (`abi::FUEL_EXPORT`), or `None` in a build
     /// with fuel switched off. Read to price this thread's guest work - see
     /// [`BrowserThread::fuel_used`].
@@ -1661,6 +2135,67 @@ struct ThreadEngine {
     /// that stack can never resume, reusing the instance underneath it would mean a
     /// suspended frame and a live thread sharing one register file.
     abandoned: Rc<Cell<bool>>,
+    /// >>> SMP ONLY (`crate::smp`). A host call this worker may not run (its handler needs
+    /// the RUN worker's JavaScript - `vita::smp_owner_only`), parked here by the import
+    /// closure as the thread suspends. The helper loop hands it to the run worker, which
+    /// dispatches it and sends back [`ThreadEngine::patch`].
+    forward: Rc<RefCell<Option<ForwardReq>>>,
+    /// >>> SMP ONLY. A small-target completion (`VitaState::pending_early`) this thread's
+    /// call raised, taken INSIDE the call while the host lock is still held. The field is one
+    /// slot and several workers make host calls at once, so reading it after the resume -
+    /// what the one-baton loop does - could find another thread's request, or none.
+    early: Rc<Cell<Option<(i32, usize, usize)>>>,
+    /// >>> SMP ONLY. Registers a forwarded call produced, written into this instance's file
+    /// just before its parked stack is resumed.
+    patch: Option<RegPatch>,
+    /// >>> SMP ONLY. The instance's `cur_thread`, `thread_id` and `elide` globals
+    /// (`abi::CUR_THREAD_EXPORT` ...), set before every resume - see `set_smp_words`.
+    smp_words: Option<[WebAssembly::Global; 3]>,
+}
+
+/// A host call the parallel scheduler must run on the run worker: the selector and the
+/// register file as the guest handed it over. See [`ThreadEngine::forward`].
+pub(crate) struct ForwardReq {
+    pub(crate) selector: u32,
+    pub(crate) regs: [u32; abi::REG_COUNT],
+    pub(crate) vfp: [u32; VFP_ARG_COUNT],
+}
+
+/// The registers a forwarded call changed: the file as it went in and as it came out, so
+/// the write-back sends exactly the lanes that moved - see [`ThreadRt::write_file_changed`].
+pub(crate) struct RegPatch {
+    pub(crate) before: ([u32; abi::REG_COUNT], [u32; VFP_ARG_COUNT]),
+    pub(crate) regs: [u32; abi::REG_COUNT],
+    pub(crate) vfp: [u32; VFP_ARG_COUNT],
+}
+
+/// What an import closure needs to know on an SMP worker - see `crate::smp`.
+pub(crate) struct SmpHooks {
+    /// By SELECTOR: whether this call must be forwarded to the run worker.
+    pub(crate) owner_only: Vec<bool>,
+    /// By SELECTOR: of the `owner_only` calls, those whose route is decided per CALL
+    /// (`vita::smp_forward_per_call`) - asked under the host lock, run here when self-contained.
+    pub(crate) per_call: Vec<bool>,
+    /// This worker's index, for the runnable count the delay-yield elision asks for.
+    pub(crate) worker: usize,
+    /// LAYOUT offset of this worker's PREEMPT word, which every instance built here is
+    /// pointed at (`abi::PREEMPT_EXPORT`) - see `crate::smp` for who sets it.
+    pub(crate) preempt_off: Option<u64>,
+    /// The same word's LINEAR address, for the import closure: a thread spinning through
+    /// host calls never reaches a back edge, so the call that returns is where it yields.
+    pub(crate) preempt_ptr: Option<usize>,
+}
+
+impl SmpHooks {
+    /// Whether another worker has asked this one for its CPU back (see `crate::smp`).
+    fn preempt_requested(&self) -> bool {
+        self.preempt_ptr.is_some_and(|p| {
+            // SAFETY: an aligned word in the reserved guest layout, read atomically.
+            unsafe { &*(p as *const std::sync::atomic::AtomicI32) }
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != 0
+        })
+    }
 }
 
 impl BrowserThread {
@@ -1701,6 +2236,35 @@ impl BrowserThread {
         self.engine.as_mut()?.work_read = Some(out);
         Some(out)
     }
+
+    /// SMP: the host call this thread parked to have forwarded, if its last suspension was one.
+    pub(crate) fn take_forward(&mut self) -> Option<ForwardReq> {
+        self.engine.as_ref()?.forward.borrow_mut().take()
+    }
+
+    /// SMP: the small-target completion this thread's last resume raised, if any.
+    pub(crate) fn take_early(&mut self) -> Option<(i32, usize, usize)> {
+        self.engine.as_ref()?.early.take()
+    }
+
+    /// SMP: registers to write before this thread's parked stack resumes.
+    pub(crate) fn set_patch(&mut self, patch: RegPatch) {
+        if let Some(e) = self.engine.as_mut() {
+            e.patch = Some(patch);
+        }
+    }
+
+    /// SMP: the per-thread words the inline forms read (`InlineOp::ThreadWord`), and a fresh
+    /// elided-yield run (`InlineOp::SmpDelayYield`) - what the one-worker engine's mirror
+    /// refresh does for the shared block before each resume.
+    pub(crate) fn set_smp_words(&mut self, cur_thread: u32, thread_id: u32) {
+        if let Some([cur, tid, elide]) = self.engine.as_ref().and_then(|e| e.smp_words.as_ref()) {
+            set_one(cur, cur_thread);
+            set_one(tid, thread_id);
+            set_one(elide, 0);
+        }
+    }
+
 }
 
 impl ThreadHandle for BrowserThread {
@@ -1814,6 +2378,11 @@ impl ThreadHandle for BrowserThread {
         *engine.rt_cell.borrow_mut() = None;
         engine.signal.borrow_mut().take();
         engine.cont.borrow_mut().take();
+        // SMP carry-overs: a pooled instance must not hand the next thread a request or a
+        // register patch that belonged to this one.
+        engine.forward.borrow_mut().take();
+        engine.early.set(None);
+        engine.patch = None;
         hostcalls::note_thread_released();
         if engine.abandoned.get() || !instance_pool_enabled() {
             drop(engine);
@@ -1915,10 +2484,12 @@ fn deliver(signal: &Rc<RefCell<Option<Function>>>, ev: &Ev) {
 /// [`GuestEngine`] so it stands up threads for [`SchedCore`].
 pub struct BrowserEngine {
     module: WebAssembly::Module,
+    /// The memory every guest instance imports: a memory of the guest's own, or THIS
+    /// MODULE'S memory when the guest region lives inside it (see [`HostRegion`]).
     shared_mem: WebAssembly::Memory,
-    /// The one cached typed-array view over `shared_mem`, handed to every thread and to
-    /// every host call. See [`SharedView`].
-    view: SharedView,
+    /// The guest memory as the host reaches it, handed to every thread and to every host
+    /// call. See [`GuestMem`].
+    view: GuestMem,
     host: Host,
     base: u32,
     /// `WebAssembly.promising` (not in the wasm-bindgen bindings; fetched by name).
@@ -1937,6 +2508,10 @@ pub struct BrowserEngine {
     /// Instances given back by finished threads, ready to run another - see
     /// [`ThreadHandle::release`] for why this exists at all.
     pool: InstancePool,
+    /// `Some` on an SMP worker (`crate::smp`): what its import closures need to forward a
+    /// call and to capture a completion request. `None` on the one-baton engine, whose
+    /// closures are then exactly what they always were.
+    smp: Option<Rc<SmpHooks>>,
 }
 
 impl BrowserEngine {
@@ -1947,13 +2522,14 @@ impl BrowserEngine {
     /// The instance comes from the POOL when a finished thread has left one there, and is
     /// instantiated only when the pool is empty. A pooled instance was reset by the module
     /// itself on release, so the two paths are indistinguishable to the guest.
-    fn make_thread(
+    pub(crate) fn make_thread(
         &self,
         thid: i32,
         entries: &[u32],
         r0: u32,
         r1: u32,
         r2: u32,
+        r3: u32,
         sp: u32,
         priority: i32,
     ) -> Result<BrowserThread, JsValue> {
@@ -1979,11 +2555,9 @@ impl BrowserEngine {
         let (tp, tls_src, tls_len) = self.host.lock().unwrap().thread_tls_base(thid);
         if tp != 0 {
             if tls_len != 0 {
-                let view = &self.view.bytes;
                 let src = tls_src.wrapping_sub(self.base);
                 let dst = tp.wrapping_sub(self.base);
-                let head = view.subarray(src, src + tls_len).to_vec();
-                view.subarray(dst, dst + tls_len).copy_from(&head);
+                self.view.copy_within(src as usize, dst as usize, tls_len as usize);
             }
             let tp_global = Reflect::get(&engine.exports, &JsValue::from_str(abi::TP_EXPORT))?
                 .dyn_into::<WebAssembly::Global>()?;
@@ -2005,6 +2579,7 @@ impl BrowserEngine {
         engine.r0 = r0;
         engine.r1 = r1;
         engine.r2 = r2;
+        engine.r3 = r3;
 
         Ok(BrowserThread {
             thid,
@@ -2033,6 +2608,9 @@ impl BrowserEngine {
         // Raised by the NON-SUSPENDING trap when the host-call quantum expires on one of its
         // calls - it cannot suspend, so the next call through the suspending trap does.
         let pending_preempt = Rc::new(Cell::new(false));
+        // SMP only - see the fields of the same names on `ThreadEngine`.
+        let forward: Rc<RefCell<Option<ForwardReq>>> = Rc::new(RefCell::new(None));
+        let early: Rc<Cell<Option<(i32, usize, usize)>>> = Rc::new(Cell::new(None));
 
         let import_closure = {
             let host = self.host.clone();
@@ -2042,6 +2620,9 @@ impl BrowserEngine {
             let thid_cell = thid_cell.clone();
             let abandoned = abandoned.clone();
             let pending_preempt = pending_preempt.clone();
+            let smp = self.smp.clone();
+            let forward = forward.clone();
+            let early = early.clone();
             Closure::wrap(Box::new(move |selector: i32| -> JsValue {
                 let thid = thid_cell.get();
                 // A software fuel point (see `vitaslop_transpiler::emit::set_fuel_interval`)
@@ -2053,6 +2634,9 @@ impl BrowserEngine {
                 // and reset the host-call quantum, which measures a different thing.
                 if selector as u32 == vitaslop_transpiler::abi::FUEL_SELECTOR {
                     hostcalls::note_fuel_yield();
+                    if smp.is_some() {
+                        crate::smp::note_fuel(thid);
+                    }
                     // The thread is leaving the CPU, so its host-call quantum starts
                     // fresh - the same rule every other suspension here follows. Without
                     // it a thread that fuel-yielded would carry a nearly-spent host-call
@@ -2068,19 +2652,69 @@ impl BrowserEngine {
                 let sampling = hostcalls::start_sample();
                 let clock = || if timed { hostcalls::now() } else { 0.0 };
                 let t_sample = if sampling && !timed { hostcalls::now() } else { 0.0 };
+                let acc0 = if sampling { vitaslop_runtime::perf::guest_accesses() } else { (0, 0) };
                 let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
                 let (mut regs, mut vfp) = rt.read_file();
+                // >>> SMP: a call this worker may not run is parked and FORWARDED - the thread
+                // suspends as if blocked, and the run worker dispatches it and sends the
+                // registers back (`crate::smp`). Never reached on the one-baton engine.
+                // A call whose route is decided per CALL takes the lock here and, when it may
+                // run here, keeps it for its dispatch - the session it was judged by is the one
+                // it runs against.
+                let mut held = None;
+                if let Some(h) = smp.as_ref()
+                    && h.owner_only.get(selector as usize).copied().unwrap_or(false) {
+                        if h.per_call.get(selector as usize).copied().unwrap_or(false) {
+                            let g = crate::smp::lock_host(&host);
+                            if g.smp_call_is_self_contained(selector as u32, &regs, &rt.view, rt.base) {
+                                held = Some(g);
+                            }
+                        }
+                        if held.is_none() {
+                            *forward.borrow_mut() = Some(ForwardReq { selector: selector as u32, regs, vfp });
+                            hostcalls::reset_quantum();
+                            return suspend(&signal, &cont, Stop::Blocked);
+                        }
+                    }
                 // What the guest handed in, so the write-back can send back only what moved.
                 let before = (regs, vfp);
                 let d0 = clock();
+                // Three clock reads per host call, and their only reader is `trace_call` - so
+                // they are taken only while `VITASLOP_SMP_TRACE` is armed.
+                let traced = smp.is_some() && crate::smp::tracing();
+                let tc0 = if traced { crate::smp::abs_ms() } else { 0.0 };
+                let mut tc1 = 0.0;
                 let outcome = {
                     // BORROWED, not cloned - see `impl GuestMemory for &SharedView`.
-                    let mut mem: &SharedView = &rt.view;
-                    let mut host = host.lock().unwrap();
+                    let mut mem: &GuestMem = &rt.view;
+                    let mut host = held.take().unwrap_or_else(|| crate::smp::lock_host(&host));
+                    if traced {
+                        tc1 = crate::smp::abs_ms();
+                    }
+                    if let Some(h) = smp.as_ref() {
+                        // "Would a yield find anyone to yield to" is a question about THIS
+                        // worker's runnable threads under SMP, and it is asked per call.
+                        host.note_runnable_others(crate::smp::runnable_others(h.worker));
+                    }
                     host.set_current_thread(thid);
-                    host.dispatch(selector as u32, &mut regs, &mut vfp, &mut mem, rt.base)
+                    // `VITASLOP_GUEST_PROF`: this worker is in OUR code now - see `smp::PROF_HOST_TAG`.
+                    let prof = smp.as_ref().and_then(|h| crate::smp::prof_host_enter(h.worker, selector as u32));
+                    let out = host.dispatch(selector as u32, &mut regs, &mut vfp, &mut mem, rt.base);
+                    if let Some(h) = smp.as_ref() {
+                        crate::smp::prof_host_exit(h.worker, prof);
+                    }
+                    if smp.is_some() {
+                        // Taken while the lock is held - see `ThreadEngine::early`.
+                        if let Some(e) = host.state.pending_early.take() {
+                            early.set(Some(e));
+                        }
+                    }
+                    out
                 };
+                if traced {
+                    crate::smp::trace_call(selector as u32, tc1 - tc0, crate::smp::abs_ms() - tc1);
+                }
                 let d1 = clock();
                 rt.write_file_changed(&before, &regs, &vfp);
                 // Split the call the way native's `perf` module does: the handler versus
@@ -2089,9 +2723,13 @@ impl BrowserEngine {
                 let total_ms = clock() - t0;
                 if sampling {
                     let sample_ms = if timed { total_ms } else { hostcalls::now() - t_sample };
-                    hostcalls::note_sample(sample_ms, selector as u32);
+                    let acc1 = vitaslop_runtime::perf::guest_accesses();
+                    hostcalls::note_sample(sample_ms, selector as u32, acc1.0 - acc0.0, acc1.1 - acc0.1);
                 }
                 hostcalls::note_selector(selector as u32, thid, total_ms);
+                if smp.is_some() {
+                    crate::smp::note_call(thid, selector as u32);
+                }
                 if hostcalls::record(total_ms, d1 - d0) {
                     // Name the NIDs the guest is spending its calls on. This is the
                     // browser twin of what native's per-selector `perf` breakdown does,
@@ -2140,7 +2778,9 @@ impl BrowserEngine {
                     // ...or the quantum expired on a call through the NON-suspending trap,
                     // which could only raise the flag and leave the switch to this one.
                     SvcOutcome::Continue
-                        if hostcalls::quantum_expired() || pending_preempt.replace(false) =>
+                        if hostcalls::quantum_expired()
+                            || pending_preempt.replace(false)
+                            || smp.as_ref().is_some_and(|h| h.preempt_requested()) =>
                     {
                         suspend(&signal, &cont, Stop::Quantum)
                     }
@@ -2148,7 +2788,12 @@ impl BrowserEngine {
                     // A switch point: tell the scheduler why we stopped, then return a
                     // pending Promise so the guest stack suspends until it resolves.
                     SvcOutcome::Reschedule => suspend(&signal, &cont, Stop::Quantum),
-                    SvcOutcome::Block => suspend(&signal, &cont, Stop::Blocked),
+                    SvcOutcome::Block => {
+                        if smp.is_some() {
+                            crate::smp::note_block(selector as u32);
+                        }
+                        suspend(&signal, &cont, Stop::Blocked)
+                    }
                     SvcOutcome::Flip => suspend(&signal, &cont, Stop::Flip),
                     // The thread (or process) ends here: report the event and park on a
                     // never-resolving Promise (this stack is abandoned - on a thread exit
@@ -2194,6 +2839,7 @@ impl BrowserEngine {
             let thid_cell = thid_cell.clone();
             let abandoned = abandoned.clone();
             let pending_preempt = pending_preempt.clone();
+            let smp_worker = self.smp.as_ref().map(|h| h.worker);
             Closure::wrap(Box::new(move |selector: i32| {
                 let thid = thid_cell.get();
                 let timed = hostcalls::timing_enabled();
@@ -2203,25 +2849,39 @@ impl BrowserEngine {
                 let sampling = hostcalls::start_sample();
                 let clock = || if timed { hostcalls::now() } else { 0.0 };
                 let t_sample = if sampling && !timed { hostcalls::now() } else { 0.0 };
+                let acc0 = if sampling { vitaslop_runtime::perf::guest_accesses() } else { (0, 0) };
                 let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
                 let (mut regs, mut vfp) = rt.read_file();
                 let before = (regs, vfp);
                 let d0 = clock();
                 let outcome = {
-                    let mut mem: &SharedView = &rt.view;
-                    let mut host = host.lock().unwrap();
+                    let mut mem: &GuestMem = &rt.view;
+                    let mut host = crate::smp::lock_host(&host);
+                    if let Some(w) = smp_worker {
+                        host.note_runnable_others(crate::smp::runnable_others(w));
+                    }
                     host.set_current_thread(thid);
-                    host.dispatch(selector as u32, &mut regs, &mut vfp, &mut mem, rt.base)
+                    // `VITASLOP_GUEST_PROF`: this worker is in OUR code now - see `smp::PROF_HOST_TAG`.
+                    let prof = smp_worker.and_then(|w| crate::smp::prof_host_enter(w, selector as u32));
+                    let out = host.dispatch(selector as u32, &mut regs, &mut vfp, &mut mem, rt.base);
+                    if let Some(w) = smp_worker {
+                        crate::smp::prof_host_exit(w, prof);
+                    }
+                    out
                 };
                 let d1 = clock();
                 rt.write_file_changed(&before, &regs, &vfp);
                 let total_ms = clock() - t0;
                 if sampling {
                     let sample_ms = if timed { total_ms } else { hostcalls::now() - t_sample };
-                    hostcalls::note_sample(sample_ms, selector as u32);
+                    let acc1 = vitaslop_runtime::perf::guest_accesses();
+                    hostcalls::note_sample(sample_ms, selector as u32, acc1.0 - acc0.0, acc1.1 - acc0.1);
                 }
                 hostcalls::note_selector(selector as u32, thid, total_ms);
+                if smp_worker.is_some() {
+                    crate::smp::note_call(thid, selector as u32);
+                }
                 hostcalls::note_fast_call();
                 // The periodic per-NID dump rides the suspending trap's calls; this only
                 // keeps the totals honest.
@@ -2254,6 +2914,51 @@ impl BrowserEngine {
             }) as Box<dyn FnMut(i32)>)
         };
 
+        // >>> THE BLOCK TRACER'S `env.svc`, when `VITASLOP_TRACE_BLOCKS` asked for one.
+        //
+        // The shared stub below is a no-op because the Vita path never traps a real `svc`.
+        // But the transpiler's per-block tracer announces every block entry through exactly
+        // this import, and a no-op there means the one instrument that says WHICH PATH A
+        // FUNCTION TOOK exists only on the desktop - while the divergences worth chasing are
+        // the ones where the desktop is the arm that works. It is built PER INSTANCE (unlike
+        // the stub) because the register file is per instance, and a control-flow trace with
+        // no register values cannot say which state decided the branch.
+        let trace_closure = if trace_blocks_on() {
+            let rt_cell = rt_cell.clone();
+            let thid_cell = thid_cell.clone();
+            Some(Closure::wrap(Box::new(move |selector: i32| {
+                let sel = selector as u32;
+                // Guest addresses are >= 0x81000000; a real (small) syscall immediate is not
+                // a block announcement and stays a no-op, as it is on native.
+                if sel & 0x8000_0000 == 0 {
+                    return;
+                }
+                let Some(rt) = rt_cell.borrow().as_ref().cloned() else { return };
+                // Every register, one global at a time - NOT `read_file`, which fills only
+                // `NARROW_REGS` and leaves the rest ZERO. A control-flow trace whose r4..r11
+                // read as a plausible all-zeros is worse than one with no registers at all:
+                // it says the callee-saved file was clobbered, which is a bug that is not there.
+                let regs: [u32; 16] = std::array::from_fn(|i| rt.read_reg(i));
+                // >>> STRAIGHT TO THE CONSOLE, NOT THROUGH `tracing`.
+                //
+                // A WARN is COLLECTED by the panel and REPLAYED in full at every heartbeat, so
+                // a per-block trace line comes back once per report and a trace of ONE guest
+                // call reads as eleven. That is not noise - it is a false FINDING: this exact
+                // artifact was read as "the browser runs the module entry eleven times", and
+                // cost an afternoon before the replay was noticed. A raw console log is
+                // emitted once, in order, and the e2e harness captures it the same way.
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "[trace] frame={} t{:#x} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}                      r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x}                      r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x}",
+                    vitaslop_runtime::sched::current_frame(),
+                    thid_cell.get(),
+                    regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6],
+                    regs[7], regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14],
+                )));
+            }) as Box<dyn FnMut(i32)>))
+        } else {
+            None
+        };
+
         // env.import wrapped as Suspending; env.import_fast plain; env.memory the shared
         // memory; env.svc / env.dispatch_miss the shared non-suspending stubs.
         let suspending_import = Reflect::construct(
@@ -2268,7 +2973,12 @@ impl BrowserEngine {
             &JsValue::from_str(abi::IMPORT_FAST_NAME),
             fast_closure.as_ref().unchecked_ref(),
         )?;
-        Reflect::set(&env, &JsValue::from_str(abi::SVC_NAME), &self.svc_fn)?;
+        match trace_closure.as_ref() {
+            Some(c) => {
+                Reflect::set(&env, &JsValue::from_str(abi::SVC_NAME), c.as_ref().unchecked_ref())?
+            }
+            None => Reflect::set(&env, &JsValue::from_str(abi::SVC_NAME), &self.svc_fn)?,
+        };
         Reflect::set(&env, &JsValue::from_str(abi::DISPATCH_MISS_NAME), &self.dispatch_miss_fn)?;
         let imports = Object::new();
         Reflect::set(&imports, &JsValue::from_str(abi::IMPORT_MODULE), &env)?;
@@ -2277,7 +2987,7 @@ impl BrowserEngine {
         hostcalls::note_instance_created();
         let exports = instance.exports();
 
-        let regs = read_globals(&exports, |i| abi::reg_export(i), abi::REG_COUNT)?;
+        let regs = read_globals(&exports, abi::reg_export, abi::REG_COUNT)?;
         let vfp = read_globals(&exports, |i| abi::vfp_s_export(i as u8), VFP_ARG_COUNT)?;
         // The same globals as one JS array, ARM registers first, so a host call marshals
         // the whole file in one crossing rather than one per register.
@@ -2290,14 +3000,38 @@ impl BrowserEngine {
         let globals: Vec<WebAssembly::Global> = regs.into_iter().chain(vfp).collect();
         let narrow = js_sys::Uint32Array::new_with_length(NARROW_REGS.len() as u32);
         narrow.copy_from(&NARROW_REGS);
+        // Absent on an ordinary build - `VITASLOP_TRACK_PC` is what exports it - so a lookup
+        // failure is the normal case and must not fail the instantiation.
+        let guest_pc = Reflect::get(&exports, &JsValue::from_str(abi::GUEST_PC_EXPORT))
+            .ok()
+            .and_then(|v| v.dyn_into::<WebAssembly::Global>().ok());
         let rt = Rc::new(ThreadRt {
             regs: globals,
             file,
             narrow,
+            guest_pc,
             view: self.view.clone(),
             base: self.base,
         });
 
+        // SMP: point this instance's back-edge check at its worker's PREEMPT word. Per
+        // INSTANCE and not reset by `reset` - the instance stays on this worker for good.
+        let smp_global = |name: &str| -> Result<WebAssembly::Global, JsValue> {
+            Reflect::get(&exports, &JsValue::from_str(name))?
+                .dyn_into::<WebAssembly::Global>()
+                .map_err(|_| JsValue::from_str("an SMP engine was handed a module built WITHOUT VITASLOP_SMP"))
+        };
+        if let Some(off) = self.smp.as_ref().and_then(|h| h.preempt_off) {
+            set_one(&smp_global(abi::PREEMPT_EXPORT)?, off as u32);
+        }
+        let smp_words = match self.smp {
+            Some(_) => Some([
+                smp_global(abi::CUR_THREAD_EXPORT)?,
+                smp_global(abi::THREAD_ID_EXPORT)?,
+                smp_global(abi::ELIDE_EXPORT)?,
+            ]),
+            None => None,
+        };
         // The module's own reset (see `abi::RESET_EXPORT`), resolved once here so
         // releasing a thread is a single call and cannot fail on a lookup.
         let reset = Reflect::get(&exports, &JsValue::from_str(abi::RESET_EXPORT))?
@@ -2313,10 +3047,12 @@ impl BrowserEngine {
             r0: 0,
             r1: 0,
             r2: 0,
+            r3: 0,
             signal,
             cont,
             _import: import_closure,
             _import_fast: fast_closure,
+            _trace: trace_closure,
             // Absent in a build with `VITASLOP_BROWSER_FUEL=0`, which is exactly the
             // build that has no fuel to report; the clock then falls back to advancing
             // on flips and idles alone, as it did before fuel existed.
@@ -2333,6 +3069,10 @@ impl BrowserEngine {
             reset,
             thid: thid_cell,
             abandoned,
+            forward,
+            early,
+            patch: None,
+            smp_words,
         })
     }
 }
@@ -2341,29 +3081,20 @@ impl GuestEngine for BrowserEngine {
     type Thread = BrowserThread;
 
     fn spawn(&mut self, r: &Reentry) -> Result<BrowserThread, ()> {
-        self.make_thread(r.thid, &[r.entry], r.arg_len, r.arg_ptr, r.r2, r.stack_top, r.priority)
+        self.make_thread(r.thid, &[r.entry], r.arg_len, r.arg_ptr, r.r2, r.r3, r.stack_top, r.priority)
             .map_err(|_| ())
     }
 
     fn write_mem(&mut self, addr: u32, bytes: &[u8]) {
         let off = addr.wrapping_sub(self.base) as usize;
-        let view = &self.view.bytes;
-        if off + bytes.len() <= view.length() as usize {
-            view.subarray(off as u32, (off + bytes.len()) as u32).copy_from(bytes);
-            // A scheduler-side write is a host write like any other - see
-            // `SharedView::stamp_written`.
-            self.view.stamp_written(off, bytes.len());
-        }
+        // A scheduler-side write is a host write like any other - `write_at` stamps the
+        // dirty map, see `SharedView::stamp_written`.
+        self.view.write_at(off, bytes);
     }
 
     fn read_mem(&self, addr: u32, out: &mut [u8]) -> bool {
         let off = addr.wrapping_sub(self.base) as usize;
-        let view = &self.view.bytes;
-        if off.checked_add(out.len()).is_none_or(|end| end > view.length() as usize) {
-            return false;
-        }
-        view.subarray(off as u32, (off + out.len()) as u32).copy_to(out);
-        true
+        self.view.read_into(off, out)
     }
 
     fn mirror_base(&self) -> Option<u32> {
@@ -2409,7 +3140,7 @@ fn suspend(
 ///
 /// A `MessageChannel` message is the cheapest real task there is - unlike `setTimeout(0)`,
 /// which a worker clamps to 4 ms ([[vitaslop-worker-settimeout-is-clamped]]).
-async fn event_loop_turn() {
+pub(crate) async fn event_loop_turn() {
     EVENT_LOOP_TURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     thread_local! {
         static CHANNEL: Option<web_sys::MessageChannel> = web_sys::MessageChannel::new().ok();
@@ -2507,7 +3238,7 @@ fn read_globals(
 /// and keeps going, so the whole `module_init` sequence runs as one uninterrupted main
 /// thread (matching native's `instantiate_thread_seq`). Only a suspend, a halt, a trap,
 /// or the final entry ending yields a [`ThreadStep`].
-async fn resume(t: &mut BrowserThread) -> ThreadStep {
+pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
     let thid = t.thid;
     let host = t.host.clone();
     // A released thread is a finished one, and `pick_next` never returns a finished
@@ -2530,6 +3261,7 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
             t.rt.set_reg(0, if t.entry_idx == 0 { t.r0 } else { 0 });
             t.rt.set_reg(1, if t.entry_idx == 0 { t.r1 } else { 0 });
             t.rt.set_reg(2, if t.entry_idx == 0 { t.r2 } else { 0 });
+            t.rt.set_reg(3, if t.entry_idx == 0 { t.r3 } else { 0 });
             hostcalls::note_stack_start();
             // Which thread started a stack, and which of its entries. A count alone says
             // stacks are being created; it cannot say whether that is a handful of guest
@@ -2553,9 +3285,56 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
                 deliver(&sig_ok, &Ev::Returned(rt.read_reg(0)));
             }) as Box<dyn FnOnce(JsValue)>);
             let sig_err = t.signal.clone();
+            // >>> THE REGISTER FILE, AT THE TRAP, IN THE MESSAGE.
+            //
+            // A guest trap reaches the panel as `RuntimeError: memory access out of bounds` and
+            // two wasm function indices. Those name the guest FUNCTION - which is already worth
+            // having - but not the POINTER, and for an out-of-bounds access the pointer is the
+            // whole finding: a wild address is a corrupted object, a small one is a NULL
+            // dereference (guest 0 maps far outside linear memory, so a null deref traps here
+            // exactly like a wild one), and nothing in the report could tell those apart.
+            //
+            // MEASURED on the user's phone: a fault in `0x816d6d58` on the movie player's demux
+            // thread, whose first four instructions are `r6 = this; r0 = [r6+0xc];
+            // r1 = [r0]; ip = [r1+0xc]` - a C++ virtual call. Which of `r6`, `[r6+0xc]` or the
+            // vtable was bad decides whether the object was destroyed, never built, or fine and
+            // the field wrong, and the three have different causes. One register dump answers
+            // it; without one it is a disassembly session and a guess.
+            //
+            // The registers are read in the REJECTION handler, which is a microtask delivered
+            // while this thread's step is still awaited - no other guest thread has run, so the
+            // file still holds the faulting thread's values.
+            let rt_err = t.rt.clone();
             let on_err = Closure::once(Box::new(move |e: JsValue| {
                 let msg = e.as_string().unwrap_or_else(|| format!("{e:?}"));
-                deliver(&sig_err, &Ev::Error(msg));
+                let mut regs = String::from("
+  guest registers AT THE TRAP:");
+                for i in 0..vitaslop_transpiler::abi::REG_COUNT {
+                    // r13/r14/r15 are sp/lr/pc by ARM convention; naming them saves the reader
+                    // counting along a row of sixteen hex words.
+                    let name = match i {
+                        13 => "sp".to_string(),
+                        14 => "lr".to_string(),
+                        15 => "pc".to_string(),
+                        n => format!("r{n}"),
+                    };
+                    if i % 4 == 0 {
+                        regs.push_str("
+   ");
+                    }
+                    regs.push_str(&format!(" {name}={:#010x}", rt_err.read_reg(i)));
+                }
+                if let Some(pc) = rt_err.tracked_pc() {
+                    regs.push_str(&format!(
+                        "
+  the guest block executing at the trap: {pc:#010x} (VITASLOP_TRACK_PC)"
+                    ));
+                }
+                regs.push_str(
+                    "
+  A small value (under a megabyte) in a register the faulting                      instruction dereferences is a NULL or near-null pointer, not a wild one -                      guest address 0 is far outside linear memory, so both trap the same way                      here and only the value separates them.",
+                );
+                deliver(&sig_err, &Ev::Error(format!("{msg}{regs}")));
             }) as Box<dyn FnOnce(JsValue)>);
             let _ = done.then2(&on_ok, &on_err);
             on_ok.forget();
@@ -2572,6 +3351,12 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
                  already started: nothing to run"
             );
         } else if let Some(res) = t.cont.borrow_mut().take() {
+            // SMP: the registers a FORWARDED call produced on the run worker, written before
+            // anything else - a timed wait's code below must still win over them, exactly as
+            // it would over a call this worker had dispatched itself.
+            if let Some(p) = t.patch.take() {
+                t.rt.write_file_changed(&p.before, &p.regs, &p.vfp);
+            }
             // A timed wait that expired owes this thread a return code other than the
             // 0 it parked with (a WAIT_TIMEOUT); write it into r0 before the guest
             // stack resumes. A signal wake has no code and keeps r0 = 0. (Native does
@@ -2642,11 +3427,25 @@ const LONG_FRAME_ROUNDS: u64 = 2_000;
 /// hung one printed the identical line for minutes. The round count is what tells them
 /// apart, and its rate is the only direct read on how fast the browser executes guest
 /// code at all.
+/// The frontend's half of `VitaState::complete_scene_async`: render these scenes as
+/// offscreen targets NOW and hand back the small targets' pixels (`(guest address, width,
+/// height, RGBA8)`), asynchronously, because a WebGPU readback resolves on a later
+/// event-loop turn.
+pub trait EarlyCompleter {
+    fn complete<'a>(
+        &'a mut self,
+        scenes: Vec<vitaslop_runtime::capture::Scene>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(u32, u32, u32, Vec<u8>)>> + 'a>>;
+}
+
 pub async fn run_frames(
     core: &mut SchedCore<BrowserEngine, VitaEnv>,
     max_frames: u64,
     max_rounds: u64,
     progress: &mut dyn FnMut(u64),
+    // `+ 'static` on the object so the `&mut` can be REBORROWED per round: a `&'a mut (dyn
+    // Trait + 'a)` cannot be, the object lifetime being invariant.
+    mut completer: Option<&mut (dyn EarlyCompleter + 'static)>,
 ) -> RunReport {
     let mut rounds = 0u64;
     // What the rounds ARE: idle-path turns (nothing runnable), and resumes split by why
@@ -2681,20 +3480,20 @@ pub async fn run_frames(
             return RunReport::RoundLimit;
         }
         rounds += 1;
-        if rounds % TURN_CHECK_ROUNDS == 0 && perf_clock() - slice_start > SLICE_BUDGET_MS {
+        if rounds.is_multiple_of(TURN_CHECK_ROUNDS) && perf_clock() - slice_start > SLICE_BUDGET_MS {
             event_loop_turn().await;
             slice_start = perf_clock();
         }
         // `rounds == 1` as well as the window: a frame that blocks on its FIRST call would
         // otherwise say nothing at all, and "frame N in progress: 1 round" against a frozen
         // clock is the whole diagnosis.
-        if rounds == 1 || rounds % PROGRESS_ROUNDS == 0 {
+        if rounds == 1 || rounds.is_multiple_of(PROGRESS_ROUNDS) {
             progress(rounds);
         }
         // The HEAVY half of the report keeps the coarse window: it takes the host lock and
         // builds a selector histogram, which is not something to do every 64 rounds. The
         // cheap half above is what a blocked frame needs; this is what a SPINNING one does.
-        if rounds % LONG_FRAME_ROUNDS == 0 {
+        if rounds.is_multiple_of(LONG_FRAME_ROUNDS) {
             // What a long frame is actually DOING, unconditionally: the game clock (a
             // frame that grinds with a FROZEN clock is a livelock, one that grinds with a
             // moving clock is just slow, and those need opposite fixes), and the NIDs the
@@ -2770,7 +3569,7 @@ pub async fn run_frames(
                         consecutive_idle.is_power_of_two()
                             && perf_clock() - slice_start >= OWED_TURN_MIN_MS
                     } else {
-                        consecutive_idle % IDLE_ROUNDS_PER_EVENT_LOOP_TURN == 0
+                        consecutive_idle.is_multiple_of(IDLE_ROUNDS_PER_EVENT_LOOP_TURN)
                     };
                     if turn {
                         event_loop_turn().await;
@@ -2817,7 +3616,17 @@ pub async fn run_frames(
         if let Some(report) = done {
             return report;
         }
-        // A host call in this resume may have started threads or woken parked ones.
+        // A thread parked by a small target's `sceGxmEndScene` (see
+        // `VitaState::complete_scene_async`): render the batch, wait for the pixels, put them
+        // in guest memory, mark the scenes completed, and wake it - before the drain that
+        // makes it runnable again.
+        let pending = core.host().lock().unwrap().state.pending_early.take();
+        if let Some((thid, start, n)) = pending {
+            let early = vitaslop_runtime::perf::scope(vitaslop_runtime::perf::Phase::SchedEarlyBatch);
+            let host = core.host().clone();
+            complete_early_batch(&host, core.engine(), completer.as_deref_mut(), thid, start, n).await;
+            drop(early);
+        }
         core.drain();
         drop(book);
     }
@@ -2832,12 +3641,119 @@ pub async fn compile_module(wasm: &[u8]) -> Result<WebAssembly::Module, JsValue>
 }
 
 /// The JSPI primitives and a fresh shared memory, ready to build a [`SchedCore`].
+///
+/// Exactly one of the two engines is live: the one-baton [`SchedCore`] (the default, and the
+/// deterministic one), or - under `VITASLOP_SMP=1` - the parallel run in `crate::smp`. The
+/// live loop reaches either through the methods below and never needs to know which.
 pub struct BrowserSched {
-    pub core: SchedCore<BrowserEngine, VitaEnv>,
+    core: Option<SchedCore<BrowserEngine, VitaEnv>>,
     pub host: Host,
+    smp: Option<crate::smp::SmpRun>,
 }
 
 impl BrowserSched {
+    /// The one-baton core. Panics under SMP: only the canned harnesses call this, and they
+    /// never stand up a parallel run.
+    pub fn core_mut(&mut self) -> &mut SchedCore<BrowserEngine, VitaEnv> {
+        self.core.as_mut().expect("the one-baton scheduler (this run is VITASLOP_SMP)")
+    }
+
+    /// The parallel run, if this is one.
+    pub fn smp(&self) -> Option<&crate::smp::SmpRun> {
+        self.smp.as_ref()
+    }
+
+    /// The parallel run, mutably (its pacing-wait service loop).
+    pub fn smp_mut(&mut self) -> Option<&mut crate::smp::SmpRun> {
+        self.smp.as_mut()
+    }
+
+    pub fn frames(&self) -> u64 {
+        match (&self.core, &self.smp) {
+            (Some(c), _) => c.frames(),
+            (None, Some(s)) => s.frames(),
+            (None, None) => 0,
+        }
+    }
+
+    pub fn fuel_report(&self) -> (u64, u64, u64) {
+        match (&self.core, &self.smp) {
+            (Some(c), _) => c.fuel_report(),
+            (None, Some(s)) => s.fuel_report(),
+            (None, None) => (0, 0, 0),
+        }
+    }
+
+    pub fn unbilled_report(&self) -> (u64, u64) {
+        match (&self.core, &self.smp) {
+            (Some(c), _) => c.unbilled_report(),
+            (None, Some(s)) => s.unbilled_report(),
+            (None, None) => (0, 0),
+        }
+    }
+
+    pub fn thread_census(&self) -> (usize, usize) {
+        match (&self.core, &self.smp) {
+            (Some(c), _) => c.thread_census(),
+            (None, Some(s)) => s.thread_census(),
+            (None, None) => (0, 0),
+        }
+    }
+
+    pub fn read_guest(&self, addr: u32, out: &mut [u8]) -> bool {
+        match (&self.core, &self.smp) {
+            (Some(c), _) => c.read_guest(addr, out),
+            (None, Some(s)) => s.read_guest(addr, out),
+            (None, None) => false,
+        }
+    }
+
+    pub fn write_guest(&mut self, addr: u32, bytes: &[u8]) {
+        match (&mut self.core, &self.smp) {
+            (Some(c), _) => c.write_guest(addr, bytes),
+            (None, Some(s)) => s.write_guest(addr, bytes),
+            (None, None) => {}
+        }
+    }
+
+    /// Run to `max_frames` display frames on whichever engine this run has - see
+    /// [`run_frames`] and `crate::smp::SmpRun::run_frames`.
+    pub async fn run_frames(
+        &mut self,
+        max_frames: u64,
+        max_rounds: u64,
+        progress: &mut dyn FnMut(u64),
+        completer: Option<&mut (dyn EarlyCompleter + 'static)>,
+    ) -> RunReport {
+        if let Some(s) = self.smp.as_mut() {
+            return s.run_frames(max_frames, progress, completer).await;
+        }
+        run_frames(self.core_mut(), max_frames, max_rounds, progress, completer).await
+    }
+
+    /// Stand up a PARALLEL run (`VITASLOP_SMP=1`) of a linked title: the same engine setup as
+    /// [`BrowserSched::from_linked`], but the main thread and every thread after it run on the
+    /// guest workers - see `crate::smp`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_linked_smp(
+        module: WebAssembly::Module,
+        image: &[u8],
+        base: u32,
+        mem_pages: u32,
+        mirror_off: Option<u64>,
+        dirty_off: Option<u64>,
+        host_off: u32,
+        entries: &[u32],
+        main_sp: u32,
+        env: VitaEnv,
+        audio_ring: &JsValue,
+    ) -> Result<BrowserSched, JsValue> {
+        let (engine, host) =
+            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env)?;
+        let smp = crate::smp::SmpRun::start(engine, mem_pages, dirty_off, host_off, entries, main_sp, audio_ring)
+            .await?;
+        Ok(BrowserSched { core: None, host, smp: Some(smp) })
+    }
     /// Stand up a preemptive run of `wasm` (the transpiler's `import_memory` module for
     /// a guest loaded at `base`, sized `mem_pages`), seeding `image` into a fresh shared
     /// memory and the main thread ready to run from `entry`. `env` is the single-owner
@@ -2849,15 +3765,17 @@ impl BrowserSched {
         mem_pages: u32,
         mirror_off: Option<u64>,
         dirty_off: Option<u64>,
+        host_off: u32,
         entry: u32,
         main_sp: u32,
         env: VitaEnv,
     ) -> Result<BrowserSched, JsValue> {
         let (engine, host) =
-            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, env)?;
+            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env)?;
         let main = engine.make_thread(
-            0,
+            vitaslop_runtime::host::MAIN_THID,
             &[entry & !1],
+            0,
             0,
             0,
             0,
@@ -2865,7 +3783,7 @@ impl BrowserSched {
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
         )?;
         let core = SchedCore::new(engine, host.clone(), main);
-        Ok(BrowserSched { core, host })
+        Ok(BrowserSched { core: Some(core), host, smp: None })
     }
 
     /// Stand up a preemptive run whose main thread runs `entries` in sequence (a linked
@@ -2880,15 +3798,17 @@ impl BrowserSched {
         mem_pages: u32,
         mirror_off: Option<u64>,
         dirty_off: Option<u64>,
+        host_off: u32,
         entries: &[u32],
         main_sp: u32,
         env: VitaEnv,
     ) -> Result<BrowserSched, JsValue> {
         let (engine, host) =
-            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, env)?;
+            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env)?;
         let main = engine.make_thread(
-            0,
+            vitaslop_runtime::host::MAIN_THID,
             entries,
+            0,
             0,
             0,
             0,
@@ -2896,8 +3816,51 @@ impl BrowserSched {
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
         )?;
         let core = SchedCore::new(engine, host.clone(), main);
-        Ok(BrowserSched { core, host })
+        Ok(BrowserSched { core: Some(core), host, smp: None })
     }
+}
+
+/// The guest region this worker reserved inside its own linear memory: `(offset, bytes)`.
+/// See [`reserve_guest_region`].
+static RESERVED_REGION: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+/// >>> RESERVE THE GUEST REGION IN THIS MODULE'S OWN MEMORY, ONCE, and return its offset.
+///
+/// The page calls this on the RUN worker before it transpiles, and hands the offset to the
+/// transpile worker, whose module is then emitted for exactly this region
+/// (`vitaslop_transpiler::Program::host_off`) - see [`HostRegion`] for what that buys. The
+/// reservation is `len` bytes, page-aligned, taken from the host allocator and never freed:
+/// it is the guest's whole address space for the life of the worker, and a worker runs one
+/// title. A second call returns the same offset; a call with a different length after the
+/// first is an error, because the module built for the first is already on its way.
+pub fn reserve_guest_region(len: usize) -> Result<u32, JsValue> {
+    if let Some(&(ptr, have)) = RESERVED_REGION.get() {
+        if have != len {
+            return Err(JsValue::from_str(&format!(
+                "guest region already reserved at {have} bytes; asked again for {len}"
+            )));
+        }
+        return Ok(ptr as u32);
+    }
+    let page = vitaslop_transpiler::abi::PAGE_SIZE as usize;
+    let layout = std::alloc::Layout::from_size_align(len, page)
+        .map_err(|e| JsValue::from_str(&format!("guest region layout: {e}")))?;
+    // SAFETY: a non-zero, page-aligned layout. Zeroed so the guest sees the fresh memory
+    // a `WebAssembly.Memory` would have given it.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return Err(JsValue::from_str(&format!(
+            "could not reserve a {} MB guest region in the emulator's memory",
+            len / (1024 * 1024)
+        )));
+    }
+    let _ = RESERVED_REGION.set((ptr as usize, len));
+    Ok(ptr as u32)
+}
+
+/// The reservation [`reserve_guest_region`] made in this worker, if any: `(offset, bytes)`.
+pub fn reserved_region() -> Option<(usize, usize)> {
+    RESERVED_REGION.get().copied()
 }
 
 /// Build the browser engine (JSPI primitives, module, a fresh seeded shared memory) and
@@ -2909,9 +3872,26 @@ fn build_engine(
     mem_pages: u32,
     mirror_off: Option<u64>,
     dirty_off: Option<u64>,
+    host_off: u32,
     env: VitaEnv,
 ) -> Result<(BrowserEngine, Host), JsValue> {
     {
+        // A module transpiled for a host offset runs ONLY in the region reserved at that
+        // offset in this worker; anything else is a module reading the wrong bytes. `0`
+        // is the separate-memory form.
+        let host_region = if host_off == 0 {
+            None
+        } else {
+            let (ptr, len) = reserved_region().ok_or_else(|| {
+                JsValue::from_str("the module was transpiled for a host guest region but this worker reserved none")
+            })?;
+            if ptr as u32 != host_off {
+                return Err(JsValue::from_str(&format!(
+                    "the module was transpiled for guest region offset {host_off:#x} but this worker's region is at {ptr:#x}"
+                )));
+            }
+            Some(HostRegion { ptr: ptr as *mut u8, len, dirty_off })
+        };
         let wasm_global =
             Reflect::get(&js_sys::global(), &JsValue::from_str("WebAssembly"))?;
         let promising = Reflect::get(&wasm_global, &JsValue::from_str("promising"))?
@@ -2921,29 +3901,54 @@ fn build_engine(
             .dyn_into::<Function>()
             .map_err(|_| JsValue::from_str("WebAssembly.Suspending missing (needs JSPI)"))?;
 
-        // One shared memory of exactly the transpiler's declared size, imported into
-        // every instance. A shared memory needs a maximum and a cross-origin-isolated
-        // page (COOP/COEP).
-        let desc = Object::new();
-        Reflect::set(&desc, &JsValue::from_str("initial"), &JsValue::from_f64(mem_pages as f64))?;
-        Reflect::set(&desc, &JsValue::from_str("maximum"), &JsValue::from_f64(mem_pages as f64))?;
-        Reflect::set(&desc, &JsValue::from_str("shared"), &JsValue::TRUE)?;
-        let shared_mem = WebAssembly::Memory::new(&desc)?;
-        // The one view over it, for the life of the run. Sound because `initial ==
-        // maximum` above makes this memory non-growable and its SharedArrayBuffer never
-        // detaches - see [`SharedView`] for why rebuilding it per access was the whole
-        // browser performance problem.
-        let buffer = shared_mem.buffer();
-        let view = SharedView {
-            bytes: Uint8Array::new(&buffer),
-            // Over the SAME buffer from offset 0, so a rebased byte offset indexes as
-            // `off >> 2` / `off >> 1`. Built once, for the reason the byte view is.
-            words: js_sys::Uint32Array::new(&buffer),
-            halves: js_sys::Uint16Array::new(&buffer),
-            dirty_off,
+        let (shared_mem, view) = if let Some(region) = host_region {
+            // >>> THE GUEST RUNS INSIDE THIS MODULE'S MEMORY. The module was transpiled for
+            // exactly this region (`Program::host_off` = its offset), every instance imports
+            // the host's own `WebAssembly.Memory`, and the host reads the guest with loads.
+            // See [`HostRegion`].
+            let need = mem_pages as usize * vitaslop_transpiler::abi::PAGE_SIZE as usize;
+            if region.len < need {
+                return Err(JsValue::from_str(&format!(
+                    "the reserved guest region is {} bytes but this module's layout needs {need}",
+                    region.len
+                )));
+            }
+            if image.len() > region.len {
+                return Err(JsValue::from_str("the guest image is larger than the reserved region"));
+            }
+            // SAFETY: the region is this module's own leaked allocation (see
+            // `reserve_guest_region`), nothing else reaches it, and no guest code runs yet.
+            unsafe { std::ptr::copy_nonoverlapping(image.as_ptr(), region.ptr, image.len()) };
+            let mem = wasm_bindgen::memory()
+                .dyn_into::<WebAssembly::Memory>()
+                .map_err(|_| JsValue::from_str("wasm_bindgen::memory() is not a WebAssembly.Memory"))?;
+            (mem, GuestMem::Host(HostRegion { ptr: region.ptr, len: need, dirty_off }))
+        } else {
+            // One shared memory of exactly the transpiler's declared size, imported into
+            // every instance. A shared memory needs a maximum and a cross-origin-isolated
+            // page (COOP/COEP).
+            let desc = Object::new();
+            Reflect::set(&desc, &JsValue::from_str("initial"), &JsValue::from_f64(mem_pages as f64))?;
+            Reflect::set(&desc, &JsValue::from_str("maximum"), &JsValue::from_f64(mem_pages as f64))?;
+            Reflect::set(&desc, &JsValue::from_str("shared"), &JsValue::TRUE)?;
+            let shared_mem = WebAssembly::Memory::new(&desc)?;
+            // The one view over it, for the life of the run. Sound because `initial ==
+            // maximum` above makes this memory non-growable and its SharedArrayBuffer never
+            // detaches - see [`SharedView`] for why rebuilding it per access was the whole
+            // browser performance problem.
+            let buffer = shared_mem.buffer();
+            let view = SharedView {
+                bytes: Uint8Array::new(&buffer),
+                // Over the SAME buffer from offset 0, so a rebased byte offset indexes as
+                // `off >> 2` / `off >> 1`. Built once, for the reason the byte view is.
+                words: js_sys::Uint32Array::new(&buffer),
+                halves: js_sys::Uint16Array::new(&buffer),
+                dirty_off,
+            };
+            // Seed the image at offset 0.
+            view.bytes.subarray(0, image.len() as u32).copy_from(image);
+            (shared_mem, GuestMem::Js(view))
         };
-        // Seed the image at offset 0.
-        view.bytes.subarray(0, image.len() as u32).copy_from(image);
 
         // Shared non-suspending env stubs. svc is unused on the Vita path; a dispatch
         // miss (an indirect call to an untranslated target) throws a clear error.
@@ -2977,9 +3982,174 @@ fn build_engine(
             dispatch_miss_fn,
             mirror_off,
             pool: Rc::new(RefCell::new(Vec::new())),
+            smp: None,
         };
 
         Ok((engine, host))
+    }
+}
+
+impl BrowserEngine {
+    /// >>> AN SMP WORKER'S ENGINE (`crate::smp`): the same module over the SAME guest region,
+    /// dispatching to the SAME host, built on a worker that did not set any of it up.
+    ///
+    /// Nothing is seeded or allocated: the region is the run worker's reservation, reached
+    /// here because every worker instantiated this bundle over one shared linear memory, so
+    /// the pointer is the same pointer. What IS per worker is everything JavaScript: the JSPI
+    /// wrappers, the import closures, the instance pool - which is why a guest thread, once it
+    /// has run on a worker, stays on it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attach(
+        module: WebAssembly::Module,
+        host: Host,
+        base: u32,
+        mem_pages: u32,
+        mirror_off: Option<u64>,
+        dirty_off: Option<u64>,
+        host_off: u32,
+        hooks: SmpHooks,
+    ) -> Result<BrowserEngine, JsValue> {
+        if host_off == 0 {
+            return Err(JsValue::from_str(
+                "VITASLOP_SMP needs the guest inside the emulator's memory (host_off != 0); \
+                 VITASLOP_BROWSER_SPLIT_MEMORY cannot run in parallel",
+            ));
+        }
+        let need = mem_pages as usize * vitaslop_transpiler::abi::PAGE_SIZE as usize;
+        let region = HostRegion { ptr: host_off as usize as *mut u8, len: need, dirty_off };
+        let wasm_global = Reflect::get(&js_sys::global(), &JsValue::from_str("WebAssembly"))?;
+        let promising = Reflect::get(&wasm_global, &JsValue::from_str("promising"))?
+            .dyn_into::<Function>()
+            .map_err(|_| JsValue::from_str("WebAssembly.promising missing (needs JSPI)"))?;
+        let suspending = Reflect::get(&wasm_global, &JsValue::from_str("Suspending"))?
+            .dyn_into::<Function>()
+            .map_err(|_| JsValue::from_str("WebAssembly.Suspending missing (needs JSPI)"))?;
+        let shared_mem = wasm_bindgen::memory()
+            .dyn_into::<WebAssembly::Memory>()
+            .map_err(|_| JsValue::from_str("wasm_bindgen::memory() is not a WebAssembly.Memory"))?;
+        let svc = Closure::wrap(Box::new(|_sel: i32| {}) as Box<dyn FnMut(i32)>);
+        let svc_fn: JsValue = svc.as_ref().clone();
+        let dispatch_miss = Closure::wrap(Box::new(|target: i32, caller: i32| -> () {
+            let msg = format!(
+                "indirect dispatch to unknown target {:#010x} from f_{:x}",
+                target as u32, caller as u32
+            );
+            wasm_bindgen::throw_str(&msg)
+        }) as Box<dyn FnMut(i32, i32)>);
+        let dispatch_miss_fn: JsValue = dispatch_miss.as_ref().clone();
+        Ok(BrowserEngine {
+            module,
+            shared_mem,
+            view: GuestMem::Host(region),
+            host,
+            base,
+            promising,
+            suspending,
+            _svc: svc,
+            svc_fn,
+            _dispatch_miss: dispatch_miss,
+            dispatch_miss_fn,
+            mirror_off,
+            pool: Rc::new(RefCell::new(Vec::new())),
+            smp: Some(Rc::new(hooks)),
+        })
+    }
+
+    /// The shared host this engine dispatches to.
+    pub(crate) fn host(&self) -> &Host {
+        &self.host
+    }
+
+    /// Dispatch one host call on THIS worker, for a thread that is not running here - the
+    /// run worker's half of an SMP forward. Returns the outcome and any small-target
+    /// completion the call raised (taken under the same lock, see `ThreadEngine::early`).
+    pub(crate) fn dispatch_forwarded(
+        &self,
+        thid: i32,
+        selector: u32,
+        regs: &mut [u32; abi::REG_COUNT],
+        vfp: &mut [u32; VFP_ARG_COUNT],
+    ) -> (SvcOutcome, Option<(i32, usize, usize)>) {
+        let mut mem: &GuestMem = &self.view;
+        let mut host = crate::smp::lock_host(&self.host);
+        host.set_current_thread(thid);
+        let out = host.dispatch(selector, regs, vfp, &mut mem, self.base);
+        let early = host.state.pending_early.take();
+        (out, early)
+    }
+
+    /// >>> A SYNC POINT'S RESOLVE-ONLY PARK, SETTLED ON THE GUEST'S OWN WORKER.
+    ///
+    /// `sceGxmFinish` (and a notification wait) hands its geometry to the resolver worker and
+    /// parks the thread with an EMPTY early batch (`VitaState::queue_sync_resolve`). That park
+    /// used to be served by the RUN worker, which reaches its early queue only between its own
+    /// spans - MEASURED on the phone (026, MLB pitches): the render thread parked 30-45 ms a
+    /// frame behind the run worker's resolver wait (14-17 ms) and present (28-35 ms) for a read
+    /// that takes under a millisecond, and the run worker then paused EVERY guest thread for it.
+    /// Here the worker that ran the thread waits for the resolver (no host lock held), applies
+    /// the bytes and wakes the thread - nothing renders, so nothing needs the run worker.
+    /// `VITASLOP_SYNC_RESOLVE_ON_WORKER=0` is the arm back.
+    pub(crate) fn settle_sync_resolve(&self, thid: i32) {
+        let post = crate::smp::lock_host(&self.host).async_resolve_handle();
+        post.wait_idle();
+        let mut mem: &GuestMem = &self.view;
+        let mut h = crate::smp::lock_host(&self.host);
+        h.apply_posted_resolve(&mut mem, self.base);
+        h.state.wake_thread(thid);
+    }
+
+    /// Read the geometry the last guest flip left for the presenter - see
+    /// `VitaState::resolve_at_flip`. A no-op unless the async flip resolve is on.
+    pub(crate) fn resolve_flipped_geometry(&self) {
+        // Taken and applied under the host lock (both cheap); READ without it, so a guest
+        // thread's host call never queues behind the resolve - that queueing is what cost the
+        // main thread +3.2 ms/f when the whole resolve ran under the lock (ovl26e).
+        //
+        // Traced as W0 spans (`VITASLOP_SMP_TRACE`): `T` take (host lock), `C` compute here,
+        // `Q` waiting for the resolver worker, `A` apply (host lock). Emitted after the locks.
+        let now = crate::smp::abs_ms;
+        let t0 = now();
+        let (taken, post) = {
+            let mut h = crate::smp::lock_host(&self.host);
+            (h.take_flip_resolve_job(), h.async_resolve_handle())
+        };
+        let t1 = now();
+        if let Some(job) = taken {
+            let mut mem: &GuestMem = &self.view;
+            vitaslop_runtime::host::compute_flip_resolve_job(job, &mut mem, self.base);
+        }
+        let t2 = now();
+        // A resolver worker may still be reading the flip's job (see `run_resolver_worker`).
+        post.wait_idle();
+        let t3 = now();
+        let mut mem: &GuestMem = &self.view;
+        crate::smp::lock_host(&self.host).apply_posted_resolve(&mut mem, self.base);
+        let t4 = now();
+        crate::smp::trace_w0_abs(b'T', t0, t1);
+        crate::smp::trace_w0_abs(b'C', t1, t2);
+        crate::smp::trace_w0_abs(b'Q', t2, t3);
+        crate::smp::trace_w0_abs(b'A', t3, t4);
+    }
+
+    /// The rebase origin: guest address `A` is region byte `A - base`.
+    pub(crate) fn base(&self) -> u32 {
+        self.base
+    }
+
+    /// The host-mirror block's offset in the layout, if the module has one.
+    pub(crate) fn mirror_off(&self) -> Option<u64> {
+        self.mirror_off
+    }
+
+    /// The transpiled guest module every thread instantiates.
+    pub(crate) fn module(&self) -> &WebAssembly::Module {
+        &self.module
+    }
+
+    /// Write guest memory from outside a host call - [`GuestEngine::write_mem`] without the
+    /// `&mut`, which nothing here needs (the view writes through a pointer or a typed array).
+    pub(crate) fn write_guest(&self, addr: u32, bytes: &[u8]) {
+        self.view.write_at(addr.wrapping_sub(self.base) as usize, bytes);
     }
 }
 
@@ -3032,4 +4202,207 @@ pub fn name_guest_frames(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// See `run_frames`: finish a small-target batch the guest is parked on.
+///
+/// Takes the host and the ENGINE rather than a scheduler, because the parallel scheduler
+/// (`crate::smp`) runs it too - on the run worker, whose engine holds no guest thread but
+/// reaches the same guest memory.
+pub(crate) async fn complete_early_batch(
+    host: &Host,
+    engine: &BrowserEngine,
+    completer: Option<&mut (dyn EarlyCompleter + 'static)>,
+    thid: i32,
+    start: usize,
+    n: usize,
+) {
+    let rendered = render_early_batch(host, completer, start, n).await;
+    apply_early_batch(host, engine, thid, start, n, rendered);
+}
+
+/// The first half of [`complete_early_batch`]: the batch's scenes rendered and read back. It
+/// WRITES NO GUEST MEMORY, so the SMP engine runs it with the guest still running - it reads
+/// captured scenes and texture bytes exactly as a present does, and a present already overlaps
+/// the guest. MEASURED on the phone (063, MLB at-bat): each readback took 30-78 ms and the whole
+/// guest was paused for it, every frame or two for ~25 frames (50-180 ms frames).
+pub(crate) struct EarlyRendered {
+    display: Vec<u32>,
+    batch: Vec<vitaslop_runtime::capture::Scene>,
+    readbacks: Vec<(u32, u32, u32, Vec<u8>)>,
+}
+
+pub(crate) async fn render_early_batch(
+    host: &Host,
+    completer: Option<&mut (dyn EarlyCompleter + 'static)>,
+    start: usize,
+    n: usize,
+) -> EarlyRendered {
+    use vitaslop_runtime::capture::Scene;
+    // Every preceding scene of the frame but the display buffer's own - see
+    // `complete_small_target_now` in the runtime for why the order matters.
+    let display: Vec<u32> = {
+        let h = host.lock().unwrap();
+        h.state.capture.presents.iter().rev().take(4).copied().collect()
+    };
+    let in_batch = |s: &Scene| s.color.is_none_or(|c| !display.contains(&c.data_addr));
+    let batch: Vec<Scene> = {
+        let h = host.lock().unwrap();
+        let scenes = &h.state.capture.scenes;
+        let n = n.min(scenes.len());
+        let start = start.min(n);
+        scenes[start..n].iter().filter(|s| in_batch(s)).cloned().collect()
+    };
+    let readbacks = match completer {
+        Some(c) if !batch.is_empty() => c.complete(batch.clone()).await,
+        _ => Vec::new(),
+    };
+    EarlyRendered { display, batch, readbacks }
+}
+
+/// The second half of [`complete_early_batch`]: write the read-back pixels into guest memory and
+/// wake `thid`. The guest must be stopped (the SMP engine pauses it for this half only).
+pub(crate) fn apply_early_batch(
+    host: &Host,
+    engine: &BrowserEngine,
+    thid: i32,
+    start: usize,
+    n: usize,
+    rendered: EarlyRendered,
+) {
+    use vitaslop_runtime::capture::Scene;
+    let EarlyRendered { display, batch, readbacks } = rendered;
+    let in_batch = |s: &Scene| s.color.is_none_or(|c| !display.contains(&c.data_addr));
+    let write_guest = |a: u32, b: &[u8]| {
+        engine.view.write_at(a.wrapping_sub(engine.base) as usize, b);
+    };
+    for scene in &batch {
+        let Some(c) = scene.color else { continue };
+        for (addr, w, h, rgba) in &readbacks {
+            if *addr != c.data_addr {
+                continue;
+            }
+            let mut probe = vec![0u8; vitaslop_runtime::rtt_writeback::probe_len(*w, *h, &c)];
+            if !engine.read_mem(*addr, &mut probe) {
+                probe.clear();
+            }
+            let ok = vitaslop_runtime::rtt_writeback::apply_one(
+                *addr,
+                *w,
+                *h,
+                rgba,
+                &c,
+                &mut |_, k| probe[..k.min(probe.len())].to_vec(),
+                &mut |a, b| write_guest(a, b),
+            );
+            if ok {
+                vitaslop_runtime::vita::report_completed_early(c.data_addr, c.width, c.height);
+                let (w, h) = (*w as usize, *h as usize);
+                let t = if w > 24 && h > 1 { rgba[(w + 24) * 4..(w + 24) * 4 + 4].to_vec() } else { Vec::new() };
+                // >>> AND THE WHOLE TARGET'S MEAN PLUS A 4x4 GRID, for small targets only. One
+                // texel cannot say whether a target is SHIFTED (every texel off the same way - a
+                // per-device arithmetic difference) or WRONG IN PLACES (a few texels - a sampling
+                // or addressing difference), and those need different fixes. MEASURED need: MLB's
+                // 128x128 lighting chain reads green on the phone at texel(24,1) only
+                // (2026-09-25), and nothing on the desktop reproduces it.
+                let detail = if w * h <= 256 * 256 && rgba.len() >= w * h * 4 && w >= 4 && h >= 4 {
+                    let mut sum = [0u64; 3];
+                    for px in rgba[..w * h * 4].chunks_exact(4) {
+                        sum[0] += px[0] as u64;
+                        sum[1] += px[1] as u64;
+                        sum[2] += px[2] as u64;
+                    }
+                    let n = (w * h) as u64;
+                    let grid: Vec<String> = (0..4)
+                        .flat_map(|gy| (0..4).map(move |gx| (gx, gy)))
+                        .map(|(gx, gy)| {
+                            let (x, y) = (gx * w / 4 + w / 8, gy * h / 4 + h / 8);
+                            let o = (y * w + x) * 4;
+                            format!("{:02x}{:02x}{:02x}", rgba[o], rgba[o + 1], rgba[o + 2])
+                        })
+                        .collect();
+                    format!(" mean=[{},{},{}] grid4x4={}", sum[0] / n, sum[1] / n, sum[2] / n, grid.join(","))
+                } else {
+                    String::new()
+                };
+                tracing::info!(target: "vitaslop::status", "gxm rtt: early completion of {addr:#010x} ({w}x{h}): texel(24,1)={t:?}{detail}");
+                // `VITASLOP_RTT_GRID_FRAMES=a+b+..`: the same line STAMPED with the frame, for
+                // the first completion at or after each listed frame. The unstamped line cannot pair a device's target with the
+                // desktop's - both runs log it at unknown moments - and a same-recipe comparison
+                // needs the same FRAME on both sides.
+                static GRID_FRAMES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+                let at = GRID_FRAMES.get_or_init(|| {
+                    vitaslop_platform::knobs::var("VITASLOP_RTT_GRID_FRAMES")
+                        .map(|v| v.split(['+', ',']).filter_map(|s| s.trim().parse().ok()).collect())
+                        .unwrap_or_default()
+                });
+                // The FIRST completion of each target at or after each listed frame: a small
+                // target completes early only every ~12 frames (MLB), so a fixed window misses.
+                static GRID_SEEN: std::sync::Mutex<Vec<(u64, u32)>> = std::sync::Mutex::new(Vec::new());
+                let f = vitaslop_runtime::sched::current_frame();
+                let due = at.iter().copied().filter(|&a| f >= a).max();
+                let fresh = due.is_some_and(|a| {
+                    let mut seen = GRID_SEEN.lock().unwrap();
+                    let new = !seen.contains(&(a, *addr));
+                    if new {
+                        seen.push((a, *addr));
+                    }
+                    new
+                });
+                if !detail.is_empty() && fresh {
+                    tracing::info!(target: "vitaslop::status", "gxm rtt grid @f{f} {addr:#010x} ({w}x{h}):{detail}");
+                }
+            }
+        }
+    }
+    // Readbacks that landed meanwhile for OTHER targets (the present path's own) are
+    // write-backs too; dropping them lost a probe's first real pixels at load.
+    let batch_addrs: std::collections::HashSet<u32> =
+        batch.iter().filter_map(|s| s.color.map(|c| c.data_addr)).collect();
+    let others: Vec<(u32, u32, u32, Vec<u8>, vitaslop_runtime::capture::ColorSurface)> = {
+        let h = host.lock().unwrap();
+        readbacks
+            .iter()
+            .filter(|r| !batch_addrs.contains(&r.0))
+            .filter_map(|r| {
+                vitaslop_runtime::rtt_writeback::surface_for(&h.state.capture.scenes, r.0)
+                    .map(|c| (r.0, r.1, r.2, r.3.clone(), c))
+            })
+            .collect()
+    };
+    for (addr, w, h, rgba, c) in &others {
+        let mut probe = vec![0u8; vitaslop_runtime::rtt_writeback::probe_len(*w, *h, c)];
+        if !engine.read_mem(*addr, &mut probe) {
+            probe.clear();
+        }
+        let _ = vitaslop_runtime::rtt_writeback::apply_one(
+            *addr,
+            *w,
+            *h,
+            rgba,
+            c,
+            &mut |_, k| probe[..k.min(probe.len())].to_vec(),
+            &mut |a, b| write_guest(a, b),
+        );
+    }
+    let mut h = host.lock().unwrap();
+    let scenes = &mut h.state.capture.scenes;
+    let n = n.min(scenes.len());
+    for s in scenes[start.min(n)..n].iter_mut() {
+        if in_batch(s) {
+            s.completed_early = true;
+        }
+    }
+    h.state.wake_thread(thid);
+}
+
+/// The RESOLVER worker's body (`VITASLOP_SMP_ASYNC_RESOLVE`): read each flip's deferred
+/// geometry over the shared guest region until the run stops - see
+/// `vitaslop_runtime::host::run_resolver`. Blocks this worker.
+pub(crate) fn run_resolver_worker(host: &Host, base: u32, mem_pages: u32, dirty_off: Option<u64>, host_off: u32) {
+    let need = mem_pages as usize * vitaslop_transpiler::abi::PAGE_SIZE as usize;
+    let view = GuestMem::Host(HostRegion { ptr: host_off as usize as *mut u8, len: need, dirty_off });
+    let handles = crate::smp::lock_host(host).resolver_handles();
+    let mut mem: &GuestMem = &view;
+    vitaslop_runtime::host::run_resolver(handles, &mut mem, base);
 }

@@ -104,11 +104,10 @@ pub fn stop_host_watch() {
         return;
     }
     WATCH_ID.with(|c| {
-        if let Some(id) = c.borrow_mut().take() {
-            if let Some(geo) = window_geolocation() {
+        if let Some(id) = c.borrow_mut().take()
+            && let Some(geo) = window_geolocation() {
                 geo.clear_watch(id);
             }
-        }
     });
 }
 
@@ -118,7 +117,7 @@ fn window_geolocation() -> Option<web_sys::Geolocation> {
     web_sys::window()?.navigator().geolocation().ok()
 }
 
-/// The MAIN-THREAD engine's own watch. Mirrors what `web/live.html` does for the worker
+/// The MAIN-THREAD engine's own watch. Mirrors what `web/player.js` does for the worker
 /// engine, so both reach the same cell through the same conversions.
 fn start_window_watch() {
     let Some(geo) = window_geolocation() else {

@@ -9,6 +9,10 @@
 //!                     partial post, and the leftover count satisfies a later wait.
 //!   - `sematimeout` - a timed wait times out with SCE_KERNEL_ERROR_WAIT_TIMEOUT,
 //!                     while satisfied timed/untimed waits return 0.
+//!   - `semapoll`    - a ZERO timeout is a POLL, not a park: an unsatisfied one answers
+//!                     WAIT_TIMEOUT at once and a satisfied one returns 0, for both the
+//!                     semaphore and the event flag. NOT covered by `sematimeout`, which
+//!                     passes whether a zero timeout polls or parks for ever.
 //!
 //! Run with: cargo test -p vitaslop-conformance-harness --test vita_sema_matrix
 
@@ -18,6 +22,7 @@ use vitaslop_native::{DeterministicWorld, RunReport, ThreadedScheduler, VitaEnv}
 const SEMAFIFO: &[u8] = include_bytes!("../../vitaslop-conformance-suite-vita/semafifo-src/semafifo.velf");
 const SEMACOUNT: &[u8] = include_bytes!("../../vitaslop-conformance-suite-vita/semacount-src/semacount.velf");
 const SEMATIMEOUT: &[u8] = include_bytes!("../../vitaslop-conformance-suite-vita/sematimeout-src/sematimeout.velf");
+const SEMAPOLL: &[u8] = include_bytes!("../../vitaslop-conformance-suite-vita/semapoll-src/semapoll.velf");
 
 /// Load `velf`, run it to completion on the preemptive scheduler, and return the
 /// verdict plus the captured stdout. Panics on any unimplemented NID so a missing
@@ -79,4 +84,27 @@ fn semaphore_timed_wait_times_out_and_returns_code() {
     // 'T' = the unsatisfied timed wait returned SCE_KERNEL_ERROR_WAIT_TIMEOUT; 'S' =
     // a satisfied timed wait returned 0; 'i' = a satisfied untimed wait returned 0.
     assert_eq!(output, "TSiM");
+}
+
+/// >>> A ZERO TIMEOUT IS A POLL, NOT A PARK - and this is the case the suite was missing.
+///
+/// `sematimeout` above proves a NON-ZERO timeout expires and that satisfied timed/untimed
+/// waits return 0. Every one of those passes whether a zero timeout polls or parks for ever,
+/// because none of them ever passes a pointer to the value zero. A NULL `pTimeout` and a
+/// pointer to 0 are different calls; this engine read them as the same one and parked a
+/// retail title's asset-load thread permanently on a semaphore it had merely POLLED, and the
+/// whole suite stayed green through it.
+///
+/// The guest is single-threaded on purpose: a poll must not park, so if one does, the only
+/// thread is parked and the verdict is not `Finished` - a deadlock rather than a wrong
+/// string. So this asserts BOTH, and the report assertion is the one that catches a
+/// regression to the old behaviour.
+#[test]
+fn a_zero_timeout_is_a_poll_and_never_parks() {
+    let (report, output) = run(SEMAPOLL);
+    assert_eq!(report, RunReport::Finished(0), "a poll must not park - this is the deadlock check");
+    // 'T'/'U' = the unsatisfied semaphore/event-flag POLLS returned WAIT_TIMEOUT at once;
+    // 'S'/'V' = the same polls, now satisfied, returned 0 (a poll is not a refusal); 'M' =
+    // main reached the end.
+    assert_eq!(output, "TUSVM");
 }

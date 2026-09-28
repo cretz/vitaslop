@@ -141,13 +141,38 @@ const SAMPLER_CUBE_BIT: u32 = 0x1000_0000;
 /// alone rather than given a meaning it has not earned.
 const _SIZE_BIT6_NOT_A_PREFETCH_FLAG: u32 = 0x40;
 
-/// `component_info` bit a fragment varying descriptor carries exactly when it declares a
-/// prefetched sample - the redundant statement of [`INFO_PREFETCH`]. The two are cross-checked
-/// on parse; a program where they disagree is not decoded at all.
-const COMPONENT_INFO_PREFETCH: u32 = 0x20;
+/// `component_info` FIELD (bits 7:4) that is non-zero exactly when a fragment varying descriptor
+/// declares a prefetched sample - the redundant statement of [`INFO_PREFETCH`]. The two are
+/// cross-checked on parse; a program where they disagree is not decoded at all.
+///
+/// # It is a field, not a bit, and reading it as a bit refused a title's whole world
+/// This was `0x20` - bit 1 of the nibble - because every descriptor in four corpora carries
+/// either 0x0 or 0x20 here, and a two-valued field is indistinguishable from a flag. A fifth
+/// title uses the rest of it. Censused over its 269 blobs (`tabulate_prefetch_field_values`),
+/// the nibble takes exactly {0x0, 0x2, 0x3, 0x4}, and the value tracks the prefetched sample's
+/// WIDTH rather than its presence: 0x2 always beside `size` bits 7:6 = 1 (a one-register
+/// prefetch) and 0x3/0x4 always beside `size` bits 7:6 = 3 (the four-register one). Non-zero is
+/// therefore what "a prefetch rides along" means, and it agrees with [`INFO_PREFETCH`] and with
+/// `size` on every descriptor of every corpus - which the single-bit reading did not: it called
+/// three descriptors carrying 0x40 a CONTRADICTION and threw away their programs' whole
+/// interpolant lists.
+const COMPONENT_INFO_PREFETCH: u32 = 0x0000_00f0;
 
-/// `attribute_info` bit marking a descriptor that declares a prefetched sample.
-const INFO_PREFETCH: u32 = 0x0000_0100;
+/// `attribute_info` FIELD (bits 10:8) that is non-zero exactly when a descriptor declares a
+/// prefetched sample.
+///
+/// # Also a field, and the same measurement settles it
+/// This was the single bit `0x100`. Across the five captured corpora the field takes {0, 1, 2,
+/// 3, 5}; the four corpora that agreed with the old reading only ever use 1 and 3, so bit 0
+/// looked like the flag. The fifth title has eight descriptors carrying 2 and one carrying 5,
+/// and on every one of them [`COMPONENT_INFO_PREFETCH`] and the `size` prefetch bits BOTH say a
+/// prefetch is present - so the disagreement was ours, not the program's. What the value itself
+/// counts (a PDS fetch slot, a sample count) is not established and nothing here needs it: the
+/// layout question is only whether a sample rides along, and zero-versus-non-zero answers it
+/// with no contradiction anywhere in 300+ descriptors.
+///
+/// Bit 11 ([`INFO_PREFETCH_LAST`]) sits above this field and is deliberately outside the mask.
+const INFO_PREFETCH: u32 = 0x0000_0700;
 
 /// `attribute_info` bit marking the LAST prefetched sample in the program's descriptor array
 /// (the end of the PDS fetch sequence). Set on exactly one descriptor per program that has any
@@ -247,6 +272,55 @@ pub struct SamplePrefetch {
     pub source_texcoord: u8,
     /// This is the last prefetch in the program's fetch sequence ([`INFO_PREFETCH_LAST`]).
     pub last: bool,
+    /// What KIND of lookup the PDS performs - see [`PrefetchLookup`].
+    pub lookup: PrefetchLookup,
+}
+
+/// The lookup a PDS prefetch performs, from `attribute_info` bits 10:8 ([`INFO_PREFETCH`]).
+///
+/// # The field is the lookup kind, and the census that says so
+/// That field was read only as "zero or not" (a prefetch rides along or it does not), with its
+/// value explicitly left unexplained. `census_prefetch_lookup_kind_against_the_sampler` tabulates
+/// it against the SAMPLER each prefetch names, over every captured fragment blob:
+///
+/// | value | sampler            | count      |
+/// |-------|--------------------|------------|
+/// | 1     | flat 2D, never cube | 1031 + 244 |
+/// | 2     | flat 2D, never cube | 10         |
+/// | 3     | CUBE, every time    | 21 + 3     |
+/// | 5     | flat 2D             | 1          |
+///
+/// So 3 is the cube lookup (the sampler's own cube bit agrees on all 24), and 2 is a 2D lookup
+/// that is NOT the plain one: all ten name a baseball title's `PlayerShadowsTarget`, a
+/// screen-space target, and every paired vertex program writes that TEXCOORD as the
+/// HOMOGENEOUS screen position `(0.5x + 0.5w, -0.5y + 0.5w, z, w)` - a coordinate that means
+/// nothing until it is divided by its `w`. It is the PROJECTIVE lookup (`tex2Dproj`). Read as a
+/// plain 2D sample it wrapped the target tens of times across the ground and painted its one
+/// shadow wedge as a grid of dark dashes over the whole field.
+///
+/// 5 is seen once and its meaning is NOT established; it keeps the plain 2D reading it has always
+/// had rather than being given one it has not earned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefetchLookup {
+    /// Value 1: a plain 2D (or, for a cube sampler, 3D) lookup at the interpolated coordinate.
+    Plain,
+    /// Value 2: `xy / w` - the coordinate is divided by its fourth component first.
+    Projective,
+    /// Value 3: a cube-map lookup (the sampler's own cube bit is the authority on the shape).
+    Cube,
+    /// Any other value, carried verbatim. Sampled as [`PrefetchLookup::Plain`].
+    Other(u8),
+}
+
+impl PrefetchLookup {
+    pub fn from_attribute_info(attribute_info: u32) -> Self {
+        match (attribute_info & INFO_PREFETCH) >> 8 {
+            1 => Self::Plain,
+            2 => Self::Projective,
+            3 => Self::Cube,
+            v => Self::Other(v as u8),
+        }
+    }
 }
 
 /// One fragment-program interpolated input, decoded from the varyings block's per-interpolant
@@ -963,7 +1037,7 @@ impl Program {
         let (literals, texture_control, sa_base_from_container) =
             parse_sa_tables(bytes, default_uniform_regs, &containers);
 
-        Ok(Program {
+        let mut program = Program {
             kind,
             major,
             minor,
@@ -985,7 +1059,11 @@ impl Program {
             output_varyings,
             output_order,
             hash: fnv1a64(bytes),
-        })
+        };
+        if program.kind == ProgramKind::Vertex {
+            order_varyings_by_code(&mut program);
+        }
+        Ok(program)
     }
 
     /// The samplers this fragment program declares, as (unit, name). Handy for the
@@ -1069,10 +1147,29 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
         return Err("the varyings count is outside the blob");
     };
     let count = count as usize;
-    // A sane fragment program has a handful of varyings; reject an absurd count rather than
-    // walk off the blob (a sign the block offset is wrong for this blob).
+    // >>> A COUNT OF ZERO IS A PROGRAM THAT INTERPOLATES NOTHING, NOT A FAILED DECODE.
+    //
+    // This used to be refused beside the absurd-count guard below, on the same reasoning - "a
+    // sane fragment program has a handful of varyings, so a strange count means the block
+    // offset is wrong for this blob". That reasoning holds for a LARGE count, which would walk
+    // the descriptor loop off the end of the blob. It does not hold for zero: the loop below
+    // simply does not run, and there is nothing to read out of bounds.
+    //
+    // MEASURED, and the corpus is unusually clear here - **exactly ONE blob of 596 declares a
+    // count of 0**, a football title's `frag_90c054e0`, and its body is the proof that the
+    // count is TRUE: `Nop`, a `Test` on constants, a predicated `Kill`, `Nop`, `Nop`. It reads
+    // no primary attribute and writes no colour register, so there is genuinely nothing for the
+    // PDS to iterate. Reporting that as a decode ERROR cost the pair its link (the fragment was
+    // treated as a PASSTHROUGH whose colour IS its register file, and then refused because
+    // nothing fed it) and DROPPED every draw of it - 168 fallback draws in one browser run of
+    // that title's kickoff.
+    //
+    // Nothing downstream is loosened by this. A count-0 program that DOES read a primary
+    // attribute still fails `PaReadUnfed` exactly as before, because nothing feeds it; the
+    // difference is only that the refusal is now reported against a list that is honestly
+    // empty rather than against a decode that supposedly failed.
     if count == 0 {
-        return Err("the varyings block declares a count of 0");
+        return Ok(Vec::new());
     }
     if count > 32 {
         return Err("the varyings count is absurd (>32), so the block offset is wrong here");
@@ -1122,7 +1219,18 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
         // varyings block is not the layout decoded here - bind nothing rather than a wrong PA
         // register map. (`size` bit 6 was once a third; see
         // `_SIZE_BIT6_NOT_A_PREFETCH_FLAG` for the measurement that removed it.)
-        let source = attribute_info & INFO_PREFETCH_SOURCE;
+        // >>> BIT 4 OF THE SOURCE BYTE IS A FLAG, NOT PART OF THE TEXCOORD INDEX. One title sets
+        // it on every prefetch (0x10..0x17) and no other corpus ever does. MEASURED by pairing:
+        // a fragment program whose samples name 0x10, 0x11, 0x14 and 0x15 is paired with a
+        // vertex program that outputs TEXCOORD0 and TEXCOORD1 - which the fragment never
+        // iterates for itself, so they exist ONLY to be those coordinates - and TEXCOORD4/5.
+        // So the low nibble names the texcoord. What the flag selects is not established; it
+        // does not change which interpolant is the coordinate. Refusing it threw away the whole
+        // interpolant list of every world material of that title, and its stage drew black.
+        let source = match attribute_info & INFO_PREFETCH_SOURCE {
+            s @ 0x10..=0x19 => s & 0x0f,
+            s => s,
+        };
         let flags = [
             attribute_info & INFO_PREFETCH != 0,
             // A BIT test, not equality: a retail title has a descriptor carrying 0x30 here, and
@@ -1170,6 +1278,7 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
                     unit: resource_index as u8,
                     source_texcoord: source as u8,
                     last: attribute_info & INFO_PREFETCH_LAST != 0,
+                    lookup: PrefetchLookup::from_attribute_info(attribute_info),
                 })
             }
             [true, true] => {
@@ -1180,6 +1289,7 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
                     unit: resource_index as u8,
                     source_texcoord: source as u8,
                     last: attribute_info & INFO_PREFETCH_LAST != 0,
+                    lookup: PrefetchLookup::from_attribute_info(attribute_info),
                 })
             }
             _ => {
@@ -1215,7 +1325,7 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
         // picture, which is the one outcome this decoder must not produce.
         if size & 0x80 != 0 && size & 0x40 == 0 {
             return Err(
-                "a varying descriptor sets the wide-prefetch bit without the two-register bit,                  which is not a prefetch width this decoder has ever observed",
+                "a varying descriptor sets the wide-prefetch bit without the two-register bit, which is not a prefetch width this decoder has ever observed",
             );
         }
         let prefetch_regs = if size & 0x80 != 0 {
@@ -1581,6 +1691,80 @@ fn attribute_order(
             .map(|u| *declared.iter().find(|&&(d, _, _)| d == u).expect("cover checked above"))
             .collect(),
     )
+}
+
+/// >>> THE VERTEX PROGRAM'S OWN CODE, WHERE IT STATES THE ORDER: the output lane each varying
+/// is MOVED into, read off the moves that copy its attribute's PA register into the output bank.
+///
+/// # Why the attribute order was not enough
+/// [`attribute_order`] takes a passthrough program's outputs to sit in its inputs' PA order.
+/// That is a convention, and MLB's boot splash program refutes it: attributes position@PA0,
+/// `aUV`@PA4, `aColor`@PA8, and the code MOVES the colour to o4..o7 and the UV to o8..o9. The
+/// attribute order put TexCoord(0)@4 and Color0@6, so the fragment sampled at the COLOUR (1,1 -
+/// the texture's black corner block) and 1,400 frames of logos and the health warning were a
+/// black screen, on every device.
+///
+/// # The rule
+/// Only a COMPLETE, EXACT reading replaces the layout: every declared varying's attribute is
+/// found moved (unpredicated, unmodified) into the output bank, the lanes are distinct, and laid
+/// out in lane order with their declared widths they tile the bank from the position onward with
+/// no gap. Anything less leaves the layout exactly as the container decoded it.
+fn order_varyings_by_code(program: &mut Program) {
+    use crate::ir::{Bank, Op, Predicate};
+    if program.output_varyings.len() < 2 || !crate::link::arm_on(crate::link::VARYING_CODE_ORDER_ARM) {
+        return;
+    }
+    let shader = crate::usse::decode_shader(program);
+    // PA register -> the lowest output lane a plain move copies it to.
+    let mut moved: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for i in &shader.instrs {
+        if !matches!(i.op, Op::Mov | Op::Pack { .. }) || i.pred != Predicate::Always || i.srcs.len() != 1 {
+            continue;
+        }
+        let (Some(d), s) = (i.dest.as_ref(), &i.srcs[0]) else { continue };
+        if d.bank != Bank::Output || s.bank != Bank::PrimaryAttr || s.abs || s.neg {
+            continue;
+        }
+        let lane = moved.entry(u32::from(s.index)).or_insert(u32::from(d.index));
+        *lane = (*lane).min(u32::from(d.index));
+    }
+    let attr_reg = |u: VaryingUsage| {
+        program
+            .parameters
+            .iter()
+            .filter(|p| p.category == ParamCategory::Attribute)
+            .find(|p| semantic_usage(p) == Some(u))
+            .and_then(|p| u32::try_from(p.resource_index).ok())
+    };
+    let mut placed: Vec<(u32, OutputVarying)> = Vec::new();
+    for v in &program.output_varyings {
+        let Some(lane) = attr_reg(v.usage).and_then(|r| moved.get(&r).copied()) else { return };
+        placed.push((lane, *v));
+    }
+    placed.sort_by_key(|&(lane, _)| lane);
+    // The declared lanes each varying occupies, from the container's own layout.
+    let width = |v: &OutputVarying| {
+        let mut sorted: Vec<&OutputVarying> = program.output_varyings.iter().collect();
+        sorted.sort_by_key(|o| o.base_lane);
+        let at = sorted.iter().position(|o| o.usage == v.usage).expect("from the same list");
+        match sorted.get(at + 1) {
+            Some(n) => n.base_lane - sorted[at].base_lane,
+            None => v.components,
+        }
+    };
+    let mut lane = VERTEX_POSITION_LANES;
+    let mut out = Vec::new();
+    for (at, v) in &placed {
+        if *at != lane {
+            return;
+        }
+        out.push(OutputVarying { usage: v.usage, base_lane: lane, components: v.components });
+        lane += width(v);
+    }
+    if out.iter().zip(&program.output_varyings).any(|(a, b)| a.usage != b.usage) || program.output_order != VaryingOrder::Known {
+        program.output_varyings = out;
+        program.output_order = VaryingOrder::Known;
+    }
 }
 
 /// The varying a vertex ATTRIBUTE's declared semantic names, or `None` for a semantic that is
@@ -2149,7 +2333,7 @@ mod tests {
                     register_count: 2,
                     span: 4,
                     half: true,
-                    prefetch: Some(SamplePrefetch { unit: 13, source_texcoord: 0, last: false }),
+                    prefetch: Some(SamplePrefetch { unit: 13, source_texcoord: 0, last: false, lookup: PrefetchLookup::Plain }),
                     prefetch_regs: 2,
                 },
                 Interpolant {
@@ -2158,7 +2342,7 @@ mod tests {
                     register_count: 2,
                     span: 4,
                     half: true,
-                    prefetch: Some(SamplePrefetch { unit: 0, source_texcoord: 3, last: true }),
+                    prefetch: Some(SamplePrefetch { unit: 0, source_texcoord: 3, last: true, lookup: PrefetchLookup::Plain }),
                     prefetch_regs: 2,
                 },
                 Interpolant {
@@ -2180,6 +2364,28 @@ mod tests {
     }
 
     #[test]
+    fn the_prefetch_field_names_the_lookup_kind() {
+        // mlb's infield grass (`frag_843cda78`), descriptors 2..4 verbatim: a plain prefetch of
+        // unit 3 from TEXCOORD4 (field value 1), the PROJECTIVE prefetch of unit 4 -
+        // `PlayerShadowsTarget` - from TEXCOORD0 (value 2), and a plain one of unit 5 (value 1).
+        // A cube descriptor (value 3) from a gloss material, and the one value-5 descriptor in
+        // any corpus, carried verbatim rather than guessed at.
+        let b = build_frag_with_varyings(&[
+            (0x0000_f104, 3, 0x40, 0x20),
+            (0x0000_f200, 4, 0x40, 0x20),
+            (0x0000_f905, 5, 0x40, 0x20),
+        ]);
+        let p = Program::parse(&b).expect("parse");
+        let kinds: Vec<_> = p.interpolants.iter().filter_map(|i| i.prefetch).map(|pf| (pf.unit, pf.lookup)).collect();
+        assert_eq!(
+            kinds,
+            vec![(3, PrefetchLookup::Plain), (4, PrefetchLookup::Projective), (5, PrefetchLookup::Plain)]
+        );
+        assert_eq!(PrefetchLookup::from_attribute_info(0x0ec0_0b04), PrefetchLookup::Cube);
+        assert_eq!(PrefetchLookup::from_attribute_info(0x2cc0_0d00), PrefetchLookup::Other(5));
+    }
+
+    #[test]
     fn a_wide_prefetch_descriptor_takes_four_pa_registers() {
         // frag_866a6180's only descriptor, verbatim: a retail racer's in-race composite. `size`
         // is 0xf0 - the register-count field says four data registers, bit 6 says the prefetched
@@ -2197,7 +2403,7 @@ mod tests {
                 register_count: 4,
                 span: 8,
                 half: false,
-                prefetch: Some(SamplePrefetch { unit: 0, source_texcoord: 0, last: true }),
+                prefetch: Some(SamplePrefetch { unit: 0, source_texcoord: 0, last: true, lookup: PrefetchLookup::Plain }),
                 prefetch_regs: 4,
             }]
         );

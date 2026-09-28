@@ -52,6 +52,13 @@ pub enum Value {
     /// base of this thread's thread-local-storage block. Reads the per-instance `tp`
     /// global (see [`crate::abi::TP_GLOBAL`]).
     ThreadPtr,
+    /// The address the EXCLUSIVE MONITOR currently holds, or 0 for "no record".
+    ///
+    /// One word in the host-mirror block, cleared before every resume, which is what makes
+    /// it a per-thread monitor and what makes it the `CLREX` hardware performs on a context
+    /// switch. Read by `STREX` to decide whether its store may proceed; see
+    /// `vita::mirror::SLOT_EXCL`.
+    ExclAddr,
 }
 
 /// Binary operators over 32-bit values. Shifts are the logical/arithmetic wasm
@@ -161,6 +168,10 @@ pub enum NeonStmt {
     /// Widening multiply[-accumulate]: `dst(Q) = [dst -/+] widen(a(D)) * widen(b(D))`
     /// (`vmull`/`vmlal`/`vmlsl`). `acc` enables the accumulate, `sub` its sign.
     WideMul { acc: bool, sub: bool, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// `vmull`/`vmlal`/`vmlsl` by a scalar lane: the widening product of `a` and
+    /// `broadcast(D[src].lane)`, [accumulated into `dst`]. A football title's texture
+    /// filter kernel is `vmlal.s16 q11, d3, d2[0]` in its inner loop.
+    WideMulScalar { acc: bool, sub: bool, ty: NeonType, dst: NeonReg, a: NeonReg, src: u8, lane: u8 },
     /// Widening absolute difference[-accumulate]: `dst(Q) = [dst +] |widen(a) - widen(b)|`
     /// (`vabdl`/`vabal`). `acc` enables the accumulate. `ty` is the narrow element.
     WideAbd { acc: bool, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
@@ -199,7 +210,11 @@ pub enum NeonStmt {
     /// Vector convert between f32 and 32-bit integer lanes (`vcvt`). `to_int` picks
     /// the direction (f32->int when true, int->f32 when false); `signed` picks the
     /// integer signedness. Float->int rounds toward zero (saturating).
-    CvtFloatInt { to_int: bool, signed: bool, dst: NeonReg, src: NeonReg },
+    /// `vcvt` between f32 and s32/u32 lanes. `frac` is the FIXED-POINT fractional bit
+    /// count of the integer side (0 for the plain integer form): the value is scaled by
+    /// `2^frac` on the way to fixed point and by `2^-frac` on the way back, which is the
+    /// whole difference between `vcvt.s32.f32 q0,q0` and `vcvt.s32.f32 q0,q0,#16`.
+    CvtFloatInt { to_int: bool, signed: bool, frac: u32, dst: NeonReg, src: NeonReg },
     /// Vector compare (`vceq`/`vcgt`/`vcge`): each `dst` lane is all-ones when the
     /// relation holds and zero otherwise, matching wasm SIMD compare semantics.
     /// `ty.float`/`ty.signed`/`ty.bits` select the lane type.
@@ -251,6 +266,16 @@ pub enum NeonStmt {
     /// to `2*esize` bits (sign- or zero-extending per `signed`) and shift it left by
     /// `shift`. `vmovl` is the `shift == 0` case and has its own node.
     WidenShift { esize: u8, dst: NeonReg, src: NeonReg, shift: u8, signed: bool },
+    /// Vector half-precision widen (`vcvt.f32.f16 Qd, Dm`): the four IEEE binary16
+    /// values in the low 64 bits of `src` become four f32 lanes in `dst`.
+    ///
+    /// The narrowing direction (`vcvt.f16.f32`) is deliberately absent - see the note
+    /// in `lower.rs`, and the matching one on the scalar `VfpOp::CvtF32FromHalf`.
+    CvtHalfToFloat { dst: NeonReg, src: NeonReg },
+    /// Vector half-precision narrow (`vcvt.f16.f32 Dd, Qm`): the four f32 lanes of
+    /// `src` become four IEEE binary16 values in the low 64 bits of `dst`, rounded to
+    /// nearest with ties to even.
+    CvtFloatToHalf { dst: NeonReg, src: NeonReg },
     /// Narrowing move (`vmovn`): truncate each `2*esize`-bit element of the `Qm`
     /// source `src` to its low `esize` bits and write the `Dd` result `dst`.
     Narrow { esize: u8, dst: NeonReg, src: NeonReg },
@@ -450,6 +475,9 @@ pub enum VfpOp {
     /// S`sd` (`vcvtb`/`vcvtt.f32.f16`). `top` selects the top half (`vcvtt`) over the
     /// bottom (`vcvtb`). Emitted as the branchless bit/float conversion.
     CvtF32FromHalf { sd: u8, sm: u8, top: bool },
+    /// Narrow f32 in S`sm` to IEEE half precision (round to nearest, ties to even) in one
+    /// 16-bit half of S`sd`, keeping the other half (`vcvtb`/`vcvtt.f16.f32`).
+    CvtHalfFromF32 { sd: u8, sm: u8, top: bool },
     /// `vmov Rt, Rt2, Dm`: copy D`d`'s low 32 bits to `rt`, high 32 to `rt2`.
     DoubleToCore { rt: u8, rt2: u8, d: u8 },
     /// `vmov Dm, Rt, Rt2`: assemble D`d` from `rt` (low) and `rt2` (high).
@@ -480,6 +508,29 @@ pub enum Stmt {
     /// present (the shifter carry-out); leave V unchanged. `live` as for
     /// [`Stmt::FlagsAdd`].
     FlagsLogic { value: Value, carry: Option<Value>, live: FlagMask },
+    /// Record (or clear, with `Imm(0)`) the EXCLUSIVE MONITOR's address - see
+    /// [`Value::ExclAddr`]. Emitted by `LDREX` to arm it and by `STREX` to spend it.
+    ExclSet(Value),
+    /// >>> SMP ONLY (see `crate::emit::set_smp`). `LDREX{,B,H,D}` as a real load-exclusive:
+    /// an ATOMIC load of `addr` into `rt` (and the high word into `rt2` for the doubleword
+    /// form), recording the address AND the value read in this instance's own monitor
+    /// globals. The value is what the matching [`Stmt::StoreExcl`] compares against, which is
+    /// how a monitor that other workers cannot see still refuses a store after a concurrent
+    /// write: see [`Stmt::StoreExcl`].
+    LoadExcl { rt: u8, rt2: Option<u8>, addr: Value, size: MemSize },
+    /// >>> SMP ONLY. `STREX{,B,H,D}` as a compare-and-swap: when this instance's monitor holds
+    /// `addr`, `cmpxchg(addr, value read by the LDREX, rt[:rt2])` and `rd = 0` if memory still
+    /// held that value, else `rd = 1` with memory untouched. The monitor is spent either way.
+    /// A value-based monitor admits the ABA case (another thread wrote and restored the value
+    /// in between) - the same compromise every emulator that runs guest threads in parallel
+    /// on a host without LL/SC makes, and a correct lock-free guest algorithm tolerates it.
+    StoreExcl { rd: u8, rt: u8, rt2: Option<u8>, addr: Value, size: MemSize },
+    /// >>> SMP ONLY. `CLREX`: drop this instance's monitor record.
+    ClearExcl,
+    /// >>> SMP ONLY. `DMB`/`DSB`: a sequentially consistent fence (`atomic.fence`). Without SMP
+    /// a barrier lowers to nothing - one guest thread runs at a time and the host call that
+    /// switches threads is the synchronisation.
+    Fence,
     /// Service an ARM `svc #imm` through the host `svc` import.
     Svc(u32),
     /// Service a Vita NID call through the host `import` import, by dense index.

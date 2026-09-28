@@ -86,6 +86,68 @@ pub(super) fn change_thread_vfp_exception(_clear_mask: i32, _set_mask: i32) -> i
     0
 }
 
+/// int sceKernelCheckCallback(void)
+///
+/// Run the CALLING thread's pending kernel callbacks (see [`crate::host::KCallback`]). A
+/// title puts it in its main loop so callbacks it made with `sceKernelCreateCallback` -
+/// its vblank handler, its own `sceKernelNotifyCallback` posts - run at a point of its
+/// choosing. One pending callback is delivered per call: it runs on its own fiber at the
+/// caller's priority while the caller is parked, and the call returns 1; with nothing
+/// pending it returns 0 at once.
+///
+/// The service-state pumps (`sceNpCheckCallback`, `sceNetCtlCheckCallback`) are a different
+/// mechanism with their own registration and their own deliveries - see `vita::services`.
+pub(super) fn check_callback(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    if st.kcb_deliver_one() {
+        ctx.ret(1);
+        return SvcOutcome::Block;
+    }
+    ctx.ret(0);
+    SvcOutcome::Continue
+}
+
+/// `SCE_KERNEL_ERROR_UNKNOWN_CALLBACK_ID`.
+const ERR_UNKNOWN_CALLBACK_ID: i32 = 0x8002_8190_u32 as i32;
+
+/// int sceKernelCreateCallback(const char *name, unsigned int attr,
+///     SceKernelCallbackFunction func, void *userData)
+pub(super) fn create_callback(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let (name_ptr, func, common) = (ctx.arg(0), ctx.arg(2), ctx.arg(3));
+    let name = if name_ptr != 0 { ctx.read_cstr(name_ptr, 31) } else { String::new() };
+    let uid = st.kcb_create(name, func, common);
+    ctx.ret(uid as u32);
+}
+
+/// int sceKernelDeleteCallback(SceUID cb)
+#[hostcall]
+pub(super) fn delete_callback(st: &mut VitaState, uid: i32) -> i32 {
+    if st.kcb_delete(uid) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+}
+
+/// int sceKernelNotifyCallback(SceUID cb, int arg2)
+#[hostcall]
+pub(super) fn notify_callback(st: &mut VitaState, uid: i32, arg: i32) -> i32 {
+    if st.kcb_notify(uid, arg as u32) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+}
+
+/// int sceKernelCancelCallback(SceUID cb)
+#[hostcall]
+pub(super) fn cancel_callback(st: &mut VitaState, uid: i32) -> i32 {
+    if st.kcb_cancel(uid) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+}
+
+/// int sceKernelGetCallbackCount(SceUID cb)
+#[hostcall]
+pub(super) fn get_callback_count(st: &mut VitaState, uid: i32) -> i32 {
+    st.kcb_count(uid).map_or(ERR_UNKNOWN_CALLBACK_ID, |n| n as i32)
+}
+
+/// int sceDisplayRegisterVblankStartCallback(SceUID uid) / ...Unregister...: every vblank
+/// edge from here on is one notification of `uid`.
+pub(super) fn vblank_start_callback_raw(st: &mut VitaState, uid: i32, on: bool) -> i32 {
+    if st.kcb_vblank(uid, on) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+}
+
 /// int sceKernelChangeThreadPriority(SceUID thid, int priority)
 ///
 /// Retarget a thread's scheduler priority; `thid` 0 is the calling thread. Returns
@@ -99,6 +161,24 @@ pub(super) fn change_thread_priority(st: &mut VitaState, thid: i32, priority: i3
     match st.change_thread_priority(thid, priority) {
         Ok(previous) => previous,
         Err(e) => e as i32,
+    }
+}
+
+/// The inline form of `sceKernelDelayThread`: a yield (`delay <= 1`) with nobody to yield to
+/// is answered in guest code from the host-mirror block, and everything else reaches
+/// [`delay_thread`] unchanged. Both spellings, as the dispatch routes both to one handler.
+/// See [`vitaslop_transpiler::InlineOp::DelayYield`] for the argument and the measurement.
+pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
+    use crate::vita::mirror::{SLOT_ELIDE_RUN, SLOT_YIELD_FREE};
+    match func_nid {
+        crate::vita::tm_nid::DELAY_THREAD | crate::vita::tm_nid::DELAY_THREAD_CB => {
+            Some(vitaslop_transpiler::InlineOp::DelayYield {
+                free_slot: SLOT_YIELD_FREE,
+                run_slot: SLOT_ELIDE_RUN,
+                cap: VitaState::ELIDE_RUN_CAP,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -119,12 +199,72 @@ pub(super) fn delay_thread(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome
     if !st.is_preemptive() {
         return SvcOutcome::Continue;
     }
+    // >>> THE CENSUS RUNS FIRST, BECAUSE THE CASE IT COULD NOT SEE IS THE COMMON ONE.
+    //
+    // It used to sit below the early return, so every `delay(0)` and `delay(1)` was invisible
+    // to it - and those are the ones a polling loop makes. On a football title the call-site
+    // profiler put 10.4 MILLION calls at one address and the delay census listed that address
+    // NOWHERE, which reads as "that site does not sleep" rather than "this instrument cannot
+    // see it" [[vitaslop-instrument-failure-imitating-its-subject]].
+    delay_census(delay_us, ctx.regs[14]);
     // A zero/one-us delay is "give someone else the CPU", not a real sleep - and not
     // a display frame either (see [`SvcOutcome::Flip`]). A worker polling in a
     // delay(0) loop hits this thousands of times per rendered frame.
+    //
+    // >>> AND WITH NOBODY TO GIVE IT TO, THE KERNEL RETURNS TO THE CALLER. Suspending anyway
+    // costs a full fiber suspend and resume for a scheduler round that re-picks this same
+    // thread - 2,377 of them a frame on that title, against 4 on another. See
+    // [`VitaState::yield_would_repick_this_thread`] for why the answer is exact.
     if delay_us <= 1 {
+        // >>> A YIELD THAT REACHED THE HOST FROM THE INLINE FORM AT ITS CAP IS DUE A SUSPEND.
+        //
+        // The emitted `DelayYield` elides up to `ELIDE_RUN_CAP` yields a slice in guest code and
+        // falls through here for the next one. Eliding THAT one through the handler's own
+        // (still-zero) count would spend another whole cap of crossings before the suspend
+        // the cap exists to force. MEASURED on a football title's browser frame: 5.0 million
+        // host-elided yields remained after the inline form landed, one crossing each, for
+        // exactly this reason. Reading the run word costs one guest-memory read on this path
+        // only, which is one per cap rather than one per yield.
+        if st.inline_elide_run_at_cap(ctx) {
+            return SvcOutcome::Reschedule;
+        }
+        if st.yield_would_repick_this_thread() {
+            return SvcOutcome::Continue;
+        }
         return SvcOutcome::Reschedule;
     }
     st.sleep_park(delay_us as u64);
     SvcOutcome::Block
+}
+
+/// Diagnostic (`VITASLOP_DELAY_CENSUS=1`): every `sceKernelDelayThread` tallied by (call site,
+/// requested microseconds), printed by [`dump_delay_census`] at the end of a run.
+///
+/// A polling thread's cost is `iterations x crossings`, and the iteration count is decided by
+/// how long it asked to sleep - which is the ONE number the call-site profiler cannot show.
+/// Without it, "this loop runs 8,000 times a second" reads the same whether the title asked for
+/// a 125 us sleep or asked for a millisecond and this scheduler woke it eight times too often.
+/// Those are opposite defects with opposite fixes.
+static DELAY_HIST: std::sync::Mutex<Option<std::collections::BTreeMap<(u32, u32), u64>>> =
+    std::sync::Mutex::new(None);
+
+fn delay_census(delay_us: u32, lr: u32) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::knobs::flag("VITASLOP_DELAY_CENSUS")) {
+        return;
+    }
+    let mut g = DELAY_HIST.lock().unwrap_or_else(|e| e.into_inner());
+    *g.get_or_insert_with(Default::default).entry((lr, delay_us)).or_insert(0) += 1;
+}
+
+/// Print what [`delay_census`] gathered, most-called first. A no-op unless the knob is set.
+pub fn dump_delay_census(top: usize) {
+    let g = DELAY_HIST.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(hist) = g.as_ref() else { return };
+    let mut rows: Vec<_> = hist.iter().map(|(&(lr, us), &n)| (lr, us, n)).collect();
+    rows.sort_by_key(|&(_, _, n)| std::cmp::Reverse(n));
+    eprintln!("--- sceKernelDelayThread by (call site, requested us): count ---");
+    for (lr, us, n) in rows.into_iter().take(top) {
+        eprintln!("  {n:>10}  {us:>8} us @ lr={lr:#010x}");
+    }
 }

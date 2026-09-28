@@ -1,8 +1,8 @@
 # Build the desktop binary for every platform on a release tag and attach the archives to
 # the GitHub release.
 #
-# Triggered by a `v*` tag - the same trigger as pages.yml, so the site and these binaries
-# come from one commit. The release itself is created here if the tag has none yet
+# Triggered by a `v*` tag. (The site is NOT: pages.yml publishes every merge to `main`, so
+# the page can be ahead of the newest release's binaries.) The release itself is created here if the tag has none yet
 # (`gh release create`), as a draft-free release with generated notes; re-running the
 # workflow re-uploads the assets with `--clobber`.
 #
@@ -57,6 +57,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown,${{ matrix.target }}
+          # `rust-src`: build.mjs also builds the THREADS bundle with `-Z build-std`, which
+          # recompiles std and fails without the standard library's source.
+          components: rust-src
 
       - uses: Swatinem/rust-cache@v2
         with:

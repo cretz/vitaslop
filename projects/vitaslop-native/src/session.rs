@@ -149,7 +149,7 @@ pub struct Session {
     ///
     /// `None` after a failed attempt is remembered in `gpu_refused` so a machine with no
     /// adapter is not asked once per shot.
-    gpu: Option<crate::wgpu_render::GeneralRenderer>,
+    gpu: std::sync::Arc<std::sync::Mutex<Option<crate::wgpu_render::GeneralRenderer>>>,
     /// Whether building the GPU renderer has already failed once; see [`Session::gpu`].
     gpu_refused: bool,
 }
@@ -296,9 +296,31 @@ impl Session {
             last_sprites: None,
             drift_origin: [0.0; 3],
             drift_updates: 0,
-            gpu: None,
+            gpu: std::sync::Arc::new(std::sync::Mutex::new(None)),
             gpu_refused: false,
         };
+        // A small render target a title reads on the CPU is completed at its own
+        // `sceGxmEndScene` - see `VitaState::complete_scene_now`. Only when this session
+        // renders at all (a shot directory), since the hook creates the renderer on first use.
+        if s.opts.shot_dir.is_some() {
+            let gpu = s.gpu.clone();
+            let refused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            s.sched.host().state.complete_scene_now = Some(Box::new(move |scenes| {
+                let mut g = gpu.lock().unwrap_or_else(|e| e.into_inner());
+                if g.is_none() {
+                    if refused.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Vec::new();
+                    }
+                    *g = crate::wgpu_render::GeneralRenderer::new();
+                    if g.is_none() {
+                        refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Vec::new();
+                    }
+                }
+                let r = g.as_mut().expect("checked above");
+                r.complete_scenes(scenes)
+            }));
+        }
         s.reset_watch_csv();
         Ok(s)
     }
@@ -714,7 +736,7 @@ impl Session {
         let ty = ValType::parse(ty).ok_or_else(|| format!("bad type {ty:?}"))?;
         let addr = parse_addr(addr)?;
         self.recipe.watches.retain(|w| w.name != name);
-        self.recipe.watches.push(WatchDecl { name: name.to_string(), ty, addr });
+        self.recipe.watches.push(WatchDecl { name: name.to_string(), ty, addr, deref: None });
         // The CSV header names the watch set, so a changed set starts a new log.
         self.reset_watch_csv();
         Ok(format!("watching {name} {} at {addr:#010x} = {}", ty.keyword(), self.watch_value(name)))
@@ -782,7 +804,7 @@ impl Session {
         let mut s = String::new();
         for w in &self.recipe.watches {
             let v = sample_watch(&self.sched, w).map(format_f64).unwrap_or("oob".into());
-            s.push_str(&format!("{:<16} {:<4} {:#010x} = {v}\n", w.name, w.ty.keyword(), w.addr));
+            s.push_str(&format!("{:<16} {:<4} {:<22} = {v}\n", w.name, w.ty.keyword(), w.addr_text()));
         }
         s
     }
@@ -1005,22 +1027,35 @@ impl Session {
         if scenes.is_empty() {
             return None;
         }
-        if self.gpu.is_none() {
+        let mut gpu = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if gpu.is_none() {
             if self.gpu_refused {
                 return None;
             }
-            self.gpu = crate::wgpu_render::GeneralRenderer::new();
-            if self.gpu.is_none() {
+            *gpu = crate::wgpu_render::GeneralRenderer::new();
+            if gpu.is_none() {
                 self.gpu_refused = true;
                 eprintln!(
-                    "session: no GPU adapter, so `shot` falls back to the SOFTWARE                      rasteriser - which cannot run a recompiled fragment program, so on a                      shader-driven title the image will be missing everything the guest's                      own shaders draw."
+                    "session: no GPU adapter, so `shot` falls back to the SOFTWARE rasteriser - which cannot run a recompiled fragment program, so on a shader-driven title the image will be missing everything the guest's own shaders draw."
                 );
                 return None;
             }
         }
         let (dw, dh) = self.sched.host().state.display_size();
-        let renderer = self.gpu.as_mut()?;
+        let renderer = gpu.as_mut()?;
         let fb = renderer.render_frame(&scenes, dw, dh, SHOT_CLEAR);
+        // A title that reads texels out of its own render target on the CPU gets them back
+        // here. See `apply_rtt_writebacks` for why this exists and what it costs.
+        let wb = renderer.rtt_writebacks();
+        if !wb.is_empty() {
+            let sched = &self.sched;
+            crate::wgpu_render::apply_rtt_writebacks(
+                &wb,
+                &scenes,
+                |a, n| sched.read_guest(a, n),
+                |a, b| sched.write_guest(a, b),
+            );
+        }
         let fb = fb.scaled_to(SHOT_PANEL_W, SHOT_PANEL_H);
         std::fs::create_dir_all(dir).ok()?;
         let path = dir.join(format!("{name}.png"));
@@ -2569,7 +2604,7 @@ impl Session {
         let worth_us = self.frame() * 1_000_000 / 60;
         let rate = if worth_us > 0 { clock_us as f64 / worth_us as f64 } else { 0.0 };
         format!(
-            "frame      {}\nrun        {:?}\nguest mem  {base:#010x}+{len:#x}\nheld input buttons={:#06x} lx={} ly={} rx={} ry={} touch={}\nwatches    {}\nscan       {scan}\nshots      {}\nclock      {:.3}s = {rate:.2}x the {:.1}s these frames are worth\nsig        {:#018x}",
+            "frame {}\nrun {:?}\nguest mem  {base:#010x}+{len:#x}\nheld input buttons={:#06x} lx={} ly={} rx={} ry={} touch={}\nwatches    {}\nscan {scan}\nshots {}\nclock {:.3}s = {rate:.2}x the {:.1}s these frames are worth\nsig {:#018x}",
             self.frame(),
             self.last,
             input.buttons,

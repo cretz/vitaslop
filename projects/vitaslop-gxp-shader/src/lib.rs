@@ -19,7 +19,10 @@
 //! definitions: permissive, fact-only sources, with no copyleft or proprietary code read,
 //! linked, or derived from.
 
+pub mod attrflow;
 pub mod container;
+pub mod fold;
+pub mod gxpwrite;
 pub mod interp;
 pub mod ir;
 pub mod link;
@@ -29,7 +32,7 @@ pub mod wgsl;
 
 pub use container::{Parameter, ParamCategory, ParamType, Program, ProgramKind};
 pub use ir::{Instr, Op, Shader};
-pub use link::{link_programs, LinkError, LinkedProgram, MAX_VARYINGS};
+pub use link::{LinkOptions, link_programs_with, link_programs, link_programs_memo, prelink, prelink_stats, guest_attr_spec, PatcherPair, LinkError, LinkedProgram, MAX_VARYINGS};
 pub use module::{
     BindingPlan, ColorOutput, ColorPrecision, FragmentModule, MemWindow, VertexAttribute,
     VertexBindingPlan, VertexModule,
@@ -70,7 +73,7 @@ impl core::fmt::Display for RecompileError {
             RecompileError::Emit(e) => write!(f, "{e}"),
             RecompileError::ColorRegisterNeverWritten => write!(
                 f,
-                "fragment writes neither OUTPUT nor PRIMATTR register 0, so the register carrying                  its colour is not established (a pass-through of an interpolated varying)"
+                "fragment writes neither OUTPUT nor PRIMATTR register 0, so the register carrying its colour is not established (a pass-through of an interpolated varying)"
             ),
             RecompileError::TooManyVaryings { needed, limit } => write!(
                 f,
@@ -105,6 +108,12 @@ pub struct RecompiledFragment {
     pub wgsl_body: String,
     /// Stable content hash of the source blob, for pipeline caching.
     pub hash: u64,
+    /// The blend this program performed ITSELF over the destination colour, when
+    /// [`module::lower_dest_blend`] recognised one and rewrote the program to emit only the
+    /// source term. The renderer must apply it as PIPELINE blend state; a `None` here on a
+    /// program that reads its output bank means the equation is not a blend any hardware can
+    /// express and the draw needs the destination texture instead.
+    pub dest_blend: Option<module::DestBlend>,
 }
 
 /// Decode + coverage of a program without requiring full translation. Useful for the
@@ -196,10 +205,14 @@ pub fn recompile_fragment(bytes: &[u8]) -> Result<RecompiledFragment, RecompileE
     if program.kind != ProgramKind::Fragment {
         return Err(RecompileError::WrongKind);
     }
-    let shader = usse::decode_shader(&program);
+    let mut shader = usse::decode_shader(&program);
+    // BEFORE the body is emitted: a program that blends itself over the destination colour is
+    // rewritten here to emit only its source term, and the equation comes back as pipeline
+    // state. See `module::lower_dest_blend` for the shapes and for what it refuses.
+    let dest_blend = module::lower_dest_blend(&mut shader);
     let wgsl_body = wgsl::emit_fragment(&shader)?;
     let hash = program.hash;
-    Ok(RecompiledFragment { program, shader, wgsl_body, hash })
+    Ok(RecompiledFragment { program, shader, wgsl_body, hash, dest_blend })
 }
 
 /// Recompile a fragment shader blob all the way to a complete, bindable [`FragmentModule`]
@@ -255,12 +268,43 @@ pub fn recompile_vertex(bytes: &[u8]) -> Result<RecompiledVertex, RecompileError
 ///
 /// The opcode scan short-circuits before parsing operands: memory loads are a handful of
 /// programs in the whole captured corpus, and this runs once per registered program.
+///
+/// >>> IT SCANS BOTH STREAMS, AND SCANNING ONLY THE PRIMARY BLACKED OUT A WHOLE TITLE'S WORLD.
+///
+/// A program that reads a bound uniform buffer by chasing its pointer normally issues that load
+/// from the SECONDARY (prologue) stream - the prologue runs once and leaves the fetched
+/// registers in the SA file, which is the whole point of having one. [`resolve_mem_windows`]
+/// already looks in both, so the LINK resolved a window and the pipeline was built expecting
+/// its bytes; this pre-filter looked only in `code`, found no 0x1d, and told the capture to
+/// snapshot nothing. The two then disagreed at every draw, and a draw whose pipeline wants a
+/// window it did not get is DROPPED rather than fed zeroes - correctly, and silently as far as
+/// the picture is concerned. MEASURED on a retail fighting title: its stage, its crowd and both
+/// fighters were dropped that way while the HUD, whose programs load no memory, rendered
+/// perfectly on top of the black.
+///
+/// [`resolve_mem_windows`]: module::resolve_mem_windows
 pub fn mem_windows_for_vertex_blob(bytes: &[u8]) -> Vec<module::MemWindow> {
+    mem_windows_for_blob(bytes, ProgramKind::Vertex)
+}
+
+/// The same, for a FRAGMENT blob. A fragment program reaches its window through
+/// `sceGxmSetFragmentUniformBuffer`, so the capture reads a different table - which is the
+/// only thing that differs. MEASURED on a baseball title: EVERY draw of its menus (72-79 a
+/// frame) uses one pair whose FRAGMENT program opens with a 0xE8 load, and with the stage
+/// refused outright the whole screen was black while the frame kept flipping.
+pub fn mem_windows_for_fragment_blob(bytes: &[u8]) -> Vec<module::MemWindow> {
+    mem_windows_for_blob(bytes, ProgramKind::Fragment)
+}
+
+/// The stage-agnostic body of the two above: the window resolution is a property of the
+/// program's own containers and parameter table, not of which stage runs it.
+fn mem_windows_for_blob(bytes: &[u8], kind: ProgramKind) -> Vec<module::MemWindow> {
     let Ok(program) = Program::parse(bytes) else { return Vec::new() };
-    if program.kind != ProgramKind::Vertex {
+    if program.kind != kind {
         return Vec::new();
     }
-    if !program.code.iter().any(|&w| usse::opcode1(w) == 0x1d) {
+    let loads_memory = |code: &[u64]| code.iter().any(|&w| usse::opcode1(w) == 0x1d);
+    if !loads_memory(&program.code) && !loads_memory(&program.secondary_code) {
         return Vec::new();
     }
     let shader = usse::decode_shader(&program);
@@ -300,6 +344,39 @@ pub struct RopBlend {
     /// The alpha op field (42:41) differs between titles; `true` is the second observed value.
     /// Carried so a caller can refuse rather than silently treat the two alike.
     pub alpha_op_differs: bool,
+    /// The whole equation as `SceGxmBlendFactor` values - `(color_src, color_dst, alpha_src,
+    /// alpha_dst)`, every function ADD - when the word was read through the full plain-SOP2
+    /// field table (`docs-re/usse-spec-sop2.md`) rather than the two pinned shapes. `None` for
+    /// the pinned shapes, whose callers keep their established mapping.
+    pub factors: Option<(u8, u8, u8, u8)>,
+}
+
+/// `SceGxmBlendFactor` for a plain-SOP2 factor selector, with the ORIENTATION of this reading
+/// fixed: SRC1 is the shader colour (the blend SOURCE) and SRC2 the output register (the blend
+/// DESTINATION). `colour` picks between the 3-bit colour table and the 2-bit alpha table.
+/// `None` for a selector the spec does not establish.
+fn sop2_gxm_factor(sel: u32, complement: bool, colour: bool) -> Option<u8> {
+    // SceGxmBlendFactor: 0 ZERO, 1 ONE, 2 SRC_COLOR, 3 1-SRC_COLOR, 4 SRC_ALPHA, 5 1-SRC_ALPHA,
+    // 6 DST_COLOR, 7 1-DST_COLOR, 8 DST_ALPHA, 9 1-DST_ALPHA.
+    let base = if colour {
+        match sel {
+            0 => 0, // zero
+            1 => 2, // src1 colour = the source colour
+            2 => 6, // src2 colour = the destination colour
+            3 => 4, // src1 alpha
+            4 => 8, // src2 alpha
+            _ => return None,
+        }
+    } else {
+        match sel {
+            0 => 0,
+            1 => 4,
+            2 => 8,
+            _ => return None,
+        }
+    };
+    // The complement of each factor is the next enum value; the complement of ZERO is ONE.
+    Some(if complement { base + 1 } else { base })
 }
 
 /// The blend equation a FRAGMENT program performs itself, in its epilogue, or `None`.
@@ -356,6 +433,92 @@ pub struct RopBlend {
 /// corpus here, that word takes this path and blends the wrong way round. It would show as a
 /// surface that is too bright where it should be dark. The guard below pins every field that
 /// this evidence does not read, so such a word returns `None` instead.
+/// Whether a FRAGMENT blob reads the destination colour out of its output bank, and so must be
+/// given a copy of the colour attachment to blend against - see
+/// [`module::BindingPlan::reads_dest_color`].
+///
+/// Standalone (rather than only a field of the link result) because the renderer has to know
+/// BEFORE it starts encoding a pass: the copy is a pass split, and a split cannot be decided
+/// halfway through a render pass that has already begun.
+///
+/// A blob that does not parse or is not a fragment program answers `false`: it has no
+/// destination read this can be sure of, and the link will refuse it anyway.
+pub fn fragment_reads_dest_color(bytes: &[u8]) -> bool {
+    let Ok(program) = Program::parse(bytes) else { return false };
+    if program.kind != ProgramKind::Fragment {
+        return false;
+    }
+    // The same question the recompiler asks, in the same order: a program whose ALU blend
+    // LOWERS to a pipeline blend does not read the destination at all after the rewrite, and
+    // asking before the rewrite would split a pass for every one of them.
+    let mut shader = usse::decode_shader(&program);
+    let _ = module::lower_dest_blend(&mut shader);
+    module::declares_dest_color(&shader)
+}
+
+/// The DUAL-SOURCE plan of a FRAGMENT blob: `Err` (naming why) if its destination read cannot
+/// be lowered that way at all, else the gates a draw has to satisfy - `(source, byte offset,
+/// byte length)`, every one of which must be zero in the draw's own data. `source` is an index
+/// into the draw's captured fragment memory windows, or [`DUAL_GATE_UNIFORM`] for the fragment
+/// default uniform buffer (`frag_sa`). Empty means every draw qualifies. See
+/// [`module::dual_source_plan`].
+pub fn fragment_dual_source_plan(bytes: &[u8]) -> Result<Vec<(u32, u32, u8)>, String> {
+    let program = Program::parse(bytes).map_err(|e| format!("does not parse: {e:?}"))?;
+    if program.kind != ProgramKind::Fragment {
+        return Err("not a fragment program".into());
+    }
+    // The SAME shader the linker emits from - `recompile_fragment` runs the decode's expansion
+    // passes (a memory load, say, exists only after them) and the ALU-blend lowering.
+    let shader = recompile_fragment(bytes).map_err(|e| format!("does not recompile: {e:?}"))?.shader;
+    let literals = link::secondary_attr_init(&shader, &program).map_err(|e| format!("literals: {e}"))?;
+    let coefs = module::dual_source_plan_or_why(&module::with_secondary(&program, &shader), program.sa_carried_extent(), &literals)?;
+    let windows = module::resolve_mem_windows(&program, &shader).map_err(|e| format!("windows: {e}"))?;
+    coefs
+        .iter()
+        .map(|c| match *c {
+            module::DualCoef::Uniform { byte, len } => Ok((DUAL_GATE_UNIFORM, byte, len)),
+            module::DualCoef::Zero => Err("a zero literal is not a gate".to_string()),
+            module::DualCoef::Window { base_sa, byte, len } => {
+                let w = windows
+                    .iter()
+                    .position(|w| w.base_sa == base_sa)
+                    .ok_or_else(|| format!("gate at pointer sa{base_sa} names no window"))?;
+                Ok((w as u32, byte, len))
+            }
+        })
+        .collect()
+}
+
+/// The `source` of a [`fragment_dual_source_plan`] gate that lives in the fragment default
+/// uniform buffer rather than in a memory window.
+pub const DUAL_GATE_UNIFORM: u32 = u32::MAX;
+
+/// Whether a FRAGMENT blob uses the frame-buffer colour as an INPUT - the question
+/// `sceGxmProgramIsFragColorUsed` asks of a program, answered from the program itself.
+///
+/// # Why this is not [`fragment_reads_dest_color`], which looks like the same question
+/// That one answers what the RENDERER needs to do: it runs the ALU-blend lowering first,
+/// because a program whose blend is rewritten into pipeline state no longer reads the
+/// attachment and must not cost a pass split. This one answers what the PROGRAM is, and a
+/// rewrite this engine performs for its own convenience cannot change that - a title asking
+/// whether its shader consumes FragColor would otherwise be told "no" about a shader that
+/// plainly does, and the answer would move whenever the lowering table grew.
+///
+/// The SOP2 exclusion inside [`module::reads_output_bank`] is kept, and it is right for this
+/// question too: an 8-bit SOP2 epilogue over the output register is the FIXED-FUNCTION blend
+/// the compiler emits for a `SceGxmBlendInfo`, present in ordinary programs that declare no
+/// frag-colour input at all.
+///
+/// A blob that does not parse, or is not a fragment program, answers `false` - a vertex
+/// program has no frame buffer to read, which is the API's own answer for one.
+pub fn fragment_uses_frag_color(bytes: &[u8]) -> bool {
+    let Ok(program) = Program::parse(bytes) else { return false };
+    if program.kind != ProgramKind::Fragment {
+        return false;
+    }
+    module::reads_output_bank(&usse::decode_shader(&program))
+}
+
 pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
 
     let program = Program::parse(bytes).ok()?;
@@ -418,7 +581,7 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
             if found.is_some() {
                 return None;
             }
-            found = Some(RopBlend { dst: RopDstFactor::One, alpha_op_differs: false });
+            found = Some(RopBlend { dst: RopDstFactor::One, alpha_op_differs: false, factors: None });
             continue;
         }
         if !dest_is_output || !src2_is_output {
@@ -433,8 +596,41 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
             && bit(48, 48) == 0              // no src2 bank extension
             && bit(47, 47) == 1              // mod2 - the destination term IS complemented
             && bit(46, 43) == 0              // the bits SOP2M spends on its write mask
-            && bit(40, 38) == 3; // sel1 = SRC1_ALPHA, the source coefficient
+            && bit(40, 38) == 3              // sel1 = SRC1_ALPHA, the source coefficient
+            && bit(20, 14) == 0; // both ops ADD and no modifier (the plain-SOP2 spec's fields)
         if !pinned {
+            // >>> THE FULL PLAIN-SOP2 FIELD TABLE (`docs-re/usse-spec-sop2.md`), for this
+            // orientation only: SRC1 the shader colour, SRC2 the output register fed back. Both
+            // factor tables and their complements are read; the OPS are required to be ADD (bits
+            // 19:16 zero) because the spec's op fields are established only here - its reading of
+            // the swapped words' low bits as a reverse subtract contradicts what those words were
+            // measured to draw (see the swapped arm above), so the op fields stay unproven there.
+            // MEASURED on a 2011 fighting title: its sprite, portrait and menu programs end in
+            // `808088c190000000` / `808088d990000000` / `8180880590000000` - the two pinned
+            // equations with ONE alpha factors, and the ONE, ONE additive - and all three were
+            // refused, dropping 95 draws a scene (its character select drew names over black).
+            let general = bit(58, 57) == 0
+                && bit(51, 51) == 0
+                && bit(49, 49) == 0
+                && bit(48, 48) == 0
+                && bit(46, 44) == 0              // no repeat
+                && bit(20, 14) == 0;             // src1 unmodified, both ops ADD, bits 15/14 clear
+            if general {
+                let cs = sop2_gxm_factor(bit(40, 38), bit(56, 56) == 1, true);
+                let cd = sop2_gxm_factor(bit(37, 35), bit(47, 47) == 1, true);
+                let as_ = sop2_gxm_factor(bit(53, 52), bit(43, 43) == 1, false);
+                let ad = sop2_gxm_factor(bit(42, 41), bit(34, 34) == 1, false);
+                if let (Some(cs), Some(cd), Some(as_), Some(ad)) = (cs, cd, as_, ad) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    // The legacy summary fields, for the callers and reports that read them.
+                    let dst = if cd == 5 { RopDstFactor::OneMinusSrcAlpha } else { RopDstFactor::One };
+                    found = Some(RopBlend { dst, alpha_op_differs: bit(42, 41) != 0, factors: Some((cs, cd, as_, ad)) });
+                    continue;
+                }
+                return None;
+            }
             return None;
         }
         let dst = match bit(37, 35) {
@@ -451,7 +647,7 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
         if found.is_some() {
             return None;
         }
-        found = Some(RopBlend { dst, alpha_op_differs });
+        found = Some(RopBlend { dst, alpha_op_differs, factors: None });
     }
     found
 }

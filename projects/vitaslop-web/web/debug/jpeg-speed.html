@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>vitaslop - JPEG: ours or the browser's</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: #14161a;
+        color: #e6e8ec;
+        font: 15px/1.5 system-ui, sans-serif;
+      }
+      h1 {
+        font-size: 17px;
+        margin: 0 0 4px;
+      }
+      p {
+        margin: 0 0 12px;
+        color: #a9b0bd;
+      }
+      button,
+      input[type="file"] {
+        font: inherit;
+      }
+      button {
+        padding: 8px 14px;
+        border-radius: 8px;
+        border: 1px solid #39404d;
+        background: #222731;
+        color: #e6e8ec;
+      }
+      button:disabled {
+        opacity: 0.5;
+      }
+      pre {
+        white-space: pre-wrap;
+        background: #0f1116;
+        border: 1px solid #262c36;
+        border-radius: 8px;
+        padding: 12px;
+        margin-top: 14px;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>JPEG: this build's decoder, or the browser's</h1>
+    <p>
+      SceJpeg is a synchronous guest call and every browser JPEG entry point is a promise, but
+      a host call can wait on one here - that is what every blocking kernel primitive already
+      does through JSPI. So the browser's decoder is reachable and the question is only which
+      is faster on the device you are holding. The comparable number is
+      <strong>bitmap+read</strong>: the guest needs pixels in its own memory, so the browser
+      path has to draw the bitmap and read it back, and comparing decode against decode would
+      flatter it.
+    </p>
+    <div class="row">
+      <button id="synth">Measure with a generated 416x560 image</button>
+      <input type="file" id="pick" accept="image/jpeg" />
+    </div>
+    <pre id="out">Pick a JPEG, or press the button to generate one the size this title decodes.</pre>
+    <script type="module">
+      const out = document.getElementById("out");
+      const synth = document.getElementById("synth");
+      const pick = document.getElementById("pick");
+      const log = (line) => {
+        out.textContent += `\n${line}`;
+      };
+
+      async function run(bytes) {
+        out.textContent = "running...";
+        synth.disabled = true;
+        pick.disabled = true;
+        const w = new Worker("./jpeg-speed-worker.js", { type: "module" });
+        w.onmessage = (e) => {
+          if (e.data.type === "log") log(e.data.line);
+          if (e.data.type === "done") {
+            w.terminate();
+            synth.disabled = false;
+            pick.disabled = false;
+          }
+        };
+        w.postMessage({ bytes, iterations: 20 }, [bytes]);
+      }
+
+      // A generated image the size the title actually decodes, so the page works with no
+      // file to hand and ships no game content. Structured detail, not flat colour: a JPEG
+      // of a blank image decodes far faster than a real one and would answer nothing.
+      synth.onclick = async () => {
+        const [w, h] = [416, 560];
+        const c = new OffscreenCanvas(w, h);
+        const ctx = c.getContext("2d");
+        const img = ctx.createImageData(w, h);
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            const i = (y * w + x) * 4;
+            const n = (Math.random() * 36 - 18) | 0;
+            img.data[i] = Math.max(0, Math.min(255, 127 + 120 * Math.sin(x / 23) * Math.cos(y / 31) + n));
+            img.data[i + 1] = Math.max(0, Math.min(255, 127 + 120 * Math.sin((x + y) / 17) + n));
+            img.data[i + 2] = Math.max(0, Math.min(255, 127 + 120 * Math.cos(x / 41) + n));
+            img.data[i + 3] = 255;
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+        const blob = await c.convertToBlob({ type: "image/jpeg", quality: 0.85 });
+        run(await blob.arrayBuffer());
+      };
+
+      pick.onchange = async () => {
+        const f = pick.files && pick.files[0];
+        if (f) run(await f.arrayBuffer());
+      };
+    </script>
+  </body>
+</html>

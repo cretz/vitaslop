@@ -1147,6 +1147,9 @@ impl Transcoder {
         // which for the largest texture family on the target device is half an instrument.
         let give_up = |spare: Option<wgpu::Texture>, why: &'static str| {
             if let Some(t) = spare {
+                // COUNTED, because the caller counted it when it was created and the handle
+                // ledger is read as a LEAK report - see `gpu::note_texture_destroyed`.
+                crate::gpu::note_texture_destroyed();
                 t.destroy();
             }
             LAST_RAW_REFUSAL.with(|c| c.set(why));
@@ -1406,8 +1409,10 @@ impl Transcoder {
         let texture = match spare.take() {
             Some(t) if reusable => t,
             other => {
-                // The wrong shape is still OUR handle to release.
+                // The wrong shape is still OUR handle to release - and still one the
+                // handle ledger counted on the way in.
                 if let Some(t) = other {
+                    crate::gpu::note_texture_destroyed();
                     t.destroy();
                 }
                 crate::gpu::note_texture_created();

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use vitaslop_native::{RunReport, ThreadedScheduler};
 use crate::gfx::{acquire, ACQUIRE_FAILURE_LIMIT};
-use vitaslop_platform::gpu::{GxmRenderer, DEPTH_FORMAT};
+use vitaslop_platform::gpu::{depth_format, GxmRenderer};
 use vitaslop_runtime::capture::Scene;
 use vitaslop_runtime::ingest::pipeline::decrypt_container;
 use vitaslop_runtime::ingest::vfs::MemVfs;
@@ -171,6 +171,10 @@ fn read_dir_files(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
             let path = entry.path();
             let ty = entry.file_type().map_err(|e| format!("file type: {e}"))?;
             if ty.is_dir() {
+                // Not the game's - see `diskvfs::walk`.
+                if dir.as_path() == root && entry.file_name() == vitaslop_native::compile_cache::DIR {
+                    continue;
+                }
                 stack.push(path);
             } else {
                 let rel = path
@@ -223,20 +227,96 @@ impl RetailGuest {
     /// frame-keyed TAS text) is overlaid on the live input so a recorded playthrough
     /// replays in the window.
     pub fn new(dir: &Path, input: SharedInput, recipe: Option<&str>) -> Result<RetailGuest, String> {
+        Self::new_with_exec(dir, input, recipe, None)
+    }
+
+    /// [`Self::new`] with the app's executable `main_exec` (an `sceAppMgrLoadExec` path) in
+    /// the main executable's place - the process a title's `LoadExec` asked for. See
+    /// [`Self::take_exec_request`].
+    pub fn new_with_exec(
+        dir: &Path,
+        input: SharedInput,
+        recipe: Option<&str>,
+        main_exec: Option<&str>,
+    ) -> Result<RetailGuest, String> {
         let t0 = Instant::now();
-        let files = read_dir_files(dir)?;
-        let mut vfs = MemVfs::new();
-        for (path, bytes) in files {
-            vfs.insert(path, bytes);
+        // >>> THE DATA FILES STAY ON DISK. See `crate::diskvfs`.
+        //
+        // A decrypted-dump tree - which is what every extracted title here is - mounts LAZILY:
+        // the manifest and the loadable modules are read (link and transpile want the whole
+        // image, and they are a few megabytes), and the data files are served a read at a time
+        // from handles opened once. Reading them all instead held 2,822 MB at frame 0 on one
+        // title and peaked at 4,940 MB during the load, for bytes the title had not asked for.
+        // The browser has mounted this way since it had to; the desktop merely could afford not
+        // to, and paid for it on every measurement run.
+        //
+        // Anything that is NOT a dump (a picked .pkg, a PFS tree) still goes through the eager
+        // container decrypt below - that path has to hold its output anyway, and it is not what
+        // a measurement or a play session uses.
+        //
+        // `VITASLOP_EAGER_FILES=1` is the arm back, and it exists so the change can be A/B'd
+        // bit-for-bit from ONE build: a lazy read serves the same bytes or it does not, and a
+        // picture is the only thing that says so.
+        let disk = crate::diskvfs::DiskVfs::open(dir)?;
+        let eager = std::env::var_os("VITASLOP_EAGER_FILES").is_some();
+        let lazy = (!eager)
+            .then(|| vitaslop_runtime::ingest::pipeline::dump_root(&disk))
+            .flatten()
+            .map(|root| vitaslop_runtime::ingest::pipeline::mount_dump_lazy(&disk, &root))
+            .transpose()
+            .map_err(|e| format!("mount dump: {e:?}"))?;
+        let (mut game_modules, execs, mut resident, backing) = match lazy {
+            Some(dump) => {
+                let backing =
+                    crate::diskvfs::DiskBacking::new(disk.under(&dump.files_prefix));
+                println!(
+                    "loaded: {} data file(s), {:.0} MB, served FROM DISK (not resident)",
+                    backing.file_count(),
+                    backing.total_bytes() as f64 / 1e6,
+                );
+                (dump.modules, dump.execs, None, Some(backing))
+            }
+            None => {
+                let files = read_dir_files(dir)?;
+                let mut vfs = MemVfs::new();
+                for (path, bytes) in files {
+                    vfs.insert(path, bytes);
+                }
+                let game = decrypt_container(&mut vfs).map_err(|e| format!("decrypt: {e:?}"))?;
+                (game.modules, game.execs, Some(game.files), None)
+            }
+        };
+        if let Some(path) = main_exec {
+            let rel = vitaslop_runtime::ingest::pipeline::exec_rel_path(path);
+            let exec = execs
+                .into_iter()
+                .find(|m| m.path == rel)
+                .ok_or_else(|| format!("sceAppMgrLoadExec(\"{path}\"): the app carries no executable at {rel}"))?;
+            println!("exec: {path} replaces the main executable ({} KB)", exec.elf.len() / 1024);
+            match game_modules.iter().position(|m| m.path == "eboot.bin") {
+                Some(slot) => game_modules[slot] = exec,
+                None => game_modules.push(exec),
+            }
         }
-        let game = decrypt_container(&mut vfs).map_err(|e| format!("decrypt: {e:?}"))?;
-        let modules = game
-            .modules
+        let modules = game_modules
             .iter()
             .map(|m| loader::load(&m.elf))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("load module: {e:?}"))?;
-        let linked = link(modules).map_err(|e| format!("link: {e:?}"))?;
+        // The module images are only needed by `load` above; the linked program owns what it
+        // took from them. Dropped here rather than at the end of the function because link and
+        // transpile are the allocation peak of the whole system.
+        drop(game_modules);
+        // This run stands up the THREADED scheduler, so the host mirror block exists and is
+    // refreshed at its resume point - which is what lets the RTC tick be read inline.
+    // See `vitaslop_runtime::vita::set_preemptive_linking`.
+    vitaslop_runtime::vita::set_preemptive_linking(true);
+    let linked = link(modules);
+    // Reset at once: the flag is process-wide and read only by `link`, so left set it would
+    // make a later link in this process (a test, a second title) inline a clock read its
+    // scheduler does not refresh.
+    vitaslop_runtime::vita::set_preemptive_linking(false);
+    let linked = linked.map_err(|e| format!("link: {e:?}"))?;
 
         let world: Box<dyn World + Send> = match recipe {
             Some(text) => {
@@ -257,14 +337,47 @@ impl RetailGuest {
         env.state.set_modules(linked.loaded_modules.clone());
         env.state.set_tls_template(linked.tls_template);
         env.state.set_preemptive(true);
-        // Move (not clone) the decrypted assets into the guest filesystem - for a
-        // large 3D title this is hundreds of megabytes.
-        for (path, bytes) in game.files.into_files() {
-            env.state.add_file(&path, bytes);
+        // Either the disk serves the assets on demand, or - for a container that had to be
+        // decrypted whole - they are MOVED (not cloned) into the guest filesystem.
+        match (backing, resident.take()) {
+            (Some(b), _) => env.state.set_file_backing(Box::new(b)),
+            (None, Some(files)) => {
+                for (path, bytes) in files.into_files() {
+                    env.state.add_file(&path, bytes);
+                }
+            }
+            (None, None) => {}
         }
 
-        let (sched, _stubs) = ThreadedScheduler::from_linked(&linked, env, QUANTUM_FUEL)
+        // >>> THE BOOT'S OWN RESIDENCY, BRACKETED. See `vitaslop_platform::heap`.
+        //
+        // Transpile is the allocation peak of the whole system and nothing said where in the
+        // boot it was paid. These two lines bracket it: whatever the peak rises to between them
+        // is the transpiler's, and the LIVE figure after it is what the run then carries. The
+        // browser's ceiling is 4,096 MB and its transpile happens in a worker of its own, so the
+        // peak here is the number that decides whether a title can be brought up at all.
+        {
+            let (live, peak) = vitaslop_platform::heap::live_peak_mb();
+            println!("loaded: RUST HEAP before transpile - live {live} MB, peak {peak} MB");
+        }
+        vitaslop_platform::heap::reset_peak();
+        // `VITASLOP_HEAP_TRACE=<min MB>`: keep a backtrace for every live allocation of at
+        // least that size, and name the holders on every heap line - see `heap::trace_large`.
+        if let Some(mb) = std::env::var("VITASLOP_HEAP_TRACE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            vitaslop_platform::heap::trace_large(mb * 1024 * 1024);
+            println!("loaded: heap ledger armed - every live allocation of {mb} MB or more keeps its backtrace");
+        }
+        // The compiled module is kept beside the game (see `vitaslop_native::compile_cache`), so
+        // only the first boot after a build pays the transpile and the Cranelift compile.
+        // `VITASLOP_COMPILE_CACHE=0` bypasses it (neither read nor written).
+        let cache = (std::env::var("VITASLOP_COMPILE_CACHE").as_deref() != Ok("0"))
+            .then(|| vitaslop_native::compile_cache::CompileCache::new(dir, main_exec.unwrap_or("eboot.bin")));
+        let (sched, _stubs) = ThreadedScheduler::from_linked_with_cache(&linked, env, QUANTUM_FUEL, cache.as_ref())
             .map_err(|e| format!("scheduler: {e:?}"))?;
+        {
+            let (live, peak) = vitaslop_platform::heap::live_peak_mb();
+            println!("loaded: RUST HEAP after transpile+instantiate - live {live} MB, TRANSPILE PEAK {peak} MB");
+        }
         // >>> NO DETERMINISM SIGNATURE unless something will read it. The fold hashes every
         // retired scene's vertices, indices and uniforms - 3.5 MB a frame on a race, MEASURED
         // at 8.0% of a desktop frame - and this path never prints or compares one. The
@@ -295,7 +408,7 @@ impl RetailGuest {
             vitaslop_native::SaveStore::title_for(&game_dir.to_string_lossy(), sfo.as_deref());
         if !from_container {
             println!(
-                "[gamedata] this container names no title id; saves are filed under {title:?}                  (its directory name), which another title extracted the same way would share"
+                "[gamedata] this container names no title id; saves are filed under {title:?} (its directory name), which another title extracted the same way would share"
             );
         }
         let mut store = vitaslop_native::SaveStore::new(root, &title);
@@ -366,8 +479,17 @@ impl RetailGuest {
             // the world never gets drawn at all - a retail racer's race was a live HUD over
             // black for exactly this reason. An empty list means the guest submitted no
             // scene this frame, in which case the previous frame's stays on screen.
-            if !cap.scenes.is_empty() {
-                self.scenes = std::mem::take(&mut cap.scenes);
+            // >>> A SCENE WHOSE GEOMETRY IS STILL PENDING IS NOT TAKEN. Its vertex bytes are
+            // read at the guest's GPU wait or flip (`resolve_deferred_geometry`), and on a
+            // title whose frame boundary (a vblank wait) comes BETWEEN `sceGxmEndScene` and
+            // that flip, taking it here hands the renderer a scene with NO vertices and the
+            // flip finds nothing to read into. MEASURED on a football title's intro: every
+            // draw of every frame "carried no vertices", scenes_held=0 at each resolve. Such a
+            // scene stays in the capture and is taken at the next boundary, after its flip.
+            let (pending, ready): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut cap.scenes).into_iter().partition(|s| s.deferred_id != 0);
+            if !ready.is_empty() {
+                self.scenes = ready;
                 // Kept with the scenes they belong to, and for the same reason: these are the
                 // buffers the guest FLIPPED while those scenes were captured, which is what
                 // lets the renderer recognise a frame that straddles a flip instead of
@@ -375,7 +497,7 @@ impl RetailGuest {
                 // `GxmRenderer::set_presented`.
                 self.presents = cap.presents.clone();
             }
-            cap.scenes.clear();
+            cap.scenes = pending;
             cap.trace.clear();
             cap.trace_thid.clear();
             cap.presents.clear();
@@ -513,6 +635,29 @@ impl RetailGuest {
     /// Who got the CPU, and how much of the device's parallelism the run used. The two
     /// belong together: a lopsided share is only a problem if the starved threads were
     /// READY, and the second report is what says so.
+    /// Overwrite guest memory - the path a RENDER TARGET's pixels take back to the guest.
+    ///
+    /// A title that reads texels out of a target it drew (this one's ambient probe is a 128x128
+    /// grid it indexes on the CPU) reads its allocator's poison unless the rendered pixels are
+    /// put back. See `vitaslop_native::apply_rtt_writebacks`.
+    /// Install the `sceGxmEndScene` completion hook - see `VitaState::complete_scene_now`.
+    pub fn install_complete_scene_hook(
+        &self,
+        hook: Box<dyn FnMut(&[Scene]) -> Vec<(u32, u32, u32, Vec<u8>)> + Send>,
+    ) {
+        self.sched.host().state.complete_scene_now = Some(hook);
+    }
+
+    pub fn write_guest(&self, addr: u32, bytes: &[u8]) {
+        self.sched.write_guest(addr, bytes);
+    }
+
+    /// Read guest memory - the writeback's own gate reads a target's bytes to decide whether
+    /// anything has ever been written there.
+    pub fn read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
+        self.sched.read_guest(addr, len)
+    }
+
     pub fn scheduler_report(&self) -> String {
         format!("{}{}", self.sched.cpu_share_report(), self.sched.runnable_report())
     }
@@ -546,6 +691,15 @@ impl RetailGuest {
     }
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// The executable the guest's `sceAppMgrLoadExec` asked to replace this process with, if
+    /// that is how the run ended - taken, so a host acts on it once.
+    pub fn take_exec_request(&mut self) -> Option<String> {
+        if !self.finished {
+            return None;
+        }
+        self.sched.host().state.exec_request.take()
     }
     pub fn frames(&self) -> u64 {
         self.sched.frames()
@@ -684,7 +838,7 @@ impl RetailGfx {
             required_features: vitaslop_platform::gpu::wanted_features(&adapter),
             // Raise resolution-derived limits to the adapter's: a real title binds
             // textures past the 2048 downlevel floor (some titles have a ~2480px atlas).
-            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            required_limits: vitaslop_platform::gpu::device_limits(&adapter),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -828,7 +982,7 @@ impl RetailGfx {
             Some((scenes, (dw, dh), presents)) => {
                 let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
                 self.gxm.set_presented(presents);
-                self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, dw, dh, fw, fh, CLEAR);
+                self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, dw, dh, fw, fh, CLEAR, Some(&frame.texture));
             }
             None => {
                 let c = wgpu::Color { r: 11.0 / 255.0, g: 11.0 / 255.0, b: 18.0 / 255.0, a: 1.0 };
@@ -861,7 +1015,7 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
@@ -885,6 +1039,89 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
 ///   `VITASLOP_HEADLESS_NO_TAPS` is set, which runs input-free to the title screen.
 /// - `VITASLOP_HEADLESS_TIMING` - report per-frame GUEST cost (the emulated CPU work
 ///   behind one display flip) and the GPU cost of rendering the final captured scene.
+/// >>> THE DEVICE BUDGET: THE USER'S PHONE'S LIMITS, ASSERTED ON THIS MACHINE.
+///
+/// # Why this exists
+/// The user asked for it in the plainest terms - *"find a way to assert this without me running
+/// on my phone"* - after a device dump carried four defects that a desktop run had been walking
+/// past for weeks. The warnings panel is headed *"each one is a fix we owe"* and every one of
+/// these was already in it; what was missing was anything that made a breach STOP a run rather
+/// than scroll past in a log nobody greps.
+///
+/// # The trick that makes a desktop run able to answer a device question
+/// It cannot answer the timing one. `queue.write_buffer` blocked for **208 ms** on the device
+/// and reads **0.5 ms** here, and no amount of desktop measurement will close that - the GPU,
+/// the driver and the staging path are all different. So the budget is not on the milliseconds.
+///
+/// The device supplies the RATE and this machine supplies the BYTES AND THE COUNTS, and those
+/// halves are *identical on both machines* because they are properties of what this code
+/// chooses to do, not of the hardware it lands on. A budget on the size of a write, or on the
+/// number of draws that render with no uniform bank, is therefore exactly as true here as
+/// there - and it fails here first, which is the only place it is cheap to fix.
+///
+/// # What is deliberately NOT here
+/// The audio UNDERRUN the device reported (54% of one run) is a browser audio-thread figure and
+/// this binary has no audio-out path at all. Putting a row here that silently reads zero would
+/// be worse than having no row: it would report a PASS on a defect this machine cannot see.
+/// That one needs the browser, and saying so is the honest form of the answer.
+///
+/// Returns whether anything breached. `VITASLOP_DEVICE_BUDGET=0` reports without failing.
+fn report_device_budget() -> bool {
+    let mut rows = vitaslop_platform::gpu::device_budget_rows();
+    // The runtime's own row: a draw whose stage found the default uniform buffer reserved for a
+    // DIFFERENT program, and so took the `sceGxmSetUniformDataF` SA bank instead.
+    //
+    // >>> REPORTED, NOT GATED, AND THE DIFFERENCE IS A CORRECTION I OWE THIS FILE.
+    //
+    // It was written here as `budget 0` on the strength of the warning's own wording - "renders
+    // with NO uniform bank at all". That wording is WRONG about what the code does:
+    // `current_vertex_uniform_src` returns `None` and `current_vertex_uniform_bytes` falls
+    // straight through to `sa_bank_bytes`, so the draw renders with the SA bank, which for a
+    // program whose uniforms really are set that way is the RIGHT bank and not a defect at all.
+    //
+    // The evidence says so too. A 12,000-frame A/B of `VITASLOP_GXM_STALE_UNIFORMS` over this
+    // title - drop the binding versus keep it - came back **24 of 24 shots byte-identical**, and
+    // eight of the nine titles report ZERO of these. A gate that fails a run on a number whose
+    // two arms draw the same pixels is a gate that will be switched off the first week.
+    //
+    // So it stays a printed row with no verdict until someone shows a draw that NEEDED the
+    // bound buffer and got the SA bank instead. What is NOT settled by that A/B: both arms can
+    // be wrong the same way - a degenerate transform lands offscreen either way - so this is
+    // "unproven", not "harmless". mlb's 3.3 million is 30% of its draws and wants an answer.
+    let stale = vitaslop_runtime::host::stale_uniform_draws();
+    rows.push(vitaslop_platform::gpu::BudgetRow {
+        name: "draws on the SA-bank fallback",
+        reading: format!("{stale}"),
+        budget: "(reported)".into(),
+        pass: true,
+        why: "",
+    });
+    let failed: Vec<&vitaslop_platform::gpu::BudgetRow> =
+        rows.iter().filter(|r| !r.pass).collect();
+    println!(
+        "\nDEVICE BUDGET - the user's device's limits, checked here. The device owns the RATE; \
+         this machine owns the BYTES and the COUNTS, and those are the same on both."
+    );
+    for r in &rows {
+        println!(
+            "  {:<28} {:>12}   budget {:<10} {}",
+            r.name,
+            r.reading,
+            r.budget,
+            if r.pass { "ok" } else { ">>> BREACH" }
+        );
+    }
+    for r in &failed {
+        println!("  >>> {}: {}", r.name, r.why);
+    }
+    if failed.is_empty() {
+        return false;
+    }
+    // A knob to report without failing, for a run taken deliberately over a known breach - and
+    // VALUE-sensitive, so the only way to switch the gate off is to say so explicitly.
+    !matches!(std::env::var("VITASLOP_DEVICE_BUDGET").as_deref(), Ok("0"))
+}
+
 /// - `VITASLOP_HEADLESS_SHOT_EVERY` - also write `<shot_dir>/fNNNNNN.png` every N display
 ///   flips, so one run shows the whole boot SEQUENCE rather than only its last frame.
 /// - `VITASLOP_HEADLESS_SHOT_FROM` / `VITASLOP_HEADLESS_SHOT_TO` - restrict those shots to an
@@ -892,6 +1129,12 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
 ///   a fade, a wipe, a one-frame flash - is invisible at any interval coarse enough to cover
 ///   a boot, and every-frame-from-boot is gigabytes of stored-deflate PNG. An empty window is
 ///   an ERROR rather than a run that quietly writes nothing.
+/// - `VITASLOP_HEADLESS_RENDER_FROM` - begin RENDERING at this frame while still WRITING only
+///   inside the shot window (default: `SHOT_FROM`, i.e. the two coincide as before). Render
+///   history is state: a title that paints a small target at a screen transition and samples
+///   it for the next thousand frames renders wrong out of a window that starts after the
+///   paint, with nothing in the log to say so. `RENDER_FROM=0` buys a faithful dense
+///   sequence for one full replay's render cost.
 ///
 /// NOTE what the timing does and does not measure. The guest advances every frame but the
 /// scene is RENDERED ONCE, at the end - so a wall-clock total over a headless run is CPU
@@ -1023,6 +1266,15 @@ fn report_frame_timing(
     // Encode counters already taken per frame by the hiccup log, folded back in so this
     // report still covers the whole run.
     enc_window: &vitaslop_platform::gpu::EncodeWork,
+    // ...and HOW MANY FRAMES those are, which the divisor was missing.
+    //
+    // >>> THIS IS THE `encode work/frame` INFLATION, FIXED. The counters covered the warm
+    // re-renders PLUS the whole shot window and were divided by the warm re-renders alone, so
+    // every per-frame figure in that line read about 2.7x high on a baseball title - "1797
+    // draws" for a frame of ~586, with the bytes, the calls and the bind-group counts inflated
+    // in step. A count instrument that over-reports is worse than none when the thing it is
+    // used for is RANKING [[vitaslop-a-drop-count-needs-its-draw-count]].
+    enc_window_frames: u64,
 ) {
     if frame_ms.is_empty() {
         println!("timing: no frames advanced");
@@ -1074,23 +1326,121 @@ fn report_frame_timing(
          submit+wait {:.2} ms (contains the GPU)",
         split.build_ms, split.encode_ms, split.submit_ms
     );
+    // >>> EVERY PHASE, AND THE RESIDUAL, BECAUSE THREE OF THEM ACCOUNTED FOR 30% OF `encode`.
+    //
+    // This printed `prepare`, `upload` and `pass` only. MEASURED on a baseball title's gameplay
+    // frame: `encode 6.60 ms` against `prepare 1.25 + upload 0.52 + pass 0.22` = 1.99, leaving
+    // **4.61 ms - 70% of the phase - with no instrument on it at all**, and nothing in the
+    // output said so. `EncodePhases` was already carrying the other seven fields; they simply
+    // were not printed, so every reading of "where does encode go" for this title was made from
+    // the smallest third of it.
+    //
+    // The RESIDUAL is the load-bearing part, not the new names: a phase table is only an
+    // argument if it accounts for the thing it divides, which is the same rule `PrepareSplit`
+    // states for itself. If it is large, the next phase to add is unknown and guessing at one
+    // is what this line exists to prevent.
+    //
+    // >>> AND `arena` AND `ubo-bind-groups` ARE **INSIDE** `upload`, WHICH THIS SUM USED TO
+    // >>> DOUBLE-COUNT. `t_upload` brackets the whole of step 2 in `encode_pass` and the arena
+    // and uniform-bind-group stopwatches are nested within it, so adding them to `upload` made
+    // NAMED bigger than the work and the residual correspondingly smaller: on the baseball
+    // frame `1.68 ms of 6.90` was really `1.32`, i.e. 81% unnamed rather than 76%. An
+    // over-reported NAMED is the one error a residual line cannot survive, because it is the
+    // direction that makes the table look complete.
+    let named = p.prepare_ms + p.upload_ms + p.pass_ms + p.precompile_ms + p.retire_ms + p.resident_ms;
     println!(
-        "timing: encode phases - prepare {:.2} ms, upload {:.2} ms, pass {:.2} ms over \
-         {} recompiled + {} fixed-function draws",
-        p.prepare_ms, p.upload_ms, p.pass_ms, p.gxp_draws, p.fixed_draws
+        "timing: encode phases - prepare {:.2} ms, upload {:.2} ms (of which arena {:.2} \
+         = create {:.2} + write {:.2}, ubo-bind-groups {:.2}), pass {:.2} ms, precompile {:.2} ms, \
+         retire {:.2} ms, resident {:.2} ms over {} recompiled + {} fixed-function draws; \
+         NAMED {:.2} ms of encode {:.2} ms, RESIDUAL {:.2} ms ({:.0}%)",
+        p.prepare_ms,
+        p.upload_ms,
+        p.arena_ms,
+        p.arena_create_ms,
+        p.arena_write_ms,
+        p.ubo_bg_ms,
+        p.pass_ms,
+        p.precompile_ms,
+        p.retire_ms,
+        p.resident_ms,
+        p.gxp_draws,
+        p.fixed_draws,
+        named,
+        split.encode_ms,
+        split.encode_ms - named,
+        100.0 * (split.encode_ms - named) / split.encode_ms.max(1e-9),
+    );
+    // >>> ...AND WHERE THE RESIDUAL IS, WHICH IS THE LINE THAT REPLACES GUESSING AT THE NEXT
+    // >>> PHASE NAME. See `EncodePhases::chain_head_ms`.
+    //
+    // `encode_chain` is HEAD + LOOP + TAIL by construction, and the loop is the `encode_pass`
+    // calls plus the per-scene RTT setup around them, so these four numbers are the residual
+    // BROKEN DOWN rather than four more spans somebody chose. `unplaced` is what is left after
+    // all of it, and it is work OUTSIDE `encode_chain` - the command-encoder creation and the
+    // timestamp resolve - which is a different question from the one the old residual posed.
+    let chain = p.chain_head_ms + p.scene_loop_ms + p.chain_tail_ms;
+    let head_other = p.chain_head_ms - (p.precompile_ms + p.retire_ms + p.resident_ms);
+    let loop_other = p.scene_loop_ms - p.pass_wall_ms;
+    let pass_other = p.pass_wall_ms - (p.prepare_ms + p.upload_ms + p.pass_ms + p.negw_ms);
+    println!(
+        "timing: encode residual split - chain head {:.2} ms (cache sweeps {:.2} + frame scans \
+         {:.2} + rtt bookkeeping {:.2}, other {:.2}), scene loop {:.2} ms (of it {:.2} OUTSIDE the passes: \
+         RTT ensure/snapshot/depth-convert setup), passes {:.2} ms wall (clip verdict {:.2} ms \
+         over {} vertex programs INTERPRETED, other unnamed {:.2}: the dest-blend scan, \
+         summaries), chain tail {:.2} ms (diagnostics, display blit, resolve, texture flush); \
+         chain {:.2} ms of encode {:.2} ms, unplaced {:.2} ms",
+        p.chain_head_ms,
+        p.head_sweep_ms,
+        p.head_scan_ms,
+        p.head_rtt_ms,
+        head_other - (p.head_sweep_ms + p.head_scan_ms + p.head_rtt_ms),
+        p.scene_loop_ms,
+        loop_other,
+        p.pass_wall_ms,
+        p.negw_ms,
+        p.clip_measures,
+        pass_other,
+        p.chain_tail_ms,
+        chain,
+        split.encode_ms,
+        split.encode_ms - chain,
     );
     // ...and WHAT `build` did, in counts. The browser prints the same line from the same
     // counters, so "build costs 21 ms there and 1.6 ms here" can be answered by comparing
     // work instead of comparing two machines' clocks.
     let n = warm_render_ms.len().max(1) as u64;
-    println!("timing: {}", vitaslop_runtime::render::take_build_work().line(n));
+    // >>> AND THE SAME DIVISOR, BECAUSE `build work` HAD THE SAME BUG AND IT WAS WORSE:
+    // `take_build_work` is drained ONCE, here, so it holds every render of the run - the shot
+    // window, the cold render and the warm re-renders - and dividing by the warm re-renders
+    // alone inflated it exactly as `encode work` was inflated. The two lines are read against
+    // each other, so one being right and the other not is its own trap.
+    let frames = n + enc_window_frames;
+    println!("timing: {}", vitaslop_runtime::render::take_build_work().line(frames));
     // ...and what `encode` did, in the same units, for the same reason. `encode` is 84% of the
     // browser's render on a burst frame and the three phase timings do not say what is IN it -
     // upload volume and per-call boundary overhead live in the same phase and have opposite
     // fixes. The browser prints this identical line, which is what makes the two comparable.
     let mut enc = vitaslop_platform::gpu::take_encode_work();
     enc.add(enc_window);
-    println!("timing: {}", enc.line(n));
+    // The DIVISOR has to cover both halves - see `enc_window_frames`. `build work` above needs
+    // no such correction: `take_build_work` is not drained by the hiccup log, so what it holds
+    // is the warm re-renders only.
+    println!("timing: {}", enc.line(frames));
+    // ...and how much of that upload was the SAME BYTES as last frame - see
+    // `gpu::arena_repeat_probe`. Silent unless the probe is on.
+    let (repeated, total) = vitaslop_platform::gpu::take_arena_repeat();
+    if total > 0 {
+        println!(
+            "timing: arena upload repeat - {:.2} MB of {:.2} MB ({:.0}%) written into the geometry \
+             arenas was BYTE-IDENTICAL to what the same arena was given last frame, over {} \
+             render(s). A high share is geometry that should be RESIDENT and is being re-uploaded; \
+             a low one means residency cannot help here.",
+            repeated as f64 / (1024.0 * 1024.0),
+            total as f64 / (1024.0 * 1024.0),
+            100.0 * repeated as f64 / total as f64,
+            frames,
+        );
+    }
     // ...and inside `prepare`, which is most of `encode`, WHERE. Only when asked for: the split
     // reads a clock six times a draw, which is affordable here and is not in the browser.
     //
@@ -1101,6 +1451,52 @@ fn report_frame_timing(
     let prep = vitaslop_platform::gpu::take_prepare_split();
     if !prep.is_empty() {
         println!("timing: warm re-render {}", prep.line(n));
+        // >>> THE TWO INSTRUMENTS MUST AGREE, AND WHEN THEY DO NOT, SAY SO HERE.
+        //
+        // `encode phases`' `prepare_ms` is ONE stopwatch over the prepare loop, folded per pass
+        // into `chain_phases`. `PrepareSplit::total_ns` is the sum of a per-DRAW `Drop` guard
+        // inside the same function. A sum of parts CANNOT exceed the wall time of the loop that
+        // contains them, so a large ratio either way is an instrument defect, not a finding -
+        // and MEASURED on a baseball title's gameplay frame it is **10x** (`prepare 1.25 ms`
+        // against a split TOTAL of 13.50 ms for the same single render), with the draw counts
+        // disagreeing 3x alongside it (586 against 1797).
+        //
+        // That matters because `key` is 63-81% of the split and is the obvious thing to
+        // optimise next - and this area already contains one REFUTED optimisation that was
+        // aimed by a count instead of a phase (see the redundant-state note in `gpu.rs`). A
+        // phase table nobody can trust is how that mistake gets made twice, so the check rides
+        // beside the numbers rather than in a comment someone has to find.
+        let split_ms = prep.total_ns as f64 / n.max(1) as f64 / 1.0e6;
+        let loop_ms = p.prepare_ms;
+        let (hi, lo) = if split_ms > loop_ms { (split_ms, loop_ms) } else { (loop_ms, split_ms) };
+        if lo > 0.0 && hi / lo > 2.0 {
+            println!(
+                "timing: >>> PREPARE INSTRUMENTS DISAGREE {:.1}x - `encode phases` says {:.2} ms \
+                 over {} gxp draws, the per-draw split says {:.2} ms over {:.0} draws, for the \
+                 SAME renders. A sum of per-draw parts cannot exceed the wall time of the loop \
+                 around them. DO NOT rank phases off either number until this is settled; one \
+                 of the two is measuring a different span.",
+                hi / lo,
+                loop_ms,
+                p.gxp_draws,
+                split_ms,
+                prep.draws as f64 / n.max(1) as f64,
+            );
+        }
+    }
+    // >>> THE VERTEX INTERN'S TWO OUTCOMES, AND THE THIRD ONE THAT LOOKS LIKE THE SECOND.
+    //
+    // A hit hands the renderer the buffer it already holds, so every cache downstream keyed on
+    // identity hits too. A miss copies. A COLLISION is a miss on a key the index already held -
+    // two meshes whose 64-word fingerprints agree - and it evicts the other mesh, so both are
+    // copied every frame for ever while their contents never changed. Only the last one is a
+    // defect, and it is invisible in the other two. Needs `VITASLOP_PERF`.
+    if vitaslop_runtime::perf::enabled() {
+        let (_, hits, _) = vitaslop_runtime::perf::read(vitaslop_runtime::perf::Phase::DrawVertexInternHit);
+        let (_, coll, _) = vitaslop_runtime::perf::read(vitaslop_runtime::perf::Phase::DrawVertexInternCollide);
+        println!(
+            "timing: vertex intern - {hits} hit(s), {coll} MISS(es) on a key the index already              held (fingerprint collisions - each one costs both meshes their identity)"
+        );
     }
     println!("timing: {}", vitaslop_runtime::render::decode_by_format_line());
     let (bg_hit, bg_new) = vitaslop_platform::gpu::take_sampler_bg_counts();
@@ -1184,12 +1580,12 @@ pub fn headless_check(
         None => "built-in taps",
     }))? {
         true => println!(
-            "headless: STALL WATCHDOG armed at {} s - if no frame flips for that long the run              dumps what the guest is calling and stops with exit {}.",
+            "headless: STALL WATCHDOG armed at {} s - if no frame flips for that long the run dumps what the guest is calling and stops with exit {}.",
             vitaslop_native::watchdog::budget_secs()?.unwrap_or(0),
             vitaslop_native::watchdog::STALL_EXIT_CODE
         ),
         false => println!(
-            "headless: no stall watchdog (set VITASLOP_STALL_WATCHDOG=<seconds> to arm one;              without it a guest that spins hangs this run forever)."
+            "headless: no stall watchdog (set VITASLOP_STALL_WATCHDOG=<seconds> to arm one; without it a guest that spins hangs this run forever)."
         ),
     }
 
@@ -1244,6 +1640,35 @@ pub fn headless_check(
              so the window is empty and the run would silently write no shots"
         ));
     }
+    // >>> `VITASLOP_HEADLESS_RENDER_FROM=<frame>` - START RENDERING EARLIER THAN THE FIRST
+    // >>> WRITTEN SHOT, because a narrow window is not a faithful picture of this title.
+    //
+    // The window above bounds BOTH what is rendered and what is written, and that conflation
+    // has a measured cost. MEASURED on PCSA00002 (`hit1`, shots every 4 from f11280): every
+    // player model is BLOWN OUT white-yellow, and in a full replay of the same recipe the
+    // same batter is the grey-and-blue uniform the device shows. Nothing in the log says a
+    // layer is stale - the draw counts agree - because the thing that is missing is a
+    // 128x128 ambient probe atlas this title paints at a screen transition long before the
+    // window and reads back on the CPU every frame after it (see `apply_rtt_writebacks`).
+    // Render history IS state here, and starting it at the frame you want to look at throws
+    // that state away.
+    //
+    // Rendering from frame 0 always is not the answer either - that is the fifteen minutes a
+    // window exists to avoid. So: render from here, WRITE inside the window. Set it to 0 for
+    // a faithful dense sequence at one full-replay's render cost, and leave it unset (=
+    // `SHOT_FROM`) for the cheap rig, which is still right for anything that does not read a
+    // target painted before the window.
+    let render_from: u64 = std::env::var("VITASLOP_HEADLESS_RENDER_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(shot_from);
+    if render_from > shot_from {
+        return Err(format!(
+            "VITASLOP_HEADLESS_RENDER_FROM={render_from} is after \
+             VITASLOP_HEADLESS_SHOT_FROM={shot_from}, so the first shots would be written out \
+             of frames that were never rendered"
+        ));
+    }
     // `VITASLOP_CALLSITES_WINDOW=<from>-<to>`: clear the call-site histogram at display frame
     // `from` and print it at `to`, so the ranking describes those frames and not the boot.
     //
@@ -1279,10 +1704,21 @@ pub fn headless_check(
     // The idle attribution at the call-site window's open, so its close can print the
     // window's own figure - see `idle_attribution_since`.
     let mut idle_at_window_open: Vec<(vitaslop_runtime::host::IdleOwner, u64, u64)> = Vec::new();
-    let mut periodic: Option<vitaslop_native::GeneralRenderer> = None;
+    // Shared with the guest's `sceGxmEndScene` hook (below): a small render target a title
+    // reads on the CPU is completed there, on THIS renderer, so the probe sees the same cube
+    // and targets the frame render built. See `VitaState::complete_scene_now`.
+    let periodic_shared: std::sync::Arc<std::sync::Mutex<Option<vitaslop_native::GeneralRenderer>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     if shot_every > 0 {
         std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
-        periodic = Some(vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?);
+        *periodic_shared.lock().unwrap() =
+            Some(vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?);
+        let hook_renderer = periodic_shared.clone();
+        guest.install_complete_scene_hook(Box::new(move |scenes| {
+            let mut g = hook_renderer.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(r) = g.as_mut() else { return Vec::new() };
+            r.complete_scenes(scenes)
+        }));
     }
     let mut frame_ms: Vec<f64> = Vec::new();
     // >>> THE HICCUP LOG: per-frame `(frame, guest ms, render ms, scenes, draws)` for every
@@ -1300,6 +1736,12 @@ pub fn headless_check(
     // Outside the shot window nothing is rendered, so a row there would report a render cost of
     // zero and read as a guest-only frame. Only the window is logged.
     let mut hiccups: Vec<Hiccup> = Vec::new();
+    // The last reported heap figure and the frame it was taken on, so a jump can name the
+    // interval it happened in rather than only the frame it was noticed on.
+    let mut last_heap_mb = vitaslop_platform::heap::live_peak_mb().0;
+    let mut last_heap_frame = 0u64;
+    // The run peak already reported, so only a frame that RAISES it says so.
+    let mut last_peak_mb = vitaslop_platform::heap::live_peak_mb().1;
     // Encode counters folded up across the window's per-frame takes, so the run-total report
     // below still sees every one of them. `take_encode_work` RESETS, and the hiccup rows need
     // per-frame deltas, so the two readers have to cooperate rather than race.
@@ -1311,8 +1753,87 @@ pub fn headless_check(
     // its geometry, and this is the reader that sees that.
     let mut prep_total = vitaslop_platform::gpu::PrepareSplit::default();
     let mut prep_frames = 0u64;
-    while guest.frames() < target && !guest.finished() {
+    // The same counters over the window's STEADY frames only - see the drain site.
+    let mut prep_steady = vitaslop_platform::gpu::PrepareSplit::default();
+    let mut steady_frames = 0u64;
+    loop {
+        // >>> A PROCESS REPLACEMENT. The guest halted on `sceAppMgrLoadExec` of one of its own
+        // app's executables: boot that one in its place, with the same input and recipe, and
+        // keep going - the new process's frames count from zero, exactly as a new process's do.
+        if guest.finished()
+            && let Some(path) = guest.take_exec_request()
+        {
+            println!("headless: frame {}: the title exec'd {path} - booting it", guest.frames());
+            guest = RetailGuest::new_with_exec(&dir, input.clone(), recipe.as_deref(), Some(&path))?;
+            if let Some(root) = save_dir.as_deref() {
+                guest.persist_to(root, &dir)?;
+            }
+        }
+        if guest.frames() >= target || guest.finished() {
+            break;
+        }
         let f = guest.frames();
+        // >>> WHAT THE RUST HEAP HOLDS, EVERY 250 FRAMES, ALWAYS.
+        //
+        // The browser's own panel prints `memory_size(0)`, a page count that never falls, and on
+        // one title it read 68 MB for nine thousand frames and 3,412 MB thirty frames later -
+        // against wasm32's 4,096 MB ceiling. A page count cannot say what happened in those
+        // thirty frames. LIVE bytes can, because they come back down: a rise that falls is a
+        // working set and a rise that stays is a leak, and the PEAK beside it is what a wasm
+        // heap took pages for and can never return. This is the desktop reader of the same
+        // counters the panel now carries, so a residency A/B can be run here in a minute
+        // instead of on a phone. See `vitaslop_platform::heap`.
+        //
+        // Printed on a schedule AND on a JUMP: a 250-frame interval put two samples inside a
+        // 100-frame render window and read 270 MB then 2,481 MB, which says a step happened
+        // and nothing about where. A 64 MB move since the last line is the pathology this is
+        // looking for, so it reports itself.
+        {
+            let (live, peak) = vitaslop_platform::heap::live_peak_mb();
+            // >>> AND WHICH FRAME RAISED THE RUN'S PEAK. A peak that stands 2 GB above the
+            // largest LIVE figure ever printed is a WITHIN-FRAME transient, and a per-frame
+            // live sample cannot see one at all: it is allocated and freed between two prints.
+            // On wasm32 a transient costs the device its address space permanently, so it is
+            // worth exactly as much as a leak.
+            if peak > last_peak_mb {
+                println!(
+                    "headless: frame {f} | RUST HEAP PEAK raised to {peak} MB (live here is {live} MB - the difference is a transient INSIDE this frame)"
+                );
+                last_peak_mb = peak;
+            }
+            let jumped = live.abs_diff(last_heap_mb) >= 64;
+            if f % 250 == 0 || jumped {
+                println!(
+                    "headless: frame {f} | RUST HEAP live {live} MB, peak {peak} MB{}",
+                    if jumped { format!(" | JUMPED {} MB since frame {last_heap_frame}", live as i64 - last_heap_mb as i64) } else { String::new() },
+                );
+                // ...and WHAT is holding it, whenever the figure moved. The renderer's cache
+                // line is the browser panel's `RENDERER CACHES`, which the desktop never
+                // printed - so an unbounded cache could be found only from a device dump, on
+                // the one engine where a run costs a minute and the OS reports the process's
+                // working set.
+                // >>> ON THE SCHEDULE TOO, NOT ONLY ON A HEAP JUMP. The caches this line prices
+                // are mostly GPU objects, which the RUST heap cannot see at all: the recompiler's
+                // texture VIEW cache was measured on the user's device holding 343 MB of GPU
+                // texture behind a rust-heap figure that never moved, so the one trigger this
+                // line had could never fire for the cache it exists to watch.
+                if jumped || f % 250 == 0 {
+                    if let Some(r) = periodic_shared.lock().unwrap().as_ref() {
+                        println!("headless: frame {f} | {}", r.cache_sizes());
+                    }
+                    if jumped {
+                        println!("headless: frame {f} | snapshot caches: {}", vitaslop_runtime::host::snapshot_cache_report());
+                    }
+                }
+                // ...and WHO holds it, when the ledger is armed (`VITASLOP_HEAP_TRACE`): the
+                // named caches on one title summed to 200 MB under a 2,400 MB live figure.
+                for line in vitaslop_platform::heap::large_live_report(12) {
+                    println!("headless: frame {f} | heap holder: {line}");
+                }
+                last_heap_mb = live;
+                last_heap_frame = f;
+            }
+        }
         if let Some((from, to)) = callsite_window {
             if f == from {
                 vitaslop_runtime::vita::reset_call_sites();
@@ -1333,6 +1854,10 @@ pub fn headless_check(
             }
         }
         let in_shot_window = f >= shot_from && f <= shot_to;
+        // Rendering starts at `render_from` (= `shot_from` unless asked otherwise) and stops
+        // where the writes do: past `shot_to` nothing is looked at again, so the history has
+        // nobody left to serve.
+        let in_render_window = f >= render_from && f <= shot_to;
         // The size the guest declared for THIS frame. It is read per frame rather than once
         // because a title changes it: one front end presents 640x368 and its world 960x544,
         // through the same three buffers.
@@ -1360,16 +1885,22 @@ pub fn headless_check(
         // cost of being faithful. Outside the window nothing is rendered, exactly as before.
         let mut render_ms = 0.0f64;
         let mut frame_shape = (0usize, 0usize);
-        if let (Some(r), true) = (periodic.as_mut(), shot_every > 1 && in_shot_window && f % shot_every != 0) {
+        // Rendered pixels that have to reach GUEST memory, collected while the scenes are
+        // still borrowed and applied below once they are not.
+        let mut writeback: Vec<(u32, u32, u32, Vec<u8>)> = Vec::new();
+        let mut periodic = periodic_shared.lock().unwrap_or_else(|e| e.into_inner());
+        let writes_this_frame = shot_every > 0 && in_shot_window && f % shot_every == 0;
+        if let (Some(r), true) = (periodic.as_mut(), shot_every > 0 && in_render_window && !writes_this_frame) {
             let scenes = guest.current();
             if !scenes.is_empty() {
                 frame_shape = (scenes.len(), scenes.iter().map(|s| s.draws.len()).sum());
                 let t = std::time::Instant::now();
                 let _ = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
+                writeback = r.rtt_writebacks();
             }
         }
-        if let (Some(r), true) = (periodic.as_mut(), shot_every > 0 && in_shot_window && f % shot_every == 0) {
+        if let (Some(r), true) = (periodic.as_mut(), writes_this_frame) {
             let scenes = guest.current();
             // The frame's COMPOSITION, taken while the scenes are borrowed and printed below
             // with the clock. A frame that loses most of its picture from one flip to the next
@@ -1395,9 +1926,11 @@ pub fn headless_check(
                 .collect();
             frame_shape = (scene_count, draw_count);
             if !scenes.is_empty() {
+                vitaslop_runtime::capsule::maybe_write_frame(scenes, display.0, display.1, CLEAR, f as u64);
                 let t = std::time::Instant::now();
                 let fb = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
+                writeback = r.rtt_writebacks();
                 let path = shot_dir.join(format!("f{f:06}.png"));
                 // Written at PANEL size whatever the guest declared, so a shot sequence is
                 // comparable frame to frame and against the browser. `scaled_to` is a copy
@@ -1430,6 +1963,21 @@ pub fn headless_check(
                     .join(" "),
             );
         }
+        // The rendered pixels of any small render target go back to GUEST memory now, with the
+        // scenes no longer borrowed. A title that reads texels out of a target it drew - this
+        // one's ambient probe is a 128x128 grid it indexes on the CPU - otherwise reads its own
+        // allocator poison. See `vitaslop_native::apply_rtt_writebacks`.
+        // Released BEFORE the guest advances: the `sceGxmEndScene` hook takes this lock.
+        drop(periodic);
+        if !writeback.is_empty() {
+            let scenes = guest.current().to_vec();
+            vitaslop_native::apply_rtt_writebacks(
+                &writeback,
+                &scenes,
+                |a, n| guest.read_guest(a, n),
+                |a, b| guest.write_guest(a, b),
+            );
+        }
         if use_builtin_taps {
             let touch = taps
                 .iter()
@@ -1442,7 +1990,7 @@ pub fn headless_check(
             guest.advance();
             let guest_ms = t.elapsed().as_secs_f64() * 1000.0;
             frame_ms.push(guest_ms);
-            if in_shot_window && periodic.is_some() {
+            if in_shot_window && periodic_shared.lock().unwrap().is_some() {
                 // The encode counters THIS frame moved. A hitch with a pipeline build in it and
                 // a hitch with a megabyte of texture in it look identical in milliseconds and
                 // need different fixes, and neither is visible in a run total.
@@ -1460,7 +2008,22 @@ pub fn headless_check(
                     buffer_bytes: e.buffer_bytes,
                 });
                 enc_total.add(&e);
-                prep_total.add(&vitaslop_platform::gpu::take_prepare_split());
+                let ps = vitaslop_platform::gpu::take_prepare_split();
+                // >>> A FRAME THAT BUILT SOMETHING IS NOT A STEADY FRAME, AND THE MEAN CANNOT
+                // >>> SEE THE DIFFERENCE.
+                //
+                // `key`'s stopwatch spans the pipeline-cache lookup AND, on a miss, the BUILD -
+                // shader compile, `create_render_pipeline`, the lot. One frame of this window
+                // built 153 pipelines and cost 359 ms; averaged over 101 frames that alone is
+                // ~6 ms/frame of `key`, which is how a phase that costs a steady frame almost
+                // nothing came to be 61% of the table and the obvious thing to go and optimise.
+                // So the same counters are accumulated a SECOND time over the frames that built
+                // NOTHING, and that is the line to rank a steady gameplay frame off.
+                if e.pipelines_built == 0 && e.tex_uploaded == 0 {
+                    prep_steady.add(&ps);
+                    steady_frames += 1;
+                }
+                prep_total.add(&ps);
                 prep_frames += 1;
             }
         } else {
@@ -1482,8 +2045,24 @@ pub fn headless_check(
     // How many vblank wait loops were parked rather than spun through. Silent when none
     // were, which is the reading for a title that does not wait that way.
     vitaslop_runtime::host::report_vblank_spin_parks();
+    vitaslop_runtime::host::report_yield_elision();
     // What the NGS mix carried, and how much of it was audible.
     vitaslop_runtime::vita::at9::report_mix();
+    // >>> AND WHICH VERTEX PLAN EACH PIPELINE GOT. This census existed only as a BROWSER PANEL
+    // line, so the one host that can run every title in a batch could not read it - and the
+    // per-pipeline status lines beside it quote only the FIRST subject, so counting them
+    // answers nothing. Sizing "how many pipelines copy the guest's row rather than binding it"
+    // needed a browser session per title; it is one headless run now.
+    println!("timing: {}", vitaslop_platform::gpu::vertex_plan_census_line());
+    // >>> AND WHERE THE GUEST-CPU MILLISECONDS WENT, BY PHASE - see `perf::table`. Same gap as
+    // the census above: the counters are engine-agnostic and native times with `Instant`, but
+    // the only formatter was the browser's panel, so `VITASLOP_PERF=1` on a headless run
+    // printed nothing at all. Divide every row by its entry count before believing it.
+    for line in vitaslop_runtime::perf::table() {
+        println!("timing: phase {line}");
+    }
+    // >>> THE DEVICE BUDGET. See `report_device_budget`.
+    let device_budget_failed = report_device_budget();
     // Each guest memory space, and above all its allocs against its frees - a pool that only
     // ever fills is a release path this engine does not implement, and one that churns is the
     // title's own business. The warning on a failed allocation guesses between those two; this
@@ -1523,6 +2102,17 @@ pub fn headless_check(
     if let Some(e) = guest.error() {
         return Err(format!("guest error at frame {}: {e}", guest.frames()));
     }
+    // ...and AFTER it, because a guest fault is the more fundamental failure and reporting a
+    // budget breach instead of it would name the symptom over the cause. The report itself has
+    // already printed either way; this is only what makes the exit code carry it, which is the
+    // whole point of a gate. `VITASLOP_DEVICE_BUDGET=0` reports without failing, for a run
+    // deliberately taken over a known breach.
+    if device_budget_failed {
+        return Err("DEVICE BUDGET breached - see the panel above. This is a defect the user's \
+                    device would feel and this machine cannot time; the budget is on the SIZE \
+                    and the COUNT, which are the same on both."
+            .into());
+    }
     let scenes = guest.current().to_vec();
     if scenes.is_empty() {
         return Err("no scene captured".into());
@@ -1539,18 +2129,45 @@ pub fn headless_check(
         // texture; a steady frame does none of that. Reporting only the cold number would
         // overstate the per-frame cost by orders of magnitude, and reporting only the warm
         // one would hide a startup hitch users would actually feel.
+        // >>> DROP WHAT THE COLD RENDER AND THE POST-WINDOW FRAMES LEFT IN THE SPLIT.
+        //
+        // The counters are drained per frame INSIDE the shot window and nowhere else, so by
+        // here they hold the COLD render - 823 ms, 153 pipeline builds, every one of them
+        // inside `key`'s stopwatch - plus the handful of real frames after the window. Divided
+        // by the 60 warm samples that made `key` read 10.19 ms on a render whose whole encode
+        // is 1.53 ms, which is the 13.8x the instrument-disagreement check was firing on.
+        let _ = vitaslop_platform::gpu::take_prepare_split();
         let mut warm: Vec<f64> = Vec::new();
         for _ in 0..WARM_RENDER_SAMPLES {
             let t = std::time::Instant::now();
             let _ = renderer.render_frame(&scenes, display.0, display.1, CLEAR);
             warm.push(t.elapsed().as_secs_f64() * 1000.0);
         }
-        report_frame_timing(&frame_ms, cold_render_ms, &warm, renderer.last_split(), &enc_total);
+        report_frame_timing(
+            &frame_ms,
+            cold_render_ms,
+            &warm,
+            renderer.last_split(),
+            &enc_total,
+            prep_frames,
+        );
         report_hiccups(&hiccups);
+        // The GPU's own clock over the warm re-renders of the final frame, per pass.
+        println!("gpu time: {}", renderer.take_gpu_time_report());
         // Where `prepare` went, averaged over the WINDOW's real frames. `encode` is most of a
         // render and `prepare` is most of `encode`; this is the line that says what in it.
         if !prep_total.is_empty() {
             println!("hiccups: {}", prep_total.line(prep_frames));
+        }
+        // ...and the same window with the BUILDING frames taken out, which is the one to rank
+        // off. See the drain site for what a single building frame does to the mean.
+        if !prep_steady.is_empty() {
+            println!(
+                "hiccups: STEADY ({} of {} window frames built no pipeline and uploaded no                  texture) {}",
+                steady_frames,
+                prep_frames,
+                prep_steady.line(steady_frames)
+            );
         }
     }
     std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
@@ -1574,7 +2191,7 @@ pub fn headless_check(
     let clock_s = guest.clock_us() as f64 / 1e6;
     if let Some(why) = guest.ended_by() {
         println!(
-            "headless: the run ENDED BEFORE the frame target ({frames} of {target}): {why}.              That is the guest stopping, not the target being met - a deadlock, a thread              exiting or a round budget running out all land here."
+            "headless: the run ENDED BEFORE the frame target ({frames} of {target}): {why}. That is the guest stopping, not the target being met - a deadlock, a thread exiting or a round budget running out all land here."
         );
     }
     println!(
@@ -1608,6 +2225,22 @@ pub fn headless_check(
             vitaslop_runtime::host::QUANTUM_FUEL,
         );
     }
+    // >>> THE HOST-DECODER DELIVERY DIGEST, next to the fuel it can move.
+    //
+    // `numOfOutput` is drained from a HOST DECODER THREAD, so the count the guest is handed on
+    // any one call depends on how far that thread got in wall time - and the guest branches on
+    // it. Two runs of one recipe that disagree here have been told two different stories, and
+    // the fuel total above is then expected to differ for that reason and not for a change
+    // under test. It is the cheap first check on any two-run comparison of this title, because
+    // it disagrees the FIRST time the race resolves differently rather than only when the
+    // difference happens to survive to the end.
+    let (au, pics, calls, _) = vitaslop_runtime::vita::avcdec::movie_counters();
+    if calls > 0 {
+        println!(
+            "headless: movie delivery digest {:#018x} over {calls} calls ({au} access units, {pics} pictures). TWO RUNS OF ONE RECIPE MUST AGREE ON THIS.",
+            vitaslop_runtime::vita::avcdec::delivery_digest(),
+        );
+    }
     // The emitted work counter against wasmtime's own metering, over the same intervals.
     // Both engines preempt on that counter and the game clock is billed from it, and
     // nothing in a BROWSER run can say whether it agrees with a real engine - this is
@@ -1619,6 +2252,20 @@ pub fn headless_check(
             sw as f64 / wt.max(1) as f64,
         );
     }
+    // >>> WHICH GUEST INSTRUCTION MAKES THE HOST CALLS, when the profiler is armed.
+    //
+    // A phase that spends its frame in host calls says so in the per-NID tally, and the tally
+    // then says nothing about WHERE - a title's lock traffic is thousands of calls to one NID
+    // from a handful of call sites, and only the site names the loop to fix
+    // [[vitaslop-rank-the-loop-not-the-nid]]. `VITASLOP_DBG_CALLSITES=1` keys the count by
+    // (NID, guest return address); this is what prints it at the end of a headless run, which
+    // is the only place a recipe-pinned window can be read off.
+    if vitaslop_runtime::vita::callsite_profiling_on() {
+        vitaslop_runtime::vita::dump_call_sites(400);
+    }
+    // ...and how long each of those sleeps ASKED for, which is what decides how many of them
+    // a polling thread makes. See `vitaslop_runtime::vita::threadmgr::delay_census`.
+    vitaslop_runtime::vita::threadmgr::dump_delay_census(30);
     // Zero unless the engine suspended a fiber without running any of our code, which on
     // a build with the emitted work check should be impossible.
     let stray = vitaslop_native::threaded::unattributed_suspends();

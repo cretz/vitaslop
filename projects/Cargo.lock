@@ -3960,6 +3960,7 @@ version = "0.1.0"
 name = "vitaslop-conformance-harness"
 version = "0.1.0"
 dependencies = [
+ "tracing-subscriber",
  "vitaslop-conformance-suite-arm",
  "vitaslop-loader",
  "vitaslop-native",
@@ -4061,6 +4062,7 @@ dependencies = [
  "pollster 1.0.1",
  "tracing",
  "tracing-subscriber",
+ "vitaslop-gxp-shader",
  "vitaslop-loader",
  "vitaslop-platform",
  "vitaslop-runtime",
@@ -4074,6 +4076,7 @@ dependencies = [
 name = "vitaslop-platform"
 version = "0.1.0"
 dependencies = [
+ "js-sys",
  "tracing",
  "vitaslop-aac",
  "vitaslop-gxp-shader",
@@ -4105,6 +4108,8 @@ dependencies = [
  "yaxpeax-arch",
  "yaxpeax-arm",
  "zeno",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4688,8 +4693,6 @@ dependencies = [
 [[package]]
 name = "wgpu"
 version = "30.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d8f4bd44d92da5270f03409dba9f952dab24f128e05d6a554926101d1bf9114"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.0",
@@ -5285,7 +5288,7 @@ dependencies = [
 [[package]]
 name = "yaxpeax-arm"
 version = "0.4.0"
-source = "git+https://github.com/cretz/yaxpeax-arm?rev=e8fd10345a4dc9ba91efe2479d2db022e4607b9e#e8fd10345a4dc9ba91efe2479d2db022e4607b9e"
+source = "git+https://github.com/cretz/yaxpeax-arm?rev=57a5099a88647d981d611a6e5c5489a7fd0c70aa#57a5099a88647d981d611a6e5c5489a7fd0c70aa"
 dependencies = [
  "bitvec",
  "yaxpeax-arch",
@@ -5502,6 +5505,21 @@ checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
 dependencies = [
  "cc",
  "pkg-config",
+]
+
+[[package]]
+name = "zune-core"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
+
+[[package]]
+name = "zune-jpeg"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
+dependencies = [
+ "zune-core",
 ]
 
 [[package]]

@@ -226,7 +226,7 @@ impl WebVm {
         // Pull the guest handles the closures and accessors need; fill the cell.
         let memory = Reflect::get(&exports_obj, &JsValue::from_str(abi::MEMORY_EXPORT))?
             .dyn_into::<WebAssembly::Memory>()?;
-        let regs = read_globals::<{ abi::REG_COUNT }>(&exports_obj, |i| abi::reg_export(i))?;
+        let regs = read_globals::<{ abi::REG_COUNT }>(&exports_obj, abi::reg_export)?;
         let vfp = read_globals::<{ vitaslop_runtime::VFP_ARG_COUNT }>(&exports_obj, |i| {
             abi::vfp_s_export(i as u8)
         })?;

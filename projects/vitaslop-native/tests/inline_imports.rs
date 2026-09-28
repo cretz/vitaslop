@@ -117,6 +117,7 @@ fn vm_with(op: InlineOp) -> Vm {
             mem_bytes: MEM_BYTES,
             discover_code_pointers: false,
             import_memory: false,
+            host_off: 0,
         },
         &abi,
     )
@@ -617,6 +618,104 @@ fn store_arg_run_without_stack_words_ignores_sp() {
     assert_eq!(vm.get_reg(0), 0);
 }
 
+/// A small synthetic [`SetAllUniformBuffersLayout`]: a 3-word table two words into the
+/// block, behind a struct magic. The runtime's own layout is pinned against its handler in
+/// the runtime crate; these prove the EMITTER computes any layout, and that every guard
+/// sends its case to the host.
+fn set_all_layout() -> vitaslop_transpiler::SetAllUniformBuffersLayout {
+    vitaslop_transpiler::SetAllUniformBuffersLayout {
+        st_magic_at: 0,
+        st_magic: 0x57A7_E002,
+        st_block_at: 4,
+        table_at: 8,
+        bytes: 12,
+    }
+}
+
+/// Seed the SetAll fixture: the state struct at `ST_PTR` (magic, block), the arrays block
+/// at `BLK_PTR` under sentinels (six words), and the source table at `OUT_PTR`.
+fn seed_set_all(vm: &mut Vm, st_magic: u32, block: u32) {
+    let st: [u32; 2] = [st_magic, block];
+    let bytes: Vec<u8> = st.iter().flat_map(|w| w.to_le_bytes()).collect();
+    vm.write_mem(ST_PTR, &bytes).expect("state struct");
+    for i in 0..6u32 {
+        vm.write_mem(BLK_PTR + i * 4, &(SENTINEL_BASE | i).to_le_bytes()).expect("block sentinel");
+    }
+    let src: [u32; 3] = [0x0B10_D001, 0x0B10_D002, 0x0B10_D003];
+    let bytes: Vec<u8> = src.iter().flat_map(|w| w.to_le_bytes()).collect();
+    vm.write_mem(OUT_PTR, &bytes).expect("source table");
+    vm.set_reg(0, ST_PTR);
+    vm.set_reg(1, OUT_PTR);
+}
+
+fn block_word(vm: &mut Vm, i: u32) -> u32 {
+    let b = vm.read_mem(BLK_PTR + i * 4, 4).expect("read back");
+    u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"))
+}
+
+#[test]
+fn set_all_uniform_buffers_copies_the_table_into_the_block() {
+    let l = set_all_layout();
+    let mut vm = vm_with(InlineOp::SetAllUniformBuffers { layout: l });
+    seed_set_all(&mut vm, l.st_magic, BLK_PTR);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "the struct is stamped and has a block - the inline arm must serve this");
+    // The table lands at `table_at`, all three words; the words either side of it keep
+    // their sentinels, so a copy that is long or lands one slot over cannot pass.
+    assert_eq!(block_word(&mut vm, 0), SENTINEL_BASE, "before the table");
+    assert_eq!(block_word(&mut vm, 1), SENTINEL_BASE | 1, "before the table");
+    assert_eq!(block_word(&mut vm, 2), 0x0B10_D001, "table word 0");
+    assert_eq!(block_word(&mut vm, 3), 0x0B10_D002, "table word 1");
+    assert_eq!(block_word(&mut vm, 4), 0x0B10_D003, "table word 2");
+    assert_eq!(block_word(&mut vm, 5), SENTINEL_BASE | 5, "after the table");
+    assert_eq!(vm.get_reg(0), 0, "the call returns the handler's success code");
+}
+
+#[test]
+fn set_all_uniform_buffers_falls_back_on_an_unstamped_struct() {
+    let l = set_all_layout();
+    let mut vm = vm_with(InlineOp::SetAllUniformBuffers { layout: l });
+    seed_set_all(&mut vm, l.st_magic ^ 1, BLK_PTR);
+    assert!(run(&mut vm), "an unstamped struct is the handler's case - it allocates");
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+    for i in 0..6u32 {
+        assert_eq!(block_word(&mut vm, i), SENTINEL_BASE | i, "nothing written inline");
+    }
+}
+
+#[test]
+fn set_all_uniform_buffers_falls_back_on_a_blockless_struct() {
+    let l = set_all_layout();
+    let mut vm = vm_with(InlineOp::SetAllUniformBuffers { layout: l });
+    seed_set_all(&mut vm, l.st_magic, 0);
+    assert!(run(&mut vm), "a stamped struct with no block is the handler's case");
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+}
+
+#[test]
+fn set_all_uniform_buffers_falls_back_when_the_array_runs_past_memory() {
+    let l = set_all_layout();
+    let mut vm = vm_with(InlineOp::SetAllUniformBuffers { layout: l });
+    seed_set_all(&mut vm, l.st_magic, BLK_PTR);
+    // Two words left in memory, three asked for: the handler reads the tail as zeros, and
+    // the inline form must hand it that case rather than trap on the load.
+    vm.set_reg(1, BASE + MEM_BYTES - 8);
+    assert!(run(&mut vm), "a short tail is the handler's case");
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+    for i in 0..6u32 {
+        assert_eq!(block_word(&mut vm, i), SENTINEL_BASE | i, "nothing written inline");
+    }
+    // ...and exactly enough left is the inline arm.
+    let mut vm = vm_with(InlineOp::SetAllUniformBuffers { layout: l });
+    seed_set_all(&mut vm, l.st_magic, BLK_PTR);
+    let src: [u32; 3] = [0x0B10_D001, 0x0B10_D002, 0x0B10_D003];
+    let bytes: Vec<u8> = src.iter().flat_map(|w| w.to_le_bytes()).collect();
+    vm.write_mem(BASE + MEM_BYTES - 12, &bytes).expect("source at the very end");
+    vm.set_reg(1, BASE + MEM_BYTES - 12);
+    assert!(!run(&mut vm), "the last admissible pointer is served inline");
+    assert_eq!(block_word(&mut vm, 4), 0x0B10_D003, "table word 2");
+}
+
 /// A small synthetic [`BindStateLayout`]: a 3-word copy, magic checks on both structures,
 /// and the program-handle store on. The runtime's own layout is pinned against its
 /// handlers in the runtime crate; this test proves the EMITTER computes any layout.
@@ -807,6 +906,30 @@ fn bind_state_null_state_zeroes_the_vertex_shape() {
     assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
 }
 
+/// Under the PER-SLOT copy the vertex null arm must leave the TABLE alone and zero only the
+/// record, because that is what its handler does: it copies an all-zero table slot by slot,
+/// skipping every empty slot, and so writes nothing. Clearing the table here erased the direct
+/// `sceGxmSetVertexUniformBuffer` bindings of every draw that followed an unbind - a football
+/// title dropped them all on the inlined build and none with the imports not inlined.
+#[test]
+fn bind_state_null_state_keeps_the_per_slot_vertex_table() {
+    let l = vitaslop_transpiler::BindStateLayout { has_prog: false, ..bind_layout_per_slot() };
+    let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+    seed_bind(&mut vm, l.ctx_magic, l.st_magic);
+    vm.set_reg(1, 0);
+    assert!(!run(&mut vm), "the null unbind must not reach the host");
+    for i in 1..8u32 {
+        let b = vm.read_mem(OUT_PTR + i * 4, 4).expect("read back");
+        let got = u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"));
+        if (1..=3).contains(&i) {
+            assert_eq!(got, 0, "word {i} is the record and must be ZERO");
+        } else {
+            assert_eq!(got, SENTINEL_BASE | i, "word {i} (table or beyond) must be untouched");
+        }
+    }
+    assert_eq!(vm.get_reg(0), 0);
+}
+
 /// An indexed form's POINTER guard must be computed against its LAST element, not its
 /// first. A pointer that leaves room for element 0 but not element `count - 1` passes a
 /// first-element bound and then stores past the end of linear memory on a high index -
@@ -980,6 +1103,132 @@ fn check_lw(lock: bool, before: State, ptr: u32, count_arg: u32, thid: i32) {
         let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
         assert_eq!(got, SENTINEL_BASE | i, "word {i} past the state must be UNTOUCHED: {what}");
     }
+}
+
+/// A kernel mutex's SceUID for these cases, and one that maps to the SAME table entry.
+///
+/// `KM_OTHER_UID` is `KM_UID + kmutex::ENTRIES`, so the mask sends both to one entry - which
+/// is the collision case the `id == r0` term exists for, and the one thing about the kernel
+/// form that the lightweight one cannot be asked.
+const KM_UID: i32 = 0x0000_2A11;
+const KM_OTHER_UID: i32 = KM_UID + vitaslop_runtime::vita::kmutex::ENTRIES as i32;
+
+/// The mutex-table entry `uid` indexes, as a guest address inside the mirror block.
+fn km_entry(vm: &Vm, uid: i32) -> u32 {
+    use vitaslop_runtime::vita::{kmutex, mirror};
+    let base = BASE + vm.mirror_off().expect("a mirror op reserves the block") as u32;
+    kmutex::entry_addr(base + mirror::SLOT_MUTEX_TABLE * 4, uid)
+}
+
+/// Run one kernel lock-or-unlock case through the emitted code and hold it to the SAME
+/// definition the lightweight form is held to.
+///
+/// The two emitted forms share their body (`emit_lock_take`), so what is under test here is
+/// what differs: the entry a uid indexes, and the `id == r0` term that decides whether that
+/// entry is this mutex's at all. `uid_arg` is what the guest passes in r0; `entry_id` is the
+/// uid the ENTRY names, which is the same one on the ordinary path and a different one on the
+/// collision path.
+fn check_km(lock: bool, before: State, uid_arg: i32, entry_id: i32, count_arg: u32, thid: i32) {
+    use vitaslop_runtime::vita::{kmutex, mirror};
+    let op = if lock {
+        InlineOp::KernelMutexLock {
+            layout: kmutex::layout(),
+            thread_slot: 3,
+            table_slot: mirror::SLOT_MUTEX_TABLE,
+            entries: kmutex::ENTRIES,
+        }
+    } else {
+        InlineOp::KernelMutexUnlock {
+            layout: kmutex::layout(),
+            thread_slot: 3,
+            table_slot: mirror::SLOT_MUTEX_TABLE,
+            entries: kmutex::ENTRIES,
+        }
+    };
+    let mut vm = vm_with(op);
+    let entry = km_entry(&vm, uid_arg);
+    // The entry's own id is the state's `id` field, so the collision case is expressed by
+    // seeding it with the OTHER uid.
+    let before = State { id: entry_id as u32, ..before };
+
+    // What the definition says should happen, replayed on a plain word map at that entry.
+    let mut expect = Words::default();
+    before.write(&mut expect, entry);
+    let taken = if lock {
+        kmutex::fast_lock(&mut expect, entry, uid_arg, thid, count_arg)
+    } else {
+        kmutex::fast_unlock(&mut expect, entry, uid_arg, thid, count_arg)
+    };
+
+    before.write_vm(&mut vm, entry);
+    write_mirror(&mut vm, &[0, 0, 0, thid as u32]);
+    vm.set_reg(0, uid_arg as u32);
+    vm.set_reg(1, count_arg);
+    let crossed = run(&mut vm);
+
+    let what = format!(
+        "{} {before:?} uid={uid_arg:#x} entry_id={entry_id:#x} n={count_arg} thid={thid}",
+        if lock { "lock" } else { "unlock" }
+    );
+    assert_eq!(crossed, !taken, "crossing disagrees with the definition: {what}");
+    let after = State::read_vm(&mut vm, entry);
+    if taken {
+        assert_eq!(vm.get_reg(0), 0, "a served call returns success: {what}");
+        let want = State::read(&expect, entry);
+        assert_eq!(after.owner, want.owner, "owner: {what}");
+        assert_eq!(after.count, want.count, "count: {what}");
+        assert_eq!(after.waiters, want.waiters, "waiters: {what}");
+    } else {
+        assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "the handler answers: {what}");
+        assert_eq!(after.owner, before.owner, "owner: {what}");
+        assert_eq!(after.count, before.count, "count: {what}");
+        assert_eq!(after.waiters, before.waiters, "waiters: {what}");
+    }
+    assert_eq!(after.id, before.id, "no arm may rewrite the entry's id: {what}");
+}
+
+/// The kernel take, over every shape of entry, against the same definition.
+#[test]
+fn kernel_mutex_lock_matches_the_lock_definition_on_every_arm() {
+    for &before in &[
+        State::free(),
+        State { owner: OTHER, ..State::free() },
+        State::held_by(CUR, 1),
+        State::held_by(CUR, 5),
+        State::held_by(OTHER, 1),
+        State { waiters: 1, ..State::free() },
+    ] {
+        check_km(true, before, KM_UID, KM_UID, 1, CUR);
+    }
+    // A count other than one is the handler's, exactly as it is for the lightweight form.
+    check_km(true, State::free(), KM_UID, KM_UID, 2, CUR);
+}
+
+#[test]
+fn kernel_mutex_unlock_matches_the_unlock_definition_on_every_arm() {
+    for &before in &[
+        State::held_by(CUR, 1),
+        State::held_by(CUR, 3),
+        State::free(),
+        State::held_by(OTHER, 1),
+        State { waiters: 1, ..State::held_by(CUR, 1) },
+    ] {
+        check_km(false, before, KM_UID, KM_UID, 1, CUR);
+    }
+}
+
+/// >>> A UID THAT COLLIDES WITH ANOTHER MUTEX'S ENTRY MUST REACH THE HANDLER.
+///
+/// The table is indexed by `uid & (ENTRIES - 1)`, so two live mutexes can name one entry. The
+/// newcomer is refused an entry at create and keeps its state on the host - and this is the
+/// emitted half of that contract: an entry whose id is not the uid in r0 is somebody else's,
+/// and touching it would let one mutex take and release another's lock with nothing to say so.
+#[test]
+fn a_kernel_mutex_whose_entry_belongs_to_another_uid_reaches_the_handler() {
+    check_km(true, State::free(), KM_UID, KM_OTHER_UID, 1, CUR);
+    check_km(false, State::held_by(CUR, 1), KM_UID, KM_OTHER_UID, 1, CUR);
+    // ...and an entry that was never claimed (id zero) is nobody's.
+    check_km(true, State::free(), KM_UID, 0, 1, CUR);
 }
 
 /// The take, over every shape of work area, against the definition.
@@ -1971,4 +2220,65 @@ fn the_register_accessors_round_trip() {
     vm.set_reg(1, 0x5A5A_5A5A);
     assert_eq!(vm.get_reg(1), 0x5A5A_5A5A);
     assert!(abi::REG_COUNT > 1, "r1 exists");
+}
+
+/// The ELIDED YIELD, all four arms - see [`InlineOp::DelayYield`].
+///
+/// The op answers a `sceKernelDelayThread(<=1)` in guest code when the mirror says nobody
+/// is runnable and the run is under its cap, and falls through to the import for everything
+/// else. Each arm is invisible from the others: an elide that should have crossed defers a
+/// runnable thread's turn, and a crossing that should have been elided is the cost this op
+/// exists to remove.
+#[test]
+fn a_yield_with_nobody_to_yield_to_is_elided_in_guest_code() {
+    let op = InlineOp::DelayYield { free_slot: 0, run_slot: 1, cap: 256 };
+    let mut vm = vm_with(op);
+    write_mirror(&mut vm, &[1, 7]);
+    vm.set_reg(0, 1);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "a yield with the free word set never reaches the host");
+    assert_eq!(vm.get_reg(0), 0, "and it returns the success code");
+    let off = vm.mirror_off().expect("a mirror op reserves the block") as u32;
+    let run_word = vm.read_mem(BASE + off + 4, 4).expect("the run word is in memory");
+    assert_eq!(
+        u32::from_le_bytes(run_word.try_into().expect("4 bytes")),
+        8,
+        "one elided yield adds exactly one to the run"
+    );
+}
+
+#[test]
+fn a_yield_with_somewhere_to_go_reaches_the_handler() {
+    let op = InlineOp::DelayYield { free_slot: 0, run_slot: 1, cap: 256 };
+    let mut vm = vm_with(op);
+    write_mirror(&mut vm, &[0, 0]);
+    vm.set_reg(0, 0);
+    let crossed = run(&mut vm);
+    assert!(crossed, "a yield with the free word clear must reach the host");
+    assert_eq!(selectors(&vm), vec![0], "as the import's own index");
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "and the handler's answer stands");
+}
+
+#[test]
+fn a_real_sleep_reaches_the_handler_whatever_the_mirror_says() {
+    let op = InlineOp::DelayYield { free_slot: 0, run_slot: 1, cap: 256 };
+    let mut vm = vm_with(op);
+    write_mirror(&mut vm, &[1, 0]);
+    vm.set_reg(0, 2000);
+    let crossed = run(&mut vm);
+    assert!(crossed, "a 2 ms sleep is not a yield and must reach the host");
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+}
+
+#[test]
+fn an_elided_run_at_its_cap_reaches_the_handler() {
+    let op = InlineOp::DelayYield { free_slot: 0, run_slot: 1, cap: 256 };
+    let mut vm = vm_with(op);
+    write_mirror(&mut vm, &[1, 256]);
+    vm.set_reg(0, 1);
+    let crossed = run(&mut vm);
+    assert!(crossed, "the yield that would exceed the cap must reach the host");
+    let off = vm.mirror_off().expect("a mirror op reserves the block") as u32;
+    let run_word = vm.read_mem(BASE + off + 4, 4).expect("the run word is in memory");
+    assert_eq!(u32::from_le_bytes(run_word.try_into().expect("4 bytes")), 256, "and the run is left as it was");
 }

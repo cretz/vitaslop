@@ -2,7 +2,7 @@
 //! queue callback (deferred), but a direct call is also supported: it records the
 //! presented framebuffer address.
 
-use crate::host::{GuestCtx, VitaState};
+use crate::host::{GuestCtx, Ptr, VitaState};
 use crate::hostcall;
 use crate::SvcOutcome;
 
@@ -153,6 +153,20 @@ pub(super) fn get_vcount(st: &mut VitaState) -> u32 {
     vcount(st)
 }
 
+/// int sceDisplayGetRefreshRate(float *pFps)
+///
+/// The rate of the vblank grid this engine's clock runs - one edge every [`VBLANK_US`] -
+/// rather than the panel's nominal 59.94 Hz: a title that derives its frame time from this
+/// and then counts vblanks with `sceDisplayGetVcount` must see the two agree, and they are
+/// both this one grid here.
+pub(super) fn get_refresh_rate(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let out = ctx.arg(0);
+    if out != 0 {
+        ctx.write_u32(out, (1_000_000.0f32 / VBLANK_US as f32).to_bits());
+    }
+    ctx.ret(0);
+}
+
 /// The vblank counter the display has reached: the virtual clock in units of one
 /// vblank period.
 ///
@@ -220,11 +234,11 @@ fn report_geometry_once(pitch: u32, fmt: u32, w: u32, h: u32) {
     let note = if w == crate::host::VitaState::PANEL_W && h == crate::host::VitaState::PANEL_H {
         "the full panel, so nothing is scaled"
     } else {
-        "NOT THE PANEL - the display controller stretches this onto 960x544, so the frame is          rendered at this size and scaled up to present. Everything in it, text included,          carries only this much detail"
+        "NOT THE PANEL - the display controller stretches this onto 960x544, so the frame is rendered at this size and scaled up to present. Everything in it, text included, carries only this much detail"
     };
     tracing::info!(
         target: "vitaslop::status",
-        "display: sceDisplaySetFrameBuf declares a {w}x{h} buffer (pitch {pitch}, format          {fmt:#x}) - {note}."
+        "display: sceDisplaySetFrameBuf declares a {w}x{h} buffer (pitch {pitch}, format {fmt:#x}) - {note}."
     );
 }
 
@@ -282,7 +296,62 @@ pub(super) fn set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr, 
         "set frame buf"
     );
     if base != 0 {
+        st.flip_candidates.insert(base);
+        // The flip is the latest moment the GPU can still be reading this frame's buffers.
+        st.resolve_at_flip(ctx);
         st.present(base);
+    }
+    // Kept whole so `sceDisplayGetFrameBuf` can report the scanout: the `pitch` and `fmt`
+    // words exist nowhere else in this engine, and the only truthful source for what the
+    // display controller holds is what the guest just handed it.
+    st.set_display_frame_buf([
+        ctx.read_u32(param.addr()),
+        base,
+        ctx.read_u32(param.addr() + 8),
+        ctx.read_u32(param.addr() + 12),
+        ctx.read_u32(param.addr() + 16),
+        ctx.read_u32(param.addr() + 20),
+    ]);
+    0
+}
+
+/// `SCE_DISPLAY_ERROR_INVALID_ADDR`: the error for a null struct pointer
+/// (`psp2common/display.h`).
+const SCE_DISPLAY_ERROR_INVALID_ADDR: i32 = 0x8029_0002u32 as i32;
+
+/// int sceDisplayGetFrameBuf(SceDisplayFrameBuf *pParam, SceDisplaySetBufSync sync)
+///
+/// Reads back the six-word struct the last [`set_frame_buf`] declared. A title calls it to
+/// recover the scanout it is presenting into - its size, its pitch and its address - usually
+/// so a screenshot or an overlay can write into the same buffer.
+///
+/// **Before the guest has set one, this reports the buffer as BLACKED OUT** (`base` null,
+/// every other field zero) rather than inventing a panel-sized buffer. There is no shell
+/// here, so nothing owns the scanout until the title does; a fabricated address would be one
+/// a caller could write through, and 960x544 with a null base is a shape that reads as real.
+/// `sceDisplaySetFrameBuf` documents null as exactly this state, so it is a state the API
+/// already describes rather than one invented for the answer.
+///
+/// `sync` selects WHICH buffer a real display reports - the one being scanned out or the one
+/// queued - and this engine has one: the queue is drained at the flip
+/// (`sceGxmDisplayQueueAddEntry`), so the set that was made is the set that is live.
+#[hostcall]
+pub(super) fn get_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr, _sync: i32) -> i32 {
+    // The null check wants an early exit, which a `#[hostcall]` body cannot have.
+    get_frame_buf_impl(ctx, st, param)
+}
+
+fn get_frame_buf_impl(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr) -> i32 {
+    if param.is_null() {
+        return SCE_DISPLAY_ERROR_INVALID_ADDR;
+    }
+    let fb = st.display_frame_buf().unwrap_or([0; 6]);
+    // Word 0 is `size`, which the CALLER fills in - it is the struct-version field the
+    // library reads to know how much it may write. Overwriting it with the size a previous
+    // set declared would hand the caller back somebody else's version number, so the five
+    // fields the library actually reports start at word 1.
+    for (i, w) in fb.iter().enumerate().skip(1) {
+        ctx.write_u32(param.addr() + i as u32 * 4, *w);
     }
     0
 }

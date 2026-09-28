@@ -68,7 +68,9 @@ pub(super) fn voice_unlock_params(ctx: &mut GuestCtx, st: &mut VitaState) {
             // these turned out to carry the master level, and it was identified from
             // exactly this report.
             let id = ctx.read_u32(addr);
-            let bytes = ctx.read_bytes(addr, 48);
+            // Onto the stack, not a `Vec`: this runs per params write (millions in a race).
+            let mut bytes = [0u8; 48];
+            ctx.read_into(addr, &mut bytes);
             tracing::debug!(
                 target: "vitaslop::at9",
                 voice = format_args!("{voice:#x}"),
@@ -80,7 +82,7 @@ pub(super) fn voice_unlock_params(ctx: &mut GuestCtx, st: &mut VitaState) {
             // one per write (millions in a race) and off by default, so the shape of what is
             // missing was only ever visible to whoever thought to turn it on.
             let is_buss = st.audio_state.at9.is_buss(voice);
-            crate::vita::at9::note_unknown_module(id, module, is_buss, bytes);
+            crate::vita::at9::note_unknown_module(id, module, is_buss, &bytes);
         }
     }
     ctx.ret(0);
@@ -89,8 +91,55 @@ pub(super) fn voice_unlock_params(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// SceInt32 sceNgsVoicePlay(SceNgsHVoice voice) - begin decoding this voice's AT9.
 pub(super) fn voice_play(ctx: &mut GuestCtx, st: &mut VitaState) {
     let voice = ctx.arg(0);
+    let silent_before = super::at9::voices_no_source();
     st.audio_state.at9.play(voice);
+    if super::at9::voices_no_source() > silent_before {
+        report_silent_play(st, voice);
+    }
     ctx.ret(0);
+}
+
+/// Record one `sceNgsVoice*` call against the voice it names (argument 0) - see
+/// `AudioState::ngs_voice_calls`.
+pub(super) fn trace_voice_call(st: &mut VitaState, nid: u32, args: [u32; 4]) {
+    let calls = &mut st.audio_state.ngs_voice_calls;
+    if !calls.contains_key(&args[0]) && calls.len() >= 1024 {
+        return;
+    }
+    let v = calls.entry(args[0]).or_default();
+    if v.len() < 24 {
+        v.push((nid, args));
+    }
+}
+
+/// >>> A PLAY ON A VOICE WITH NO SOURCE, EXPLAINED BY EVERYTHING THE TITLE DID TO THAT VOICE.
+///
+/// The panel's `ngs silent voices` count says HOW MANY plays decode nothing; it cannot say why,
+/// and a title's audio path is a sequence of calls on the handle - lock/write/unlock, a params
+/// block, a module callback, a rack it came from. Printing the whole sequence for the first few
+/// silent plays names the path the source should have arrived by, in one run, rather than one
+/// hypothesis per run. Bounded to eight voices.
+fn report_silent_play(st: &mut VitaState, voice: u32) {
+    let a = &mut st.audio_state;
+    if a.ngs_silent_reported >= 8 {
+        return;
+    }
+    a.ngs_silent_reported += 1;
+    let rack = a.ngs_voice_handles.iter().find(|(_, v)| *v == voice).map(|(k, _)| *k);
+    let calls: Vec<String> = a
+        .ngs_voice_calls
+        .get(&voice)
+        .map(|v| {
+            v.iter()
+                .map(|(nid, g)| format!("{}({:#x},{:#x},{:#x},{:#x})", crate::nid::name(*nid), g[0], g[1], g[2], g[3]))
+                .collect()
+        })
+        .unwrap_or_default();
+    tracing::warn!(
+        target: "vitaslop::audio",
+        "ngs SILENT PLAY on voice {voice:#x} (rack, index) = {rack:x?}: the title's calls on this handle, oldest first: {}",
+        if calls.is_empty() { "NONE".to_string() } else { calls.join(" -> ") }
+    );
 }
 
 /// SceInt32 sceNgsVoiceInit(SceNgsHVoice voice, const SceNgsVoicePreset *preset,
@@ -405,7 +454,9 @@ pub(super) fn rack_init(ctx: &mut GuestCtx, st: &mut VitaState, _system: u32, ra
 pub(super) fn rack_get_voice_handle(ctx: &mut GuestCtx, st: &mut VitaState, rack: u32, index: u32, handle: Ptr) -> i32 {
     // The A/B arm: `VITASLOP_NGS_VOICE_HANDLE_MEMO=0` restores the fresh-handle-per-call
     // behaviour, which is the one way to put a number on what it costs on any title.
-    let memo = !matches!(crate::knobs::var("VITASLOP_NGS_VOICE_HANDLE_MEMO").as_deref(), Ok("0"));
+    // Cached: asked per call.
+    static MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let memo = *MEMO.get_or_init(|| !matches!(crate::knobs::var("VITASLOP_NGS_VOICE_HANDLE_MEMO").as_deref(), Ok("0")));
     let found = if memo {
         st.audio_state.ngs_voice_handles.iter().find(|(k, _)| *k == (rack, index)).copied()
     } else {
@@ -427,12 +478,59 @@ pub(super) fn rack_get_voice_handle(ctx: &mut GuestCtx, st: &mut VitaState, rack
 
 /// SceInt32 sceNgsVoiceGetStateData(SceNgsHVoice voice, SceUInt32 moduleId,
 ///                                  void *data, SceUInt32 dataSize)
-/// Report an all-zero state: voice available / not playing. A title polling for a
-/// sound to finish sees "done" and proceeds rather than waiting forever.
+///
+/// Zero for every field except the PLAYER's read position, which is the one field a title
+/// has been seen to read - and returning zero for THAT is a streaming title that never
+/// streams.
+///
+/// >>> THE EVIDENCE, off the calling code (one title's audio middleware, `lr=0x816e458b`).
+/// It calls this with `moduleId = 0` (the player) and `dataSize = 0x18`, tests the return
+/// code, and then reads the state buffer EXACTLY ONCE, at offset 0:
+///
+/// ```text
+///   ldr.w r0, [r5, 0x268]   ; the voice handle
+///   movs  r1, 0             ; module 0 - the source player
+///   add   r2, sp, 0         ; the 24-byte state buffer
+///   movs  r3, 0x18
+///   blx.w sceNgsVoiceGetStateData
+///   ...
+///   ldr   r0, [sp]          ; state word 0, and nothing else
+///   ...                     ; zero-extend to 64 bits, multiply by 8,
+///   bl    <64-bit divide>   ; divide by the format's bits per sample
+/// ```
+///
+/// `bytes * 8 / bits_per_sample` is a SAMPLE position, so word 0 is a BYTE position - and
+/// the caller polls it about ten times a displayed frame to decide how much of its ring it
+/// may refill. Held at zero, it concludes nothing has been consumed, never writes, and the
+/// ring it handed NGS stays the silence it was allocated as. That is what made one title
+/// silent from its splash movie onwards, with a voice that was playing correctly the whole
+/// time. [[vitaslop-a-fallback-must-report]] does not apply to a value: there is nothing to
+/// warn about here, only a number to get right.
+///
+/// The OTHER fields stay zero because nothing has been observed reading them, and a
+/// plausible-looking number in a field this engine cannot check is worse than a zero: it
+/// cannot be told from a measurement later.
 #[hostcall]
-pub(super) fn voice_get_state_data(ctx: &mut GuestCtx, _st: &mut VitaState, _voice: u32, _module: u32, data: Ptr, size: u32) -> i32 {
+pub(super) fn voice_get_state_data(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, module: u32, data: Ptr, size: u32) -> i32 {
     if data.addr() != 0 && size != 0 {
         ctx.write_bytes(data.addr(), &vec![0u8; size as usize]);
+        // The whole state block, not just the byte position - see `At9::state_words` for
+        // the streamer that reads word 3 before it queues anything.
+        if module == NGS_PLAYER_MODULE
+            && let Some(words) = st.audio_state.at9.state_words(voice)
+        {
+            for (i, w) in words.iter().enumerate() {
+                if (i as u32 + 1) * 4 <= size {
+                    ctx.write_u32(data.addr() + i as u32 * 4, *w);
+                }
+            }
+            tracing::trace!(
+                target: "vitaslop::ngs",
+                voice = format_args!("{voice:#x}"),
+                lr = format_args!("{:#010x}", ctx.regs[14]),
+                "player state words {words:?}"
+            );
+        }
     }
     0
 }
@@ -565,6 +663,41 @@ pub(super) fn patch_create_routing(ctx: &mut GuestCtx, st: &mut VitaState, info:
     0
 }
 
+/// SceInt32 sceNgsVoiceGetOutputPatch(SceNgsHVoice voice, SceInt32 index, SceNgsHPatch *patch)
+///
+/// The reverse of [`patch_create_routing`]: which patch carries this voice's `index`-th
+/// output. `ngs_patch_voice` already records `(patch, source voice)` for every routing the
+/// title created, in creation order, so the answer is the `index`-th entry whose source is
+/// this voice. No such output writes a NULL handle and returns 0 - which is what a title
+/// asking "is anything routed here yet" expects, and is not an error.
+///
+/// >>> IT IS HERE BECAUSE REFUSING A BOGUS EVENT-FLAG WAIT UNCOVERED IT. PCSE00084's audio
+/// thread was parked forever on `sceKernelWaitEventFlag` on a uid that names nothing; once
+/// that wait returns `UNKNOWN_EVF_ID` the thread runs on and calls this, which had no
+/// implementation at all. A stall hides every gap downstream of it
+/// [[vitaslop-fast-fail-no-silent-success]].
+#[hostcall]
+pub(super) fn voice_get_output_patch(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    voice: u32,
+    index: i32,
+    patch: Ptr,
+) -> i32 {
+    let found = st
+        .audio_state
+        .ngs_patch_voice
+        .iter()
+        .filter(|(_, v)| *v == voice)
+        .nth(index.max(0) as usize)
+        .map(|(p, _)| *p)
+        .unwrap_or(0);
+    if !patch.is_null() {
+        ctx.write_u32(patch.addr(), found);
+    }
+    0
+}
+
 /// SceInt32 sceNgsVoicePatchSetVolume(SceNgsHPatch patch, SceInt32 outputChannel,
 ///                                    SceInt32 inputChannel, SceFloat32 volume)
 ///
@@ -580,11 +713,19 @@ pub(super) fn voice_patch_set_volume(
     _ctx: &mut GuestCtx,
     st: &mut VitaState,
     patch: u32,
-    _output_channel: i32,
-    _input_channel: i32,
+    output_channel: i32,
+    input_channel: i32,
     volume: f32,
 ) -> i32 {
-    st.audio_state.set_patch_volume(patch, volume);
+    // ONE cell: the source's OUTPUT channel to the destination's INPUT channel - see
+    // `At9Voice::patch`. Taking it as the whole patch gain made the LAST call win, so a title
+    // writing its cross-feed cell (L->R = 0) after its straight cells went silent.
+    st.audio_state.set_patch_cells(
+        patch,
+        Some((output_channel.clamp(0, 1) as usize, input_channel.clamp(0, 1) as usize)),
+        volume,
+        [[0.0; 2]; 2],
+    );
     0
 }
 
@@ -605,11 +746,14 @@ pub(super) fn voice_patch_set_volumes_matrix(
     // No early `return` here: `#[hostcall]` rewrites the body, so one would not mean
     // what it reads as.
     if !matrix.is_null() {
-        let loudest = (0..4u32)
-            .map(|i| f32::from_bits(ctx.read_u32(matrix.addr() + i * 4)))
-            .filter(|v| v.is_finite())
-            .fold(0.0f32, f32::max);
-        st.audio_state.set_patch_volume(patch, loudest);
+        // Four f32 in memory order `[src0->dst0, src0->dst1, src1->dst0, src1->dst1]` -
+        // `m[source][destination]`, copied whole. See `At9Voice::patch`.
+        let cell = |i: u32| f32::from_bits(ctx.read_u32(matrix.addr() + i * 4));
+        let m = [[cell(0), cell(1)], [cell(2), cell(3)]];
+        let loudest = m.iter().flatten().copied().filter(|v| v.is_finite()).fold(0.0f32, f32::max);
+        if m.iter().flatten().all(|v| v.is_finite() && *v >= 0.0) {
+            st.audio_state.set_patch_cells(patch, None, loudest, m);
+        }
     }
     0
 }

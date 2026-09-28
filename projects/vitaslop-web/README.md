@@ -28,14 +28,81 @@ is where it is either true or not.
   Plain ES modules and CSS, no framework, no bundler; GitHub Pages is the target and
   `coi.js` (a service worker) supplies the cross-origin-isolation headers a static host
   cannot.
+- Each route makes a new `current` object; a screen's renderer captures it and stops
+  after its awaits if the router has moved on, so a slow screen never paints over the
+  next one (and its failure never paints the error card there).
 - Settings are one record (`vitaslop-frontend`); the global one is stored whole, a
   title stores only its patch. `store.js` keeps both in localStorage and the library
   records (`library/<id>/meta.json` + images) in OPFS beside the titles (`games/<id>/`).
 - Importing streams: the page hands the picked `File`s to `import-worker.js`, which
   reads ranges with `FileReaderSync` and writes OPFS sync handles while the Rust
   streaming ingest peels zip/pkg/PFS/SELF. Nothing is ever resident.
-- The old debug pages (`live.html`, the cube, conformance) live under `web/debug/`
+- The old debug pages (the cube, conformance) live under `web/debug/`
   and the e2e rigs drive them there.
+- The title page draws before anything slow resolves: its size is remembered in the
+  record (`storedBytes`, summed once - a title is up to ~1,300 files), and the settings
+  (which run in the emulator bundle) fill in the profile, Play and save buttons when
+  ready. The app starts loading that bundle at boot so it is usually ready already.
+
+## Storage (OPFS layout)
+
+All of it is in the origin's private file system; nothing leaves the browser.
+
+- `games/<titleId>/` - the imported title, one flat file per game path (`/` encoded as
+  `%2F`), plus `vitaslop-opfs-manifest.json` written LAST as the "import complete"
+  marker. Immutable after import; a re-import empties the directory first. Remove =
+  delete the directory (recursive), which takes everything below with it.
+- `games/<titleId>/vitaslop-transpiled/` - the TRANSPILE CACHE (`transpile-cache.js`):
+  the title's transpiled guest module (`<name>.wasm`, tens of MB) and its layout numbers
+  (`<name>.json`, written last). `<name>` = `<build>-<settings>-<hostOff>`: a hash of the
+  bundle's `build-stamp.txt` (so every new build invalidates - one re-transpile per title
+  per deploy), the transpiler's resolved emit settings for this run's knobs, and the host
+  offset the module is emitted for. One entry per title: a miss deletes the old one
+  before transpiling, and every prepare sweeps other titles' entries from older builds.
+  Only the first play after a build pays the transpile. `VITASLOP_TRANSPILE_CACHE=0`
+  bypasses it. Lives under the title so removing the game removes it.
+- `library/<titleId>/` - the library record: `meta.json` (title, sizes, dates) and the
+  `icon0.png` / `pic0.png` taken from the package at import.
+- `gamedata/<titleId>/` (default profile) and `gamedata-profiles/<profile>/<titleId>/` -
+  what the game saved. Deliberately NOT under `games/`: removing a game keeps its saves.
+- Settings are in localStorage, not OPFS (see above).
+
+## The player
+
+- The page fetches and compiles the emulator bundle ONCE (`bundle.js`, keyed on the build
+  stamp) and posts the compiled module to the run worker and the transpile worker; each
+  used to fetch and compile its own 9 MB copy. A second play from the same page reuses it.
+- A canvas hands its drawing to a worker once, so each run gets a fresh `#screen`
+  element in place of the last (`cloneNode`); no reload between games.
+- Fullscreen and the landscape lock are asked for once per run, from a gesture (Play,
+  or the menu button), never from a resize/orientation/focus/visibility handler, and
+  not again if already fullscreen. Chrome for Android shows its "swipe down to exit"
+  toast on every fullscreen layout and every window-focus regain while fullscreen
+  (`FullscreenHtmlApiHandlerBase.onWindowFocusChanged`), which the page cannot
+  suppress; it can only avoid causing them. A screen wake lock is held while a run is
+  on (re-asked on each return to the foreground, released on stop) so the screen does
+  not dim and wake into one.
+- The in-game menu's Restart and Quit go through a Yes/No panel inside the menu, not
+  `window.confirm`, which a fullscreen phone browser hides. Restart tears the run down
+  (`stop(false)`: everything but leaving the screen) and the app starts the same title
+  through `play()`, the one start path.
+
+## Controllers
+
+- In a game `gamepad.js` owns the pad: mapped buttons post their keyboard codes to the
+  worker. The `home` control (index 16, exposed by some pads and browsers) opens the
+  menu unless a Vita button is mapped to it; start+select held for a second opens it
+  on any pad (the game sees a short press of each first).
+- Outside a game, and inside the menu while it is open, `navpad.js` owns the pad: one
+  focus-based navigator over one root (the document, or the menu). D-pad or left stick
+  moves focus spatially with DOM order as the fallback, south picks, east goes back
+  (`history.back`, or the menu's own back), start opens the settings (resumes, in the
+  menu), left/right change a select, checkbox or slider. The ring is the `navfocus`
+  class, not `:focus-visible`.
+- Hand-over is exclusive and edge-safe: the menu suspends `gamepad.js` (releasing
+  everything held) before the navigator attaches, and each side ignores whatever is
+  still down at its hand-over until it is released, so the press that opened or
+  closed the menu is seen by one owner only.
 
 ## The guest engine
 
@@ -44,6 +111,13 @@ is where it is either true or not.
   worth measuring at all.
 - The scheduler is one worker instance-per-thread over JSPI, so a guest thread
   can block without blocking the page.
+- The guest's memory is a region INSIDE the run worker's own linear memory: the page
+  asks the run worker to reserve it first (`reserve` message), the throwaway transpile
+  worker builds the module for that offset (`hostOff`), and every guest instance imports
+  the emulator's memory. A host read of guest memory is then a load, not a JavaScript
+  call - which was several crossings per draw and the phone's biggest CPU item.
+  `VITASLOP_BROWSER_SPLIT_MEMORY=1` restores a separate, exactly-sized guest memory
+  (a wild guest pointer traps there instead of reaching the emulator's heap).
 
 ## Conformance parity
 

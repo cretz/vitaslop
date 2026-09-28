@@ -278,11 +278,16 @@ struct Slot<T> {
     /// GAME CLOCK is charged for the difference; `fuel_seen` above now only feeds the fuel
     /// report and the preemption accounting.
     arm_seen: u64,
+    /// GUEST INSTRUCTIONS this thread retired, summed over its whole life - its share of the
+    /// emulated CPU, which `cpu_share_report` ranks by. `picks` says how often a thread ran;
+    /// this says how much it did, and a thread busy-polling a flag is exactly the one whose
+    /// two answers disagree.
+    retired_total: u64,
 }
 
 impl<T> Slot<T> {
     fn new(thread: T, state: ThreadState) -> Slot<T> {
-        Slot { thread, state, cooled: false, picks: 0, quanta: 0, fuel_seen: 0, arm_seen: 0 }
+        Slot { thread, state, cooled: false, picks: 0, quanta: 0, fuel_seen: 0, arm_seen: 0, retired_total: 0 }
     }
 }
 
@@ -300,6 +305,25 @@ pub enum IdleStep {
 /// the synchronous [`Scheduler`] (native) and the browser's asynchronous loop compose
 /// it - each owns only the tiny resume step, and defers priority, frame counting,
 /// spawn/wake draining, deadlock/timed-wait, and the verdict to these methods.
+/// The display frame the run has reached, stamped by [`SchedCore`] at every flip.
+///
+/// It exists BESIDE the scheduler's own `frames` field because the readers are diagnostics in
+/// other crates - the browser's block tracer among them - that have no `&SchedCore` to ask and
+/// run on the guest's own stack, under a host import, where nothing is borrowable.
+static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stamp the engine-agnostic frame counter - for a scheduler that is not [`SchedCore`] (the
+/// browser's parallel one), which reaches the same frame boundary by its own path.
+pub fn set_current_frame(frame: u64) {
+    CURRENT_FRAME.store(frame, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The display frame the run has reached (0 before the first flip), for a diagnostic with no
+/// scheduler in hand. See [`CURRENT_FRAME`].
+pub fn current_frame() -> u64 {
+    CURRENT_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct SchedCore<E: GuestEngine, H: ImportDispatch> {
     engine: E,
     host: Arc<Mutex<H>>,
@@ -403,14 +427,18 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // cause: an unfilled mirror means every inlined read returns a word that never
         // changes, and for the clock that is a vblank spin that can never be satisfied -
         // a livelock thousands of frames away with nothing pointing back here.
-        if core.engine.mirror_base().is_some() {
-            let written = core.refresh_mirror();
-            assert!(
-                written > 0,
-                "this build inlines host-mirror reads, but the host writes no mirror slots \
-                 (ImportDispatch::refresh_mirror); the guest would read a word that never \
-                 changes",
-            );
+        if let Some(base) = core.engine.mirror_base() {
+            // Where the block IS, told to the host once: everything behind the mirrored slots
+            // is shared state the host reads and writes directly - today the kernel mutex
+            // table - and it needs the address, not the slot writer.
+            core.host.lock().unwrap().set_mirror_base(base);
+            // >>> THE BLOCK EXISTING IS NO LONGER EVIDENCE THAT A READ WAS INLINED. It is
+            // reserved UNCONDITIONALLY now, because the ARM exclusive monitor lives in it
+            // (`EXCL_MIRROR_SLOT`) and every build lowers `LDREX`/`STREX` whether or not any
+            // host call was inlined. A host with no mirror writer is therefore an ordinary
+            // build - a mock in a scheduler test - and not the defect this used to guard, so
+            // the assertion that every such build fills a slot is simply false now.
+            let _written = core.refresh_mirror();
         }
         core
     }
@@ -494,18 +522,24 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     pub fn cpu_share_report(&self) -> String {
         use std::fmt::Write;
         let total: u64 = self.threads.iter().map(|t| t.picks).sum();
-        let mut rows: Vec<(i32, i32, u64, u64, ThreadState)> = self
+        let retired: u64 = self.threads.iter().map(|t| t.retired_total).sum();
+        let mut rows: Vec<(i32, i32, u64, u64, u64, ThreadState)> = self
             .threads
             .iter()
-            .map(|t| (t.thread.thid(), t.thread.priority(), t.picks, t.quanta, t.state))
+            .map(|t| (t.thread.thid(), t.thread.priority(), t.picks, t.quanta, t.retired_total, t.state))
             .collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
-        let mut s = format!("--- scheduler CPU share: {total} resumes over {} threads ---\n", rows.len());
-        for (thid, prio, picks, quanta, state) in rows {
+        // By WORK, not by resumes - see `Slot::retired_total`.
+        rows.sort_by_key(|r| std::cmp::Reverse(r.4));
+        let mut s = format!(
+            "--- scheduler CPU share: {total} resumes, {retired} guest instructions over {} threads ---\n",
+            rows.len()
+        );
+        for (thid, prio, picks, quanta, work, state) in rows {
             let pct = if total == 0 { 0.0 } else { picks as f64 * 100.0 / total as f64 };
+            let wpct = if retired == 0 { 0.0 } else { work as f64 * 100.0 / retired as f64 };
             let _ = writeln!(
                 s,
-                "  thid={thid:#x} prio={prio:#x} {pct:6.2}%  picks={picks} whole-quanta={quanta} {state:?}"
+                "  thid={thid:#x} prio={prio:#x} work {wpct:6.2}%  resumes {pct:6.2}%  picks={picks} whole-quanta={quanta} {state:?}"
             );
         }
         s
@@ -592,6 +626,12 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// The seam a recipe's `@watch` is sampled through on either engine.
     pub fn read_guest(&self, addr: u32, out: &mut [u8]) -> bool {
         self.engine.read_mem(addr, out)
+    }
+
+    /// Write shared guest memory at guest address `addr`. The seam a render target's
+    /// pixels are put back through on either engine (`rtt_writeback`).
+    pub fn write_guest(&mut self, addr: u32, bytes: &[u8]) {
+        self.engine.write_mem(addr, bytes)
     }
 
     /// Mutable access to thread `idx`, for an engine whose resume is driven externally
@@ -797,7 +837,31 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // lightweight-mutex take, and a resumed thread must read its own id from the first
         // instruction - not the previous thread's until it happens to call the host.
         let thid = self.threads[idx].thread.thid();
-        self.host.lock().unwrap().set_current_thread(thid);
+        // >>> HOW MANY OTHER THREADS COULD RUN INSTEAD, told to the host AT THE PICK.
+        //
+        // A `sceKernelDelayThread(0)` is "give someone else the CPU", and with nobody to give
+        // it to the kernel returns to the caller. This scheduler could not say that: every
+        // such call took a full suspend and resume, and the scheduler then re-picked the same
+        // thread. On one football title that is **2,377 QUANTUM suspends a frame** against a
+        // baseball title's 4, from ONE guest spin, and a suspend is the most expensive thing a
+        // scheduler round does on the browser. The host cannot see the runnable set, so the
+        // pick - the one place both schedulers pass through - hands it the count.
+        //
+        // It is exact at the moment of the pick, and the only thing that can make another
+        // thread runnable while this one runs is this one's OWN host calls, which go through
+        // the same state and bump it. A timed wake needs the clock to advance, which needs a
+        // suspension - and the ENGINE's fuel preemption still forces those, so nothing this
+        // elides can be deferred longer than one preemption interval.
+        let others = self
+            .live
+            .iter()
+            .filter(|&&i| i != idx && self.threads[i].state == ThreadState::Runnable)
+            .count();
+        {
+            let mut h = self.host.lock().unwrap();
+            h.note_runnable_others(others);
+            h.set_current_thread(thid);
+        }
         // Guest code is about to run, so the host-mirror block has to be current. This
         // is the one place both schedulers (native and browser) pass through on their
         // way to a resume, which is why the refresh lives here rather than in either
@@ -841,6 +905,26 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // Count the frame and advance any frame-keyed input (a scripted TAS
                 // recipe) in lockstep with the render loop.
                 self.frames += 1;
+                // `VITASLOP_CPU_SHARE_FROM=<frame>`: start the CPU-share counters (`picks`,
+                // `quanta`, `retired_total`) afresh at that frame, so `cpu_share_report`
+                // describes gameplay rather than the boot and loading screens before it.
+                if Some(self.frames) == cpu_share_from() {
+                    for t in self.threads.iter_mut() {
+                        t.picks = 0;
+                        t.quanta = 0;
+                        t.retired_total = 0;
+                    }
+                    for h in self.runnable_hist.iter_mut() {
+                        *h = 0;
+                    }
+                }
+                // Stamp the ENGINE-AGNOSTIC frame counter beside the scheduler's own, so a
+                // diagnostic that lives outside this crate can put a frame number on its
+                // lines. Native's block tracer has always been able to; the browser's could
+                // not, and a control-flow trace with no frame number cannot be lined up with
+                // a crash frame, a recipe cue, or another instrument's output - which is most
+                // of what such a trace is for.
+                CURRENT_FRAME.store(self.frames, std::sync::atomic::Ordering::Relaxed);
                 // Diagnostic (`RUST_LOG=vitaslop::display=trace`): the frame boundary itself,
                 // so the flip and scene traces either side of it can be attributed to a frame.
                 // Without it those lines are an undivided stream and "which frame flipped what"
@@ -906,6 +990,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             Some(t) => {
                 let d = t.saturating_sub(self.threads[idx].arm_seen);
                 self.threads[idx].arm_seen = t;
+                self.threads[idx].retired_total = self.threads[idx].retired_total.saturating_add(d);
                 Some(d)
             }
             None => None,
@@ -1421,7 +1506,7 @@ where
 /// A deadline that has already passed expired before any transfer can complete, so it
 /// goes first. That cannot starve the device: a woken poller burning its quantum charges
 /// the storage clock, as does the idle jump itself.
-fn storage_completes_first(
+pub fn storage_completes_first(
     io_remaining_us: Option<u64>,
     next_deadline_us: Option<u64>,
     now_us: u64,
@@ -1487,5 +1572,76 @@ mod idle_order_tests {
         // 5 ms of transfer left against a deadline 1 ms away: the deadline is at
         // 101_000 on a clock reading 100_000, so the transfer must NOT win.
         assert!(!storage_completes_first(Some(5_000), Some(101_000), 100_000));
+    }
+}
+
+/// `VITASLOP_CPU_SHARE_FROM=<frame>` - see the reset in `SchedCore::on_suspended`.
+pub fn cpu_share_from() -> Option<u64> {
+    use std::sync::OnceLock;
+    static AT: OnceLock<Option<u64>> = OnceLock::new();
+    *AT.get_or_init(|| crate::knobs::var("VITASLOP_CPU_SHARE_FROM").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// For the parallel browser scheduler (`vitaslop-web`'s `smp`): the last [`SpinHistory::N`]
+/// MID-FRAME waits of one guest worker (the gate open: the guest is
+/// between flips, so a thread of this worker is blocked on another's work rather than on the
+/// next frame), as "did it end by a ring within the cap". Spin when at least half did.
+pub struct SpinHistory {
+    bits: u32,
+    seen: u32,
+}
+
+impl SpinHistory {
+    const N: u32 = 32;
+
+    pub fn new() -> Self {
+        SpinHistory { bits: 0, seen: 0 }
+    }
+
+    pub fn record(&mut self, short: bool) {
+        self.bits = (self.bits << 1) | short as u32;
+        self.seen = (self.seen + 1).min(Self::N);
+    }
+
+    /// Spin only on evidence: 8 waits recorded, at least half of them short.
+    pub fn should_spin(&self) -> bool {
+        let mask = if self.seen >= 32 { u32::MAX } else { (1u32 << self.seen) - 1 };
+        self.seen >= 8 && (self.bits & mask).count_ones() * 2 >= self.seen
+    }
+}
+
+impl Default for SpinHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod spin_history_tests {
+    use super::SpinHistory;
+
+    #[test]
+    fn spins_only_on_evidence_that_half_the_mid_frame_waits_were_short() {
+        let mut h = SpinHistory::new();
+        for _ in 0..7 {
+            h.record(true);
+        }
+        assert!(!h.should_spin(), "seven waits are not evidence");
+        h.record(true);
+        assert!(h.should_spin(), "eight short waits are");
+        // A worker whose waits turn long stops spinning once they are the majority of the window.
+        for _ in 0..17 {
+            h.record(false);
+        }
+        assert!(!h.should_spin(), "17 long of the last 25 is a worker that mostly sleeps");
+        let mut long = SpinHistory::new();
+        for _ in 0..100 {
+            long.record(false);
+        }
+        assert!(!long.should_spin(), "a storage worker idle for whole frames never spins");
+        for _ in 0..16 {
+            long.record(true);
+        }
+        assert!(long.should_spin(), "16 of the last 32 short is exactly half - spin");
     }
 }

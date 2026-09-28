@@ -38,6 +38,16 @@ Vita toolchain via `$VITASDK`).
   (UBFX). Surfaced and lifted all of them (+ MLS/UXTH/SBFX), qemu-certified.
 - **`cube-src/`** (`cube_*`): the minimal GXM spinning cube - the graphics north
   star. See its README; bring-up was work-backwards over this artifact.
+- **`gxmconf-src/`** (`vita_gxmconf`): GXM **pipeline-state** conformance - eight
+  offscreen scenes, one per feature (region clip, out-of-viewport geometry, depth
+  test, alpha blend, viewport transform, the viewport and clip TOGETHER over
+  different rectangles, and a stencil mask: a NEVER/fail-REPLACE mark then an
+  EQUAL fill confined to it), each drawing axis-aligned NDC quads so
+  the expected result is a RECTANGLE the harness asserts exactly. No golden image
+  and no tolerance on the geometry. It covers the half the shader conformance
+  suite cannot: the state machine around the shader, which is where a region clip
+  belonging to the wrong target and geometry placed off the top of the screen each
+  cost a title-level debugging session.
 - **`pvf-src/`** (`vita_pvf`): the ScePvf vector-font engine end to end - create a
   library, open a real font file through the host filesystem (the first case to
   read a data file the way a title does), configure size/resolution, and query
@@ -46,7 +56,7 @@ Vita toolchain via `$VITASDK`).
 
 ## Status
 
-`hello`, `clib`, `thread`, `kernel`, `compute`, `compute2`, `cube`, `io`, and
-`pvf` are all RUNNABLE and green. Remaining north-star rungs (SELF/ELF loading of
+`hello`, `clib`, `thread`, `kernel`, `compute`, `compute2`, `cube`, `io`, `pvf`
+and `gxmconf` are all RUNNABLE and green. Remaining north-star rungs (SELF/ELF loading of
 a signed title, richer module surface, Chocolate Doom) are staged in the project
 notes.

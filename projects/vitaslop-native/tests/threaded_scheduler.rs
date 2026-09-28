@@ -137,6 +137,7 @@ impl MockKernel {
             arg_len: 0,
             arg_ptr: 0,
             r2: 0,
+            r3: 0,
             stack_top: Self::stack_for(thid),
             thid,
             priority: vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,

@@ -46,6 +46,14 @@ sha2 = "0.10"
 miniz_oxide = "0.8"
 skrifa = "0.45.0"
 zeno = "0.3.3"
+# Pure-Rust JPEG decode for SceJpeg (MIT/Apache/Zlib, decoder only, wasm-clean). Its `x86`
+# and `neon` features are ON - they are the crate's own defaults and they are gated by
+# `target_arch` inside it, so they cost the wasm build nothing and buy the native one an
+# AVX2/NEON IDCT and colour convert instead of the scalar one. wasm SIMD would need the
+# crate's `portable_simd` feature, which needs a nightly toolchain, so the browser runs the
+# scalar path [[vitaslop-wasm-simd-must-be-asked-for]].
+zune-jpeg = "0.5.15"
+zune-core = "0.5.3"
 
 [features]
 # >>> A DIAGNOSTIC BUILD, NOT A SHIPPING ONE. Marks a handful of audio-path functions
@@ -70,7 +78,7 @@ vitaslop-platform = { path = "../vitaslop-platform", features = ["aac"] }
 
 # Dev-only: the `disasm` example prints guest instructions when recovering an
 # undocumented library from its call sites. The transpiler already decodes with this.
-yaxpeax-arm = { git = "https://github.com/cretz/yaxpeax-arm", rev = "e8fd10345a4dc9ba91efe2479d2db022e4607b9e", default-features = false, features = ["non-exhaustive-enums"] }
+yaxpeax-arm = { git = "https://github.com/cretz/yaxpeax-arm", rev = "57a5099a88647d981d611a6e5c5489a7fd0c70aa", default-features = false, features = ["non-exhaustive-enums"] }
 yaxpeax-arch = { version = "0.3.1", default-features = false }
 # Validates the whole-program wasm the linker+transpiler emit, in the fixture tests.
 wasmparser = "0.253"

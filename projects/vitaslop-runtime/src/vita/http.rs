@@ -298,3 +298,88 @@ pub(super) fn ssl_get_ssl_error(ctx: &mut GuestCtx, st: &mut VitaState, id: i32,
         0
     }
 }
+
+// --- The cookie jar ---------------------------------------------------------------
+//
+// A jar is filled by RESPONSES: the library reads `Set-Cookie` off a reply and stores it
+// against the URL's domain. No reply ever arrives here (`sceHttpSendRequest` fails with the
+// link down), so the jar is empty for the whole run - not broken, EMPTY, which is the state
+// a console is in before its first successful request too. The switch that turns it on and
+// the callback that would filter incoming cookies are local settings and are treated as
+// such.
+
+/// int sceHttpSetCookieEnabled(int id, int enable)
+///
+/// Really recorded against the object, and really read back by [`get_cookie_enabled`]. This
+/// is the guest's own setting, so dropping it and reporting success would be the one thing
+/// this module does not do.
+#[hostcall]
+pub(super) fn set_cookie_enabled(st: &mut VitaState, id: i32, enable: i32) -> i32 {
+    if st.http_set_cookies_enabled(id, enable != 0) {
+        0
+    } else {
+        SCE_HTTP_ERROR_INVALID_ID
+    }
+}
+
+/// int sceHttpGetCookieEnabled(int id, int *enable)
+#[hostcall]
+pub(super) fn get_cookie_enabled(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, enable: Ptr) -> i32 {
+    match st.http_cookies_enabled(id) {
+        None => SCE_HTTP_ERROR_INVALID_ID,
+        Some(on) => {
+            if !enable.is_null() {
+                ctx.write_u32(enable.addr(), on as u32);
+            }
+            0
+        }
+    }
+}
+
+/// int sceHttpSetCookieRecvCallback(int id, SceHttpCookieRecvCallback cbfunc, void *userArg)
+///
+/// Registers the hook the library calls for each `Set-Cookie` header in a response, so the
+/// title can decide whether to keep it. Registered against a valid id and never invoked,
+/// because no response header ever arrives - the same position [`ssl_set_ssl_callback`] is
+/// in, and for the same reason.
+///
+/// The callback is deliberately NOT stored. Nothing can ever call it, and holding it would
+/// suggest otherwise; what the call has to get right is refusing an id that names no object.
+#[hostcall]
+pub(super) fn set_cookie_recv_callback(st: &mut VitaState, id: i32) -> i32 {
+    if st.http_exists(id) {
+        0
+    } else {
+        SCE_HTTP_ERROR_INVALID_ID
+    }
+}
+
+/// int sceHttpGetCookie(const char *url, char *cookie, unsigned int *cookieLength,
+///                      unsigned int prepare, int secure)
+///
+/// Fetch the cookies stored for `url` as one header-shaped string. The jar is empty (see
+/// above), so the answer is a length of ZERO and nothing written - which is exactly what the
+/// library reports for a URL it holds no cookie for, whether or not it has ever been online.
+///
+/// `prepare` selects the two-call protocol: non-zero asks only for the LENGTH the caller must
+/// allocate, zero asks for the bytes. Both answers are the same here, and both write the
+/// length, because a caller that skipped the prepare call still reads `*cookieLength` to know
+/// how much it got. Writing it is what stops a title reading an uninitialised stack word as a
+/// cookie length and walking a buffer that was never filled.
+#[hostcall]
+pub(super) fn get_cookie(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _url: Ptr,
+    _cookie: Ptr,
+    cookie_length: Ptr,
+    _prepare: u32,
+    _secure: i32,
+) -> i32 {
+    if cookie_length.is_null() {
+        SCE_HTTP_ERROR_INVALID_VALUE
+    } else {
+        ctx.write_u32(cookie_length.addr(), 0);
+        0
+    }
+}

@@ -18,6 +18,7 @@ pub mod gxm;
 pub mod gxmctx;
 pub mod gxmstate;
 pub mod gxmprog;
+pub mod hevag;
 pub mod http;
 pub mod iofilemgr;
 pub mod jpeg;
@@ -26,6 +27,7 @@ pub mod libkernel;
 pub mod livearea;
 pub mod location;
 pub mod lwsync;
+pub mod kmutex;
 pub mod lwwork;
 pub mod mirror;
 pub mod ngs;
@@ -41,6 +43,7 @@ pub mod touch;
 pub mod audiodec;
 pub mod avcdec;
 pub mod video;
+pub mod voice;
 
 use crate::host::{GuestCtx, VitaState};
 use crate::nid::{
@@ -50,7 +53,7 @@ use crate::nid::{
     livearea as livearea_nid, lwsync as lw_nid, pgf as pgf_nid, xml as xml_nid,
     net as net_nid, ngs as ngs_nid,
     processmgr as pm_nid, pvf as pvf_nid, services as sv_nid, sync as sync_nid,
-    sysmem as sm_nid, threadmgr as tm_nid, videodec as vd_nid,
+    sysmem as sm_nid, threadmgr as tm_nid, videodec as vd_nid, voice as voice_nid,
 };
 use crate::{nid, SvcOutcome};
 
@@ -73,7 +76,204 @@ use std::sync::{LazyLock, Mutex};
 /// - a BULK move or compare over guest memory and nothing else (the `sceClibMem*` trio in
 ///   [`libkernel`]), which is the first shape whose reach the guest chooses rather than the
 ///   emitter, and so the first whose guard is arithmetic rather than a constant.
+/// Whether the module about to be linked will run under the PREEMPTIVE scheduler.
+///
+/// The HOST MIRROR block only exists under that scheduler - it is refreshed at its single
+/// resume point - and one mirrored value, the RTC wall tick, is a pure function of the virtual
+/// clock only there ([`crate::vita::mirror::SLOT_RTC_LO`] states the contract). The linker runs
+/// BEFORE any `VitaState` exists, so the answer cannot be read off one; a frontend that stands
+/// up the threaded scheduler says so here first.
+///
+/// Defaults to FALSE, which is the safe direction: an entry point that forgets to set it loses
+/// an optimisation, where the other default would serve a clock the contract does not cover.
+static PREEMPTIVE_LINK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare that the next [`link`](crate::link::link) is for a preemptive run. See
+/// [`PREEMPTIVE_LINK`].
+pub fn set_preemptive_linking(on: bool) {
+    PREEMPTIVE_LINK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the module about to be linked will run its guest threads AT ONCE on several
+/// workers (the browser's `VITASLOP_SMP=1`). Off by default, like [`PREEMPTIVE_LINK`] and for
+/// the same reason: the linker runs before any `VitaState` exists.
+static SMP_LINK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare that the next [`link`](crate::link::link) is for a PARALLEL run. See
+/// [`smp_inline_filter`] for what that refuses.
+pub fn set_smp_linking(on: bool) {
+    SMP_LINK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the next link is for a parallel run - see [`set_smp_linking`].
+pub fn smp_linking() -> bool {
+    SMP_LINK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// >>> WHICH INLINE FORMS SURVIVE PARALLEL GUEST EXECUTION, and what the rest become.
+///
+/// Every inline form was admitted under one of the argument shapes in [`inline_op`]'s doc, and
+/// two of those shapes lean on ONE guest thread running at a time:
+///
+/// - the MIRROR block's contract is "cannot change while guest code runs". Under SMP a
+///   refresh on one worker lands while another worker's thread is mid-slice. A single GLOBAL
+///   word survives that - a vblank count or a constant is simply a newer value, as it is on
+///   hardware - but a PER-THREAD slot does not (`CURRENT_THREAD`, `THREAD_ID`, the spin
+///   budget, the yield flags: there is one block and several current threads), and a two-word
+///   PAIR can tear (the clock's low word from one refresh, its high word from the next).
+/// - the LOCK forms are check-then-store with no compare-and-swap, correct only because nothing
+///   else can run between the check and the store.
+///
+/// So under SMP: plain global mirror reads stay; the vblank read keeps its value but loses its
+/// parking budget (a spin then burns its worker until the fuel preempts it, which on a separate
+/// core costs nobody else anything); every per-thread, paired or lock form is refused and runs
+/// as the host call it always could have been - under the host mutex, which is what makes it
+/// atomic with every other host call. The guest-owned read-modify-writes (GXM context setters,
+/// the uniform ring, `sceClib` bulk ops) are untouched: on hardware those are plain userspace
+/// code too, with exactly the races the guest itself has.
+///
+/// A NID whose handler needs the RUN worker's JavaScript (see
+/// [`smp_owner_only`]) may not take the non-suspending trap either: the parallel scheduler can
+/// only forward a call it is allowed to suspend.
+fn smp_inline_filter(func_nid: u32, op: vitaslop_transpiler::InlineOp) -> Option<vitaslop_transpiler::InlineOp> {
+    use vitaslop_transpiler::InlineOp as I;
+    let global_slot = |s: u32| s == mirror::SLOT_VCOUNT || s == mirror::SLOT_SA_BANK;
+    // The per-thread and paired forms have SMP spellings (see each `InlineOp`): the thread
+    // words become instance globals, the clocks one atomic 64-bit word, the elided yield a test
+    // of THIS worker's runnable count. Measured reason they are worth it: a football title's
+    // loop threads poll `GetThreadId` / `GetProcessTimeWide` / `DelayThread(0)` ~16,000 times
+    // a frame each, and as host calls that doubled the parallel run's frame (`smp25e`).
+    let clock = |slot: u32| match slot {
+        s if s == mirror::SLOT_CLOCK_LO => Some(false),
+        s if s == mirror::SLOT_RTC_LO => Some(true),
+        _ => None,
+    };
+    match op {
+        I::LoadMirror { slot } if slot == mirror::SLOT_THREAD_ID => Some(I::ThreadWord { cur: false }),
+        I::LoadMirror { slot } if slot == mirror::SLOT_CURRENT_THREAD => Some(I::ThreadWord { cur: true }),
+        I::LoadMirror { slot } => global_slot(slot).then_some(op),
+        I::LoadMirrorParking { slot, .. } => global_slot(slot).then_some(I::LoadMirror { slot }),
+        I::LoadMirrorPair { slot } => clock(slot).map(|rtc| I::LoadClock64 { rtc }),
+        I::StoreMirrorPair { slot } => clock(slot).map(|rtc| I::StoreClock64 { rtc }),
+        I::DelayYield { cap, .. } => Some(I::SmpDelayYield { cap }),
+        I::LwMutexLock { .. }
+        | I::LwMutexUnlock { .. }
+        | I::KernelMutexLock { .. }
+        | I::KernelMutexUnlock { .. } => None,
+        I::Fast if smp_owner_only(func_nid) => None,
+        other => {
+            // Anything else that names a mirror slot is a form added after this filter was
+            // written; refuse it until someone has made the argument above for it.
+            if other.mirror_slot().is_some_and(|s| !global_slot(s)) {
+                return None;
+            }
+            Some(other)
+        }
+    }
+}
+
+/// >>> THE HOST CALLS THAT MUST RUN ON THE WORKER THAT OWNS THE EMULATOR'S JAVASCRIPT.
+///
+/// Under the parallel browser scheduler a host call normally runs on the worker whose guest
+/// thread made it, under the host mutex. These cannot: their handlers reach an object that
+/// exists in ONE worker's JavaScript heap - a WebCodecs decoder (whose pictures also arrive on
+/// that worker's event loop), the storage worker's synchronous reader, the page relay for
+/// location. From anywhere else the handle names a different object, or none. So the calling
+/// thread is suspended and the call is FORWARDED to the run worker, which dispatches it and
+/// hands the registers back.
+///
+/// Chosen by LIBRARY rather than call by call: the whole family shares the backing object,
+/// the calls are rare next to a frame's GXM traffic, and a family member left off would be a
+/// wrong object rather than a slow call. The owning backends also check the worker they run on
+/// and fail loudly, so a miss here is a panic that names itself, never silent corruption.
+pub fn smp_owner_only(func_nid: u32) -> bool {
+    smp_forwarded(func_nid, false)
+}
+
+/// [`smp_owner_only`] for a run that knows whether its guest workers each hold their own view
+/// of the title's storage ring: when they do, the pure file families (`sceIo`, `sceFios`) run
+/// where they are made. `VITASLOP_SMP_FORWARD` still wins - it is the bisection override.
+///
+/// MEASURED why (`tel25h`, MLB): with audio off the forward list, `sceIoPread` was the only
+/// per-frame forward left, and each one parked its thread and held the idle clock for the
+/// length of a present.
+pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
+    const FAMILIES: &[&str] = &[
+        "sceIo",
+        "sceFios",
+        "sceAvcdec",
+        "sceVideodec",
+        "sceMp4",
+        "sceAudiodec",
+        // NOT sceAudioOut: its sink writes a SharedArrayBuffer ring through per-WORKER views
+        // (`vitaslop_web::audio::install_ring`), so it runs on whichever worker calls it.
+        // MEASURED forwarded (tel25f/g): it was the per-frame forward that parked MLB's and
+        // Madden's audio threads behind every present.
+        "sceAudioIn",
+        "sceLocation",
+        "sceAppUtil",
+        "sceSaveData",
+        "sceNpTrophy",
+        "scePvf",
+        "sceLiveArea",
+        "scePlayer",
+    ];
+    let name = crate::nid::name(func_nid);
+    // `VITASLOP_SMP_FORWARD=<prefix>[,<prefix>...]`: forward these too - the bisection knob for
+    // a defect that appears when a family STOPS being forwarded.
+    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let extra = EXTRA.get_or_init(|| {
+        crate::knobs::var("VITASLOP_SMP_FORWARD")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    if extra.iter().any(|p| name.starts_with(p.as_str())) {
+        return true;
+    }
+    // A family's COMMON DIALOG calls (`sceSaveDataDialog*`, `sceNpTrophySetupDialog*`) are the
+    // dialog state machine in `services` - host state only, no file and no JavaScript - and a
+    // title polls their status once a frame. Forwarded, each poll parked its thread until the
+    // run worker's present was over (Madden: 62 of 158 forwards a window).
+    if name.contains("Dialog") {
+        return false;
+    }
+    // The system/app PARAMETER getters answer constants (`services::apputil_*_param_get_*`) -
+    // no state, no file, no JavaScript - and a title may poll them every frame: MEASURED DOA5
+    // (`sw25r-doa`) 96 forwards a window of `sceAppUtilSystemParamGetInt`.
+    if name.starts_with("sceAppUtilSystemParam") || name.starts_with("sceAppUtilAppParam") {
+        return false;
+    }
+    // The families whose ONLY JavaScript is the storage reader. The others that read files
+    // (`sceAppUtil`, `sceSaveData`, `sceNpTrophy`, `scePvf`, `sceLiveArea`) stay forwarded:
+    // they are rare, and not every call in them has been audited for other JS.
+    if storage_on_workers && (name.starts_with("sceIo") || name.starts_with("sceFios")) {
+        return false;
+    }
+    FAMILIES.iter().any(|f| name.starts_with(f))
+}
+
+/// The forwarded calls whose route is decided per CALL rather than per NID: the scheduler asks
+/// [`crate::host::VitaEnv::smp_call_is_self_contained`] under the host lock, runs the call
+/// locally when it says so, and forwards it otherwise.
+///
+/// `sceAudiodecDecode` serves two codecs under one NID: AT9 (pure Rust) and a movie's AAC (the
+/// run worker's WebCodecs). MEASURED (`sw25r-doa`): 200 AT9 decodes a window were forwarded,
+/// each parking its audio thread until the run worker's present was over.
+pub fn smp_forward_per_call(func_nid: u32) -> bool {
+    matches!(func_nid, ad_nid::DECODE | ad_nid::DECODE_N_FRAMES)
+}
+
 pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
+    let op = inline_op_one_baton(func_nid)?;
+    if smp_linking() {
+        return smp_inline_filter(func_nid, op);
+    }
+    Some(op)
+}
+
+/// [`inline_op`] as the one-baton scheduler has it - every form, under the arguments in the
+/// module docs. [`smp_inline_filter`] narrows this for a parallel run.
+fn inline_op_one_baton(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     if no_inline_imports() {
         return None;
     }
@@ -92,61 +292,177 @@ pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     gxm::inline_op(func_nid)
         .or_else(|| display::inline_op(func_nid))
         .or_else(|| libkernel::inline_op(func_nid))
+        .or_else(|| {
+            let preemptive = PREEMPTIVE_LINK.load(std::sync::atomic::Ordering::Relaxed);
+            services::inline_op(func_nid, preemptive)
+                .or_else(|| (!no_inline_mutex()).then(|| sync::inline_op(func_nid, preemptive)).flatten())
+        })
         .or_else(|| (!no_inline_lwmutex()).then(|| lwsync::inline_op(func_nid)).flatten())
+        .or_else(|| (!no_inline_delay()).then(|| threadmgr::inline_op(func_nid)).flatten())
         .or_else(|| (!no_inline_stubs()).then(|| stub_inline_op(func_nid)).flatten())
 }
+
+/// `VITASLOP_NO_INLINE_DELAY`: route every `sceKernelDelayThread` through the host, leaving
+/// every other inline form on. The scoped A/B arm for the elided-yield form
+/// ([`vitaslop_transpiler::InlineOp::DelayYield`]), and the way to see every yield in the
+/// host-call histogram again - an inlined one never reaches the host.
+fn no_inline_delay() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_DELAY"))
+}
+
+// The NIDs whose `dispatch` arm is exactly `cont!(..)`, DERIVED from the dispatch table
+// itself by `build.rs`: `DISPATCH_CONT_ONLY`, `DISPATCH_CONT_ONLY_ARMS` and
+// `dispatch_arm_is_cont_only`. See that script for why the set is generated, not written.
+include!(concat!(env!("OUT_DIR"), "/dispatch_cont_only.rs"));
 
 /// Whether `func_nid`'s handler can only ever CONTINUE, so the transpiler may route the
 /// call through the non-suspending trap ([`vitaslop_transpiler::abi::IMPORT_FAST_NAME`]).
 ///
-/// # Why this list is written out rather than derived
-/// The admissibility test is the SHAPE of the dispatch arm: every NID here is dispatched
-/// as `cont!(handler(..))` in [`dispatch`], an unconditional `Continue` around a handler
-/// that returns nothing - so it cannot block, reschedule, flip or exit whatever the guest
-/// passes it. (`sceKernelTryLockLwMutex` is the one arm here that returns an outcome, and
-/// both of its paths are `Continue`: a contended try-lock fails rather than parks.) A
-/// handler that later grows a parking path must leave this list in the same edit; the
-/// browser turns a fast call that suspends into a loud run-ending error, never a thread
-/// left unparked.
+/// # This list is DERIVED, not written
+/// The admissibility test is the SHAPE of the dispatch arm: `cont!(handler(..))` in
+/// [`dispatch`] is an unconditional `Continue` around a handler that returns NOTHING, so it
+/// cannot block, reschedule, flip or exit whatever the guest passes it - a handler returning
+/// `()` has no channel through which to ask for a suspension, because the `SvcOutcome` IS
+/// that channel. `build.rs` reads that shape off `src/vita/mod.rs` and generates
+/// `dispatch_arm_is_cont_only`, so the fast set and the dispatch table cannot disagree.
 ///
-/// The list is the race's own host-call profile: draws and scene boundaries are ~90% of a
-/// retail race frame's calls, and the rest of it is the allocator, the mixer, the
-/// lightweight signal/unlock side of the title's thread handoffs, and input polling.
-/// `VITASLOP_NO_FAST_IMPORT=1` routes every call through the suspending trap again (the
-/// A/B arm).
+/// That closes the footgun the hand-written list documented and could not enforce: a handler
+/// that grows a parking path has to start returning its own `SvcOutcome`, which takes its arm
+/// out of the `cont!` shape, which takes it out of this set - one edit, mechanically. And it
+/// closes the other direction, which cost more: the written list named 23 NIDs drawn from ONE
+/// racing title's profile, while 684 arms (873 NIDs) qualify. On a device capture of a fighting title
+/// 318 of 456 host calls a frame took the suspending path; nearly all of them are `cont!`
+/// arms that no profile had ever put in front of anyone.
+///
+/// # What is NOT in the set, and why nothing has to be excluded by name
+/// Every handler that can park returns its outcome, so the shape test already refuses it:
+/// `sceGxmFinish` and `sceGxmNotificationWait` (a small target's completion parks the thread
+/// there in the browser - `VitaState::complete_scene_async`), `sceGxmDisplayQueueAddEntry` and
+/// `sceSharedFbEnd` (`Flip`), every wait (sema, cond, event flag, thread end, vblank,
+/// framebuffer), `sceKernelDelayThread`, the thread and process exits, the blocking IO reads,
+/// the fibers, and the audio/camera inputs. [`FAST_EXCLUDED`] exists for a handler that IS
+/// `cont!` yet must not be fast anyway; it is empty, and an entry there needs a named reason.
+///
+/// `sceGxmEndScene` is out for the same structural reason - its arm returns an `SvcOutcome` -
+/// and it is worth saying why that is still right now that the arm happens to return
+/// `Continue` on every path: the completion this area parks for has moved between EndScene
+/// and the guest's own GPU wait twice, and the arm shape is where that choice is expressed.
+///
+/// The one scheduler path that does NOT go through `SvcOutcome` is `VitaState::pending_early`
+/// (the browser drains it after a suspension). It is written in exactly one function,
+/// `gxm::complete_scenes_through`, reached only from those same three handlers - so it cannot
+/// be raised by anything the shape test admits. That is the whole argument for an empty
+/// exclusion list, and it is the thing to re-check if a new handler ever sets that field.
+///
+/// # Preemption, which is the one thing a fast call cannot do
+/// The fast trap cannot suspend, so a host-call quantum that expires on one only raises a flag
+/// for the next suspending call. That is not the browser's only preemption mechanism and never
+/// was: the transpiler emits a SOFTWARE FUEL counter on guest loop BACK EDGES, which is what
+/// reaches a loop making no suspending call at all (see `browser_sched::preempt_note`). A spin
+/// waiting on another thread still yields there.
+///
+/// # The A/B arms, and why the DEFAULT is still the old list
+/// Three points from ONE build, chosen at run time:
+/// - `VITASLOP_NO_FAST_IMPORT=1` - nothing is fast, every call takes the suspending trap;
+/// - the default - the hand-written 23 ([`CURATED_FAST_NIDS`]), i.e. today's behaviour;
+/// - `VITASLOP_FAST_IMPORT_CURATED=1` - the old hand-written 23 (the falsifier; derived is now the default).
+///
+/// The derived set is not the default YET, and that is deliberate: it is one of three
+/// independent guest-CPU changes in flight, and they are being priced in ONE batch against a
+/// SHARED baseline of today's defaults - on a machine whose control spread at the median is
+/// 2.6 ms, three separate batches means three warm-ups and three control spreads for one
+/// question. Flip the default here when that batch has priced it; the derivation, the tests
+/// and the exclusion list do not change when it does.
 pub fn fast_nid(func_nid: u32) -> bool {
     if no_fast_import() {
         return false;
     }
-    matches!(
-        func_nid,
-        gxm_nid::DRAW
-            | gxm_nid::DRAW_PRECOMPUTED
-            | gxm_nid::BEGIN_SCENE
-            | gxm_nid::END_SCENE
-            | gxm_nid::SET_VISIBILITY_BUFFER
-            | gxm_nid::COLOR_SURFACE_GET_DATA
-            | gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS
-            | gxm_nid::PAD_HEARTBEAT
-            | lw_nid::SIGNAL_LW_COND
-            // (the lightweight-mutex lock/unlock pair is INLINED - `lwsync::inline_op` - so
-            // it never reaches a trap and is not named here)
-            | lw_nid::TRY_LOCK_LW_MUTEX
-            | sync_nid::UNLOCK_MUTEX
-            | sync_nid::SIGNAL_COND
-            | lk_nid::CLIB_MSPACE_MALLOC
-            | lk_nid::CLIB_MSPACE_MEMALIGN
-            | lk_nid::CLIB_MSPACE_FREE
-            | lk_nid::GET_TLS_ADDR
-            | ngs_nid::VOICE_GET_STATE_DATA
-            | ngs_nid::SYSTEM_UPDATE
-            | ngs_nid::VOICE_SET_PARAMS_BLOCK
-            | pm_nid::POWER_TICK
-            | sv_nid::APP_MGR_GET_APP_STATE
-            | sv_nid::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER
-            | sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT
-            | sv_nid::TOUCH_READ
-    )
+    // A parallel run forwards these to the run worker, which needs a suspension to do it.
+    if smp_linking() && smp_owner_only(func_nid) {
+        return false;
+    }
+    if fast_import_derived() {
+        return fast_admissible(func_nid);
+    }
+    CURATED_FAST_NIDS.contains(&func_nid)
+}
+
+/// Whether the DERIVED rule admits `func_nid`: its dispatch arm is exactly `cont!(..)` and it
+/// is not held back by name. Separate from [`fast_nid`] because the knob decides which SET is
+/// in use and this decides what is IN the derived one - and the tests have to reach the second
+/// question whatever the first is answering today.
+fn fast_admissible(func_nid: u32) -> bool {
+    dispatch_arm_is_cont_only(func_nid) && !FAST_EXCLUDED.iter().any(|(n, _)| *n == func_nid)
+}
+
+/// A NID whose dispatch arm IS `cont!(..)` and which must still not be routed through the
+/// non-suspending trap, with the reason it is held back.
+///
+/// EMPTY, and that is a finding rather than an oversight: the parking handlers all return
+/// their own `SvcOutcome` already, so the shape test refuses them without help. The list
+/// exists because the next one will not be like that - a handler that returns nothing but
+/// whose fast form is wrong for a reason outside the type system needs somewhere to be
+/// written down with its reason, and a reason in a list beats a reason in a commit message.
+pub const FAST_EXCLUDED: &[(u32, &str)] = &[];
+
+/// The hand-written fast list as it stood before the set was derived, and still the DEFAULT
+/// until the derived set is priced - it is the middle point of the A/B, so one build can hold
+/// "today's 23" against "all-slow" and "derived" without a second binary in the comparison.
+///
+/// `the_curated_list_is_a_subset_of_the_derived_one` holds it to the derivation: every name
+/// here must still be admitted by the shape test, so this cannot quietly become a second,
+/// divergent opinion about what may suspend.
+pub const CURATED_FAST_NIDS: &[u32] = &[
+    gxm_nid::DRAW,
+    gxm_nid::DRAW_PRECOMPUTED,
+    gxm_nid::BEGIN_SCENE,
+    gxm_nid::SET_VISIBILITY_BUFFER,
+    gxm_nid::COLOR_SURFACE_GET_DATA,
+    gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS,
+    gxm_nid::PAD_HEARTBEAT,
+    lw_nid::SIGNAL_LW_COND,
+    lw_nid::TRY_LOCK_LW_MUTEX,
+    sync_nid::UNLOCK_MUTEX,
+    sync_nid::SIGNAL_COND,
+    lk_nid::CLIB_MSPACE_MALLOC,
+    lk_nid::CLIB_MSPACE_MEMALIGN,
+    lk_nid::CLIB_MSPACE_FREE,
+    lk_nid::GET_TLS_ADDR,
+    ngs_nid::VOICE_GET_STATE_DATA,
+    ngs_nid::SYSTEM_UPDATE,
+    ngs_nid::VOICE_SET_PARAMS_BLOCK,
+    pm_nid::POWER_TICK,
+    sv_nid::APP_MGR_GET_APP_STATE,
+    sv_nid::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER,
+    sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT,
+    sv_nid::TOUCH_READ,
+];
+
+/// Whether to use the DERIVED fast set - every `cont!` dispatch arm, 873 NIDs over 684 arms -
+/// rather than the 23 hand-picked ones. **DERIVED IS THE DEFAULT**;
+/// `VITASLOP_FAST_IMPORT_CURATED=1` is the falsifier that restores the hand-written list.
+/// Read at LINK time, so it must be set for the whole run.
+///
+/// # Why the default moved, and what it rests on
+/// The old list was hand-written from ONE racing title's host-call profile, so every other
+/// title paid a JSPI stack switch on calls that provably cannot suspend. The derivation is
+/// not a judgement: a handler that returns `()` has no channel through which to ask for a
+/// suspension, because `SvcOutcome` IS that channel - so `cont!(handler(..))` is the whole
+/// admissibility test, and a handler that later grows a parking path must start returning an
+/// outcome, which takes its arm out of the shape and out of the set in the same edit.
+///
+/// MEASURED, desktop browser, a fighting title, seven sampled frames per arm: the share of
+/// host calls taking the NON-SUSPENDING trap goes from a median of ~21% to ~45%, with six of
+/// the seven derived samples above the curated median. The frames are not paired, so that is
+/// a direction and a magnitude rather than a precise figure - but the mechanism is not in
+/// doubt (a suspending call is a stack switch; a fast one is a direct call), and the picture
+/// is unchanged: 72 of 72 shots bit-identical across three titles, one build, a knob per arm.
+/// The wall-clock effect is UNMEASURED - this rig's browser timing could not resolve effects
+/// of this size - so do not quote a millisecond figure for it.
+fn fast_import_derived() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::knobs::flag("VITASLOP_FAST_IMPORT_CURATED"))
 }
 
 fn no_fast_import() -> bool {
@@ -362,6 +678,20 @@ fn no_inline_lwmutex() -> bool {
     *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_LWMUTEX"))
 }
 
+/// `VITASLOP_NO_INLINE_MUTEX`: route `sceKernelLockMutex`/`sceKernelUnlockMutex` through the
+/// host, leaving every other inline form on.
+///
+/// The scoped A/B arm for the heavyweight lock pair, and the falsifier for the one change it
+/// rests on - the mutex's ownership moving out of `VitaState` and into guest memory
+/// ([`crate::vita::kmutex`]). With the knob set the emitted form is gone but the TABLE is still
+/// where the state lives, so a run that differs between the arms is the emitted code, and one
+/// that differs from a build before the table is the move. Two questions, and only this
+/// separates them.
+fn no_inline_mutex() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_MUTEX"))
+}
+
 /// `VITASLOP_NO_INLINE_TEXTURE`: route `sceGxmSetFragmentTexture` through the host,
 /// leaving every other inline form on.
 ///
@@ -500,10 +830,31 @@ static BACKTRACE_AT: LazyLock<Option<(u32, u64, u64)>> = LazyLock::new(|| {
     let nid_ = u32::from_str_radix(nid_s.trim().trim_start_matches("0x"), 16).ok()?;
     Some((nid_, win.0, win.1))
 });
-/// (nid, thread) pairs already reported, so the backtrace prints once per thread
-/// instead of every frame.
-static BACKTRACE_DONE: Mutex<std::collections::BTreeSet<(u32, i32)>> =
+/// (nid, thread, CALL SITE) triples already reported, so the backtrace prints once per
+/// distinct site instead of every frame.
+///
+/// >>> THE SITE BELONGS IN THE KEY, and leaving it out cost a whole investigation. Keyed on
+/// (nid, thread) alone, the diagnostic reports whichever call a thread happens to make FIRST -
+/// and for a call as common as `sceKernelGetSemaInfo` that is almost never the one being
+/// hunted. The line it prints looks exactly like the line it would print for the right call,
+/// so its registers get read as the right object's.
+///
+/// >>> AND THE IMMEDIATE `lr` IS NOT THE SITE when the title routes the call through a
+/// WRAPPER, which is the normal shape: one game wraps every semaphore operation in a
+/// `GetSemaInfo`-then-`SignalSema` helper, so every signal a thread makes - nine different
+/// semaphores, from nine unrelated subsystems - shares the one `lr` and the key collapses to
+/// (nid, thread). MEASURED: a run hunting which site signals one particular uid got exactly
+/// ONE line for the whole main thread, naming a different uid, and the collapse is invisible
+/// because a single plausible line is what a working instrument prints too. So the key is a
+/// fold of the whole CHAIN, which separates callers that share a wrapper; the cost is one
+/// stack scan per call of the chosen NID, which is env-gated to begin with.
+static BACKTRACE_DONE: Mutex<std::collections::BTreeSet<(u32, i32, u64)>> =
     Mutex::new(std::collections::BTreeSet::new());
+
+/// How many distinct chains one `VITASLOP_BACKTRACE` run may print. A stack SCAN can pick up
+/// stale slots, so two calls from one site can fold differently and the report is no longer
+/// bounded by the number of sites; past this it stops and says so rather than filling the log.
+const BACKTRACE_CAP: usize = 200;
 
 /// Ordered-timeline trace (env `VITASLOP_TRACE_ORDER`): print every *meaningful*
 /// host call live, in global order, with a monotonic index and thread id. Unlike
@@ -738,6 +1089,22 @@ pub fn dispatch(
     ctx: &mut GuestCtx,
     st: &mut VitaState,
 ) -> SvcOutcome {
+    let outcome = dispatch_inner(library_nid, func_nid, ctx, st);
+    // The one mirror word a host call can change, kept current for the inlined yield - see
+    // `VitaState::publish_yield_free_change`. A thread that is about to suspend gets a fresh
+    // block at its next pick anyway, so only a continuing thread can read a stale word.
+    if matches!(outcome, SvcOutcome::Continue) {
+        st.publish_yield_free_change(ctx);
+    }
+    outcome
+}
+
+fn dispatch_inner(
+    library_nid: u32,
+    func_nid: u32,
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+) -> SvcOutcome {
     // A handler that returns `()` leaves the guest running; wrap its call so the arm
     // yields `Continue`. Handlers that can suspend a thread (blocking waits, the
     // frame flip, process/thread exit) return the `SvcOutcome` directly instead.
@@ -776,19 +1143,52 @@ pub fn dispatch(
     // may contain stale slots; it is a set of candidates ordered by depth, not proof.
     if let Some((want_nid, lo_f, hi_f)) = *BACKTRACE_AT
         && func_nid == want_nid && (lo_f..=hi_f).contains(&st.cur_frame()) {
-            let key = (want_nid, st.current_thread());
-            if BACKTRACE_DONE.lock().unwrap().insert(key) {
-                let (lo, hi) = *CALLSITE_CODE_RANGE;
-                let sp = ctx.regs[13];
-                let mut chain = vec![format!("{:#010x}", ctx.regs[14])];
-                for i in 0..256u32 {
-                    let v = ctx.read_u32(sp.wrapping_add(i * 4));
-                    if (lo..hi).contains(&v) {
-                        chain.push(format!("{v:#010x}"));
-                    }
+            let (lo, hi) = *CALLSITE_CODE_RANGE;
+            let sp = ctx.regs[13];
+            // The chain first, because it is the KEY as well as the output: see
+            // [`BACKTRACE_DONE`] for why the immediate `lr` is not enough.
+            let mut fold = (0xcbf2_9ce4_8422_2325u64 ^ ctx.regs[14] as u64)
+                .wrapping_mul(0x100_0000_01b3);
+            let mut chain = vec![format!("{:#010x}", ctx.regs[14])];
+            for i in 0..256u32 {
+                let v = ctx.read_u32(sp.wrapping_add(i * 4));
+                if (lo..hi).contains(&v) {
+                    fold = (fold ^ v as u64).wrapping_mul(0x100_0000_01b3);
+                    chain.push(format!("{v:#010x}"));
                 }
+            }
+            let key = (want_nid, st.current_thread(), fold);
+            let fresh = {
+                let mut done = BACKTRACE_DONE.lock().unwrap();
+                match done.len() {
+                    n if n > BACKTRACE_CAP => false,
+                    n if n == BACKTRACE_CAP => {
+                        done.insert(key);
+                        eprintln!(
+                            "backtrace: {BACKTRACE_CAP} distinct call chains reported for this NID; further \
+                             ones are dropped. A stack SCAN can fold differently for one site when a \
+                             stale slot lands in the code range, so this cap is reached by noise as \
+                             readily as by real callers - narrow VITASLOP_BACKTRACE's frame window."
+                        );
+                        false
+                    }
+                    _ => done.insert(key),
+                }
+            };
+            if fresh {
+                // >>> AND THE REGISTER FILE, because the chain alone names CODE and the
+                // question is usually about an OBJECT. A stalled state machine is read through
+                // a field of a heap object this diagnostic's caller cannot name: `findref`
+                // reaches a global, a store watchpoint reaches an address you already have, and
+                // neither reaches `r4` [[vitaslop-a-store-watch-prints-registers-so-it-reaches-
+                // heap-objects]]. The `this` pointer a wrapper was handed is sitting in a
+                // register at the moment of the call, and printing it costs one line.
+                let regs = (0..13)
+                    .map(|i| format!("r{i}={:#x}", ctx.regs[i]))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 eprintln!(
-                    "backtrace f{} t{} {}: lr+stack candidates [{}]",
+                    "backtrace f{} t{} {}: lr+stack candidates [{}] | sp={sp:#010x} {regs}",
                     st.cur_frame(),
                     st.current_thread(),
                     nid::name(func_nid),
@@ -827,13 +1227,17 @@ pub fn dispatch(
     // boot sequence and its flatline-into-spin are legible. Zero cost when unset.
     if TRACE_ORDER.is_some_and(|(lo, hi)| (lo..=hi).contains(&st.cur_frame())) {
         let nm = nid::name(func_nid);
-        let noise = nm.contains("LwMutex")
+        // `VITASLOP_TRACE_ORDER_FULL=1` keeps the GXM setters and draws: the question "which
+        // calls set up THIS draw" is exactly the one the noise filter would hide.
+        static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let full = *FULL.get_or_init(|| std::env::var("VITASLOP_TRACE_ORDER_FULL").is_ok());
+        let noise = !full && (nm.contains("LwMutex")
             || nm.contains("LockMutex")
             || nm.contains("UnlockMutex")
             || nm.starts_with("sceGxmProgram")
             || nm.starts_with("sceGxmSet")
             || nm == "sceGxmDraw"
-            || nm == "sceKernelGetTLSAddr";
+            || nm == "sceKernelGetTLSAddr");
         if !noise {
             let seq = TRACE_ORDER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let label = if nm == "<unknown>" {
@@ -869,9 +1273,19 @@ pub fn dispatch(
             "call"
         );
     }
+    // Every `sceNgsVoice*` call, against the voice it names - see `ngs::report_silent_play`.
+    // The library test first (a compare, where the name lookup is a large match and a string
+    // test on EVERY host call), and nothing once the silent-play reports are spent.
+    if library_nid == crate::nid::lib::SCE_NGS
+        && st.audio_state.ngs_silent_reported < 8
+        && crate::nid::name(func_nid).starts_with("sceNgsVoice")
+    {
+        ngs::trace_voice_call(st, func_nid, [ctx.arg(0), ctx.arg(1), ctx.arg(2), ctx.arg(3)]);
+    }
     let outcome = match func_nid {
         // --- lwsync: lightweight mutex / cond (the hottest surface) --------------
         lw_nid::CREATE_LW_MUTEX => cont!(lwsync::create_lw_mutex(ctx, st)),
+        lw_nid::GET_LW_MUTEX_INFO => cont!(lwsync::get_lw_mutex_info(ctx, st)),
         lw_nid::CREATE_LW_COND => cont!(lwsync::create_lw_cond(ctx, st)),
         lw_nid::WAIT_LW_COND | lw_nid::WAIT_LW_COND_CB => lwsync::wait_lw_cond(ctx, st),
         lw_nid::SIGNAL_LW_COND => cont!(lwsync::signal_lw_cond(ctx, st, false)),
@@ -884,9 +1298,11 @@ pub fn dispatch(
         // exclusion (keyed by its guest work-area address). The `_CB` lock variant
         // additionally processes pending callbacks - none are queued in this model, so
         // it takes the same path.
-        lw_nid::LOCK_LW_MUTEX | lw_nid::LOCK_LW_MUTEX_CB => lwsync::lock_lw_mutex(ctx, st, false),
-        lw_nid::TRY_LOCK_LW_MUTEX => lwsync::lock_lw_mutex(ctx, st, true),
-        lw_nid::UNLOCK_LW_MUTEX | lw_nid::UNLOCK_LW_MUTEX2 => {
+        lw_nid::LOCK_LW_MUTEX | lw_nid::LOCK_LW_MUTEX_CB | lw_nid::LOCK_LW_MUTEX_0 => {
+            lwsync::lock_lw_mutex(ctx, st)
+        }
+        lw_nid::TRY_LOCK_LW_MUTEX => cont!(lwsync::try_lock_lw_mutex(ctx, st)),
+        lw_nid::UNLOCK_LW_MUTEX | lw_nid::UNLOCK_LW_MUTEX2 | lw_nid::UNLOCK_LW_MUTEX_0 => {
             cont!(lwsync::unlock_lw_mutex(ctx, st))
         }
         lw_nid::DELETE_LW_MUTEX => cont!(lwsync::delete_lw_mutex(ctx, st)),
@@ -930,10 +1346,36 @@ pub fn dispatch(
         sync_nid::CLEAR_EVENT_FLAG => cont!(sync::clear_event_flag(ctx, st)),
         sync_nid::DELETE_EVENT_FLAG => cont!(sync::delete_object(ctx, st)),
         sync_nid::GET_SYSTEM_TIME_WIDE => cont!(sync::get_system_time_wide(ctx, st)),
+        // Virtual timers: a stopwatch the guest starts and reads. `Open`/`Start`/`Stop`
+        // are SceThreadmgr spellings, `Create`/`GetTime` SceLibKernel ones - one family,
+        // two exporting libraries, which is why the arms sit together.
+        sync_nid::CANCEL_SEMA => cont!(sync::cancel_sema(ctx, st)),
+        sync_nid::CREATE_TIMER => cont!(sync::create_timer(ctx, st)),
+        tm_nid::OPEN_TIMER => cont!(sync::open_timer(ctx, st)),
+        tm_nid::START_TIMER => cont!(sync::start_timer(ctx, st)),
+        tm_nid::GET_TIMER_TIME_WIDE => cont!(sync::get_timer_time_wide(ctx, st)),
+        tm_nid::STOP_TIMER => cont!(sync::stop_timer(ctx, st)),
+        tm_nid::DELETE_TIMER => cont!(sync::delete_timer(ctx, st)),
+        sync_nid::GET_TIMER_TIME => cont!(sync::get_timer_time(ctx, st)),
+
+        // --- SceVoice: no microphone, no session (see `vita::voice`) -----------
+        voice_nid::INIT => cont!(voice::init(ctx, st)),
+        voice_nid::END => cont!(voice::end(ctx, st)),
+        voice_nid::START => cont!(voice::start(ctx, st)),
+        voice_nid::STOP => cont!(voice::stop(ctx, st)),
+        voice_nid::CREATE_PORT => cont!(voice::create_port(ctx, st)),
+        voice_nid::DELETE_PORT => cont!(voice::delete_port(ctx, st)),
+        voice_nid::CONNECT_IPORT_TO_OPORT => cont!(voice::connect(ctx, st)),
+        voice_nid::DISCONNECT_IPORT_FROM_OPORT => cont!(voice::disconnect(ctx, st)),
+        voice_nid::WRITE_TO_IPORT => cont!(voice::write_to_iport(ctx, st)),
+        voice_nid::READ_FROM_OPORT => cont!(voice::read_from_oport(ctx, st)),
+        voice_nid::GET_PORT_INFO => cont!(voice::get_port_info(ctx, st)),
 
         // --- libkernel: clib string/mem, threads, process ----------------------
         lk_nid::CLIB_PRINTF => cont!(libkernel::clib_printf(ctx, st)),
         lk_nid::CLIB_SNPRINTF => cont!(libkernel::clib_snprintf(ctx, st)),
+        lk_nid::CLIB_VSNPRINTF => cont!(libkernel::clib_vsnprintf(ctx, st)),
+        lk_nid::CLIB_VPRINTF => cont!(libkernel::clib_vprintf(ctx, st)),
         // memmove shares memcpy's read-then-write impl (tolerates overlap).
         lk_nid::CLIB_MEMCPY | lk_nid::CLIB_MEMMOVE => cont!(libkernel::clib_memcpy(ctx, st)),
         lk_nid::CLIB_MEMSET => cont!(libkernel::clib_memset(ctx, st)),
@@ -960,7 +1402,8 @@ pub fn dispatch(
         lk_nid::CREATE_MSG_PIPE => cont!(libkernel::msg_pipe_create(ctx, st)),
         tm_nid::DELETE_MSG_PIPE => cont!(libkernel::msg_pipe_delete(ctx, st)),
         lk_nid::SEND_MSG_PIPE | lk_nid::TRY_SEND_MSG_PIPE => cont!(libkernel::msg_pipe_send(ctx, st)),
-        lk_nid::RECEIVE_MSG_PIPE | lk_nid::TRY_RECEIVE_MSG_PIPE => cont!(libkernel::msg_pipe_receive(ctx, st)),
+        lk_nid::RECEIVE_MSG_PIPE => libkernel::msg_pipe_receive(ctx, st, false),
+        lk_nid::TRY_RECEIVE_MSG_PIPE => libkernel::msg_pipe_receive(ctx, st, true),
         lk_nid::GET_THREAD_TLS_ADDR => cont!(libkernel::get_thread_tls_addr(ctx, st)),
         lk_nid::GET_RANDOM_NUMBER => cont!(libkernel::get_random_number(ctx, st)),
         lk_nid::GET_PROCESS_TIME => libkernel::get_process_time(ctx, st),
@@ -999,6 +1442,27 @@ pub fn dispatch(
         // Closing a semaphore invalidates its id, same as deleting it in this model.
         tm_nid::CLOSE_SEMA => cont!(sync::delete_object(ctx, st)),
         tm_nid::CHANGE_THREAD_VFP_EXCEPTION => cont!(threadmgr::change_thread_vfp_exception(ctx, st)),
+        sync_nid::CREATE_SIMPLE_EVENT => cont!(sync::create_simple_event(ctx, st)),
+        sync_nid::DELETE_SIMPLE_EVENT => cont!(sync::delete_simple_event(ctx, st)),
+        sync_nid::SET_EVENT => cont!(sync::set_event(ctx, st)),
+        sync_nid::WAIT_EVENT | sync_nid::WAIT_EVENT_CB => sync::wait_event(ctx, st),
+        tm_nid::CHECK_CALLBACK => threadmgr::check_callback(ctx, st),
+        tm_nid::CREATE_CALLBACK => cont!(threadmgr::create_callback(ctx, st)),
+        tm_nid::CLEAR_EVENT => cont!(sync::clear_event(ctx, st)),
+        tm_nid::DELETE_CALLBACK => cont!(threadmgr::delete_callback(ctx, st)),
+        tm_nid::NOTIFY_CALLBACK => cont!(threadmgr::notify_callback(ctx, st)),
+        tm_nid::CANCEL_CALLBACK => cont!(threadmgr::cancel_callback(ctx, st)),
+        tm_nid::GET_CALLBACK_COUNT => cont!(threadmgr::get_callback_count(ctx, st)),
+        display_nid::REGISTER_VBLANK_START_CALLBACK => {
+            let uid = ctx.arg(0) as i32;
+            ctx.ret(threadmgr::vblank_start_callback_raw(st, uid, true) as u32);
+            SvcOutcome::Continue
+        }
+        display_nid::UNREGISTER_VBLANK_START_CALLBACK => {
+            let uid = ctx.arg(0) as i32;
+            ctx.ret(threadmgr::vblank_start_callback_raw(st, uid, false) as u32);
+            SvcOutcome::Continue
+        }
 
         // --- net: BSD sockets, modelled OFFLINE (see `vita::net`) ---------------
         // --- SceMotion: a device AT REST, flat. The two sampling switches are real
@@ -1112,6 +1576,10 @@ pub fn dispatch(
         http_nid::SSL_LOAD_CERT => cont!(http::ssl_load_cert(ctx, st)),
         http_nid::SSL_SET_SSL_CALLBACK => cont!(http::ssl_set_ssl_callback(ctx, st)),
         http_nid::SSL_GET_SSL_ERROR => cont!(http::ssl_get_ssl_error(ctx, st)),
+        http_nid::SET_COOKIE_ENABLED => cont!(http::set_cookie_enabled(ctx, st)),
+        http_nid::GET_COOKIE_ENABLED => cont!(http::get_cookie_enabled(ctx, st)),
+        http_nid::SET_COOKIE_RECV_CALLBACK => cont!(http::set_cookie_recv_callback(ctx, st)),
+        http_nid::GET_COOKIE => cont!(http::get_cookie(ctx, st)),
 
         net_nid::SOCKET => cont!(net::socket(ctx, st)),
         net_nid::SOCKET_CLOSE => cont!(net::socket_close(ctx, st)),
@@ -1135,6 +1603,7 @@ pub fn dispatch(
         net_nid::ERRNO_LOC => cont!(net::errno_loc(ctx, st)),
         net_nid::RESOLVER_CREATE => cont!(net::resolver_create(ctx, st)),
         net_nid::RESOLVER_DESTROY => cont!(net::resolver_destroy(ctx, st)),
+        net_nid::RESOLVER_ABORT => cont!(net::resolver_abort(ctx, st)),
         net_nid::RESOLVER_START_NTOA | net_nid::RESOLVER_START_ATON => {
             cont!(net::resolver_start(ctx, st))
         }
@@ -1142,7 +1611,11 @@ pub fn dispatch(
         net_nid::EPOLL_CREATE => cont!(net::epoll_create(ctx, st)),
         net_nid::EPOLL_DESTROY => cont!(net::epoll_destroy(ctx, st)),
         net_nid::EPOLL_CONTROL => cont!(net::epoll_control(ctx, st)),
-        net_nid::EPOLL_WAIT => cont!(net::epoll_wait(ctx, st)),
+        // The `CB` spelling shares the handler: a `CB` wait additionally delivers the
+        // calling thread's pending callbacks, and this engine delivers those at host-call
+        // boundaries anyway - the same reason the display waits fold their pairs.
+        net_nid::EPOLL_WAIT | net_nid::EPOLL_WAIT_CB => cont!(net::epoll_wait(ctx, st)),
+        net_nid::SOCKET_ABORT => cont!(net::socket_abort(ctx, st)),
 
         // --- fiber: cooperative user-level threads -------------------------------
         // Run/Switch/ReturnToThread hand the baton over and PARK the caller, so these
@@ -1161,8 +1634,8 @@ pub fn dispatch(
 
         // --- gxm: graphics ------------------------------------------------------
         gxm_nid::INITIALIZE | gxm_nid::VSH_INITIALIZE => cont!(gxm::initialize(ctx, st)),
-        gxm_nid::FINISH
-        | gxm_nid::PAD_HEARTBEAT
+        gxm_nid::FINISH => gxm::finish(ctx, st),
+        gxm_nid::PAD_HEARTBEAT
         | gxm_nid::DISPLAY_QUEUE_FINISH
         | gxm_nid::PROGRAM_CHECK
         | gxm_nid::DESTROY_CONTEXT
@@ -1170,15 +1643,32 @@ pub fn dispatch(
         | gxm_nid::SYNC_OBJECT_DESTROY => cont!(gxm::ok(ctx)),
         gxm_nid::MAP_MEMORY => cont!(gxm::map_memory(ctx, st)),
         gxm_nid::DEPTH_STENCIL_SURFACE_INIT => cont!(gxm::depth_stencil_surface_init(ctx, st)),
-        // Nothing to tear down for these, but the guest is now free to reuse the
-        // program's memory, so the reflected constants cached against its header
-        // address must not outlive it.
+        gxm_nid::DEPTH_STENCIL_SURFACE_INIT_DISABLED => cont!(gxm::depth_stencil_surface_init_disabled(ctx, st)),
+        // Drop one reference: after its last, the handle must stop reading as a live program
+        // to `...GetProgramRefCount`.
+        //
+        // >>> NO REFLECTION INVALIDATION HERE. A release gives back the patcher's program
+        // >>> OBJECT; the `SceGxmProgram` header the reflection is keyed by stays registered,
+        // >>> and only UNREGISTER (below) can make that address mean a different program. This
+        // >>> used to clear every reflection table on each release - harmless while the patcher
+        // >>> never shared (a title that releases on "the create found an existing program"
+        // >>> never released anything), and ~40 whole-table clears a frame once it did.
+        gxm_nid::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM
+        | gxm_nid::SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM => {
+            st.note_program_released(ctx.arg(1));
+            cont!(gxm::ok(ctx))
+        }
+        gxm_nid::TRANSFER_COPY => cont!(gxm::transfer_copy(ctx)),
+        gxm_nid::TRANSFER_DOWNSCALE => cont!(gxm::transfer_downscale(ctx)),
         gxm_nid::SHADER_PATCHER_DESTROY
         | gxm_nid::SHADER_PATCHER_UNREGISTER_PROGRAM
-        | gxm_nid::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM
-        | gxm_nid::SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM => {
+        | gxm_nid::SHADER_PATCHER_FORCE_UNREGISTER_PROGRAM => {
             st.invalidate_program_reflection();
             cont!(gxm::ok(ctx))
+        }
+        gxm_nid::SHADER_PATCHER_GET_VERTEX_PROGRAM_REF_COUNT
+        | gxm_nid::SHADER_PATCHER_GET_FRAGMENT_PROGRAM_REF_COUNT => {
+            cont!(gxm::shader_patcher_get_program_ref_count(ctx, st))
         }
         // Record the bound fragment program so a draw can reflect its samplers (albedo
         // selection). The direct-draw path binds it here rather than via a precomputed
@@ -1204,6 +1694,12 @@ pub fn dispatch(
         gxm_nid::SYNC_OBJECT_CREATE => cont!(gxm::out_handle(ctx, st, 0)),
         gxm_nid::SHADER_PATCHER_REGISTER_PROGRAM => cont!(gxm::register_program(ctx, st)),
         gxm_nid::SHADER_PATCHER_GET_PROGRAM_FROM_ID => cont!(gxm::get_program_from_id(ctx, st)),
+        gxm_nid::SHADER_PATCHER_SET_USER_DATA => cont!(gxm::shader_patcher_set_user_data(ctx, st)),
+        gxm_nid::SHADER_PATCHER_GET_USER_DATA => cont!(gxm::shader_patcher_get_user_data(ctx, st)),
+        gxm_nid::PROGRAM_IS_FRAG_COLOR_USED => cont!(gxm::program_is_frag_color_used(ctx, st)),
+        // The one GXM wait with no published prototype - see `gxm::wait_event`. It gives up
+        // the CPU rather than returning inline, so it is not in the `ok` group above.
+        gxm_nid::WAIT_EVENT => gxm::wait_event(ctx, st),
         gxm_nid::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => cont!(gxm::param_get_resource_index(ctx)),
         gxm_nid::PROGRAM_FIND_PARAMETER_BY_NAME => cont!(gxm::find_parameter(ctx, st)),
         gxm_nid::PROGRAM_GET_PARAMETER_COUNT => cont!(gxm::program_get_parameter_count(ctx)),
@@ -1213,15 +1709,29 @@ pub fn dispatch(
         gxm_nid::PROGRAM_PARAMETER_GET_COMPONENT_COUNT => cont!(gxm::param_get_component_count(ctx)),
         gxm_nid::PROGRAM_PARAMETER_GET_CONTAINER_INDEX => cont!(gxm::param_get_container_index(ctx)),
         gxm_nid::PROGRAM_PARAMETER_GET_ARRAY_SIZE => cont!(gxm::param_get_array_size(ctx)),
+        gxm_nid::PROGRAM_PARAMETER_IS_REG_FORMAT => cont!(gxm::param_is_reg_format(ctx)),
+        gxm_nid::PROGRAM_PARAMETER_GET_INDEX => cont!(gxm::param_get_index(ctx)),
         gxm_nid::PROGRAM_PARAMETER_GET_NAME => cont!(gxm::param_get_name(ctx)),
         gxm_nid::COLOR_SURFACE_INIT => cont!(gxm::color_surface_init(ctx, st)),
         gxm_nid::COLOR_SURFACE_INIT_DISABLED => cont!(gxm::color_surface_init_disabled(ctx, st)),
         gxm_nid::SHADER_PATCHER_CREATE_VERTEX_PROGRAM => cont!(gxm::create_vertex_program(ctx, st)),
         gxm_nid::SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM => cont!(gxm::create_fragment_program(ctx, st)),
+        gxm_nid::VERTEX_PROGRAM_GET_PROGRAM => cont!(gxm::vertex_program_get_program(ctx, st)),
+        gxm_nid::FRAGMENT_PROGRAM_GET_PROGRAM => cont!(gxm::fragment_program_get_program(ctx, st)),
         gxm_nid::BEGIN_SCENE => cont!(gxm::begin_scene(ctx, st)),
-        gxm_nid::END_SCENE => cont!(gxm::end_scene(ctx, st)),
+        gxm_nid::END_SCENE => gxm::end_scene(ctx, st),
         gxm_nid::SET_VERTEX_PROGRAM => cont!(gxm::set_vertex_program(ctx, st)),
         gxm_nid::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER => cont!(gxm::reserve_vertex_uniforms(ctx, st)),
+        gxm_nid::SET_VERTEX_DEFAULT_UNIFORM_BUFFER => {
+            let buf = ctx.arg(1);
+            st.set_default_uniform_buffer(ctx, crate::host::ProgramStage::Vertex, buf);
+            cont!(ctx.ret(0))
+        }
+        gxm_nid::SET_FRAGMENT_DEFAULT_UNIFORM_BUFFER => {
+            let buf = ctx.arg(1);
+            st.set_default_uniform_buffer(ctx, crate::host::ProgramStage::Fragment, buf);
+            cont!(ctx.ret(0))
+        }
         gxm_nid::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER => cont!(gxm::reserve_fragment_uniforms(ctx, st)),
         gxm_nid::SET_UNIFORM_DATA_F => cont!(gxm::set_uniform_data_f(ctx, st)),
         gxm_nid::SET_VERTEX_STREAM => cont!(gxm::set_vertex_stream(ctx, st)),
@@ -1259,7 +1769,11 @@ pub fn dispatch(
         }
         gxm_nid::TEXTURE_GET_STRIDE => cont!(gxm::texture_get_stride(ctx, st)),
         gxm_nid::TEXTURE_GET_LOD_BIAS => cont!(gxm::texture_get_lod_bias(ctx)),
-        gxm_nid::TEXTURE_GET_U_ADDR_MODE_SAFE => cont!(gxm::texture_get_u_addr_mode(ctx)),
+        gxm_nid::TEXTURE_GET_U_ADDR_MODE_SAFE | gxm_nid::TEXTURE_GET_U_ADDR_MODE => {
+            cont!(gxm::texture_get_u_addr_mode(ctx))
+        }
+        gxm_nid::TEXTURE_GET_V_ADDR_MODE => cont!(gxm::texture_get_v_addr_mode(ctx)),
+        gxm_nid::TEXTURE_GET_MIP_FILTER => cont!(gxm::texture_get_mip_filter(ctx)),
         gxm_nid::TEXTURE_GET_V_ADDR_MODE_SAFE => cont!(gxm::texture_get_v_addr_mode(ctx)),
         gxm_nid::TEXTURE_GET_MIN_FILTER => cont!(gxm::texture_get_min_filter(ctx)),
         gxm_nid::TEXTURE_GET_MAG_FILTER => cont!(gxm::texture_get_mag_filter(ctx)),
@@ -1350,6 +1864,9 @@ pub fn dispatch(
         gxm_nid::SET_FRONT_VISIBILITY_TEST_ENABLE => cont!(gxm::set_front_visibility_test_enable(ctx, st)),
         gxm_nid::SET_FRONT_VISIBILITY_TEST_INDEX => cont!(gxm::set_front_visibility_test_index(ctx, st)),
         gxm_nid::SET_FRONT_VISIBILITY_TEST_OP => cont!(gxm::set_front_visibility_test_op(ctx, st)),
+        gxm_nid::SET_BACK_VISIBILITY_TEST_ENABLE => cont!(gxm::set_back_visibility_test(ctx, st, 0)),
+        gxm_nid::SET_BACK_VISIBILITY_TEST_INDEX => cont!(gxm::set_back_visibility_test(ctx, st, 1)),
+        gxm_nid::SET_BACK_VISIBILITY_TEST_OP => cont!(gxm::set_back_visibility_test(ctx, st, 2)),
         gxm_nid::UNMAP_MEMORY
         | gxm_nid::UNMAP_VERTEX_USSE_MEMORY
         | gxm_nid::UNMAP_FRAGMENT_USSE_MEMORY => cont!(gxm::unmap_memory(ctx, st)),
@@ -1361,8 +1878,13 @@ pub fn dispatch(
         gxm_nid::RENDER_TARGET_GET_DRIVER_MEM_BLOCK => {
             cont!(gxm::render_target_get_driver_mem_block(ctx, st))
         }
-        gxm_nid::NOTIFICATION_WAIT => cont!(gxm::notification_wait(ctx, st)),
-        gxm_nid::SET_VERTEX_TEXTURE => cont!(gxm::set_vertex_texture(ctx, st)),
+        gxm_nid::NOTIFICATION_WAIT => gxm::notification_wait(ctx, st),
+        gxm_nid::SET_VERTEX_TEXTURE | gxm_nid::SET_VERTEX_TEXTURE_PUBLIC => cont!(gxm::set_vertex_texture(ctx, st)),
+        gxm_nid::SHADER_PATCHER_GET_HOST_MEM_ALLOCATED => cont!(ctx.ret(0)),
+        gxm_nid::SHADER_PATCHER_GET_BUFFER_MEM_ALLOCATED
+        | gxm_nid::SHADER_PATCHER_GET_VERTEX_USSE_MEM_ALLOCATED
+        | gxm_nid::SHADER_PATCHER_GET_FRAGMENT_USSE_MEM_ALLOCATED => cont!(gxm::shader_patcher_get_mem_allocated(ctx)),
+        gxm_nid::TRANSFER_FINISH => cont!(gxm::ok(ctx)),
         gxm_nid::TEXTURE_INIT_CUBE_ARBITRARY => {
             cont!(gxm::texture_init(ctx, st, gxm::TYPE_CUBE_ARBITRARY))
         }
@@ -1385,6 +1907,7 @@ pub fn dispatch(
         gxm_nid::SET_FRONT_POINT_LINE_WIDTH => cont!(gxm::set_front_point_line_width(ctx, st)),
         gxm_nid::SET_FRONT_POLYGON_MODE => cont!(gxm::set_front_polygon_mode(ctx, st)),
         gxm_nid::SET_FRONT_STENCIL_REF => cont!(gxm::set_front_stencil_ref(ctx, st)),
+        gxm_nid::SET_BACK_STENCIL_REF => cont!(gxm::set_back_stencil_ref(ctx, st)),
         gxm_nid::SET_FRONT_STENCIL_FUNC => cont!(gxm::set_front_stencil_func(ctx, st)),
         gxm_nid::SET_BACK_STENCIL_FUNC => cont!(gxm::set_back_stencil_func(ctx, st)),
         gxm_nid::SET_VIEWPORT => cont!(gxm::set_viewport(ctx, st)),
@@ -1393,8 +1916,15 @@ pub fn dispatch(
         gxm_nid::COLOR_SURFACE_GET_FORMAT => cont!(gxm::color_surface_get_format(ctx, st)),
         gxm_nid::COLOR_SURFACE_GET_TYPE => cont!(gxm::color_surface_get_type(ctx, st)),
         gxm_nid::COLOR_SURFACE_SET_CLIP => cont!(gxm::color_surface_set_clip(ctx, st)),
+        gxm_nid::COLOR_SURFACE_GET_CLIP => cont!(gxm::color_surface_get_clip(ctx, st)),
+        gxm_nid::COLOR_SURFACE_SET_FORMAT => cont!(gxm::color_surface_set_format(ctx, st)),
+        gxm_nid::COLOR_SURFACE_GET_GAMMA_MODE => cont!(gxm::color_surface_get_gamma_mode(ctx, st)),
+        gxm_nid::COLOR_SURFACE_SET_DITHER_MODE => cont!(gxm::color_surface_set_dither_mode(ctx, st)),
+        gxm_nid::COLOR_SURFACE_GET_DITHER_MODE => cont!(gxm::color_surface_get_dither_mode(ctx, st)),
         gxm_nid::TEXTURE_GET_TYPE => cont!(gxm::texture_get_type(ctx, st)),
-        gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC => cont!(gxm::param_get_semantic(ctx, st)),
+        gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC | gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC_PUBLIC => {
+            cont!(gxm::param_get_semantic(ctx, st))
+        }
         gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC_INDEX => {
             cont!(gxm::param_get_semantic_index(ctx, st))
         }
@@ -1407,6 +1937,9 @@ pub fn dispatch(
             cont!(gxm::texture_set_v_addr_mode(ctx))
         }
         gxm_nid::TEXTURE_SET_LOD_BIAS => cont!(gxm::texture_set_lod_bias(ctx)),
+        gxm_nid::TEXTURE_SET_MIPMAP_COUNT => cont!(gxm::texture_set_mipmap_count(ctx)),
+        gxm_nid::TEXTURE_SET_LOD_MIN => cont!(gxm::texture_set_lod_min(ctx)),
+        gxm_nid::TEXTURE_GET_LOD_MIN => cont!(gxm::texture_get_lod_min(ctx)),
         gxm_nid::DRAW => cont!(gxm::draw(ctx, st)),
         gxm_nid::DRAW_INSTANCED => cont!(gxm::draw_instanced(ctx, st)),
         gxm_nid::DISPLAY_QUEUE_ADD_ENTRY => {
@@ -1451,6 +1984,7 @@ pub fn dispatch(
         // --- thread and semaphore introspection, signals, module queries ---------
         lk_nid::GET_THREAD_INFO => cont!(libkernel::get_thread_info(ctx, st)),
         lk_nid::GET_SEMA_INFO => cont!(sync::get_sema_info(ctx, st)),
+        lk_nid::GET_MUTEX_INFO => cont!(sync::get_mutex_info(ctx, st)),
         sync_nid::OPEN_SEMA => cont!(sync::open_sema(ctx, st)),
         tm_nid::CHANGE_THREAD_PRIORITY => cont!(threadmgr::change_thread_priority(ctx, st)),
         tm_nid::SEND_SIGNAL => cont!(libkernel::send_signal(ctx, st)),
@@ -1508,6 +2042,7 @@ pub fn dispatch(
 
         // --- display ------------------------------------------------------------
         display_nid::SET_FRAME_BUF => cont!(display::set_frame_buf(ctx, st)),
+        display_nid::GET_FRAME_BUF => cont!(display::get_frame_buf(ctx, st)),
         // A real timed vblank wait (parks under the preemptive scheduler).
         //
         // The `CB` spellings share each handler. A `CB` wait additionally runs the
@@ -1529,6 +2064,7 @@ pub fn dispatch(
             display::wait_set_frame_buf_multi(ctx, st)
         }
         display_nid::GET_VCOUNT => cont!(display::get_vcount(ctx, st)),
+        display_nid::GET_REFRESH_RATE => cont!(display::get_refresh_rate(ctx, st)),
 
         // --- ctrl: input --------------------------------------------------------
         ctrl_nid::PEEK_BUFFER_POSITIVE => cont!(ctrl::peek_buffer_positive(ctx, st)),
@@ -1558,7 +2094,8 @@ pub fn dispatch(
         | ngs_nid::VOICE_DEF_GET_SCREAM_ATRAC9_VOICE
         | ngs_nid::VOICE_DEF_GET_SCREAM_VOICE
         | ngs_nid::VOICE_DEF_GET_TEMPLATE1
-        | ngs_nid::VOICE_DEF_GET_ATRAC9_VOICE => {
+        | ngs_nid::VOICE_DEF_GET_ATRAC9_VOICE
+        | ngs_nid::VOICE_DEF_GET_SAS_EMU_VOICE => {
             // One blob per definition, keyed by the NID this call arrived on - the pointer
             // is the only thing a rack description says about what it is made of.
             let addr = ngs::voice_def_get_for(st, func_nid);
@@ -1566,6 +2103,7 @@ pub fn dispatch(
             SvcOutcome::Continue
         }
         ngs_nid::PATCH_CREATE_ROUTING => cont!(ngs::patch_create_routing(ctx, st)),
+        ngs_nid::VOICE_GET_OUTPUT_PATCH => cont!(ngs::voice_get_output_patch(ctx, st)),
         // The remaining NGS calls are state transitions / per-frame pumps that
         // succeed silently: update/flags/release, voice play/keyoff/kill/pause/
         // resume, param unlock, callbacks, bypass, patch info, AT9 details,
@@ -1697,6 +2235,7 @@ pub fn dispatch(
             cont!(services::rtc_get_current_clock_local_time(ctx, st))
         }
         sv_nid::RTC_GET_CURRENT_TICK => cont!(services::rtc_get_current_tick(ctx, st)),
+        sv_nid::RTC_GET_ACCUMULATIVE_TIME => cont!(services::rtc_get_accumulative_time(ctx, st)),
         sv_nid::RTC_GET_TICK_RESOLUTION => cont!(services::rtc_get_tick_resolution(ctx, st)),
         sv_nid::RTC_CONVERT_UTC_TO_LOCAL_TIME | sv_nid::RTC_CONVERT_LOCAL_TIME_TO_UTC => {
             cont!(services::rtc_convert_time_zone(ctx, st))
@@ -1738,6 +2277,7 @@ pub fn dispatch(
         sv_nid::RTC_FORMAT_RFC3339_LOCAL_TIME => {
             cont!(services::rtc_format_rfc3339_local_time(ctx, st))
         }
+        sv_nid::RTC_PARSE_RFC3339 => cont!(services::rtc_parse_rfc3339(ctx, st)),
         sv_nid::APPUTIL_SYSTEM_PARAM_GET_INT => cont!(services::apputil_system_param_get_int(ctx, st)),
         sv_nid::APPUTIL_APP_PARAM_GET_INT => cont!(services::apputil_app_param_get_int(ctx, st)),
         sv_nid::LIVE_AREA_GET_STATUS => cont!(services::live_area_get_status(ctx, st)),
@@ -1780,11 +2320,25 @@ pub fn dispatch(
         sv_nid::ADHOC_MATCHING_STOP => cont!(net::adhoc_matching_set_started(ctx, st, false)),
         sv_nid::ADHOC_MATCHING_DELETE => cont!(net::adhoc_matching_delete(ctx, st)),
         sv_nid::ADHOC_MATCHING_SELECT_TARGET => cont!(net::adhoc_matching_select_target(ctx, st)),
+        sv_nid::ADHOC_MATCHING_TERM => cont!(net::adhoc_matching_term(ctx, st)),
+        // Both name a PEER on a context no peer has ever appeared on - see the handlers for
+        // why the send REFUSES and the cancel succeeds.
+        sv_nid::ADHOC_MATCHING_SEND_DATA => cont!(net::adhoc_matching_send_data(ctx, st)),
+        sv_nid::ADHOC_MATCHING_CANCEL_TARGET => cont!(net::adhoc_matching_cancel_target(ctx, st)),
+        sv_nid::ADHOC_MATCHING_GET_MEMBERS => cont!(net::adhoc_matching_get_members(ctx, st)),
+        sv_nid::ADHOC_MATCHING_SET_HELLO_OPT => cont!(net::adhoc_matching_set_hello_opt(ctx, st)),
+        sv_nid::NET_CTL_GET_NAT_INFO => cont!(services::netctl_get_nat_info(ctx, st)),
+        sv_nid::APPUTIL_STORE_BROWSE => cont!(services::apputil_store_browse(ctx, st)),
+        sv_nid::NET_CHECK_DIALOG_GET_PS3_CONNECT_INFO => {
+            cont!(services::net_check_dialog_get_ps3_connect_info(ctx, st))
+        }
         sv_nid::MP4_OPEN_FILE => cont!(video::mp4_open_file(ctx, st)),
         sv_nid::MP4_START_FILE_STREAMING => cont!(video::mp4_start_file_streaming(ctx, st)),
         sv_nid::MP4_CLOSE_FILE => cont!(video::mp4_close_file(ctx, st)),
         sv_nid::MP4_RELEASE_BUFFER_7B4832FE => cont!(video::mp4_release_buffer(ctx, st)),
         sv_nid::MP4_GET_NEXT_UNIT_8BE0E3D3 => cont!(video::mp4_get_next_unit(ctx, st)),
+        sv_nid::MP4_GET_STREAM_INFO => cont!(video::mp4_get_stream_info(ctx, st)),
+        sv_nid::MP4_STOP_FILE_STREAMING_C05DFF01 => cont!(video::mp4_stop_file_streaming(ctx, st)),
         sv_nid::MP4_ENABLE_STREAM_609E57AD => cont!(video::mp4_enable_stream(ctx, st)),
         // NOT `cont!`: a unit that is not due yet parks the caller briefly rather than being
         // refused into a spin. See `video::mp4_get_next_unit_info`.
@@ -1804,6 +2358,7 @@ pub fn dispatch(
         }
         vd_nid::AVCDEC_CREATE_DECODER => cont!(avcdec::avcdec_create_decoder(ctx, st)),
         vd_nid::AVCDEC_DELETE_DECODER => cont!(avcdec::avcdec_delete_decoder(ctx, st)),
+        vd_nid::AVCDEC_DECODE_AVAILABLE_SIZE => cont!(avcdec::avcdec_decode_available_size(ctx, st)),
         // NOT `cont!`: a decode that produced nothing parks its caller, which is what lets
         // a browser's decoder answer at all. See `avcdec::avcdec_decode`.
         vd_nid::AVCDEC_DECODE => avcdec::avcdec_decode(ctx, st),
@@ -1816,6 +2371,7 @@ pub fn dispatch(
             cont!(audiodec::audiodec_create_decoder_external(ctx, st))
         }
         ad_nid::DECODE => cont!(audiodec::audiodec_decode(ctx, st)),
+        ad_nid::DECODE_N_FRAMES => cont!(audiodec::audiodec_decode_n_frames(ctx, st)),
         // The AT9 family: the title's own stream, decoded synchronously in the call.
         ad_nid::INIT_LIBRARY => cont!(audiodec::audiodec_init_library(ctx, st)),
         ad_nid::TERM_LIBRARY => cont!(audiodec::audiodec_term_library(ctx, st)),
@@ -1873,6 +2429,9 @@ pub fn dispatch(
         sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_INDEX => {
             cont!(gesture::get_touch_event_by_index(ctx, st))
         }
+        sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_EVENT_ID => {
+            cont!(gesture::get_touch_event_by_event_id(ctx, st))
+        }
         sv_nid::SYSTEM_GESTURE_GET_TOUCH_RECOGNIZER_INFORMATION => {
             cont!(gesture::get_touch_recognizer_information(ctx, st))
         }
@@ -1887,9 +2446,16 @@ pub fn dispatch(
         // SceJpegEnc: context setup is real; Encode/Csc are left to the hard-fail
         // because there is no honest way to hand back a JPEG that was never encoded.
         sv_nid::JPEG_INIT_MJPEG => cont!(jpeg::init_mjpeg(ctx, st)),
+        sv_nid::JPEG_INIT_MJPEG_WITH_PARAM => cont!(jpeg::init_mjpeg_with_param(ctx, st)),
         sv_nid::JPEG_FINISH_MJPEG => cont!(jpeg::finish_mjpeg(ctx, st)),
+        sv_nid::JPEG_GET_OUTPUT_INFO => cont!(jpeg::get_output_info(ctx, st)),
+        sv_nid::JPEG_DECODE_MJPEG_YCBCR => cont!(jpeg::decode_mjpeg_ycbcr(ctx, st)),
+        sv_nid::JPEG_MJPEG_CSC => cont!(jpeg::mjpeg_csc(ctx, st)),
+        sv_nid::JPEG_CSC => cont!(jpeg::plain_csc(ctx, st)),
         sv_nid::JPEGENC_GET_CONTEXT_SIZE => cont!(jpegenc::get_context_size(ctx, st)),
         sv_nid::JPEGENC_INIT => cont!(jpegenc::init(ctx, st)),
+        sv_nid::JPEGENC_INIT_WITH_PARAM => cont!(jpegenc::init_with_param(ctx, st)),
+        sv_nid::JPEGENC_SET_HEADER_MODE => cont!(jpegenc::set_header_mode(ctx, st)),
         sv_nid::JPEGENC_END => cont!(jpegenc::end(ctx, st)),
         sv_nid::JPEGENC_SET_OUTPUT_ADDR => cont!(jpegenc::set_output_addr(ctx, st)),
         sv_nid::JPEGENC_SET_COMPRESSION_RATIO => cont!(jpegenc::set_compression_ratio(ctx, st)),
@@ -1972,9 +2538,48 @@ pub fn dispatch(
         | sv_nid::NP_SCORE_GET_RANKING_BY_RANGE_ASYNC
         // The async poll: no request was ever accepted, so there is no operation whose
         // completion this could report.
-        | sv_nid::NP_SCORE_POLL_ASYNC => {
+        | sv_nid::NP_SCORE_POLL_ASYNC
+        // The identity, messaging and lookup calls this title adds to the same surface.
+        // `GetCachedParam` reads the signed-in account's cached parameters, of which there
+        // are none; `SendInGameDataMessage` needs a session to send over; `LookupNpIdAsync`
+        // needs the lookup service; and a message's ATTACHMENT can only exist on a message,
+        // of which there are none off-console.
+        | sv_nid::NP_MANAGER_GET_CACHED_PARAM
+        | sv_nid::NP_BASIC_SEND_IN_GAME_DATA_MESSAGE
+        | sv_nid::NP_LOOKUP_NP_ID_ASYNC
+        | sv_nid::NP_MESSAGE_GET_ATTACHED_DATA
+        | sv_nid::NP_MESSAGE_SET_ATTACHED_DATA_USED_FLAG
+        // The rest of SceNpCommerce2's product surface. Every one of these needs the STORE:
+        // a session against it, a request over that session, or a result that only a reply
+        // can fill. `NP_COMMERCE2_CREATE_SESSION_GET_RESULT` above already reports the
+        // signed-out failure of the session those requests would hang off, so reporting the
+        // same cause here is what tells a title the store is unreachable rather than that
+        // its own bookkeeping is wrong.
+        //
+        // The two `Init*Result` calls belong here and not with the successes: they take a
+        // REQUEST id (they initialise the caller's result object against the request that
+        // produced it), and no request here was ever accepted.
+        | sv_nid::NP_COMMERCE2_GET_SESSION_INFO
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_CREATE_REQ
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_START
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_GET_RESULT
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_LIST_CREATE_REQ
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_LIST_START
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_LIST_GET_RESULT
+        | sv_nid::NP_COMMERCE2_INIT_GET_PRODUCT_INFO_RESULT
+        | sv_nid::NP_COMMERCE2_INIT_GET_PRODUCT_INFO_LIST_RESULT
+        // ...and the four accessors that READ a fetched product. They are handed a result
+        // object no fetch ever filled, and each hands back a POINTER into it on hardware.
+        // Reporting signed out is the one answer that cannot mislead: a fabricated product
+        // record would be a price and a name for something nobody offered, and a title
+        // showing it would be showing an invented store listing.
+        | sv_nid::NP_COMMERCE2_GET_GAME_PRODUCT_INFO
+        | sv_nid::NP_COMMERCE2_GET_GAME_PRODUCT_INFO_FROM_GET_PRODUCT_INFO_LIST_RESULT
+        | sv_nid::NP_COMMERCE2_GET_GAME_SKU_INFO_FROM_GAME_PRODUCT_INFO
+        | sv_nid::NP_COMMERCE2_GET_PRICE => {
             cont!(ctx.ret(services::SCE_NP_ERROR_SIGNED_OUT as u32))
         }
+        sv_nid::NET_GET_MAC_ADDRESS => cont!(services::net_get_mac_address(ctx, st)),
         // Everything else here is an init/register that simply succeeds offline.
         sv_nid::NET_INIT
         | sv_nid::NET_CTL_INIT
@@ -2003,6 +2608,10 @@ pub fn dispatch(
         // here, so the claim is granted. `sceAudioOut` opening a BGM-type port is what
         // actually produces sound (see `vita::audio`), and that is independent of this.
         | sv_nid::APPMGR_ACQUIRE_BGM_PORT
+        // ... and releasing it again. Nothing was taken from anyone, so nothing has to be
+        // handed back; what matters is that the pair is symmetric, since a title that is
+        // told the acquire worked will release it later.
+        | sv_nid::APPMGR_RELEASE_BGM_PORT
         // ScePerf/Razor: a marker packet for the CPU profiler's timeline. No profiler is
         // attached and there is no capture buffer to append to, so the packet has nowhere
         // to go - which is exactly the retail case the call is written to survive.
@@ -2036,7 +2645,18 @@ pub fn dispatch(
         | sv_nid::NP_LOOKUP_INIT
         | sv_nid::NP_TUS_INIT
         | sv_nid::NP_MESSAGE_INIT_WITH_PARAM
+        // The paramless spelling of the same init, a separate NID a title may link instead.
+        | sv_nid::NP_MESSAGE_INIT
         | sv_nid::NP_MESSAGE_TERM
+        // SceNpCommerce2 TEARDOWN, for the reason the rest of the online stack's teardown
+        // succeeds: destroying a context, a request or a result that was never filled
+        // against a server still releases the local object, and a title unwinding after
+        // being told the store is unreachable must not be handed a second error on the way
+        // out.
+        | sv_nid::NP_COMMERCE2_TERM
+        | sv_nid::NP_COMMERCE2_DESTROY_CTX
+        | sv_nid::NP_COMMERCE2_DESTROY_REQ
+        | sv_nid::NP_COMMERCE2_DESTROY_GET_PRODUCT_INFO_RESULT
         | sv_nid::NP_MATCHING2_INIT
         // Matching2 / NpScore TEARDOWN, for the same reason the rest of the online stack's
         // teardown succeeds: nothing was created, so there is nothing that can fail to be
@@ -2092,6 +2712,7 @@ pub fn dispatch(
         // so a frame update is an accepted no-op (the async variant has no completion
         // to deliver - there is no LiveArea state that changes).
         | sv_nid::LIVE_AREA_UPDATE_FRAME_ASYNC
+        | sv_nid::LIVE_AREA_UPDATE_FRAME_SYNC
         // Unnamed exports absent from every vita-headers revision, serviced as an
         // offline no-op success so they are handled rather than left as gaps.
         | sv_nid::NEAR_UTIL_UNKNOWN_A412E9CA
@@ -2113,6 +2734,17 @@ pub fn dispatch(
         sv_nid::NP_PROFILE_DIALOG_TERM => {
             cont!(services::dialog_term(ctx, st, services::DialogFamily::NpProfile))
         }
+        // The PSN friend picker, in the same shape and for the same reasons: no account and
+        // no friend list, so it completes with nobody chosen rather than refusing to open.
+        sv_nid::NP_FRIEND_LIST_DIALOG_INIT => {
+            cont!(services::dialog_init(ctx, st, services::DialogFamily::NpFriendList))
+        }
+        sv_nid::NP_FRIEND_LIST_DIALOG_GET_STATUS => {
+            cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NpFriendList))
+        }
+        sv_nid::NP_FRIEND_LIST_DIALOG_TERM => {
+            cont!(services::dialog_term(ctx, st, services::DialogFamily::NpFriendList))
+        }
         sv_nid::PHOTO_IMPORT_DIALOG_INIT => {
             cont!(services::dialog_init(ctx, st, services::DialogFamily::PhotoImport))
         }
@@ -2122,14 +2754,28 @@ pub fn dispatch(
         sv_nid::PHOTO_IMPORT_DIALOG_TERM => {
             cont!(services::dialog_term(ctx, st, services::DialogFamily::PhotoImport))
         }
+        sv_nid::CAMERA_IMPORT_DIALOG_INIT => {
+            cont!(services::dialog_init(ctx, st, services::DialogFamily::CameraImport))
+        }
+        sv_nid::CAMERA_IMPORT_DIALOG_GET_STATUS => {
+            cont!(services::dialog_get_status(ctx, st, services::DialogFamily::CameraImport))
+        }
+        sv_nid::CAMERA_IMPORT_DIALOG_TERM => {
+            cont!(services::dialog_term(ctx, st, services::DialogFamily::CameraImport))
+        }
         // Their result reads, and the trophy-setup one, all write a zeroed result -
         // which for each of these families is "completed, nothing selected".
-        sv_nid::NP_PROFILE_DIALOG_GET_RESULT | sv_nid::PHOTO_IMPORT_DIALOG_GET_RESULT => {
+        sv_nid::NP_PROFILE_DIALOG_GET_RESULT
+        | sv_nid::PHOTO_IMPORT_DIALOG_GET_RESULT
+        | sv_nid::CAMERA_IMPORT_DIALOG_GET_RESULT
+        | sv_nid::NP_FRIEND_LIST_DIALOG_GET_RESULT => {
             cont!(services::dialog_ok(ctx, st))
         }
         // Aborting a dialog that has already completed, and closing one the title put
         // up itself, both genuinely succeed: there is nothing left running to stop.
-        sv_nid::NP_PROFILE_DIALOG_ABORT | sv_nid::MSG_DIALOG_CLOSE => cont!(ctx.ret(0)),
+        sv_nid::NP_PROFILE_DIALOG_ABORT
+        | sv_nid::MSG_DIALOG_CLOSE
+        | sv_nid::SAVEDATA_DIALOG_ABORT => cont!(ctx.ret(0)),
         sv_nid::MSG_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::Msg)),
         sv_nid::MSG_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::Msg)),
         sv_nid::MSG_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::Msg)),
@@ -2258,61 +2904,151 @@ mod frame_boundary_tests {
         }
     }
 
+    /// >>> THE HANDLERS THAT CAN PARK ARE NOT IN THE DERIVED FAST SET.
+    ///
+    /// The generated table is only as good as the shape test `build.rs` applies to the arms,
+    /// and the failure that would matter is silent: a mis-parse that admitted a PARKING
+    /// handler makes the browser end the run the first time that call blocks. So every
+    /// suspending handler this engine has is named here with the outcome it owes, and
+    /// required to be absent. `sceGxmEndScene` is the one the old hand-written list called
+    /// out in prose; it is here with the other eighteen, and it is excluded now for a
+    /// structural reason rather than a remembered one - its arm returns an `SvcOutcome`.
+    #[test]
+    fn no_parking_handler_is_fast() {
+        let parks: &[(u32, &str)] = &[
+            (gxm_nid::END_SCENE, "a small target's completion parks the thread in the browser"),
+            (gxm_nid::FINISH, "completes the frame's scenes at the guest's own GPU wait"),
+            (gxm_nid::NOTIFICATION_WAIT, "the same completion, on one notification"),
+            (gxm_nid::DISPLAY_QUEUE_ADD_ENTRY, "Flip - the frame ends here"),
+            (gxm_nid::WAIT_EVENT, "waits on the GXM event"),
+            (sv_nid::SHARED_FB_END, "Flip - a SceSharedFb title's present"),
+            (lw_nid::WAIT_LW_COND, "parks until signalled"),
+            (lw_nid::LOCK_LW_MUTEX, "parks behind the owner"),
+            (sync_nid::LOCK_MUTEX, "parks behind the owner"),
+            (sync_nid::WAIT_SEMA, "parks until signalled"),
+            (sync_nid::WAIT_COND, "parks until signalled"),
+            (sync_nid::WAIT_EVENT_FLAG, "parks until the pattern is satisfied"),
+            (tm_nid::DELAY_THREAD, "Reschedule - that IS the call"),
+            (tm_nid::EXIT_THREAD, "ThreadExit"),
+            (lk_nid::EXIT_PROCESS, "Halt"),
+            (lk_nid::WAIT_THREAD_END, "parks until the thread ends"),
+            (lk_nid::START_THREAD, "hands the CPU to the new thread"),
+            (lk_nid::WAIT_SIGNAL, "parks until signalled"),
+            (display_nid::WAIT_VBLANK_START, "parks until the vblank"),
+            (display_nid::WAIT_SET_FRAME_BUF, "parks until the flip is taken"),
+            (io_nid::IO_READ, "a blocking read"),
+            (audio_nid::OUT_OUTPUT, "parks when the port's queue is full"),
+            (audioin_nid::INPUT, "parks for the capture period"),
+            (fiber_nid::RUN, "switches stacks"),
+        ];
+        for (nid_fn, why) in parks {
+            // Against the DERIVED rule, not against `fast_nid`: which SET is in use is a knob,
+            // and a test that only asked the knob would go quiet on the day the default flips.
+            assert!(
+                !fast_admissible(*nid_fn),
+                "{} is admitted by the derived rule but {why} - a fast call that suspends ENDS \
+                 the run in the browser. Its dispatch arm must return its own SvcOutcome.",
+                nid::name(*nid_fn)
+            );
+            assert!(!fast_nid(*nid_fn), "{} is in the fast set in use but {why}", nid::name(*nid_fn));
+            assert!(
+                !DISPATCH_CONT_ONLY.contains(nid_fn),
+                "{} was read off the dispatch table as a `cont!` arm and it is not one - \
+                 build.rs has mis-parsed the match",
+                nid::name(*nid_fn)
+            );
+        }
+    }
+
     /// >>> EVERY NID [`fast_nid`] ROUTES THROUGH THE NON-SUSPENDING TRAP REALLY CANNOT SUSPEND.
     ///
     /// The browser binds that trap to a plain function: a handler that returned anything but
-    /// `Continue` there would end the run. So every name on the list is dispatched here with
-    /// zeroed registers and required to CONTINUE - the arm shape (`cont!`) is what admits it,
-    /// and this is that shape asserted at the one place a grown parking path would show.
-    /// The list is also required to be DISJOINT from the inline forms: a NID with an inline
-    /// lowering never reaches either trap, so naming it fast would be a lie the link step
-    /// silently drops.
+    /// `Continue` there would end the run. So the WHOLE derived set is dispatched here with
+    /// zeroed registers over zeroed memory and required to CONTINUE. The arm shape (`cont!`)
+    /// is what admits a NID and the shape makes this true by construction - which is the
+    /// point: this is that construction checked against the real dispatch, so a generated
+    /// table that named the wrong arm shows up here rather than on a device.
     ///
-    /// The blocking primitives the race also makes - a cond wait, a plain lock - are held to
-    /// the opposite: not fast, so a copy-paste that widened the list would fail here.
+    /// A handler is allowed to PANIC on zeroed arguments (several read a guest struct the
+    /// test never builds); that is not what is under test, so it is caught and counted. What
+    /// is not allowed is returning an outcome that suspends.
     #[test]
     fn the_fast_nids_only_continue() {
-        let fast = [
-            gxm_nid::DRAW,
-            gxm_nid::DRAW_PRECOMPUTED,
-            gxm_nid::BEGIN_SCENE,
-            gxm_nid::END_SCENE,
-            gxm_nid::SET_VISIBILITY_BUFFER,
-            gxm_nid::COLOR_SURFACE_GET_DATA,
-            gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS,
-            gxm_nid::PAD_HEARTBEAT,
-            lw_nid::SIGNAL_LW_COND,
-            lw_nid::TRY_LOCK_LW_MUTEX,
-            sync_nid::UNLOCK_MUTEX,
-            sync_nid::SIGNAL_COND,
-            lk_nid::CLIB_MSPACE_MALLOC,
-            lk_nid::CLIB_MSPACE_MEMALIGN,
-            lk_nid::CLIB_MSPACE_FREE,
-            lk_nid::GET_TLS_ADDR,
-            ngs_nid::VOICE_GET_STATE_DATA,
-            ngs_nid::SYSTEM_UPDATE,
-            ngs_nid::VOICE_SET_PARAMS_BLOCK,
-            pm_nid::POWER_TICK,
-            sv_nid::APP_MGR_GET_APP_STATE,
-            sv_nid::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER,
-            sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT,
-            sv_nid::TOUCH_READ,
-        ];
-        for nid_fn in fast {
-            let name = nid::name(nid_fn);
-            assert!(fast_nid(nid_fn), "{name} is on the fast list but fast_nid() refuses it");
+        let mut checked = 0usize;
+        let mut panicked = Vec::new();
+        for &nid_fn in DISPATCH_CONT_ONLY {
+            if !fast_admissible(nid_fn) {
+                continue;
+            }
+            let run = std::panic::catch_unwind(|| outcome_of(0, nid_fn, [0, 0, 0, 0]));
+            match run {
+                Ok(outcome) => {
+                    assert_eq!(
+                        outcome,
+                        "Continue",
+                        "{} is routed through the non-suspending trap but did not CONTINUE",
+                        nid::name(nid_fn)
+                    );
+                    checked += 1;
+                }
+                Err(_) => panicked.push(nid::name(nid_fn)),
+            }
+        }
+        assert!(
+            checked > DISPATCH_CONT_ONLY.len() / 2,
+            "only {checked} of {} fast NIDs actually ran - too many panicked on zeroed \
+             arguments for this to be evidence of anything ({panicked:?})",
+            DISPATCH_CONT_ONLY.len()
+        );
+    }
+
+    /// >>> THE DERIVED SET IS THE DISPATCH TABLE'S `cont!` ARMS, AND IT COVERS THE OLD LIST.
+    ///
+    /// Three claims. That the derivation actually ran (a parse that came adrift would leave a
+    /// tiny set, and a tiny set is a silent performance regression). That the set has no
+    /// duplicate NID, which would mean two arms claim one call. And that every NID the
+    /// hand-written list named is still fast - the derived set must be a superset of what it
+    /// replaced, or this change is a regression on the title that list came from.
+    #[test]
+    fn the_curated_list_is_a_subset_of_the_derived_one() {
+        assert!(
+            DISPATCH_CONT_ONLY_ARMS > 600 && DISPATCH_CONT_ONLY.len() > DISPATCH_CONT_ONLY_ARMS,
+            "the derived set is {} NIDs over {DISPATCH_CONT_ONLY_ARMS} arms, which is far \
+             short of the dispatch table - build.rs has come adrift from the source",
+            DISPATCH_CONT_ONLY.len()
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for &n in DISPATCH_CONT_ONLY {
+            assert!(seen.insert(n), "{} appears twice in the dispatch table", nid::name(n));
+        }
+        for &n in CURATED_FAST_NIDS {
             assert!(
-                inline_op(nid_fn).is_none(),
-                "{name} has an inline form, so routing it through a trap is unreachable"
+                seen.contains(&n),
+                "{} was on the hand-written fast list but its arm is not `cont!` - the \
+                 derived set would drop it, which is a regression on the title that list \
+                 came from",
+                nid::name(n)
             );
-            assert_eq!(
-                outcome_of(0, nid_fn, [0, 0, 0, 0]),
-                "Continue",
-                "{name} is routed through the non-suspending trap but did not CONTINUE"
+            assert!(
+                fast_admissible(n),
+                "{} is no longer admitted by the derived rule",
+                nid::name(n)
+            );
+            assert!(fast_nid(n), "{} is no longer fast at today's default", nid::name(n));
+            assert!(
+                inline_op(n).is_none(),
+                "{} has an inline form, so routing it through a trap is unreachable",
+                nid::name(n)
             );
         }
-        for nid_fn in [lw_nid::WAIT_LW_COND, lw_nid::LOCK_LW_MUTEX, tm_nid::DELAY_THREAD] {
-            assert!(!fast_nid(nid_fn), "{} can park and must not be fast", nid::name(nid_fn));
+        for (n, why) in FAST_EXCLUDED {
+            assert!(
+                seen.contains(n),
+                "{} is on the exclusion list ({why}) but its arm is not `cont!` anyway - an \
+                 exclusion that excludes nothing reads as a fact and is not one",
+                nid::name(*n)
+            );
+            assert!(!fast_admissible(*n), "{} is excluded but still admitted", nid::name(*n));
         }
     }
 
@@ -2403,9 +3139,12 @@ mod frame_boundary_tests {
     /// the guest handing a finished frame to scanout - ends a frame.
     #[test]
     fn only_a_display_queue_entry_counts_as_a_frame_boundary() {
+        // A yield with NOBODY TO YIELD TO returns to the caller - see
+        // `VitaState::yield_would_repick_this_thread`. The probe's state has one thread and no
+        // pending wake, so this is that case; what the test is about is that it is not a FRAME.
         assert_eq!(
             outcome_of(nid::lib::SCE_THREADMGR, tm_nid::DELAY_THREAD, [0, 0, 0, 0]),
-            "Reschedule",
+            "Continue",
             "delayThread(0) is a plain yield, not a frame"
         );
         assert_eq!(
@@ -2426,3 +3165,88 @@ mod frame_boundary_tests {
         );
     }
 }
+
+/// The parallel run's two policies: which inline forms survive it, and which host calls must
+/// be forwarded to the worker that owns the emulator's JavaScript.
+#[cfg(test)]
+mod smp_policy_tests {
+    use super::*;
+    use crate::nid::{audio as au, display as d, gxm as g, iofilemgr as io, lwsync as lw, services as sv, videodec as vd};
+    use vitaslop_transpiler::{InlineOp as I, LwMutexLayout};
+
+    #[test]
+    fn the_calls_that_reach_run_worker_javascript_are_forwarded_and_the_frame_path_is_not() {
+        for n in [io::IO_READ, vd::AVCDEC_DECODE, vd::AVCDEC_CREATE_DECODER] {
+            assert!(smp_owner_only(n), "{} must run on the run worker", crate::nid::name(n));
+        }
+        // With a storage view on every guest worker, a file read runs where it is made; the
+        // decoder still needs the run worker's WebCodecs.
+        assert!(!smp_forwarded(io::IO_READ, true), "a file read is local when storage is shared");
+        assert!(smp_forwarded(vd::AVCDEC_DECODE, true), "a decode is forwarded whatever storage is");
+        // The frame's own traffic runs where it is made: forwarding it would put every draw
+        // behind a round trip to the run worker. Audio output writes a shared ring through
+        // per-worker views, and a common dialog's status is host state - both are polled
+        // every frame, and a forward parks the poller until the present is over.
+        for n in [
+            g::DRAW,
+            g::DRAW_PRECOMPUTED,
+            lw::LOCK_LW_MUTEX,
+            d::GET_VCOUNT,
+            au::OUT_OUTPUT,
+            sv::SAVEDATA_DIALOG_GET_STATUS,
+            sv::NP_TROPHY_SETUP_DIALOG_GET_STATUS,
+            sv::APPUTIL_SYSTEM_PARAM_GET_INT,
+        ] {
+            assert!(!smp_owner_only(n), "{} must not be forwarded", crate::nid::name(n));
+        }
+    }
+
+    #[test]
+    fn a_parallel_link_keeps_global_mirror_words_and_refuses_per_thread_and_lock_forms() {
+        let vcount = I::LoadMirror { slot: mirror::SLOT_VCOUNT };
+        assert_eq!(smp_inline_filter(0, vcount), Some(vcount));
+        let bank = I::LoadMirror { slot: mirror::SLOT_SA_BANK };
+        assert_eq!(smp_inline_filter(0, bank), Some(bank));
+        // The vblank read keeps its value and loses the per-thread spin budget.
+        assert_eq!(
+            smp_inline_filter(0, I::LoadMirrorParking { slot: mirror::SLOT_VCOUNT, budget: mirror::SLOT_SPIN_BUDGET }),
+            Some(vcount)
+        );
+        // Per-thread slots: one block, several current threads - so each instance carries its
+        // own word instead.
+        assert_eq!(
+            smp_inline_filter(0, I::LoadMirror { slot: mirror::SLOT_CURRENT_THREAD }),
+            Some(I::ThreadWord { cur: true })
+        );
+        assert_eq!(
+            smp_inline_filter(0, I::LoadMirror { slot: mirror::SLOT_THREAD_ID }),
+            Some(I::ThreadWord { cur: false })
+        );
+        // Pairs would tear across a refresh on another worker: one atomic 64-bit word instead.
+        assert_eq!(
+            smp_inline_filter(0, I::LoadMirrorPair { slot: mirror::SLOT_CLOCK_LO }),
+            Some(I::LoadClock64 { rtc: false })
+        );
+        assert_eq!(
+            smp_inline_filter(0, I::StoreMirrorPair { slot: mirror::SLOT_RTC_LO }),
+            Some(I::StoreClock64 { rtc: true })
+        );
+        // The elided yield asks about THIS worker's runnable threads.
+        assert_eq!(
+            smp_inline_filter(0, I::DelayYield { free_slot: 10, run_slot: 11, cap: 4 }),
+            Some(I::SmpDelayYield { cap: 4 })
+        );
+        // Check-then-store locks are not atomic across workers.
+        let layout = LwMutexLayout { id: 0, owner: 4, count: 8, waiters: 12 };
+        let thread_slot = mirror::SLOT_CURRENT_THREAD;
+        assert_eq!(smp_inline_filter(0, I::LwMutexLock { layout, thread_slot }), None);
+        assert_eq!(smp_inline_filter(0, I::LwMutexUnlock { layout, thread_slot }), None);
+        // Guest-owned reads and bulk ops are what they are on hardware: unchanged.
+        assert_eq!(smp_inline_filter(0, I::MemCopy), Some(I::MemCopy));
+        // The non-suspending trap is refused for a call that has to be forwarded.
+        assert_eq!(smp_inline_filter(io::IO_READ, I::Fast), None);
+        assert_eq!(smp_inline_filter(g::DRAW, I::Fast), Some(I::Fast));
+    }
+}
+
+pub use gxm::report_completed_early;

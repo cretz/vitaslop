@@ -43,6 +43,7 @@ fn newlib_qsort_sorts_integers() {
             mem_bytes: DEFAULT_MEM_BYTES,
             discover_code_pointers: false,
             import_memory: false,
+            host_off: 0,
         };
         let d = entry("VITASLOP_HB_DUMP").unwrap_or(qsort); eprintln!("{}", vitaslop_transpiler::dump_func(&program, d).unwrap_or_default());
     }

@@ -1,0 +1,184 @@
+@title  PCSA00002 - reach a live game, SWING, and play the ball out
+@game   PCSA00002
+@shot-every 200
+
+# WHAT THIS RECIPE IS FOR, AND WHY IT IS NOT `into-a-game.recipe`
+# --------------------------------------------------------------
+# `into-a-game.recipe` arrives at a live game and stops there: a wide shot of the field
+# with the batter up, every frame of it a STILL at-bat. Every render question this title
+# has been asked was asked at that frame, and it is the reason two faults the user sees in
+# seconds have never appeared in a run here - both of them happen when the BALL IS HIT:
+# the shape that flashes over the field after contact, and the play that follows it.
+#
+# A recipe that never swings cannot reach either. This one swings.
+#
+# HOW THE SWING WORKS, because the timing is not ours to know
+# ----------------------------------------------------------
+# The CPU pitches on its own schedule and a swing connects only inside a few frames of the
+# pitch arriving. Nothing in the emulator can see the pitch, so the recipe does not try to
+# time one: it takes a swing on the R TRIGGER (the user's own swing button on this title -
+# square never connected in any replay) on a steady cadence across a long window, so
+# the swings walk through every phase of the pitcher's cycle rather than landing on one.
+# Missing is free - a strike, another pitch - and contact only has to happen once.
+#
+# `cross` is deliberately NOT the swing here even though it is a swing in this title: it
+# is also the button that dismisses every dialog, so a run that presses it during a
+# between-innings prompt advances the menu instead, and a recipe cannot tell those apart.
+
+0: @section boot
+1900: @section accept-user-settings
+1900: cross
+1910:
+2100: @section title-screen
+2200: touch=400,560
+2203: touch=470,560
+2206: touch=540,560
+2209: touch=610,560
+2212: touch=680,560
+2215: touch=750,560
+2218: touch=820,560
+2221: touch=890,560
+2224: touch=960,560
+2227: touch=1030,560
+2230: touch=1100,560
+2233: touch=1170,560
+2236: touch=1240,560
+2239: touch=1310,560
+2242: touch=1380,560
+2245: touch=1450,560
+2248:
+2308: touch=1500,560
+2311: touch=1430,560
+2314: touch=1360,560
+2317: touch=1290,560
+2320: touch=1220,560
+2323: touch=1150,560
+2326: touch=1080,560
+2329: touch=1010,560
+2332: touch=940,560
+2335: touch=870,560
+2338: touch=800,560
+2341: touch=730,560
+2344: touch=660,560
+2347: touch=590,560
+2350: touch=520,560
+2353: touch=450,560
+2356:
+3200: cross
+3210:
+3500: cross
+3510:
+3800: start
+3810:
+4500: @section game-modes
+4500: cross
+4510:
+4800: cross
+4810:
+5100: cross
+5110:
+5400: cross
+5410:
+5700: cross
+5710:
+6000: cross
+6010:
+6300: cross
+6310:
+6600: cross
+6610:
+6900: cross
+6910:
+7200: cross
+7210:
+7500: cross
+7510:
+7800: cross
+7810:
+8100: cross
+8110:
+8400: cross
+8410:
+9200: @section stadium-options
+9200: down
+9210:
+9260: down
+9270:
+9320: down
+9330:
+9380: cross
+9390:
+9780: @section into-the-game
+9780: cross
+9790:
+10180: cross
+10190:
+10580: cross
+10590:
+10980: cross
+10990:
+11380: cross
+11390:
+11700: @section swing-until-contact
+11700: rtrigger
+11703:
+11760: rtrigger
+11763:
+11820: rtrigger
+11823:
+11880: rtrigger
+11883:
+11940: rtrigger
+11943:
+12000: rtrigger
+12003:
+12060: rtrigger
+12063:
+12120: rtrigger
+12123:
+12180: rtrigger
+12183:
+12240: rtrigger
+12243:
+12300: rtrigger
+12303:
+12360: rtrigger
+12363:
+12420: rtrigger
+12423:
+12480: rtrigger
+12483:
+12540: rtrigger
+12543:
+12600: rtrigger
+12603:
+12660: rtrigger
+12663:
+12720: rtrigger
+12723:
+12780: rtrigger
+12783:
+12840: rtrigger
+12843:
+12900: rtrigger
+12903:
+12960: rtrigger
+12963:
+13020: rtrigger
+13023:
+13080: rtrigger
+13083:
+13140: rtrigger
+13143:
+13200: rtrigger
+13203:
+13260: rtrigger
+13263:
+13320: rtrigger
+13323:
+13380: rtrigger
+13383:
+
+13460: @section play-it-out
+# Nothing is pressed here. A ball in play is the FIELDERS' to resolve, and a button
+# during it advances a prompt that has not appeared yet.

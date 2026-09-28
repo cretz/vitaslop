@@ -121,6 +121,22 @@ pub const SLOT_SA_BANK: u32 = 5;
 /// the host writes it, and only between resumes.
 pub const SLOT_SPIN_BUDGET: u32 = 6;
 
+/// Slots 7-8 are the RTC tick pair; slot 9 is the EXCLUSIVE MONITOR.
+///
+/// # The monitor, and why one shared word is a per-thread monitor
+/// `LDREX` records the address it loaded from here; `STREX` stores only if the word still
+/// holds its address, and reports failure (1) otherwise, which is what makes the guest's own
+/// retry loop reachable. Hardware clears the LOCAL monitor on a context switch (the kernel
+/// executes `CLREX`), and this block is rewritten before EVERY resume - so the host clearing
+/// this slot in [`snapshot`] IS that `CLREX`, and a record can only ever belong to the thread
+/// currently running. One word is enough for the same reason the rest of the block is: only
+/// one guest thread runs at a time, and the word cannot survive the switch away from it.
+///
+/// Without this, `STREX` always succeeded: two threads that both read a free lock word could
+/// both claim it, and the guest's `BNE` retry after the store was provably dead code. That is
+/// not a rare race - it is how a title's own compare-and-swap spinlock is built.
+pub const SLOT_EXCL: u32 = 9;
+
 /// Reads of the vblank counter, inside ONE resume, that mean "spinning".
 ///
 /// Generous on purpose. A real spin takes hundreds of thousands - it runs until the clock
@@ -129,8 +145,76 @@ pub const SLOT_SPIN_BUDGET: u32 = 6;
 /// dropped frame, timestamping) can never reach it and is never parked.
 pub const SPIN_BUDGET: u32 = 1024;
 
-/// How many slots the block has. The scheduler writes exactly this many.
-pub const SLOT_COUNT: usize = 7;
+/// Slots 7-8: the guest's WALL clock as `sceRtcGetCurrentTick` reports it - microseconds
+/// since 0001-01-01 - low word then high word.
+///
+/// TWO CONTIGUOUS slots, for the same reason [`SLOT_CLOCK_LO`] and [`SLOT_CLOCK_HI`] are:
+/// [`vitaslop_transpiler::InlineOp::StoreMirrorPair`] reads `mirror[slot]` and
+/// `mirror[slot + 1]` off one base.
+///
+/// # Why a SECOND clock pair rather than the process clock's
+/// They are different clocks. The process clock counts from process start; this one counts
+/// from the SceRtc epoch, and the offset between them is a constant a title is free to
+/// subtract, format or compare against a save-game stamp. Folding them would make
+/// `sceRtcGetCurrentTick` report the process clock, which reads as a game that thinks it is
+/// in the year 1.
+///
+/// # Why it may live in the block
+/// Under the preemptive scheduler it is `GUEST_WALL_EPOCH_US + virtual_us`
+/// ([`VitaState::guest_wall_us`]) - a pure function of the virtual clock, which advances only
+/// in the scheduler with no guest thread live. That is the same argument [`SLOT_CLOCK_LO`]
+/// rests on. Under the SINGLE-THREAD bring-up model it is the host's own wall clock, which
+/// moves whenever it likes, so [`crate::vita::services::inline_op`] refuses the inline form
+/// there rather than serve a value the contract does not cover.
+///
+/// # What it is worth
+/// MEASURED on a fighting title's opening MOVIE: `sceRtcGetCurrentTick` is **1,094,210 calls
+/// over 800 frames - 1,368 a frame, from a SINGLE call site** (a timed wait polling the tick
+/// until its event flag fires), and it is the largest single host-call item of that phase by
+/// a factor of seven. At the ~20 us a crossing costs on the user's phone that is most of the
+/// movie's 45.8 ms frame [[vitaslop-the-movie-phase-is-a-mutex-storm]].
+pub const SLOT_RTC_LO: u32 = 7;
+pub const SLOT_RTC_HI: u32 = 8;
+
+/// First slot of the KERNEL MUTEX TABLE - `kmutex::ENTRIES` entries of four words each, laid
+/// out by [`crate::vita::kmutex`].
+///
+/// It is in this block rather than in guest memory for one reason: the block is the only run of
+/// words BOTH the emitted code and the host can address without a crossing and that no guest
+/// allocation can reach. It is not a mirror of anything - nothing refreshes it per resume, and
+/// [`snapshot`] does not describe it. It is shared STATE, and the host reads and writes it
+/// through the same accessors the emitted form uses.
+///
+/// It must sit ABOVE every mirrored slot: [`snapshot`] rewrites slots `0..SLOT_COUNT` before
+/// every resume, so a table that started inside that range would have entry 0's `id` word
+/// zeroed on every switch - the mutex that hashes there would silently lose its inline home
+/// mid-run, and a later `claim` could hand the same entry to a second uid.
+pub const SLOT_MUTEX_TABLE: u32 = 12;
+
+/// How many slots the SCHEDULER writes - the mirrored values, which is everything up to the
+/// mutex table. Refreshing further would clobber live lock state with a snapshot of nothing.
+/// Slot 10: whether a `sceKernelDelayThread(<=1)` from the thread about to run has NOBODY
+/// to yield to - the host's own elide predicate ([`VitaState::yield_would_repick_this_thread`])
+/// as one word, so the emitted [`vitaslop_transpiler::InlineOp::DelayYield`] can answer it
+/// without a crossing. Refreshed at every resume like the rest of the block, AND cleared in
+/// guest memory by the host on the first host call of the slice that wakes or spawns a
+/// thread (`VitaState::publish_yield_free_change`) - that is what keeps a value a host call
+/// CAN change inside the block's contract.
+pub const SLOT_YIELD_FREE: u32 = 10;
+/// Slot 11: how many yields this slice has elided so far - the host's `elided_run`, which the
+/// emitted code increments in place and tests against the same cap the handler applies. A
+/// spin that waits on something outside the scheduler's reasoning therefore still gives the
+/// loop back after the cap, exactly as it does through the handler.
+pub const SLOT_ELIDE_RUN: u32 = 11;
+pub const SLOT_COUNT: usize = 12;
+
+/// Total slots the block must hold: the mirrored values plus the mutex table behind them.
+pub const BLOCK_SLOTS: u32 = SLOT_MUTEX_TABLE + super::kmutex::SLOTS;
+
+/// The table may not start inside the region [`snapshot`] rewrites. Compile-time, because the
+/// symptom of getting it wrong is a mutex that loses its state on a thread switch - a hang far
+/// from here, with nothing at the crash site to name this line.
+const _: () = assert!(SLOT_MUTEX_TABLE as usize >= SLOT_COUNT);
 
 /// The current value of every mirror slot, in slot order.
 ///
@@ -139,6 +223,7 @@ pub const SLOT_COUNT: usize = 7;
 /// `mirror_matches_its_handlers` holds them to that.
 pub fn snapshot(st: &VitaState) -> [u32; SLOT_COUNT] {
     let now = st.now_us();
+    let rtc = st.guest_wall_tick();
     [
         super::display::vcount(st),
         now as u32,
@@ -147,6 +232,14 @@ pub fn snapshot(st: &VitaState) -> [u32; SLOT_COUNT] {
         super::libkernel::thread_id(st) as u32,
         st.sa_bank(),
         SPIN_BUDGET,
+        rtc as u32,
+        (rtc >> 32) as u32,
+        // The exclusive monitor, cleared on every resume - see `SLOT_EXCL`. Zero is "no
+        // record": a guest address of 0 is not one any `LDREX` can legitimately hold, since
+        // the guest image starts far above it.
+        0,
+        st.yield_free_word(),
+        st.elided_run_word(),
     ]
 }
 
@@ -246,6 +339,8 @@ mod tests {
             SLOT_CURRENT_THREAD,
             SLOT_THREAD_ID,
             SLOT_SPIN_BUDGET,
+            SLOT_YIELD_FREE,
+            SLOT_ELIDE_RUN,
         ] {
             assert!((slot as usize) < SLOT_COUNT, "slot {slot} is outside the block");
         }
@@ -327,7 +422,14 @@ mod tests {
     #[test]
     fn the_lock_forms_read_the_current_thread_slot() {
         use crate::nid::lwsync as lw;
-        for nid in [lw::LOCK_LW_MUTEX, lw::LOCK_LW_MUTEX_CB, lw::UNLOCK_LW_MUTEX, lw::UNLOCK_LW_MUTEX2] {
+        for nid in [
+            lw::LOCK_LW_MUTEX,
+            lw::LOCK_LW_MUTEX_CB,
+            lw::LOCK_LW_MUTEX_0,
+            lw::UNLOCK_LW_MUTEX,
+            lw::UNLOCK_LW_MUTEX2,
+            lw::UNLOCK_LW_MUTEX_0,
+        ] {
             let op = super::super::lwsync::inline_op(nid).expect("has an inline form");
             assert_eq!(
                 op.mirror_slot(),
@@ -345,7 +447,10 @@ mod tests {
     fn libkernel_calls_with_behaviour_are_not_inlined() {
         use crate::nid::libkernel as lk;
         for nid in [
-            crate::vita::tm_nid::DELAY_THREAD, // blocks: that IS the behaviour
+            // Blocks: that IS the behaviour. Its ELIDED-YIELD form lives in `threadmgr`, and
+            // falls through to this handler for every call that sleeps or has someone to
+            // yield to - the libkernel table still has no entry for it.
+            crate::vita::tm_nid::DELAY_THREAD,
             lk::CREATE_THREAD,                 // spawns
             lk::EXIT_PROCESS,                  // halts the run
             lk::GET_TLS_ADDR,                  // per-thread host state
@@ -369,5 +474,30 @@ mod tests {
                 crate::nid::name(nid)
             );
         }
+    }
+
+    /// The EXCLUSIVE MONITOR's slot number is shared with the transpiler, which emits the
+    /// `LDREX`/`STREX` accesses against it, and the two crates have no header in common. A
+    /// disagreement would not fail to build: the guest would record its address in one word
+    /// and test another, so every `STREX` would fail and every guest retry loop would spin
+    /// forever - a livelock with nothing pointing here. So it is pinned.
+    #[test]
+    fn the_exclusive_monitor_slot_matches_the_transpiler() {
+        assert_eq!(
+            SLOT_EXCL,
+            vitaslop_transpiler::EXCL_MIRROR_SLOT,
+            "the host's monitor slot and the one the emitted code uses must be the same word"
+        );
+    }
+
+    /// ...and the host must CLEAR it on every refresh. That clearing is the `CLREX` a context
+    /// switch performs on hardware, and it is what makes one shared word a per-thread monitor.
+    #[test]
+    fn every_refresh_clears_the_exclusive_monitor() {
+        assert_eq!(
+            snapshot(&state_at(12_345))[SLOT_EXCL as usize],
+            0,
+            "a resume must leave no exclusive record behind"
+        );
     }
 }

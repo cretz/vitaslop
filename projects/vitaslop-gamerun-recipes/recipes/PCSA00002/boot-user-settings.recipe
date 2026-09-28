@@ -1,0 +1,46 @@
+@title  PCSA00002 - boot to the USER SETTINGS menu
+@game   PCSA00002
+@shot-every 300
+
+# WHAT THIS RECIPE PROVES
+# ----------------------
+# The title boots from cold, plays its logo, loads, and reaches its first interactive screen -
+# the USER SETTINGS dialog (BEGINNER / EXPERIENCED / EXPERT over the photo background). It runs
+# with NO input at all, which is the whole point of a boot recipe: everything it exercises is
+# the engine's, not a menu walk's.
+#
+# WHAT IT TOOK TO GET HERE, so none of it is re-derived:
+#
+#   * The main thread's SceUID was ZERO. This title's own recursive lock stores the owning
+#     thread id in a word and reads 0 as "free", so every one of the main thread's acquisitions
+#     was a no-op that believed it already held the lock. A display worker later took the same
+#     lightweight mutex for real and never gave it back, and the run deadlocked at frame 1074 -
+#     a thousand frames after the corruption, with nothing at the stall naming it. `MAIN_THID`
+#     is 0x40 now, and no SceUID on hardware is ever zero.
+#   * CDRAM and main RAM were ONE arena. The title sizes its pools by allocating until refused
+#     (`TestAvailRAM`), and told it had 256 MB of video memory it took 255 and then could not
+#     have the 56 MB MAIN-RAM pool it asked for next. The partitions are budgeted separately
+#     now, at the figures `sceAppMgrGetBudgetInfo` already reported.
+#   * Freed memory blocks did not COALESCE, so the probe's own alloc/free pairs left two
+#     adjacent holes it could never reuse.
+#   * Its menus are drawn by a generic-blend fragment program that reads its blend coefficients
+#     through a 0xE8 MEMORY LOAD. Fragment-stage memory windows did not exist, so the pair could
+#     not be recompiled and every menu draw was DROPPED: the screen was black while the frame
+#     kept flipping.
+#   * The menu pair's varying layout could not be read off the vertex's attribute table (the
+#     program COMPUTES its colour rather than forwarding it, so the passthrough reading is
+#     wrong). The vertex's own forwarding move settles it once the ordering search can reach
+#     the claimed lane - see `exhaustive_layout_from_claims`.
+#
+# HOW TO REPLAY IT:
+#
+#   vitaslop --game <extracted> --recipe .../boot-user-settings.recipe --headless <dir>
+#
+# There is deliberately no @sig: this recipe has never been run twice on one build to see
+# whether it folds the same number, and a pinned signature nobody has confirmed is a test that
+# fails for the wrong reason.
+
+0: @section boot
+1060: @shot logo
+1500: @note the first frame with the menu's full draw list (72-79 draws, one blend pair)
+1800: @shot user-settings-menu

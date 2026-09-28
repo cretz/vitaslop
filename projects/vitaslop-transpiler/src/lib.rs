@@ -16,14 +16,26 @@ mod emit;
 /// writing [`Artifact::arm_word_off`] when the run reaches it.
 pub use emit::arm_at_frame;
 pub use emit::set_fuel_interval;
+pub use emit::{set_shared_host_memory, set_smp, smp};
 /// Whether emitted modules hold the ARM register file in wasm LOCALS along each
 /// straight-line run (`VITASLOP_PROMOTE_REGS`), and the per-thread override a test uses
 /// to emit both arms in one process. See [`promote`].
 pub use emit::{promote_registers, set_promote_registers};
+pub use emit::codegen_fingerprint;
 pub use emit::{neon_cache, set_neon_cache};
 /// The A/B arm for the flag carry/overflow forms - see [`emit::flags_wide_c`]. The browser
 /// has no environment, so it selects the arm through the setter.
 pub use emit::{flags_wide_c, set_flags_wide_c};
+/// The per-block execution tracer's ranges, settable where there is no environment to
+/// read them from - see [`emit::set_trace_blocks`].
+pub use emit::{parse_trace_blocks, set_trace_blocks};
+/// Guest-PC tracking, settable where there is no environment - see [`emit::set_track_pc`].
+pub use emit::set_track_pc;
+/// The on-device guest-function profiler's emit switch - see [`emit::set_guest_prof`].
+pub use emit::set_guest_prof;
+/// The emit-time diagnostic knobs (watchpoints, frame arming) on a platform with no
+/// environment - see [`emit::set_emit_knob`].
+pub use emit::{set_emit_knob, EMIT_KNOBS_OVERRIDABLE};
 /// The ablation that prices a DISPATCH RE-ENTRY - see [`emit::dispatch_all`]. Selected
 /// through the setter for the same reason: the browser has no environment, and the browser
 /// is the engine whose indirect-branch cost is the question.
@@ -42,7 +54,10 @@ pub use emit::StmtKind;
 /// out at [`Artifact::dirty_off`] as `[epoch byte][map]` (see [`DIRTY_EPOCH_OFF`] and
 /// [`DIRTY_MAP_OFF`]). A host that stamps its own reads against the epoch can prove a
 /// region of guest memory unchanged without reading it.
-pub use emit::{set_dirty_tracking, DIRTY_EPOCH_OFF, DIRTY_MAP_OFF, DIRTY_SHIFT};
+pub use emit::{
+    set_dirty_run_marks, set_dirty_tracking, DIRTY_EPOCH_OFF, DIRTY_MAP_OFF, DIRTY_PAGE_BYTES,
+    DIRTY_SHIFT,
+};
 mod flags;
 mod ir;
 mod lower;
@@ -108,6 +123,18 @@ pub struct Program<'a> {
     /// scheduler (`vitaslop_native::ThreadedScheduler`) needs this; every single-
     /// instance host leaves it off and gets the original self-contained module.
     pub import_memory: bool,
+    /// >>> WHERE THE GUEST LAYOUT SITS INSIDE THE IMPORTED MEMORY, in bytes. 0 means the
+    /// layout starts at linear offset 0 (a memory of its own, the shared-memory form
+    /// above). Non-zero means the imported memory is the HOST'S OWN linear memory and the
+    /// guest region, dispatch table, dirty map and mirror block all live `host_off` bytes
+    /// into it: every emitted load and store carries the offset in its immediate
+    /// (`emit::Body::raw`), the bulk operations add it on the stack, and the module
+    /// imports `env.memory` as a plain growable memory. What that buys is a host that reads
+    /// guest memory with a load instead of a boundary crossing - the browser paid one
+    /// JavaScript call per guest read, several per draw. The artifact's offsets
+    /// (`mirror_off`, `dirty_off`) stay relative to the layout, not the memory. Requires
+    /// `import_memory`.
+    pub host_off: u32,
 }
 
 /// A guest address that dispatches to a host import (the Vita NID mechanism): a
@@ -238,6 +265,23 @@ pub enum InlineOp {
     /// See [`abi::VBLANK_PARK_SELECTOR`] for what the host does with it and what it is
     /// worth. `budget` names a slot, not a count: the count is the word in it.
     LoadMirrorParking { slot: u32, budget: u32 },
+    /// A `sceKernelDelayThread(us)` whose `us <= 1` is a YIELD, elided in guest code when the
+    /// host mirror says there is nobody to yield to: `mirror[free_slot] != 0` (no other thread
+    /// runnable at the pick, and none woken or spawned since) and `mirror[run_slot] < cap`
+    /// (the bounded run the host handler applies too). Then `mirror[run_slot] += 1` and
+    /// `r0 = 0`. Everything else - a real sleep, a yield with somewhere to go, a run past the
+    /// cap - falls through to the import, whose handler is unchanged.
+    ///
+    /// Why it qualifies for the block: `free` is a fact about the scheduler's runnable set,
+    /// which changes only at a pick or through THIS thread's own host calls - and the host
+    /// clears the word in guest memory on the first such call that wakes or spawns a thread
+    /// (`VitaState::publish_yield_free_change`), so a stale 1 is never read. The run word is
+    /// this thread's own bookkeeping, refreshed from the host's counter at each resume.
+    ///
+    /// MEASURED on a football title's browser frame: its main loop paces itself with a
+    /// lock, a clock read and a one-microsecond delay, ~2,600 iterations a frame; the clock
+    /// and the lock were already inline, and the delay was the one crossing left in it.
+    DelayYield { free_slot: u32, run_slot: u32, cap: u32 },
     /// `r0 = value` - the whole call. For a handler that returns a constant and does
     /// NOTHING else.
     ///
@@ -629,6 +673,34 @@ pub enum InlineOp {
     /// neither engine can preempt inside it ([`InlineOp::LwMutexLock`] states the whole
     /// argument).
     BindPrecomputedState { layout: BindStateLayout },
+    /// `sceGxmPrecomputed{Vertex,Fragment}StateSetAllUniformBuffers(state, array)`: copy the
+    /// non-default uniform-buffer TABLE (`layout.bytes` bytes at r1) into the state's arrays
+    /// block at `layout.table_at`, then return 0 - when the state struct (r0) carries this
+    /// stage's magic and names a non-zero arrays block. Anything else runs the handler.
+    ///
+    /// # Why this is the whole call
+    /// The handler (`VitaState::precomputed_state_set_all_nondefault_uniform_buffers`) is:
+    /// resolve the arrays block (allocating one only when the struct is unstamped), read
+    /// `bytes` of pointers from `array`, write them into the block. On a stamped struct with
+    /// a block that is one `memory.copy`, and the guest owns both ends of it. The two cases
+    /// the handler defines differently - an unstamped struct (it allocates and stamps) and an
+    /// `array` whose tail runs past guest memory (it reads zeros) - are exactly the ones the
+    /// guards send back to it.
+    ///
+    /// # Why it pays
+    /// MEASURED on a football title's browser frame: **1,027 calls a frame**, one per
+    /// `sceGxmDrawPrecomputed`, 0.75 us each - the single hottest host call left in its draw
+    /// path after the yield was inlined, and every one a crossing to move 56 bytes between two
+    /// guest buffers.
+    ///
+    /// # No dirty stamp
+    /// The destination is the state's arrays block, a heap block this engine allocates for
+    /// its own bookkeeping - never a texture's bytes - so like every other storing form it
+    /// stamps nothing (see `emit_dirty_range` in `emit` for the rule).
+    ///
+    /// # No yield point
+    /// Loads, one `memory.copy`, one store; no loop, no call.
+    SetAllUniformBuffers { layout: SetAllUniformBuffersLayout },
     /// Take a recursive lock whose state lives in the guest WORK AREA pointed to by r0,
     /// when it is uncontended. Everything else runs the real host call.
     ///
@@ -710,6 +782,46 @@ pub enum InlineOp {
     /// thread), so a stale owner is unobservable while a sentinel would be a second encoding
     /// of the same fact.
     LwMutexUnlock { layout: LwMutexLayout, thread_slot: u32 },
+    /// The HEAVYWEIGHT twin of [`InlineOp::LwMutexLock`]: take kernel mutex `r0` when it is
+    /// uncontended. Everything else runs the real host call.
+    ///
+    /// ```text
+    /// e    = table_slot * 4 + (r0 & (entries - 1)) * 16   ; the entry, in linear memory
+    /// take = r1 == 1
+    ///      & u32_at(e + layout.id) == r0
+    ///      & u32_at(e + layout.waiters) == 0
+    ///      & (u32_at(e + layout.count) == 0 | u32_at(e + layout.owner) == mirror[thread_slot])
+    /// if take { owner = mirror[thread_slot]; count += 1; r0 = 0 } else { host call }
+    /// ```
+    ///
+    /// # Why a kernel mutex can be inlined at all, when its handle is host-owned
+    /// It cannot, while its ownership lives on the host - which is the whole reason
+    /// `vitaslop_runtime::vita::kmutex` moves that ownership into a table BOTH sides address.
+    /// Once it is there the uncontended take is the same four-word state machine the
+    /// lightweight form already runs, over the same [`LwMutexLayout`], and this emits the same
+    /// code with one difference: a lightweight mutex is named by a POINTER the guest supplies
+    /// (which needs a bounds guard), and a kernel mutex by an `SceUID` (which needs an index).
+    ///
+    /// The `id == r0` term is what makes the indexing safe rather than merely fast: two uids
+    /// can map to one entry, and an entry that does not name the uid being locked belongs to
+    /// the other mutex, so the operation goes to the handler - which is where that mutex's
+    /// state is.
+    ///
+    /// # What it is worth
+    /// MEASURED on a fighting title's opening MOVIE, where it is the largest remaining item
+    /// once the RTC tick is mirrored: two poll loops, `lock/signalCond/unlock` and
+    /// `lock/unlock/delayThread(30 us)`, at ~158,000 iterations each per 800 frames. Three
+    /// crossings an iteration at ~20 us on the user's phone is most of that phase's 45.8 ms
+    /// frame; this takes each loop to one.
+    ///
+    /// # No yield point
+    /// Loads, a compare and two stores, with no loop and no call on the path that writes -
+    /// see [`InlineOp::LwMutexLock`], which states the whole argument and is pinned by
+    /// `a_lock_form_has_no_suspension_point`.
+    KernelMutexLock { layout: LwMutexLayout, thread_slot: u32, table_slot: u32, entries: u32 },
+    /// Release a lock taken by [`InlineOp::KernelMutexLock`], when nothing is parked on it.
+    /// The heavyweight twin of [`InlineOp::LwMutexUnlock`], over the same entry.
+    KernelMutexUnlock { layout: LwMutexLayout, thread_slot: u32, table_slot: u32, entries: u32 },
     /// `memmove(r0, r1, r2); r0 unchanged` - copy the r2 bytes at the pointer in r1 to the
     /// pointer in r0, and leave the destination in r0 as the return value.
     ///
@@ -755,6 +867,27 @@ pub enum InlineOp {
     /// computes and what C requires the SIGN of. [`mem_compare`] is the one definition of
     /// it, called by the handler and asserted against the emitted code.
     MemCompare,
+    /// >>> SMP ONLY (`emit::set_smp`). `r0 =` this instance's thread word: the thread id the
+    /// guest is told (`cur == false`, what `LoadMirror` of the THREAD_ID slot reads on one
+    /// worker) or the scheduler's current thread (`cur == true`). Several threads run at once
+    /// under SMP, so the one shared mirror word cannot hold either; each instance carries its
+    /// own, set by the host before every resume ([`abi::THREAD_ID_EXPORT`],
+    /// [`abi::CUR_THREAD_EXPORT`]).
+    ThreadWord { cur: bool },
+    /// >>> SMP ONLY. `r0:r1 =` a 64-bit clock (`rtc == false`: the process clock, `true`: the
+    /// RTC tick) as ONE atomic, aligned 64-bit load from [`abi::SMP_CLOCK64_SLOT`] /
+    /// [`abi::SMP_RTC64_SLOT`]. The one-worker form reads two words that cannot change under it;
+    /// under SMP another worker republishes the clock while this one reads, and two word loads
+    /// could pair one refresh's low half with the next one's high half.
+    LoadClock64 { rtc: bool },
+    /// >>> SMP ONLY. `*(u64 *)r0 =` the same clock, `r0 = 0` - the pointer-out spelling of
+    /// [`InlineOp::LoadClock64`], guarded like [`InlineOp::StoreMirrorPair`].
+    StoreClock64 { rtc: bool },
+    /// >>> SMP ONLY. The elided yield ([`InlineOp::DelayYield`]) with its two per-thread words
+    /// made per-thread: "is anyone else runnable" is this instance's WORKER's runnable count
+    /// (a word beside its preempt word, see [`abi::SMP_RUNNABLE_SLOT_OFFSET`]) and the run
+    /// counter is an instance global ([`abi::ELIDE_EXPORT`]), reset by the host at each resume.
+    SmpDelayYield { cap: u32 },
 }
 
 /// The answer `sceClibMemcmp` gives for `a` and `b`: the difference of the first differing
@@ -795,6 +928,13 @@ pub struct LwMutexLayout {
     /// operation to the host, which is the only side that can wake one.
     pub waiters: u32,
 }
+
+/// Bytes one KERNEL MUTEX TABLE entry occupies - the four words of [`LwMutexLayout`].
+///
+/// The transpiler needs it to turn a uid into an entry offset, and the runtime lays the table
+/// out with it (`vitaslop_runtime::vita::kmutex::ENTRY_BYTES`); the two are held together by
+/// the emitted form reading exactly the words the handler writes.
+pub const MUTEX_ENTRY_BYTES: u32 = 16;
 
 /// Where an [`InlineOp::ReserveUniformBuffer`] finds every word it reads and writes.
 ///
@@ -853,13 +993,42 @@ pub struct BindStateLayout {
     /// does the same: the two must leave byte-identical state, which is the whole contract the
     /// inline forms rest on.
     ///
-    /// Zero keeps the plain bulk `memory.copy` - which is what the VERTEX stage wants, because
-    /// its copy is the uniform-buffer TABLE, where a zero entry really does mean "no buffer
-    /// bound" and replacing it is correct.
+    /// >>> THE VERTEX STAGE NEEDS THIS TOO, AND USED NOT TO HAVE IT. Its copy is the
+    /// uniform-buffer TABLE, and the reading that a zero entry there "really does mean no
+    /// buffer bound" is refuted: the table lives in the SAME host-allocated, host-zeroed block
+    /// as the texture array, so a state that never received a `SetAllUniformBuffers` carries
+    /// fourteen zeros no guest call put there. MEASURED on a football title: the draws whose
+    /// windows are withheld read an EMPTY context table while a neighbouring draw reads
+    /// `0=0x953ffe10 2=0x8d599a30`. Its slot is one word.
+    ///
+    /// Zero keeps the plain bulk `memory.copy`, which nothing uses today.
     pub copy_slot_stride: u32,
     /// Context slot the program handle is stored to, when `has_prog`.
     pub ctx_prog: u32,
     pub has_prog: bool,
+}
+
+/// Where an [`InlineOp::SetAllUniformBuffers`] finds the state struct's identity, its arrays
+/// block, and the table inside that block. Both stages share the type; the fragment stage's
+/// table sits behind its texture array (`table_at` non-zero), the vertex stage's is first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetAllUniformBuffersLayout {
+    /// The state STRUCT's identity stamp (stage-specific), and the value it must hold.
+    pub st_magic_at: u32,
+    pub st_magic: u32,
+    /// Where the state struct keeps the guest address of its ARRAYS block.
+    pub st_block_at: u32,
+    /// Byte offset of the uniform-buffer table inside the arrays block.
+    pub table_at: u32,
+    /// Bytes copied: one word per possible buffer index.
+    pub bytes: u32,
+}
+
+impl SetAllUniformBuffersLayout {
+    /// The highest offset reached from the STATE STRUCT pointer.
+    pub fn st_top(self) -> u32 {
+        self.st_magic_at.max(self.st_block_at)
+    }
 }
 
 impl BindStateLayout {
@@ -996,6 +1165,8 @@ impl InlineOp {
             }
             // The mirror word IS the answer; the host computed it.
             InlineOp::LoadMirror { .. } | InlineOp::LoadMirrorParking { .. } => word,
+            // An elided yield returns the success code, whatever the mirror said.
+            InlineOp::DelayYield { .. } => 0,
             InlineOp::LoadScaled { shl, .. } => word << shl,
             // The pair forms deliver the mirror words untouched, wherever they land.
             InlineOp::StoreMirrorPair { .. } | InlineOp::LoadMirrorPair { .. } => word,
@@ -1020,6 +1191,8 @@ impl InlineOp {
             // `vitaslop_runtime::vita::lwwork::fast_lock`, which the emitted code is held
             // against directly.
             InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => 0,
+            // Same state machine over the same four words, one table entry further out.
+            InlineOp::KernelMutexLock { .. } | InlineOp::KernelMutexUnlock { .. } => 0,
             // A successful reserve returns 0, and a refused one never gets here (the host
             // call answers instead). Its real meaning is a bump over two structures, which
             // `eval`'s one-word signature cannot express - the execution test in
@@ -1032,6 +1205,9 @@ impl InlineOp {
             // structures, held to its handler by the execution test and the runtime's
             // layout equivalence tests.
             InlineOp::BindPrecomputedState { .. } => 0,
+            // A successful table copy returns 0; its meaning is a byte range, held to its
+            // handler by the execution test and the runtime's layout equivalence test.
+            InlineOp::SetAllUniformBuffers { .. } => 0,
             // A bulk form's meaning is a RANGE of memory, which a one-word `eval` cannot
             // express any more than it can express the copy form's. `MemCopy` and `MemFill`
             // return the destination they were handed, so 0 here is not their r0 - the
@@ -1046,6 +1222,12 @@ impl InlineOp {
             // r0 is left ALONE, which a one-word `eval` cannot express any more than it can
             // express a store form's range. Its meaning is that nothing happens.
             InlineOp::Nop => 0,
+            // The SMP forms read per-instance or host-published state, not a guest word; what
+            // holds them to their handlers is the SMP execution runs, not a one-word `eval`.
+            InlineOp::ThreadWord { .. }
+            | InlineOp::LoadClock64 { .. }
+            | InlineOp::StoreClock64 { .. }
+            | InlineOp::SmpDelayYield { .. } => 0,
         }
     }
 
@@ -1095,11 +1277,15 @@ impl InlineOp {
             InlineOp::CopyArgIndexed { .. } => None,
             InlineOp::LoadMirror { .. }
             | InlineOp::LoadMirrorParking { .. }
-            | InlineOp::LoadMirrorPair { .. } => None,
+            | InlineOp::LoadMirrorPair { .. }
+            | InlineOp::DelayYield { .. } => None,
             // Take no pointer and read nothing.
             InlineOp::RetConst { .. } | InlineOp::Nop | InlineOp::Fast => None,
             // Reads four words and writes two, so no single offset describes it.
-            InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => None,
+            InlineOp::LwMutexLock { .. }
+            | InlineOp::LwMutexUnlock { .. }
+            | InlineOp::KernelMutexLock { .. }
+            | InlineOp::KernelMutexUnlock { .. } => None,
             // Reaches from the pointer itself for a length the guest supplies; there is no
             // fixed offset to name.
             InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => None,
@@ -1112,6 +1298,13 @@ impl InlineOp {
             InlineOp::StoreVfpRun { .. } | InlineOp::StoreArgRun { .. } => None,
             // Reads a struct and a block, writes the context; no single offset names it.
             InlineOp::BindPrecomputedState { .. } => None,
+            // Reads a struct and an array, writes a block; no single offset names it.
+            InlineOp::SetAllUniformBuffers { .. } => None,
+            // Take no pointer (the store form writes through r0, like `StoreMirrorPair`).
+            InlineOp::ThreadWord { .. }
+            | InlineOp::LoadClock64 { .. }
+            | InlineOp::StoreClock64 { .. }
+            | InlineOp::SmpDelayYield { .. } => None,
         }
     }
 
@@ -1148,6 +1341,8 @@ impl InlineOp {
             // Names the VALUE slot; the budget slot is covered by `top_mirror_slot`, which
             // is what the layout pass sizes the block from.
             InlineOp::LoadMirrorParking { slot, .. } => Some(slot),
+            // Names the FREE slot; the run slot is covered by `top_mirror_slot`.
+            InlineOp::DelayYield { free_slot, .. } => Some(free_slot),
             InlineOp::StoreMirrorPair { slot } | InlineOp::LoadMirrorPair { slot } => Some(slot),
             // The lock forms read the mirror too - the CURRENT THREAD, which is the one
             // fact about the take that is not in the work area. Naming the slot here is
@@ -1156,6 +1351,10 @@ impl InlineOp {
             // mutex on behalf of thread zero.
             InlineOp::LwMutexLock { thread_slot, .. }
             | InlineOp::LwMutexUnlock { thread_slot, .. } => Some(thread_slot),
+            // The kernel forms read the same thread slot AND live in the block themselves;
+            // `top_mirror_slot` is what sizes it for their table.
+            InlineOp::KernelMutexLock { thread_slot, .. }
+            | InlineOp::KernelMutexUnlock { thread_slot, .. } => Some(thread_slot),
             InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => None,
             // Read nothing at all, mirror included.
             InlineOp::RetConst { .. } | InlineOp::Nop | InlineOp::Fast => None,
@@ -1166,6 +1365,14 @@ impl InlineOp {
             InlineOp::SetUniformData { layout } => Some(layout.bank_slot),
             // Everything it reads is in the guest structures it is handed.
             InlineOp::BindPrecomputedState { .. } => None,
+            InlineOp::SetAllUniformBuffers { .. } => None,
+            // The SMP forms read instance globals and the fixed SMP words at the top of the
+            // block (`abi::SMP_CLOCK64_SLOT`, the runnable words), which the always-present
+            // one-page block holds whatever the slots below need - no mirrored slot to name.
+            InlineOp::ThreadWord { .. }
+            | InlineOp::LoadClock64 { .. }
+            | InlineOp::StoreClock64 { .. }
+            | InlineOp::SmpDelayYield { .. } => None,
         }
     }
 
@@ -1180,6 +1387,14 @@ impl InlineOp {
             // BOTH its slots have to be inside the block: the budget is written by the same
             // snapshot and decremented by the emitted code.
             InlineOp::LoadMirrorParking { slot, budget } => Some(slot.max(budget)),
+            // Both words are in the block: one read, one read-and-written by the emitted code.
+            InlineOp::DelayYield { free_slot, run_slot, .. } => Some(free_slot.max(run_slot)),
+            // The TABLE is part of the block: its last word has to be inside the page, or the
+            // highest-numbered mutex would read and write past the end of it.
+            InlineOp::KernelMutexLock { thread_slot, table_slot, entries, .. }
+            | InlineOp::KernelMutexUnlock { thread_slot, table_slot, entries, .. } => {
+                Some(thread_slot.max(table_slot + entries * 4 - 1))
+            }
             other => other.mirror_slot(),
         }
     }
@@ -1544,6 +1759,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             program.mem_bytes,
             program.inline_imports,
             program.import_memory,
+            program.host_off,
         );
     Ok(Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off, expansion })
 }
@@ -1709,6 +1925,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         program.mem_bytes,
         program.inline_imports,
         program.import_memory,
+        program.host_off,
     );
     stubbed.sort_unstable();
     let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
@@ -1921,7 +2138,7 @@ mod tests {
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
-                import_memory: false,
+                import_memory: false, host_off: 0,
             })
             .expect("transpile");
             wasmparser::validate(&a.wasm).expect("valid wasm");
@@ -2018,7 +2235,7 @@ mod tests {
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
-                import_memory: false,
+                import_memory: false, host_off: 0,
             })
             .expect("transpile")
             .wasm;
@@ -2186,7 +2403,7 @@ mod tests {
             noreturn_svc: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
-            import_memory: false,
+            import_memory: false, host_off: 0,
         })
         .expect("transpile");
         assert!(!artifact.wasm.is_empty());
@@ -2231,6 +2448,11 @@ mod tests {
         for op in [
             InlineOp::LwMutexLock { layout, thread_slot: 3 },
             InlineOp::LwMutexUnlock { layout, thread_slot: 3 },
+            // The KERNEL forms share this body and add an index computation in front of it,
+            // so they are held to the same rule - and they have to be listed, because a form
+            // that shares code today is a form somebody can stop sharing tomorrow.
+            InlineOp::KernelMutexLock { layout, thread_slot: 3, table_slot: 9, entries: 16 },
+            InlineOp::KernelMutexUnlock { layout, thread_slot: 3, table_slot: 9, entries: 16 },
         ] {
             let artifact = transpile(&Program {
                 code: &code,
@@ -2244,7 +2466,7 @@ mod tests {
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
-                import_memory: false,
+                import_memory: false, host_off: 0,
             })
             .expect("transpile");
             wasmparser::validate(&artifact.wasm).expect("valid wasm");
@@ -2266,11 +2488,17 @@ mod tests {
                 .expect("operators");
             let loops = ops.iter().filter(|o| matches!(o, Operator::Loop { .. })).count();
             assert_eq!(loops, 0, "{op:?} must emit no loop - a loop header is a yield point");
-            // Two calls, and both are the FALLBACK: one from the pointer guard and one from
-            // the predicate. Any third call would be on the served path, where a yield is
-            // exactly the race this test exists to rule out.
+            // Every call is a FALLBACK arm, and there is one per GUARD: the lightweight form
+            // has two (the pointer guard and the predicate), the kernel form one (only the
+            // predicate - its entry is an index into a block the module reserved, so there is
+            // no pointer to bound). Any call BEYOND those would be on the served path, where a
+            // yield is exactly the race this test exists to rule out.
+            let want = match op {
+                InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => 2,
+                _ => 1,
+            };
             let calls = ops.iter().filter(|o| matches!(o, Operator::Call { .. })).count();
-            assert_eq!(calls, 2, "{op:?} must call the host on its two refusal arms and nowhere else");
+            assert_eq!(calls, want, "{op:?} must call the host on its refusal arms and nowhere else");
         }
     }
 
@@ -2303,22 +2531,24 @@ mod tests {
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
-                import_memory: false,
+                import_memory: false, host_off: 0,
             })
             .expect("transpile")
         };
 
         let plain = program(&[]);
-        assert_eq!(plain.mirror_off, None, "no mirror op means no block and no layout change");
+        // The block is reserved in EVERY build now: the ARM exclusive monitor lives in it
+        // (`EXCL_MIRROR_SLOT`), and `LDREX`/`STREX` are lowered whether or not a host call was
+        // inlined. What a mirror op adds is the SLOT, not the block.
+        assert!(plain.mirror_off.is_some(), "the block is reserved for the exclusive monitor");
 
         let mirrored =
             program(&[InlineImport { import: 0, op: InlineOp::LoadMirror { slot: SLOT } }]);
         wasmparser::validate(&mirrored.wasm).expect("valid wasm");
         let off = mirrored.mirror_off.expect("a mirror op reserves the block");
         assert_eq!(
-            mirrored.mem_pages,
-            plain.mem_pages + 1,
-            "the block is one more declared page"
+            mirrored.mem_pages, plain.mem_pages,
+            "the block is one page whether or not a mirror op reads it"
         );
         assert!(
             off >= u64::from(0x20000u32),
@@ -2397,7 +2627,7 @@ mod tests {
             noreturn_svc: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
-            import_memory: false,
+            import_memory: false, host_off: 0,
         })
         .expect("transpile indirect");
         // One guest function plus the emitted dispatcher must produce valid wasm.
@@ -2445,7 +2675,7 @@ mod tests {
             noreturn_svc: &[],
             mem_bytes: 0x1_0000,
             discover_code_pointers: false,
-            import_memory: false,
+            import_memory: false, host_off: 0,
         })
         .expect("transpile memset");
         if let Err(e) = wasmparser::validate(&artifact.wasm) {
@@ -2475,6 +2705,91 @@ mod tests {
         }
     }
 
+    /// A module emitted for a host offset (`Program::host_off`) imports a plain growable
+    /// memory whose minimum covers the layout's end, validates, and carries the offset on
+    /// EVERY memory access: each load/store immediate is at least `host_off`, and every
+    /// bulk operation is fed an `i32.add` of the offset. A memory form the shifter in
+    /// `emit::Body::raw` does not know would show up here as an immediate below the offset.
+    #[test]
+    fn host_off_shifts_every_form() {
+        use wasmparser::{Operator, Parser, Payload, TypeRef};
+        // A program with an ordinary store, a load, and an inline memcpy-shaped bulk
+        // operation is what the retail titles produce; the Thumb pair below is a store
+        // and a load through r0, and the bulk path is exercised by the dirty-range mark
+        // the emitter adds to a multi-word store.
+        let code: [u8; 12] = [
+            0x01, 0x60, // str r1, [r0]
+            0x02, 0x68, // ldr r2, [r0]
+            0x06, 0xc0, // stm r0!, {r1, r2}
+            0x00, 0xdf, // svc #0
+            0x00, 0xbf, 0x00, 0xbf, // nop nop
+        ];
+        const HOST_OFF: u32 = 0x1000_0000;
+        let wasm = transpile(&Program {
+            code: &code,
+            base: 0x10000,
+            thumb: true,
+            entries: &[0x10000],
+            arm_entries: &[],
+            externs: &[],
+            redirects: &[],
+            inline_imports: &[],
+            noreturn_svc: &[],
+            mem_bytes: 0x20000,
+            discover_code_pointers: false,
+            import_memory: true,
+            host_off: HOST_OFF,
+        })
+        .expect("transpile")
+        .wasm;
+        wasmparser::validate(&wasm).expect("host-offset module valid");
+        let mut saw_memory = false;
+        let mut accesses = 0;
+        let mut adds_of_off = 0;
+        let mut bulk = 0;
+        for payload in Parser::new(0).parse_all(&wasm) {
+            match payload.unwrap() {
+                Payload::ImportSection(reader) => {
+                    for imp in reader.into_imports() {
+                        let imp = imp.unwrap();
+                        if let TypeRef::Memory(mt) = imp.ty {
+                            saw_memory = true;
+                            assert!(!mt.shared, "a host-hosted memory is the host's own, not shared");
+                            assert!(mt.maximum.is_none(), "the host's memory declares no maximum");
+                            assert!(mt.initial >= (HOST_OFF as u64 + 0x20000) / 65536, "minimum must cover the layout's end");
+                        }
+                    }
+                }
+                Payload::CodeSectionEntry(body) => {
+                    for op in body.get_operators_reader().unwrap() {
+                        match op.unwrap() {
+                            Operator::I32Load { memarg }
+                            | Operator::I32Store { memarg }
+                            | Operator::I32Load8U { memarg }
+                            | Operator::I32Load8S { memarg }
+                            | Operator::I32Load16U { memarg }
+                            | Operator::I32Load16S { memarg }
+                            | Operator::I32Store8 { memarg }
+                            | Operator::I32Store16 { memarg }
+                            | Operator::I64Load { memarg }
+                            | Operator::I64Store { memarg } => {
+                                accesses += 1;
+                                assert!(memarg.offset >= HOST_OFF as u64, "an access immediate below the host offset: {memarg:?}");
+                            }
+                            Operator::I32Const { value } if value as u32 == HOST_OFF => adds_of_off += 1,
+                            Operator::MemoryCopy { .. } | Operator::MemoryFill { .. } => bulk += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_memory, "the module must import env.memory");
+        assert!(accesses > 0, "the program has memory accesses");
+        assert!(bulk == 0 || adds_of_off >= bulk, "every bulk operation adds the offset: {bulk} bulk ops, {adds_of_off} adds");
+    }
+
     #[test]
     fn import_memory_mode_imports_shared_memory_and_validates() {
         // Same tiny ARM program, once self-contained and once importing a shared
@@ -2498,6 +2813,7 @@ mod tests {
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
                 import_memory,
+                host_off: 0,
             })
             .expect("transpile")
             .wasm
@@ -2569,7 +2885,7 @@ mod tests {
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
-                import_memory: false,
+                import_memory: false, host_off: 0,
             })
             .expect("transpile");
             wasmparser::validate(&a.wasm).expect("valid wasm");
@@ -2614,3 +2930,7 @@ mod tests {
         assert_eq!(plain, plain_again, "an unpromoted build must be deterministic");
     }
 }
+
+/// The host-mirror slot the exclusive monitor lives in, re-exported so the runtime can pin
+/// the agreement in a test (see `emit::EXCL_SLOT`).
+pub const EXCL_MIRROR_SLOT: u32 = 9;

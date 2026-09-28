@@ -9,7 +9,7 @@
 //! the browser WebGPU backend build on the same shared pipeline.
 
 use pollster::block_on;
-use vitaslop_platform::gpu::{CubeRenderer, GxmRenderer, DEPTH_FORMAT};
+use vitaslop_platform::gpu::{depth_format, CubeRenderer, GxmRenderer};
 use vitaslop_runtime::capture::Scene;
 use vitaslop_runtime::render::{Framebuffer, RenderSceneBuilder};
 
@@ -42,7 +42,7 @@ impl WgpuRenderer {
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-gpu"),
             required_features: vitaslop_platform::gpu::wanted_features(&adapter),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits: vitaslop_platform::gpu::device_limits(&adapter),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -79,7 +79,7 @@ impl WgpuRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -92,9 +92,17 @@ impl WgpuRenderer {
         self.cube
             .encode(&self.device, &self.queue, &mut encoder, &color_view, &depth_view, &batches, clear);
 
-        // Copy the color texture into a readback buffer. width*4 is 256-aligned
-        // for 960 (3840 = 15*256), so no per-row padding is needed here.
-        let bytes_per_row = width * 4;
+        // >>> THE ROW PITCH IS PADDED TO 256, AND ASSUMING IT NEED NOT BE COST A BLACK RUN.
+        //
+        // `width * 4` is 256-aligned for the 960-wide panel (3840 = 15*256), which is what the
+        // comment here used to rest on. A title is free to declare a display buffer SMALLER
+        // than the panel and let the display controller stretch it - MEASURED on a baseball
+        // title, which switches to 720x408 the moment a game starts, and 720*4 = 2880 is not a
+        // multiple of 256. The copy is then a validation error, the submit fails, and the
+        // readback holds nothing: 9,101 errors in one run and every shot from the moment the
+        // game loaded came back BLACK, with the guest submitting 540 draws a frame behind it.
+        let bytes_per_row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: (bytes_per_row * height) as u64,
@@ -127,7 +135,7 @@ impl WgpuRenderer {
         });
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
-        let rgba = slice.get_mapped_range().unwrap().to_vec();
+        let rgba = unpad_rows(&slice.get_mapped_range().unwrap(), width, height, bytes_per_row);
         readback.unmap();
 
         Framebuffer { width, height, rgba }
@@ -146,6 +154,10 @@ pub struct GeneralRenderer {
     builder: RenderSceneBuilder,
     /// The adapter name, for logging which GPU serviced the render.
     pub adapter_name: String,
+    /// The adapter is a SOFTWARE rasteriser (`DeviceType::Cpu`, or a Microsoft adapter - WARP,
+    /// the Basic Render Driver - lavapipe, SwiftShader):
+    /// correct, but far slower, which a test may need to know - see `vita_gxmconf_real.rs`.
+    pub software: bool,
     /// Where the last [`GeneralRenderer::render_scene`] went. See [`RenderSplit`].
     last_split: RenderSplit,
 }
@@ -220,19 +232,32 @@ fn pick_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
     .ok()
 }
 
+/// The adapter [`GeneralRenderer::new`] would take - `(name, software)` - WITHOUT creating a
+/// device or building the renderer, which on a software adapter is itself minutes of shader
+/// compilation (see `vita_gxmconf_real.rs`). `None` if no adapter is available.
+pub fn general_adapter() -> Option<(String, bool)> {
+    let adapter = pick_adapter(&wgpu::Instance::default())?;
+    let info = adapter.get_info();
+    Some((info.name.clone(), is_software(&info)))
+}
+
+/// A software rasteriser: `DeviceType::Cpu`, or one of Microsoft's own adapters (vendor 0x1414 -
+/// WARP and the Basic Render Driver), whatever device type the backend reports for them.
+fn is_software(info: &wgpu::AdapterInfo) -> bool {
+    info.device_type == wgpu::DeviceType::Cpu || info.vendor == 0x1414
+}
+
 impl GeneralRenderer {
     /// Acquire a GPU and build the general pipeline. `None` if no adapter is available.
     pub fn new() -> Option<Self> {
         let instance = wgpu::Instance::default();
         let adapter = pick_adapter(&instance)?;
         let adapter_name = adapter.get_info().name;
+        let software = is_software(&adapter.get_info());
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-gxm"),
             required_features: vitaslop_platform::gpu::wanted_features(&adapter),
-            // Raise the resolution-derived limits (max texture dimension, buffer/binding
-            // sizes) to what the adapter really supports: a real title binds textures
-            // larger than the 2048 downlevel floor (some titles have a ~2480px atlas).
-            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            required_limits: vitaslop_platform::gpu::device_limits(&adapter),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -261,6 +286,7 @@ impl GeneralRenderer {
             gxm,
             builder: RenderSceneBuilder::new(),
             adapter_name,
+            software,
             last_split: RenderSplit::default(),
         })
     }
@@ -313,7 +339,7 @@ impl GeneralRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -324,6 +350,15 @@ impl GeneralRenderer {
         // when the composite comes out black the question is WHICH pass is empty - a
         // question the finished frame cannot answer, because every failure mode looks like
         // black. This shows any single pass on its own.
+        // Scenes completed at their own `sceGxmEndScene` are not rendered again: their target
+        // already holds the image (see `Scene::completed_early`).
+        let owned: Vec<Scene>;
+        let scenes: &[Scene] = if scenes.iter().any(|s| s.completed_early) {
+            owned = scenes.iter().filter(|s| !s.completed_early).cloned().collect();
+            &owned
+        } else {
+            scenes
+        };
         let limit = std::env::var("VITASLOP_CHAIN_LIMIT").ok().and_then(|s| s.trim().parse::<usize>().ok());
         let scenes = match limit {
             Some(n) if n > 0 && n < scenes.len() => &scenes[..n],
@@ -368,11 +403,20 @@ impl GeneralRenderer {
             width,
             height,
             clear,
+            // The offline path renders straight into this texture, so a draw whose fragment
+            // program reads the DESTINATION colour is served here too - without it a capsule
+            // of such a draw is dropped and replays to an empty frame.
+            Some(&color_tex),
         );
+        // `VITASLOP_GXM_DRAW_COVERAGE`: resolve the per-draw occlusion queries onto this same
+        // encoder, so the counts describe the frame the readback below is about.
+        self.gxm.ts_finish_chain(&mut encoder);
         let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
         let t_submit = std::time::Instant::now();
 
-        let bytes_per_row = width * 4;
+        // Padded to 256, for the reason the other readback in this file spells out.
+        let bytes_per_row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: (bytes_per_row * height) as u64,
@@ -397,6 +441,7 @@ impl GeneralRenderer {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         self.queue.submit([encoder.finish()]);
+        self.gxm.ts_map_after_submit();
 
         let slice = readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -405,8 +450,14 @@ impl GeneralRenderer {
         });
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
-        let rgba = slice.get_mapped_range().unwrap().to_vec();
+        // The frame's pass timestamps rode that submit: the map was asked for after it and
+        // has completed with the wait above, so `take_gpu_time_report` describes THIS render.
+        self.gxm.ts_poll();
+        let rgba = unpad_rows(&slice.get_mapped_range().unwrap(), width, height, bytes_per_row);
         readback.unmap();
+        // ...and now that the submit has completed, say what every draw of that frame covered.
+        // Inert unless `VITASLOP_GXM_DRAW_COVERAGE` is set.
+        self.gxm.coverage_report_blocking(&self.device);
         self.last_split = RenderSplit {
             build_ms,
             encode_ms,
@@ -415,10 +466,135 @@ impl GeneralRenderer {
             phases: self.gxm.chain_phases(),
         };
         if let Some(dir) = std::env::var_os("VITASLOP_GPU_CHAIN_DIR") {
-            self.dump_chain_targets(std::path::Path::new(&dir));
-            self.dump_chain_depth_targets(std::path::Path::new(&dir));
+            // >>> AN EARLY COMPLETION'S TARGETS GO IN THEIR OWN DIRECTORY. Both kinds of render
+            // land here, they share the `rtt_<addr>_<w>x<h>.png` filename, and the early one
+            // runs on EVERY guest frame - so in a headless run with a shot window the last
+            // writer of every file is an early completion from some frame after the window,
+            // whose world-sized target is nearly black because an early completion does not
+            // render the display passes at all. Read as "the frame I asked for", that is a
+            // measurement of a render nobody requested
+            // [[vitaslop-instrument-failure-imitating-its-subject]].
+            let dir = std::path::Path::new(&dir);
+            let early = dir.join("early");
+            let dir = if self.gxm.offscreen_only() { &early } else { dir };
+            self.dump_chain_targets(dir);
+            self.dump_chain_depth_targets(dir);
         }
         Framebuffer { width, height, rgba }
+    }
+
+    /// The rendered pixels of every offscreen target small enough to hand back to the GUEST,
+    /// as `(guest colour address, width, height, straight RGBA8)`.
+    ///
+    /// # Why a render target has to reach guest memory at all
+    /// A title does not only SAMPLE its render targets - it also reads texels out of them on
+    /// the CPU. MEASURED on a baseball title: its ambient light is a 128x128 target the GPU
+    /// paints once a frame and the guest then indexes with `row*512 + col*4` to pull one texel
+    /// out. Because nothing ever put the rendered pixels back in guest memory, the read
+    /// returned the game's OWN allocator poison - `0xBAADCAFE`, every word of the buffer - and
+    /// the three poison bytes (254, 202, 173) went through the title's base-10 log decode into
+    /// an ambient of (97.2, 23.7, 10.7). That is a hundred times an ambient, and it is the
+    /// whole of that title's washed-out frame.
+    ///
+    /// # Why SMALL only
+    /// The copy is a GPU->CPU readback, and one per frame for every target would be tens of
+    /// megabytes. The split is not arbitrary: a target a title reads on the CPU is small BY
+    /// CONSTRUCTION - a probe grid, a luminance reduction, an occlusion or exposure result -
+    /// because the CPU has to walk it. A full-size colour buffer is consumed by the GPU and
+    /// never crosses back. `VITASLOP_GXM_RTT_WRITEBACK` is the cap in TEXELS (default 65536,
+    /// i.e. 256x256); `0` disables the writeback entirely and is the arm back.
+    /// What the renderer's caches are holding, in the same line the browser panel prints.
+    ///
+    /// The desktop had no reader for it at all, which is why an unbounded cache could be found
+    /// only from a device dump or a browser panel - on the one engine where a run costs a minute
+    /// and the OS will tell you the process's working set. A residency question should be
+    /// answerable here first.
+    pub fn cache_sizes(&self) -> String {
+        self.gxm.cache_sizes()
+    }
+
+    /// Complete ONE scene now - render it as an offscreen target and return the small
+    /// targets' pixels - for the guest's `sceGxmEndScene` (see `VitaState::complete_scene_now`).
+    /// The scene must not be taken for the display: alone in a frame it would be.
+    pub fn complete_scenes(&mut self, scenes: &[Scene]) -> Vec<(u32, u32, u32, Vec<u8>)> {
+        if scenes.is_empty() {
+            return Vec::new();
+        }
+        self.gxm.set_offscreen_only(true);
+        let _ = self.render_frame(scenes, 960, 544, [0, 0, 0, 0]);
+        self.gxm.set_offscreen_only(false);
+        self.rtt_writebacks()
+    }
+
+    pub fn rtt_writebacks(&self) -> Vec<(u32, u32, u32, Vec<u8>)> {
+        let cap = rtt_writeback_texels();
+        if cap == 0 {
+            return Vec::new();
+        }
+        // Row pitch for a texture->buffer copy must be a multiple of 256 bytes, so the
+        // readback is padded and the padding stripped per row on the way out.
+        const ALIGN: u32 = 256;
+        // ONE encoder, ONE submit and ONE poll for every target. A copy-submit-poll per target
+        // is a GPU stall per target: this title has seven small ones and paid seven stalls a
+        // frame for a job whose whole point is that it is cheap
+        // [[vitaslop-a-stall-must-not-buy-a-sentence]].
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gxm-rtt-writeback") });
+        let mut staged: Vec<(u32, u32, u32, u32, wgpu::Buffer)> = Vec::new();
+        let skip_sampled = vitaslop_runtime::rtt_writeback::writeback_skips_sampled();
+        for (addr, tex, w, h) in self.gxm.rtt_targets() {
+            // `skip=sampled`: a target the GPU consumes is not the CPU-read probe this seam
+            // exists for. See `rtt_writeback::writeback_spec`.
+            if skip_sampled && self.gxm.frame_samples(addr) {
+                continue;
+            }
+            let (w, h) = (w.max(1), h.max(1));
+            if w * h > cap {
+                continue;
+            }
+            let padded = (w * 4).div_ceil(ALIGN) * ALIGN;
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gxm-rtt-writeback"),
+                size: (padded * h) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            staged.push((addr, w, h, padded, readback));
+        }
+        if staged.is_empty() {
+            return Vec::new();
+        }
+        self.queue.submit([enc.finish()]);
+        for (_, _, _, _, buf) in &staged {
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        }
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let mut out = Vec::with_capacity(staged.len());
+        for (addr, w, h, padded, buf) in &staged {
+            let Ok(view) = buf.slice(..).get_mapped_range() else { continue };
+            out.push((*addr, *w, *h, unpad_rows(&view, *w, *h, *padded)));
+            drop(view);
+            buf.unmap();
+        }
+        out
     }
 
     /// `VITASLOP_GPU_CHAIN_DIR=<dir>`: write every offscreen target of the frame just
@@ -429,6 +605,12 @@ impl GeneralRenderer {
     /// WHICH pass failed - and on a title whose draws are real recompiled shaders the
     /// software chain is not an answer either, because it cannot run them. Written after
     /// submit, so these are the finished images the composite had available to sample.
+    ///
+    /// **The DISPLAY frame's targets are the ones in `<dir>`; an EARLY COMPLETION's go in
+    /// `<dir>/early`** - see the call site. A headless run with a shot window renders early
+    /// completions on every frame and display frames only inside the window, so without the
+    /// split the files an operator reads are from neither the frame nor the kind of render
+    /// they meant.
     fn dump_chain_targets(&self, dir: &std::path::Path) {
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!("gpu chain dump: mkdir {}: {e}", dir.display());
@@ -437,9 +619,41 @@ impl GeneralRenderer {
         // Row pitch for a texture->buffer copy must be a multiple of 256 bytes, so the
         // readback is padded and the padding stripped per row on the way out.
         const ALIGN: u32 = 256;
-        for (addr, tex, w, h) in self.gxm.rtt_targets() {
+        let skip_sampled = vitaslop_runtime::rtt_writeback::writeback_skips_sampled();
+        // BOTH maps: the ordinary targets and the RAW 64-BIT ones, which live in their own
+        // map (`GxmRenderer::rtt_raw`) and so have appeared in NO dump at all until now.
+        let targets = self
+            .gxm
+            .rtt_targets()
+            .into_iter()
+            .chain(self.gxm.rtt_raw_targets())
+            .chain(self.gxm.rtt_float_targets());
+        for (addr, tex, w, h) in targets {
+            // `skip=sampled`: a target the GPU consumes is not the CPU-read probe this seam
+            // exists for. See `rtt_writeback::writeback_spec`.
+            if skip_sampled && self.gxm.frame_samples(addr) {
+                continue;
+            }
             let (w, h) = (w.max(1), h.max(1));
-            let padded = (w * 4).div_ceil(ALIGN) * ALIGN;
+            // >>> A RAW 64-BIT TARGET IS EIGHT BYTES A TEXEL, AND A PNG OF IT SAYS NOTHING.
+            //
+            // A title can render a surface the guest's own shaders then read as RAW `u32` WORDS
+            // (`RAW64_FORMAT`, see `LinkOptions::raw_units`): two packed words per texel, which
+            // a reading program unpacks itself - typically as two `unorm8x4` groups. Copied at
+            // `w * 4` bytes a row it is read HALF A ROW SHORT and reassembled from the wrong
+            // bytes, and squeezed through `to_png` the four channels are not the bytes the
+            // shader unpacks anyway. Both failures are silent and both look like a wrong
+            // picture rather than a wrong dump.
+            //
+            // So this writes the texels VERBATIM to `.bin` - `[word0 word1]` per texel, little
+            // endian, row by row with the copy padding stripped - and leaves the decode to the
+            // reader, who is the only one who knows what the program packed into them
+            // [[vitaslop-a-captured-texel-dump-is-not-what-the-draw-samples]]. MEASURED need:
+            // PCSA00002's crowd atlas (`0x8e20b030`, 256x256) is the last unmeasured input of
+            // its washed-out close-up, and no instrument here could read it.
+            let half = tex.format() == wgpu::TextureFormat::Rgba16Float;
+            let texel_bytes = if tex.format() == vitaslop_platform::gpu::RAW64_FORMAT || half { 8 } else { 4 };
+            let padded = (w * texel_bytes).div_ceil(ALIGN) * ALIGN;
             let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("gxm-rtt-readback"),
                 size: (padded * h) as u64,
@@ -478,10 +692,39 @@ impl GeneralRenderer {
             }
             let padded_bytes = slice.get_mapped_range().unwrap().to_vec();
             readback.unmap();
-            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            let mut rgba = Vec::with_capacity((w * h * texel_bytes) as usize);
             for row in 0..h as usize {
                 let start = row * padded as usize;
-                rgba.extend_from_slice(&padded_bytes[start..start + (w * 4) as usize]);
+                rgba.extend_from_slice(&padded_bytes[start..start + (w * texel_bytes) as usize]);
+            }
+            // The raw surface goes out as bytes, not as a picture - see above.
+            // A FLOAT target likewise: four IEEE halves a texel, verbatim.
+            if texel_bytes == 8 {
+                let kind = if half { "f16" } else { "raw64" };
+                let path = dir.join(format!("rtt_{addr:08x}_{w}x{h}_{kind}.bin"));
+                if let Err(e) = std::fs::write(&path, &rgba) {
+                    eprintln!("gpu chain dump: write {}: {e}", path.display());
+                }
+                continue;
+            }
+            // TEMPORARY TELEMETRY (`VITASLOP_RTT_CLEAR_PROBE=<hex addr>`): what this dump
+            // actually READ, at the moment it read it, with the renderer's mode and the wgpu
+            // texture's global id. The display dir and the `early` dir disagree for one guest
+            // address - 3 of 128 probe-atlas slots against 82 - and reasoning about WHEN each
+            // file is written has now twice failed to explain it. The texture id settles the
+            // only question that matters: whether the two dumps are reading the same texture.
+            if let Ok(v) = vitaslop_runtime::knobs::var("VITASLOP_RTT_CLEAR_PROBE")
+                && u32::from_str_radix(v.trim_start_matches("0x"), 16) == Ok(addr)
+            {
+                let nonzero = rgba.chunks_exact(4).filter(|p| p != &[0, 0, 0, 0]).count();
+                tracing::warn!(
+                    target: "vitaslop::gxm",
+                    "rtt dump probe: {addr:#010x} {w}x{h} offscreen_only={} texture={:p} \
+                     nonzero_texels={nonzero} of {}",
+                    self.gxm.offscreen_only(),
+                    tex as *const wgpu::Texture,
+                    w * h,
+                );
             }
             let path = dir.join(format!("rtt_{addr:08x}_{w}x{h}.png"));
             let fb = Framebuffer { width: w, height: h, rgba };
@@ -600,6 +843,14 @@ impl GeneralRenderer {
     pub fn last_split(&self) -> RenderSplit {
         self.last_split
     }
+
+    /// The GPU's own per-pass clock over the renders since the last call - the `GPU TIME`
+    /// line the browser's diagnostics carry. A pass reading 8 ms on a desktop GPU is the one
+    /// reading 50-350 ms on a phone, so this prices a GPU-bound title with no phone in the
+    /// loop. See `GxmRenderer::take_gpu_time_report`.
+    pub fn take_gpu_time_report(&mut self) -> String {
+        self.gxm.take_gpu_time_report()
+    }
 }
 
 /// Decode an IEEE binary16 bit pattern to `f32`, including subnormals, infinities and NaN.
@@ -607,6 +858,25 @@ impl GeneralRenderer {
 /// Written out rather than pulled from a crate because it is the ONLY place this crate needs
 /// it and a wrong `f16` decode would misreport exactly the values this diagnostic exists to
 /// report - a silently wrong number is worse than no number.
+/// Strip a readback's row PADDING: `bytes_per_row` is rounded up to
+/// `COPY_BYTES_PER_ROW_ALIGNMENT` for the copy, and a `Framebuffer` is tightly packed.
+/// A no-op copy when the two already agree, which is every panel-width frame.
+pub use vitaslop_runtime::rtt_writeback::apply_rtt_writebacks;
+use vitaslop_runtime::rtt_writeback::rtt_writeback_texels;
+
+fn unpad_rows(padded: &[u8], width: u32, height: u32, bytes_per_row: u32) -> Vec<u8> {
+    let tight = (width * 4) as usize;
+    if bytes_per_row as usize == tight {
+        return padded.to_vec();
+    }
+    let mut rgba = Vec::with_capacity(tight * height as usize);
+    for row in 0..height as usize {
+        let start = row * bytes_per_row as usize;
+        rgba.extend_from_slice(&padded[start..start + tight]);
+    }
+    rgba
+}
+
 fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exp = ((h >> 10) & 0x1f) as u32;
@@ -661,5 +931,29 @@ mod f16_tests {
         assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);
         assert_eq!(f16_to_f32(0xfc00), f32::NEG_INFINITY);
         assert!(f16_to_f32(0x7e00).is_nan());
+    }
+}
+
+#[cfg(test)]
+mod writeback_tests {
+    use vitaslop_runtime::rtt_writeback::nothing_written_here;
+
+    /// The gate that keeps the render-target writeback off memory a title composed itself.
+    #[test]
+    fn a_uniform_fill_is_unwritten_and_an_image_is_not() {
+        // Zeros - a freshly mapped page.
+        assert!(nothing_written_here(&[0u8; 64]));
+        // 0xBAADCAFE - MLB 12's allocator poison, the case that found this.
+        let poison: Vec<u8> = [0xFEu8, 0xCA, 0xAD, 0xBA].repeat(16);
+        assert!(nothing_written_here(&poison));
+        // One texel written into the poison is enough to make it the guest's.
+        let mut touched = poison.clone();
+        touched[8] = 0x01;
+        assert!(!nothing_written_here(&touched));
+        // Too short to carry a word answers "not empty" rather than guessing.
+        assert!(!nothing_written_here(&[0u8; 3]));
+        // A gradient is an image.
+        let ramp: Vec<u8> = (0..64u8).collect();
+        assert!(!nothing_written_here(&ramp));
     }
 }

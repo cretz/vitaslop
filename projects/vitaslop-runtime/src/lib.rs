@@ -41,13 +41,14 @@ pub mod recipe;
 pub mod recipe_eval;
 pub mod sched;
 pub mod render;
+pub mod rtt_writeback;
 pub mod trophy;
 pub mod vita;
 pub mod world;
 
 pub use host::{
-    GuestCtx, GuestMemory, ImportDispatch, Ptr, Reentry, SliceMemory, SvcDispatch, VitaEnv,
-    VitaState, VFP_ARG_COUNT,
+    GuestCtx, GuestMemory, ImportDispatch, Ptr, Reentry, SliceMemory,
+    SvcDispatch, VitaEnv, VitaState, VFP_ARG_COUNT,
 };
 pub use audio::{AudioFormat, AudioSink, NullSink};
 pub use recipe::{InputSegment, Recipe, RecipeError, RecipeWorld, SharedTimeline, Timeline};

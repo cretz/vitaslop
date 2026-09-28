@@ -134,7 +134,7 @@ fn texture_sample_produces_valid_wgsl() {
     };
     let body = emit_fragment(&sh).unwrap();
     assert!(body.contains("textureSample(t3, s3,"), "tex emit:\n{body}");
-    assert_eq!(tex_units(&sh, |_| false), vec![TexBinding { unit: 3, coords: 2, cube: false }]);
+    assert_eq!(tex_units(&sh, |_| false), vec![TexBinding { unit: 3, coords: 2, cube: false, raw: false }]);
     validate_with(&body, &tex_units(&sh, |_| false));
 
     // A 3-component sample validates as a texture_3d binding when the container does not mark
@@ -148,7 +148,7 @@ fn texture_sample_produces_valid_wgsl() {
     assert!(body3.contains("vec3<f32>"), "3D tex emits vec3 coord:\n{body3}");
     validate_with(&body3, &tex_units(&sh3, |_| false));
     let cube = tex_units(&sh3, |_| true);
-    assert_eq!(cube, vec![TexBinding { unit: 6, coords: 3, cube: true }]);
+    assert_eq!(cube, vec![TexBinding { unit: 6, coords: 3, cube: true, raw: false }]);
     assert_eq!(cube[0].wgsl_type(), "texture_cube<f32>");
     validate_with(&body3, &cube);
 }
@@ -193,4 +193,93 @@ fn multi_instruction_shader_validates() {
     };
     let body = emit_fragment(&sh).unwrap();
     validate(&body);
+}
+
+/// Where the 16-bit boundary actually is in the shader compiler we ship against.
+///
+/// A USSE 16-bit register is two halves in a 32-bit word, and the cheapest possible home for one
+/// would be WGSL's own `f16`: half arithmetic runs at twice the rate on a phone GPU and the
+/// register file would need no conversions at all, only `bitcast`s between `vec2<f16>` and the
+/// 32-bit views. This pins both halves of that idea against naga:
+///
+/// * f16 ARITHMETIC is available - declarations, component stores, the builtins the emitter
+///   uses, comparisons and `select`;
+/// * `bitcast` between `vec2<f16>` and `u32`/`f32`/`i32` is NOT, in either direction, so the
+///   register file cannot be a union of the two views and native f16 cannot be reached by
+///   bitcasting alone. That is what makes `link::unpack_half_registers` - an f32 home plus
+///   `quantizeToF16` - the representation this emitter can actually use today.
+///
+/// The second assertion is a TRIGGER, not a preference: the day naga grows f16 bitcast this
+/// test fails, and the native register file becomes reachable.
+#[test]
+fn the_f16_boundary_in_the_shader_compiler() {
+    let module = |body: &str| {
+        format!(
+            "enable f16;
+@group(0) @binding(0) var<uniform> u: vec4<u32>;
+@fragment
+             fn fs_main() -> @location(0) vec4<f32> {{ var out = 0.0; {body} return vec4<f32>(out); }}
+"
+        )
+    };
+    validate_src(&module(
+        "var r: array<vec2<f16>, 4>; r[1].y = 2.0h; r[1].x = f16(u.x) * r[1].y + 1.0h;          r[2].x = select(0.0h, 1.0h, r[1].x < 0.0h);          out += f32(fract(r[1].x) + min(r[2].x, max(abs(r[1].y), 0.0h)) + dot(r[1], r[2]));",
+    ));
+    for cast in [
+        "let a = bitcast<vec2<f16>>(u.x); out += f32(a.x);",
+        "var a: vec2<f16>; a.x = 1.0h; out += f32(bitcast<u32>(a));",
+        "var a: vec2<f16>; a.x = 1.0h; out += bitcast<f32>(a);",
+        "let a = bitcast<vec2<f16>>(1.5f); out += f32(a.x);",
+    ] {
+        let src = module(cast);
+        assert!(
+            std::panic::catch_unwind(|| validate_src(&src)).is_err(),
+            "naga now accepts f16 bitcast - the NATIVE f16 register file is reachable:
+{src}"
+        );
+    }
+}
+
+/// >>> ALL THREE f16 ROUNDING ARMS HAVE TO BE REAL WGSL, INCLUDING THE ONE THIS MACHINE DOES
+/// >>> NOT TAKE.
+///
+/// The arm a run uses is chosen from the DEVICE's features, so on any one machine two of the
+/// three are never assembled - and a module that does not parse is not a wrong number, it is a
+/// pipeline the device refuses and a frame that never draws. The native arm in particular
+/// carries `enable f16;`, which has to be the module's first line and needs the validator's
+/// f16 capability; getting that wrong is invisible here and fatal on a phone.
+#[test]
+fn every_f16_rounding_arm_parses_and_validates() {
+    use vitaslop_gxp_shader::link::{set_arm, F16_ROUND_ARM};
+    use vitaslop_gxp_shader::wgsl::set_native_f16;
+
+    // A real F16 instruction, so the body under test is the emitter's own text and not a
+    // transcription of it: two channels fold into the PAIR helper and the third, whose partner
+    // is masked out, keeps the single-half one. `gxp_hq` is reached through the unpacked
+    // half-register home, which the second arm of the loop turns on.
+    let d = Operand::plain(Bank::Temp, 0, 0);
+    let a = Operand::plain(Bank::SecondaryAttr, 6, 3);
+    let b = Operand::plain(Bank::PrimaryAttr, 4, 2);
+    let mut ins = instr(Op::Mul, d, vec![a, b], [true, true, true, false]);
+    ins.half_precision = true;
+    let sh = Shader { kind: ProgramKind::Fragment, instrs: vec![ins] };
+    let body = emit_fragment(&sh).expect("emit");
+    assert!(body.contains("gxp_hpk(") && body.contains("gxp_hlo("), "got:
+{body}");
+
+    for arm in ["0", "portable", "native"] {
+        set_arm(F16_ROUND_ARM, arm);
+        set_native_f16(false);
+        let src = wrap_module(&body, &[], ProgramKind::Fragment);
+        assert_eq!(
+            src.contains("enable f16;"),
+            arm == "native",
+            "only the native arm enables the extension:\n{src}"
+        );
+        if arm == "native" {
+            assert!(src.starts_with("enable f16;\n"), "the directive must come first:\n{src}");
+        }
+        validate_src(&src);
+    }
+    set_arm(F16_ROUND_ARM, "1");
 }

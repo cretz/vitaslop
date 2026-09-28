@@ -21,7 +21,7 @@
          The worker addresses reports BY ELEMENT ID, so without this element the headless
          page silently drops the one channel that carries blocked threads, guest heaps, idle
          attribution and the movie counters - and a harness run then has to be repeated by
-         hand on `live.html` to ask anything about a stall. Kept out of the way rather than
+         hand on the product page to ask anything about a stall. Kept out of the way rather than
          hidden: `display:none` still yields textContent, but a screenshot of this page is
          also a diagnostic and the panel does not belong on top of the frame. -->
     <pre id="diag" style="position:absolute;left:-9999px;top:0;white-space:pre-wrap"></pre>
@@ -41,6 +41,24 @@
       // reach a VITASLOP_* knob - and one retail racer needs VITASLOP_FRAME_TOPUP=0 to
       // finish loading at all.
       window.__boot = async (recipe, maxFrames, maxRounds, knobs, titleId = "default") => {
+      // Fetch one container file, refusing anything that is not a complete, successful
+      // response.
+      //
+      // >>> A NON-OK RESPONSE HAS A BODY, AND THAT BODY IS NOT THE FILE. Without this check
+      // > > > a 404's nine-byte `not found` was imported AS a 2.9 GB game archive, the marker
+      // > > > called the title complete, and every later boot reused it. The run then failed
+      // > > > three hundred frames later inside the guest, with nothing anywhere saying a file
+      // > > > was wrong. `content-length` is passed on so the import can hold the transfer to
+      // > > > the length the server promised.
+      const gameFile = async (p) => {
+        const res = await fetch("/game/" + p);
+        if (!res.ok) {
+          throw new Error(`GET /game/${p} -> HTTP ${res.status} ${res.statusText}; the body of a
+ failed response is not the file`);
+        }
+        const len = res.headers.get("content-length");
+        return { body: res.body, bytes: len === null ? null : Number(len) };
+      };
         status.textContent = "fetching manifest...";
         const manifest = await (await fetch("/game-manifest.json")).json();
 
@@ -61,10 +79,7 @@
           // was re-importing, for 29 runs and 49 GB.
           console.log(`[opfs] REUSED an existing import of ${titleId} (${manifest.length} files)`);
         } else {
-          const entries = manifest.map((p) => ({
-            path: p,
-            source: async () => (await fetch("/game/" + p)).body,
-          }));
+          const entries = manifest.map((p) => ({ path: p, source: () => gameFile(p) }));
           await importTitle(titleId, entries, (done, total, bytes) => {
             if (done % 20 === 0 || done === total) {
               status.textContent = `importing to OPFS ${done}/${total} (${(bytes / 1e6) | 0} MB)`;
@@ -84,9 +99,25 @@
         //
         // It must finish and CLOSE its OPFS handles before the run worker opens its own:
         // a sync access handle is an exclusive lock.
+        // The run worker first: it reserves the guest region in its own memory and reports
+        // the offset the module has to be built for (see worker.js's "reserve" message).
+        // `VITASLOP_SMP=1` needs the wasm-threads bundle in BOTH the run and the transpile
+        // worker - see build.mjs. The default engine keeps the single-threaded one.
+        const bundleQ = String((knobs || {}).VITASLOP_SMP ?? "") === "1" ? "?smp=1" : "";
+        const worker = new Worker("../worker.js" + bundleQ, { type: "module" });
+        status.textContent = "reserving the guest region in the run worker...";
+        const hostOff = await new Promise((resolve, reject) => {
+          worker.onmessage = (e) => {
+            const d = e.data;
+            if (d.type === "reserved") resolve(d.hostOff);
+            else if (d.type === "error" || d.type === "panic") reject(new Error(d.message));
+          };
+          worker.onerror = (e) => reject(new Error(e.message || "run worker failed to start"));
+          worker.postMessage({ type: "reserve", knobs: knobs || {} });
+        });
         status.textContent = "transpiling (throwaway worker)...";
         const prebuilt = await new Promise((resolve, reject) => {
-          const tw = new Worker("../transpile-worker.js", { type: "module" });
+          const tw = new Worker("../transpile-worker.js" + bundleQ, { type: "module" });
           tw.onmessage = (e) => {
             tw.terminate();
             e.data.type === "built" ? resolve(e.data.built) : reject(new Error(e.data.message));
@@ -95,11 +126,10 @@
             tw.terminate();
             reject(new Error(e.message || "transpile worker failed to start"));
           };
-          tw.postMessage({ titleId, knobs: knobs || {} });
+          tw.postMessage({ titleId, knobs: knobs || {}, hostOff });
         });
         status.textContent = "transpiled; starting run worker...";
 
-        const worker = new Worker("../worker.js", { type: "module" });
         worker.onmessage = (e) => {
           const d = e.data;
           if (d.type === "report") {

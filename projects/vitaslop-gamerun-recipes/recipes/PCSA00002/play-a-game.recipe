@@ -1,0 +1,142 @@
+@title  PCSA00002 - take control of a team and PLAY: menu walk, then swing at the plate
+@game   PCSA00002
+@shot-every 400
+
+# WHY THIS RECIPE EXISTS, AND WHY `swing-and-play` IS NOT IT
+# ---------------------------------------------------------
+# `swing-and-play` never swings, and nothing it presses at the plate reaches the game. Its
+# menu walk is a blind run of `cross` presses that leaves TEAM SELECT with **Rangers CPU vs
+# Cardinals CPU and P1 unassigned**, so the title has been playing itself in every run this
+# project has taken - the ball is hit by a CPU batter, on the CPU's schedule, and our input
+# is read by nobody. Its 16-point touch sweep across the title screen is fiction too: the
+# title screen is dismissed by START, and sits there through the whole sweep.
+#
+# This one walks the menu that was actually walked and shot step by step, and the step that
+# matters is `left` at TEAM SELECT: it moves P1 onto the ROAD team, who bat first. After
+# that the batter is OURS and `cross` is the swing.
+#
+# Every step carries a `@shot`, so a run of this recipe says for itself whether the walk
+# still lands - a menu that has moved shows up as a wrong picture at a named step rather
+# than as a silent arrival somewhere else.
+
+0: @section boot
+
+1900: @section accept-user-settings
+1900: cross
+1910:
+2200: @shot after-user-settings
+
+3800: @section title-screen-start
+3800: start
+3810:
+4100: @shot game-modes
+
+4400: @section exhibition
+# GAME MODES, with EXHIBITION already highlighted.
+4400: cross
+4410:
+4700: @shot exhibition-modal
+
+5000: @section play-now
+# The EXHIBITION / PLAY NOW / CANCEL modal.
+5000: cross
+5010:
+5300: @shot team-select
+
+5600: @section take-the-road-team
+# >>> THE STEP THE OLD RECIPE MISSED. `left` moves P1 from "unassigned" onto the ROAD team
+# (Texas), who bat first - so the first at-bat is ours to swing at. `r` here would change
+# the LEAGUE (MLB -> TRIPLE-A), not advance, which is the other way this screen was misread.
+5600: left
+5610:
+5900: @shot p1-on-the-road-team
+6000: cross
+6010:
+6300: @shot road-uniform
+
+6600: @section uniform
+6600: cross
+6610:
+6900: @shot select-pitcher
+
+7200: @section pitcher
+7200: cross
+7210:
+7500: @shot pregame-lineup
+
+7800: @section lineup-press-start
+# The PREGAME LINEUP screen says PRESS START, and `cross` does not leave it.
+7800: start
+7810:
+8100: @shot stadium-select
+
+8400: @section stadium
+8400: cross
+8410:
+8700: @shot options
+
+9000: @section options-confirm
+9000: down
+9010:
+9060: down
+9070:
+9120: down
+9130:
+9180: cross
+9190:
+9600: @shot loading-into-the-game
+
+10200: @shot in-the-game
+10600: @shot at-the-plate
+
+11000: @section swing
+# >>> OURS TO SWING NOW. `cross` is the normal swing on this title; the CPU pitches on its
+# own schedule and nothing here can see the pitch, so the swings walk a steady cadence
+# across a long window rather than trying to time one. Missing costs a strike and another
+# pitch; contact only has to happen once.
+11000: cross
+11003:
+11060: cross
+11063:
+11120: cross
+11123:
+11180: cross
+11183:
+11240: cross
+11243:
+11300: cross
+11303:
+11360: cross
+11363:
+11420: cross
+11423:
+11480: cross
+11483:
+11540: cross
+11543:
+11600: cross
+11603:
+11660: cross
+11663:
+11720: cross
+11723:
+11780: cross
+11783:
+11840: cross
+11843:
+11900: cross
+11903:
+11960: cross
+11963:
+12020: cross
+12023:
+12080: cross
+12083:
+12140: cross
+12143:
+
+12300: @section play-it-out
+# Nothing is pressed here: a ball in play is the FIELDERS' to resolve, and a button during
+# it advances a prompt that has not appeared yet.
+12400: @shot the-ball-is-in-play
+13000: @shot after-the-play

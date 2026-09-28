@@ -19,8 +19,11 @@ pub use sched::{FrameStop, Scheduler};
 pub mod threaded;
 pub use threaded::{dump_block_hist, RunReport, ThreadSpawn, ThreadedScheduler};
 
+/// The desktop's cache of compiled guest modules, beside each game - see its module docs.
+pub mod compile_cache;
+
 pub mod wgpu_render;
-pub use wgpu_render::{GeneralRenderer, RenderSplit, WgpuRenderer};
+pub use wgpu_render::{apply_rtt_writebacks, GeneralRenderer, RenderSplit, WgpuRenderer};
 
 pub mod observe;
 
@@ -213,6 +216,7 @@ impl Vm {
                 discover_code_pointers: true,
                 // The single-instance `Vm` defines its own memory.
                 import_memory: false,
+                host_off: 0,
             },
             host_abi,
         )
@@ -319,6 +323,7 @@ impl Vm {
             mem_bytes,
             discover_code_pointers: true,
             import_memory: false,
+                host_off: 0,
         });
 
         wasmparser::validate(&built.artifact.wasm)

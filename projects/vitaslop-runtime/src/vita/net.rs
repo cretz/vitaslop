@@ -153,6 +153,26 @@ pub(super) fn shutdown(st: &mut VitaState, s: i32, _how: i32) -> i32 {
     }
 }
 
+/// int sceNetSocketAbort(int s, int flags)
+///
+/// Unblock everything waiting on a socket, so a worker parked in a receive can be torn
+/// down. Nothing here ever blocks on a socket - every call that would need a peer fails at
+/// once with the link down - so there is never a wait for this to break, and the abort has
+/// genuinely done all there is to do. The descriptor is still CHECKED, because aborting one
+/// that does not exist is a caller error the console reports and this engine's socket table
+/// can see.
+///
+/// `flags` selects which directions to abort (send, receive, or both). With no blocked
+/// operation in either direction the selection changes nothing, which is why it is not read.
+#[hostcall]
+pub(super) fn socket_abort(st: &mut VitaState, s: i32, _flags: i32) -> i32 {
+    if st.net_socket_exists(s) {
+        0
+    } else {
+        fail(st, SCE_NET_EBADF)
+    }
+}
+
 /// int sceNetGetsockname(int s, SceNetSockaddr *name, unsigned int *namelen)
 ///
 /// Reads back what `sceNetBind` recorded. An unbound socket reports the wildcard
@@ -345,6 +365,78 @@ pub(super) fn resolver_create(st: &mut VitaState, _name: Ptr, _param: Ptr, _flag
     st.net_resolver_create()
 }
 
+/// int sceNetResolverAbort(int rid, int flags)
+///
+/// Cancels an in-flight resolve. Nothing here is ever in flight - `resolver_start`
+/// fails synchronously with no record - so there is never anything to cancel, and
+/// saying so is the truthful answer for a live handle. A handle that does not exist is
+/// still `EBADF`, which is the distinction a title's teardown path cares about.
+#[hostcall]
+pub(super) fn resolver_abort(st: &mut VitaState, rid: i32, _flags: i32) -> i32 {
+    if st.net_resolver_error(rid).is_some() { 0 } else { fail(st, SCE_NET_EBADF) }
+}
+
+/// int sceNetGetMacAddress(SceNetEtherAddr *addr, int flags)
+///
+/// The interface is down, not absent: a Vita has a MAC address whether or not it is
+/// associated, and a title uses it as a stable per-console identity (a seed, a save
+/// tag, a peer name). So this succeeds with a FIXED, locally-administered address -
+/// the `0x02` bit in the first octet is what "not globally unique, assigned locally"
+/// means in IEEE 802, which is exactly what this is. It is the same every run, because
+/// a title that stores it must find it again.
+///
+/// It is deliberately not a random or host-derived address: a real one would leak the
+/// player's machine identity into a save file, and a random one would make a title that
+/// remembers it think it moved to a different console on every launch.
+#[hostcall]
+pub(super) fn get_mac_address(ctx: &mut GuestCtx, st: &mut VitaState, addr: Ptr, _flags: i32) -> i32 {
+    if addr.is_null() {
+        fail(st, SCE_NET_EINVAL)
+    } else {
+        ctx.write_bytes(addr.addr(), &[0x02, 0x00, 0x00, 0x76, 0x69, 0x74]);
+        0
+    }
+}
+
+/// int sceNetShowIfconfig(void *p, int b)
+///
+/// A DIAGNOSTIC dump of the interface configuration, which the real one prints to the
+/// system log. There is no interface to describe and nothing that reads our stdout as
+/// an ifconfig table, so it does its work by reporting the state once and succeeding.
+#[hostcall]
+pub(super) fn show_ifconfig(st: &mut VitaState, _p: Ptr, _b: i32) -> i32 {
+    tracing::info!(
+        target: "vitaslop::status",
+        thread = st.current_thread(),
+        "sceNetShowIfconfig: no interface is up (see `vita::net` - the network is modelled down)"
+    );
+    0
+}
+
+/// int sceNetDumpCreate(const char *name, int len, int flags)
+///
+/// A packet-capture handle over an interface. There is no interface, so there is
+/// nothing to capture from and no handle to give: `ENETDOWN` is the same answer every
+/// other call that needs the link returns, and a title is told one consistent story.
+#[hostcall]
+pub(super) fn dump_create(st: &mut VitaState, _name: Ptr, _len: i32, _flags: i32) -> i32 {
+    fail(st, SCE_NET_ENETDOWN)
+}
+
+/// int sceNetDumpDestroy(int id)
+///
+/// No dump handle was ever created, so any id is a bad one.
+#[hostcall]
+pub(super) fn dump_destroy(st: &mut VitaState, _id: i32) -> i32 {
+    fail(st, SCE_NET_EBADF)
+}
+
+/// int sceNetDumpRead(int id, void *buf, int len, int *pflags)
+#[hostcall]
+pub(super) fn dump_read(st: &mut VitaState, _id: i32, _buf: Ptr, _len: i32, _pflags: Ptr) -> i32 {
+    fail(st, SCE_NET_EBADF)
+}
+
 /// int sceNetResolverDestroy(int rid)
 #[hostcall]
 pub(super) fn resolver_destroy(st: &mut VitaState, rid: i32) -> i32 {
@@ -523,6 +615,99 @@ pub(super) fn adhoc_matching_set_started(ctx: &mut GuestCtx, st: &mut VitaState,
 #[hostcall]
 pub(super) fn adhoc_matching_delete(st: &mut VitaState, id: i32) -> i32 {
     if st.adhoc_matching_delete(id) {
+        0
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID
+    }
+}
+
+/// int sceNetAdhocMatchingTerm(void)
+///
+/// Hand the pool back and drop every context with it (see
+/// [`VitaState::adhoc_matching_term`] for why the contexts go too). A term before an init is
+/// the one way this can fail, and it is a caller error the console reports.
+#[hostcall]
+pub(super) fn adhoc_matching_term(st: &mut VitaState) -> i32 {
+    if st.adhoc_matching_term() {
+        tracing::info!(
+            target: "vitaslop::status",
+            thread = st.current_thread(),
+            "SceNetAdhocMatching: no wireless link and no nearby consoles - matchmaking found no peers"
+        );
+        0
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_NOT_INITIALIZED
+    }
+}
+
+/// int sceNetAdhocMatchingSendData(int id, SceNetInAddr *addr, int data_len, void *data)
+///
+/// Send a payload to one paired peer. It gets the same answer
+/// [`adhoc_matching_select_target`] gives, for the same reason: no handler has ever fired on
+/// this context, so no address the title can pass is one it has heard from, and
+/// UNKNOWN_TARGET is what the console says about an address that is not in its member list.
+///
+/// Reporting success would be a claim that bytes went out to somebody - the one answer that
+/// cannot be true here, and one a title acts on by waiting for a reply that cannot come.
+#[hostcall]
+pub(super) fn adhoc_matching_send_data(st: &mut VitaState, id: i32, _addr: Ptr, _data_len: i32, _data: Ptr) -> i32 {
+    if st.adhoc_matching_live(id) {
+        SCE_NET_ADHOC_MATCHING_ERROR_UNKNOWN_TARGET
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID
+    }
+}
+
+/// int sceNetAdhocMatchingCancelTarget(int id, SceNetInAddr *target)
+///
+/// Withdraw a pairing request. Unlike [`adhoc_matching_send_data`] this SUCCEEDS on a live
+/// context: it is a cancel, no request to that address is outstanding (none could be), and
+/// so the state it asks for is the state already in force. A title reaches this from its own
+/// cleanup path, and the codebase's rule for cancels holds here - there is nothing left
+/// running to stop, so nothing can fail to stop. The context id is still checked, because a
+/// cancel on a context that does not exist is a caller error the console reports.
+#[hostcall]
+pub(super) fn adhoc_matching_cancel_target(st: &mut VitaState, id: i32, _target: Ptr) -> i32 {
+    if st.adhoc_matching_live(id) {
+        0
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID
+    }
+}
+
+/// int sceNetAdhocMatchingGetMembers(int id, unsigned int *members_count,
+///     struct SceNetAdhocMatchingMember *members)
+///
+/// ZERO members, and the count is written even when the buffer is null - that is the
+/// two-call idiom this API is used with (ask the count, allocate, ask again), and a title
+/// that skipped the write would allocate from a stale number. An empty member list is a real
+/// state, not a failure: it is what the first console into a room sees.
+#[hostcall]
+pub(super) fn adhoc_matching_get_members(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    id: i32,
+    count: Ptr,
+    _members: Ptr,
+) -> i32 {
+    if !st.adhoc_matching_live(id) {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID
+    } else {
+        if !count.is_null() {
+            ctx.write_u32(count.addr(), 0);
+        }
+        0
+    }
+}
+
+/// int sceNetAdhocMatchingSetHelloOpt(int id, int opt_len, void *opt)
+///
+/// The "hello" payload advertised to peers. There is nobody to advertise to, so the payload
+/// is accepted and goes nowhere - which is what happens on a console in an empty room too:
+/// the hello really is broadcast, and nothing answers.
+#[hostcall]
+pub(super) fn adhoc_matching_set_hello_opt(st: &mut VitaState, id: i32, _opt_len: i32, _opt: Ptr) -> i32 {
+    if st.adhoc_matching_live(id) {
         0
     } else {
         SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID

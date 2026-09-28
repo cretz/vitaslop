@@ -91,6 +91,8 @@ struct Shared {
     error: Option<String>,
     /// `copyTo` promises in flight, i.e. frames decoded but not yet readable.
     copies: usize,
+    /// Pictures the decoder's `output` callback has handed over, over the backend's life.
+    outputs: u64,
     /// True between `flush()` and the promise it returns settling.
     flushing: bool,
     /// A resolver for whoever is awaiting the next frame.
@@ -148,14 +150,29 @@ pub struct WebCodecsBackend {
     /// The configuration last given to the decoder, kept so [`Backend::reset`] can put it
     /// back - see there for why it has to.
     config: Option<Object>,
+    /// The wasm thread (worker) that created the decoder - the only one whose JS heap and
+    /// event loop it lives in. See the `Send` note below.
+    owner: std::thread::ThreadId,
 }
 
-// SAFETY: this holds JS values, which wasm-bindgen marks `!Send` because they live in a
-// per-thread heap no other thread can reach. On `wasm32-unknown-unknown` without the
-// atomics feature there IS no other thread - the whole emulator, including its scheduler,
-// runs in one worker - so the values are never reachable from anywhere else. This is the
-// same reasoning the browser storage layer records for its own handles.
+// SAFETY: this holds JS values (and `Rc`s and closures), which wasm-bindgen marks `!Send`
+// because they live in a per-thread heap no other thread can reach. The one-worker engine
+// has no other thread. The wasm-threads bundle's parallel run (`VITASLOP_SMP`) does - but
+// it forwards every host call that can reach a decoder to the worker that made it, and
+// every entry point below checks `owner` and panics rather than touch a foreign heap. So the
+// value may MOVE (it sits in the shared host) but is only ever USED where it was made.
 unsafe impl Send for WebCodecsBackend {}
+
+/// Refuse, loudly, a decoder used from a worker that did not create it - see `owner`.
+fn assert_owner(owner: std::thread::ThreadId) {
+    if std::thread::current().id() != owner {
+        panic!(
+            "a WebCodecs VideoDecoder was used from a worker that does not own it - a host \
+             call reached it from an SMP guest worker; its NID family must be forwarded to \
+             the run worker (`vita::smp_owner_only`)"
+        );
+    }
+}
 
 impl WebCodecsBackend {
     /// Bind a `VideoDecoder`, or report that this browser has none.
@@ -205,6 +222,7 @@ impl WebCodecsBackend {
             low_latency,
             scratch: Vec::new(),
             config: None,
+            owner: std::thread::current().id(),
         })
     }
 
@@ -260,10 +278,25 @@ impl Backend for WebCodecsBackend {
     }
 
     fn detail(&self) -> Option<String> {
-        self.shared.borrow().layout.clone()
+        // The layout, plus WHERE every owed picture is: still inside the decoder
+        // (`decodeQueueSize` = chunks it has not started; the rest of `submitted - outputs` it
+        // is holding), mid-copy, or copied and waiting to be taken. A movie that stalls with
+        // pictures "still owed" looks the same from the guest side in all three cases.
+        let s = self.shared.borrow();
+        Some(format!(
+            "{} | outputs {} copying {} ready {} flushing {} queue {}{}",
+            s.layout.as_deref().unwrap_or("no frame yet"),
+            s.outputs,
+            s.copies,
+            s.ready.len(),
+            s.flushing,
+            self.decoder.decode_queue_size(),
+            s.error.as_deref().map(|e| format!(" ERROR {e}")).unwrap_or_default(),
+        ))
     }
 
     fn configure(&mut self, config: StreamConfig<'_>) -> Result<()> {
+        assert_owner(self.owner);
         let avcc = config.avcc;
         // `avc1.PPCCLL`: profile, constraint byte, level, as the codec registry spells it.
         let codec = format!(
@@ -311,6 +344,7 @@ impl Backend for WebCodecsBackend {
     }
 
     fn send(&mut self, au: &AccessUnit, timestamp: i64) -> Result<()> {
+        assert_owner(self.owner);
         // The description above is an avcC record, so chunks must be length-prefixed.
         self.scratch.clear();
         avcc::annex_b_to_length_prefixed(&au.data, 4, &mut self.scratch);
@@ -329,11 +363,13 @@ impl Backend for WebCodecsBackend {
     }
 
     fn poll(&mut self, pool: &mut FramePool, out: &mut Vec<Frame>) -> Result<()> {
+        assert_owner(self.owner);
         self.refill(pool);
         self.take_ready(out)
     }
 
     fn drain(&mut self, pool: &mut FramePool, out: &mut Vec<Frame>) -> Result<()> {
+        assert_owner(self.owner);
         self.refill(pool);
         // The guard is dropped BEFORE `take_ready`, which borrows the same cell: an early
         // return with it still alive is a double borrow, i.e. a panic on the ordinary
@@ -376,6 +412,7 @@ impl Backend for WebCodecsBackend {
     }
 
     fn reset(&mut self) -> Result<()> {
+        assert_owner(self.owner);
         self.decoder
             .reset()
             .map_err(|e| Error::platform("VideoDecoder.reset", 0, describe(&e)))?;
@@ -437,6 +474,7 @@ fn deliver_frame(frame: JsVideoFrame, shared: Rc<RefCell<Shared>>) {
         return;
     };
     s.copies += 1;
+    s.outputs += 1;
     drop(s);
     spawn_local(async move {
         let result = read_frame(&frame, &shared).await;
@@ -513,7 +551,7 @@ async fn read_frame(frame: &JsVideoFrame, shared: &Rc<RefCell<Shared>>) -> Resul
         1 if reported.starts_with("RGB") || reported.starts_with("BGR") => PixelFormat::Rgba,
         n => {
             return Err(Error::unsupported(format!(
-                "VideoFrame.copyTo returned {n} plane(s) (the frame calls itself                  {reported:?}) - this decoder reads 4:2:0 in two or three planes, or one                  packed RGB plane"
+                "VideoFrame.copyTo returned {n} plane(s) (the frame calls itself {reported:?}) - this decoder reads 4:2:0 in two or three planes, or one packed RGB plane"
             )));
         }
     };
@@ -526,7 +564,7 @@ async fn read_frame(frame: &JsVideoFrame, shared: &Rc<RefCell<Shared>>) -> Resul
                 reported.clone()
             };
             let note = if planes.length() == 1 {
-                " - PACKED RGB, so the decoder converted colour before handing it over and                  a caller that wants 4:2:0 converts it back"
+                " - PACKED RGB, so the decoder converted colour before handing it over and a caller that wants 4:2:0 converts it back"
             } else {
                 ""
             };

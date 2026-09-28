@@ -47,6 +47,7 @@ impl Engine for WebEngine {
             // addresses; keep discovery off so output matches the native runner.
             discover_code_pointers: false,
             import_memory: false,
+            host_off: 0,
         })
         .map_err(|e| format!("transpile: {e:?}"))?;
 

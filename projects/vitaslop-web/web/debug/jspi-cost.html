@@ -29,14 +29,54 @@
     jspi-suspend   the handler returns an already-resolved Promise, so every call really
                    suspends and resumes. What a call that BLOCKS costs, for scale.
     plain-marshal  plain import, and the handler moves a 32-slot register file out of the
-                   instance's wasm globals and back, exactly the way `save_globals` /
-                   `load_globals` do it in `browser_sched.rs`. Prices the marshalling.
-    jspi-marshal   both together: THE SHAPE THE ENGINE ACTUALLY RUNS TODAY.
+                   instance's wasm globals and back, one `.value` at a time.
+    jspi-marshal   both together.
+                   >>> THESE TWO PRICE A PATH THE ENGINE RETIRED. They were written from
+                   the names `save_globals` / `load_globals`, which exist only on THIS
+                   PAGE - `browser_sched.rs` has no such functions. Kept because the gap
+                   to `jspi-narrow` says what the batching already bought, but they are
+                   NOT the baseline and anything measured against them overstates the
+                   remaining win.
 
-  Reading it: the arms are ns per call. `plain-marshal - plain-bare` is what moving the
-  register file into shared linear memory could remove; `jspi-bare - plain-bare` is what
-  a non-suspending import for non-blocking NIDs could remove. Whichever is larger is the
-  one to build first, and until this page has been run on a phone neither is known.
+    plain-narrow   plain import + THE MARSHAL THE ENGINE ACTUALLY RUNS: one `save_some`
+                   crossing carrying the seven `NARROW_REGS` lanes into a `Uint32Array`
+                   view, and one setter back for the register the handler changed
+                   (`read_file` / `write_file_changed`). ~2 crossings, not 64.
+    jspi-narrow    the same under Suspending. >>> THIS IS THE REAL BASELINE.
+
+    plain-spill    THE PROPOSED FIX. The register file STAYS in globals - moving it into
+                   linear memory would let guest stores alias register accesses and cost
+                   every translated instruction, which is why `abi.rs` chose globals. The
+                   transpiler instead emits a spill of the seven lanes into a fixed linmem
+                   block AT THE CALL SITE and a reload after, so the handler reads them
+                   through the view the Rust side already holds and nothing crosses per
+                   slot. The arm's wasm really does the stores and loads, so the cost is
+                   in the number.
+    jspi-spill     the same under Suspending.
+                   >>> (jspi-narrow - jspi-spill) IS THE WHOLE WIN, and it decides whether
+                   this gets built. Option A of three: B exported the spill as a function
+                   the JS shim calls (2 crossings - it pays what we are removing) and C had
+                   the handler ask for lanes on demand (worse still).
+
+    wasm-export    the import is ANOTHER WASM MODULE'S EXPORT rather than a JS function,
+                   so the call never leaves wasm at all.
+                   >>> (plain-bare - wasm-export) IS THE JS FRAME. Every host call this
+                   engine makes pays it, INCLUDING the ones already routed through the
+                   non-suspending trap: `env.import_fast` is bound to a wasm-bindgen
+                   `Closure`, i.e. a JS function, so the path is guest wasm -> JS -> our
+                   wasm to reach Rust that is already wasm in the same page.
+
+  Reading it: the arms are ns per call, and the ONE number that decides the next build is
+  `jspi-narrow - jspi-spill`. `jspi-bare - plain-bare` is what a non-suspending import for
+  non-blocking NIDs could remove; `plain-bare - wasm-export` is the JS frame.
+
+  >>> AND `plain-bare - wasm-export` IS THE ONE THAT DOES NOT NEED A LIST. The other two
+  are per-NID: a call qualifies for the fast trap, or a getter qualifies for an inline
+  form, and every new title brings a new hot NID to add. Removing the JS frame is
+  structural - it makes EVERY host call cheaper at once, whether or not anyone has
+  thought about that NID. On a title whose frame carries 2,537 host calls, an accessor
+  measured at 0.59 us to read one word and mask two bits is not a slow handler, it is a
+  toll; this arm says what the toll is and therefore what removing it is worth.
 -->
 <style>
   :root { color-scheme: light dark; }
@@ -88,7 +128,14 @@
   //
   // The loop passes the counter as the call argument so the engine cannot hoist the
   // call out or turn the body into a constant.
-  function buildModule(nGlobals, withMemory) {
+  // >>> THE REGISTERS A HOST CALL CAN ACTUALLY REACH (`browser_sched.rs`: NARROW_REGS).
+  // AAPCS puts the arguments in r0..r3 and the return in r0; the stack arguments need sp,
+  // the call-site attribution lr, and a fault report pc. r4..r11 are callee-saved, so a
+  // host call must not touch them, and r12 is scratch. Seven lanes, and the shipping
+  // engine has read only these for months.
+  const NARROW = [0, 1, 2, 3, 13, 14, 15];
+
+  function buildModule(nGlobals, withMemory, spill) {
     const TYPE = section(1, vec([[0x60, ...vec([[0x7f]]), ...vec([])]]));
     const IMPORT = section(2, vec([[...str("env"), ...str("f"), 0x00, 0x00]]));
     const FUNC = section(3, vec([[0x00]]));
@@ -100,12 +147,32 @@
     if (withMemory) exports.push([...str("mem"), 0x02, 0x00]);
     for (let i = 0; i < nGlobals; i++) exports.push([...str("g" + i), 0x03, ...uleb(i)]);
     const EXPORT = section(7, vec(exports));
+    // The SPILL the transpiler would emit at a call site: the narrow lanes stored to a
+    // fixed linear-memory block before the call, and reloaded after it. No export, no
+    // round trip, and NOTHING crosses the JS boundary - the whole point of the design.
+    // Lane k lives at byte k*4, matching the `Int32Array` view the handler reads.
+    const spillOut = spill ? NARROW.flatMap((k) => [
+      0x41, ...uleb(k * 4),               // i32.const k*4
+      0x23, ...uleb(k),                   // global.get k
+      0x36, 0x02, 0x00,                   // i32.store align=4 offset=0
+    ]) : [];
+    // Reload ALL the narrow lanes, not just r0. A design that reloads only the lanes the
+    // handler changed needs the handler to SAY which, which is a second crossing - the
+    // thing being removed. Seven loads with no boundary is the honest shape, and it is
+    // also the upper bound on this side of the fix.
+    const spillIn = spill ? NARROW.flatMap((k) => [
+      0x41, ...uleb(k * 4),               // i32.const k*4
+      0x28, 0x02, 0x00,                   // i32.load align=4 offset=0
+      0x24, ...uleb(k),                   // global.set k
+    ]) : [];
     const body = [
       0x00,                               // no locals
       0x02, 0x40,                         // block
       0x03, 0x40,                         //   loop
       0x20, 0x00, 0x45, 0x0d, 0x01,       //     local.get 0; i32.eqz; br_if 1
+      ...spillOut,                        //     [spill the narrow lanes to linmem]
       0x20, 0x00, 0x10, 0x00,             //     local.get 0; call $f
+      ...spillIn,                         //     [reload them]
       0x20, 0x00, 0x41, 0x01, 0x6b, 0x21, 0x00, // local.get 0; i32.const 1; i32.sub; local.set 0
       0x0c, 0x00,                         //     br 0
       0x0b, 0x0b, 0x0b,                   //   end; end; end
@@ -117,19 +184,68 @@
     ]);
   }
 
+  // A CALLEE module: one exported function that adds its argument into a mutable global,
+  // so the engine cannot delete it and cannot constant-fold it away.
+  //
+  // (module (global $g (mut i32) i32.const 0)
+  //         (func (export "f") (param i32) global.get $g local.get 0 i32.add global.set $g))
+  //
+  // Its whole purpose is to be handed to the CALLER as `env.f` instead of a JS function.
+  // A `WebAssembly.Instance`'s exported function is a JS-callable object, but when it is
+  // used as another module's import the engine binds it as a DIRECT wasm-to-wasm call and
+  // no JS frame is created - which is exactly the claim this arm exists to price.
+  function buildCallee() {
+    const TYPE = section(1, vec([[0x60, ...vec([[0x7f]]), ...vec([])]]));
+    const FUNC = section(3, vec([[0x00]]));
+    const GLOBAL = section(6, vec([[0x7f, 0x01, 0x41, 0x00, 0x0b]]));
+    const EXPORT = section(7, vec([[...str("f"), 0x00, 0x00], [...str("g"), 0x03, 0x00]]));
+    const body = [
+      0x00,                   // no locals
+      0x23, 0x00,             // global.get 0
+      0x20, 0x00,             // local.get 0
+      0x6a,                   // i32.add
+      0x24, 0x00,             // global.set 0
+      0x0b,                   // end
+    ];
+    const CODE = section(10, vec([[...uleb(body.length), ...body]]));
+    return new Uint8Array([
+      0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+      ...TYPE, ...FUNC, ...GLOBAL, ...EXPORT, ...CODE,
+    ]);
+  }
+
   // ---------------------------------------------------------------- the arms
   // The register file the engine really marshals: 16 ARM registers plus 16 VFP argument
   // registers (`browser_sched.rs`: FILE_LEN = REG_COUNT + VFP_ARG_COUNT).
   const FILE_LEN = 32;
 
-  // Byte-for-byte what `save_globals` / `load_globals` do today.
+  // The 32-slot form. >>> NOT what `browser_sched.rs` runs - see `save_some` below.
   const save = (globals, out) => { for (let i = 0; i < globals.length; i++) out[i] = globals[i].value; };
   const load = (globals, values) => { for (let i = 0; i < globals.length; i++) globals[i].value = values[i]; };
+
+  // >>> BYTE-FOR-BYTE WHAT THE SHIPPING ENGINE DOES, and the arm this page was missing.
+  //
+  // `browser_sched.rs` does NOT walk 32 globals: `read_file` calls `save_some` ONCE with
+  // the seven `NARROW_REGS` indices (one crossing, writing straight into a `Uint32Array`
+  // view over the Rust buffer), and `write_file_changed` diffs in Rust and sets back only
+  // the lanes the handler CHANGED - which its own comment says averages one. So the real
+  // per-call marshalling is ~2 crossings, not 64, and `plain-marshal` prices a path that
+  // was retired months ago. Without this arm the page overstates the remaining headroom
+  // by whatever the batching already bought.
+  const save_some = (globals, idxs, out) => {
+    for (let k = 0; k < idxs.length; k++) { const i = idxs[k]; out[i] = globals[i].value; }
+  };
 
   // A sink the optimiser cannot prove dead, so an empty handler is not deleted outright.
   let sink = 0;
 
   const ARMS = [
+    {
+      name: "wasm-export",
+      what: "the import IS another module's export - no JS frame at all",
+      globals: 0, jspi: false, n: 2_000_000,
+      wasmCallee: true,
+    },
     {
       name: "plain-bare",
       what: "plain import, no marshalling - the floor",
@@ -176,16 +292,98 @@
         for (let i = 0; i < FILE_LEN; i++) w[i] = i;
       },
     },
+    {
+      // >>> THE ARM THAT SAYS WHETHER A SUSPENDING CALL KEEPS THE WIN.
+      //
+      // The fix moves the register file; it does NOT decide whether a call may park, and a
+      // real engine has both kinds - a draw never suspends, a mutex the guest loses does.
+      // The components look additive (`jspi-marshal - plain-marshal` is a few tens of ns, so
+      // the suspension wrapper is nearly free once 32 slots are already being copied), but
+      // "looks additive" is a model. This measures it: if the win survives here, then the
+      // calls that MUST stay on JSPI get it too and the fix needs no exception list.
+      name: "jspi-linmem",
+      what: "Suspending import + the same 32 slots through a linear-memory view",
+      globals: 0, memory: true, jspi: true, n: 500_000,
+      handler: (s) => (v) => {
+        const w = s.view;
+        for (let i = 0; i < FILE_LEN; i++) sink += w[i];
+        sink += v;
+        for (let i = 0; i < FILE_LEN; i++) w[i] = i;
+      },
+    },
+    {
+      // >>> WHAT THE ENGINE ACTUALLY RUNS TODAY. Read this one, not `jspi-marshal`.
+      //
+      // One `save_some` of the seven narrow lanes, then one setter for the return
+      // register - the average `write_file_changed` case. Everything above it on the
+      // marshal arms is a cost the batching already removed.
+      name: "plain-narrow",
+      what: "plain import + the SHIPPING marshal (save_some of 7, set 1 back)",
+      globals: FILE_LEN, jspi: false, n: 1_000_000,
+      handler: (s) => (v) => {
+        save_some(s.globals, NARROW, s.u32);
+        sink += s.u32[0];
+        s.globals[0].value = v;
+      },
+    },
+    {
+      name: "jspi-narrow",
+      what: "Suspending + the SHIPPING marshal - THE REAL BASELINE",
+      globals: FILE_LEN, jspi: true, n: 1_000_000,
+      handler: (s) => (v) => {
+        save_some(s.globals, NARROW, s.u32);
+        sink += s.u32[0];
+        s.globals[0].value = v;
+      },
+    },
+    {
+      // >>> THE PROPOSED FIX, AND THE ONLY ARM THAT MEASURES IT HONESTLY.
+      //
+      // The register file STAYS in globals - moving it into linear memory would make guest
+      // stores alias register accesses and cost every translated instruction, which is the
+      // reason `abi.rs` chose globals in the first place. Instead the transpiler emits a
+      // SPILL of the seven narrow lanes into a fixed linmem block at the call site, and a
+      // reload after. The handler then reads and writes them through the typed-array view
+      // the Rust side already holds, and the call crosses the JS boundary with NOTHING
+      // attached to it.
+      //
+      // Read `jspi-narrow - jspi-spill`: that is the entire win available, and it is the
+      // number that decides whether this gets built at all.
+      name: "plain-spill",
+      what: "plain import + 7 lanes spilled to linmem BY THE GUEST - no marshal crossing",
+      globals: FILE_LEN, memory: true, spill: true, jspi: false, n: 1_000_000,
+      handler: (s) => (v) => {
+        const w = s.view;
+        sink += w[0] + w[1] + w[2] + w[3] + w[13] + w[14] + w[15];
+        w[0] = v;
+      },
+    },
+    {
+      name: "jspi-spill",
+      what: "Suspending + the same guest-side spill - THE FIX, priced",
+      globals: FILE_LEN, memory: true, spill: true, jspi: true, n: 1_000_000,
+      handler: (s) => (v) => {
+        const w = s.view;
+        sink += w[0] + w[1] + w[2] + w[3] + w[13] + w[14] + w[15];
+        w[0] = v;
+      },
+    },
   ];
 
   async function runArm(arm) {
-    const mod = await WebAssembly.compile(buildModule(arm.globals, !!arm.memory));
+    const mod = await WebAssembly.compile(buildModule(arm.globals, !!arm.memory, !!arm.spill));
     // The handler needs the instance's own globals and memory, and the instance needs the
     // handler - so the handler closes over a state object that is filled in immediately
     // after instantiation, rather than over a first throwaway instance. Every arm that
     // touches state pays the same one property load for it, so the differences hold.
-    const state = { globals: [], buf: new Float64Array(FILE_LEN), view: null };
-    const fn = arm.handler(state);
+    // `u32` is the narrow arm's destination - the same `Uint32Array` shape `read_file`
+    // hands `save_some` as a view over its Rust buffer.
+    const state = { globals: [], buf: new Float64Array(FILE_LEN), u32: new Uint32Array(FILE_LEN), view: null };
+    // The wasm arm's endpoint is an EXPORT, not a handler: instantiate the callee and hand
+    // its exported function over as the caller's import.
+    const fn = arm.wasmCallee
+      ? (await WebAssembly.instantiate(await WebAssembly.compile(buildCallee()), {})).exports.f
+      : arm.handler(state);
     const imported = arm.jspi ? new WebAssembly.Suspending(fn) : fn;
     const inst = await WebAssembly.instantiate(mod, { env: { f: imported } });
     for (let i = 0; i < arm.globals; i++) state.globals.push(inst.exports["g" + i]);
@@ -253,20 +451,26 @@
     }
     html += "</table>";
     html +=
-      `<p class="note">Against <b>jspi-marshal</b>, which is what the engine runs today:` +
-      ` dropping the <b>Suspending wrap</b> alone is worth <b>${delta("jspi-marshal", "plain-marshal")}</b>/call,` +
-      ` dropping the <b>globals marshalling</b> alone is worth <b>${delta("jspi-marshal", "jspi-bare")}</b>/call,` +
-      ` and doing both leaves <b>${delta("jspi-marshal", "plain-bare")}</b>/call on the table.` +
-      ` A real suspend costs ${delta("jspi-suspend", "jspi-bare")} more than a Suspending call that does not suspend.` +
-      `<br /><b>plain-linmem is an UPPER BOUND on the marshalling fix, not the fix</b>: it still copies the 32 slots` +
-      ` in JS. In the real design the register file lives in memory the emulator already maps, so the handler` +
-      ` copies nothing and the endpoint is plain-bare.</p>`;
+      `<p class="note"><b>THE BASELINE IS jspi-narrow, NOT jspi-marshal.</b> The shipping engine` +
+      ` batches its read into one <code>save_some</code> of seven lanes and writes back only what` +
+      ` changed, so <b>jspi-marshal is a retired 32-slot path</b> and the gap between them` +
+      ` (<b>${delta("jspi-marshal", "jspi-narrow")}</b>/call) is headroom ALREADY BANKED - do not count it twice.` +
+      `<br />>>> <b>THE DECISION: the guest-side spill is worth ${delta("jspi-narrow", "jspi-spill")}/call.</b>` +
+      ` That is jspi-narrow minus jspi-spill, and it already includes the 7 stores + 7 loads the guest pays` +
+      ` at the call site. If it is small, the marshalling question is CLOSED and the remaining cost is the` +
+      ` crossing itself (${delta("jspi-spill", "wasm-export")}/call above a pure wasm-to-wasm call).` +
+      `<br />For scale: the <b>Suspending wrap</b> costs ${delta("jspi-bare", "plain-bare")}/call, a REAL suspend` +
+      ` ${delta("jspi-suspend", "jspi-bare")} more than one that does not, and the <b>JS frame</b>` +
+      ` ${delta("plain-bare", "wasm-export")}.</p>`;
     $("out").innerHTML = html;
 
     lastText =
       $("env").textContent + "\n" +
       results.map((r) => (r.error ? `${r.name}: ERROR ${r.error}` : `${r.name}: ${r.ns.toFixed(1)} ns/call (${r.calls} calls, ${r.ms.toFixed(1)} ms)`)).join("\n") +
-      `\nsuspension tax = ${delta("jspi-bare", "plain-bare")}/call, marshalling = ${delta("plain-marshal", "plain-bare")}/call` +
+      `\n>>> THE SPILL IS WORTH ${delta("jspi-narrow", "jspi-spill")}/call (jspi-narrow - jspi-spill)` +
+      `\nalready banked by the narrow marshal = ${delta("jspi-marshal", "jspi-narrow")}/call` +
+      `\nsuspension tax = ${delta("jspi-bare", "plain-bare")}/call, JS frame = ${delta("plain-bare", "wasm-export")}/call` +
+      `\nspill still above pure wasm-to-wasm = ${delta("jspi-spill", "wasm-export")}/call` +
       `\nsink=${sink}`;
     $("go").disabled = false;
     window.__jspiCost = { results, text: lastText };

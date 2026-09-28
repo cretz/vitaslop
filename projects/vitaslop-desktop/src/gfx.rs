@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use pollster::block_on;
-use vitaslop_platform::gpu::{CubeRenderer, DEPTH_FORMAT};
+use vitaslop_platform::gpu::{depth_format, CubeRenderer};
 use vitaslop_runtime::capture::Scene;
 use winit::window::Window;
 
@@ -56,12 +56,7 @@ impl Gfx {
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-desktop"),
             required_features: wgpu::Features::empty(),
-            // Keep the conservative downlevel baseline (so this path matches the
-            // headless oracle's capability floor) but raise the resolution-derived
-            // limits to what the adapter really supports: a high-DPI desktop window
-            // is physically larger than the 2048 downlevel max texture dimension.
-            required_limits: wgpu::Limits::downlevel_defaults()
-                .using_resolution(adapter.limits()),
+            required_limits: vitaslop_platform::gpu::device_limits(&adapter),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -131,7 +126,7 @@ fn make_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureVi
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
@@ -163,7 +158,7 @@ pub(crate) fn acquire(
 ) -> Option<wgpu::SurfaceTexture> {
     let give_up = |what: &str, n: u32| -> ! {
         panic!(
-            "the surface has not produced a texture for {n} presents in a row (last answer:              {what}). Nothing rendered since then reached the screen, so the run stops here              rather than keep paying for frames nobody will see."
+            "the surface has not produced a texture for {n} presents in a row (last answer: {what}). Nothing rendered since then reached the screen, so the run stops here rather than keep paying for frames nobody will see."
         )
     };
     match surface.get_current_texture() {
@@ -196,7 +191,7 @@ pub(crate) fn acquire(
             None
         }
         wgpu::CurrentSurfaceTexture::Validation => panic!(
-            "the surface refused to hand out a texture with a VALIDATION error, which means it              was configured with something this device will not accept. Nothing can be drawn."
+            "the surface refused to hand out a texture with a VALIDATION error, which means it was configured with something this device will not accept. Nothing can be drawn."
         ),
     }
 }

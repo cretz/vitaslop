@@ -1,0 +1,55 @@
+@title  PCSE00235 - boot through the intro movie (probe; NOT yet a gameplay recipe)
+@game   PCSE00235
+
+# WHAT THIS RECIPE IS FOR
+# ----------------------
+# A BOOT PROBE for Dead or Alive 5 Plus while it is being brought up. It presses nothing
+# until the intro movie has had time to finish, then taps start/cross looking for a way on.
+#
+# WHAT A RUN OF THIS LOOKS LIKE (2026-09-24, desktop headless):
+#   f000000-f000590  black: the title draws only a full-screen fade quad (verified with a
+#                    capsule replay - near-zero alpha over the clear), which is its own
+#                    loading screen, not a render fault
+#   f000600-f001500  the Team Ninja intro movie `ninja_vi.mp4` (AVC + AAC, 20 s) plays
+#   f001667          the autosave notice (a MsgDialog, answered OK)
+#   f001700+         BLACK AND IDLE - the game draws one fade quad a frame and waits; the
+#                    presses below change nothing. OPEN: see agent notes 2026-09-24a B.
+#
+# There is deliberately no @sig: the frontier is not settled.
+
+0: @section boot
+
+# After the movie and the autosave notice.
+1800: @section probe-presses
+1800: start
+1860: cross
+1920: start
+1980: cross
+2040: start
+2100: cross
+2160: start
+2220: cross
+2280: start
+2340: cross
+2400: start
+2460: cross
+2520: start
+2580: cross
+2640: start
+2700: cross
+2760: start
+2820: cross
+2880: start
+2940: cross
+3000: start
+3060: cross
+3120: start
+3180: cross
+3240: start
+3300: cross
+3360: start
+3420: cross
+3480: start
+3540: cross
+3600: start
+3660: cross

@@ -31,6 +31,10 @@ const CTL_PEAK = 7;
 const CTL_LATENCY_SKIP = 8;
 /// Frames of backlog at the last block: the live output latency, in frames.
 const CTL_FILL = 9;
+/// Times a producer port a whole ring AHEAD of the consumer was moved back to the frontier -
+/// see `WebAudioSink::publish_into`. Each one is a stretch of game time that ran ahead of the
+/// wall clock (a load, a fast-forward) and whose audio could never have been played in time.
+const CTL_REJOINS = 10;
 const CTL_HEADER_BYTES = 64;
 
 /// Ring depth. Half a second is far more than a real backend needs, and that is
@@ -53,7 +57,18 @@ const VITA_SAMPLE_RATE = 48000;
 export async function startAudio(note = () => {}) {
   const channels = 2;
   const context = new AudioContext({ sampleRate: VITA_SAMPLE_RATE, latencyHint: "playback" });
-  await context.audioWorklet.addModule("./audio-worklet.js");
+  // >>> RESOLVED AGAINST THIS MODULE, NOT AGAINST THE DOCUMENT.
+  //
+  // `audioWorklet.addModule` is the one loader here that resolves a relative URL against the
+  // DOCUMENT's base URL rather than the importing module's, so a plain "./audio-worklet.js"
+  // works from `/index.html` and 404s from any page in a subdirectory - which is every debug
+  // and e2e page under `web/debug/`. MEASURED: every browser run in this project reported
+  // `AbortError: Unable to load a worklet's module` and then `no ring supplied - this run is
+  // SILENT`, and the engine's own SOUND line read 1.00x throughout - it was producing audio
+  // into a NullSink. That was carried in the notes as "browser audio is silent" and chased as
+  // an NGS gap. `import.meta.url` is this file's own address, so the worklet is found from any
+  // page that can import this one.
+  await context.audioWorklet.addModule(new URL("./audio-worklet.js", import.meta.url));
 
   const capacity = Math.floor(context.sampleRate * RING_SECONDS);
   const ring = new SharedArrayBuffer(CTL_HEADER_BYTES + capacity * channels * 4);
@@ -109,6 +124,7 @@ export async function startAudio(note = () => {}) {
     /// `fill` IS the latency a player hears between a sound being produced and heard.
     latencySkip: Atomics.load(ctl, CTL_LATENCY_SKIP),
     fill: Atomics.load(ctl, CTL_FILL),
+    rejoins: Atomics.load(ctl, CTL_REJOINS),
   });
 
   /// A copy of the PCM currently sitting in the ring, as interleaved f32.
@@ -137,7 +153,7 @@ export async function startAudio(note = () => {}) {
     return out;
   };
 
-  // A hard pause (see live.html): the worklet plays silence and leaves the ring alone, so
+  // A hard pause (see player.js): the worklet plays silence and leaves the ring alone, so
   // the pause is neither heard as a stale burst on resume nor counted as an underrun.
   const pause = (paused) => node.port.postMessage(paused ? "pause" : "resume");
 

@@ -398,6 +398,9 @@ details.card[open] > summary::before { content: "\25BE"; }
 #menu { background: rgba(5, 5, 10, 0.35); }
 #menu .menu-in { background: rgba(20, 20, 31, 0.82); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
 #loading[hidden], #menu[hidden], #fatal[hidden] { display: none; }
+/* Shown only when a fullscreen request was not granted - see `showFullscreenPrompt`. Above the
+   loading panel so it is reachable while the title is still preparing. */
+.fs-prompt { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 6; }
 .loading-in, .fatal-in { max-width: 520px; width: calc(100% - 32px); }
 .menu-in { max-width: 960px; width: calc(100% - 32px); }
 .menu-title { margin: 0 0 10px; font-size: 18px; color: var(--accent); }
@@ -435,6 +438,17 @@ details.card[open] > summary::before { content: "\25BE"; }
 .vita-val.dim { color: var(--dim); font-size: 10px; }
 .menu-in .vita { max-width: 100%; }
 @media (max-width: 520px) { .vita-key, .vita-sel, .vita-val { min-width: 48px; font-size: 10px; padding: 3px 4px; } .vita-name { font-size: 8px; } }
+
+/* the controller's focus ring (navpad.js): a class, because :focus-visible is the
+   browser's call and a pad press is not a keyboard's */
+.navfocus { outline: 3px solid var(--accent) !important; outline-offset: 2px; }
+.tile.navfocus { outline: 0 !important; }
+.tile.navfocus .icon { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent); }
+
+/* the menu's Yes/No panel */
+.menu-confirm { max-width: 420px; text-align: center; }
+.menu-confirm p { margin: 4px 0 14px; font-size: 16px; }
+.menu-confirm .menu-row { justify-content: center; margin-bottom: 0; }
 
 /* the key-capture modal */
 .capture { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: rgba(5, 5, 10, 0.85); }

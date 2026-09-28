@@ -1,0 +1,173 @@
+@title  PCSE00084 - boot to a kickoff, kick it, return it, and run the first snap
+@game   PCSE00084
+
+# WHAT THIS RECIPE IS FOR
+# ----------------------
+# The GAMEPLAY recipe for this title: it boots, walks the whole front end, starts a match,
+# KICKS OFF and reaches `1ST & 10`. Every frame below was found by playing and is what a
+# run actually did; the four gates it clears are each non-obvious, so they are written out.
+#
+#   1. THE INTRO honours a button only after its own 5.0 s timer ([obj+0x784] climbs about
+#      0.0328 a frame, so around frame 165) - and it tests a 30-BIT BITSET OF ITS OWN,
+#      indices 10 and 1, which is NOT the SceCtrl bit order. Nobody has mapped that bitset,
+#      so the recipe SWEEPS every button rather than guessing which one is index 10.
+#
+#   2. THE TITLE SCREEN is a separate gate and is only up around FRAME 700. An earlier
+#      recipe stopped pressing at 292, so every press it made landed before the screen that
+#      wanted one existed, and eight hundred frames sat on "PRESS START BUTTON" looking
+#      exactly like a stall.
+#
+#   3. THE FRONT END is a stack of lists - PLAY NOW, then the game-setup screen (Event Type,
+#      Quarter, Accel Clock, Stadium, Weather) and "Advance to Game". The first entry of each
+#      is the one that leads to a match, so a `cross` every 120 frames walks it. The match is
+#      live by about frame 2,300: the field, the stadium and the HUD reading `5:00 KICKOFF`.
+#
+#   4. THE `NEW - Motion Sensor Kicking` TIP blocks the kick, and `cross` does NOT dismiss
+#      it - the dialog's own options are ⊗ Dismiss / △ Disable Tips / ▢ Open Controls Screen
+#      and only TRIANGLE was observed to clear it. Found by sweeping, as gate 1 was.
+#
+#   5. THE KICK IS THE RIGHT STICK, NOT A BUTTON. The tip's glyphs are analog-stick icons:
+#      hold the stick back to raise the power meter, then flick it forward. Every face
+#      button, both triggers and the d-pad were swept at the kickoff and NONE of them kicks -
+#      the screen does not change at all. `ry=255` held for 60 frames then `ry=1` does.
+#
+# WHAT A RUN OF THIS LOOKS LIKE, so a regression is recognisable:
+#   f002300  the field, the stadium, HUD `5:00 KICKOFF`, the selection reticle on a player
+#   f002880  the kick is away - the camera tracks it, the kicker's name is on the HUD
+#   f003760  `1ST & 10`, `4:56`, at the 24, play clock `:25` - the return is over
+#   f004060+ the snap and a run upfield (sections `hike` and `run`)
+#
+# KNOWN DEFECTS AT THIS FRONTIER: none visible in the desktop browser as of 2026-09-23 (the
+# players, their faces, the HUD, the scoreboard logos and the player-to-watch strip all
+# render). What used to be here, so a regression is recognisable:
+#   * players not drawn (blocked USSE decodes), a white band across the top, black rectangles
+#     for the jumbotron and the play-call panel;
+#   * SMEARED FACES / black vertical streaks through heads - two repeat misdecodes in the
+#     skinning program (VPCK destination SMLSI slot; group-0x14 repeat count);
+#   * WHITE BOXES over the scoreboard team names and the bottom bar, a white play-call panel -
+#     the HUD's STENCIL masks, which the renderer did not implement.
+#   * A PRESS DURING THE PLAY used to fault in the title's own sprintf (a `%s` whose
+#     argument was NULL). That was OURS - a `tbh` whose 29 entries were read as 14, so
+#     every conversion from the fifteenth on landed in the default. Fixed; the note stays
+#     because the shape of it is worth recognising again.
+#
+# There is deliberately no @sig: nothing here has been run twice on one build.
+
+0: @section boot
+
+# The intro's own bitset is unmapped, so sweep every button rather than guess.
+200: @section sweep-buttons
+200: start
+206: start
+212:
+220: cross
+226: cross
+232:
+240: circle
+246: circle
+252:
+260: triangle
+266: triangle
+272:
+280: square
+286: square
+292:
+
+# The title screen is only up around frame 700 - the gate an earlier recipe missed.
+700: @section title-screen
+700: start
+706: start
+712:
+760: start
+766: start
+772:
+820: start
+826: start
+832:
+880: start
+886: start
+892:
+
+# PLAY NOW, then the setup screen, then "Advance to Game". The first entry of each list is
+# the one that leads to a match, so a `cross` every 120 frames walks the whole stack.
+1000: @section front-end
+1000: cross
+1006: cross
+1012:
+1120: cross
+1126: cross
+1132:
+1240: cross
+1246: cross
+1252:
+1360: cross
+1366: cross
+1372:
+1480: cross
+1486: cross
+1492:
+1600: cross
+1606: cross
+1612:
+1720: cross
+1726: cross
+1732:
+1840: cross
+1846: cross
+1852:
+1960: cross
+1966: cross
+1972:
+2080: cross
+2086: cross
+2092:
+2200: cross
+2206: cross
+2212:
+
+# The match is live from about here. STOP PRESSING: the title is on its kicking tip and a
+# `cross` at this point is a press the dialog does not want.
+2300: @shot in-a-game
+
+# TRIANGLE - not cross - clears the tip. See gate 4 above.
+2600: @section clear-tip
+2600: triangle
+2614:
+2700: @shot at-the-kickoff
+
+# THE KICK. Hold the right stick BACK to raise the power meter, then FLICK it forward.
+# 60 frames of hold is what the played run used; the flick only has to last long enough to
+# be sampled (the guest samples once per display frame).
+2800: @section kick-pull-back
+2800: ry=255
+2860: @section kick-flick
+2860: ry=1
+2880:
+2900: @shot the-kick-is-away
+
+# The return plays itself out; the down marker turns over to 1ST & 10 by about f3700.
+3600: @section first-and-ten
+3760: @shot first-and-ten
+
+# THE FIRST SNAP. After the return the offence lines up on its own (f3420 already shows the
+# formation at the line) and a `Hike the Ball` tip comes up somewhere around f3920-f4000 -
+# its first option is `Dismiss` on cross, and cross is also the hike. So cross is pressed
+# THREE times, 60 frames apart: the first dismisses the tip wherever it landed, the next one
+# snaps the ball, and a spare covers a tip that arrived late. Then the left stick is held
+# UP and the ball carrier runs upfield until the play is whistled dead.
+3900: @section settle
+3930: @section hike
+3930: cross
+3936:
+3990: cross
+3996:
+4050: cross
+4056:
+4060: @shot the-snap
+4070: @section run
+4070: ly=0
+4120: @shot running
+4180: @shot running-2
+4260: ly=128
+4300: @shot after-the-play
+4400: @section end-of-play

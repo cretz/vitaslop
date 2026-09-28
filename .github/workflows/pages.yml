@@ -44,6 +44,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
+          # `rust-src`: build.mjs also builds the THREADS bundle with `-Z build-std`, which
+          # recompiles std and fails without the standard library's source.
+          components: rust-src
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -70,13 +73,18 @@ jobs:
         working-directory: projects/vitaslop-web
         run: node build.mjs
 
-      # The debug pages are rigs, not the product; they stay out of the published site.
+      # The debug pages, the device runner (it talks to `serve.mjs` endpoints a static host does
+      # not have) and the OPFS test worker are rigs, not the product; none of them is loaded by
+      # the product pages, and they stay out of the published site. BOTH bundles must be there:
+      # a cross-origin-isolated page (every phone, via `coi.js`) runs `pkg-threads`.
       - name: Stage the site
         run: |
           rm -rf site
           cp -r projects/vitaslop-web/web site
-          rm -rf site/debug
+          rm -rf site/debug site/runner
+          rm -f site/opfs-test-worker.js
           test -f site/pkg/vitaslop_web_bg.wasm
+          test -f site/pkg-threads/vitaslop_web_bg.wasm
           du -sh site
 
       - uses: actions/configure-pages@v5

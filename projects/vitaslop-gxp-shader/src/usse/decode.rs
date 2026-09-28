@@ -266,6 +266,8 @@ pub fn decode(word: u64) -> Instr {
         0x00 => decode_grp_mad(word, hi, lo),
         0x01 | 0x02 => decode_grp_alu(word, hi, lo, op1),
         0x03 => decode_grp_18(word, hi, lo),
+        0x04 => decode_grp_20(word, false),
+        0x05 => decode_grp_20(word, true),
         0x06 => decode_grp_30(word, hi, lo),
         0x07 => decode_grp_38(word, hi, lo),
         0x08 => decode_grp_pack(word),
@@ -278,7 +280,9 @@ pub fn decode(word: u64) -> Instr {
         0x15 => decode_grp_imad32(word),
         0x1a => decode_grp_imad32_step(word),
         0x1c => decode_grp_tex(word),
+        0x1d if bits(word, 43, 42) == 1 => decode_local_access(word),
         0x1d => decode_grp_mem_load(word),
+        0x1e => decode_local_access(word),
         0x1f => decode_grp_flow(word),
         _ => classified_stub(word, op1, hi, lo),
     }
@@ -380,7 +384,8 @@ fn decode_grp_sop2(word: u64) -> Instr {
         && bits(word, 46, 43) == 0                   // the bits SOP2M spends on its write mask
         && matches!(bits(word, 42, 41), 0 | 1)       // "aop" - the two observed values
         && bits(word, 40, 38) == 3                   // "sel1"
-        && matches!(bits(word, 37, 35), 0 | 3); // "sel2" - the two observed values
+        && matches!(bits(word, 37, 35), 0 | 3)  // "sel2" - the two observed values
+        && bits(word, 20, 14) == 0; // src1 modifier and both OPS (ADD) - the spec's fields, all zero in every observed word
     // >>> THE SAME EPILOGUE WITH ITS TWO SOURCE SLOTS THE OTHER WAY ROUND. See the SWAPPED
     // section of this function's docs: one title carries `frag_81a7f590` and `frag_81a7f798`,
     // 216 bytes each, byte-identical but for the header hash and THIS WORD - so the two
@@ -409,7 +414,22 @@ fn decode_grp_sop2(word: u64) -> Instr {
         // frame it first appears in is the title's first 3D scene. Refusing it stops that
         // title at its first scene instead.
         && matches!(bits(word, 20, 14), 16 | 20);
-    if !established && !swapped {
+    // >>> THE FULL PLAIN-SOP2 READING of the epilogue, as `crate::rop_blend` reads it: SRC2 the
+    // output register (the blend destination fed back), every factor selector and complement
+    // the spec establishes, both ops ADD. The copy of SRC1 is what a fragment shader can emit;
+    // the equation becomes the PIPELINE blend. Any selector the spec does not establish, or any
+    // op or modifier bit, keeps the refusal.
+    let general = bits(word, 58, 57) == 0
+        && bits(word, 51, 51) == 0
+        && bits(word, 49, 49) == 0
+        && bits(word, 48, 48) == 0
+        && bits(word, 46, 44) == 0
+        && bits(word, 20, 14) == 0
+        && bits(word, 33, 32) == 1 && bits(word, 27, 21) == 0      // dest o[0]
+        && bits(word, 29, 28) == 1 && bits(word, 6, 0) == 0        // src2 o[0]
+        && bits(word, 40, 38) <= 4 && bits(word, 37, 35) <= 4      // colour selectors 0-4
+        && bits(word, 53, 52) <= 2 && bits(word, 42, 41) <= 2;     // alpha selectors 0-2
+    if !established && !swapped && !general {
         blocked = blocked.or(Some(
             "0x80 SOP2 in a form outside the fragment epilogue this corpus establishes - its \
              coefficient and op fields are not read, only pinned (see `decode_grp_sop2`)",
@@ -845,18 +865,26 @@ fn decode_grp_test(word: u64) -> Instr {
 /// `chan_cc` and no `pdst_n`.
 ///
 /// # What the corpus establishes, and what is therefore refused
-/// Group 0x78 occurs THREE times in the whole corpus and every occurrence is the same word - a
-/// shadow filter's per-texel depth comparison in three of a golf title's world fragment
-/// programs. So the encoding this decodes is exactly one point in the space, and every field
-/// value away from it is BLOCKED rather than extrapolated:
+/// The captured corpora hold only a handful of distinct group-0x78 words: a golf title's shadow
+/// filter (the `0x78c08aa0...` family, NUMERIC mask, float subtract - the calibration point),
+/// one crash blob's unsigned-16 pair, and a fighting title's four `0x78c48902...` words (8-BIT
+/// mask type, float add, with `src1_neg` set - see `every_blocked_instruction_in_every_blob`).
+/// So the encoding this EMITS is a couple of points in the space, and every field value away
+/// from them is BLOCKED rather than extrapolated:
 ///
 /// * `tst_mask_type` other than NUMERIC. The numeric form writes `1.0` / `0.0` per channel,
 ///   which is what the consumer needs (the very next instruction dots the mask against the
 ///   sample's four bilinear coefficients, i.e. averages the four comparisons). The 8-bit and
 ///   precision-width mask forms write a BIT PATTERN whose width rule is not established, and a
-///   wrong one there is a shadow that is either always on or always off.
-/// * `test_flag_2` (bit 50) set. VTST puts `src1_neg` there and this group does not; what the
-///   flag feeds is explicitly open in the reference.
+///   wrong one there is a shadow that is either always on or always off. That includes the
+///   8-BIT form with a FLOAT family, which the fighting title emits four times: the two
+///   readings disagree about BOTH the value (`1.0` if the data type decides, `0xFF` if the
+///   form's name does) AND the channel count (four if the family decides, one if the form
+///   does), and nothing in either corpus or reference separates them.
+/// * `test_flag_2` (bit 50) set ON A NON-FLOAT FAMILY. The bit itself is no longer open - it is
+///   `src1_neg`, and the float path applies it (see the operand decode below) - but the
+///   raw-lane emit path the non-float families use cannot express a negation, and dropping one
+///   silently is worse than refusing.
 /// * `test_wben` clear. With no predicate destination and the write-back disabled the
 ///   instruction would write nothing at all, which is not a thing a compiler emits - so a clear
 ///   bit means the field means something this does not model.
@@ -876,9 +904,6 @@ fn decode_grp_test_mask(word: u64) -> Instr {
     // the FORMAT OF THE WRITTEN VALUE and the format's width comes from the family - see the
     // `mask_type` gate after the ALU table.
     let mask_type = bits(word, 37, 36);
-    if bits(word, 50, 50) != 0 {
-        blocked = blocked.or(Some("0x78 VTSTMSK test_flag_2 set - what it feeds is not established"));
-    }
     if bits(word, 20, 20) == 0 {
         blocked = blocked.or(Some(
             "0x78 VTSTMSK with test_wben clear: the instruction would write neither a predicate \
@@ -959,13 +984,34 @@ fn decode_grp_test_mask(word: u64) -> Instr {
     //     this translatable without knowing which rule is the true one - the answer does not
     //     depend on the choice.
     //
+    //   * 8-BIT MASK (0) with a FLOAT family: 1.0 / 0.0 again, and the FLOAT family's four
+    //     channels. This is the pair the two readings were said to disagree on - "1.0 if the
+    //     data type decides, 0xFF if the form's name does", four channels or one - and a
+    //     football title's skinned vertex programs settle BOTH halves from their own consumers,
+    //     which is evidence the fighting title's four words could not supply because nothing
+    //     there reads the result in a way that separates them.
+    //
+    //     The instruction is `mask pa[6] <- (-sa[74] + i0) >= 0`, four channels written, and
+    //     the program reads pa[6] back THREE times, all as FLOAT MULTIPLIERS and across TWO
+    //     channels: `i0.xyz = sa[48].xyz * pa[6].x`, `o[6].xy = pa[6].y * sa[56].xy + i0.xy`,
+    //     `o[8].x = pa[6].y * sa[58].x + i0.z`.
+    //       - THE VALUE is numeric. A bit pattern `0xFF` read through a float view is `3.6e-43`,
+    //         a denormal indistinguishable from zero, so under that reading all three terms
+    //         vanish for every vertex, always - the program would be computing nothing.
+    //       - THE CHANNEL COUNT is four, or at least not one: channel Y is read twice, and the
+    //         one-channel reading writes only X, leaving Y whatever it held.
+    //     So the FAMILY decides both, and the mask-type field selects a WIDTH that only means
+    //     something where the written value is a bit pattern - which is the integer families.
+    //
     // Still refused, because there the two rules give different numbers: the 8-bit-mask form
-    // (0) with a 16- or 32-bit type (0xFF against 0xFFFF/0xFFFFFFFF), the numeric form (2) with
-    // an INTEGER family (all-ones against 1), and every signed integer type (one reading writes
-    // maximum-positive and nothing corroborates it). Value 3 is named "reserved".
+    // (0) with a 16- or 32-bit INTEGER type (0xFF against 0xFFFF/0xFFFFFFFF), the numeric form
+    // (2) with an INTEGER family (all-ones against 1), and every signed integer type (one
+    // reading writes maximum-positive and nothing corroborates it). Value 3 is named
+    // "reserved", and the precision-mask form (1) with a FLOAT family has no consumer in any
+    // corpus to read it off.
     let mask_ok = matches!(
         (mask_type, alu),
-        (2, TestAlu::Add | TestAlu::Sub | TestAlu::Mul) | (1, TestAlu::IntSub16U)
+        (0 | 2, TestAlu::Add | TestAlu::Sub | TestAlu::Mul) | (1, TestAlu::IntSub16U)
     );
     if !mask_ok {
         blocked = blocked.or(Some(
@@ -1009,14 +1055,75 @@ fn decode_grp_test_mask(word: u64) -> Instr {
         };
         Operand::plain(bank, index, bank_sel)
     };
-    let s1 = source(bits(word, 31, 30) as u8, bits(word, 13, 7), bits(word, 49, 49) != 0);
+    let mut s1 = source(bits(word, 31, 30) as u8, bits(word, 13, 7), bits(word, 49, 49) != 0);
     let mut s2 = source(bits(word, 29, 28) as u8, bits(word, 6, 0), bits(word, 48, 48) != 0);
     if bits(word, 46, 46) != 0 {
         s2.swizzle = [0; 4];
     }
+    // >>> `test_flag_2` (BIT 50) IS `src1_neg`: the ALU sees `-src1`.
+    //
+    // This bit was refused wholesale ("what it feeds is not established") on the strength of
+    // one clean-room pass that read it as a second, unspecified mask-generation flag. That
+    // reading is superseded, and by the stronger of the two sources: a VENDOR hardware
+    // bit-definition header for this shader core defines a "negate source 1" flag for the TEST
+    // group as a mask on the word's HIGH 32-bit half whose set bit is bit 18 of that half -
+    // i.e. bit 50 of the 64-bit word. That is the fact taken; the code below is derived from
+    // it. It agrees with the independently-read emulator description, and with the structural
+    // observation that the bit occupies precisely the VTST `src1_neg` slot while no other
+    // field in the VTSTMSK layout moves relative to VTST.
+    //
+    // >>> AND IT IS RESTRICTED TO THE FLOAT FAMILIES, because that is the only place this
+    // emitter can express a negation. A float VTSTMSK reaches the device through
+    // `src_channel`, which applies `Operand::neg`; the UNSIGNED-16 form goes through
+    // `raw_lane_expr`, which reads a whole lane as an integer bit pattern and has no negate.
+    // Setting the flag on that path would DROP the negation silently - the exact failure this
+    // decoder refuses - so a non-float VTSTMSK with the bit set stays blocked.
+    if bits(word, 50, 50) != 0 {
+        if float_ty {
+            s1.neg = true;
+        } else {
+            blocked = blocked.or(Some(
+                "0x78 VTSTMSK src1 negate (test_flag_2) on a non-float family: the raw-lane path this emitter uses for it cannot express a negation",
+            ));
+        }
+    }
 
+    // >>> THE 8-BIT-MASK FORM (type 0) OF THE FLOAT FAMILY: A DOUBLED DESTINATION, AND ITS FOUR
+    // >>> ANSWERS PACKED AS BYTES OF ONE REGISTER.
+    //
+    // Every type-0 word in the corpus (48 in a football title's 17 skinning programs, 4 in a
+    // fighting title's) is the float-to-int SATURATION guard `(-2^31 + index) >= 0` feeding a
+    // byte-wise conditional move `[0x7fffffff, packed index, mask]`. Read with a DIRECT
+    // destination every one of those masks was dead - written, then overwritten or never read.
+    // Read DOUBLE-REGISTER scaled like the family's sources, each lands exactly on the LAST
+    // operand of the VMOVCU8 after it (4-bone: pa[6] -> pa[12] four times; 2-bone: pa[7] ->
+    // pa[14], pa[6] -> pa[12]; fighting: pa[4] -> pa[8], pa[7] -> pa[14]), each after the
+    // previous value there was consumed. It writes ONE register: four float lanes at a doubled
+    // pa[14] would destroy `blendIndices.xy` in pa[16..17] one block before bone 1 reads them.
+    // The byte packing is the form's own name, and what a BYTE-wise consumer can read.
+    //
+    // The NUMERIC form (type 2) is untouched: all of its instances (shadow filters in three
+    // titles) write an INTERNAL register and a DOT reads four float lanes straight back.
+    // `VITASLOP_GXP_TSTMSK_DEST=raw` is the arm back to reading type 0 as type 2.
     let dest_sel = bits(word, 33, 32) as u8;
-    let dest = match r7_dest_bank_index(dest_sel, bits(word, 27, 21)) {
+    let dest_field = bits(word, 27, 21);
+    let byte_mask = float_ty
+        && mask_type == 0
+        && std::env::var("VITASLOP_GXP_TSTMSK_DEST").as_deref() != Ok("raw");
+    let doubled = byte_mask;
+    let dest_bi = match r7_dest_bank_index(dest_sel, dest_field) {
+        Some((Bank::Internal, i)) => Some((Bank::Internal, i)),
+        Some((b, _)) if doubled => {
+            if dest_field >= 64 {
+                blocked = blocked.or(Some(
+                    "0x78 VTSTMSK float destination field >= 64: doubled, it is off the register file",
+                ));
+            }
+            Some((b, reg_index(dest_field)))
+        }
+        other => other,
+    };
+    let dest = match dest_bi {
         Some((b, i)) => Some(Operand::plain(b, i, dest_sel)),
         None => {
             blocked = blocked.or(Some("0x78 VTSTMSK destination in index mode"));
@@ -1025,7 +1132,7 @@ fn decode_grp_test_mask(word: u64) -> Instr {
     };
 
     Instr {
-        op: Op::TestMask { alu, cmp },
+        op: Op::TestMask { alu, cmp, byte_mask },
         pred,
         dest,
         // >>> THE CHANNEL COUNT IS DERIVED FROM THE ALU FAMILY, NOT FROM THE MASK TYPE.
@@ -1038,7 +1145,10 @@ fn decode_grp_test_mask(word: u64) -> Instr {
         // integer form's operands are whole raw lanes with no per-channel content to compare,
         // so four channels would be four copies of one answer written over four registers the
         // instruction was never meant to touch.
-        write_mask: if float_ty { [true; 4] } else { [true, false, false, false] },
+        //
+        // >>> EXCEPT THE 8-BIT-MASK FORM, whose four answers are the four BYTES of one register
+        // (see `byte_mask` above) - one register written, lane x.
+        write_mask: if float_ty && !byte_mask { [true; 4] } else { [true, false, false, false] },
         srcs: vec![s1, s2],
         half_precision,
         raw: word,
@@ -1213,9 +1323,32 @@ fn exotic_source(opt_sel: u8, op_field: u32, swizzle: [u8; 4], abs: bool, neg: b
         o.swizzle = swizzle;
         o.abs = abs;
         o.neg = neg;
-        Some(o)
-    } else {
-        None
+        return Some(o);
+    }
+    // >>> THE TWO INDEXED ROWS (selectors 0 and 3) ARE THE ROWS [`ext_source_r6`] ALREADY
+    // >>> RESOLVES, and refusing them here was a statement about this function rather than
+    // >>> about the encoding.
+    //
+    // The field is the same SIX-bit R6 field the register rows use, so the indexed number is
+    // the doubled one - see [`ext_source_r6`] for why that is the same reading twice rather
+    // than a choice. A football title's vertex programs put one two instructions after the
+    // `LoadIndex` that sets the register, and the instruction directly AFTER it is a
+    // group-0x38 move reading the SAME indexed operand, `Indexed[110]`, through the row this
+    // group was refusing:
+    //
+    //   #6  idx[0] = (pa[4] + 11) * 2
+    //   #7  pa[4]  = <indexed, field 55> * cnst[1]     (this row)
+    //   #8  pa[4]  = <indexed, field 55>               (group 0x38, already decoded)
+    //
+    // An INDEXED operand carries no swizzle - its components are consecutive - which is the
+    // same rule the pack and move groups apply to the same row.
+    match ext_source_r6(opt_sel, op_field) {
+        Ok(mut o) if o.bank == Bank::Indexed => {
+            o.abs = abs;
+            o.neg = neg;
+            Some(o)
+        }
+        _ => None,
     }
 }
 
@@ -1261,6 +1394,33 @@ fn ext_source(bank_sel: u8, field_val: u32, seven_bit_number: bool) -> Result<Op
             abs: false,
             neg: false,
         }),
+    }
+}
+
+/// [`ext_source`] for a group whose operand number is a SIX-bit R6 field.
+///
+/// The two INDEXED rows need a seven-bit number - two bits of sub-bank and five of offset - and
+/// a six-bit field cannot hold one directly. It does not have to: an R6 number is
+/// DOUBLE-REGISTER SCALED, so the register this group names is `2 * field`, and the indexed
+/// number it names is that same doubled value. The two readings that are even conceivable here
+/// are the same reading: doubling the whole field puts the sub-bank at `field[5:4]` and leaves
+/// `2 * field[3:0]` as the offset, which is bit-for-bit what splitting the field first and
+/// doubling the offset gives. The consequence is only that such an operand addresses EVEN
+/// offsets, exactly as an R6 register operand addresses even registers.
+///
+/// It is corroborated from outside the group. One title's vertex programs load an index
+/// register and then read the array through it TWICE, once from a group whose number field is a
+/// full seven bits (`0x50` VBW, which resolves `sa[i0 + 14]`) and once from this group with
+/// field 55 - and `2 * 55 = 110` is that same `sa[i0 + 14]`. Two groups, two field widths, one
+/// address, in the same idiom.
+///
+/// SPECIAL and IMMEDIATE are NOT doubled - the reference is explicit that an extension-row
+/// constant is never double-register scaled - so those rows pass the field through untouched,
+/// which is what [`ext_source`] already does for them.
+fn ext_source_r6(bank_sel: u8, field_val: u32) -> Result<Operand, &'static str> {
+    match bank_sel & 3 {
+        0 | 3 => ext_source(bank_sel, (field_val & 0x3f) * 2, true),
+        _ => ext_source(bank_sel, field_val, false),
     }
 }
 
@@ -1543,26 +1703,84 @@ fn rswz2_mad(which: u8, half: bool, swz_alt: u32, op_swz: u32) -> [u8; 4] {
     swz_str(if half { f16t[row][idx] } else { f32t[row][idx] })
 }
 
-/// The mad-group destination write mask. f32 mode writes 2 channels (swz_mask32, swz_en);
-/// f16 mode writes 4 (swz_mask16, swz_en). Both from the henkaku masking tables.
+/// [`rswz2_mad`] for the ASSEMBLER, which searches this table for the field values producing a
+/// requested swizzle rather than keeping a second copy of it. Exposing the decoder's own
+/// function is what makes a drift between the two directions impossible.
+pub(crate) fn rswz2_mad_for(which: u8, half: bool, swz_alt: u32, op_swz: u32) -> [u8; 4] {
+    rswz2_mad(which, half, swz_alt, op_swz)
+}
+
+/// [`rswz2_op2`] for the assembler; see [`rswz2_mad_for`].
+pub(crate) fn rswz2_op2_for(swz_alt: u32, op_swz: u32) -> [u8; 4] {
+    rswz2_op2(swz_alt, op_swz)
+}
+
+/// [`rswz2_dot_op2`] for the assembler; see [`rswz2_mad_for`].
+///
+/// The DOT's operand-2 table is the only one in the decoder that depends on a field OUTSIDE
+/// the swizzle - `c3_en` selects between a three-channel and a four-channel table - so an
+/// assembler searching it has to search the right one, and asking this rather than restating
+/// it is what makes that impossible to get wrong in only one direction.
+pub(crate) fn rswz2_dot_op2_for(c3_en: bool, swz_alt_op2: u32, op2_swz: u32) -> [u8; 4] {
+    rswz2_dot_op2(c3_en, swz_alt_op2, op2_swz)
+}
+
+/// [`mask_table_08`] for the assembler; see [`rswz2_mad_for`].
+pub(crate) fn mask_table_08_for(m3: u32, m2: u32, m1: u32, en: u32) -> [bool; 4] {
+    mask_table_08(m3, m2, m1, en)
+}
+
+/// [`mask_table_mad`] for the assembler; see [`rswz2_mad_for`]. The three bits are ONE per-lane
+/// bitmask, which is why a 32-bit mad cannot write channel 3 at all and the assembler refuses
+/// to be asked for it.
+pub(crate) fn mask_table_mad_for(half: bool, m16: u32, m32: u32, en: u32) -> [bool; 4] {
+    mask_table_mad(half, m16, m32, en)
+}
+
+/// The mad-group destination write mask: a BITMASK over the destination's REGISTER LANES.
+///
+/// The henkaku tables for this group are given as two truth tables - one for 32-bit mode over
+/// `(swz_mask32, swz_en)` and two channels, one for 16-bit mode over `(swz_mask16, swz_en)` and
+/// four - and reading them as tables leaves the THIRD control bit unused in each mode. They are
+/// not two tables. Every row of both is what a plain per-lane bitmask produces:
+/// `swz_en` selects lane 0, and the mode's own mask bit selects lane 1. In 16-bit mode a LANE is
+/// a register holding two f16 channels, which is why its rows come in pairs (`x,x,1,1`).
+///
+/// So in 32-bit mode the bit the 32-bit table never mentions - `swz_mask16` - selects lane 2.
+/// Every documented row is reproduced EXACTLY by this function; the only behaviour that changes
+/// is the combination the tables do not cover.
+///
+/// >>> AND THAT COMBINATION IS REAL AND ITS OLD READING WAS IMPOSSIBLE. `instructions_whose_
+/// >>> write_mask_is_empty` censuses every corpus on disk: the ONLY instruction anywhere that
+/// >>> decodes to an empty destination mask is exactly `df=0 m16=1 m32=0 en=0` - 45 in mlb, 5 in
+/// >>> ridgeracer, 1 in mk, 0 in seven other titles - and a shipped compiler does not emit an
+/// >>> instruction that writes nothing. Under the bitmask it writes lane 2, which is the third
+/// >>> component of a vec3, and that is what those instructions are: the tail of a skinning
+/// >>> accumulate whose first two lanes are the MAD before it.
+///
+/// MEASURED: with lane 2 lost, one title's characters render as a FAN OF STREAKS - the z of
+/// every blended position reads the previous bone's stale accumulator. Offline skinning from the
+/// same capsule gives a compact standing figure, so the guest's data was never the problem.
+/// `VITASLOP_GXP_MAD_MASK16=0` is the arm back to the two-table reading.
 fn mask_table_mad(half: bool, swz_mask16: u32, swz_mask32: u32, swz_en: u32) -> [bool; 4] {
+    let (lane0, lane1) = (swz_en & 1 != 0, if half { swz_mask16 & 1 != 0 } else { swz_mask32 & 1 != 0 });
     if half {
-        // (swz_mask16, swz_en) -> ch0..3. x(masked) = not written.
-        match ((swz_mask16 & 1) << 1) | (swz_en & 1) {
-            0b00 => [false, false, false, false],
-            0b01 => [true, true, false, false],
-            0b10 => [false, false, true, true],
-            _ => [true, true, true, true],
-        }
+        // A lane is a REGISTER, and a register holds two f16 channels.
+        [lane0, lane0, lane1, lane1]
     } else {
-        // (swz_mask32, swz_en) -> ch0, ch1; ch2/ch3 unused in f32 mode.
-        match ((swz_mask32 & 1) << 1) | (swz_en & 1) {
-            0b00 => [false, false, false, false],
-            0b01 => [true, false, false, false],
-            0b10 => [false, true, false, false],
-            _ => [true, true, false, false],
-        }
+        let lane2 = swz_mask16 & 1 != 0 && mad_mask16_lane2();
+        [lane0, lane1, lane2, false]
     }
+}
+
+/// Does `swz_mask16` select destination lane 2 in a 32-bit mad
+/// (`VITASLOP_GXP_MAD_MASK16=0` turns it off)?
+///
+/// An A/B ARM rather than a mode, so both readings are reachable from ONE build - the arms must
+/// differ in one thing or the comparison is between two binaries
+/// ([[vitaslop-browser-ab-needs-a-negative-control]]).
+fn mad_mask16_lane2() -> bool {
+    std::env::var("VITASLOP_GXP_MAD_MASK16").as_deref() != Ok("0")
 }
 
 /// Decode a group-0x00 `mad` (multiply-add) instruction: `op0 = op1 * op2 + op3`.
@@ -1697,6 +1915,485 @@ fn rswz2_dot_op2(c3_en: bool, swz_alt_op2: u32, op2_swz: u32) -> [u8; 4] {
     swz_str_const(if c3_en { T4[idx] } else { T3[idx] })
 }
 
+/// A group-0x20 three-channel swizzle table entry, as a selector triple (`h` = 0.5).
+fn grp20_swz3(s: &str) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for (i, ch) in s.chars().take(3).enumerate() {
+        out[i] = match ch {
+            'x' => 0,
+            'y' => 1,
+            'z' => 2,
+            'w' => 3,
+            '0' => 4,
+            '1' => 5,
+            '2' => 6,
+            _ => 7, // 'h' = 0.5
+        };
+    }
+    // The destination is `.xyz` only; channel w is never written, so its selector is unread.
+    out[3] = out[2];
+    out
+}
+
+/// A FOUR-lane swizzle string (group 0x28) as selectors, the constants encoded as in
+/// [`grp20_swz3`].
+fn grp20_swz4(s: &str) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for (i, ch) in s.chars().take(4).enumerate() {
+        out[i] = match ch {
+            'x' => 0,
+            'y' => 1,
+            'z' => 2,
+            'w' => 3,
+            '0' => 4,
+            '1' => 5,
+            '2' => 6,
+            _ => 7, // 'h' = 0.5
+        };
+    }
+    out
+}
+
+/// Group 0x28's (four-lane) swizzle tables, from the clean-room four-lane swizzle spec: the
+/// 16-entry STANDARD table (`opN` and `op1i`, and `op2i` with its extended bit clear) followed
+/// by the 16-entry EXTENDED one (`op2i` with bit 52 set; `opN` when the primary op has fewer
+/// than two sources and bit 15 is set). CALIBRATED on a shipped word, `0x2ce430d6d0d11388`,
+/// whose `op2i` index 5 with bit 52 set decodes as extended entry 5, `wzwz`. Conformance: `conf_a_four_lane_word_reads_its_extended_swizzle_table` (the old decoder refused that word).
+const GRP28_SWZ32: [&str; 32] = [
+    "xxxx", "yyyy", "zzzz", "wwww", "xyzw", "yzww", "xyzz", "xxyz", "xyxy", "xywz", "zxyw", "zwzw",
+    "0000", "hhhh", "1111", "2222", "yzxw", "zwxy", "xzwy", "yyww", "wyzw", "wzwz", "xyzx", "zzww",
+    "xwzx", "yyyx", "yyyz", "zwzw", "yzxz", "xxyy", "xzww", "xyz1",
+];
+
+// Group 0x20's vector swizzle for `opN` and `op1i` (henkaku, FACT), indexed by
+// `swz_alt << 2 | swz`. The constant rows are splats.
+
+/// Group 0x20's vector swizzle for `op2i` (henkaku, FACT), indexed by
+/// `swz_alt_op2i_2 << 4 | swz_alt_op2i_x << 2 | op2i_swz`.
+const GRP20_SWZ32: [&str; 32] = [
+    "xxx", "yyy", "zzz", "www", "xyz", "yzw", "xxy", "xyx", "yyx", "yyz", "zxy", "xzy", "000", "hhh",
+    "111", "222", "xyy", "yxy", "xxz", "yxx", "xy0", "x10", "xzy", "yzx", "zyx", "zzy", "xy1", "hhh",
+    "hhh", "hhh", "hhh", "hhh",
+];
+
+/// The SCALAR forms' (exp/log/rsq/rcp) component select for `opN` and `op1i` (henkaku, FACT):
+/// the one lane the function reads, indexed like the first 16 entries of [`GRP20_SWZ32`].
+const GRP20_SCALAR16: [u8; 16] = [0, 1, 2, 3, 0, 1, 0, 0, 1, 1, 2, 0, 0, 3, 1, 2];
+
+/// The scalar forms' component select for `op2i`, indexed like [`GRP20_SWZ32`].
+const GRP20_SCALAR32: [u8; 32] = [
+    0, 1, 2, 3, 0, 1, 0, 0, 1, 1, 2, 0, 0, 3, 1, 2, 0, 1, 0, 1, 0, 0, 0, 1, 2, 2, 0, 3, 3, 3, 3, 3,
+];
+
+/// One of the fourteen operations a group-0x20/0x28 word can carry in either of its two issue
+/// slots (see [`decode_grp_20_pair`]), indexed `extension_bit * 8 + 3-bit opcode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum G20Op {
+    VMad,
+    VDot,
+    /// A vector dotted with itself (sum of squares).
+    SelfDot,
+    VMul,
+    VAdd,
+    VMov,
+    Rsq,
+    Rcp,
+    SMad,
+    SAdd,
+    SMul,
+    /// `a - floor(b)` - no IR op; blocks.
+    SubFlr,
+    Exp,
+    Log,
+}
+
+impl G20Op {
+    fn from_index(i: u32) -> Option<Self> {
+        use G20Op::*;
+        [VMad, VDot, SelfDot, VMul, VAdd, VMov, Rsq, Rcp, SMad, SAdd, SMul, SubFlr, Exp, Log]
+            .get(i as usize)
+            .copied()
+    }
+    fn sources(self) -> usize {
+        use G20Op::*;
+        match self {
+            VMad | SMad => 3,
+            VDot | VMul | VAdd | SAdd | SMul | SubFlr => 2,
+            SelfDot | VMov | Rsq | Rcp | Exp | Log => 1,
+        }
+    }
+    /// Reads its sources as vectors (and so reads the register operand DOUBLED).
+    fn vector_load(self) -> bool {
+        use G20Op::*;
+        matches!(self, VMad | VDot | SelfDot | VMul | VAdd | VMov)
+    }
+    /// Stores a vector (and so writes a register destination DOUBLED, two lanes / four halves).
+    fn vector_store(self) -> bool {
+        use G20Op::*;
+        matches!(self, VMad | VMul | VAdd | VMov)
+    }
+}
+
+/// Decode a group-0x20 (three-lane) or group-0x28 (four-lane) word into the one or two IR
+/// instructions it issues, in an order that gives each the operand values from BEFORE the word
+/// (see "Ordering" below).
+///
+/// # THE WORD IS DUAL-ISSUE (clean-room facts, `docs-re/usse-spec-grp20-exp-forms.md`)
+/// Every word carries a PRIMARY operation (`op_sel2` (54, three-lane only) * 8 + `opcode2`
+/// (46:44)) and a SECONDARY one (`gr_sel` (43) * 8 + `opcode3` (20:18)), from one table of
+/// fourteen: vector mad, dot, self-dot, mul, add, mov, then scalar rsq, rcp, mad, add, mul,
+/// subflr, exp, log. `op_sel1` (42) decides which of the two writes the REGISTER destination
+/// (bank 33:32, number 27:21 - `1` = the primary); the other writes internal register
+/// `i<29:28>` under the mask 9:7 (plus 54 = w in the four-lane group). The henkaku page's
+/// forms name only the primary and document only its operands, which is why its "EXP"/"RR"
+/// cells looked undocumented and why the fields it calls unused held register numbers.
+///
+/// A register number is DOUBLED only for an operation that stores (destination) or loads
+/// (the register source) a VECTOR; a scalar operation's register is the field itself. The
+/// register destination writes a fixed lane count: a vector store two f32 lanes / four f16
+/// halves, a scalar store one f32 lane / two f16 halves (one register). A temp-bank code
+/// 124..127 names `i0..i3` instead, written three (four) lanes wide.
+///
+/// MEASURED, each against the program's own arithmetic in a fighting title's corpus (no other
+/// captured title uses these groups at all):
+/// * `vert_846501d0`: `log i0.x <- x`, then this word's primary `mul i0.x <- sa73.y * i0.x`,
+///   then `exp`: a pow whose exponent the UNDOUBLED `sa73.y` names - the high half of the
+///   register the secondary program loads from uniform offset 312, `gSpecularColor.w`, the
+///   specular power. Read doubled it is `sa146`, past the last register the program loads.
+/// * `frag_846ee450`: the secondary `mov pa16 <- pa2.xyz` fills the vector a later mul reads
+///   whole, where the primary alone left its y/z lanes unwritten.
+/// * the cell once read as "an rsq that is really a self-dot" is a primary rsq into a register
+///   plus a SECONDARY self-dot into `i<29:28>` - the dot the following rsq/normalize reads.
+/// * group 0x28's register moves/mads: the destination is next read as a whole f16 vector.
+///
+/// # Operands
+/// `U` = the register operand (bank 31:30, number 6:0, swizzle 51:48, negate 47; when the
+/// primary has fewer than two sources, 15 selects the extended swizzle table and 14 is abs);
+/// `I0` = `i<11:10>` swizzle 41:38; `I1` = `i<13:12>` swizzle 52,37:34, negate 58; `I2` =
+/// `i<15:14>` with the identity swizzle when the primary has two or more sources, else a fixed
+/// `i2`. `nsel` (17:16) places them, per the primary's and the secondary's source counts.
+///
+/// # Ordering
+/// Both operations read the register values from before the word. They are emitted one after
+/// the other, so the one whose destination the other reads goes SECOND; a word whose two
+/// operations each read the other's destination has no such order and blocks.
+fn decode_grp_20_pair(word: u64, four_lane: bool) -> Vec<Instr> {
+    let mut blocked: Option<&'static str> = None;
+    let group = if four_lane { 0x28 } else { 0x20 };
+    let half = bits(word, 53, 53) != 0;
+    let blocked_instr = |why: &'static str| Instr {
+        op: Op::Todo("grp20 dual-issue word"),
+        pred: Predicate::Always,
+        dest: None,
+        write_mask: [false; 4],
+        srcs: Vec::new(),
+        half_precision: half,
+        raw: word,
+        group,
+        blocked: Some(why),
+    };
+    let p_index = if four_lane { 0 } else { bits(word, 54, 54) * 8 } + bits(word, 46, 44);
+    let s_index = bits(word, 43, 43) * 8 + bits(word, 20, 18);
+    let (Some(prim), Some(sec)) = (G20Op::from_index(p_index), G20Op::from_index(s_index)) else {
+        return vec![blocked_instr("group 0x20 word naming an invalid operation slot (14/15)")];
+    };
+    if s_index == 0 {
+        return vec![blocked_instr("group 0x20 word with the invalid secondary operation 0")];
+    }
+    if bits(word, 57, 56) != 0 {
+        blocked = Some("group 0x20 predicate: this group's table is not established");
+    }
+    let prim_writes_reg = bits(word, 42, 42) == 1;
+    let (pn, sn) = (prim.sources(), sec.sources());
+    let nsel = bits(word, 17, 16);
+
+    // The register destination, for whichever operation owns it.
+    let reg_owner = if prim_writes_reg { prim } else { sec };
+    let dst_field = bits(word, 27, 21);
+    let dst_bank = bits(word, 33, 32) as u8;
+    let (reg_dest, reg_dest_internal) = match bank_rsi2(dst_bank) {
+        None => {
+            blocked = blocked.or(Some("group 0x20 register destination in indexed mode"));
+            (Operand::plain(Bank::Temp, 0, 0), false)
+        }
+        Some(Bank::Temp) if (124..=127).contains(&dst_field) => {
+            (Operand::plain(Bank::Internal, internal_base(dst_field - 124), dst_bank), true)
+        }
+        Some(b) => {
+            let index = if reg_owner.vector_store() { reg_index(dst_field) } else { dst_field as u8 };
+            (Operand::plain(b, index, dst_bank), false)
+        }
+    };
+    let reg_mask = if reg_dest_internal {
+        [true, true, true, four_lane]
+    } else {
+        match (reg_owner.vector_store(), half) {
+            (true, false) => [true, true, false, false],
+            (true, true) => [true; 4],
+            (false, false) => [true, false, false, false],
+            (false, true) => [true, true, false, false],
+        }
+    };
+    let mut int_mask = match bits(word, 9, 7) {
+        0b000 => [false, false, false, false],
+        0b001 => [true, false, false, false],
+        0b010 => [false, true, false, false],
+        0b011 => [true, true, false, false],
+        0b100 => [false, false, true, false],
+        0b101 => [true, false, true, false],
+        0b110 => [false, true, true, false],
+        _ => [true, true, true, false],
+    };
+    if four_lane {
+        int_mask[3] = bits(word, 54, 54) != 0;
+    }
+    let int_dest = Operand::plain(Bank::Internal, internal_base(bits(word, 29, 28)), 0);
+
+    // Operand builders. A source's lanes depend on the operation that reads it: a scalar
+    // operation reads one lane (the scalar tables), a vector operation the three- (four-) lane
+    // table - cut to the lanes its REGISTER destination has when it stores a vector there.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Slot {
+        U,
+        I0,
+        I1,
+        I2,
+    }
+    let u_ext = pn < 2 && bits(word, 15, 15) != 0;
+    let u_abs = pn < 2 && bits(word, 14, 14) != 0;
+    let k_u = ((bits(word, 51, 50) << 2) | bits(word, 49, 48)) as usize;
+    let k_1 = ((bits(word, 41, 40) << 2) | bits(word, 39, 38)) as usize;
+    let k_2 = ((bits(word, 52, 52) << 4) | (bits(word, 37, 36) << 2) | bits(word, 35, 34)) as usize;
+    if u_ext && k_u > 10 {
+        blocked = blocked.or(Some("group 0x20 extended register swizzle beyond the established entries"));
+    }
+    // `k` indexes the 32-entry table of the width in force (the three-lane one's first 16 are
+    // the `opN`/`op1i` table, and so are the four-lane one's).
+    let lanes = |k: usize, op: G20Op, writes_reg: bool| -> [u8; 4] {
+        let mut sw = if four_lane { grp20_swz4(GRP28_SWZ32[k]) } else { grp20_swz3(GRP20_SWZ32[k]) };
+        if writes_reg && !reg_dest_internal && op.vector_store() {
+            if half {
+                // The three-lane table's fourth half repeats x; the four-lane table has its own w.
+                if !four_lane {
+                    sw[3] = 0;
+                }
+            } else {
+                sw[2] = sw[1];
+                sw[3] = sw[1];
+            }
+        }
+        sw
+    };
+    let splat = |c: u8| [c, c, c, c];
+    let operand = |slot: Slot, op: G20Op, writes_reg: bool| -> Operand {
+        let scalar = !op.vector_load();
+        match slot {
+            Slot::U => {
+                let field = bits(word, 6, 0);
+                let bank_sel = bits(word, 31, 30) as u8;
+                let (b, i) = if op.vector_load() {
+                    r7_double_source_bank_index(bank_sel, field)
+                } else {
+                    source_bank_index(bank_sel, field, 124, |f| f as u8)
+                };
+                let mut o = Operand::plain(b, i, bank_sel);
+                let k = (if u_ext { 16 + k_u } else { k_u }).min(31);
+                o.swizzle = if scalar { splat(GRP20_SCALAR32[k]) } else { lanes(k, op, writes_reg) };
+                o.neg = bits(word, 47, 47) != 0;
+                o.abs = u_abs;
+                o
+            }
+            Slot::I0 => {
+                let mut o = Operand::plain(Bank::Internal, internal_base(bits(word, 11, 10)), 0);
+                o.swizzle = if scalar { splat(GRP20_SCALAR16[k_1]) } else { lanes(k_1, op, writes_reg) };
+                o
+            }
+            Slot::I1 => {
+                let mut o = Operand::plain(Bank::Internal, internal_base(bits(word, 13, 12)), 0);
+                o.swizzle = if scalar { splat(GRP20_SCALAR32[k_2]) } else { lanes(k_2, op, writes_reg) };
+                o.neg = bits(word, 58, 58) != 0;
+                o
+            }
+            Slot::I2 => {
+                let n = if pn >= 2 { bits(word, 15, 14) } else { 2 };
+                let mut o = Operand::plain(Bank::Internal, internal_base(n), 0);
+                // No swizzle field: identity, entry 4 of either width's table.
+                o.swizzle = if scalar { splat(0) } else { lanes(4, op, writes_reg) };
+                o
+            }
+        }
+    };
+    use Slot::*;
+    let prim_slots: Option<Vec<Slot>> = match (pn, nsel) {
+        (1, 0) => Some(vec![U]),
+        (1, 1) => Some(vec![I0]),
+        (1, 2) => Some(vec![I1]),
+        (1, _) => Some(vec![I2]),
+        (2, 0) => Some(vec![U, I1]),
+        (2, 1) => Some(vec![I0, U]),
+        (2, 2) => Some(vec![I0, I1]),
+        (3, 0) => Some(vec![U, I1, I2]),
+        (3, 1) => Some(vec![I0, U, I2]),
+        (3, 2) => Some(vec![I0, I1, U]),
+        (3, _) => Some(vec![I0, I1, I2]),
+        _ => None,
+    };
+    let sec_slots: Option<Vec<Slot>> = match (pn, sn, nsel) {
+        (1, 1, 0) => Some(vec![I0]),
+        (1, 1, _) => Some(vec![U]),
+        (1, 2, 0) => Some(vec![I0, I1]),
+        (1, 2, 1) => Some(vec![U, I1]),
+        (1, 2, 2) => Some(vec![I0, U]),
+        (1, 2, _) => Some(vec![I1, U]),
+        (1, 3, 0) => Some(vec![I0, I1, I2]),
+        (1, 3, 1) => Some(vec![U, I1, I2]),
+        (1, 3, 2) => Some(vec![I0, U, I2]),
+        (1, 3, _) => Some(vec![I0, U, I1]),
+        (2, 1, 0) => Some(vec![I0]),
+        (2, 1, 1) => Some(vec![I1]),
+        (2, 1, 2) => Some(vec![U]),
+        (2, 2, 0) => Some(vec![I0, I2]),
+        (2, 2, 1) => Some(vec![I1, I2]),
+        (2, 2, 2) => Some(vec![I2, U]),
+        (3, 1, 0) => Some(vec![I0]),
+        (3, 1, 1) => Some(vec![I1]),
+        (3, 1, 2) => Some(vec![I2]),
+        (3, 1, _) => Some(vec![U]),
+        _ => None,
+    };
+    let (Some(prim_slots), Some(sec_slots)) = (prim_slots, sec_slots) else {
+        return vec![blocked_instr("group 0x20 source arrangement invalid for this pair of operations")];
+    };
+    if four_lane {
+        // The four-lane VECTOR tables are established (`GRP28_SWZ32`); what a SCALAR operation
+        // reads from an entry beyond the splats and identity is not - the spec gives no
+        // four-lane scalar table - so a scalar read of one still blocks.
+        let scalar_reads = |slots: &[Slot], op: G20Op| -> Vec<Slot> {
+            if op.vector_load() { Vec::new() } else { slots.to_vec() }
+        };
+        let all: Vec<Slot> =
+            scalar_reads(&prim_slots, prim).into_iter().chain(scalar_reads(&sec_slots, sec)).collect();
+        if (all.contains(&U) && (k_u > 4 || u_ext)) || (all.contains(&I0) && k_1 > 4) || (all.contains(&I1) && k_2 > 4) {
+            blocked = blocked.or(Some(
+                "group 0x28 SCALAR read of a swizzle entry beyond the splats and identity, which is not established for four lanes",
+            ));
+        }
+    }
+    let components = if four_lane { 4 } else { 3 };
+    let build = |op: G20Op, slots: &[Slot], writes_reg: bool| -> Instr {
+        let mut srcs: Vec<Operand> = slots.iter().map(|&s| operand(s, op, writes_reg)).collect();
+        let ir_op = match op {
+            G20Op::VMad | G20Op::SMad => Op::Mad,
+            G20Op::VDot => Op::Dot { components },
+            G20Op::SelfDot => {
+                srcs.push(srcs[0]);
+                Op::Dot { components }
+            }
+            G20Op::VMul | G20Op::SMul => Op::Mul,
+            G20Op::VAdd | G20Op::SAdd => Op::Add,
+            G20Op::VMov => Op::Mov,
+            G20Op::Rsq => Op::Rsq,
+            G20Op::Rcp => Op::Rcp,
+            G20Op::Exp => Op::Exp,
+            G20Op::Log => Op::Log,
+            G20Op::SubFlr => Op::Todo("grp20 subflr"),
+        };
+        let this_blocked = match op {
+            G20Op::SubFlr => Some("group 0x20 SUBFLR (a - floor(b)) has no IR operation"),
+            _ => None,
+        };
+        Instr {
+            op: ir_op,
+            pred: Predicate::Always,
+            dest: Some(if writes_reg { reg_dest } else { int_dest }),
+            write_mask: if writes_reg { reg_mask } else { int_mask },
+            srcs,
+            half_precision: half,
+            raw: word,
+            group,
+            blocked: blocked.or(this_blocked),
+        }
+    };
+    let a = build(prim, &prim_slots, prim_writes_reg);
+    let b = build(sec, &sec_slots, !prim_writes_reg);
+    // An operation that writes NOTHING (an all-clear internal mask) has no effect to place.
+    let writes = |i: &Instr| i.write_mask.iter().any(|&m| m);
+    match (writes(&a), writes(&b)) {
+        (true, false) | (false, false) => return vec![a],
+        (false, true) => return vec![b],
+        _ => {}
+    }
+    match (g20_reads_dest_of(&b, &a), g20_reads_dest_of(&a, &b)) {
+        // b reads a's destination: b must run first.
+        (true, false) => vec![b, a],
+        (false, _) => vec![a, b],
+        // Each reads the other's destination (MEASURED once: `i1 <- pa6 * i0.x` beside
+        // `pa6 <- i1.x * i1.x`). `a` computes into a SCRATCH temp that no program allocates
+        // (the corpus's largest temp file is 120 registers), `b` runs on the old values, and
+        // a move lands `a`'s result - so both read what was there before the word.
+        (true, true) => {
+            let final_dest = a.dest;
+            let scratch = Operand::plain(Bank::Temp, G20_SCRATCH_TEMP, 0);
+            let mut mov_src = scratch;
+            mov_src.swizzle = [0, 1, 2, 3];
+            let land = Instr {
+                op: Op::Mov,
+                pred: Predicate::Always,
+                dest: final_dest,
+                write_mask: a.write_mask,
+                srcs: vec![mov_src],
+                half_precision: a.half_precision,
+                raw: word,
+                group,
+                blocked: a.blocked,
+            };
+            vec![Instr { dest: Some(scratch), ..a }, b, land]
+        }
+    }
+}
+
+/// The temp register a mutually dependent dual-issue word parks its first result in (see
+/// [`decode_grp_20_pair`]): past every temp any captured program allocates.
+const G20_SCRATCH_TEMP: u8 = 248;
+
+/// Whether any source of `reader` overlaps the registers `writer` stores to. Conservative:
+/// a register operand is taken to span two 32-bit registers at f16 and four at f32 (the most
+/// a group-0x20 operand reads), an internal register its whole four.
+fn g20_reads_dest_of(reader: &Instr, writer: &Instr) -> bool {
+    let Some(d) = writer.dest else { return false };
+    let span = |o: &Operand, half: bool| -> u32 {
+        if o.bank == Bank::Internal || !half {
+            4
+        } else {
+            2
+        }
+    };
+    let (d0, d1) = (u32::from(d.index), u32::from(d.index) + span(&d, writer.half_precision));
+    reader.srcs.iter().any(|s| {
+        s.bank == d.bank && {
+            let (s0, s1) = (u32::from(s.index), u32::from(s.index) + span(s, reader.half_precision));
+            s0 < d1 && d0 < s1
+        }
+    })
+}
+
+fn decode_grp_20(word: u64, four_lane: bool) -> Instr {
+    decode_grp_20_pair(word, four_lane).remove(0)
+}
+
+/// The instructions a dual-issue group-0x20/0x28 word emits AFTER the one [`decode`] returns
+/// (see [`decode_grp_20_pair`]) - empty for any other word.
+pub fn decode_dual_rest(word: u64) -> Vec<Instr> {
+    let mut v = match opcode1(word) {
+        0x04 => decode_grp_20_pair(word, false),
+        0x05 => decode_grp_20_pair(word, true),
+        0x06 => decode_grp_30_parts(word, 0, 0),
+        _ => return Vec::new(),
+    };
+    v.remove(0);
+    v
+}
+
 /// Decode a group-0x18 instruction. Its 1-bit `opcode2` (a fact) splits the group into
 /// dot.f32 (0) and mad.f32 (1); both read the same bit position (high-word bit 21).
 fn decode_grp_18(word: u64, hi: u32, lo: u32) -> Instr {
@@ -1749,16 +2446,27 @@ fn decode_grp_18_dot(word: u64, hi: u32, lo: u32) -> Instr {
     let dest = Some(Operand::plain(dbank, didx, op0_sel));
 
     // Source 1 (op1): R6/RS2 register, explicit per-channel RSWZ3 swizzle (c0..c3), abs+neg.
+    // With `alt_opt1` set it is an EXTENSION-row operand instead, resolved exactly as the
+    // sibling MAD form resolves its own - see [`ext_source_r6`] for why a six-bit field can
+    // still name a register-INDIRECT operand, which is the row a program uses to read a uniform
+    // array through the index register the integer pipeline just loaded.
     let op1_sel = field(lo, low, "opt1") as u8;
-    if field(hi, high, "alt_opt1") != 0 {
-        blocked = blocked.or(Some("op1 in index/exotic mode"));
-    }
-    let (b1, i1) = r6_source_bank_index(op1_sel, field(lo, low, "op1"));
     let c0 = field(lo, low, "op1_swz_c0") as u8;
     let c1 = field(lo, low, "op1_swz_c1") as u8;
     let c2 = field(lo, low, "op1_swz_c2") as u8;
     let c3 = field(lo, low, "op1_swz_c3") as u8;
-    let mut s1 = Operand::plain(b1, i1, op1_sel);
+    let mut s1 = if field(hi, high, "alt_opt1") != 0 {
+        match ext_source_r6(op1_sel, field(lo, low, "op1")) {
+            Ok(o) => o,
+            Err(why) => {
+                blocked = blocked.or(Some(why));
+                Operand::plain(Bank::Temp, 0, op1_sel)
+            }
+        }
+    } else {
+        let (b1, i1) = r6_source_bank_index(op1_sel, field(lo, low, "op1"));
+        Operand::plain(b1, i1, op1_sel)
+    };
     s1.swizzle = [c0, c1, c2, c3];
     s1.abs = field(hi, high, "abs_op1") != 0;
     s1.neg = field(hi, high, "neg_op1") != 0;
@@ -1779,12 +2487,12 @@ fn decode_grp_18_dot(word: u64, hi: u32, lo: u32) -> Instr {
     match dot_repeat {
         None => {
             blocked = blocked.or(Some(
-                "dot repeat field 47:44 outside the census (only 8 = once, and 1..3 = that                  many extra iterations, are observed)",
+                "dot repeat field 47:44 outside the census (only 8 = once, and 1..3 = that many extra iterations, are observed)",
             ))
         }
         Some(n) if n > 0 && write_mask.iter().filter(|w| **w).count() != 1 => {
             blocked = blocked.or(Some(
-                "a repeating dot whose destination mask names other than ONE channel - the                  per-iteration channel step is only established for the single-channel form",
+                "a repeating dot whose destination mask names other than ONE channel - the per-iteration channel step is only established for the single-channel form",
             ))
         }
         Some(_) => {}
@@ -1839,7 +2547,7 @@ const MAD18_SWZ_VEC3: [[u8; 4]; 32] = [
     [0, 5, 4, 0], // x10x
     [4, 4, 4, 0], // 000x
     [5, 5, 5, 0], // 111x
-    [8, 8, 8, 0], // hhhx (h undocumented -> sentinel 8, blocked)
+    [7, 7, 7, 0], // hhhx - `h` is the HALF constant (selector 7); see `SWZ_HALF_READING`
     [6, 6, 6, 0], // 222x
     [0, 4, 4, 0], // x00x
     [7, 7, 7, 7], // {0.5, 0.5, 0.5, 0.5}
@@ -1849,8 +2557,30 @@ const MAD18_SWZ_VEC3: [[u8; 4]; 32] = [
     [7, 7, 7, 7],
 ];
 
-/// The sentinel selector for the undocumented `h` swizzle value in [`MAD18_SWZ_VEC3`].
-const SWZ_UNKNOWN: u8 = 8;
+/// >>> `h` IN THE EXTENDED SWIZZLE TABLES IS THE HALF CONSTANT, 0.5 (selector 7).
+///
+/// The extended half of [`MAD18_SWZ_VEC3`] / [`MAD18_SWZ_VEC4`] carries the constant patterns
+/// `000x`, `111x`, `hhhx`, `222x` at consecutive indices, and the rows past them are the
+/// all-constant `{0.5, 0.5, 0.5, 0.5}` this file already read as selector 7. The hardware's
+/// swizzle-constant set is `{0.0 = 4, 1.0 = 5, 2.0 = 6, 0.5 = 7}` - four values, and this
+/// codebase already materialises all four in four places in [`crate::wgsl`]. Three of them
+/// appear in the extended list by their VALUE; the fourth appears by its NAME. `h` is half,
+/// and the row is `(0.5, 0.5, 0.5, x)`.
+///
+/// It reads as one in the programs that use it, too. The blocked words are `mad` instructions
+/// whose FIRST and THIRD operands both select this row while the second is a broadcast
+/// `.xxxx` of an internal register - i.e. `0.5 * v + 0.5`, the bias-and-scale that maps a
+/// clip coordinate into a texture one. Under any reading where `h` is a register channel
+/// rather than a constant, the operand's register number would matter and it does not: the
+/// swizzle names no lane of it at all.
+///
+/// >>> AND THE CHANGE IS STRICTLY ADDITIVE, which is why it can ship on this reasoning.
+/// > > > The row previously produced a sentinel that made the instruction BLOCK, so every
+/// > > > program reaching it was refused outright. No program that recompiled before
+/// > > > recompiles differently now - there is nothing for this to regress, only draws that
+/// > > > were dropped and are not.
+#[allow(dead_code)]
+const SWZ_HALF_READING: () = ();
 
 /// The VEC4 form of the same table-indexed ("vec34") swizzle scheme: standard patterns at
 /// index 0..15, the extended set at 16..31.
@@ -1895,7 +2625,7 @@ const MAD18_SWZ_VEC4: [[u8; 4]; 32] = [
     [0, 5, 4, 0], // x10x
     [4, 4, 4, 0], // 000x
     [5, 5, 5, 0], // 111x
-    [8, 8, 8, 0], // hhhx (h undocumented -> sentinel 8, blocked)
+    [7, 7, 7, 0], // hhhx - `h` is the HALF constant (selector 7); see `SWZ_HALF_READING`
     [6, 6, 6, 0], // 222x
     [0, 4, 4, 0], // x00x
     [7, 7, 7, 7], // {0.5, 0.5, 0.5, 0.5}
@@ -1985,10 +2715,7 @@ fn decode_grp_18_mad(word: u64, hi: u32, lo: u32) -> Instr {
     s3.abs = field(hi, high, "abs_op3") != 0;
     s3.neg = field(hi, high, "neg_op3") != 0;
 
-    // Any operand resolving to the undocumented `h` selector cannot be translated exactly.
-    if [&s1, &s2, &s3].iter().any(|s| s.swizzle.contains(&SWZ_UNKNOWN)) {
-        blocked = blocked.or(Some("0x18 mad 'h' swizzle selector undocumented"));
-    }
+    // (`h` resolves to the half constant - see `SWZ_HALF_READING`.)
 
     let write_mask = mask_table_08(
         field(hi, high, "swz_mask3"),
@@ -2022,7 +2749,28 @@ fn decode_grp_18_mad(word: u64, hi: u32, lo: u32) -> Instr {
 /// 10-bit packed pipeline is not modeled), an extended-bank operand (immediate/special/
 /// indexed), or an index-mode destination. F16/F32 both emit in the shared scalar-lane
 /// register model (the same convention the 0x08/0x10 groups already use).
-fn decode_grp_30(word: u64, _hi: u32, _lo: u32) -> Instr {
+fn decode_grp_30(word: u64, hi: u32, lo: u32) -> Instr {
+    decode_grp_30_parts(word, hi, lo).remove(0)
+}
+
+/// Group 0x30 (the scalar `rcp`/`rsq`/`log`/`exp`) as the IR instructions it becomes.
+///
+/// # A SOURCE AND A DESTINATION OF DIFFERENT WIDTHS
+/// The word carries a data type for its destination (54:53) AND one for its source (40:39),
+/// and they need not agree: a shader clamps a value at half precision and takes its log at full
+/// precision in one instruction. The IR op reads its source at the destination's width, so a
+/// mixed word is split, through [`G20_SCRATCH_TEMP`]:
+///
+/// * F16 source, F32 destination: `scratch.x = f32(src.c)` (a precision-converting pack), then
+///   the op on `scratch.x` at F32;
+/// * F32 source, F16 destination: the op at F32 into `scratch`, then a pack of it to F16 into
+///   the destination.
+///
+/// MEASURED on a fighting title (PCSE00235): its character vertex programs clamp `dot(N,H)` with
+/// a half-precision `max` into `pa0.x` and `log` it at full precision. Reading that half as an
+/// F32 took the packed pair's bits as a float (a tiny negative), the log was NaN, the NaN rode a
+/// varying into the fragment's colour arithmetic, and every character was drawn black.
+fn decode_grp_30_parts(word: u64, _hi: u32, _lo: u32) -> Vec<Instr> {
     let op = match bits(word, 42, 41) {
         0 => Op::Rcp,
         1 => Op::Rsq,
@@ -2040,9 +2788,14 @@ fn decode_grp_30(word: u64, _hi: u32, _lo: u32) -> Instr {
     if dest_type >= 2 || src_type >= 2 {
         blocked = blocked.or(Some("0x30 C10/reserved operand type not modeled"));
     }
-    // Extended banks (immediate/special/indexed) are not modeled for this group.
-    if bits(word, 51, 51) != 0 || bits(word, 49, 49) != 0 {
-        blocked = blocked.or(Some("0x30 extended-bank operand (immediate/special/indexed) not modeled"));
+    // An extended DESTINATION row is SECATTR/SPECIAL/INDEX/INDEXED2, none of which this
+    // group's emit models, so it stays blocked. The extended SOURCE row does not: it is the
+    // same extension row every other group reads, at the same bit (49), and `ext_source`
+    // already splits SPECIAL into FPCONSTANT/GLOBAL and carries the two INDEXED rows. This
+    // group's number field IS a full seven bits (13:7), so it can carry an indexed number
+    // directly and needs no R6 doubling argument - see `ext_source_r6` for the group that does.
+    if bits(word, 51, 51) != 0 {
+        blocked = blocked.or(Some("0x30 extended-bank DESTINATION (secattr/special/indexed) not modeled"));
     }
 
     // Destination op0: 2-bit bank (0=temp 1=output 2=pa 3=indexed) + R7 number, with the
@@ -2066,7 +2819,31 @@ fn decode_grp_30(word: u64, _hi: u32, _lo: u32) -> Instr {
     // reserving 124..127 for the internal registers; 2-bit modifier; broadcast of the single
     // selected source component to every channel.
     let op1_sel = bits(word, 31, 30) as u8;
-    let (b1, i1) = r7_double_source_bank_index(op1_sel, bits(word, 13, 7));
+    let src1_ext = bits(word, 49, 49) != 0;
+    let (b1, i1) = if src1_ext {
+        match ext_source(op1_sel, bits(word, 13, 7), true) {
+            // >>> ONLY THE SPECIAL ROW, because only it has a settled reading HERE.
+            //
+            // This group is SCALAR: it selects one source component with `src_comp` and
+            // broadcasts it. An INDEXED row spends the operand's low bits on the indexed bank
+            // and number, so what `src_comp` then means is exactly the question the sibling
+            // group answers with "an indexed source carries no swizzle - its components are
+            // consecutive" - and a broadcast has no consecutive components to carry. Blocked
+            // and NAMED rather than given a guessed component.
+            Ok(o) if o.bank == Bank::Indexed => {
+                blocked = blocked
+                    .or(Some("0x30 extended-bank INDEXED source: the broadcast component is not established"));
+                (Bank::Temp, 0)
+            }
+            Ok(o) => (o.bank, o.index),
+            Err(why) => {
+                blocked = blocked.or(Some(why));
+                (Bank::Temp, 0)
+            }
+        }
+    } else {
+        r7_double_source_bank_index(op1_sel, bits(word, 13, 7))
+    };
     let (abs1, neg1) = src_mod2(bits(word, 38, 37));
     let comp = bits(word, 36, 35) as u8; // 0=x 1=y 2=z 3=w
     let mut s1 = Operand::plain(b1, i1, op1_sel);
@@ -2074,7 +2851,7 @@ fn decode_grp_30(word: u64, _hi: u32, _lo: u32) -> Instr {
     s1.abs = abs1;
     s1.neg = neg1;
 
-    Instr {
+    let base = Instr {
         op,
         pred: ext_predicate(predicate_raw),
         dest,
@@ -2084,6 +2861,58 @@ fn decode_grp_30(word: u64, _hi: u32, _lo: u32) -> Instr {
         raw: word,
         group: 0x06,
         blocked,
+    };
+    if src_type == dest_type || blocked.is_some() {
+        return vec![base];
+    }
+    // A mixed word that also REPEATS would need both parts stepped together; not established.
+    if repeat_extra_iterations(word).is_some_and(|n| n > 0) {
+        return vec![Instr { blocked: Some("0x30 mixed source/destination width under a repeat not modeled"), ..base }];
+    }
+    let scratch = Operand::plain(Bank::Temp, G20_SCRATCH_TEMP, 0);
+    let mut scratch_x = scratch;
+    scratch_x.swizzle = [0, 0, 0, 0];
+    if src_type == 1 {
+        // F16 source -> F32: convert the one selected half first. The source modifiers stay
+        // on the op, which reads the converted value.
+        let mut plain = s1;
+        plain.abs = false;
+        plain.neg = false;
+        let convert = Instr {
+            op: Op::Pack { src_half: true },
+            pred: base.pred,
+            dest: Some(scratch),
+            write_mask: [true, false, false, false],
+            srcs: vec![plain],
+            half_precision: false,
+            raw: word,
+            group: 0x06,
+            blocked: None,
+        };
+        let mut src = scratch_x;
+        src.abs = s1.abs;
+        src.neg = s1.neg;
+        vec![convert, Instr { srcs: vec![src], half_precision: false, ..base }]
+    } else {
+        // F32 source -> F16 destination: compute at F32 into the scratch, then narrow it.
+        let compute = Instr {
+            dest: Some(scratch),
+            write_mask: [true, false, false, false],
+            half_precision: false,
+            ..base.clone()
+        };
+        let narrow = Instr {
+            op: Op::Pack { src_half: false },
+            pred: base.pred,
+            dest: base.dest,
+            write_mask: base.write_mask,
+            srcs: vec![scratch_x],
+            half_precision: true,
+            raw: word,
+            group: 0x06,
+            blocked: None,
+        };
+        vec![compute, narrow]
     }
 }
 
@@ -2109,9 +2938,30 @@ fn decode_grp_38(word: u64, _hi: u32, _lo: u32) -> Instr {
     if matches!(ext_predicate(predicate_raw), Predicate::Raw(_)) {
         blocked = blocked.or(Some("PN (per-instance) predicate depends on repeat state - not modeled"));
     }
-    if move_type == 2 {
-        blocked = blocked.or(Some("0x38 VMOVCU8 (UINT8-test conditional move) not modeled in float register file"));
-    }
+    // >>> VMOVCU8 (move_type 2) IS A BYTE-WISE CONDITIONAL MOVE, AND THAT IS WHAT THE 4-BIT
+    // >>> WRITE MASK MEANS ON IT.
+    //
+    // It was refused because "its test reads the source as UINT8 which the scalar-float
+    // register model cannot represent". The model does not have to: on this form NOTHING is
+    // read through a float view. The four mask bits are the four BYTES of ONE register, the
+    // test is that byte against zero, and the data moved is that byte's bits.
+    //
+    // THE CHANNEL COUNT IS MEASURED, not chosen. A football title's skinned vertex programs
+    // emit four of these in a row - destination fields 11, 10, 9, 8, mask 0b1111 each - and
+    // four instructions later read `r[8]`, `r[9]`, `r[10]` and `r[11]`, one per bone, as the
+    // index halves of `o[20..23] = LOW16(r[n]) * 16 + pa[7]`. If a mask bit named a REGISTER,
+    // the first of the four would write `r[11..14]` and the second `r[10..13]`, so three of
+    // the four instructions would be clobbering each other and only one bone would survive.
+    // One register, four bytes, is the only reading under which all four are live.
+    //
+    // AND ITS OPERANDS ARE NOT DOUBLED, by the same census that settled the other non-float
+    // TEST-group operands ("a non-float operand stays inside its program's declared register
+    // file only if it is not doubled"). Three independent closures in those programs, each one
+    // instruction apart: the destination fields 8..11 against the `r[8..11]` the IMAD32s read;
+    // `src2` field 13 against the `pa[13]` the two `PackToInt16`s just above wrote; and `src1`
+    // field 7 against the `pa[7]` the LIMM immediately above loaded. Every one of the three is
+    // an exact match undoubled and lands on a register nothing wrote doubled.
+    let byte_cond = move_type == 2;
     if move_type == 3 {
         blocked = blocked.or(Some("0x38 reserved move_type 3"));
     }
@@ -2119,7 +2969,9 @@ fn decode_grp_38(word: u64, _hi: u32, _lo: u32) -> Instr {
     // Only the float types F16/F32 map onto the scalar-lane register model; block the rest.
     let data_type = bits(word, 42, 40);
     let is_float = data_type == 4 || data_type == 5;
-    if !is_float {
+    // The byte form reads and writes RAW lanes, so its data type selects nothing this has to
+    // represent - see the `byte_cond` note above. Every other non-float form still blocks.
+    if !is_float && !byte_cond {
         blocked = blocked.or(Some("0x38 non-float (integer/C10) move not modeled in scalar-lane register file"));
     }
     // Extended-bank rows for the DESTINATION (bit 51) and, in the conditional form, src0
@@ -2135,7 +2987,12 @@ fn decode_grp_38(word: u64, _hi: u32, _lo: u32) -> Instr {
 
     // Destination op0: 2-bit bank + R6 number (with reserved top-of-temp internal range).
     let op0_sel = bits(word, 33, 32) as u8;
-    let dest = match r6_dest_bank_index(op0_sel, bits(word, 23, 18)) {
+    let dest_lookup = if byte_cond {
+        bank_rsi2(op0_sel).map(|b| (b, bits(word, 23, 18) as u8))
+    } else {
+        r6_dest_bank_index(op0_sel, bits(word, 23, 18))
+    };
+    let dest = match dest_lookup {
         Some((b, idx)) => Some(Operand::plain(b, idx, op0_sel)),
         None => {
             blocked = blocked.or(Some("dest operand in index mode"));
@@ -2150,21 +3007,46 @@ fn decode_grp_38(word: u64, _hi: u32, _lo: u32) -> Instr {
     // 10 = immediate (IMM6), 11 = index2 (RIO6). Only the constant mode is resolvable from clean
     // facts (the CNST6 table, exactly as the group 0x00 constant operand is handled); the RIO6/
     // IMM6 addressing modes are not modeled and stay blocked.
+    //
+    // >>> AND THE OTHER THREE ROWS ARE THE SAME THREE ROWS EVERY OTHER GROUP READS. This used
+    // to decode the constant row by hand and refuse the rest, which was a statement about this
+    // DECODER rather than about the encoding: [`ext_source_r6`] already resolves the extension
+    // row of a SIX-BIT R6 field - the field this group has - and the pack group reads its own
+    // src1 through it. Wiring it here is not a new reading of anything.
+    //
+    //   * INDEXED1 / INDEXED2 (selectors 0 and 3) are register-INDIRECT reads through `idx[n]`,
+    //     the number doubled exactly as an R6 register number is. A football title's vertex
+    //     programs put one DIRECTLY AFTER the `LoadIndex` that sets the register: `#13
+    //     idx[0] = (pa[0] + 24) * 2`, `#14 mov o[6].y <- <index1, field 54>`. The two cannot be
+    //     read apart, and field 54 doubled is 108, which splits into SECATTR + offset 12 - a
+    //     register inside the program's own declared uniform block, which the linker checks.
+    //   * IMMEDIATE (selector 2) is a scalar literal whose NUMBER IS THE VALUE, typed per the
+    //     operand's data type (spec A.7, and `src_channel` already emits it that way for the
+    //     groups that carry one). Not doubled - an extension-row constant never is.
+    //
+    // The indexed rows carry NO swizzle: their components are consecutive, which is the same
+    // rule the pack group applies to the same row [[vitaslop-an-indexed-source-carries-no-swizzle]].
     let src1_sel = bits(word, 31, 30) as u8;
     let src1_ext = bits(word, 49, 49) != 0;
     let s1 = if src1_ext {
-        if src1_sel & 3 == 0b01 {
-            // CNST6 constant: op1 (bits 11:6) is the 6-bit constant selector; the operand's
-            // swizzle still selects the constant bank per channel, so it is carried through.
-            let mut o = Operand::plain(Bank::Constant, (bits(word, 11, 6) & 0x3f) as u8, src1_sel);
-            if is_float {
-                o.swizzle = VEC4_STD_SWIZZLE[bits(word, 38, 35) as usize];
-            }
-            o
+        let field = bits(word, 11, 6);
+        let mut o = if src1_sel & 3 == 2 {
+            Operand::plain(Bank::Immediate, (field & 0x3f) as u8, src1_sel)
         } else {
-            blocked = blocked.or(Some("0x38 src1 extended bank (index1/immediate/index2) not modeled"));
-            Operand::plain(Bank::Temp, 0, src1_sel) // placeholder; the instruction is blocked
+            match ext_source_r6(src1_sel, field) {
+                Ok(o) => o,
+                Err(why) => {
+                    blocked = blocked.or(Some(why));
+                    Operand::plain(Bank::Temp, 0, src1_sel)
+                }
+            }
+        };
+        if is_float && o.bank != Bank::Indexed {
+            o.swizzle = VEC4_STD_SWIZZLE[bits(word, 38, 35) as usize];
         }
+        o
+    } else if byte_cond {
+        Operand::plain(bank_rs2(src1_sel), bits(word, 11, 6) as u8, src1_sel)
     } else {
         let (b1, i1) = r6_source_bank_index(src1_sel, bits(word, 11, 6));
         let mut o = Operand::plain(b1, i1, src1_sel);
@@ -2174,7 +3056,7 @@ fn decode_grp_38(word: u64, _hi: u32, _lo: u32) -> Instr {
         o
     };
 
-    let (op, srcs) = if conditional {
+    let (op, srcs) = if conditional || byte_cond {
         // VMOVC: dest.c = compare(src0.c, 0) ? src1.c : src2.c.
         let test = match (bits(word, 54, 54) << 1) | bits(word, 39, 39) {
             0 => CompareMethod::EqZero,
@@ -2188,7 +3070,9 @@ fn decode_grp_38(word: u64, _hi: u32, _lo: u32) -> Instr {
         let src0_sel = bits(word, 34, 34);
         let src0_n = bits(word, 17, 12);
         let src0_bank = if src0_sel == 0 { Bank::Temp } else { Bank::PrimaryAttr };
-        let (b0, i0) = if matches!(src0_bank, Bank::Temp) && (60..=63).contains(&src0_n) {
+        let (b0, i0) = if byte_cond {
+            (src0_bank, src0_n as u8)
+        } else if matches!(src0_bank, Bank::Temp) && (60..=63).contains(&src0_n) {
             (Bank::Internal, internal_base(src0_n - 60))
         } else {
             (src0_bank, reg_index(src0_n))
@@ -2212,12 +3096,17 @@ fn decode_grp_38(word: u64, _hi: u32, _lo: u32) -> Instr {
                     Operand::plain(Bank::Temp, 0, src2_sel)
                 }
             }
+        } else if byte_cond {
+            Operand::plain(bank_rs2(src2_sel), bits(word, 5, 0) as u8, src2_sel)
         } else {
             let (b2, i2) = r6_source_bank_index(src2_sel, bits(word, 5, 0));
             Operand::plain(b2, i2, src2_sel)
         };
-        s2.swizzle = s1.swizzle;
-        (Op::Cmov { test }, vec![s1, s2, s0])
+        if !byte_cond {
+            s2.swizzle = s1.swizzle;
+        }
+        let op = if byte_cond { Op::CmovU8 { test } } else { Op::Cmov { test } };
+        (op, vec![s1, s2, s0])
     } else {
         (Op::Mov, vec![s1])
     };
@@ -2226,7 +3115,11 @@ fn decode_grp_38(word: u64, _hi: u32, _lo: u32) -> Instr {
         op,
         pred: ext_predicate(predicate_raw),
         dest,
-        write_mask: write_mask_f16(bits(word, 27, 24), dest.as_ref(), data_type == 4),
+        write_mask: if byte_cond {
+            write_mask4(bits(word, 27, 24))
+        } else {
+            write_mask_f16(bits(word, 27, 24), dest.as_ref(), data_type == 4)
+        },
         srcs,
         half_precision: data_type == 4,
         raw: word,
@@ -2250,7 +3143,7 @@ fn decode_grp_38(word: u64, _hi: u32, _lo: u32) -> Instr {
 fn decode_grp_bitwise(word: u64, op1: u8) -> Instr {
     use crate::ir::BitwiseKind::*;
     let op2 = bits(word, 35, 35);
-    let kind = match (op1 & 0b111, op2) {
+    let mut kind = match (op1 & 0b111, op2) {
         (0b010, 0) => And,
         (0b010, _) => Or,
         (0b011, _) => Xor,
@@ -2334,18 +3227,55 @@ fn decode_grp_bitwise(word: u64, op1: u8) -> Instr {
     let src2_sel = bits(word, 29, 28);
     let src2_ext = bits(word, 48, 48) != 0;
     let src2_imm = src2_ext && src2_sel == 2;
-    if src1_imm.is_some() && src2_imm {
-        blocked = blocked.or(Some("0x50 with BOTH sources immediate - the two would assemble                                    different values out of one shared field pair"));
+    // >>> BOTH SOURCES IMMEDIATE IS THE USSE'S LOAD-IMMEDIATE, NOT AN AMBIGUITY.
+    //
+    // The two immediates share the high field pair (20:14 and 37:36) and take their low seven
+    // bits from their OWN register field, so they are two different constants - which is
+    // exactly what the operation then combines. `or dst, #imm, #0` is how this ISA spells
+    // "put a constant in an integer register": there is no integer move, and 15 of the 16
+    // occurrences in one title's corpus are literally `or dst, #0, #0`, a register clear whose
+    // value is 0 under any reading of the fields at all.
+    //
+    // The sixteenth pins the reading. It is `or o[5], #0x40, #0` in a SKINNING vertex program,
+    // and the byte offset it builds indexes `UVP_SkinningMatrix` - declared in that program's
+    // own parameter table as 236 vec4s, i.e. 3776 bytes. The competing reading (one immediate
+    // assembled from BOTH seven-bit fields) gives 0x2000 = 8192, which is outside the buffer
+    // the program declares. 0x40 is inside it. The parameter table decides it, not a picture.
+    //
+    // Only for the COMMUTATIVE members: a shift whose shifted value is an immediate is a
+    // different question and is refused just below, as it already was.
+    let both_imm = src1_imm.is_some() && src2_imm;
+    if both_imm && !matches!(kind, And | Or | Xor) {
+        blocked = blocked.or(Some("0x50 with BOTH sources immediate on a shift - operand order not established"));
     }
     // The emitter puts `srcs[0]` on the LEFT and the immediate on the right, so a `src1`
     // immediate can only be expressed by swapping - which is exact for the commutative members
     // and wrong for a shift. A shift whose SHIFTED value is the immediate is not observed and
     // is blocked rather than silently reversed.
     if src1_imm.is_some() && !matches!(kind, And | Or | Xor) {
-        blocked = blocked.or(Some("0x50 non-commutative member (shift/rotate) with an                                    IMMEDIATE first source - operand order not established"));
+        blocked = blocked.or(Some("0x50 non-commutative member (shift/rotate) with an IMMEDIATE first source - operand order not established"));
     }
     let mut srcs = Vec::new();
-    let imm = if let Some(v) = src1_imm {
+    let imm = if both_imm {
+        // Both constants: the left one rides in on a hardware-constant operand whose table
+        // entry is exactly zero (`CNST6` index 0), so the emitter's own raw-u32 path
+        // materialises `0u` there and the folded value is the whole instruction. Folding into
+        // ONE constant instead would need an integer load-immediate the IR does not have, and
+        // inventing one to express `x OP 0` is a bigger change than using the zero the
+        // constant table already provides.
+        srcs.push(Operand::plain(Bank::Constant, 0, 0));
+        let (a, b) = (src1_imm.unwrap_or(0), assemble_imm(bits(word, 6, 0)));
+        let folded = match kind {
+            And => a & b,
+            Or => a | b,
+            Xor => a ^ b,
+            _ => a,
+        };
+        // The OPERATION becomes OR, because the left operand is now the constant table's
+        // zero: `0 | folded` is `folded`, while `0 & folded` would be zero for every AND.
+        kind = Or;
+        Some(folded)
+    } else if let Some(v) = src1_imm {
         // The register operand becomes the left-hand side; the immediate is the right.
         if src2_ext {
             blocked = blocked.or(Some("0x50 src2 extended bank (special/indexed) not modeled"));
@@ -2382,60 +3312,252 @@ fn decode_grp_bitwise(word: u64, op1: u8) -> Instr {
     }
 }
 
-/// The one group-0x14 (I16MAD) encoding this corpus establishes, with the register-number
-/// field [17:14] masked out.
+/// The group-0x14 (I16MAD) index-load encoding, with every field the corpus can read masked
+/// out: the register-number field [17:14], the ADDEND [6:0], and bit 54.
 ///
-/// Every bit outside [17:14] is CONSTANT across every occurrence of the group in three titles,
-/// so the corpus can say nothing about what those bits mean. Matching the whole word is
-/// therefore not paranoia, it is the exact limit of the evidence: a different group-0x14
-/// instruction is a different instruction, and must hard-fail rather than be decoded by a rule
-/// that was only ever fitted to this one.
-const I16MAD_LOAD_INDEX_WORD: u64 = 0xa08b_0946_a020_0088;
+/// Every remaining bit is CONSTANT across every occurrence of the group in four titles, so the
+/// corpus can say nothing about what those bits mean. Matching them all is therefore not
+/// paranoia, it is the exact limit of the evidence: a group-0x14 word that differs anywhere
+/// else is a different instruction and must hard-fail rather than be decoded by a rule that was
+/// only ever fitted to this one.
+const I16MAD_LOAD_INDEX_WORD: u64 = 0xa08b_0946_a020_0080;
 
-/// How much the [`I16MAD_LOAD_INDEX_WORD`] encoding adds to its source on the way into the
-/// index register.
+/// The fields of [`I16MAD_LOAD_INDEX_WORD`] that may vary: the source register [17:14], the
+/// addend [6:0], bit 54, and - added once a fourth title's corpus was large enough to say so -
+/// bits 51 and 8, [45], [34:33], [25:21] and [19:18].
 ///
-/// This is NOT decoded - no bit of the instruction varies, so there is nothing to decode it
-/// from. It is fixed by ARITHMETIC CLOSURE against the container's own parameter table, and the
-/// closure is exact. In the one shader that uses it, the six source registers hold `2*k` for
-/// `k = 6*offsetIndices.x + p`, the indexed read that follows is `SA[i0 + 14 + r]` over two
-/// repeat iterations, and the parameter table puts `sampleOffsets` (F32[2] x 36) at resource
-/// index 22 - independently corroborated by `worldViewProj` at 0, `texCoord2offset` at 16 and
-/// `posOffset` at 18, each confirmed against the instruction that reads it. `2*k + 8 + 14`
-/// is `SA[22 + 2k]` and `SA[23 + 2k]`, which is exactly `sampleOffsets[k].xy`. No other addend
-/// lands on the array at all.
+/// >>> THE ADDED FIELDS ARE MEASURED NOT TO FEED THE INDEX, BY A CLOSURE OVER 131 GROUPS.
 ///
-/// The corpus cannot say whether the 8 belongs to this instruction or to the indexed
-/// addressing; it does not matter, because the two only ever appear together, and the pairing
-/// is what is measured.
-const I16MAD_LOAD_INDEX_ADDEND: i32 = 8;
+/// A football title's skinning is the case that supplies them: 51 vertex programs, 118 distinct
+/// group-0x14 words, each a `LoadIndex ; IntMad ; MemLoad` triple that reads one row of a
+/// `g_aMatrixPalette` bone matrix (`F32[4] x 152`, three registers a bone) off `IN.blendIndices`.
+/// The ADDEND is therefore the matrix ROW, and two loads of the same addend in one program MUST
+/// land on the same row whichever bone they are for.
+///
+/// Group the corpus's occurrences by (program, addend) and 131 groups have two or more members.
+/// **Bits [25:21], [19:18], [34:33] and 45 all VARY INSIDE such a group**, so none of them can
+/// contribute to the index value - if any did, the two bones' row-1 loads could not both be
+/// row 1. (Read off one program directly: `#46` and `#49` are both addend 1, for source
+/// registers 3 and 4, and differ in [25:21] alone - 1 against 2.)
+///
+/// Bits 51 and 8 are ONE FIELD, not two: over 118 distinct words they are perfectly
+/// ANTI-CORRELATED, `(b8,b51) = (1,0)` on 112 and `(0,1)` on 6, with no other combination. The
+/// six are the `0xa08b`/`0xa0cb` forms - the SAME MODE [`I16MAD_LOAD_INDEX_WORD`] itself is in -
+/// and they carry the large addends that index an SA table (49, 44, 45, 11, 24, 30) while the
+/// 112 carry the 0/1/2 of a matrix row. So the flag distinguishes what CONSUMES the index (an
+/// indexed SA read against a `MemLoad`), which is decoded from the consuming instruction and
+/// not from this one, and the index value is `src + addend` under both.
+///
+/// The arithmetic closes the way [`i16mad_addend`]'s did: three consecutive registers per bone
+/// against addends that are exactly 0, 1 and 2. A hidden multiplier in any of these fields would
+/// have produced rows 0, 3, 6 instead.
+const I16MAD_LOAD_INDEX_VARIABLE: u64 = (0xf << 14)
+    | 0x7f
+    | (1 << 54)
+    | (1 << 51)
+    | (1 << 45)
+    | (0b11 << 33)
+    | (0x1f << 21)
+    | (0b11 << 18)
+    | (1 << 8);
+
+/// Whether `word` is the index-load encoding, comparing only the bits outside
+/// [`I16MAD_LOAD_INDEX_VARIABLE`].
+///
+/// >>> BOTH SIDES ARE MASKED, AND THAT IS NOT COSMETIC.
+///
+/// This was written as `word & !VARIABLE == I16MAD_LOAD_INDEX_WORD`, which is only correct while
+/// the template holds ZERO in every variable position. It did when the mask was three fields;
+/// the template has [25:21] = 1 and bit 51 set, so the moment those became variable that form
+/// rejected the template itself. Masking both sides says what is meant at any mask.
+fn i16mad_is_load_index(word: u64) -> bool {
+    word & !I16MAD_LOAD_INDEX_VARIABLE == I16MAD_LOAD_INDEX_WORD & !I16MAD_LOAD_INDEX_VARIABLE
+}
+
+/// The index-load TEMPLATE and the mask of its variable fields, for the assembler.
+///
+/// Group 0x14's encoding is not in any ISA reference this project works from - the corpus is
+/// the whole authority, and it establishes ONE encoding with a handful of fields that vary.
+/// An assembler for it therefore cannot build a word from field definitions; it can only start
+/// from the established word and change what the corpus proved may change. Handing out the
+/// template and the mask says exactly that, and keeps the one statement of both in the decoder.
+pub(crate) fn i16mad_load_index_template() -> (u64, u64) {
+    (I16MAD_LOAD_INDEX_WORD, I16MAD_LOAD_INDEX_VARIABLE)
+}
+
+/// >>> THE FRAGMENT-PIPELINE MEMBERS OF GROUP 0xF8, AS TEMPLATES AN ASSEMBLER CAN VARY.
+///
+/// The two members with a real fragment effect - KILL and DEPTHF - are the one part of the
+/// render rig that NO corpus program exercises end to end. 29 corpus blobs carry a `kill` and
+/// all 29 are alpha tests; not one writes a fragment depth, so `DepthF`'s reference arm and the
+/// rig's depth capture are checked by a Rust test and by nothing on the GPU at all. An AUTHORED
+/// case closes that, and an authored case needs an encoder.
+///
+/// Each is given as the REAL CORPUS WORD plus a mask of the bits an assembler may change, for
+/// the same reason [`i16mad_load_index_template`] is: every bit outside the mask is CONSTANT
+/// wherever the member occurs, so the corpus can say nothing about what those bits mean, and
+/// starting from the word that shipped is the exact limit of the evidence. A word that differed
+/// elsewhere would be a different instruction.
+///
+/// KILL's variable field is its OWN 2-bit predicate at [42:41] - the group's ordinary
+/// ExtPredicate slot is not what a KILL reads; see `decode_grp_flow`, and the alpha-test
+/// closure that settles which ordering it uses.
+const KILL_WORD: u64 = 0xf930_0406_f000_070e;
+const KILL_VARIABLE: u64 = 0b11 << 41;
+
+/// DEPTHF's variable fields are its single source operand: the bank selector at [36], its
+/// extension bit at [51], and the register number at [20:14] - read DIRECT, not
+/// double-register scaled, because this group carries no data-type field to select a scaling.
+const DEPTHF_WORD: u64 = 0xfb30_0000_f000_0183;
+const DEPTHF_VARIABLE: u64 = (1 << 36) | (1 << 51) | (0x7f << 14);
+
+/// The KILL encoding: the shipped word, and the bits an assembler may vary.
+pub(crate) fn kill_template() -> (u64, u64) {
+    (KILL_WORD, KILL_VARIABLE)
+}
+
+/// The DEPTHF encoding: the shipped word, and the bits an assembler may vary.
+pub(crate) fn depthf_template() -> (u64, u64) {
+    (DEPTHF_WORD, DEPTHF_VARIABLE)
+}
+
+/// The addend the index-load encoding adds to its source on the way into the index register:
+/// bits [6:0].
+///
+/// >>> THE POSITION OF THIS FIELD IS MEASURED, AND IT WAS A CONSTANT BEFORE IT WAS A FIELD.
+///
+/// It began as a hardcoded `8`, fixed by ARITHMETIC CLOSURE against one title's parameter
+/// table because no bit of the instruction varied in that corpus: the six source registers hold
+/// `2*k`, the indexed read that follows is `SA[i0 + 14 + r]` over two repeat iterations, and
+/// the parameter table puts `sampleOffsets` (F32[2] x 36) at resource index 22 - corroborated
+/// by `worldViewProj` at 0, `texCoord2offset` at 16 and `posOffset` at 18, each confirmed
+/// against the instruction that reads it. `2*k + 8 + 14` is `SA[22 + 2k]` and `SA[23 + 2k]`,
+/// exactly `sampleOffsets[k].xy`, and no other addend lands on the array at all.
+///
+/// A fourth title then supplied group-0x14 words whose ONLY difference outside the register
+/// field is this low byte, and its value closes the same way in the programs that carry it:
+///
+///  * A particle-sprite vertex program loads the index from `2 * CornerIndex` (a
+///    `PackToInt16` of the attribute followed by a 16-bit shift left) and immediately reads
+///    `SA[i0 + 14]` and `SA[i0 + 15]` into two output lanes - a per-corner float2. Its low byte
+///    is `0x24` = 36, which places the four entries at `SA[50..57]`, the last eight registers of
+///    its DATA container (base 32, size 26, so 32..57) - a four-entry float2 table ending
+///    exactly on the container's last register. The old constant 8 would have placed it at
+///    `SA[22..29]`, inside `CameraRight`/`CameraUp`/`ScreenAlignment`, which are float4 uniforms
+///    the same program reads by name elsewhere.
+///  * The word the original closure fixed reads 8 in these bits, which is the value that
+///    closure produced. A field position that reproduces an independently derived constant and
+///    also lands a second title's table on its container boundary is measured, not fitted.
+fn i16mad_addend(word: u64) -> i32 {
+    bits(word, 6, 0) as i32
+}
 
 /// Decode a group-0x14 (I16MAD) instruction.
 ///
 /// The ISA reference this project works from does not carry this group's encoding - it is
-/// listed among its own open questions - so the only authority is the corpus, and the corpus is
-/// narrow: six occurrences, one program, three titles, and the only bits that ever vary are
-/// [17:14]. What those six instructions DO is settled instead by what surrounds them: each
-/// loads one of six computed array indices, and each is immediately followed by a
-/// register-indirect read that uses index register 0. See [`I16MAD_LOAD_INDEX_ADDEND`].
+/// listed among its own open questions - so the only authority is the corpus. What these
+/// instructions DO is settled by what surrounds them: each loads a computed array index, and
+/// each is immediately followed by a register-indirect read that uses index register 0. The
+/// source register is [17:14] and the addend is [6:0] (see [`i16mad_addend`]).
+///
+/// >>> BIT 54 IS ALLOWED TO VARY AND ITS MEANING IS NOT KNOWN.
+///
+/// Two vertex programs of the same title carry this instruction in an IDENTICAL setting: the
+/// same `PackToInt16` plus 16-bit shift feeding it, the same addend, the same pair of
+/// register-indirect reads of `SA[i0 + 14]` and `SA[i0 + 15]` into the same two output lanes,
+/// and the same container layout underneath. They differ in bit 54 and in the source register
+/// number, and in nothing else. So bit 54 does not change what this instruction computes here,
+/// and that is measured - from a pair that holds everything else fixed - rather than assumed.
+/// What it would mean on some other encoding is not something this corpus can say, so every
+/// other bit still has to match and a word that differs anywhere else hard-fails.
 fn decode_grp_i16mad(word: u64) -> Instr {
-    const REG_FIELD: u64 = 0xf << 14;
     let mut blocked = None;
-    if word & !REG_FIELD != I16MAD_LOAD_INDEX_WORD {
+    if !i16mad_is_load_index(word) {
         blocked = Some(
-            "0x14 I16MAD: only the one encoding the corpus establishes (an index-register load) \
-             is modeled - this is a different one, and its fields are not decodable from the \
-             corpus",
+            "0x14 I16MAD: only the index-register load the corpus establishes is modeled - this is a different encoding, and its fields are not decodable from the corpus",
         );
     }
-    let src_n = bits(word, 17, 14) as u8;
+    // >>> THE `(b8, b51)` FLAG SAYS WHERE THE SUM GOES, AND ONE OF THE TWO ANSWERS IS NOT AN
+    // >>> INDEX REGISTER AT ALL.
+    //
+    // The flag was already known to be one field (perfectly anti-correlated over 118 words) and
+    // was read as naming only what CONSUMES the index. It names the DESTINATION:
+    //
+    //   * `(b8,b51) = (0,1)` - the form [`I16MAD_LOAD_INDEX_WORD`] itself is in, the particle
+    //     title's, whose consumer is an INDEXED SA READ. It writes the index register, and
+    //     nothing here changes for it.
+    //   * `(b8,b51) = (1,0)` - a football title's skinning, 400 words, whose consumer is the
+    //     `IntMad ; MemLoad` pair directly below. It writes an ORDINARY REGISTER.
+    //
+    // THREE INDEPENDENT CLOSURES SAY SO, and the defect they explain is that the index register
+    // was written and NOTHING READ IT: 42 of that title's 54 programs with an index load had
+    // ZERO indexed reads (`load_index_whose_index_register_nothing_reads`), so every one of its
+    // skinned meshes computed its bone address from whatever register the consumer's `src0`
+    // field happened to name. That is the shattered players.
+    //
+    //   1. DESTINATION. `[25:21]` equals the consuming IMAD32's `src0` register on **398 of
+    //      399** pairs, and bit 33 maps to its bank on all of them under the same one-bit table
+    //      (0 -> TEMP, 1 -> PRIMATTR) that group 0x15 uses for `src0` itself
+    //      (`the_index_load_destination_against_its_consumer`). `[25:21]` was already known to
+    //      vary inside one (program, addend) group, which is why it could not feed the index -
+    //      it is the register being written.
+    //   2. SOURCE. The number is SIX bits, `[19:14]`, with bit 34 for its bank on the same
+    //      table - not a four-bit number under a `[19:18]` bank. Over all 400 words the six-bit
+    //      reading names a register an earlier instruction WROTE every time; the old reading
+    //      fails 17 (`index_load_source_readings_against_what_the_program_wrote`).
+    //   3. ONE PROGRAM END TO END. `vert_90aa68a0` packs four blend indices as int16 pairs into
+    //      `r[17]`/`r[18]` and extracts the two high halves into `r[15]`/`r[16]`, so its four
+    //      bone indices sit in the low halves of r15, r16, r17, r18 - and its four index loads
+    //      name 15, 18, 16, 17 under the six-bit reading. Under the old one they name Temp 15
+    //      and OUTPUT 0, 1, 2, three registers nothing has written at that point in the stream.
+    //
+    // The index-register form's `* 2` PAIR SCALE does not come with it: that scale is a
+    // property of addressing the register file indirectly, and this form addresses nothing -
+    // its sum is an integer the IMAD32 below multiplies by the palette's row stride.
+    let to_index = bits(word, 51, 51) != 0 || !crate::link::arm_on(crate::link::IDX_REGDEST_ARM);
+    // The one-bit bank table group 0x15 uses for its own `src0`, which is the operand this
+    // instruction's destination becomes.
+    let bank1 = |sel: u32| if sel == 0 { Bank::Temp } else { Bank::PrimaryAttr };
+    let (dest, srcs) = if to_index {
+        // >>> THE SOURCE IS THE SAME SIX-BIT FIELD, UNDER THE SAME BANK BIT, IN BOTH FORMS.
+        //
+        // Closure 2 above established `[19:14]` with bit 34 for its bank over the 400 words of
+        // the ORDINARY-REGISTER form, and this branch kept the older four-bit `[17:14]` with the
+        // bank HARDCODED to PrimaryAttr. One instruction encoding cannot address its source two
+        // ways, and the corpus says which: on every one of the seven index-register words the
+        // decode tests pin, bits [19:18] are 0 and bit 34 is 1, so the six-bit reading returns
+        // exactly the register the old one did - the change is STRICTLY ADDITIVE there.
+        //
+        // What it is not inert on is a football title's STADIUM CROWD (`vert_90b70dc0` and its
+        // family), whose word differs from those seven in bit 34 ALONE (`0xa08b_0942_...`
+        // against `0xa08b_0946_...`). Under the old reading it indexed the table with
+        // `PrimaryAttr[0]` - the raw bits of a F16 POSITION - which lands past the end of every
+        // bank and clamps to a register nothing wrote, so the scale it reads back is ZERO and
+        // every fan collapses to a degenerate quad: 23 draws and 59,202 indices that rasterise
+        // NOTHING, measured by `VITASLOP_GXM_DRAW_COVERAGE`, and empty grey seating on screen.
+        // Under this reading the source is `Temp[0]`, which the instruction immediately above
+        // writes with the section index - and which, under the old reading, NOTHING READ. That
+        // dead computed index is the same tell that named the destination field.
+        let src_n = bits(word, 19, 14) as u8;
+        let sbank = bank1(bits(word, 34, 34));
+        (
+            // Index register 0: the read that consumes it is INDEXED1, whose index register is i0.
+            Operand::plain(Bank::Index, 0, 0),
+            vec![Operand::plain(sbank, src_n, bits(word, 34, 34) as u8 * 2)],
+        )
+    } else {
+        let (dsel, ssel) = (bits(word, 33, 33), bits(word, 34, 34));
+        (
+            Operand::plain(bank1(dsel), bits(word, 25, 21) as u8, dsel as u8),
+            vec![Operand::plain(bank1(ssel), bits(word, 19, 14) as u8, ssel as u8)],
+        )
+    };
     Instr {
-        op: Op::LoadIndex { addend: I16MAD_LOAD_INDEX_ADDEND },
+        op: Op::LoadIndex { addend: i16mad_addend(word), to_index, stride: 1 },
         pred: Predicate::Always,
-        // Index register 0: the read that consumes it is INDEXED1, whose index register is i0.
-        dest: Some(Operand::plain(Bank::Index, 0, 0)),
+        dest: Some(dest),
         write_mask: [true, false, false, false],
-        srcs: vec![Operand::plain(Bank::PrimaryAttr, src_n, 2)],
+        srcs,
         half_precision: false,
         raw: word,
         group: 0x14,
@@ -2499,9 +3621,16 @@ fn decode_grp_imad32(word: u64) -> Instr {
     if bits(word, 42, 42) != 0 {
         block("0x15 IMAD32: the saturating form - the clamping rule is not established");
     }
-    if bits(word, 46, 44) != 0 {
-        block("0x15 IMAD32: a repeat count above zero - which operands a repeat increments is \
-               not established for this group");
+    // >>> A REPEAT COUNT IS NO LONGER REFUSED HERE. It blocked with "which operands a repeat
+    // increments is not established for this group"; a football title's own repeating IMAD32
+    // establishes all four steps from what the program does with the results, and
+    // `repeat_operands` carries that evidence. What it cannot establish is the SLOT NUMBERING,
+    // so `unroll_repeats` refuses any state that could tell the candidates apart, and the
+    // grammar only covers the inline-immediate `src1` form.
+    if bits(word, 46, 44) != 0 && !imad32_src1_is_inline_immediate(word) {
+        block(
+            "0x15 IMAD32 repeat whose src1 is a REGISTER: the repeat grammar is established only              for the inline-immediate form, where there is no register field under src1 to step",
+        );
     }
     let signed = bits(word, 43, 43) != 0;
     if bits(word, 39, 38) != 2 {
@@ -2523,6 +3652,36 @@ fn decode_grp_imad32(word: u64) -> Instr {
             }
         }
     };
+
+    // >>> `src0_high` (bit 56) SELECTS A 16-BIT HALF OF src0, and src0 is always half of a
+    // packed pair. See `Op::IntMad`: across five titles' corpora every IMAD32's src0 register
+    // is one a 16-bit PACK wrote, and this bit is what picks one of the two values back out.
+    // The skinned meshes are the closure - four blend indices go into two registers as four
+    // halves, and four IMAD32s read them back as (lo, hi, lo, hi) to fetch four bone matrices.
+    // Ignoring it made all four read whole registers, so the four fetches became two, each
+    // taken twice: the mesh blended the wrong bones and collapsed.
+    let src0_high = bits(word, 56, 56) != 0;
+    // >>> `src1_high` (bit 53) IS THE SAME SELECTOR ON THE SIBLING OPERAND, and this title's
+    // skinned vertex programs are what establish it. It was zero on every word of five
+    // corpora, so it blocked by name; a sixth title sets it, and refusing dropped every
+    // skinned mesh in that title.
+    //
+    // The program says what it is. `pa[5]` is set to 64 by an immediate OR just above (a 4x4
+    // bone matrix is 64 bytes), `pa[3]` is written by a 16-bit PACK of the `Index` vertex
+    // attribute, and `sa[9]` holds the matrix buffer's base - so the instruction is
+    // `addr = STRIDE * bone_index + base`, and the operand that must be read a HALF at a time
+    // is the packed INDEX PAIR, which is `src1` here and not `src0`. Which operand the ISA
+    // calls src0 is an encoding detail; the packed pair is wherever the compiler put it, and
+    // the half-select rides on the operand that holds it.
+    //
+    // A CLEAR bit still reads the whole 32-bit register, which is what every previously
+    // recompiling program did, so nothing that worked before changes. The two readings agree
+    // on every value any corpus program puts through here anyway - a bone index is small and
+    // its packed sibling is in the other half.
+    let src1_high = bits(word, 53, 53) != 0;
+    if bits(word, 52, 52) != 0 {
+        block("0x15 IMAD32: src2_high (bit 52) is set - no corpus word establishes what a half-selected src2 means here");
+    }
 
     // src0: a ONE-bit bank selector with its own table and no extension bit.
     let src0_sel = bits(word, 34, 34) as u8;
@@ -2554,7 +3713,7 @@ fn decode_grp_imad32(word: u64) -> Instr {
         // A blocked destination still has to produce a well-formed instruction for the
         // listing; the block above is what stops it being emitted.
         return Instr {
-            op: Op::IntMad { signed, bits: 32 },
+            op: Op::IntMad { signed, bits: 32, src0_high, src1_high },
             pred: short_predicate(bits(word, 58, 57)),
             dest: None,
             write_mask: [true, false, false, false],
@@ -2567,7 +3726,7 @@ fn decode_grp_imad32(word: u64) -> Instr {
     }
 
     Instr {
-        op: Op::IntMad { signed, bits: 32 },
+        op: Op::IntMad { signed, bits: 32, src0_high, src1_high },
         pred: short_predicate(bits(word, 58, 57)),
         dest,
         // Scalar: this group carries no write mask, so it writes the one word it names.
@@ -2681,13 +3840,31 @@ fn decode_grp_imad32_step(word: u64) -> Instr {
              not established for this group",
         );
     }
+    // >>> THE SIGNED FORM IS EMITTED, AND THE SIGN RULE DOES NOT HAVE TO BE ESTABLISHED.
+    //
+    // This blocked with "which of the two steps carries the sign of src0 is not established, and
+    // no word in the corpus is signed". The second half of that premise died when a football
+    // title's corpus arrived: 20 of its 126 group-0x1a occurrences set bit 41. The first half
+    // turns out not to matter, for two independent reasons.
+    //
+    // ARITHMETIC. A pair emits, in u32 wrapping arithmetic,
+    // `((x >> 16) * y) << 16 + (x & 0xffff) * y + src2`, and the `<< 16` discards everything the
+    // high product carries above bit 15, so that sum is exactly `x * y + src2` modulo 2^32.
+    // Two's-complement multiplication agrees on the LOW 32 BITS whether its operands are read as
+    // signed or unsigned, so the value the PAIR produces is the same under either reading - and
+    // the pair's net value is the only thing `validate_imad_step_pairs` lets this group emit.
+    //
+    // CORPUS. In every one of the 10 signed pairs, across 6 programs, the guest MASKS `src0`
+    // WITH `& 0xffff` one to four instructions earlier (`vert_90b2d9c0` #3 against the pair at
+    // #6/#7, `vert_8e97f0e0` #2 against #3/#4, and so on). A value the program has just reduced
+    // to 16 unsigned bits has a ZERO high half, so the high step contributes nothing and the low
+    // step is the whole product - on every word that exists the sign question is not merely
+    // confined, it is vacuous.
+    //
+    // All 57 well-formed pairs AGREE on bit 41 across both steps, so the flag is a property of
+    // the PAIR rather than of one half of it - which is what "which of the two steps carries
+    // the sign" was really asking, and the answer is "both, always".
     let signed = bits(word, 41, 41) != 0;
-    if signed {
-        block(
-            "0x1a IMAD32-STEP: the SIGNED form - which of the two steps carries the sign of src0 \
-             is not established, and no word in the corpus is signed",
-        );
-    }
     if bits(word, 40, 40) != 0 || bits(word, 39, 39) != 0 {
         block(
             "0x1a IMAD32-STEP: a negated source operand - the field is established but its \
@@ -2773,6 +3950,22 @@ fn decode_grp_imad32_step(word: u64) -> Instr {
 /// representation this model does not carry, so they are decoded but hard-fail BLOCKED
 /// (named) rather than guessed. src1 is double-register (float source), so the scalarised
 /// contiguous lanes naturally span the adjacent register a two-source gather would use.
+/// WHICH BIT OF A PACK WORD CARRIES COMP0'S HIGH SELECTOR BIT, for a source format.
+///
+/// Stated ONCE because both the decoder and [`crate::usse::asm::pack`] need it and a second
+/// transcription is how they came to disagree: the assembler wrote the bit at 1 for every
+/// non-F32 format while the decoder had moved format 3 to bit 7, so the assembler could not
+/// express `comp0` of 2 or 3 for a 16-bit source AT ALL - its own round-trip check refused
+/// every such word, which reads as "the encoding cannot say this" and is not what was wrong.
+/// Nothing caught it because no authored case had ever asked for that selector.
+///
+/// See the note in [`decode_grp_pack`] for how the assignment was measured over ten corpora.
+pub(crate) fn pack_comp0_high_bit(src_fmt: u32) -> u32 {
+    let from_bit7 =
+        src_fmt == 6 || (src_fmt == 3 && crate::link::arm_on(crate::link::PACK_COMP0_ARM));
+    if from_bit7 { 7 } else { 1 }
+}
+
 fn decode_grp_pack(word: u64) -> Instr {
     let src_fmt = bits(word, 43, 41);
     let dest_fmt = bits(word, 40, 38);
@@ -2797,6 +3990,47 @@ fn decode_grp_pack(word: u64) -> Instr {
     // an ARRAY INDEX in float and then indexing with it uses.
     let scale = bits(word, 18, 18) != 0;
     let float_to_int = is_float(src_fmt) && int_dest.is_some() && !scale;
+    // The mirror direction: an INTEGER source widened to a float destination, `scale` clear.
+    // Same reading as `float_to_int` - a plain numeric cast, not a normalize.
+    //
+    // >>> THE 8-BIT WIDTHS ARE IN, and what let them in was not a new rule but the model
+    // finding it already had the packing. This was restricted to 16 bits because "an 8-bit
+    // integer source would be a quarter of a register and no part of this model carries
+    // that" - which was wrong: `Instr::source_packed_bytes` has described an operand as four
+    // channels in ONE register since the `fx8` combiner ops needed it, and every span
+    // computation asks it. A football title's fragment secondaries read four selectors off
+    // ONE register and the primary stream dots the four results together, which is what
+    // establishes that a byte selector counts BYTES within the register rather than
+    // registers - see [`Op::PackFromInt`].
+    let int_src = match src_fmt {
+        0 => Some((8u8, false)),
+        1 => Some((8u8, true)),
+        3 => Some((16u8, false)),
+        4 => Some((16u8, true)),
+        _ => None,
+    };
+    let int_to_float = int_src.is_some() && is_float(dest_fmt) && !scale;
+    // An INTEGER OF THE SAME WIDTH on BOTH sides with `scale` clear converts nothing: it is a
+    // swizzled copy of elements, and the elements are the packing this model already carries at
+    // both ends (`Dest::store_raw_half` / `Dest::store_raw_byte` write one, `Op::PackFromInt`
+    // reads one). Signedness is not consulted because at equal widths the bit pattern does not
+    // depend on it. The 16-bit form is the single largest blocked pack word in one title's
+    // fragment corpus - NINE of its eleven distinct blocked words are `U16->U16 scale=0`, and
+    // nothing about them was ever unmodeled. The byte form is the same statement one width
+    // down, and the football title emits two of them (a byte broadcast, `sa[2]` bytes 1 and 2
+    // both from `sa[0]` byte 0).
+    //
+    // A MIXED width - U8 into U16, say - is NOT this: it is a widening convert, and which end
+    // of the destination element it lands in is not established. It stays blocked below.
+    let int_dest_width = match dest_fmt {
+        0 | 1 => Some(8u8),
+        3 | 4 => Some(16u8),
+        _ => None,
+    };
+    let int_copy = match (int_src, int_dest_width) {
+        (Some((sw, _)), Some(dw)) if sw == dw && !scale => Some(sw),
+        _ => None,
+    };
     // The NORMALIZED U8 conversions, both directions. U8 is format 0, and it is the one
     // normalized width this model can represent exactly: a register read and written as four
     // `byte/255` channels is `Prec::Fx8`, which already exists for the SOP2M combiner. So
@@ -2804,7 +4038,13 @@ fn decode_grp_pack(word: u64) -> Instr {
     // widths (S8/U16/S16) have no such representation and stay blocked below.
     let unorm8_from_float = scale && is_float(src_fmt) && dest_fmt == 0;
     let unorm8_to_float = scale && src_fmt == 0 && is_float(dest_fmt);
-    if (!is_float(src_fmt) || !is_float(dest_fmt)) && !float_to_int && !unorm8_from_float && !unorm8_to_float {
+    if (!is_float(src_fmt) || !is_float(dest_fmt))
+        && !float_to_int
+        && !int_to_float
+        && !unorm8_from_float
+        && !unorm8_to_float
+        && int_copy.is_none()
+    {
         blocked = blocked.or(Some("0x40 pack non-float<->float conversion (int-normalize / C10 / O8) not modeled"));
     }
     // A DESTINATION in an extended bank stays blocked: the extension row for a destination is
@@ -2844,9 +4084,13 @@ fn decode_grp_pack(word: u64) -> Instr {
     // signature of a CONSTANT rather than an offset into anything.
     let src1_ext = bits(word, 49, 49) != 0;
     let (b1, i1) = if src1_ext {
-        // The extended row's own number, undoubled - `ext_source` splits SPECIAL into
-        // FPCONSTANT/GLOBAL on bit 0x40 exactly as every other group's operands do.
-        match ext_source(src1_sel, bits(word, 13, 8), false) {
+        // The extended row's own number, undoubled for SPECIAL and IMMEDIATE - `ext_source`
+        // splits SPECIAL into FPCONSTANT/GLOBAL on bit 0x40 exactly as every other group's
+        // operands do. The two INDEXED rows ARE doubled, because a six-bit field cannot hold a
+        // seven-bit indexed number and an R6 operand's number is doubled anyway - see
+        // [`ext_source_r6`], and note that the same title reads the same array through the
+        // sibling DOT group's six-bit field and through a seven-bit VBW field, at one address.
+        match ext_source_r6(src1_sel, bits(word, 13, 8)) {
             Ok(o) => (o.bank, o.index),
             Err(why) => {
                 blocked = blocked.or(Some(why));
@@ -2856,13 +4100,99 @@ fn decode_grp_pack(word: u64) -> Instr {
     } else {
         r6_source_bank_index(src1_sel, bits(word, 13, 8))
     };
-    let comp0_hi = if src_fmt == 6 { bits(word, 7, 7) } else { bits(word, 1, 1) };
+    // >>> COMP0'S HIGH SELECTOR BIT IS BIT 7 FOR THE 16-BIT SOURCE FORMAT TOO, NOT JUST F32.
+    //
+    // It was bit 7 for `src_fmt == 6` and bit 1 for everything else, which left a 16-bit
+    // source's selector unable to reach components 2 and 3 at all - and a 16-bit operand's
+    // components 2 and 3 are the NEXT REGISTER's two halves, so the whole upper half of every
+    // such operand was unaddressable. A football title spends it:
+    //
+    //   `0x408106c421e00901`  ->  r[15].lo = r[18].hi    field 9, bit 7 clear, comp0 = 1
+    //   `0x408106c422000881`  ->  r[16].lo = r[1?].hi    field 8, bit 7 SET
+    //
+    // Two words of one program, identical but for bits 8 and 7 and the destination. The program
+    // packs four blend indices as int16 pairs into `r[17]`/`r[18]` and extracts the two HIGH
+    // halves so all four sit in a low half, so the second must read `r[17]` - which only
+    // comp0 = 3 reaches (field 8 -> register 16, component 3 -> register 17, high half). Under
+    // the old reading comp0 was 1 and it read `r[16]`, a register nothing in the program has
+    // written.
+    //
+    // WHICH BIT BELONGS TO WHICH FORMAT IS MEASURED, not assumed, over ten corpora
+    // (`pack_comp0_high_bit_candidates_by_source_format`): for `src_fmt` 3 bit 1 is NEVER set
+    // and bit 7 is (62 words), for `src_fmt` 5 bit 7 is NEVER set and bit 1 is (381), and
+    // `src_fmt` 6 already used bit 7. So format 3 is the F32 format's sibling here, format 5
+    // keeps bit 1, and no other format's words move: every one outside 3 and 6 has bit 7 clear.
+    //
+    // A SECOND READING FITS THE SAME WORDS - bit 7 as the register number's LOW bit, making the
+    // field seven bits - and on this corpus the two are INDISTINGUISHABLE: every word that sets
+    // bit 7 writes only channel x, where "component 0 steps one register" and "the register
+    // steps one" are the same operand. This one is chosen because it does not touch the
+    // register number, so a word with bit 7 clear cannot move under it at all.
+    let comp0_bit = pack_comp0_high_bit(src_fmt);
+    let comp0_hi = bits(word, comp0_bit, comp0_bit);
     let c0 = ((comp0_hi << 1) | bits(word, 0, 0)) as u8;
     let c1 = bits(word, 17, 16) as u8;
     let c2 = bits(word, 15, 14) as u8;
     let c3 = bits(word, 20, 19) as u8;
     let mut s1 = Operand::plain(b1, i1, src1_sel);
     s1.swizzle = [c0, c1, c2, c3];
+    // >>> AN INDEXED SOURCE CARRIES NO SWIZZLE - ITS COMPONENTS ARE CONSECUTIVE.
+    //
+    // The extended row spends the operand's low bits on the indexed BANK and NUMBER (a seven-bit
+    // number in a six-bit field, which is why an indexed offset is always even), and what is
+    // left in the component-selector positions is not a selector. Two things say so:
+    //
+    //  * THE POPULATION IS CONSTANT. `indexed_source_swizzles` over every captured corpus finds
+    //    exactly three indexed operand shapes, and EVERY two-lane VPCK among them - 28 of them
+    //    in one title's corpus, 12 in another capture of the same title, none anywhere else -
+    //    decodes to the same `[0, 3]`. A real selector field varies; the non-indexed two-lane
+    //    packs beside them carry `[0,1]`, `[2,3]`, `[1,0]`, `[0,0]`, `[0,2]`, `[2,1]`.
+    //  * THE REPEAT WOULD NOT TILE. These packs come in a REPEAT whose source advances by TWO
+    //    registers per iteration and which writes two lanes per iteration. Reading components
+    //    0 and 3 makes consecutive iterations read `+12,+15` then `+14,+17` - overlapping, and
+    //    running off the end of the eight-entry corner table the last iteration must land in.
+    //    Consecutive reads tile it exactly: `+12,+13` then `+14,+15`.
+    //
+    // See `wgsl::emit_load_index` and `the_indexed_corner_table_closes_only_when_the_index_    // counts_register_pairs` for the table this completes.
+    if s1.bank == Bank::Indexed {
+        s1.swizzle = [0, 1, 2, 3];
+    }
+
+    // >>> A 32-BIT SOURCE IS A REGISTER PAIR, SO COMPONENTS 2 AND 3 COME FROM `src2`.
+    //
+    // The pack has TWO source fields: `src1_n` (13:8) and `src2_n` (6:1), with banks at 31:30
+    // and 29:28. A six-bit register field in double-register mode names a PAIR of 32-bit
+    // registers - two components - so a four-component F32 source vector is
+    // `(src1.x, src1.y, src2.x, src2.y)`, and the component selectors index THAT vector. The
+    // compiler sets `src2 = src1 + 1` (the next pair) for a plain vec4 - every `Pack i0.xyz <-
+    // pa0.xyz`, `Pack i4 <- sa12.xyzw` in every corpus does - which is why reading src1 as a
+    // contiguous vec4 was right for those and silently wrong for every other one.
+    //
+    // MEASURED on a baseball title's world vertex programs: `Pack o[16].xy <- pa[6].[0,2]`
+    // with `src2_n = 0` and `Pack o[18].xy <- pa[0].[1,2]` with `src2_n = 1`. Read from src1
+    // alone they write `(n.z, uv.x)` and `(pos.y, pos.z)` - a normal's last lane paired with a
+    // texture coordinate, then two thirds of a position. Read with src2 they write
+    // `(n.z, pos.x)` and `(pos.y, pos.z)`: the normal's third lane, then the whole model-space
+    // POSITION as the three-lane varying the container declares next to it. The same rule
+    // closes every other pack in the corpus because their `src2` IS `src1 + 1`.
+    //
+    // Represented as a second source operand carrying the same swizzle; `unroll_repeats`
+    // splits such a pack into one instruction per source (they are per-channel copies, so the
+    // split is exact), and the rest of the pipeline never sees a two-source pack.
+    let src2_pair_rule = src_fmt == 6 && !src1_ext && s1.bank != Bank::Indexed;
+    let mut srcs = vec![s1];
+    if src2_pair_rule && bits(word, 48, 48) == 0 {
+        let src2_sel = bits(word, 29, 28) as u8;
+        let (b2, i2) = r6_source_bank_index(src2_sel, bits(word, 6, 1));
+        let mask = write_mask4(bits(word, 37, 34));
+        let reads_upper = (0..4).any(|c| mask[c] && (2..=3).contains(&s1.swizzle[c]));
+        let contiguous = b2 == s1.bank && u32::from(i2) == u32::from(s1.index) + 2;
+        if reads_upper && !contiguous {
+            let mut s2 = Operand::plain(b2, i2, src2_sel);
+            s2.swizzle = s1.swizzle;
+            srcs.push(s2);
+        }
+    }
 
     Instr {
         op: if unorm8_from_float {
@@ -2870,17 +4200,23 @@ fn decode_grp_pack(word: u64) -> Instr {
         } else if unorm8_to_float {
             Op::PackUnorm8 { to_unorm8: false, float_half: dest_fmt == 5 }
         } else {
-            match int_dest {
-                Some((bits_, signed)) if float_to_int => {
+            match (int_dest, int_src) {
+                (Some((bits_, signed)), _) if float_to_int => {
                     Op::PackToInt { bits: bits_, signed, src_half: src_fmt == 5 }
                 }
-                _ => Op::Pack { src_half: src_fmt == 5 },
+                (_, Some((bits_, signed))) if int_to_float => {
+                    Op::PackFromInt { bits: bits_, signed }
+                }
+                _ => match int_copy {
+                    Some(bits_) => Op::PackIntCopy { bits: bits_ },
+                    None => Op::Pack { src_half: src_fmt == 5 },
+                },
             }
         },
         pred: ext_predicate(predicate_raw),
         dest,
         write_mask: write_mask4(bits(word, 37, 34)),
-        srcs: vec![s1],
+        srcs,
         // An integer destination is not the F16 pipeline whatever its width, so the
         // half-precision flag (which selects the DESTINATION's float view) is only meaningful
         // for a float destination.
@@ -3146,14 +4482,33 @@ fn decode_grp_tex(word: u64) -> Instr {
 /// only that they "force override swizzle masking with single channel" - a description of an
 /// EFFECT with no encoding behind it.
 ///
-/// # The census that settles it (766 blobs, six titles)
-/// Over every 0x18 DOT in the corpus the field takes exactly four values: `0x8` (365
-/// occurrences), `0x1` (3), `0x2` (6), `0x3` (5). Never `0x0`, and never any value with bit 47
-/// set *and* a low bit set. That perfect anti-correlation is what says bit 47 is part of the
-/// same field rather than an independent flag: an orthogonal bit would show `0x9`/`0xa`/`0xb`
-/// somewhere in 379 samples. So `0x8` is the "runs once" encoding and `1..3` are extra
-/// iterations - and reading the four bits as a plain count instead would make 365 instructions
-/// repeat eight times, which the destination-closure oracle would report immediately.
+/// # The census, and the title that corrected it
+/// Over five titles the field took exactly four values - `0x8` (365 occurrences), `0x1` (3),
+/// `0x2` (6), `0x3` (5) - never `0x0`, and never bit 47 set *together with* a low bit. That
+/// anti-correlation was read as saying bit 47 belongs to the same field: `0x8` the "runs once"
+/// encoding, `1..3` extra iterations. Reading the four bits as a plain count instead would make
+/// 365 instructions repeat eight times, which the destination-closure oracle reports
+/// immediately, so the `0x8` half of that reading is not in doubt.
+///
+/// A SIXTH title emits `0x9`, twice, in one vertex program - so bit 47 is orthogonal after all,
+/// and the count is bits 46:44 with `0x8` simply being "bit 47 set, count 0". The two
+/// occurrences close arithmetically, which is what settles it rather than the histogram:
+///
+/// ```text
+///   #92  field 0x9  dest i8, src t40      -> under "1 extra": i8 channels 0 and 1
+///   #93  field 0x8  dest i8 mask .z, t16  -> i8 channel 2
+///   #99                                      reads i8 as a THREE-component vector
+/// ```
+///
+/// Read as running once, `#92` writes channel 0 and leaves channel 1 to whatever was in the
+/// internal register, and `#99` multiplies it. Read as one extra iteration - the destination
+/// walking one channel, the source stepping a whole slot under the SMLSI in force - the three
+/// instructions fill exactly the three channels the reader consumes, which is the same closure
+/// the `0x1..0x3` counts already stand on.
+///
+/// `0x0` stays BLOCKED. Under this rule it would mean "runs once", but it has never appeared in
+/// any corpus while `0x1..0x3` and both bit-47 forms have, and a value the evidence does not
+/// contain is not a value this decoder can claim to know.
 ///
 /// # What a repeated DP does, and why it is not the generic operand step
 /// A DP writes a SCALAR. Repeating it walks the destination one CHANNEL per iteration (which
@@ -3164,11 +4519,28 @@ fn decode_grp_tex(word: u64) -> Instr {
 /// `WorldViewProjection` uniform declared `F32[4]` x 4 at register 0, writing the four position
 /// lanes nothing else in the program writes. Read as running once, those programs emit a single
 /// scalar for a whole clip position and the title renders a BLACK FRAME.
+/// # AND BIT 46 IS SPELLED TWICE, WHICH THE CORPUS SETTLES BY NEVER SETTING IT
+/// The field table names bit 46 `abs_op2` - an absolute modifier on the internal-register
+/// operand - and the reading above makes it the count's MIDDLE bit. Both cannot be true of one
+/// word, and a word with it set would decode here as a repeat of four to seven AND as an
+/// operand modifier, which is two different instructions wearing one encoding.
+///
+/// MEASURED over the whole corpus: of 1,884 DOTs the field takes six values - `0x8` (1,645),
+/// `0x2` (130), `0x1` (52), `0x3` (49), `0x9` (7) and `0xa` (1) - and **bit 46 is clear in every
+/// one of them**. So no shipped program distinguishes the two readings, and nothing here has
+/// ever had to.
+///
+/// It is BLOCKED rather than resolved, for the same reason `0x0` is: a value no corpus contains
+/// is not a value this decoder can claim to know, and guessing which of two names owns a bit is
+/// exactly the guess that reaches the emitter and the interpreter identically and therefore
+/// never shows up as a divergence. `usse::asm::dot` refuses to write one from the other side.
 fn dot_repeat_extra(word: u64) -> Option<u32> {
     match bits(word, 47, 44) {
-        0x8 => Some(0),
-        n @ 1..=3 => Some(n),
-        _ => None,
+        0x0 => None,
+        // Bit 46 is `abs_op2` under the other reading of the same bit - see above.
+        n if n & 0x4 != 0 => None,
+        // Bit 47 is not part of the count; bits 46:44 are.
+        n => Some(n & 0x7),
     }
 }
 
@@ -3197,6 +4569,16 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // would repeat several hundred instructions that demonstrably run once.
         0x03 if bits(word, 53, 53) == 1 => Some(0),
         0x03 => dot_repeat_extra(word),
+        // 0x20, the internal-register vec3 group: its documented layout has no repeat field
+        // (47:44 is neg_opN + opcode2), and the def-use chains close under single execution.
+        // MEASURED on a fighting title's fog program: `dot i1.x <- i0, i0`, `rsq i1.x`, then
+        // this group's `rcp i2.x <- i1.x`, read back as `i2.x` by the next add - while the dot
+        // after it still reads `i0` as the view vector. One scalar in, one scalar out; a repeat
+        // would have stepped the destination through i3 and beyond. The 7-bit run at 27:21 the
+        // page calls `op0 (unused)` carries register-shaped values (124 here = i0) and is NOT a
+        // destination: had this word written i0, that later dot would read the reciprocal.
+        // 0x28 is 0x20's four-lane sibling on the same field map: no repeat field either.
+        0x04 | 0x05 => Some(0),
         // 0x80 SOP2, in the fragment-epilogue form `decode_grp_sop2` establishes and only
         // there: that form pins bits 46:43 to zero, and bit 47 is the second complement flag
         // its sibling 0x90 establishes at the same position. So the four bits where a repeat
@@ -3213,7 +4595,12 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // byte-for-byte twin of a program that ends on the `10000` word. Anything outside the
         // two shapes `decode_grp_sop2` pins still blocks there, so admitting `00000` here does
         // not admit a word on its own.
-        0x10 if matches!(bits(word, 47, 43), 0b10000 | 0b00000) => Some(0),
+        //
+        // >>> NOW READ FROM THE SPEC (`docs-re/usse-spec-sop2.md`): plain SOP2's repeat count is
+        // 46:44 ALONE - 47 is the second colour complement and 43 the first ALPHA complement - so
+        // `amod1` set (a ONE alpha factor, the fighting title's epilogues) is not a repeat. Only a
+        // zero count is admitted: no program here repeats one, and the stepping is unestablished.
+        0x10 if bits(word, 46, 44) == 0 => Some(0),
         // 0x90 SOP2M: no repeat_count field either, and the field table accounts for every bit
         // - the four bits at 47:44, where every group that HAS a repeat count puts it, are the
         // second complement bit plus the top three bits of the write mask. Both are read by
@@ -3228,15 +4615,36 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // executing once. Any OTHER group-0x14 word is a different instruction whose repeat
         // encoding is unknown, and unknown means blocked, not zero: a dropped iteration is
         // exactly the invisible failure this pass exists to prevent.
-        0x14 if word & !(0xf << 14) == I16MAD_LOAD_INDEX_WORD => Some(0),
+        // >>> ...AND BIT 45 IS ITS REPEAT COUNT - bits 46:44, the IMAD32 sibling's position.
+        //
+        // Bit 45 was already known to VARY inside a (program, addend) group without touching
+        // the index VALUE, and was read as "no repeat" on the strength of that. Not changing the
+        // first iteration's value is exactly what a repeat does. A football title's face/skin
+        // program (`vert_903341b0`) settles it: its two load-index words with bit 45 set are the
+        // only producers the program has for `pa[19]` and `pa[21]`, which the IMAD32s below read
+        // as bone-row offsets - under "no repeat" those two reads find the raw float bits of a
+        // vertex colour and a blend index, and HALF the skinning loads (6,832 of 13,728 in one
+        // draw) land outside the palette. Under repeat 2 in the SMLSI in force (offset mode
+        // (0,1,3) on dest and src0) the three iterations write `pa[18]`, `pa[19]`, `pa[21]` from
+        // `pa[11]`, `pa[12]`, `pa[14]` - the four bones' row-0 offsets, every one read.
+        // `VITASLOP_GXP_IDX_REPEAT=0` is the arm back.
+        0x14 if i16mad_is_load_index(word) => {
+            Some(if load_index_repeats() { bits(word, 46, 44) } else { 0 })
+        }
         // 0x15 IMAD32: a THREE-bit repeat count at 46:44, and bit 47 is a reserved zero rather
         // than the top of it. Reading it as the usual four bits at 47:44 would be harmless on
         // every word whose bit 47 is clear and would double the count on any word where it is
         // not - and `decode_grp_imad32` blocks such a word anyway, because a set bit 47 means
-        // the whole layout is a different one. The field's POSITION is established; what a
-        // repeat ITERATES over in this group is not, so a non-zero count is `None` (blocked)
-        // rather than an unroll count - the same stance `decode_grp_imad32` takes.
-        0x15 if bits(word, 46, 44) == 0 => Some(0),
+        // the whole layout is a different one.
+        //
+        // >>> A NON-ZERO COUNT IS AN UNROLL COUNT NOW, for the INLINE-IMMEDIATE form. What a
+        // repeat iterates over in this group used to be unestablished; a football title's own
+        // repeating IMAD32 establishes all four operand steps from what the program does with
+        // the three results - see [`repeat_operands`]. The register-`src1` form keeps the old
+        // stance, because there the immediate argument that pins `src1` does not apply.
+        0x15 if bits(word, 46, 44) == 0 || imad32_src1_is_inline_immediate(word) => {
+            Some(bits(word, 46, 44))
+        }
         // 0x1a IMAD32-STEP: the same three-bit repeat count at 46:44, with bit 47 taken by
         // this group's own src0 bank EXTENSION rather than by a reserved zero or the top of the
         // count. Same stance as 0x15: the position is established, what an iteration steps is
@@ -3262,8 +4670,10 @@ pub enum SmlsiSlot {
     /// -1, -2, -3, -4 and -8 that a program walking a matrix or an attribute block in reverse
     /// asks for. `Increment(1)` is the default - the state in force before any SMLSI.
     Increment(i8),
-    /// The operand does not advance by a register count; the byte selects the channels each
-    /// iteration reads instead. Not modeled.
+    /// The operand does not advance by a fixed count; the byte is FOUR 2-bit REGISTER OFFSETS,
+    /// entry `k` (bits `2k+1:2k`) taken on iteration `k`, so iteration `k` addresses
+    /// `base + entry[k] * stride`. It is a per-iteration register table, not a component
+    /// selector - see [`decode_smlsi`] for the program that settles it.
     Swizzle(u8),
 }
 
@@ -3301,9 +4711,23 @@ pub enum SmlsiSlot {
 /// the attribute copy). It sits where group 0x38 documents `end`, and it is not part of either
 /// field above; the register-addressing model does not read it.
 pub fn decode_smlsi(word: u64) -> [SmlsiSlot; 4] {
+    // >>> THE BYTES RUN DEST-FIRST FROM THE TOP: dest at 31:24, src0 at 23:16, src1 at 15:8,
+    // >>> src2 at 7:0, and the mode bits the same way down from bit 35. The old reading took
+    // >>> them bottom-up, which put every operand on another operand's byte.
+    //
+    // Settled by a clean-room read of the ISA (three independent decoders agree on these
+    // positions) and by the corpus word that could not close under the old order: a baseball
+    // title's stands program opens `SMLSI 0xfa10000a34010e01; VMOV.xy o4 <- pa12 (x3)`. Read
+    // bottom-up that walks o4/o6/o8 <- pa12/pa14/pa16 and hands the fragment's 4-lane Color0 the
+    // UV1 attribute while TexCoord(1) (lanes 10..11) is never written. Read top-down, dest and
+    // src1 are both in OFFSET mode - (0,1,3) and (2,3,0) - so the three iterations write
+    // `o4.xy <- pa16.xy`, `o6.xy <- pa18.xy`, `o10.xy <- pa12.xy`: Color in lanes 4..7 and
+    // UV1.xy in 10..11, exactly the layout the paired fragment program declares. The pinned
+    // four-iteration copy on another title's program still consumes exactly its two attributes
+    // under this order (its src1 is in offset mode too: (2,3,0,1) walks pa8/pa10/pa4/pa6).
     std::array::from_fn(|k| {
-        let value = ((word >> (8 * k)) & 0xff) as u8;
-        if (word >> (32 + k)) & 1 == 0 {
+        let value = ((word >> (8 * (3 - k))) & 0xff) as u8;
+        if (word >> (35 - k)) & 1 == 0 {
             SmlsiSlot::Increment(value as i8)
         } else {
             SmlsiSlot::Swizzle(value)
@@ -3355,6 +4779,88 @@ pub(crate) struct RepeatOperand {
 /// fixes across three titles' corpora: 312 -> 310 standalone recompiles on one, 64 -> 59 on
 /// another, and 79 -> 78 on a corpus that is otherwise CLEAN under this order. A reading that
 /// breaks a corpus with nothing left to explain is the wrong reading.
+/// The 0x40 VPCK destination's repeat multiplier, from its destination FORMAT (bits 40:38).
+///
+/// A destination format that packs TWO values into a register makes one unit of the field one
+/// register; a 32-bit one holds a single value, so a unit is two. That is formats U16 (3),
+/// S16 (4) and F16 (5) against F32 (6). See the arm in [`repeat_operands`] for the closures.
+///
+/// >>> THE 16-BIT INTEGER FORMS USED TO BE ON THE 32-BIT SIDE OF THIS, and it cost a title
+/// >>> every skinned mesh it draws. The reading was taken from a closure that assumed a 16-bit
+/// pack writes ONE value per register, so a two-lane pack repeated twice had to reach four
+/// registers and the multiplier had to be 2. The assumption is what was wrong: those four
+/// values are four HALVES of two registers, and the group-0x15 IMAD32s that read them back say
+/// so directly - they name `(base, lo)`, `(base, hi)`, `(base+1, lo)`, `(base+1, hi)` through
+/// their own `src0_high` bit. Under the old pair of readings the pack wrote `base..base+4` and
+/// the four fetches read `base` and `base+1` twice each, so a four-bone vertex blended two
+/// bones against themselves. Every repeating 16-bit pack in every corpus is a skinned mesh of
+/// exactly this shape, and their consumers split 42 low / 42 high - a balance only the packed
+/// reading explains.
+fn pack_dest_stride(word: u64) -> u32 {
+    // >>> AN INTERNAL DESTINATION STEPS BY A WHOLE INTERNAL REGISTER, and that is the encoding
+    // >>> rather than a closure: the reserved range 124..127 names i0, i1, i2, i3 - ONE FIELD
+    // >>> VALUE PER INTERNAL REGISTER - and an internal register is four 32-bit lanes, which is
+    // >>> how `internal_base` lays them out. So one unit of the field is FOUR scalar lanes here,
+    // >>> where for an ordinary temp/pa/output register it is one or two.
+    //
+    // This is the case the notes below say the corpus could not separate ("one program packs
+    // four channels into an INTERNAL register, where a unit of the field is a whole INTERNAL
+    // REGISTER"). A baseball title's ground material settles it, and the witness is a whole
+    // idiom rather than a fit: its vertex program repeats one VPCK twice from i1, filling the
+    // NORMAL and then the TANGENT, and the two instructions that follow are a DOT3 of the two
+    // triples and a `T - (N.T)N` MAD - textbook Gram-Schmidt. Under a stride of 2 the second
+    // iteration lands on scalar base 6, which is not any internal register's base and which the
+    // field cannot even encode; the normal's third component is overwritten by the tangent's
+    // first, the dot is of two overlapping triples, and the re-orthogonalised tangent comes out
+    // as the ZERO VECTOR over part of the mesh. The fragment then normalises that zero -
+    // `Rsq(0)` is +inf and `inf * 0` is a NaN - and the surface is stored BLACK. Under a stride
+    // of 4 the iterations are i1 and i2, the dot is `N . T`, and the black is gone.
+    //
+    // `VITASLOP_GXP_PACK_INTERNAL=0` is the ARM BACK to the old stride, so both readings are
+    // reachable from ONE build [[vitaslop-browser-ab-needs-a-negative-control]].
+    if std::env::var("VITASLOP_GXP_PACK_INTERNAL").as_deref() != Ok("0")
+        && matches!(
+            r7_dest_bank_index(bits(word, 33, 32) as u8, bits(word, 27, 21)),
+            Some((Bank::Internal, _))
+        )
+    {
+        return 4;
+    }
+    if matches!(bits(word, 40, 38), 3..=5) { 1 } else { 2 }
+}
+
+/// The SMLSI slot a repeating 0x40 VPCK's DESTINATION steps under: slot 0, the DEST byte
+/// (31:24), as for every other group's destination. `VITASLOP_GXP_PACK_DEST_SLOT=1` is the
+/// arm back to the old src0-byte reading.
+///
+/// >>> MEASURED, and it reverses a closure that predates the stride-4 INTERNAL destination.
+/// A football title's face/skin program repeats one 16-bit `PackToInt` of its four blend
+/// indices under `SMLSI [9,1,1,1]`: slot 0 lands the second pair in `pa[12]` - free by then,
+/// and exactly where the `PackIntCopy` below reads index 3 - while slot 1 lands it in `pa[4]`,
+/// the TANGENT the program dots against the bone rows forty instructions later. Over the whole
+/// corpus (`census_repeating_pack_destinations_live_or_dead`), slot 0 turns ten later
+/// iterations from written-and-never-read into read (internal i1 -> i2 fills whose second write
+/// used to land back on i1) and slot 1 wins one, a symmetric three-iteration case.
+fn pack_dest_slot() -> usize {
+    use std::sync::OnceLock;
+    static SLOT: OnceLock<usize> = OnceLock::new();
+    *SLOT.get_or_init(|| {
+        std::env::var("VITASLOP_GXP_PACK_DEST_SLOT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&s| s < 4)
+            .unwrap_or(0)
+    })
+}
+
+/// Whether a load-index word's bits 46:44 repeat it (`VITASLOP_GXP_IDX_REPEAT=0` is the arm
+/// back). See the 0x14 arm of [`repeat_extra_iterations`].
+fn load_index_repeats() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VITASLOP_GXP_IDX_REPEAT").as_deref() != Ok("0"))
+}
+
 pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
     let op = |slot, stride| RepeatOperand { slot, stride, moe: true };
     // An operand whose per-iteration advance is the instruction's own, not the MOE's.
@@ -3371,25 +4877,117 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
         // and the single source is a SIX-bit field (13:8) - strides (1, 2), the reference's own
         // repeat multipliers.
         //
-        // The source's SMLSI slot is 1 (src0), MEASURED, and it is NOT the slot the sibling VMOV
-        // uses. Two independent populations of repeating VPCKs in one title's corpus say so:
+        // The SOURCE's SMLSI slot is 1, MEASURED, and it is NOT the slot the sibling VMOV uses.
+        // Two independent populations of repeating VPCKs in one title's corpus say so:
         //
-        //   dest 46 src 62, smlsi [dest,src0,src1,src2] = [ 3,  3,  1, -4]   (6 blobs)
-        //   dest 46 src  0, smlsi [dest,src0,src1,src2] = [ 2,  2, -4, -4]   (2 blobs)
+        //   dest 46 src 62, smlsi [slot0,slot1,slot2,slot3] = [ 3,  3,  1, -4]   (6 blobs)
+        //   dest 46 src  0, smlsi [slot0,slot1,slot2,slot3] = [ 2,  2, -4, -4]   (2 blobs)
         //
-        // In both, the compiler set slot 0 and slot 1 to the SAME increment and left the others
-        // unrelated - the signature of a one-source instruction whose two live operands are dest
-        // and src0. It also closes arithmetically: this VPCK writes packed F16 halves from F32
-        // sources, so one iteration's dest advance in HALVES must equal its source advance in
-        // FLOATS. Slot 1 gives (3 regs = 6 halves, 3*2 = 6 floats) and (2 regs = 4 halves,
-        // 2*2 = 4 floats); slot 2 gives 6 halves from 2 floats, and 4 halves from a source
-        // stepping to register -16, which is not a register at all.
-        0x08 => Some(vec![op(0, 1), op(1, 2)]),
+        // It closes arithmetically: this VPCK writes packed F16 halves from F32 sources, so one
+        // iteration's dest advance in HALVES must equal its source advance in FLOATS. Slot 1
+        // gives (3 regs = 6 halves, 3*2 = 6 floats) and (2 regs = 4 halves, 2*2 = 4 floats);
+        // slot 2 gives 6 halves from 2 floats, and 4 halves from a source stepping to register
+        // -16, which is not a register at all. (Slot 0 carries the same value as slot 1 in every
+        // repeating VPCK in every corpus, so the closure cannot separate those two and does not
+        // need to.)
+        //
+        // >>> THE DESTINATION'S SLOT IS 2, AND IT USED TO BE 0. That reading came from the same
+        // two populations, where it was not a measurement but the only thing left: with slot 0
+        // and slot 1 equal, "the two live operands are dest and src0" fits, and so does anything
+        // else. A fourth title's corpus separates them, three ways, and every one of the three
+        // rules slot 0 out:
+        //
+        //  * IT ADDRESSES OUTSIDE THE REGISTER FILE. `dest_n 0` under `[-10,-10,6,6]` steps to
+        //    register -10, and `dest_n 125` under `[3,3,1,-1]` steps to 128. Two shipped
+        //    instructions in two programs. Slot 2 leaves the file on neither, and on no other
+        //    repeating VPCK in any corpus.
+        //  * ITS SECOND DESTINATION IS DEAD. Take the register each candidate's second iteration
+        //    writes and ask whether anything READS it before overwriting it: on the two
+        //    instructions where the candidates differ and the answer is knowable, slot 2's is
+        //    live and slot 0's is written and never read (`dest_n 20` under `[8,8,-18,-18]`
+        //    steps to `pa[28]`, which nothing reads; slot 2 steps to `pa[2]`, which the next
+        //    instruction but one multiplies).
+        //  * IT SKIPS AND REVERSES. Several of these VPCKs write the INTERNAL registers
+        //    (`dest_n` 124..127). Under slot 2 every one of them walks CONSECUTIVE internals -
+        //    i0 then i1, i1 then i2 - which is what a pack filling them does. Under slot 3 one
+        //    of them skips i1 and another runs backwards from i1 to i0, which is why the
+        //    destination is slot 2 and not slot 3, the only other candidate the first two tests
+        //    leave standing.
+        //
+        // >>> AND THE DESTINATION'S MULTIPLIER IS 2 UNLESS THE DESTINATION IS F16.
+        //
+        // It was 1 for every form, which is right for the F16 destination the two populations
+        // above carry and wrong for every other one - because the multiplier is a property of
+        // the destination's DATA TYPE, exactly as the source's double-register scaling is. An
+        // F16 destination packs TWO values into a register, so one unit of the field is one
+        // register; a 32-bit one holds a single value, so a unit is two.
+        //
+        // Two independent closures in a fourth title's corpus require the 2, and both are
+        // whole-program arguments rather than a fit:
+        //
+        //  * A SKINNED MESH's blend indices. One `PackToInt` (dest format S16) with a
+        //    two-channel mask, repeated twice, over the four indices at `pa[12..15]`. Under a
+        //    multiplier of 1 it writes `pa[8],pa[9]` and then `pa[9],pa[10]` - the second
+        //    iteration OVERWRITES the first's second index with the third, and the two
+        //    `bone * 48 + base` lookups that follow read the wrong matrices out of the bone
+        //    array. Under 2 it writes `pa[8],pa[9]` then `pa[10],pa[11]`, which is the four
+        //    indices in the four registers, and the two lookups read `pa[8]` and `pa[9]`.
+        //  * A DOT4's vector source. Two `Pack`s (dest format F32, two-channel masks) fill the
+        //    operand a following four-component DP reads at `pa[8]`, which spans `pa[8..11]`.
+        //    Under 1 they write `pa[8],pa[9]` and `pa[9],pa[10]`, leaving `pa[11]` - a lane of
+        //    the dot - never written. Under 2 they write `pa[8..9]` and `pa[10..11]`, exactly
+        //    the four the dot reads.
+        //
+        // No repeating VPCK in any corpus leaves the register file under this rule. What it
+        // does NOT establish is the FOUR-channel F32 form: one program packs four channels into
+        // an internal register, where a unit of the field is a whole internal register rather
+        // than a 32-bit one, and no closure in this corpus separates the readings for it.
+        // A two-source pack (32-bit source, upper components from `src2_n`) carries its second
+        // source in slot 3, stepping as any six-bit source field does.
+        // Under the top-down byte order the MEASURED destination byte (23:16, the three-way
+        // closure above) is the src0 slot, the source is src1 (15:8, which the ISA also names
+        // as VPCK's source), and the second source is src2 (7:0).
+        0x08 => Some(vec![op(pack_dest_slot(), pack_dest_stride(word)), op(2, 2), op(3, 2)]),
         // 0x50 VBW family (`decode_grp_bitwise`): dest `dest_n` (27:21), src1 (13:7) and src2
         // (6:0) are all SEVEN-bit fields - "repeat multipliers all 1". An immediate src2 is
         // folded into the op at decode and is not an IR source, so the list is dest, src1, and
         // src2 only when it is a register; a shorter `srcs` simply consumes fewer entries.
+        //
+        // >>> THE REGISTER SOURCE'S SLOT IS 1, AND IT USED TO BE 2. What settles it is the
+        // CLOSURE of the loads that feed these repeats, in two independent programs of one
+        // title, and it is the same argument that fixed the VPCK destination:
+        //
+        //   a 4-element MemLoad at B, then a VBW repeat reading B+2, B+3, B+4
+        //
+        // - one register PAST the load, in every instance. Under slot 2 (+1 in the SMLSI in
+        // force) that last read is a register nothing has written; under a -1 walk the three
+        // reads are B+2, B+1, B, every one inside the load. The same pair of programs carries
+        // a SECOND load-and-repeat where the walk is two iterations, and -1 closes that too.
+        //
+        // Slot 1 and slot 3 both carry -1 in that SMLSI, so one instance cannot separate them.
+        // A THIRD instance does: the skinned-character program's second repeat runs under
+        // `0xfa100000e001ff01`, where slot 3 is -32 and would read sa[4] - a DATA-container
+        // register, not data - while slot 1 is -1 and lands inside its load. Slot 1 is the only
+        // value that closes all three.
+        //
+        // The title's world program then programs slot 1 in SWIZZLE mode for a later repeat,
+        // which is itself corroboration that slot 1 is the one a VBW consults - and is why
+        // `unroll_repeats` models the component walk rather than refusing it.
+        //
+        // >>> UNDER THE TOP-DOWN BYTE ORDER (see `decode_smlsi`) the byte those closures
+        // >>> measured - 15:8 - IS the src1 byte, so the source sits on its ROLE's slot, 2.
+        // The three-way closure above is about a BYTE, and it still holds: `0xfa100000ff01ff01`
+        // carries -1 at 15:8 and `0xfa100000e001ff01` carries -1 there too (with -32 at 31:24
+        // and +1 at 7:0). Read as slot 1 under the new order (byte 23:16, +1) the same repeats
+        // walked one register PAST their loads again and 18 pairs of a baseball title's corpus
+        // refused to link; on slot 2 all 40 link.
         0x0a..=0x0d => Some(vec![op(0, 1), op(2, 1), op(3, 1)]),
+        // 0x14 load-index (`decode_grp_i16mad`): the destination is the SEVEN-bit [27:21]
+        // field... read as [25:21] with its bank bit, and the source the six-bit [19:14] -
+        // both DIRECT (no double-register scaling), so both stride 1. Destination on the dest
+        // slot and source on src0's, the ISA order; the closure is `repeat_extra_iterations`'s
+        // note for this group.
+        0x14 if i16mad_is_load_index(word) => Some(vec![op(0, 1), op(1, 1)]),
         // 0x18 DOT (`decode_grp_18_dot`), and it is the one group whose repeat is not a plain
         // register walk - see [`dot_repeat_extra`]:
         //
@@ -3409,9 +5007,10 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
         //   `[o0 -1 -2 o3]` was. Under the intrinsic advance they land in `o[0..3]` beside the
         //   `w` the next instruction copies, and the program's clip position closes. The
         //   channel walk is the DP's own; the MOE has nothing to step it with.
-        // * op1, the R6 vector source, advances by a whole VECTOR - `c3_en` channels - which is
-        //   what makes four iterations read the four rows of a 4x4 matrix laid out at
-        //   consecutive registers.
+        // * op1, the R6 vector source, advances by a whole four-register SLOT - see the block
+        //   below for why that is the slot width and not `c3_en`, and why the advance is the
+        //   DP's own rather than the MOE's - which is what makes successive iterations read
+        //   successive rows of a matrix laid out at consecutive registers.
         // * op2 is an INTERNAL register (RI2, a 2-bit selector, not a register field). It is
         //   the vector being transformed and it does not move; a 2-bit selector has nowhere to
         //   step to in any case.
@@ -3431,11 +5030,189 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             // that walk a 4x4 matrix at consecutive registers are unchanged, because their
             // rows are four apart too. `c3_en` says how many channels are SUMMED; it does not
             // say how far the next iteration's operand slot begins.
+            //
+            // >>> AND THAT FOUR-REGISTER SLOT IS INTRINSIC, NOT MULTIPLIED BY THE MOE - the same
+            // >>> correction the DESTINATION above already carries, for the same reason.
+            // Routing it through the SMLSI source byte is invisible while the state is
+            // `Increment(1)`, which is what every repeating DP that motivated the stride-4
+            // reading runs under, and wrong the moment a program programs anything else. mlb's
+            // CROWD-ATLAS bake (`vert_843ba650`, pair 713e7c1416ebf530) opens
+            // `SMLSI [2, 2, 2, 2]` and then builds its clip position with a three-iteration
+            // 4-component DP whose source is `PrimaryAttr[20]`. Its rows are the
+            // `InstanceMatrix3x4[0..2]` attributes, which the container declares at 20, 24 and
+            // 28 - four apart, each a declared float4. Multiplied by the MOE's 2 the three
+            // iterations read `pa[20]`, `pa[28]` and `pa[36]`: row 0 correct, row 1 reading
+            // `InstanceMatrix3x4[2]` where row 1 belongs, and row 2 reading a register PAST the
+            // program's own declared PA count (36), so clip `z` came out of nothing. Every
+            // crowd instance then took its Y from the third matrix row, whose translation is
+            // CONSTANT across the mesh, and the 256x256 sprite sheet baked eleven tapering
+            // WEDGES instead of a crowd - which is what the stands behind the batter are made
+            // of [[vitaslop-a-repeating-vpck-into-an-internal-register-steps-four]].
+            //
+            // The intrinsic reading is the only one that fits all three witnesses at once: this
+            // program (SMLSI 2, rows 4 apart), its sibling `vert_843b9ce8` (SMLSI 1, rows 4
+            // apart, which the MOE reading also gets right) and PCSA00009's world material
+            // (rows 4 apart). A MOE-governed source would have to read a different stride out
+            // of each, and there is no stride that does.
             let _ = bits(word, 52, 52);
-            Some(vec![fixed(1), op(2, 4), op(3, 0)])
+            // >>> EXCEPT WHEN BIT 47 IS SET: THEN THE SOURCE IS MOE-GOVERNED, TWO REGISTERS A UNIT.
+            //
+            // The intrinsic four is right for every repeating DP whose bit 47 is CLEAR - golf's
+            // `modelWorldX/Y/Z` transforms under the default state, and the crowd-atlas bake above
+            // under `SMLSI [2,2,2,2]`, which a MOE reading would have sent to pa[20]/pa[28]/pa[36].
+            // It is wrong for the two whose bit 47 is SET. mlb's crowd-PEOPLE program
+            // (`vert_843b87e4`) and its sibling (`vert_843b9ce8`) run a TWO-iteration 4-channel DP
+            // over `InstanceMatrix3x4` under `SMLSI [1,1,4,4]`, and compute row 1 with a SEPARATE
+            // dot - so the repeat must read rows 0 and 2, eight registers apart. Stepping four
+            // made world z a copy of world y, the projection then drove clip x and y from the same
+            // value, and every crowd member rasterised as a diagonal line of dots: MEASURED on the
+            // GPU with the world xy a proper 2D blob and the clip output a 14-pixel line, and by
+            // hand from the capsule's own bytes (a person at NDC x[-0.38,-0.22] y[-0.98,-0.52]).
+            //
+            // The op1 register field counts PAIRS of 32-bit registers, so one MOE unit is two
+            // registers - the same scaling every six-bit field here carries - and byte 4 gives
+            // the eight. Which of the src1/src2 bytes governs it is NOT settled: every bit-47
+            // repeating DP in the corpus has them equal. `VITASLOP_GXP_DP_MOE_BIT47=0` restores the
+            // intrinsic four for every DP.
+            //
+            // >>> AND BIT 48 SAYS WHICH SOURCE WALKS. Set (the crowd pair, mk's two bone dots):
+            // op1 steps as above. CLEAR: op1 HOLDS and the INTERNAL op2 steps one register per
+            // iteration, whatever the SMLSI says - three programs, three SMLSIs ([1,1,-2,-2],
+            // [1,1,2,2], swizzle mode), one answer, and each proven by a load that is otherwise
+            // dead. mlb's `vert_84377374` loads `i1 = sa40`, `i2 = sa36` and never reads `i2`
+            // again: the repeat is `(dot(pa8, sa40), dot(pa8, sa36))`, a planar UV projection.
+            // Madden's `frag_9091b740` loads `i1 = sa72`, `i2 = sa76`, repeats twice, then carries
+            // on BY HAND with `i2 = sa80` and `sa84` - four matrix rows against one `Temp8`.
+            // Madden's `vert_90c06100` loads `i0,i1,i2 = t0,t4,t8` and writes `i0.xyz`: a 3x3
+            // transform of `pa8`. Stepping op1 instead read the raw Normal/UV1 attributes as
+            // matrix rows (mlb) and overwrote the operand it was reading (Madden vert).
+            if bits(word, 47, 47) == 1 && crate::link::arm_on(crate::link::DP_MOE_BIT47_ARM) {
+                if bits(word, 48, 48) == 0 {
+                    return Some(vec![fixed(1), fixed(0), fixed(4)]);
+                }
+                return Some(vec![fixed(1), op(2, 2), op(3, 0)]);
+            }
+            // >>> BIT 47 CLEAR WITH BIT 48 SET: BOTH SOURCES WALK, one internal register each.
+            //
+            // The corpus holds exactly three such words (a census over 1,147 blobs: every other
+            // bit-47-clear repeating DP has bit 48 clear), and all three are the same idiom -
+            // `188118820151a23c` in two of a baseball title's vertex programs, `188118820011a23c`
+            // in a fighting title's character program - a two-iteration 3-channel DP whose BOTH
+            // operands are internal registers, followed by an `rsq` of each result and a scale of
+            // the matching vector by it. That is NORMALISING TWO VECTORS, `i0` and `i1`: the second
+            // result scales `i1`, so it must be `|i1|^2`. Holding op2 read `dot(i1, i0)` instead -
+            // for a normal and tangent a value near zero or negative - the `rsq` went to inf/NaN
+            // and the NaN rode a varying into the fragment stage. MEASURED on the fighting title:
+            // `rsq` of -4623 at #112, the light vector NaN over most of each fighter's body, and
+            // the toon ramp read at a NaN coordinate - every fighter drew BLACK. On the baseball
+            // title the same NaN feeds a varying the phone's GPU and the desktop's treat
+            // differently. `VITASLOP_GXP_DP_B48_BOTH=0` is the arm back.
+            if bits(word, 48, 48) == 1 && crate::link::arm_on(crate::link::DP_B48_BOTH_ARM) {
+                return Some(vec![fixed(1), fixed(4), fixed(4)]);
+            }
+            Some(vec![fixed(1), fixed(4), op(3, 0)])
+        }
+        // 0x30 VCOMP (`decode_grp_30`), the scalar transcendentals. Like the DOT above, its
+        // repeat is not a register walk: the op reads ONE source component, applies rcp/rsq/
+        // log/exp and writes ONE destination channel, so successive iterations step a CHANNEL
+        // at each end while both register numbers stay put.
+        //
+        // In this IR both of those ARE a stride of one: a masked destination writes lane
+        // `index + channel`, and a source with a broadcast swizzle reads `index + component`,
+        // so advancing either operand's index by one is exactly advancing its channel by one.
+        //
+        // MEASURED, and by the strongest witness there is - THE COMPILER'S OWN UNROLLED FORM OF
+        // THE SAME OPERATION, in the very blob that carries the repeat. That fragment program
+        // writes the identical idiom out longhand four times over:
+        //
+        //   Exp pa[2].x <- t[12].x   Exp pa[2].y <- t[12].y   Exp pa[2].z <- t[12].z
+        //   Exp pa[2].x <- pa[4].x   Exp pa[2].y <- pa[4].y   Exp pa[2].z <- pa[4].z
+        //
+        // - consecutive lanes at both ends, registers fixed - and the two-iteration repeat at
+        // instruction 76 is the same `Exp pa[2].x <- pa[2].x`. Reproducing those sequences is
+        // the whole test, and it rules out both MOE readings on the SMLSI actually in force
+        // (`[dest 1, src0 4, src1 2, src2 2]`, over seven-bit DOUBLE-scaled fields): a
+        // MOE-governed destination steps two registers and writes `pa[2]` then `pa[4]`, SKIPPING
+        // the lane the longhand form writes, and a MOE-governed source jumps eight.
+        //
+        // The single-channel mask is REQUIRED, not assumed: a lane stride only expresses a
+        // channel walk when the mask names one channel, so any other mask stays blocked rather
+        // than unrolling into a wrong set of lanes.
+        0x06 if bits(word, 3, 0).count_ones() == 1 => Some(vec![fixed(1), fixed(1)]),
+        // 0x15 IMAD32 (`decode_grp_imad32`). Every operand is a SEVEN-bit field - dest 27:21,
+        // src0 20:14, src1 13:7, src2 6:0 - so every stride is 1.
+        //
+        // >>> WHAT IS MEASURED HERE IS THE STEPS, NOT THE SLOT NUMBERS, AND THE CALLER REFUSES
+        // >>> EVERY STATE THAT COULD TELL THEM APART.
+        //
+        // A football title repeats one of these three times and then reads the three results
+        // as POINTERS, which is what pins each operand's advance:
+        //
+        //   #54  (x3)  pa[?] = pa[?] * <imm 16> + sa[77]
+        //   #63  r[4]  = mem[pa[2]]   #64  r[0] = mem[pa[1]]   #65  pa[12] = mem[pa[0]]
+        //
+        //  * THE DESTINATION STEPS. `pa[0]`, `pa[1]` and `pa[2]` are all read as pointers three
+        //    instructions later and NOTHING else in the program writes `pa[1]` or `pa[2]`, so a
+        //    destination that stood still would leave two loads addressing registers nothing
+        //    ever wrote.
+        //  * `src2` DOES NOT. It is `sa[77]`, which is the bound buffer's base address - the
+        //    same register the program's six OTHER memory loads all read. Stepping it would
+        //    give three different buffers for one array.
+        //  * `src1` DOES NOT, and cannot: it is an inline IMMEDIATE, the bone-matrix stride 16,
+        //    which every other IMAD32 in the program also carries. There is no register field
+        //    under it to step, and stepping the literal would make the stride 16, 17, 18.
+        //  * `src0` STEPS, by elimination and by use: the three products are three different
+        //    bone rows, and `pa[19]`/`pa[20]` are read by nothing else.
+        //
+        // The state in force is `[0, 1, 1, 1]`: exactly one slot holds zero. So src2 is on slot
+        // 0 and the other two are on slots that all carry the SAME increment - which is why
+        // the numbering below cannot be read off this word, and why `unroll_repeats` blocks
+        // this group whenever slots 1..3 disagree, where the choice would change the answer.
+        //
+        // >>> UNDER THE TOP-DOWN BYTE ORDER the zero byte of that `[0, 1, 1, 1]` state is 7:0 -
+        // >>> the src2 byte - so the non-stepping base address sits on src2's own slot, and
+        // >>> the two stepping operands on theirs. The steps measured above are unchanged;
+        // >>> what the order settles is which byte each operand reads, so the state no longer
+        // >>> has to be uniform across the other three slots.
+        0x15 if imad32_src1_is_inline_immediate(word) => {
+            Some(vec![op(0, 1), op(1, 1), fixed(0), op(3, 1)])
         }
         _ => None,
     }
+}
+
+/// Whether a group-0x15 IMAD32's `src1` is an inline literal rather than a register.
+///
+/// A repeat steps an operand's REGISTER FIELD; an immediate has no register under it, and
+/// stepping the literal would change the multiplier. [`repeat_operands`] only describes this
+/// group's repeat for the immediate form, so anything else stays blocked.
+pub(crate) fn imad32_src1_is_inline_immediate(word: u64) -> bool {
+    bits(word, 49, 49) != 0 && bits(word, 31, 30) & 3 == 2
+}
+
+/// The LIMM member's destination and 32-bit immediate - see [`Op::Limm`] for the evidence.
+///
+/// Returns `Op::Limm` with the assembled value; the destination is filled in by the caller,
+/// which owns the `Instr`. An index-mode destination has no register to write, so it keeps the
+/// blocked path rather than inventing one.
+/// The SMBO `src1` base offset, or `None` when the word is not an SMBO.
+///
+/// The state walk in [`crate::usse::smbo_states`] is what applies it; this is only the field.
+pub(crate) fn smbo_src1_base(word: u64) -> Option<u16> {
+    (opcode1(word) == 0x1f && bits(word, 58, 56) == 0b011 && bits(word, 53, 52) == 0b01)
+        .then(|| bits(word, 23, 12) as u16)
+}
+
+fn limm_value(word: u64) -> u32 {
+    let low = bits(word, 20, 0);
+    let mid = bits(word, 40, 36);
+    let high = bits(word, 48, 44);
+    let top = bits(word, 54, 54);
+    (top << 31) | (high << 26) | (mid << 21) | low
+}
+
+fn limm_op(word: u64) -> Op {
+    Op::Limm { value: limm_value(word) }
 }
 
 fn decode_grp_flow(word: u64) -> Instr {
@@ -3454,11 +5231,39 @@ fn decode_grp_flow(word: u64) -> Instr {
     } else if op2 == 0b010 && opcat == 0b01 {
         (Op::Todo("flow smlsi (repeat-state) not modeled"), Some("0xF8 SMLSI repeat/swizzle state not modeled - would mis-address later instructions"))
     } else if op2 == 0b011 && opcat == 0b01 {
-        (Op::Todo("flow smbo (base-offset state) not modeled"), Some("0xF8 SMBO base-offset state not modeled - would mis-address later instructions"))
+        // SMBO: four 12-bit BASE OFFSETS added to later instructions' register numbers. Only
+        // the `src1` slot at [23:12] is established - see [`crate::usse::smbo_states`] for the
+        // two-program closure that pins it and for what the state does - so a word that
+        // programs any other slot is refused rather than applied on a guessed field order.
+        let others = bits(word, 11, 0) | bits(word, 35, 24) | bits(word, 47, 36);
+        let src1 = bits(word, 23, 12);
+        let why = if others != 0 {
+            Some(
+                "0xF8 SMBO programs a base-offset slot other than src1, and which 12-bit field is which is not established",
+            )
+        } else if src1 != 0 && bits(word, 50, 50) != 0 {
+            // Bit 50 varies between the two all-zero RESET words the same program emits
+            // interchangeably, so it cannot change what an all-zero word does. What it does to
+            // a NON-zero one is unknown, and no word in any corpus sets both.
+            Some("0xF8 SMBO with bit 50 set AND a non-zero base offset is outside the corpus")
+        } else {
+            None
+        };
+        (Op::Nop, why)
     } else if op2 == 0b001 && opcat == 0b11 {
         (Op::Kill, None)
     } else if op2 == 0b100 && opcat == 0b10 {
-        (Op::Todo("flow limm load-immediate"), Some("0xF8 LIMM (load 32-bit immediate) not yet wired"))
+        // LIMM: `dest = <32-bit immediate>`. See [`Op::Limm`] for the layout and the evidence.
+        //
+        // >>> THE REFUSAL THIS REPLACES OUTLIVED THE CORPUS THAT WROTE IT. It said the corpus
+        // "contains exactly TWO LIMM words, both from one program", and that the second REFUTES
+        // both candidate destination readings - one overwriting "a live blend index". A
+        // football title's corpus carries 29 LIMMs over six distinct words, and the "live blend
+        // index" was an artefact: the instruction that read it is a VMOVCU8, which this decoder
+        // was reading through the FLOAT operand numbering. It is a non-float move, so its
+        // operands are not doubled, and under the undoubled reading it is not a blend index at
+        // all - it is `select(CONSTANT, packed_pair)`, and the constant is this LIMM's.
+        (limm_op(word), None)
     } else if op2 == 0b011 && opcat == 0b11 {
         // DEPTHF (spec F8.7): write `src0` - a scalar - into the fragment depth output.
         //
@@ -3577,11 +5382,28 @@ fn decode_grp_flow(word: u64) -> Instr {
         Vec::new()
     };
 
+    // LIMM is the one member with a DESTINATION. Its number is the ordinary seven-bit
+    // undoubled field at [27:21] and its bank the ordinary selector at [33:32] - see
+    // [`Op::Limm`]. An index-mode destination has no register to name, so it blocks.
+    let (dest, write_mask, blocked) = if matches!(op, Op::Limm { .. }) {
+        match r7_dest_bank_index(bits(word, 33, 32) as u8, bits(word, 27, 21)) {
+            Some((b, i)) => (
+                Some(Operand::plain(b, i, bits(word, 33, 32) as u8)),
+                // One whole 32-bit lane: the immediate is a bit pattern, not four channels.
+                [true, false, false, false],
+                blocked,
+            ),
+            None => (None, [false; 4], blocked.or(Some("0xF8 LIMM destination in index mode"))),
+        }
+    } else {
+        (None, [false; 4], blocked)
+    };
+
     Instr {
         op,
         pred,
-        dest: None,
-        write_mask: [false; 4],
+        dest,
+        write_mask,
         srcs,
         half_precision: false,
         raw: word,
@@ -3616,6 +5438,132 @@ fn decode_grp_flow(word: u64) -> Instr {
 /// address-space selector in some arrangement that remains unestablished - but a field that
 /// is ZERO in every shipped instance does not need its other values established to decode
 /// the zero case. Every departure from the census blocks BY NAME below; none is guessed.
+/// Decode a LOCAL-memory access: the 0x1d (load) / 0x1e (store) format with `addr_mode = 1`.
+///
+/// Local memory is a per-invocation scratch area, not guest memory - see [`Op::LocalLoad`]. The
+/// facts this rests on (the clean-room memory-access spec, local section):
+///
+/// * a STORE's address is `src0 + src1` and its DATA is src2 (bank 29:28 + ext 48, number
+///   6:0) - `dest_n` is unused on a store; a LOAD's address is `src0 + src1 + src2` into `dest`;
+/// * `src0` is the thread-buffer slot the driver fills and its value is NOT added: the area is
+///   private to the invocation;
+/// * a register offset's LOW 16 BITS are the byte offset. The one program in any corpus that
+///   uses local memory stores nine words at offsets `0x00240000 .. 0x00240020`: the low halves
+///   are nine distinct words `0..0x20`, and the constant upper half `0x24` = 36 bytes is the area
+///   size, not a displacement;
+/// * `addr_mode = 1` on every local access and 0 on every absolute one. Reading 1 as "local" is
+///   consistent with every captured word and stated by no source; 2 and 3 stay blocked.
+///
+/// Modelled: 32-bit, ONE element, unconditional, `mode = 0`, no auto-increment, `moe_expand`
+/// set (every local word in the corpus), src0 in the SA bank, immediate offsets counting
+/// elements. Every departure blocks by name.
+fn decode_local_access(word: u64) -> Instr {
+    let mut blocked: Option<&'static str> = None;
+    let set = |b: &mut Option<&'static str>, why: &'static str| *b = b.or(Some(why));
+    let store = bits(word, 60, 59) == 2;
+    if bits(word, 43, 42) != 1 {
+        set(&mut blocked, "0xF0 memory store outside the LOCAL address mode (addr_mode 1) not established");
+    }
+    if bits(word, 58, 56) != 0 {
+        set(&mut blocked, "local memory access predicate table not established");
+    }
+    if bits(word, 53, 53) == 0 {
+        set(&mut blocked, "local memory access without moe_expand not established");
+    }
+    if bits(word, 52, 52) != 0 {
+        set(&mut blocked, "local memory access sync_start not established");
+    }
+    if bits(word, 47, 44) != 0 {
+        set(&mut blocked, "multi-element local memory access not established");
+    }
+    if bits(word, 41, 40) != 0 {
+        set(&mut blocked, "local memory access mode value not established (only 0 is)");
+    }
+    if bits(word, 38, 38) != 0 {
+        set(&mut blocked, "local memory access range_enable not established");
+    }
+    if bits(word, 37, 36) != 0 {
+        set(&mut blocked, "non-32-bit local memory access not established");
+    }
+    if bits(word, 35, 35) != 0 {
+        set(&mut blocked, "local memory access auto-increment not established");
+    }
+    // src0: the thread-buffer slot, an SA register (bank bit 34 = 1 with extension 50 = 1).
+    if bits(word, 50, 50) != 1 || bits(word, 34, 34) != 1 {
+        set(&mut blocked, "local memory access whose base is not an SA register not established");
+    }
+    // The offsets (src1, and src2 on a load) and, on a store, the data (src2).
+    let mut imm_elements = 0u32;
+    let mut offset_regs: Vec<Operand> = Vec::new();
+    let mut data: Option<Operand> = None;
+    let fields: &[(u32, u32, u32, u32, u32, bool)] = &[
+        (31, 30, 49, 13, 7, false),
+        (29, 28, 48, 6, 0, store),
+    ];
+    for &(bank_hi, bank_lo, ext_bit, n_hi, n_lo, is_data) in fields {
+        let (sel, ext) = (bits(word, bank_hi, bank_lo), bits(word, ext_bit, ext_bit));
+        let n = bits(word, n_hi, n_lo);
+        match (ext, sel, is_data) {
+            (1, 2, false) => imm_elements += n,
+            (1, _, _) => set(&mut blocked, "local memory operand in an extended bank not established"),
+            (_, sel, is_data) => {
+                let op = Operand::plain(bank_rs2(sel as u8), r7_reg_index(n), sel as u8);
+                if is_data {
+                    data = Some(op);
+                } else {
+                    offset_regs.push(op);
+                }
+            }
+        }
+    }
+    let offset_bytes = imm_elements * 4;
+    if imm_elements != 0 {
+        set(&mut blocked, "local memory access with a non-zero IMMEDIATE offset not established");
+    }
+    let (op, dest, srcs) = if store {
+        let Some(d) = data else {
+            return Instr { blocked: Some("local store data operand is not a register"), ..stub(word, 0x1e) };
+        };
+        let mut srcs = vec![d];
+        srcs.append(&mut offset_regs);
+        (Op::LocalStore { offset_bytes }, None, srcs)
+    } else {
+        let dest_n = bits(word, 27, 21);
+        let dest_bank = if bits(word, 39, 39) == 0 { Bank::Temp } else { Bank::PrimaryAttr };
+        if dest_bank == Bank::Temp && dest_n >= 124 {
+            set(&mut blocked, "local load destination in the reserved TEMP range");
+        }
+        let dest = Operand::plain(dest_bank, r7_reg_index(dest_n), bits(word, 39, 39) as u8);
+        (Op::LocalLoad { offset_bytes }, Some(dest), offset_regs)
+    };
+    Instr {
+        op,
+        pred: Predicate::Always,
+        dest,
+        write_mask: if store { [false; 4] } else { [true, false, false, false] },
+        srcs,
+        half_precision: false,
+        raw: word,
+        group: if store { 0x1e } else { 0x1d },
+        blocked,
+    }
+}
+
+/// An empty instruction of `group`, for a decoder's early refusal.
+fn stub(word: u64, group: u8) -> Instr {
+    Instr {
+        op: Op::Todo("local memory"),
+        pred: Predicate::Always,
+        dest: None,
+        write_mask: [false; 4],
+        srcs: Vec::new(),
+        half_precision: false,
+        raw: word,
+        group,
+        blocked: None,
+    }
+}
+
 fn decode_grp_mem_load(word: u64) -> Instr {
     let mut blocked: Option<&'static str> = None;
     // First reason wins, matching the convention every other group decoder uses.
@@ -3685,8 +5633,23 @@ fn decode_grp_mem_load(word: u64) -> Instr {
     //   header), so blocking it here refused the one form the rest of the pipeline is built to
     //   serve. Three vertex programs of a retail title load through it.
     //
-    // TEMP and OUTPUT stay out: neither is observed, and a pointer read out of a register the
-    // program computed for something else is not a thing to guess at.
+    // * TEMP - the SAME skinning idiom as the PA case, landing in a different bank. A
+    //   retail title's skinned vertex program computes `bone_index * 48 + sa[34]` four
+    //   times over (48 bytes being a 4x3 bone matrix) and the compiler puts one of those
+    //   addresses in a PA register and the other three in TEMPs - so the census accepted
+    //   one load of a group and refused its three siblings, on a distinction the program
+    //   does not make. The address arithmetic is the guest's own either way, and the
+    //   emitter addresses a temp (`r[n]`) exactly as it addresses a PA register.
+    //
+    // * OUTPUT - the same skinning idiom again, in the one remaining bank. It was refused
+    //   here on the reasoning that "an output register is where a program puts results, not
+    //   addresses", and that reasoning was wrong: an output register is a REGISTER, and this
+    //   title's skinned vertex programs use the bank as scratch for exactly the pointers the
+    //   three accepted banks hold in its other programs. 19 blobs of one corpus - every
+    //   skinned mesh in the title - were refused whole for it, and the distinction is one the
+    //   programs do not make. The bank encoding is the ordinary two-bit one already read for
+    //   the other three rows, so admitting this row is not a new reading of anything; the
+    //   emitter addresses `o[n]` exactly as it addresses `r[n]` and `pa[n]`.
     let src0 = {
         let (ext, sel) = (bits(word, 50, 50), bits(word, 34, 34));
         let bank = match (ext, sel) {
@@ -3695,25 +5658,113 @@ fn decode_grp_mem_load(word: u64) -> Instr {
             (_, 0) => Bank::Output,
             (_, _) => Bank::SecondaryAttr,
         };
-        if !matches!(bank, Bank::PrimaryAttr | Bank::SecondaryAttr) {
-            set(&mut blocked, "0xE8 memory-load src0 outside the PA/SA banks not in the census");
+        if !matches!(
+            bank,
+            Bank::PrimaryAttr | Bank::SecondaryAttr | Bank::Temp | Bank::Output
+        ) {
+            set(&mut blocked, "0xE8 memory-load src0 outside the PA/SA/TEMP/OUTPUT banks not in the census");
         }
         Operand::plain(bank, r7_reg_index(bits(word, 20, 14)), sel as u8)
     };
 
-    // src1/src2, the offsets: 2-bit bank + extension, the shared row. The census holds
-    // IMMEDIATE only, where the 7-bit number is a count of ELEMENTS scaled by the element
-    // size (32-bit here). A register-supplied byte offset is spec'd but unobserved.
+    // src1/src2, the offsets: 2-bit bank + extension, the shared row. An IMMEDIATE offset
+    // (extension row selector 2) carries a 7-bit count of ELEMENTS, scaled by the element size
+    // (32-bit here). A REGISTER-supplied offset is already in BYTES - the two are different
+    // units and the spec's own address sum says so.
+    //
+    // >>> THE REGISTER FORM IS WHAT AN INDEXED UNIFORM-BUFFER READ COMPILES TO, and it closes
+    // exactly. Three vertex programs of a shipped title read a float4 array out of a bound
+    // uniform buffer like this:
+    //
+    //   PA21 = int16(SubUVIndices.x)          (PackToInt16 of the attribute)
+    //   PA8  = PA21 * 16 + SA[88]             (IMAD32: 16 bytes per float4, SA[88] the
+    //                                          array's byte offset inside the buffer)
+    //   T4..T7 = mem[SA[38] + PA8]            (this instruction: SA[38] is the buffer's bound
+    //                                          address, in the DATA container the +0x78 table
+    //                                          names)
+    //
+    // The stride, the element size and the destination burst all agree with the container's
+    // own `SubUVExtents` (F32[4] x 32) declaration, and the immediate offset in these words is
+    // zero - the whole displacement is in the register, which is why it cannot be folded.
+    //
+    // Only the banks a program can actually compute an address into are accepted, for the same
+    // reason `src0` accepts only those: PRIMATTR and TEMP are where the integer pipeline leaves
+    // a computed offset, and SECATTR is where the driver leaves a bound one.
+    //
+    // >>> AND **OUTPUT** IS A FOURTH, BY THE SAME EVIDENCE THAT ADMITTED IT FOR `src0`. It was
+    // refused here with "OUTPUT is where a program puts results, not addresses" - the identical
+    // sentence the `src0` row above carries as a REFUTED reading, left standing on this row
+    // only because the two were widened at different times. A football title's skinned vertex
+    // programs settle it the same way: the pointer arithmetic and the load sit next to each
+    // other, and the compiler puts the sum in an output register.
+    //
+    //   o[12] = IMAD32(r[0], 16, sa[92])        (16 bytes a matrix row, sa[92] the array's
+    //                                            byte offset inside the bound buffer)
+    //   r[4..8] = mem[sa[89] + o[12]]           (this instruction)
+    //
+    // That pair repeats verbatim down the program with o[12], o[13], ... o[23], and the SAME
+    // program also loads through PA and TEMP offsets - so the distinction is one the program
+    // does not make. 96 distinct words in the title's corpus carry this row, EVERY ONE of them
+    // selector 1, and the emitter addresses `o[n]` exactly as it addresses `r[n]` and `pa[n]`.
     let mut imm_elements = 0u32;
+    let mut offset_regs: Vec<Operand> = Vec::new();
     for (bank_hi, bank_lo, ext_bit, n_hi, n_lo) in [(31u32, 30u32, 49u32, 13u32, 7u32), (29, 28, 48, 6, 0)] {
         let (sel, ext) = (bits(word, bank_hi, bank_lo), bits(word, ext_bit, ext_bit));
-        if ext == 1 && sel == 2 {
-            imm_elements += bits(word, n_hi, n_lo);
-        } else {
-            set(&mut blocked, "0xE8 memory-load register-supplied offset not in the census");
+        let n = bits(word, n_hi, n_lo);
+        match (ext, sel) {
+            (1, 2) => imm_elements += n,
+            (1, _) => set(
+                &mut blocked,
+                "0xE8 memory-load offset in an extended bank other than IMMEDIATE not in the census",
+            ),
+            (_, sel) => {
+                let bank = bank_rs2(sel as u8);
+                if !matches!(
+                    bank,
+                    Bank::PrimaryAttr | Bank::SecondaryAttr | Bank::Temp | Bank::Output
+                ) {
+                    set(
+                        &mut blocked,
+                        "0xE8 memory-load register offset outside the PA/SA/TEMP/OUTPUT banks not in the census",
+                    );
+                }
+                offset_regs.push(Operand::plain(bank, r7_reg_index(n), sel as u8));
+            }
         }
     }
-    let offset_bytes = imm_elements * 4;
+    // >>> A `moe_expand` LOAD'S IMMEDIATE OFFSET IS BIASED BY ONE REGISTER, and reading it raw
+    // >>> is what made a shipped baseball title's whole 3D world render BLACK.
+    //
+    // The bit was allowed through for a single element on the argument that expansion has no
+    // second iteration to step to, so it cannot change which address is read. The first half of
+    // that is still true; the conclusion was not, because the FIELD ITSELF is encoded
+    // differently under the bit.
+    //
+    // THE CENSUS THAT SETTLES IT (`usse_memory_group_field_census`, over BOTH streams - the old
+    // census walked the primary only, and every memory load of this title's world materials is
+    // in the SECONDARY): 100 `moe_expand` loads in that title, three distinct immediate offsets
+    // - 7, 9 and 27 - and EVERY ONE IS ODD. Not one is even. Meanwhile every one of the 1,530
+    // ordinary loads in the same corpora lands on an even register. An offset field that is
+    // never even over a hundred instructions is not an offset field in that low bit.
+    //
+    // Debiased by one they are 6, 8 and 26, and all three land exactly on a declared parameter
+    // or ARRAY-ELEMENT start of the program's own table (`UFP_TuneMatrix` F16[4]x4 at reg 6, so
+    // its elements begin at 6, 8, 10, 12; `UFP_ExposureControls` at reg 26). Read raw they point
+    // one register PAST each - into the middle of a float4, which is where no compiler aims a
+    // whole-vector load. The raw reading delivered the SECOND half of a float4 whose low
+    // component was zero, so the world's final `colour * exposure` multiplied by exactly 0.
+    //
+    // PROVABLY INERT ON EVERY OTHER TITLE: the same census reports ZERO `moe_expand` loads in
+    // the mk, golf, p4 and OlliOlli corpora - the bit is set nowhere else, so this row cannot
+    // move a shader that does not use it.
+    //
+    // A field of 0 would be ambiguous under a bias of one and does not occur; it refuses by name
+    // rather than underflowing into a 512 MB displacement.
+    let moe_expand = bits(word, 53, 53) != 0;
+    if moe_expand && imm_elements == 0 && offset_regs.is_empty() {
+        set(&mut blocked, "0xE8 memory-load moe_expand with a ZERO immediate offset - the one-register bias cannot be undone");
+    }
+    let offset_bytes = if moe_expand { imm_elements.saturating_sub(1) * 4 } else { imm_elements * 4 };
 
     // Destination: a 1-bit bank (TEMP / PRIMATTR), 7-bit direct number, `elements`
     // CONSECUTIVE registers from it. The reserved internal-register encodings (TEMP
@@ -3725,6 +5776,11 @@ fn decode_grp_mem_load(word: u64) -> Instr {
     }
     let dest = Operand::plain(dest_bank, r7_reg_index(dest_n), bits(word, 39, 39) as u8);
 
+    // `srcs[0]` is the pointer; any REGISTER-supplied byte offsets follow it, in src1-then-src2
+    // order. The emitter adds them to the address; there are at most two.
+    let mut srcs = vec![src0];
+    srcs.append(&mut offset_regs);
+
     Instr {
         op: Op::MemLoad { elements, offset_bytes },
         pred: Predicate::Always,
@@ -3732,7 +5788,7 @@ fn decode_grp_mem_load(word: u64) -> Instr {
         // NOT meaningful for this op: the written span is `elements` consecutive registers
         // (up to 16), which four channel bits cannot carry. Consumers read `elements`.
         write_mask: [true; 4],
-        srcs: vec![src0],
+        srcs,
         half_precision: false,
         raw: word,
         group: 0x1d,
@@ -3967,11 +6023,97 @@ mod tests {
         assert_eq!(ins.srcs.len(), 3);
     }
 
+    /// LIMM's destination and 32-bit immediate, on the football title's own words - and the
+    /// cross-check that makes the immediate assembly a closure rather than a fit.
+    ///
+    /// That title compiles ONE skinned shader two ways. The first loads three constants with
+    /// LIMMs; the second has no LIMM at all and reads the same three out of its LITERAL TABLE,
+    /// which the container spells out. The three values have to agree, and they do.
     #[test]
-    fn vmovcu8_and_predicated_move_still_block() {
-        // move_type 2 (VMOVCU8) cannot be modeled in the float register file -> blocked.
-        let cu8 = decode(0x38408506a1001006); // same word, move_type bits 47:46 -> 10
-        assert!(cu8.blocked.is_some(), "VMOVCU8 must hard-fail, not emit");
+    fn limm_assembles_the_three_constants_its_other_compilation_keeps_as_literals() {
+        // `pa[7] = 0x7FFFFFFF` - the sentinel a byte-wise conditional move selects one
+        // instruction later. `vert_90c28c60`'s literal table holds it at `sa[83]`.
+        let a = decode(0xfca1_f1f2_00ff_ffff);
+        assert_eq!(a.blocked, None, "{:?}", a.blocked);
+        assert_eq!(a.op, Op::Limm { value: 0x7fff_ffff });
+        let d = a.dest.expect("a destination");
+        assert_eq!((d.bank, d.index), (Bank::PrimaryAttr, 7), "number[27:21], UNDOUBLED");
+        assert_eq!(a.write_mask, [true, false, false, false], "one whole 32-bit lane");
+
+        // `o[0] = -2^31` - broadcast to o[1..3] and then used as the floor of a `>=` running
+        // maximum. The other compilation's literal table holds `0xcf000000` at `sa[78]` and
+        // feeds it to a `Max`, which is the same role. This is the word that pins BIT 54 as
+        // the immediate's top bit: without it the value is `+2^31`, the floor of a MINIMUM.
+        let b = decode(0xfce1_3181_0000_0000);
+        assert_eq!(b.blocked, None, "{:?}", b.blocked);
+        assert_eq!(b.op, Op::Limm { value: 0xcf00_0000 });
+        let d = b.dest.expect("a destination");
+        assert_eq!((d.bank, d.index), (Bank::Output, 0));
+
+        // `pa[5] = 65536` - added as a byte offset by the IMAD32 one instruction later, whose
+        // `src2` names `pa[5]`. Five is ODD, so no doubled field can name it. The literal
+        // tables hold `0x00010000` too (`sa[82]`, `sa[100]`).
+        let c = decode(0xfca0_0002_00a1_0000);
+        assert_eq!(c.blocked, None, "{:?}", c.blocked);
+        assert_eq!(c.op, Op::Limm { value: 0x0001_0000 });
+        let d = c.dest.expect("a destination");
+        assert_eq!((d.bank, d.index), (Bank::PrimaryAttr, 5));
+        // The same constant into three other registers, in three other programs.
+        for (w, n) in
+            [(0xfca0_0002_0261_0000u64, 19u8), (0xfca0_0002_00e1_0000, 7), (0xfca0_0002_0061_0000, 3)]
+        {
+            let i = decode(w);
+            assert_eq!(i.op, Op::Limm { value: 0x0001_0000 }, "{w:#018x}");
+            assert_eq!(i.dest.expect("dest").index, n, "{w:#018x}");
+        }
+    }
+
+    /// SMBO sets a `src1` base offset because a SIX-bit operand field cannot name a register
+    /// above 63 - and the two words that establish it both land on a `0x7fffffff` literal.
+    #[test]
+    fn smbo_programs_a_src1_base_and_refuses_every_slot_it_cannot_place() {
+        // base 20: `src1` field 63 -> `sa[83]`, which `vert_90c28c60`'s literal table holds.
+        assert_eq!(smbo_src1_base(0xfb10_0000_0001_4000), Some(20));
+        assert_eq!(decode(0xfb10_0000_0001_4000).blocked, None);
+        // base 38: field 63 -> `sa[101]`, which `vert_90c2e8f0`'s table holds.
+        assert_eq!(smbo_src1_base(0xfb10_0000_0002_6000), Some(38));
+        // Both spellings of the all-zero reset the same programs emit after a use.
+        for reset in [0xfb10_0000_0000_0000u64, 0xfb14_0000_0000_0000] {
+            assert_eq!(smbo_src1_base(reset), Some(0), "{reset:#018x}");
+            assert_eq!(decode(reset).blocked, None, "{reset:#018x}");
+        }
+        // Any other slot, and bit 50 over a non-zero base, stay refused.
+        for bad in [
+            0xfb10_0000_0000_0001u64,
+            0xfb10_0000_1000_0000,
+            0xfb10_0100_0000_0000,
+            0xfb14_0000_0001_4000,
+        ] {
+            assert!(decode(bad).blocked.is_some(), "{bad:#018x} must block");
+        }
+        // A word that is not an SMBO has no base.
+        assert_eq!(smbo_src1_base(0xfca1_f1f2_00ff_ffff), None);
+    }
+
+    /// VMOVCU8 is a BYTE-WISE conditional move over RAW lanes: one register, four bytes, every
+    /// operand undoubled. On the football title's own word, which is the evidence.
+    #[test]
+    fn vmovcu8_is_a_byte_wise_select_over_undoubled_raw_lanes() {
+        // `r[8] = (pa[12].byte[c] != 0) ? pa[7].byte[c] : pa[16].byte[c]`, all four bytes -
+        // the last of the four the program emits in a row, and the one whose destination the
+        // IMAD32 four instructions later reads as `r[8]`.
+        let ins = decode(0x388082a4af20c1d0);
+        assert_eq!(ins.blocked, None, "the byte form needs no float view: {:?}", ins.blocked);
+        assert_eq!(ins.op, Op::CmovU8 { test: CompareMethod::NeZero });
+        let dest = ins.dest.expect("a destination");
+        assert_eq!((dest.bank, dest.index), (Bank::Temp, 8), "UNDOUBLED destination field 8");
+        assert_eq!(ins.write_mask, [true; 4], "four BYTES of that one register");
+        // srcs are [src1 (true), src2 (false), src0 (test)], every number undoubled.
+        assert_eq!((ins.srcs[0].bank, ins.srcs[0].index), (Bank::PrimaryAttr, 7), "the LIMM's register");
+        assert_eq!((ins.srcs[1].bank, ins.srcs[1].index), (Bank::PrimaryAttr, 16));
+        assert_eq!((ins.srcs[2].bank, ins.srcs[2].index), (Bank::PrimaryAttr, 12));
+        assert!(!ins.half_precision, "nothing here is read through a float view");
+        assert!(ins.is_supported());
         // A predicated unconditional VMOV still blocks (predicate model not yet wired).
         let pred = decode(0x39000000_00000000);
         assert!(pred.blocked.is_some());
@@ -3998,9 +6140,21 @@ mod tests {
         assert_eq!(cst.srcs[0].bank, Bank::Constant);
         assert_eq!(cst.srcs[0].index, 2);
         assert_eq!((cst.dest.unwrap().bank, cst.dest.unwrap().index), (Bank::Output, 18));
-        // opt1 = 00 (index1 mode) is a real RIO6 addressing mode not modeled -> still blocked.
+        // opt1 = 00 is INDEXED1 - a register-INDIRECT read through `idx[0]`, the R6 number
+        // doubled exactly as a register number is, and NO swizzle (an indexed operand's
+        // components are consecutive). It used to be refused here as "not modeled", which was
+        // a statement about this decoder: the row is `ext_source_r6`'s, the pack group already
+        // reads it, and a football title emits one directly after the `LoadIndex` that sets
+        // the register.
         let idx = decode(base); // bits 31:30 = 00
-        assert!(idx.blocked.is_some(), "src1 ext index1 mode must stay blocked");
+        assert_eq!(idx.blocked, None, "src1 indexed1 resolves through ext_source_r6");
+        assert_eq!(idx.srcs[0].bank, Bank::Indexed);
+        assert_eq!(idx.srcs[0].index, 4, "R6 field 2 doubled");
+        assert_eq!(idx.srcs[0].swizzle, [0, 1, 2, 3], "an indexed source carries no swizzle");
+        // IMMEDIATE (opt1 = 10) is a scalar literal whose number IS the value, undoubled.
+        let imm = decode(base | (2 << 30));
+        assert_eq!(imm.blocked, None, "src1 immediate is a literal, not a register file");
+        assert_eq!((imm.srcs[0].bank, imm.srcs[0].index), (Bank::Immediate, 2));
     }
 
     /// The group-0x1a IMAD32-STEP layout, checked against the two shapes the corpus carries -
@@ -4060,7 +6214,6 @@ mod tests {
             ("reserved bits 38:35", base | 1 << 35),
             ("sn value 2 (bit 53)", base | 1 << 53),
             ("a repeat count", base | 1 << 44),
-            ("the signed form", base | 1 << 41),
             ("a negated src1", base | 1 << 40),
             ("a negated src2", base | 1 << 39),
             ("an extended destination bank", base | 1 << 51),
@@ -4069,6 +6222,42 @@ mod tests {
                 decode(word).blocked.is_some(),
                 "{name} must block rather than decode through this layout"
             );
+        }
+    }
+
+    /// The SIGNED form decodes, and the reason it may is that the PAIR's value does not depend
+    /// on the sign rule this group's layout leaves open.
+    ///
+    /// It used to hard-fail on "no word in the corpus is signed", which stopped being true: a
+    /// football title sets bit 41 on 20 of its 126 group-0x1a occurrences, and they were its
+    /// largest single blocked cause at 194 fallback draws. Two facts retire the refusal, and
+    /// both are pinned here because each alone would be thinner than it looks.
+    #[test]
+    fn group_1a_emits_the_signed_form_because_the_pair_is_sign_independent() {
+        // A real signed pair, verbatim: `vert_90b2d9c0` #6 and #7. Same src0, same src1, and the
+        // high step's src2 is the low step's destination - the shape `validate_imad_step_pairs`
+        // requires, which is what confines the reading to the pair's net value.
+        let lo = decode(0xd083_0206_a000_c180u64);
+        let hi = decode(0xd092_0206_a000_c180u64);
+        assert_eq!(lo.op, Op::IntMadStep { signed: true, high_half: false });
+        assert_eq!(hi.op, Op::IntMadStep { signed: true, high_half: true });
+        assert_eq!(lo.blocked, None, "the signed form must decode: {:?}", lo.blocked);
+        assert_eq!(hi.blocked, None, "the signed form must decode: {:?}", hi.blocked);
+        // BOTH STEPS CARRY THE FLAG. Over the corpus all 57 well-formed pairs agree on bit 41,
+        // so it describes the pair, not one half - which is what the old refusal was asking.
+        assert_eq!(lo.srcs[0].index, hi.srcs[0].index);
+        assert_eq!(lo.srcs[1].index, hi.srcs[1].index);
+        assert_eq!(hi.srcs[2].index, lo.dest.expect("a destination").index);
+        // The arithmetic that makes one emission right for both readings: the pair computes
+        // `x*y + z` modulo 2^32, and two's-complement multiplication agrees on the low 32 bits
+        // for signed and unsigned operands. Stated over the emitted form itself.
+        for (x, y, z) in [(0xffff_8000u32, 7u32, 3u32), (0x0001_2345, 0xdead_beef, 0), (0x8000_0000, 3, 9)] {
+            let paired = ((x >> 16).wrapping_mul(y) << 16)
+                .wrapping_add((x & 0xffff).wrapping_mul(y))
+                .wrapping_add(z);
+            assert_eq!(paired, x.wrapping_mul(y).wrapping_add(z), "x={x:#x} y={y:#x}");
+            let as_signed = (x as i32).wrapping_mul(y as i32).wrapping_add(z as i32) as u32;
+            assert_eq!(paired, as_signed, "signed and unsigned must agree mod 2^32");
         }
     }
 
@@ -4084,7 +6273,7 @@ mod tests {
     fn group_78_vtstmsk_closes_on_the_word_that_established_it() {
         let instr = decode(0x78c0_8aa0_0f93_807c);
         assert_eq!(instr.group, 0x0f);
-        assert_eq!(instr.op, Op::TestMask { alu: TestAlu::Sub, cmp: TestCmp::Gt });
+        assert_eq!(instr.op, Op::TestMask { alu: TestAlu::Sub, cmp: TestCmp::Gt, byte_mask: false });
         assert_eq!(instr.pred, Predicate::Always);
         assert_eq!(instr.blocked, None, "the layout must close with nothing blocked");
         // Destination and src2 are the SAME internal register: the reference depth goes in and
@@ -4098,19 +6287,75 @@ mod tests {
         assert_eq!(repeat_extra_iterations(0x78c0_8aa0_0f93_807c), Some(0));
     }
 
-    /// The VTSTMSK forms the corpus does not establish stay blocked - the two bit-pattern mask
-    /// types, the second test flag, and a write-back-disabled word that would write nothing.
+    /// The VTSTMSK forms the corpus does not establish stay blocked - the precision-mask form
+    /// on a float family, the reserved form, and a write-back-disabled word that would write
+    /// nothing - while the 8-BIT form on a FLOAT family no longer does.
+    ///
+    /// That pair was refused because the two readings of what a mask writes disagreed on both
+    /// the value and the channel count. RESTATED 2026-09-23c: it is the BYTE MASK - four
+    /// channels as the bytes of one register, destination doubled - which a football title's
+    /// skinning programs feed straight into a byte-wise conditional move (the earlier "read back
+    /// as a float multiplier" consumer was a later DOT's result). See `byte_mask` in
+    /// `decode_grp_test_mask`.
     #[test]
     fn group_78_vtstmsk_blocks_what_it_cannot_establish() {
         let base: u64 = 0x78c0_8aa0_0f93_807c;
         for (name, word) in [
-            ("the 8-bit mask type", base & !(0b11 << 36)),
             ("the precision mask type", (base & !(0b11 << 36)) | (1 << 36)),
-            ("test_flag_2", base | 1 << 50),
+            ("the reserved mask type", (base & !(0b11 << 36)) | (3 << 36)),
             ("test_wben clear", base & !(1 << 20)),
         ] {
             assert!(decode(word).blocked.is_some(), "{name} must block");
         }
+        // The 8-bit form on a float family is the BYTE mask: one register, the channels as bytes.
+        let eight_bit = decode(base & !(0b11 << 36));
+        assert_eq!(eight_bit.blocked, None, "8-bit mask type on a float family");
+        assert_eq!(eight_bit.op, Op::TestMask { alu: TestAlu::Sub, cmp: TestCmp::Gt, byte_mask: true });
+        assert_eq!(eight_bit.write_mask, [true, false, false, false], "one register, channel x");
+        assert_eq!(decode(base).write_mask, [true; 4], "the numeric form keeps four float lanes");
+        // ...and it does NOT unblock an integer family, where 0xFF and 0xFFFF differ.
+        let u16_word: u64 = 0x7802_0192_71f6_a839;
+        assert!(
+            decode((u16_word & !(0b11 << 36)) | (0 << 36)).blocked.is_some(),
+            "an 8-bit mask on the unsigned-16 family stays refused"
+        );
+    }
+
+    /// `test_flag_2` (bit 50) is `src1_neg` - the ALU sees `-src1` - and the FLOAT families
+    /// apply it rather than refusing it.
+    ///
+    /// The fact is the vendor bit-definition header's "negate source 1" flag for this group,
+    /// defined as bit 18 of the word's HIGH 32-bit half, i.e. bit 50. The bit is CLEAR on every
+    /// word any captured corpus contains except one title's four, so this arm changes no
+    /// program that already recompiles - which the whole-corpus link census confirms.
+    #[test]
+    fn group_78_vtstmsk_test_flag_2_is_src1_negate_on_the_float_families() {
+        let base: u64 = 0x78c0_8aa0_0f93_807c;
+        let plain = decode(base);
+        assert!(!plain.srcs[0].neg, "the calibration word does not negate");
+
+        let negated = decode(base | 1 << 50);
+        assert_eq!(negated.blocked, None, "a float VTSTMSK with src1_neg is no longer refused");
+        assert_eq!(negated.op, plain.op, "the flag changes no operation");
+        assert!(negated.srcs[0].neg, "src1 is negated");
+        assert!(!negated.srcs[1].neg, "src2 is untouched");
+        // Everything else about the two decodes is identical, so the flag cannot have moved
+        // an operand or a mask.
+        assert_eq!(
+            (negated.dest, negated.write_mask, negated.pred, negated.srcs[1]),
+            (plain.dest, plain.write_mask, plain.pred, plain.srcs[1]),
+        );
+
+        // >>> AND IT STAYS REFUSED ON THE NON-FLOAT FAMILY, whose emit path reads whole raw
+        // lanes and has no negate to apply - taking the flag there would DROP it silently.
+        let u16_word: u64 = 0x7802_0192_71f6_a839;
+        assert_eq!(decode(u16_word).blocked, None, "the unsigned-16 calibration word decodes");
+        assert!(
+            decode(u16_word | 1 << 50)
+                .blocked
+                .is_some_and(|w| w.contains("src1 negate")),
+            "src1_neg on the raw-lane path must block"
+        );
     }
 
     /// The group-0xE0 GATHER form, on the word a golf title's shadow filter uses: a 2D
@@ -4161,7 +6406,7 @@ mod tests {
     fn group_15_imad32_closes_on_the_word_that_established_it() {
         let instr = decode(0xa882_0886_b040_9818);
         assert_eq!(instr.group, 0x15);
-        assert_eq!(instr.op, Op::IntMad { signed: true, bits: 32 });
+        assert_eq!(instr.op, Op::IntMad { signed: true, bits: 32, src0_high: false, src1_high: false });
         assert_eq!(instr.pred, Predicate::Always);
         assert_eq!(instr.blocked, None, "the layout must close with nothing blocked");
         let dest = instr.dest.expect("a decoded destination");
@@ -4189,7 +6434,9 @@ mod tests {
             ("reserved bits 41:40", base | 1 << 40),
             ("reserved bits 37:35", base | 1 << 35),
             ("saturation", base | 1 << 42),
-            ("a repeat count", base | 1 << 44),
+            // A repeat whose `src1` is a REGISTER: the grammar is established only for the
+            // inline-immediate form, where no register field sits under src1 to step.
+            ("a repeat count over a register src1", (base | 1 << 44) & !(1 << 49)),
         ] {
             assert!(
                 decode(word).blocked.is_some(),
@@ -4200,6 +6447,12 @@ mod tests {
         // form must block.
         let narrow = (base & !(0b11 << 38)) | (1 << 38);
         assert!(decode(narrow).blocked.is_some(), "a 16-bit width must block");
+        // ...and the INLINE-IMMEDIATE repeat does decode: that is the football title's own
+        // three-iteration bone-pointer computation, whose four operand steps its own memory
+        // loads establish. `unroll_repeats` is where a state that could separate the slot
+        // candidates refuses it.
+        let imm_repeat = base | 1 << 44;
+        assert_eq!(decode(imm_repeat).blocked, None, "{:?}", decode(imm_repeat).blocked);
     }
 
     #[test]
@@ -4291,21 +6544,34 @@ mod tests {
         assert_eq!((d.bank, d.index), (Bank::Output, 0));
         assert_eq!((ins.srcs[0].bank, ins.srcs[0].index), (Bank::SecondaryAttr, 0));
         assert_eq!((ins.srcs[1].bank, ins.srcs[1].index), (Bank::Internal, 0));
-        // dest one lane, op1 one four-component vector, the internal operand still.
+        // dest one lane, op1 one four-component vector, the internal operand still. The first
+        // two advances are the DP's OWN - `moe` false - so an SMLSI that programs something
+        // other than the default cannot scale either of them; see [`repeat_operands`].
         let ops = repeat_operands(word).expect("dot repeat operands");
         assert_eq!(ops.len(), 3);
-        assert_eq!((ops[0].slot, ops[0].stride), (0, 1));
-        assert_eq!((ops[1].slot, ops[1].stride), (2, 4));
+        assert_eq!((ops[0].moe, ops[0].stride), (false, 1));
+        assert_eq!((ops[1].moe, ops[1].stride), (false, 4));
         assert_eq!((ops[2].slot, ops[2].stride), (3, 0));
     }
 
-    /// The value the census never shows must BLOCK rather than pick a plausible count.
+    /// Bit 47 rides ALONGSIDE the count, and the one value no corpus contains still blocks.
     #[test]
-    fn a_dot_repeat_field_outside_the_census_blocks() {
-        // Bit 47 set AND a low bit set - never observed in 379 real DOTs.
-        let word = 0x18903081c011a200u64 | (1 << 47);
-        assert_eq!(repeat_extra_iterations(word), None);
-        assert!(decode(word).blocked.is_some());
+    fn a_dot_repeat_field_reads_the_count_from_bits_46_44() {
+        // The real three-iteration transform, with bit 47 set on top: still three.
+        let word = 0x18903081c011a200u64;
+        assert_eq!(repeat_extra_iterations(word), Some(3));
+        assert_eq!(repeat_extra_iterations(word | (1 << 47)), Some(3));
+        assert!(decode(word | (1 << 47)).blocked.is_none());
+        // `0x8` is bit 47 with a zero count - by far the commonest word in every corpus.
+        assert_eq!(repeat_extra_iterations(0x188188820011a23cu64), Some(0));
+        // `0x9` is bit 47 with a count of one. Two real instructions of one title carry it,
+        // and their destinations close only under this reading - see `dot_repeat_extra`.
+        assert_eq!(repeat_extra_iterations(0x188198820151a212u64), Some(1));
+        assert!(decode(0x188198820151a212u64).blocked.is_none());
+        // A ZERO field is the one value the rule would cover that no corpus contains.
+        let zero_field = 0x18903081c011a200u64 & !(0xfu64 << 44);
+        assert_eq!(repeat_extra_iterations(zero_field), None);
+        assert!(decode(zero_field).blocked.is_some());
     }
 
     #[test]
@@ -4372,9 +6638,12 @@ mod tests {
         // every object-to-clip transform multiplies by it.
         let lo23 = encode(G18_MAD_LOW, &[("swz_alt_op1", 0b101), ("op1_swz", 0b11)]);
         assert_eq!(decode(word(hi4, lo23)).srcs[0].swizzle, [5, 5, 5, 0]);
-        // The extended half still carries the undocumented `h` entry, which blocks.
+        // Index 24 is `hhhx`, and `h` is the HALF constant (selector 7) - see
+        // `SWZ_HALF_READING`. It used to block, which refused every program that reached it.
         let lo24 = encode(G18_MAD_LOW, &[("swz_alt_op1", 0b110), ("op1_swz", 0)]);
-        assert!(decode(word(hi4, lo24)).blocked.is_some(), "h-swizzle must block");
+        let h = decode(word(hi4, lo24));
+        assert!(h.blocked.is_none(), "the `h` swizzle is 0.5, not a gap: {:?}", h.blocked);
+        assert_eq!(h.srcs[0].swizzle, [7, 7, 7, 0], "hhhx is (0.5, 0.5, 0.5, x)");
     }
 
     #[test]
@@ -4391,12 +6660,20 @@ mod tests {
         assert!(ins.is_supported());
     }
 
+    /// `alt_opt2 = 1` with `opt2 = 00` is INDEXED1 - a register-indirect read through `idx[0]`,
+    /// the R6 number doubled and no swizzle, exactly as every other group reads that row. It
+    /// used to be refused as "index/immediate mode" not resolvable; a football title emits one
+    /// two instructions after the `LoadIndex` that sets the register, with a group-0x38 move
+    /// reading the SAME operand directly after it - see [`exotic_source`].
     #[test]
-    fn alu_op2_index_mode_still_blocks() {
-        // alt_opt2=1 with opt2=00 (index1 mode) is not resolvable -> block.
+    fn alu_op2_index_mode_resolves_through_the_index_register() {
         let hi = encode(G08_HIGH, &[("opcode1", 0x01), ("alt_opt2", 1)]);
-        let lo = encode(G08_LOW, &[("opcode2", 0), ("opt2", 0b00)]);
-        assert!(decode(word(hi, lo)).blocked.is_some());
+        let lo = encode(G08_LOW, &[("opcode2", 0), ("op2", 55), ("opt2", 0b00)]);
+        let ins = decode(word(hi, lo));
+        assert_eq!(ins.blocked, None, "indexed1 resolves: {:?}", ins.blocked);
+        assert_eq!(ins.srcs[1].bank, Bank::Indexed);
+        assert_eq!(ins.srcs[1].index, 110, "the R6 field doubled");
+        assert_eq!(ins.srcs[1].swizzle, [0, 1, 2, 3], "an indexed source carries no swizzle");
     }
 
     /// Build a 64-bit word by OR-ing `(value, msb, lsb)` fields at absolute bit positions -
@@ -4501,9 +6778,10 @@ mod tests {
         let ci = decode(cmov);
         assert!(matches!(ci.op, Op::Cmov { .. }), "float VMOVC classifies as Cmov");
         assert!(ci.blocked.is_none() && ci.is_supported(), "plain float VMOVC must emit");
-        // VMOVCU8 (move_type=2) is still blocked (UINT8 test not modeled in a float file).
+        // VMOVCU8 (move_type=2) is the byte-wise select - see the test below for the word
+        // that establishes it.
         let cu8 = word_bits(&[(0x07, 63, 59), (2, 47, 46), (5, 42, 40)]);
-        assert!(decode(cu8).blocked.is_some());
+        assert!(matches!(decode(cu8).op, Op::CmovU8 { .. }));
         // Integer data type (INT32=2) -> blocked (scalar-lane file holds floats).
         let int_mov = word_bits(&[(0x07, 63, 59), (0, 47, 46), (2, 42, 40)]);
         assert!(decode(int_mov).blocked.is_some());
@@ -4661,6 +6939,38 @@ mod tests {
     }
 
     #[test]
+    fn pack_with_a_32bit_source_reads_components_2_and_3_from_src2() {
+        // Two REAL words from a baseball title's crowd-atlas vertex program (`vert_842ef018`),
+        // both `Pack` with an F32 source, dest o[24]/o[26], two-channel masks.
+        //
+        // `0x40800d8da302090c`: `o[24].xy <- pa[18].[0,2]` with `src2_n` naming `pa[12]`. A
+        // six-bit source field in double-register mode is a PAIR, so component 2 of the
+        // source vector is `src2.x` = pa[12], NOT pa[20] - which is past the program's
+        // 20-register attribute bank and was the "reads PA [20] which no attribute declares"
+        // census row for this program and three siblings. The IR carries the second source
+        // as a second operand with the same swizzle; `unroll_repeats` splits it per channel.
+        let ins = decode(0x40800d8da302090c);
+        assert_eq!(ins.op, Op::Pack { src_half: false });
+        assert_eq!((ins.dest.unwrap().bank, ins.dest.unwrap().index), (Bank::Output, 24));
+        assert_eq!(ins.srcs.len(), 2, "components 2..3 come from src2: {:?}", ins.srcs);
+        assert_eq!((ins.srcs[0].bank, ins.srcs[0].index), (Bank::PrimaryAttr, 18));
+        assert_eq!((ins.srcs[1].bank, ins.srcs[1].index), (Bank::PrimaryAttr, 12));
+        assert_eq!(ins.srcs[0].swizzle, ins.srcs[1].swizzle);
+        assert_eq!(&ins.srcs[0].swizzle[..2], &[0, 2]);
+
+        // `0x40c00d8da342060f`: `o[26].xy <- pa[12].[1,2]` with `src2 = src1 + 1` (the next
+        // pair, pa[14]) - the plain contiguous vec4 the compiler emits for every ordinary
+        // pack. It stays ONE source: `(src1.x, src1.y, src2.x, src2.y)` is then exactly
+        // `pa[12..16]`, and a second operand would only cost the pipeline a split.
+        let ins = decode(0x40c00d8da342060f);
+        assert_eq!(ins.op, Op::Pack { src_half: false });
+        assert_eq!((ins.dest.unwrap().bank, ins.dest.unwrap().index), (Bank::Output, 26));
+        assert_eq!(ins.srcs.len(), 1, "a contiguous pair is one source: {:?}", ins.srcs);
+        assert_eq!((ins.srcs[0].bank, ins.srcs[0].index), (Bank::PrimaryAttr, 12));
+        assert_eq!(&ins.srcs[0].swizzle[..2], &[1, 2]);
+    }
+
+    #[test]
     fn pack_f32_from_f16_reads_its_source_as_halves_not_whole_registers() {
         // The mirror case (VPCK F32<-F16, dest_fmt=6 src_fmt=5) is the one the terrain vertex
         // program uses to widen its computed fog term into an F32 output lane. Reading that
@@ -4767,10 +7077,21 @@ mod tests {
         // establishes and must block rather than emit a copy.
         assert!(decode(0x8190_0021_6004_0000u64 | (1 << 47)).blocked.is_some());
 
-        // One bit outside the operand fields - here the "cop" position the epilogue pins to 1
-        // - is a form nothing establishes, and it must refuse rather than emit a copy.
-        let other = 0x8090_80d9_9000_0000u64 & !(1 << 52);
-        assert!(decode(other).blocked.is_some(), "an unestablished 0x80 form must block");
+        // The plain-SOP2 field table (`docs-re/usse-spec-sop2.md`) admits the epilogue with ANY
+        // established factor pair: a fighting title's ONE-alpha and ONE,ONE words copy the shader
+        // colour too (the equation goes to the pipeline blend - see `crate::rop_blend`).
+        for word in [0x8080_88c1_9000_0000u64, 0x8080_88d9_9000_0000, 0x8180_8805_9000_0000] {
+            let ins = decode(word);
+            assert_eq!(ins.op, Op::CopyFx8, "{word:#x}");
+            assert!(ins.blocked.is_none(), "{word:#x}: {:?}", ins.blocked);
+            assert_eq!(crate::usse::decode::repeat_extra_iterations(word), Some(0), "{word:#x}");
+        }
+        // What the spec does NOT establish still refuses: a SUBTRACT colour op (bit 18) and a
+        // colour selector of 5 (40:38) - a copy would drop the equation they describe.
+        let op_sub = 0x8090_80d9_9000_0000u64 | (1 << 18);
+        assert!(decode(op_sub).blocked.is_some(), "an unestablished 0x80 op must block");
+        let sel5 = (0x8090_80d9_9000_0000u64 & !(7 << 38)) | (5 << 38);
+        assert!(decode(sel5).blocked.is_some(), "an unestablished 0x80 selector must block");
         // ...and so must one whose repeat-count position is not the pinned `1000`.
         let repeated = 0x8090_80d9_9000_0000u64 | (1 << 44);
         assert!(
@@ -4875,7 +7196,7 @@ mod tests {
         assert_eq!(
             t.srcs[1].swizzle,
             [0; 4],
-            "src2_vscomp broadcasts the scalar threshold from channel 0, while the reduction              reads src1's channel 3"
+            "src2_vscomp broadcasts the scalar threshold from channel 0, while the reduction reads src1's channel 3"
         );
         assert!(t.dest.is_none(), "test_wben is clear, so the register destination is inert");
 
@@ -4975,7 +7296,7 @@ mod tests {
         assert_eq!(
             (t.srcs[1].bank, t.srcs[1].index),
             (Bank::SecondaryAttr, 7),
-            "src2 is the literal 0, NOT double-register scaled: an 8-bit operand is a direct              register number, and scaling it would read sa14 instead"
+            "src2 is the literal 0, NOT double-register scaled: an 8-bit operand is a direct register number, and scaling it would read sa14 instead"
         );
     }
 
@@ -5146,30 +7467,30 @@ mod tests {
         assert_eq!(
             decode_smlsi(SMLSI),
             [
-                SmlsiSlot::Increment(1),  // dest
-                SmlsiSlot::Swizzle(0x4e), // src0 - a slot an unconditional VMOV does not have
-                SmlsiSlot::Increment(1),  // src1
-                SmlsiSlot::Increment(1),  // src2
+                SmlsiSlot::Increment(1),  // dest (31:24)
+                SmlsiSlot::Increment(1),  // src0 (23:16) - a slot an unconditional VMOV does not have
+                SmlsiSlot::Swizzle(0x4e), // src1 (15:8), bit 33: offsets (2,3,0,1) - pa8/pa10/pa4/pa6
+                SmlsiSlot::Increment(1),  // src2 (7:0)
             ]
         );
 
-        // A racing title's track programs, where the high bytes are BACKWARD steps rather than
-        // 248-register forward leaps. 0xfa140000ff01ff01 sets src0 and src2 to -1;
-        // 0xfa1000000601f801 sets src0 to -8 and src2 to +6.
+        // A racing title's track programs, where the 0xff bytes are BACKWARD steps rather than
+        // 248-register forward leaps. 0xfa140000ff01ff01 sets dest and src1 to -1;
+        // 0xfa1000000601f801 sets dest to +6 and src1 to -8.
         assert_eq!(
             decode_smlsi(0xfa140000ff01ff01),
-            [SmlsiSlot::Increment(1), SmlsiSlot::Increment(-1), SmlsiSlot::Increment(1), SmlsiSlot::Increment(-1)]
+            [SmlsiSlot::Increment(-1), SmlsiSlot::Increment(1), SmlsiSlot::Increment(-1), SmlsiSlot::Increment(1)]
         );
         assert_eq!(
             decode_smlsi(0xfa1000000601f801),
-            [SmlsiSlot::Increment(1), SmlsiSlot::Increment(-8), SmlsiSlot::Increment(1), SmlsiSlot::Increment(6)]
+            [SmlsiSlot::Increment(6), SmlsiSlot::Increment(1), SmlsiSlot::Increment(-8), SmlsiSlot::Increment(1)]
         );
 
-        // The mode bits at [35:32] put a slot in swizzle mode, and they are per-slot: this word
-        // is swizzle on src2 (bit 35) and increments elsewhere.
+        // The mode bits at [35:32] put a slot in offset mode, and they are per-slot, dest-first
+        // from the top: this word is offset mode on DEST (bit 35) and increments elsewhere.
         assert_eq!(
             decode_smlsi(0xfa10000838010201),
-            [SmlsiSlot::Increment(1), SmlsiSlot::Increment(2), SmlsiSlot::Increment(1), SmlsiSlot::Swizzle(0x38)]
+            [SmlsiSlot::Swizzle(0x38), SmlsiSlot::Increment(1), SmlsiSlot::Increment(2), SmlsiSlot::Increment(1)]
         );
 
         for w in [0xfa10000201010e01u64, 0xfa14000001010101, 0xfa1400000101f601] {
@@ -5209,27 +7530,71 @@ mod tests {
         // 0x40 VPCK: a SEVEN-bit destination and a SIX-bit source - the reference's own
         // "(dest,src1,src2) = (1,2,2) for a float source", recovered from the field widths.
         //
-        // Its source's SMLSI SLOT is 1, not the 2 the sibling VMOV above uses. Measured on the
-        // corpus; the reasoning is at the match arm. The two groups differing here is the whole
-        // point of the assertion - a slot is a property of a group's field table, not a global.
+        // Its source's SMLSI SLOT is 1 and its DESTINATION's is 2 - neither the 0/2 pair the
+        // sibling VMOV above uses. Measured on the corpus; the reasoning is at the match arm.
+        // The two groups differing here is the whole point of the assertion - a slot is a
+        // property of a group's field table, not a global.
         let vpck = 0x40u64 << 56;
         assert_eq!(opcode1(vpck), 0x08);
+        // Destination format 0 (an 8-bit integer): NOT one of the 16-bit forms, so it keeps
+        // the multiplier of 2. No corpus contains a repeating 8-bit pack, so what four bytes
+        // in one register would do to the step is unestablished and deliberately unchanged.
+        //
+        // The THIRD entry is the second source a 32-bit-source pack carries (`src2_n`, the
+        // upper two components of the source pair - see `decode_grp_pack`). It is an IR source
+        // only when the pack reads components 2..3 from a non-contiguous pair, and a shorter
+        // `srcs` simply consumes fewer entries.
         assert_eq!(
             repeat_operands(vpck),
             Some(vec![
-                RepeatOperand { slot: 0, stride: 1, moe: true },
-                RepeatOperand { slot: 1, stride: 2, moe: true },
+                // The destination on the DEST byte (31:24, slot 0 - see `pack_dest_slot` for the
+                // face program and the corpus census that moved it off 23:16), the source on
+                // src1's.
+                RepeatOperand { slot: 0, stride: 2, moe: true },
+                RepeatOperand { slot: 2, stride: 2, moe: true },
+                RepeatOperand { slot: 3, stride: 2, moe: true },
             ])
         );
+        // An F16 destination (format 5) packs two values per register, so its multiplier is 1.
+        let vpck_f16 = vpck | (5u64 << 38);
+        assert_eq!(
+            repeat_operands(vpck_f16).map(|v| (v[0].slot, v[0].stride)),
+            Some((0, 1))
+        );
+        // 0x14 load-index: dest on the dest slot, source on src0's, both direct (stride 1); its
+        // repeat count is bits 46:44 (bit 45 set = two EXTRA iterations).
+        let idx = 0xa0832946a242c180u64;
+        assert_eq!(
+            repeat_operands(idx),
+            Some(vec![RepeatOperand { slot: 0, stride: 1, moe: true }, RepeatOperand { slot: 1, stride: 1, moe: true }])
+        );
+        assert_eq!(repeat_extra_iterations(idx), Some(2));
+        assert_eq!(repeat_extra_iterations(0xa0830946a2834180u64), Some(0));
+        // A skinned mesh's S16 index pack. It steps ONE register per iteration, because a
+        // 16-bit destination packs two values into a register - the two lanes of one iteration
+        // are the two HALVES of one register, not two registers.
+        //
+        // This word used to assert 2. What settled it is the four group-0x15 IMAD32s that read
+        // what it writes: they name `(base, low)`, `(base, HIGH)`, `(base+1, low)`,
+        // `(base+1, HIGH)` through their own `src0_high` bit. Under a step of 2 the pack wrote
+        // `base..base+4` and those four fetches collapsed onto two registers, each read twice,
+        // so a four-bone vertex blended two bones against themselves and the mesh folded up.
+        // Every repeating 16-bit pack in every corpus is a skinned mesh of this exact shape.
+        assert_eq!(repeat_operands(0x40811d0ea1010600u64).map(|v| v[0].stride), Some(1));
+        // A dot4's F32 source pack: 32 bits is one value per register, so this one still steps
+        // two. The closure behind it is untouched - the four lanes it fills ARE four registers.
+        assert_eq!(repeat_operands(0x40c31d8e0103366cu64).map(|v| v[0].stride), Some(2));
+        assert_eq!(repeat_operands(0x40c01d5ea281860eu64).map(|v| v[0].stride), Some(1));
 
         // 0x50 VBW: every operand is a seven-bit field - the reference's "all 1".
         let vbw = 0x50u64 << 56;
         assert_eq!(opcode1(vbw), 0x0a);
         assert!(repeat_operands(vbw).unwrap().iter().all(|o| o.stride == 1));
 
-        // 0x18 DP: the destination's channel walk is the instruction's OWN, so it carries
-        // `moe: false` and steps one lane whatever the SMLSI programmed - see the match arm.
-        // The vector source IS MOE-governed, and its stride is a whole vector.
+        // 0x18 DP: BOTH the destination's channel walk and the vector source's slot walk are
+        // the instruction's OWN, so both carry `moe: false` and step one lane / one four-
+        // register slot whatever the SMLSI programmed - see the match arm. Only the internal
+        // operand consults the MOE, and it has a stride of zero, so it cannot move either.
         let dp = (0x18u64 << 56) | (1 << 52) | (2 << 44);
         assert_eq!(opcode1(dp), 0x03);
         assert_eq!(bits(dp, 53, 53), 0, "the DOT form, not the MAD form");
@@ -5237,9 +7602,51 @@ mod tests {
             repeat_operands(dp),
             Some(vec![
                 RepeatOperand { slot: 0, stride: 1, moe: false },
-                RepeatOperand { slot: 2, stride: 4, moe: true },
+                RepeatOperand { slot: 0, stride: 4, moe: false },
                 RepeatOperand { slot: 3, stride: 0, moe: true },
             ])
+        );
+        // With bits 47 AND 48 SET the vector source is MOE-governed instead: the SMLSI's src1
+        // slot, two registers a unit (mlb's crowd `[1,1,4,4]` reads rows 0 and 2; mk's
+        // `[1,1,-10,-10]` steps back twenty).
+        assert_eq!(
+            repeat_operands(dp | (1 << 47) | (1 << 48)),
+            Some(vec![
+                RepeatOperand { slot: 0, stride: 1, moe: false },
+                RepeatOperand { slot: 2, stride: 2, moe: true },
+                RepeatOperand { slot: 3, stride: 0, moe: true },
+            ])
+        );
+        // Bit 47 set, bit 48 CLEAR: the vector source holds and the INTERNAL source steps one
+        // register (four lanes) per iteration - a matrix's rows in i0..i3 against one vector.
+        assert_eq!(bits(dp, 48, 48), 0);
+        assert_eq!(
+            repeat_operands(dp | (1 << 47)),
+            Some(vec![
+                RepeatOperand { slot: 0, stride: 1, moe: false },
+                RepeatOperand { slot: 0, stride: 0, moe: false },
+                RepeatOperand { slot: 0, stride: 4, moe: false },
+            ])
+        );
+
+        // Bit 47 clear, bit 48 set: BOTH internal sources walk one internal register - the
+        // two-vector normalise (`dot(i0,i0)`, `dot(i1,i1)`) in a baseball and a fighting title.
+        // With op2 held the second iteration read `dot(i1, i0)` and its `rsq` made a NaN varying.
+        for word in [0x1881_1882_0151_a23cu64, 0x1881_1882_0011_a23c] {
+            assert_eq!(
+                repeat_operands(word),
+                Some(vec![
+                    RepeatOperand { slot: 0, stride: 1, moe: false },
+                    RepeatOperand { slot: 0, stride: 4, moe: false },
+                    RepeatOperand { slot: 0, stride: 4, moe: false },
+                ]),
+                "{word:#018x}"
+            );
+        }
+        // Bit 48 clear keeps the matrix-row reading: op1 walks, the transformed vector holds.
+        assert_eq!(
+            repeat_operands(0x1890_2882_803d_a20a).map(|v| (v[1].stride, v[1].moe, v[2].stride)),
+            Some((4, false, 0))
         );
 
         // A group with no established operand grammar must answer "unknown", never a default.
@@ -5285,29 +7692,88 @@ mod tests {
         assert_eq!(repeat_extra_iterations(REAL_INDEXED_READ), Some(1));
     }
 
-    /// Group 0x14 (I16MAD) has no published layout, so the ONE encoding the corpus establishes
-    /// decodes and every other word of the group hard-fails. That asymmetry is the point: the
-    /// corpus can say what this instruction is, and cannot say what a different one would be.
+    /// Group 0x14 (I16MAD) has no published layout, so only the index-load encoding the corpus
+    /// establishes decodes and every other word of the group hard-fails. That asymmetry is the
+    /// point: the corpus can say what this instruction is, and cannot say what a different one
+    /// would be. What VARIES is the source register [17:14], the addend [6:0], bit 54, and the
+    /// fields a fourth title's skinning added - see [`I16MAD_LOAD_INDEX_VARIABLE`] for the
+    /// closure that admits them; every other bit must still match.
     #[test]
     fn i16mad_decodes_only_the_index_load_the_corpus_establishes() {
-        // The six real words differ only in bits [17:14], the source register.
-        for (word, reg) in [
-            (0xa08b_0946_a022_0088u64, 8u8),
-            (0xa08b_0946_a021_8088, 6),
-            (0xa08b_0946_a022_c088, 11),
+        // Every real word, from four titles: the three the original closure fixed (addend 8),
+        // and the four a particle-heavy title adds, whose addends are the field's evidence.
+        for (word, reg, addend) in [
+            (0xa08b_0946_a022_0088u64, 8u8, 8i32),
+            (0xa08b_0946_a021_8088, 6, 8),
+            (0xa08b_0946_a022_c088, 11, 8),
+            // Two programs of one title, the SAME idiom and the same addend, differing only in
+            // bit 54 and the source register. That pair is why bit 54 is allowed to vary.
+            (0xa0cb_0946_a023_c0a4, 15, 36),
+            (0xa08b_0946_a023_80a4, 14, 36),
+            (0xa0cb_0946_a021_8095, 6, 21),
+            (0xa0cb_0946_a021_809e, 6, 30),
         ] {
             let ins = decode(word);
             assert!(ins.blocked.is_none(), "{word:#018x}: {:?}", ins.blocked);
-            assert_eq!(ins.op, Op::LoadIndex { addend: I16MAD_LOAD_INDEX_ADDEND });
+            assert_eq!(ins.op, Op::LoadIndex { addend, to_index: true, stride: 1 }, "{word:#018x}");
             assert_eq!(ins.dest.unwrap().bank, Bank::Index);
             assert_eq!((ins.srcs[0].bank, ins.srcs[0].index), (Bank::PrimaryAttr, reg));
             assert_eq!(repeat_extra_iterations(word), Some(0));
         }
-        // Any other group-0x14 word is a different instruction whose fields are not decodable
-        // from this corpus - including its repeat encoding, which is why it must not be zero.
-        let other = 0xa08b_0946_a022_0089u64;
+        // A group-0x14 word that differs OUTSIDE those three fields is a different instruction
+        // whose fields are not decodable from this corpus - including its repeat encoding,
+        // which is why it must not be zero. Bit 7 of the low byte sits just above the addend
+        // and is set in every real word.
+        let other = 0xa08b_0946_a022_0008u64;
         assert!(decode(other).blocked.is_some(), "an unestablished 0x14 encoding must block");
         assert_eq!(repeat_extra_iterations(other), None);
+    }
+
+    /// The football title's skinning words decode to an ORDINARY-REGISTER destination, and the
+    /// fields the corpus shows cannot feed the index are the source and destination registers.
+    ///
+    /// Under the old three-field mask 3 of that title's 118 distinct group-0x14 words decoded
+    /// and 115 hard-failed, which failed their whole programs. The evidence that widened it is
+    /// in [`I16MAD_LOAD_INDEX_VARIABLE`]; the evidence that this form does not write an index
+    /// register at all is in [`decode_grp_i16mad`]. What is pinned here is that it is STRICTLY
+    /// ADDITIVE for the OTHER form - every word the old mask accepted decodes to exactly what
+    /// it did before, so no program that worked can move.
+    #[test]
+    fn i16mad_admits_the_skinning_words_without_changing_any_word_it_already_decoded() {
+        // One program's six loads, in order: two bones x three matrix rows. The ADDEND is the
+        // row, so the pairs that share one must decode to the same row whatever else differs.
+        // The SOURCE is `r[3]`/`r[4]`, the two registers this program packed its blend indices
+        // into; the DESTINATION is the register the IMAD32 directly below reads as its `src0`.
+        let six = [
+            (0xa083_0942_a000_c180u64, 3u8, 0u8, 0i32),
+            (0xa083_0942_a001_0180, 4, 0, 0),
+            (0xa083_0942_a020_c181, 3, 1, 1),
+            (0xa083_0942_a041_0181, 4, 2, 1),
+            (0xa083_0942_a060_c182, 3, 3, 2),
+            (0xa083_0942_a081_0182, 4, 4, 2),
+        ];
+        for (word, src, dst, addend) in six {
+            let ins = decode(word);
+            assert!(ins.blocked.is_none(), "{word:#018x}: {:?}", ins.blocked);
+            assert_eq!(ins.op, Op::LoadIndex { addend, to_index: false, stride: 1 }, "{word:#018x}");
+            assert_eq!((ins.srcs[0].bank, ins.srcs[0].index), (Bank::Temp, src), "{word:#018x}");
+            let d = ins.dest.unwrap();
+            assert_eq!((d.bank, d.index), (Bank::PrimaryAttr, dst), "{word:#018x}");
+        }
+        // [25:21] differs (1 against 2) between two loads of the SAME row for different bones -
+        // it is the destination register, so the two must differ in the DEST and agree on the
+        // row.
+        assert_ne!(six[2].0 >> 21 & 0x1f, six[3].0 >> 21 & 0x1f);
+        assert_eq!(decode(six[2].0).op, decode(six[3].0).op);
+        // STRICTLY ADDITIVE: a word the old mask accepted is untouched, index register and all.
+        assert_eq!(
+            decode(0xa08b_0946_a022_0088).op,
+            Op::LoadIndex { addend: 8, to_index: true, stride: 1 }
+        );
+        assert_eq!(decode(0xa08b_0946_a022_0088).dest.unwrap().bank, Bank::Index);
+        // And a word outside the widened mask still blocks - bit 7 above the addend is set in
+        // every real word and clear here.
+        assert!(decode(0xa083_0940_a001_0100u64).blocked.is_some());
     }
 
     #[test]
@@ -5471,11 +7937,11 @@ mod tests {
         assert!(load.blocked.is_some_and(|b| b.contains("mode value not established")));
         assert!(load.is_classified(), "load operation is known");
 
-        // Stores (0xF0) remain a stub.
+        // Stores (0xF0) decode only in the LOCAL address mode; this all-zero word is not it.
         let store = decode(word(0xF000_0000, 0));
         assert_eq!(store.group, 0x1e);
-        assert_eq!(store.op, Op::Todo("sta32/stl32/stt32"));
-        assert!(!store.is_supported(), "stores not wired for emit yet");
+        assert!(matches!(store.op, Op::LocalStore { .. }));
+        assert!(store.blocked.is_some_and(|b| b.contains("LOCAL address mode")), "{:?}", store.blocked);
 
         // The TEST group (0x48 = opcode1 0x09 = VTST) decodes to a real test operation. This
         // all-zero word has both sub-tests disabled, which names no relation against zero, so
@@ -5524,7 +7990,8 @@ mod tests {
         // Departures from the census block BY NAME rather than decode loosely: flip
         // addr_mode, the data type, and the src0 bank on the first real word.
         let base = 0xe883b004a000c000u64;
-        let addr = base | (1 << 42);
+        // addr_mode 1 is the LOCAL space (`decode_local_access`); 2 is established nowhere.
+        let addr = base | (1 << 43);
         assert!(decode(addr).blocked.is_some_and(|b| b.contains("addr_mode")));
         let half = base | (1 << 36);
         assert!(decode(half).blocked.is_some_and(|b| b.contains("data_type")));
@@ -5534,10 +8001,40 @@ mod tests {
         let sa_i = decode(sa_ptr);
         assert_eq!(sa_i.blocked, None, "{sa_ptr:#018x}");
         assert_eq!(sa_i.srcs[0].bank, Bank::SecondaryAttr);
-        // A TEMP pointer is in neither, and still blocks by name.
+        // A TEMP pointer is the third census shape: the skinning idiom puts the computed
+        // address of a bone matrix in whichever bank the compiler chose, and one retail
+        // program uses a PA register for one load of a group and TEMPs for its siblings.
         let temp_ptr = base & !(1 << 34); // ext=0, sel=0 -> TEMP pointer
-        assert!(decode(temp_ptr).blocked.is_some_and(|b| b.contains("PA/SA banks")));
-        let reg_off = base & !(1 << 49); // src1 ext cleared -> register offset row
-        assert!(decode(reg_off).blocked.is_some_and(|b| b.contains("register-supplied")));
+        let temp_i = decode(temp_ptr);
+        assert_eq!(temp_i.blocked, None, "{temp_ptr:#018x}");
+        assert_eq!(temp_i.srcs[0].bank, Bank::Temp);
+        // OUTPUT is the FOURTH shape, and the same skinning idiom: one title's skinned vertex
+        // programs compute the bone-matrix address into an output register and load through
+        // it. Refusing it dropped every skinned mesh in that title.
+        let out_ptr = (base | (1 << 50)) & !(1 << 34); // ext=1, sel=0 -> OUTPUT pointer
+        let out_i = decode(out_ptr);
+        assert_eq!(out_i.blocked, None, "{out_ptr:#018x}");
+        assert_eq!(out_i.srcs[0].bank, Bank::Output);
+        // A REGISTER-supplied offset decodes and lands in `srcs` after the pointer. It is a
+        // BYTE displacement the guest's integer pipeline computed, which is what an indexed
+        // read of a bound uniform buffer compiles to.
+        let reg_off = base & !(1 << 49); // src1 ext cleared -> ordinary bank row, sel 2 = PA
+        let reg_i = decode(reg_off);
+        assert_eq!(reg_i.blocked, None, "{reg_off:#018x}");
+        assert_eq!(reg_i.srcs.len(), 2, "pointer plus one register offset");
+        assert_eq!((reg_i.srcs[1].bank, reg_i.srcs[1].index), (Bank::PrimaryAttr, 0));
+        // The real words from the title that needs it: `mem[SA[38] + PA8]`, four elements.
+        for (raw, off_reg) in [(0xe885_3004_a089_8400u64, 8u8), (0xe885_3004_a009_8480, 9)] {
+            let i = decode(raw);
+            assert_eq!(i.blocked, None, "{raw:#018x}");
+            assert_eq!(i.op, Op::MemLoad { elements: 4, offset_bytes: 0 });
+            assert_eq!((i.srcs[0].bank, i.srcs[0].index), (Bank::SecondaryAttr, 38));
+            assert_eq!(i.srcs.len(), 2, "{raw:#018x}");
+            assert_eq!((i.srcs[1].bank, i.srcs[1].index), (Bank::PrimaryAttr, off_reg));
+        }
+        // An EXTENDED offset row that is not IMMEDIATE still blocks: the indexed and special
+        // rows address through state this decoder does not carry for this group.
+        let ext_other = (base & !(3 << 30)) | (1 << 30); // ext=1, sel=1 -> SPECIAL
+        assert!(decode(ext_other).blocked.is_some_and(|b| b.contains("other than IMMEDIATE")));
     }
 }

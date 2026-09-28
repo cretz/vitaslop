@@ -179,6 +179,11 @@ pub mod off {
     /// their fog and material block is container 0 at sa[0] - and its bind was previously only
     /// warned about and dropped. Appended last so every pre-existing offset keeps its value.
     pub const FRAGMENT_UNIFORM_BUFFERS: u32 = FRONT_DEPTH_BIAS_UNITS + 4;
+    /// `sceGxmSetBackStencilRef(context, sref)` - the two-sided counterpart of
+    /// [`FRONT_STENCIL_REF`]. Appended last, like every field added after the original
+    /// layout, so no offset a running title already holds moves.
+    pub const BACK_STENCIL_REF: u32 =
+        FRAGMENT_UNIFORM_BUFFERS + (super::MAX_UNIFORM_BUFFERS as u32) * 4;
 }
 
 /// Word offsets WITHIN a `VERTEX_UNIFORM` / `FRAGMENT_UNIFORM` record. Both stages have
@@ -225,7 +230,7 @@ pub const MAX_UNIFORM_BUFFERS: usize = 14;
 
 /// Total bytes the block occupies. Every guest context must have at least this much host
 /// memory behind it.
-pub const BYTES: u32 = off::FRAGMENT_UNIFORM_BUFFERS + (MAX_UNIFORM_BUFFERS as u32) * 4;
+pub const BYTES: u32 = off::BACK_STENCIL_REF + 4;
 
 /// `SCE_GXM_MINIMUM_CONTEXT_HOST_MEM_SIZE` (vitasdk `gxm.h`): the smallest `hostMem` GXM
 /// accepts, and therefore the smallest a conforming title can pass.
@@ -602,6 +607,7 @@ pub fn store(ctx: &mut GuestCtx, context: u32, rs: &crate::capture::RenderState)
     w(off::BACK_STENCIL_OP_DEPTH_PASS, rs.back_stencil_op_depth_pass);
     w(off::BACK_STENCIL_COMPARE_MASK, rs.back_stencil_compare_mask);
     w(off::BACK_STENCIL_WRITE_MASK, rs.back_stencil_write_mask);
+    w(off::BACK_STENCIL_REF, rs.back_stencil_ref);
     w(off::VIEWPORT_ENABLE, rs.viewport_enable);
     for (i, v) in rs.viewport.iter().enumerate() {
         w(off::VIEWPORT + i as u32 * 4, v.to_bits());
@@ -738,7 +744,8 @@ impl<'a> Block<'a> {
         std::array::from_fn(|i| self.word(off::STREAMS + i as u32 * 4))
     }
 
-    /// Every BOUND sampler unit's binding. The counterpart of [`texture_bindings`].
+    /// Every BOUND sampler unit's binding. The counterpart of [`texture_bindings`], and the same
+    /// parse as [`texture_bindings_in_span`] over `self.span(off::TEXTURES, ..)`.
     pub fn texture_bindings(&self, out: &mut Vec<(u32, TexBinding)>) {
         out.clear();
         for unit in 0..MAX_TEXTURE_UNITS {
@@ -807,6 +814,7 @@ impl<'a> Block<'a> {
         back_stencil_op_depth_pass: r(off::BACK_STENCIL_OP_DEPTH_PASS),
         back_stencil_compare_mask: r(off::BACK_STENCIL_COMPARE_MASK) & 0xff,
         back_stencil_write_mask: r(off::BACK_STENCIL_WRITE_MASK) & 0xff,
+        back_stencil_ref: r(off::BACK_STENCIL_REF),
         viewport_enable: r(off::VIEWPORT_ENABLE),
         viewport,
         region_clip_mode: r(off::REGION_CLIP_MODE),
@@ -849,6 +857,7 @@ pub(crate) const SCALARS: &[(u32, &str)] = &[
     (off::BACK_STENCIL_OP_DEPTH_PASS, "back_stencil_op_depth_pass"),
     (off::BACK_STENCIL_COMPARE_MASK, "back_stencil_compare_mask"),
     (off::BACK_STENCIL_WRITE_MASK, "back_stencil_write_mask"),
+    (off::BACK_STENCIL_REF, "back_stencil_ref"),
     (off::VIEWPORT_ENABLE, "viewport_enable"),
     (off::REGION_CLIP_MODE, "region_clip_mode"),
     (off::FRONT_VISIBILITY_TEST_ENABLE, "front_visibility_test_enable"),
@@ -1285,5 +1294,61 @@ mod tests {
             assert_eq!(streams(ctx, CONTEXT), [0; MAX_VERTEX_STREAMS]);
             assert_eq!(stream(ctx, CONTEXT, MAX_VERTEX_STREAMS as u32), 0);
         });
+    }
+}
+
+/// Every BOUND sampler unit's binding, parsed out of a copy of the context block's sampler
+/// array (`MAX_TEXTURE_UNITS * TEXTURE_STRIDE` bytes from `off::TEXTURES`) - what a deferred
+/// draw keeps (see `host::DeferredTextures`). The same parse as [`Block::texture_bindings`].
+pub fn texture_bindings_in_span(span: &[u8], out: &mut Vec<(u32, TexBinding)>) {
+    out.clear();
+    let word = |at: usize| u32::from_le_bytes([span[at], span[at + 1], span[at + 2], span[at + 3]]);
+    for unit in 0..MAX_TEXTURE_UNITS {
+        let at = unit * TEXTURE_STRIDE as usize;
+        let addr = word(at);
+        if addr == 0 {
+            continue;
+        }
+        out.push((
+            unit as u32,
+            TexBinding {
+                addr,
+                words: [word(at + 4), word(at + 8), word(at + 12), word(at + 16)],
+                from_precomputed: word(at + 4 + TEXTURE_CONTROL_WORDS as usize * 4) != 0,
+            },
+        ));
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    /// The deferred parse and the block's own agree on every slot, bound or not.
+    #[test]
+    fn the_span_parse_is_the_block_parse() {
+        let mut bytes = [0u8; BYTES as usize];
+        let mut x: u32 = 0x1234_5678;
+        for b in bytes.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x as u8;
+        }
+        // Unbind every third unit so the skip is exercised.
+        for unit in (0..MAX_TEXTURE_UNITS).step_by(3) {
+            let at = (off::TEXTURES + unit as u32 * TEXTURE_STRIDE) as usize;
+            bytes[at..at + 4].copy_from_slice(&[0; 4]);
+        }
+        let blk = Block::Copied(bytes);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        blk.texture_bindings(&mut a);
+        texture_bindings_in_span(blk.span(off::TEXTURES, MAX_TEXTURE_UNITS * TEXTURE_STRIDE as usize), &mut b);
+        assert!(!a.is_empty());
+        assert_eq!(a.len(), b.len());
+        for ((ua, ba), (ub, bb)) in a.iter().zip(b.iter()) {
+            assert_eq!(ua, ub);
+            assert_eq!((ba.addr, ba.words, ba.from_precomputed), (bb.addr, bb.words, bb.from_precomputed));
+        }
     }
 }

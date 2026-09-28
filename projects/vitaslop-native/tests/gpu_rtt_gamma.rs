@@ -101,10 +101,12 @@ fn quad_inset(color: [u8; 4], tex: Option<BoundTexture>, inset: f32) -> Draw {
         // Fixed-function parity path: no recompiled GXP payload.
         vprog: vitaslop_runtime::capture::no_program(),
         fprog: vitaslop_runtime::capture::no_program(),
+        fprog_patched_vprog: vitaslop_runtime::capture::no_program(),
         vert_sa: std::sync::Arc::from(&[][..]),
         frag_sa: std::sync::Arc::from(&[][..]),
         frag_sa_addr: 0,
         mem_windows: Vec::new(),
+        frag_mem_windows: Vec::new(),
         shader_expanded: false,
     }
 }
@@ -186,19 +188,21 @@ fn chain_centre(gpu: &mut GeneralRenderer, gamma: u32, feedback: usize) -> [u8; 
     let mut seed = texture_naming_target();
     seed.data_addr = SEED_ADDR;
     seed.pixels = std::iter::repeat_n([MID, MID, MID, 255], 16).flatten().collect::<Vec<u8>>().into();
-    let mut scenes = vec![Scene {
+    let mut scenes = vec![Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
         precompile: Default::default(),
         color: Some(surface(gamma)),
         depth: None,
         multisample: 0,
+        target_extent: None,
         draws: vec![quad_inset([255, 255, 255, 255], Some(seed), 8.0)],
     }];
     for _ in 0..feedback {
-        scenes.push(Scene {
+        scenes.push(Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: Some(surface(gamma)),
             depth: None,
             multisample: 0,
+        target_extent: None,
             draws: vec![full_quad(white, Some(texture_naming_target()))],
         });
     }
@@ -209,11 +213,12 @@ fn chain_centre(gpu: &mut GeneralRenderer, gamma: u32, feedback: usize) -> [u8; 
     // the real thing, it is a different case.
     let mut display_surface = surface(0);
     display_surface.data_addr = DISPLAY_ADDR;
-    scenes.push(Scene {
+    scenes.push(Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
         precompile: Default::default(),
 color: Some(display_surface),
         depth: None,
         multisample: 0,
+        target_extent: None,
         draws: vec![quad_inset(white, Some(texture_naming_target()), 8.0)],
     });
     let fb = gpu.render_frame(&scenes, W, H, CLEAR);
@@ -241,7 +246,7 @@ fn a_gamma_target_survives_being_sampled_by_the_pass_that_draws_into_it() {
     // to the display in one pass. If either of these is wrong then nothing further down
     // measures the renderer, it measures the test.
     let direct_color = gpu.render_frame(
-        &[Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![quad_inset([MID, MID, MID, 255], None, 8.0)] }],
+        &[Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws: vec![quad_inset([MID, MID, MID, 255], None, 8.0)] }],
         W, H, CLEAR,
     );
     eprintln!(
@@ -250,11 +255,12 @@ fn a_gamma_target_survives_being_sampled_by_the_pass_that_draws_into_it() {
         direct_color.pixel(W / 2, H / 2)
     );
     let direct_tex = gpu.render_frame(
-        &[Scene {
+        &[Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
+        target_extent: None,
             draws: vec![full_quad([255, 255, 255, 255], Some(texture_naming_target()))],
         }],
         W, H, CLEAR,

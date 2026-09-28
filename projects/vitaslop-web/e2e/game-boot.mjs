@@ -34,7 +34,8 @@
 import { chromium } from "playwright";
 import { createServer } from "node:http";
 import { readFile, readdir, stat, mkdir, writeFile } from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, createReadStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
 import { join, extname, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startProcMon } from "./procmon.mjs";
@@ -99,6 +100,9 @@ async function main() {
     const coi = {
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",
+      // Never from the HTTP cache: an A/B serves two bundles at the SAME URLs from one profile
+      // (`WEB_DIR`), and an arm that loaded the other arm's cached wasm would measure it.
+      "Cache-Control": "no-store",
     };
     try {
       const url = decodeURIComponent(req.url.split("?")[0]);
@@ -109,10 +113,30 @@ async function main() {
       const file = url.startsWith("/game/")
         ? join(gameDir, url.slice("/game/".length))
         : join(webDir, url === "/" ? "/debug/game.html" : url);
-      const body = await readFile(file);
-      res.writeHead(200, { "content-type": MIME[extname(file)] || "application/octet-stream", ...coi });
-      res.end(body);
-    } catch {
+      // STREAMED, and with a content-length the page holds the transfer to.
+      //
+      // >>> `readFile` CANNOT READ A RETAIL CONTAINER. Node refuses a file over 2 GiB
+      // > > > (`ERR_FS_FILE_TOO_LARGE`), so one title's 2.9 GB archive threw here and the
+      // > > > catch below answered the request with a 404 whose nine-byte body - `not found` -
+      // > > > the page imported AS the archive. The title then booted with nothing loaded and
+      // > > > died three hundred frames later inside the guest. Streaming has no size limit,
+      // > > > and the length lets the client refuse a short transfer.
+      const { size } = await stat(file);
+      res.writeHead(200, {
+        "content-type": MIME[extname(file)] || "application/octet-stream",
+        "content-length": String(size),
+        ...coi,
+      });
+      await pipeline(createReadStream(file), res);
+    } catch (e) {
+      // >>> A 404 THAT DOES NOT SAY WHAT IT COULD NOT FIND COSTS A SESSION.
+      //
+      // This catch answered every failure with nine bytes and no name, and an import that died
+      // at "fetched 80/105" could not be told from a missing file, a bad URL, or a read that
+      // threw for its own reasons - every one of which wants a different fix. The manifest walk
+      // stats all 105 files successfully, so "the file is missing" was never even the likely
+      // one, and there was no way to find that out from the log.
+      console.log(`[game] 404 ${req.url} -> ${e.code || e.message}`);
       res.writeHead(404).end("not found");
     }
   });
@@ -204,7 +228,7 @@ async function main() {
     channel: process.env.PWCHANNEL || "chrome",
     headless,
     viewport: { width: 1100, height: 800 },
-    deviceScaleFactor: 1,
+    deviceScaleFactor: Number(process.env.DSF || 1),
     args: [
       "--enable-unsafe-webgpu",
       `--enable-features=${features}`,
@@ -517,8 +541,25 @@ async function main() {
     // re-running to a different fast-forward target to bisect costs minutes per guess.
     // Each shot is filed under the FRAME the run had reached, taken from the pushed
     // heartbeat, because a browser frame and a wall second are not the same axis.
+    // >>> A WALL-CLOCK CADENCE CANNOT SAMPLE A GAME EVENT, so there is a FRAME cadence too.
+    //
+    // `SHOT_EVERY_MS` samples the wall clock, which is the right axis for "is the picture
+    // still there after a minute" and the wrong one for "what does the frame after contact
+    // look like": the run's frame rate is the thing under test, so a fixed millisecond
+    // interval lands on different frames in every arm and cannot be compared with the
+    // desktop oracle's frame-keyed sequence at all.
+    //
+    // `SHOT_EVERY_FRAMES=N` (optionally bounded by `SHOT_FROM_FRAME` / `SHOT_TO_FRAME`)
+    // shoots on the GUEST's frame axis instead, so a browser sequence and a desktop sequence
+    // name the same frames. It is only as sharp as the heartbeat that publishes the frame
+    // number, so set `VITASLOP_BROWSER_HEARTBEAT_MS` low (100-250) when using it - at the
+    // 20,000 ms a perf run uses, every shot in a window lands on one frame number.
     const shotEveryMs = Number(process.env.SHOT_EVERY_MS || 0);
+    const shotEveryFrames = Number(process.env.SHOT_EVERY_FRAMES || 0);
+    const shotFromFrame = Number(process.env.SHOT_FROM_FRAME || 0);
+    const shotToFrame = Number(process.env.SHOT_TO_FRAME || Number.MAX_SAFE_INTEGER);
     let shotTimer = null;
+    let frameShotTimer = null;
     if (shotEveryMs > 0) {
       let busy = false;
       shotTimer = setInterval(async () => {
@@ -537,6 +578,38 @@ async function main() {
           busy = false;
         }
       }, shotEveryMs);
+    }
+    if (shotEveryFrames > 0) {
+      let busy = false;
+      let nextAt = -1;
+      let taken = 0;
+      // Polled rather than driven off the console handler: a screenshot is async and the
+      // handler must stay non-blocking, or the heartbeat that feeds `liveFrame` queues up
+      // behind the very thing it is timing.
+      frameShotTimer = setInterval(async () => {
+        if (busy || liveFrame < 0) return;
+        if (liveFrame < shotFromFrame || liveFrame > shotToFrame) return;
+        if (nextAt < 0) nextAt = liveFrame;
+        if (liveFrame < nextAt) return;
+        // Snap forward rather than firing once per missed multiple: at 36 fps with a 150 ms
+        // heartbeat the frame number jumps in steps, and a catch-up burst would shoot the
+        // same picture several times under different names.
+        nextAt = liveFrame + shotEveryFrames - (liveFrame % shotEveryFrames);
+        busy = true;
+        const at = liveFrame;
+        try {
+          await page.locator("#screen").screenshot({
+            path: join(shotDir, `f${String(at).padStart(6, "0")}.png`),
+            timeout: 20000,
+          });
+          taken += 1;
+          if (taken % 25 === 0) console.log(`[game] ${taken} frame-keyed shots, latest f${at}`);
+        } catch (e) {
+          console.log(`[game] frame-keyed shot at frame ${at} failed: ${e.message}`);
+        } finally {
+          busy = false;
+        }
+      }, 40);
     }
     // `HIDE_SHOW_MS=N` (optionally `HIDE_FOR_MS=M`, `HIDE_FROM_FRAME=F`): every N ms, put
     // the page in the BACKGROUND for M ms and bring it back.
@@ -622,6 +695,7 @@ async function main() {
     }
     clearInterval(ticker);
     if (shotTimer) clearInterval(shotTimer);
+    if (frameShotTimer) clearInterval(frameShotTimer);
     if (hideTimer) {
       clearInterval(hideTimer);
       console.log(`[game] ${hideCycles} hide/show cycle(s) during the run`);
@@ -667,7 +741,7 @@ async function main() {
           // `latencySkip` is sound the worklet threw away to stop the backlog growing (heard
           // as a skip), `fill` is the backlog still standing at the end (heard as delay
           // between a button and its sound). Underrun and overrun cannot distinguish either.
-          ` latencySkip=${audio.latencySkip ?? 0} fill=${audio.fill ?? 0}`
+          ` latencySkip=${audio.latencySkip ?? 0} fill=${audio.fill ?? 0} rejoins=${audio.rejoins ?? 0}`
       );
       // >>> COUNTERS CANNOT TELL MUSIC FROM SILENCE. A frame of zeroes is written and
       // read exactly like a frame of music, and an engine that produced nothing but

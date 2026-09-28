@@ -275,6 +275,46 @@ pub const fn split_work(bits: u64) -> (u32, u32) {
 /// clears the operator half itself after each yield.
 pub const FUEL_EXPORT: &str = "work";
 
+/// SMP builds only: the export of the global holding the layout offset of this instance's
+/// worker's PREEMPT word - see `emit::PREEMPT_GLOBAL`. The host points it at
+/// `mirror_off + 4 * (PREEMPT_SLOT_BASE + worker)` when it builds the instance.
+pub const PREEMPT_EXPORT: &str = "preempt";
+
+/// First host-mirror slot of the per-worker PREEMPT words (SMP). Far above every mirrored
+/// slot and the kernel mutex table that follows them, and inside the one-page block (16,384
+/// slots). Slot `PREEMPT_SLOT_BASE - 1` is the "never set" word an unpointed instance reads.
+pub const PREEMPT_SLOT_BASE: u32 = 8192;
+
+/// SMP: worker `w`'s RUNNABLE count sits this many slots above its preempt word (so at
+/// `PREEMPT_SLOT_BASE + SMP_RUNNABLE_SLOT_OFFSET + w`), and an instance reaches it through the
+/// same pointer global plus `4 * SMP_RUNNABLE_SLOT_OFFSET` bytes. See `InlineOp::SmpDelayYield`.
+pub const SMP_RUNNABLE_SLOT_OFFSET: u32 = 64;
+
+/// SMP, `VITASLOP_GUEST_PROF` only: worker `w`'s GUEST-FUNCTION slot is host-mirror slot
+/// `PREEMPT_SLOT_BASE + SMP_PROF_SLOT_OFFSET + SMP_PROF_SLOT_STRIDE * w`. A profiled module stores
+/// the guest address of the function it is executing there (on entry and after every call
+/// returns), the host tags it while a host call runs and zeroes it when a resume ends, and a
+/// sampler worker reads it - the on-device answer to "which guest code is this worker running".
+///
+/// SIXTEEN SLOTS (64 bytes) APART, one cache line each: written on every guest call by three
+/// cores at once, adjacent words made the lines ping-pong - MEASURED, the first cut took an
+/// at-bat from ~90% to 45% speed and so measured a different machine.
+pub const SMP_PROF_SLOT_OFFSET: u32 = 256;
+pub const SMP_PROF_SLOT_STRIDE: u32 = 16;
+
+/// SMP: the host-mirror slots of the 64-bit process clock and RTC tick, each written as ONE
+/// aligned 64-bit word (both are even slots of a page-aligned block, so 8-aligned). See
+/// `InlineOp::LoadClock64`.
+pub const SMP_CLOCK64_SLOT: u32 = 8184;
+pub const SMP_RTC64_SLOT: u32 = 8186;
+
+/// SMP builds only: the exports of the per-instance thread words (`InlineOp::ThreadWord`)
+/// and the elided-yield run counter (`InlineOp::SmpDelayYield`), which the host sets before
+/// every resume.
+pub const THREAD_ID_EXPORT: &str = "thread_id";
+pub const CUR_THREAD_EXPORT: &str = "cur_thread";
+pub const ELIDE_EXPORT: &str = "elide";
+
 /// Alias kept for the one thing that reads only the operator half. Both halves live in
 /// [`WORK_GLOBAL`]; see it for the layout and for why they share a global.
 pub const FUEL_GLOBAL: u32 = WORK_GLOBAL;

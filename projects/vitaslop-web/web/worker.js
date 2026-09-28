@@ -7,21 +7,28 @@
 // fetched container bytes to this worker, which renders straight to that canvas. Since a
 // worker has no DOM, metrics come back as { type: "report", id, text } messages the page
 // applies to its FPS/status elements.
-import init, {
-  run_game_worker,
+//
+// >>> WHICH BUNDLE: `worker.js?smp=1` loads `pkg-threads` (wasm threads, a shared memory -
+// what `VITASLOP_SMP=1` needs to run guest threads on several workers); anything else loads
+// `pkg`, the single-threaded build the default engine has always run on. The page decides,
+// because it has to decide BEFORE this worker's first line: the bundle is this worker's code.
+// See build.mjs for why there are two.
+const SMP_BUNDLE = new URL(self.location.href).searchParams.get("smp") === "1";
+let run_game_worker,
   set_knob,
   set_system_font,
   worker_input_key,
   worker_input_pointer,
   worker_input_stick,
   worker_set_paused,
+  worker_set_output_size,
   worker_set_keymap,
   worker_location_fix,
   worker_location_error,
   worker_location_unavailable,
   worker_location_note,
   flush_game_data,
-} from "./pkg/vitaslop_web.js";
+  reserve_guest_region;
 import { openTitleCached } from "./opfs.js";
 import * as gamedata from "./gamedata.js";
 
@@ -46,6 +53,26 @@ const note = (text) => {
   if (consoleOn) console.log(text);
   self.postMessage({ type: "note", text });
 };
+
+// >>> THE SMP TIMELINE (`VITASLOP_SMP_TRACE`) IS PRINTED BY THE WASM TO THE CONSOLE, which a
+// phone does not have. Its lines are posted to the page as notes as well, so a device run
+// (web/runner/live.js) brings the timeline back with the rest of the diagnostics.
+// `forwardConsole` in the start message (a device-runner live job's `params.console`) forwards
+// EVERY console line as well, capped, so any trace knob can be read off a phone.
+let forwardConsole = 0;
+for (const level of ["log", "info", "warn", "error"]) {
+  const orig = console[level].bind(console);
+  console[level] = (...a) => {
+    const text = a.map((x) => (typeof x === "string" ? x : String(x))).join(" ");
+    // `rtt probe:` = `VITASLOP_RTT_PROBE_LOG`'s per-frame line (reaches the console under VITASLOP_CONSOLE=1).
+    if (text.startsWith("smptrace") || text.startsWith("presentlog") || text.startsWith("drawnote") || text.startsWith("presentshot") || text.includes("rtt probe:") || text.includes("host write watch") || text.startsWith("jsprofile") || text.startsWith("guestprof")) self.postMessage({ type: "note", text });
+    else if (forwardConsole > 0) {
+      forwardConsole -= 1;
+      self.postMessage({ type: "note", text: `console.${level}: ${text.slice(0, 60000)}` });
+    }
+    orig(...a);
+  };
+}
 
 async function loadSystemFont() {
   try {
@@ -133,8 +160,43 @@ globalThis.__vitaslopPanic = (text) => {
   }
 };
 
-// Start loading the wasm module immediately; the first message awaits it.
-const ready = init();
+// Start loading the glue immediately; the bundle itself is initialised by the first message
+// that needs it - see `bundle`.
+// `loadTimes`: where the worker's start-up went (import of the glue, then `init` = fetch +
+// compile + instantiate of the bundle), reported with the reservation.
+const loadTimes = { t0: performance.now() };
+const glue = import(SMP_BUNDLE ? "./pkg-threads/vitaslop_web.js" : "./pkg/vitaslop_web.js");
+let readyP = null;
+// >>> THE PAGE HANDS US THE BUNDLE ALREADY COMPILED, when it can. Each worker used to fetch and
+// compile the 9 MB bundle itself, and a phone on the dev server's self-signed certificate gets
+// NO HTTP cache: MEASURED (runner, MLB) 8.7 s and the full 9 MB over the wire, per worker, per
+// play. The page compiles it once (web/bundle.js) and posts the `WebAssembly.Module` with the
+// reserve; the first caller decides, and a page that sends none (the debug pages) gets the old
+// self-fetch.
+const bundle = (module) =>
+  (readyP ??= glue.then(async (m) => {
+    loadTimes.imported = performance.now();
+    loadTimes.given = !!module;
+    ({
+      run_game_worker,
+      set_knob,
+      set_system_font,
+      worker_input_key,
+      worker_input_pointer,
+      worker_input_stick,
+      worker_set_paused,
+      worker_set_output_size,
+      worker_set_keymap,
+      worker_location_fix,
+      worker_location_error,
+      worker_location_unavailable,
+      worker_location_note,
+      flush_game_data,
+      reserve_guest_region,
+    } = m);
+    await m.default(module ? { module_or_path: module } : undefined);
+    loadTimes.inited = performance.now();
+  }));
 
 // Where this run's saves go, once the start message names a title. Held at module scope so
 // the page's `flush-game-data` message can reach it - that arrives on the way out, long
@@ -147,7 +209,14 @@ let saveSink = null;
 // that way simply stops, and from the page it is indistinguishable from a run that is
 // merely slow. Both are forwarded so the failure names itself.
 self.addEventListener("error", (e) =>
-  self.postMessage({ type: "error", message: `worker error: ${e.message || e}` })
+  self.postMessage({
+    type: "error",
+    message:
+      `worker error: ${e.message || e}` +
+      (e.filename ? ` at ${e.filename}:${e.lineno || "?"}:${e.colno || "?"}` : "") +
+      (e.error && e.error.stack ? `
+${e.error.stack}` : ""),
+  })
 );
 self.addEventListener("unhandledrejection", (e) =>
   self.postMessage({
@@ -175,17 +244,23 @@ self.onmessage = async (e) => {
     worker_input_stick(d.stick, d.x, d.y, d.active);
     return;
   }
-  // The page's hard pause (tab hidden / window blurred) - see live.html. The live loop
+  // The page's hard pause (tab hidden / window blurred) - see player.js. The live loop
   // reads it at the top of every tick and runs no guest frame while it is set.
   if (d.type === "pause") {
     worker_set_paused(!!d.paused);
+    return;
+  }
+  // The canvas's size in DEVICE pixels (see player.js `postOutputSize`): the renderer sizes the
+  // canvas to it and scales the 960x544 picture into it crisply - see present_scale.rs.
+  if (d.type === "output-size") {
+    if (worker_set_output_size) worker_set_output_size(d.w | 0, d.h | 0);
     return;
   }
   // The person's keyboard map (see vitaslop-frontend); the on-screen pad and a gamepad
   // post keyboard codes too, so this one table serves all three.
   if (d.type === "keymap") {
     try {
-      await ready;
+      await bundle();
       worker_set_keymap(String(d.json));
     } catch (err) {
       self.postMessage({ type: "error", message: `keymap rejected: ${err}` });
@@ -233,6 +308,37 @@ self.onmessage = async (e) => {
   // would otherwise lose that write. `flush_game_data` returns the container only if there
   // is something unwritten AND the guest is not mid-host-call, so this is a no-op on the
   // common path and cannot block the worker on the way out.
+  // >>> RESERVE THE GUEST'S MEMORY INSIDE THIS WORKER'S OWN, before anything is transpiled.
+  //
+  // The guest region lives in the emulator's linear memory (a host read of guest memory
+  // is then a load, not a JavaScript call - see `browser_sched::HostRegion`), and the
+  // transpiled module is emitted for the region's exact offset. So the page asks THIS
+  // worker for the offset first, hands it to the throwaway transpile worker, and only then
+  // sends the start message. The knobs are set first: `VITASLOP_BROWSER_SPLIT_MEMORY` is
+  // read by the reservation itself.
+  if (d.type === "reserve") {
+    try {
+      await bundle(d.module);
+      for (const [k, v] of Object.entries(d.knobs || {})) set_knob(k, String(v));
+      const tr = performance.now();
+      const hostOff = reserve_guest_region();
+      const lt = loadTimes;
+      // The bundle's own fetch, from resource timing: `transferSize` 0 means it came from the
+      // cache (a 304 or a fresh entry), so the rest of `init` is compile + instantiate.
+      const wasm = performance.getEntriesByType("resource").find((r) => /_bg\.wasm/.test(r.name));
+      const fetchNote = wasm
+        ? `wasm fetch ${Math.round(wasm.responseEnd - wasm.startTime)} ms (${Math.round(wasm.transferSize / 1024)} KB over the wire), then ${Math.round(lt.inited - wasm.responseEnd)} ms to ready`
+        : lt.given
+          ? "bundle handed over compiled by the page"
+          : "wasm fetch not in resource timing";
+      const split = `import ${Math.round(lt.imported - lt.t0)} ms, init (fetch+compile+instantiate) ${Math.round(lt.inited - lt.imported)} ms [${fetchNote}], reserve ${Math.round(performance.now() - tr)} ms`;
+      self.postMessage({ type: "reserved", hostOff, split });
+    } catch (err) {
+      self.postMessage({ type: "error", message: `guest region: ${String((err && err.message) || err)}` });
+    }
+    return;
+  }
+
   if (d.type === "flush-game-data") {
     if (!saveSink) return;
     try {
@@ -254,17 +360,37 @@ self.onmessage = async (e) => {
   // `audioRing` is the SharedArrayBuffer the page's AudioWorklet drains (see
   // web/audio.js). It is shared, not transferred, so it needs no transfer list - and a
   // start message without one simply runs silent, which the setup says on the console.
-  const { offscreen, titleId, files, recipe, maxFrames, knobs, prebuilt, audioRing, profile } = d;
+  const { offscreen, titleId, files, recipe, maxFrames, knobs, prebuilt, audioRing, profile, noPersist } = d;
+  forwardConsole = Number(d.forwardConsole || 0);
   // Which game-data profile this run saves into; the page picked it from the settings.
   gamedata.setProfile(profile || "default");
   try {
-    await ready;
+    await bundle();
     // A worker is its own wasm instance, so it needs the knobs set here, not on the page.
     for (const [k, v] of Object.entries(knobs || {})) set_knob(k, String(v));
     consoleOn = String((knobs || {}).VITASLOP_CONSOLE ?? "") === "1";
     await loadSystemFont();
     // Forward each (id, text) metric the run publishes to the page.
-    const report = (id, text) => self.postMessage({ type: "report", id, text });
+    //
+    // `shots` (a device-runner live job's `params.shots`, frame numbers): the canvas as it
+    // stands when the run first reports reaching each one, posted back as a JPEG data URL note
+    // - the only way to SEE a phone's picture from the desktop.
+    const shots = (d.shots || []).map(Number).sort((a, b) => a - b);
+    const report = (id, text) => {
+      self.postMessage({ type: "report", id, text });
+      if (shots.length && id === "status") {
+        const m = /frame (\d+)/.exec(text);
+        if (m && Number(m[1]) >= shots[0]) {
+          const at = Number(m[1]);
+          while (shots.length && shots[0] <= at) shots.shift();
+          offscreen
+            .convertToBlob({ type: "image/jpeg", quality: 0.8 })
+            .then((b) => new Promise((ok) => { const r = new FileReader(); r.onload = () => ok(r.result); r.readAsDataURL(b); }))
+            .then((url) => self.postMessage({ type: "note", text: `shot f${at} ${url}` }))
+            .catch((err) => self.postMessage({ type: "note", text: `shot f${at} FAILED ${err}` }));
+        }
+      }
+    };
     // The title's files are opened on a STORAGE WORKER (see storage-worker.js), which
     // serves them into a shared page ring and reads ahead between requests. That open is
     // asynchronous, which is why it happens now, before any guest code runs. Once it is
@@ -289,7 +415,9 @@ self.onmessage = async (e) => {
     // Only for an OPFS run. The in-memory `files` path is the e2e fixture path and has no
     // title id to key storage by, so it plays without persistence rather than guessing one.
     let persist;
-    if (titleId) {
+    // `noPersist` (the device runner's reproducible runs): no saved state read, none written,
+    // so every run boots as a first boot - a recipe keyed to first-boot screens stays in step.
+    if (titleId && !noPersist) {
       const stored = await gamedata.read(titleId);
       if (stored) note(`[gamedata] restoring ${stored.length} bytes for ${titleId}`);
       saveSink = gamedata.sink(titleId, (err) => {
