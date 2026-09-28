@@ -104,11 +104,10 @@ pub fn stop_host_watch() {
         return;
     }
     WATCH_ID.with(|c| {
-        if let Some(id) = c.borrow_mut().take() {
-            if let Some(geo) = window_geolocation() {
+        if let Some(id) = c.borrow_mut().take()
+            && let Some(geo) = window_geolocation() {
                 geo.clear_watch(id);
             }
-        }
     });
 }
 

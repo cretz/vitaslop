@@ -144,11 +144,10 @@ impl World for BrowserWorld {
     fn poll_touch(&mut self, port: u32) -> TouchFrame {
         // A live pointer press overrides the scripted touch; otherwise the recipe (if
         // any) drives, and failing that there is no finger down.
-        if port == 0 {
-            if let Some(t) = self.live.lock().unwrap().touch {
+        if port == 0
+            && let Some(t) = self.live.lock().unwrap().touch {
                 return t;
             }
-        }
         self.recipe.as_mut().map(|r| r.poll_touch(port)).unwrap_or_default()
     }
     fn location_permission(&mut self) -> LocationPermission {

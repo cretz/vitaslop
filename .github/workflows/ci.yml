@@ -185,8 +185,9 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
           # `rust-src`: build.mjs also builds the THREADS bundle with `-Z build-std`, which
-          # recompiles std and fails without the standard library's source.
-          components: rust-src
+          # recompiles std and fails without the standard library's source. `clippy`: the wasm
+          # lint step below.
+          components: rust-src, clippy
 
       # >>> SAVE THE CACHE EVEN WHEN THE JOB FAILS.
       #
@@ -218,6 +219,16 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: projects/vitaslop-web/e2e/package-lock.json
+
+      # The browser-only code (vitaslop-web, the WebCodecs backends) is compiled for wasm32 and
+      # nowhere else, so the workspace clippy steps above never see it.
+      - name: Clippy (wasm)
+        working-directory: projects
+        run: >-
+          cargo clippy --locked --release --target wasm32-unknown-unknown
+          -p vitaslop-web -p vitaslop-aac -p vitaslop-h264 -p vitaslop-platform -p vitaslop-runtime
+          -p vitaslop-gxp-shader -p vitaslop-transpiler -p vitaslop-frontend -p vitaslop-hostcall
+          -p vitaslop-loader -p vitaslop-atrac9 -- -D warnings
 
       - name: Build the wasm bundle
         working-directory: projects/vitaslop-web
@@ -294,6 +305,15 @@ jobs:
         env:
           ALLOW_SOFTWARE: "1"
         run: node run.mjs
+
+      # The path a phone actually runs: the THREADS bundle with the guest on several workers
+      # (`VITASLOP_SMP`, the player's default), reached through the real import screen and Play.
+      - name: Homebrew cube on the threads bundle with SMP
+        working-directory: projects/vitaslop-web/e2e
+        env:
+          ALLOW_SOFTWARE: "1"
+          HEADLESS: "1"
+        run: node smp-cube.mjs
 
       - name: Keep the screenshots
         if: always()

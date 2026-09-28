@@ -68,6 +68,23 @@ fn main() {
   }
 }`;
 
+// >>> THE VECTOR PAIR ROUND TRIP (`gxp_q2` on the native arm, browser builds), exercised the
+// same way: both lanes carry the input, and the result is packed back to read its bits - the
+// value is already a half, so that pack rounds nothing. Proven exhaustively (all 2^32 inputs)
+// on two GPUs by the `f16-helper-equiv` runner job; this keeps every CI device honest too.
+const shippedQ2 = () => `enable f16;
+${armText("native")}${armText("common")}${armText("q2vec")}
+struct Out { bits: array<u32, ${LANES}> };
+@group(0) @binding(0) var<storage, read> inp: array<f32, ${LANES}>;
+@group(0) @binding(1) var<storage, read_write> outp: Out;
+@compute @workgroup_size(1)
+fn main() {
+  for (var i = 0u; i < ${LANES}u; i = i + 1u) {
+    let both = pack2x16float(gxp_q2(vec2<f32>(inp[i], inp[i])));
+    outp.bits[i] = (both & 0xffffu) | select(0x10000u, 0u, (both >> 16u) == (both & 0xffffu));
+  }
+}`;
+
 // >>> THE SHIPPED ARM, AND IT IS EXERCISED THROUGH `gxp_hpk` RATHER THAN `gxp_f16b` ALONE.
 // The pair helper is what a folded four-channel store calls - the commonest f16 store there is -
 // and in the native arm it is a DIFFERENT expression from two single narrowings. Reading both
@@ -231,15 +248,18 @@ function score(bits) {
 }
 
 const results = [];
-for (const [label, src, shippedArm] of [
-  ["pack2x16float  (the OLD store instruction)", BUILTIN_PACK, false],
-  ["native f16()   conversion", BUILTIN_NATIVE, false],
-  ["SHIPPED gxp_hpk - control arm (pack)", shipped("pack"), true],
-  ["SHIPPED gxp_hpk - PORTABLE arm", shipped("portable"), true],
-  ["SHIPPED gxp_hpk - NATIVE arm", shipped("native"), true],
+// The third field: the row needs `shader-f16`, so a device without it SKIPS the row (the product
+// never uses that arm there) instead of failing it.
+for (const [label, src, shippedArm, needsF16] of [
+  ["pack2x16float  (the OLD store instruction)", BUILTIN_PACK, false, false],
+  ["native f16()   conversion", BUILTIN_NATIVE, false, true],
+  ["SHIPPED gxp_hpk - control arm (pack)", shipped("pack"), true, false],
+  ["SHIPPED gxp_hpk - PORTABLE arm", shipped("portable"), true, false],
+  ["SHIPPED gxp_hpk - NATIVE arm", shipped("native"), true, true],
+  ["SHIPPED gxp_q2 - NATIVE vector pair", shippedQ2(), true, true],
 ]) {
   const got = await runArm(src);
-  results.push({ label, got, shippedArm });
+  results.push({ label, got, shippedArm, needsF16 });
 }
 
 const adapterName = results.find((r) => r.got.adapter)?.got.adapter ?? "(unknown)";
@@ -249,9 +269,9 @@ console.log(`shader-f16: ${hasF16 ? "available" : "NOT available"}`);
 console.log("");
 console.log("  store instruction                            RTE      RTZ     what we require");
 let failed = 0;
-for (const { label, got, shippedArm } of results) {
+for (const { label, got, shippedArm, needsF16 } of results) {
   if (got.error) {
-    const skippable = !hasF16 && label.includes("NATIVE") ;
+    const skippable = !hasF16 && needsF16;
     console.log(`  ${label.padEnd(44)} ${skippable ? "(skipped: no shader-f16)" : `FAILED: ${got.error}`}`);
     if (!skippable) failed++;
     continue;

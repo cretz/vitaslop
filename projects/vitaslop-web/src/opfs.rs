@@ -31,8 +31,6 @@ pub struct OpfsReader {
     paths: Function,
     size: Function,
     read: Function,
-    /// `stats()` if the reader has a ring behind it - see [`OpfsReader::ring_stats`].
-    stats: Option<Function>,
     this: Object,
     /// The worker (wasm thread) that built this reader - the only one whose JS heap holds
     /// the functions above. See the `Send` note below.
@@ -124,15 +122,12 @@ impl OpfsReader {
                 .dyn_into::<Function>()
                 .map_err(|_| JsValue::from_str(&format!("OPFS reader has no {name}()")))
         };
-        Ok(OpfsReader {
-            paths: get("paths")?,
-            size: get("size")?,
-            read: get("read")?,
-            // OPTIONAL, unlike the three above: the in-memory fixture reader has no ring
-            // behind it and nothing to report, and an absent counter is a reader without a
-            // ring rather than a failure. The three that ARE required stay required - a
-            // missing `read` is a title that silently reads zeros.
-            stats: {
+        let (paths, size, read) = (get("paths")?, get("size")?, get("read")?);
+        // `stats()` is OPTIONAL, unlike the three above: the in-memory fixture reader has no
+        // ring behind it and nothing to report, and an absent counter is a reader without a
+        // ring rather than a failure. The three that ARE required stay required - a missing
+        // `read` is a title that silently reads zeros.
+        {
                 let f = Reflect::get(&this, &JsValue::from_str("stats"))
                     .ok()
                     .and_then(|f| f.dyn_into::<Function>().ok());
@@ -150,27 +145,14 @@ impl OpfsReader {
                     .and_then(|f| f.call0(&this).ok())
                     .filter(|v| v.is_object());
                 SHARE.with(|s| *s.borrow_mut() = share);
-                f
-            },
+        }
+        Ok(OpfsReader {
+            paths,
+            size,
+            read,
             this,
             owner: std::thread::current().id(),
         })
-    }
-
-    /// `(ring hits, misses, ms waited on a miss)` from the storage worker's page ring, or
-    /// `None` from a reader that has no ring.
-    ///
-    /// # Why the read COUNT could not answer this
-    /// Once the emulator's reads come out of the ring, the panel's read count says nothing
-    /// about what they cost: a hit is a `copy_from_slice` out of shared memory, a miss is a
-    /// round trip to another thread with an `Atomics.wait` in the middle, and the count is the
-    /// same number either way. A device dump was read with the storage worker live and could
-    /// not say whether its 16-page read-ahead was serving anything at all - which is the entire
-    /// claim the worker exists to make. Called once per panel window, never per read.
-    pub fn ring_stats(&self) -> Option<(u64, u64, f64)> {
-        let v = self.stats.as_ref()?.call0(&self.this).ok()?;
-        let num = |k: &str| Reflect::get(&v, &JsValue::from_str(k)).ok()?.as_f64();
-        Some((num("hits")? as u64, num("misses")? as u64, num("waitMs")?))
     }
 
     /// Run `f` with the reader functions THIS worker may call: the ones this reader was built
@@ -269,8 +251,8 @@ struct ReadWindow {
     data: Vec<u8>,
 }
 
-/// OPFS reads made and bytes moved, cumulatively, and how many `read_at` calls the window
-/// answered without one. The panel differences two snapshots. See [`opfs_read_counts`].
+// OPFS reads made and bytes moved, cumulatively, and how many `read_at` calls the window
+// answered without one. The panel differences two snapshots. See `opfs_read_counts`.
 thread_local! {
     /// The live reader's `stats()` and its receiver, for [`ring_read_counts`]. A
     /// thread_local because this target has exactly one thread - see the `unsafe impl Send`
@@ -280,7 +262,15 @@ thread_local! {
 }
 
 /// `(ring hits, misses, ms waited on a miss)` for the panel, or `None` before a title with a
-/// storage ring is open. See [`OpfsReader::ring_stats`] for why the read count cannot say this.
+/// storage ring is open.
+///
+/// # Why the read COUNT could not answer this
+/// Once the emulator's reads come out of the ring, the panel's read count says nothing about
+/// what they cost: a hit is a `copy_from_slice` out of shared memory, a miss is a round trip to
+/// another thread with an `Atomics.wait` in the middle, and the count is the same number either
+/// way. A device dump was read with the storage worker live and could not say whether its
+/// 16-page read-ahead was serving anything at all - which is the entire claim the worker exists
+/// to make. Called once per panel window, never per read.
 pub fn ring_read_counts() -> Option<(u64, u64, f64)> {
     RING.with(|r| {
         let borrowed = r.borrow();

@@ -84,11 +84,10 @@ pub async fn frame_replay(bytes: Vec<u8>, scene_limits: Vec<u32>, draw_limit: i3
     for &limit in &scene_limits {
         let n = if limit == 0 || limit as usize > scenes.len() { scenes.len() } else { limit as usize };
         let mut chosen: Vec<_> = scenes[..n].to_vec();
-        if draw_limit >= 0 {
-            if let Some(last) = chosen.last_mut() {
+        if draw_limit >= 0
+            && let Some(last) = chosen.last_mut() {
                 last.draws.truncate(draw_limit as usize);
             }
-        }
         let t0 = crate::perf_now();
         let color_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("replay colour"),

@@ -740,15 +740,6 @@ impl RttWriteback {
             .count()
     }
 
-    /// Age in ms of the OLDEST copy still waiting for its map, or 0 with none in flight.
-    ///
-    /// A copy whose map has LANDED is excluded: it is handed over at the next `take`, so its
-    /// age says nothing about how far behind the GPU is - and counting it declined 140 presents
-    /// of a healthy desktop run's paced play.
-    fn oldest_in_flight_ms(&self) -> f64 {
-        self.oldest_in_flight().map_or(0.0, |(_, _, _, a)| a)
-    }
-
     /// The oldest not-yet-landed copy as `(addr, w, h, age ms)` - what the age bound declined
     /// on, for the panel. See [`Self::oldest_in_flight_ms`].
     fn oldest_in_flight(&self) -> Option<(u32, u32, u32, f64)> {
@@ -1693,7 +1684,7 @@ impl PresentProbe {
     /// Should this present be sampled? `frame` is the guest frame, for `shots`.
     fn wants(&self, presents: u64, frame: u64) -> bool {
         !self.in_flight
-            && ((presents > 0 && presents % (self.every as u64) == 0) || self.shots.front().is_some_and(|&f| frame >= f))
+            && ((presents > 0 && presents.is_multiple_of(self.every as u64)) || self.shots.front().is_some_and(|&f| frame >= f))
     }
 
     /// Queue the copy. Call with the encoder that is about to be submitted, BEFORE
@@ -2426,160 +2417,14 @@ struct AdapterProbe {
 const SOFTWARE_ADAPTER_MARKERS: &[&str] =
     &["swiftshader", "llvmpipe", "lavapipe", "softpipe", "warp", "basic render", "microsoft basic"];
 
-/// Ask `navigator.gpu` directly what adapter this page would get, and read the fields
-/// wgpu's WebGPU backend does not surface.
-///
-/// wgpu's `AdapterInfo` on the WebGPU backend carries only the description string and a
-/// `device_type` that is `Cpu` solely for a *fallback* adapter - which SwiftShader-behind-
-/// `--enable-unsafe-swiftshader` is NOT: Chrome hands it over as an ordinary adapter. The
-/// vendor/architecture fields, which do name it, are only reachable through the raw
-/// `GPUAdapterInfo`. Requesting a second adapter is cheap (the page gets the same one) and
-/// is the only way to answer the question honestly.
-/// Establish that WebGPU is genuinely usable here BEFORE any of it reaches `wgpu`, and name the
-/// step that failed if it is not.
-///
-/// # Why this has to exist, and what it cost not to have it
-/// `wgpu::Instance::request_adapter` on the WebGPU backend can return `Ok` holding an adapter
-/// whose underlying JavaScript object is NULL. Nothing about that is visible from Rust: the
-/// `Result` is fine, the `Adapter` exists, and the first property read off it - `adapter.features`
-/// in the generated glue, which is the very first thing this renderer asks for - throws a JS
-/// `TypeError` that no Rust error handling can intercept. Inside the emulator's worker that kills
-/// the worker outright, and the user sees one line:
-///
-/// ```text
-/// worker error: Uncaught TypeError: Cannot read properties of null (reading 'features')
-/// ```
-///
-/// which names a property in generated glue and nothing about the cause. REPORTED FROM A DEVICE,
-/// twice - the first time on `.info`, and removing that read only moved it one property along,
-/// because it was a symptom. This is the cause: an adapter that does not exist must be refused at
-/// the boundary, not carried inward.
-///
-/// Every step here is reflection with a guard, so this function itself can never throw.
-async fn webgpu_preflight() -> Result<(), String> {
-    use js_sys::{Function, Reflect};
-    let global = js_sys::global();
-    let navigator = Reflect::get(&global, &JsValue::from_str("navigator"))
-        .map_err(|_| "no `navigator` in this context".to_string())?;
-    let gpu = Reflect::get(&navigator, &JsValue::from_str("gpu"))
-        .map_err(|_| "reading `navigator.gpu` threw".to_string())?;
-    if gpu.is_undefined() || gpu.is_null() {
-        return Err(
-            "`navigator.gpu` is absent - this browser has no WebGPU, or it is disabled for this \
-             origin. On Android, Chrome exposes WebGPU only on a SECURE context it trusts: a \
-             self-signed certificate that was clicked through can be enough to withhold it. \
-             Check chrome://gpu on the device."
-                .into(),
-        );
-    }
-    let request: Function = Reflect::get(&gpu, &JsValue::from_str("requestAdapter"))
-        .map_err(|_| "`navigator.gpu.requestAdapter` is unreadable".to_string())?
-        .dyn_into()
-        .map_err(|_| "`navigator.gpu.requestAdapter` is not callable".to_string())?;
-    // >>> ASK EVERY WAY THE SPEC ALLOWS, AND RETRY, BEFORE BELIEVING A NULL.
-    //
-    // Two different things make `requestAdapter` answer null, and only one of them is permanent.
-    //
-    // 1. TIMING. A phone that has just restarted its GPU process - which is what happens after a
-    //    page crashed one, and this renderer has crashed one - answers null for a moment and then
-    //    answers properly. A single ask turns a half-second race into "this device has no WebGPU".
-    //
-    // 2. THE REQUEST SHAPE. `powerPreference` is documented as a hint, but it is a hint an
-    //    implementation is free to fail: a device with one GPU and no "high performance" tier can
-    //    answer null to `high-performance` and hand over the very same adapter when asked with no
-    //    preference at all. This renderer asked for `high-performance` and nothing else, so a
-    //    device behaving that way looked exactly like a device with no WebGPU.
-    //
-    // So: every shape, several times, and the shape that works is the one the renderer then uses
-    // - see `PREFERRED_POWER`. Reporting which shapes were tried is what makes the failure
-    // actionable when none of them work.
-    let shapes: [(&str, Option<&str>); 3] =
-        [("high-performance", Some("high-performance")), ("default", None), ("low-power", Some("low-power"))];
-    for round in 0..3 {
-        for (name, pref) in shapes {
-            let got = adapter_once(&request, &gpu, pref).await?;
-            if !(got.is_null() || got.is_undefined()) {
-                set_preferred_power(pref);
-                if name != "high-performance" {
-                    logging::note(&format!(
-                        "adapter: `high-performance` was refused; this device answered to \
-                         powerPreference `{name}`, which is what the renderer will use"
-                    ));
-                }
-                return Ok(());
-            }
-        }
-        if round < 2 {
-            sleep_ms(300).await;
-        }
-    }
-    Err(
-        "`navigator.gpu.requestAdapter()` returned NULL for every powerPreference \
-         (high-performance, default, low-power), three times each over a second - WebGPU is \
-         present but this device will not hand over an adapter at all. That is a blocklisted or \
-         repeatedly-crashed GPU process rather than a missing feature: open `chrome://gpu` on the \
-         device and read `Graphics Feature Status` and `Problems Detected`. Note that Chrome \
-         disables acceleration for a PROFILE after enough GPU-process crashes, and that survives \
-         restarting the browser."
-            .into(),
-    )
-}
-
-/// The `powerPreference` this device actually answered to, chosen by [`webgpu_preflight`].
-///
-/// `wgpu` is asked with the same one. Preflighting with one shape and then letting the renderer
-/// request another would mean the check passed for a request nobody makes.
-static PREFERRED_POWER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-fn set_preferred_power(pref: Option<&str>) {
-    let v = match pref {
-        Some("low-power") => 2,
-        None => 1,
-        _ => 0,
-    };
-    PREFERRED_POWER.store(v, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn preferred_power() -> wgpu::PowerPreference {
-    match PREFERRED_POWER.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => wgpu::PowerPreference::None,
-        2 => wgpu::PowerPreference::LowPower,
-        _ => wgpu::PowerPreference::HighPerformance,
-    }
-}
-
-/// One `requestAdapter` call at a given `powerPreference` (`None` = ask with no preference at
-/// all, which is a different request and can succeed where a preference is refused), guarded.
-async fn adapter_once(
-    request: &js_sys::Function,
-    gpu: &JsValue,
-    power: Option<&str>,
-) -> Result<JsValue, String> {
-    use js_sys::{Object, Reflect};
-    let options = Object::new();
-    if let Some(p) = power {
-        let _ =
-            Reflect::set(&options, &JsValue::from_str("powerPreference"), &JsValue::from_str(p));
-    }
-    let promise: js_sys::Promise = request
-        .call1(gpu, &options)
-        .map_err(|e| format!("`requestAdapter` threw: {e:?}"))?
-        .dyn_into()
-        .map_err(|_| "`requestAdapter` did not return a promise".to_string())?;
-    wasm_bindgen_futures::JsFuture::from(promise)
-        .await
-        .map_err(|e| format!("`requestAdapter` rejected: {e:?}"))
-}
-
 /// `setTimeout` as an await point.
 async fn sleep_ms(ms: i32) {
     let p = js_sys::Promise::new(&mut |resolve, _reject| {
         let global = js_sys::global();
-        if let Ok(f) = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout")) {
-            if let Ok(f) = f.dyn_into::<js_sys::Function>() {
+        if let Ok(f) = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
+            && let Ok(f) = f.dyn_into::<js_sys::Function>() {
                 let _ = f.call2(&global, &resolve, &JsValue::from_f64(ms as f64));
             }
-        }
     });
     let _ = wasm_bindgen_futures::JsFuture::from(p).await;
 }
@@ -2944,11 +2789,10 @@ impl LivePlayback {
                 // too, because the callback can fire while the run is between presents and
                 // the earliest possible word is the point.
                 tracing::error!(target: "vitaslop::gxm", "WebGPU DEVICE LOST - {text}");
-                if let Ok(mut slot) = sink.lock() {
-                    if slot.is_none() {
+                if let Ok(mut slot) = sink.lock()
+                    && slot.is_none() {
                         *slot = Some(text);
                     }
-                }
             });
         }
 
@@ -3465,8 +3309,7 @@ impl LivePlayback {
         if self.wb_max_age_ms > 0.0 && !self.fps.paused {
             if let Some((addr, w, h, age)) =
                 self.writeback.oldest_in_flight().filter(|o| o.3 > self.wb_max_age_ms)
-            {
-                if self.wb_age_skips < BACKPRESSURE_SKIP_CAP {
+                && self.wb_age_skips < BACKPRESSURE_SKIP_CAP {
                     self.wb_age_skips += 1;
                     self.wb_age_skips_total += 1;
                     let e = self.wb_age_why.entry((addr, w, h)).or_insert((0, 0.0, 0));
@@ -3475,7 +3318,6 @@ impl LivePlayback {
                     e.2 = self.writeback.in_flight.len();
                     return PresentOutcome::Skipped;
                 }
-            }
             self.wb_age_skips = 0;
         }
         let t0 = clock(&self.perf);
@@ -4185,11 +4027,10 @@ async fn next_tick_in(ms: f64) {
             // Whatever the turn did not use. Landing ON the deadline matters: returning early
             // puts the caller straight back here with a sub-millisecond wait, which is the spin
             // this function exists to avoid.
-            if let (Some(deadline), Some(now)) = (deadline, now_ms()) {
-                if deadline > now {
+            if let (Some(deadline), Some(now)) = (deadline, now_ms())
+                && deadline > now {
                     precise_sleep(deadline - now);
                 }
-            }
             return;
         }
     }
@@ -4961,7 +4802,12 @@ async fn mount_and_link(source: JsValue) -> Result<Mounted, JsValue> {
     // And whether its guest threads will run AT ONCE on several workers, which refuses the
     // inline forms that assume one runs at a time (see `vita::set_smp_linking`).
     vitaslop_runtime::vita::set_smp_linking(smp::enabled());
-    let linked = link(modules).map_err(|e| JsValue::from_str(&format!("link: {e:?}")))?;
+    let linked = link(modules);
+    // Reset at once: the flag is process-wide and read only by `link`, so left set it would
+    // make a later link in this process (a test, a second title) inline a clock read its
+    // scheduler does not refresh.
+    vitaslop_runtime::vita::set_preemptive_linking(false);
+    let linked = linked.map_err(|e| JsValue::from_str(&format!("link: {e:?}")))?;
     let decrypt_ms = perf.now() - t_dec;
     // The heap high-water mark is PERMANENT: wasm linear memory grows and never shrinks,
     // so whatever setup peaks at is carried for the whole run. Sampling either side of
@@ -5199,18 +5045,6 @@ pub fn set_system_font(bytes: &[u8]) {
     vitaslop_runtime::font::system::set_bytes(bytes.to_vec());
 }
 
-/// Boot the REAL retail title LIVE on the MAIN THREAD: decrypt + link + transpile, then
-/// run the guest frame-by-frame through the JSPI preemptive scheduler, rendering each
-/// freshly-executed frame to the WebGPU `canvas` through the general GXM renderer and
-/// feeding real input (pointer/keyboard on the canvas, plus an optional scripted
-/// `recipe`) through the browser [`BrowserWorld`]. Returns after setup once the live
-/// loop is spawned; the loop then runs on the event loop, updating the on-page FPS
-/// meter and status. `max_frames` bounds the run (display flips); `max_rounds` is unused
-/// (kept for API compatibility - the live loop caps rounds per frame).
-///
-/// Note: instantiating the title's (large) transpiled module synchronously mid-run
-/// needs the `WebAssemblyUnlimitedSyncCompilation` flag on the main thread; the worker
-/// entry ([`run_game_worker`]) is the flag-free production home.
 // ===========================================================================
 // THE GUEST'S OWN SAVED STATE
 // ===========================================================================
@@ -5311,6 +5145,18 @@ pub fn game_data_describe(zip: &[u8]) -> Result<String, JsValue> {
     Ok(out)
 }
 
+/// Boot the REAL retail title LIVE on the MAIN THREAD: decrypt + link + transpile, then
+/// run the guest frame-by-frame through the JSPI preemptive scheduler, rendering each
+/// freshly-executed frame to the WebGPU `canvas` through the general GXM renderer and
+/// feeding real input (pointer/keyboard on the canvas, plus an optional scripted
+/// `recipe`) through the browser [`BrowserWorld`]. Returns after setup once the live
+/// loop is spawned; the loop then runs on the event loop, updating the on-page FPS
+/// meter and status. `max_frames` bounds the run (display flips); `max_rounds` is unused
+/// (kept for API compatibility - the live loop caps rounds per frame).
+///
+/// Note: instantiating the title's (large) transpiled module synchronously mid-run
+/// needs the `WebAssemblyUnlimitedSyncCompilation` flag on the main thread; the worker
+/// entry ([`run_game_worker`]) is the flag-free production home.
 #[wasm_bindgen]
 pub async fn run_game(
     canvas: JsValue,
@@ -5475,20 +5321,20 @@ impl vitaslop_runtime::recipe_eval::GuestRead for CoreRead<'_> {
     }
 }
 
-/// The live run: step the guest one display frame, render it through the general GXM
-/// renderer, pace to the display refresh, repeat - until `max_frames` flips or the run
-/// ends. This is what makes the browser build *live* (the guest computes each frame on
-/// demand and reacts to input) rather than replaying a canned capture. The presented
-/// FPS the meter shows is the true combined guest-CPU + render cadence.
-///
-/// `recipe`, when given, is EVALUATED as well as replayed: its `@watch`/`@assert`/`@sig`
-/// go through the same `vitaslop-runtime` evaluator the native runner uses, so a browser
-/// run of a recipe reaches the same verdict instead of merely pressing the same buttons.
-/// The `(sound seconds, clock seconds)` the last diagnostics panel read, so the next one
-/// can report the RATE between them rather than only the run's cumulative total. See the
-/// `CLOCK vs PICTURE vs SOUND` line for why the cumulative figure cannot answer "is the
-/// audio path keeping up". A worker is single-threaded, so a thread-local Cell is the whole
-/// mechanism.
+// The live run: step the guest one display frame, render it through the general GXM
+// renderer, pace to the display refresh, repeat - until `max_frames` flips or the run
+// ends. This is what makes the browser build *live* (the guest computes each frame on
+// demand and reacts to input) rather than replaying a canned capture. The presented
+// FPS the meter shows is the true combined guest-CPU + render cadence.
+//
+// `recipe`, when given, is EVALUATED as well as replayed: its `@watch`/`@assert`/`@sig`
+// go through the same `vitaslop-runtime` evaluator the native runner uses, so a browser
+// run of a recipe reaches the same verdict instead of merely pressing the same buttons.
+// The `(sound seconds, clock seconds)` the last diagnostics panel read, so the next one
+// can report the RATE between them rather than only the run's cumulative total. See the
+// `CLOCK vs PICTURE vs SOUND` line for why the cumulative figure cannot answer "is the
+// audio path keeping up". A worker is single-threaded, so a thread-local Cell is the whole
+// mechanism.
 thread_local! {
     static SOUND_CLOCK_WINDOW: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
 }
@@ -6075,7 +5921,7 @@ async fn live_loop(
                             return;
                         }
                         next_due_ms = now_ms + PROGRESS_EVERY_MS;
-                    } else if rounds % PROGRESS_EVERY_ROUNDS != 0 {
+                    } else if !rounds.is_multiple_of(PROGRESS_EVERY_ROUNDS) {
                         return;
                     }
                     let elapsed = now_ms - c0;
@@ -6090,7 +5936,7 @@ async fn live_loop(
                     // never COMPLETES emits no heartbeat at all, so without this the last
                     // thing a watcher sees is the previous frame finishing - and a frame
                     // that dies half way through looks identical to one that never started.
-                    if console_status_ms == 0.0 && rounds % 200_000 == 0 {
+                    if console_status_ms == 0.0 && rounds.is_multiple_of(200_000) {
                         logging::note(&format!("[live] {line}"));
                     }
                 }
@@ -6360,7 +6206,7 @@ async fn live_loop(
                 // Inert unless a signature is actually being folded: `Capture::signature`
                 // refuses a partial hash, and printing a number nothing folded is how an EMPTY
                 // fold (the FNV basis) gets read as a DIFFERENT fold.
-                if want_sig && sig_every > 0 && frames % sig_every == 0 {
+                if want_sig && sig_every > 0 && frames.is_multiple_of(sig_every) {
                     // The COUNTS ride along with the hash - see `Capture::stream_counts` for
                     // why a differing signature is only half an answer without them.
                     let (sig, scenes, egress, calls) = {
@@ -6651,8 +6497,8 @@ async fn live_loop(
         // the guest is between frames, so the export sees a filesystem no host call is
         // half-way through changing. Skipped during a fast-forward, which is not play and
         // whose whole point is to reach a later frame quickly.
-        if let Some(p) = persist.as_ref().filter(|p| p.save.is_some() && !fast) {
-            if t - last_save_at >= SAVE_MIN_MS {
+        if let Some(p) = persist.as_ref().filter(|p| p.save.is_some() && !fast)
+            && t - last_save_at >= SAVE_MIN_MS {
                 let dirty = { sched.host.lock().unwrap().state.game_data_dirty() };
                 if dirty {
                     last_save_at = t;
@@ -6691,7 +6537,6 @@ async fn live_loop(
                     }
                 }
             }
-        }
 
         // NOT while fast-forwarding: nobody is watching a fast-forward, and every present
         // is a full GXM->WebGPU encode of a scene that is discarded a moment later. It is
@@ -6719,11 +6564,10 @@ async fn live_loop(
         // a fast-forward that stops short of the window still leaves the render state the
         // window needs. Default = the fast-forward target, i.e. exactly the old behaviour.
         if fast && sched.frames() < ff_render_from {
-            if carry_unpresented_on() {
-                if let Some((old, _)) = latest.take() {
+            if carry_unpresented_on()
+                && let Some((old, _)) = latest.take() {
                     carry_unpresented(&mut carried, old, &display_addrs);
                 }
-            }
             latest = None;
         }
         if let Some((mut frame, flips)) = latest {
@@ -7057,7 +6901,7 @@ async fn live_loop(
                 // ([[vitaslop-web-is-the-product-not-the-tool]]). Set
                 // `VITASLOP_PERF_CONSOLE=1` to get them back while debugging.
                 let to_console = perf_console();
-                let mut line = |diag: &mut String, tag: &str, text: &str| {
+                let line = |diag: &mut String, tag: &str, text: &str| {
                     if to_console {
                         web_sys::console::log_1(&JsValue::from_str(&format!(
                             "[perf] frame {frame_no} | {tag} | {text}"
@@ -7072,7 +6916,7 @@ async fn live_loop(
                 // counters and `mean` the window mean's, already formatted. When they agree there
                 // is nothing to compare, so `prefix` (its millisecond cost, which is NOT the mean's)
                 // is printed on its own.
-                let mut worst_line =
+                let worst_line =
                     |diag: &mut String, tag: &str, prefix: &str, payload: &str, mean: &str| {
                         if payload == mean {
                             let text = format!(
@@ -7199,7 +7043,7 @@ async fn live_loop(
                         &format!(
                             "{} - declined {n} present(s) this run to keep the GPU queue bounded ({lag_n} of them by the LAG rule alone: the oldest unfinished submit older than {GPU_LAG_MS} ms); newest measured frame {ms:.1} ms of GPU.{} A present is made only when that much wall time has accrued since the last, and none is made while a readback of a HEAVY frame (>= {GPU_HEAVY_MS} ms) has been stuck for {GPU_STALE_MS} ms - the queue itself. A device that keeps up declines none. `VITASLOP_GPU_BUDGET=0` is the arm back.",
                             if on { "ON" } else { "OFF (VITASLOP_GPU_BUDGET=0)" },
-                            format!("{lag_seen}{}", if burn > 0 { format!(" >>> TEST RIG ARMED: VITASLOP_GPU_BURN={burn}.") } else { String::new() }),
+                            format_args!("{lag_seen}{}", if burn > 0 { format!(" >>> TEST RIG ARMED: VITASLOP_GPU_BURN={burn}.") } else { String::new() }),
                         ),
                     );
                 }
@@ -8026,7 +7870,7 @@ async fn live_loop(
                             .map(|ph| (vitaslop_runtime::perf::word_reads(ph), ph.label()))
                             .filter(|(w, _)| *w > 0)
                             .collect();
-                        rows.sort_by(|a, b| b.0.cmp(&a.0));
+                        rows.sort_by_key(|a| std::cmp::Reverse(a.0));
                         let text = rows
                             .iter()
                             .take(10)

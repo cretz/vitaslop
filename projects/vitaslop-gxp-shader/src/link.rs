@@ -5034,13 +5034,11 @@ fn gxp_q2(v: vec2<f32>) -> vec2<f32> {
 /// desktop, for all 2^32 inputs (0 mismatches, NaN stays NaN) - see [`q2_vec_on`] for where it
 /// is NOT proven - and it took 5.5% off the pipeline build of the eight slowest corpus fragment
 /// programs on the phone (2,580 -> 2,438 ms). `VITASLOP_GXP_Q2_VEC=0` is the arm back.
-const GXP_Q2_VEC: &str = "
-fn gxp_q2(v: vec2<f32>) -> vec2<f32> {
-  let m = bitcast<vec2<u32>>(v) & vec2<u32>(0x7fffffffu);
-  let c = select(v, sign(v) * 65504.0, (m > vec2<u32>(0x477fe000u)) & (m < vec2<u32>(0x7f800000u)));
-  return unpack2x16float(pack2x16float(vec2<f32>(vec2<f16>(c))));
-}
-";
+///
+/// The text lives in `src/f16rounding/q2vec.wgsl` so `probe-f16round.mjs` runs the SHIPPED bytes on
+/// each CI device, like the other rounding helpers.
+const GXP_Q2_VEC: &str = concat!("
+", include_str!("f16rounding/q2vec.wgsl"));
 
 fn resolve_sa_init(module: &str) -> String {
     let mut out = String::with_capacity(module.len());

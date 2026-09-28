@@ -8,6 +8,7 @@
 //! inside the output callback and nothing here has to await anything.
 
 use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use js_sys::{ArrayBuffer, Float32Array, Int16Array, Object, Reflect, Uint8Array};
@@ -90,11 +91,13 @@ struct Shared {
 
 /// The WebCodecs backend.
 pub struct WebCodecsAac {
-    decoder: JsAudioDecoder,
-    shared: Rc<RefCell<Shared>>,
+    // The four fields bound to the creating worker's JS heap are `ManuallyDrop`: `Drop` releases
+    // them only on the `owner` worker and LEAKS them anywhere else - see `Drop` below.
+    decoder: ManuallyDrop<JsAudioDecoder>,
+    shared: ManuallyDrop<Rc<RefCell<Shared>>>,
     /// Kept alive for as long as the decoder: dropping a closure detaches its JS function.
-    _on_output: Closure<dyn FnMut(JsAudioData)>,
-    _on_error: Closure<dyn FnMut(JsValue)>,
+    _on_output: ManuallyDrop<Closure<dyn FnMut(JsAudioData)>>,
+    _on_error: ManuallyDrop<Closure<dyn FnMut(JsValue)>>,
     channels: u32,
     sample_rate: u32,
     /// The wasm thread (worker) that created the decoder - see the `Send` note below.
@@ -103,8 +106,9 @@ pub struct WebCodecsAac {
 
 // SAFETY: the one-worker engine runs everything on one worker, so nothing is ever sent
 // anywhere. The wasm-threads bundle's parallel run (`VITASLOP_SMP`) has other workers, but
-// forwards every host call that can reach a decoder to the one that made it, and `submit` and
-// `poll` check `owner` and panic rather than touch a foreign JS heap. The bound exists because
+// forwards every host call that can reach a decoder to the one that made it, EVERY trait method
+// checks `owner` and panics rather than touch a foreign JS heap, and a drop on a foreign worker
+// leaks the JS objects instead of releasing them there. The bound exists because
 // the trait is shared with the native backends, which really are moved between threads.
 unsafe impl Send for WebCodecsAac {}
 
@@ -167,10 +171,10 @@ impl WebCodecsAac {
             .map_err(|e| Error::Stream(format!("AudioDecoder.configure: {}", describe(&e))))?;
 
         Ok(WebCodecsAac {
-            decoder,
-            shared,
-            _on_output: on_output,
-            _on_error: on_error,
+            decoder: ManuallyDrop::new(decoder),
+            shared: ManuallyDrop::new(shared),
+            _on_output: ManuallyDrop::new(on_output),
+            _on_error: ManuallyDrop::new(on_error),
             channels,
             sample_rate,
             owner: std::thread::current().id(),
@@ -228,6 +232,7 @@ impl Backend for WebCodecsAac {
     }
 
     fn reset(&mut self) -> Result<()> {
+        assert_owner(self.owner);
         {
             let mut s = self.shared.borrow_mut();
             s.ready.clear();
@@ -242,6 +247,7 @@ impl Backend for WebCodecsAac {
     }
 
     fn describe(&self) -> String {
+        assert_owner(self.owner);
         let layout = self.shared.borrow().layout.clone().unwrap_or_else(|| "not yet decoded".into());
         format!("WebCodecs AAC {} ch @ {} Hz - {layout}", self.channels, self.sample_rate)
     }
@@ -249,7 +255,22 @@ impl Backend for WebCodecsAac {
 
 impl Drop for WebCodecsAac {
     fn drop(&mut self) {
+        // On a worker that does not own them, closing the decoder, dropping the closures or
+        // even decrementing the `Rc` would touch another worker's JS heap. A panic here would
+        // abort instead, so the objects are LEAKED - one decoder, which only a misrouted host
+        // call (already a bug `assert_owner` reports) can produce.
+        if std::thread::current().id() != self.owner {
+            return;
+        }
         let _ = self.decoder.close();
+        // SAFETY: each field is dropped exactly once, here, and never used again - `drop` is the
+        // last thing that touches `self`.
+        unsafe {
+            ManuallyDrop::drop(&mut self._on_output);
+            ManuallyDrop::drop(&mut self._on_error);
+            ManuallyDrop::drop(&mut self.decoder);
+            ManuallyDrop::drop(&mut self.shared);
+        }
     }
 }
 

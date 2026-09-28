@@ -171,11 +171,10 @@ pub(crate) fn prof_host_enter(w: usize, selector: u32) -> Option<i32> {
 
 /// Undo [`prof_host_enter`].
 pub(crate) fn prof_host_exit(w: usize, prev: Option<i32>) {
-    if let (Some(prev), Some(sh)) = (prev, SHARED.get()) {
-        if let Some(s) = prof_slot(sh, w) {
+    if let (Some(prev), Some(sh)) = (prev, SHARED.get())
+        && let Some(s) = prof_slot(sh, w) {
             s.store(prev, Ordering::Relaxed);
         }
-    }
 }
 
 /// Entry point of the SAMPLER worker (`role: "sampler"`) - see [`guest_prof`]. Returns the
@@ -226,7 +225,7 @@ pub fn smp_sampler_main() -> Result<String, JsValue> {
     };
     for w in 1..=workers {
         let mut v: Vec<(u32, u64)> = counts[w].iter().map(|(a, n)| (*a, *n)).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|a| std::cmp::Reverse(a.1));
         let host_share: u64 = v.iter().filter(|(a, _)| a & PROF_HOST_TAG == PROF_HOST_TAG).map(|(_, n)| n).sum();
         let body: Vec<String> = std::iter::once(format!("ALL-HOST={:.2}", 100.0 * host_share as f64 / total.max(1) as f64))
             .chain(v.iter().take(60).map(|(a, n)| format!("{}={:.2}", label(*a), 100.0 * *n as f64 / total.max(1) as f64)))
@@ -952,12 +951,11 @@ impl State {
     /// woken higher-priority thread takes the core now, not at the running one's next block.
     fn preempt_for(&mut self, sh: &Shared, idx: usize) {
         let w = self.threads[idx].home;
-        if let Some(r) = self.running_on[w] {
-            if self.threads[idx].priority < self.threads[r].priority {
+        if let Some(r) = self.running_on[w]
+            && self.threads[idx].priority < self.threads[r].priority {
                 self.preempt_prio += 1;
                 sh.preempt_worker(w);
             }
-        }
     }
 
     fn publish_runnable(&self, sh: &Shared) {
@@ -1641,6 +1639,10 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
         }
         let bell = sh.bells[w].load(Ordering::SeqCst);
         // Take a job: a thread of ours to run, or an idle clock step for the whole machine.
+        // Allowed, not boxed: a `Job` is a stack temporary returned once per scheduling decision
+        // and never stored, so its size costs nothing, while boxing `Run` would put a heap
+        // allocation on the guest's hot path.
+        #[allow(clippy::large_enum_variant)]
         enum Job {
             Run(usize, Option<Birth>, Option<RegPatch>, i32, i32),
             Again,
@@ -1796,11 +1798,10 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                 LOCK_WAIT_MS.with(|w| w.set(0.0));
                 let t0 = now_ms();
                 let step = browser_sched::resume(&mut t).await;
-                if guest_prof().is_some() {
-                    if let Some(s) = prof_slot(sh, w) {
+                if guest_prof().is_some()
+                    && let Some(s) = prof_slot(sh, w) {
                         s.store(0, Ordering::Relaxed);
                     }
-                }
                 // `VITASLOP_SMP_GUEST_SLOW=<x>`: spin x times the slice's own length after it,
                 // before the thread is folded back - a guest worker that is (1+x) times slower,
                 // as a phone's is. The desktop's guest is 4-5x faster than the phone's, so how
@@ -1877,7 +1878,7 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                 } else {
                     local.borrow_mut().insert(i, t);
                 }
-                if stats.resumes.load(Ordering::Relaxed) % 64 == 0 {
+                if stats.resumes.load(Ordering::Relaxed).is_multiple_of(64) {
                     publish_tallies(sh);
                 }
             }
@@ -2050,11 +2051,10 @@ impl SmpRun {
                             sh.ring(0);
                         }
                         // Forward to the page's panic sink, as a panic here would be.
-                        if let Ok(f) = Reflect::get(&js_sys::global(), &JsValue::from_str("__vitaslopPanic")) {
-                            if let Ok(f) = f.dyn_into::<js_sys::Function>() {
+                        if let Ok(f) = Reflect::get(&js_sys::global(), &JsValue::from_str("__vitaslopPanic"))
+                            && let Ok(f) = f.dyn_into::<js_sys::Function>() {
                                 let _ = f.call1(&JsValue::UNDEFINED, &JsValue::from_str(&text));
                             }
-                        }
                     }
                     // A guest worker's CPU profile (`VITASLOP_JS_PROFILE`, smp-worker.js): raw to
                     // the console, where the page's worker forwards `jsprofile` lines as notes.
@@ -2212,10 +2212,6 @@ impl SmpRun {
         let st = self.sh.state.lock().unwrap();
         let at = |f: u64| st.flip_clock.iter().find(|(n, _)| *n == f).map(|(_, us)| *us);
         Some(at(frame)?.saturating_sub(at(frame.checked_sub(1)?)?))
-    }
-
-    pub fn host(&self) -> &Host {
-        &self.sh.host
     }
 
     /// The frame the live loop is at: the last one taken for presenting under [`overlap`],
@@ -2471,7 +2467,7 @@ impl SmpRun {
         let mut reached_at: Option<f64> = None;
         loop {
             rounds += 1;
-            if rounds % 64 == 0 {
+            if rounds.is_multiple_of(64) {
                 progress(rounds);
             }
             let bell = self.sh.bells[0].load(Ordering::SeqCst);
@@ -2481,7 +2477,7 @@ impl SmpRun {
             // Forwarded host calls, in arrival order, and the small-target completions a thread
             // is parked on.
             let tv = now_ms();
-            self.serve_pending(completer.as_mut().map(|c| &mut **c)).await;
+            self.serve_pending(completer.as_deref_mut()).await;
             trace_w0(b'v', tv, now_ms());
             // `l` (waiting for the state lock) and `i` (an idle clock step) are TIMED under the
             // lock and EMITTED after it drops: `trace_w0` takes this same lock for the frame number,
@@ -2546,7 +2542,7 @@ impl SmpRun {
         let end = now_ms() + ms.max(0.0);
         loop {
             let bell = self.sh.bells[0].load(Ordering::SeqCst);
-            self.serve_pending(completer.as_mut().map(|c| &mut **c)).await;
+            self.serve_pending(completer.as_deref_mut()).await;
             let left = end - now_ms();
             if left <= 0.0 {
                 break;
@@ -2594,7 +2590,7 @@ impl SmpRun {
                 self.pause_guest().await;
             }
             let rendered =
-                browser_sched::render_early_batch(&host, completer.as_mut().map(|c| &mut **c), start, n).await;
+                browser_sched::render_early_batch(&host, completer.as_deref_mut(), start, n).await;
             // The completion WRITES the rendered pixels into guest memory - with the guest
             // stopped, as the one-worker engine always is here (see `pause_guest`).
             if !pause_all {
@@ -2715,12 +2711,6 @@ pub struct SmpSnapshot {
     preempts: (u64, u64),
 }
 
-/// A promise and the function that resolves it.
-fn futures_oneshot() -> (js_sys::Function, js_sys::Promise) {
-    let (resolve, _, p) = futures_oneshot_or_fail();
-    (resolve, p)
-}
-
 /// [`futures_oneshot`] that can also FAIL: `(resolve, reject, promise)`.
 fn futures_oneshot_or_fail() -> (js_sys::Function, js_sys::Function, js_sys::Promise) {
     let mut ends = None;
@@ -2729,9 +2719,9 @@ fn futures_oneshot_or_fail() -> (js_sys::Function, js_sys::Function, js_sys::Pro
     (res, rej, p)
 }
 
-/// Wait on `bell` (while it still reads `seen`) WITHOUT blocking the event loop: the run worker
-/// has WebCodecs callbacks and GPU promises to deliver while the guest workers run. Falls back
-/// to one event-loop turn where `Atomics.waitAsync` is missing.
+// Wait on `bell` (while it still reads `seen`) WITHOUT blocking the event loop: the run worker
+// has WebCodecs callbacks and GPU promises to deliver while the guest workers run. Falls back
+// to one event-loop turn where `Atomics.waitAsync` is missing.
 thread_local! {
     /// Wall ms this (run) worker has spent inside [`wait_async`] - i.e. YIELDED to its event
     /// loop, where GPU callbacks are delivered. Added to the live loop's own tick sleeps by

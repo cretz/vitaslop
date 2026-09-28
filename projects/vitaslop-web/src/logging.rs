@@ -169,11 +169,10 @@ pub fn install_panic_hook() {
         push_page_log(&text);
 
         let global = js_sys::global();
-        if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK)) {
-            if let Some(f) = sink.dyn_ref::<js_sys::Function>() {
+        if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK))
+            && let Some(f) = sink.dyn_ref::<js_sys::Function>() {
                 let _ = f.call1(&JsValue::NULL, &JsValue::from_str(&text));
             }
-        }
     }));
 }
 
@@ -195,32 +194,10 @@ pub fn report_fatal(text: &str) {
     web_sys::console::error_1(&JsValue::from_str(text));
     push_page_log(text);
     let global = js_sys::global();
-    if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK)) {
-        if let Some(f) = sink.dyn_ref::<js_sys::Function>() {
+    if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK))
+        && let Some(f) = sink.dyn_ref::<js_sys::Function>() {
             let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
         }
-    }
-}
-
-/// Say - once per address - that a deferred render-target write-back was DROPPED because the
-/// guest had unmapped its destination before the readback landed.
-///
-/// At `warn`, unconditionally, because both readings matter and they need opposite fixes: a
-/// target a CPU-reading title still wants has silently lost its pixels, and a target it does
-/// not is one we were about to corrupt. Counting rather than repeating - a pooled target cycles
-/// through many addresses and one line each is the index, not a flood.
-pub fn report_writeback_into_unmapped(addr: u32, w: u32, h: u32) {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
-    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert(addr) {
-        return;
-    }
-    tracing::warn!(
-        target: "vitaslop::gxm",
-        "gxm rtt writeback: DROPPED the readback of {addr:#010x} ({w}x{h}) - the guest had          `sceGxmUnmapMemory`d that memory before the copy landed, so those bytes are no longer          a render target and writing pixels over them would corrupt whatever the allocator has          since put there. A title that reads this target on the CPU loses this frame's pixels."
-    );
 }
 
 /// The default filter when `VITASLOP_LOG` is unset: warnings and errors only.

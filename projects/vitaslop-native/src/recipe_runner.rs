@@ -194,7 +194,12 @@ pub fn boot_retail(
     // refreshed at its resume point - which is what lets the RTC tick be read inline.
     // See `vitaslop_runtime::vita::set_preemptive_linking`.
     vitaslop_runtime::vita::set_preemptive_linking(true);
-    let linked = link(modules).map_err(|e| format!("link: {e:?}"))?;
+    let linked = link(modules);
+    // Reset at once: the flag is process-wide and read only by `link`, so left set it would
+    // make a later link in this process (a test, a second title) inline a clock read its
+    // scheduler does not refresh.
+    vitaslop_runtime::vita::set_preemptive_linking(false);
+    let linked = linked.map_err(|e| format!("link: {e:?}"))?;
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     // >>> EVERY NATIVE TOOL DECODES VIDEO, because the one that did not could not SEE the
     // movie path at all.

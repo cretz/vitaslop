@@ -244,7 +244,7 @@ mod hostcalls {
         static FUEL_YIELDS: Cell<u64> = const { Cell::new(0) };
     }
 
-    /// Count one fuel preemption.
+    // Count one fuel preemption.
     thread_local! {
         /// Every suspension the scheduler loop saw, by what the thread stopped for:
         /// `[quantum, blocked, flip]`. The `susp` total on the running line could not say
@@ -321,7 +321,7 @@ mod hostcalls {
         /// "which thread is burning the calls" is not answerable from the totals - and
         /// that is exactly the question when one thread spins while another never runs.
         static PER_THID: std::cell::RefCell<std::collections::BTreeMap<i32, u64>> =
-            std::cell::RefCell::new(std::collections::BTreeMap::new());
+            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     }
 
     /// Count one call against `selector`, made by guest thread `thid`, and - when per-call
@@ -354,34 +354,6 @@ mod hostcalls {
                 .enumerate()
                 .filter(|&(_, &m)| m > 0.0)
                 .map(|(i, &m)| (i as u32, calls[i], m))
-                .collect();
-            all.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
-            all.truncate(n);
-            all
-        })
-    }
-
-    /// The `n` costliest selectors BY THE SAMPLED ESTIMATE, as
-    /// `(selector, calls, estimated ms, samples)`, descending by estimated ms.
-    ///
-    /// Each selector's sampled milliseconds are scaled by ITS OWN sampled share - calls
-    /// divided by samples - not by the global one. A NID called 200,000 times and a NID called
-    /// twice are not sampled at the same rate, and scaling both by the run's average rate puts
-    /// the rare one wherever chance placed its single sample. The sample count rides along for
-    /// the same reason it does on the panel line: a row standing on three samples has to be
-    /// visibly standing on three samples.
-    pub fn sampled_selectors_by_ms(n: usize) -> Vec<(u32, u64, f64, u64)> {
-        let calls = PER_SELECTOR.with(|v| v.borrow().clone());
-        let samples = SAMPLED_SELECTOR_N.with(|v| v.borrow().clone());
-        SAMPLED_SELECTOR_MS.with(|v| {
-            let ms = v.borrow();
-            let mut all: Vec<(u32, u64, f64, u64)> = ms
-                .iter()
-                .enumerate()
-                .filter(|&(i, &m)| m > 0.0 && samples[i] > 0)
-                .map(|(i, &m)| {
-                    (i as u32, calls[i], m * calls[i] as f64 / samples[i] as f64, samples[i])
-                })
                 .collect();
             all.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
             all.truncate(n);
@@ -520,7 +492,7 @@ mod hostcalls {
             m.set(m.get() + dispatch_ms);
             m.get()
         });
-        if calls % REPORT_EVERY != 0 {
+        if !calls.is_multiple_of(REPORT_EVERY) {
             return false;
         }
         if !timing_enabled() {
@@ -831,12 +803,6 @@ pub fn host_call_estimate() -> (f64, u64) {
 /// [`hostcalls::take_sample_max`].
 pub fn take_host_call_sample_max() -> f64 {
     hostcalls::take_sample_max()
-}
-
-/// The costliest host calls BY THE SAMPLED ESTIMATE - see
-/// [`hostcalls::sampled_selectors_by_ms`]. Available on any run, timed or not.
-pub fn host_calls_by_sampled_ms(n: usize) -> Vec<(u32, u64, f64, u64)> {
-    hostcalls::sampled_selectors_by_ms(n)
 }
 
 /// The costliest host calls of the last panel window, by the sampled estimate - see
@@ -1437,12 +1403,6 @@ enum GuestMem {
 }
 
 impl GuestMem {
-    fn stamp_written(&self, off: usize, len: usize) {
-        match self {
-            GuestMem::Js(v) => v.stamp_written(off, len),
-            GuestMem::Host(r) => r.stamp_written(off, len),
-        }
-    }
 
     /// Write `bytes` at `off` (a host write, so the dirty map is stamped). False if out of range.
     fn write_at(&self, off: usize, bytes: &[u8]) -> bool {
@@ -1714,7 +1674,7 @@ impl SharedView {
             return Some(());
         }
         let shift = vitaslop_transpiler::DIRTY_SHIFT;
-        let page_bytes = 1usize << shift;
+        let _page_bytes = 1usize << shift;
         let first = off >> shift;
         let last = (off + len - 1) >> shift;
         if last >= self.pages() {
@@ -2018,9 +1978,6 @@ impl ThreadRt {
         let g = self.guest_pc.as_ref()?;
         Some(g.value().as_f64().unwrap_or(0.0) as i64 as u32)
     }
-    fn view(&self) -> GuestMem {
-        self.view.clone()
-    }
 }
 
 /// Whether this run asked for the per-block execution trace. Read once: the transpile that
@@ -2308,10 +2265,6 @@ impl BrowserThread {
         }
     }
 
-    /// Whether this thread still holds its engine state (a finished one has released it).
-    pub(crate) fn is_live(&self) -> bool {
-        self.engine.is_some()
-    }
 }
 
 impl ThreadHandle for BrowserThread {
@@ -2710,8 +2663,8 @@ impl BrowserEngine {
                 // run here, keeps it for its dispatch - the session it was judged by is the one
                 // it runs against.
                 let mut held = None;
-                if let Some(h) = smp.as_ref() {
-                    if h.owner_only.get(selector as usize).copied().unwrap_or(false) {
+                if let Some(h) = smp.as_ref()
+                    && h.owner_only.get(selector as usize).copied().unwrap_or(false) {
                         if h.per_call.get(selector as usize).copied().unwrap_or(false) {
                             let g = crate::smp::lock_host(&host);
                             if g.smp_call_is_self_contained(selector as u32, &regs, &rt.view, rt.base) {
@@ -2724,7 +2677,6 @@ impl BrowserEngine {
                             return suspend(&signal, &cont, Stop::Blocked);
                         }
                     }
-                }
                 // What the guest handed in, so the write-back can send back only what moved.
                 let before = (regs, vfp);
                 let d0 = clock();
@@ -3035,7 +2987,7 @@ impl BrowserEngine {
         hostcalls::note_instance_created();
         let exports = instance.exports();
 
-        let regs = read_globals(&exports, |i| abi::reg_export(i), abi::REG_COUNT)?;
+        let regs = read_globals(&exports, abi::reg_export, abi::REG_COUNT)?;
         let vfp = read_globals(&exports, |i| abi::vfp_s_export(i as u8), VFP_ARG_COUNT)?;
         // The same globals as one JS array, ARM registers first, so a host call marshals
         // the whole file in one crossing rather than one per register.
@@ -3528,20 +3480,20 @@ pub async fn run_frames(
             return RunReport::RoundLimit;
         }
         rounds += 1;
-        if rounds % TURN_CHECK_ROUNDS == 0 && perf_clock() - slice_start > SLICE_BUDGET_MS {
+        if rounds.is_multiple_of(TURN_CHECK_ROUNDS) && perf_clock() - slice_start > SLICE_BUDGET_MS {
             event_loop_turn().await;
             slice_start = perf_clock();
         }
         // `rounds == 1` as well as the window: a frame that blocks on its FIRST call would
         // otherwise say nothing at all, and "frame N in progress: 1 round" against a frozen
         // clock is the whole diagnosis.
-        if rounds == 1 || rounds % PROGRESS_ROUNDS == 0 {
+        if rounds == 1 || rounds.is_multiple_of(PROGRESS_ROUNDS) {
             progress(rounds);
         }
         // The HEAVY half of the report keeps the coarse window: it takes the host lock and
         // builds a selector histogram, which is not something to do every 64 rounds. The
         // cheap half above is what a blocked frame needs; this is what a SPINNING one does.
-        if rounds % LONG_FRAME_ROUNDS == 0 {
+        if rounds.is_multiple_of(LONG_FRAME_ROUNDS) {
             // What a long frame is actually DOING, unconditionally: the game clock (a
             // frame that grinds with a FROZEN clock is a livelock, one that grinds with a
             // moving clock is just slow, and those need opposite fixes), and the NIDs the
@@ -3617,7 +3569,7 @@ pub async fn run_frames(
                         consecutive_idle.is_power_of_two()
                             && perf_clock() - slice_start >= OWED_TURN_MIN_MS
                     } else {
-                        consecutive_idle % IDLE_ROUNDS_PER_EVENT_LOOP_TURN == 0
+                        consecutive_idle.is_multiple_of(IDLE_ROUNDS_PER_EVENT_LOOP_TURN)
                     };
                     if turn {
                         event_loop_turn().await;
@@ -3672,7 +3624,7 @@ pub async fn run_frames(
         if let Some((thid, start, n)) = pending {
             let early = vitaslop_runtime::perf::scope(vitaslop_runtime::perf::Phase::SchedEarlyBatch);
             let host = core.host().clone();
-            complete_early_batch(&host, core.engine(), completer.as_mut().map(|c| &mut **c), thid, start, n).await;
+            complete_early_batch(&host, core.engine(), completer.as_deref_mut(), thid, start, n).await;
             drop(early);
         }
         core.drain();

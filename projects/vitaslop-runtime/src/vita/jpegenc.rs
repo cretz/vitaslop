@@ -111,7 +111,9 @@ pub(super) fn set_header_mode(ctx: &mut GuestCtx, _st: &mut VitaState, context: 
     if context.is_null() {
         SCE_JPEGENC_ERROR_INVALID_POINTER
     } else {
-        ctx.write_u32(context.addr() + 28, mode);
+        // +36, its own slot: +28/+32 are `set_valid_region`'s width and height, and sharing +28
+        // let either call overwrite the other's setting.
+        ctx.write_u32(context.addr() + 36, mode);
         0
     }
 }

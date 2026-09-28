@@ -27,7 +27,7 @@ function vertexBuffers(code) {
   ];
 }
 
-function desc(dev, code) {
+export function desc(dev, code) {
   const module = dev.createShaderModule({ code });
   return {
     layout: "auto",
