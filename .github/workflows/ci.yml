@@ -313,10 +313,10 @@ jobs:
         env:
           ALLOW_SOFTWARE: "1"
           HEADLESS: "1"
-          # Chrome's own output (GPU process included) into this log - a lost device on this
-          # runner has to be attributable to the browser or to us from the log alone.
-          DEBUG: pw:browser
-        run: node smp-cube.mjs
+        # Under a virtual display: without one, Chrome's GPU process could not initialise GL
+        # (no X display), restarted seven times, stopped presenting, and destroyed the WebGPU
+        # device seven seconds in. The short cube test above finishes before that matters.
+        run: xvfb-run -a node smp-cube.mjs
 
       - name: Keep the screenshots
         if: always()

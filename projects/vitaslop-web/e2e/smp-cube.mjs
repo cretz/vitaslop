@@ -8,6 +8,8 @@
 // the run is on `pkg-threads`, that the SMP workers ran, and that frames advanced.
 //
 // Env: HEADLESS=1 (CI), SHOT_DIR=<dir> (default ./screenshots/smp-cube), PLAY_MS (default 8000),
+//      BASE_URL=<url> (run against an already-served site instead - e.g. a staged Pages build
+//      on a plain static server, where `coi.js` must supply the isolation),
 //      ALLOW_SOFTWARE=1 (CI: a software adapter; the player refuses one unless the link arms
 //      VITASLOP_ALLOW_SOFTWARE_GPU, and it renders slowly, so fewer frames are required)
 // Run: node smp-cube.mjs
@@ -64,14 +66,17 @@ await mkdir(shotDir, { recursive: true });
 
 // Cross-origin isolated, like the hosted page: without it there is no SharedArrayBuffer and the
 // player falls back to the single-threaded bundle, which is exactly what this must not test.
-const server = await startServer(webDir);
+const server = process.env.BASE_URL ? null : await startServer(webDir);
 const software = !!process.env.ALLOW_SOFTWARE;
-const base = `http://127.0.0.1:${server.address().port}/`;
+const base = process.env.BASE_URL || `http://127.0.0.1:${server.address().port}/`;
 const url = base + (software ? "?knobs=VITASLOP_ALLOW_SOFTWARE_GPU=1" : "");
 const context = await chromium.launchPersistentContext(join(work, "profile"), {
   channel: process.env.PWCHANNEL || "chrome",
   headless: !!process.env.HEADLESS,
   viewport: { width: 1100, height: 800 },
+  // CI runs this under `xvfb-run`: without a display, Chrome's GPU process failed to start seven
+  // times, the canvas stopped presenting ("1 shown of 60 run") and the WebGPU device was
+  // destroyed seven seconds in (PR #4).
   args: [
     "--enable-unsafe-webgpu", "--enable-features=Vulkan", "--enable-gpu", "--use-angle=default", "--autoplay-policy=no-user-gesture-required",
     ...(software ? ["--enable-unsafe-swiftshader"] : []),
@@ -135,7 +140,7 @@ try {
   await writeFile(join(shotDir, "console.txt"), logs.join("\n")).catch(() => {});
 } finally {
   await context.close();
-  server.close();
+  server?.close();
   await rm(work, { recursive: true, force: true }).catch(() => {});
 }
 console.log(ok ? "[smp-cube] PASS" : "[smp-cube] FAIL");

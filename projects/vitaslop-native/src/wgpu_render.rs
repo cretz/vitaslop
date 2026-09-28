@@ -154,7 +154,8 @@ pub struct GeneralRenderer {
     builder: RenderSceneBuilder,
     /// The adapter name, for logging which GPU serviced the render.
     pub adapter_name: String,
-    /// The adapter is a SOFTWARE rasteriser (`DeviceType::Cpu` - WARP, lavapipe, SwiftShader):
+    /// The adapter is a SOFTWARE rasteriser (`DeviceType::Cpu`, or a Microsoft adapter - WARP,
+    /// the Basic Render Driver - lavapipe, SwiftShader):
     /// correct, but far slower, which a test may need to know - see `vita_gxmconf_real.rs`.
     pub software: bool,
     /// Where the last [`GeneralRenderer::render_scene`] went. See [`RenderSplit`].
@@ -231,13 +232,28 @@ fn pick_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
     .ok()
 }
 
+/// The adapter [`GeneralRenderer::new`] would take - `(name, software)` - WITHOUT creating a
+/// device or building the renderer, which on a software adapter is itself minutes of shader
+/// compilation (see `vita_gxmconf_real.rs`). `None` if no adapter is available.
+pub fn general_adapter() -> Option<(String, bool)> {
+    let adapter = pick_adapter(&wgpu::Instance::default())?;
+    let info = adapter.get_info();
+    Some((info.name.clone(), is_software(&info)))
+}
+
+/// A software rasteriser: `DeviceType::Cpu`, or one of Microsoft's own adapters (vendor 0x1414 -
+/// WARP and the Basic Render Driver), whatever device type the backend reports for them.
+fn is_software(info: &wgpu::AdapterInfo) -> bool {
+    info.device_type == wgpu::DeviceType::Cpu || info.vendor == 0x1414
+}
+
 impl GeneralRenderer {
     /// Acquire a GPU and build the general pipeline. `None` if no adapter is available.
     pub fn new() -> Option<Self> {
         let instance = wgpu::Instance::default();
         let adapter = pick_adapter(&instance)?;
         let adapter_name = adapter.get_info().name;
-        let software = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
+        let software = is_software(&adapter.get_info());
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-gxm"),
             required_features: vitaslop_platform::gpu::wanted_features(&adapter),

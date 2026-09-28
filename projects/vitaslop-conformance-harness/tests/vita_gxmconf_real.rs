@@ -36,6 +36,18 @@ fn render_on_gpu(index: usize) -> Option<Framebuffer> {
 /// scenes needs when the second samples a target only the first rendered (on the GPU, never in
 /// guest memory). Returns the frame's final framebuffer, or `None` without an adapter.
 fn render_frame_on_gpu(range: std::ops::Range<usize>) -> Option<Framebuffer> {
+    // >>> NOT ON WINDOWS' SOFTWARE ADAPTER, AND DECIDED BEFORE ANYTHING IS BUILT. The Windows CI
+    // runner's only adapter is the Microsoft Basic Render Driver (its `gpu_probe` step says so),
+    // where D3D12 compiles in software with FXC: MEASURED 1,058 s for this one test binary against
+    // 1.9 min for the whole Linux test step. Building the renderer with the recompiled path on is
+    // itself minutes there, so the adapter is asked first, not the renderer. The D3D12 path is
+    // still covered on that runner by every other GPU test, and these scenes run on Linux's
+    // software Vulkan, macOS's Metal and any Windows machine with a GPU.
+    let (adapter, software) = vitaslop_native::wgpu_render::general_adapter()?;
+    if cfg!(windows) && software {
+        eprintln!("software adapter on Windows ({adapter}): scenes {range:?} not checked here");
+        return None;
+    }
     vitaslop_runtime::knobs::set_override("VITASLOP_GXP_LIVE", "1");
     let m = loader::load(GXMCONF).expect("load gxmconf.velf");
     let inputs = m.program_inputs();
@@ -64,14 +76,6 @@ fn render_frame_on_gpu(range: std::ops::Range<usize>) -> Option<Framebuffer> {
         "scenes {range:?} carry draws with no program bytes - the recompiled path is not on"
     );
     let mut gpu = GeneralRenderer::new()?;
-    // >>> NOT ON WINDOWS' SOFTWARE ADAPTER. The Windows CI runner has no GPU, so this is WARP,
-    // and D3D12 compiles these recompiled shaders with FXC: MEASURED 1,058 s for this one test
-    // binary (the whole Linux test step is 1.9 min). The D3D12 path is still covered there by
-    // every other GPU test, and these scenes run on Linux's software Vulkan and macOS's Metal.
-    if cfg!(windows) && gpu.software {
-        eprintln!("software adapter on Windows ({}): scenes {range:?} not checked here", gpu.adapter_name);
-        return None;
-    }
     Some(if scenes.len() == 1 {
         gpu.render_scene(&scenes[0], W, H, CLEAR)
     } else {

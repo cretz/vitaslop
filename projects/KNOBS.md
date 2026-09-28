@@ -54,7 +54,7 @@ during boot.
 | `VITASLOP_CARRY_UNPRESENTED` | vitaslop-web/src/lib.rs:2171 | `VITASLOP_CARRY_UNPRESENTED=0`: the arm back - drop an unpresented frame's scenes whole. |
 | `VITASLOP_CHAIN_DRAWS` | vitaslop-platform/src/gpu.rs:23669 | - |
 | `VITASLOP_CHAIN_LIMIT` | vitaslop-native/tests/gpu_rtt_gamma.rs:179 | Render a chain of `feedback` sample-and-write-back passes over the offscreen target and |
-| `VITASLOP_CHAIN_SKIP` | vitaslop-native/src/wgpu_render.rs:351 | - |
+| `VITASLOP_CHAIN_SKIP` | vitaslop-native/src/wgpu_render.rs:367 | - |
 | `VITASLOP_CHECK_ADDRS` | vitaslop-native/tests/retail_boot_probe.rs:43 | - |
 | `VITASLOP_CLOCK_TRACE` | vitaslop-runtime/src/sched.rs:1175 | - |
 | `VITASLOP_CLOCK_WALL_FLOOR` | vitaslop-web/src/smp.rs:109 | The game clock is floored at the wall - see `VitaState::wall_floor_tick`. |
@@ -142,7 +142,7 @@ during boot.
 | `VITASLOP_GPU` | vitaslop-native/tests/retail_boot_probe.rs:1390 | - |
 | `VITASLOP_GPU_BUDGET` | vitaslop-web/src/lib.rs:1129 | >>> THE GPU BUDGET: a present costs the GPU milliseconds the newest timestamp query |
 | `VITASLOP_GPU_BURN` | vitaslop-platform/src/gpu.rs:5700 | `VITASLOP_GPU_BURN`'s compute work, built on first use - see [`Self::gpu_burn`]. |
-| `VITASLOP_GPU_CHAIN_DIR` | vitaslop-native/src/wgpu_render.rs:584 | `VITASLOP_GPU_CHAIN_DIR=<dir>`: write every offscreen target of the frame just |
+| `VITASLOP_GPU_CHAIN_DIR` | vitaslop-native/src/wgpu_render.rs:600 | `VITASLOP_GPU_CHAIN_DIR=<dir>`: write every offscreen target of the frame just |
 | `VITASLOP_GPU_QUEUE_DEPTH` | vitaslop-web/src/lib.rs:1027 | How many submits may be in flight before a present declines to make another. |
 | `VITASLOP_GPU_STALE_OLD` | vitaslop-web/src/lib.rs:1229 | `VITASLOP_GPU_STALE_OLD=1`: the stale rule as it was - see the check in `present`. |
 | `VITASLOP_GPU_TIME_ALL` | vitaslop-platform/src/gpu.rs:853 | `VITASLOP_GXP_PASS_SPLIT_EVERY=<n>` cuts a render pass every `n` draws, with no shader |
@@ -150,13 +150,13 @@ during boot.
 | `VITASLOP_GUEST_CORES` | vitaslop-runtime/src/host.rs:21838 | CPU cores a Vita gives a GAME. |
 | `VITASLOP_GUEST_PROF` | vitaslop-transpiler/src/abi.rs:293 | SMP, `VITASLOP_GUEST_PROF` only: worker `w`'s GUEST-FUNCTION slot is host-mirror slot |
 | `VITASLOP_GXM` | vitaslop-native/examples/capsule-replay.rs:598 | - |
-| `VITASLOP_GXM_ALPHA_SINGLE` | vitaslop-conformance-harness/tests/vita_gxmconf_real.rs:112 | **SCENE 10 - A U8_A SURFACE STORES THE FRAGMENT'S ALPHA.** |
+| `VITASLOP_GXM_ALPHA_SINGLE` | vitaslop-conformance-harness/tests/vita_gxmconf_real.rs:116 | **SCENE 10 - A U8_A SURFACE STORES THE FRAGMENT'S ALPHA.** |
 | `VITASLOP_GXM_ARENA_FLOOR_KB` | vitaslop-platform/src/gpu.rs:898 | `VITASLOP_GXM_DEST_SPLIT_AB=<n>`: alternate the destination-colour pass SPLIT on and off every |
 | `VITASLOP_GXM_ARENA_POOL` | vitaslop-platform/src/gpu.rs:14251 | `VITASLOP_GXM_ARENA_POOL=1` pools the six per-pass staging arenas. |
 | `VITASLOP_GXM_ARENA_REPEAT` | vitaslop-platform/src/gpu.rs:4206 | >>> REPACKS OF GEOMETRY THIS RUN HAD ALREADY EVICTED - the cache THRASHING. |
 | `VITASLOP_GXM_BACKGROUND_DEPTH` | vitaslop-conformance-harness/tests/vita_gxmconf.rs:621 | **SCENE 8 - A REVERSED DEPTH RANGE: THE PASS STARTS FROM THE SURFACE'S BACKGROUND DEPTH.** |
 | `VITASLOP_GXM_BUFFER_PREINIT` | vitaslop-platform/src/gpu.rs:18990 | Create through the pool: a hit is free, a miss is the allocation that was going to |
-| `VITASLOP_GXM_COLOR_MASK_ORDER` | vitaslop-conformance-harness/tests/vita_gxmconf_real.rs:175 | **SCENE 14 - THE COLOUR MASK NUMBERS ALPHA AS BIT 0.** |
+| `VITASLOP_GXM_COLOR_MASK_ORDER` | vitaslop-conformance-harness/tests/vita_gxmconf_real.rs:179 | **SCENE 14 - THE COLOUR MASK NUMBERS ALPHA AS BIT 0.** |
 | `VITASLOP_GXM_DEPTH_ENC` | vitaslop-platform/src/gpu.rs:3586 | Which value a later pass reads out of a render target's depth |
 | `VITASLOP_GXM_DEST_SPLIT_AB` | vitaslop-platform/src/gpu.rs:873 | `VITASLOP_GXM_DEST_SPLIT_AB=<n>`: alternate the destination-colour pass SPLIT on and off every |
 | `VITASLOP_GXM_DRAW_COVERAGE` | vitaslop-gxp-shader/src/link.rs:5462 | `1` - WHERE DID THIS DRAW'S VERTICES GO? Draw the mesh at CLAMPED normalised coordinates and |
@@ -165,7 +165,7 @@ during boot.
 | `VITASLOP_GXM_NO_MULTISAMPLE` | vitaslop-platform/src/gpu.rs:8246 | A/B instrument: force every pass to ONE sample, whatever the guest asked for. |
 | `VITASLOP_GXM_PVS_BULK_TABLE` | vitaslop-runtime/src/vita/gxm.rs:728 | `VITASLOP_GXM_PVS_BULK_TABLE=1` - restore the VERTEX bind's old WHOLESALE table copy, zeros |
 | `VITASLOP_GXM_RTT_CLEAR_EVERY_FRAME` | vitaslop-platform/src/gpu.rs:25032 | `VITASLOP_GXM_RTT_CLEAR_EVERY_FRAME=1` - restore the pre-2026-09-12 behaviour, in which the |
-| `VITASLOP_GXM_RTT_WRITEBACK` | vitaslop-native/src/wgpu_render.rs:488 | The rendered pixels of every offscreen target small enough to hand back to the GUEST, |
+| `VITASLOP_GXM_RTT_WRITEBACK` | vitaslop-native/src/wgpu_render.rs:504 | The rendered pixels of every offscreen target small enough to hand back to the GUEST, |
 | `VITASLOP_GXM_SHARE_PROGRAMS` | vitaslop-runtime/src/vita/gxm.rs:1633 | Report - once per program - that a blend came from the SHADER rather than from GXM. |
 | `VITASLOP_GXM_STAGING` | vitaslop-platform/src/gpu.rs:1024 | Whether the arena upload goes through the STAGING BELT (default) rather than |
 | `VITASLOP_GXM_STALE_UNIFORMS` | vitaslop-desktop/src/retail.rs:1082 | Headless self-check of the retail path (NO window): load `dir`, optionally drive a |
@@ -414,12 +414,12 @@ during boot.
 | `VITASLOP_RESOLVE_CHUNK` | vitaslop-runtime/src/host.rs:23806 | `VITASLOP_RESOLVE_CHUNK=<draws>`: how many draws the RESOLVER reads per hold of the snapshot |
 | `VITASLOP_ROUNDS_PER_FRAME` | vitaslop-native/tests/retail_boot_probe.rs:660 | - |
 | `VITASLOP_RTT_BG_CACHE` | vitaslop-platform/src/gpu.rs:796 | `VITASLOP_RTT_BG_CACHE=0` restores the OLD behaviour: a sampler bind group naming a render |
-| `VITASLOP_RTT_CLEAR_PROBE` | vitaslop-native/src/wgpu_render.rs:694 | - |
+| `VITASLOP_RTT_CLEAR_PROBE` | vitaslop-native/src/wgpu_render.rs:710 | - |
 | `VITASLOP_RTT_GRID_FRAMES` | vitaslop-web/src/browser_sched.rs:4329 | - |
 | `VITASLOP_RTT_PROBE_FIND` | vitaslop-runtime/src/rtt_writeback.rs:135 | TEMPORARY TELEMETRY (`VITASLOP_RTT_PROBE_FIND=<rrggbb>[+<rrggbb>...]`): name every |
 | `VITASLOP_RTT_PROBE_LOG` | vitaslop-runtime/src/rtt_writeback.rs:85 | TEMPORARY TELEMETRY (`VITASLOP_RTT_PROBE_LOG=1`): print every written-back target's |
 | `VITASLOP_RTT_STALE_EXTENT` | vitaslop-platform/src/gpu.rs:2767 | Whether a held render target is refused as a sampler source when this frame has written its |
-| `VITASLOP_RTT_SUBRECT` | vitaslop-conformance-harness/tests/vita_gxmconf_real.rs:226 | **SCENES 16 + 17 - A TEXTURE NAMING A SUB-RECTANGLE OF A RENDERED TARGET SAMPLES THAT RECTANGLE.** |
+| `VITASLOP_RTT_SUBRECT` | vitaslop-conformance-harness/tests/vita_gxmconf_real.rs:230 | **SCENES 16 + 17 - A TEXTURE NAMING A SUB-RECTANGLE OF A RENDERED TARGET SAMPLES THAT RECTANGLE.** |
 | `VITASLOP_RTT_WRITEBACK_DELAY_MS` | vitaslop-web/src/lib.rs:650 | `VITASLOP_RTT_WRITEBACK_DELAY_MS`: a copy is not handed over, and its slot stays mapped, |
 | `VITASLOP_RTT_WRITEBACK_MAX_AGE_MS` | vitaslop-web/src/lib.rs:1081 | >>> THE WRITEBACK AGE BOUND: a present DECLINES while the oldest render-target copy |
 | `VITASLOP_RTT_WRITEBACK_SYNC_MS` | vitaslop-web/src/lib.rs:5602 | - |
@@ -463,7 +463,7 @@ during boot.
 | `VITASLOP_STALL_WAVES` | vitaslop-native/tests/retail_boot_probe.rs:546 | - |
 | `VITASLOP_STRICT_DRAWS` | vitaslop-runtime/src/render.rs:6767 | Why [`RenderSceneBuilder::build`] discarded draws from a captured scene. |
 | `VITASLOP_SWITCH_WHY` | vitaslop-transpiler/src/lower.rs:1225 | Whether the table-branch diagnostic is on for this address |
-| `VITASLOP_SW_CHAIN` | vitaslop-native/src/wgpu_render.rs:587 | `VITASLOP_GPU_CHAIN_DIR=<dir>`: write every offscreen target of the frame just |
+| `VITASLOP_SW_CHAIN` | vitaslop-native/src/wgpu_render.rs:603 | `VITASLOP_GPU_CHAIN_DIR=<dir>`: write every offscreen target of the frame just |
 | `VITASLOP_SW_CHAIN_DIR` | vitaslop-runtime/src/render.rs:5308 | - |
 | `VITASLOP_SW_POST` | vitaslop-runtime/src/render.rs:5355 | - |
 | `VITASLOP_SYNC_RESOLVE_ASYNC` | vitaslop-runtime/src/host.rs:18721 | >>> A SYNC POINT'S RESOLVE, HANDED TO THE RESOLVER WORKER INSTEAD OF READ UNDER THE HOST |
