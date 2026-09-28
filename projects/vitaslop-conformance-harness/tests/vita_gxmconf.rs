@@ -132,7 +132,20 @@ fn show_renderer_diagnostics() {
 
 /// Run the app once and render every captured scene, software and (when an adapter is present)
 /// on the GPU. Returns one framebuffer per scene from the software oracle, plus the GPU's.
-fn run_and_render() -> (Vec<Framebuffer>, Option<Vec<Framebuffer>>) {
+/// [`render_all`], ONCE per test binary, shared by every test in it.
+///
+/// Each test used to render the whole app itself, and the harness runs them in parallel: nine
+/// tests times a fresh adapter per scene was over a hundred GPU devices created at once, and on
+/// the Windows CI runner - no GPU, a software adapter - that crashed the test binary with
+/// `STATUS_ACCESS_VIOLATION` (PR #4's first run). The pictures are deterministic, so one render
+/// answers every test, and the devices are created one after another.
+fn run_and_render() -> &'static (Vec<Framebuffer>, Option<Vec<Framebuffer>>) {
+    static RENDERED: std::sync::OnceLock<(Vec<Framebuffer>, Option<Vec<Framebuffer>>)> =
+        std::sync::OnceLock::new();
+    RENDERED.get_or_init(render_all)
+}
+
+fn render_all() -> (Vec<Framebuffer>, Option<Vec<Framebuffer>>) {
     show_renderer_diagnostics();
     // Scenes 9 and 10 draw through REAL programs and are asserted by `vita_gxmconf_real.rs`,
     // which turns the recompiled path on. It stays OFF here: under it a placeholder pair cannot
@@ -661,7 +674,7 @@ fn the_gpu_renderer_agrees_with_the_software_oracle_on_every_scene() {
         return;
     };
     let mut worst = (0usize, 0.0f64);
-    for (i, (s, h)) in sw.iter().zip(&hw).enumerate() {
+    for (i, (s, h)) in sw.iter().zip(hw.iter()).enumerate() {
         let sum: u64 = s
             .rgba
             .iter()

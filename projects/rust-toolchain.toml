@@ -10,5 +10,6 @@
 # with its own run, which is the only way a lint gate stays honest.
 [toolchain]
 channel = "1.98.0"
-components = ["clippy", "rustfmt"]
+# `rust-src` is for the web THREADS bundle, which rebuilds std with `-Z build-std`.
+components = ["clippy", "rustfmt", "rust-src"]
 targets = ["wasm32-unknown-unknown"]

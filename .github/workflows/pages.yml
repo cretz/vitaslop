@@ -44,6 +44,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
+          # `rust-src`: build.mjs also builds the THREADS bundle with `-Z build-std`, which
+          # recompiles std and fails without the standard library's source.
+          components: rust-src
 
       - uses: Swatinem/rust-cache@v2
         with:
