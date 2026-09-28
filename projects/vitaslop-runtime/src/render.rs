@@ -9582,6 +9582,22 @@ mod texture_tests {
         panic!("a resumable encode that never finishes is a leak, not a defer");
     }
 
+    /// [`transcode_done`] through `compressed_source` - the passthrough first, then the transcode
+    /// driven to completion. One call can SUSPEND on the 2 ms wall-clock budget, and on a busy CI
+    /// runner a tiny encode did (Windows, PR #4: `None` read as a refusal).
+    fn compressed_done(t: &BoundTexture) -> Option<CompressedUpload> {
+        for _ in 0..4096 {
+            super::reset_inline_encode_budget();
+            if let Some(c) = compressed_source(t, None) {
+                return Some(c);
+            }
+            if !super::PARTIAL_ENCODE.with(|c| c.borrow().is_some()) {
+                return None;
+            }
+        }
+        panic!("a resumable encode that never finishes is a leak, not a defer");
+    }
+
     /// >>> A SUSPENDED ENCODE, RESUMED, IS THE ONE-SHOT ENCODE.
     ///
     /// `chunked_matches_whole` proves the block RANGE is bit-identical to the whole image; this
@@ -9958,7 +9974,7 @@ mod texture_tests {
         t.mip_filter = 1;
         t.face_bytes = total as u32;
         assert!(passthrough_source(&t).is_none(), "the passthrough must refuse this");
-        let c = compressed_source(&t, None).expect("but it must still reach the GPU compressed");
+        let c = compressed_done(&t).expect("but it must still reach the GPU compressed");
         assert!(c.transcoded, "and it must be labelled as re-encoded, not as guest blocks");
         assert_eq!(c.levels, levels, "the transcode owns the encode, so it supplies the chain");
     }

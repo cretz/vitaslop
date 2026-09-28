@@ -154,6 +154,9 @@ pub struct GeneralRenderer {
     builder: RenderSceneBuilder,
     /// The adapter name, for logging which GPU serviced the render.
     pub adapter_name: String,
+    /// The adapter is a SOFTWARE rasteriser (`DeviceType::Cpu` - WARP, lavapipe, SwiftShader):
+    /// correct, but far slower, which a test may need to know - see `vita_gxmconf_real.rs`.
+    pub software: bool,
     /// Where the last [`GeneralRenderer::render_scene`] went. See [`RenderSplit`].
     last_split: RenderSplit,
 }
@@ -234,6 +237,7 @@ impl GeneralRenderer {
         let instance = wgpu::Instance::default();
         let adapter = pick_adapter(&instance)?;
         let adapter_name = adapter.get_info().name;
+        let software = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-gxm"),
             required_features: vitaslop_platform::gpu::wanted_features(&adapter),
@@ -266,6 +270,7 @@ impl GeneralRenderer {
             gxm,
             builder: RenderSceneBuilder::new(),
             adapter_name,
+            software,
             last_split: RenderSplit::default(),
         })
     }

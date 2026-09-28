@@ -98,7 +98,20 @@ try {
   await page.waitForFunction(() => !document.getElementById("player").hidden, null, { timeout: 10000 });
   await page.waitForFunction(() => document.getElementById("loading").hidden || !document.getElementById("fatal").hidden, null, { timeout: 120000 });
   if (!(await page.$eval("#fatal", (e) => e.hidden))) throw new Error("fatal: " + (await page.$eval("#fatal-text", (e) => e.innerText)));
-  await page.waitForTimeout(playMs);
+  // Watched second by second rather than slept through, so a run that dies says WHEN (wall
+  // time and frame) instead of surfacing as a click that timed out on the fault panel.
+  const t0 = Date.now();
+  while (Date.now() - t0 < playMs) {
+    await page.waitForTimeout(1000);
+    const s = await page.evaluate(() => ({
+      fatal: !document.getElementById("fatal").hidden,
+      text: document.getElementById("fatal-text")?.innerText || "",
+      fps: document.getElementById("fpsbadge")?.textContent || "",
+      title: document.title,
+    }));
+    console.log(`  +${((Date.now() - t0) / 1000).toFixed(0)} s: ${s.fatal ? "FATAL" : "running"} ${s.fps}`);
+    if (s.fatal) throw new Error(`the run stopped after ${((Date.now() - t0) / 1000).toFixed(1)} s: ${s.text.slice(0, 300)}`);
+  }
   await page.screenshot({ path: join(shotDir, "playing.png") });
   await page.click("#menubtn");
   await page.waitForFunction(() => (document.getElementById("m-diag")?.textContent || "").length > 100, null, { timeout: 10000 });

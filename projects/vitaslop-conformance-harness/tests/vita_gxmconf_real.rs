@@ -64,6 +64,14 @@ fn render_frame_on_gpu(range: std::ops::Range<usize>) -> Option<Framebuffer> {
         "scenes {range:?} carry draws with no program bytes - the recompiled path is not on"
     );
     let mut gpu = GeneralRenderer::new()?;
+    // >>> NOT ON WINDOWS' SOFTWARE ADAPTER. The Windows CI runner has no GPU, so this is WARP,
+    // and D3D12 compiles these recompiled shaders with FXC: MEASURED 1,058 s for this one test
+    // binary (the whole Linux test step is 1.9 min). The D3D12 path is still covered there by
+    // every other GPU test, and these scenes run on Linux's software Vulkan and macOS's Metal.
+    if cfg!(windows) && gpu.software {
+        eprintln!("software adapter on Windows ({}): scenes {range:?} not checked here", gpu.adapter_name);
+        return None;
+    }
     Some(if scenes.len() == 1 {
         gpu.render_scene(&scenes[0], W, H, CLEAR)
     } else {

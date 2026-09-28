@@ -313,6 +313,9 @@ jobs:
         env:
           ALLOW_SOFTWARE: "1"
           HEADLESS: "1"
+          # Chrome's own output (GPU process included) into this log - a lost device on this
+          # runner has to be attributable to the browser or to us from the log alone.
+          DEBUG: pw:browser
         run: node smp-cube.mjs
 
       - name: Keep the screenshots
