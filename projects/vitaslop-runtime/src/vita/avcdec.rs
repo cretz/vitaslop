@@ -172,9 +172,12 @@ pub struct AvcdecState {
     /// access unit, so an engine whose decoder answers on its event loop can wait for that
     /// answer before the real call delivers pictures. See [`decoder_behind`].
     pub submit_only: bool,
-    /// The unit that submit-only pass handed the decoder, `(handle, es_ptr, pts)`: the real
-    /// dispatch of the SAME call finds it here and does not submit it twice.
-    pub presubmitted: Option<(u32, u32, u64)>,
+    /// The units submit-only passes handed the decoder, `(handle, es_ptr, pts)`: the real
+    /// dispatch of the SAME call finds its own here, removes it, and does not submit it twice.
+    /// A list, not one slot: the browser parks several decode calls at once (`smp.rs`
+    /// `parked_decodes`), and a later call's pass must not overwrite an earlier one's entry -
+    /// which would make both submit their unit twice.
+    pub presubmitted: Vec<(u32, u32, u64)>,
 }
 
 impl AvcdecState {
@@ -499,6 +502,7 @@ fn do_avcdec_delete_decoder(ctx: &mut GuestCtx, st: &mut VitaState, decoder: Ptr
         return SCE_AVCDEC_ERROR_INVALID_PARAM;
     };
     let session = st.avcdec.sessions.remove(index);
+    st.avcdec.presubmitted.retain(|p| p.0 != handle);
     // Whatever this decoder still owed goes with it - see `pictures_owed`.
     PICTURES_OWED.store(0, std::sync::atomic::Ordering::Relaxed);
     // >>> THE ERROR IS DECIDED HERE, AT THE END, WHERE IT CAN BE TRUE.
@@ -575,7 +579,14 @@ fn do_avcdec_decode(
     let pts = ((ctx.read_u32(au_ptr.addr() + au::PTS_UPPER) as u64) << 32)
         | ctx.read_u32(au_ptr.addr() + au::PTS_LOWER) as u64;
     // The submit-only pass submitted this very unit already (see `presubmitted`).
-    let already = st.avcdec.presubmitted.take() == Some((handle, es_ptr, pts));
+    let already = !st.avcdec.submit_only
+        && match st.avcdec.presubmitted.iter().position(|p| *p == (handle, es_ptr, pts)) {
+            Some(at) => {
+                st.avcdec.presubmitted.remove(at);
+                true
+            }
+            None => false,
+        };
     if es_ptr != 0 && es_size != 0 && !already {
         let bytes = ctx.read_bytes(es_ptr, es_size as usize);
         // What the guest actually handed over. An Annex B access unit starts with a start
@@ -600,7 +611,7 @@ fn do_avcdec_decode(
             return SCE_AVCDEC_ERROR_INVALID_STATE;
         }
         if st.avcdec.submit_only {
-            st.avcdec.presubmitted = Some((handle, es_ptr, pts));
+            st.avcdec.presubmitted.push((handle, es_ptr, pts));
         }
     }
     if st.avcdec.submit_only {
@@ -889,7 +900,9 @@ fn note_destination(addr: u32) {
 /// Polls every session's decoder (so call it on the worker that owns them) and says whether
 /// any is behind. See [`VideoDecode::behind_stream`].
 pub fn decoder_behind(st: &mut VitaState) -> bool {
-    st.avcdec.sessions.iter_mut().any(|s| s.decoder.behind_stream())
+    // NOT `any`: `behind_stream` also collects each decoder's finished pictures, so a
+    // short-circuit would leave every session after the first lagging one uncollected.
+    st.avcdec.sessions.iter_mut().fold(false, |behind, s| s.decoder.behind_stream() | behind)
 }
 
 /// A decode call that waited for [`decoder_behind`] to clear: how long, and whether it gave up.

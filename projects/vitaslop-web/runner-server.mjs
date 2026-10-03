@@ -108,6 +108,22 @@ export function createRunner({ dir, coi, laneSrc, runnerWebDir }) {
 
   const doneFor = (job, device) => existsSync(sub("results", job.id, `${device}.json`));
 
+  /// Move a CANCELLED job to `done/` once no lease can still report on it - its device posted,
+  /// or vanished and let the lease lapse. `offerable` never hands a cancelled job out again, so
+  /// without this one whose device died (or a `target: "all"` job after its reports) would sit
+  /// in `queue/` for ever. Returns whether it moved.
+  const retireIfCancelled = async (f, job, now) => {
+    if (!job.cancel) return false;
+    if (Object.values(job.leases || {}).some((l) => l.until >= now)) return false;
+    const r = sub("results", job.id);
+    await mkdir(r, { recursive: true });
+    if ((await list(r)).length === 0) {
+      await writeJson(join(r, "cancelled.json"), { status: "cancelled", job: job.id, at: new Date(now).toISOString() });
+    }
+    await rename(f, sub("done", `${job.id}.json`));
+    return true;
+  };
+
   /// Whether `device` may take `job` now.
   const offerable = (job, device, now) => {
     // A cancelled job waits only for its running device's report - never hand it out again.
@@ -241,6 +257,7 @@ export function createRunner({ dir, coi, laneSrc, runnerWebDir }) {
         } catch {
           continue;
         }
+        if (await retireIfCancelled(sub("queue", f), job, now)) continue;
         if (!offerable(job, device, now)) continue;
         job.leases = job.leases || {};
         job.leases[device] = { until: now + job.timeoutMs + LEASE_MS, taken: new Date(now).toISOString() };
@@ -296,7 +313,7 @@ export function createRunner({ dir, coi, laneSrc, runnerWebDir }) {
         const job = await readJson(f);
         if (job.target === "all") {
           if (job.leases) delete job.leases[device];
-          await writeJson(f, job);
+          if (!(await retireIfCancelled(f, job, now))) await writeJson(f, job);
         } else {
           await rename(f, sub("done", `${jobId}.json`));
         }

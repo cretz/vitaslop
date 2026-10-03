@@ -499,11 +499,23 @@ fn main() {
         }
         eprintln!("  gpu time: {}", gpu.take_gpu_time_report());
     }
-    // The first positional argument after the frame, skipping every option's VALUE.
-    let out = args.iter().enumerate().skip(1).find_map(|(i, a)| {
-        let is_value = matches!(args[i - 1].as_str(), "--before" | "--extract" | "--gpu-time" | "--truncate")
-            || (i >= 2 && args[i - 2] == "--truncate");
-        (!a.starts_with("--") && !is_value).then_some(a)
+    // The first positional argument after the frame, skipping every option's operands. Only
+    // the options that reach this render are listed: `--tex`, `--ir`, `--sa`, `--slim`,
+    // `--prepend-scene`, `--keep-vprog` and `--scene-only` return before it.
+    let operands = |opt: &str| match opt {
+        "--before" | "--extract" | "--gpu-time" | "--progs" | "--params" => 1,
+        "--truncate" => 2,
+        "--prog" => 3,
+        _ => 0,
+    };
+    let mut skip = 0;
+    let out = args.iter().skip(1).find(|a| {
+        if skip > 0 {
+            skip -= 1;
+            return false;
+        }
+        skip = operands(a);
+        !a.starts_with("--")
     });
     if let Some(out) = out {
         std::fs::write(out, fb.to_png()).unwrap_or_else(|e| {

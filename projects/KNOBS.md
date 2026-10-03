@@ -372,8 +372,8 @@ during boot.
 | `VITASLOP_MEM_FIND` | vitaslop-web/src/lib.rs:2298 | TEMPORARY TELEMETRY (`VITASLOP_MEM_FIND=<frame>:<hex bytes>[,<hex bytes>...]`): at the first |
 | `VITASLOP_MOVIE` | vitaslop-runtime/src/vita/video.rs:2562 | A track whose codec this engine does not decode is not offered at all: the title's |
 | `VITASLOP_MOVIE_AUDIO_BACKLOG` | vitaslop-runtime/src/vita/video.rs:1229 | How many decoded frames to hold for a title that is not collecting them. |
-| `VITASLOP_MOVIE_DUMP_DIR` | vitaslop-runtime/src/vita/avcdec.rs:1292 | >>> AND WHAT THE PICTURE ACTUALLY LOOKS LIKE, because "a picture arrived" and "the movie |
-| `VITASLOP_MOVIE_DUMP_EVERY` | vitaslop-runtime/src/vita/avcdec.rs:1292 | >>> AND WHAT THE PICTURE ACTUALLY LOOKS LIKE, because "a picture arrived" and "the movie |
+| `VITASLOP_MOVIE_DUMP_DIR` | vitaslop-runtime/src/vita/avcdec.rs:1305 | >>> AND WHAT THE PICTURE ACTUALLY LOOKS LIKE, because "a picture arrived" and "the movie |
+| `VITASLOP_MOVIE_DUMP_EVERY` | vitaslop-runtime/src/vita/avcdec.rs:1305 | >>> AND WHAT THE PICTURE ACTUALLY LOOKS LIKE, because "a picture arrived" and "the movie |
 | `VITASLOP_MOVIE_PICTURE_HASH` | vitaslop-runtime/src/vita/avcdec.rs:168 | Pictures handed to the guest so far, which is what `VITASLOP_MOVIE_PICTURE_HASH` |
 | `VITASLOP_MOVIE_SUBSTITUTE` | vitaslop-runtime/src/vita/video.rs:416 | >>> OPEN A DIFFERENT MOVIE THAN THE TITLE ASKED FOR |
 | `VITASLOP_MP4_AUDIO` | vitaslop-runtime/src/vita/video.rs:1618 | The tracks this engine will hand units for, as cursors, in the order they appear in the |

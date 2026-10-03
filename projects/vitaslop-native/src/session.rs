@@ -527,7 +527,8 @@ impl Session {
         // writes no shots reads as "the renderer is broken", which is a long way from
         // the truth.
         let sample = force_sample || !self.recipe.watches.is_empty() || self.shot_every.is_some();
-        let target = self.frame() + n;
+        let start = self.frame();
+        let target = start + n;
         if sample {
             while self.frame() < target {
                 let next = self.frame() + 1;
@@ -540,11 +541,12 @@ impl Session {
         } else {
             self.last = self.sched.run_frames(target, self.opts.max_rounds);
         }
-        // A launcher that exec'd: the new process runs the REST of this step (its frames
-        // count from zero, so the step's remaining length is what is left of `n`).
-        let done = self.frame();
-        if self.follow_exec()? && n > done {
-            return self.advance(n - done, force_sample);
+        // A launcher that exec'd: the new process runs the REST of this step. Its frames count
+        // from zero, so what is left is `n` less the frames THIS step ran before the exec -
+        // not less the absolute frame, which is only the same when the step began at zero.
+        let ran = self.frame() - start;
+        if self.follow_exec()? && n > ran {
+            return self.advance(n - ran, force_sample);
         }
         Ok(self.status())
     }
