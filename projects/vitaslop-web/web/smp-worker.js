@@ -54,7 +54,7 @@ import { attachTitleCached } from "./opfs.js";
 // worker running it - whose console a phone never shows and the run worker's forwarding never
 // saw. Relayed on the `jsprofile` channel, which the run worker writes raw to ITS console, where
 // a device-runner job's `params.console` forwards it as a note (30c: phone job 093 traced the
-// Uncharted job pool and brought back nothing).
+// action title's job pool and brought back nothing).
 for (const level of ["log", "info", "warn"]) {
   const orig = console[level].bind(console);
   console[level] = (...a) => {

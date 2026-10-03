@@ -387,7 +387,7 @@ fn glyph_image(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32
         return 0;
     }
     // >>> THE PEN IS THE BITMAP'S TOP-LEFT, NOT ITS BASELINE. MEASURED, not read from a
-    // header: PCSA00009 rasterises its glyph cache through this call and then draws quads
+    // header: a golf title rasterises its glyph cache through this call and then draws quads
     // sampling exactly `[pen_x, pen_x+width) x [pen_y, pen_y+height)` - 'S' at pen (2,2),
     // glyph 8x11, sampled u 2..10 v 2..13; 't' at pen (742,112), glyph 6x10, sampled
     // u 742..748 v 112.. - with NO bearing offsets, on a 20-px cell grid. The title renders
@@ -418,7 +418,7 @@ fn glyph_image(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32
     // that buffer and we must not write past it. What is not correct is saying nothing: the
     // stand-in is rasterized at OUR metrics, not the console font's, so a glyph whose ascent
     // exceeds the headroom the title left above its baseline loses its top and nothing
-    // anywhere connects the two. MEASURED on PCSA00009's glyph atlas: one glyph at
+    // anywhere connects the two. MEASURED on that title's glyph atlas: one glyph at
     // `pen_y = 2` with `top = 11` keeps 2 of its 11 rows, and the 2-pixel band that leaves in
     // a 1024x512 atlas was read as a font-size defect for a whole session.
     //

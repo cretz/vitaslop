@@ -1107,8 +1107,8 @@ pub mod services {
     /// and branches on the first two words - it is the FRAME FETCH. See
     /// `vita::video::mp4_get_next_unit` for the field map and what in it is inferred.
     pub const MP4_GET_NEXT_UNIT_8BE0E3D3: u32 = 0x8BE0_E3D3;
-    /// The same function under the NID DOA5 links - the henkaku wiki names it
-    /// `sceMp4GetStreamInfo` - and DOA5's consumer copies the result field for field
+    /// The same function under the NID a fighting title links - the henkaku wiki names it
+    /// `sceMp4GetStreamInfo` - and that title's consumer copies the result field for field
     /// exactly as the first title's does (+0x08/+0x0c -> +0x60/+0x64, +0x30 -> +0x78, the
     /// halfwords to +0x6e/+0x70, the bytes to +0x6c/+0x6d, +0x20 -> +0x20).
     pub const MP4_GET_STREAM_INFO: u32 = 0xD5B2_6179;
@@ -1136,11 +1136,11 @@ pub mod services {
     /// An unnamed SceNearUtil export the title imports ("near" is the offline-social
     /// app; present in no vita-headers revision). Serviced as an offline success.
     pub const NEAR_UTIL_UNKNOWN_A412E9CA: u32 = 0xA412_E9CA;
-    /// Another unnamed SceNearUtil export (PCSA00029's near thread). Eight arguments; the
+    /// Another unnamed SceNearUtil export (an action title's near thread). Eight arguments; the
     /// caller tests the result `> 0` and skips its handling otherwise - a count of near
     /// results - so the offline answer is 0: nothing nearby.
     pub const NEAR_UTIL_UNKNOWN_49A97D5F: u32 = 0x49A9_7D5F;
-    /// The REST of the unnamed SceNearUtil surface PCSA00029 imports (13 in all, every call site
+    /// The REST of the unnamed SceNearUtil surface that title imports (13 in all, every call site
     /// in one component, 0x81282162..0x81283870). The readable sites treat 0 / an untouched
     /// out-parameter as "nothing": a status tested `== 1`, a loop that continues on non-zero, a
     /// count tested `> 0`. With no Near peers anywhere, that IS the offline answer - the same
@@ -1437,7 +1437,7 @@ pub mod sync {
     pub const CLEAR_EVENT_FLAG: u32 = 0x4CB8_7CA7;
     pub const DELETE_EVENT_FLAG: u32 = 0x5840_162C;
 
-    // --- SIMPLE EVENTS: create/delete/set/wait are dispatched since DOA5 CALLS them and its
+    // --- SIMPLE EVENTS: create/delete/set/wait are dispatched since a fighting title CALLS them and its
     // call sites pin the argument positions (see `vita::sync::create_simple_event`). The
     // history below is why the rest (open/close/poll/cancel) still are not. ---
     //

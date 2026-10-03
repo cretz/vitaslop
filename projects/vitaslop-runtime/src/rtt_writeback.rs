@@ -85,7 +85,7 @@ pub fn writeback_fill_rows() -> Option<(usize, usize)> {
 /// TEMPORARY TELEMETRY (`VITASLOP_RTT_PROBE_LOG=1`): print every written-back target's
 /// texel(24,1) EVERY frame, not once. The trajectory of that value across frames is the input
 /// side of the feedback loop the writeback closes; a once-only line shows only its first step.
-/// An entry may also be a SIZE, `<w>x<h>`: a heap target's address moves from boot to boot (MLB's
+/// An entry may also be a SIZE, `<w>x<h>`: a heap target's address moves from boot to boot (a baseball title's
 /// 32x32 exposure probe: 0x957a3950 in one phone run, 0x957a5050 in the next), its size does not.
 fn probe_log(addr: u32, w: u32, h: u32) -> bool {
     static SIZES: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
@@ -134,7 +134,7 @@ fn probe_log(addr: u32, w: u32, h: u32) -> bool {
 
 /// TEMPORARY TELEMETRY (`VITASLOP_RTT_PROBE_FIND=<rrggbb>[+<rrggbb>...]`): name every
 /// written-back target that CONTAINS one of those colours - with the first pixel found, how many
-/// match, and the frame. For "the guest took this colour from a pixel - which target is it" (MLB's
+/// match, and the frame. For "the guest took this colour from a pixel - which target is it" (a baseball title's
 /// load bake clears to (24,208,107)/255 on the phone and (38,46,68)/255 on the desktop).
 fn report_probe_find(addr: u32, w: u32, h: u32, rgba: &[u8]) {
     static SPEC: std::sync::OnceLock<Vec<[u8; 3]>> = std::sync::OnceLock::new();
@@ -401,7 +401,7 @@ pub fn apply_one(
         // whose alpha is under 0.75 (`frag_90b70060`: `pf0.w - 0.75 >= 0` or `discard`), so
         // "how much of this target would pass that test" is the whole question for it and an
         // RGB mean cannot answer it. Reported as a PERCENTAGE of texels at or above 191/255.
-        // EVERY row's rgb mean, one hex byte each, for a narrow target (MLB's 64x512 ambient-cube
+        // EVERY row's rgb mean, one hex byte each, for a narrow target (a baseball title's 64x512 ambient-cube
         // atlas is written one 6-row band a frame, and eight sampled rows never land on the band).
         let all_rows: String = if w <= 64 && h <= 512 {
             (0..h as usize)
@@ -478,7 +478,7 @@ pub fn apply_one(
 /// [`writeback_still_ours`] fingerprints the first row, because on the one-worker engine the
 /// guest is not running while pixels land and the recycling it guards against rewrites the
 /// start of a pooled block. Under `VITASLOP_SMP` other guest threads keep running while a
-/// readback is in flight, and MEASURED (PCSE00084, `bis25a`/`bis25b`, 4 of 5 runs trapped at
+/// readback is in flight, and MEASURED (a football title, `bis25a`/`bis25b`, 4 of 5 runs trapped at
 /// frame ~1255): the guest reused a 128x64 target's memory from row 8 on as a structure, the
 /// first row still held our pixels, and the next write-back painted `0xff353535` over a saved
 /// return address - the render thread then jumped to it.
@@ -548,7 +548,7 @@ mod whole_region_tests {
         )
     }
 
-    /// The PCSE00084 frame-1255 shape: the guest reuses a written-back target from row 8 on,
+    /// The football title's frame-1255 shape: the guest reuses a written-back target from row 8 on,
     /// the first row still holds our pixels, and the next write-back must NOT land.
     #[test]
     fn a_target_recycled_past_its_first_row_is_not_written_back_under_smp() {
@@ -643,7 +643,7 @@ fn writeback_bytes_per_pixel(format: u32) -> Option<usize> {
         0x3000_0000 | 0x4000_0000 => Some(2), // U5U6U5, U1U5U5U5
         // >>> U4U4U4U4, AND LEAVING IT OUT HID A TARGET AN ALPHA TEST READS.
         //
-        // MEASURED on PCSE00084: its CROWD atlas (0x94111900, 1024x128, painted by 103
+        // MEASURED on a football title: its CROWD atlas (0x94111900, 1024x128, painted by 103
         // draws in four 256-wide tiles) is this format, so it was refused here and no
         // instrument in the project could read a texel of it - while the crowd program
         // that samples it DISCARDS every fragment whose alpha is under 0.75, which is
@@ -655,7 +655,7 @@ fn writeback_bytes_per_pixel(format: u32) -> Option<usize> {
         // >>> U8 AND U8U8 - the SINGLE-CHANNEL family, and leaving it out left a whole class of
         // >>> target with no write-back at all AND no way to look at one.
         //
-        // MEASURED on PCSE00084: its shadow chain is U8 throughout - a 720x408 target the player
+        // MEASURED on the football title: its shadow chain is U8 throughout - a 720x408 target the player
         // meshes are rendered into and several 960x544 targets a blur pass filters it through -
         // and every one of them was refused here by format, so nothing has ever read a texel of
         // any of them back. That is not only a lost write-back: it is the reason "what does the
@@ -690,7 +690,7 @@ fn float_writeback_bytes_per_pixel(format: u32) -> Option<usize> {
 ///
 /// These surfaces are held as `Rgba16Float` so values above 1.0 survive, and before this they
 /// had no write-back at all: the guest's memory kept whatever it held. MEASURED on an action
-/// title (PCSA00029): its exposure is computed on the CPU from a RING of three 32x32 `F32`
+/// title: its exposure is computed on the CPU from a RING of three 32x32 `F32`
 /// luminance targets (0x8b234d00 / 0x8b235d00 / 0x8b236d00, one rendered a frame, read two
 /// frames later), and with none of them written back the tone-map ran on stale memory. `row` is
 /// RGBA halves, 8 bytes a texel, little endian. F16 and F16F16 are copied as halves - exact;
@@ -946,7 +946,7 @@ fn fold_str(s: &str) -> u64 {
 /// Whether a bounded prefix of a buffer says NOTHING HAS BEEN WRITTEN HERE.
 ///
 /// One repeated 4-byte word, which is what a zero fill and an allocator's poison fill both are
-/// - MLB 12 fills a fresh allocation with `0xBAADCAFE` - and which no composed image is. A
+/// - a baseball title fills a fresh allocation with `0xBAADCAFE` - and which no composed image is. A
 /// shorter prefix than one word cannot answer the question and is not treated as empty.
 pub fn nothing_written_here(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes.chunks_exact(4).all(|word| word == &bytes[..4])

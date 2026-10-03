@@ -5621,7 +5621,7 @@ fn link_every_pair_and_rank_the_failures() {
 /// WGSL without the `f16` extension has no half type, so every 16-bit register in the USSE file
 /// is a packed `u32` and every read and write of one is a CONVERSION. A desktop GPU's compiler
 /// folds most of them away and a desktop measurement therefore prices this at zero
-/// [[vitaslop-desktop-cannot-price-a-count-win]]; a tiler does not, and mlb's world pass is
+/// [[vitaslop-desktop-cannot-price-a-count-win]]; a tiler does not, and a baseball title's world pass is
 /// where that bill lands [[vitaslop-f16-emulation-is-the-phones-world-pass]].
 ///
 /// This is the STATIC instrument for that bill: per pair, the conversions in the linked module

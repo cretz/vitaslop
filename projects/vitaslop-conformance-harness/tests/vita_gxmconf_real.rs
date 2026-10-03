@@ -87,7 +87,7 @@ fn render_frame_on_gpu(range: std::ops::Range<usize>) -> Option<Framebuffer> {
 ///
 /// Background depth 0.0 and GREATER_EQUAL, the near quad (z 0.9, green) over the right half
 /// drawn FIRST, then the far one (z 0.1, red) over everything: left red, right STAYS green.
-/// This is a fighting title's (PCSE00235) whole world. Run with
+/// This is a fighting title's whole world. Run with
 /// `VITASLOP_GXM_BACKGROUND_DEPTH=0` it must fail (nothing painted).
 #[test]
 fn a_reversed_depth_range_holds_through_real_shaders() {
@@ -133,7 +133,7 @@ fn a_u8_a_surface_stores_alpha() {
 /// Scene 11 renders six differently coloured 16x16 faces into one 16x128 surface, face `k` in
 /// rows `16k..16k+16`; scene 12 binds that memory as a 16x16 CUBE and samples it along +X, +Y
 /// and +Z in three strips, which must read faces 0, 2 and 4 - red, green, blue. A fighting
-/// title (PCSE00235) renders its image-based lighting this way. The faces exist only on the
+/// title renders its image-based lighting this way. The faces exist only on the
 /// GPU, so the two scenes are rendered as ONE frame; sampled from guest memory the strips are
 /// black, and a wrong face order shows the wrong colour.
 #[test]
@@ -158,7 +158,7 @@ fn a_stacked_render_target_is_sampled_as_a_cube() {
 /// **SCENE 13 - AN UNTYPED POSITION IS FETCHED AS ITS RAW WORDS.**
 ///
 /// A full green quad whose position attribute is declared `SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED`.
-/// A fighting title's (PCSE00235) engine clears its targets with such a triangle; a fetch that
+/// A fighting title's engine clears its targets with such a triangle; a fetch that
 /// read UNTYPED as zero collapsed it to a point, the clear drew nothing, and a map it clears to
 /// alpha 1 stayed at alpha 0 - which its character shader multiplies every colour by.
 #[test]
@@ -175,7 +175,7 @@ fn an_untyped_position_is_fetched_as_its_raw_words() {
 ///
 /// White through `colorMask = R` over the left half, through `colorMask = A` over the right.
 /// Left must be red over the clear's green and blue; right must keep the clear's colour. A
-/// fighting title's (PCSE00235) hair pass (mask RGB, alpha kept) lost its red to the old
+/// fighting title's hair pass (mask RGB, alpha kept) lost its red to the old
 /// R-first reading and came out cyan. Run with `VITASLOP_GXM_COLOR_MASK_ORDER=0` it must fail.
 #[test]
 fn the_colour_mask_numbers_alpha_as_bit_zero() {
@@ -200,7 +200,7 @@ fn the_colour_mask_numbers_alpha_as_bit_zero() {
 /// A CPU-filled cube initialised as U2F10F10F10, set to A8B8G8R8, then copied; the COPY is
 /// bound, so only its control words say what it is. The +X, +Y, +Z strips must read faces 0, 2
 /// and 4 - red, green, blue. A SetFormat that leaves the init's extension bit in word 0 makes
-/// the copy decode as another format entirely (PCSE00235's lighting cubes).
+/// the copy decode as another format entirely (a fighting title's lighting cubes).
 #[test]
 fn a_copy_of_a_reformatted_texture_reads_the_new_format() {
     let Some(fb) = render_on_gpu(15) else {
@@ -225,7 +225,7 @@ fn a_copy_of_a_reformatted_texture_reads_the_new_format() {
 /// Scene 16 renders four quadrants into a 64x64 target (bottom-right yellow); scene 17 binds a
 /// 32x32 LINEAR_STRIDED texture at the bottom-right quadrant's INTERIOR address with the
 /// target's pitch and samples it at uv (0.25, 0.25). Every pixel must be yellow. Binding the
-/// whole target instead reads the top-left quadrant's red - a fighting title's (PCSE00235)
+/// whole target instead reads the top-left quadrant's red - a fighting title's
 /// bloom chain, whose levels share one surface, did that. The target exists only on the GPU,
 /// so both scenes render as ONE frame. Run with `VITASLOP_RTT_SUBRECT=0` it must fail.
 #[test]

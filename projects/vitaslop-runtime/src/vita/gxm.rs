@@ -3250,7 +3250,7 @@ pub(super) fn texture_set_mip_filter(ctx: &mut GuestCtx) {
 /// SceGxmTextureMipFilter sceGxmTextureGetMipFilter(const SceGxmTexture *texture)
 ///
 /// The inverse of [`texture_set_mip_filter`]: the enum is the register bits in place, so the
-/// field is shifted back up. DOA5 links it (NID from the vitasdk db, called at runtime).
+/// field is shifted back up. A fighting title links it (NID from the vitasdk db, called at runtime).
 pub(super) fn texture_get_mip_filter(ctx: &mut GuestCtx) {
     let texture = ctx.arg(0);
     let (shift, _) = texword0::MIP_FILTER;
@@ -4170,7 +4170,7 @@ pub(super) fn precomputed_state_set_uniform_buffer(
         // ONE read of the array and ONE write of the table - see
         // `VitaState::precomputed_state_set_all_nondefault_uniform_buffers` for why the
         // per-index loop this replaces was the largest block of boundary crossings in a
-        // Madden frame.
+        // football-title frame.
         st.precomputed_state_set_all_nondefault_uniform_buffers(ctx, state, stage, ctx.arg(1));
     } else {
         let (index, data) = (ctx.arg(1), ctx.arg(2));
@@ -5214,7 +5214,7 @@ mod precomputed_state_binds {
         // in it, so an empty slot is an unwritten value rather than an unbind the guest asked
         // for [[vitaslop-poison-separates-a-guest-zero-from-an-unwritten-one]].
         //
-        // MEASURED on PCSE00120: 19,603 direct `sceGxmSetFragmentTexture` binds, a texture put
+        // MEASURED on a role-playing title: 19,603 direct `sceGxmSetFragmentTexture` binds, a texture put
         // INTO a precomputed state **0 times** (a complete count - that setter is never
         // inlined), ~1,286 state binds a frame. A store watchpoint on unit 0's slot caught the
         // sequence: the guest binds its sprite texture, twenty state binds follow, and the

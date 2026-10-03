@@ -71,6 +71,19 @@ fn main() {
         fc.width,
         fc.height
     );
+    // `--blend-census`: every SUBTRACT / REVERSE_SUBTRACT blend in the frame (colour or alpha),
+    // as `scene draw func src dst` - the draws whose meaning rides on the operand order.
+    if args.iter().any(|a| a == "--blend-census") {
+        for (si, s) in fc.scenes.iter().enumerate() {
+            for (di, d) in s.draws.iter().enumerate() {
+                let b = d.blend;
+                if matches!(b.color_func, 2 | 3) || matches!(b.alpha_func, 2 | 3) {
+                    println!("blend-census scene {si} draw {di} {b:?}");
+                }
+            }
+        }
+        return;
+    }
     let list = args.iter().any(|a| a == "--list");
     for (i, s) in fc.scenes.iter().enumerate() {
         let target = s.color.map_or("no colour".to_string(), |c| {
@@ -211,6 +224,8 @@ fn main() {
         };
         let h = |b: &[u8]| vitaslop_gxp_shader::Program::parse(b).map(|p| p.hash).unwrap_or(0);
         println!("scene {si} draw {di}: vprog {:016x} fprog {:016x}", h(&d.vprog), h(&d.fprog));
+        println!("scene {si} draw {di}: blend {:?}", d.blend);
+        println!("scene {si} draw {di}: render state {:?}", d.render_state);
         println!("scene {si} draw {di}: vert_sa {} B: {}", d.vert_sa.len(), floats(&d.vert_sa));
         println!("  frag_sa {} B (from {:#x}): {}", d.frag_sa.len(), d.frag_sa_addr, floats(&d.frag_sa));
         println!(

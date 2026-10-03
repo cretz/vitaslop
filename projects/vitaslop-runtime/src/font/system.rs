@@ -5,7 +5,7 @@
 //! fonts are the vendor's assets and are not shipped here, so both calls used to refuse - and
 //! refuse SILENTLY. A title that renders its strings through the system font therefore drew
 //! every one of them from an all-zero glyph atlas, which reaches the screen as blank or BLACK
-//! areas where dynamic text belongs. MEASURED on PCSA00009: one `sceFontOpen(0)` at boot, a
+//! areas where dynamic text belongs. MEASURED on a golf title: one `sceFontOpen(0)` at boot, a
 //! 1024x512 8-bit atlas at `0x8f8b4c00` that the guest zeroes and nothing ever fills, and two
 //! UI quads sampling it as a flat black rectangle over the club list.
 //!

@@ -2644,7 +2644,7 @@ impl BrowserEngine {
     /// did. Called by an SMP worker that has nothing to run.
     ///
     /// >>> A THREAD'S FIRST RUN PAID 9-21 ms OF INSTANTIATION ON THE PHONE, AND A MOVIE DIED OF
-    /// >>> IT. MEASURED (DOA5 intro movie, SMP trace with `N m` spans, job 333): the player's
+    /// >>> IT. MEASURED (a fighting title's intro movie, SMP trace with `N m` spans, job 333): the player's
     /// controller instance took 20.8 ms to build on w2, its audio decoder 9.6 ms and demuxer
     /// 8.6 ms on w3 - synchronously, on the worker that first picked each thread, with the
     /// pool empty (a title's long-lived threads never give an instance back). Behind those
@@ -3162,7 +3162,7 @@ impl BrowserEngine {
                 // emitted once, in order, and the e2e harness captures it the same way.
                 // `at=` is the SMP trace clock (`smp::abs_ms`, one origin across workers), so a
                 // hit can be ordered against the `smptrace` spans of other threads. Without it
-                // two hits of one frame on two workers had no order: the DOA movie handshake was
+                // two hits of one frame on two workers had no order: the fighting title's movie handshake was
                 // read as "main stored 2, then the sound thread read 1" with nothing to say
                 // which came first.
                 let line = format!(
@@ -3679,7 +3679,7 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
                 // >>> THE OBJECTS THE REGISTERS POINT AT, AT THE TRAP. A register dump says a
                 // loaded field was NULL; it cannot say whether the whole object around it was
                 // zeroed (freed, recycled, never built) or only that field - and those have
-                // different causes. MEASURED on the phone: Uncharted's job worker faulted on a
+                // different causes. MEASURED on the phone: an action title's job worker faulted on a
                 // job whose argument word read 0, with the job pointer still in r5 and no way to
                 // see the job. So every register that points into guest memory (sp and lr
                 // excluded, pc is 0) gets its 64 bytes printed, each address once.
@@ -4481,7 +4481,7 @@ impl BrowserEngine {
     /// `sceGxmFinish` (and a notification wait) hands its geometry to the resolver worker and
     /// parks the thread with an EMPTY early batch (`VitaState::queue_sync_resolve`). That park
     /// used to be served by the RUN worker, which reaches its early queue only between its own
-    /// spans - MEASURED on the phone (026, MLB pitches): the render thread parked 30-45 ms a
+    /// spans - MEASURED on the phone (026, a baseball title's pitches): the render thread parked 30-45 ms a
     /// frame behind the run worker's resolver wait (14-17 ms) and present (28-35 ms) for a read
     /// that takes under a millisecond, and the run worker then paused EVERY guest thread for it.
     /// Here the worker that ran the thread waits for the resolver (no host lock held), applies
@@ -4635,7 +4635,7 @@ pub(crate) async fn complete_early_batch(
 /// The first half of [`complete_early_batch`]: the batch's scenes rendered and read back. It
 /// WRITES NO GUEST MEMORY, so the SMP engine runs it with the guest still running - it reads
 /// captured scenes and texture bytes exactly as a present does, and a present already overlaps
-/// the guest. MEASURED on the phone (063, MLB at-bat): each readback took 30-78 ms and the whole
+/// the guest. MEASURED on the phone (063, a baseball at-bat): each readback took 30-78 ms and the whole
 /// guest was paused for it, every frame or two for ~25 frames (50-180 ms frames).
 pub(crate) struct EarlyRendered {
     display: Vec<u32>,
@@ -4713,7 +4713,7 @@ pub(crate) fn apply_early_batch(
                 // >>> AND THE WHOLE TARGET'S MEAN PLUS A 4x4 GRID, for small targets only. One
                 // texel cannot say whether a target is SHIFTED (every texel off the same way - a
                 // per-device arithmetic difference) or WRONG IN PLACES (a few texels - a sampling
-                // or addressing difference), and those need different fixes. MEASURED need: MLB's
+                // or addressing difference), and those need different fixes. MEASURED need: a baseball title's
                 // 128x128 lighting chain reads green on the phone at texel(24,1) only
                 // (2026-09-25), and nothing on the desktop reproduces it.
                 let detail = if w * h <= 256 * 256 && rgba.len() >= w * h * 4 && w >= 4 && h >= 4 {
@@ -4748,7 +4748,7 @@ pub(crate) fn apply_early_batch(
                         .unwrap_or_default()
                 });
                 // The FIRST completion of each target at or after each listed frame: a small
-                // target completes early only every ~12 frames (MLB), so a fixed window misses.
+                // target completes early only every ~12 frames (baseball), so a fixed window misses.
                 static GRID_SEEN: std::sync::Mutex<Vec<(u64, u32)>> = std::sync::Mutex::new(Vec::new());
                 let f = vitaslop_runtime::sched::current_frame();
                 let due = at.iter().copied().filter(|&a| f >= a).max();

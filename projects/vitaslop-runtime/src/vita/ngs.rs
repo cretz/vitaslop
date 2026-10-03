@@ -682,7 +682,7 @@ pub(super) fn patch_create_routing(ctx: &mut GuestCtx, st: &mut VitaState, info:
 /// this voice. No such output writes a NULL handle and returns 0 - which is what a title
 /// asking "is anything routed here yet" expects, and is not an error.
 ///
-/// >>> IT IS HERE BECAUSE REFUSING A BOGUS EVENT-FLAG WAIT UNCOVERED IT. PCSE00084's audio
+/// >>> IT IS HERE BECAUSE REFUSING A BOGUS EVENT-FLAG WAIT UNCOVERED IT. A football title's audio
 /// thread was parked forever on `sceKernelWaitEventFlag` on a uid that names nothing; once
 /// that wait returns `UNKNOWN_EVF_ID` the thread runs on and calls this, which had no
 /// implementation at all. A stall hides every gap downstream of it

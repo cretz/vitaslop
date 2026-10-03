@@ -1730,11 +1730,11 @@ fn swz_str(s: &str) -> [u8; 4] {
 /// 32-bit mad can write a THIRD lane (`mask_table_mad`), and the two-lane tables say nothing
 /// about what it reads - padding it with `x` made lane 2 read lane 0's selector. The f16
 /// pattern's third lane is what the programs compute:
-/// * Uncharted's foliage wind (vprog 6a583bbed9fe6ea1 #22, `0x00a22b807f03c119`) is
+/// * An action title's foliage wind (vprog 6a583bbed9fe6ea1 #22, `0x00a22b807f03c119`) is
 ///   `frc(p + 0.5) * 2 - 1` over xyz - op1 entry 4 must read `z` and op3 entry 1 (`yy`, the
 ///   -1 in SA51) must read `y`. Padded, z became `2 * frc.x + 3` and the leaves flew off the
 ///   plant as giant flat shards.
-/// * MK's decal skinning (vert_86119530 #64/#65) computes `I4.xy = pa13 * sa0.xy + sa12.xy`
+/// * A fighting title's decal skinning (vert_86119530 #64/#65) computes `I4.xy = pa13 * sa0.xy + sa12.xy`
 ///   and then the lane-2-only tail `I4.z = pa12.[yy] * sa2 + sa14` - `pa13` again under the
 ///   f16 pattern, the unrelated `pa12` under the padding.
 /// `f32_mads_that_write_lane_2` (tests/corpus.rs) lists every instruction this reaches.
@@ -1798,8 +1798,8 @@ pub(crate) fn mask_table_mad_for(half: bool, m16: u32, m32: u32, en: u32) -> [bo
 ///
 /// >>> AND THAT COMBINATION IS REAL AND ITS OLD READING WAS IMPOSSIBLE. `instructions_whose_
 /// >>> write_mask_is_empty` censuses every corpus on disk: the ONLY instruction anywhere that
-/// >>> decodes to an empty destination mask is exactly `df=0 m16=1 m32=0 en=0` - 45 in mlb, 5 in
-/// >>> ridgeracer, 1 in mk, 0 in seven other titles - and a shipped compiler does not emit an
+/// >>> decodes to an empty destination mask is exactly `df=0 m16=1 m32=0 en=0` - 45 in a baseball title, 5 in
+/// >>> a racer, 1 in a fighting title, 0 in seven other titles - and a shipped compiler does not emit an
 /// >>> instruction that writes nothing. Under the bitmask it writes lane 2, which is the third
 /// >>> component of a vec3, and that is what those instructions are: the tail of a skinning
 /// >>> accumulate whose first two lanes are the MAD before it.
@@ -2812,7 +2812,7 @@ fn decode_grp_30(word: u64, hi: u32, lo: u32) -> Instr {
 /// * F32 source, F16 destination: the op at F32 into `scratch`, then a pack of it to F16 into
 ///   the destination.
 ///
-/// MEASURED on a fighting title (PCSE00235): its character vertex programs clamp `dot(N,H)` with
+/// MEASURED on a fighting title: its character vertex programs clamp `dot(N,H)` with
 /// a half-precision `max` into `pa0.x` and `log` it at full precision. Reading that half as an
 /// F32 took the packed pair's bits as a float (a tiny negative), the log was NaN, the NaN rode a
 /// varying into the fragment's colour arithmetic, and every character was drawn black.
@@ -5122,7 +5122,7 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             // This used to advance by the number of channels the DP SUMS (3 or 4 from bit 52),
             // which is right for a 4-component DP and wrong for a 3-component one - and a
             // 3-component DP over a matrix is exactly how a program transforms a NORMAL.
-            // PCSA00009's world material opens with a three-iteration 3-component DP whose
+            // A golf title's world material opens with a three-iteration 3-component DP whose
             // source is `PrimaryAttr[28]`; its rows are the `modelWorldX/Y/Z` attributes, which
             // the container declares at lanes 28, 32 and 36 - FOUR apart, because each is a
             // declared float4. Stepping by three read `pa[28]`, `pa[31]`, `pa[34]`: row 0
@@ -5138,7 +5138,7 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             // >>> correction the DESTINATION above already carries, for the same reason.
             // Routing it through the SMLSI source byte is invisible while the state is
             // `Increment(1)`, which is what every repeating DP that motivated the stride-4
-            // reading runs under, and wrong the moment a program programs anything else. mlb's
+            // reading runs under, and wrong the moment a program programs anything else. A baseball title's
             // CROWD-ATLAS bake (`vert_843ba650`, pair 713e7c1416ebf530) opens
             // `SMLSI [2, 2, 2, 2]` and then builds its clip position with a three-iteration
             // 4-component DP whose source is `PrimaryAttr[20]`. Its rows are the
@@ -5154,7 +5154,7 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             //
             // The intrinsic reading is the only one that fits all three witnesses at once: this
             // program (SMLSI 2, rows 4 apart), its sibling `vert_843b9ce8` (SMLSI 1, rows 4
-            // apart, which the MOE reading also gets right) and PCSA00009's world material
+            // apart, which the MOE reading also gets right) and the golf title's world material
             // (rows 4 apart). A MOE-governed source would have to read a different stride out
             // of each, and there is no stride that does.
             let _ = bits(word, 52, 52);
@@ -5163,7 +5163,7 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             // The intrinsic four is right for every repeating DP whose bit 47 is CLEAR - golf's
             // `modelWorldX/Y/Z` transforms under the default state, and the crowd-atlas bake above
             // under `SMLSI [2,2,2,2]`, which a MOE reading would have sent to pa[20]/pa[28]/pa[36].
-            // It is wrong for the two whose bit 47 is SET. mlb's crowd-PEOPLE program
+            // It is wrong for the two whose bit 47 is SET. The baseball title's crowd-PEOPLE program
             // (`vert_843b87e4`) and its sibling (`vert_843b9ce8`) run a TWO-iteration 4-channel DP
             // over `InstanceMatrix3x4` under `SMLSI [1,1,4,4]`, and compute row 1 with a SEPARATE
             // dot - so the repeat must read rows 0 and 2, eight registers apart. Stepping four
@@ -5178,17 +5178,17 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             // repeating DP in the corpus has them equal. `VITASLOP_GXP_DP_MOE_BIT47=0` restores the
             // intrinsic four for every DP.
             //
-            // >>> AND BIT 48 SAYS WHICH SOURCE WALKS. Set (the crowd pair, mk's two bone dots):
+            // >>> AND BIT 48 SAYS WHICH SOURCE WALKS. Set (the crowd pair, a fighting title's two bone dots):
             // op1 steps as above. CLEAR: op1 HOLDS and the INTERNAL op2 steps one register per
             // iteration, whatever the SMLSI says - three programs, three SMLSIs ([1,1,-2,-2],
             // [1,1,2,2], swizzle mode), one answer, and each proven by a load that is otherwise
-            // dead. mlb's `vert_84377374` loads `i1 = sa40`, `i2 = sa36` and never reads `i2`
+            // dead. The baseball title's `vert_84377374` loads `i1 = sa40`, `i2 = sa36` and never reads `i2`
             // again: the repeat is `(dot(pa8, sa40), dot(pa8, sa36))`, a planar UV projection.
-            // Madden's `frag_9091b740` loads `i1 = sa72`, `i2 = sa76`, repeats twice, then carries
+            // A football title's `frag_9091b740` loads `i1 = sa72`, `i2 = sa76`, repeats twice, then carries
             // on BY HAND with `i2 = sa80` and `sa84` - four matrix rows against one `Temp8`.
-            // Madden's `vert_90c06100` loads `i0,i1,i2 = t0,t4,t8` and writes `i0.xyz`: a 3x3
+            // Its `vert_90c06100` loads `i0,i1,i2 = t0,t4,t8` and writes `i0.xyz`: a 3x3
             // transform of `pa8`. Stepping op1 instead read the raw Normal/UV1 attributes as
-            // matrix rows (mlb) and overwrote the operand it was reading (Madden vert).
+            // matrix rows (baseball) and overwrote the operand it was reading (football vert).
             if bits(word, 47, 47) == 1 && crate::link::arm_on(crate::link::DP_MOE_BIT47_ARM) {
                 if bits(word, 48, 48) == 0 {
                     return Some(vec![fixed(1), fixed(0), fixed(4)]);
@@ -5858,7 +5858,7 @@ fn decode_grp_mem_load(word: u64) -> Instr {
     // component was zero, so the world's final `colour * exposure` multiplied by exactly 0.
     //
     // PROVABLY INERT ON EVERY OTHER TITLE: the same census reports ZERO `moe_expand` loads in
-    // the mk, golf, p4 and OlliOlli corpora - the bit is set nowhere else, so this row cannot
+    // the fighting, golf, role-playing and skating corpora - the bit is set nowhere else, so this row cannot
     // move a shader that does not use it.
     //
     // A field of 0 would be ambiguous under a bias of one and does not occur; it refuses by name
@@ -7036,7 +7036,7 @@ mod tests {
     }
 
     /// A 32-bit mad that writes lane 2 reads lane 2 through the F16 four-lane pattern. The real
-    /// word is Uncharted's foliage wind (`frc(p + 0.5) * 2 - 1` over xyz): op1 entry 4 (`xy` in
+    /// word is an action title's foliage wind (`frc(p + 0.5) * 2 - 1` over xyz): op1 entry 4 (`xy` in
     /// the two-lane table) must read `z`, and op3 entry 1 (`yy`, the -1) must read `y`. Padded
     /// with `x`, lane 2 computed `2 * frc.x + 3` and flung the leaves off every plant.
     #[test]
@@ -7767,7 +7767,7 @@ mod tests {
             ])
         );
         // With bits 47 AND 48 SET the vector source is MOE-governed instead: the SMLSI's src1
-        // slot, two registers a unit (mlb's crowd `[1,1,4,4]` reads rows 0 and 2; mk's
+        // slot, two registers a unit (the baseball crowd `[1,1,4,4]` reads rows 0 and 2; the fighting title's
         // `[1,1,-10,-10]` steps back twenty).
         assert_eq!(
             repeat_operands(dp | (1 << 47) | (1 << 48)),

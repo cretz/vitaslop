@@ -4799,7 +4799,7 @@ mod switch_bound_tests {
     /// the rebase - and the entries that fall off the end are silently routed to the
     /// switch's default instead of their case bodies.
     ///
-    /// These are the real bytes at guest `0x81c566c8` in PCSE00084's query-language
+    /// These are the real bytes at guest `0x81c566c8` in a football title's query-language
     /// lexer, whose nine cases are identifier LENGTHS 2..10. Read as seven, the
     /// ten-character keyword `fastcursor` degraded to a plain identifier, the cursor it
     /// declared bound no columns, and the title faulted four hundred frames later inside

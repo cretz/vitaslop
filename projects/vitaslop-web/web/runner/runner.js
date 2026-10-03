@@ -250,7 +250,7 @@ async function tick() {
   log(`  ${result.status} in ${result.ms} ms${result.summary ? " - " + result.summary : ""}${result.error ? " - " + result.error : ""}`, result.status === "ok" ? "ok" : "bad");
   // >>> EVERY LIVE JOB STARTS IN A FRESH TAB. Whatever one game run leaves behind (GPU
   // objects, a worker the browser has not reaped) is the next one's to inherit otherwise: the
-  // phone Aw-Snapped at f0 on the seventh back-to-back Uncharted soak in one tab (30b, 059).
+  // phone Aw-Snapped at f0 on the seventh back-to-back action-title soak in one tab (30b, 059).
   if (job.kind === "live") {
     log("fresh tab for the next live job - reloading");
     location.reload();

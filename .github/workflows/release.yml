@@ -88,7 +88,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libudev-dev libx11-dev libxkbcommon-dev libwayland-dev
+            pkg-config libudev-dev libx11-dev libxkbcommon-dev libwayland-dev libasound2-dev
 
       - name: Cache wasm-bindgen-cli
         id: wbg-cache

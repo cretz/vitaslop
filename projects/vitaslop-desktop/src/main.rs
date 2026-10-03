@@ -20,12 +20,14 @@
 static ALLOC: vitaslop_platform::heap::Counting<std::alloc::System> =
     vitaslop_platform::heap::Counting(std::alloc::System);
 
+mod audio_out;
 mod diskvfs;
 mod gfx;
 mod input;
 mod library;
 mod live;
 mod log;
+mod navpad;
 mod retail;
 mod serve;
 mod session;
@@ -58,6 +60,17 @@ fn main() {
     // -> preemptive scheduler -> general GXM renderer) in a live window. With no
     // argument, the shell opens.
     let args: Vec<String> = std::env::args().collect();
+    // >>> THE PLAYING PRODUCTS RUN THE PARALLEL ENGINE BY DEFAULT, as the browser page does: the
+    // shell and the `--game` window take `VITASLOP_SMP=1` unless the caller set it. Without it a
+    // title runs every guest thread on one, and the flip's draw resolve on the drawing thread -
+    // MEASURED (an action title's ruins, window): 80% of the wall where the parallel engine holds 100%.
+    // `--headless` keeps the one-baton engine: it is the deterministic render and timing oracle.
+    let plays = args.get(1).is_none() || (args.iter().any(|a| a == "--game" || a == "-g") && !args.iter().any(|a| a == "--headless"));
+    if plays && std::env::var_os("VITASLOP_SMP").is_none() {
+        // SAFETY: first statement of `main` after reading the arguments - no other thread
+        // exists yet to read the environment concurrently.
+        unsafe { std::env::set_var("VITASLOP_SMP", "1") };
+    }
     // Subcommands. With no arguments the native shell opens (library, settings, play);
     // `--game <dir>` is the direct window the rigs drive; `--cube` the built-in demo.
     //

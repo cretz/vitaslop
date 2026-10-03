@@ -826,7 +826,7 @@ fn bind_state_copies_the_table_too() {
 /// The emitted counterpart of `bind_precomputed_fragment_state`'s per-slot loop. A precomputed
 /// fragment state's texture array is a block this engine allocates and ZEROES, so an empty slot
 /// means "no setter ever named this unit" - and copying that emptiness over the context erases a
-/// texture the guest bound directly. MEASURED on PCSE00120, whose title-screen art did not draw
+/// texture the guest bound directly. MEASURED on a role-playing title, whose title-screen art did not draw
 /// for exactly this reason: 19,603 direct binds, zero textures ever put into a state, and a
 /// state bind between the bind and the immediate draw that sampled it.
 ///

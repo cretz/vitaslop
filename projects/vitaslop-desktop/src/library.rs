@@ -63,6 +63,18 @@ pub fn save_global_settings(s: &Settings) -> std::io::Result<()> {
     fs::write(home().join("settings.json"), serde_json::to_string_pretty(&s.to_value())?)
 }
 
+/// Whether sound is muted - the desktop's form of the web player's mute button, which keeps
+/// its choice in `localStorage` beside (not inside) the shared settings; here it is a file
+/// beside `settings.json`, so the settings schema stays the browser's.
+pub fn muted() -> bool {
+    read_json(&home().join("audio.json")).get("muted").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+pub fn save_muted(muted: bool) -> std::io::Result<()> {
+    fs::create_dir_all(home())?;
+    fs::write(home().join("audio.json"), serde_json::json!({ "muted": muted }).to_string())
+}
+
 pub fn title_patch(id: &str) -> Option<serde_json::Value> {
     let p = home().join("titles").join(format!("{id}.json"));
     p.exists().then(|| read_json(&p))

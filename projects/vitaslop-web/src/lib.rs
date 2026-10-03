@@ -635,7 +635,7 @@ struct RttWriteback {
     ///
     /// This exists because a washed-out picture could not be told apart from a STARVED
     /// writeback. MEASURED on this machine, one build, one recipe, one frame: turning the
-    /// writeback off entirely takes mlb's at-bat from a frame mean of 135,132,124 to
+    /// writeback off entirely takes a baseball title's at-bat from a frame mean of 135,132,124 to
     /// 203,180,144 - the device's exact look - because the guest's auto-exposure reads its
     /// light probe out of guest memory and raises the exposure until it clamps when that probe
     /// is dark. So "is the probe being written back, and how often" is the question the whole
@@ -649,14 +649,14 @@ struct RttWriteback {
     dropped_stale: u64,
     /// `VITASLOP_RTT_WRITEBACK_DELAY_MS`: a copy is not handed over, and its slot stays mapped,
     /// until this long after it was CAPTURED - the desktop rig for a device whose GPU runs
-    /// hundreds of milliseconds behind (the phone's mlb read ~400 ms), so the ring's pressure
+    /// hundreds of milliseconds behind (the phone's baseball title read ~400 ms), so the ring's pressure
     /// and the probe's staleness can be measured here. 0 = off.
     delay_ms: f64,
     /// When each `(addr, slot)` copy was captured - for `delay_ms`, and for the AGE of every
     /// delivery below.
     captured_at: std::collections::HashMap<(u32, u8), f64>,
     /// >>> HOW LATE THE GUEST GETS ITS PIXELS: capture-to-hand-over age of every delivery,
-    /// summed, counted and maxed. MEASURED with `delay_ms`: mlb's auto-exposure reads a 32x32
+    /// summed, counted and maxed. MEASURED with `delay_ms`: a baseball title's auto-exposure reads a 32x32
     /// target it rendered itself, and handing it pixels 400 ms old washes the whole picture out
     /// (frame mean 152,146,137 -> 247,214,124) while every copy is still delivered. So on a
     /// device whose GPU runs far behind, the SKIP share can look fine and the picture still
@@ -738,7 +738,7 @@ impl RttWriteback {
     ///
     /// `bufs` is keyed by guest ADDRESS and nothing ever removed an entry, so every distinct
     /// target address a title rendered into kept up to eight readback buffers for the life of the
-    /// run. MEASURED in the desktop browser (Hot Shots, `hslong3` GPU census): 351 -> 755 live
+    /// run. MEASURED in the desktop browser (a golf title, `long3` GPU census): 351 -> 755 live
     /// `gxm-rtt-writeback` buffers over three minutes of golf, still climbing. A slot with a copy
     /// pending or in flight is never touched; everything else idle for `IDLE_MS` is destroyed,
     /// and the address's sequence state goes with its last slot - with nothing in flight there is
@@ -818,7 +818,7 @@ impl RttWriteback {
     }
 
     // The cached clock: an uncached `Reflect::get("performance")` here, on the early-batch path,
-    // was 2.3% of the run worker in an MLB at-bat profile (mlbprof26b).
+    // was 2.3% of the run worker in a baseball at-bat profile (prof26b).
     fn now_ms() -> f64 {
         perf_now()
     }
@@ -1135,7 +1135,7 @@ struct LivePlayback {
     /// still in flight is older than this many ms (`VITASLOP_RTT_WRITEBACK_MAX_AGE_MS`,
     /// DEFAULT 0 = OFF - an arm for the phone, see the last paragraph).
     ///
-    /// MEASURED on the desktop browser with `VITASLOP_RTT_WRITEBACK_DELAY_MS`: mlb's
+    /// MEASURED on the desktop browser with `VITASLOP_RTT_WRITEBACK_DELAY_MS`: a baseball title's
     /// auto-exposure loop reads a target it rendered itself and is correct with its pixels up to
     /// 200 ms old, and WASHES the whole picture out at 400 ms (frame mean 149,142,132 ->
     /// 247,214,124) - the phone's exact look, on a device whose GPU runs at 239% of its period
@@ -1164,8 +1164,8 @@ struct LivePlayback {
     /// >>> measured for a frame, and is made only when that much wall time has accrued.
     ///
     /// # THE QUEUE GREW WITHOUT BOUND ON A GPU THAT COULD NOT KEEP UP, AND IT HUNG THE PHONE
-    /// MEASURED on the user's phone (2026-09-23e, this build): Madden `GPU WORK-DONE LATENCY
-    /// 7085 ms`, mlb `1442.9 ms`, with the depth bound `ARMED 0 time(s)` - the whole phone
+    /// MEASURED on the user's phone (2026-09-23e, this build): a football title `GPU WORK-DONE LATENCY
+    /// 7085 ms`, a baseball title `1442.9 ms`, with the depth bound `ARMED 0 time(s)` - the whole phone
     /// stopped responding and the browser had to be killed. The GPU's own clock read 27.4 ms
     /// of a 34.5 ms period (one 960x544 pass, 735 draws, 28 ms of it): a device running at its
     /// ceiling, so any heavier scene outruns it and every frame after queues behind.
@@ -1208,9 +1208,9 @@ struct LivePlayback {
     /// The timestamp estimate alone is FEED-FORWARD and it runs the GPU at 100% of what it
     /// measures, so any GPU work it does not measure - the browser compositing the canvas, the
     /// write-back copies, a tiler's resolves - accrues as a backlog that never drains.
-    /// MEASURED (`ec1-burn`, mlb intro, desktop browser with the slow-GPU rig): timestamps read
+    /// MEASURED (`ec1-burn`, a baseball title's intro, desktop browser with the slow-GPU rig): timestamps read
     /// 28 ms a frame, a present every ~29 ms was admitted, and the work-done latency climbed to
-    /// 1,568 ms; the phone's own mlb diag read 35.6 ms measured against a 42 ms period - 85%
+    /// 1,568 ms; the phone's own diag of that title read 35.6 ms measured against a 42 ms period - 85%
     /// busy by the GPU's clock - and a 14,149 ms queue. The oldest unfinished submit's AGE is
     /// the queue itself, measured rather than estimated. See `GPU_LAG_MS`.
     gpu_submits: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(f64, f64)>>>,
@@ -2202,7 +2202,7 @@ fn early_wait_any() -> bool {
 ///
 /// The run worker served early completions (a guest parked in `sceGxmFinish` or a notification
 /// wait on a small target) only between its own spans, and the present is one synchronous span
-/// of 27-37 ms on the phone. MEASURED (031, MLB pitches): the render thread parked right as the
+/// of 27-37 ms on the phone. MEASURED (031, a baseball title's pitches): the render thread parked right as the
 /// present began, or while the flip's resolve was still being applied, and waited the whole
 /// present before its batch was even started - ~70 ms a frame blocked. Served here, the batch
 /// renders first and the guest resumes while the present encodes. The batch's scenes (the NEXT
@@ -2222,7 +2222,7 @@ fn early_grace_ms() -> Option<f64> {
 ///
 /// Under SMP each write-back batch stops every guest worker (`X` waiting for them, `Y` the
 /// writes). Taken after the present it lands in the middle of the render thread's frame -
-/// MEASURED on the phone (110, MLB at-bat): 27 of 30 frames, 1.3 ms/f, inside the ~30 ms the
+/// MEASURED on the phone (110, a baseball at-bat): 27 of 30 frames, 1.3 ms/f, inside the ~30 ms the
 /// render thread needs from its vblank to its flip against a 33.3 ms budget. At the flip the
 /// render thread is about to park for the next vblank anyway and the main thread is polling,
 /// so the same pause costs the critical path nothing. The pixels are no older for it: they are
@@ -2257,7 +2257,7 @@ fn scene_target_key(s: &vitaslop_runtime::capture::Scene) -> Option<(u32, u32, u
 /// paints ONCE - a bake at a screen transition, then sampled for the rest of the scene - is
 /// lost for good, and the renderer then samples a target nobody rendered.
 ///
-/// MEASURED on the phone (MLB at-bat): the 256x256 map the players' light cells are gathered
+/// MEASURED on the phone (a baseball at-bat): the 256x256 map the players' light cells are gathered
 /// from is rendered twice at load and never again; the phone's copy read rows
 /// [113,112,85,81,87,103,102,112] against the desktop's [51,56,59,61,59,67,57,52], its 8x8
 /// ambient cubes came out ~2x bright and warm (235,183,155 vs 122,112,114), and every lit
@@ -2298,7 +2298,7 @@ fn supersede_carried(carried: &mut Vec<vitaslop_runtime::capture::Scene>, newer:
 /// TEMPORARY TELEMETRY (`VITASLOP_MEM_FIND=<frame>:<hex bytes>[,<hex bytes>...]`): at the first
 /// guest frame at or after `<frame>`, scan the whole guest memory for each byte pattern and name
 /// up to 24 addresses holding it, with the 16 bytes around each. For "the guest took this value
-/// from memory - where" when the value is not in any render target (MLB's load-bake ClearColor).
+/// from memory - where" when the value is not in any render target (a baseball title's load-bake ClearColor).
 fn mem_find_at(sched: &browser_sched::BrowserSched, frame: u64) {
     static SPEC: std::sync::OnceLock<Option<(u64, Vec<Vec<u8>>)>> = std::sync::OnceLock::new();
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2693,7 +2693,7 @@ impl LivePlayback {
         // >>> AND THE OTHER FEATURES THAT DECIDE WHAT THIS RENDERER DOES, by name, because a
         // phone dump cannot otherwise say which of two renderers it is describing.
         //
-        // `depth-clip-control` is the one that motivated this. mlb's post-hit "wedge" was
+        // `depth-clip-control` is the one that motivated this. A baseball title's post-hit "wedge" was
         // diagnosed and fixed on the DESKTOP as a near-plane clamp (`unclipped_depth`), and the
         // next phone dump still showed a wedge. Those two facts only compose into a diagnosis if
         // it is known whether the phone's adapter offers the feature at all: with it absent the
@@ -3273,13 +3273,13 @@ impl LivePlayback {
             self.poll_timestamps();
             // AGE AND DEPTH, not age alone: a worker that blocked for a while (the fast-forward
             // hand-off, a load's shader builds) dispatches no callbacks meanwhile, so its one or
-            // two outstanding submits AGE with the GPU idle. MEASURED (`ec3-none`, Madden): the
+            // two outstanding submits AGE with the GPU idle. MEASURED (`ec3-none`, a football title): the
             // age rule alone declined 304 presents of a healthy run, 259 of them in the 300
             // frames after fast-forward. A real backlog is many submits deep.
             // >>> THE AGE IS YIELDED TIME, NOT WALL TIME. A callback reaches this worker only
             // while it is yielded, so a worker that ran 150 ms ticks (the fast-forward hand-off,
             // a load's shader builds) saw its submits "age" with the GPU idle: MEASURED on a
-            // healthy Madden run with the GPU at 15 ms a frame, wall-time age (even with depth
+            // healthy football-title run with the GPU at 15 ms a frame, wall-time age (even with depth
             // and a persist-across-a-yield rule) declined 144 presents at the hand-off and ~100
             // at a load. Yielded time since the submit is the delivery opportunity the callback
             // has had; if it has had 150 ms of it and still not come, the queue is deep.
@@ -3289,10 +3289,10 @@ impl LivePlayback {
             // lag far beyond that is not work the GPU is behind on - it is the browser's GPU
             // process busy with something else (compiling the pipelines a new character or
             // stage brings) or its callbacks arriving late, and declining presents shortens
-            // neither. MEASURED on the phone, MK (jobs 065/066): the rule declined 158 presents
+            // neither. MEASURED on the phone, a fighting title (jobs 065/066): the rule declined 158 presents
             // with the GPU at 3.7 ms a frame and work-done latency 15 ms; with the budget off the
             // sub-20 fps readings fell from 11 to 3 (the loads) and p10 fps rose 28 -> 39, with
-            // no backlog building. MLB's real 14 s queue at 35 ms a frame still trips it.
+            // no backlog building. A baseball title's real 14 s queue at 35 ms a frame still trips it.
             let gpu_ms = self.gxm.ts_latest().map(|(ms, _)| ms).filter(|ms| *ms > 0.0);
             let (depth, age) = self
                 .gpu_submits
@@ -3302,7 +3302,7 @@ impl LivePlayback {
             // The queued frames' own GPU time must EXPLAIN the lag: a queue that is `depth`
             // frames of `ms` each has at most `depth * ms` of work in it, and a backlog is the GPU
             // busy the whole time, so it ages about that fast. A lag many times longer is the
-            // GPU waiting on something else - MEASURED on the desktop browser (Hot Shots loads):
+            // GPU waiting on something else - MEASURED on the desktop browser (a golf title's loads):
             // 35 submits at 2.2 ms a frame, the oldest 1,547 ms old = the browser compiling the
             // new pipelines those submits need. Declining presents shortens none of that.
             let lag = depth >= GPU_LAG_DEPTH
@@ -5677,7 +5677,7 @@ async fn live_loop(
     // >>> THE LONGEST DISPLAY GAPS: wall time between two presents that were actually SHOWN.
     //
     // The lost-time list above cannot see a declined present - the guest keeps pace, so no
-    // emulated time is lost - but the SCREEN froze for it. MEASURED (phone, MK fight, job 061):
+    // emulated time is lost - but the SCREEN froze for it. MEASURED (phone, a fighting title's fight, job 061):
     // 136 presents declined while new pipelines compiled, and the lost-time list's worst in-fight
     // frame was 11 ms. The user sees hiccups mid-fight and a fighter's intro cut short; this is
     // the list that measures what they see.
@@ -5695,7 +5695,7 @@ async fn live_loop(
     let mut last_serve_ms = 0.0f64;
     // The wait the PACER asked for inside `last_serve_ms` / the tick (`due_in` when positive):
     // time the emulated clock was AHEAD and deliberately gave back, which is not lost. MEASURED
-    // on the phone (Hot Shots, job 016): without it the list's worst non-load frames were
+    // on the phone (a golf title, job 016): without it the list's worst non-load frames were
     // `serve 84` - five display periods of the pacer repaying a 30 Hz frame's 33 ms charge.
     let mut last_asked_ms = 0.0f64;
     let mut deficit_total_ms = 0.0f64;
@@ -5769,8 +5769,8 @@ async fn live_loop(
     // targets back for the guest, yield until those copies land - at most this long - before
     // the next guest frame runs.
     //
-    // MEASURED on the desktop browser: mlb washed out for a moment at an at-bat's camera cut
-    // (`mlbw24h` f12767) where native - whose writeback is synchronous - never does; the
+    // MEASURED on the desktop browser: a baseball title washed out for a moment at an at-bat's camera cut
+    // (`w24h` f12767) where native - whose writeback is synchronous - never does; the
     // asynchronous hand-over feeds the title's auto-exposure a probe two or more frames old,
     // and at a cut that is the previous camera's light. And on a device whose GPU runs far
     // behind (the phone read ~400 ms) the copies arrive later still, which is the wash-out
@@ -5778,7 +5778,7 @@ async fn live_loop(
     // the title's own reads require, which is what the console's guest does when it waits on
     // its GPU work. A title with no CPU-read target copies nothing and never waits.
     //
-    // >>> OFF BY DEFAULT, BECAUSE THE A/B REFUTED THE FIRST HALF. `mlbsync-on/off` (desktop
+    // >>> OFF BY DEFAULT, BECAUSE THE A/B REFUTED THE FIRST HALF. `sync-on/off` (desktop
     // browser, one build): the wait cut the copies' age from ~50 ms to ~8 ms and cost 98% ->
     // 78% speed - and the at-bat wash appeared in BOTH arms (frame means 218,203,163 and
     // 220,204,165), so that transient is not writeback latency. What remains is the phone's
@@ -5830,7 +5830,7 @@ async fn live_loop(
                 //
                 // >>> KEPT BECAUSE IT IS CORRECT AND PROVEN INERT, NOT BECAUSE IT IS PROVEN
                 // >>> USEFUL. It was built first on the reading that the unmap is what happens
-                // here, and that reading is REFUTED: on PCSE00084 it fires **0 times** and fixed
+                // here, and that reading is REFUTED: on a football title it fires **0 times** and fixed
                 // nothing. The corruption that kills that title at frame 1263 is a target the
                 // guest RECYCLES without unmapping, which `apply_one`'s own fingerprint guard
                 // catches instead.
@@ -6194,7 +6194,7 @@ async fn live_loop(
             // per-frame advance JITTERS around one period (0.6, 1.5, 0.9 ... averaging 1.07) was
             // charged the floor on every short frame and the full amount on every long one -
             // more game time than the clock actually moved, so the loop held the guest for wall
-            // time the game never used. MEASURED on the phone (MLB menus, 032): this loop's own
+            // time the game never used. MEASURED on the phone (a baseball title's menus, 032): this loop's own
             // line read 101% speed while the clock ran 92% of the wall and the audio ring (paced
             // on that clock) underran 9.5% - the menu music hiccups. The overcharge is banked
             // (bounded by four frames) and refunded out of the frames that advance more than a
@@ -6204,7 +6204,7 @@ async fn live_loop(
             // `acc`. When the guest is slower than real time the floor pulls the clock up to the
             // wall; charging that pull as game time counted the same wall twice, and after any
             // slow stretch (whose surplus `acc` had already dropped at its cap) the loop held
-            // the whole guest at the gate: MEASURED on the phone (MLB pitches, 052) 56-84 ms
+            // the whole guest at the gate: MEASURED on the phone (a baseball title's pitches, 052) 56-84 ms
             // holds, 16 in 4.7 s, a fifth of the wall with nothing running. Only the clock the
             // guest advanced by itself (quanta, idle jumps) is charged.
             // `VITASLOP_PACE_FLOOR_FREE=0` is the arm back.
@@ -6763,7 +6763,7 @@ async fn live_loop(
         // RENDER HISTORY IS STATE. A render target is guest memory the GPU wrote, so a pass
         // sampling one the run never rendered falls through to decoding the guest bytes -
         // which are zero - and multiplies its whole output by nothing
-        // [[vitaslop-a-render-target-reads-empty-in-guest-memory]]. MEASURED on PCSE00084
+        // [[vitaslop-a-render-target-reads-empty-in-guest-memory]]. MEASURED on a football title
         // fast-forwarded to 3400: every sideline character shades to rgb(18,19,19), and the
         // per-draw chain trace shows **2,046 draws a frame** sampling `0x95880100` (the
         // title's 960x544 world shadow/AO map, a scene colour surface) with NO residency
@@ -6771,7 +6771,7 @@ async fn live_loop(
         // once, long before the window.
         //
         // This is the same defect `VITASLOP_HEADLESS_RENDER_FROM` was added to the desktop
-        // headless rig for (PCSA00002's blown-out players, a 128x128 ambient probe atlas
+        // headless rig for (a baseball title's blown-out players, a 128x128 ambient probe atlas
         // painted at a screen transition) - and the browser, which is the engine the
         // pictures are actually judged on, had no equivalent. `VITASLOP_BROWSER_RENDER_FROM`
         // is it: frames from there on are RENDERED even though the loop is still unpaced, so
@@ -6861,7 +6861,7 @@ async fn live_loop(
             // Every `Skipped` arm (the GPU budget, the queue-depth bound, a failed acquire)
             // returns before it renders a scene, and this frame's scenes - plus everything
             // carried INTO it - were dropped here. A target the title paints once was then lost
-            // for good: Madden's 1024x128 crowd-card atlas (0x940d1900) is painted only over
+            // for good: a football title's 1024x128 crowd-card atlas (0x940d1900) is painted only over
             // rendered frames ~1521-1524 of the stadium load, a phone run declined 117 presents,
             // and the stands came out EMPTY for the rest of the game while the desktop, which
             // declines none, drew the crowd.
@@ -8711,7 +8711,7 @@ impl LivePlayback {
     /// A synchronous `createRenderPipeline` returns to this worker at once - the browser
     /// compiles it in the GPU process, where it holds the queue, not the emulation. Awaiting
     /// the async promise instead parked THIS thread for the whole compile, 200-300 ms a batch
-    /// on the phone, and the guest waited behind it: MK (phone, same bundle and warm cache)
+    /// on the phone, and the guest waited behind it: a fighting title (phone, same bundle and warm cache)
     /// 95.5% mean / p10 87 awaiting, 98.2% / p10 97 with `VITASLOP_ASYNC_PIPELINES=0` - 9-11 s
     /// of the 100 s run spent in these waits. A Vita has no compile to wait for; the frame it
     /// cannot draw yet is the one to lose, as a GPU backlog loses one (`gpu_budget_skips`).
@@ -8775,7 +8775,7 @@ impl LivePlayback {
 
 /// >>> WHEN AN ASYNC PIPELINE REALLY SETTLED, AND WHEN THE PRESENT LOOP FOUND OUT.
 ///
-/// One new pipeline froze the display 170-310 ms on a DESKTOP (MK fight, 16-18 declined
+/// One new pipeline froze the display 170-310 ms on a DESKTOP (a fighting title's fight, 16-18 declined
 /// presents), which is implausible as compile time on that GPU. The loop only learns of a
 /// settled promise when it next polls, and the promise only settles when this worker's event
 /// loop runs the browser's reply - so the two are measured apart: a spawned task awaits the
@@ -8862,15 +8862,15 @@ fn settle_times_line() -> String {
 ///
 /// A COUNT of declines was the first bound and it was wrong: a menu that introduces shaders
 /// every few frames never empties the in-flight set, and 60 declines in a row forced 518-650 ms
-/// waits (phone, Hot Shots, job 013) on compiles that were landing on their own. What the bound
+/// waits (phone, a golf title, job 013) on compiles that were landing on their own. What the bound
 /// exists for is a compile that NEVER lands (a lost promise, a device that stopped answering),
 /// which a picture held for this long names; a phone compile batch measured up to ~1.1 s.
 ///
 /// >>> 100 MS, NOT 3 S: EVERY DECLINED PRESENT IS A FRAME NOBODY SEES. With 3 s the guest ran on
-/// through a whole compile batch and the picture JUMPED ahead when it landed - MK's pre-fight
+/// through a whole compile batch and the picture JUMPED ahead when it landed - a fighting title's pre-fight
 /// intro skipped 40 frames in one 1.1 s compile on the phone and the user saw the game "fast
-/// forwarding". MEASURED on the phone, same bundle, 3 s vs 100 ms: MK worst gap 1.1 s / 40
-/// skipped vs 615 ms / 3; Hot Shots 11.5 s / 80 vs 6.0 s / 2; Madden 5.3 s / 27 vs 4.1 s / 2 - with
+/// forwarding". MEASURED on the phone, same bundle, 3 s vs 100 ms: a fighting title's worst gap 1.1 s / 40
+/// skipped vs 615 ms / 3; a golf title 11.5 s / 80 vs 6.0 s / 2; a football title 5.3 s / 27 vs 4.1 s / 2 - with
 /// the TOTAL frozen time unchanged (32.3 vs 32.3 s, 48.5 vs 47.3 s: compile throughput sets it)
 /// and mean speed 1-3.5 points lower, because the game clock now really waits. A Vita never
 /// drops a frame to compile; a hitch is the faithful failure, a jump is not.
@@ -8878,7 +8878,7 @@ const PIPE_DEFER_MAX_MS_DEFAULT: f64 = 100.0;
 
 /// `VITASLOP_PIPELINE_DEFER_MAX_MS`: overrides [`PIPE_DEFER_MAX_MS_DEFAULT`]. Every declined
 /// present is a frame the guest computed and nobody saw, so a long run of them plays as a jump
-/// forward - MK's pre-fight intros skipped 40 frames (0.7 s of animation) in one 1.1 s compile
+/// forward - a fighting title's pre-fight intros skipped 40 frames (0.7 s of animation) in one 1.1 s compile
 /// on the phone, and the user reported it as the game "fast forwarding". A short window skips a
 /// few frames and then waits, which reads as a hitch instead.
 fn pipe_defer_max_ms() -> f64 {
@@ -8952,7 +8952,7 @@ impl browser_sched::EarlyCompleter for LivePlayback {
             self.gxm.set_offscreen_only(false);
             // >>> BOUNDED BY WALL CLOCK, NOT BY TURNS. A turn is a MessageChannel post - a few
             // microseconds - so the old `0..2000` gave up after tens of milliseconds, while at a
-            // scene load the GPU queue is seconds deep (mlb: maps unanswered for 1.3-3.3 s). The
+            // scene load the GPU queue is seconds deep (a baseball title: maps unanswered for 1.3-3.3 s). The
             // guest was then woken onto its allocator's poison, read its ambient probe ONCE, and
             // played ~40 s washed out. The bound only exists for a device that stops answering.
             const EARLY_WAIT_MS: f64 = 10_000.0;
@@ -8966,7 +8966,7 @@ impl browser_sched::EarlyCompleter for LivePlayback {
             // capture would skip it, and the guest would be woken with nothing. Let it land -
             // but only when it would be skipped, i.e. every one of the target's ring slots is
             // taken. Waiting on ANY in-flight copy paid the present's whole GPU frame plus a map
-            // round trip before this batch was even submitted: MEASURED on the phone (034, MLB
+            // round trip before this batch was even submitted: MEASURED on the phone (034, a baseball title's
             // pitches) 61-64 ms per early batch, the render thread parked for all of it. A free
             // slot takes the new copy; the older one, landing later, is dropped as stale by its
             // sequence number (`newest_delivered`). `VITASLOP_EARLY_WAIT_ANY=1` is the arm back.

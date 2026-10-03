@@ -1,7 +1,7 @@
 // cpu-workers - what N concurrently busy browser workers each get from this device's CPU, and
 // what a cross-worker wake costs.
 //
-// The question (2026-10-02, Marvel fight on the phone): the render thread's own guest work cost
+// The question (2026-10-02, an arcade fighter's fight on the phone): the render thread's own guest work cost
 // 2.5 ms a frame with ONE SMP worker and 6-10 ms with three - the same code, slower per thread
 // once other workers are busy. Big/little cores, a governor or memory contention would all look
 // like that; this job measures the device without the emulator in the way.

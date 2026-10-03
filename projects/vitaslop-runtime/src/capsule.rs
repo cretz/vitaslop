@@ -96,7 +96,7 @@ fn w_f32(o: &mut impl Write, v: f32) -> io::Result<()> {
     o.write_all(&v.to_le_bytes())
 }
 /// >>> SLIM FRAMES: every byte field of [`SLIM_MIN`] bytes or more is written ONCE per frame and
-/// referenced by id after that. A frame capsule wrote each draw's textures in full, so an MLB
+/// referenced by id after that. A frame capsule wrote each draw's textures in full, so a baseball-title
 /// at-bat with ~900 draws sampling the same atlases came to 2.66 GB - unshippable to a phone,
 /// which is exactly where a frame has to be replayed to see a device-only picture defect
 /// (2026-09-26, the device runner). Active only inside [`write_frame_slim`] / a

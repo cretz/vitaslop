@@ -206,7 +206,7 @@ async function run(p) {
   const watchdog = setInterval(() => {
     const t = performance.now();
     const gap = t - lastTick;
-    // 150, not 250: a 100 ms tick that arrives 50+ ms late. MK's in-fight hitches are 40-120
+    // 150, not 250: a 100 ms tick that arrives 50+ ms late. A fighting title's in-fight hitches are 40-120
     // ms, and whether THOSE are whole-browser pauses is the question (user, 30b).
     if (gap > 150 && hangs.length < 400) hangs.push({ atMs: Math.round(t - tReady), gapMs: Math.round(gap), frame: lastFrame });
     lastTick = t;

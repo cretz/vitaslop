@@ -3,7 +3,7 @@
 //! device runner (`web/runner/jobs/frame-replay.js`).
 //!
 //! # Why
-//! A picture defect that appears only on a phone (MLB's green players, 2026-09) cannot be
+//! A picture defect that appears only on a phone (a baseball title's green players, 2026-09) cannot be
 //! bisected on the desktop, and a person driving the phone to the frame is the cost the runner
 //! exists to remove. With this the phone renders the SAME frame the desktop does - the frame
 //! passes one prefix at a time, a pass one draw prefix at a time - and the first prefix whose
@@ -74,7 +74,7 @@ pub async fn frame_replay(bytes: Vec<u8>, scene_limits: Vec<u32>, draw_limit: i3
     // Passes completed at their own end-scene already hold their image and are not rendered
     // again - the rule the native replay and the live loop both follow.
     // `VITASLOP_REPLAY_EARLY=1`: render those too - a capsule is the only record of a pass that
-    // completed early (the boot light-cell bake on MLB), and replaying it is the question.
+    // completed early (the boot light-cell bake on a baseball title), and replaying it is the question.
     let early = vitaslop_runtime::knobs::var("VITASLOP_REPLAY_EARLY").is_ok_and(|v| v.trim() == "1");
     let scenes: Vec<_> = fc.scenes.iter().filter(|s| early || !s.completed_early).cloned().collect();
 
@@ -134,7 +134,7 @@ pub async fn frame_replay(bytes: Vec<u8>, scene_limits: Vec<u32>, draw_limit: i3
         gxm.ts_finish_chain(&mut encoder);
         // `VITASLOP_REPLAY_TARGET=<hex guest address>`: hand back that OFFSCREEN target (as the
         // renderer holds it, RGBA8) instead of the display - how a pass whose output only
-        // another pass samples is compared across devices. Madden's U4U4U4U4 crowd atlas: the
+        // another pass samples is compared across devices. A football title's U4U4U4U4 crowd atlas: the
         // crowd program discards under alpha 0.75 and the phone drew no crowd from identical
         // inputs, while the same pass rendered AS the display matched the desktop.
         let want_target = vitaslop_runtime::knobs::var("VITASLOP_REPLAY_TARGET")

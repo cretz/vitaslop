@@ -72,7 +72,7 @@ jobs:
           workspaces: projects
           cache-on-failure: true
 
-      # The desktop frontend links a window/input stack. These are its Linux build
+      # The desktop frontend links a window/input/audio stack (ALSA for `cpal`). These are its Linux build
       # dependencies only - the crate is cross-platform and macOS/Windows ship the
       # equivalents in their SDKs.
       - name: Install Linux build dependencies
@@ -80,7 +80,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libudev-dev libx11-dev libxkbcommon-dev libwayland-dev
+            pkg-config libudev-dev libx11-dev libxkbcommon-dev libwayland-dev libasound2-dev
 
       # `--locked` throughout: CI must build the dependency set the committed lockfile
       # pins, which is the set a shipped artifact is built from. Letting cargo re-resolve

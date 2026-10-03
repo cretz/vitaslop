@@ -1,6 +1,6 @@
 // texenc-bench - time the GPU texture encoder (`vitaslop-platform/src/texenc.wgsl`) on THIS
 // device: one `encode_etc2` dispatch over a synthetic image, RGB and RGBA, per shader variant.
-// Written for MK's round start (30c): one frame measured 1034 ms of GPU with 18 PVRTC textures
+// Written for a fighting title's round start (30c): one frame measured 1034 ms of GPU with 18 PVRTC textures
 // ETC2-encoded in it, and the question is how much of that is the encoder itself.
 //
 // params: {

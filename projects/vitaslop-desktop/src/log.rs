@@ -83,6 +83,27 @@ fn install(always_mirror: bool, force_status: bool) {
         .try_init();
 }
 
+/// `text` without its terminal colour codes (`ESC [ ... <letter>`). The fmt layer colours its
+/// lines for a terminal; the ring is READ in the Diagnostics view and saved as a report, where
+/// the codes are noise around every timestamp and level.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// A line-buffered writer: each completed event line goes to its ring, and to stderr when
 /// the mirror is on.
 struct CaptureWriter {
@@ -107,7 +128,7 @@ impl std::io::Write for CaptureWriter {
         let text = String::from_utf8_lossy(&self.buf);
         let text = text.trim_end();
         if self.keep {
-            diag::push(self.channel, text);
+            diag::push(self.channel, &strip_ansi(text));
         }
         if mirroring() {
             let mut err = std::io::stderr();
@@ -164,4 +185,14 @@ pub fn snapshot() -> String {
     out.push_str("\n== STATUS ==\n");
     out.push_str(diag::report(Channel::Status).as_deref().unwrap_or("(none)\n"));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn colour_codes_are_stripped_and_text_kept() {
+        let line = "\u{1b}[2m2026-10-03T20:42:04Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m gxm depth: ok";
+        assert_eq!(super::strip_ansi(line), "2026-10-03T20:42:04Z  INFO gxm depth: ok");
+        assert_eq!(super::strip_ansi("plain [brackets] stay"), "plain [brackets] stay");
+    }
 }

@@ -314,7 +314,7 @@ fn color_precision(shader: &Shader, color: ColorOutput) -> ColorPrecision {
     //
     // >>> AND A COPY IS NOT ALWAYS SPELLED `MOV`. A full-width BITWISE op against its identity
     // (`OR`/`XOR` 0, `AND` all-ones, a shift by 0) moves the word unchanged, and compilers use
-    // it as the final copy. MEASURED on a retail title (PCSE00120, a hedge's lit material):
+    // it as the final copy. MEASURED on a retail role-playing title (a hedge's lit material):
     // `o[0] = pa[0] | 0u` over a `pa[0]` built by four 8-bit packs - read as F32, the packed
     // bytes went out as one float's bits, and the draw painted BLACK with RED fringes.
     for _ in 0..8 {
@@ -1603,7 +1603,7 @@ pub fn dest_is_linear_or_why(shader: &Shader) -> Result<(), String> {
 /// The dual-source lowering evaluates the body once with the destination forced to zero and
 /// once with it forced to one ([`dual_source_plan`]). Everything BEFORE this index computes the
 /// same values in both passes - it reads varyings, uniforms and textures and never the output
-/// bank - so it only has to run once. In mlb's world-family blend, which is 78% of the world
+/// bank - so it only has to run once. In a baseball title's world-family blend, which is 78% of the world
 /// pass's fragments, three quarters of the body is that prefix.
 ///
 /// The taint walk is [`dest_is_linear`]'s, and the two must agree by construction: the
@@ -2166,7 +2166,7 @@ pub fn mem_window_helper_named(windows: &[MemWindow], binding: &str) -> String {
 /// branch chain, inlined at the call, and a skinned vertex program loads its bone rows four words
 /// at a time - one fighting title's calls it 49 times, a golf title's 57. MEASURED on the phone
 /// (PowerVR, `pipeline-compile` with a salt the compiler cannot strip, `createRenderPipelineAsync`
-/// per module): MK's skinned pair 232.8 / 227.6 ms as emitted, 156.2 ms with this (-32%); the
+/// per module): a fighting title's skinned pair 232.8 / 227.6 ms as emitted, 156.2 ms with this (-32%); the
 /// golf title's largest module 658 -> 514 ms (-22%). A first compile is what freezes a scene start.
 ///
 /// >>> WHY IT IS EXACT. The four words are read from the same address register the four calls
@@ -2349,7 +2349,7 @@ pub fn resolve_static_mem_reads(body: &str, windows: &[MemWindow], binding: &str
 /// corpus closure over five reads in two programs (see [`MemWindow::base_offset`]), which is
 /// strong but is not a specification, and a title whose driver turns out to place the base
 /// after all should cost one run to find out rather than a rebuild. It is also what PROVED
-/// this change inert for the other titles - PCSE00001's first 1,600 frames are bit-identical
+/// this change inert for the other titles - a racer's first 1,600 frames are bit-identical
 /// under both arms while the golf title's menu differs on 98.6% of its pixels, which is the
 /// negative control an A/B needs - and a no-regression claim that needs a rebuild to check is
 /// one nobody checks.
@@ -2441,13 +2441,13 @@ const OPEN_ARRAY_ELEMENTS: u32 = 256;
 /// `OPEN_ARRAY_ELEMENTS * stride`, the largest such product: the element an 8-bit index can
 /// name, plus the element itself (`stride` bytes).
 ///
-/// MEASURED on an action title (PCSA00029): its skinning program declares `g_mSkinTransforms`
+/// MEASURED on an action title: its skinning program declares `g_mSkinTransforms`
 /// as 96 vec4s (32 bones, 1536 bytes) and forms each bone pointer as
 /// `imad(int(iBlendIndices.c), 48, sa[39])` - but its U8 blend indices run 75..82: the title
 /// binds the buffer at the start of a LARGER palette and indexes it absolutely. Sized as
 /// declared, 12,744 of 13,635 sampled loads read past the window and got ZERO, every bone
 /// matrix past 32 was a zero matrix, and the player character collapsed to nothing - the night
-/// prologue had no Drake in it. The console reads memory; the window has to cover what the
+/// prologue had no player in it. The console reads memory; the window has to cover what the
 /// index can reach for the shader's reads to be the console's.
 fn indexed_reach(base_sa: u32, shader: &Shader, secondary: &Shader) -> Option<u32> {
     let mut reach: Option<u32> = None;
@@ -3541,7 +3541,7 @@ mod tests {
 
     #[test]
     fn an_identity_bitwise_copy_keeps_the_packed_byte_colour() {
-        // PCSE00120's hedge: four 8-bit packs build pa0, then `o0 = pa0 | 0` hands it to the
+        // The role-playing title's hedge: four 8-bit packs build pa0, then `o0 = pa0 | 0` hands it to the
         // colour register. Read as F32 the bytes left as one float's bits: black, red fringes.
         let pack = instr(
             Op::PackUnorm8 { to_unorm8: true, float_half: false },

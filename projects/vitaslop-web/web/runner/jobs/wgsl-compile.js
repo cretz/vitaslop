@@ -17,7 +17,7 @@ export async function run(params, { progress, asset }) {
   const dev = await adapter.requestDevice({ requiredFeatures: features });
   const failed = [];
   // Per module: ms to parse (createShaderModule + compilation info) and ms for the pipeline's
-  // async compile - the second is the in-game freeze (MK: p90 557 ms on a desktop, 30b).
+  // async compile - the second is the in-game freeze (a fighting title: p90 557 ms on a desktop, 30b).
   const times = [];
   let warned = 0;
   let ok = 0;
@@ -50,7 +50,7 @@ export async function run(params, { progress, asset }) {
     // test/write, blend - which GXM sets per draw and a pipeline bakes in. Whether a state
     // variant costs a whole compile or reuses the first one's shader code decides whether
     // compiling one pipeline per patcher-named pair on a loading screen removes the in-game
-    // compiles (30b, MK).
+    // compiles (30b, a fighting title).
     if (params.variants && !pipeline && !errors.length && !scoped) {
       const base = desc(dev, code);
       const vs = [
@@ -80,7 +80,7 @@ export async function run(params, { progress, asset }) {
   }
   // `parallel`: the same pipelines AGAIN but all started at once, under fresh state so nothing
   // is a cache hit (blend on, cull front) - total wall against the sum of one-at-a-time says
-  // whether the browser compiles them concurrently or queues them (30b, MK: in-game compiles
+  // whether the browser compiles them concurrently or queues them (30b, fighting title: in-game compiles
   // took 156 ms p50 against 75-100 ms one at a time).
   let parallel = null;
   if (params.parallel) {

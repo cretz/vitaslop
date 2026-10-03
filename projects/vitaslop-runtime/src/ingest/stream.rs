@@ -35,7 +35,7 @@ use std::rc::Rc;
 use super::filesdb::FilesDb;
 use super::pfs::{FileCtx, PfsImage};
 use super::pfscrypt::GameData;
-use super::pipeline::{DUMP_MAGIC, DUMP_MANIFEST, WORK_BIN_PATH};
+use super::pipeline::{is_exec_alternate, DUMP_MAGIC, DUMP_MANIFEST, WORK_BIN_PATH};
 use super::pkg::{is_directory, PkgHeader, PkgItem};
 use super::rif::Rif;
 use super::self2elf::self2elf;
@@ -616,6 +616,20 @@ fn is_module_path(path: &str) -> bool {
     path == "eboot.bin" || (path.starts_with("sce_module/") && path.ends_with(".suprx"))
 }
 
+/// A path that MAY be an alternate executable - a root-level `*.self`, which
+/// `sceAppMgrLoadExec("app0:<x>.self")` replaces the running one with. Kept whole while it
+/// streams; the SELF magic decides (`pipeline::is_exec_alternate`, the one rule both
+/// importers use).
+///
+/// >>> THE STREAMING IMPORT USED TO DROP THESE, and only the in-memory pipeline kept them.
+/// The library on both products imports through here, so a title that LoadExecs out of its
+/// launcher - MEASURED, an action title boots a launcher `eboot.bin` that execs
+/// `app0:<name>.self` - failed at that exec with "the app carries no executable", while every
+/// rig run (which mounts a pipeline-made dump) played it.
+fn is_exec_candidate_path(path: &str) -> bool {
+    !path.contains('/') && path.ends_with(".self")
+}
+
 // ============================== the probe ==============================
 
 fn sfo_probe(probe: &mut Probe, sfo_bytes: &[u8]) {
@@ -674,7 +688,7 @@ pub fn probe(src: Rc<dyn ByteSource>) -> Result<Probe, Error> {
             p.bytes = names.iter().map(|n| src.size(n).unwrap_or(0)).sum();
             let rels: Vec<String> = names.iter().map(|n| n[prefix.len()..].to_string()).collect();
             let mut outs: Vec<String> = rels.iter().map(|r| format!("files/{r}")).collect();
-            outs.extend(rels.iter().filter(|r| is_module_path(r)).map(|r| format!("modules/{r}")));
+            outs.extend(rels.iter().filter(|r| is_module_path(r) || is_exec_candidate_path(r)).map(|r| format!("modules/{r}")));
             outs.push(DUMP_MANIFEST.to_string());
             p.outputs = outs;
             if let Ok(s) = read_whole(&*src, &under(&root, "sce_sys/param.sfo")) {
@@ -703,7 +717,7 @@ pub fn probe(src: Rc<dyn ByteSource>) -> Result<Probe, Error> {
             p.files = files.len();
             p.bytes = files.iter().map(|f| src.size(&under(&root, &f.path)).unwrap_or(0)).sum();
             let mut outs: Vec<String> = files.iter().map(|f| format!("files/{}", f.path)).collect();
-            outs.extend(files.iter().filter(|f| is_module_path(&f.path)).map(|f| format!("modules/{}", f.path)));
+            outs.extend(files.iter().filter(|f| is_module_path(&f.path) || is_exec_candidate_path(&f.path)).map(|f| format!("modules/{}", f.path)));
             outs.push(DUMP_MANIFEST.to_string());
             p.outputs = outs;
             if let Ok(s) = pfs.read_file(&*src, &root, "sce_sys/param.sfo") {
@@ -746,22 +760,28 @@ fn import_homebrew(
     let total: u64 = names.iter().map(|n| src.size(n).unwrap_or(0)).sum();
     let mut done = 0u64;
     let mut modules: Vec<String> = Vec::new();
+    let mut execs: Vec<String> = Vec::new();
     for n in &names {
         let rel = &n[prefix.len()..];
         copy_through(src, n, &format!("files/{rel}"), sink, |b| {
             done += b;
             progress(Progress { stage: "copy", file: rel, done, total });
         })?;
-        if is_module_path(rel) {
+        if is_module_path(rel) || is_exec_candidate_path(rel) {
             let head = read_head(src, n, 4)?;
             if head.as_slice() == b"SCE\0" || head.as_slice() == b"\x7fELF" {
-                modules.push(rel.to_string());
+                if is_module_path(rel) {
+                    modules.push(rel.to_string());
+                } else {
+                    execs.push(rel.to_string());
+                }
             }
         }
     }
     modules.sort();
     modules.sort_by_key(|p| p == "eboot.bin");
-    for m in &modules {
+    execs.sort();
+    for m in modules.iter().chain(&execs) {
         copy_through(src, &under(root, m), &format!("modules/{m}"), sink, |_| {})?;
     }
     let sfo = read_whole(src, &under(root, "sce_sys/param.sfo")).ok();
@@ -777,6 +797,9 @@ fn import_homebrew(
     manifest.push_str(&format!("content_id={content_id}\n"));
     for m in &modules {
         manifest.push_str(&format!("module={m}\n"));
+    }
+    for m in &execs {
+        manifest.push_str(&format!("exec={m}\n"));
     }
     sink.begin(DUMP_MANIFEST, manifest.len() as u64)?;
     sink.write(manifest.as_bytes())?;
@@ -850,12 +873,17 @@ fn import_pfs(
     let total: u64 = files.iter().map(|f| src.size(&under(root, &f.path)).unwrap_or(0)).sum();
     let mut done = 0u64;
     let mut modules: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut execs: Vec<(String, Vec<u8>)> = Vec::new();
     for f in &files {
         let ctx = pfs.image.ctx_of(f, &pfs.rif.key);
         let out_path = format!("files/{}", f.path);
         sink.begin(&out_path, ctx.plaintext_size as u64)?;
         // An executable is kept whole for the SELF unwrap that follows.
-        let mut keep: Option<Vec<u8>> = if is_module_path(&f.path) { Some(Vec::with_capacity(ctx.plaintext_size)) } else { None };
+        let mut keep: Option<Vec<u8>> = if is_module_path(&f.path) || is_exec_candidate_path(&f.path) {
+            Some(Vec::with_capacity(ctx.plaintext_size))
+        } else {
+            None
+        };
         // Progress per CHUNK, not per file: a title's bytes are not spread evenly over
         // its files, and a counter that only moves when a file finishes sits still for
         // the whole of a gigabyte file, which reads as a hang and was reported as one.
@@ -878,13 +906,17 @@ fn import_pfs(
         )?;
         sink.finish()?;
         done = before + consumed;
-        if let Some(bytes) = keep
-            && bytes.len() >= 4 && &bytes[..4] == b"SCE\0" {
+        if let Some(bytes) = keep {
+            if is_module_path(&f.path) && bytes.len() >= 4 && &bytes[..4] == b"SCE\0" {
                 modules.push((f.path.clone(), bytes));
+            } else if is_exec_alternate(&f.path, &bytes) {
+                execs.push((f.path.clone(), bytes));
             }
+        }
     }
     modules.sort_by(|a, b| a.0.cmp(&b.0));
     modules.sort_by_key(|(p, _)| p == "eboot.bin");
+    execs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut manifest = String::new();
     manifest.push_str(DUMP_MAGIC);
     manifest.push('\n');
@@ -897,6 +929,15 @@ fn import_pfs(
         sink.write(&elf)?;
         sink.finish()?;
         manifest.push_str(&format!("module={path}\n"));
+    }
+    for (path, bytes) in &execs {
+        progress(Progress { stage: "unwrap", file: path, done, total });
+        let elf = self2elf(bytes, &pfs.rif.key)?;
+        let out_path = format!("modules/{path}");
+        sink.begin(&out_path, elf.len() as u64)?;
+        sink.write(&elf)?;
+        sink.finish()?;
+        manifest.push_str(&format!("exec={path}\n"));
     }
     // Last: the marker.
     sink.begin(DUMP_MANIFEST, manifest.len() as u64)?;
@@ -992,7 +1033,15 @@ mod tests {
         expect.sort_by(|a, b| a.0.cmp(&b.0));
         let mut got = sink.files;
         got.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(got.len(), expect.len(), "file count");
+        let names = |v: &[(String, Vec<u8>)]| v.iter().map(|f| f.0.clone()).collect::<std::collections::BTreeSet<_>>();
+        let (g, e) = (names(&got), names(&expect));
+        assert_eq!(
+            got.len(),
+            expect.len(),
+            "file count - only streamed: {:?}; only resident: {:?}",
+            g.difference(&e).collect::<Vec<_>>(),
+            e.difference(&g).collect::<Vec<_>>()
+        );
         for ((gp, gb), (ep, eb)) in got.iter().zip(expect.iter()) {
             assert_eq!(gp, ep);
             assert!(gb == eb, "{gp}: bytes differ ({} vs {})", gb.len(), eb.len());
@@ -1072,6 +1121,33 @@ mod tests {
         assert!(!cid.is_empty());
         let eboot = sink.files.iter().find(|f| f.0 == "modules/eboot.bin").expect("module");
         vitaslop_loader::load(&eboot.1).expect("the loader takes the fSELF");
+        for (path, _) in &sink.files {
+            assert!(p.outputs.contains(path), "{path} written but not planned");
+        }
+    }
+
+    /// A root-level `*.self` beside the eboot is an ALTERNATE executable - what
+    /// `sceAppMgrLoadExec("app0:<x>.self")` boots - so the import must keep it under `modules/`
+    /// and list it as `exec=` (never `module=`: it is not loaded at boot). One in a subfolder is
+    /// data, and a `.self` without an executable header is not one. The probe plans it too.
+    #[test]
+    fn a_root_self_is_imported_as_an_exec() {
+        let mut files = HashMap::new();
+        files.insert("app/eboot.bin".to_string(), b"\x7fELF-boot".to_vec());
+        files.insert("app/game.self".to_string(), b"\x7fELF-exec".to_vec());
+        files.insert("app/data/inner.self".to_string(), b"\x7fELF-data".to_vec());
+        files.insert("app/notes.self".to_string(), b"not an executable".to_vec());
+        let src = Rc::new(MemSource { files });
+        let p = probe(src.clone()).expect("probe");
+        let mut sink = MemSink::default();
+        import(src, &mut sink, &mut |_| {}).expect("import");
+        let manifest = sink.files.iter().find(|f| f.0 == DUMP_MANIFEST).expect("manifest");
+        let manifest = String::from_utf8_lossy(&manifest.1);
+        assert!(manifest.lines().any(|l| l == "module=eboot.bin"), "{manifest}");
+        assert!(manifest.lines().any(|l| l == "exec=game.self"), "{manifest}");
+        assert!(!manifest.contains("inner.self") && !manifest.contains("notes.self"), "{manifest}");
+        let exec = sink.files.iter().find(|f| f.0 == "modules/game.self").expect("the exec is written under modules/");
+        assert_eq!(exec.1, b"\x7fELF-exec");
         for (path, _) in &sink.files {
             assert!(p.outputs.contains(path), "{path} written but not planned");
         }

@@ -148,7 +148,7 @@ mod ledger {
     /// The workspace frames of a backtrace, innermost first, up to six of them - the frames
     /// of the allocator, of `alloc::` and of this module are noise on every trace. Led by the
     /// innermost frame OUTSIDE the workspace and the standard library when one sits below the
-    /// first workspace frame (`[wgpu_core::...]`): Madden's largest holder read only
+    /// first workspace frame (`[wgpu_core::...]`): a football title's largest holder read only
     /// "194 MB in 1191 allocation(s): headless_check" - a dependency allocated it, and the
     /// workspace frames alone could not say which.
     fn site_of(trace: &std::backtrace::Backtrace) -> String {

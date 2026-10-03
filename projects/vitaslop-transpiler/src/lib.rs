@@ -909,7 +909,7 @@ pub enum InlineOp {
     /// ```
     ///
     /// A device does exactly this: the uncontended take is a userspace LDREX/STREX of the work
-    /// area. MEASURED why it matters (MK sound/asset load, phone job 101): ~82k allocs and
+    /// area. MEASURED why it matters (a fighting title's sound/asset load, phone job 101): ~82k allocs and
     /// ~81k frees in two frames, each a lock and an unlock - 356k host crossings, 1.3 s.
     LwMutexSmp { layout: LwMutexLayout, lock: bool },
 }
@@ -1010,7 +1010,7 @@ pub struct BindStateLayout {
     /// slot is an UNWRITTEN value, not a guest request to unbind, and copying it over the
     /// context destroys a binding the guest made through `sceGxmSetFragmentTexture`.
     ///
-    /// MEASURED on PCSE00120: 19,603 direct binds, **0** textures ever put into a state, ~1,286
+    /// MEASURED on a role-playing title: 19,603 direct binds, **0** textures ever put into a state, ~1,286
     /// state binds a frame - and its title-screen art did not draw, because the state binds
     /// erased the sprite texture between the bind and the immediate `sceGxmDraw` that sampled
     /// it. The handler skips empty slots for that reason and this exists so the emitted form
@@ -1896,7 +1896,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     // >>> WHAT WAS FOUND, NOT THE IR: A RECORD PER FUNCTION, AND THE IR IS LIFTED AGAIN AT EMIT.
     //
     // Holding every function's IR from discovery to emission was the allocation peak of a
-    // whole boot: Madden's 7.6 M guest instructions lift to 9.3 M statements in 1.1 M
+    // whole boot: a football title's 7.6 M guest instructions lift to 9.3 M statements in 1.1 M
     // blocks, and the transpile peaked 1,967 MB above where it started - inside a browser
     // worker whose ceiling is 4,096 MB, on a phone. Discovery needs only which addresses are
     // functions (and, for the sweep, where each one ends); emission needs one function at a
@@ -1905,7 +1905,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     // checked), and the module is byte-identical. Discovery's lift skips the flag passes
     // (`lower::discover_shape`), which only rewrite statements.
     //
-    // A second lift is not free (Madden: 6.5 s on the desktop, on top of 8.9 s of
+    // A second lift is not free (that title: 6.5 s on the desktop, on top of 8.9 s of
     // discovery), so IR is KEPT while it fits [`KEEP_IR_BYTES`] and lifted again only past
     // it: a title whose IR fits pays nothing, and one that does not has its peak bounded by
     // the budget instead of by its size.
@@ -2223,13 +2223,13 @@ pub fn transpile_report(program: &Program) -> Report {
 /// starts lifting functions a second time instead, by [`ir_bytes_estimate`].
 ///
 /// The whole-program IR is the peak of a boot, and the browser builds it inside a worker
-/// whose ceiling is 4,096 MB - on a phone. Madden's is ~2 GB; with this budget its
+/// whose ceiling is 4,096 MB - on a phone. A football title's is ~2 GB; with this budget its
 /// transpile peaks ~400 MB above where it started plus this, and smaller titles, whose IR
 /// fits, lift once as before.
 const KEEP_IR_BYTES: usize = 384 << 20;
 
 /// What one function's IR costs on the heap, estimated from its statement count: MEASURED
-/// on Madden as the transpile's whole peak over its statements (1,967 MB / 9.3 M = ~211 B),
+/// on that title as the transpile's whole peak over its statements (1,967 MB / 9.3 M = ~211 B),
 /// which carries the boxed value trees and the blocks along with the 80-byte `Stmt`.
 fn ir_bytes_estimate(f: &ir::Func) -> usize {
     const BYTES_PER_STMT: usize = 211;

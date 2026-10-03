@@ -574,7 +574,7 @@ pub(super) fn get_random_number(ctx: &mut GuestCtx, st: &mut VitaState, buf: Ptr
     }
 }
 
-/// `SCE_KERNEL_MSG_PIPE_MODE_*` bits of a send/receive's mode word, as DOA5's own call sites
+/// `SCE_KERNEL_MSG_PIPE_MODE_*` bits of a send/receive's mode word, as a fighting title's own call sites
 /// use them (a FULL receive of one 4-byte message that dereferences what it got with no
 /// error check; a send of mode `0x11` from a path that must not stall). The low bit asks for
 /// the WHOLE size (FULL) rather than whatever is there (ASAP), and `0x10` is DONT_WAIT.

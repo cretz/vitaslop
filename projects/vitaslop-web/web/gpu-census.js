@@ -1,6 +1,6 @@
 // GPU OBJECT CENSUS (`VITASLOP_GPU_CENSUS=1`): live WebGPU objects by kind, from the JS side.
 //
-// Why it exists: a desktop-browser Hot Shots run (`hslong1`) held its wasm heap flat at 1,084 MB
+// Why it exists: a desktop-browser golf-title run (`long1`) held its wasm heap flat at 1,084 MB
 // while the RENDERER process grew 1,616 -> 2,142 MB and the GPU process 2,103 -> 2,823 MB over
 // seven minutes of golf - a leak no panel could name, because every panel counts what the Rust
 // side holds and neither of those processes is the Rust heap. wgpu hands its objects to the

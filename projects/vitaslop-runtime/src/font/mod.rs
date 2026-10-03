@@ -378,7 +378,7 @@ impl FontLibrary {
         // >>> `advanceWidthMax`.
         //
         // `sceFontGetFontInfo`'s maxima are not decoration: a title sizes its glyph-cache CELLS
-        // from them. MEASURED on PCSA00009 - it lays glyphs out on a fixed pen grid whose pitch
+        // from them. MEASURED on a golf title - it lays glyphs out on a fixed pen grid whose pitch
         // is exactly what these maxima say, 36 px for a 16 px face and 68 px for a 32 px one, and
         // it then draws each cell into a fixed on-screen box. So a face that overstates its
         // maximum glyph gets cells about twice the size of the letters in them, and every string

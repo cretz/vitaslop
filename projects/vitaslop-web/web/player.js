@@ -724,7 +724,7 @@ export function createPlayer({ onExit, onRestart }) {
     stop(false);
     // After the old run has let go of the title's files: an exec reboot opens the SAME files,
     // and opening them while the old worker's storage worker still held them failed with
-    // "this title's files are still open in another worker" (Uncharted, desktop page, 30b).
+    // "this title's files are still open in another worker" (an action title, desktop page, 30b).
     released.then(() => onRestart(id, full));
   }
 

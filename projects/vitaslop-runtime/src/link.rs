@@ -174,12 +174,12 @@ impl LinkedProgram {
     /// `sceUserMainThreadPriority` / `sceUserMainThreadCpuAffinityMask` variables; Vita3K reads
     /// them the same way and starts the main thread with them. Measured across ten titles
     /// (2026-10-02): eight leave both unset or at the default (`0x10000100` = default
-    /// priority, `0x70000` = every user core); Dead or Alive 5 Plus asks for priority 0x56 and
+    /// priority, `0x70000` = every user core); a fighting title asks for priority 0x56 and
     /// mask `0x1`.
     ///
     /// # A mask without bits 16..18 is read as its low bits naming the cores
     /// The kernel's masks name user cores in bits 16..18 (`SCE_KERNEL_CPU_MASK_USER_0 =
-    /// 0x10000`). DOA's `0x1` sets none of them; read as low bits it names core 0, the only
+    /// 0x10000`). That title's `0x1` sets none of them; read as low bits it names core 0, the only
     /// core any reading of it names. That pins the title's main thread to core 0, and every
     /// thread it creates with mask 0 inherits that (see `VitaState::create_thread`).
     pub fn main_thread_request(&self) -> (Option<i32>, Option<i32>) {
@@ -862,7 +862,7 @@ fn var_addend_on() -> bool {
 ///
 /// # >>> THE CODE WORD'S HIGH HALF IS AN ADDEND, AND C++ RTTI DEPENDS ON IT.
 /// This read "the addend is always zero for a variable import" and wrote the bare symbol.
-/// MEASURED on PCSA00029: 1,747 of its ABS32 sites carry `code_word = 0x00080201` - type 2
+/// MEASURED on an action title: 1,747 of its ABS32 sites carry `code_word = 0x00080201` - type 2
 /// (`ABS32`) in byte 1, and **8** in the high half. They are `type_info` objects importing
 /// SceLibc's `__si_class_type_info` VTABLE: a vptr must point 8 bytes INTO a vtable (past
 /// offset-to-top and the type_info pointer), which is exactly the `+ 8`. Without it every

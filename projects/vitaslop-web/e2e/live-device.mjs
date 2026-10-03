@@ -5,7 +5,7 @@
 // The title has to be in the page's OPFS, as it is on a phone. A PERSISTENT profile holds it,
 // so the one-time import (streamed from serve.mjs's /game/<id>/) happens only on the first run.
 //
-//   PARAMS='{"titleId":"PCSA00002","stopFrame":600}' OUT=result.json node e2e/live-device.mjs
+//   PARAMS='{"titleId":"PCSA00000","stopFrame":600}' OUT=result.json node e2e/live-device.mjs
 //
 // Env: URL (default https://127.0.0.1:8443), PROFILE_DIR (required), PARAMS (the job params),
 // OUT (where the result JSON goes), HEADED=1, MAX_S (default 600).

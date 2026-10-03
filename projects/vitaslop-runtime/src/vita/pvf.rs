@@ -422,9 +422,9 @@ fn glyph_image_impl(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, ch: u32, 
     // bitmap sits at pen + (bitmap_left, -bitmap_top).
     //
     // >>> THIS IS THE OPPOSITE OF `pgf::glyph_image`, AND BOTH ARE MEASURED - DO NOT
-    // "UNIFY" THEM. The PGF library's pen is the bitmap's TOP-LEFT (PCSA00009's glyph-cache
+    // "UNIFY" THEM. The PGF library's pen is the bitmap's TOP-LEFT (a golf title's glyph-cache
     // quads sample exactly `[pen, pen+size)`). This PVF library's pen is the BASELINE:
-    // PCSA00027 opens a TTF through `scePvfOpenUserFile` and its control-hint text renders
+    // An RC racer opens a TTF through `scePvfOpenUserFile` and its control-hint text renders
     // correctly under this convention - switching it to top-left (tried 2026-08-28c) pushed
     // every glyph one ascent DOWN and the text vanished under the panel that follows it.
     // Two libraries, two conventions, one title proving each.

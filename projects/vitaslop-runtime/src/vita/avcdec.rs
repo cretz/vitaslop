@@ -1830,7 +1830,7 @@ pub(super) fn videodec_term_library(
 
 /// int sceAvcdecDecodeAvailableSize(SceAvcdecCtrl *decoder)
 ///
-/// Undocumented: no header or wiki gives its meaning. DOA5, its one caller, passes the
+/// Undocumented: no header or wiki gives its meaning. A fighting title, its one caller, passes the
 /// decoder control block and prints the result as `"Available size: %d"` - nothing reads
 /// it otherwise. Answered with the size of the frame buffer the title gave the decoder
 /// (`SceAvcdecCtrl.frameBuf.size`, the one "size" this call can see), never an error.

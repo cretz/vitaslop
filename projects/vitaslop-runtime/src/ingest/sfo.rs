@@ -69,7 +69,7 @@ pub fn text_field(blob: &[u8], key: &str) -> Option<String> {
     None
 }
 
-/// The container's title id (e.g. `PCSA00009`), sanitised to the characters that are safe in
+/// The container's title id (e.g. `PCSA00000`), sanitised to the characters that are safe in
 /// a path component - it names a DIRECTORY on both backends, and a value read out of a game
 /// file must not be able to name a directory somewhere else.
 pub fn title_id(blob: &[u8]) -> Option<String> {

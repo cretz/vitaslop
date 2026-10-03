@@ -418,7 +418,7 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
             "gxm depth: this adapter offers `depth-clip-control`. It is NOT taken by default - \
              it disables the near and far z clip planes TOGETHER, and without the near one a \
              primitive straddling the camera plane is drawn AT the plane instead of being cut \
-             (mlb's post-hit wedge). `VITASLOP_GXP_UNCLIPPED_DEPTH=1` turns the clamp back on."
+             (a baseball title's post-hit wedge). `VITASLOP_GXP_UNCLIPPED_DEPTH=1` turns the clamp back on."
         );
     } else {
         report_warn!(
@@ -434,7 +434,7 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     // far geometry at the plane rather than losing it. The near plane is a different story,
     // and this is what it cost:
     //
-    // MEASURED on mlb, the post-hit "wedge" the user has reported since this title was first
+    // MEASURED on a baseball title, the post-hit "wedge" the user has reported since it was first
     // playable. It is the field-decal pair `764e083d01208aa3`, four vertices of a flat ground
     // quad (y = 0, x in [-132.6, 132.6], z in [-164.4, 100.75]) textured with the 512x512
     // top-down infield atlas `0x8ca7efc0`. Through the draw's own view-projection (read out of
@@ -933,7 +933,7 @@ pub(crate) fn arena_floor_bytes() -> u64 {
 /// >>> with the other wash instruments.
 ///
 /// # The question, which nobody has actually asked the machine
-/// The RTT WRITEBACK fixes one mlb scene and breaks another, and holding its three probe targets
+/// The RTT WRITEBACK fixes one baseball-title scene and breaks another, and holding its three probe targets
 /// back is now REFUTED as a fix (it loses the wide shot). The standing explanation is that "the
 /// consumer is on our side and is unfound", and the obvious candidate - that we sample the
 /// bytes we wrote back INSTEAD of the live render target - has only ever been argued, never
@@ -1129,7 +1129,7 @@ pub(crate) static DEST_AB_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomi
 /// >>> A TEXTURE'S ETC2 ENCODE IS SPREAD OVER LATER FRAMES, AND THE FRAME THAT BINDS IT DRAWS
 /// >>> THE EXACT DECODE MEANWHILE - see `texenc::Transcoder::run_deferred`.
 ///
-/// MEASURED on the phone (MK, runner jobs 078/085): screens that bind dozens of new textures
+/// MEASURED on the phone (a fighting title, runner jobs 078/085): screens that bind dozens of new textures
 /// spent 240-955 ms of GPU in ONE frame encoding them, freezing the display for up to 1.4 s.
 /// `VITASLOP_TEX_ENCODE_DEFER=0` is the arm back: every encode inline, in the frame that binds it.
 #[cfg(feature = "gpu")]
@@ -1303,7 +1303,7 @@ pub(crate) fn gxp_cull() -> bool {
 /// them - see [`gxm::GxmRenderer::precompile_pairs`]. OFF; `VITASLOP_GXP_PRECOMPILE=1` arms it.
 ///
 /// >>> OFF BECAUSE OF WHAT THE PATCHER NAMES, NOT BECAUSE OF THE KEY. MEASURED on the phone
-/// (Madden, job 105): the patcher named 4,096 pairs (the list cap), the walk translated them in
+/// (a football title, job 105): the patcher named 4,096 pairs (the list cap), the walk translated them in
 /// 8,072 ms of render-worker time, and 43 draws used one - 1% of the work, spread as up to 6 ms
 /// of every frame across the loads and the coin toss. The translation speedups and the draw-time
 /// memo (`vitaslop_gxp_shader::link_programs_memo`) are unconditional and are what cut the
@@ -1312,7 +1312,7 @@ pub(crate) fn gxp_cull() -> bool {
 /// This replaced a warmer that was OFF for good reason: it created shader MODULES filed under
 /// the two blobs alone while the draw looked them up under a key folded with the blend, raw-slot
 /// and vertex-layout state, so for every skinned pair it paid the work and the draw paid it
-/// again (Madden hitches -81% worse at the worst window with it on). The translation memo keys on
+/// again (the football title's hitches -81% worse at the worst window with it on). The translation memo keys on
 /// the link's FULL inputs, and the patcher-time entry carries the vertex layout the title created
 /// its program with, so the draw's lookup is the same key by construction.
 pub(crate) fn gxp_precompile() -> bool {
@@ -1329,7 +1329,7 @@ pub(crate) fn gxp_precompile() -> bool {
 /// MEASURED on the user's phone (runner job kind `pipeline-compile`, 100 real corpus pairs): a
 /// synchronous `createRenderPipeline` compiles on Chrome's GPU MAIN thread - the compositor - so
 /// after 10 of them a submit + `onSubmittedWorkDone` probe took 2,024 ms (idle: 1.7 ms) and the
-/// whole browser froze (Hot Shots 5.6 s, MLB 7.8 s). With 10 `createRenderPipelineAsync` in
+/// whole browser froze (a golf title 5.6 s, a baseball title 7.8 s). With 10 `createRenderPipelineAsync` in
 /// flight the same probe took 193 ms.
 pub(crate) fn async_pipelines() -> bool {
     use std::sync::OnceLock;
@@ -1742,7 +1742,7 @@ pub struct GxmTexture {
     /// invented, which the Vita never had"); the decoded path could not, because these two facts
     /// stopped at the runtime and never reached here.
     ///
-    /// MEASURED on PCSA00009's character select: the 1024x512 system-font atlas at `0x8f8b4c00`
+    /// MEASURED on a golf title's character select: the 1024x512 system-font atlas at `0x8f8b4c00`
     /// is written by the guest at one level, and the club-bar label minifies it several times
     /// over - with an invented chain that is a soft grey smear where the device draws small
     /// sharp text.
@@ -2834,7 +2834,7 @@ pub fn raw64_color_format(format: u32) -> bool {
 ///
 /// # The other 32-bit float formats take the same attachment
 /// `U2F10F10F10`, `F16`, `F16F16` and `F32` are HDR surfaces too, and on the UNORM attachment
-/// they clamped exactly as F11F11F10 did. MEASURED on an action title (PCSA00029): it renders
+/// they clamped exactly as F11F11F10 did. MEASURED on an action title: it renders
 /// its whole world into a 720x408 `U2F10F10F10` target and its exposure through 32x32 `F32`
 /// ones; clamped, the tone-map read a world capped at 1.0 against a clamped average and the
 /// night prologue came out near-black. The 10-bit unsigned floats and F16 are EXACT in f16 (5
@@ -2864,7 +2864,7 @@ pub fn float_color_format(format: u32) -> bool {
 /// reads back (see `rtt_writeback::encode_row`). So for an `_A` surface the fragment's alpha has
 /// to be the value that lands in red: the link splats it (`LinkOptions::alpha_to_red`), the
 /// pipeline blends that channel by the guest's ALPHA equation, and the guest's alpha write bit
-/// gates it. MEASURED on a fighting title (PCSE00235): its fight renders four draws a frame into
+/// gates it. MEASURED on a fighting title: its fight renders four draws a frame into
 /// a 128x256 `U8_A` target (0x80900000), which stored red instead.
 /// `VITASLOP_GXM_ALPHA_SINGLE=0` is the arm back to storing red.
 pub fn alpha_single_color_format(format: u32) -> bool {
@@ -3033,7 +3033,7 @@ pub struct RenderScene {
     /// The depth this scene's depth-stencil surface clears to - its `backgroundDepth`
     /// (`sceGxmDepthStencilSurfaceSetBackgroundDepth`, 1.0 after `...Init`).
     ///
-    /// MEASURED on a fighting title (PCSE00235): every scene sets it to 0.0 and draws its world
+    /// MEASURED on a fighting title: every scene sets it to 0.0 and draws its world
     /// with `GREATER_EQUAL` - a REVERSED depth range. Cleared to a fixed 1.0, no surface could
     /// pass its test, the world target held only the always-pass light shafts, and the frame
     /// tone-mapped those into a flat cyan. `VITASLOP_GXM_BACKGROUND_DEPTH=0` is the arm back to
@@ -3816,7 +3816,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// the one instrument that says what a draw LEFT in the target it drew into, live, on the
     /// real pipeline - `VITASLOP_GXM_DRAW_COVERAGE` says whether it rasterised, a capsule says
     /// what it would draw alone, and neither can say that its live output was zero. Built for
-    /// mlb's reflection-cube faces, whose lower half reads back black after a draw the
+    /// a baseball title's reflection-cube faces, whose lower half reads back black after a draw the
     /// coverage query says painted it.
     /// `VITASLOP_GXP_TEXCOORD_NUDGE=<eps>`: add `eps` (normalised units) to every 2-D
     /// `textureSample` coordinate - see [`nudge_texcoords`].
@@ -3829,7 +3829,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// Rewrite every `textureSample(t, s, vec2<f32>(..)..)` so its coordinate is `gxp_nudge2(..)`:
     /// the coordinate plus a tiny positive epsilon. A coordinate computed in f16 (the GXP's half
     /// registers, emulated bit-exactly) lands EXACTLY on texel boundaries, and a point sample
-    /// there is a tie each GPU breaks its own way - measured on the PowerVR phone: MLB's boot
+    /// there is a tie each GPU breaks its own way - measured on the PowerVR phone: a baseball title's boot
     /// light-cell blur read the cells' black gutters and came out darker from identical input.
     fn nudge_texcoords(wgsl: &str, eps: f32) -> String {
         const CALL: &str = "textureSample(";
@@ -4218,7 +4218,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // applying opposite rules to one question is exactly the kind of split this codebase
         // fixes elsewhere.
         //
-        // **It was tried to explain PCSA00009's smudged club label, and it did not: MEASURED at
+        // **It was tried to explain a golf title's smudged club label, and it did not: MEASURED at
         // f2400, ZERO of the 2400 pixels in the label's own box moved.** What DID move was
         // 0.256% of the frame, confined to (282,313)-(424,466) - a patch of the golfer's lower
         // legs - and there is no evidence that patch is more faithful rather than less. A change
@@ -5046,8 +5046,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         ///
         /// A slice pins the guest stream it was built from (see the type's doc comment), and
         /// the only thing that dropped a slice was a compaction or a reset - both triggered by
-        /// the GPU buffer filling at its 128 MB budget. MEASURED in the desktop browser, Mortal
-        /// Kombat walking fights (`mklong1`): 35,703 vertex + 26,864 index slices at f19986 and
+        /// the GPU buffer filling at its 128 MB budget. MEASURED in the desktop browser, a
+        /// fighting title walking fights (`long1`): 35,703 vertex + 26,864 index slices at f19986 and
         /// no compaction yet, the Rust heap climbing 572 -> 899 MB at ~1 MB per second of play
         /// while every byte-budgeted cache sat under its budget. The snapshot caches had evicted
         /// those streams long before; the slices were what kept them allocated.
@@ -5098,7 +5098,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // A bump allocator fills with meshes the title stopped drawing, so "full" says
                 // nothing about the working set. Doubling on every fill took both heaps to their
                 // 128 MB budget and then kept a same-size compaction spare beside each: MEASURED
-                // in the desktop browser (Hot Shots, `hslong3` GPU census) 287 + 143 MB of
+                // in the desktop browser (a golf title, `long3` GPU census) 287 + 143 MB of
                 // resident-heap buffers holding a live set of 15-25 MB. Grow only when the live
                 // set itself needs the room.
                 self.compact(device, queue, keep_from, label);
@@ -5410,8 +5410,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// >>> THE COSTLIEST MEASURED FRAMES OF THE RUN, WITH EVERY PASS - `(summed ms, span ms,
         /// >>> guest frame, passes)`, costliest first, at most [`Self::WORST_KEPT`].
         ///
-        /// `last_passes` is whichever frame landed last, so the one frame worth reading - MK's
-        /// round start, measured at 1,034 ms of GPU on the phone (job 078) - was overwritten a
+        /// `last_passes` is whichever frame landed last, so the one frame worth reading - a fighting
+        /// title's round start, measured at 1,034 ms of GPU on the phone (job 078) - was overwritten a
         /// frame later and the panel could only say it had happened. A frame that expensive is
         /// rare by construction, so it is KEPT, named by guest frame so it lines up with the
         /// page's LONGEST DISPLAY GAPS, and printed pass by pass - including the texture
@@ -5429,7 +5429,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     ///
     /// The transcoder (`crate::texenc`) submits its compute passes while a frame's textures are
     /// prepared, ahead of the frame's own render passes. On a tiling GPU the first timed pass
-    /// after them then absorbs their whole cost, so MK's round start read `1,034 ms` against a
+    /// after them then absorbs their whole cost, so a fighting title's round start read `1,034 ms` against a
     /// render pass with the transcodes invisible. The renderer lends its timestamps here around
     /// the prepare, and the transcoder takes a labelled pair per pass like any render pass.
     pub(crate) fn lent_ts_pair(
@@ -5919,7 +5919,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // The grouping above rests on "draws of one pair either all cover something or
                 // all do not", which is true of the question it was built for (a black frame)
                 // and NOT of the question "which one draw painted over everything". MEASURED on
-                // PCSA00002: a pair whose eight draws total 1,520,090 samples hides whichever of
+                // a baseball title: a pair whose eight draws total 1,520,090 samples hides whichever of
                 // them is the 160,000-sample one, and reading the per-pair list named the WRONG
                 // draw - a suppression run then showed the artefact still there. One ranked line
                 // per pass costs nothing and answers it outright.
@@ -6112,7 +6112,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         ///
         /// This was `HashMap<u32, RttSurface>`, and `ensure_rtt` read a changed extent at a
         /// known address as "the guest resized its target" and REBUILT it - which discards the
-        /// image. MEASURED on a retail baseball title (PCSA00002), every frame:
+        /// image. MEASURED on a retail baseball title, every frame:
         ///
         ///   colour 0x8e20b030 rasterised through render target 0x40000337 (256x256)  - 41 draws
         ///   colour 0x8e20b030 rasterised through render target 0x40000010 (512x1024) -  4 draws
@@ -6227,8 +6227,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// Last frames' sub-rectangle copies, free for reuse by `(width, height, format)`.
         ///
         /// A copy used to be a NEW texture every frame, dropped at the next frame's head and
-        /// left to the browser's collector: MEASURED in the desktop browser (Mortal Kombat GPU
-        /// census `mklong3`) 3,748 `gxm-rtt-subrect` textures made over ~100 s, none destroyed,
+        /// left to the browser's collector: MEASURED in the desktop browser (a fighting title's
+        /// GPU census `long3`) 3,748 `gxm-rtt-subrect` textures made over ~100 s, none destroyed,
         /// 680 / 106 MB of them live at once waiting on a GC - GPU memory the process could not
         /// get back on its own schedule. Reused here, and destroyed past `SUBRECT_FREE_CAP`.
         subrect_free: HashMap<(u32, u32, wgpu::TextureFormat), Vec<wgpu::Texture>>,
@@ -6272,7 +6272,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// first pipelines build synchronously, as they always did, and count as UNWARMED.
         pass_shapes: HashMap<Option<(u32, u32, u32, u32)>, Vec<(wgpu::TextureFormat, u32, bool)>>,
         /// The same shapes by the target's GUEST COLOUR FORMAT alone - the fallback
-        /// `warm_pipelines` predicts a never-encoded target from. MEASURED (MK, desktop Chrome,
+        /// `warm_pipelines` predicts a never-encoded target from. MEASURED (a fighting title, desktop Chrome,
         /// 30c): the worst display gap left, 770 ms at the fight intro, was 16 pipelines built
         /// SYNCHRONOUSLY for a target at a new address - the title allocates a fresh surface of
         /// a format it has drawn before. A wrong guess costs one background compile nobody
@@ -6343,7 +6343,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         ///
         /// # A cube face IS a GXM render target, and this renderer assumed it was not
         /// Both render-target sampler paths are 2D-only, on that stated assumption. MEASURED on
-        /// PCSA00009: ten shader pairs bind a cube at unit 11 naming `0x891e6520`, and the frame
+        /// a golf title: ten shader pairs bind a cube at unit 11 naming `0x891e6520`, and the frame
         /// renders six 256x256 passes at exactly `0x891e6520 + n*0x40000` - six faces of one
         /// 256x256 RGBA8 cube, laid out back to back the way GXM lays out a cube's faces. With
         /// the assumption in place the cube fell through to an upload of GUEST MEMORY, which the
@@ -6527,7 +6527,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// colour targets never shared depth - and on the console they do whenever the guest
         /// says so: the tiler stores a surface's depth at the end of a scene with FORCE_STORE
         /// and loads it at the start of one with FORCE_LOAD (`zlsControl`, see
-        /// [`RenderScene::zls_control`]). MEASURED on an action title (PCSA00029): its deferred
+        /// [`RenderScene::zls_control`]). MEASURED on an action title: its deferred
         /// frame draws the world into a G-buffer with depth at 0x8a8dee00 (store), then lights
         /// it into an HDR target with 49 draws testing EQUAL / LEQUAL / GREATER against that
         /// same depth (load + store). Each started from a CLEARED buffer, so every light and
@@ -6540,7 +6540,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// by (sampled address, width, height, format): the staging buffer the words go through
         /// and the texture a sampler binds. REUSED every frame - made fresh they were ~5 MB of
         /// GPU objects per view per frame left to the garbage collector, the churn that took
-        /// MK's GPU process to 2.3 GB (`subrect_free`).
+        /// a fighting title's GPU process to 2.3 GB (`subrect_free`).
         word_views: HashMap<(u32, u32, u32, wgpu::TextureFormat), (wgpu::Buffer, wgpu::Texture, wgpu::TextureView)>,
         /// TEMPORARY: readbacks pending for `VITASLOP_GXM_DRAW_PROBE`. See [`draw_probe_spec`].
         draw_probes: Vec<DrawProbe>,
@@ -6556,7 +6556,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// This was `Option<String>`, holding the last line, on the reasoning that "a title
         /// whose frame structure is stable pays one line for a run". A race's structure is not
         /// stable - it CYCLES, and a one-slot memo turns a cycle of N shapes into N reports per
-        /// cycle, for ever. MEASURED in the browser on PCSA00015's race: 16,218 of these lines
+        /// cycle, for ever. MEASURED in the browser on a racer's race: 16,218 of these lines
         /// in one run, and with the `gxp: scene has` tally beside it **58,418 warn lines**, worth
         /// **1.9 ms of a 5.0 ms render** - 38% of the browser's whole renderer
         /// ([[vitaslop-a-diagnostic-can-bury-the-findings]] is the same lesson from the other
@@ -8357,14 +8357,14 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // texture they are copied into, under an address that is not their own. Without this
         // the biggest pass in a frame that renders a cube map is reported as "renders into a
         // target nothing reads" forever, which is how this read before cube maps were bound
-        // from their renders at all: face 5 of PCSA00009's environment cube carries 356 draws,
+        // from their renders at all: face 5 of a golf title's environment cube carries 356 draws,
         // the most of any pass in the frame, and only face 0 shares the cube's address.
         cube_faces: &HashSet<u32>,
         // The answer this function reached on the PREVIOUS frame, and it is load-bearing.
         // `cube_faces` comes from `rtt_cubes`, which is filled BETWEEN passes - i.e. after
         // this runs - so on the first frame of a scene it is empty and every cube face looks
         // orphaned. This report fires once and never again, so firing it there pins a false
-        // alarm for the whole run: PCSA00009's course reported its 423-draw environment-cube
+        // alarm for the whole run: the golf title's course reported its 423-draw environment-cube
         // face as "MISSING from the picture" in the same dump whose next line assembled that
         // cube. Requiring the same address twice costs one frame of latency and closes the
         // window, because a cube known on frame N is known on every frame after it.
@@ -8829,7 +8829,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     fn log_pipe(how: &str, k: &PipeCacheKey, g: &GxpRecompile) {
         use std::sync::OnceLock;
         // ALWAYS: count the build, and whether this exact key was built before anywhere in the
-        // process - a rebuild of an identical pipeline is a whole compile paid twice (MK native:
+        // process - a rebuild of an identical pipeline is a whole compile paid twice (a fighting title, native:
         // 32 of 65 pairs built twice), and nothing else can say whether the browser does it too.
         {
             use std::hash::{Hash, Hasher};
@@ -10145,7 +10145,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // projection) a single full-screen quad silently decides the whole pass.
             //
             // MEASURED before it was acted on, over every title that renders: across
-            // PCSA00027, PCSE00341, PCSA00015 and PCSE00001 the two verdicts agree on EVERY
+            // an RC racer, a skating title and two racers, the two verdicts agree on EVERY
             // pass, and they disagree on exactly ONE pass anywhere - a golf title's 960x544
             // world, where 241 perspective draws put 2,058 sampled vertices behind the eye and
             // two screen-space quads put 4 in front. Those four vertices were the whole reason
@@ -10167,7 +10167,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // SETTLE on the first frame that produced any evidence at all - the original
             // rule, and it is the right one now that the KEY distinguishes the passes that
             // share a buffer. Waiting for a PERSPECTIVE draw instead was tried and MEASURED
-            // wrong: a PCSA00015 pass whose fit comes from a draw with no vertex inside the
+            // wrong: a racer's pass whose fit comes from a draw with no vertex inside the
             // frustum then never settles at all, so it re-decides every frame - which
             // re-interprets every pair of the pass per frame (the cost this cache exists to
             // avoid) and lets its stored depth fit drift with the camera. It moved three of
@@ -11808,7 +11808,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // GUEST MEMORY - which the GPU wrote and the guest never did, so the reflection
                 // sampled stale or empty bytes and nothing said so
                 // ([[vitaslop-a-render-target-reads-empty-in-guest-memory]]). MEASURED on
-                // PCSA00009: ten pairs sample a cube at unit 11 naming `0x891e6520`, whose six
+                // a golf title: ten pairs sample a cube at unit 11 naming `0x891e6520`, whose six
                 // faces the same frame renders as six 256x256 passes 0x40000 apart.
                 //
                 // Checked BEFORE the two 2D paths for the same reason the depth path is: an
@@ -12307,7 +12307,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // None of them says what the renderer ended up NAMING, and those differ by design -
             // a render target this frame drew, a depth buffer, a cube, a cached decode of guest
             // bytes, or a fallback are five different answers to one descriptor. MEASURED on
-            // PCSA00002: one draw's descriptor is an 8x8 texture and the pixels it paints are
+            // a baseball title: one draw's descriptor is an 8x8 texture and the pixels it paints are
             // plainly a 512x512 image, and no existing line could say which of those the
             // sampler was given. Reported at `warn` so it survives the default filter, and
             // once per (pair, plan shape) so a 500-draw pass cannot flood the log.
@@ -12541,11 +12541,11 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// NEAREST one is read rather than a blend of two.
     ///
     /// # Why it matters more than a softer or sharper picture
-    /// A texture can carry DATA in a channel. mlb's player material reads a colorization ROW
+    /// A texture can carry DATA in a channel. A baseball title's player material reads a colorization ROW
     /// out of its base texture's 4-bit alpha - `floor(alpha * 15.99)` - and the guest turned
     /// mip filtering off for it. Blending two levels hands that `floor` a fraction of two
     /// indices, and the leg guards came out speckled with other rows' colours (red and white
-    /// dots on a black guard, `vitaslop-mlb` batter and catcher alike).
+    /// dots on a black guard, batter and catcher alike).
     const MIP_NEAREST_SAMPLER_FLAG: u32 = 0x4000_0000;
 
     /// The sampler-mode key of a guest texture: its filter, its address modes, and whether it
@@ -12892,7 +12892,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // (A GPU plan with `repeat > 1` - a flat texture bound to a CUBE sampler - lands
             // neither here nor in the arm above: the transcoder makes only the source's own
             // layers, so it takes the ordinary decode below. This was an `unreachable!` that
-            // PANICKED the phone's Madden run at the coin toss, job 067.)
+            // PANICKED the phone's football-title run at the coin toss, job 067.)
             enc(&ENC.tex_uploaded, 1);
             enc_tex_upload(c.byte_len() as u64);
             enc(&ENC.tex_uploaded_compressed, 1);
@@ -14292,8 +14292,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         let u16at = |o: usize| -> Option<u16> { buf.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]])) };
         match gxm_format {
             // F32, and UNTYPED (10): a 32-bit word the fetch hands the shader UNCONVERTED, so the
-            // f32 carrying exactly those bits is that word. MEASURED on a fighting title
-            // (PCSE00235): its engine clears a target with a fullscreen triangle whose only
+            // f32 carrying exactly those bits is that word. MEASURED on a fighting title:
+            // its engine clears a target with a fullscreen triangle whose only
             // attribute is UNTYPED x2 - float positions. Reading it as 0.0 collapsed the triangle
             // to a point, the clear drew nothing, and a map the game clears to alpha 1 stayed at
             // alpha 0 - which its character shader multiplies every surface colour by.
@@ -14677,7 +14677,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// # A REPORT THAT EXISTS IS NOT A DIAGNOSTIC A READER CAN COUNT
     /// `report_vertex_plan_ok` and `report_vertex_repack` already say, per pair, which of the
     /// three plans it got. They cannot be COUNTED: both go through panels that keep 96 distinct
-    /// lines and drop the rest (one mlb run dropped 379 from STATUS and 293 from the warnings
+    /// lines and drop the rest (one baseball-title run dropped 379 from STATUS and 293 from the warnings
     /// panel), so grepping a log for them answers a question about the panel's capacity.
     /// MEASURED against that: two changes that each took pipelines off the repack moved the
     /// per-frame `packed_passthrough` counter by 95 -> 140 draws of 605 while the log said every
@@ -15678,9 +15678,9 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// (`api` = the graphics API's `(0, 0, 0, 1)`, `zero`, `one`).
     ///
     /// # ONE CONSTANT CANNOT SERVE TWO TITLES - MEASURED, BOTH DIRECTIONS
-    /// Ridge Racer's cows are correct at 1.0 and turn BRIGHT GREEN/CYAN under a zero
+    /// A racer's cows are correct at 1.0 and turn BRIGHT GREEN/CYAN under a zero
     /// (`f008800` is the discriminating frame; 10 of its 12 oracle frames are identical either
-    /// way). Mortal Kombat's effect meshes do the exact reverse: `Input.Color` with BLUE pinned
+    /// way). A fighting title's effect meshes do the exact reverse: `Input.Color` with BLUE pinned
     /// to 1.0 is a saturated cyan mass, and `Input.CornerIndex` with two lanes pinned to 1 is a
     /// stretched quad. The obvious discriminator - the guest's attribute FORMAT - is refuted:
     /// both titles carry over-wide attributes on plain F32. What separates them is what each
@@ -16384,7 +16384,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // PowerVR CLAMPS window depth; it does not clip on it. The default arm leaves that clamp
         // to the rasteriser (`unclipped_depth`), which only a device offering
         // `depth-clip-control` can grant - and a PowerVR phone does not offer it. There every
-        // vertex whose depth fell outside [0, w] was CLIPPED: MLB's boot splash quads sit at clip
+        // vertex whose depth fell outside [0, w] was CLIPPED: a baseball title's boot splash quads sit at clip
         // z = -1 with no viewport set, so all 1,400 frames of logos and the health warning were
         // clipped away and the only thing left on screen was the title's black fade quad
         // (measured on the device: `VITASLOP_GXP_KEYCOLOR` + `VITASLOP_GXP_NODEPTH` with the fade
@@ -16608,7 +16608,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // [[vitaslop-a-render-target-reads-empty-in-guest-memory]]. That case only ever looks at
         // textures bound at a target's OWN address, so a recycled allocation that starts a few
         // bytes INTO a freed target came through here unchecked and was handed the old target.
-        // MEASURED (Madden, desktop browser, 2026-09-25): the scoreboard's EA SPORTS badge bound
+        // MEASURED (a football title, desktop browser, 2026-09-25): the scoreboard's publisher badge bound
         // `rendered@0x9257ab00` - a 32x64 target last drawn in the front end - and drew as a flat
         // RED SQUARE; native bound the guest's decode only because a slower run had already aged
         // the target out after its one-minute TTL. Real guest bytes: sample those.
@@ -16821,7 +16821,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // >>> AS PRESSURE. A frame that bound no textures - a loading screen, a black fade -
         // published a real 0 here, so the NEXT screen's first frames read as "unknown" and
         // re-encoded every BC texture they bound to ETC2 on a phone whose working set was 22 MB
-        // of 477. MEASURED (MK, runner job 085): the two worst display gaps of the run, 1.46 s
+        // of 477. MEASURED (a fighting title, runner job 085): the two worst display gaps of the run, 1.46 s
         // and 1.40 s, were 46 and 56 textures transcoded at a screen's first frame, almost all
         // `Bc -> Etc2Rgba8` - a second lossy step the budget never asked for, at ~17 ms of GPU
         // each on that device.
@@ -16987,7 +16987,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// >>> two render targets sharing one colour address being mistaken for one that resized.
     ///
     /// `rtt` is keyed by `(address, width, height)` now, so a different extent at a known
-    /// address is a different target and a first sighting. MEASURED on PCSA00002: this line
+    /// address is a different target and a first sighting. MEASURED on a baseball title: this line
     /// fired every frame on the three stadium-board addresses 0x8e55a090, 0x8e79c2e0 and
     /// 0x8ec4a8e0, where a 4-draw 512x1024 pass and a 41-draw 256x256 pass share a colour
     /// surface - and each recreation threw the other pass's image away. Those boards rendered
@@ -17220,6 +17220,19 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(addr) {
             report_warn!(
                 "gxm rtt {addr:#x} is registered as BOTH a rendered colour target and a converted DEPTH surface. Binding the COLOUR: a sampler naming a colour target wants the image, and the depth path is consulted first, so this would otherwise hand it a distance. One of the two registrations is wrong."
+            );
+        }
+    }
+
+    /// Say - once per address - that a colour pass began into an address that held a converted
+    /// DEPTH surface, which was retired so no later sampler binds it there. See the scene loop.
+    fn report_depth_retired_by_colour(addr: u32) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
+        if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(addr) {
+            report_status!(
+                "gxm rtt {addr:#x}: a COLOUR pass began into memory a depth pass used, so the depth converted there is retired - a sampler naming {addr:#x} now gets the colour image (or the guest's bytes), not a distance"
             );
         }
     }
@@ -18599,8 +18612,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // >>> THE GUEST'S ATTRIBUTE FORMAT, because it is the only variable left that
                 // >>> could make ONE rule right for two titles that need opposite fills.
                 //
-                // MEASURED both ways on this machine: Ridge Racer's cows are correct at a fill
-                // of 1.0 and turn BRIGHT GREEN/CYAN under the API's `(0,0,0,1)`; MK's effect
+                // MEASURED both ways on this machine: a racer's cows are correct at a fill
+                // of 1.0 and turn BRIGHT GREEN/CYAN under the API's `(0,0,0,1)`; a fighting title's effect
                 // meshes do the reverse - `Input.Color` with blue pinned to 1.0 is the
                 // saturated mass a user photographed. `component_count` is the guest's own word
                 // (read straight off `SceGxmVertexAttribute`), so this is not a case of
@@ -20783,7 +20796,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     // wgpu's web `BufferViewMut` is a COPY: the first write pulls the whole
                     // mapped range into the wasm heap (`Uint8Array::to_vec`), and the drop
                     // `set`s it all back - three passes over every uploaded byte, MEASURED at
-                    // 1.4% + 0.5% of the busy worker on mlb. The read view's `Uint8Array` is
+                    // 1.4% + 0.5% of the busy worker on a baseball title. The read view's `Uint8Array` is
                     // the mapped `ArrayBuffer` itself, and WebGPU does not care which kind of
                     // view a mapped range is written through, so one `set` from a view of
                     // `data` does the whole upload. Same allocation, same copy command as
@@ -20994,7 +21007,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// the hardware writes. A later program that declares an F16F16F16F16 TEXTURE over the
         /// same memory samples those words as four halves - FILTERED, through its own sample
         /// instruction - and an `Rg32Uint` texture can be neither filtered nor sampled.
-        /// MEASURED on a fighting title (PCSE00235): its image-based lighting renders 12x72 and
+        /// MEASURED on a fighting title: its image-based lighting renders 12x72 and
         /// 24x144 F16F16F16F16 intermediates and filters them into the lighting cubes; with
         /// only the raw view the cube pass was refused and every character was unlit.
         fn convert_raw_to_float(
@@ -21390,8 +21403,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     sample_count: samples,
                     dimension: wgpu::TextureDimension::D2,
                     // The colour texture's OWN format, which a float surface overrides: a resolve
-                    // must land in a texture of the attachment's format. MEASURED on a racer
-                    // (PCSA00015): a multisampled F16 target resolved an Rgba8Unorm attachment
+                    // must land in a texture of the attachment's format. MEASURED on a racer:
+                    // a multisampled F16 target resolved an Rgba8Unorm attachment
                     // into its Rgba16Float `color`, wgpu refused every pass, and the frame was black.
                     format: want_format,
                     // RENDER_ATTACHMENT only: nothing samples the multisampled image. What
@@ -22048,7 +22061,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// scene (a viewport per face) and binds the address as a cube, and on hardware nothing
         /// converts anything.
         ///
-        /// MEASURED on a fighting title (PCSE00235): at stage load it renders its image-based
+        /// MEASURED on a fighting title: at stage load it renders its image-based
         /// lighting into three such targets (`0x93379000` 16x96, `0x9337a800` 16x96,
         /// `0x9337c000` 32x192) with one pair, and every character draw afterwards samples them
         /// as 16x16 / 32x32 CUBES - its diffuse and specular light. Nothing assembled them, the
@@ -22302,8 +22315,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// the layout its vertex program was created with) is linked into the translation memo
         /// under the SAME options the draw path computes for its common case - see
         /// `vitaslop_gxp_shader::link_programs_memo`. The draw then finds it and pays a hash,
-        /// not a translation: MEASURED, our translation was 731-780 ms of in-frame time a Hot
-        /// Shots session and the whole of the "new character appears" stall on MK. A draw whose
+        /// not a translation: MEASURED, our translation was 731-780 ms of in-frame time a golf
+        /// title's session and the whole of the "new character appears" stall on a fighting title. A draw whose
         /// state differs (a dual-source blend, a raw sampler slot, a masked colour) misses and
         /// translates as before, so this can cost work but never a picture.
         ///
@@ -22565,7 +22578,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 belt.recall();
                 // >>> AND GIVE A BURST'S CHUNKS BACK. The belt's free list never shrinks, so a
                 // course load's high-water mark stayed mapped for the whole run: MEASURED in the
-                // desktop browser (Hot Shots GPU census `hslong4`) 36 chunks / 147 MB, against a
+                // desktop browser (a golf title's GPU census `long4`) 36 chunks / 147 MB, against a
                 // steady frame that uses one or two. Every ten seconds, keep a reserve and
                 // destroy the rest (the vendored `trim_free`, a marked VITASLOP PATCH).
                 if self.chain_frames_seen.is_multiple_of(600) && super::memory_bound_on("VITASLOP_STAGING_TRIM") {
@@ -22593,7 +22606,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // >>> DROP THE PASS ARENAS ONLY A LOAD FRAME REACHED. A slot exists per pass ORDINAL
             // (times the ring), so the count is the most passes any one frame ever opened and
             // each slot keeps the largest size it ever needed: MEASURED in the desktop browser
-            // (Hot Shots GPU census `hslong4`) ~300 `gxp-vbo` + ~250 `gxp-ubo`/`gxp-ibo`,
+            // (a golf title's GPU census `long4`) ~300 `gxp-vbo` + ~250 `gxp-ubo`/`gxp-ibo`,
             // ~137 MB, sized by course loads. Trailing slots idle for `ARENA_IDLE_FRAMES` go
             // to the graveyard with the rest; their last use was hundreds of submits ago. A
             // pass that reaches that ordinal again re-creates the slot under a fresh
@@ -22751,7 +22764,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // exists to make that geometry free.
             // >>> ...BUT NOT ON EVERY FRAME, BECAUSE THE DEVICE PRICED IT AND IT IS NOT FREE.
             //
-            // MEASURED on the user's phone, mlb's stadium: `head 1.4 ms (sweeps 1.1 + scans 0.2
+            // MEASURED on the user's phone, a baseball title's stadium: `head 1.4 ms (sweeps 1.1 + scans 0.2
             // + rtt 0.0)` - so this block and the promotion sweep below were **1.1-1.4 ms of a
             // 35 ms frame**, almost all of it spent deciding that nothing needed doing. Both
             // walks are proportional to what the caches HOLD, not to what the frame draws:
@@ -22931,8 +22944,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // >>> ...UNLESS THAT SCENE IS NOT A DISPLAY BUFFER AT ALL.
             //
             // "The last scene's target is the display" put an OFFSCREEN pass on the screen
-            // whenever a captured frame ended on one: MEASURED on Dead or Alive 5 Plus's K.O.
-            // (browser `doaweb1`, native `doa79` f6600/f7050 and `doa80` f6900) the frame closes
+            // whenever a captured frame ended on one: MEASURED on a fighting title's K.O.
+            // (browser run `web1`, native runs `79` f6600/f7050 and `80` f6900) the frame closes
             // with the NEXT frame's 128x256 fighter-silhouette pass at 0x93394000, so the whole
             // screen became that silhouette - natively on black, in the browser as a black box
             // over the last picture. The console shows the buffer the guest FLIPPED.
@@ -23082,7 +23095,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                         // all-zero buffer is not evidence of a dead target - it is evidence of a
                         // LIVE one, and blocking it hands the draw an empty texture.
                         //
-                        // MEASURED on PCSE00120, which is what found this: its title-screen logo
+                        // MEASURED on a role-playing title, which is what found this: its title-screen logo
                         // is rendered into an 840x476 target and sampled through a 1024x1024
                         // descriptor, and blocking the alias drew the logo as an untextured
                         // gradient band. The 192x192-against-1024x1024 cases the block was built
@@ -23438,6 +23451,23 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // address 0x8e20b030 in the same frame, and an address-only lookup here handed
                 // the 4-draw pass the 41-draw pass's target and then rebuilt it.
                 let key = (t.data_addr, t.width, t.height);
+                // >>> A COLOUR PASS INTO AN ADDRESS RETIRES THE DEPTH CONVERTED THERE.
+                //
+                // A title may reuse one block of memory as a pass's DEPTH and, later in the
+                // frame, as another pass's COLOUR target. Once the colour pass begins, that memory
+                // is a colour image's, so the converted depth registered at the address - which
+                // the sampler side consults FIRST, by exact address - no longer describes it. Left
+                // in place it is bound for any draw naming the address before the colour pass is
+                // registered as rendered (the colour pass sampling its own target), and the depth
+                // conversion holds its distance in the RED channel. MEASURED (a fighting title, every fight):
+                // the 128x256 shadow pass's depth sits at 0x93ca1000, which is also the 512x128
+                // glow atlas; the atlas's second draw sampled the depth as its first level, and
+                // the glow added a translucent RED band x 480-720 over 5-9% of desktop frames, and
+                // a red wash over the whole fight in the browser.
+                if self.rtt_depth_rendered.remove(&t.data_addr).is_some() {
+                    self.rtt_depth_addrs.remove(&t.data_addr);
+                    report_depth_retired_by_colour(t.data_addr);
+                }
                 // Drawing into a buffer this frame already filled, which this pass may also
                 // sample: hand it a snapshot to read so the live buffer is a target only.
                 self.rtt_reads_snapshot.clear();
@@ -23593,7 +23623,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // >>> reads it reads THIS frame's. The depth came from an earlier pass - on a
                 // deferred title the G-buffer pass, which renders RAW and converts nothing - and
                 // the newest conversion at the address was otherwise last frame's. MEASURED on
-                // an action title (PCSA00029): its lighting samples 0x8a8dee00 while it tests
+                // an action title: its lighting samples 0x8a8dee00 while it tests
                 // against it, and read the previous frame's depth to rebuild positions.
                 let loaded = self.depth_load_now;
                 if loaded && want_depth {
@@ -24220,7 +24250,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             //
             // Rule 1 can only ever fire where an address holds more than one target, which is
             // why `declared` below is not even collected otherwise: with one target per address
-            // - every title measured before PCSA00002 - every candidate scores identically on
+            // - every title measured before the baseball title - every candidate scores identically on
             // it and this produces precisely the map it always did.
             let ambiguous: HashSet<u32> = {
                 // The DISTINCT keys of the two maps, unioned first. A rendered target is
@@ -24295,8 +24325,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             //
             // A target held from an EARLIER frame at such an address with a DIFFERENT extent is
             // stale: the memory it stood for has since been rewritten as the other surface, so
-            // its image is no longer what those bytes hold. MEASURED on a fighting title
-            // (PCSE00235): its bloom builds a mip chain inside ONE 512x128 surface and reads
+            // its image is no longer what those bytes hold. MEASURED on a fighting title:
+            // its bloom builds a mip chain inside ONE 512x128 surface and reads
             // level 0 back through a 256x128 texture at the surface's own address; the extent
             // match handed that draw a 256x128 target left over from the character-select
             // screen - a red-only image - and every bloom level after it, and the final frame,
@@ -24404,7 +24434,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // A 64-bit pixel is two words in memory, so a title can sample the SAME surface as a
             // 32-bit texture twice as wide, with the surface's own row pitch: at the base address
             // every even texel is a pixel's first word, at base+4 its second. MEASURED on an
-            // action title (PCSA00029): its deferred lighting reads its F32F32 G-buffer
+            // action title: its deferred lighting reads its F32F32 G-buffer
             // (0x8ac5fec0, 720x408) as a 1440x408 U8U8U8U8 texture (albedo) and again at +4 as
             // S8S8S8S8 (normals). Neither matched the held raw surface, and the address's entry
             // in `sample_views` was LAST frame's final RGBA8 image, which the frame writes over the
@@ -24522,7 +24552,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // Its address lies INSIDE the target and its row stride IS the target's pitch, so on
             // the hardware it reads exactly the texels at `(offset / 4) % pitch`,
             // `(offset / 4) / pitch` onward - a window onto the surface, clamped at its own
-            // edges. MEASURED on a fighting title (PCSE00235): its bloom builds a mip chain
+            // edges. MEASURED on a fighting title: its bloom builds a mip chain
             // inside ONE 512x128 surface and its final composite samples level 2 as a 128x64
             // texture 1536 bytes in. The range alias (`rendered_alias`) bound the WHOLE surface
             // at its origin, so the composite stretched all three levels across the screen and
@@ -25596,7 +25626,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                                 // exactly the same thing to wgpu with no allocator in the loop. The
                                 // browser is where that matters: the allocator is a measured 7.3% of
                                 // the busy worker on this title's race
-                                // (PCSA00015, the race), and a wasm malloc
+                                // (a racer, the race), and a wasm malloc
                                 // is dearer than a native one. The bytes handed to `set_bind_group`
                                 // are unchanged, so the frame is bit-identical.
                                 //
@@ -25835,7 +25865,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// A display buffer is an address the guest has FLIPPED (`sceDisplaySetFrameBuf`) at
         /// some point in the run - its own statement, kept in `flipped_ever`. The capture does
         /// not end exactly on a flip, so a frame can close with the NEXT frame's opening pass
-        /// (MEASURED, DOA5 native `doa80` f6900: `... 0x9257e000:2 0x93394000:4`, the display
+        /// (MEASURED, a fighting title, native run `80` f6900: `... 0x9257e000:2 0x93394000:4`, the display
         /// composite then the 128x256 silhouette target). Then:
         ///   * `Scene(a)`: the last scene drawing into a display buffer is the display, and the
         ///     trailing passes are offscreen - they still render, in order, for the next frame.
@@ -26073,7 +26103,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         ///
         /// Separate from [`Self::rtt_targets`] because [`Self::rtt_raw`] is a separate map, and
         /// that is why a dump built on `rtt_targets` alone has never contained one: a title's
-        /// 64-bit surface is invisible to it. On PCSA00002 that surface is the CROWD ATLAS its
+        /// 64-bit surface is invisible to it. On a baseball title that surface is the CROWD ATLAS its
         /// sprite pass reads as two packed words a texel - the last unmeasured input of that
         /// title's washed-out close-up, and unreadable until this existed.
         pub fn rtt_raw_targets(&self) -> Vec<(u32, &wgpu::Texture, u32, u32)> {

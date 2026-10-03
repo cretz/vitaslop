@@ -382,7 +382,7 @@ fn halve(@builtin(global_invocation_id) gid: vec3<u32>) {
 // The first port kept every selector set as `array<i32, 16>` (six of them live at once, copied
 // by value at every "keep the best so far") and walked a subblock as all sixteen texels with a
 // `continue` for the other eight. MEASURED on the phone (PowerVR, runner job 081): 18 ms for a
-// 512x512 RGB level and 30 ms RGBA - and MK's round start encodes 18 textures in one frame. A
+// 512x512 RGB level and 30 ms RGBA - and a fighting title's round start encodes 18 textures in one frame. A
 // selector is 2 bits (3 for EAC), so a set is one `u32` (a `vec2<u32>` for EAC) and "copy the
 // best" is a register move; the eight texels of a subblock are named by `sub_texel` in the same
 // ascending order the sixteen-texel walk visited them, so every early-out fires at the same
@@ -1137,7 +1137,7 @@ fn encode_etc2(@builtin(global_invocation_id) gid: vec3<u32>) {
 //
 // One dispatch per level serialised the chain: each dispatch waits for the one before it, and
 // a small level is ONE block's search, which on the phone's GPU is a millisecond or two of one
-// thread's latency whatever the level's size. MEASURED (MK, runner job 085): a 128x128 BC3
+// thread's latency whatever the level's size. MEASURED (a fighting title, runner job 085): a 128x128 BC3
 // texture - 8 levels, 1,365 blocks - took 17 ms, and a 2048x1024 one only 57. The levels are
 // independent once the RGBA8 chain exists (every block is encoded from the chain alone), so
 // they can share a dispatch and the latency is paid once. Same blocks, same bytes.

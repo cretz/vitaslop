@@ -206,7 +206,7 @@ pub fn smp_owner_only(func_nid: u32) -> bool {
 /// of the title's storage ring: when they do, the pure file families (`sceIo`, `sceFios`) run
 /// where they are made. `VITASLOP_SMP_FORWARD` still wins - it is the bisection override.
 ///
-/// MEASURED why (`tel25h`, MLB): with audio off the forward list, `sceIoPread` was the only
+/// MEASURED why (`tel25h`, a baseball title): with audio off the forward list, `sceIoPread` was the only
 /// per-frame forward left, and each one parked its thread and held the idle clock for the
 /// length of a present.
 pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
@@ -219,8 +219,8 @@ pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
         "sceAudiodec",
         // NOT sceAudioOut: its sink writes a SharedArrayBuffer ring through per-WORKER views
         // (`vitaslop_web::audio::install_ring`), so it runs on whichever worker calls it.
-        // MEASURED forwarded (tel25f/g): it was the per-frame forward that parked MLB's and
-        // Madden's audio threads behind every present.
+        // MEASURED forwarded (tel25f/g): it was the per-frame forward that parked a baseball and
+        // a football title's audio threads behind every present.
         "sceAudioIn",
         "sceLocation",
         "sceAppUtil",
@@ -245,13 +245,13 @@ pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
     // A family's COMMON DIALOG calls (`sceSaveDataDialog*`, `sceNpTrophySetupDialog*`) are the
     // dialog state machine in `services` - host state only, no file and no JavaScript - and a
     // title polls their status once a frame. Forwarded, each poll parked its thread until the
-    // run worker's present was over (Madden: 62 of 158 forwards a window).
+    // run worker's present was over (a football title: 62 of 158 forwards a window).
     if name.contains("Dialog") {
         return false;
     }
     // The system/app PARAMETER getters answer constants (`services::apputil_*_param_get_*`) -
-    // no state, no file, no JavaScript - and a title may poll them every frame: MEASURED DOA5
-    // (`sw25r-doa`) 96 forwards a window of `sceAppUtilSystemParamGetInt`.
+    // no state, no file, no JavaScript - and a title may poll them every frame: MEASURED a fighting
+    // title (`sw25r`) 96 forwards a window of `sceAppUtilSystemParamGetInt`.
     if name.starts_with("sceAppUtilSystemParam") || name.starts_with("sceAppUtilAppParam") {
         return false;
     }
@@ -269,7 +269,7 @@ pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
 /// locally when it says so, and forwards it otherwise.
 ///
 /// `sceAudiodecDecode` serves two codecs under one NID: AT9 (pure Rust) and a movie's AAC (the
-/// run worker's WebCodecs). MEASURED (`sw25r-doa`): 200 AT9 decodes a window were forwarded,
+/// run worker's WebCodecs). MEASURED (`sw25r`): 200 AT9 decodes a window were forwarded,
 /// each parking its audio thread until the run worker's present was over.
 pub fn smp_forward_per_call(func_nid: u32) -> bool {
     matches!(func_nid, ad_nid::DECODE | ad_nid::DECODE_N_FRAMES)

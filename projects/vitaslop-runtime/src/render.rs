@@ -1643,7 +1643,7 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
     // about CPU cost. It was also about QUALITY - ETC2 is a second lossy step over the guest's
     // own compression and buys only megabytes (see `block_source`, which decodes such a texture
     // on the GPU exactly and was written on the understanding that this refusal still applied)
-    // - and the GPU encode is not free either. MEASURED on the phone (MK, round start): 1.3 s of
+    // - and the GPU encode is not free either. MEASURED on the phone (a fighting title's round start): 1.3 s of
     // GPU time in one frame re-encoding the new fight's textures, 36 of them BC3, freezing the
     // display 1.6 s and then 0.6 s more while the queue caught up; with compression off the
     // same frame took 4 ms of GPU. So BC waits for real budget pressure here too, exactly as the
@@ -1686,7 +1686,7 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
     // words ("a cheap encoder is a reason to spend CPU, never a reason to spend QUALITY").
     // Every one of those statements is true.
     //
-    // **MEASURED 2026-08-28b on PCSA00015's campaign race, and the trade is not close:
+    // **MEASURED 2026-08-28b on a racer's campaign race, and the trade is not close:
     // one frame's texture working set went 62 MB -> 207 MB, 3.3x.** The picture did improve -
     // 48% of pixels at max delta 15 across the whole front end, which is exactly the BC1
     // re-encode error disappearing - but a delta of 15 is not worth 145 MB on a device where
@@ -3608,7 +3608,7 @@ fn snorm16_to_u8(raw: u16) -> u8 {
 /// so no amount of re-reading the header settles it. **This used to take the first reading, and
 /// it was wrong.**
 ///
-/// MEASURED on PCSA00009, which is the only kind of evidence there is here. Its single-channel
+/// MEASURED on a golf title, which is the only kind of evidence there is here. Its single-channel
 /// textures use exactly three of the eight modes - `1RRR` x485, `R000` x1052 and `R111` x5 in
 /// one frame - and under the low-to-high reading those decode to `[1,r,r,r]`, `[r,0,0,0]` and
 /// `[r,1,1,1]`: one of them opaque with the byte in three channels, one of them **alpha zero on
@@ -7614,7 +7614,7 @@ impl RenderSceneBuilder {
             // NOT license is taking those 4 KB off the FRONT - see the strided sample below
             // for the buffer that argument let through.
             // >>> A BUFFER NOTHING HAS WRITTEN IS NOT ONLY A BUFFER OF ZEROS. A retail title
-            // fills a fresh allocation with its OWN poison - MLB 12 uses `0xBAADCAFE` - and
+            // fills a fresh allocation with its OWN poison - a baseball title uses `0xBAADCAFE` - and
             // such a buffer is exactly as empty as one of zeros. A test for zero alone calls
             // it real data, REFUSES the render-target alias, and the draw then samples the
             // poison: MEASURED as the three flat salmon video boards in that title's stadium,
@@ -10295,7 +10295,7 @@ mod texture_tests {
         // `swizzle1`'s own doc for the measurement and for why the header cannot settle it.
         //
         // R111 (7): white RGB with the byte as ALPHA - a glyph atlas. Decoding this as
-        // `[c,255,255,255]` is what painted PCSA00009's every string as a cyan box.
+        // `[c,255,255,255]` is what painted a golf title's every string as a cyan box.
         let t = tex(0x00, 7, 1, 1, 1, vec![c]);
         assert_eq!(sample_texture(&t, 0.5, 0.5), [255, 255, 255, c]);
         // R000 (6): black with the byte as alpha - a mask. The mirror of R111, and the mode

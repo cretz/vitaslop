@@ -99,7 +99,7 @@ pub struct Transcoder {
     /// >>> THE TWO ETC2 ENCODER PIPELINES ARE BUILT WHEN FIRST NEEDED, NOT AT CONSTRUCTION.
     ///
     /// The encoder is by far the biggest shader here, and a pipeline created at construction is
-    /// compiled by the GPU process AHEAD of everything the title asks for next. MEASURED (MK,
+    /// compiled by the GPU process AHEAD of everything the title asks for next. MEASURED (a fighting title,
     /// desktop Chrome, 30c): the run's first four render pipelines settled at ~1.45 s each -
     /// 14-51 ms each compiled alone - and the boot logos froze 2.8 s; the phone compiles the
     /// encoder in ~10 s cold. `encode_chain` is built eagerly only where it will certainly run
@@ -967,7 +967,7 @@ impl Transcoder {
     /// >>> THE SAME TRANSCODE, WITH THE ENCODE SPREAD OVER LATER FRAMES - AND AN EXACT PICTURE
     /// >>> MEANWHILE.
     ///
-    /// MEASURED on the phone (MK, round start, runner job 078): one frame read `1,034 ms` of GPU
+    /// MEASURED on the phone (a fighting title's round start, runner job 078): one frame read `1,034 ms` of GPU
     /// with 18 PVRTC textures transcoded in it, and the display froze 1.4 s. The encoder runs at
     /// 13-30 ms per 512x512 level on that GPU (`texenc-bench`, jobs 083/084) - it is a search,
     /// and no rewrite of it makes eighteen fighters' worth fit in one frame. The decode and the

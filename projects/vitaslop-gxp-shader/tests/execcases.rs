@@ -1260,7 +1260,7 @@ fn a_full_precision_move_carries_the_view_of_what_it_moved() {
     let o = |i: u8| Operand::plain(Bank::Output, i, 1);
 
     // Half-precision arithmetic fills `pa[0]`/`pa[1]`, then a FULL-PRECISION move copies those
-    // two whole words into `o[0]`/`o[1]` - the exact shape `mk-corpus-roof__frag_86c41b20` ends
+    // two whole words into `o[0]`/`o[1]` - the exact shape `__frag_86c41b20` ends
     // with, and the one that made a NaN sign bit read as 4,227,955,712 ULP.
     let mut mov = make(Op::Mov, o(0), vec![pa(0)], [true, true, false, false], false);
     mov.srcs[0].swizzle = [0, 1, 0, 1];

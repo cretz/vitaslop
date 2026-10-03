@@ -4,9 +4,9 @@
 //! # Why the browser's own scaling is not good enough
 //! The canvas used to be 960x544 and the browser stretched it to the screen with bilinear
 //! filtering. On a phone that is a ~2x non-integer stretch, and every hard-edged pixel the
-//! title draws - text above all - comes out soft: MLB's warning screen is a 1:1 texel-for-pixel
+//! title draws - text above all - comes out soft: a baseball title's warning screen is a 1:1 texel-for-pixel
 //! blit of hard-edged glyphs (measured: the rendered frame is crisp and matches the desktop
-//! texel for texel), and the user saw it blurred on the phone while Hot Shots' antialiased font
+//! texel for texel), and the user saw it blurred on the phone while a golf title's antialiased font
 //! survived the blur. Nearest-neighbour (`image-rendering: pixelated`) is crisp but at a
 //! non-integer ratio it drops or doubles whole columns unevenly.
 //!

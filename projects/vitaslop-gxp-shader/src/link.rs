@@ -471,7 +471,7 @@ fn memo_store(v: &[u8], f: &[u8], opts: LinkOptions, r: Result<std::sync::Arc<Li
 /// [`link_programs_with`], memoised on EXACTLY its inputs - both blobs by content and the whole
 /// [`LinkOptions`] - so a hit is by construction the module a fresh link would produce.
 ///
-/// MEASURED: a Hot Shots session spent 731-780 ms of in-frame time in OUR translation (USSE ->
+/// MEASURED: a golf title's session spent 731-780 ms of in-frame time in OUR translation (USSE ->
 /// IR -> WGSL), against 20-45 ms in the browser's compile and pipeline creation - every new pair
 /// a hitch in the frame that first drew it (the "new fighter appears" stall, the load stutter).
 /// On the console the equivalent work happens when the title calls
@@ -515,8 +515,8 @@ type RcMemo<T> = std::sync::Mutex<Option<std::collections::HashMap<u64, Vec<(std
 static VERTEX_RC_MEMO: RcMemo<crate::RecompiledVertex> = std::sync::Mutex::new(None);
 static FRAGMENT_RC_MEMO: RcMemo<crate::RecompiledFragment> = std::sync::Mutex::new(None);
 
-/// A program's decode, done once per distinct blob. A title pairs one program with many (Hot
-/// Shots creates 1,087 fragment programs against a few hundred vertex programs), and every link
+/// A program's decode, done once per distinct blob. A title pairs one program with many (a golf
+/// title creates 1,087 fragment programs against a few hundred vertex programs), and every link
 /// of every pair used to decode BOTH from scratch - 22% of a link's time on a 596-pair corpus.
 /// The decode is a function of the blob's bytes alone, so the memo is exact; failures are not
 /// kept (they are rare and report on each attempt, as before).
@@ -2824,7 +2824,7 @@ fn plan_interface_with(
             //
             // The fill for registers a vertex output does not reach is established below (a
             // shipping title's draws, correct on the device); a texcoord with NO vertex output is
-            // that rule with nothing written. MEASURED need: a fighting title (PCSE00235) creates
+            // that rule with nothing written. MEASURED need: a fighting title creates
             // a character-cloth fragment reading TEXCOORD5/9 against a vertex program declaring
             // neither - created by the title itself with that pairing - and refusing it dropped
             // the garment from every frame. Colours and fog keep the refusal: no default is
@@ -3185,7 +3185,7 @@ pub(crate) fn secondary_attr_init(
     let mut needed_strict = std::collections::BTreeSet::new();
     // >>> A SECONDARY INSTRUCTION WHOSE SA RESULT NOTHING READS OWES NOTHING. Its inputs cannot
     // reach a pixel, so demanding a source for them refuses a program over a value it throws
-    // away. MEASURED on a fighting title (PCSE00235): its image-based-lighting program's
+    // away. MEASURED on a fighting title: its image-based-lighting program's
     // secondary computes the per-thread LOCAL-memory base `sa[0] = special * 2304 + sa[0]` from
     // the driver's thread-buffer slot - a base the local-memory model does not add (the area is
     // private to the invocation), so no instruction reads the result, and the pass that lights
@@ -3692,7 +3692,7 @@ fn build_linked_module(
     // algebra), and the straightforward way to get that is a function called twice. But the
     // PREFIX - everything before the first instruction that reads the output bank - reads
     // varyings, uniforms and textures and nothing that differs between the two calls, so
-    // running it twice is pure waste. On mlb's world-family blend, which paints 78% of the
+    // running it twice is pure waste. On a baseball title's world-family blend, which paints 78% of the
     // world pass's fragments, that prefix is most of the body.
     //
     // So when the body can be cut, `fs_main` IS the body: the prefix once, then the suffix
@@ -4076,7 +4076,7 @@ fn split_dual_body(fbody: &str, split: Option<usize>) -> Option<(String, String)
 fn emit_dual_split_tail(m: &mut String, tail: &str, color: &str, precision: ColorPrecision) {
     // >>> RE-RUNNING ONLY THE DESTINATION-DEPENDENT STATEMENTS WAS TRIED 2026-09-12g AND IS A
     // >>> NULL ON THE PAIR IT WAS AIMED AT. The suffix is cut at the first instruction that
-    // READS the destination, so "after the cut" is a POSITION and not a dependence, and on mlb's
+    // READS the destination, so "after the cut" is a POSITION and not a dependence, and on a baseball title's
     // world-family blend only three of its 82 statements touch the destination. But a second
     // evaluation that skips the other 79 is only correct if none of them overwrites a register a
     // dependent statement wrote - and this program reuses `r[]` heavily, so every one of them
@@ -4145,7 +4145,7 @@ fn fs_main(in: FsIn) -> GxpDual {
 /// two halves and the emitter spells every read `unpack2x16float(r[n])[k]` and every write
 /// `r[n] = gxp_hlo(r[n], ...)`, which is a narrowing plus a masked merge. Those are
 /// CONVERSIONS, and a fragment
-/// program runs them per fragment: mlb's world-family blend emits 466 of them, and that pair
+/// program runs them per fragment: a baseball title's world-family blend emits 466 of them, and that pair
 /// paints 78% of the samples in the pass that is the phone's most expensive
 /// [[vitaslop-f16-emulation-is-the-phones-world-pass]]. A desktop GPU's compiler folds most of
 /// them away and prices this at zero [[vitaslop-desktop-cannot-price-a-count-win]]; a tiler
@@ -4400,7 +4400,7 @@ fn stray_bank_refs_by_name(text: &str) -> Vec<Result<(&'static str, usize), &'st
 /// (`VITASLOP_GXP_HALF_REGS=0` is the arm back), and the reason is a PICTURE on the phone.
 ///
 /// >>> THE PACKED FORM IS COMPUTED WRONG ON THE POWERVR PHONE (img-tec d-series), DATA-DEPENDENTLY.
-/// MLB's boot light-cell blur (`frag_842e7990`/`frag_842e875c`) replayed from one captured frame
+/// A baseball title's boot light-cell blur (`frag_842e7990`/`frag_842e875c`) replayed from one captured frame
 /// halved the light on every pass on the phone (cell grid 8 -> 4 -> 2) while the desktop kept it
 /// (8 -> 8 -> 8); this arm on the phone gave 8 -> 8 -> 8. That chain feeds the players' ambient
 /// cubes through the game's own CPU-side colour pick, so the whole at-bat rendered warm and
@@ -4413,9 +4413,9 @@ fn stray_bank_refs_by_name(text: &str) -> Vec<Result<(&'static str, usize), &'st
 ///
 /// The earlier measurements, kept because they are what the default used to rest on:
 ///
-/// The pass removes 70% of the f16 conversions a corpus emits (mlb: 4,459 -> 1,330), and on the
+/// The pass removes 70% of the f16 conversions a corpus emits (a baseball title: 4,459 -> 1,330), and on the
 /// only engine here that can price it - the DESKTOP BROWSER, whose shader compiler is the
-/// phone's family - it is worth NOTHING: mlb's world pass reads p50 0.91 and 0.88 ms across two
+/// phone's family - it is worth NOTHING: that title's world pass reads p50 0.91 and 0.88 ms across two
 /// runs of the SAME arm, and both arms of the change land inside that. It also moves pixels on
 /// five of seven titles (a mean of 0.02-0.07 of 255, on glyph edges and stipple, where a rounding
 /// difference flips an edge blend) and grows a pair's declared register storage 228 -> 332 words,
@@ -4434,7 +4434,7 @@ fn half_regs_on() -> bool {
 
 /// A register's occurrences, split into the LIVE RANGES a whole-register write separates.
 ///
-/// A program reuses one register at two precisions: mlb's world blend keeps a prefetched texel
+/// A program reuses one register at two precisions: a baseball title's world blend keeps a prefetched texel
 /// pair in `pa[2]` as two halves for fifty reads, then overwrites the whole register with an
 /// `f32` and uses it as a texture coordinate. Under a per-REGISTER rule that one `f32` use costs
 /// all fifty half reads their unpacked home. Under a per-RANGE rule it costs only its own range,
@@ -5459,7 +5459,7 @@ pub(crate) fn f16_fcmp_on() -> bool {
 /// not an identity of the language: `f16-helper-equiv` found 0 mismatches over all 2^32 inputs
 /// under Chrome's Tint on the phone (PowerVR) AND on the desktop (D3D12), but the NATIVE
 /// renderer compiles through naga, and a native frame replay moved 12 pixels by one level
-/// (Madden kickoff f2300, 2,089,727 bytes; the alias peephole alone left it byte-identical). So
+/// (a football title's kickoff f2300, 2,089,727 bytes; the alias peephole alone left it byte-identical). So
 /// the browser - the product, where the build cost is paid - takes it by default, and the
 /// native renderer, which is the regression oracle, keeps the scalar form unless asked.
 fn q2_vec_on() -> bool {
@@ -5562,7 +5562,7 @@ pub const PACK_COMP0_ARM: &str = "VITASLOP_GXP_PACK_COMP0";
 /// The multiplier the ORDINARY-REGISTER index load applies to its source, as a decimal string.
 /// Default 1, which is what the corpus grammar decodes today.
 ///
-/// >>> IT IS A QUESTION, NOT A SETTING. Madden's matrix palette is THREE float4 rows per bone
+/// >>> IT IS A QUESTION, NOT A SETTING. A football title's matrix palette is THREE float4 rows per bone
 /// (measured: rows 0,1,2 of the bound window are one affine transform, 3,4,5 the next, and so
 /// on for every group), and its `IN.blendIndices` are plain consecutive BONE numbers - 31, 32,
 /// 33 - so the row a bone's matrix starts at is `3 * index`, not `index`. No field of the
@@ -5693,7 +5693,7 @@ fn folded_unpack(word: u32) -> String {
 /// constant folding: bit-identical by construction (every f16 is exact in f32, see
 /// [`f16_bits_to_f32_bits`]) and fewer instructions in the shader.
 ///
-/// It is also what a real device needs. MEASURED on the PowerVR phone (Madden's crowd,
+/// It is also what a real device needs. MEASURED on the PowerVR phone (a football title's crowd,
 /// `ae75f4bf0fc3cc0c`, replayed from one captured frame): the translated module is valid and
 /// the desktop browser computes `unpack2x16float(0x3c002c00u)` as (0.0625, 1.0), while the phone
 /// returned 0.0625 for component 1 too - its crowd texcoord came out at a quarter of its value,
@@ -5969,7 +5969,7 @@ fn clamped_subscript_bound(sub: &str) -> Option<usize> {
 ///
 /// An indexed read (`indexed_element`) clamps its subscript to `BANK_REGS - 1`, so
 /// [`size_register_banks`] had to keep that bank at all 512 registers - a 2 KB private array a
-/// shader indexes at run time. MEASURED (MK fight shaders, one module compiled per pipeline on a
+/// shader indexes at run time. MEASURED (a fighting title's fight shaders, one module compiled per pipeline on a
 /// desktop GPU): every module slower than 140 ms had one - a skinned vertex program reading its
 /// bone palette out of `sa` - and those compiles are the in-fight display freezes (the browser
 /// declines presents until the pipeline exists: 234 ms desktop, ~500 ms on the phone).
@@ -6317,7 +6317,7 @@ mod tests {
         assert!(f32::from_bits(f16_bits_to_f32_bits(0x7e00)).is_nan(), "NaN stays NaN");
     }
 
-    /// Madden's crowd program: a literal SA register read through `unpack2x16float` folds to
+    /// A football title's crowd program: a literal SA register read through `unpack2x16float` folds to
     /// its exact halves; a register written twice, or a bank with a dynamic store, does not.
     #[test]
     fn a_literal_register_unpack_folds_and_nothing_else_does() {
@@ -6331,7 +6331,7 @@ mod tests {
         let dynamic = "fn vs_main() {\n  sa[59] = 0x3c002c00u;\n  sa[idx[0] + 1] = 0u;\n  let u = unpack2x16float(sa[59]);\n}\n";
         assert!(fold_literal_unpacks(dynamic).contains("unpack2x16float(sa[59])"), "an indexed store may hit it");
         // The bank's own INIT LOOP (a dynamic store) runs BEFORE the literal and cannot clobber
-        // it - Madden's crowd stage is exactly this shape; a read BEFORE the literal is not one.
+        // it - that crowd stage is exactly this shape; a read BEFORE the literal is not one.
         let init = "fn vs_main() {\n  let early = unpack2x16float(sa[59]);\n  for (var k: u32 = 0u; k < 56u; k = k + 1u) { sa[k] = vs_sa.data[k / 4u][k % 4u]; }\n  sa[59] = 0x3c002c00u;\n  let u = unpack2x16float(sa[59]);\n}\n";
         let f = fold_literal_unpacks(init);
         assert!(f.contains("let early = unpack2x16float(sa[59]);"), "{f}");
@@ -6468,7 +6468,7 @@ mod tests {
     /// The second copy reads what the PREFIX left, not what the first copy wrote. Carrying the
     /// first copy's range ids into the second put a read in a range that never reached it, and
     /// when one of those ranges lived unpacked and the other packed, the second copy read a word
-    /// nothing had written: mlb's whole frame came back BLACK.
+    /// nothing had written: a baseball title's whole frame came back BLACK.
     #[test]
     fn the_dual_source_split_rewinds_the_ranges_with_the_register_file() {
         let out = unpack_half_registers(&half_region(
@@ -7121,7 +7121,7 @@ mod tests {
     }
 
     /// The fragment of `a_projective_prefetch_*`: TEXCOORD1's data in PA[0..2] and unit 4's
-    /// sample in PA[2..4], coordinated by TEXCOORD0 - mlb's grass sampling `PlayerShadowsTarget`.
+    /// sample in PA[2..4], coordinated by TEXCOORD0 - a baseball title's grass sampling `PlayerShadowsTarget`.
     fn projective_pair(texcoord0_width: u32) -> (Program, Program) {
         let mut vprog = vertex_program(0, Vec::new(), 0);
         vprog.output_varyings = vec![texcoord_out(0, 6, texcoord0_width), texcoord_out(1, 10, 4)];
@@ -7163,7 +7163,7 @@ mod tests {
     fn a_projective_prefetch_samples_at_xy_over_w() {
         // The emitted sample, against the plain reading as its negative control: the same pair
         // with the descriptor's lookup field at 1 samples the raw (x', y') - which is what wrapped
-        // `PlayerShadowsTarget` across mlb's whole infield as a grid of dark dashes.
+        // `PlayerShadowsTarget` across that title's whole infield as a grid of dark dashes.
         let emit = |projective: bool| {
             let (vprog, mut fprog) = projective_pair(4);
             if !projective {

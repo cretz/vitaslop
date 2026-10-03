@@ -145,7 +145,7 @@ pub struct MemOps {
 ///
 /// >>> IT COMES OUT OF THE TITLE'S OWN POOL, SO IT MUST BE SMALL. A title that passes memory
 /// functions sizes that pool for the real library's buffer plus the units its demuxer holds.
-/// MEASURED on DOA5's intro (`ninja_vi.mp4`): its pool is ~305 KB, and with a 256 KB buffer
+/// MEASURED on a fighting title's intro movie: its pool is ~305 KB, and with a 256 KB buffer
 /// in it the browser run showed a unit allocation REFUSED for want of room. (That movie's
 /// stall was NOT this - 4 KB stalls identically; see the notes.) 64 KB covers that movie's
 /// largest unit (~43 KB) in one read; a bigger unit just takes two.
@@ -300,9 +300,9 @@ fn do_open_file(
     // >>> A PLAIN FILE IS READ AS ONE, EVEN WHEN THE TITLE ALSO HANDED OVER ITS FUNCTIONS.
     //
     // The functions are for a movie only they can reach - one inside the title's own archive,
-    // whose path is not a file at all (Uncharted's live in `gamedata.bin`). When the path IS a
+    // whose path is not a file at all (an action title's live in a packed archive). When the path IS a
     // file of ours the bytes are the same either way, and reading them directly keeps the
-    // title's player fed at storage speed. MEASURED on DOA5's intro (`ninja_vi.mp4`, a plain
+    // title's player fed at storage speed. MEASURED on a fighting title's intro movie (a plain
     // file): through its functions every read is a round trip through its FS thread, the first
     // units arrived a few per frame instead of in one burst, its audio-out thread found its
     // queue empty at f468, left its loop for good, and the movie sat black and silent after 4
@@ -781,12 +781,12 @@ pub(super) fn mp4_get_next_unit(
     do_get_next_unit(ctx, st, handle, stream, out.addr(), StreamInfoLayout::Wide)
 }
 
-/// `sceMp4GetStreamInfo` under the NID DOA5 links (`0xd5b26179`) - the same call as
+/// `sceMp4GetStreamInfo` under the NID a fighting title links (`0xd5b26179`) - the same call as
 /// [`mp4_get_next_unit`] from a later library build whose struct is SMALLER (the caller zeroes
-/// 0x140 bytes, not 0x158) and whose AUDIO form moved: DOA5's consumer reads the sample rate
+/// 0x140 bytes, not 0x158) and whose AUDIO form moved: that title's consumer reads the sample rate
 /// as a word from +0x08 and the channel count from +0x1c (stored as a halfword into its
 /// `SceAudiodecInfoAac`), where the first title reads +0x38 and +0x4c. The video form is
-/// identical in both. Answered with the first title's layout, DOA5 opened its AAC decoder
+/// identical in both. Answered with the first title's layout, the fighting title opened its AAC decoder
 /// with 0 channels at 0 Hz and its player stalled after 7 audio units.
 #[hostcall]
 pub(super) fn mp4_get_stream_info(
@@ -922,7 +922,7 @@ fn do_get_next_unit(
             return -1;
         };
         // Only as far as the fields this defines. The struct's SIZE differs by title (0x158
-        // on the first, a 0x140-byte STACK buffer on DOA5) and both callers zero it
+        // on the first, a 0x140-byte STACK buffer on the second) and both callers zero it
         // themselves - clearing 0x158 there overwrote 0x18 bytes of the caller's frame.
         for word in 0..(STREAM_INFO_DEFINED / 4) {
             ctx.write_u32(out + word * 4, 0);
@@ -1216,14 +1216,14 @@ pub fn movie_audio_report() -> Option<String> {
 /// # >>> THE QUEUE FOLLOWS THE TITLE'S DEMUX, NOT ITS DECODE - AND A DEMUX READS AHEAD.
 /// Units are submitted when the title's demux thread READS them (`pump_movie_audio`), and a
 /// title's decode thread asks for them later. This was 24 (half a second), sized for a
-/// decoder pipeline. MEASURED (Marvel vs Capcom 3's intro, `QUEUED_AT_TAKE_MAX`): the queue is
+/// decoder pipeline. MEASURED (an arcade fighter's intro, `QUEUED_AT_TAKE_MAX`): the queue is
 /// up to 273 frames deep when the title takes one - its demux runs ~5.8 s ahead. At 24 the
 /// cap shed the front of the queue, which is exactly the frames the title asked for next:
 /// 6,459 of its calls got silence, 4 frames of sound were delivered, in the browser and
 /// natively - and natively the title then gave up on the movie 44 s into 141. At this cap:
 /// 0 starved and 0 shed on both (native 6,498 frames delivered over the whole movie, which now
 /// plays to its end; the browser's queue peaked at 274, its audio ring at -11 dBFS against
-/// -71 before). Hot Shots (29 deep, 5 starved) and MK (34 deep, 11 starved) had the same
+/// -71 before). A golf title (29 deep, 5 starved) and a fighting title (34 deep, 11 starved) had the same
 /// silence at 24; `=24` reproduces their old reference frames exactly.
 ///
 /// `VITASLOP_MOVIE_AUDIO_BACKLOG=<frames>` overrides it; `24` is the old cap, the A/B arm.
@@ -2102,7 +2102,7 @@ fn movie_unit_wait_us(st: &mut crate::host::VitaState, handle: i32) -> Option<u6
     // already.
     // >>> A PLAYER THAT TOOK THE SOUND GETS A DEEPER READ-AHEAD.
     //
-    // It pre-buffers audio before it runs. MEASURED on DOA5's intro (`ninja_vi.mp4`, AAC +
+    // It pre-buffers audio before it runs. MEASURED on a fighting title's intro movie (AAC +
     // AVC): the two-frame read-ahead let its audio decoder see 4 units, the player dropped into
     // its buffering state (flow state 12) with the demux's memory full of video it would not
     // decode while paused - a black screen for good. See `AUDIO_READ_AHEAD_US`.
@@ -2171,8 +2171,8 @@ fn audio_read_ahead_us() -> u64 {
 
 /// How far ahead of the movie's clock a player that took the SOUND may read.
 ///
-/// Such a player pre-buffers audio before it will run: MEASURED on DOA5's intro (AAC + AVC,
-/// `doa-ra*`), 100 and 150 ms leave its audio decoder starved and the player parks in its
+/// Such a player pre-buffers audio before it will run: MEASURED on a fighting title's intro (AAC + AVC,
+/// runs `ra*`), 100 and 150 ms leave its audio decoder starved and the player parks in its
 /// buffering state for good (a black screen), while 250 and 500 ms play the whole movie - so
 /// its prebuffer is about 200 ms. 500 ms is that with margin for a hitch. Still a GATE, not an
 /// open tap: the same player also presents video as fast as units arrive, and with no gate
@@ -2343,7 +2343,7 @@ pub(super) fn mp4_close_file(
 }
 
 /// SceMp4 `0xc05dff01(handle)` - unnamed; read as STOP STREAMING, the counterpart of
-/// `sceMp4StartFileStreaming`. Evidence (DOA5, the only title that links it; P4G's older build
+/// `sceMp4StartFileStreaming`. Evidence (a fighting title, the only title that links it; a role-playing title's older build
 /// has no such export): its one caller is the reader object's vtable slot +0x44, reached on
 /// the player's teardown after it has released every unit buffer, and only while the reader's
 /// own state word says STREAMING (2); `sceMp4CloseFile` follows. So from here the session

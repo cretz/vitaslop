@@ -17,6 +17,8 @@ pub mod sched;
 pub use sched::{FrameStop, Scheduler};
 
 pub mod threaded;
+/// Parallel guest threads on OS threads - see the module docs.
+pub mod smp;
 pub use threaded::{dump_block_hist, RunReport, ThreadSpawn, ThreadedScheduler};
 
 /// The desktop's cache of compiled guest modules, beside each game - see its module docs.

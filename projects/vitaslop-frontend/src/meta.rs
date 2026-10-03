@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TitleMeta {
-    /// `PCSE00120` - the key everything else is stored under.
+    /// `PCSA00000`-shaped - the key everything else is stored under.
     pub title_id: String,
     /// `param.sfo` `TITLE`, or the id when there is none.
     pub title: String,

@@ -170,7 +170,7 @@ const glue = import(SMP_BUNDLE ? "./pkg-threads/vitaslop_web.js" : "./pkg/vitasl
 let readyP = null;
 // >>> THE PAGE HANDS US THE BUNDLE ALREADY COMPILED, when it can. Each worker used to fetch and
 // compile the 9 MB bundle itself, and a phone on the dev server's self-signed certificate gets
-// NO HTTP cache: MEASURED (runner, MLB) 8.7 s and the full 9 MB over the wire, per worker, per
+// NO HTTP cache: MEASURED (runner, a baseball title) 8.7 s and the full 9 MB over the wire, per worker, per
 // play. The page compiles it once (web/bundle.js) and posts the `WebAssembly.Module` with the
 // reserve; the first caller decides, and a page that sends none (the debug pages) gets the old
 // self-fetch.

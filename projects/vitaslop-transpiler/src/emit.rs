@@ -1131,7 +1131,7 @@ fn emit_dirty_mark(f: &mut Body, addr_local: u32) {
 /// `store8` of a byte that already holds the epoch changes nothing, but it still takes that
 /// line EXCLUSIVE, and with guest threads storing on several cores at once every store pulls
 /// the line from the core that stamped it last: false sharing on the hottest path in a module.
-/// MEASURED symptom (phone, Marvel fight, 10-02): the same render thread's guest work took
+/// MEASURED symptom (phone, an arcade fighter's fight, 10-02): the same render thread's guest work took
 /// 2.5 ms a frame on ONE worker and 6-10 ms on three, while a bare compute benchmark on the
 /// same phone lost only 10-30% per worker under the same concurrency (job 372). A load keeps
 /// the line SHARED on every core; the store happens once per page per epoch.
@@ -2474,7 +2474,7 @@ thread_local! {
 /// a `JSFunction`, a `SharedFunctionInfo`, `WasmExportedFunctionData`, `WasmInternalFunction`,
 /// a `WasmFuncRef` and its name string - and each of those holds entries in V8's pointer
 /// tables, which are FINITE and shared by the whole renderer process. The browser gives
-/// every guest thread its own instance. MEASURED (Marvel vs Capcom 3, `v8.gc_stats` trace):
+/// every guest thread its own instance. MEASURED (an arcade fighter, `v8.gc_stats` trace):
 /// 42,746 exports x 67 instances = 2,864,025 live wrappers in the first 11 s of a run, with
 /// nothing ever reading more than a handful of them; the renderer then died at
 /// `V8 process OOM (ExternalEntityTable::AllocateEntry)` once ordinary churn used up what

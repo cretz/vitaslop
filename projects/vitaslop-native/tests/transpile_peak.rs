@@ -1,6 +1,6 @@
 //! >>> THE TRANSPILE'S MEMORY PEAK AND ITS OUTPUT, FOR ONE TITLE, WITH NO EMULATOR.
 //!
-//! The lenient transpile is the allocation peak of a whole boot (Madden: 1,991 MB of Rust heap
+//! The lenient transpile is the allocation peak of a whole boot (a football title: 1,991 MB of Rust heap
 //! for 7.6 M guest instructions, inside a browser worker whose ceiling is 4,096 MB). A change
 //! that lowers that peak must not move a single emitted byte, and this probe answers both
 //! halves in seconds: it prints the peak, the time, and a hash of the module.

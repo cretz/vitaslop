@@ -394,7 +394,7 @@ const handler = async (req, res) => {
       }
       // >>> STREAMED, WITH ITS LENGTH. `readFile` refuses a file over 2 GiB, and the catch below
       // then answered a 2.9 GB archive with a 9-byte `404 not found` that a phone import stored
-      // AS the archive (2026-09-26: MLB died at frame 328 on the device, every desktop arm
+      // AS the archive (2026-09-26: a baseball title died at frame 328 on the device, every desktop arm
       // clean). `content-length` lets the importer hold the transfer to the size promised.
       const full = join(t.dir, rel);
       const { size } = await stat(full);
@@ -406,7 +406,7 @@ const handler = async (req, res) => {
     const file = join(webDir, path.endsWith("/") ? path + "index.html" : path);
     // >>> THE BUNDLE IS REVALIDATED, NOT RE-DOWNLOADED. `no-store` made every worker of every
     // play fetch the 9 MB emulator wasm again, and a phone on this LAN takes ~1 MB/s - MEASURED
-    // (runner 117, MLB): `init` 9.6 s of the run worker's start, and the transpile worker pays
+    // (runner 117, a baseball title): `init` 9.6 s of the run worker's start, and the transpile worker pays
     // it again. `no-cache` + an ETag of (size, mtime) still asks on every load, so a rebuild is
     // seen at once (a changed file is a changed tag) - the stale-bundle hazard `no-store` guards
     // against stays closed - while an unchanged bundle is a 304 and V8 can reuse its compiled

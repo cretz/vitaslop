@@ -71,11 +71,11 @@ pub fn enabled() -> bool {
 /// See `SmpRun::run_frames`.
 ///
 /// # Why it is the default
-/// MEASURED (`pf25b`, desktop Chrome, CPU ms of run-worker wall per frame): Madden one worker
+/// MEASURED (`pf25b`, desktop Chrome, CPU ms of run-worker wall per frame): a football title one worker
 /// 13.9-16.1, SMP stop-the-world 11.6-13.0, overlapped ~0 (the run worker slept 27 of a 32.7 ms
-/// period); MLB one worker 8.5-9.0, SMP stop-the-world 9.7-10.7 (SLOWER), overlapped 0.0-0.2
+/// period); a baseball title one worker 8.5-9.0, SMP stop-the-world 9.7-10.7 (SLOWER), overlapped 0.0-0.2
 /// (slept 12.5 of 17.1). Sweep `sw25o`: all 8 gameplay recipes reach their end frame with
-/// correct pictures and DOA5's @assert passes. It is safe because the present reads no live
+/// correct pictures and the fighting title's @assert passes. It is safe because the present reads no live
 /// guest memory: geometry is snapshotted at the guest's GPU wait or flip, textures per scene.
 pub fn overlap() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -99,7 +99,7 @@ fn sync_resolve_on_worker() -> bool {
 /// (`VITASLOP_SMP_EARLY_PAUSE_ALL=1`), or - the DEFAULT since 27c - only for its write into guest
 /// memory. On hardware the GPU renders and writes that target while every other core keeps
 /// running; pausing them all froze the audio thread for 30-60 ms per batch. MEASURED on the
-/// phone (MLB pitches): 027 vs 026, speed 79.7% vs 73.3%, audio underrun 21% vs 28%.
+/// phone (a baseball title's pitches): 027 vs 026, speed 79.7% vs 73.3%, audio underrun 21% vs 28%.
 fn early_pause_all() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| vitaslop_runtime::knobs::var("VITASLOP_SMP_EARLY_PAUSE_ALL").as_deref().map(str::trim) == Ok("1"))
@@ -110,7 +110,7 @@ fn early_pause_all() -> bool {
 ///
 /// Not below `VITASLOP_BROWSER_FASTFORWARD`: a fast-forward is not real time by definition, and
 /// a frame-numbered recipe written against the unfloored clock must land where it was written
-/// on a device slower than real time too (the phone's MLB menu walk ended in another scene).
+/// on a device slower than real time too (the phone's baseball-title menu walk ended in another scene).
 fn wall_floor(frame: u64) -> bool {
     static ON: OnceLock<(bool, u64)> = OnceLock::new();
     let (on, from) = *ON.get_or_init(|| {
@@ -430,7 +430,7 @@ fn spin_us() -> f64 {
 /// default 400; 0 turns adaptive spinning off). `VITASLOP_SMP_SPIN_US` (a fixed spin on every
 /// wait) still wins when it is set.
 ///
-/// MEASURED on the phone (2026-09-25, MLB, SMP): a thread made runnable by another worker waited
+/// MEASURED on the phone (2026-09-25, a baseball title, SMP): a thread made runnable by another worker waited
 /// for its sleeping worker to wake - `queued` 4.42 ms/f for the main thread and 6.70 ms/f for
 /// the Kinematics thread against 0.29 and 1.02 on the desktop, i.e. a futex wake there costs
 /// ~15x what it does here, and those waits sit on the frame's chain. A worker that polls for
@@ -456,7 +456,7 @@ fn spin_fixed() -> bool {
 /// `VITASLOP_SMP_PLACE=spread`: bind a new thread whose mask allows several workers to the one
 /// with the FEWEST live threads (then the least recent work), instead of the least recent work
 /// first. The load figure does not move between the spawns of one burst, so load-first sends a
-/// whole burst to one worker - MEASURED on MLB (`pf25b`): 21 threads on w2 beside its render
+/// whole burst to one worker - MEASURED on a baseball title (`pf25b`): 21 threads on w2 beside its render
 /// thread, w3 holding 3 and busy 3%.
 fn place_spread() -> bool {
     matches!(place_mode(), Place::Spread | Place::Apart | Place::Busy)
@@ -467,9 +467,9 @@ fn place_spread() -> bool {
 /// thread COUNT. A thread younger than [`IDLE_GRACE_MS`] has no history yet and counts a nominal
 /// [`YOUNG_DEMAND`], so the spawns of one burst still spread.
 ///
-/// >>> A COUNT CANNOT TELL A POOL WORKER FROM A FILE CALLBACK. MEASURED (phone, MK, 10-02): w3
+/// >>> A COUNT CANNOT TELL A POOL WORKER FROM A FILE CALLBACK. MEASURED (phone, a fighting title, 10-02): w3
 /// held 11 threads (FIOS, FMOD, audio - blocked nearly always, 21% busy together) and w2 six UE3
-/// pool threads; MK re-creates its RENDER thread for every fight, and the count sent each new
+/// pool threads; the title re-creates its RENDER thread for every fight, and the count sent each new
 /// one to w2 - 97% busy, the pool threads RUNNABLE-but-waiting 5-9 ms a frame, the game clock
 /// below real time ("slow motion") and its audio-synced intros running ahead of the picture.
 const YOUNG_DEMAND: f64 = 0.05;
@@ -478,7 +478,7 @@ const YOUNG_DEMAND: f64 = 0.05;
 /// another worker's: 0.5 = another worker is chosen only when the named one has done more than
 /// twice its recent work.
 ///
-/// >>> A MASK IS A HINT HERE BECAUSE OUR CORES ARE NOT THE CONSOLE'S. MK pins its render thread
+/// >>> A MASK IS A HINT HERE BECAUSE OUR CORES ARE NOT THE CONSOLE'S. A fighting title pins its render thread
 /// (and a stream of short-lived threads) to core 1 (`0x80028021`) beside its UE3 pool threads;
 /// on the console that core keeps up, but here every draw is a host call and the render
 /// thread costs several times its native share, so the faithful pin is the one worker that
@@ -489,15 +489,15 @@ const NAMED_CORE_SHARE: f64 = 0.5;
 
 /// `VITASLOP_SMP_PLACE=apart` (THE DEFAULT; `load` = the old least-recent-work rule): `spread`, but a thread whose mask allows another worker is never
 /// bound beside the MAIN thread - the title's heaviest thread keeps a worker to itself, and the
-/// rest share the others by count. MEASURED (MLB desktop, `sp25a`): under the default, 20
+/// rest share the others by count. MEASURED (a baseball title, desktop, `sp25a`): under the default, 20
 /// threads (the render thread and the per-frame Kinematics thread among them) shared w2 at 70%
 /// busy while w3 held three storage threads at 4%, and Kinematics waited 1.3 ms/f RUNNABLE
 /// behind its neighbours - 6.7 ms/f on the phone.
-/// Capacity (UNPACED presented/s, desktop, one build): MLB load 78-90 -> apart 89-94 (`sp25a`/
-/// `sp25c`); Madden load 68-73 -> apart 75-77 (`sp25d`/`sp25e`).
+/// Capacity (UNPACED presented/s, desktop, one build): a baseball title load 78-90 -> apart 89-94 (`sp25a`/
+/// `sp25c`); a football title load 68-73 -> apart 75-77 (`sp25d`/`sp25e`).
 /// `VITASLOP_SMP_PLACE=busy`: `apart`, but a worker's count leaves out the BLOCKED threads that
 /// have done almost nothing since they were born ([`IDLE_SHARE`] of their life) - they occupy a
-/// slot, not a core. MEASURED (phone 031, Uncharted gameplay): WorkerThread-0/1 (mask "any")
+/// slot, not a core. MEASURED (phone 031, an action title's gameplay): WorkerThread-0/1 (mask "any")
 /// both went to w2 because w3 already counted three pinned FIOS threads that are blocked
 /// nearly always; each then waited ~4 ms/f RUNNABLE behind the other.
 #[derive(Clone, Copy, PartialEq)]
@@ -519,8 +519,8 @@ const IDLE_GRACE_MS: f64 = 1000.0;
 /// Whether a thread pinned to a core that already carries a better-priority thread is placed
 /// as if unpinned - see the rule in [`State::place`]. OFF by default since 2026-10-02:
 /// `VITASLOP_SMP_UNPIN_STARVED=1` turns it on. It measured no gain on the title it was built for
-/// (Marvel fight 25.3 / 27.7 fps against 25-28 without it, phone jobs 330/334), and it is
-/// unfaithful exactly where faithfulness matters: Dead or Alive 5 Plus pins its main thread
+/// (an arcade fighter's fight 25.3 / 27.7 fps against 25-28 without it, phone jobs 330/334), and it is
+/// unfaithful exactly where faithfulness matters: another fighting title pins its main thread
 /// (prio 0x56) to core 0 and its movie player's threads inherit the pin at worse priorities -
 /// the rule moved them OFF main's worker, which is the placement whose movie never plays.
 fn unpin_starved_on() -> bool {
@@ -531,12 +531,12 @@ fn unpin_starved_on() -> bool {
 /// Whether a fiber's backing thread is placed on its runner's worker (`VitaState::spawn_near`).
 /// OFF by default; `VITASLOP_SMP_FIBER_NEAR=1` turns it on.
 ///
-/// >>> NOT YET VALIDATED ON THE PHONE. Built from the DOA fight trace (job 528: main blocked in
+/// >>> NOT YET VALIDATED ON THE PHONE. Built from a fighting title's fight trace (job 528: main blocked in
 /// sceFiberRun 7.7 ms a frame while its fibers ran on another worker; the title paced at 30).
 /// The one phone run of it (job 532) had `VITASLOP_FIBER_RUNNER_PRIORITY` on as well, and the
 /// movie stalled again (4 units / 3 pictures, black to the end) - so that run measured NOTHING
 /// about the fight; its "60 fps" was presents of a black screen. Neither desktop arm reproduces
-/// the stall (doafibweb, doafibslow: 359 / 298 pictures). Phone A/B owed: NEAR=1 alone,
+/// the stall (fibweb, fibslow: 359 / 298 pictures). Phone A/B owed: NEAR=1 alone,
 /// RUNNER_PRIORITY=1 alone, both - movie AND fight fps with the shots looked at.
 fn fiber_near_on() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
@@ -569,7 +569,7 @@ fn place_mode() -> Place {
 
 /// >>> WHO RAN WHERE, WHEN, AND WHY IT STOPPED - for `frames` frames from `from`, then dumped to
 /// the console as `smptrace` lines. The per-thread totals (`run`/`queued`) cannot say what a
-/// frame's critical path is: MLB's threads summed to its whole period with no worker busier than
+/// frame's critical path is: a baseball title's threads summed to its whole period with no worker busier than
 /// 55%, which is a dependency chain, and only an ordered record of the spans shows the chain.
 ///
 /// Events, all stamped with [`abs_ms`] (one clock across workers):
@@ -905,7 +905,7 @@ struct State {
     early: VecDeque<(i32, usize, usize)>,
     /// Early batches (and resolve-only sync parks) taken off `early` and still being served:
     /// their thread is parked on HOST work, not on game time, so the machine is not idle -
-    /// an idle jump here raced the clock ahead by the whole readback (Hot Shots: 561 s of
+    /// an idle jump here raced the clock ahead by the whole readback (a golf title: 561 s of
     /// game time over one 3.3 s phone readback, 0.01x sound).
     early_serving: u32,
     verdict: Option<RunReport>,
@@ -1091,7 +1091,7 @@ impl State {
     /// are busy NOW.
     fn place(&self, workers: usize, mask: i32, priority: i32) -> usize {
         // Worker `w` (1-based) backs Vita core `(w - 1) % 3`, so with more than three workers
-        // a core has TWINS and a thread pinned to it picks between them. MEASURED need (MK,
+        // a core has TWINS and a thread pinned to it picks between them. MEASURED need (a fighting title,
         // phone and the throttled desktop repro): the title pins its render threads AND its
         // pool threads to core 1, and one worker of a phone cannot carry what one Vita core
         // does there - w2 at 95-97%, pool threads runnable-but-waiting 7-9 ms a frame - while
@@ -1112,12 +1112,12 @@ impl State {
         // The Vita schedules strictly by priority within a core, so a title that pins a worse
         // thread to a core already carrying a better one is saying "this one runs in the
         // gaps". On a worker that is several times slower than a Vita core there are no gaps:
-        // MEASURED on the phone (Marvel, SMP trace job 237): `SubJobThread` (prio 127, core 2)
+        // MEASURED on the phone (an arcade fighter, SMP trace job 237): `SubJobThread` (prio 127, core 2)
         // sat RUNNABLE 10.3 ms a frame (max 19) behind `rendering` (prio 100, core 2, 15 ms of
         // guest work a frame) while w1 ran 22% busy; the main loop waits on that job every
         // frame, so a 60 fps fight ran at 25 fps. Placing the pinned-behind thread on the least
         // loaded worker instead: 52.8 fps (job 238, where `demand` did it for every thread -
-        // and cost Madden 7 points of speed by scattering its unpinned threads, which is why
+        // and cost a football title 7 points of speed by scattering its unpinned threads, which is why
         // this is the only case that leaves the title's pin). Affinity decides WHERE a thread
         // runs, never what it computes; the sync between the two threads is the title's own.
         // `VITASLOP_SMP_UNPIN_STARVED=0` is the arm back.
@@ -1135,7 +1135,7 @@ impl State {
                  better-priority thread on every worker its core names - placed away from them"
             );
             // Away from the named workers, not merely "anywhere": with every worker a
-            // candidate the fewest-live-threads tie-break put Marvel's SubJobThread straight
+            // candidate the fewest-live-threads tie-break put the arcade fighter's SubJobThread straight
             // back on the render thread's worker (job 330, 25 fps again). `demand` had put it
             // beside the game's main loop, where the two alternate (238: 52.8 fps).
             let away: Vec<usize> = (1..=workers).filter(|w| !cands.contains(w)).collect();
@@ -1163,7 +1163,7 @@ impl State {
         // A thread that is not blocked counts (it wants its worker NOW - a burst's earlier
         // spawns among them); a blocked one counts only once it is old enough to judge and
         // has run a real share of its life. MEASURED (phone 053): a first version that
-        // counted every thread younger than a second as busy counted Uncharted's freshly
+        // counted every thread younger than a second as busy counted an action title's freshly
         // started FIOS threads, and both job workers still landed on w2.
         let counts = |t: &Slot| {
             place_mode() != Place::Busy
@@ -1590,7 +1590,7 @@ impl State {
         // The wall-clock floor moves the clock in steps of several ms on a device slower than a
         // Vita, so a short timed wait can expire the moment it begins: the thread never really
         // waits, and at a better priority it can hold its worker indefinitely. MEASURED (desktop
-        // repro of the phone - `VITASLOP_SMP_GUEST_SLOW=8`, 4x CPU throttle - doaweb15, and phone
+        // repro of the phone - `VITASLOP_SMP_GUEST_SLOW=8`, 4x CPU throttle - run web15, and phone
         // jobs 065/066): a movie's video thread polled with 1 ms timed waits and held its worker
         // 28 ms (phone: 100-258 ms) while the movie's sound thread sat runnable behind it; the
         // player state that thread checks once on waking had moved on by then, it quit, and the
@@ -2024,7 +2024,7 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                     // >>> JUDGED BY WHEN THE BELL RANG, NOT WHEN THIS WORKER WOKE. A futex wake
                     // costs what the device charges for it, and counting it here made every
                     // wait on the phone look long, so the history never said "spin" - MEASURED
-                    // `spun 0 caught 0` on all three workers (2026-09-25, MLB) while the
+                    // `spun 0 caught 0` on all three workers (2026-09-25, a baseball title) while the
                     // render thread queued 7.4 ms/f and Kinematics 11.5 ms/f. The hand-off
                     // distance is sleep-start to ring; the wake latency is what spinning removes.
                     let rung = f64::from_bits(sh.rung_at[w].load(Ordering::Relaxed));
@@ -2966,7 +2966,7 @@ impl SmpRun {
     /// >>> AND THE WAIT IS A PARK, NOT A BLOCK. The first version turned the event loop right
     /// here until the decoder answered - ~13 ms per picture on a phone - and every other
     /// forwarded call queued behind it: the title's demuxer (`sceMp4GetNextUnit`, thousands a
-    /// movie) and its sound decodes. MEASURED (desktop repro of the phone, doaweb17/21-23): the
+    /// movie) and its sound decodes. MEASURED (desktop repro of the phone, runs web17/21-23): the
     /// sound side under-ran, the player's controller set its status to 12 (buffering, eboot
     /// 0x8164e1b0 -> event 5 -> state 1), the video thread stopped, the demux pool never drained,
     /// and the movie never resumed. So a behind decode is parked in `parked_decodes` with its
@@ -3147,9 +3147,9 @@ thread_local! {
 /// >>> WITHOUT THIS THE GPU LAG BOUND NEVER FIRES UNDER SMP. The run worker spends most of a
 /// frame awaiting the guest's flip inside `run_frames` - yielded, callbacks flowing - but only
 /// the live loop's between-frame sleep was counted, 0.6 ms a frame on the phone (2026-09-25,
-/// MLB, period 45.6 ms). A submit then aged ~0.6 ms a frame against a 150 ms bound, the bound
+/// a baseball title, period 45.6 ms). A submit then aged ~0.6 ms a frame against a 150 ms bound, the bound
 /// never bound, and work-done latency and the render-target write-back age both reached
-/// ~780 ms - old enough to wash MLB's auto-exposure.
+/// ~780 ms - old enough to wash that title's auto-exposure.
 pub(crate) fn yielded_ms() -> f64 {
     YIELDED_MS.with(|y| y.get())
 }

@@ -1264,7 +1264,7 @@ pub const SCE_KERNEL_ERROR_ALREADY_SENT: u32 = 0x8002_8121;
 /// Whether a fiber's backing thread runs at its runner's priority (the hardware: a fiber IS its
 /// runner) rather than [`DEFAULT_THREAD_PRIORITY`]. OFF by default; `VITASLOP_FIBER_RUNNER_PRIORITY=1`
 /// turns it on. MEASURED (phone job 532, with the SMP fiber-near arm `smp::fiber_near_on`
-/// also on): Dead or Alive 5 Plus's intro movie stalled again - main's fibers at main's 0x56 on main's worker outrank the
+/// also on): a fighting title's intro movie stalled again - main's fibers at main's 0x56 on main's worker outrank the
 /// movie player's threads (0x8e-0x96) that inherit the same core, and on a phone that runs guest
 /// code several times slower than a Vita they leave the demuxer too little time before the
 /// player's first buffering check. Faithful on paper, wrong on this CPU until the A/B says how.
@@ -1530,7 +1530,7 @@ struct GuestCallFrame {
 /// them, ALWAYS ON.
 ///
 /// # Why
-/// 2026-09-26: MLB died at frame 328 on the PHONE, deterministically (two runs, identical
+/// 2026-09-26: a baseball title died at frame 328 on the PHONE, deterministically (two runs, identical
 /// registers), and booted on every desktop arm. The dump showed the guest's FIOS falling
 /// through for every `wadC:` path - the archive mount had failed - but not ONE of the file
 /// operations that mount made, so the only way forward left was knob arms on the device. A
@@ -3804,7 +3804,7 @@ fn defer_window_bytes() -> bool {
 /// of a scene - see [`defer_window_bytes`] for the golf bake that established that.
 ///
 /// >>> `slot` IS REFUTED AS A FIX FOR A MESH THAT RENDERS ONLY PART OF ITSELF, and the census
-/// >>> below is how. It was written for Madden, whose players render from the waist up: the
+/// >>> below is how. It was written for a football title, whose players render from the waist up: the
 /// reasoning was that a bone palette partly filled at the draw keeps zero rows, and a vertex
 /// weighted to a zero matrix collapses. The rule fires there in quantity - 631,134 of 3,290,724
 /// windows tested in one run are partly unwritten - and the frame is **bit-identical** to the
@@ -3812,7 +3812,7 @@ fn defer_window_bytes() -> bool {
 /// those rows are still zero at the guest's own GPU wait, and nothing fills them late.
 ///
 /// The same census carries the fact that sent this the wrong way: **`blank` fires ZERO times on
-/// this title**. The late-fill mechanism is entirely inert for Madden, so whatever empties its
+/// this title**. The late-fill mechanism is entirely inert for that title, so whatever empties its
 /// legs is not this path, and a reader should not spend a second run here.
 /// [[vitaslop-a-refuted-diagnosis-left-in-place-reads-as-a-finding]]
 #[derive(Clone, Copy, PartialEq)]
@@ -5333,7 +5333,7 @@ impl TextureSnapshots {
         // This function charges `DrawVertexGather`, but both of its callers sit OUTSIDE the
         // `DrawVertices` timer the non-instanced vertex path is wrapped in - so an instanced
         // draw's gather was billed to the child and to nothing above it. MEASURED in the browser
-        // on mlb, whose crowd is instanced: the gather read **1.06 ms/frame against its own
+        // on a baseball title, whose crowd is instanced: the gather read **1.06 ms/frame against its own
         // parent's 0.99**, which is impossible for a nested phase and is how much of that
         // subtree was unattributed.
         //
@@ -5908,7 +5908,7 @@ impl TextureSnapshots {
         // SAME bytes (a static mesh rebuilt every frame), and the path below allocated and
         // copied the whole buffer only to find that out and throw the copy away. The answer is
         // the same buffer either way; this just skips the allocation and the copy when it is.
-        // MLB moves ~4 MB/frame (desktop) - ~9 on a phone - through this read, on the game's
+        // A baseball title moves ~4 MB/frame (desktop) - ~9 on a phone - through this read, on the game's
         // render thread, which is the phone's critical path (ovl26b).
         if inplace_compare()
             && let Some(p) = self.vertex_entries.get(&(addr, len))
@@ -5956,7 +5956,7 @@ impl TextureSnapshots {
                 // recognised through THIS path - the single-stream snapshot path, which is most
                 // draws of most frames - was served from the index and then looked untouched to
                 // the very next eviction. So the index evicted exactly the entries it was
-                // answering from: MEASURED on one mlb run, **96,281 entries and 2,770 MB shed**,
+                // answering from: MEASURED on one baseball-title run, **96,281 entries and 2,770 MB shed**,
                 // ending at 485 entries against an 8,192 cap and 3 MB against a 64 MB budget,
                 // while ~95 draws a frame arrived in a fresh allocation whose bytes the
                 // renderer's packed cache still held. `VITASLOP_VERTEX_INTERN_USE=0` is the OFF
@@ -8487,7 +8487,7 @@ pub struct VitaState {
     program_blobs: FxHashMap<u32, std::sync::Arc<[u8]>>,
     /// The blend compiled into each fragment program's epilogue (`vitaslop_gxp_shader::rop_blend`),
     /// by header - a pure function of the blob `program_blobs` holds for that header, and cleared
-    /// with it. A title that re-creates its fragment programs every frame (Madden: ~46) paid a
+    /// with it. A title that re-creates its fragment programs every frame (a football title: ~46) paid a
     /// whole-shader parse and decode per create to re-derive the same answer.
     pub(crate) rop_blend_memo: FxHashMap<u32, Option<vitaslop_gxp_shader::RopBlend>>,
     /// Whether (and how) each VERTEX program's 0xE8 memory loads need guest-memory windows
@@ -8971,7 +8971,7 @@ pub struct VitaState {
     /// >>> A FLIP MUST NOT WAIT FOR THE RESOLVER. The async flip resolve reads the frame's
     /// geometry on its own worker WITH this cache locked, starting the moment the flip queues
     /// it; the flip then reached `on_frame_boundary` - holding the SMP state lock AND the host
-    /// lock - and blocked on this mutex for the whole resolve. MEASURED on the phone at MLB's
+    /// lock - and blocked on this mutex for the whole resolve. MEASURED on the phone at a baseball title's
     /// at-bat: 7-11 ms per frame during which no guest thread ran, no idle clock step could be
     /// taken and the run worker could not even read the scheduler state (~9 of ~58 ms a frame).
     snaps_frames_pending: std::sync::atomic::AtomicU32,
@@ -10460,7 +10460,7 @@ impl VitaState {
         // >>> MASK 0 INHERITS THE CREATOR'S MASK (`SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT`:
         // "Inherit calling thread affinity mask", vitasdk). It used to be stored as 0 and read
         // as "any core", so a title that pins its main thread and lets its helpers inherit
-        // the pin had them scattered over every worker. MEASURED (phone, Dead or Alive 5 Plus,
+        // the pin had them scattered over every worker. MEASURED (phone, a fighting title,
         // 10-02): main asks for core 0 (`SceProcessParam`) and creates its movie player's
         // controller, decoders and demuxer with mask 0; spread over three workers the
         // controller's buffering check ran BESIDE the demuxer and found its queues empty 9-17
@@ -10638,7 +10638,7 @@ impl VitaState {
         // >>> A FIBER RUNS ON ITS RUNNER'S CORE AT ITS RUNNER'S PRIORITY - it is user-mode
         // context switching inside that thread, not a thread of its own. The default priority
         // here, and a placement anywhere, made every Run/Switch a CROSS-WORKER handoff under
-        // SMP. MEASURED (phone, Dead or Alive 5 Plus fight, SMP trace job 528): main (prio 0x56,
+        // SMP. MEASURED (phone, a fighting title's fight, SMP trace job 528): main (prio 0x56,
         // core 0) blocked in sceFiberRun 7.7 ms a frame while its fibers ran on another worker,
         // the frame chain came to 27 ms and the title paced itself at 30 fps (60 on a Vita).
         let logical_runner = self.logical_thread(runner);
@@ -10960,7 +10960,7 @@ impl VitaState {
     /// Both used to be missing. The exit code of a thread's FIRST run was never cleared, so
     /// `sceKernelWaitThreadEnd` on every later run returned at once, while the thread was still
     /// going - and the next `sceKernelStartThread` then launched a second run of the SAME thread
-    /// on the SAME stack while the first was still using it. MEASURED on the phone (MLB, two
+    /// on the SAME stack while the first was still using it. MEASURED on the phone (a baseball title, two
     /// runs of ~30): a per-frame job worker (entry 0x8104ecfe) whose command cursor lives in its
     /// 12 KB stack frame read garbage commands and called a null handler - `GUEST FAULT` at
     /// f3978 and f4321, `pc=0`, callee-saved registers clobbered. The kernel keeps a started
@@ -11058,7 +11058,7 @@ impl VitaState {
         // The replay is positional when the handler repeats itself exactly - but a handler may
         // NOT repeat itself: one that caches what an earlier pass read skips that read on the
         // next pass, and the call after it would then be handed the SKIPPED call's result.
-        // MEASURED on DOA5's intro movie: the audio look-ahead reads several samples per call,
+        // MEASURED on a fighting title's intro movie: the audio look-ahead reads several samples per call,
         // the first was served from the read cache on the replay, and the second sample
         // received the first one's bytes - corrupt units, 4 decodes, a black silent movie.
         if frame.cursor < frame.results.len() && frame.results[frame.cursor].0 == call {
@@ -12148,7 +12148,7 @@ impl VitaState {
     /// The clock advances by charged quanta (a flat amount per quantum of guest execution) and
     /// by idle jumps. On a device whose guest executes slower than a Vita's core, the quanta
     /// arrive slower than real time, so the clock - and every vblank edge on it - falls behind
-    /// the wall. MEASURED on the phone (MLB at-bat, trace 059): the main thread parked in
+    /// the wall. MEASURED on the phone (a baseball at-bat, trace 059): the main thread parked in
     /// `sceCtrlReadBufferPositive` (next vblank) for 23.8 ms/f and was released only ~5 ms
     /// after the render thread flipped, because the edge it waited for was reached only by the
     /// render thread's own quanta. On hardware the vblank is real time and main's next update
@@ -12166,7 +12166,7 @@ impl VitaState {
     /// so it held the guest longer, which advanced the clock further - MEASURED on the phone
     /// (062): frames alternating ~30 / ~100 ms with 40-60 ms of nothing running, 16 fps.
     ///
-    /// >>> AND NOT A LINE ANCHORED TO THE WALL. Tried 27c (phone job 025, MLB pitches): with
+    /// >>> AND NOT A LINE ANCHORED TO THE WALL. Tried 27c (phone job 025, a baseball title's pitches): with
     /// the whole wall recovered the clock read 97% speed, but the guest's own frame period went
     /// from 45 to 80 ms (11 fps), the audio thread fell to 0.66x of the clock and the ring
     /// underran 35% of the time - worse on every axis the player sees. Pushing the clock does
@@ -12175,7 +12175,7 @@ impl VitaState {
     /// >>> HELD TIME IS SKIPPED, SO THE CLAMP CAN COVER A WHOLE QUANTUM. `held` (the frame gate
     /// is shut or the guest is paused) moves the tick's anchor without advancing anything, so
     /// the clamp no longer has to be what keeps a hold out. It was 4 ms, and a phone resume
-    /// runs 5-7 ms between two ticks: MEASURED (029, MLB pitches) the main thread parked 17 ms
+    /// runs 5-7 ms between two ticks: MEASURED (029, a baseball title's pitches) the main thread parked 17 ms
     /// for a vblank while the render thread drew, released only by the render thread's own
     /// quanta, because every tick threw away a third of the wall that had passed.
     /// `VITASLOP_CLOCK_WALL_STEP_MS` sets the clamp (default 12).
@@ -12196,7 +12196,7 @@ impl VitaState {
         // >>> THE FLOOR TRAILS A CLOCK THAT RAN AHEAD; IT DOES NOT JUMP UP TO IT. It used to be
         // `max(floor + step, clock)`: every idle jump (the clock running AHEAD of the wall) reset
         // the floor to the clock, and the next ticks added wall on top - a ratchet that pushes a
-        // guest past real time. MEASURED on the phone (042, MLB pitches) once ticks came often
+        // guest past real time. MEASURED on the phone (042, a baseball title's pitches) once ticks came often
         // (idle workers now wake for wall parks): `% speed` mean 104.7%. Kept at most
         // `WALL_FLOOR_LAG_US` below the clock, so an idle jump is paid back by wall time first
         // and a long idle stretch is not banked.
@@ -12206,7 +12206,7 @@ impl VitaState {
         if floor > self.virtual_us {
             // >>> THE STORAGE CLOCK GETS THE SAME FLOOR. A Vita's card streams in real time; the
             // storage clock otherwise moves only on flips, quanta and idle jumps, and a title
-            // that polls a load with short delays from two threads (MK's sound banks: main and
+            // that polls a load with short delays from two threads (a fighting title's sound banks: main and
             // render each `sceKernelDelayThread(100)` ~2000 times a frame) is never globally
             // idle and never flips. MEASURED on the phone (job 098): AsyncIOSystem parked
             // 180-240 ms per 128 KB pread modelled at ~2.7 ms, frames of 530 ms; the desktop
@@ -12343,7 +12343,7 @@ impl VitaState {
     ///
     /// For a wait the DEVICE times in real time whatever the guest clock does - the audio
     /// output's DAC (see `vita::audio::out_output`). A virtual-clock park there stretches with
-    /// every stall of the virtual clock: MEASURED on the phone (MLB pitches, 040) a ~10 ms audio
+    /// every stall of the virtual clock: MEASURED on the phone (a baseball title's pitches, 040) a ~10 ms audio
     /// park lasted 50-85 ms of wall 27 times in 4.4 s, while every guest thread was parked and
     /// the run worker presented. Served only by an engine that expires them
     /// ([`wall_parks_served`]); the caller falls back to [`Self::sleep_park`] otherwise.
@@ -12626,7 +12626,7 @@ impl VitaState {
         // a serial callback thread and never bounded the queue behind it, so a title whose
         // callback completes less often than it queues runs away.
         //
-        // MEASURED on PCSE00120's front-end movie (`displayQueueMaxPendingCount = 2`): the
+        // MEASURED on a role-playing title's front-end movie (`displayQueueMaxPendingCount = 2`): the
         // guest queued 60 entries a second and the callback completed 30, and by frame 2700 the
         // backlog was **1,348 entries deep**. The callback-data ring is
         // [`Self::DISPLAY_CB_SLOT_COUNT`] slots, so it had wrapped 168 times and EVERY callback
@@ -12914,9 +12914,9 @@ impl VitaState {
             // >>> RAISING THIS TO `SCE_KERNEL_HIGHEST_PRIORITY_USER` WAS TRIED AND REVERTED.
             // GXM creates this thread itself and the SDK's samples put it at the top of the
             // user band, so that looked more faithful - and it MEASURED as no change at all:
-            // PCSE00120's callback rate stayed at one per two vblanks (it is the title's own
-            // TWO `sceDisplayWaitVblankStart` calls that set it, see `pace_flip`), and Ridge
-            // Racer's race was identical either way. What it did do is move the schedule, so
+            // The role-playing title's callback rate stayed at one per two vblanks (it is the title's own
+            // TWO `sceDisplayWaitVblankStart` calls that set it, see `pace_flip`), and a
+            // racer's race was identical either way. What it did do is move the schedule, so
             // it is not carried on an argument alone.
             priority: DEFAULT_THREAD_PRIORITY - 0x10,
         });
@@ -13779,7 +13779,7 @@ impl VitaState {
         uid
     }
 
-    /// `attr` bit of a simple event read as AUTO-RESET. DOA5 creates its task events with
+    /// `attr` bit of a simple event read as AUTO-RESET. A fighting title creates its task events with
     /// exactly this bit and uses each as a one-shot wake between a producer and one waiter.
     pub const SIMPLE_EVENT_AUTO_RESET: u32 = 0x100;
 
@@ -15354,7 +15354,7 @@ impl VitaState {
     /// written the guest may have unmapped that memory and its allocator may have handed the
     /// block to something that is not an image. Writing pixels over it then corrupts whatever
     /// now lives there, and the failure arrives much later and looks nothing like a renderer
-    /// bug: PCSE00084 dies at frame 1263 with `pc=0x00000000`, a call through a pointer that
+    /// bug: a football title dies at frame 1263 with `pc=0x00000000`, a call through a pointer that
     /// used to be a pointer. The desktop writes back SYNCHRONOUSLY inside the same frame and
     /// does not have the window, which is why the same run survives there.
     ///
@@ -15858,14 +15858,14 @@ impl VitaState {
     /// the guest's pointer ARRAY in one go.
     ///
     /// >>> THIS IS THE SAME WRITES IN TWO CROSSINGS INSTEAD OF EIGHTY-FOUR, and it is the
-    /// > > > largest single block of boundary traffic a Madden frame made.
+    /// > > > largest single block of boundary traffic a football-title frame made.
     ///
     /// Per-index it used to be a `read_u32` of the array (one crossing), an
     /// `ensure_state_block` that re-read the state's magic AND block words (two more) and a
     /// `write_u32` into the table (three, counting the dirty-map stamp) - eighty-four
     /// crossings for fourteen pointers, on a title that calls this ONCE PER DRAW, 1,026 times
     /// a frame. It is where 41,333 of that frame's single-word guest reads came from, against
-    /// mlb's 1,436 in total.
+    /// a baseball title's 1,436 in total.
     ///
     /// The guest cannot run during a host call and the two tables are fourteen CONTIGUOUS
     /// words in either block, so the array is read whole, the block is resolved once, and the
@@ -16147,7 +16147,7 @@ impl VitaState {
         // [[vitaslop-poison-separates-a-guest-zero-from-an-unwritten-one]] - and copying it
         // over the context DESTROYS a binding the guest made directly.
         //
-        // MEASURED on PCSE00120, which is what found this: the title makes 19,603 direct
+        // MEASURED on a role-playing title, which is what found this: the title makes 19,603 direct
         // `sceGxmSetFragmentTexture` binds, puts a texture into a precomputed state **0 times**
         // (a complete count - those setters are never inlined), and binds ~1,286 states a
         // frame. A store watchpoint on unit 0's slot caught the sequence exactly: the guest
@@ -17408,7 +17408,7 @@ impl VitaState {
             // >>> AND THE VERTEX WINDOWS, AS FLOATS, because a TRANSFORM can live in one.
             //
             // Only the fragment side was printed, on the reading that a windowed uniform is a
-            // blend coefficient. It is not always: MEASURED on PCSA00002, a screen-space quad's
+            // blend coefficient. It is not always: MEASURED on a baseball title, a screen-space quad's
             // vertex program loads sixteen words through its window and MADs them against the
             // position - its whole MODEL-VIEW-PROJECTION is in there, and the `TRANSFORM` line
             // above says `STALE-ubuf`/`composed=no` because the matrix is in no bank that line
@@ -18043,7 +18043,7 @@ impl VitaState {
         // `VitaState::mem_windows_zero_tested`) - and silent after `MAX_REPORTS`.
         //
         // It used to run for every window of every draw: a byte scan, then a SipHash of every
-        // byte and a global lock to dedupe a warning that had already fired - on MLB's at-bat
+        // byte and a global lock to dedupe a warning that had already fired - on a baseball title's at-bat
         // that is 231 crowd draws a frame, each with a 3,776-byte skinning window that is all
         // zero at the draw (a job thread fills it later). Measured on the phone, removing the
         // hash alone did NOT move the window-snapshot phase, so this is waste, not the phase's
@@ -18302,7 +18302,7 @@ impl VitaState {
         // capture block opens one and calls this twice, once per stage), so a scope here bills
         // the SAME wall interval to the same phase three times over.
         //
-        // MEASURED in the browser on mlb: `draw: gxp blob + SA bytes` read **1.03 ms/frame over
+        // MEASURED in the browser on a baseball title: `draw: gxp blob + SA bytes` read **1.03 ms/frame over
         // 1,739 entries against 459 draws** - 3.79 scopes a draw - and 26% of DRAW TOTAL, which
         // made it the largest named row in the table and the one 16d's ranking put first. A
         // phase that double-counts is worse than one that is missing: it reads as the thing to
@@ -18383,7 +18383,7 @@ impl VitaState {
                 // >>> NOT BEHIND THE RESOLVER. The cache only keeps a window's IDENTITY stable
                 // for the renderer's push memo; when the resolver holds the snapshot lock for a
                 // chunk of its flip read, reading the few KB straight out of guest memory costs
-                // less than the wait - MEASURED on the phone (MLB pitches, 048) 1.36 ms/f of the
+                // less than the wait - MEASURED on the phone (a baseball title's pitches, 048) 1.36 ms/f of the
                 // render thread's frame queued here over ~4 takes. The bytes are the same either
                 // way (both read guest memory now). `VITASLOP_WINDOW_WAIT=1` is the arm back.
                 let bytes = match self.texture_snapshots.try_lock() {
@@ -18840,7 +18840,7 @@ impl VitaState {
             // Containers 0..13 are the ordinary uniform buffers (`sceGxmSetVertexUniformBuffer`)
             // and 14 is the DEFAULT one; `resource_index` is an offset inside the parameter's
             // OWN container. Reading every parameter out of the default buffer therefore prints
-            // one buffer's bytes under another buffer's names. MEASURED on PCSA00002's field
+            // one buffer's bytes under another buffer's names. MEASURED on a baseball title's field
             // decal (`vert_842dce60`): `MaterialColor_V0` (container 14, res 0) and
             // `UVP_ViewProjectionMatrix` (res 0 of its own container) both printed from float 0
             // of the default buffer, so the view-projection read as `[1,1,1,1,0,...]` - not a
@@ -19151,7 +19151,7 @@ impl VitaState {
     /// # Why this may wait past the flip
     /// The hardware does: a flip QUEUES the frame, and the GPU reads that frame's vertex
     /// buffers after it, while the CPU is already building the next one. A title therefore
-    /// cannot rewrite them at the flip (MLB double-buffers and syncs on nothing else - no
+    /// cannot rewrite them at the flip (a baseball title double-buffers and syncs on nothing else - no
     /// notification wait, no `sceGxmFinish`, over a 30-frame at-bat window). Every sync point
     /// that COULD make a rewrite safe (`sceGxmFinish`, a notification wait) still resolves
     /// everything first, through `resolve_deferred_geometry`.
@@ -21337,7 +21337,7 @@ fn build_texture_template(
     //
     // The pitch is the explicit stride `sceGxmTextureInitLinearStrided` was given (the control
     // words spread it over three fields whose composition is not published, so it rides in the
-    // host shadow - see `vita::gxm::texture_init`). MEASURED on a fighting title (PCSE00235): its
+    // host shadow - see `vita::gxm::texture_init`). MEASURED on a fighting title: its
     // bloom samples each mip level as a 128- or 256-wide strided window onto ONE 512-wide
     // surface. Read at the width's pitch, every row after the first came from the wrong place
     // (four texture rows to one surface row), and a renderer resolving the window against the
@@ -24475,7 +24475,7 @@ fn compute_posted_resolve_job(
 /// `VITASLOP_RESOLVE_CHUNK=<draws>`: how many draws the RESOLVER reads per hold of the snapshot
 /// lock (default 16); `0` holds it for the whole job, which is what this did before. 16, not 64:
 /// the render thread's `sceGxmDraw` window capture waits on whole chunks - MEASURED on the phone
-/// (MLB pitches, the lock's waits-by-holder line) 1.07 ms/f at 64, 0.70 at 16 (039).
+/// (a baseball title's pitches, the lock's waits-by-holder line) 1.07 ms/f at 64, 0.70 at 16 (039).
 fn resolve_chunk() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| crate::knobs::var("VITASLOP_RESOLVE_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16))
@@ -24646,8 +24646,8 @@ fn compute_resolve_job(snaps: &mut TextureSnapshots, ctx: &GuestCtx, job: &mut R
     // (indices, single-stream vertices, windows, the gather memo) answer from the dirty
     // map without a read for anything the guest has not stored into since - most of a
     // steady frame. The first cut of this table fetched every range regardless, and the
-    // DESKTOP, where a crossing was already cheap, paid for it: mlb cpu p10 10.7 -> 12.1
-    // ms, Madden 16.2 -> 19.2, every byte of a hit copied into the overlay and then never
+    // DESKTOP, where a crossing was already cheap, paid for it: a baseball title's cpu p10 10.7 -> 12.1
+    // ms, a football title's 16.2 -> 19.2, every byte of a hit copied into the overlay and then never
     // looked at. So the stamp copy is taken FIRST, each candidate is probed against its
     // cache exactly as the read below will probe it, and a hit stays out of the table.
     // The probe is the same test the read makes, on the same copy of the map, so a range
@@ -25001,6 +25001,22 @@ pub fn set_async_flip_resolve(on: bool) {
 
 fn async_flip_resolve() -> bool {
     ASYNC_FLIP_RESOLVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Which of the draw-deferral switches are on, as one line - geometry read at end of scene,
+/// texture sets proven by the resolver, and the conditions the second rests on. For an engine's
+/// run report: `defer_textures` is decided ONCE, at the first draw, so a resolver attached after
+/// it is a resolver nobody hands texture work to.
+pub fn deferral_report() -> String {
+    format!(
+        "deferral: geometry {}, textures {} (resolver attached {}, flip resolve async {}, gxp live {}, fixed-function wanted {})",
+        defer_geometry(),
+        defer_textures(),
+        resolver_attached(),
+        async_flip_resolve(),
+        gxp_live_capture(),
+        fixed_function_wanted()
+    )
 }
 
 fn defer_geometry() -> bool {

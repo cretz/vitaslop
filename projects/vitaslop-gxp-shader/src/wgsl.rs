@@ -948,7 +948,7 @@ const HALF_HELPERS_PACK: &str = include_str!("f16rounding/pack.wgsl");
 ///
 /// >>> WHY `clamp` AND NOT `sign(v) * 65504` BEHIND TWO COMPARES. The phone's compiler pays for
 /// the saturation at every one of the ~250 f16 narrowings a skinned vertex program makes.
-/// MEASURED (PowerVR, salted `pipeline-compile`, the three largest Hot Shots modules, two runs
+/// MEASURED (PowerVR, salted `pipeline-compile`, the three largest golf-title modules, two runs
 /// each): the two-compare float form 333-355 ms, this form 277-297 ms (-17..-19%); the bit-test
 /// form it replaced was 13-21% dearer again. The saturation value by sign bit alone (`(bits &
 /// 0x80000000) | 0x477fe000`) was -12..-20%, so the `sign()` was most of it and the second compare
@@ -1228,7 +1228,7 @@ pub fn emit_body_marked(shader: &Shader) -> Result<String, EmitError> {
     // lane); the guard would wrongly reject those, so it applies to fragment programs only.
     //
     // >>> AND ONLY WHERE THE VALUE IS LIVE. The guard as first written refused on the read
-    // ALONE, and that is what dropped fifteen of Madden's twenty-one unrecompilable fragment
+    // ALONE, and that is what dropped fifteen of a football title's twenty-one unrecompilable fragment
     // blobs - a dropped pair means its mesh is ABSENT from the frame. MEASURED over every
     // captured corpus (`undefined_internal_reads_that_are_actually_live`): 57 fragment reads of
     // an unwritten internal lane, and **not one of them is live** - every single one is a
@@ -3659,11 +3659,11 @@ fn block(stmts: &str, staged: bool) -> String {
 /// the stores are right there in [`Dest`] - moves a store past whatever sits between them, and
 /// what sits between them can be a READ of the same register: [`dest_aliases_source`] only
 /// looks four registers either side of the destination, and a repeated instruction reaches
-/// further than that. MEASURED: pairing structurally changed mlb's frame on 31% of its pixels.
+/// further than that. MEASURED: pairing structurally changed a baseball title's frame on 31% of its pixels.
 /// Adjacent lines cannot have anything between them, so there is nothing to move past.
 ///
 /// It is worth this care because a 16-bit program pays the pack/unpack emulation on EVERY
-/// fragment: mlb's world-family blend is 54 packs and 118 unpacks per evaluation over three
+/// fragment: that title's world-family blend is 54 packs and 118 unpacks per evaluation over three
 /// million samples a frame, which a desktop GPU shrugs off and a phone's does not
 /// [[phone-gpu-has-four-times-the-headroom]].
 fn fold_halves(stmts: &str) -> String {
@@ -3704,7 +3704,7 @@ fn fold_halves(stmts: &str) -> String {
 ///
 /// A 16-bit source operand reads one HALF of a register, so a four-channel instruction over
 /// two registers spells `unpack2x16float(pa[2])` four times for two distinct registers, and a
-/// three-source instruction spells each of its sources' registers four times over. mlb's
+/// three-source instruction spells each of its sources' registers four times over. A baseball title's
 /// world-family blend emits 118 unpacks per evaluation where 40-odd registers are read; the
 /// rest is the same call again. A desktop compiler folds them and the run never notices; the
 /// phone's does not, and this shader is three million fragments a frame
@@ -4866,7 +4866,7 @@ fn emit_int_mad(
     //
     // >>> A CLEAR BIT IS THE LOW HALF, NOT THE WHOLE REGISTER. This is a 16x16 multiply, and
     // the two readings differ only where src1's high half is non-zero - which is exactly a
-    // PACKED PAIR, the case the select bit exists for. MEASURED (MLB, the pitcher's shadow
+    // PACKED PAIR, the case the select bit exists for. MEASURED (a baseball title, the pitcher's shadow
     // skinning, pairs 82529743a5ff9842 / 6faa30c99e818ce2, 2026-09-25): two bone indices packed
     // in one register, `pa[4] = 64 * (pa[3] >> 16) + base` for the high one and
     // `64 * pa[3] + base` for the low one - which added `64 * idx_hi << 16` to every low-bone
@@ -5697,7 +5697,7 @@ mod tests {
     }
 
     /// The other half of the guard: the same read, into a temporary nothing goes on to consume,
-    /// TRANSLATES. This is the shape that was dropping fifteen of Madden's fragment blobs - an
+    /// TRANSLATES. This is the shape that was dropping fifteen of a football title's fragment blobs - an
     /// F32 write of lane 0 followed by a narrower consumer whose second channel is thrown away -
     /// and refusing it removed the pair's whole mesh from the frame over a value no one reads.
     #[test]

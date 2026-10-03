@@ -147,7 +147,7 @@ impl AudioState {
     ///   clock it is paced on. Measured 0.95-0.99 on all five titles.
     /// * **clock per displayed frame, in display periods** is the title's own vblank divisor
     ///   - a WHOLE number (1 for 60 fps, 2 for 30). That is the one that catches a clock
-    ///   running fast, and it is NOT visible in the ratio above: PCSA00009 read 0.985 sound /
+    ///   running fast, and it is NOT visible in the ratio above: a golf title read 0.985 sound /
     ///   clock while charging **2.99 periods a frame for a limiter that asks for two**, and
     ///   that extra period is what made the guest produce 1.7 s of audio per second of real
     ///   time on a phone, fill the ring, drop a third of it, and starve on the next hitch.
@@ -546,7 +546,7 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     // queue has room - when the PREVIOUS grain has finished and this one starts. This used to
     // sleep one grain's length from the moment of the call, which bills every microsecond the
     // audio thread spends between calls (its own mixing, a lock, a late wake) on top of the
-    // grain, so the port drifts behind the clock for ever. MEASURED on the phone, MLB menu and
+    // grain, so the port drifts behind the clock for ever. MEASURED on the phone, a baseball title's menu and
     // at-bat alike: sound 0.86-0.87x of the clock in every window, underrunning ~9 s in 42 s
     // (the hiccups). With the schedule, a thread that ran late is released at once and the
     // port catches up to the clock; one that is early waits exactly as the device makes it.
@@ -556,7 +556,7 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     // >>> ON THE WALL CLOCK WHEN THERE IS ONE - the device's audio hardware drains in real time.
     //
     // Paced on the guest's virtual clock, a port plays exactly as fast as that clock runs, and on
-    // a device slower than a Vita the clock runs below real time: MEASURED on the phone (MLB
+    // a device slower than a Vita the clock runs below real time: MEASURED on the phone (a baseball title's
     // pitches, 026) 73% speed and the ring underran 28% of the time - the music hiccups. On the
     // hardware the audio thread is released by the DAC draining its queue, whatever the game's
     // own frame rate; the music keeps its tempo and it is the PICTURE that drops frames. So the

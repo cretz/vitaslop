@@ -410,7 +410,7 @@ fn decrypt_pfs(vfs: &dyn Vfs, root: &str) -> Result<Game, Error> {
 /// treated as code.)
 /// A root-level `*.self` carrying the SELF magic: an executable the app can `LoadExec` into,
 /// not one loaded at boot (see [`Game::execs`]).
-fn is_exec_alternate(path: &str, plaintext: &[u8]) -> bool {
+pub(crate) fn is_exec_alternate(path: &str, plaintext: &[u8]) -> bool {
     !path.contains('/') && path.ends_with(".self") && plaintext.len() >= 4 && &plaintext[..4] == SCE_MAGIC
 }
 
