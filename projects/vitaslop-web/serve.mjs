@@ -99,6 +99,10 @@ const MIME = {
 /// Recursively list files under `root`, returning forward-slash relative paths.
 async function walk(root, dir = root, out = []) {
   for (const name of await readdir(dir)) {
+    // The NATIVE engine's compiled-module cache (build-keyed, rewritten by every native run on
+    // a new build) - not the title's data, useless to a browser, and a listing taken before a
+    // native run names files that are gone by the time a device imports them.
+    if (dir === root && name === "vitaslop-transpiled") continue;
     const full = join(dir, name);
     const s = await stat(full);
     if (s.isDirectory()) await walk(root, full, out);

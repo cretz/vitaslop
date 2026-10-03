@@ -242,6 +242,11 @@ pub enum NeonStmt {
     Test { ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
     /// Bitwise NOT (`vmvn`) - element-size agnostic, so no type rides with it.
     Not { dst: NeonReg, src: NeonReg },
+    /// Population count of each byte (`vcnt.8`) - wasm's `i8x16.popcnt` exactly.
+    PopCount { dst: NeonReg, src: NeonReg },
+    /// Count leading zeros (`vclz`) or leading sign bits (`vcls`, `sign`) of each `bits`-wide
+    /// element (8/16/32).
+    CountLeading { bits: u8, sign: bool, dst: NeonReg, src: NeonReg },
     /// Saturating absolute value (`vqabs`) or negate (`vqneg`). They differ from the plain
     /// forms at exactly ONE input - the element's minimum, whose true magnitude is one past
     /// the maximum - and that input is the one a signal at full scale produces.
@@ -344,6 +349,8 @@ pub enum PermuteOp {
     Zip,
     /// `vuzp`: de-interleave (the inverse of `vzip`).
     Uzp,
+    /// `vswp`: exchange the two registers whole.
+    Swp,
 }
 
 /// The NEON vector-compare relations ([`NeonStmt::Cmp`] and [`NeonStmt::CmpZero`]).
@@ -544,6 +551,10 @@ pub enum Stmt {
     /// `rdlo`/`rdhi`.
     /// `accumulate` adds the 64-bit `rdhi:rdlo` already in the registers (`smlal`/`umlal`).
     MulLong { rdlo: u8, rdhi: u8, rn: Value, rm: Value, signed: bool, accumulate: bool },
+    /// The HIGH word of a signed 64-bit product (ARM `smmul`/`smmla`/`smmls`):
+    /// `rd = ((ra << 32) +/- rn * rm + (round ? 0x8000_0000 : 0)) >> 32`, where `ra` is
+    /// absent for `smmul` and `sub` selects `smmls`. `round` is the `R` form.
+    MulHigh { rd: u8, rn: Value, rm: Value, ra: Option<Value>, sub: bool, round: bool },
     /// A direct guest call (`bl`/`blx` to translated code): call the callee's
     /// wasm function, which returns here. `lr` is set by a preceding `SetReg`.
     Call { target: u32 },

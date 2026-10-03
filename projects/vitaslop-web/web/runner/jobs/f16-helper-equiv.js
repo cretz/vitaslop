@@ -21,10 +21,17 @@ export async function run(params, { progress, asset }) {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter.features.has("shader-f16")) throw new Error("no shader-f16 on this device");
   const dev = await adapter.requestDevice({ requiredFeatures: ["shader-f16"] });
+  // `candidate`: WGSL defining `fn cand_hq(v: f32) -> f32`, counted against the reference in
+  // place of the shipped `gxp_hq` - how a cheaper narrowing is PROVEN bit-exact before it ships.
+  const cand = params.candidate || "";
+  const hqUnder = cand.includes("fn cand_hq") ? "cand_hq" : "gxp_hq";
+  // ...and `fn cand_q2(v: vec2<f32>) -> vec2<f32>` in place of the shipped pair form.
+  const q2Under = cand.includes("fn cand_q2") ? "cand_q2" : "gxp_q2";
   const code = `enable f16;
 ${native}
 ${common}
 ${q2}
+${cand}
 fn old_hq(v: f32) -> f32 { return unpack2x16float(gxp_f16b(v))[0]; }
 struct Cnt { hq: atomic<u32>, q2: atomic<u32>, nan: atomic<u32>, first_hq: atomic<u32>, first_q2: atomic<u32>, done: atomic<u32> };
 @group(0) @binding(0) var<storage, read_write> cnt: Cnt;
@@ -37,7 +44,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let b = base.x + lane * 16u + k;
     let v = bitcast<f32>(b);
     let o = bitcast<u32>(old_hq(v));
-    let n = bitcast<u32>(gxp_hq(v));
+    let n = bitcast<u32>(${hqUnder}(v));
     if (is_nan(b)) {
       if (!is_nan(o) || !is_nan(n)) { atomicAdd(&cnt.nan, 1u); }
     } else if (o != n) {
@@ -48,7 +55,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let b2 = b ^ 0x5a5a5a5au;
     let w = vec2<f32>(v, bitcast<f32>(b2));
     let qo = bitcast<vec2<u32>>(vec2<f32>(old_hq(w.x), old_hq(w.y)));
-    let qn = bitcast<vec2<u32>>(gxp_q2(w));
+    let qn = bitcast<vec2<u32>>(${q2Under}(w));
     let nan0 = is_nan(b);
     let nan1 = is_nan(b2);
     if ((!nan0 && qo.x != qn.x) || (!nan1 && qo.y != qn.y)) {

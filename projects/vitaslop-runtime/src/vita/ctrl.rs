@@ -328,7 +328,7 @@ fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) -> SvcO
         new.clamp(1, u64::from(buffer_count(count))) as i32
     };
     let n = fill_ctrl(ctx, st, port, data, negative, count);
-    tracing::trace!(target: "vitaslop::input", port, asked = ctx.arg(2), returned = n, vblank, lr = format_args!("{:#010x}", ctx.regs[14]), "ctrl read");
+    tracing::trace!(target: "vitaslop::input", port, asked = ctx.arg(2), returned = n, vblank, frame = st.cur_frame(), lr = format_args!("{:#010x}", ctx.regs[14]), "ctrl read");
     ctx.ret(n as u32);
     if !st.is_preemptive() {
         return SvcOutcome::Continue;

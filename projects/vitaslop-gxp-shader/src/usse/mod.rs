@@ -559,6 +559,49 @@ fn remap_branch_targets(instrs: &mut [crate::ir::Instr], starts: &[usize]) {
 ///    partial products into one sum;
 ///  * neither is predicated differently from the other, since a pair split by a predicate is
 ///    not a pair.
+/// Whether the group-0x80 epilogue at `at`, writing its blend into a PRIMARY-ATTRIBUTE register,
+/// has the one program shape that makes it the blend: every later instruction is a `Nop` except
+/// exactly one unpredicated 32-bit identity copy (`OR #0`) of that register into `o[0]`.
+///
+/// MEASURED on a fighting title's stage-transition scene: `pack.unorm8 pa0 <- colour`, then
+/// `0x808088da90000000` (source-over, dest `pa0`), then `or o0, pa0, #0` - the established
+/// epilogue with its result parked one register away. Anything else reading or rewriting that
+/// register would make the copy not the whole story, and stays refused.
+pub(crate) fn sop2_pa_epilogue_tail_ok(instrs: &[crate::ir::Instr], at: usize) -> bool {
+    use crate::ir::{Bank, BitwiseKind, Op, Predicate};
+    let Some(dest) = instrs.get(at).and_then(|i| i.dest.as_ref()) else { return false };
+    if dest.bank != Bank::PrimaryAttr {
+        return false;
+    }
+    let mut copies = 0;
+    for ins in &instrs[at + 1..] {
+        match ins.op {
+            Op::Nop if ins.blocked.is_none() => {}
+            Op::Bitwise { kind: BitwiseKind::Or, imm: Some(0), lane_bits: 32 }
+                if ins.blocked.is_none()
+                    && matches!(ins.pred, Predicate::Always)
+                    && ins.dest.as_ref().is_some_and(|d| d.bank == Bank::Output && d.index == 0)
+                    && ins.srcs.len() == 1
+                    && ins.srcs[0].bank == Bank::PrimaryAttr
+                    && ins.srcs[0].index == dest.index =>
+            {
+                copies += 1;
+            }
+            _ => return false,
+        }
+    }
+    copies == 1
+}
+
+/// Clear [`decode::SOP2_PA_DEST_PENDING`] where [`sop2_pa_epilogue_tail_ok`] holds.
+fn validate_sop2_pa_epilogues(instrs: &mut [crate::ir::Instr]) {
+    for at in 0..instrs.len() {
+        if instrs[at].blocked == Some(decode::SOP2_PA_DEST_PENDING) && sop2_pa_epilogue_tail_ok(instrs, at) {
+            instrs[at].blocked = None;
+        }
+    }
+}
+
 fn validate_imad_step_pairs(instrs: &mut [crate::ir::Instr]) {
     use crate::ir::{Instr, Op};
 
@@ -748,11 +791,21 @@ pub fn decode_shader(program: &Program) -> Shader {
         }
     }
     validate_imad_step_pairs(&mut instrs);
+    validate_sop2_pa_epilogues(&mut instrs);
     resolve_index_load_stride(&mut instrs);
     // Last, so every pass above still sees one instruction per code word.
     let (mut instrs, starts) = unroll_repeats(&program.code, instrs);
     remap_branch_targets(&mut instrs, &starts);
     Shader { kind: program.kind, instrs }
+}
+
+/// The bank an operand of the SECONDARY program really names - see [`decode_secondary_shader`].
+fn secondary_bank(bank: crate::ir::Bank) -> crate::ir::Bank {
+    use crate::ir::Bank;
+    match bank {
+        Bank::Internal | Bank::Constant | Bank::Immediate | Bank::Index => bank,
+        _ => Bank::SecondaryAttr,
+    }
 }
 
 /// Decode a program's SECONDARY code stream (see [`Program::secondary_code`]) into shader IR
@@ -776,16 +829,21 @@ pub fn decode_shader(program: &Program) -> Shader {
 /// The destinations deliberately reuse uniform slots the primary never reads as F32 (register 48
 /// is the view matrix's `m00`, and the primary reads only that matrix's third column).
 pub fn decode_secondary_shader(program: &Program) -> Shader {
-    use crate::ir::Bank;
     let mut instrs: Vec<_> = program.secondary_code.iter().map(|&w| decode(w)).collect();
     for instr in &mut instrs {
         for op in instr.dest.iter_mut().chain(instr.srcs.iter_mut()) {
-            // Everything but an internal register and a constant becomes SA. An inline
-            // immediate is not an operand in this IR (the decoder folds it into the op), so
-            // the exemption list is exactly Internal + Constant.
-            if !matches!(op.bank, Bank::Internal | Bank::Constant) {
-                op.bank = Bank::SecondaryAttr;
-            }
+            // Everything but an internal register, a constant and an inline IMMEDIATE becomes
+            // SA - the spec's own exemption list. (The index-register file is not a bank at all.)
+            //
+            // >>> THE IMMEDIATE USED TO BE FORCED TOO, on the belief that "an inline immediate is
+            // not an operand in this IR". It became one (`Bank::Immediate`, the extension row's
+            // IMM6), and the force turned `#0` into `SA[0]`. MEASURED: a football title's skinned
+            // program (`122a883ec212c8d9`, secondary #22 `0x3882052283400000`) zeroes the two
+            // spare blend weights of its rigid-attachment path with `mov sa32.xy <- #0`; read as
+            // `SA[0]` they became the first row of the view-projection matrix (0.29, -0.10), so
+            // every attachment - the referee's cap at the kickoff - blended ~0.19 of bone 0 into
+            // its head joint and floated off whenever the body moved under the head.
+            op.bank = secondary_bank(op.bank);
         }
     }
     validate_imad_step_pairs(&mut instrs);
@@ -799,6 +857,44 @@ pub fn decode_secondary_shader(program: &Program) -> Shader {
 mod tests {
     use super::*;
     use crate::ir::Instr;
+
+    /// A fighting title's stage-transition fragment ends `pack.unorm8 pa0`, then the source-over
+    /// SOP2 into `pa0` (`0x808088da90000000`), then `or o0, pa0, #0`. That tail - and only that -
+    /// admits the PA-destination blend; a second reader of the result keeps it refused.
+    #[test]
+    fn a_pa_destination_blend_is_admitted_only_when_moved_to_the_output() {
+        let words = [0x40810c3e201dbc00u64, 0x808088da90000000, 0x50a10009a0000000];
+        let mut ok: Vec<Instr> = words.iter().map(|&w| decode::decode(w)).collect();
+        assert_eq!(ok[1].blocked, Some(decode::SOP2_PA_DEST_PENDING), "one word cannot see the tail");
+        validate_sop2_pa_epilogues(&mut ok);
+        assert!(ok[1].blocked.is_none(), "{:?}", ok[1].blocked);
+        // The same blend followed by TWO copies (or anything else) is not the epilogue.
+        let mut twice: Vec<Instr> =
+            [0x808088da90000000u64, 0x50a10009a0000000, 0x50a10009a0000000].iter().map(|&w| decode::decode(w)).collect();
+        validate_sop2_pa_epilogues(&mut twice);
+        assert_eq!(twice[0].blocked, Some(decode::SOP2_PA_DEST_PENDING));
+        // ...and with nothing after it, the result never reaches o[0].
+        let mut alone = vec![decode::decode(0x808088da90000000)];
+        validate_sop2_pa_epilogues(&mut alone);
+        assert!(alone[0].blocked.is_some());
+    }
+
+    /// The secondary program's bank rule keeps an inline immediate an immediate: the referee's
+    /// cap word `mov sa32.xy <- #0` must still read zero after the remap, not `SA[0]`.
+    #[test]
+    fn the_secondary_bank_rule_keeps_immediates_constants_and_internals() {
+        use crate::ir::Bank;
+        let i = decode::decode(0x3882052283400000);
+        assert_eq!(i.srcs[0].bank, Bank::Immediate);
+        assert_eq!(secondary_bank(i.srcs[0].bank), Bank::Immediate, "#0 stays #0");
+        assert_eq!(secondary_bank(i.dest.unwrap().bank), Bank::SecondaryAttr, "the destination is SA");
+        for keep in [Bank::Internal, Bank::Constant, Bank::Immediate, Bank::Index] {
+            assert_eq!(secondary_bank(keep), keep);
+        }
+        for force in [Bank::Temp, Bank::PrimaryAttr, Bank::Output, Bank::SecondaryAttr] {
+            assert_eq!(secondary_bank(force), Bank::SecondaryAttr);
+        }
+    }
 
     /// The two words of a golf title's address computation, which are a well-formed pair.
     const STEP0: u64 = 0xd082_8006_a01a_c080;

@@ -255,13 +255,14 @@ impl WebVm {
         })
     }
 
-    /// Call the guest function exported at `addr`, running until it returns or a
-    /// host handler halts it. A clean halt is `Ok`, mirroring native `Vm::call`.
+    /// Call the guest function at `addr` through the module's dispatcher
+    /// ([`abi::DISPATCH_EXPORT`]), running until it returns or a host handler halts it. A
+    /// clean halt is `Ok`, mirroring native `Vm::call`.
     pub fn call(&self, addr: u32) -> Result<(), JsValue> {
         let exports_obj = self.instance.exports();
-        let func = Reflect::get(&exports_obj, &JsValue::from_str(&abi::func_export(addr)))?
+        let dispatch = Reflect::get(&exports_obj, &JsValue::from_str(abi::DISPATCH_EXPORT))?
             .dyn_into::<Function>()?;
-        match func.call0(&JsValue::NULL) {
+        match dispatch.call2(&JsValue::NULL, &JsValue::from(addr), &JsValue::from(0u32)) {
             Ok(_) => Ok(()),
             Err(e) => {
                 if *self.halted.borrow() {
@@ -316,6 +317,12 @@ fn finish(halted: &Rc<RefCell<bool>>, outcome: vitaslop_runtime::SvcOutcome) -> 
         // Unfaithful call (e.g. unimplemented NID): throw the message as a real JS
         // error so the run fails loudly instead of faking a success and desyncing.
         SvcOutcome::Fatal(msg) => Err(JsValue::from_str(&msg)),
+        // A library calling back into the title mid-call is run by the scheduler engines
+        // only; stop loudly rather than return a result the call never finished.
+        SvcOutcome::CallGuest => Err(JsValue::from_str(
+            "a host call needs to call back into the guest (SvcOutcome::CallGuest), which only the \
+             scheduler engines run",
+        )),
     }
 }
 

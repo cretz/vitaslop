@@ -2032,7 +2032,7 @@ fn only_an_unmixed_lane_is_substituted_and_a_truncated_one_gets_a_float() {
     // pa[4] is read ONLY by the float-to-int cast; pa[8] by an ordinary float multiply as well.
     let shader = pin_shader(vec![
         pin_instr(
-            Op::PackToInt { bits: 32, signed: true, src_half: false },
+            Op::PackToInt { bits: 32, signed: true, src_half: false, norm: false },
             Some(Operand::plain(Bank::Temp, 0, 0)),
             [true, false, false, false],
             vec![Operand::plain(Bank::PrimaryAttr, 4, 0)],

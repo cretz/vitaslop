@@ -122,6 +122,8 @@ than expected.
 - OlliOlli
 - Persona 4 Golden
 - Ridge Racer
+- Ultimate Marvel vs. Capcom 3
+- Uncharted: Golden Abyss
 - WipEout 2048
 
 </details>

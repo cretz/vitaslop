@@ -120,6 +120,15 @@ async function storeOne(dir, path, source, onBytes = () => {}) {
   return (await fh.getFile()).size;
 }
 
+/// The stored size of `path` in `dir`, or -1 when it is not stored.
+async function storedSize(dir, path) {
+  try {
+    return (await (await dir.getFileHandle(encodeName(path))).getFile()).size;
+  } catch {
+    return -1;
+  }
+}
+
 /// How much room this origin has, or `null` where the browser will not say.
 ///
 /// # Why this is checked BEFORE an import and not caught after
@@ -160,6 +169,16 @@ export async function importTitle(id, entries, onProgress = () => {}) {
   const dir = await titleDir(id);
   let bytes = 0;
   for (let i = 0; i < entries.length; i++) {
+    // RESUME: an entry that names its `size` and is already stored at exactly that size (an
+    // earlier import cut off part-way, e.g. by a runner job's time limit) is kept, not refetched.
+    if (typeof entries[i].size === "number") {
+      const have = await storedSize(dir, entries[i].path);
+      if (have === entries[i].size) {
+        bytes += have;
+        onProgress(i + 1, entries.length, bytes, false);
+        continue;
+      }
+    }
     // Report DURING each file as well as after it, throttled to every 4 MB so a slow large
     // file still moves the counter without flooding the caller. See `storeOne`.
     let inFlight = 0;
@@ -338,12 +357,32 @@ export async function openTitleCached(id) {
     /// guest workers of `VITASLOP_SMP` read files themselves instead of forwarding every
     /// read to this worker. Plain data: a SharedArrayBuffer and two arrays.
     share: () => ({ sab, paths, sizes }),
-    close: () => {
-      Atomics.store(h, H.CLOSE, 1);
-      Atomics.store(h, H.REQ, 1);
-      Atomics.notify(h, H.REQ);
-      setTimeout(() => worker.terminate(), 2000);
-    },
+    /// Close the title's files and the storage worker. Resolves once the worker says its
+    /// sync handles are CLOSED (or after 2 s, when it is terminated regardless). A caller that
+    /// is about to open the same title again - the next device-runner job - has to wait for
+    /// this: MEASURED on the phone, a run worker terminated with its storage worker still
+    /// nested under it left the handles open for the page's lifetime, and every later run of
+    /// that title failed "files are still open in another worker" until every tab was closed.
+    close: () =>
+      new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          worker.terminate();
+          resolve();
+        };
+        const timer = setTimeout(finish, 2000);
+        worker.addEventListener("message", (e) => {
+          if (e.data.type === "closed") {
+            clearTimeout(timer);
+            finish();
+          }
+        });
+        Atomics.store(h, H.CLOSE, 1);
+        Atomics.store(h, H.REQ, 1);
+        Atomics.notify(h, H.REQ);
+      }),
   };
 }
 

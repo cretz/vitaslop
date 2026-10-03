@@ -45,6 +45,9 @@ export const MAX_TIMEOUT_MS = 90_000;
 /// A LIVE job (the installed game played by a recipe, web/runner/live.html) has to boot, reach
 /// the frames it measures and measure them; still bounded, so a phone is not held for long.
 export const MAX_LIVE_TIMEOUT_MS = 360_000;
+/// A SOAK (a live job with `params.wallMs`): a defect that needs time to show (a renderer that
+/// dies after ~40 min of play) cannot be asked in six minutes. The page stops itself at wallMs.
+export const MAX_SOAK_TIMEOUT_MS = 3_300_000;
 const DEFAULT_TIMEOUT_MS = 60_000;
 /// How long a lease outlives its last heartbeat before the job is offered again.
 const LEASE_MS = 25_000;
@@ -107,6 +110,10 @@ export function createRunner({ dir, coi, laneSrc, runnerWebDir }) {
 
   /// Whether `device` may take `job` now.
   const offerable = (job, device, now) => {
+    // A cancelled job waits only for its running device's report - never hand it out again.
+    // MEASURED (10-03a, job 533): the phone ended a cancelled run without a result, polled
+    // `next`, was handed the same job back under its own lease, and ran it from the start.
+    if (job.cancel) return false;
     const target = job.target || "any";
     if (target !== "any" && target !== "all" && target !== device) return false;
     if (target === "all" && doneFor(job, device)) return false;
@@ -172,7 +179,14 @@ export function createRunner({ dir, coi, laneSrc, runnerWebDir }) {
         kind: spec.kind,
         params: spec.params || {},
         target: spec.target || "any",
-        timeoutMs: Math.min(Number(spec.timeoutMs) || DEFAULT_TIMEOUT_MS, spec.kind === "live" ? MAX_LIVE_TIMEOUT_MS : MAX_TIMEOUT_MS),
+        // An import is resumable only per FILE, so its cap has to fit the largest file: a
+        // title's 3 GB archive restarted from zero on every 90-second job and never finished.
+        timeoutMs: Math.min(
+          Number(spec.timeoutMs) || DEFAULT_TIMEOUT_MS,
+          spec.kind === "import-title" ? MAX_SOAK_TIMEOUT_MS
+            : spec.kind !== "live" ? MAX_TIMEOUT_MS
+            : spec.params?.wallMs ? MAX_SOAK_TIMEOUT_MS : MAX_LIVE_TIMEOUT_MS
+        ),
         note: spec.note || "",
         queued: new Date(now).toISOString(),
         leases: {},

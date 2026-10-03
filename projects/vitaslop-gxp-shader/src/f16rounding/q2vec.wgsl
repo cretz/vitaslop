@@ -1,5 +1,4 @@
 fn gxp_q2(v: vec2<f32>) -> vec2<f32> {
-  let m = bitcast<vec2<u32>>(v) & vec2<u32>(0x7fffffffu);
-  let c = select(v, sign(v) * 65504.0, (m > vec2<u32>(0x477fe000u)) & (m < vec2<u32>(0x7f800000u)));
+  let c = select(v, clamp(v, vec2<f32>(-65504.0), vec2<f32>(65504.0)), abs(v) <= vec2<f32>(3.40282346638528859812e+38f));
   return unpack2x16float(pack2x16float(vec2<f32>(vec2<f16>(c))));
 }

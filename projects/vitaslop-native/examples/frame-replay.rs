@@ -43,10 +43,26 @@ fn main() {
         eprintln!("frame-replay: cannot read {path}: {e}");
         std::process::exit(1);
     });
-    let fc = vitaslop_runtime::capsule::read_frame(&mut &bytes[..]).unwrap_or_else(|e| {
+    let mut fc = vitaslop_runtime::capsule::read_frame(&mut &bytes[..]).unwrap_or_else(|e| {
         eprintln!("frame-replay: {path}: {e}");
         std::process::exit(1);
     });
+    // `--truncate <scene> <n>`: keep only the first `n` draws of that scene - bisect which draw
+    // puts a defect on screen (render at n, look at the pixel, halve). Later scenes still run,
+    // so a composite that samples the truncated target shows the truncated picture.
+    if let Some(at) = args.iter().position(|a| a == "--truncate") {
+        let parse = |i: usize| args.get(at + i).and_then(|v| v.parse::<usize>().ok());
+        let (Some(si), Some(n)) = (parse(1), parse(2)) else {
+            eprintln!("frame-replay: --truncate <scene> <n>");
+            std::process::exit(2);
+        };
+        let Some(scene) = fc.scenes.get_mut(si) else {
+            eprintln!("frame-replay: --truncate: no scene {si}");
+            std::process::exit(2);
+        };
+        scene.draws.truncate(n);
+        eprintln!("  scene {si} truncated to its first {} draw(s)", scene.draws.len());
+    }
     eprintln!(
         "frame {} - {} scene(s), {} draw(s), {}x{}",
         fc.frame,
@@ -68,7 +84,11 @@ fn main() {
         if list {
             for (di, d) in s.draws.iter().enumerate() {
                 let h = |b: &[u8]| vitaslop_gxp_shader::Program::parse(b).map(|p| p.hash).unwrap_or(0);
-                eprintln!("    draw {di} vprog {:016x} fprog {:016x}", h(&d.vprog), h(&d.fprog));
+                let rs = &d.render_state;
+                eprintln!(
+                    "    draw {di} vprog {:016x} fprog {:016x} depth func {} write {} cull {}",
+                    h(&d.vprog), h(&d.fprog), rs.front_depth_func, rs.front_depth_write, rs.cull_mode
+                );
                 for t in d.textures.iter() {
                     eprintln!(
                         "    draw {di} unit {} tex {:#x} {}x{} type {} fmt {:#x} stride {} faces {} min {} mag {} mip {} mips {} addr {}/{}",
@@ -77,6 +97,46 @@ fn main() {
                     );
                 }
             }
+        }
+    }
+    // `--prog <scene> <draw> <dir>`: write that draw's vertex and fragment program blobs to
+    // `<dir>/<hash>.v.gxp` / `<dir>/<hash>.f.gxp`, for the shader crate's disassembly and
+    // linked-WGSL tools - the one step between "this draw is wrong" and reading its program.
+    // `--progs <dir>`: every DISTINCT program of the whole frame, the same way - the frame's own
+    // shader corpus, for a census of one instruction shape across everything it draws with.
+    if let Some(dir) = args.iter().position(|a| a == "--progs").and_then(|at| args.get(at + 1)) {
+        std::fs::create_dir_all(dir).expect("create --progs dir");
+        let mut seen = std::collections::HashSet::new();
+        for d in fc.scenes.iter().flat_map(|s| s.draws.iter()) {
+            for (blob, kind) in [(&d.vprog, "v"), (&d.fprog, "f")] {
+                let hash = vitaslop_gxp_shader::Program::parse(blob).map(|p| p.hash).unwrap_or(0);
+                if seen.insert((hash, kind)) {
+                    std::fs::write(std::path::Path::new(dir).join(format!("{hash:016x}.{kind}.gxp")), &blob[..])
+                        .expect("write program blob");
+                }
+            }
+        }
+        eprintln!("  wrote {} distinct programs to {dir}", seen.len());
+    }
+    if let Some(at) = args.iter().position(|a| a == "--prog") {
+        let (Some(si), Some(di), Some(dir)) = (
+            args.get(at + 1).and_then(|s| s.parse::<usize>().ok()),
+            args.get(at + 2).and_then(|s| s.parse::<usize>().ok()),
+            args.get(at + 3),
+        ) else {
+            eprintln!("frame-replay: --prog <scene> <draw> <dir>");
+            std::process::exit(2);
+        };
+        let Some(d) = fc.scenes.get(si).and_then(|s| s.draws.get(di)) else {
+            eprintln!("frame-replay: --prog: no draw {di} in scene {si}");
+            std::process::exit(2);
+        };
+        std::fs::create_dir_all(dir).expect("create --prog dir");
+        for (blob, kind) in [(&d.vprog, "v"), (&d.fprog, "f")] {
+            let hash = vitaslop_gxp_shader::Program::parse(blob).map(|p| p.hash).unwrap_or(0);
+            let path = std::path::Path::new(dir).join(format!("{hash:016x}.{kind}.gxp"));
+            std::fs::write(&path, &blob[..]).expect("write program blob");
+            eprintln!("  wrote {}", path.display());
         }
     }
     // `--tex <addr> <dir>`: every DISTINCT binding of the texture at that guest address, as the
@@ -194,6 +254,55 @@ fn main() {
     // `--extract <vprog content hash> <dir>`: write every draw whose VERTEX program hashes to that
     // value as its own draw capsule, for `capsule-replay` (named uniforms, per-draw probes) - the
     // per-draw instrument, without another title run to capture the draw on its own.
+    // `--params <vprog hash>`: that vertex program's parameter table, its +0x78 buffer bindings
+    // and the memory windows the capture resolves for it - what sizes a window it reads past.
+    if let Some(at) = args.iter().position(|a| a == "--params") {
+        let want = args.get(at + 1).and_then(|w| u64::from_str_radix(w.trim_start_matches("0x"), 16).ok());
+        let Some(want) = want else {
+            eprintln!("frame-replay: --params <vprog hash>");
+            std::process::exit(2);
+        };
+        for s in &fc.scenes {
+            for d in &s.draws {
+                let Ok(p) = vitaslop_gxp_shader::Program::parse(&d.vprog) else { continue };
+                if p.hash != want {
+                    continue;
+                }
+                eprintln!("vprog {want:016x}: default uniform regs {}", p.default_uniform_regs);
+                for q in &p.parameters {
+                    eprintln!(
+                        "  param {:<32} {:?} type {:?} comps {} array {} res {} semantic {}/{} container {}",
+                        q.name, q.category, q.ptype, q.component_count, q.array_size, q.resource_index, q.semantic,
+                        q.semantic_index, q.container_index
+                    );
+                }
+                for b in &p.uniform_buffer_bindings {
+                    eprintln!("  +0x78 binding {b:?}");
+                }
+                for w in vitaslop_gxp_shader::mem_windows_for_vertex_blob(&d.vprog) {
+                    eprintln!("  window {w:?}");
+                }
+                for (a, b) in &d.mem_windows {
+                    eprintln!("  captured window at {a:#x}, {} bytes", b.len());
+                }
+                eprintln!("  vertex stride {} bytes, {} bytes captured", d.vertex_stride, d.vertices.len());
+                for at in d.attributes.iter() {
+                    eprintln!("  attr {at:?}");
+                    let stride = d.vertex_stride.max(1) as usize;
+                    let raw: Vec<String> = (0..4)
+                        .filter_map(|v| {
+                            let o = v * stride + at.offset as usize;
+                            d.vertices.get(o..o + 8).map(|b| format!("{b:02x?}"))
+                        })
+                        .collect();
+                    eprintln!("    first 4 vertices, 8 bytes at its offset: {}", raw.join(" "));
+                }
+                return;
+            }
+        }
+        eprintln!("frame-replay: no draw binds vprog {want:016x}");
+        return;
+    }
     if let Some(at) = args.iter().position(|a| a == "--extract") {
         let (Some(want), Some(dir)) = (args.get(at + 1), args.get(at + 2)) else {
             eprintln!("frame-replay: --extract <vprog hash> <dir>");
@@ -392,7 +501,8 @@ fn main() {
     }
     // The first positional argument after the frame, skipping every option's VALUE.
     let out = args.iter().enumerate().skip(1).find_map(|(i, a)| {
-        let is_value = matches!(args[i - 1].as_str(), "--before" | "--extract" | "--gpu-time");
+        let is_value = matches!(args[i - 1].as_str(), "--before" | "--extract" | "--gpu-time" | "--truncate")
+            || (i >= 2 && args[i - 2] == "--truncate");
         (!a.starts_with("--") && !is_value).then_some(a)
     });
     if let Some(out) = out {

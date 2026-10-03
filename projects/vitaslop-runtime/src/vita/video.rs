@@ -48,7 +48,13 @@ pub struct MovieSession {
     ///
     /// So the header is read at open and the sample data is read per access unit, which is
     /// what the device does and what the API is shaped for.
-    pub fd: i32,
+    pub source: MovieSource,
+    /// Samples read and not yet handed over, by `(track, sample)`. A unit is DESCRIBED
+    /// (`sceMp4GetNextUnit`) before it is TAKEN (`sceMp4GetNextUnitData`), and the audio
+    /// lookahead reads units ahead of both - through a title's callbacks each of those is a
+    /// call into the title, so a sample is read once and kept until its track's cursor
+    /// passes it. See [`prefetch_samples`].
+    pub read_cache: std::collections::BTreeMap<(usize, usize), Vec<u8>>,
     /// The parsed container.
     pub mp4: crate::mp4::Mp4,
     /// The video track's parameter sets, so a sample can be rewritten into a
@@ -95,6 +101,159 @@ pub struct MovieSession {
     pub reported_gate_stall: bool,
 }
 
+/// Where a movie's bytes come from.
+#[derive(Clone, Copy)]
+pub enum MovieSource {
+    /// A descriptor the engine opened on the path the title named.
+    Host { fd: i32 },
+    /// >>> THE TITLE'S OWN FILE FUNCTIONS: `sceMp4OpenFile`'s second argument.
+    ///
+    /// A title may keep its movies INSIDE an archive of its own and hand the library the
+    /// functions that read it - the path is then a name only those functions understand, and
+    /// opening it as a file fails. The library calls them on the caller's thread, mid-call
+    /// ([`crate::SvcOutcome::CallGuest`]), into an I/O buffer from the title's own allocator
+    /// (the third argument) when it gave one.
+    Guest { ops: FileOps, mem: Option<MemOps>, buf: u32 },
+}
+
+/// `sceMp4OpenFile`'s file-operations block: `{ userdata, open, close, read }`. RECOVERED
+/// from the one title that passes it, by what each function does with its arguments:
+/// `int open(void *userdata, const char *path)`, `int close(void *userdata)`, and
+/// `int read(void *userdata, void *buf, SceOff offset, SceSize size)` - the offset a 64-bit
+/// value in r2:r3, the size on the stack. Each returns a negative value on failure; `read`
+/// returns the bytes it read.
+#[derive(Clone, Copy, Debug)]
+pub struct FileOps {
+    pub userdata: u32,
+    pub open: u32,
+    pub close: u32,
+    pub read: u32,
+}
+
+/// `sceMp4OpenFile`'s memory-operations block: `{ userdata, alloc, free }`, with
+/// `void *alloc(void *userdata, SceSize alignment, SceSize size)` and
+/// `void free(void *userdata, void *ptr)` - recovered the same way (`alloc` hands the title's
+/// allocator its r2 as the size and its r1 as the alignment).
+#[derive(Clone, Copy, Debug)]
+pub struct MemOps {
+    pub userdata: u32,
+    pub alloc: u32,
+    pub free: u32,
+}
+
+/// The I/O buffer a callback-read movie is read through, and the largest single read.
+///
+/// >>> IT COMES OUT OF THE TITLE'S OWN POOL, SO IT MUST BE SMALL. A title that passes memory
+/// functions sizes that pool for the real library's buffer plus the units its demuxer holds.
+/// MEASURED on DOA5's intro (`ninja_vi.mp4`): its pool is ~305 KB, and with a 256 KB buffer
+/// in it the browser run showed a unit allocation REFUSED for want of room. (That movie's
+/// stall was NOT this - 4 KB stalls identically; see the notes.) 64 KB covers that movie's
+/// largest unit (~43 KB) in one read; a bigger unit just takes two.
+/// `VITASLOP_MP4_GUEST_IO_KB` overrides it.
+fn guest_io_buf() -> u32 {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<u32> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        crate::knobs::var("VITASLOP_MP4_GUEST_IO_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&kb| kb > 0)
+            .map_or(64 * 1024, |kb| kb * 1024)
+    })
+}
+
+/// Read the three-word or four-word ops block at `addr`, or `None` for a null pointer or a
+/// block with a null function in it (which no library could call).
+fn read_file_ops(ctx: &crate::host::GuestCtx, addr: u32) -> Option<FileOps> {
+    if addr == 0 {
+        return None;
+    }
+    let ops = FileOps {
+        userdata: ctx.read_u32(addr),
+        open: ctx.read_u32(addr + 4),
+        close: ctx.read_u32(addr + 8),
+        read: ctx.read_u32(addr + 12),
+    };
+    (ops.open != 0 && ops.close != 0 && ops.read != 0).then_some(ops)
+}
+
+fn read_mem_ops(ctx: &crate::host::GuestCtx, addr: u32) -> Option<MemOps> {
+    if addr == 0 {
+        return None;
+    }
+    let ops = MemOps { userdata: ctx.read_u32(addr), alloc: ctx.read_u32(addr + 4), free: ctx.read_u32(addr + 8) };
+    (ops.alloc != 0 && ops.free != 0).then_some(ops)
+}
+
+/// A read that could not finish in this dispatch: the title's read function has to run first
+/// (see [`crate::host::VitaState::call_guest`]). The handler returns at once; it is dispatched
+/// again with the answer.
+struct Pending;
+
+/// Read `len` bytes at `at` through the title's read function, in buffer-sized pieces.
+/// Short at end of file, as a plain read is.
+fn guest_read(
+    st: &mut crate::host::VitaState,
+    ops: FileOps,
+    buf: u32,
+    at: u64,
+    len: usize,
+) -> Result<Vec<u8>, Pending> {
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let want = (len - out.len()).min(guest_io_buf() as usize) as u32;
+        let off = at + out.len() as u64;
+        let call = crate::host::GuestCall {
+            entry: ops.read,
+            args: vec![ops.userdata, buf, off as u32, (off >> 32) as u32, want],
+        };
+        let r = st.call_guest(call, Some((buf, want))).ok_or(Pending)?;
+        let got = r.r0 as i32;
+        if got <= 0 {
+            break;
+        }
+        let got = (got as usize).min(want as usize);
+        out.extend_from_slice(&r.bytes[..got]);
+        if got < want as usize {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Read `len` bytes at `at` from wherever the movie lives.
+fn source_read(
+    st: &mut crate::host::VitaState,
+    source: &MovieSource,
+    at: u64,
+    len: usize,
+) -> Result<Vec<u8>, Pending> {
+    match *source {
+        MovieSource::Host { fd } => Ok(read_at(st, fd, at, len)),
+        MovieSource::Guest { ops, buf, .. } => guest_read(st, ops, buf, at, len),
+    }
+}
+
+/// Give back what a movie holds - the title's file and I/O buffer, through its own functions,
+/// or the engine's descriptor. `Err` while one of those calls is still to run.
+fn release_source(st: &mut crate::host::VitaState, source: &MovieSource) -> Result<(), Pending> {
+    match *source {
+        MovieSource::Host { fd } => {
+            st.io_close(fd);
+            Ok(())
+        }
+        MovieSource::Guest { ops, mem, buf } => {
+            let close = crate::host::GuestCall { entry: ops.close, args: vec![ops.userdata] };
+            st.call_guest(close, None).ok_or(Pending)?;
+            if let Some(m) = mem {
+                let free = crate::host::GuestCall { entry: m.free, args: vec![m.userdata, buf] };
+                st.call_guest(free, None).ok_or(Pending)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 // The `#[hostcall]` macro rewrites these signatures and emits its own fully-qualified
 // paths, so a module of nothing but host calls has no use for a plain `use` of them -
 // hence the qualified types below rather than an import that reads as unused.
@@ -120,12 +279,12 @@ pub(super) fn mp4_open_file(
     ctx: &mut crate::host::GuestCtx,
     st: &mut crate::host::VitaState,
     path: crate::host::Ptr,
-    _a1: crate::host::Ptr,
-    _a2: crate::host::Ptr,
+    file_ops: crate::host::Ptr,
+    mem_ops: crate::host::Ptr,
     buffer: crate::host::Ptr,
     buffer_size: u32,
 ) -> i32 {
-    do_open_file(ctx, st, path.addr(), buffer.addr(), buffer_size)
+    do_open_file(ctx, st, path.addr(), file_ops.addr(), mem_ops.addr(), buffer.addr(), buffer_size)
 }
 
 /// The body of [`mp4_open_file`], as a plain function so it can use guard clauses.
@@ -133,17 +292,124 @@ fn do_open_file(
     ctx: &mut crate::host::GuestCtx,
     st: &mut crate::host::VitaState,
     path_ptr: u32,
+    file_ops: u32,
+    mem_ops: u32,
     buffer: u32,
     buffer_size: u32,
 ) -> i32 {
-    let path = substitute_movie(ctx.read_cstr(path_ptr, 256));
-    match open_movie(st, &path, buffer, buffer_size) {
+    // >>> A PLAIN FILE IS READ AS ONE, EVEN WHEN THE TITLE ALSO HANDED OVER ITS FUNCTIONS.
+    //
+    // The functions are for a movie only they can reach - one inside the title's own archive,
+    // whose path is not a file at all (Uncharted's live in `gamedata.bin`). When the path IS a
+    // file of ours the bytes are the same either way, and reading them directly keeps the
+    // title's player fed at storage speed. MEASURED on DOA5's intro (`ninja_vi.mp4`, a plain
+    // file): through its functions every read is a round trip through its FS thread, the first
+    // units arrived a few per frame instead of in one burst, its audio-out thread found its
+    // queue empty at f468, left its loop for good, and the movie sat black and silent after 4
+    // decodes. Read directly it plays (515 pictures by f1500).
+    // `VITASLOP_MP4_GUEST_OPS`: `0` never uses the title's functions, `1` always does (the arm
+    // for the callback path on a title whose movies are plain files), unset = this rule.
+    let mode = crate::knobs::var("VITASLOP_MP4_GUEST_OPS").ok();
+    let use_ops = match mode.as_deref().map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => !st.io_size(&ctx.read_cstr(path_ptr, 256)).is_some_and(|size| size > 0),
+    };
+    let ops = if use_ops { read_file_ops(ctx, file_ops) } else { None };
+    let mem = if use_ops { read_mem_ops(ctx, mem_ops) } else { None };
+    // The title's own path when its own functions will open it - a substitute is a path
+    // on OUR file system.
+    let path = match ops {
+        Some(_) => ctx.read_cstr(path_ptr, 256),
+        None => substitute_movie(ctx.read_cstr(path_ptr, 256)),
+    };
+    let opened = match ops {
+        Some(ops) => open_guest_source(st, ops, mem, path_ptr, &path),
+        None => open_host_source(st, &path),
+    };
+    let result = match opened {
+        Ok((source, size)) => open_movie(st, &path, source, size, buffer, buffer_size),
+        Err(e) => Err(e),
+    };
+    match result {
         Ok(handle) => handle,
-        Err(reason) => {
+        // Waiting on the title's code; this dispatch is replayed with its answer.
+        Err(OpenFail::Pending) => 0,
+        Err(OpenFail::Refused(reason)) => {
             report_no_video(st, &path, &reason);
             0
         }
     }
+}
+
+/// Why `sceMp4OpenFile` did not produce a session this dispatch.
+enum OpenFail {
+    /// A call into the title has to run first - see [`Pending`].
+    Pending,
+    /// The movie cannot be played, and why.
+    Refused(String),
+}
+
+impl From<Pending> for OpenFail {
+    fn from(_: Pending) -> Self {
+        OpenFail::Pending
+    }
+}
+
+/// Open the movie as a file of our own, with its size.
+fn open_host_source(st: &mut crate::host::VitaState, path: &str) -> Result<(MovieSource, u64), OpenFail> {
+    // SCE_O_RDONLY is 1, not 0 - the Vita's flags are a value, not a bit position, and
+    // opening with 0 yields a descriptor that is neither readable nor writable: the open
+    // SUCCEEDS and every read then returns nothing, which is a much more confusing failure
+    // than a refused open.
+    const SCE_O_RDONLY: u32 = 0x0001;
+    let fd = st.io_open(path, SCE_O_RDONLY);
+    if fd < 0 {
+        return Err(OpenFail::Refused(format!("{path} cannot be opened ({fd:#x})")));
+    }
+    let size = st.io_size(path).unwrap_or(0);
+    if size == 0 {
+        st.io_close(fd);
+        return Err(OpenFail::Refused(format!("{path} is empty or its size is unknown")));
+    }
+    Ok((MovieSource::Host { fd }, size))
+}
+
+/// Open the movie through the title's own functions: its I/O buffer from its allocator (or
+/// the engine's one scratch buffer when it gave none), then its `open` on its own path. The
+/// size is not something those functions report, so it is unknown - the box walk stops where
+/// the reads come back short.
+fn open_guest_source(
+    st: &mut crate::host::VitaState,
+    ops: FileOps,
+    mem: Option<MemOps>,
+    path_ptr: u32,
+    path: &str,
+) -> Result<(MovieSource, u64), OpenFail> {
+    let buf = match mem {
+        Some(m) => {
+            let alloc = crate::host::GuestCall { entry: m.alloc, args: vec![m.userdata, 64, guest_io_buf()] };
+            let r = st.call_guest(alloc, None).ok_or(Pending)?;
+            if r.r0 == 0 {
+                return Err(OpenFail::Refused(format!(
+                    "{path}: the title's allocator refused the {}-byte I/O buffer",
+                    guest_io_buf()
+                )));
+            }
+            r.r0
+        }
+        None => st.mp4_io_scratch(guest_io_buf()),
+    };
+    let open = crate::host::GuestCall { entry: ops.open, args: vec![ops.userdata, path_ptr] };
+    let r = st.call_guest(open, None).ok_or(Pending)?;
+    if (r.r0 as i32) < 0 {
+        if let Some(m) = mem {
+            let free = crate::host::GuestCall { entry: m.free, args: vec![m.userdata, buf] };
+            st.call_guest(free, None).ok_or(Pending)?;
+        }
+        return Err(OpenFail::Refused(format!("{path}: the title's own open function refused it ({:#x})", r.r0)));
+    }
+    Ok((MovieSource::Guest { ops, mem, buf }, u64::MAX))
 }
 
 /// >>> OPEN A DIFFERENT MOVIE THAN THE TITLE ASKED FOR
@@ -174,70 +440,100 @@ fn substitute_movie(asked: String) -> String {
     sub
 }
 
-/// Read the file and demux it.
+/// Demux an opened movie: find and parse its header, and make it the session. A movie that
+/// cannot be played gives back what its source holds before it is refused.
 fn open_movie(
     st: &mut crate::host::VitaState,
     path: &str,
+    source: MovieSource,
+    size: u64,
     buffer: u32,
     buffer_size: u32,
-) -> Result<i32, String> {
-    // SCE_O_RDONLY is 1, not 0 - the Vita's flags are a value, not a bit position, and
-    // opening with 0 yields a descriptor that is neither readable nor writable: the open
-    // SUCCEEDS and every read then returns nothing, which is a much more confusing failure
-    // than a refused open.
-    const SCE_O_RDONLY: u32 = 0x0001;
-    let fd = st.io_open(path, SCE_O_RDONLY);
-    if fd < 0 {
-        return Err(format!("{path} cannot be opened ({fd:#x})"));
+) -> Result<i32, OpenFail> {
+    match parse_movie(st, path, &source, size) {
+        Ok((mp4, avcc)) => Ok(start_session(st, path, source, mp4, avcc, buffer, buffer_size)),
+        Err(OpenFail::Pending) => Err(OpenFail::Pending),
+        Err(OpenFail::Refused(reason)) => {
+            release_source(st, &source)?;
+            Err(OpenFail::Refused(reason))
+        }
     }
-    // >>> ONLY THE HEADER IS READ. See `MovieSession::fd` for what reading the whole file
+}
+
+/// Read and check a movie's header. Reads only; changes nothing - see
+/// [`crate::host::VitaState::call_guest`] for why a callback-read open must be that way.
+fn parse_movie(
+    st: &mut crate::host::VitaState,
+    path: &str,
+    source: &MovieSource,
+    size: u64,
+) -> Result<(crate::mp4::Mp4, crate::mp4::AvcC), OpenFail> {
+    let refuse = |s: String| OpenFail::Refused(s);
+    // >>> ONLY THE HEADER IS READ. See `MovieSession::source` for what reading the whole file
     // cost, and why a desktop could never show it.
-    let size = st.io_size(path).unwrap_or(0);
-    if size == 0 {
-        st.io_close(fd);
-        return Err(format!("{path} is empty or its size is unknown"));
+    let mut pending = false;
+    let found = crate::mp4::find_moov(size, |at, len| match source_read(st, source, at, len) {
+        Ok(b) => b,
+        Err(Pending) => {
+            pending = true;
+            Vec::new()
+        }
+    });
+    if pending {
+        return Err(OpenFail::Pending);
     }
-    let (moov_at, moov_len) = crate::mp4::find_moov(size, |at, len| read_at(st, fd, at, len))
-        .map_err(|e| format!("{path}: no moov box ({e:?})"))?;
+    let (moov_at, moov_len) = found.map_err(|e| refuse(format!("{path}: no moov box ({e:?})")))?;
     // A header is hundreds of kilobytes at most; a cap turns a mis-parse into a refusal
     // rather than an allocation the size of the file.
     const MAX_MOOV: u64 = 8 * 1024 * 1024;
     if moov_len > MAX_MOOV {
-        st.io_close(fd);
-        return Err(format!("{path}: its moov box is {moov_len} bytes, past the {MAX_MOOV} cap"));
+        return Err(refuse(format!("{path}: its moov box is {moov_len} bytes, past the {MAX_MOOV} cap")));
     }
-    let moov = read_at(st, fd, moov_at, moov_len as usize);
+    let moov = source_read(st, source, moov_at, moov_len as usize)?;
     if moov.len() as u64 != moov_len {
-        st.io_close(fd);
-        return Err(format!(
+        return Err(refuse(format!(
             "{path}: read {} of the {moov_len}-byte moov box at {moov_at}",
             moov.len()
-        ));
+        )));
     }
 
-    let mp4 = crate::mp4::Mp4::parse_moov(&moov).map_err(|e| format!("{path}: {e:?}"))?;
+    let mp4 = crate::mp4::Mp4::parse_moov(&moov).map_err(|e| refuse(format!("{path}: {e:?}")))?;
     let track = mp4
         .track(crate::mp4::TrackKind::Video)
-        .ok_or_else(|| format!("{path} has no video track"))?;
+        .ok_or_else(|| refuse(format!("{path} has no video track")))?;
     if &track.codec != b"avc1" && &track.codec != b"avc3" {
-        return Err(format!(
+        return Err(refuse(format!(
             "{path}: the video track is {:?}, not H.264",
             String::from_utf8_lossy(&track.codec)
-        ));
+        )));
     }
     if track.codec_config.is_empty() {
-        return Err(format!("{path}: the video track carries no avcC record"));
+        return Err(refuse(format!("{path}: the video track carries no avcC record")));
     }
     let avcc = crate::mp4::AvcC::parse(&track.codec_config)
-        .map_err(|e| format!("{path}: the avcC record cannot be read ({e:?})"))?;
+        .map_err(|e| refuse(format!("{path}: the avcC record cannot be read ({e:?})")))?;
     if avcc.sps.is_empty() || avcc.pps.is_empty() {
-        return Err(format!(
+        return Err(refuse(format!(
             "{path}: the avcC record carries {} SPS and {} PPS - a decoder cannot be \
              configured from it",
             avcc.sps.len(),
             avcc.pps.len()
-        ));
+        )));
     }
+    Ok((mp4, avcc))
+}
+
+/// Make a parsed movie the session, and hand back its handle.
+fn start_session(
+    st: &mut crate::host::VitaState,
+    path: &str,
+    source: MovieSource,
+    mp4: crate::mp4::Mp4,
+    avcc: crate::mp4::AvcC,
+    buffer: u32,
+    buffer_size: u32,
+) -> i32 {
+    let Some(track) = mp4.track(crate::mp4::TrackKind::Video) else { unreachable!("checked by parse_movie") };
     let (width, height) = (track.width, track.height);
     let samples = track.samples.len();
     let audio = mp4
@@ -250,15 +546,24 @@ fn open_movie(
     // WARN so a device's default log level carries it - see the note on the first-picture
     // report in `vita::avcdec` for why the movie path says its landmarks out loud.
     // A milestone for the panel's STATUS section: which movie, at what size, with what sound.
+    let through = match &source {
+        MovieSource::Host { .. } => "the engine's own file access".to_string(),
+        MovieSource::Guest { ops, mem, .. } => format!(
+            "the title's own file functions (read {:#010x}{})",
+            ops.read,
+            if mem.is_some() { ", I/O buffer from its allocator" } else { "" }
+        ),
+    };
     tracing::info!(
         target: "vitaslop::status",
         %path, width, height, samples, ?audio,
-        buffer = format_args!("{buffer:#010x}"), buffer_size,
+        buffer = format_args!("{buffer:#010x}"), buffer_size, %through,
         "SceMp4: demuxing a movie"
     );
     st.movie = Some(MovieSession {
         path: path.to_string(),
-        fd,
+        source,
+        read_cache: std::collections::BTreeMap::new(),
         cursors: served_cursors(&mp4),
         audio: open_movie_audio(st, &mp4),
         mp4,
@@ -276,7 +581,7 @@ fn open_movie(
         gate_refusals: 0,
         reported_gate_stall: false,
     });
-    Ok(handle)
+    handle
 }
 
 /// Read `len` bytes at an absolute file offset through an open descriptor.
@@ -678,6 +983,7 @@ fn do_get_next_unit(
             ctx.write_u32(out + unit::KIND, 4);
             return 0;
         }
+        Err(_) if st.guest_call_pending() => return 0,
         Err(reason) => {
             let path = st.movie.as_ref().map(|m| m.path.clone()).unwrap_or_default();
             report_no_video(st, &path, &reason);
@@ -766,6 +1072,8 @@ struct PendingUnit {
     es_size: u32,
     /// [`unit_id`] of the unit's bytes.
     id: u64,
+    /// The unit's first bytes - see [`DecodedFrame::head`].
+    head: [u8; 16],
 }
 
 /// One decoded audio frame, waiting for the guest to ask for it.
@@ -778,6 +1086,11 @@ pub struct DecodedFrame {
     /// computes the same over the elementary stream the guest passes, which is how the queue
     /// knows WHICH unit the title is decoding rather than merely whether it is the next one.
     pub id: u64,
+    /// The first bytes of that access unit (zero-padded). Carried only so a decode call that
+    /// matches NOTHING while frames are queued can show what it was offered against what the
+    /// demuxer cut - the difference between a decoder that is behind and two parties that
+    /// disagree about what a unit is.
+    pub head: [u8; 16],
 }
 
 /// The identity of one access unit: FNV-1a over its bytes, folded with its length.
@@ -819,6 +1132,10 @@ pub mod audio_counters {
     pub static FRAMES_CUT: AtomicU64 = AtomicU64::new(0);
     /// Frames the title collected through `sceAudiodecDecode`.
     pub static FRAMES_DELIVERED: AtomicU64 = AtomicU64::new(0);
+    /// The deepest the queue has been when the title took a frame from it: how far the
+    /// decode, which follows the title's DEMUX, runs ahead of the title's own decode calls.
+    /// The backlog cap must sit above it or it sheds the very frames the title asks for next.
+    pub static QUEUED_AT_TAKE_MAX: AtomicU64 = AtomicU64::new(0);
     /// `sceAudiodecDecode` calls answered with silence because the unit asked for was not
     /// decoded yet.
     pub static STARVED_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -832,6 +1149,7 @@ pub mod audio_counters {
     pub static UNIT_FRAMES: AtomicU32 = AtomicU32::new(0);
 
     pub fn reset() {
+        QUEUED_AT_TAKE_MAX.store(0, Relaxed);
         UNITS_SUBMITTED.store(0, Relaxed);
         OUTPUTS.store(0, Relaxed);
         OUTPUT_FRAMES_MIN.store(u32::MAX, Relaxed);
@@ -873,7 +1191,7 @@ pub fn movie_audio_report() -> Option<String> {
          ({} against the {expected} the units add up to at {unit_frames}/unit) -> {} frames cut, \
          {} delivered to the title | {} calls STARVED (served silence, nothing decoded yet for \
          that unit) | {} resyncs dropping {} stale frames (the title had moved past them) | \
-         {} frames shed to the backlog cap. Sound that repeats or echoes is here: a starved \
+         {} frames shed to the backlog cap (cap {}; the queue was up to {} deep when the title took a frame). Sound that repeats or echoes is here: a starved \
          call is a gap, a resync is lost sound, and a decoded total short of the expected one \
          is a decoder that trims - all three leave the TOTAL looking right.",
         match decoded.cmp(&expected) {
@@ -887,14 +1205,38 @@ pub fn movie_audio_report() -> Option<String> {
         RESYNCS.load(Relaxed),
         RESYNC_DROPPED.load(Relaxed),
         BACKLOG_DROPPED.load(Relaxed),
+        audio_backlog(),
+        QUEUED_AT_TAKE_MAX.load(Relaxed),
     ))
 }
 
 /// How many decoded frames to hold for a title that is not collecting them. One AAC frame
-/// is about 21 ms of audio, so this is half a second - deep enough that no decoder pipeline
-/// is ever the reason one is dropped, shallow enough that a title which stops asking does
-/// not accumulate a movie's worth of PCM.
-const AUDIO_BACKLOG: usize = 24;
+/// is about 21 ms of audio (4 KB of stereo PCM), so this is about 22 s and 4 MB at most.
+///
+/// # >>> THE QUEUE FOLLOWS THE TITLE'S DEMUX, NOT ITS DECODE - AND A DEMUX READS AHEAD.
+/// Units are submitted when the title's demux thread READS them (`pump_movie_audio`), and a
+/// title's decode thread asks for them later. This was 24 (half a second), sized for a
+/// decoder pipeline. MEASURED (Marvel vs Capcom 3's intro, `QUEUED_AT_TAKE_MAX`): the queue is
+/// up to 273 frames deep when the title takes one - its demux runs ~5.8 s ahead. At 24 the
+/// cap shed the front of the queue, which is exactly the frames the title asked for next:
+/// 6,459 of its calls got silence, 4 frames of sound were delivered, in the browser and
+/// natively - and natively the title then gave up on the movie 44 s into 141. At this cap:
+/// 0 starved and 0 shed on both (native 6,498 frames delivered over the whole movie, which now
+/// plays to its end; the browser's queue peaked at 274, its audio ring at -11 dBFS against
+/// -71 before). Hot Shots (29 deep, 5 starved) and MK (34 deep, 11 starved) had the same
+/// silence at 24; `=24` reproduces their old reference frames exactly.
+///
+/// `VITASLOP_MOVIE_AUDIO_BACKLOG=<frames>` overrides it; `24` is the old cap, the A/B arm.
+fn audio_backlog() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        crate::knobs::var("VITASLOP_MOVIE_AUDIO_BACKLOG")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(1024)
+    })
+}
 
 /// Open a decoder for the movie's audio track, if it has one this engine can decode.
 ///
@@ -991,6 +1333,9 @@ fn pump_movie_audio(
         // The unit just handed over is in hand; only the lookahead is read again.
         let (bytes, pts): (std::borrow::Cow<[u8]>, i64) = if next == at {
             (std::borrow::Cow::Borrowed(&unit.bytes[..]), unit.pts as i64)
+        } else if !sample_ready(st, track, next) {
+            // Not read ahead (see `prefetch_samples`); the next hand-over feeds it.
+            break;
         } else {
             match access_unit_at(st, track, next) {
                 Ok(Some(u)) => (std::borrow::Cow::Owned(u.bytes), u.pts as i64),
@@ -1008,7 +1353,10 @@ fn pump_movie_audio(
             return;
         }
         audio_counters::UNITS_SUBMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        audio.pending.push_back(PendingUnit { es_size: bytes.len() as u32, id: unit_id(&bytes) });
+        let mut head = [0u8; 16];
+        let n = bytes.len().min(16);
+        head[..n].copy_from_slice(&bytes[..n]);
+        audio.pending.push_back(PendingUnit { es_size: bytes.len() as u32, id: unit_id(&bytes), head });
         audio.submitted_to = next + 1;
     }
     collect_decoded_audio(st);
@@ -1091,9 +1439,9 @@ impl MovieAudio {
                 continue;
             };
             let samples: Vec<i16> = self.pcm.drain(..per_frame).collect();
-            self.ready.push_back(DecodedFrame { samples, es_size: unit.es_size, id: unit.id });
+            self.ready.push_back(DecodedFrame { samples, es_size: unit.es_size, id: unit.id, head: unit.head });
             audio_counters::FRAMES_CUT.fetch_add(1, Relaxed);
-            while self.ready.len() > AUDIO_BACKLOG {
+            while self.ready.len() > audio_backlog() {
                 self.ready.pop_front();
                 self.dropped += 1;
                 audio_counters::BACKLOG_DROPPED.fetch_add(1, Relaxed);
@@ -1152,6 +1500,7 @@ pub(crate) fn take_decoded_audio(
         }
     }
     let at = found?;
+    audio_counters::QUEUED_AT_TAKE_MAX.fetch_max(audio.ready.len() as u64, Relaxed);
     let dropped = audio.ready.drain(..at).count() as u64;
     if dropped > 0 {
         audio_counters::RESYNCS.fetch_add(1, Relaxed);
@@ -1160,6 +1509,14 @@ pub(crate) fn take_decoded_audio(
     let frame = audio.ready.pop_front()?;
     audio_counters::FRAMES_DELIVERED.fetch_add(1, Relaxed);
     Some((frame, dropped))
+}
+
+/// `(frames queued, the head frame's es_size and first bytes)` - for a decode call that
+/// matched nothing, to show what the queue holds against what the title offered.
+pub(crate) fn decoded_audio_head(st: &crate::host::VitaState) -> Option<(usize, u32, [u8; 16])> {
+    let audio = st.movie.as_ref()?.audio.as_ref()?;
+    let f = audio.ready.front()?;
+    Some((audio.ready.len(), f.es_size, f.head))
 }
 
 /// Say, once, that decoded audio was thrown away because the title stopped collecting it.
@@ -1172,7 +1529,7 @@ fn report_audio_backlog_dropped(dropped: u64) {
         tracing::warn!(
             target: "vitaslop::movie",
             dropped,
-            backlog = AUDIO_BACKLOG,
+            backlog = audio_backlog(),
             "decoded audio frames were dropped because the title stopped collecting them - the movie is short by that much sound from here"
         );
     });
@@ -1296,6 +1653,7 @@ fn next_access_unit(st: &mut crate::host::VitaState) -> Result<Option<AccessUnit
         && let Some(movie) = st.movie.as_mut() {
             // The gate opened, so the refusal run ends here - see `movie_unit_wait_us`.
             movie.gate_refusals = 0;
+            movie.read_cache.remove(&(track, at));
             if let Some(c) = movie.cursors.iter_mut().find(|(t, _)| *t == track) {
                 c.1 += 1;
             }
@@ -1306,6 +1664,61 @@ fn next_access_unit(st: &mut crate::host::VitaState) -> Result<Option<AccessUnit
             }
         }
     Ok(unit)
+}
+
+/// Samples kept read ahead of their hand-over - see `MovieSession::read_cache`. The audio
+/// lookahead is the deepest reader, a handful of units; this is several times that.
+const READ_CACHE_MAX: usize = 32;
+
+/// Read into the cache every sample `sceMp4GetNextUnitData` is about to need: the unit it
+/// takes and, for an audio unit, the ones the decode-ahead feeds after it
+/// ([`pump_movie_audio`]). Only a movie read through the title's functions needs this - its
+/// reads are calls into the title, and they must all be made BEFORE the call changes
+/// anything (see `VitaState::call_guest`); the engine's own file can be read at any point.
+fn prefetch_samples(st: &mut crate::host::VitaState) -> Result<(), Pending> {
+    let Some(movie) = st.movie.as_ref() else { return Ok(()) };
+    if matches!(movie.source, MovieSource::Host { .. }) {
+        return Ok(());
+    }
+    let Some((track, at)) = next_unit_track(movie) else { return Ok(()) };
+    let Some(t) = movie.mp4.tracks.get(track) else { return Ok(()) };
+    let ahead = if t.kind == crate::mp4::TrackKind::Audio && movie.audio.is_some() {
+        1 + AUDIO_LOOKAHEAD
+    } else {
+        1
+    };
+    let last = (at + ahead).min(t.samples.len());
+    for index in at..last {
+        if access_unit_at(st, track, index).is_err() && st.guest_call_pending() {
+            return Err(Pending);
+        }
+    }
+    Ok(())
+}
+
+/// Keep a read sample. When the cache is full, what goes first is what can no longer be
+/// asked for - samples behind their track's cursor (a reset or a seek leaves those) - and then
+/// the one furthest ahead, never the unit about to be taken.
+fn cache_sample(movie: &mut MovieSession, key: (usize, usize), raw: Vec<u8>) {
+    if movie.read_cache.len() >= READ_CACHE_MAX {
+        let cursors = movie.cursors.clone();
+        movie.read_cache.retain(|&(t, i), _| cursors.iter().any(|&(ct, c)| ct == t && i >= c));
+        if movie.read_cache.len() >= READ_CACHE_MAX
+            && let Some(&last) = movie.read_cache.keys().next_back()
+        {
+            movie.read_cache.remove(&last);
+        }
+    }
+    movie.read_cache.insert(key, raw);
+}
+
+/// Whether a sample can be read without calling into the title: always for the engine's
+/// own file, only once it is in the cache for a title's. The decode-ahead runs after the unit
+/// has been handed over and must not start a call there.
+fn sample_ready(st: &crate::host::VitaState, track: usize, index: usize) -> bool {
+    st.movie.as_ref().is_some_and(|m| {
+        matches!(m.source, MovieSource::Host { .. }) || m.read_cache.contains_key(&(track, index))
+    })
 }
 
 /// Build the access unit for one sample of one track.
@@ -1325,13 +1738,25 @@ fn access_unit_at(
     // The track's position in the container, which is how the title numbers streams.
     let stream = track as u32;
     let video = t.kind == crate::mp4::TrackKind::Video;
-    let fd = movie.fd;
+    let source = movie.source;
     // Only a video sample needs rewriting into a self-describing elementary stream; an AAC
     // sample IS the elementary stream the decoder is given.
     let sets = if video && sync { movie.avcc.annex_b_parameter_sets() } else { Vec::new() };
     // One read per access unit - tens of kilobytes - which is what the device's own
-    // streaming demuxer does.
-    let raw = read_at(st, fd, offset, size);
+    // streaming demuxer does. Kept until it is handed over: see `MovieSession::read_cache`.
+    let raw = match movie.read_cache.get(&(track, index)) {
+        Some(raw) => raw.clone(),
+        None => {
+            let raw = source_read(st, &source, offset, size)
+                .map_err(|_| "waiting on the title's read function".to_string())?;
+            if raw.len() == size
+                && let Some(movie) = st.movie.as_mut()
+            {
+                cache_sample(movie, (track, index), raw.clone());
+            }
+            raw
+        }
+    };
     if raw.len() != size {
         return Err(format!(
             "sample {index} of track {stream} is {size} bytes at {offset} but only {} could \
@@ -1440,6 +1865,15 @@ pub(super) fn mp4_get_next_unit_info(
     let wait = movie_unit_wait_us(st, handle);
     let got = do_get_next_unit_info(ctx, st, handle, info);
     ctx.ret(got as u32);
+    tracing::trace!(
+        target: "vitaslop::movie",
+        got,
+        wait = ?wait,
+        pending = st.guest_call_pending(),
+        size = if info != 0 { ctx.read_u32(info + unit_info::SIZE) } else { 0 },
+        stream = if info != 0 { ctx.read_u32(info + unit_info::STREAM_ID) } else { 0 },
+        "sceMp4GetNextUnit exit"
+    );
     match wait {
         Some(us) if st.is_preemptive() => {
             st.sleep_park(us.min(UNIT_WAIT_SLICE_US));
@@ -1467,16 +1901,6 @@ fn do_get_next_unit_info(
         Some(movie) if movie.handle == handle => {}
         _ => return SCE_ERROR_ERRNO_ENOENT,
     }
-    let unit = match peek_access_unit(st) {
-        Ok(Some(unit)) => unit,
-        // End of stream - see above: POSITIVE, not zero.
-        Ok(None) => return 1,
-        Err(reason) => {
-            let path = st.movie.as_ref().map(|m| m.path.clone()).unwrap_or_default();
-            report_no_video(st, &path, &reason);
-            return -1;
-        }
-    };
     // >>> A UNIT IS NOT OFFERED BEFORE ITS OWN PRESENTATION TIME. See `movie_unit_wait_us` for
     // >>> the rate this fixes and for the two placements that were measured and rejected.
     //
@@ -1485,10 +1909,26 @@ fn do_get_next_unit_info(
     // with a SUCCESS return is "nothing this time" - the return code is deliberately left at 0,
     // because a POSITIVE return here is what makes this title log "Looping back to start of the
     // file" and call `sceMp4Reset`, i.e. restart the movie rather than wait a moment for it.
+    //
+    // Asked BEFORE the unit is read: the gate needs only the sample table, and most asks are
+    // refused - a read here would be thrown away, and through a title's own read function
+    // it is a call into the title each time. At the end of the stream the gate has no unit
+    // to hold back and lets the ask through to the end-of-stream answer below.
     if movie_unit_wait_us(st, handle).is_some() {
         ctx.write_u32(info + unit_info::SIZE, 0);
         return 0;
     }
+    let unit = match peek_access_unit(st) {
+        Ok(Some(unit)) => unit,
+        // End of stream - see above: POSITIVE, not zero.
+        Ok(None) => return 1,
+        Err(_) if st.guest_call_pending() => return 0,
+        Err(reason) => {
+            let path = st.movie.as_ref().map(|m| m.path.clone()).unwrap_or_default();
+            report_no_video(st, &path, &reason);
+            return -1;
+        }
+    };
     // >>> TIMESTAMPS IN THE MOVIE'S TIMESCALE, not the track's. The title reads the movie
     // timescale out of `sceMp4StartFileStreaming`'s out-struct (see there) and places every
     // stream's units on one clock with it, so a video unit stamped in its own 30,060 Hz and
@@ -1601,6 +2041,14 @@ pub(super) fn mp4_get_next_unit_data(
     // submit whatever was in that buffer.
     let got = do_get_next_unit_data(ctx, st, handle, dest);
     ctx.ret(got as u32);
+    tracing::trace!(
+        target: "vitaslop::movie",
+        got,
+        pending = st.guest_call_pending(),
+        cursors = ?st.movie.as_ref().map(|m| m.cursors.clone()),
+        cached = st.movie.as_ref().map_or(0, |m| m.read_cache.len()),
+        "sceMp4GetNextUnitData exit"
+    );
     if got <= 0 {
         return crate::SvcOutcome::Continue;
     }
@@ -1757,12 +2205,17 @@ fn do_get_next_unit_data(
         Some(movie) if movie.handle == handle => {}
         _ => return SCE_ERROR_ERRNO_ENOENT,
     }
+    // Every read this call makes, made first - see `prefetch_samples`.
+    if prefetch_samples(st).is_err() {
+        return 0;
+    }
     // Which sample this call is about to take, for the audio pump below: the cursor has
     // moved on by the time the unit is in hand.
     let taking = st.movie.as_ref().and_then(next_unit_track);
     let unit = match next_access_unit(st) {
         Ok(Some(unit)) => unit,
         Ok(None) => return 0,
+        Err(_) if st.guest_call_pending() => return 0,
         Err(reason) => {
             let path = st.movie.as_ref().map(|m| m.path.clone()).unwrap_or_default();
             report_no_video(st, &path, &reason);
@@ -1916,7 +2369,13 @@ fn do_close_file(st: &mut crate::host::VitaState, handle: i32) -> i32 {
     if movie.handle != handle {
         return 0;
     }
-    let (fd, path, delivered) = (movie.fd, movie.path.clone(), movie.delivered);
+    let (source, path, delivered) = (movie.source, movie.path.clone(), movie.delivered);
+    // The file and buffer go back first: through a title's functions those are calls into
+    // it, and nothing below may happen until they have run.
+    if release_source(st, &source).is_err() {
+        return 0;
+    }
+    let Some(movie) = st.movie.as_ref() else { return 0 };
     // >>> A MOVIE WITH SOUND THE TITLE NEVER ASKED FOR PLAYED SILENT, AND THAT IS SAID OUT
     // >>> LOUD RATHER THAN LEFT AS A QUIET PICTURE.
     //
@@ -1948,7 +2407,6 @@ fn do_close_file(st: &mut crate::host::VitaState, handle: i32) -> i32 {
         tracing::info!(target: "vitaslop::status", %path, "sceMp4CloseFile: {line}");
     }
     st.movie = None;
-    st.io_close(fd);
     tracing::debug!(
         target: "vitaslop::movie", %path, units = delivered,
         "sceMp4CloseFile: the movie is closed"
@@ -2144,7 +2602,7 @@ mod movie_audio_tests {
         let path = b"app0:movie.mp4\0";
         ctx.write_bytes(PATH_AT, path);
 
-        let handle = super::do_open_file(&mut ctx, &mut st, PATH_AT, UNIT_BUF, 0x40000);
+        let handle = super::do_open_file(&mut ctx, &mut st, PATH_AT, 0, 0, UNIT_BUF, 0x40000);
         assert!(handle != 0, "the movie opens");
         assert!(
             st.movie.as_ref().is_some_and(|m| m.audio.is_some()),

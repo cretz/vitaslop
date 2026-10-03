@@ -63,6 +63,26 @@ pub mod off {
 /// Bytes the state occupies at the front of the work area.
 pub const BYTES: u32 = 0x10;
 
+/// >>> THE CONTENDED BIT, the top bit of the COUNT word: the host has a thread parked here.
+///
+/// Under the browser's parallel run the inline lock and unlock are COMPARE-AND-SWAPS of the
+/// count word on several workers at once (`InlineOp::LwMutexLockSmp`), racing the host's
+/// slow path. A waiter count in a SEPARATE word cannot be made safe against that without a
+/// two-word handshake: an owner checking `waiters == 0` and then storing `count = 0` can
+/// interleave with a contender that read the count as held and is about to park - and the
+/// parked thread is never woken. With the bit IN the count word, the contender parks only if
+/// its CAS from the held value it read succeeds, and the owner's release is a CAS from a
+/// value WITHOUT the bit - so exactly one of them wins, and the loser goes to the host, which
+/// settles it under its mutex. Set and cleared only by the host; [`count`] masks it.
+/// [`off::WAITERS`] is still published for the single-baton inline form, which reads it.
+pub const CONTENDED: u32 = 1 << 31;
+
+/// The owner word of a free mutex. Every release to zero writes it BEFORE the count, so a
+/// thread can never read its own id from a mutex someone else has just taken (the take writes
+/// the owner AFTER its compare-and-swap of the count). Thread 0 is a real thread, so the old
+/// "leave it stale" rule could not be kept once takes and releases run on several workers.
+pub const NO_OWNER: u32 = u32::MAX;
+
 /// Size of `SceKernelLwMutexWork` (`SceInt64 data[4]`), the storage the guest supplies.
 pub const WORK_SIZE: u32 = 32;
 
@@ -85,7 +105,7 @@ fn set(w: &mut dyn GuestWords, work: u32, offset: u32, value: u32) {
 /// and so a fast path that reached it mid-init would see `id != work` and defer to the
 /// host rather than take a lock whose count word is still whatever the guest left there.
 pub fn init(w: &mut dyn GuestWords, work: u32) {
-    set(w, work, off::OWNER, 0);
+    set(w, work, off::OWNER, NO_OWNER);
     set(w, work, off::COUNT, 0);
     set(w, work, off::WAITERS, 0);
     set(w, work, off::ID, work);
@@ -110,9 +130,55 @@ pub fn carried_id(w: &dyn GuestWords, work: u32) -> u32 {
     get(w, work, off::ID)
 }
 
-/// The recursion depth; zero means free.
+/// The recursion depth; zero means free. The [`CONTENDED`] bit is not part of it.
 pub fn count(w: &dyn GuestWords, work: u32) -> u32 {
+    get(w, work, off::COUNT) & !CONTENDED
+}
+
+/// The count word as stored, [`CONTENDED`] bit and all - the value a compare-and-swap of it
+/// has to expect.
+pub fn count_word(w: &dyn GuestWords, work: u32) -> u32 {
     get(w, work, off::COUNT)
+}
+
+/// Take a FREE mutex for `thid`, atomically against the inline parallel form: a
+/// compare-and-swap of the count word from the free value just read, then the owner.
+/// `contended` states the [`CONTENDED`] bit to leave behind (the host's queue is not empty -
+/// a barge past parked threads). Returns false if the mutex was not free when the swap ran;
+/// the caller re-reads and decides again.
+pub fn take_free(w: &mut dyn GuestWords, work: u32, thid: i32, contended: bool) -> bool {
+    let raw = get(w, work, off::COUNT);
+    if raw & !CONTENDED != 0 {
+        return false;
+    }
+    let new = 1 | if contended { CONTENDED } else { 0 };
+    if w.cas_word(work.wrapping_add(off::COUNT), raw, new) != raw {
+        return false;
+    }
+    set(w, work, off::OWNER, thid as u32);
+    true
+}
+
+/// Set the recursion depth of a mutex held by a thread that cannot be running guest code
+/// right now (the caller of this host call, or a parked thread being handed it), with the
+/// [`CONTENDED`] bit stated. A plain store is exact here: only the owner changes a held count,
+/// and the owner is not running.
+pub fn set_held(w: &mut dyn GuestWords, work: u32, held: u32, contended: bool) {
+    set(w, work, off::COUNT, held | if contended { CONTENDED } else { 0 });
+}
+
+/// Mark a HELD mutex contended, if its count word still reads `raw` (a held value without
+/// the bit, as just read). False means it changed - released, or the owner recursed - and the
+/// caller must decide again rather than park: parking on a mutex that was released in
+/// between would wait for a release that already happened.
+pub fn mark_contended(w: &mut dyn GuestWords, work: u32, raw: u32) -> bool {
+    w.cas_word(work.wrapping_add(off::COUNT), raw, raw | CONTENDED) == raw
+}
+
+/// Release fully: the owner word first ([`NO_OWNER`]), then the count - see [`NO_OWNER`].
+pub fn release(w: &mut dyn GuestWords, work: u32) {
+    set(w, work, off::OWNER, NO_OWNER);
+    set(w, work, off::COUNT, 0);
 }
 
 /// The owning thread, meaningful only while [`count`] is non-zero.
@@ -126,18 +192,12 @@ pub fn set_waiters(w: &mut dyn GuestWords, work: u32, n: usize) {
     set(w, work, off::WAITERS, n as u32);
 }
 
-/// Give the mutex to `thid` at recursion depth `held`. The host's spelling of an
-/// acquisition, for the cases [`fast_lock`] refuses: barging past a parked waiter, and
-/// handing a fully released mutex to the thread at the front of the queue.
-pub fn set_owner_count(w: &mut dyn GuestWords, work: u32, thid: i32, held: u32) {
+/// HAND a mutex the releasing caller still holds to the parked thread `thid`, at depth 1.
+/// The count never passes through zero, so no take can slip in between: the owner word
+/// changes first, then the count (with the [`CONTENDED`] bit as the queue now stands).
+pub fn hand_to(w: &mut dyn GuestWords, work: u32, thid: i32, contended: bool) {
     set(w, work, off::OWNER, thid as u32);
-    set(w, work, off::COUNT, held);
-}
-
-/// Set the recursion depth alone, leaving the owner where it is (see [`fast_unlock`] on
-/// why a released mutex keeps a stale owner).
-pub fn set_count(w: &mut dyn GuestWords, work: u32, held: u32) {
-    set(w, work, off::COUNT, held);
+    set_held(w, work, 1, contended);
 }
 
 /// Take the mutex without the host's help, if it is uncontended and this pointer is the
@@ -152,12 +212,18 @@ pub fn fast_lock(w: &mut dyn GuestWords, work: u32, thid: i32, lock_count: u32) 
         return false;
     }
     let held = get(w, work, off::COUNT);
-    if held != 0 && get(w, work, off::OWNER) != thid as u32 {
+    if held & CONTENDED != 0 {
         return false;
     }
-    // Correct on both arms at once: `held + 1` takes a free mutex to 1 and a recursive one
-    // to n+1, and re-writing an owner that already reads `thid` changes nothing.
-    set(w, work, off::OWNER, thid as u32);
+    if held == 0 {
+        // A compare-and-swap, so the host's take is atomic against the inline parallel form
+        // (a single-baton backing's swap is a plain read and write - the same thing there).
+        return take_free(w, work, thid, false);
+    }
+    if get(w, work, off::OWNER) != thid as u32 {
+        return false;
+    }
+    // Recursion: only the owner changes a held count, and the owner is the caller.
     set(w, work, off::COUNT, held + 1);
     true
 }

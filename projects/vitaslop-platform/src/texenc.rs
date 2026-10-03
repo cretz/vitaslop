@@ -96,7 +96,25 @@ pub struct Transcoder {
     /// Packed RGBA8 rows -> the 256-byte-aligned rows `copyBufferToTexture` requires.
     copy_rows: wgpu::ComputePipeline,
     halve: wgpu::ComputePipeline,
-    encode_etc2: wgpu::ComputePipeline,
+    /// >>> THE TWO ETC2 ENCODER PIPELINES ARE BUILT WHEN FIRST NEEDED, NOT AT CONSTRUCTION.
+    ///
+    /// The encoder is by far the biggest shader here, and a pipeline created at construction is
+    /// compiled by the GPU process AHEAD of everything the title asks for next. MEASURED (MK,
+    /// desktop Chrome, 30c): the run's first four render pipelines settled at ~1.45 s each -
+    /// 14-51 ms each compiled alone - and the boot logos froze 2.8 s; the phone compiles the
+    /// encoder in ~10 s cold. `encode_chain` is built eagerly only where it will certainly run
+    /// (an adapter with ETC2, which has no other way to take PVRTC); `encode_etc2` (one level per
+    /// dispatch) only serves the parity tests' readback helper and is never built by a run.
+    encode_etc2: std::cell::OnceCell<wgpu::ComputePipeline>,
+    /// Every level of a chain in one dispatch - see `encode_etc2_chain` in the shader.
+    encode_chain: std::cell::OnceCell<wgpu::ComputePipeline>,
+    /// What the lazy pipelines above are built from.
+    module: wgpu::ShaderModule,
+    pipe_layout: wgpu::PipelineLayout,
+    /// Deferred encodes in progress, oldest first - see [`Transcoder::run_deferred`].
+    deferred: std::cell::RefCell<std::collections::VecDeque<PendingEncode>>,
+    /// Deferred encodes finished and not yet collected - see [`Transcoder::take_finished`].
+    finished: std::cell::RefCell<Vec<(u64, wgpu::Texture)>>,
     // BUILT BUT NEVER DISPATCHED - the YUV conversion runs on the CPU today. Kept so the
     // pipeline that exists is visible rather than silently absent.
     #[allow(dead_code)]
@@ -344,7 +362,9 @@ struct Params {
     flags: u32,
     src_format: u32,
     src_block_words: u32,
-    _pad: u32,
+    /// `encode_etc2`: the first block row this dispatch encodes. `encode_etc2_chain`: the
+    /// first FLAT block (see the shader).
+    row0: u32,
 }
 
 impl Params {
@@ -371,7 +391,7 @@ impl Params {
             self.flags,
             self.src_format,
             self.src_block_words,
-            self._pad,
+            self.row0,
         ];
         let mut out = [0u8; Self::BYTES];
         for (i, w) in words.iter().enumerate() {
@@ -510,6 +530,14 @@ pub fn last_raw_refusal() -> &'static str {
 ///
 /// Until that is answered this function is the PRE-EXISTING arithmetic exactly, and the tests
 /// below pin the three rules rather than the fix. [[vitaslop-never-trade-quality]]
+/// Whether a texture the kept LARGEST-SEEN scratch cannot fit is given a scratch sized for itself
+/// instead of being refused to the CPU (`VITASLOP_TEXENC_SHRINK_SCRATCH=0` is the arm back). See
+/// the note where it is used.
+fn shrink_scratch_to_fit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_TEXENC_SHRINK_SCRATCH").ok().as_deref() != Some("0"))
+}
+
 fn source_window(need_src: u64, s0: u64, want_rgba: u64, want_out: u64) -> u64 {
     let room = RAW_SCRATCH_BUDGET.saturating_sub(want_rgba + want_out);
     need_src.max(s0).max(RAW_BATCH_SRC_WINDOW.min(room))
@@ -721,9 +749,20 @@ impl Transcoder {
             decode_raw: make("decode_raw"),
             copy_rows: make("copy_rows"),
             halve: make("halve"),
-            encode_etc2: make("encode_etc2"),
+            encode_etc2: std::cell::OnceCell::new(),
+            encode_chain: {
+                let cell = std::cell::OnceCell::new();
+                if device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
+                    let _ = cell.set(make("encode_etc2_chain"));
+                }
+                cell
+            },
+            deferred: std::cell::RefCell::new(std::collections::VecDeque::new()),
+            finished: std::cell::RefCell::new(Vec::new()),
             convert_yuv: make("convert_yuv420p2"),
             layout,
+            module,
+            pipe_layout,
         }
     }
 
@@ -872,16 +911,6 @@ impl Transcoder {
         plan: &GpuTranscode,
         gamma: bool,
     ) -> Option<wgpu::Texture> {
-        // ETC2 is the only target implemented here. BC stays on the CPU deliberately: it runs at
-        // 95 Mtexel/s, so it was never the bottleneck, and the desktop's headless render is the
-        // determinism oracle every capture in this project is compared against. Moving the
-        // encoder that produces its blocks would retire that comparison to fix a cost that does
-        // not exist on that engine.
-        let alpha = match upload.format {
-            BlockFormat::Etc2Rgb8 => false,
-            BlockFormat::Etc2Rgba8 => true,
-            BlockFormat::Bc1 | BlockFormat::Bc2 | BlockFormat::Bc3 => return None,
-        };
         // >>> ASK THE DEVICE, HERE, RATHER THAN TRUST THE CALLER.
         //
         // The caller does resolve the family from `device.features()` and filters the upload by
@@ -899,6 +928,380 @@ impl Transcoder {
         if !device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
             return None;
         }
+        let st = self.stage(device, queue, upload, plan)?;
+        let texture = etc2_texture(device, plan.width, plan.height, st.format, gamma, st.levels.len() as u32);
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("texenc"),
+        });
+        {
+            // Timed on the frame's own clock when the frame is measured - see
+            // `crate::gpu::transcode_ts_pair` for why an untimed transcode misled the report.
+            let pair = crate::gpu::transcode_ts_pair(|| {
+                format!(
+                    "texenc {}x{} {:?}->{:?} {} levels",
+                    plan.width,
+                    plan.height,
+                    plan.codec,
+                    upload.format,
+                    st.levels.len()
+                )
+            });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("texenc-pass"),
+                timestamp_writes: compute_ts(&pair),
+            });
+            self.record_decode(&mut pass, &st, plan);
+            // Every level in ONE dispatch - see `encode_etc2_chain` for the measurement.
+            pass.set_pipeline(self.chain_pipeline(device));
+            pass.set_bind_group(0, &st.bg, &[st.chain_slot() as u32]);
+            let (gx, gy) = chain_grid(st.total_blocks);
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+        record_copies(&mut enc, &st.out_buf, &texture, &st.levels);
+        queue.submit([enc.finish()]);
+        st.destroy();
+        Some(texture)
+    }
+
+    /// >>> THE SAME TRANSCODE, WITH THE ENCODE SPREAD OVER LATER FRAMES - AND AN EXACT PICTURE
+    /// >>> MEANWHILE.
+    ///
+    /// MEASURED on the phone (MK, round start, runner job 078): one frame read `1,034 ms` of GPU
+    /// with 18 PVRTC textures transcoded in it, and the display froze 1.4 s. The encoder runs at
+    /// 13-30 ms per 512x512 level on that GPU (`texenc-bench`, jobs 083/084) - it is a search,
+    /// and no rewrite of it makes eighteen fighters' worth fit in one frame. The decode and the
+    /// mip filter are cheap (1.5 ms and 0.4 ms at 512x512).
+    ///
+    /// So this runs the cheap half now and hands back an RGBA8 texture copied straight out of
+    /// the scratch chain the encoder READS - the guest's texels exactly, the same box-filtered
+    /// levels, no second lossy step - and queues the encode. [`Self::pump`] encodes a bounded
+    /// number of block rows per frame and, when a texture's last row is done, builds the ETC2
+    /// texture the immediate path would have built, byte for byte (same shader, same inputs,
+    /// same row order does not matter: every block is encoded from the chain alone). The caller
+    /// swaps it in by `key` (see [`Self::take_finished`]).
+    ///
+    /// The picture during the interim is the UNcompressed decode, which is closer to the guest's
+    /// asset than the ETC2 that replaces it; the memory is RGBA8 for as long as the encode takes,
+    /// which is the trade the PVRTC policy refuses only as a steady state.
+    pub fn run_deferred(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        upload: &CompressedUpload,
+        plan: &GpuTranscode,
+        gamma: bool,
+        key: u64,
+    ) -> Option<wgpu::Texture> {
+        // The same device test `run` makes: the finished texture is ETC2.
+        if !device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
+            return None;
+        }
+        let st = self.stage(device, queue, upload, plan)?;
+        let n = st.levels.len();
+        // The interim's aligned rows, level by level, after one another.
+        let mut rows: Vec<(u32, u32)> = Vec::with_capacity(n);
+        let mut view_bytes = 0u64;
+        for l in &st.levels {
+            let row = align_up(l.width * 4, COPY_ROW_ALIGN);
+            rows.push((view_bytes as u32, row));
+            view_bytes += row as u64 * l.height as u64;
+        }
+        let view_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("texenc-interim-rows"),
+            size: view_bytes.max(4),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // The row copies' parameters, in their own slots after the encode's.
+        let mut slots: Vec<u8> = Vec::new();
+        for (l, (off, row)) in st.levels.iter().zip(&rows) {
+            slots.extend_from_slice(
+                &Params {
+                    width: l.width,
+                    height: l.height,
+                    rgba_word: l.rgba_word,
+                    out_word: off / 4,
+                    out_row_words: row / 4,
+                    ..Default::default()
+                }
+                .to_bytes(),
+            );
+            slots.resize(align_up(slots.len() as u32, UNIFORM_SLOT as u32) as usize, 0);
+        }
+        queue.write_buffer(&st.params_buf, st.copy_slot(0), &slots);
+        let bg_view = self.bind(device, &st.params_buf, &st.src_buf, &st.rgba_buf, &view_buf);
+
+        let format = if gamma {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
+        crate::gpu::note_texture_created();
+        let interim = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gxp-tex-interim"),
+            size: wgpu::Extent3d { width: plan.width.max(1), height: plan.height.max(1), depth_or_array_layers: 1 },
+            mip_level_count: n as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("texenc-interim"),
+        });
+        {
+            let pair = crate::gpu::transcode_ts_pair(|| {
+                format!("texenc-decode {}x{} {:?} {} levels (encode deferred)", plan.width, plan.height, plan.codec, n)
+            });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("texenc-interim"),
+                timestamp_writes: compute_ts(&pair),
+            });
+            self.record_decode(&mut pass, &st, plan);
+            pass.set_pipeline(&self.copy_rows);
+            for (i, l) in st.levels.iter().enumerate() {
+                pass.set_bind_group(0, &bg_view, &[st.copy_slot(i) as u32]);
+                pass.dispatch_workgroups(l.width.div_ceil(8), l.height.div_ceil(8), 1);
+            }
+        }
+        for (i, (l, (off, row))) in st.levels.iter().zip(&rows).enumerate() {
+            enc.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &view_buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: *off as u64,
+                        bytes_per_row: Some(*row),
+                        rows_per_image: Some(l.height),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &interim,
+                    mip_level: i as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: l.width, height: l.height, depth_or_array_layers: 1 },
+            );
+        }
+        queue.submit([enc.finish()]);
+        // Destroyed, not dropped - see `run`.
+        view_buf.destroy();
+        let blocks = st.total_blocks as u64;
+        DEFER_STATS.with(|c| {
+            let mut s = c.get();
+            s.queued += 1;
+            s.blocks_queued += blocks;
+            c.set(s);
+        });
+        self.deferred.borrow_mut().push_back(PendingEncode {
+            st,
+            key,
+            gamma,
+            width: plan.width,
+            height: plan.height,
+            label: format!("{}x{} {:?}->{:?}", plan.width, plan.height, plan.codec, upload.format),
+            next_block: 0,
+            queued_frame: crate::gpu::frame_tag(),
+        });
+        Some(interim)
+    }
+
+    /// Encode up to `budget` block-row WORK UNITS of the deferred textures (a block of an
+    /// RGBA target counts twice: EAC alpha plus the colour search), oldest first, in one submit.
+    /// Textures whose last row this finishes are built and queued for [`Self::take_finished`].
+    ///
+    /// At least one slice is always encoded when anything is pending, so a budget smaller than
+    /// one slice still makes progress.
+    pub fn pump(&self, device: &wgpu::Device, queue: &wgpu::Queue, budget: u64) {
+        let mut deferred = self.deferred.borrow_mut();
+        if deferred.is_empty() {
+            return;
+        }
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("texenc-pump"),
+        });
+        let mut left = budget.max(1);
+        let mut done: Vec<PendingEncode> = Vec::new();
+        let mut units = 0u64;
+        // One pass per texture this pump touches, so each carries its own label and timestamp.
+        while left > 0 {
+            let Some(job) = deferred.front_mut() else { break };
+            let weight = if job.st.alpha { 2 } else { 1 };
+            let pair = crate::gpu::transcode_ts_pair(|| format!("texenc-slice {}", job.label));
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("texenc-slice"),
+                timestamp_writes: compute_ts(&pair),
+            });
+            pass.set_pipeline(self.chain_pipeline(device));
+            // Whole workgroups (64 blocks), unless the chain ends first.
+            let want = (left / weight).max(64) / 64 * 64;
+            let n = want.min((job.st.total_blocks - job.next_block) as u64) as u32;
+            let (gx, gy) = chain_grid(n);
+            let p = Params {
+                src_word: job.st.table_word,
+                blocks_x: job.st.levels.len() as u32,
+                row0: job.next_block,
+                width: n,
+                padded_x: gx,
+                flags: job.st.base_flags,
+                ..Default::default()
+            };
+            // One slot per texture per pump: a pump visits each texture at most once, and
+            // `write_buffer` lands after the previous submit and before this one.
+            queue.write_buffer(&job.st.params_buf, job.st.slice_slot(), &p.to_bytes());
+            pass.set_bind_group(0, &job.st.bg, &[job.st.slice_slot() as u32]);
+            pass.dispatch_workgroups(gx, gy, 1);
+            drop(pass);
+            let spent = n as u64 * weight;
+            units += spent;
+            left = left.saturating_sub(spent);
+            job.next_block += n;
+            if job.next_block >= job.st.total_blocks {
+                done.push(deferred.pop_front().expect("front exists"));
+            } else {
+                // The budget ran out inside this texture; the rest of it is next frame's.
+                break;
+            }
+        }
+        drop(deferred);
+        let mut built: Vec<(u64, wgpu::Texture)> = Vec::new();
+        for job in &done {
+            let tex = etc2_texture(device, job.width, job.height, job.st.format, job.gamma, job.st.levels.len() as u32);
+            record_copies(&mut enc, &job.st.out_buf, &tex, &job.st.levels);
+            built.push((job.key, tex));
+        }
+        queue.submit([enc.finish()]);
+        let now = crate::gpu::frame_tag();
+        DEFER_STATS.with(|c| {
+            let mut s = c.get();
+            s.pumps += 1;
+            s.units += units;
+            s.finished += done.len() as u64;
+            for job in &done {
+                s.frames_waited_max = s.frames_waited_max.max(now.saturating_sub(job.queued_frame));
+            }
+            c.set(s);
+        });
+        for job in done {
+            job.st.destroy();
+        }
+        self.finished.borrow_mut().extend(built);
+    }
+
+    /// Deferred textures whose encode has finished since the last call, by the `key` they were
+    /// queued under. The caller owns each texture: swap it in or destroy it.
+    pub fn take_finished(&self) -> Vec<(u64, wgpu::Texture)> {
+        std::mem::take(&mut *self.finished.borrow_mut())
+    }
+
+    /// Deferred encodes not yet finished.
+    pub fn deferred_pending(&self) -> usize {
+        self.deferred.borrow().len()
+    }
+
+    /// TEST SUPPORT: the chain encoder's blocks for `plan`, level by level and unpadded, WITHOUT
+    /// the finished texture - so a desktop adapter with no ETC2 can check the encode `run` and
+    /// the deferred pump perform. `slice`, when given, encodes the chain `slice` blocks per
+    /// dispatch through the pump's slice slot, one submit each, exactly as frames would.
+    pub fn chain_blocks_readback(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        upload: &CompressedUpload,
+        plan: &GpuTranscode,
+        slice: Option<u32>,
+    ) -> Option<Vec<Vec<u8>>> {
+        let st = self.stage(device, queue, upload, plan)?;
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("texenc-test-chain") });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            self.record_decode(&mut pass, &st, plan);
+            if slice.is_none() {
+                pass.set_pipeline(self.chain_pipeline(device));
+                pass.set_bind_group(0, &st.bg, &[st.chain_slot() as u32]);
+                let (gx, gy) = chain_grid(st.total_blocks);
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+        }
+        queue.submit([enc.finish()]);
+        if let Some(n) = slice {
+            let mut next = 0u32;
+            while next < st.total_blocks {
+                let count = n.min(st.total_blocks - next);
+                let (gx, gy) = chain_grid(count);
+                let p = Params {
+                    src_word: st.table_word,
+                    blocks_x: st.levels.len() as u32,
+                    row0: next,
+                    width: count,
+                    padded_x: gx,
+                    flags: st.base_flags,
+                    ..Default::default()
+                };
+                queue.write_buffer(&st.params_buf, st.slice_slot(), &p.to_bytes());
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                    pass.set_pipeline(self.chain_pipeline(device));
+                    pass.set_bind_group(0, &st.bg, &[st.slice_slot() as u32]);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                queue.submit([enc.finish()]);
+                next += count;
+            }
+        }
+        let size = st.out_buf.size();
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("texenc-test-chain-read"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(&st.out_buf, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let bytes = read.slice(..).get_mapped_range().expect("the poll above waited for the map").to_vec();
+        read.unmap();
+        let bb = st.format.block_bytes();
+        let out = st
+            .levels
+            .iter()
+            .map(|l| {
+                let mut v = Vec::with_capacity((l.blocks_x * l.blocks_y * bb) as usize);
+                for r in 0..l.blocks_y {
+                    let o = (l.out_byte + r * l.out_row_bytes) as usize;
+                    v.extend_from_slice(&bytes[o..o + (l.blocks_x * bb) as usize]);
+                }
+                v
+            })
+            .collect();
+        st.destroy();
+        Some(out)
+    }
+
+    /// Everything the decode and the encode share: the buffers, the parameter slots, the bind
+    /// group and the chain's layout. `None` for every shape `run` has always refused.
+    fn stage(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        upload: &CompressedUpload,
+        plan: &GpuTranscode,
+    ) -> Option<Staged> {
+        // ETC2 is the only target implemented here. BC stays on the CPU deliberately: it runs at
+        // 95 Mtexel/s, so it was never the bottleneck, and the desktop's headless render is the
+        // determinism oracle every capture in this project is compared against. Moving the
+        // encoder that produces its blocks would retire that comparison to fix a cost that does
+        // not exist on that engine.
+        let alpha = match upload.format {
+            BlockFormat::Etc2Rgb8 => false,
+            BlockFormat::Etc2Rgba8 => true,
+            BlockFormat::Bc1 | BlockFormat::Bc2 | BlockFormat::Bc3 => return None,
+        };
         let levels = self.plan_levels(plan, upload.format)?;
         let rgba_words: u64 = levels
             .iter()
@@ -917,6 +1320,16 @@ impl Transcoder {
         let mut src_bytes = plan.src.to_vec();
         while !src_bytes.len().is_multiple_of(4) {
             src_bytes.push(0);
+        }
+        // The chain encoder's level table rides at the end of the source bytes - see
+        // `encode_etc2_chain`: `[width, height, rgba_word, out_word, out_row_words, first block]`.
+        let table_word = (src_bytes.len() / 4) as u32;
+        let mut total_blocks = 0u32;
+        for l in &levels {
+            for w in [l.width, l.height, l.rgba_word, l.out_byte / 4, l.out_row_bytes / 4, total_blocks] {
+                src_bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            total_blocks = total_blocks.checked_add(l.blocks_x.checked_mul(l.blocks_y)?)?;
         }
         // `create_buffer_init` is `mappedAtCreation` on the web backend and every call takes a
         // renderer-side staging region; this path runs per transcoded texture, which on a screen
@@ -985,117 +1398,84 @@ impl Transcoder {
                 }
             }
         }
-        // Phase 2: one dispatch per level, encoding blocks.
-        for l in &levels {
-            push(Params {
-                width: l.width,
-                height: l.height,
-                rgba_word: l.rgba_word,
-                out_word: l.out_byte / 4,
-                out_row_words: l.out_row_bytes / 4,
-                flags: base_flags,
-                ..Default::default()
-            });
-        }
+        // Phase 2: the whole chain, one dispatch - see `Staged::chain_slot`.
+        let (gx, _) = chain_grid(total_blocks);
+        push(Params {
+            src_word: table_word,
+            blocks_x: levels.len() as u32,
+            width: total_blocks,
+            padded_x: gx,
+            flags: base_flags,
+            ..Default::default()
+        });
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("texenc-params"),
-            size: slots.len().max(4) as u64,
+            size: Staged::slots(levels.len()) * UNIFORM_SLOT,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         queue.write_buffer(&params_buf, 0, &slots);
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = self.bind(device, &params_buf, &src_buf, &rgba_buf, &out_buf);
+        Some(Staged {
+            src_buf,
+            rgba_buf,
+            out_buf,
+            params_buf,
+            bg,
+            format: upload.format,
+            alpha,
+            base_flags,
+            table_word,
+            total_blocks,
+            levels,
+        })
+    }
+
+    /// The transcoder's bind group over one texture's buffers.
+    fn bind(
+        &self,
+        device: &wgpu::Device,
+        params: &wgpu::Buffer,
+        src: &wgpu::Buffer,
+        rgba: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("texenc-bg"),
             layout: &self.layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &params_buf,
+                        buffer: params,
                         offset: 0,
                         size: wgpu::BufferSize::new(Params::BYTES as u64),
                     }),
                 },
-                wgpu::BindGroupEntry { binding: 1, resource: src_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: rgba_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: rgba.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
             ],
-        });
+        })
+    }
 
-        crate::gpu::note_texture_created();
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("gxp-tex-gpu"),
-            size: wgpu::Extent3d {
-                width: plan.width.max(1),
-                height: plan.height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: levels.len() as u32,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: crate::gpu::block_wgpu_format_pub(upload.format, gamma),
-            // >>> COPY_SRC IS HERE SO THE FINISHED TEXTURE CAN BE READ BACK AND CHECKED.
-            //
-            // Nothing in the renderer copies out of it. It is here because the alternative was a
-            // test-only code path that builds its own texture, and "the verification runs
-            // different code from the thing that ships" is precisely how the copy extent reached
-            // a phone wrong: the shaders were each verified through their own readback helpers
-            // while `run` itself - the buffer sizes, the dynamic offsets, the copies - was never
-            // executed anywhere. `gpu_transcode_round_trips_through_a_real_etc2_texture` drives
-            // THIS function and reads THIS texture.
-            //
-            // The cost is a flag on a sampled texture. It can stop a driver electing a
-            // compressed-in-memory layout for a render target; this is neither.
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("texenc"),
-        });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("texenc-pass"),
-                timestamp_writes: None,
-            });
-            for (i, l) in levels.iter().enumerate() {
-                let off = (i as u64) * UNIFORM_SLOT;
-                match plan.src_levels.get(i) {
-                    Some(s) => {
-                        pass.set_pipeline(self.decoder(plan.codec));
-                        pass.set_bind_group(0, &bg, &[off as u32]);
-                        pass.dispatch_workgroups(s.blocks_x.div_ceil(8), s.blocks_y.div_ceil(8), 1);
-                    }
-                    None => {
-                        pass.set_pipeline(&self.halve);
-                        pass.set_bind_group(0, &bg, &[off as u32]);
-                        pass.dispatch_workgroups(l.width.div_ceil(8), l.height.div_ceil(8), 1);
-                    }
+    /// Phase 1 into `pass`: decode the guest's levels and box-filter the rest into the chain.
+    fn record_decode(&self, pass: &mut wgpu::ComputePass<'_>, st: &Staged, plan: &GpuTranscode) {
+        for (i, l) in st.levels.iter().enumerate() {
+            let off = (i as u64) * UNIFORM_SLOT;
+            match plan.src_levels.get(i) {
+                Some(s) => {
+                    pass.set_pipeline(self.decoder(plan.codec));
+                    pass.set_bind_group(0, &st.bg, &[off as u32]);
+                    pass.dispatch_workgroups(s.blocks_x.div_ceil(8), s.blocks_y.div_ceil(8), 1);
+                }
+                None => {
+                    pass.set_pipeline(&self.halve);
+                    pass.set_bind_group(0, &st.bg, &[off as u32]);
+                    pass.dispatch_workgroups(l.width.div_ceil(8), l.height.div_ceil(8), 1);
                 }
             }
-            pass.set_pipeline(&self.encode_etc2);
-            for (i, l) in levels.iter().enumerate() {
-                let off = ((levels.len() + i) as u64) * UNIFORM_SLOT;
-                pass.set_bind_group(0, &bg, &[off as u32]);
-                pass.dispatch_workgroups(l.blocks_x.div_ceil(8), l.blocks_y.div_ceil(8), 1);
-            }
         }
-        record_copies(&mut enc, &out_buf, &texture, &levels);
-        queue.submit([enc.finish()]);
-
-        // >>> DESTROYED, NOT DROPPED. In the browser a `wgpu::Buffer` is a `GPUBuffer` living in
-        // JavaScript and dropping the Rust handle only makes it GARBAGE; the GPU memory behind it
-        // comes back whenever the JS collector next feels like it, which is not a schedule a path
-        // that allocates tens of megabytes per texture can rely on. WebGPU defines `destroy()` on
-        // a buffer with work in flight as completing that work before releasing the memory, and
-        // the submit above is that work.
-        src_buf.destroy();
-        rgba_buf.destroy();
-        out_buf.destroy();
-        params_buf.destroy();
-        Some(texture)
     }
 
     /// Build a finished RGBA8 texture, with its whole mip chain, WITHOUT the CPU touching a
@@ -1224,7 +1604,21 @@ impl Transcoder {
         // does not re-allocate its way back down and then up again.
         let (s0, r0, o0) =
             held.as_ref().map_or((0, 0, 0), |k| (k.src_bytes, k.rgba_bytes, k.out_bytes));
-        let (want_rgba, want_out) = (need_rgba.max(r0), need_out.max(o0));
+        let (mut want_rgba, mut want_out) = (need_rgba.max(r0), need_out.max(o0));
+        // >>> THE LARGEST-SEEN SIZES ARE A CONVENIENCE, NOT A REQUIREMENT. Each axis keeps the
+        // largest texture ever seen ON THAT AXIS, so a run that met a texture with a large RGBA
+        // chain and, later, one with a large SOURCE holds the SUM of two unrelated maxima - and
+        // past `RAW_SCRATCH_BUDGET` every later texture was refused below, even ones a fraction
+        // of the budget. MEASURED in the desktop browser on a fighting title: 195 one-megabyte
+        // U8U8U8U8 textures sent to the CPU re-encode, each a 770-1,200 ms frozen display, which
+        // made its character select run at ~1 fps. When the kept maxima do not fit, the scratch
+        // is sized for THIS texture alone (and regrows later if it must).
+        if shrink_scratch_to_fit()
+            && source_window(need_src, s0, want_rgba, want_out) + want_rgba + want_out > RAW_SCRATCH_BUDGET
+            && need_src + need_rgba + need_out <= RAW_SCRATCH_BUDGET
+        {
+            (want_rgba, want_out) = (need_rgba, need_out);
+        }
         // >>> THE SOURCE BUFFER IS SIZED FOR A BATCH, NOT FOR ONE TEXTURE, and that is the whole
         // difference between batching and not.
         //
@@ -1586,7 +1980,7 @@ impl Transcoder {
         let mut enc = device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.encode_etc2);
+            pass.set_pipeline(self.encode_etc2.get_or_init(|| self.lazy_pipeline(device, "encode_etc2")));
             pass.set_bind_group(0, &bg, &[0]);
             pass.dispatch_workgroups(blocks_x.div_ceil(8), blocks_y.div_ceil(8), 1);
         }
@@ -1828,6 +2222,22 @@ impl Transcoder {
         plan_levels(plan, format)
     }
 
+    fn lazy_pipeline(&self, device: &wgpu::Device, entry: &str) -> wgpu::ComputePipeline {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&self.pipe_layout),
+            module: &self.module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    }
+
+    /// The whole-chain encoder - see `encode_chain`.
+    fn chain_pipeline(&self, device: &wgpu::Device) -> &wgpu::ComputePipeline {
+        self.encode_chain.get_or_init(|| self.lazy_pipeline(device, "encode_etc2_chain"))
+    }
+
     /// The decode shader for a source codec.
     fn decoder(&self, codec: SourceCodec) -> &wgpu::ComputePipeline {
         match codec {
@@ -1835,6 +2245,162 @@ impl Transcoder {
             SourceCodec::Bc { .. } => &self.decode_bc,
         }
     }
+}
+
+/// One texture's transcode state between the decode and the finished blocks: its buffers, its
+/// parameter slots, its bind group and its chain. Shared by [`Transcoder::run`], which finishes
+/// it in the same submit, and [`Transcoder::run_deferred`], which keeps it across frames.
+///
+/// Parameter slots, by index: `0..L` the decode/filter dispatch per level, `L` the whole-chain
+/// encode, `L+1..2L+1` the interim's row copies, `2L+1` the deferred encode's slice.
+struct Staged {
+    src_buf: wgpu::Buffer,
+    rgba_buf: wgpu::Buffer,
+    out_buf: wgpu::Buffer,
+    params_buf: wgpu::Buffer,
+    bg: wgpu::BindGroup,
+    format: BlockFormat,
+    alpha: bool,
+    base_flags: u32,
+    /// Word offset of the chain encoder's level table in `src_buf`.
+    table_word: u32,
+    /// Blocks across every level - the chain encoder's flat index runs over these.
+    total_blocks: u32,
+    levels: Vec<Level>,
+}
+
+impl Staged {
+    fn slots(levels: usize) -> u64 {
+        2 * levels as u64 + 2
+    }
+
+    fn chain_slot(&self) -> u64 {
+        self.levels.len() as u64 * UNIFORM_SLOT
+    }
+
+    fn copy_slot(&self, level: usize) -> u64 {
+        (self.levels.len() + 1 + level) as u64 * UNIFORM_SLOT
+    }
+
+    fn slice_slot(&self) -> u64 {
+        (2 * self.levels.len() + 1) as u64 * UNIFORM_SLOT
+    }
+
+    /// >>> DESTROYED, NOT DROPPED. In the browser a `wgpu::Buffer` is a `GPUBuffer` living in
+    /// JavaScript and dropping the Rust handle only makes it GARBAGE; the GPU memory behind it
+    /// comes back whenever the JS collector next feels like it, which is not a schedule a path
+    /// that allocates tens of megabytes per texture can rely on. WebGPU defines `destroy()` on
+    /// a buffer with work in flight as completing that work before releasing the memory.
+    fn destroy(self) {
+        self.src_buf.destroy();
+        self.rgba_buf.destroy();
+        self.out_buf.destroy();
+        self.params_buf.destroy();
+    }
+}
+
+/// A deferred encode in progress - see [`Transcoder::run_deferred`].
+struct PendingEncode {
+    st: Staged,
+    /// What the caller queued it under, handed back by [`Transcoder::take_finished`].
+    key: u64,
+    gamma: bool,
+    width: u32,
+    height: u32,
+    label: String,
+    /// The next flat block (see `encode_etc2_chain`) to encode.
+    next_block: u32,
+    /// The guest frame it was queued on, for the report.
+    queued_frame: u64,
+}
+
+/// The deferred encoder's run totals, for the page's report - see [`defer_stats`].
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DeferStats {
+    /// Textures handed back as an interim RGBA8 with their encode queued.
+    pub queued: u64,
+    /// Of them, encoded and handed back as ETC2.
+    pub finished: u64,
+    /// Blocks queued, and block WORK UNITS encoded (an RGBA block counts twice).
+    pub blocks_queued: u64,
+    pub units: u64,
+    /// Pumps that encoded something.
+    pub pumps: u64,
+    /// The longest a texture waited for its ETC2, in guest frames.
+    pub frames_waited_max: u64,
+}
+
+thread_local! {
+    static DEFER_STATS: std::cell::Cell<DeferStats> = const {
+        std::cell::Cell::new(DeferStats {
+            queued: 0,
+            finished: 0,
+            blocks_queued: 0,
+            units: 0,
+            pumps: 0,
+            frames_waited_max: 0,
+        })
+    };
+}
+
+/// The deferred encoder's run totals on this thread (the renderer's).
+pub fn defer_stats() -> DeferStats {
+    DEFER_STATS.with(|c| c.get())
+}
+
+/// A compute pass's timestamp writes for a pair from [`crate::gpu::transcode_ts_pair`].
+fn compute_ts(
+    pair: &Option<(std::sync::Arc<wgpu::QuerySet>, u32)>,
+) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+    pair.as_ref().map(|(set, i)| wgpu::ComputePassTimestampWrites {
+        query_set: set,
+        beginning_of_pass_write_index: Some(i * 2),
+        end_of_pass_write_index: Some(i * 2 + 1),
+    })
+}
+
+/// The workgroup grid for `blocks` flat blocks at 64 per group: one row while it fits the
+/// per-dimension limit, rows of 65,535 groups beyond it.
+fn chain_grid(blocks: u32) -> (u32, u32) {
+    let groups = blocks.div_ceil(64).max(1);
+    if groups <= 65_535 {
+        (groups, 1)
+    } else {
+        (65_535, groups.div_ceil(65_535))
+    }
+}
+
+/// The finished ETC2 texture a chain's blocks are copied into.
+fn etc2_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: BlockFormat,
+    gamma: bool,
+    levels: u32,
+) -> wgpu::Texture {
+    crate::gpu::note_texture_created();
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("gxp-tex-gpu"),
+        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: crate::gpu::block_wgpu_format_pub(format, gamma),
+        // >>> COPY_SRC IS HERE SO THE FINISHED TEXTURE CAN BE READ BACK AND CHECKED.
+        //
+        // Nothing in the renderer copies out of it. It is here because the alternative was a
+        // test-only code path that builds its own texture, and "the verification runs different
+        // code from the thing that ships" is precisely how the copy extent reached a phone
+        // wrong: the shaders were each verified through their own readback helpers while `run`
+        // itself - the buffer sizes, the dynamic offsets, the copies - was never executed
+        // anywhere. `gpu_transcode_round_trips_through_a_real_etc2_texture` drives THIS
+        // function and reads THIS texture.
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
 }
 
 /// Record the buffer-to-texture copy for every level of a finished chain.

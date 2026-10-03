@@ -1,0 +1,1199 @@
+@title Ultimate Marvel vs Capcom 3 - arcade, fought deep (specials, hypers, assists, jumps)
+@game  PCSE00004
+@shot-every 100
+
+# ============================================================================
+# WHAT THIS RECIPE DOES
+# into-a-fight.recipe's boot and menus verbatim (OFFLINE MODE -> ARCADE, Ryu, default
+# assists and stage), then from f6700 FIGHTS: 240-frame cycles of a walk, an L-M-H chain,
+# a Hadoken (down, down-forward, forward + square), a Shinku Hadoken hyper (the same
+# motion + square+triangle), an assist call (L then R), a jump-in heavy and the S button
+# (cross - which also clears every win/continue screen between fights). Each cycle is
+# played once facing right and once facing left, because sides switch mid-fight.
+# The point is RENDERING AND SOUND COVERAGE: hit sparks, hyper flashes and super
+# backgrounds, assists entering, projectiles, round/KO screens and the next opponents.
+#
+# HOW IT WAS AUTHORED
+# Controls from the default Vita layout (square L, triangle M, circle H, cross S, L/R
+# assists; hyper = motion + two attacks). Generated - the timeline after 6700 is regular.
+# The boot HOLDS at 3010 until the title screen reads the pad (`@wait call
+# sceCtrlPeekBufferPositive`: f3148 native, about f4100 on a phone), and every later INPUT
+# line runs late by the hold - so input frames from there on are 140 below the display frames
+# they land on natively (the fight's first input, written 6560, lands near f6700). `@section`
+# and `@shot` frames are display frames and do not move. Without the hold a frame-timed DOWN
+# reached the PSN sign-in dialog before it existed on the phone, and every CROSS after it
+# answered "sign in", which fails offline and re-asks forever.
+# ============================================================================
+
+0: @section boot
+3000: start
+3006:
+3010: @wait call sceCtrlPeekBufferPositive   # the title screen starts reading the pad (f3148 native, ~f4100 phone)
+3100: start
+3106:
+3260: down
+3266:
+3320: cross
+3326:
+3560: cross
+3566:
+3710: cross
+3716:
+3860: cross
+3866:
+4010: cross
+4016:
+4160: cross
+4166:
+4310: cross
+4316:
+4460: cross
+4466:
+4610: cross
+4616:
+4760: cross
+4766:
+4910: cross
+4916:
+5060: cross
+5066:
+5210: cross
+5216:
+5360: cross
+5366:
+5510: cross
+5516:
+5660: cross
+5666:
+5810: cross
+5816:
+5960: cross
+5966:
+6110: cross
+6116:
+6260: cross
+6266:
+6410: cross
+6416:
+
+6700: @section fight
+6560: right
+6590: 
+6592: square
+6596: 
+6600: triangle
+6604: 
+6608: circle
+6612: 
+6630: down
+6633: down right
+6636: right
+6638: right square
+6642: 
+6670: down
+6673: down right
+6676: right
+6678: right square triangle
+6684: 
+6730: l
+6734: 
+6740: r
+6744: 
+6756: up right
+6760: 
+6774: circle
+6778: 
+6786: cross
+6790: 
+6800: left
+6830: 
+6832: square
+6836: 
+6840: triangle
+6844: 
+6848: circle
+6852: 
+6870: down
+6873: down left
+6876: left
+6878: left square
+6882: 
+6910: down
+6913: down left
+6916: left
+6918: left square triangle
+6924: 
+6970: l
+6974: 
+6980: r
+6984: 
+6996: up left
+7000: 
+7014: circle
+7018: 
+7026: cross
+7030: 
+7040: right
+7070: 
+7072: square
+7076: 
+7080: triangle
+7084: 
+7088: circle
+7092: 
+7110: down
+7113: down right
+7116: right
+7118: right square
+7122: 
+7150: down
+7153: down right
+7156: right
+7158: right square triangle
+7164: 
+7210: l
+7214: 
+7220: r
+7224: 
+7236: up right
+7240: 
+7254: circle
+7258: 
+7266: cross
+7270: 
+7280: left
+7310: 
+7312: square
+7316: 
+7320: triangle
+7324: 
+7328: circle
+7332: 
+7350: down
+7353: down left
+7356: left
+7358: left square
+7362: 
+7390: down
+7393: down left
+7396: left
+7398: left square triangle
+7404: 
+7450: l
+7454: 
+7460: r
+7464: 
+7476: up left
+7480: 
+7494: circle
+7498: 
+7506: cross
+7510: 
+7520: right
+7550: 
+7552: square
+7556: 
+7560: triangle
+7564: 
+7568: circle
+7572: 
+7590: down
+7593: down right
+7596: right
+7598: right square
+7602: 
+7630: down
+7633: down right
+7636: right
+7638: right square triangle
+7644: 
+7690: l
+7694: 
+7700: r
+7704: 
+7716: up right
+7720: 
+7734: circle
+7738: 
+7746: cross
+7750: 
+7760: left
+7790: 
+7792: square
+7796: 
+7800: triangle
+7804: 
+7808: circle
+7812: 
+7830: down
+7833: down left
+7836: left
+7838: left square
+7842: 
+7870: down
+7873: down left
+7876: left
+7878: left square triangle
+7884: 
+7930: l
+7934: 
+7940: r
+7944: 
+7956: up left
+7960: 
+7974: circle
+7978: 
+7986: cross
+7990: 
+8000: right
+8030: 
+8032: square
+8036: 
+8040: triangle
+8044: 
+8048: circle
+8052: 
+8070: down
+8073: down right
+8076: right
+8078: right square
+8082: 
+8110: down
+8113: down right
+8116: right
+8118: right square triangle
+8124: 
+8170: l
+8174: 
+8180: r
+8184: 
+8196: up right
+8200: 
+8214: circle
+8218: 
+8226: cross
+8230: 
+8240: left
+8270: 
+8272: square
+8276: 
+8280: triangle
+8284: 
+8288: circle
+8292: 
+8310: down
+8313: down left
+8316: left
+8318: left square
+8322: 
+8350: down
+8353: down left
+8356: left
+8358: left square triangle
+8364: 
+8410: l
+8414: 
+8420: r
+8424: 
+8436: up left
+8440: 
+8454: circle
+8458: 
+8466: cross
+8470: 
+8480: right
+8510: 
+8512: square
+8516: 
+8520: triangle
+8524: 
+8528: circle
+8532: 
+8550: down
+8553: down right
+8556: right
+8558: right square
+8562: 
+8590: down
+8593: down right
+8596: right
+8598: right square triangle
+8604: 
+8650: l
+8654: 
+8660: r
+8664: 
+8676: up right
+8680: 
+8694: circle
+8698: 
+8706: cross
+8710: 
+8720: left
+8750: 
+8752: square
+8756: 
+8760: triangle
+8764: 
+8768: circle
+8772: 
+8790: down
+8793: down left
+8796: left
+8798: left square
+8802: 
+8830: down
+8833: down left
+8836: left
+8838: left square triangle
+8844: 
+8890: l
+8894: 
+8900: r
+8904: 
+8916: up left
+8920: 
+8934: circle
+8938: 
+8946: cross
+8950: 
+8960: right
+8990: 
+8992: square
+8996: 
+9000: triangle
+9004: 
+9008: circle
+9012: 
+9030: down
+9033: down right
+9036: right
+9038: right square
+9042: 
+9070: down
+9073: down right
+9076: right
+9078: right square triangle
+9084: 
+9130: l
+9134: 
+9140: r
+9144: 
+9156: up right
+9160: 
+9174: circle
+9178: 
+9186: cross
+9190: 
+9200: left
+9230: 
+9232: square
+9236: 
+9240: triangle
+9244: 
+9248: circle
+9252: 
+9270: down
+9273: down left
+9276: left
+9278: left square
+9282: 
+9310: down
+9313: down left
+9316: left
+9318: left square triangle
+9324: 
+9370: l
+9374: 
+9380: r
+9384: 
+9396: up left
+9400: 
+9414: circle
+9418: 
+9426: cross
+9430: 
+9440: right
+9470: 
+9472: square
+9476: 
+9480: triangle
+9484: 
+9488: circle
+9492: 
+9510: down
+9513: down right
+9516: right
+9518: right square
+9522: 
+9550: down
+9553: down right
+9556: right
+9558: right square triangle
+9564: 
+9610: l
+9614: 
+9620: r
+9624: 
+9636: up right
+9640: 
+9654: circle
+9658: 
+9666: cross
+9670: 
+9680: left
+9710: 
+9712: square
+9716: 
+9720: triangle
+9724: 
+9728: circle
+9732: 
+9750: down
+9753: down left
+9756: left
+9758: left square
+9762: 
+9790: down
+9793: down left
+9796: left
+9798: left square triangle
+9804: 
+9850: l
+9854: 
+9860: r
+9864: 
+9876: up left
+9880: 
+9894: circle
+9898: 
+9906: cross
+9910: 
+9920: right
+9950: 
+9952: square
+9956: 
+9960: triangle
+9964: 
+9968: circle
+9972: 
+9990: down
+9993: down right
+9996: right
+9998: right square
+10002: 
+10030: down
+10033: down right
+10036: right
+10038: right square triangle
+10044: 
+10090: l
+10094: 
+10100: r
+10104: 
+10116: up right
+10120: 
+10134: circle
+10138: 
+10146: cross
+10150: 
+10160: left
+10190: 
+10192: square
+10196: 
+10200: triangle
+10204: 
+10208: circle
+10212: 
+10230: down
+10233: down left
+10236: left
+10238: left square
+10242: 
+10270: down
+10273: down left
+10276: left
+10278: left square triangle
+10284: 
+10330: l
+10334: 
+10340: r
+10344: 
+10356: up left
+10360: 
+10374: circle
+10378: 
+10386: cross
+10390: 
+10400: right
+10430: 
+10432: square
+10436: 
+10440: triangle
+10444: 
+10448: circle
+10452: 
+10470: down
+10473: down right
+10476: right
+10478: right square
+10482: 
+10510: down
+10513: down right
+10516: right
+10518: right square triangle
+10524: 
+10570: l
+10574: 
+10580: r
+10584: 
+10596: up right
+10600: 
+10614: circle
+10618: 
+10626: cross
+10630: 
+10640: left
+10670: 
+10672: square
+10676: 
+10680: triangle
+10684: 
+10688: circle
+10692: 
+10710: down
+10713: down left
+10716: left
+10718: left square
+10722: 
+10750: down
+10753: down left
+10756: left
+10758: left square triangle
+10764: 
+10810: l
+10814: 
+10820: r
+10824: 
+10836: up left
+10840: 
+10854: circle
+10858: 
+10866: cross
+10870: 
+10880: right
+10910: 
+10912: square
+10916: 
+10920: triangle
+10924: 
+10928: circle
+10932: 
+10950: down
+10953: down right
+10956: right
+10958: right square
+10962: 
+10990: down
+10993: down right
+10996: right
+10998: right square triangle
+11004: 
+11050: l
+11054: 
+11060: r
+11064: 
+11076: up right
+11080: 
+11094: circle
+11098: 
+11106: cross
+11110: 
+11120: left
+11150: 
+11152: square
+11156: 
+11160: triangle
+11164: 
+11168: circle
+11172: 
+11190: down
+11193: down left
+11196: left
+11198: left square
+11202: 
+11230: down
+11233: down left
+11236: left
+11238: left square triangle
+11244: 
+11290: l
+11294: 
+11300: r
+11304: 
+11316: up left
+11320: 
+11334: circle
+11338: 
+11346: cross
+11350: 
+11360: right
+11390: 
+11392: square
+11396: 
+11400: triangle
+11404: 
+11408: circle
+11412: 
+11430: down
+11433: down right
+11436: right
+11438: right square
+11442: 
+11470: down
+11473: down right
+11476: right
+11478: right square triangle
+11484: 
+11530: l
+11534: 
+11540: r
+11544: 
+11556: up right
+11560: 
+11574: circle
+11578: 
+11586: cross
+11590: 
+11600: left
+11630: 
+11632: square
+11636: 
+11640: triangle
+11644: 
+11648: circle
+11652: 
+11670: down
+11673: down left
+11676: left
+11678: left square
+11682: 
+11710: down
+11713: down left
+11716: left
+11718: left square triangle
+11724: 
+11770: l
+11774: 
+11780: r
+11784: 
+11796: up left
+11800: 
+11814: circle
+11818: 
+11826: cross
+11830: 
+11840: right
+11870: 
+11872: square
+11876: 
+11880: triangle
+11884: 
+11888: circle
+11892: 
+11910: down
+11913: down right
+11916: right
+11918: right square
+11922: 
+11950: down
+11953: down right
+11956: right
+11958: right square triangle
+11964: 
+12010: l
+12014: 
+12020: r
+12024: 
+12036: up right
+12040: 
+12054: circle
+12058: 
+12066: cross
+12070: 
+12080: left
+12110: 
+12112: square
+12116: 
+12120: triangle
+12124: 
+12128: circle
+12132: 
+12150: down
+12153: down left
+12156: left
+12158: left square
+12162: 
+12190: down
+12193: down left
+12196: left
+12198: left square triangle
+12204: 
+12250: l
+12254: 
+12260: r
+12264: 
+12276: up left
+12280: 
+12294: circle
+12298: 
+12306: cross
+12310: 
+12320: right
+12350: 
+12352: square
+12356: 
+12360: triangle
+12364: 
+12368: circle
+12372: 
+12390: down
+12393: down right
+12396: right
+12398: right square
+12402: 
+12430: down
+12433: down right
+12436: right
+12438: right square triangle
+12444: 
+12490: l
+12494: 
+12500: r
+12504: 
+12516: up right
+12520: 
+12534: circle
+12538: 
+12546: cross
+12550: 
+12560: left
+12590: 
+12592: square
+12596: 
+12600: triangle
+12604: 
+12608: circle
+12612: 
+12630: down
+12633: down left
+12636: left
+12638: left square
+12642: 
+12670: down
+12673: down left
+12676: left
+12678: left square triangle
+12684: 
+12730: l
+12734: 
+12740: r
+12744: 
+12756: up left
+12760: 
+12774: circle
+12778: 
+12786: cross
+12790: 
+12800: right
+12830: 
+12832: square
+12836: 
+12840: triangle
+12844: 
+12848: circle
+12852: 
+12870: down
+12873: down right
+12876: right
+12878: right square
+12882: 
+12910: down
+12913: down right
+12916: right
+12918: right square triangle
+12924: 
+12970: l
+12974: 
+12980: r
+12984: 
+12996: up right
+13000: 
+13014: circle
+13018: 
+13026: cross
+13030: 
+13040: left
+13070: 
+13072: square
+13076: 
+13080: triangle
+13084: 
+13088: circle
+13092: 
+13110: down
+13113: down left
+13116: left
+13118: left square
+13122: 
+13150: down
+13153: down left
+13156: left
+13158: left square triangle
+13164: 
+13210: l
+13214: 
+13220: r
+13224: 
+13236: up left
+13240: 
+13254: circle
+13258: 
+13266: cross
+13270: 
+13280: right
+13310: 
+13312: square
+13316: 
+13320: triangle
+13324: 
+13328: circle
+13332: 
+13350: down
+13353: down right
+13356: right
+13358: right square
+13362: 
+13390: down
+13393: down right
+13396: right
+13398: right square triangle
+13404: 
+13450: l
+13454: 
+13460: r
+13464: 
+13476: up right
+13480: 
+13494: circle
+13498: 
+13506: cross
+13510: 
+13520: left
+13550: 
+13552: square
+13556: 
+13560: triangle
+13564: 
+13568: circle
+13572: 
+13590: down
+13593: down left
+13596: left
+13598: left square
+13602: 
+13630: down
+13633: down left
+13636: left
+13638: left square triangle
+13644: 
+13690: l
+13694: 
+13700: r
+13704: 
+13716: up left
+13720: 
+13734: circle
+13738: 
+13746: cross
+13750: 
+13760: right
+13790: 
+13792: square
+13796: 
+13800: triangle
+13804: 
+13808: circle
+13812: 
+13830: down
+13833: down right
+13836: right
+13838: right square
+13842: 
+13870: down
+13873: down right
+13876: right
+13878: right square triangle
+13884: 
+13930: l
+13934: 
+13940: r
+13944: 
+13956: up right
+13960: 
+13974: circle
+13978: 
+13986: cross
+13990: 
+14000: left
+14030: 
+14032: square
+14036: 
+14040: triangle
+14044: 
+14048: circle
+14052: 
+14070: down
+14073: down left
+14076: left
+14078: left square
+14082: 
+14110: down
+14113: down left
+14116: left
+14118: left square triangle
+14124: 
+14170: l
+14174: 
+14180: r
+14184: 
+14196: up left
+14200: 
+14214: circle
+14218: 
+14226: cross
+14230: 
+14240: right
+14270: 
+14272: square
+14276: 
+14280: triangle
+14284: 
+14288: circle
+14292: 
+14310: down
+14313: down right
+14316: right
+14318: right square
+14322: 
+14350: down
+14353: down right
+14356: right
+14358: right square triangle
+14364: 
+14410: l
+14414: 
+14420: r
+14424: 
+14436: up right
+14440: 
+14454: circle
+14458: 
+14466: cross
+14470: 
+14480: left
+14510: 
+14512: square
+14516: 
+14520: triangle
+14524: 
+14528: circle
+14532: 
+14550: down
+14553: down left
+14556: left
+14558: left square
+14562: 
+14590: down
+14593: down left
+14596: left
+14598: left square triangle
+14604: 
+14650: l
+14654: 
+14660: r
+14664: 
+14676: up left
+14680: 
+14694: circle
+14698: 
+14706: cross
+14710: 
+14720: right
+14750: 
+14752: square
+14756: 
+14760: triangle
+14764: 
+14768: circle
+14772: 
+14790: down
+14793: down right
+14796: right
+14798: right square
+14802: 
+14830: down
+14833: down right
+14836: right
+14838: right square triangle
+14844: 
+14890: l
+14894: 
+14900: r
+14904: 
+14916: up right
+14920: 
+14934: circle
+14938: 
+14946: cross
+14950: 
+14960: left
+14990: 
+14992: square
+14996: 
+15000: triangle
+15004: 
+15008: circle
+15012: 
+15030: down
+15033: down left
+15036: left
+15038: left square
+15042: 
+15070: down
+15073: down left
+15076: left
+15078: left square triangle
+15084: 
+15130: l
+15134: 
+15140: r
+15144: 
+15156: up left
+15160: 
+15174: circle
+15178: 
+15186: cross
+15190: 
+15200: right
+15230: 
+15232: square
+15236: 
+15240: triangle
+15244: 
+15248: circle
+15252: 
+15270: down
+15273: down right
+15276: right
+15278: right square
+15282: 
+15310: down
+15313: down right
+15316: right
+15318: right square triangle
+15324: 
+15370: l
+15374: 
+15380: r
+15384: 
+15396: up right
+15400: 
+15414: circle
+15418: 
+15426: cross
+15430: 
+15440: left
+15470: 
+15472: square
+15476: 
+15480: triangle
+15484: 
+15488: circle
+15492: 
+15510: down
+15513: down left
+15516: left
+15518: left square
+15522: 
+15550: down
+15553: down left
+15556: left
+15558: left square triangle
+15564: 
+15610: l
+15614: 
+15620: r
+15624: 
+15636: up left
+15640: 
+15654: circle
+15658: 
+15666: cross
+15670: 
+15680: right
+15710: 
+15712: square
+15716: 
+15720: triangle
+15724: 
+15728: circle
+15732: 
+15750: down
+15753: down right
+15756: right
+15758: right square
+15762: 
+15790: down
+15793: down right
+15796: right
+15798: right square triangle
+15804: 
+15850: l
+15854: 
+15860: r
+15864: 
+15876: up right
+15880: 
+15894: circle
+15898: 
+15906: cross
+15910: 
+15920: left
+15950: 
+15952: square
+15956: 
+15960: triangle
+15964: 
+15968: circle
+15972: 
+15990: down
+15993: down left
+15996: left
+15998: left square
+16002: 
+16030: down
+16033: down left
+16036: left
+16038: left square triangle
+16044: 
+16090: l
+16094: 
+16100: r
+16104: 
+16116: up left
+16120: 
+16134: circle
+16138: 
+16146: cross
+16150: 

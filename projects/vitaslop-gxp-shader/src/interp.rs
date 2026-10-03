@@ -487,10 +487,16 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // lane - which is what the integer ops above then read. Matching `emit_pack_to_int`,
         // including its clamp: the source can be a NaN or a huge float, and an unclamped
         // conversion of either is undefined rather than merely wrong.
-        Op::PackToInt { bits, signed, .. } => {
+        Op::PackToInt { bits, signed, norm, .. } => {
             let f = s(0, c)?;
             let lane_mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
-            let raw = if signed {
+            // The NORMALIZED form, rounded exactly as the emitter rounds it.
+            let scale = if signed { ((1u64 << (bits - 1)) - 1) as f32 } else { ((1u64 << bits) - 1) as f32 };
+            let raw = if norm && signed {
+                (f.clamp(-1.0, 1.0) * scale + 0.5).floor() as i32 as u32
+            } else if norm {
+                (f.clamp(0.0, 1.0) * scale + 0.5).floor() as u32
+            } else if signed {
                 f.trunc().clamp(-2_147_483_000.0, 2_147_483_000.0) as i32 as u32
             } else {
                 f.trunc().clamp(0.0, 4_294_967_000.0) as u32

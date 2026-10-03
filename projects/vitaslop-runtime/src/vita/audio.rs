@@ -100,9 +100,12 @@ pub struct AudioState {
     /// squared off at full scale, heard on the device as static with the real sound
     /// underneath it.
     ngs_port: Option<i32>,
-    /// Optional raw-s16le capture of the mixed output stream (env
-    /// `VITASLOP_AUDIO_RAW`), for headless verification. `None` = disabled.
-    capture: Option<std::fs::File>,
+    /// Optional raw-s16le capture of the output, ONE FILE PER PORT (env `VITASLOP_AUDIO_RAW`
+    /// names the base path; port `n` goes to `<base>.p<n>`), for headless verification.
+    /// Per port because ports play AT THE SAME TIME: appended into one file, a movie or SFX
+    /// port interleaves grains with the music and the file is neither stream at either length.
+    capture: Vec<(i32, std::fs::File)>,
+    capture_base: Option<std::path::PathBuf>,
     capture_inited: bool,
     /// Scratch buffers for one grain of output, reused across calls.
     ///
@@ -272,16 +275,21 @@ impl AudioState {
         self.ngs_param_bufs.iter().find(|(k, _)| *k == key).map(|(_, a)| *a)
     }
 
-    /// Append one grain of mixed PCM to the raw-s16le capture file, if
-    /// `VITASLOP_AUDIO_RAW` names one. Diagnostic; opens the file on first use.
-    fn capture_pcm(&mut self, pcm: &[i16]) {
+    /// Append one grain of a port's PCM to that port's raw-s16le capture file, if
+    /// `VITASLOP_AUDIO_RAW` names a base path. Diagnostic; each file opens on first use.
+    fn capture_pcm(&mut self, port: i32, pcm: &[i16]) {
         if !self.capture_inited {
             self.capture_inited = true;
-            if let Some(path) = std::env::var_os("VITASLOP_AUDIO_RAW") {
-                self.capture = std::fs::File::create(path).ok();
-            }
+            self.capture_base = std::env::var_os("VITASLOP_AUDIO_RAW").map(std::path::PathBuf::from);
         }
-        if let Some(f) = self.capture.as_mut() {
+        let Some(base) = self.capture_base.as_ref() else { return };
+        if !self.capture.iter().any(|(p, _)| *p == port) {
+            let mut path = base.clone().into_os_string();
+            path.push(format!(".p{port}"));
+            let Ok(f) = std::fs::File::create(path) else { return };
+            self.capture.push((port, f));
+        }
+        if let Some((_, f)) = self.capture.iter_mut().find(|(p, _)| *p == port) {
             use std::io::Write;
             let mut bytes = Vec::with_capacity(pcm.len() * 2);
             for s in pcm {
@@ -508,7 +516,7 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             }
             st.audio_state.scratch_bytes = bytes;
         }
-        st.audio_state.capture_pcm(&pcm);
+        st.audio_state.capture_pcm(port, &pcm);
         // Counted where the grain is SUBMITTED, so it measures what the guest actually
         // handed the device rather than what it mixed - see `produced_seconds`.
         match st.audio_state.submitted.iter_mut().find(|(p, ..)| *p == port) {

@@ -320,24 +320,12 @@ const NOT_INLINABLE: &[(u32, &str)] = &[
 /// there is no deadline to overwrite the answer later either.
 pub(super) fn try_lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) {
     let work = resolve_mutex(ctx, st, ctx.arg(0));
-    if st.lwmutex_contended(ctx, work) {
-        ctx.ret(ERR_LW_MUTEX_FAILED_TO_OWN);
-        return;
-    }
-    let acquired = st.lwmutex_lock(ctx, work, None);
-    if acquired {
-        ctx.ret(0);
-        return;
-    }
-    // Unreachable by the argument above. If the two predicates ever part company, FAIL the
-    // try-lock: the caller has been queued behind an owner, and handing it a success would
-    // let two threads into one critical section - silently, and a long way from here.
-    tracing::error!(
-        target: "vitaslop::sema",
-        work = format_args!("{work:#010x}").to_string(),
-        "sceKernelTryLockLwMutex found an uncontended mutex it could not take -          `lwmutex_contended` and `lwmutex_lock` disagree; failing the try-lock"
-    );
-    ctx.ret(ERR_LW_MUTEX_FAILED_TO_OWN);
+    // One decision that never parks (`VitaState::lwmutex_try_lock`). A contended check
+    // followed by a separate take was exact with one baton, but under the parallel run an
+    // inline take on another worker can land between the two, and the take would then QUEUE
+    // a caller that was promised no wait.
+    let acquired = st.lwmutex_try_lock(ctx, work);
+    ctx.ret(if acquired { 0 } else { ERR_LW_MUTEX_FAILED_TO_OWN });
 }
 
 /// int sceKernelLockLwMutex(SceKernelLwMutexWork *pWork, int lockCount,
@@ -376,14 +364,16 @@ pub(super) fn lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcom
     let timeout_us = (timeout_ptr != 0).then(|| ctx.read_u32(timeout_ptr));
     // A zero timeout is a try-lock spelled the other way; the non-blocking spelling itself is
     // [`try_lock_lw_mutex`], which returns nothing because it cannot park.
-    if timeout_us == Some(0) && st.lwmutex_contended(ctx, work) {
-        ctx.ret(ERR_LW_MUTEX_FAILED_TO_OWN);
+    if timeout_us == Some(0) {
+        let acquired = st.lwmutex_try_lock(ctx, work);
+        ctx.ret(if acquired { 0 } else { ERR_LW_MUTEX_FAILED_TO_OWN });
         return SvcOutcome::Continue;
     }
     // Success returns 0 whether acquired now or after a wake by the releasing thread. A
     // caller that ends up parked with a deadline has this overwritten with WAIT_TIMEOUT
     // when the deadline passes (`VitaState::advance_time_to`).
     ctx.ret(0);
+    let (pre_count, pre_owner) = (lwwork::count_word(ctx, work), lwwork::owner(ctx, work));
     let acquired = st.lwmutex_lock(ctx, work, timeout_us.filter(|&us| us != 0));
     // >>> WHAT THIS TRACE CAN AND CANNOT SEE. Only the SLOW half arrives here, so an
     // uncontended take - the common case, emitted as `InlineOp::LwMutexLock` straight into guest
@@ -397,6 +387,8 @@ pub(super) fn lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcom
         thread = st.current_thread(),
         lr = format_args!("{:#010x}", ctx.regs[14]).to_string(),
         acquired,
+        count_word = format_args!("{pre_count:#x}").to_string(),
+        owner = format_args!("{pre_owner:#x}").to_string(),
         "lwmutex lock (CONTENDED path only)"
     );
     if acquired || !st.is_preemptive() {
@@ -413,6 +405,16 @@ pub(super) fn lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcom
 /// `...2` variant: release the lightweight mutex, waking the next parked waiter.
 pub(super) fn unlock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) {
     let work = resolve_mutex(ctx, st, ctx.arg(0));
+    tracing::trace!(
+        target: "vitaslop::sema",
+        work = format_args!("{work:#010x}").to_string(),
+        thread = st.current_thread(),
+        lr = format_args!("{:#010x}", ctx.regs[14]).to_string(),
+        count_word = format_args!("{:#x}", lwwork::count_word(ctx, work)).to_string(),
+        owner = format_args!("{:#x}", lwwork::owner(ctx, work)).to_string(),
+        n = ctx.arg(1),
+        "lwmutex unlock (host path)"
+    );
     st.lwmutex_unlock(ctx, work);
     ctx.ret(0);
 }

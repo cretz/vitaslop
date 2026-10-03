@@ -575,8 +575,24 @@ fn params_interface_size(param_id: u32) -> u32 {
 /// contents, because it IS the voice's persistent parameter state across the cycle.
 #[hostcall]
 pub(super) fn voice_lock_params(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, module: u32, param: u32, buffer: Ptr) -> i32 {
+    let buf = voice_params_state(ctx, st, voice, module, param);
+    if buffer.addr() != 0 {
+        ctx.write_u32(buffer.addr(), buf); // SceNgsBufferInfo.data
+        ctx.write_u32(buffer.addr() + 4, NGS_BLOCK_SIZE); // .size
+    }
+    0
+}
+
+/// The voice's CURRENT parameters for one module's params interface - the block
+/// `sceNgsVoiceLockParams` hands out, created (carrying its descriptor) on first use.
+///
+/// ONE state per `(voice, module, interface)`, whichever call writes it: a lock/unlock cycle
+/// and a `sceNgsVoiceSetParamsBlock` entry update the SAME parameters on the device, which is
+/// why a title can set a voice up whole through a block and then change one field through a
+/// lock - see [`voice_set_params_block`].
+fn voice_params_state(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, module: u32, param: u32) -> u32 {
     let key = (voice, module, param);
-    let buf = match st.audio_state.ngs_param_buf(key) {
+    match st.audio_state.ngs_param_buf(key) {
         Some(a) => a,
         None => {
             let a = st.galloc(NGS_BLOCK_SIZE, 16);
@@ -595,12 +611,7 @@ pub(super) fn voice_lock_params(ctx: &mut GuestCtx, st: &mut VitaState, voice: u
             ctx.write_u32(a + NGS_PARAMS_DESC_SIZE_OFF, params_interface_size(param));
             a
         }
-    };
-    if buffer.addr() != 0 {
-        ctx.write_u32(buffer.addr(), buf); // SceNgsBufferInfo.data
-        ctx.write_u32(buffer.addr() + 4, NGS_BLOCK_SIZE); // .size
     }
-    0
 }
 
 /// The voice-definition getters (`sceNgsVoiceDefGet*`) each return a
@@ -805,14 +816,47 @@ pub(super) fn voice_set_params_block(
         while off + NGS_MODULE_PARAM_HEADER_BYTES + 8 <= size {
             let base = block.addr() + off;
             let module = ctx.read_u32(base);
-            let params = base + NGS_MODULE_PARAM_HEADER_BYTES;
-            let entry_bytes = ctx.read_u32(params + NGS_PARAMS_DESC_SIZE_OFF);
+            let entry = base + NGS_MODULE_PARAM_HEADER_BYTES;
+            let entry_bytes = ctx.read_u32(entry + NGS_PARAMS_DESC_SIZE_OFF);
+            // >>> THE ENTRY BECOMES THE VOICE'S CURRENT PARAMETERS - the same state a later
+            // >>> `sceNgsVoiceLockParams` hands back - and is applied FROM there.
+            //
+            // A title sets a voice up whole through a block and then changes single fields
+            // through lock/unlock, writing only those fields (it never re-writes the rest:
+            // lock returns the voice's current parameters on the device). Applying the block
+            // straight from the title's memory left the lock buffer holding only what locks had
+            // written, so every later unlock read channels 0, format 0 and an EMPTY buffer
+            // chain and was refused - MEASURED on one fighting title: 2,907 unlocks, every one
+            // carrying only a new playback rate (22050..33600 Hz per sound) and every one
+            // dropped, so its sounds played at whatever rate their block named.
+            // `VITASLOP_NGS_BLOCK_STATE=0` is the arm back: apply from the title's memory only.
+            static BLOCK_STATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let block_state =
+                *BLOCK_STATE.get_or_init(|| !matches!(crate::knobs::var("VITASLOP_NGS_BLOCK_STATE").as_deref(), Ok("0")));
+            let params = if block_state && entry_bytes != 0 && entry_bytes <= NGS_BLOCK_SIZE {
+                let id = ctx.read_u32(entry);
+                let state = voice_params_state(ctx, st, voice, module, id);
+                let bytes = ctx.read_bytes(entry, entry_bytes as usize);
+                ctx.write_bytes(state, &bytes);
+                state
+            } else {
+                entry
+            };
             // Module 0 is the source player; its params carry the AT9 buffer + config.
             // Of the rest, only the buss module is understood - see `set_module_params`.
             if module == 0 {
                 st.audio_state.at9.set_player_params(ctx, voice, params);
-            } else {
-                st.audio_state.at9.set_module_params(ctx, voice, params);
+            } else if !st.audio_state.at9.set_module_params(ctx, voice, params) {
+                // COUNTED exactly as `voice_unlock_params` counts its unrecognised modules.
+                // This path used to drop them without a trace, so a title that sets its
+                // params through blocks showed an EMPTY unknown-module census while its
+                // mix ran 5x hot - the one report that names the missing stage was blind
+                // to the route the title actually used.
+                let id = ctx.read_u32(params);
+                let mut bytes = [0u8; 48];
+                ctx.read_into(params, &mut bytes);
+                let is_buss = st.audio_state.at9.is_buss(voice);
+                crate::vita::at9::note_unknown_module(id, module, is_buss, &bytes);
             }
             applied += 1;
             // A zero or absurd size cannot be stepped over; stop rather than spin.
@@ -1062,6 +1106,55 @@ mod lock_params_tests {
             vec![(voice, PlayerEvent::EndOfData { last: 1 })]
         );
         assert!(!h.st.audio_state.at9.is_playing(voice));
+    }
+
+    /// A voice set up WHOLE through `sceNgsVoiceSetParamsBlock` and then given a new playback
+    /// rate through lock/unlock - writing ONLY the rate, as a title does - keeps its source,
+    /// channels and format and plays at the new rate. Before the block and the lock shared one
+    /// state, the unlock read an empty struct, was refused, and the rate change was lost.
+    #[test]
+    fn a_lock_after_a_params_block_changes_only_what_it_writes() {
+        let mut h = Harness::new();
+        let voice = 0x1234;
+        let a = 0x0020_0000u32;
+        for i in 0..64u32 {
+            h.mem[(a + i * 2) as usize..(a + i * 2 + 2) as usize].copy_from_slice(&(1 + i as i16).to_le_bytes());
+        }
+        // The block: module 0, all channels, then a whole PCM player struct.
+        let block = 0x0030_0000u32;
+        h.write_u32(block, 0);
+        h.write_u32(block + 4, 0xffff_ffff);
+        let p = block + NGS_MODULE_PARAM_HEADER_BYTES;
+        h.write_u32(p, PCM_PLAYER_ID);
+        h.write_u32(p + NGS_PARAMS_DESC_SIZE_OFF, 84);
+        h.write_u32(p + 0x08, a);
+        h.write_u32(p + 0x0c, 128);
+        h.write_u32(p + 0x10, 0xffff_0000); // loop 0, next -1
+        h.write_u32(p + 0x38, 48000.0f32.to_bits());
+        h.write_u32(p + 0x4c, 1); // one channel, raw s16
+        let errs = 0x0031_0000u32;
+        h.call(voice_set_params_block, [voice, block, NGS_MODULE_PARAM_HEADER_BYTES + 84, errs]);
+        h.call(voice_play, [voice, 0, 0, 0]);
+        let grain = |h: &mut Harness| -> Vec<i32> {
+            let mut mix = vec![0i32; 4];
+            let mut mem = SliceMemory(&mut h.mem);
+            let ctx = GuestCtx::new(&mut h.regs, &mut h.vfp, &mut mem, 0);
+            h.st.audio_state.at9.mix_grain(&ctx, &mut mix, 4, 1, 48000);
+            mix
+        };
+        assert_eq!(grain(&mut h), vec![1, 2, 3, 4]);
+        // Lock hands back the CURRENT parameters - the block's - and the title writes the rate.
+        let info = 0x2000u32;
+        h.call(voice_lock_params, [voice, 0, PCM_PLAYER_ID, info]);
+        let buf = h.read_u32(info);
+        assert_eq!(h.read_u32(buf + 0x08), a, "lock must return the source the block set");
+        assert_eq!(h.mem[(buf + 0x4c) as usize], 1, "lock must return the channel count the block set");
+        h.write_u32(buf + 0x38, 24000.0f32.to_bits());
+        h.call(voice_unlock_params, [voice, 0, 0, 0]);
+        assert!(h.st.audio_state.at9.is_playing(voice), "a rate change must not stop the voice");
+        let next = grain(&mut h);
+        assert_eq!(next[0], 5, "a rate change continues from where the voice was");
+        assert_ne!(next, vec![5, 6, 7, 8], "the new rate must apply: half speed advances half as far");
     }
 
     /// The negative control, which is what the engine did before: with the descriptor id

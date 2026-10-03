@@ -651,6 +651,98 @@ fn round_trip_one(
     texture.destroy();
 }
 
+/// The WHOLE-CHAIN encode `run` performs, and the deferred pump's SLICED version of it, must
+/// produce what the CPU pipeline produces over the same guest bytes, level for level.
+///
+/// # Why this is separate from the round trip above
+/// `run` encodes every level of a chain in ONE dispatch over a flat block index (see
+/// `encode_etc2_chain`) - the per-level dispatches it replaced serialised the chain, and on the
+/// phone a 128x128 BC3 texture cost 17 ms of GPU for its latency alone. The round trip that drives
+/// `run` needs an adapter with ETC2 and so never runs on this desktop; this drives the same
+/// staging and the same dispatch through `chain_blocks_readback`, which stops before the ETC2
+/// texture, so it runs everywhere. The SLICED arms are the deferred encode's shape: the chain
+/// cut into dispatches of N blocks at arbitrary offsets, one submit each.
+#[test]
+fn gpu_chain_encode_matches_the_cpu_pipeline() {
+    use vitaslop_platform::gpu::{BlockFormat, CompressedData, CompressedUpload, SourceCodec};
+    let _gpu = gpu_lock();
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter - skipping");
+        return;
+    };
+    let enc = Transcoder::new(&device);
+    for (w, h) in [(32u32, 32u32), (128, 64)] {
+        for base_format in [0x80u32, 0x83, 0x85, 0x87] {
+            let tex_type = 0u32;
+            let levels = vitaslop_runtime::render::max_mip_levels(w, h);
+            let mut total = 0usize;
+            for l in 0..levels {
+                total += vitaslop_runtime::render::level_layout(base_format, tex_type, w, h, l).unwrap().bytes as usize;
+            }
+            let mut seed = 0x0bad_c0de_1234_5678u64 ^ (base_format as u64);
+            let bytes: Vec<u8> = (0..total)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 33) as u8
+                })
+                .collect();
+            let codec = match vitaslop_runtime::pvrtc::Variant::from_base_format(base_format) {
+                Some(v) => SourceCodec::Pvrtc { two: v.two, four_bpp: v.four_bpp },
+                None => SourceCodec::Bc { base_format },
+            };
+            let mut plan = build_plan(base_format, tex_type, w, h, levels, &bytes, false, true);
+            plan.codec = codec;
+            // The CPU chain: every guest level decoded, as `round_trip_one` builds it.
+            let mut chain: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+            for l in 0..levels {
+                let ll = vitaslop_runtime::render::level_layout(base_format, tex_type, w, h, l).unwrap();
+                let off = vitaslop_runtime::render::level_offset(base_format, tex_type, w, h, l).unwrap() as usize;
+                let px = match vitaslop_runtime::pvrtc::Variant::from_base_format(base_format) {
+                    Some(variant) => {
+                        let mut px = vec![0u8; (ll.width * ll.height * 4) as usize];
+                        vitaslop_runtime::pvrtc::decode_face(&bytes[off..], ll.width, ll.height, variant, vitaslop_runtime::render::swizzled_type(tex_type), &mut px);
+                        px
+                    }
+                    None => {
+                        let view = bc_texture(base_format, tex_type, ll.width, ll.height, &bytes[off..]);
+                        vitaslop_runtime::render::decode_texture_rgba8(&view).2
+                    }
+                };
+                chain.push((ll.width, ll.height, px));
+            }
+            for alpha in [false, true] {
+                let format = if alpha { BlockFormat::Etc2Rgba8 } else { BlockFormat::Etc2Rgb8 };
+                let upload = CompressedUpload {
+                    format,
+                    width: w,
+                    height: h,
+                    levels,
+                    transcoded: true,
+                    data: CompressedData::Gpu(plan.clone()),
+                };
+                let bb = format.block_bytes() as usize;
+                for slice in [None, Some(64u32), Some(100)] {
+                    let label = format!("{base_format:#04x} {w}x{h} alpha {alpha} slice {slice:?}");
+                    let got = enc
+                        .chain_blocks_readback(&device, &queue, &upload, &plan, slice)
+                        .unwrap_or_else(|| panic!("{label}: staging declined"));
+                    for (i, (lw, lh, rgba)) in chain.iter().enumerate() {
+                        let want = if alpha {
+                            vitaslop_runtime::etcenc::encode_etc2_rgba8(*lw, *lh, rgba)
+                        } else {
+                            vitaslop_runtime::etcenc::encode_etc2_rgb8(*lw, *lh, rgba)
+                        };
+                        assert_eq!(got[i].len(), want.len(), "{label} level {i}: block count");
+                        for (b, (a, e)) in got[i].chunks(bb).zip(want.chunks(bb)).enumerate() {
+                            assert_eq!(a, e, "{label} level {i} ({lw}x{lh}) block {b}\n  gpu {a:02x?}\n  cpu {e:02x?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One mip level of a compressed texture, read back and unpadded.
 fn read_back_level(
     device: &wgpu::Device,

@@ -311,9 +311,27 @@ fn color_precision(shader: &Shader, color: ColorOutput) -> ColorPrecision {
     // So a full-width move is followed back to what it copied, and that register's own
     // writer is asked instead. Bounded, because a chain of copies is still a chain and a
     // cycle must not hang the compiler.
+    //
+    // >>> AND A COPY IS NOT ALWAYS SPELLED `MOV`. A full-width BITWISE op against its identity
+    // (`OR`/`XOR` 0, `AND` all-ones, a shift by 0) moves the word unchanged, and compilers use
+    // it as the final copy. MEASURED on a retail title (PCSE00120, a hedge's lit material):
+    // `o[0] = pa[0] | 0u` over a `pa[0]` built by four 8-bit packs - read as F32, the packed
+    // bytes went out as one float's bits, and the draw painted BLACK with RED fringes.
     for _ in 0..8 {
         let Some((at, i)) = found else { break };
-        if !matches!(i.op, Op::Mov) || i.half_precision {
+        let identity_bitwise = matches!(
+            i.op,
+            Op::Bitwise {
+                kind: crate::ir::BitwiseKind::Or
+                    | crate::ir::BitwiseKind::Xor
+                    | crate::ir::BitwiseKind::Shl
+                    | crate::ir::BitwiseKind::Shr
+                    | crate::ir::BitwiseKind::Asr,
+                imm: Some(0),
+                lane_bits: 32,
+            } | Op::Bitwise { kind: crate::ir::BitwiseKind::And, imm: Some(u32::MAX), lane_bits: 32 }
+        );
+        if !(matches!(i.op, Op::Mov) || identity_bitwise) || i.half_precision {
             break;
         }
         // Only a plain register-to-register copy forwards: an immediate or a constant has
@@ -2113,7 +2131,107 @@ pub fn mem_window_helper_named(windows: &[MemWindow], binding: &str) -> String {
     }
     let _ = writeln!(s, "  return 0u;");
     let _ = writeln!(s, "}}");
+    // FOUR consecutive words from one address - see [`quad_mem_reads`]. A quad that lies wholly
+    // inside a window is served from it with ONE range check; one that straddles a window's end
+    // falls back to four word reads, which is exactly what the four calls it replaces did.
+    let _ = writeln!(s, "fn {binding}_quad(addr: u32) -> vec4<u32> {{");
+    for (i, at) in mem_window_placements(windows).iter().enumerate() {
+        let _ = writeln!(s, "  {{");
+        let _ = writeln!(s, "    let b = {binding}[{i}u].x;");
+        let _ = writeln!(s, "    if (addr >= b) {{");
+        let _ = writeln!(s, "      let w = (addr - b) >> 2u;");
+        let _ = writeln!(s, "      if (w + 3u < {}u) {{", at.words);
+        let _ = writeln!(s, "        let g = {}u + w;", at.first_word);
+        let _ = writeln!(
+            s,
+            "        return vec4<u32>({binding}[g >> 2u][g & 3u], {binding}[(g + 1u) >> 2u][(g + 1u) & 3u], \
+             {binding}[(g + 2u) >> 2u][(g + 2u) & 3u], {binding}[(g + 3u) >> 2u][(g + 3u) & 3u]);"
+        );
+        let _ = writeln!(s, "      }}");
+        let _ = writeln!(s, "    }}");
+        let _ = writeln!(s, "  }}");
+    }
+    let _ = writeln!(
+        s,
+        "  return vec4<u32>({binding}_word(addr), {binding}_word(addr + 4u), {binding}_word(addr + 8u), {binding}_word(addr + 12u));"
+    );
+    let _ = writeln!(s, "}}");
     s
+}
+
+/// Rewrite every run of four consecutive word loads from ONE address - `X = {binding}_word(gxp_aN
+/// + K)` for K, K+4, K+8, K+12 on consecutive lines - into one `{binding}_quad` read.
+///
+/// >>> WHY: THE DEVICE'S SHADER COMPILER. Every `{binding}_word` call is the whole per-window
+/// branch chain, inlined at the call, and a skinned vertex program loads its bone rows four words
+/// at a time - one fighting title's calls it 49 times, a golf title's 57. MEASURED on the phone
+/// (PowerVR, `pipeline-compile` with a salt the compiler cannot strip, `createRenderPipelineAsync`
+/// per module): MK's skinned pair 232.8 / 227.6 ms as emitted, 156.2 ms with this (-32%); the
+/// golf title's largest module 658 -> 514 ms (-22%). A first compile is what freezes a scene start.
+///
+/// >>> WHY IT IS EXACT. The four words are read from the same address register the four calls
+/// read: the address is a `let` (`gxp_aN`), so no assignment among the four can change it, and the
+/// quad helper answers each lane with the word the word helper would - a window wholly holding
+/// the quad holds the same guest bytes as any earlier window holding part of it (every window is
+/// a snapshot of guest memory taken at the same draw - see [`resolve_static_mem_reads`]), and a
+/// quad that fits no window takes the four word reads. `VITASLOP_GXP_MEM_QUAD=0` is the arm back.
+pub fn quad_mem_reads(body: &str, binding: &str) -> String {
+    if !crate::link::arm_on(crate::link::MEM_QUAD_ARM) {
+        return body.to_string();
+    }
+    let call = format!("{binding}_word(");
+    if !body.contains(&call) {
+        return body.to_string();
+    }
+    // `<indent><lhs> = <binding>_word(<addr> + <k>u);` -> (indent, lhs, addr, k), for an address
+    // that is an emitted `let` (`gxp_a...`) only.
+    let parse = |line: &str| -> Option<(String, String, String, u32)> {
+        let indent_len = line.len() - line.trim_start().len();
+        let t = line.trim_start();
+        let (lhs, rhs) = t.split_once(" = ")?;
+        if lhs.contains(' ') || lhs.starts_with("let ") {
+            return None;
+        }
+        let inner = rhs.strip_prefix(call.as_str())?.strip_suffix(");")?;
+        let (addr, k) = inner.split_once(" + ")?;
+        if !addr.starts_with("gxp_a") || !addr.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        let k = k.strip_suffix('u')?.parse::<u32>().ok()?;
+        Some((line[..indent_len].to_string(), lhs.to_string(), addr.to_string(), k))
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    let mut n = 0u32;
+    while i < lines.len() {
+        if i + 3 < lines.len()
+            && let Some((ind, l0, a, k)) = parse(lines[i])
+        {
+            let rest: Vec<_> = (1..4).filter_map(|j| parse(lines[i + j])).collect();
+            if rest.len() == 3
+                && rest.iter().enumerate().all(|(j, (_, _, aj, kj))| *aj == a && *kj == k + 4 * (j as u32 + 1))
+            {
+                // Unique per module: two quads of one address in one scope must not collide.
+                let q = format!("gxp_mq{n}");
+                n += 1;
+                out.push_str(&format!("{ind}let {q} = {binding}_quad({a} + {k}u);\n"));
+                out.push_str(&format!("{ind}{l0} = {q}.x;\n"));
+                for ((_, lj, _, _), c) in rest.iter().zip(["y", "z", "w"]) {
+                    out.push_str(&format!("{ind}{lj} = {q}.{c};\n"));
+                }
+                i += 4;
+                continue;
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    if !body.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// Resolve at EMIT time every memory load whose address is a window's own base register plus a
@@ -2316,6 +2434,38 @@ fn pointer_use(base_sa: u32, shader: &Shader, secondary: &Shader) -> PointerUse 
 /// sizing in [`resolve_mem_windows`]. 256 = every value of an 8-bit index.
 const OPEN_ARRAY_ELEMENTS: u32 = 256;
 
+/// The reach of an INDEXED pointer into the buffer whose address sits in `sa[base_sa]`: a
+/// program that forms `x * stride + base` (`IntMad` with an immediate stride and that SA
+/// register as the addend) reads element `x` of a table at run time, so the declared size of
+/// the buffer does not bound what it reads - the index does. This returns
+/// `OPEN_ARRAY_ELEMENTS * stride`, the largest such product: the element an 8-bit index can
+/// name, plus the element itself (`stride` bytes).
+///
+/// MEASURED on an action title (PCSA00029): its skinning program declares `g_mSkinTransforms`
+/// as 96 vec4s (32 bones, 1536 bytes) and forms each bone pointer as
+/// `imad(int(iBlendIndices.c), 48, sa[39])` - but its U8 blend indices run 75..82: the title
+/// binds the buffer at the start of a LARGER palette and indexes it absolutely. Sized as
+/// declared, 12,744 of 13,635 sampled loads read past the window and got ZERO, every bone
+/// matrix past 32 was a zero matrix, and the player character collapsed to nothing - the night
+/// prologue had no Drake in it. The console reads memory; the window has to cover what the
+/// index can reach for the shader's reads to be the console's.
+fn indexed_reach(base_sa: u32, shader: &Shader, secondary: &Shader) -> Option<u32> {
+    let mut reach: Option<u32> = None;
+    for i in shader.instrs.iter().chain(secondary.instrs.iter()) {
+        let crate::ir::Op::IntMad { .. } = i.op else { continue };
+        let [_, stride, addend] = i.srcs.as_slice() else { continue };
+        if addend.bank != crate::ir::Bank::SecondaryAttr || u32::from(addend.index) != base_sa {
+            continue;
+        }
+        if stride.bank != crate::ir::Bank::Immediate || stride.index == 0 {
+            continue;
+        }
+        let r = u32::from(stride.index).saturating_mul(OPEN_ARRAY_ELEMENTS);
+        reach = Some(reach.map_or(r, |x: u32| x.max(r)));
+    }
+    reach
+}
+
 pub fn resolve_mem_windows(
     program: &Program,
     shader: &Shader,
@@ -2469,7 +2619,13 @@ pub fn resolve_mem_windows(
                 // `OPEN_ARRAY_ELEMENTS` elements - the reach of the 8-bit blend-index attribute
                 // every captured skinned draw of the title binds.
                 Some(ub) if ub.semantic == 1 => ub.array_size.saturating_mul(OPEN_ARRAY_ELEMENTS),
-                Some(ub) => ub.array_size,
+                // A table the program indexes at run time reaches as far as its index does,
+                // not as far as its declaration - see `indexed_reach`. Never SMALLER than
+                // declared. `VITASLOP_GXP_INDEXED_REACH=0` is the arm back.
+                Some(ub) => match indexed_reach(base_sa, shader, &secondary) {
+                    Some(r) if indexed_reach_on() => ub.array_size.max(r),
+                    _ => ub.array_size,
+                },
                 // An entry for a buffer the program does not declare is INERT - nothing binds
                 // it and nothing can read it. Skipping it is exact as long as the pointer
                 // register really is dead, which is checked here rather than assumed.
@@ -3384,6 +3540,31 @@ mod tests {
     }
 
     #[test]
+    fn an_identity_bitwise_copy_keeps_the_packed_byte_colour() {
+        // PCSE00120's hedge: four 8-bit packs build pa0, then `o0 = pa0 | 0` hands it to the
+        // colour register. Read as F32 the bytes left as one float's bits: black, red fringes.
+        let pack = instr(
+            Op::PackUnorm8 { to_unorm8: true, float_half: false },
+            Some(Operand::plain(Bank::PrimaryAttr, 0, 1)),
+            vec![Operand::plain(Bank::Temp, 4, 2)],
+            [true; 4],
+        );
+        let or_zero = |imm: u32| {
+            instr(
+                Op::Bitwise { kind: crate::ir::BitwiseKind::Or, imm: Some(imm), lane_bits: 32 },
+                Some(Operand::plain(Bank::Output, 0, 1)),
+                vec![Operand::plain(Bank::PrimaryAttr, 0, 1)],
+                [true, false, false, false],
+            )
+        };
+        let plan = plan_bindings(&shader(vec![pack.clone(), or_zero(0)]), 0, |_| false);
+        assert_eq!(plan.color_precision, ColorPrecision::Fx8);
+        // An OR that CHANGES the word is arithmetic, not a copy, and is not followed back.
+        let plan = plan_bindings(&shader(vec![pack, or_zero(0x8000_0000)]), 0, |_| false);
+        assert_eq!(plan.color_precision, ColorPrecision::F32);
+    }
+
+    #[test]
     fn module_wires_pa_sa_and_returns_output() {
         let sh = shader(vec![instr(
             Op::Mul,
@@ -3520,3 +3701,56 @@ mod tests {
     }
 }
 
+
+/// `VITASLOP_GXP_INDEXED_REACH=0`: size an indexed table's window as declared again - see
+/// `indexed_reach`.
+fn indexed_reach_on() -> bool {
+    crate::link::arm(crate::link::INDEXED_REACH_ARM) != Some("0")
+}
+
+#[cfg(test)]
+mod quad_tests {
+    use super::*;
+
+    /// Four consecutive word loads from one `let` address become ONE quad read, lane by lane in
+    /// the order the calls had; anything else - a register address, a gap in the offsets, three
+    /// loads - is left exactly as emitted.
+    #[test]
+    fn four_word_loads_from_one_let_address_become_one_quad() {
+        let body = "  {\n    let gxp_a8: u32 = pa[3] + 0u;\n    r[32] = gxp_mem_word(gxp_a8 + 16u);\n    r[33] = gxp_mem_word(gxp_a8 + 20u);\n    r[34] = gxp_mem_word(gxp_a8 + 24u);\n    r[35] = gxp_mem_word(gxp_a8 + 28u);\n  }\n";
+        let out = quad_mem_reads(body, "gxp_mem");
+        assert!(out.contains("let gxp_mq0 = gxp_mem_quad(gxp_a8 + 16u);"), "{out}");
+        for (reg, lane) in [(32, "x"), (33, "y"), (34, "z"), (35, "w")] {
+            assert!(out.contains(&format!("r[{reg}] = gxp_mq0.{lane};")), "{out}");
+        }
+        assert!(!out.contains("gxp_mem_word("), "{out}");
+        assert!(out.ends_with("  }\n"));
+    }
+
+    #[test]
+    fn loads_the_quad_cannot_prove_equal_are_left_alone() {
+        // A REGISTER address: an assignment among the four could change it.
+        let reg = "    r[1] = gxp_mem_word(r[0] + 0u);\n    r[2] = gxp_mem_word(r[0] + 4u);\n    r[3] = gxp_mem_word(r[0] + 8u);\n    r[4] = gxp_mem_word(r[0] + 12u);\n";
+        assert_eq!(quad_mem_reads(reg, "gxp_mem"), reg);
+        // A gap in the offsets.
+        let gap = "    r[1] = gxp_mem_word(gxp_a1 + 0u);\n    r[2] = gxp_mem_word(gxp_a1 + 4u);\n    r[3] = gxp_mem_word(gxp_a1 + 12u);\n    r[4] = gxp_mem_word(gxp_a1 + 16u);\n";
+        assert_eq!(quad_mem_reads(gap, "gxp_mem"), gap);
+        // The OTHER stage's binding is not this one's.
+        let other = "    r[1] = gxp_fmem_word(gxp_a1 + 0u);\n    r[2] = gxp_fmem_word(gxp_a1 + 4u);\n    r[3] = gxp_fmem_word(gxp_a1 + 8u);\n    r[4] = gxp_fmem_word(gxp_a1 + 12u);\n";
+        assert_eq!(quad_mem_reads(other, "gxp_mem"), other);
+    }
+
+    /// The quad helper is emitted beside the word helper for every window, with the word reads
+    /// as its fallback, so a module that calls it always has it.
+    #[test]
+    fn the_quad_helper_rides_with_the_word_helper() {
+        let w = [
+            MemWindow { buffer_index: 0, bytes: 80, base_sa: 3, base_offset: 0 },
+            MemWindow { buffer_index: 1, bytes: 12288, base_sa: 4, base_offset: 0 },
+        ];
+        let h = mem_window_helper_named(&w, "gxp_mem");
+        assert!(h.contains("fn gxp_mem_quad(addr: u32) -> vec4<u32>"), "{h}");
+        assert!(h.contains("if (w + 3u < 20u)") && h.contains("if (w + 3u < 3072u)"), "{h}");
+        assert!(h.contains("return vec4<u32>(gxp_mem_word(addr), gxp_mem_word(addr + 4u)"), "{h}");
+    }
+}

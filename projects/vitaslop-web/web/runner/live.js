@@ -5,7 +5,7 @@ import { startAudio } from "../audio.js";
 import { bundleModule } from "../bundle.js";
 
 const statusEl = document.getElementById("status");
-const canvas = document.getElementById("screen");
+let canvas = document.getElementById("screen");
 const up = (m) => parent.postMessage(m, location.origin);
 const progress = (text) => {
   statusEl.textContent = text;
@@ -16,6 +16,28 @@ async function asset(path) {
   const r = await fetch(`/runner-assets/${path}`);
   if (!r.ok) throw new Error(`asset ${path}: HTTP ${r.status}`);
   return r.text();
+}
+
+/// Close the run worker's title files, then terminate it. Terminating alone left the nested
+/// storage worker's OPFS handles open on the phone, and the next job of the same title could
+/// not open them ("files are still open in another worker"). See `openTitleCached`'s close.
+async function releaseAndTerminate(worker) {
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 3000);
+    worker.addEventListener("message", (e) => {
+      if (e.data && e.data.type === "released") {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    try {
+      worker.postMessage({ type: "release" });
+    } catch {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+  worker.terminate();
 }
 
 async function run(p) {
@@ -31,12 +53,20 @@ async function run(p) {
   if (p.shots && p.shots.length && !knobs.VITASLOP_SHOT_FRAMES) knobs.VITASLOP_SHOT_FRAMES = p.shots.join(",");
   const recipe = p.recipe ? await asset(p.recipe) : p.recipeText || "";
   const stopFrame = Number(p.stopFrame || 0);
+  // A soak's stop: wall milliseconds of running (after the transpile), whatever frame it is.
+  const wallMs = Number(p.wallMs || 0);
   const t0 = performance.now();
   const reports = {};
   const notes = [];
   let traceDone = !p.waitTrace;
   let lastFrame = 0;
   let error = null;
+  // Asked to stop by the runner (a desktop cancel): end NOW, but as a result WITH its reports -
+  // a cancel that discarded them left a frozen phone run with nothing to read (30b, job 052).
+  stopAsked = false;
+  // The executable the title `sceAppMgrLoadExec`'d, when that is how this run ended - the job
+  // then continues in that process (see the `[exec] ` note below).
+  let execPath = null;
 
   const bundleQ = String(knobs.VITASLOP_SMP ?? "") === "1" ? "?smp=1" : "";
   // Compiled once here and handed to both workers, as the player does - see bundle.js.
@@ -46,6 +76,12 @@ async function run(p) {
   const worker = new Worker("../worker.js" + bundleQ, { type: "module" });
   progress("reserving...");
   let reserveSplit = `bundle compiled by the page ${Math.round(tBundle - t0)} ms; `;
+  // A run that fails before it starts must not leave its worker (a whole wasm instance)
+  // behind for the page's lifetime - see `releaseAndTerminate`.
+  const failEarly = (err) => {
+    worker.terminate();
+    throw err;
+  };
   const hostOff = await new Promise((resolve, reject) => {
     worker.onmessage = (e) => {
       const d = e.data;
@@ -56,13 +92,16 @@ async function run(p) {
     };
     worker.onerror = (e) => reject(new Error(e.message || "run worker failed to start"));
     worker.postMessage({ type: "reserve", knobs, module });
-  });
+  }).catch(failEarly);
   const tReserved = performance.now();
   progress("transpiling...");
   const prebuilt = await new Promise((resolve, reject) => {
     const tw = new Worker("../transpile-worker.js" + bundleQ, { type: "module" });
     tw.onmessage = (e) => {
-      if (e.data.type === "panic") return reject(new Error("PANIC WHILE PREPARING\n" + e.data.message));
+      if (e.data.type === "panic") {
+        tw.terminate();
+        return reject(new Error("PANIC WHILE PREPARING\n" + e.data.message));
+      }
       tw.terminate();
       e.data.type === "built" ? resolve(e.data.built) : reject(new Error(e.data.message));
     };
@@ -71,7 +110,7 @@ async function run(p) {
       reject(new Error(e.message || "transpile worker failed to start"));
     };
     tw.postMessage({ titleId, knobs, hostOff, bundleModule: module });
-  });
+  }).catch(failEarly);
   const tReady = performance.now();
   progress(`transpiled in ${((tReady - t0) / 1000).toFixed(1)} s (${prebuilt && prebuilt.split}); running`);
 
@@ -96,9 +135,27 @@ async function run(p) {
   const audioSnap = () => (audio ? { t: performance.now(), frame: lastFrame, ...audio.stats() } : null);
 
   const meter = [];
+  // >>> THE WHOLE TAB'S MEMORY on every progress line, workers included (a cross-origin-isolated
+  // page may ask). The phone Aw-Snapped at f0 after six back-to-back soak jobs in one tab, and
+  // the only evidence the desktop had was a progress line with no number in it.
+  let tabMem = "";
+  const sampleMem = () =>
+    performance.measureUserAgentSpecificMemory?.()
+      .then((m) => (tabMem = ` | tab ${Math.round(m.bytes / 1048576)} MB`))
+      .catch(() => {});
+  sampleMem();
+  const memTimer = setInterval(sampleMem, 30_000);
+  // >>> A FROZEN GAME ENDS THE JOB WITH ITS REPORTS, instead of holding the phone until the
+  // job's timeout (25 min for a soak) and then losing them.
+  let frameMovedAt = performance.now();
+  const wallUp = () => wallMs > 0 && performance.now() - tReady >= wallMs;
   const finished = new Promise((resolve) => {
     const check = () => {
-      if (error || (stopFrame && lastFrame >= stopFrame && traceDone)) resolve();
+      if (!error && lastFrame > 0 && performance.now() - frameMovedAt >= STALL_MS) {
+        error = `stalled: no new frame for ${STALL_MS / 1000} s at f${lastFrame}`;
+      }
+      if (!error && stopAsked) error = `stopped by the desktop at f${lastFrame}`;
+      if (error || execPath || (stopFrame && lastFrame >= stopFrame && traceDone) || wallUp()) resolve();
     };
     worker.onmessage = (e) => {
       const d = e.data;
@@ -112,6 +169,7 @@ async function run(p) {
         }
         if (d.id === "status") {
           const m = /frame (\d+)/.exec(d.text);
+          if (m && Number(m[1]) !== lastFrame) frameMovedAt = performance.now();
           if (m) lastFrame = Number(m[1]);
           if (audio && !audioAt && lastFrame >= (p.measureFrom || 0) && lastFrame > 0) audioAt = audioSnap();
           statusEl.textContent = `f${lastFrame} ${reports.fps || ""}`;
@@ -119,6 +177,7 @@ async function run(p) {
         check();
       } else if (d.type === "note") {
         notes.push(d.text);
+        if (d.text.startsWith("[exec] ")) execPath = d.text.slice(7).trim();
         if (d.text.startsWith("smptrace END")) traceDone = true;
         check();
       } else if (d.type === "error" || d.type === "panic") {
@@ -132,8 +191,9 @@ async function run(p) {
     };
     // Progress to the runner every few seconds, so the phone's log shows the frame.
     const beat = setInterval(() => {
-      if (error || (stopFrame && lastFrame >= stopFrame && traceDone)) return clearInterval(beat);
-      up({ type: "progress", text: `f${lastFrame} ${(reports.fps || "").replace(/^fps:\s*/, "")}` });
+      check();
+      if (error || (stopFrame && lastFrame >= stopFrame && traceDone) || wallUp()) return clearInterval(beat);
+      up({ type: "progress", text: `f${lastFrame} ${(reports.fps || "").replace(/^fps:\s*/, "")}${tabMem}` });
     }, 5000);
   });
 
@@ -146,7 +206,9 @@ async function run(p) {
   const watchdog = setInterval(() => {
     const t = performance.now();
     const gap = t - lastTick;
-    if (gap > 250) hangs.push({ atMs: Math.round(t - tReady), gapMs: Math.round(gap), frame: lastFrame });
+    // 150, not 250: a 100 ms tick that arrives 50+ ms late. MK's in-fight hitches are 40-120
+    // ms, and whether THOSE are whole-browser pauses is the question (user, 30b).
+    if (gap > 150 && hangs.length < 400) hangs.push({ atMs: Math.round(t - tReady), gapMs: Math.round(gap), frame: lastFrame });
     lastTick = t;
   }, 100);
 
@@ -157,6 +219,22 @@ async function run(p) {
   );
   await finished;
   clearInterval(watchdog);
+  clearInterval(memTimer);
+  // >>> A PROCESS REPLACEMENT: the title exec'd one of its own executables. Boot that one in
+  // its place - a fresh emulator with it as the main executable (`VITASLOP_MAIN_EXEC`), on a
+  // fresh canvas - and let the job's own stop rules apply to THAT process, as the product
+  // page's restart and native's headless loop both do.
+  if (execPath && !error) {
+    await releaseAndTerminate(worker);
+    if (audio) audio.context.close().catch(() => {});
+    const next = canvas.cloneNode(false);
+    canvas.replaceWith(next);
+    canvas = next;
+    progress(`the title exec'd ${execPath}; booting it`);
+    const inner = await run({ ...p, knobs: { ...(p.knobs || {}), VITASLOP_MAIN_EXEC: execPath } });
+    inner.notes = [...notes, ...inner.notes];
+    return inner;
+  }
   // The measured stretch's sound: seconds the ring ran dry against seconds of wall, and the
   // seconds the guest produced. Underrun over wall IS the share of time a player hears a gap.
   let audioResult = null;
@@ -209,12 +287,19 @@ async function run(p) {
     notes,
     hangs,
   };
-  worker.terminate();
+  await releaseAndTerminate(worker);
   return result;
 }
 
+const STALL_MS = 90_000;
+let stopAsked = false;
 addEventListener("message", async (e) => {
-  if (e.origin !== location.origin || e.data?.type !== "job") return;
+  if (e.origin !== location.origin) return;
+  if (e.data?.type === "stop") {
+    stopAsked = true;
+    return;
+  }
+  if (e.data?.type !== "job") return;
   try {
     up({ type: "result", result: await run(e.data.params || {}) });
   } catch (err) {

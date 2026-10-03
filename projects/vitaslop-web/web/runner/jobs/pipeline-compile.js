@@ -15,14 +15,25 @@
 // Descriptors are approximated from the WGSL (vertex inputs as float32x4, layout "auto", one
 // rgba8unorm target, no depth) - the compile is of the real shader code either way.
 
+// The vertex format each input's DECLARED type needs. Every input used to be `float32x4`, which
+// a module with an integer input (a skinned shader's `vec4<u32>` bone indices) refuses - so the
+// pipeline failed and the timing was of a validation error, not a compile.
+function vertexFormat(ty) {
+  const m = /^(?:vec([234])<)?(f32|u32|i32)>?$/.exec(ty.replace(/\s/g, ""));
+  if (!m) return "float32x4";
+  const n = m[1] ? Number(m[1]) : 1;
+  const base = { f32: "float32", u32: "uint32", i32: "sint32" }[m[2]];
+  return n === 1 ? base : `${base}x${n}`;
+}
+
 function vertexBuffers(code) {
   const m = /struct VsIn\s*\{([^}]*)\}/.exec(code);
-  const locs = m ? [...m[1].matchAll(/@location\((\d+)\)/g)].map((x) => Number(x[1])) : [];
-  if (!locs.length) return [];
+  const ins = m ? [...m[1].matchAll(/@location\((\d+)\)\s*\w+\s*:\s*([^,\n]+)/g)].map((x) => ({ loc: Number(x[1]), ty: x[2].trim() })) : [];
+  if (!ins.length) return [];
   return [
     {
-      arrayStride: 16 * locs.length,
-      attributes: locs.map((loc, i) => ({ shaderLocation: loc, offset: 16 * i, format: "float32x4" })),
+      arrayStride: 16 * ins.length,
+      attributes: ins.map((a, i) => ({ shaderLocation: a.loc, offset: 16 * i, format: vertexFormat(a.ty) })),
     },
   ];
 }
@@ -60,6 +71,28 @@ export async function run(params, { progress, asset }) {
   const dev = await adapter.requestDevice({ requiredFeatures: features });
   const codes = [];
   for (let i = 0; i < names.length; i++) codes.push(await asset(`${dir}/${names[i]}`));
+  // `salt`: make every module's CODE unique, so no cache - the browser's, or the driver's keyed on
+  // the translated shader - can answer for it. A COMMENT does not do this: the WGSL front end
+  // drops it, the driver sees identical code, and a "fresh" repeat of a module compiled 3x
+  // faster than its first build (MEASURED, job 188: 237.7 then 69.5 ms). The salt is a uniform
+  // compare against a per-run random constant that no compiler can fold away, and it never
+  // fires (the depth uniform's `range.w` is not that bit pattern).
+  if (params.salt) {
+    const run = (Math.random() * 0xffffffff) >>> 0;
+    for (let i = 0; i < codes.length; i++) {
+      const k = (((run + i * 0x9e3779b1) >>> 0) | 1) >>> 0;
+      codes[i] = codes[i].replace(
+        /(fn fs_main\([^{]*\{)/,
+        `$1\n  if (bitcast<u32>(gxp_depth.range.w) == ${k}u) { discard; }`,
+      );
+    }
+  }
+  // One throwaway build first: the device's first pipeline pays a warm-up the rest do not.
+  if (params.warmup && codes.length) {
+    try {
+      await dev.createRenderPipelineAsync(desc(dev, codes[0].replace(/(fn fs_main\([^{]*\{)/, "$1\n  if (bitcast<u32>(gxp_depth.range.w) == 3u) { discard; }")));
+    } catch {}
+  }
   // `perModule`: WHICH shaders are slow, not how slow on average - every module created on its
   // own with `createRenderPipelineAsync` (so the page stays live) and timed to resolution, one at
   // a time so the times do not overlap. Returned slowest first with the module's name, so the
@@ -70,6 +103,7 @@ export async function run(params, { progress, asset }) {
       if (i % 10 === 0) progress(`per-module ${i}/${codes.length}`);
       const t = performance.now();
       let ok = true;
+      let err = "";
       if (params.mode === "sync") {
         // Timed to the error scope's answer, which the GPU process gives only after the create.
         dev.pushErrorScope("validation");
@@ -78,17 +112,85 @@ export async function run(params, { progress, asset }) {
       } else {
         try {
           await dev.createRenderPipelineAsync(desc(dev, codes[i]));
-        } catch {
+        } catch (e) {
           ok = false;
+          err = String((e && e.message) || e).slice(0, 400);
         }
       }
-      rows.push({ name: names[i], ms: Math.round((performance.now() - t) * 10) / 10, ok, bytes: codes[i].length });
+      rows.push({ name: names[i], ms: Math.round((performance.now() - t) * 10) / 10, ok, bytes: codes[i].length, ...(err ? { err } : {}) });
     }
     rows.sort((a, b) => b.ms - a.ms);
     return {
       summary: `PER-MODULE ${stats(rows.filter((r) => r.ok).map((r) => r.ms))}; slowest: ${rows.slice(0, 8).map((r) => `${r.name} ${r.ms} ms`).join(", ")}`,
       features,
       rows,
+    };
+  }
+
+  // `variants`: does a SECOND pipeline over shaders the driver has already compiled cost a full
+  // compile again? The answer decides whether building one speculative pipeline per
+  // patcher-named pair (at load time, before cull/depth/blend are known) would take the compile
+  // out of the frame that first draws it. Per module: A = first pipeline; B = the SAME module
+  // object under a different depth/cull/blend state; C = a NEW module from the same code under a
+  // third state. Then `parallel`: the next N modules created all at once vs one at a time - how
+  // many compiles the browser actually runs concurrently.
+  if (params.variants) {
+    const depthDesc = (d, func, write) => ({
+      ...d,
+      depthStencil: { format: "depth24plus", depthCompare: func, depthWriteEnabled: write },
+    });
+    const withState = (d, cull, blend) => ({
+      ...d,
+      primitive: { topology: "triangle-list", cullMode: cull },
+      fragment: {
+        ...d.fragment,
+        targets: [
+          blend
+            ? { format: "rgba8unorm", blend: { color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" }, alpha: { srcFactor: "one", dstFactor: "zero" } } }
+            : { format: "rgba8unorm" },
+        ],
+      },
+    });
+    const timed = async (d) => {
+      const t = performance.now();
+      try {
+        await dev.createRenderPipelineAsync(d);
+        return performance.now() - t;
+      } catch {
+        return null;
+      }
+    };
+    const n = Math.min(params.variants, codes.length);
+    const a = [], b = [], c = [];
+    for (let i = 0; i < n; i++) {
+      progress(`variants ${i}/${n}`);
+      const base = desc(dev, codes[i]);
+      const ta = await timed(base);
+      const tb = await timed(depthDesc(withState(base, "back", true), "less-equal", false));
+      const tc = await timed(depthDesc(withState(desc(dev, codes[i]), "front", false), "greater", true));
+      if (ta != null && tb != null && tc != null) {
+        a.push(ta);
+        b.push(tb);
+        c.push(tc);
+      }
+    }
+    const pn = Math.min(params.parallel ?? 16, codes.length - n);
+    const serial = [];
+    const half2 = Math.floor(pn / 2);
+    for (let i = n; i < n + half2; i++) {
+      const t = await timed(desc(dev, codes[i]));
+      if (t != null) serial.push(t);
+    }
+    const tp = performance.now();
+    await Promise.all(Array.from({ length: pn - half2 }, (_, k) => timed(desc(dev, codes[n + half2 + k]))));
+    const parWall = performance.now() - tp;
+    const serialSum = serial.reduce((x, y) => x + y, 0);
+    return {
+      summary:
+        `A first pipeline ${stats(a)} | B same module, new state ${stats(b)} | C new module same code, new state ${stats(c)} | ` +
+        `serial ${serial.length} creates sum ${serialSum.toFixed(0)} ms vs ${pn - half2} in flight together ${parWall.toFixed(0)} ms wall`,
+      features,
+      a, b, c,
     };
   }
 

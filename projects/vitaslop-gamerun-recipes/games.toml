@@ -55,3 +55,13 @@ region = "NTSC"
 id = "PCSE00235"
 name = "Dead or Alive 5 Plus"
 region = "NTSC"
+
+[[game]]
+id = "PCSE00004"
+name = "Ultimate Marvel vs. Capcom 3"
+region = "NTSC"
+
+[[game]]
+id = "PCSA00029"
+name = "Uncharted: Golden Abyss"
+region = "NTSC"

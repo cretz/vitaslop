@@ -6250,6 +6250,57 @@ fn hash_every_blob_sa_literals() {
     }
 }
 
+/// Every 32-bit group-0x00 MAD that writes LANE 2, by the swizzle-table entry of each source.
+///
+/// The 32-bit swizzle tables of this group are TWO lanes wide, but the mask can write a third
+/// (see `mask_table_mad`), so what lane 2 reads is not in the tables at all. This names every
+/// instruction that depends on that answer, with the entries it uses, so a reading of lane 2
+/// can be checked against what each of those instructions computes.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn f32_mads_that_write_lane_2() {
+    use vitaslop_gxp_shader::usse::decode::{field, GROUP_TABLES};
+    let Some(dir) = corpus_dir() else {
+        eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let g00 = GROUP_TABLES.iter().find(|(n, _, _)| *n == "grp00_mad").expect("grp00_mad");
+    let mut tally: BTreeMap<(u32, u32, u32, u32, u32, u32, u32), usize> = BTreeMap::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        for shader in [
+            vitaslop_gxp_shader::usse::decode_shader(&p),
+            vitaslop_gxp_shader::usse::decode_secondary_shader(&p),
+        ] {
+            for ins in &shader.instrs {
+                if ins.group != 0x00 || ins.half_precision || !ins.write_mask[2] {
+                    continue;
+                }
+                let (hi, lo) = ((ins.raw >> 32) as u32, ins.raw as u32);
+                let f = |n: &str| field(hi, g00.1, n);
+                let l = |n: &str| field(lo, g00.2, n);
+                let mask = ins.write_mask.iter().enumerate().map(|(i, w)| u32::from(*w) << i).sum();
+                let key = (
+                    mask,
+                    f("swz_alt_op1") << 2 | l("op1_swz"),
+                    f("swz_alt_op2") << 2 | l("op2_swz"),
+                    f("swz_alt_op3") << 2 | f("op3_swz"),
+                    f("alt_opt2"),
+                    f("alt_opt3"),
+                    0,
+                );
+                *tally.entry(key).or_default() += 1;
+                println!("{name} {:#018x} mask {mask:#06b} srcs {:?}", ins.raw,
+                    ins.srcs.iter().map(|s| (s.bank, s.index, s.swizzle)).collect::<Vec<_>>());
+            }
+        }
+    }
+    println!("(mask, op1 entry, op2 entry, op3 entry, alt_opt2, alt_opt3) -> count:");
+    for ((m, a, b, c, x2, x3, _), n) in &tally {
+        println!("  mask {m:#06b} op1 {a} op2 {b} op3 {c} alt2 {x2} alt3 {x3}: {n}");
+    }
+}
+
 /// Every instruction whose destination write mask decodes to NOTHING, by group and by the
 /// mask-control bits that produced it.
 ///

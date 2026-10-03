@@ -736,6 +736,10 @@ fn bind_layout() -> vitaslop_transpiler::BindStateLayout {
         // The BULK form. The per-slot form has its own fixture and its own test below - see
         // `bind_state_skips_a_slot_the_state_does_not_carry`.
         copy_slot_stride: 0,
+        // No second (table) copy in the base fixture; `bind_state_copies_the_table_too` adds one.
+        table_src: 0,
+        table_dst: 0,
+        table_bytes: 0,
         ctx_prog: 28,
         has_prog: true,
     }
@@ -792,6 +796,29 @@ fn bind_state_copies_the_block_record_and_program() {
     // The program handle.
     assert_eq!(word(&mut vm, 28), 0xAA55_0001, "the program handle lands at ctx_prog");
     assert_eq!(vm.get_reg(0), 0, "the call returns the handler's success code");
+}
+
+/// >>> THE SECOND (TABLE) COPY LANDS, WHOLESALE - ZEROS INCLUDED.
+///
+/// The fragment bind's non-default uniform-buffer table: the handler writes it
+/// replace-not-merge, so the emitted form must too. It used not to write it at all, and a
+/// retail title binding its fragment uniform buffers only through precomputed state had every
+/// draw that loads from one dropped for an unbound window.
+#[test]
+fn bind_state_copies_the_table_too() {
+    let l = vitaslop_transpiler::BindStateLayout { table_src: 12, table_dst: 32, table_bytes: 8, ..bind_layout() };
+    let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+    seed_bind(&mut vm, l.ctx_magic, l.st_magic);
+    // The table's two words in the block (behind the three the texture copy takes), one of
+    // them ZERO, and sentinels where they land in the context.
+    let tbl: [u32; 2] = [0x7AB1_E001, 0];
+    vm.write_mem(BLK_PTR + 12, &tbl.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).expect("table");
+    vm.write_mem(OUT_PTR + 32, &[0xEEu8; 8]).expect("sentinels");
+    let crossed = run(&mut vm);
+    assert!(!crossed, "both magics hold - the inline arm must serve this");
+    let b = vm.read_mem(OUT_PTR + 32, 8).expect("read back");
+    assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 0x7AB1_E001, "table word 0");
+    assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 0, "a ZERO table word lands too");
 }
 
 /// >>> A SLOT THE STATE DOES NOT CARRY MUST SURVIVE THE BIND.

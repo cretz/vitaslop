@@ -897,6 +897,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         write_shared(&shared_mem, (arg_ptr - linked.base) as usize, arg_block);
         let arg_len = arg_block.len() as u32;
 
+        let main_prio = host.main_thread_priority();
         let host = Arc::new(Mutex::new(host));
         // Let the stall watchdog read the sync state from outside the run. Registered here
         // rather than on the raw-image path because this is the retail one - the only one a
@@ -959,7 +960,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             0,
             0,
             sp,
-            vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
+            main_prio,
         )?;
 
         // >>> EVERY DECODE GAP INSIDE A LIFTED FUNCTION, REPORTED UNCONDITIONALLY.
@@ -2093,8 +2094,17 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                         }
                     }
 
+                    // A library calling back into the title before it returns - see
+                    // `SvcOutcome::CallGuest`. Each round runs one guest call and replays
+                    // the host call, until it finishes with an ordinary outcome.
+                    let mut outcome = outcome;
+                    while matches!(outcome, SvcOutcome::CallGuest) {
+                        outcome = run_guest_call(&mut caller, selector as u32).await?;
+                    }
+
                     match outcome {
                         SvcOutcome::Continue => {}
+                        SvcOutcome::CallGuest => unreachable!("drained above"),
                         SvcOutcome::Reschedule => {
                             // Stay runnable but suspend so the scheduler re-picks by
                             // priority now (a higher-priority thread just became
@@ -2148,6 +2158,59 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
         .alias(abi::IMPORT_MODULE, abi::IMPORT_NAME, abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME)
         .map_err(|e| RunError::Wasm(e.to_string()))?;
     Ok(())
+}
+
+/// Run the guest call the last dispatch of `selector` asked for, on THIS thread, then
+/// dispatch `selector` again - see `SvcOutcome::CallGuest`.
+///
+/// The call nests on this thread's own instance and fiber: `call_async` of the module's
+/// dispatcher from inside the host call, so guest code that blocks in it suspends this whole
+/// stack, exactly as it would inside any other guest function the thread called. The register
+/// file is saved around it; only r0/r1 (its result) and its effects on memory survive.
+async fn run_guest_call<H: ImportDispatch + Send + 'static>(
+    caller: &mut Caller<'_, ThreadData<H>>,
+    selector: u32,
+) -> Result<SvcOutcome, wasmtime::Error> {
+    let thid = caller.data().thid;
+    let Some(call) = caller.data().host.lock().unwrap().take_guest_call(thid) else {
+        return Ok(SvcOutcome::Fatal(format!(
+            "host call selector {selector} on thread {thid:#x} asked for a guest call and left none to run"
+        )));
+    };
+    let mut saved = ([0u32; abi::REG_COUNT], [0u32; VFP_ARG_COUNT]);
+    read_guest_regs(caller, &mut saved.0, &mut saved.1);
+    let mut seeded = saved.0;
+    {
+        let data = caller.data();
+        let mut view = SharedView::new(&data.shared_mem, data.dirty_off);
+        call.seed(&mut seeded, &mut view, data.base);
+    }
+    write_guest_regs(caller, &saved, &seeded, &saved.1);
+    let dispatch = caller
+        .get_export(abi::DISPATCH_EXPORT)
+        .and_then(|e| e.into_func())
+        .ok_or_else(|| wasmtime::Error::msg("module exports no dispatcher"))?
+        .typed::<(i32, i32), ()>(&*caller)?;
+    dispatch.call_async(&mut *caller, ((call.entry & !1) as i32, 0)).await?;
+    let (r0, r1) = (get_reg(caller, 0), get_reg(caller, 1));
+    // Back to the file the host call was made with - every lane, whatever the call left.
+    let mut now = ([0u32; abi::REG_COUNT], [0u32; VFP_ARG_COUNT]);
+    read_guest_regs(caller, &mut now.0, &mut now.1);
+    write_guest_regs(caller, &now, &saved.0, &saved.1);
+
+    let (mut regs, mut vfp) = saved;
+    let outcome = {
+        let data = caller.data();
+        let base = data.base;
+        let shared = data.shared_mem.clone();
+        let mut view = SharedView::new(&shared, data.dirty_off);
+        let mut host = data.host.lock().unwrap();
+        host.set_current_thread(thid);
+        host.guest_call_returned(thid, r0, r1, &view, base);
+        host.dispatch(selector, &mut regs, &mut vfp, &mut view, base)
+    };
+    write_guest_regs(caller, &saved, &regs, &vfp);
+    Ok(outcome)
 }
 
 /// Record that this thread is about to suspend at `stop`, and sample the fuel it has
@@ -2604,18 +2667,27 @@ fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
 }
 
 /// Guest address of each transpiled function, indexed by wasm function index minus
-/// [`abi::IMPORT_FUNC_COUNT`]. Recorded once, when the module is built.
-static FUNC_ADDRS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+/// [`abi::IMPORT_FUNC_COUNT`]. Recorded when the module is built - and REPLACED when a new one
+/// is, see [`record_function_addresses`].
+static FUNC_ADDRS: std::sync::RwLock<Vec<u32>> = std::sync::RwLock::new(Vec::new());
 
 /// Record the emitted module's function table so a trap backtrace can name guest code.
 ///
-/// # Why a process-wide latch rather than plumbing
-/// A trap surfaces deep inside a fiber closure that has no reference to the artifact, and
-/// the module is built exactly once per run. Threading the table down to that point would
-/// touch every layer between for a diagnostic; a `OnceLock` set at build time reaches it
-/// from anywhere and cannot be set twice.
+/// # Why a process-wide slot rather than plumbing
+/// A trap surfaces deep inside a fiber closure that has no reference to the artifact.
+/// Threading the table down to that point would touch every layer between for a diagnostic;
+/// a static set at build time reaches it from anywhere.
+///
+/// # >>> AND THE LATEST MODULE WINS: A RUN CAN BUILD MORE THAN ONE.
+/// This was a `OnceLock`, on the belief that a run builds one module. A title that
+/// `sceAppMgrLoadExec`s its real executable builds two, and the latch kept the LAUNCHER's
+/// table: every frame of every later trap was named from the wrong module. MEASURED on
+/// PCSA00029: a fault in the game's own code read as `wasm function 12901 = dispatcher/reset
+/// (not guest code)`, which sent a whole investigation after the dispatcher.
 pub fn record_function_addresses(addrs: Vec<u32>) {
-    let _ = FUNC_ADDRS.set(addrs);
+    if let Ok(mut g) = FUNC_ADDRS.write() {
+        *g = addrs;
+    }
 }
 
 /// Rewrite `<wasm function N>` in a trap backtrace to name the GUEST function it is.
@@ -2633,7 +2705,10 @@ pub fn record_function_addresses(addrs: Vec<u32>) {
 /// repeat is a guest routine recursing through the indirect-call dispatcher, which is a
 /// description of the bug.
 fn name_guest_frames(s: &str) -> String {
-    let Some(addrs) = FUNC_ADDRS.get() else { return s.to_string() };
+    let Ok(addrs) = FUNC_ADDRS.read() else { return s.to_string() };
+    if addrs.is_empty() {
+        return s.to_string();
+    }
     const MARK: &str = "<wasm function ";
     let mut out = String::with_capacity(s.len() + 32);
     let mut rest = s;

@@ -1637,6 +1637,28 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
     // them in front of this would have kept the two most expensive cases in the title - the big
     // atlases, and every BC texture on an adapter that cannot take BC - on the CPU path they
     // exist to describe. They still guard the CPU fallback, which is exactly what they are about.
+    // >>> EXCEPT A BC TEXTURE THAT FITS THE BUDGET, WHICH IS NOT RE-ENCODED ON THE GPU EITHER.
+    //
+    // The BC refusal further down was moved out of this path on the reading that it was only
+    // about CPU cost. It was also about QUALITY - ETC2 is a second lossy step over the guest's
+    // own compression and buys only megabytes (see `block_source`, which decodes such a texture
+    // on the GPU exactly and was written on the understanding that this refusal still applied)
+    // - and the GPU encode is not free either. MEASURED on the phone (MK, round start): 1.3 s of
+    // GPU time in one frame re-encoding the new fight's textures, 36 of them BC3, freezing the
+    // display 1.6 s and then 0.6 s more while the queue caught up; with compression off the
+    // same frame took 4 ms of GPU. So BC waits for real budget pressure here too, exactly as the
+    // CPU path always has. PVRTC is untouched: its exemption is a measured MEMORY decision.
+    if force_format.is_none()
+        && block_format_for(t.base_format).is_some()
+        && !vitaslop_platform::gpu::texture_budget_pressure()
+    {
+        return why(
+            "it is a BC format that already fits the texture budget as RGBA8: `block_source` \
+             decodes it on the GPU exactly, and re-encoding it to ETC2 is a second lossy step \
+             that cost the phone's GPU over a second at one screen transition. It will be \
+             re-encoded if the budget tightens",
+        );
+    }
     if let Some(plan) = gpu_transcode(t, force_format) {
         return Some(plan);
     }
@@ -8420,6 +8442,7 @@ impl RenderSceneBuilder {
             depth_clear: scene_depth_clear(scene.depth.as_ref()),
             depth_extent,
             depth_extent_ambiguous,
+            zls_control: scene.depth.map_or(0, |d| d.zls_control),
         }
     }
 }

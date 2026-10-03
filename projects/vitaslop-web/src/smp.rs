@@ -124,6 +124,16 @@ fn wall_floor(frame: u64) -> bool {
     on && frame >= from
 }
 
+/// Whether a thread released by TIME (a timed wait expiring, a sleep ending) yields to threads
+/// already runnable on its worker - see `drain`. ON by default; `VITASLOP_SMP_TIMEOUT_YIELDS=0`
+/// is the arm back.
+fn timeout_yields() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        vitaslop_runtime::knobs::var("VITASLOP_SMP_TIMEOUT_YIELDS").as_deref().map(str::trim) != Ok("0")
+    })
+}
+
 /// The flip's geometry resolve runs on a RESOLVER worker of its own - see `smp_resolver_main`
 /// and `VitaState::resolve_at_flip`. ON by default under SMP (overlapped); the phone proxy
 /// measured it at -23% per guest frame (px27a 44-47 ms -> px27c 34.6 ms), because the read left
@@ -449,8 +459,33 @@ fn spin_fixed() -> bool {
 /// whole burst to one worker - MEASURED on MLB (`pf25b`): 21 threads on w2 beside its render
 /// thread, w3 holding 3 and busy 3%.
 fn place_spread() -> bool {
-    matches!(place_mode(), Place::Spread | Place::Apart)
+    matches!(place_mode(), Place::Spread | Place::Apart | Place::Busy)
 }
+
+/// `VITASLOP_SMP_PLACE=demand`: `apart`, but the workers are compared by DEMAND - the sum over
+/// their live threads of each one's long-run share of wall time spent running - instead of by a
+/// thread COUNT. A thread younger than [`IDLE_GRACE_MS`] has no history yet and counts a nominal
+/// [`YOUNG_DEMAND`], so the spawns of one burst still spread.
+///
+/// >>> A COUNT CANNOT TELL A POOL WORKER FROM A FILE CALLBACK. MEASURED (phone, MK, 10-02): w3
+/// held 11 threads (FIOS, FMOD, audio - blocked nearly always, 21% busy together) and w2 six UE3
+/// pool threads; MK re-creates its RENDER thread for every fight, and the count sent each new
+/// one to w2 - 97% busy, the pool threads RUNNABLE-but-waiting 5-9 ms a frame, the game clock
+/// below real time ("slow motion") and its audio-synced intros running ahead of the picture.
+const YOUNG_DEMAND: f64 = 0.05;
+
+/// Under `demand`, the factor a named core's RECENT load is scaled by when it is compared with
+/// another worker's: 0.5 = another worker is chosen only when the named one has done more than
+/// twice its recent work.
+///
+/// >>> A MASK IS A HINT HERE BECAUSE OUR CORES ARE NOT THE CONSOLE'S. MK pins its render thread
+/// (and a stream of short-lived threads) to core 1 (`0x80028021`) beside its UE3 pool threads;
+/// on the console that core keeps up, but here every draw is a host call and the render
+/// thread costs several times its native share, so the faithful pin is the one worker that
+/// saturates. Affinity decides WHERE a thread runs, never what it computes, so preferring the
+/// named core by this margin keeps the title's layout whenever it fits and moves the thread
+/// only when it clearly does not.
+const NAMED_CORE_SHARE: f64 = 0.5;
 
 /// `VITASLOP_SMP_PLACE=apart` (THE DEFAULT; `load` = the old least-recent-work rule): `spread`, but a thread whose mask allows another worker is never
 /// bound beside the MAIN thread - the title's heaviest thread keeps a worker to itself, and the
@@ -460,11 +495,61 @@ fn place_spread() -> bool {
 /// behind its neighbours - 6.7 ms/f on the phone.
 /// Capacity (UNPACED presented/s, desktop, one build): MLB load 78-90 -> apart 89-94 (`sp25a`/
 /// `sp25c`); Madden load 68-73 -> apart 75-77 (`sp25d`/`sp25e`).
+/// `VITASLOP_SMP_PLACE=busy`: `apart`, but a worker's count leaves out the BLOCKED threads that
+/// have done almost nothing since they were born ([`IDLE_SHARE`] of their life) - they occupy a
+/// slot, not a core. MEASURED (phone 031, Uncharted gameplay): WorkerThread-0/1 (mask "any")
+/// both went to w2 because w3 already counted three pinned FIOS threads that are blocked
+/// nearly always; each then waited ~4 ms/f RUNNABLE behind the other.
 #[derive(Clone, Copy, PartialEq)]
 enum Place {
     Load,
     Spread,
     Apart,
+    Busy,
+    Demand,
+}
+
+/// Below this share of its life spent running, a BLOCKED thread does not count against its
+/// worker under `VITASLOP_SMP_PLACE=busy`; nor does a blocked one younger than
+/// [`IDLE_GRACE_MS`], which has not had the time to show what it is.
+const IDLE_SHARE: f64 = 0.02;
+
+const IDLE_GRACE_MS: f64 = 1000.0;
+
+/// Whether a thread pinned to a core that already carries a better-priority thread is placed
+/// as if unpinned - see the rule in [`State::place`]. OFF by default since 2026-10-02:
+/// `VITASLOP_SMP_UNPIN_STARVED=1` turns it on. It measured no gain on the title it was built for
+/// (Marvel fight 25.3 / 27.7 fps against 25-28 without it, phone jobs 330/334), and it is
+/// unfaithful exactly where faithfulness matters: Dead or Alive 5 Plus pins its main thread
+/// (prio 0x56) to core 0 and its movie player's threads inherit the pin at worse priorities -
+/// the rule moved them OFF main's worker, which is the placement whose movie never plays.
+fn unpin_starved_on() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| vitaslop_runtime::knobs::var("VITASLOP_SMP_UNPIN_STARVED").as_deref().map(str::trim) == Ok("1"))
+}
+
+/// Whether a fiber's backing thread is placed on its runner's worker (`VitaState::spawn_near`).
+/// OFF by default; `VITASLOP_SMP_FIBER_NEAR=1` turns it on.
+///
+/// >>> NOT YET VALIDATED ON THE PHONE. Built from the DOA fight trace (job 528: main blocked in
+/// sceFiberRun 7.7 ms a frame while its fibers ran on another worker; the title paced at 30).
+/// The one phone run of it (job 532) had `VITASLOP_FIBER_RUNNER_PRIORITY` on as well, and the
+/// movie stalled again (4 units / 3 pictures, black to the end) - so that run measured NOTHING
+/// about the fight; its "60 fps" was presents of a black screen. Neither desktop arm reproduces
+/// the stall (doafibweb, doafibslow: 359 / 298 pictures). Phone A/B owed: NEAR=1 alone,
+/// RUNNER_PRIORITY=1 alone, both - movie AND fight fps with the shots looked at.
+fn fiber_near_on() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| vitaslop_runtime::knobs::var("VITASLOP_SMP_FIBER_NEAR").as_deref().map(str::trim) == Ok("1"))
+}
+
+/// How many module instances an SMP worker keeps built ahead of any thread - see
+/// [`BrowserEngine::stock_reserve`]. `VITASLOP_BROWSER_INSTANCE_RESERVE`, default 2.
+fn instance_reserve() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        vitaslop_runtime::knobs::var("VITASLOP_BROWSER_INSTANCE_RESERVE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)
+    })
 }
 
 fn place_mode() -> Place {
@@ -472,6 +557,8 @@ fn place_mode() -> Place {
     *V.get_or_init(|| match vitaslop_runtime::knobs::var("VITASLOP_SMP_PLACE").as_deref().map(str::trim) {
         Ok("spread") => Place::Spread,
         Ok("load") => Place::Load,
+        Ok("busy") => Place::Busy,
+        Ok("demand") => Place::Demand,
         _ => Place::Apart,
     })
 }
@@ -509,6 +596,11 @@ enum TraceEv {
     /// A span of the RUN WORKER's own: r(un_frames), e(arly batch), F(orward), P(resent); inside
     /// run_frames: z (asleep on its bell), v (serving), l (waiting for the state lock), i (idle clock step).
     W0 { kind: u8, t0: f64, t1: f64 },
+    /// A guest worker's own span: `z` asleep on its bell (or spinning for it), `r` a reserve
+    /// instance built in idle time, `m` making a
+    /// new thread's instance (`BrowserEngine::make_thread`) - a thread's FIRST run begins only
+    /// after it, and on a phone that is milliseconds the `R` span never shows.
+    Wn { w: u8, kind: u8, thid: i32, t0: f64, t1: f64 },
 }
 
 /// Record a span of the run worker's (see [`TraceEv::W0`]); `lib.rs` records the present.
@@ -643,7 +735,7 @@ fn trace_dump(frame: u64) {
     let base = evs
         .iter()
         .map(|e| match *e {
-            TraceEv::Run { t0, .. } | TraceEv::W0 { t0, .. } => t0,
+            TraceEv::Run { t0, .. } | TraceEv::W0 { t0, .. } | TraceEv::Wn { t0, .. } => t0,
             TraceEv::Wake { t, .. } | TraceEv::Jump { t } | TraceEv::Flip { t, .. } | TraceEv::Gate { t, .. } | TraceEv::Stuck { t, .. } => t,
         })
         .fold(f64::INFINITY, f64::min);
@@ -661,6 +753,7 @@ fn trace_dump(frame: u64) {
             TraceEv::Gate { target, gate, t } => format!("G {target} {gate} {}", us(t)),
             TraceEv::Stuck { w, t, c } => format!("K {w} {} {} {} {} {} {}", us(t), c[0], c[1], c[2], c[3], c[4]),
             TraceEv::W0 { kind, t0, t1 } => format!("S {} {} {}", kind as char, us(t0), us(t1)),
+            TraceEv::Wn { w, kind, thid, t0, t1 } => format!("N {w} {} {thid:#x} {} {}", kind as char, us(t0), us(t1)),
         })
         .collect();
     for chunk in lines.chunks(400) {
@@ -790,6 +883,10 @@ struct Slot {
     queued_ms: f64,
     queued_long: u64,
     run_ms: f64,
+    /// When it was created ([`abs_ms`]) and the wall clock it has run since - never reset, for
+    /// the `busy` placement's idea of which threads actually use their worker.
+    born: f64,
+    life_run_ms: f64,
 }
 
 struct State {
@@ -797,6 +894,8 @@ struct State {
     /// Slots not finished, ascending - every pass walks this, never `threads`.
     live: Vec<usize>,
     wake_tokens: HashSet<i32>,
+    /// Threads TIME released whose next wake is `cooled` - see the note in `drain`.
+    yield_next: HashSet<i32>,
     cursor: Vec<usize>,
     frames: u64,
     /// Guest threads run while `frames < gate`.
@@ -820,6 +919,10 @@ struct State {
     /// Guest instructions retired per worker, decayed at every frame - the placement's idea
     /// of how busy a worker is.
     load: Vec<f64>,
+    /// The last placements, newest last: `(thid, affinity mask, home, worker loads then)`.
+    /// Printed on the SMP panel line - a thread's worker is decided ONCE, at its first run, and
+    /// a busy worker's thread list cannot say whether that was its mask or the load rule.
+    placed: VecDeque<(i32, i32, usize, Vec<f64>)>,
     forwarded: u64,
     /// Forwarded calls by import selector since the last panel line (drained there).
     forwarded_by: HashMap<u32, u64>,
@@ -915,6 +1018,7 @@ impl State {
             threads: Vec::new(),
             live: Vec::new(),
             wake_tokens: HashSet::new(),
+            yield_next: HashSet::new(),
             cursor: vec![0; workers + 1],
             frames: 0,
             gate: 0,
@@ -931,6 +1035,7 @@ impl State {
             fuel_unreported: 0,
             fuel_idle: 0,
             load: vec![0.0; workers + 1],
+            placed: VecDeque::new(),
             forwarded: 0,
             forwarded_by: HashMap::new(),
             idle_jumps: 0,
@@ -984,18 +1089,67 @@ impl State {
     /// among every worker. Among the candidates: the least recent guest work, then the fewest
     /// live threads - a thread spawned now is most likely to share a core with the ones that
     /// are busy NOW.
-    fn place(&self, workers: usize, mask: i32) -> usize {
-        let mut cands: Vec<usize> = (0..3)
-            .filter(|k| mask & (1 << (16 + k)) != 0)
-            .map(|k| 1 + (k as usize) % workers)
-            .collect();
+    fn place(&self, workers: usize, mask: i32, priority: i32) -> usize {
+        // Worker `w` (1-based) backs Vita core `(w - 1) % 3`, so with more than three workers
+        // a core has TWINS and a thread pinned to it picks between them. MEASURED need (MK,
+        // phone and the throttled desktop repro): the title pins its render threads AND its
+        // pool threads to core 1, and one worker of a phone cannot carry what one Vita core
+        // does there - w2 at 95-97%, pool threads runnable-but-waiting 7-9 ms a frame - while
+        // affinity only ever decides WHERE a thread runs, never what it computes.
+        let mut cands: Vec<usize> = if workers >= 3 {
+            (1..=workers).filter(|&w| mask & (1 << (16 + (w - 1) % 3)) != 0).collect()
+        } else {
+            (0..3).filter(|k| mask & (1 << (16 + k)) != 0).map(|k| 1 + (k as usize) % workers).collect()
+        };
         cands.sort_unstable();
         cands.dedup();
         // No core named, or all three ("any core"): every worker is a candidate.
         if cands.is_empty() || mask & 0x0007_0000 == 0x0007_0000 {
             cands = (1..=workers).collect();
         }
-        if place_mode() == Place::Apart && cands.len() > 1 {
+        // >>> A THREAD PINNED BEHIND A BETTER-PRIORITY THREAD IS PLACED AS IF UNPINNED.
+        //
+        // The Vita schedules strictly by priority within a core, so a title that pins a worse
+        // thread to a core already carrying a better one is saying "this one runs in the
+        // gaps". On a worker that is several times slower than a Vita core there are no gaps:
+        // MEASURED on the phone (Marvel, SMP trace job 237): `SubJobThread` (prio 127, core 2)
+        // sat RUNNABLE 10.3 ms a frame (max 19) behind `rendering` (prio 100, core 2, 15 ms of
+        // guest work a frame) while w1 ran 22% busy; the main loop waits on that job every
+        // frame, so a 60 fps fight ran at 25 fps. Placing the pinned-behind thread on the least
+        // loaded worker instead: 52.8 fps (job 238, where `demand` did it for every thread -
+        // and cost Madden 7 points of speed by scattering its unpinned threads, which is why
+        // this is the only case that leaves the title's pin). Affinity decides WHERE a thread
+        // runs, never what it computes; the sync between the two threads is the title's own.
+        // `VITASLOP_SMP_UNPIN_STARVED=0` is the arm back.
+        if unpin_starved_on()
+            && cands.len() < workers
+            && cands.iter().all(|&w| {
+                self.live.iter().map(|&i| &self.threads[i]).any(|t| {
+                    t.home == w && !matches!(t.state, SState::Finished(_)) && t.priority < priority
+                })
+            })
+        {
+            tracing::info!(
+                target: "vitaslop::smp",
+                "smp place: a thread of prio {priority:#x} with mask {mask:#x} would sit behind a \
+                 better-priority thread on every worker its core names - placed away from them"
+            );
+            // Away from the named workers, not merely "anywhere": with every worker a
+            // candidate the fewest-live-threads tie-break put Marvel's SubJobThread straight
+            // back on the render thread's worker (job 330, 25 fps again). `demand` had put it
+            // beside the game's main loop, where the two alternate (238: 52.8 fps).
+            let away: Vec<usize> = (1..=workers).filter(|w| !cands.contains(w)).collect();
+            if !away.is_empty() {
+                cands = away;
+            }
+        }
+        // Under `demand` the cores a mask names are a PREFERENCE, not a fence - see
+        // [`NAMED_CORE_SHARE`]. The named ones are kept to bias the choice below.
+        let named = cands.clone();
+        if place_mode() == Place::Demand {
+            cands = (1..=workers).collect();
+        }
+        if matches!(place_mode(), Place::Apart | Place::Busy | Place::Demand) && cands.len() > 1 {
             let main_home = self
                 .threads
                 .iter()
@@ -1005,14 +1159,54 @@ impl State {
                 cands.retain(|&w| w != m);
             }
         }
-        let live_on = |w: usize| self.live.iter().filter(|&&i| self.threads[i].home == w).count();
+        let now = abs_ms();
+        // A thread that is not blocked counts (it wants its worker NOW - a burst's earlier
+        // spawns among them); a blocked one counts only once it is old enough to judge and
+        // has run a real share of its life. MEASURED (phone 053): a first version that
+        // counted every thread younger than a second as busy counted Uncharted's freshly
+        // started FIOS threads, and both job workers still landed on w2.
+        let counts = |t: &Slot| {
+            place_mode() != Place::Busy
+                || !matches!(t.state, SState::Blocked | SState::Finished(_))
+                || {
+                    let age = now - t.born;
+                    age >= IDLE_GRACE_MS && t.life_run_ms >= IDLE_SHARE * age
+                }
+        };
+        let live_on = |w: usize| {
+            self.live.iter().filter(|&&i| self.threads[i].home == w && counts(&self.threads[i])).count()
+        };
+        let demand_on = |w: usize| -> f64 {
+            self.live
+                .iter()
+                .map(|&i| &self.threads[i])
+                .filter(|t| t.home == w && !matches!(t.state, SState::Finished(_)))
+                .map(|t| {
+                    let age = now - t.born;
+                    if age < IDLE_GRACE_MS { YOUNG_DEMAND } else { (t.life_run_ms / age).clamp(0.0, 1.0) }
+                })
+                .sum()
+        };
         let by_load = |a: usize, b: usize| {
             self.load[a].partial_cmp(&self.load[b]).unwrap_or(std::cmp::Ordering::Equal)
         };
         *cands
             .iter()
             .min_by(|&&a, &&b| {
-                if place_spread() {
+                if place_mode() == Place::Demand {
+                    // RECENT load (the decayed retired-instruction count), with a named core's
+                    // load counted at NAMED_CORE_SHARE of itself: the title's pin wins until
+                    // its core is clearly the busier one. Long-run shares were tried first and
+                    // LOST under the phone repro - a boot-time thread has no history.
+                    let _ = demand_on;
+                    let score = |w: usize| self.load[w] * if named.contains(&w) { NAMED_CORE_SHARE } else { 1.0 };
+                    score(a)
+                        .partial_cmp(&score(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        // A tie (boot: nothing has run anywhere) keeps the title's pin.
+                        .then(named.contains(&b).cmp(&named.contains(&a)))
+                        .then(live_on(a).cmp(&live_on(b)))
+                } else if place_spread() {
                     live_on(a).cmp(&live_on(b)).then(by_load(a, b))
                 } else {
                     by_load(a, b).then(live_on(a).cmp(&live_on(b)))
@@ -1044,6 +1238,8 @@ impl State {
             queued_ms: 0.0,
             queued_long: 0,
             run_ms: 0.0,
+            born: abs_ms(),
+            life_run_ms: 0.0,
         });
         self.live.push(idx);
         tracing::info!(
@@ -1322,7 +1518,7 @@ impl State {
 
     /// Start the threads the host spawned and wake the ones it released - `SchedCore::drain`.
     fn drain(&mut self, sh: &Shared, engine: &BrowserEngine) {
-        let (spawns, wakes, stat_writes, masks, causes, rt_woke) = {
+        let (spawns, wakes, stat_writes, masks, causes, rt_woke, timed_out) = {
             let mut host = lock_host(&sh.host);
             let held = self.frames >= self.gate || self.paused;
             if wall_floor(self.frames) && host.state.wall_floor_tick(abs_ms(), held) {
@@ -1336,11 +1532,14 @@ impl State {
             let mut words = Words(engine);
             host.resolve_deferred(&mut words);
             let spawns: Vec<Reentry> = host.take_spawns();
-            let masks: Vec<i32> =
-                spawns.iter().map(|s| host.state.thread_cpu_affinity(s.thid)).collect();
+            let masks: Vec<(i32, Option<i32>)> = spawns
+                .iter()
+                .map(|s| (host.state.thread_cpu_affinity(s.thid), host.state.spawn_near(s.thid)))
+                .collect();
             host.state.trace_wakes = trace().is_some();
             let causes = host.state.take_wake_causes();
-            (spawns, host.take_wakes(), host.take_stat_writes(), masks, causes, rt_woke)
+            let timed_out = host.state.take_timeout_wakes();
+            (spawns, host.take_wakes(), host.take_stat_writes(), masks, causes, rt_woke, timed_out)
         };
         for thid in rt_woke {
             if let Some(i) = self.live.iter().copied().find(|&i| self.threads[i].thid == thid) {
@@ -1350,10 +1549,59 @@ impl State {
         for (addr, value) in stat_writes {
             engine.write_guest(addr, &value.to_le_bytes());
         }
-        for (sp, mask) in spawns.into_iter().zip(masks) {
-            let home = self.place(sh.workers, mask);
+        for (sp, (mask, near)) in spawns.into_iter().zip(masks) {
+            // A fiber's backing thread goes where its runner lives (`VitaState::spawn_near`):
+            // on the hardware it IS that thread, so a Run/Switch must not cross workers.
+            let near_home = near.filter(|_| fiber_near_on()).and_then(|r| {
+                self.live.iter().map(|&i| &self.threads[i]).find(|t| t.thid == r).map(|t| t.home)
+            });
+            let home = near_home.unwrap_or_else(|| self.place(sh.workers, mask, sp.priority));
+            if place_mode() == Place::Busy {
+                // Which workers held what when this thread was placed: the placement's one
+                // observable, and what said the first `busy` rule changed nothing (phone 053).
+                let held: Vec<String> = (1..=sh.workers)
+                    .map(|w| {
+                        let on: Vec<String> = self
+                            .live
+                            .iter()
+                            .map(|&i| &self.threads[i])
+                            .filter(|t| t.home == w)
+                            .map(|t| format!("{:#x}:{}", t.thid, if matches!(t.state, SState::Blocked) { "b" } else { "r" }))
+                            .collect();
+                        format!("w{w}[{}]", on.join(" "))
+                    })
+                    .collect();
+                tracing::info!(
+                    target: "vitaslop::status",
+                    "smp place (busy): thread {:#x} mask {mask:#x} -> w{home} | {}",
+                    sp.thid,
+                    held.join(" "),
+                );
+            }
+            if self.placed.len() >= 12 {
+                self.placed.pop_front();
+            }
+            self.placed.push_back((sp.thid, mask, home, self.load[1..].to_vec()));
             let birth = Birth { entries: vec![sp.entry], r: [sp.arg_len, sp.arg_ptr, sp.r2, sp.r3], sp: sp.stack_top };
             self.add_thread(sh, sp.thid, sp.priority, home, birth);
+        }
+        // >>> A THREAD RELEASED BY TIME YIELDS TO THE ONES ALREADY WAITING FOR ITS WORKER.
+        //
+        // The wall-clock floor moves the clock in steps of several ms on a device slower than a
+        // Vita, so a short timed wait can expire the moment it begins: the thread never really
+        // waits, and at a better priority it can hold its worker indefinitely. MEASURED (desktop
+        // repro of the phone - `VITASLOP_SMP_GUEST_SLOW=8`, 4x CPU throttle - doaweb15, and phone
+        // jobs 065/066): a movie's video thread polled with 1 ms timed waits and held its worker
+        // 28 ms (phone: 100-258 ms) while the movie's sound thread sat runnable behind it; the
+        // player state that thread checks once on waking had moved on by then, it quit, and the
+        // movie never played - black from the intro on. On the console a 1 ms wait hands the
+        // core over for 1 ms. So a thread TIME released is `cooled` for its next pick (the
+        // round-robin then serves every runnable, non-cooled thread on that worker first) and
+        // does not preempt. Holding the floor instead (tried: while a forward is in flight / while
+        // anything is runnable) stalls the clock whenever the guest is busy and puts a movie's
+        // picture behind its wall-paced sound - jobs 070-073. `VITASLOP_SMP_TIMEOUT_YIELDS=0`.
+        if timeout_yields() {
+            self.yield_next.extend(timed_out);
         }
         for thid in wakes {
             let cause = causes.iter().find(|c| c.0 == thid).map_or((0, 0), |c| (c.1, c.2));
@@ -1364,14 +1612,17 @@ impl State {
                 .find(|&i| self.threads[i].thid == thid && self.threads[i].state == SState::Blocked);
             match found {
                 Some(i) => {
+                    let yields = self.yield_next.remove(&thid);
                     self.threads[i].state = SState::Runnable;
                     self.threads[i].since = abs_ms();
-                    self.threads[i].cooled = false;
+                    self.threads[i].cooled = yields;
                     self.threads[i].ready_at = abs_ms();
                     if tracing() {
                         trace_ev(self.frames, TraceEv::Wake { thid, t: abs_ms(), by: TRACE_WORKER.with(|c| c.get()), wby: cause.0, line: cause.1 });
                     }
-                    self.preempt_for(sh, i);
+                    if !yields {
+                        self.preempt_for(sh, i);
+                    }
                     sh.ring(self.threads[i].home);
                 }
                 None => {
@@ -1466,6 +1717,9 @@ impl vitaslop_runtime::host::GuestWords for Words<'_> {
     }
     fn set_word(&mut self, addr: u32, value: u32) {
         self.0.write_guest(addr, &value.to_le_bytes());
+    }
+    fn cas_word(&mut self, addr: u32, expect: u32, new: u32) -> u32 {
+        self.0.cas_guest(addr, expect, new)
     }
 }
 
@@ -1610,6 +1864,9 @@ pub async fn smp_helper_main(
             preempt_ptr: sh.preempt(w).map(|p| p.as_ptr() as usize),
         },
     )?;
+    // The reserve is filled before the first thread lands here: boot is the one moment a
+    // worker is certainly idle, and the first spawns are a title's long-lived threads.
+    while engine.stock_reserve(instance_reserve())? {}
     helper_loop(&sh, &engine, w).await;
     Ok(())
 }
@@ -1633,6 +1890,7 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
     let local: RefCell<HashMap<usize, BrowserThread>> = RefCell::new(HashMap::new());
     let stats = &sh.stats[w];
     let mut history = vitaslop_runtime::sched::SpinHistory::new();
+    let mut last_waited_ms = 0.0f64;
     loop {
         if sh.stop.load(Ordering::SeqCst) {
             break;
@@ -1650,7 +1908,7 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
             /// from another worker and [`vitaslop_runtime::sched::SpinHistory`] decides whether to poll for it.
             Wait(bool),
         }
-        let (job, releases) = {
+        let (job, releases, frame_now) = {
             let mut st = sh.state.lock().unwrap();
             let releases: Vec<usize> = local
                 .borrow()
@@ -1691,7 +1949,7 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                 }
                 Job::Wait(true)
             };
-            (job, releases)
+            (job, releases, st.frames)
         };
         for i in releases {
             if let Some(mut t) = local.borrow_mut().remove(&i) {
@@ -1700,6 +1958,23 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
         }
         match job {
             Job::Wait(mid_frame) => {
+                // Nothing to run: refill the instance reserve first, one build per pass, but
+                // only when this worker has shown itself idle (its last wait was a long one)
+                // - a build is 9-21 ms on a phone, during which a woken thread would wait.
+                if last_waited_ms >= 8.0 {
+                    match engine.stock_reserve(instance_reserve()) {
+                        Ok(true) => {
+                            if trace().is_some() {
+                                let t = abs_ms();
+                                trace_ev(frame_now, TraceEv::Wn { w: w as u8, kind: b'r', thid: 0, t0: t, t1: t });
+                            }
+                            last_waited_ms = 0.0;
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(target: "vitaslop::smp", "instance reserve: {e:?}"),
+                    }
+                }
                 let t0 = now_ms();
                 let cap = spin_cap_us() / 1000.0;
                 let spin = if spin_fixed() {
@@ -1740,6 +2015,11 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                     }
                 }
                 let waited = now_ms() - t0;
+                last_waited_ms = waited;
+                if trace().is_some() {
+                    let a1 = abs_ms();
+                    trace_ev(frame_now, TraceEv::Wn { w: w as u8, kind: b'z', thid: 0, t0: a1 - waited, t1: a1 });
+                }
                 if mid_frame {
                     // >>> JUDGED BY WHEN THE BELL RANG, NOT WHEN THIS WORKER WOKE. A futex wake
                     // costs what the device charges for it, and counting it here made every
@@ -1757,7 +2037,12 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
             Job::Again => {}
             Job::Run(i, birth, patch, thid, priority) => {
                 if let Some(b) = birth {
-                    match engine.make_thread(thid, &b.entries, b.r[0], b.r[1], b.r[2], b.r[3], b.sp, priority) {
+                    let made_at = abs_ms();
+                    let made = engine.make_thread(thid, &b.entries, b.r[0], b.r[1], b.r[2], b.r[3], b.sp, priority);
+                    if trace().is_some() {
+                        trace_ev(frame_now, TraceEv::Wn { w: w as u8, kind: b'm', thid, t0: made_at, t1: abs_ms() });
+                    }
+                    match made {
                         Ok(t) => {
                             local.borrow_mut().insert(i, t);
                         }
@@ -1843,6 +2128,7 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                 {
                     let mut st = sh.state.lock().unwrap();
                     st.threads[i].run_ms += ran_ms;
+                    st.threads[i].life_run_ms += ran_ms;
                     if trace().is_some() {
                         let stop = match &step {
                             ThreadStep::Finished(_) => b'x',
@@ -1906,6 +2192,21 @@ pub struct SmpRun {
     _listeners: Vec<Closure<dyn FnMut(web_sys::MessageEvent)>>,
     /// Kept alive for the same reason: a guest worker that fails to START reports it here.
     _error_listeners: Vec<Closure<dyn FnMut(JsValue)>>,
+    /// Forwarded movie decodes waiting for their decoder to answer, `(slot, thid, call, since)`
+    /// - see [`SmpRun::begin_movie_decode`].
+    parked_decodes: Vec<(usize, i32, ForwardReq, f64)>,
+}
+
+/// `VITASLOP_AVCDEC_CATCH_UP_MS`: how long a forwarded movie decode may wait for its decoder
+/// before it is dispatched anyway (default 200; `0` = never wait).
+fn avcdec_catch_up_cap_ms() -> f64 {
+    static CAP_MS: OnceLock<f64> = OnceLock::new();
+    *CAP_MS.get_or_init(|| {
+        vitaslop_runtime::knobs::var("VITASLOP_AVCDEC_CATCH_UP_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(200.0)
+    })
 }
 
 impl SmpRun {
@@ -1977,12 +2278,19 @@ impl SmpRun {
             tallies: Mutex::new((HashMap::new(), HashMap::new())),
         });
         {
+            // The title's own request for its main thread (`SceProcessParam`): priority and the
+            // core it is pinned to, so the threads it creates with mask 0 - which inherit that
+            // pin - land beside it.
+            let (main_prio, main_mask) = {
+                let h = lock_host(&sh.host);
+                (h.state.main_thread_priority(), h.state.main_affinity())
+            };
             let mut st = sh.state.lock().unwrap();
-            let home = st.place(workers, 0);
+            let home = st.place(workers, main_mask, main_prio);
             st.add_thread(
                 &sh,
                 vitaslop_runtime::host::MAIN_THID,
-                vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
+                main_prio,
                 home,
                 Birth { entries: entries.iter().map(|e| e & !1).collect(), r: [0; 4], sp: main_sp },
             );
@@ -2203,6 +2511,7 @@ impl SmpRun {
             _workers: worker_objs,
             _listeners: listeners,
             _error_listeners: error_listeners,
+            parked_decodes: Vec::new(),
         })
     }
 
@@ -2249,6 +2558,13 @@ impl SmpRun {
 
     /// One line for the panel: per worker, its share of wall clock busy in guest code, its
     /// resumes and the threads bound to it; then the host lock's contention and the forwards.
+    /// Each guest worker's cumulative busy time (w1.., microseconds) - for a caller that
+    /// differences it around one frame, as the slowest-frames list does: under SMP the guest
+    /// runs on these workers, and a slow frame's guest work is invisible from the run worker.
+    pub fn worker_busy_us(&self) -> Vec<u64> {
+        (1..=self.sh.workers).map(|w| self.sh.stats[w].busy_us.load(Ordering::Relaxed)).collect()
+    }
+
     pub fn report(&self, since: &mut SmpSnapshot) -> String {
         use std::fmt::Write;
         let mut st = self.sh.state.lock().unwrap();
@@ -2350,6 +2666,28 @@ impl SmpRun {
         // Per frame since the counters were last cleared (`VITASLOP_CPU_SHARE_FROM`, else the
         // run): wall ms RUNNING and ms RUNNABLE-BUT-WAITING for its worker.
         let per = st.frames.saturating_sub(vitaslop_runtime::sched::cpu_share_from().unwrap_or(0)).max(1) as f64;
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let n = browser_sched::SMP_INSTANCES_NEW.load(Relaxed);
+            let _ = write!(
+                s,
+                " | thread instances: {n} instantiated ({:.0} ms total, worst {:.0} ms; {} of them built ahead into the reserve), {} reused from the pool, {} DROPPED on release ({} with an abandoned stack), {} live threads",
+                browser_sched::SMP_INSTANCES_NEW_US.load(Relaxed) as f64 / 1000.0,
+                browser_sched::SMP_INSTANCES_NEW_MAX_US.load(Relaxed) as f64 / 1000.0,
+                browser_sched::SMP_INSTANCES_RESERVED.load(Relaxed),
+                browser_sched::SMP_INSTANCES_REUSED.load(Relaxed),
+                browser_sched::SMP_INSTANCES_DROPPED.load(Relaxed),
+                browser_sched::SMP_INSTANCES_DROPPED_ABANDONED.load(Relaxed),
+                st.live.len(),
+            );
+        }
+        if !st.placed.is_empty() {
+            let _ = write!(s, " | placed (newest last):");
+            for (thid, mask, home, loads) in &st.placed {
+                let l: Vec<String> = loads.iter().map(|x| format!("{x:.0}")).collect();
+                let _ = write!(s, " {thid:#x} mask {mask:#x} -> w{home} (loads {});", l.join("/"));
+            }
+        }
         let _ = write!(s, " | threads by work:");
         for t in rows.iter().take(8) {
             let _ = write!(
@@ -2562,11 +2900,13 @@ impl SmpRun {
                 })
             };
             let Some((i, thid, Some(req))) = next else { break };
+            let Some(req) = self.begin_movie_decode(i, thid, req) else { continue };
             let t0 = now_ms();
             self.serve_forward(i, thid, req);
             self.sh.state.lock().unwrap().w0_forward_ms += now_ms() - t0;
             trace_w0(b'F', t0, now_ms());
         }
+        self.serve_parked_decodes();
         loop {
             let next = {
                 let mut st = self.sh.state.lock().unwrap();
@@ -2608,6 +2948,76 @@ impl SmpRun {
         }
     }
 
+    /// >>> A MOVIE DECODE IS SUBMITTED, ANSWERED, AND ONLY THEN DISPATCHED.
+    ///
+    /// The decoder is this worker's WebCodecs object and answers on this worker's event loop,
+    /// so a decode call cannot wait inside itself. On the console the call returns with the
+    /// picture its unit is owed (within the stream's reordering), and a title can depend on
+    /// that - see `avcdec::decoder_behind` for the phone run where it did and the movie
+    /// deadlocked. So the call's unit is SUBMITTED first (`presubmit_forwarded`), then - the
+    /// calling thread still suspended on this forward - this worker turns its event loop while
+    /// the decoder is further behind than the stream allows, up to `VITASLOP_AVCDEC_CATCH_UP_MS`
+    /// of wall time (default 200; `0` = off), and then the call is dispatched and delivers.
+    ///
+    /// MEASURED why the submit comes first (phone job 059): waiting only for EARLIER units left
+    /// every picture two calls late instead of one - the unit submitted inside the call was
+    /// answered a few ms after the call returned - and the title's player never started.
+    ///
+    /// >>> AND THE WAIT IS A PARK, NOT A BLOCK. The first version turned the event loop right
+    /// here until the decoder answered - ~13 ms per picture on a phone - and every other
+    /// forwarded call queued behind it: the title's demuxer (`sceMp4GetNextUnit`, thousands a
+    /// movie) and its sound decodes. MEASURED (desktop repro of the phone, doaweb17/21-23): the
+    /// sound side under-ran, the player's controller set its status to 12 (buffering, eboot
+    /// 0x8164e1b0 -> event 5 -> state 1), the video thread stopped, the demux pool never drained,
+    /// and the movie never resumed. So a behind decode is parked in `parked_decodes` with its
+    /// thread still suspended in the forward - on the console the call has not returned - and
+    /// [`Self::serve_parked_decodes`] dispatches it once the decoder has answered or the cap
+    /// passes, while everything else keeps being served. `None` = parked; `Some` = serve now.
+    fn begin_movie_decode(&mut self, i: usize, thid: i32, req: ForwardReq) -> Option<ForwardReq> {
+        let cap = avcdec_catch_up_cap_ms();
+        if cap <= 0.0 {
+            return Some(req);
+        }
+        let decode = lock_host(&self.sh.host)
+            .import_at(req.selector)
+            .is_some_and(|(_, nid)| vitaslop_runtime::nid::name(nid) == "sceAvcdecDecode");
+        if !decode {
+            return Some(req);
+        }
+        self.engine.presubmit_forwarded(thid, req.selector, &req.regs, &req.vfp);
+        if !vitaslop_runtime::vita::avcdec::decoder_behind(&mut lock_host(&self.sh.host).state) {
+            return Some(req);
+        }
+        self.parked_decodes.push((i, thid, req, now_ms()));
+        None
+    }
+
+    /// Dispatch every parked movie decode whose decoder has caught up, or whose wait has reached
+    /// `VITASLOP_AVCDEC_CATCH_UP_MS` - see [`Self::begin_movie_decode`]. Run at every serve, so a
+    /// parked call is re-checked each time this worker comes back from its event loop (where the
+    /// decoder's answers are delivered).
+    fn serve_parked_decodes(&mut self) {
+        if self.parked_decodes.is_empty() {
+            return;
+        }
+        let cap = avcdec_catch_up_cap_ms();
+        let behind = vitaslop_runtime::vita::avcdec::decoder_behind(&mut lock_host(&self.sh.host).state);
+        let now = now_ms();
+        let parked = std::mem::take(&mut self.parked_decodes);
+        for (i, thid, req, t0) in parked {
+            let gave_up = now - t0 >= cap;
+            if behind && !gave_up {
+                self.parked_decodes.push((i, thid, req, t0));
+                continue;
+            }
+            vitaslop_runtime::vita::avcdec::note_catch_up(now - t0, gave_up);
+            let t1 = now_ms();
+            self.serve_forward(i, thid, req);
+            self.sh.state.lock().unwrap().w0_forward_ms += now_ms() - t1;
+            trace_w0(b'F', t1, now_ms());
+        }
+    }
+
     /// Dispatch a forwarded host call here, on the worker that owns its JavaScript, and put the
     /// thread back where the outcome says - `SchedCore::on_suspended` for a call that ran here.
     fn serve_forward(&self, i: usize, thid: i32, req: ForwardReq) {
@@ -2615,13 +3025,16 @@ impl SmpRun {
         let mut vfp = req.vfp;
         let (outcome, early) = self.engine.dispatch_forwarded(thid, req.selector, &mut regs, &mut vfp);
         let mut st = self.sh.state.lock().unwrap();
-        st.threads[i].patch = Some(RegPatch { before: (req.regs, req.vfp), regs, vfp });
+        let guest_call = matches!(outcome, SvcOutcome::CallGuest);
+        st.threads[i].patch = Some(RegPatch { before: (req.regs, req.vfp), regs, vfp, guest_call });
         if let Some(e) = early {
             st.early.push_back(e);
         }
         let home = st.threads[i].home;
         match outcome {
-            SvcOutcome::Continue | SvcOutcome::Reschedule => {
+            // A guest call runs on the thread's OWN worker, as the forward's continuation
+            // (see `browser_sched::guest_call_chain`) - so the thread goes back to it runnable.
+            SvcOutcome::Continue | SvcOutcome::Reschedule | SvcOutcome::CallGuest => {
                 st.threads[i].state = SState::Runnable;
                 st.threads[i].since = abs_ms();
                 st.threads[i].ready_at = abs_ms();

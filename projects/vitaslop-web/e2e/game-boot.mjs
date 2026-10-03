@@ -58,7 +58,15 @@ const targetFrame = Number(process.env.TARGET_FRAME || 178);
 // RECIPE="" for a live-input session. No default: pass a recipe from the
 // vitaslop-gamerun-recipes crate for the title under test.
 const recipePath = process.env.RECIPE ?? "";
-const recipe = recipePath ? await readFile(recipePath, "utf8").catch(() => "") : "";
+// A RECIPE that cannot be read is fatal, never "live input": a run that silently dropped its
+// recipe presses nothing, and every screen it reaches reads as the title ignoring the input.
+// A relative path resolves against THIS process's cwd, which a wrapper script may have changed.
+const recipe = recipePath
+  ? await readFile(recipePath, "utf8").catch((e) => {
+      console.error(`[game] RECIPE ${recipePath} cannot be read (cwd ${process.cwd()}): ${e.message}`);
+      process.exit(2);
+    })
+  : "";
 
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".wasm": "application/wasm", ".json": "application/json" };
 
@@ -225,7 +233,11 @@ async function main() {
     }
   };
   const context = await launchPersistent({
-    channel: process.env.PWCHANNEL || "chrome",
+    // `CHROME_EXE=<path>` runs a SPECIFIC browser build (e.g. an older Chromium, to ask
+    // whether a defect is one V8 version's) instead of the installed channel.
+    ...(process.env.CHROME_EXE
+      ? { executablePath: process.env.CHROME_EXE }
+      : { channel: process.env.PWCHANNEL || "chrome" }),
     headless,
     viewport: { width: 1100, height: 800 },
     deviceScaleFactor: Number(process.env.DSF || 1),
@@ -332,6 +344,13 @@ async function main() {
       liveFrame = Number((text.match(/frame (\d+)/) || [])[1] ?? liveFrame);
       liveStatus = text;
     }
+    // The run ended on `sceAppMgrLoadExec`: the page reboots into that executable (see
+    // debug/game-worker.html), so the RUN is not over - its next process starts from frame 0.
+    if (text.startsWith("[exec] ")) {
+      ended = false;
+      liveFrame = 0;
+      liveStatus = `exec'd ${text.slice(7)}; rebooting`;
+    }
     console.log(`[page:${m.type()}] ${text}`);
   });
   page.on("pageerror", (e) => console.log(`[pageerror] ${e.message}`));
@@ -383,7 +402,11 @@ async function main() {
   // forward `consoleAPICalled` and `exceptionThrown` into the same log the page writes. The
   // exception's `description` is where a Rust panic's message and its wasm stack live, and it
   // is the whole difference between "an allocation failed" and "a decoder refused".
-  const rootCdp = await context.newCDPSession(page).catch(() => null);
+  // `NO_CDP=1`: attach NO DevTools session. An attached inspector is not free under JSPI: V8
+  // reports every wasm suspension to it (`Runtime_WasmSuspended` ->
+  // `OnAsyncFunctionSuspended`), so a run with the inspector on is not the run a player gets.
+  const rootCdp = process.env.NO_CDP ? null : await context.newCDPSession(page).catch(() => null);
+  const workerSends = [];
   if (rootCdp) {
     const wire = async (sessionSend, sessionOn, label) => {
       sessionOn("Runtime.consoleAPICalled", (e) => {
@@ -415,7 +438,46 @@ async function main() {
       // handlers wired above already receive them; enabling Runtime on the child is all that
       // is left. Failures are ignored: a target that vanishes mid-attach is normal.
       await send("Runtime.enable").catch(() => {});
+      if (targetInfo.type === "worker") workerSends.push(send);
     });
+    // `GC_EVERY_MS=<ms>`: force a full GC in every worker on that period. It separates a
+    // renderer process that grows because the collector is LAZY (growth stops with this on)
+    // from one that grows because something is still REACHABLE (it does not). Fire-and-forget:
+    // flat-mode child responses do not come back through this session.
+    const gcEveryMs = Number(process.env.GC_EVERY_MS || 0);
+    if (gcEveryMs > 0) {
+      console.log(`[game] forcing a worker GC every ${gcEveryMs} ms`);
+      setInterval(() => {
+        for (const send of workerSends) send("HeapProfiler.collectGarbage").catch(() => {});
+      }, gcEveryMs).unref?.();
+    }
+    // `TRACE_CATS=<categories>` (+ `TRACE_MS=<ms>`, default 30000): record a Chrome trace for
+    // that long and write `<SHOT_DIR>/trace.json`. Stopped on a timer rather than at the end
+    // because the run under study may kill its renderer, and a renderer's buffer dies with it.
+    // `disabled-by-default-v8.gc_stats` puts live V8 objects BY INSTANCE TYPE in it at every
+    // full GC, for worker isolates too - which object is piling up, not just that one is.
+    if (process.env.TRACE_CATS) {
+      const traceMs = Number(process.env.TRACE_MS || 30000);
+      await rootCdp.send("Tracing.start", {
+        categories: process.env.TRACE_CATS,
+        transferMode: "ReturnAsStream",
+      });
+      console.log(`[game] tracing ${process.env.TRACE_CATS} for ${traceMs} ms`);
+      setTimeout(async () => {
+        const done = new Promise((ok) => rootCdp.once("Tracing.tracingComplete", ok));
+        await rootCdp.send("Tracing.end").catch((e) => console.log(`[game] Tracing.end: ${e.message}`));
+        const { stream } = await done;
+        const out = createWriteStream(join(shotDir, "trace.json"));
+        for (;;) {
+          const r = await rootCdp.send("IO.read", { handle: stream, size: 1 << 20 });
+          out.write(r.base64Encoded ? Buffer.from(r.data, "base64") : r.data);
+          if (r.eof) break;
+        }
+        out.end();
+        await rootCdp.send("IO.close", { handle: stream }).catch(() => {});
+        console.log(`[game] trace written`);
+      }, traceMs).unref?.();
+    }
     await rootCdp
       .send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true })
       .catch(() => {});

@@ -361,6 +361,10 @@ mapping from outside the game, and then check you are using the whole of it.
   the content-free "the game did the thing" surface.
 - `<frame>: @shot <name>` - render this frame to `<name>.png`.
 - `<frame>: @note <text>` / `<frame>: @todo <text>` - a durable note or open task.
+- `<frame>: @wait call <function>` - hold the input timeline until the guest makes that
+  host call (e.g. `sceCtrlPeekBufferPositive`: the title starts reading the pad), then run
+  every later input line late by the hold. A load takes more frames on a slower device, so
+  a press timed for the screen after a load must be anchored, not frame-guessed.
 
 The full grammar is the rustdoc of `vitaslop-runtime/src/recipe.rs`; the runner is
 `vitaslop-native/src/recipe_runner.rs`; the session is
