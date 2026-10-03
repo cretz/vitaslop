@@ -40,7 +40,9 @@ struct Params {
     src_format: u32,
     // Words in one SOURCE block: 2 for PVRTC and BC1, 4 for BC2/BC3.
     src_block_words: u32,
-    pad0: u32,
+    // `encode_etc2` only: the first block ROW this dispatch encodes. A deferred encode runs a
+    // level a slice of rows per frame (see `Transcoder::pump`); 0 is the whole level at once.
+    row0: u32,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -374,6 +376,17 @@ fn halve(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ---------------------------------------------------------------------------------------------
 // ETC2 encode. A port of `vitaslop_runtime::etcenc`, block for block.
 // ---------------------------------------------------------------------------------------------
+//
+// >>> SELECTORS ARE PACKED WORDS AND A SUBBLOCK IS WALKED AS ITS EIGHT TEXELS - SAME ANSWER.
+//
+// The first port kept every selector set as `array<i32, 16>` (six of them live at once, copied
+// by value at every "keep the best so far") and walked a subblock as all sixteen texels with a
+// `continue` for the other eight. MEASURED on the phone (PowerVR, runner job 081): 18 ms for a
+// 512x512 RGB level and 30 ms RGBA - and MK's round start encodes 18 textures in one frame. A
+// selector is 2 bits (3 for EAC), so a set is one `u32` (a `vec2<u32>` for EAC) and "copy the
+// best" is a register move; the eight texels of a subblock are named by `sub_texel` in the same
+// ascending order the sixteen-texel walk visited them, so every early-out fires at the same
+// texel and the blocks are byte-identical (`gpu_etc2_matches_the_cpu_encoder`).
 
 var<private> MODIFIERS: array<vec4<i32>, 8> = array<vec4<i32>, 8>(
     vec4<i32>(2, 8, -2, -8),
@@ -389,10 +402,16 @@ var<private> MODIFIERS: array<vec4<i32>, 8> = array<vec4<i32>, 8>(
 // The four modifiers of a table in ASCENDING order are entries 3, 2, 0, 1.
 var<private> MOD_ASC: vec4<i32> = vec4<i32>(3, 2, 0, 1);
 
-// The block being encoded, as 16 RGBA texels. Private rather than passed, because WGSL has no
-// references and copying a 16-element array into every helper is what a port like this cannot
-// afford.
-var<private> BLK: array<vec4<i32>, 16>;
+// The block being encoded, as 16 texels packed RGBA8 (red in the low byte, as `unpack_rgba`
+// reads them). Private rather than passed, because WGSL has no references.
+var<private> BLK: array<u32, 16>;
+
+fn texel_rgb(i: u32) -> vec3<i32> {
+    let v = BLK[i];
+    return vec3<i32>(i32(v & 0xffu), i32((v >> 8u) & 0xffu), i32((v >> 16u) & 0xffu));
+}
+
+fn texel_a(i: u32) -> i32 { return i32(BLK[i] >> 24u); }
 
 fn clamp255(v: i32) -> i32 { return clamp(v, 0, 255); }
 
@@ -410,11 +429,11 @@ fn quantise(v: i32, bits: u32) -> vec2<i32> {
     return vec2<i32>(q, expand_bits_q(q, bits));
 }
 
-// Which subblock texel `idx` belongs to, under a given flip. Flip false splits left/right
-// (columns 0-1 vs 2-3), flip true splits top/bottom.
-fn subblock_of(idx: u32, flip: bool) -> u32 {
-    if (flip) { return idx / 8u; }
-    return (idx % 4u) / 2u;
+// The `k`-th texel (0..7) of subblock `sub` under a flip, in ascending texel order. Flip false
+// splits left/right (columns 0-1 vs 2-3), flip true splits top/bottom.
+fn sub_texel(flip: bool, sub: u32, k: u32) -> u32 {
+    if (flip) { return sub * 8u + k; }
+    return (k >> 1u) * 4u + sub * 2u + (k & 1u);
 }
 
 // The texel index that carries selector bit position `j`. The format stores selectors in
@@ -425,27 +444,27 @@ fn index_bit(idx: u32) -> u32 {
     return x * 4u + y;
 }
 
+// Selector `s` (0..3) of texel `i`, in a set packed two bits per texel. A fit writes only its
+// own subblock's texels into a zeroed word, so the two subblocks' words merge with `|`.
+fn sel_get(sel: u32, i: u32) -> i32 { return i32((sel >> (2u * i)) & 3u); }
+
 fn subblock_mean(flip: bool, sub: u32) -> vec3<i32> {
     var sum = vec3<i32>(0);
-    var n = 0;
-    for (var i = 0u; i < 16u; i = i + 1u) {
-        if (subblock_of(i, flip) == sub) {
-            sum = sum + BLK[i].xyz;
-            n = n + 1;
-        }
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        sum = sum + texel_rgb(sub_texel(flip, sub, k));
     }
-    return sum / vec3<i32>(n);
+    return sum / vec3<i32>(8);
 }
 
-// The selectors chosen by the last `fit_subblock` call, and its error. WGSL cannot return an
-// array cheaply, so the fit writes here.
-var<private> FIT_SEL: array<i32, 16>;
+// The selectors chosen by the last `fit_subblock` call - this subblock's texels only.
+var<private> FIT_SEL: u32;
 
 // `fit_subblock_within`: the best selector per texel of one subblock against a base and a table,
 // abandoning the fit as soon as it cannot beat `budget`. Returns the squared error, or the
 // sentinel 0x7fffffff when it gave up.
 fn fit_subblock(flip: bool, sub: u32, base: vec3<i32>, table: i32, budget: i32) -> i32 {
     var err = 0;
+    var sel = 0u;
     let mods = MODIFIERS[table];
 
     // The luminance-residual shortcut is EXACT except where a channel clamps, because then the
@@ -461,20 +480,21 @@ fn fit_subblock(flip: bool, sub: u32, base: vec3<i32>, table: i32, budget: i32) 
         let t12 = 3 * (asc[1] + asc[2]);
         let t23 = 3 * (asc[2] + asc[3]);
         let bsum3 = base.x + base.y + base.z;
-        for (var i = 0u; i < 16u; i = i + 1u) {
-            if (subblock_of(i, flip) != sub) { continue; }
-            let t = BLK[i].xyz;
+        for (var k = 0u; k < 8u; k = k + 1u) {
+            let i = sub_texel(flip, sub, k);
+            let t = texel_rgb(i);
             let r2 = 2 * (t.x + t.y + t.z - bsum3);
-            var k = 0;
-            if (r2 > t01) { k = k + 1; }
-            if (r2 > t12) { k = k + 1; }
-            if (r2 > t23) { k = k + 1; }
-            let m = asc[k];
+            var n = 0;
+            if (r2 > t01) { n = n + 1; }
+            if (r2 > t12) { n = n + 1; }
+            if (r2 > t23) { n = n + 1; }
+            let m = asc[n];
             let d = vec3<i32>(base.x + m - t.x, base.y + m - t.y, base.z + m - t.z);
             err = err + d.x * d.x + d.y * d.y + d.z * d.z;
-            FIT_SEL[i] = MOD_ASC[k];
+            sel = sel | (u32(MOD_ASC[n]) << (2u * i));
             if (err >= budget) { return 0x7fffffff; }
         }
+        FIT_SEL = sel;
         return err;
     }
 
@@ -483,60 +503,54 @@ fn fit_subblock(flip: bool, sub: u32, base: vec3<i32>, table: i32, budget: i32) 
         let m = mods[s];
         palette[s] = vec3<i32>(clamp255(base.x + m), clamp255(base.y + m), clamp255(base.z + m));
     }
-    for (var i = 0u; i < 16u; i = i + 1u) {
-        if (subblock_of(i, flip) != sub) { continue; }
-        let t = BLK[i].xyz;
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        let i = sub_texel(flip, sub, k);
+        let t = texel_rgb(i);
         var bestE = 0x7fffffff;
-        var bestS = 0;
+        var bestS = 0u;
         for (var s = 0u; s < 4u; s = s + 1u) {
             let d = palette[s] - t;
             let e = d.x * d.x + d.y * d.y + d.z * d.z;
-            if (e < bestE) { bestE = e; bestS = i32(s); }
+            if (e < bestE) { bestE = e; bestS = s; }
         }
         err = err + bestE;
-        FIT_SEL[i] = bestS;
+        sel = sel | (bestS << (2u * i));
         if (err >= budget) { return 0x7fffffff; }
     }
+    FIT_SEL = sel;
     return err;
 }
 
 // The base a subblock would ideally have GIVEN a table and the selectors it chose: the mean of
 // each texel minus the modifier assigned to it.
-fn ideal_base(flip: bool, sub: u32, table: i32, sel: ptr<function, array<i32, 16>>) -> vec3<i32> {
+fn ideal_base(flip: bool, sub: u32, table: i32, sel: u32) -> vec3<i32> {
     var sum = vec3<i32>(0);
-    var n = 0;
-    for (var i = 0u; i < 16u; i = i + 1u) {
-        if (subblock_of(i, flip) != sub) { continue; }
-        let m = MODIFIERS[table][(*sel)[i]];
-        sum = sum + BLK[i].xyz - vec3<i32>(m);
-        n = n + 1;
+    let mods = MODIFIERS[table];
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        let i = sub_texel(flip, sub, k);
+        let m = mods[sel_get(sel, i)];
+        sum = sum + texel_rgb(i) - vec3<i32>(m);
     }
-    return sum / vec3<i32>(n);
+    return sum / vec3<i32>(8);
 }
 
 // Rank the eight tables for a subblock by a LUMINANCE proxy (`r + 2g + b`, so residuals are in
 // quarter-units and the modifiers scale by four). Returns the table indices, best first.
 fn rank_tables(flip: bool, sub: u32, base: vec3<i32>) -> array<i32, 8> {
     let base_luma = base.x + base.y * 2 + base.z;
-    var residuals: array<i32, 16>;
-    var n_res = 0u;
-    for (var i = 0u; i < 16u; i = i + 1u) {
-        if (subblock_of(i, flip) == sub) {
-            let t = BLK[i].xyz;
-            residuals[n_res] = (t.x + t.y * 2 + t.z) - base_luma;
-            n_res = n_res + 1u;
-        }
+    var residuals: array<i32, 8>;
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        let t = texel_rgb(sub_texel(flip, sub, k));
+        residuals[k] = (t.x + t.y * 2 + t.z) - base_luma;
     }
     var score: array<i32, 8>;
     var order: array<i32, 8>;
     for (var table = 0u; table < 8u; table = table + 1u) {
+        let m4 = MODIFIERS[table] * 4;
         var s = 0;
-        for (var r = 0u; r < n_res; r = r + 1u) {
-            var nearest = 0x7fffffff;
-            for (var k = 0u; k < 4u; k = k + 1u) {
-                let d = abs(residuals[r] - MODIFIERS[table][k] * 4);
-                if (d < nearest) { nearest = d; }
-            }
+        for (var r = 0u; r < 8u; r = r + 1u) {
+            let d = abs(vec4<i32>(residuals[r]) - m4);
+            let nearest = min(min(d.x, d.y), min(d.z, d.w));
             s = s + nearest * nearest;
         }
         score[table] = s;
@@ -563,7 +577,7 @@ fn rank_tables(flip: bool, sub: u32, base: vec3<i32>) -> array<i32, 8> {
 const TABLES_FITTED: u32 = 3u;
 
 // The winner of `search_subblock`, written here for the same reason `FIT_SEL` exists.
-var<private> SEARCH_SEL: array<i32, 16>;
+var<private> SEARCH_SEL: u32;
 var<private> SEARCH_CODE: vec3<i32>;
 var<private> SEARCH_TABLE: i32;
 
@@ -583,6 +597,7 @@ fn search_subblock(flip: bool, sub: u32, mean: vec3<i32>, bits: u32) -> i32 {
     var best_err = 0x7fffffff;
     SEARCH_CODE = start_code;
     SEARCH_TABLE = ranked[0];
+    SEARCH_SEL = 0u;
     // PASS 1: pick the table.
     for (var i = 0u; i < TABLES_FITTED; i = i + 1u) {
         let table = ranked[i];
@@ -600,8 +615,7 @@ fn search_subblock(flip: bool, sub: u32, mean: vec3<i32>, bits: u32) -> i32 {
     let table = SEARCH_TABLE;
     var actual = start_actual;
     for (var refit = 0u; refit < 2u; refit = refit + 1u) {
-        var sel = SEARCH_SEL;
-        let want = ideal_base(flip, sub, table, &sel);
+        let want = ideal_base(flip, sub, table, SEARCH_SEL);
         let q = quant_all(want, bits);
         if (all(q[1] == actual)) { break; }
         let e2 = fit_subblock(flip, sub, q[1], table, best_err);
@@ -614,8 +628,7 @@ fn search_subblock(flip: bool, sub: u32, mean: vec3<i32>, bits: u32) -> i32 {
 
     // PASS 3: one neighbourhood probe against the winning table. Rounding to the nearest code is
     // not the same as choosing the best one.
-    var sel3 = SEARCH_SEL;
-    let want = ideal_base(flip, sub, table, &sel3);
+    let want = ideal_base(flip, sub, table, SEARCH_SEL);
     let maxv = (1 << bits) - 1;
     var per: array<vec2<i32>, 3>;
     var count: array<u32, 3>;
@@ -651,7 +664,8 @@ fn search_subblock(flip: bool, sub: u32, mean: vec3<i32>, bits: u32) -> i32 {
     return best_err;
 }
 
-// The best candidate found so far, in the form `pack_rgb8` needs.
+// The best candidate found so far, in the form `pack_rgb8` needs - selectors included, now that
+// a whole set is one word.
 struct Candidate {
     err: i32,
     flip: bool,
@@ -660,9 +674,8 @@ struct Candidate {
     stored1: vec3<i32>,
     table0: i32,
     table1: i32,
+    sel: u32,
 };
-var<private> CAND_SEL: array<i32, 16>;
-var<private> BEST_SEL: array<i32, 16>;
 
 fn sat_add(a: i32, b: i32) -> i32 {
     if (a >= 0x7fffffff - b) { return 0x7fffffff; }
@@ -674,6 +687,7 @@ fn best_individual(flip: bool) -> Candidate {
     var c: Candidate;
     c.flip = flip;
     c.diff = false;
+    c.sel = 0u;
     var total = 0;
     for (var sub = 0u; sub < 2u; sub = sub + 1u) {
         let mean = subblock_mean(flip, sub);
@@ -681,12 +695,25 @@ fn best_individual(flip: bool) -> Candidate {
         total = sat_add(total, err);
         if (sub == 0u) { c.stored0 = SEARCH_CODE; c.table0 = SEARCH_TABLE; }
         else { c.stored1 = SEARCH_CODE; c.table1 = SEARCH_TABLE; }
-        for (var i = 0u; i < 16u; i = i + 1u) {
-            if (subblock_of(i, flip) == sub) { CAND_SEL[i] = SEARCH_SEL[i]; }
-        }
+        c.sel = c.sel | SEARCH_SEL;
     }
     c.err = total;
     return c;
+}
+
+// The base reachable from `code0` nearest `want` in differential mode (a -4..3 offset per
+// channel): `(stored offset code, what a decoder expands it to)`.
+fn reach(code0: vec3<i32>, want: vec3<i32>) -> array<vec3<i32>, 2> {
+    var rc: vec3<i32>;
+    var ra: vec3<i32>;
+    for (var ch = 0u; ch < 3u; ch = ch + 1u) {
+        let tgt = quantise(want[ch], 5u).x;
+        let d = clamp(tgt - code0[ch], -4, 3);
+        let q = clamp(code0[ch] + d, 0, 31);
+        rc[ch] = (q - code0[ch]) & 0x07;
+        ra[ch] = expand5(q);
+    }
+    return array<vec3<i32>, 2>(rc, ra);
 }
 
 // DIFFERENTIAL mode: the second base is reachable only as a -4..3 offset from the first, per
@@ -701,54 +728,33 @@ fn best_differential(flip: bool) -> Candidate {
     let code0 = SEARCH_CODE;
     c.stored0 = code0;
     c.table0 = SEARCH_TABLE;
-    var sel0 = SEARCH_SEL;
-
-    // The nearest base reachable from `code0`, and what a decoder expands it to.
-    var reach_code: vec3<i32>;
-    var reach_actual: vec3<i32>;
-    // (written by `reachable`, which WGSL makes a pair of globals rather than a tuple return)
-    var want = mean1;
+    let sel0 = SEARCH_SEL;
 
     var best1 = 0x7fffffff;
     var best1_code = vec3<i32>(0);
     var best1_table = 0;
-    var best1_sel: array<i32, 16>;
+    var best1_sel = 0u;
 
     // `reachable(mean1)` once, to rank tables against.
-    for (var c3 = 0u; c3 < 3u; c3 = c3 + 1u) {
-        let tgt = quantise(want[c3], 5u).x;
-        let d = clamp(tgt - code0[c3], -4, 3);
-        let q = clamp(code0[c3] + d, 0, 31);
-        reach_code[c3] = (q - code0[c3]) & 0x07;
-        reach_actual[c3] = expand5(q);
-    }
-    let ranked1 = rank_tables(flip, 1u, reach_actual);
+    let r0 = reach(code0, mean1);
+    let ranked1 = rank_tables(flip, 1u, r0[1]);
 
     for (var ti = 0u; ti < TABLES_FITTED; ti = ti + 1u) {
         let table = ranked1[ti];
-        var code = reach_code;
-        var actual = reach_actual;
+        var code = r0[0];
+        var actual = r0[1];
         var e = fit_subblock(flip, 1u, actual, table, 0x7fffffff);
         var s = FIT_SEL;
         for (var refit = 0u; refit < 2u; refit = refit + 1u) {
-            var sc = s;
-            let w2 = ideal_base(flip, 1u, table, &sc);
-            var c2: vec3<i32>;
-            var a2: vec3<i32>;
-            for (var ch = 0u; ch < 3u; ch = ch + 1u) {
-                let tgt = quantise(w2[ch], 5u).x;
-                let d = clamp(tgt - code0[ch], -4, 3);
-                let q = clamp(code0[ch] + d, 0, 31);
-                c2[ch] = (q - code0[ch]) & 0x07;
-                a2[ch] = expand5(q);
-            }
-            if (all(a2 == actual)) { break; }
-            let e2 = fit_subblock(flip, 1u, a2, table, 0x7fffffff);
+            let w2 = ideal_base(flip, 1u, table, s);
+            let r2 = reach(code0, w2);
+            if (all(r2[1] == actual)) { break; }
+            let e2 = fit_subblock(flip, 1u, r2[1], table, 0x7fffffff);
             if (e2 >= e) { break; }
             e = e2;
             s = FIT_SEL;
-            code = c2;
-            actual = a2;
+            code = r2[0];
+            actual = r2[1];
         }
         if (e < best1) {
             best1 = e;
@@ -761,10 +767,7 @@ fn best_differential(flip: bool) -> Candidate {
     c.stored1 = best1_code;
     c.table1 = best1_table;
     c.err = sat_add(err0, best1);
-    for (var i = 0u; i < 16u; i = i + 1u) {
-        if (subblock_of(i, flip) == 0u) { CAND_SEL[i] = sel0[i]; }
-        else { CAND_SEL[i] = best1_sel[i]; }
-    }
+    c.sel = sel0 | best1_sel;
     return c;
 }
 
@@ -782,34 +785,29 @@ fn differential_can_reach(flip: bool) -> bool {
     return true;
 }
 
-fn pack_rgb8(c: Candidate, sel: ptr<function, array<i32, 16>>) -> vec2<u32> {
-    var b: array<u32, 8>;
+fn pack_rgb8(c: Candidate) -> vec2<u32> {
+    var b012: vec3<u32>;
     for (var ch = 0u; ch < 3u; ch = ch + 1u) {
         if (c.diff) {
-            b[ch] = u32((c.stored0[ch] << 3) | (c.stored1[ch] & 0x07)) & 0xffu;
+            b012[ch] = u32((c.stored0[ch] << 3) | (c.stored1[ch] & 0x07)) & 0xffu;
         } else {
-            b[ch] = u32((c.stored0[ch] << 4) | (c.stored1[ch] & 0x0f)) & 0xffu;
+            b012[ch] = u32((c.stored0[ch] << 4) | (c.stored1[ch] & 0x0f)) & 0xffu;
         }
     }
     var t = ((u32(c.table0) & 7u) << 5u) | ((u32(c.table1) & 7u) << 2u);
     if (c.diff) { t = t | 2u; }
     if (c.flip) { t = t | 1u; }
-    b[3] = t;
     var msb = 0u;
     var lsb = 0u;
     for (var i = 0u; i < 16u; i = i + 1u) {
         let bit = index_bit(i);
-        let s = u32((*sel)[i]);
+        let s = (c.sel >> (2u * i)) & 3u;
         msb = msb | (((s >> 1u) & 1u) << bit);
         lsb = lsb | ((s & 1u) << bit);
     }
-    b[4] = (msb >> 8u) & 0xffu;
-    b[5] = msb & 0xffu;
-    b[6] = (lsb >> 8u) & 0xffu;
-    b[7] = lsb & 0xffu;
     return vec2<u32>(
-        b[0] | (b[1] << 8u) | (b[2] << 16u) | (b[3] << 24u),
-        b[4] | (b[5] << 8u) | (b[6] << 16u) | (b[7] << 24u),
+        b012.x | (b012.y << 8u) | (b012.z << 16u) | (t << 24u),
+        ((msb >> 8u) & 0xffu) | ((msb & 0xffu) << 8u) | (((lsb >> 8u) & 0xffu) << 16u) | ((lsb & 0xffu) << 24u),
     );
 }
 
@@ -817,15 +815,16 @@ fn encode_etc2_rgb8_block() -> vec2<u32> {
     // A block of ONE colour is the most common block in real art, and differential mode with a
     // zero offset encodes it directly.
     var flat = true;
+    let rgb0 = BLK[0] & 0xffffffu;
     for (var i = 1u; i < 16u; i = i + 1u) {
-        if (any(BLK[i].xyz != BLK[0].xyz)) { flat = false; break; }
+        if ((BLK[i] & 0xffffffu) != rgb0) { flat = false; break; }
     }
     if (flat) {
-        let want = BLK[0].xyz;
+        let want = texel_rgb(0u);
         var bestE = 0x7fffffff;
         var bestCode = vec3<i32>(0);
         var bestTable = 0;
-        var bestSel = 0;
+        var bestSel = 0u;
         var start: vec3<i32>;
         for (var c = 0u; c < 3u; c = c + 1u) { start[c] = quantise(want[c], 5u).x; }
         for (var table = 0; table < 8; table = table + 1) {
@@ -845,7 +844,7 @@ fn encode_etc2_rgb8_block() -> vec2<u32> {
                     err = err + bd;
                     code[c] = bq;
                 }
-                if (err < bestE) { bestE = err; bestCode = code; bestTable = table; bestSel = i32(sel); }
+                if (err < bestE) { bestE = err; bestCode = code; bestTable = table; bestSel = sel; }
             }
         }
         var c: Candidate;
@@ -856,48 +855,28 @@ fn encode_etc2_rgb8_block() -> vec2<u32> {
         c.stored1 = vec3<i32>(0);
         c.table0 = bestTable;
         c.table1 = bestTable;
-        var sel: array<i32, 16>;
-        for (var i = 0u; i < 16u; i = i + 1u) { sel[i] = bestSel; }
-        return pack_rgb8(c, &sel);
+        // Every texel the same selector: the two bits repeated sixteen times.
+        c.sel = bestSel * 0x55555555u;
+        return pack_rgb8(c);
     }
 
-    var best: Candidate;
     let reach0 = differential_can_reach(false);
     let reach1 = differential_can_reach(true);
-    // >>> WRITTEN OUT RATHER THAN LOOPED, AND THAT IS NOT A STYLE CHOICE.
-    //
-    // Each of these calls leaves its selectors in `CAND_SEL`, so the winner's selectors have to
-    // be taken before the next call overwrites them. Expressed as a loop over the two flips, the
-    // capture and the comparison sit in the same `if` and the whole thing reads as though the
-    // candidate carried its own selectors - which it does not, because WGSL has no way to return
-    // a 16-element array cheaply. Four straight-line steps make the ordering the code's shape
-    // rather than something a reader has to hold in their head.
-    best = best_differential(false);
-    BEST_SEL = CAND_SEL;
+    var best = best_differential(false);
     let d1 = best_differential(true);
-    if (d1.err < best.err) {
-        best = d1;
-        BEST_SEL = CAND_SEL;
-    }
+    if (d1.err < best.err) { best = d1; }
     // Individual mode is searched only where differential CANNOT reach the second base, which is
     // the only thing individual's coarser 4-bit bases can buy. Exact already means nothing can
     // improve on it.
     if (best.err != 0 && !reach0) {
         let i0 = best_individual(false);
-        if (i0.err < best.err) {
-            best = i0;
-            BEST_SEL = CAND_SEL;
-        }
+        if (i0.err < best.err) { best = i0; }
     }
     if (best.err != 0 && !reach1) {
         let i1 = best_individual(true);
-        if (i1.err < best.err) {
-            best = i1;
-            BEST_SEL = CAND_SEL;
-        }
+        if (i1.err < best.err) { best = i1; }
     }
-    var sel = BEST_SEL;
-    return pack_rgb8(best, &sel);
+    return pack_rgb8(best);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -959,22 +938,27 @@ fn eac_nearest(a: i32) -> u32 {
     return k;
 }
 
-var<private> EAC_SEL: array<i32, 16>;
+// EAC selectors, three bits per texel: texels 0..7 in `.x`, 8..15 in `.y`.
+var<private> EAC_SEL: vec2<u32>;
 
 fn fit_eac(table: i32, mult: i32, base: i32) -> i32 {
     eac_levels(table, mult, base);
     var err = 0;
+    var sel = vec2<u32>(0u);
     for (var i = 0u; i < 16u; i = i + 1u) {
-        let a = BLK[i].w;
+        let a = texel_a(i);
         let bk = eac_nearest(a);
         let d = EAC_LV[bk] - a;
         err = sat_add(err, d * d);
-        EAC_SEL[i] = EAC_ORDER[bk];
+        let s = u32(EAC_ORDER[bk]);
+        if (i < 8u) { sel.x = sel.x | (s << (3u * i)); }
+        else { sel.y = sel.y | (s << (3u * (i - 8u))); }
     }
+    EAC_SEL = sel;
     return err;
 }
 
-fn pack_eac(base: i32, mult: i32, table: i32, sel: ptr<function, array<i32, 16>>) -> vec2<u32> {
+fn pack_eac(base: i32, mult: i32, table: i32, sel: vec2<u32>) -> vec2<u32> {
     // The 48 selector bits, as two 24-bit halves so no field ever straddles a word: bit position
     // `45 - 3j` for texel bit `j`, and every such position is a multiple of 3, so a field lies
     // wholly in `hi` (bits 24..47) or wholly in `lo` (bits 0..23).
@@ -982,7 +966,9 @@ fn pack_eac(base: i32, mult: i32, table: i32, sel: ptr<function, array<i32, 16>>
     var lo = 0u;
     for (var i = 0u; i < 16u; i = i + 1u) {
         let j = index_bit(i);
-        let s = u32((*sel)[i]) & 7u;
+        var s: u32;
+        if (i < 8u) { s = (sel.x >> (3u * i)) & 7u; }
+        else { s = (sel.y >> (3u * (i - 8u))) & 7u; }
         let shift = 45u - 3u * j;
         if (shift >= 24u) { hi = hi | (s << (shift - 24u)); }
         else { lo = lo | (s << shift); }
@@ -1004,9 +990,12 @@ fn pack_eac(base: i32, mult: i32, table: i32, sel: ptr<function, array<i32, 16>>
     );
 }
 
+// Every texel the zero modifier's selector: three bits repeated eight times per half.
+const EAC_ZERO_SELS: u32 = 0x924924u;
+
 fn encode_eac_alpha_block() -> vec2<u32> {
     var sorted: array<i32, 16>;
-    for (var i = 0u; i < 16u; i = i + 1u) { sorted[i] = BLK[i].w; }
+    for (var i = 0u; i < 16u; i = i + 1u) { sorted[i] = texel_a(i); }
     for (var i = 1u; i < 16u; i = i + 1u) {
         let v = sorted[i];
         var j = i32(i) - 1;
@@ -1022,9 +1011,7 @@ fn encode_eac_alpha_block() -> vec2<u32> {
 
     // Constant alpha is exact through the zero modifier, and it is most of real art.
     if (lo == hi) {
-        var sel: array<i32, 16>;
-        for (var i = 0u; i < 16u; i = i + 1u) { sel[i] = EAC_ZERO_SEL; }
-        return pack_eac(lo, 1, EAC_ZERO_TABLE, &sel);
+        return pack_eac(lo, 1, EAC_ZERO_TABLE, vec2<u32>(EAC_ZERO_SELS));
     }
     let spread = hi - lo;
     let samples = vec4<i32>(sorted[0], sorted[5], sorted[10], sorted[15]);
@@ -1073,8 +1060,7 @@ fn encode_eac_alpha_block() -> vec2<u32> {
     var bestBase = 0;
     var bestMult = 1;
     var bestTable = EAC_ZERO_TABLE;
-    var bestSel: array<i32, 16>;
-    for (var i = 0u; i < 16u; i = i + 1u) { bestSel[i] = EAC_ZERO_SEL; }
+    var bestSel = vec2<u32>(EAC_ZERO_SELS);
 
     for (var ti = 0u; ti < EAC_TABLES_REFINED; ti = ti + 1u) {
         let table = order[ti];
@@ -1100,47 +1086,82 @@ fn encode_eac_alpha_block() -> vec2<u32> {
                     bestSel = EAC_SEL;
                 }
                 if (e == 0) {
-                    var s = EAC_SEL;
-                    return pack_eac(base, mult, table, &s);
+                    return pack_eac(base, mult, table, EAC_SEL);
                 }
             }
         }
     }
-    return pack_eac(bestBase, bestMult, bestTable, &bestSel);
+    return pack_eac(bestBase, bestMult, bestTable, bestSel);
 }
 
-// One invocation per 4x4 destination block. Edge blocks of a non-multiple-of-4 level clamp to
-// the last texel, which is the rule `etcenc::gather` and `bcenc` both use.
-@compute @workgroup_size(8, 8, 1)
-fn encode_etc2(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let bx = gid.x;
-    let by = gid.y;
-    let bw = (P.width + 3u) / 4u;
-    let bh = (P.height + 3u) / 4u;
-    if (bx >= bw || by >= bh) { return; }
-
+// Encode block `(bx, by)` of a level `w` x `h` whose RGBA8 texels start at word `rgba_word`,
+// writing it at `out_word + by * out_row_words + bx * (2 or 4)`. Edge blocks of a
+// non-multiple-of-4 level clamp to the last texel, which is the rule `etcenc::gather` and
+// `bcenc` both use.
+fn encode_block(bx: u32, by: u32, w: u32, h: u32, rgba_word: u32, out_word: u32, out_row_words: u32) {
     for (var i = 0u; i < 16u; i = i + 1u) {
-        let x = min(bx * 4u + (i % 4u), P.width - 1u);
-        let y = min(by * 4u + (i / 4u), P.height - 1u);
-        let c = unpack_rgba(rgba[P.rgba_word + y * P.width + x]);
-        BLK[i] = vec4<i32>(i32(c.x), i32(c.y), i32(c.z), i32(c.w));
+        let x = min(bx * 4u + (i % 4u), w - 1u);
+        let y = min(by * 4u + (i / 4u), h - 1u);
+        BLK[i] = rgba[rgba_word + y * w + x];
     }
 
     // Rows are padded so `copyBufferToTexture` gets a 256-byte-aligned `bytes_per_row`.
     if (flag(FLAG_ALPHA)) {
         let a = encode_eac_alpha_block();
         let c = encode_etc2_rgb8_block();
-        let o = P.out_word + by * P.out_row_words + bx * 4u;
+        let o = out_word + by * out_row_words + bx * 4u;
         outb[o] = a.x;
         outb[o + 1u] = a.y;
         outb[o + 2u] = c.x;
         outb[o + 3u] = c.y;
     } else {
         let c = encode_etc2_rgb8_block();
-        let o = P.out_word + by * P.out_row_words + bx * 2u;
+        let o = out_word + by * out_row_words + bx * 2u;
         outb[o] = c.x;
         outb[o + 1u] = c.y;
     }
+}
+
+// One invocation per 4x4 destination block of ONE level.
+@compute @workgroup_size(8, 8, 1)
+fn encode_etc2(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let bx = gid.x;
+    let by = gid.y + P.row0;
+    let bw = (P.width + 3u) / 4u;
+    let bh = (P.height + 3u) / 4u;
+    if (bx >= bw || by >= bh) { return; }
+    encode_block(bx, by, P.width, P.height, P.rgba_word, P.out_word, P.out_row_words);
+}
+
+// >>> EVERY LEVEL OF A CHAIN IN ONE DISPATCH, OVER A FLAT BLOCK INDEX.
+//
+// One dispatch per level serialised the chain: each dispatch waits for the one before it, and
+// a small level is ONE block's search, which on the phone's GPU is a millisecond or two of one
+// thread's latency whatever the level's size. MEASURED (MK, runner job 085): a 128x128 BC3
+// texture - 8 levels, 1,365 blocks - took 17 ms, and a 2048x1024 one only 57. The levels are
+// independent once the RGBA8 chain exists (every block is encoded from the chain alone), so
+// they can share a dispatch and the latency is paid once. Same blocks, same bytes.
+//
+//   P.src_word    word offset in `src` of the level table: 6 words per level,
+//                 [width, height, rgba_word, out_word, out_row_words, first flat block]
+//   P.blocks_x    how many levels the table holds
+//   P.row0        the first flat block this dispatch encodes (a deferred encode slices here)
+//   P.width       how many blocks it encodes
+//   P.padded_x    workgroups per grid row, for a dispatch too big for one dimension
+@compute @workgroup_size(64, 1, 1)
+fn encode_etc2_chain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * P.padded_x * 64u;
+    if (i >= P.width) { return; }
+    let flat = P.row0 + i;
+    var lv = 0u;
+    for (var k = 1u; k < P.blocks_x; k = k + 1u) {
+        if (src[P.src_word + k * 6u + 5u] <= flat) { lv = k; }
+    }
+    let t = P.src_word + lv * 6u;
+    let w = src[t];
+    let local = flat - src[t + 5u];
+    let bw = (w + 3u) / 4u;
+    encode_block(local % bw, local / bw, w, src[t + 1u], src[t + 2u], src[t + 3u], src[t + 4u]);
 }
 
 // ---------------------------------------------------------------------------------------------

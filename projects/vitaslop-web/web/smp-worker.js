@@ -50,6 +50,24 @@ function startProfile(worker) {
 }
 import { attachTitleCached } from "./opfs.js";
 
+// >>> A GUEST THREAD'S `[trace]` LINES (`VITASLOP_TRACE_BLOCKS`) ARE PRINTED HERE, on the guest
+// worker running it - whose console a phone never shows and the run worker's forwarding never
+// saw. Relayed on the `jsprofile` channel, which the run worker writes raw to ITS console, where
+// a device-runner job's `params.console` forwards it as a note (30c: phone job 093 traced the
+// Uncharted job pool and brought back nothing).
+for (const level of ["log", "info", "warn"]) {
+  const orig = console[level].bind(console);
+  console[level] = (...a) => {
+    const text = a.map((x) => (typeof x === "string" ? x : String(x))).join(" ");
+    if (text.startsWith("[trace]")) {
+      try {
+        self.postMessage({ type: "jsprofile", message: text });
+      } catch {}
+    }
+    orig(...a);
+  };
+}
+
 // A Rust panic here reaches the run worker (and from there the page) the same way one on the
 // run worker does - see worker.js. Defined before `init` for the same reason it is there.
 globalThis.__vitaslopPanic = (text) => {

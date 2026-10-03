@@ -86,21 +86,44 @@ export async function lookup(titleId, name) {
   }
 }
 
-/// Delete every stored module of `titleId` - what an invalidation does before transpiling.
+/// Delete the stored modules of `titleId` - what an invalidation does before transpiling.
 /// Returns how many modules were there (for the prepare line).
-export async function clearTitle(titleId) {
+///
+/// With `suffix`, only the entries whose name ends with it: a title that EXECS another of its
+/// executables has one module per executable (see `variantSuffix`), and a miss on one must not
+/// throw the other away - the launcher and the game it execs would otherwise evict each other
+/// on every boot.
+export async function clearTitle(titleId, suffix = null) {
   let n = 0;
   try {
     const dir = await cacheDir(titleId, false);
-    for await (const [name] of dir.entries()) if (name.endsWith(".wasm")) n++;
-    await (await titleDir(titleId, { create: false })).removeEntry(DIR, { recursive: true });
+    if (suffix === null) {
+      for await (const [name] of dir.entries()) if (name.endsWith(".wasm")) n++;
+      await (await titleDir(titleId, { create: false })).removeEntry(DIR, { recursive: true });
+    } else {
+      const doomed = [];
+      for await (const [name] of dir.entries()) {
+        if (name.endsWith(suffix + ".wasm") || name.endsWith(suffix + ".json")) doomed.push(name);
+      }
+      for (const name of doomed) {
+        await dir.removeEntry(name).catch(() => {});
+        if (name.endsWith(".wasm")) n++;
+      }
+    }
   } catch {}
   return n;
 }
 
-/// Store `wasm` + `meta` under `name`, as the title's only entry.
-export async function store(titleId, name, wasm, meta) {
-  await clearTitle(titleId);
+/// The entry-name suffix for the executable a module was built from: the title's own eboot, or
+/// the one a `sceAppMgrLoadExec` replaced the process with (`VITASLOP_MAIN_EXEC`).
+export function variantSuffix(mainExec) {
+  return "-x" + tokenOf(mainExec || "eboot.bin");
+}
+
+/// Store `wasm` + `meta` under `name`, as the only entry of its executable (`suffix`, which
+/// `name` must end with) - or of the whole title when there is no suffix.
+export async function store(titleId, name, wasm, meta, suffix = null) {
+  await clearTitle(titleId, suffix);
   const dir = await cacheDir(titleId, true);
   await writeAll(dir, name + ".wasm", wasm);
   await writeAll(dir, name + ".json", new TextEncoder().encode(JSON.stringify({ ...meta, wasmBytes: wasm.length })));

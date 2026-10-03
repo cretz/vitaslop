@@ -47,7 +47,7 @@ use crate::observe::{format_f64, sample_watch, signature, write_shot};
 const SHOT_CLEAR: [u8; 4] = [16, 16, 24, 255];
 const SHOT_PANEL_W: u32 = 960;
 const SHOT_PANEL_H: u32 = 544;
-use crate::recipe_runner::boot_retail;
+use crate::recipe_runner::boot_retail_exec;
 use crate::{RunReport, ThreadedScheduler};
 
 /// How a session was configured at boot.
@@ -96,6 +96,9 @@ impl Default for SessionOpts {
 /// A booted title being played interactively.
 pub struct Session {
     sched: ThreadedScheduler<VitaEnv>,
+    /// The app directory, for a reboot into the executable a launcher exec'd - see
+    /// [`Session::follow_exec`].
+    game_dir: String,
     /// The input timeline the guest's world replays, extended as we play.
     timeline: SharedTimeline,
     /// The recipe being authored: the metadata half of the same artifact (watches,
@@ -280,10 +283,10 @@ impl Session {
     pub fn boot(game_dir: &str, recipe: Recipe, opts: SessionOpts) -> Result<Session, String> {
         let timeline = Arc::new(Mutex::new(Timeline::new(recipe.segments().to_vec())));
         let world = RecipeWorld::from_timeline(timeline.clone());
-        let sched = boot_retail(game_dir, Box::new(world), opts.quantum_fuel)?;
-        sched.host().state.capture.scene_limit = opts.scene_limit;
+        let sched = boot_retail_exec(game_dir, Box::new(world), opts.quantum_fuel, None)?;
         let mut s = Session {
             sched,
+            game_dir: game_dir.to_string(),
             timeline,
             shot_every: recipe.meta.shot_every,
             recipe,
@@ -299,6 +302,16 @@ impl Session {
             gpu: std::sync::Arc::new(std::sync::Mutex::new(None)),
             gpu_refused: false,
         };
+        s.install_host_hooks();
+        s.reset_watch_csv();
+        Ok(s)
+    }
+
+    /// What every freshly booted scheduler of this session needs from the host side: the scene
+    /// cap and (with a shot directory) the synchronous scene completion hook.
+    fn install_host_hooks(&mut self) {
+        let s = self;
+        s.sched.host().state.capture.scene_limit = s.opts.scene_limit;
         // A small render target a title reads on the CPU is completed at its own
         // `sceGxmEndScene` - see `VitaState::complete_scene_now`. Only when this session
         // renders at all (a shot directory), since the hook creates the renderer on first use.
@@ -321,8 +334,23 @@ impl Session {
                 r.complete_scenes(scenes)
             }));
         }
-        s.reset_watch_csv();
-        Ok(s)
+    }
+
+    /// >>> A PROCESS REPLACEMENT: the guest halted on `sceAppMgrLoadExec` of one of its own
+    /// executables, so boot that one in its place - the same input timeline, frames from zero,
+    /// exactly as the headless run and the browser page do. A launcher-style title is otherwise
+    /// a session that ends at frame 0. Returns whether it rebooted.
+    fn follow_exec(&mut self) -> Result<bool, String> {
+        if !self.finished() {
+            return Ok(false);
+        }
+        let Some(path) = self.sched.host().state.exec_request.take() else { return Ok(false) };
+        eprintln!("# the title exec'd {path} at f{} - booting it", self.frame());
+        let world = RecipeWorld::from_timeline(self.timeline.clone());
+        self.sched = boot_retail_exec(&self.game_dir, Box::new(world), self.opts.quantum_fuel, Some(&path))?;
+        self.install_host_hooks();
+        self.last = RunReport::FramesReached(0);
+        Ok(true)
     }
 
     /// The display frame the session is currently at.
@@ -490,6 +518,7 @@ impl Session {
     /// Advance `n` frames, sampling watches per frame when asked (or when any watch
     /// is declared). Returns the one-line status an agent reads to decide what next.
     fn advance(&mut self, n: u64, force_sample: bool) -> Result<String, String> {
+        self.follow_exec()?;
         if self.finished() {
             return Err(format!("guest has stopped ({:?}); no further frames", self.last));
         }
@@ -498,7 +527,8 @@ impl Session {
         // writes no shots reads as "the renderer is broken", which is a long way from
         // the truth.
         let sample = force_sample || !self.recipe.watches.is_empty() || self.shot_every.is_some();
-        let target = self.frame() + n;
+        let start = self.frame();
+        let target = start + n;
         if sample {
             while self.frame() < target {
                 let next = self.frame() + 1;
@@ -510,6 +540,13 @@ impl Session {
             }
         } else {
             self.last = self.sched.run_frames(target, self.opts.max_rounds);
+        }
+        // A launcher that exec'd: the new process runs the REST of this step. Its frames count
+        // from zero, so what is left is `n` less the frames THIS step ran before the exec -
+        // not less the absolute frame, which is only the same when the step began at zero.
+        let ran = self.frame() - start;
+        if self.follow_exec()? && n > ran {
+            return self.advance(n - ran, force_sample);
         }
         Ok(self.status())
     }

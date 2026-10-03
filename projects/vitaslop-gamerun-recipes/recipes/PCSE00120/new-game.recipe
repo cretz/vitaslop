@@ -1,4 +1,4 @@
-@title  PCSE00120 - New Game: title screen, difficulty, both movies, the Velvet Room, name entry, the tarot reading, the intro cutscene
+@title  PCSE00120 - New Game: title screen, difficulty, both movies, the Velvet Room, name entry, the tarot reading, the intro cutscene, arrival in Inaba, FIRST PLAYER CONTROL
 @game   PCSE00120
 @shot-every 1000
 
@@ -6,7 +6,8 @@
 # ----------------------
 # The title boots, reaches its title screen, starts a NEW GAME at NORMAL difficulty, plays
 # its two front-end movies, reaches the Velvet Room, ENTERS A NAME, sits through Igor's
-# tarot reading and goes on into the opening cutscene movie. Every screen along the way
+# tarot reading, goes on through the opening cutscene movie and the arrival in Inaba, and
+# ends in the FIELD under player control, walking the protagonist down the street. Every screen along the way
 # renders through the recompiler (no fixed-function fallback), the title music and confirm
 # sounds play, and both movies decode with their sound.
 #
@@ -38,6 +39,8 @@
 #   f10234 the reading ("The Moon, in the upright position")
 #   f12604 the intro cutscene movie (the beach), f13000 the news desk, f13504 the train,
 #          f15904 the missing-persons broadcast
+#   f17704 Dojima at Inaba station; crosses every 44 frames through the car and gas station
+#   f23600 FIELD MODE, "Shopping District, South" - the stick walks the protagonist (GAMEPLAY)
 #
 # HOW THE NAME ENTRY WORKS, because two probes read it as broken and it is not:
 #   - a DIRECTION press held 4 frames moves the keyboard cursor ONE cell. Held 8 it moves
@@ -233,3 +236,265 @@
 12604: @shot intro-movie
 13504: @shot intro-movie-train
 15904: @shot after-intro
+
+# ============================================================================
+# ARRIVAL IN INABA, THEN THE FIRST PLAYER CONTROL (authored 2026-09-28 in a resident `session`).
+# The movie hands over at ~f17700: Dojima at the station ("Hey! Over here!"), the car ride
+# and the gas station. Every line there is advanced with a CROSS every 44 frames - the
+# presses below are exactly the ones that session made. By f23584 the title is in FIELD
+# MODE on "Shopping District, South": no dialogue box, the location banner up, and a cross
+# does nothing (the session held there for 8,000 frames of crosses with no change).
+# The left stick then WALKS the protagonist and the camera follows - that is gameplay.
+# ============================================================================
+17704: @section arrival
+17704: @shot arrival-station
+18304: cross
+18308:
+18348: cross
+18352:
+18392: cross
+18396:
+18436: cross
+18440:
+18480: cross
+18484:
+18524: cross
+18528:
+18568: cross
+18572:
+18612: cross
+18616:
+18656: cross
+18660:
+18700: cross
+18704:
+18744: cross
+18748:
+18788: cross
+18792:
+18832: cross
+18836:
+18876: cross
+18880:
+18920: cross
+18924:
+18964: cross
+18968:
+19008: cross
+19012:
+19052: cross
+19056:
+19096: cross
+19100:
+19140: cross
+19144:
+19184: cross
+19188:
+19228: cross
+19232:
+19272: cross
+19276:
+19316: cross
+19320:
+19360: cross
+19364:
+19404: cross
+19408:
+19448: cross
+19452:
+19492: cross
+19496:
+19536: cross
+19540:
+19580: cross
+19584:
+19624: cross
+19628:
+19668: cross
+19672:
+19712: cross
+19716:
+19756: cross
+19760:
+19800: cross
+19804:
+19844: cross
+19848:
+19888: cross
+19892:
+19932: cross
+19936:
+19976: cross
+19980:
+20020: cross
+20024:
+20064: cross
+20068:
+20108: cross
+20112:
+20152: cross
+20156:
+20196: cross
+20200:
+20240: cross
+20244:
+20284: cross
+20288:
+20328: cross
+20332:
+20372: cross
+20376:
+20416: cross
+20420:
+20460: cross
+20464:
+20504: cross
+20508:
+20548: cross
+20552:
+20592: cross
+20596:
+20636: cross
+20640:
+20680: cross
+20684:
+20724: cross
+20728:
+20768: cross
+20772:
+20812: cross
+20816:
+20856: cross
+20860:
+20900: cross
+20904:
+20944: cross
+20948:
+20988: cross
+20992:
+21032: cross
+21036:
+21076: cross
+21080:
+21120: cross
+21124:
+21164: cross
+21168:
+21208: cross
+21212:
+21252: cross
+21256:
+21296: cross
+21300:
+21340: cross
+21344:
+21384: cross
+21388:
+21428: cross
+21432:
+21472: cross
+21476:
+21516: cross
+21520:
+21560: cross
+21564:
+21604: cross
+21608:
+21648: cross
+21652:
+21692: cross
+21696:
+21736: cross
+21740:
+21780: cross
+21784:
+21824: cross
+21828:
+21868: cross
+21872:
+21912: cross
+21916:
+21956: cross
+21960:
+22000: cross
+22004:
+22044: cross
+22048:
+22088: cross
+22092:
+22132: cross
+22136:
+22176: cross
+22180:
+22220: cross
+22224:
+22264: cross
+22268:
+22308: cross
+22312:
+22352: cross
+22356:
+22396: cross
+22400:
+22440: cross
+22444:
+22484: cross
+22488:
+22528: cross
+22532:
+22572: cross
+22576:
+22616: cross
+22620:
+22660: cross
+22664:
+22704: cross
+22708:
+22748: cross
+22752:
+22792: cross
+22796:
+22836: cross
+22840:
+22880: cross
+22884:
+22924: cross
+22928:
+22968: cross
+22972:
+23012: cross
+23016:
+23056: cross
+23060:
+23100: cross
+23104:
+23144: cross
+23148:
+23188: cross
+23192:
+23232: cross
+23236:
+23276: cross
+23280:
+23320: cross
+23324:
+23364: cross
+23368:
+23408: cross
+23412:
+23452: cross
+23456:
+23496: cross
+23500:
+23540: cross
+23544:
+23584: cross
+23588:
+23600: @section field-control
+23600: @shot field-control
+23600: lx=0
+23690:
+23700: ly=255
+23790:
+23800: @shot field-walked
+23800:

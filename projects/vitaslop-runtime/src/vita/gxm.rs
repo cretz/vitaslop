@@ -303,6 +303,27 @@ pub(super) fn program_is_frag_color_used(ctx: &mut GuestCtx, st: &mut VitaState)
     ctx.ret(used as u32);
 }
 
+/// SceBool sceGxmProgramIsDiscardUsed(const SceGxmProgram *program)
+///
+/// Whether the fragment program can discard a fragment, answered from the program's own
+/// instructions (`vitaslop_gxp_shader::fragment_uses_discard`) - the bytes the hardware
+/// library reflects over, as `sceGxmProgramIsFragColorUsed` is.
+pub(super) fn program_is_discard_used(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let program = ctx.arg(0);
+    let blob = st.program_blob(ctx, program);
+    ctx.ret(vitaslop_gxp_shader::fragment_uses_discard(&blob) as u32);
+}
+
+/// SceBool sceGxmProgramIsDepthReplaceUsed(const SceGxmProgram *program)
+///
+/// Whether the fragment program writes its own depth, answered from its instructions
+/// (`vitaslop_gxp_shader::fragment_replaces_depth`).
+pub(super) fn program_is_depth_replace_used(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let program = ctx.arg(0);
+    let blob = st.program_blob(ctx, program);
+    ctx.ret(vitaslop_gxp_shader::fragment_replaces_depth(&blob) as u32);
+}
+
 /// int sceGxmInitialize(const SceGxmInitializeParams *params)
 pub(super) fn initialize(ctx: &mut GuestCtx, st: &mut VitaState) {
     let params = ctx.arg(0);
@@ -778,6 +799,12 @@ fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
         } else {
             4
         },
+        // The fragment block's NON-DEFAULT UNIFORM-BUFFER table, wholesale, where the handler
+        // (`bind_precomputed_fragment_state`) writes it. The vertex stage's table IS its copy
+        // above, so it has no second one.
+        table_src: if fragment { gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS } else { 0 },
+        table_dst: if fragment { gxmctx::off::FRAGMENT_UNIFORM_BUFFERS } else { 0 },
+        table_bytes: if fragment { gxmctx::MAX_UNIFORM_BUFFERS as u32 * 4 } else { 0 },
         ctx_prog: gxmctx::off::FRAGMENT_PROGRAM,
         has_prog: fragment,
     }
@@ -1569,13 +1596,13 @@ fn program_rop_blend(
         }
     };
     // `SceGxmBlendFactor`: 1 = ONE, 4 = SRC_ALPHA, 5 = ONE_MINUS_SRC_ALPHA.
-    // `SceGxmBlendFunc`: 0 = NONE, 1 = ADD.
+    // `SceGxmBlendFunc`: 0 = NONE, 1 = ADD, 3 = REVERSE_SUBTRACT.
     let blend = match rop.factors {
-        // The full plain-SOP2 reading: the word's own four factors, both functions ADD.
+        // The full plain-SOP2 reading: the word's own four factors and its two functions.
         Some((color_src, color_dst, alpha_src, alpha_dst)) => crate::capture::BlendState {
             color_mask: 0xf,
-            color_func: 1,
-            alpha_func: 1,
+            color_func: rop.funcs.0,
+            alpha_func: rop.funcs.1,
             color_src,
             color_dst,
             alpha_src,

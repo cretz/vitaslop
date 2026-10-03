@@ -288,6 +288,10 @@ pub mod gxm {
     /// it is writing (programmable blending). Answered from the program itself - see
     /// `vita::gxm::program_is_frag_color_used`.
     pub const PROGRAM_IS_FRAG_COLOR_USED: u32 = 0x104F_23F4;
+    /// `sceGxmProgramIsDiscardUsed` - see `vita::gxm::program_is_discard_used`.
+    pub const PROGRAM_IS_DISCARD_USED: u32 = 0x029B_4F1C;
+    /// `sceGxmProgramIsDepthReplaceUsed` - see `vita::gxm::program_is_depth_replace_used`.
+    pub const PROGRAM_IS_DEPTH_REPLACE_USED: u32 = 0x8961_3EF2;
     /// The texture's minimum mip LEVEL, which unlike every other sampler field is split
     /// across control words 2 and 3 (`psp2/gxm.h`'s `lod_min0`/`lod_min1`).
     pub const TEXTURE_SET_LOD_MIN: u32 = 0xB79E_43DD;
@@ -1132,6 +1136,26 @@ pub mod services {
     /// An unnamed SceNearUtil export the title imports ("near" is the offline-social
     /// app; present in no vita-headers revision). Serviced as an offline success.
     pub const NEAR_UTIL_UNKNOWN_A412E9CA: u32 = 0xA412_E9CA;
+    /// Another unnamed SceNearUtil export (PCSA00029's near thread). Eight arguments; the
+    /// caller tests the result `> 0` and skips its handling otherwise - a count of near
+    /// results - so the offline answer is 0: nothing nearby.
+    pub const NEAR_UTIL_UNKNOWN_49A97D5F: u32 = 0x49A9_7D5F;
+    /// The REST of the unnamed SceNearUtil surface PCSA00029 imports (13 in all, every call site
+    /// in one component, 0x81282162..0x81283870). The readable sites treat 0 / an untouched
+    /// out-parameter as "nothing": a status tested `== 1`, a loop that continues on non-zero, a
+    /// count tested `> 0`. With no Near peers anywhere, that IS the offline answer - the same
+    /// one [`NEAR_UTIL_UNKNOWN_A412E9CA`] already gives.
+    pub const NEAR_UTIL_UNKNOWN_1AA394BA: u32 = 0x1AA3_94BA;
+    pub const NEAR_UTIL_UNKNOWN_1AE3EC1C: u32 = 0x1AE3_EC1C;
+    pub const NEAR_UTIL_UNKNOWN_69EE6FB3: u32 = 0x69EE_6FB3;
+    pub const NEAR_UTIL_UNKNOWN_76C4807C: u32 = 0x76C4_807C;
+    pub const NEAR_UTIL_UNKNOWN_8095FDEF: u32 = 0x8095_FDEF;
+    pub const NEAR_UTIL_UNKNOWN_88540CEC: u32 = 0x8854_0CEC;
+    pub const NEAR_UTIL_UNKNOWN_9B3F2DCE: u32 = 0x9B3F_2DCE;
+    pub const NEAR_UTIL_UNKNOWN_9FB9277B: u32 = 0x9FB9_277B;
+    pub const NEAR_UTIL_UNKNOWN_BF2BBE1F: u32 = 0xBF2B_BE1F;
+    pub const NEAR_UTIL_UNKNOWN_CA742B97: u32 = 0xCA74_2B97;
+    pub const NEAR_UTIL_UNKNOWN_E608000B: u32 = 0xE608_000B;
     /// `sceRtcParseRFC3339(SceRtcTick *utc, const char *pszDateTime)`: the inverse of
     /// [`RTC_FORMAT_RFC3339_LOCAL_TIME`]. A real parse - see `vita::services::rtc_parse_rfc3339`.
     pub const RTC_PARSE_RFC3339: u32 = 0x2D18_AEEC;
@@ -2497,6 +2521,18 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::IME_DIALOG_TERM => "sceImeDialogTerm",
         sv::NP_TROPHY_SETUP_DIALOG_GET_RESULT => "sceNpTrophySetupDialogGetResult",
         sv::NEAR_UTIL_UNKNOWN_A412E9CA => "SceNearUtil_A412E9CA",
+        sv::NEAR_UTIL_UNKNOWN_49A97D5F => "SceNearUtil_49A97D5F",
+        sv::NEAR_UTIL_UNKNOWN_1AA394BA => "SceNearUtil_1AA394BA",
+        sv::NEAR_UTIL_UNKNOWN_1AE3EC1C => "SceNearUtil_1AE3EC1C",
+        sv::NEAR_UTIL_UNKNOWN_69EE6FB3 => "SceNearUtil_69EE6FB3",
+        sv::NEAR_UTIL_UNKNOWN_76C4807C => "SceNearUtil_76C4807C",
+        sv::NEAR_UTIL_UNKNOWN_8095FDEF => "SceNearUtil_8095FDEF",
+        sv::NEAR_UTIL_UNKNOWN_88540CEC => "SceNearUtil_88540CEC",
+        sv::NEAR_UTIL_UNKNOWN_9B3F2DCE => "SceNearUtil_9B3F2DCE",
+        sv::NEAR_UTIL_UNKNOWN_9FB9277B => "SceNearUtil_9FB9277B",
+        sv::NEAR_UTIL_UNKNOWN_BF2BBE1F => "SceNearUtil_BF2BBE1F",
+        sv::NEAR_UTIL_UNKNOWN_CA742B97 => "SceNearUtil_CA742B97",
+        sv::NEAR_UTIL_UNKNOWN_E608000B => "SceNearUtil_E608000B",
 
         // --- kernel core -----------------------------------------------------
         s::SET_GPO => "sceKernelSetGPO",
@@ -2561,6 +2597,8 @@ pub fn name(func_nid: u32) -> &'static str {
         g::WAIT_EVENT => "sceGxmWaitEvent",
         g::SET_BACK_STENCIL_REF => "sceGxmSetBackStencilRef",
         g::PROGRAM_IS_FRAG_COLOR_USED => "sceGxmProgramIsFragColorUsed",
+        g::PROGRAM_IS_DISCARD_USED => "sceGxmProgramIsDiscardUsed",
+        g::PROGRAM_IS_DEPTH_REPLACE_USED => "sceGxmProgramIsDepthReplaceUsed",
         g::TEXTURE_SET_LOD_MIN => "sceGxmTextureSetLodMin",
         g::TEXTURE_GET_LOD_MIN => "sceGxmTextureGetLodMin",
         g::TEXTURE_SET_MIPMAP_COUNT => "sceGxmTextureSetMipmapCount",

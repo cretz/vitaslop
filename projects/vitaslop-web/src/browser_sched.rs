@@ -1326,6 +1326,33 @@ impl GuestMemory for HostRegion {
         unsafe { std::ptr::write_unaligned(self.ptr.add(off) as *mut u32, v) };
         self.stamp_written(off, 4);
     }
+    /// A REAL compare-and-swap: guest code on other workers writes this memory while a host
+    /// call runs (the lightweight mutex's inline SMP form - see `vita::lwwork`). A misaligned
+    /// word cannot be atomic and never needs to be: the inline form refuses one, so only the
+    /// host (under its mutex) ever touches it.
+    fn cas_u32(&mut self, off: usize, expect: u32, new: u32) -> u32 {
+        if !self.in_bounds(off, 4) {
+            return 0;
+        }
+        // SAFETY: bounds checked; the address is aligned for the atomic arm.
+        let p = unsafe { self.ptr.add(off) };
+        let cur = if (p as usize) & 3 == 0 {
+            let a = unsafe { &*(p as *const std::sync::atomic::AtomicU32) };
+            match a.compare_exchange(expect, new, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst) {
+                Ok(v) | Err(v) => v,
+            }
+        } else {
+            let cur = unsafe { std::ptr::read_unaligned(p as *const u32) };
+            if cur == expect {
+                unsafe { std::ptr::write_unaligned(p as *mut u32, new) };
+            }
+            cur
+        };
+        if cur == expect {
+            self.stamp_written(off, 4);
+        }
+        cur
+    }
     fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
         if !self.in_bounds(off, len) {
             return None;
@@ -1501,6 +1528,12 @@ impl GuestMemory for GuestMem {
             GuestMem::Host(r) => r.write_u32(off, v),
         }
     }
+    fn cas_u32(&mut self, off: usize, expect: u32, new: u32) -> u32 {
+        match self {
+            GuestMem::Js(m) => SharedView::cas_word(m, off, expect, new),
+            GuestMem::Host(r) => r.cas_u32(off, expect, new),
+        }
+    }
     fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
         guest_mem_delegate!(self, borrow, off, len)
     }
@@ -1560,6 +1593,15 @@ impl GuestMemory for &'_ GuestMem {
             GuestMem::Host(r) => {
                 let mut r = r;
                 r.write_u32(off, v)
+            }
+        }
+    }
+    fn cas_u32(&mut self, off: usize, expect: u32, new: u32) -> u32 {
+        match **self {
+            GuestMem::Js(ref m) => SharedView::cas_word(m, off, expect, new),
+            GuestMem::Host(r) => {
+                let mut r = r;
+                r.cas_u32(off, expect, new)
             }
         }
     }
@@ -1628,6 +1670,29 @@ impl SharedView {
         // cannot see stamped would let a texture snapshot report memory the host had just
         // overwritten as untouched. See `stamp_written`.
         self.stamp_written(off, 4);
+    }
+
+    /// `GuestMemory::cas_u32` over the shared buffer: `Atomics.compareExchange`, through an
+    /// `Int32Array` because the binding returns the old value as an i32 (a `Uint32Array`'s
+    /// values past 2^31 would not survive that). A misaligned word takes the plain path - see
+    /// `HostRegion::cas_u32` for why that is safe.
+    fn cas_word(&self, off: usize, expect: u32, new: u32) -> u32 {
+        if off & 3 != 0 || off + 4 > self.bytes.length() as usize {
+            let mut b = [0u8; 4];
+            self.read(off, &mut b);
+            let cur = u32::from_le_bytes(b);
+            if cur == expect {
+                self.write_at(off, &new.to_le_bytes());
+            }
+            return cur;
+        }
+        let ints = js_sys::Int32Array::new(&self.words.buffer());
+        let cur = js_sys::Atomics::compare_exchange(&ints, (off >> 2) as u32, expect as i32, new as i32)
+            .map_or_else(|_| self.words.get_index((off >> 2) as u32), |v| v as u32);
+        if cur == expect {
+            self.stamp_written(off, 4);
+        }
+        cur
     }
 
     fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
@@ -1978,6 +2043,20 @@ impl ThreadRt {
         let g = self.guest_pc.as_ref()?;
         Some(g.value().as_f64().unwrap_or(0.0) as i64 as u32)
     }
+    /// The 16 words at `addr` (word-aligned down), or `None` when that is not guest memory.
+    fn words_at(&self, addr: u32) -> Option<[u32; 16]> {
+        let addr = addr & !3;
+        let off = addr.checked_sub(self.base)? as usize;
+        let mut bytes = [0u8; 64];
+        if !self.view.read_into(off, &mut bytes) {
+            return None;
+        }
+        let mut w = [0u32; 16];
+        for (i, c) in bytes.chunks_exact(4).enumerate() {
+            w[i] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        Some(w)
+    }
 }
 
 /// Whether this run asked for the per-block execution trace. Read once: the transpile that
@@ -2029,6 +2108,28 @@ pub struct BrowserThread {
     /// back instead of dropping it - see [`release`](ThreadHandle::release).
     pool: InstancePool,
 }
+
+/// Guest-thread module instances made by `make_thread` on EVERY worker - PROCESS-wide, in the
+/// shared linear memory, unlike `hostcalls::instance_stats` (a JS thread's own `thread_local`,
+/// which the run worker reads as zero under SMP because it never makes a guest thread):
+/// `(instantiated, total us instantiating, worst us, reused from the pool)`.
+///
+/// >>> A THREAD THAT TAKES A THIRD OF A SECOND TO START. MEASURED (desktop browser, a fighting
+/// title's character select, SMP trace): a freshly spawned job thread first ran ~300 ms after
+/// it was made, with EVERY worker idle in between, every frame - the select screen at ~8%
+/// speed. An instance of a 43,000-function module is built synchronously on the worker that
+/// first picks the thread.
+pub static SMP_INSTANCES_NEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SMP_INSTANCES_NEW_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SMP_INSTANCES_NEW_MAX_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SMP_INSTANCES_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Instances built AHEAD of any thread, in a worker's idle time, so a new thread's first run
+/// does not pay the instantiation - see [`BrowserEngine::stock_reserve`].
+pub static SMP_INSTANCES_RESERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Instances a finished thread did NOT give back (`release` dropped them), and of those the
+/// ones whose JSPI stack was ABANDONED (never resolved, so the instance cannot be reset).
+pub static SMP_INSTANCES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SMP_INSTANCES_DROPPED_ABANDONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Instances whose guest thread has finished, reset and ready to run another. Shared
 /// between the engine (which takes from it) and every live thread (which gives back).
@@ -2121,6 +2222,9 @@ struct ThreadEngine {
     /// The instance's exports, kept so a REUSED instance can look up its next entry's
     /// function and its `tp` global without instantiating anything.
     exports: Object,
+    /// `WebAssembly.promising` over this instance's dispatcher (`abi::DISPATCH_EXPORT`), made
+    /// on the first thread it runs and reused by every later one - see `make_thread`.
+    dispatch_p: Option<Function>,
     /// The instance's `reset` export (`abi::RESET_EXPORT`), called before the instance is
     /// handed to another guest thread.
     reset: Function,
@@ -2151,6 +2255,11 @@ struct ThreadEngine {
     /// >>> SMP ONLY. The instance's `cur_thread`, `thread_id` and `elide` globals
     /// (`abi::CUR_THREAD_EXPORT` ...), set before every resume - see `set_smp_words`.
     smp_words: Option<[WebAssembly::Global; 3]>,
+    /// `dispatch_p` as the import closure reaches it, for a guest call (`guest_call_chain`).
+    dispatch_cell: Rc<RefCell<Option<Function>>>,
+    /// SMP: raised as a parked stack resumes when its FORWARDED call answered
+    /// `SvcOutcome::CallGuest`; the forward's continuation then runs the guest call.
+    forward_gc: Rc<Cell<bool>>,
 }
 
 /// A host call the parallel scheduler must run on the run worker: the selector and the
@@ -2167,6 +2276,9 @@ pub(crate) struct RegPatch {
     pub(crate) before: ([u32; abi::REG_COUNT], [u32; VFP_ARG_COUNT]),
     pub(crate) regs: [u32; abi::REG_COUNT],
     pub(crate) vfp: [u32; VFP_ARG_COUNT],
+    /// The call answered `SvcOutcome::CallGuest`: this thread runs a guest call before its
+    /// host call can finish - see `guest_call_chain`.
+    pub(crate) guest_call: bool,
 }
 
 /// What an import closure needs to know on an SMP worker - see `crate::smp`.
@@ -2383,8 +2495,13 @@ impl ThreadHandle for BrowserThread {
         engine.forward.borrow_mut().take();
         engine.early.set(None);
         engine.patch = None;
+        engine.forward_gc.set(false);
         hostcalls::note_thread_released();
         if engine.abandoned.get() || !instance_pool_enabled() {
+            SMP_INSTANCES_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if engine.abandoned.get() {
+                SMP_INSTANCES_DROPPED_ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             drop(engine);
             return;
         }
@@ -2395,6 +2512,7 @@ impl ThreadHandle for BrowserThread {
         if engine.reset.call0(&JsValue::UNDEFINED).is_err() {
             // A reset that failed leaves an instance nobody can characterise; drop it
             // rather than lend it to the next thread.
+            SMP_INSTANCES_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(engine);
             return;
         }
@@ -2522,6 +2640,34 @@ impl BrowserEngine {
     /// The instance comes from the POOL when a finished thread has left one there, and is
     /// instantiated only when the pool is empty. A pooled instance was reset by the module
     /// itself on release, so the two paths are indistinguishable to the guest.
+    /// Build ONE instance into the pool if it holds fewer than `target`, returning whether it
+    /// did. Called by an SMP worker that has nothing to run.
+    ///
+    /// >>> A THREAD'S FIRST RUN PAID 9-21 ms OF INSTANTIATION ON THE PHONE, AND A MOVIE DIED OF
+    /// >>> IT. MEASURED (DOA5 intro movie, SMP trace with `N m` spans, job 333): the player's
+    /// controller instance took 20.8 ms to build on w2, its audio decoder 9.6 ms and demuxer
+    /// 8.6 ms on w3 - synchronously, on the worker that first picked each thread, with the
+    /// pool empty (a title's long-lived threads never give an instance back). Behind those
+    /// two builds on w3 the movie's sound thread (the title's WORST priority) waited 29 ms for
+    /// its first wake, the player's 5 ms buffering check found its queues untouched, and it
+    /// entered "Buffering mode" for ever: a black screen from the movie on. A pooled instance
+    /// is 10-35 us. On a Vita a thread starts in microseconds; a reserve is how this engine
+    /// says the same. `VITASLOP_BROWSER_INSTANCE_RESERVE` is the depth (default 2, 0 = none).
+    pub(crate) fn stock_reserve(&self, target: usize) -> Result<bool, JsValue> {
+        if self.pool.borrow().len() >= target {
+            return Ok(false);
+        }
+        let t0 = js_sys::Date::now();
+        let e = self.new_instance()?;
+        let us = ((js_sys::Date::now() - t0) * 1000.0) as u64;
+        SMP_INSTANCES_NEW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SMP_INSTANCES_NEW_US.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+        SMP_INSTANCES_NEW_MAX_US.fetch_max(us, std::sync::atomic::Ordering::Relaxed);
+        SMP_INSTANCES_RESERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pool.borrow_mut().push(e);
+        Ok(true)
+    }
+
     pub(crate) fn make_thread(
         &self,
         thid: i32,
@@ -2536,9 +2682,18 @@ impl BrowserEngine {
         let mut engine = match self.pool.borrow_mut().pop() {
             Some(e) => {
                 hostcalls::note_instance_reused();
+                SMP_INSTANCES_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 e
             }
-            None => self.new_instance()?,
+            None => {
+                let t0 = js_sys::Date::now();
+                let e = self.new_instance()?;
+                let us = ((js_sys::Date::now() - t0) * 1000.0) as u64;
+                SMP_INSTANCES_NEW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                SMP_INSTANCES_NEW_US.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+                SMP_INSTANCES_NEW_MAX_US.fetch_max(us, std::sync::atomic::Ordering::Relaxed);
+                e
+            }
         };
         // Whoever built it, the instance is now this thread's: the import closure reports
         // the thread through this cell, and the register file is live again.
@@ -2567,13 +2722,29 @@ impl BrowserEngine {
         // One `promising` wrapper per entry, in load order. Per THREAD, not per instance:
         // a reused instance runs a different entry, and each wrapper is what allocates
         // the JSPI stack the entry runs on.
-        for &entry in entries {
-            let entry_fn =
-                Reflect::get(&engine.exports, &JsValue::from_str(&abi::func_export(entry & !1)))?
+        //
+        // Entered through the module's DISPATCHER, not a per-function export: the browser
+        // builds without those (see `vitaslop_transpiler::emit::set_function_exports` - every
+        // instance materialised a JS wrapper for each of ~43,000 of them, and they exhausted
+        // V8's process-wide pointer tables). `promising(dispatch)` is made once per instance
+        // and each entry binds its address to it; a bound call still starts a fresh stack.
+        let dispatch_p = match engine.dispatch_p.clone() {
+            Some(f) => f,
+            None => {
+                let dispatch = Reflect::get(&engine.exports, &JsValue::from_str(abi::DISPATCH_EXPORT))?
                     .dyn_into::<Function>()?;
-            engine.entries.push(
-                self.promising.call1(&JsValue::UNDEFINED, &entry_fn)?.dyn_into::<Function>()?,
-            );
+                let p = self.promising.call1(&JsValue::UNDEFINED, &dispatch)?.dyn_into::<Function>()?;
+                engine.dispatch_p = Some(p.clone());
+                *engine.dispatch_cell.borrow_mut() = Some(p.clone());
+                p
+            }
+        };
+        for &entry in entries {
+            engine.entries.push(dispatch_p.bind2(
+                &JsValue::UNDEFINED,
+                &JsValue::from(entry & !1),
+                &JsValue::from(0u32),
+            ).unchecked_into::<Function>());
         }
         engine.sp = sp;
         engine.r0 = r0;
@@ -2611,8 +2782,25 @@ impl BrowserEngine {
         // SMP only - see the fields of the same names on `ThreadEngine`.
         let forward: Rc<RefCell<Option<ForwardReq>>> = Rc::new(RefCell::new(None));
         let early: Rc<Cell<Option<(i32, usize, usize)>>> = Rc::new(Cell::new(None));
+        // A host call calling back into the title - see `guest_call_chain`. The dispatcher
+        // cell is filled by `make_thread`, the import cell just below once the closure exists.
+        let dispatch_cell: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
+        let reimport_cell: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
+        // SMP: set when a FORWARDED call came back asking for a guest call.
+        let forward_gc: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let gc_ctx = GuestCallCtx {
+            host: self.host.clone(),
+            rt_cell: rt_cell.clone(),
+            thid: thid_cell.clone(),
+            signal: signal.clone(),
+            abandoned: abandoned.clone(),
+            dispatch: dispatch_cell.clone(),
+            reimport: reimport_cell.clone(),
+        };
 
         let import_closure = {
+            let gc_ctx = gc_ctx.clone();
+            let forward_gc = forward_gc.clone();
             let host = self.host.clone();
             let rt_cell = rt_cell.clone();
             let signal = signal.clone();
@@ -2674,7 +2862,20 @@ impl BrowserEngine {
                         if held.is_none() {
                             *forward.borrow_mut() = Some(ForwardReq { selector: selector as u32, regs, vfp });
                             hostcalls::reset_quantum();
-                            return suspend(&signal, &cont, Stop::Blocked);
+                            let park: Promise = suspend(&signal, &cont, Stop::Blocked).unchecked_into();
+                            // The run worker may answer "call back into the title first"
+                            // (`SvcOutcome::CallGuest`): that runs here, on this thread's own
+                            // instance, once the park resolves - see `guest_call_chain`.
+                            let (gc, fgc) = (gc_ctx.clone(), forward_gc.clone());
+                            return wasm_bindgen_futures::future_to_promise(async move {
+                                JsFuture::from(park).await?;
+                                if fgc.replace(false) {
+                                    let chain: Promise = guest_call_chain(gc, selector).unchecked_into();
+                                    JsFuture::from(chain).await?;
+                                }
+                                Ok(JsValue::UNDEFINED)
+                            })
+                            .into();
                         }
                     }
                 // What the guest handed in, so the write-back can send back only what moved.
@@ -2795,14 +2996,23 @@ impl BrowserEngine {
                         suspend(&signal, &cont, Stop::Blocked)
                     }
                     SvcOutcome::Flip => suspend(&signal, &cont, Stop::Flip),
+                    // A library calling back into the title before it returns.
+                    SvcOutcome::CallGuest => guest_call_chain(gc_ctx.clone(), selector),
                     // The thread (or process) ends here: report the event and park on a
                     // never-resolving Promise (this stack is abandoned - on a thread exit
                     // the scheduler may still start the thread's next entry on a fresh
                     // stack; on a halt the run is over).
                     SvcOutcome::ThreadExit => {
-                        abandoned.set(true);
                         deliver(&signal, &Ev::ThreadExit(regs[0]));
-                        never()
+                        if exit_unwinds() {
+                            // UNWIND rather than park: the stack resumes into a throw that
+                            // runs no guest code, so the instance is idle again and its
+                            // thread's `release` POOLS it - see [`exit_unwinds`].
+                            Promise::reject(&JsValue::from_str(EXIT_UNWIND_SENTINEL)).into()
+                        } else {
+                            abandoned.set(true);
+                            never()
+                        }
                     }
                     SvcOutcome::Halt => {
                         abandoned.set(true);
@@ -2819,6 +3029,8 @@ impl BrowserEngine {
                 }
             }) as Box<dyn FnMut(i32) -> JsValue>)
         };
+        // Dropped with the closure (`ThreadEngine::_import`), which is what ends this cycle.
+        *reimport_cell.borrow_mut() = Some(import_closure.as_ref().unchecked_ref::<Function>().clone());
 
         // >>> THE NON-SUSPENDING TRAP: `env.import_fast`, a plain function.
         //
@@ -2895,6 +3107,7 @@ impl BrowserEngine {
                     SvcOutcome::Reschedule => (false, "Reschedule".to_string()),
                     SvcOutcome::Block => (false, "Block".to_string()),
                     SvcOutcome::Flip => (false, "Flip".to_string()),
+                    SvcOutcome::CallGuest => (false, "CallGuest".to_string()),
                     SvcOutcome::ThreadExit => (false, "ThreadExit".to_string()),
                     SvcOutcome::Halt => (false, "Halt".to_string()),
                 };
@@ -2947,13 +3160,23 @@ impl BrowserEngine {
                 // artifact was read as "the browser runs the module entry eleven times", and
                 // cost an afternoon before the replay was noticed. A raw console log is
                 // emitted once, in order, and the e2e harness captures it the same way.
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "[trace] frame={} t{:#x} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}                      r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x}                      r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x}",
+                // `at=` is the SMP trace clock (`smp::abs_ms`, one origin across workers), so a
+                // hit can be ordered against the `smptrace` spans of other threads. Without it
+                // two hits of one frame on two workers had no order: the DOA movie handshake was
+                // read as "main stored 2, then the sound thread read 1" with nothing to say
+                // which came first.
+                let line = format!(
+                    "[trace] frame={} t{:#x} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}                      r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x}                      r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x} at={:.3}",
                     vitaslop_runtime::sched::current_frame(),
                     thid_cell.get(),
                     regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6],
                     regs[7], regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14],
-                )));
+                    crate::smp::abs_ms(),
+                );
+                // Also kept for the diagnostics panel: a GUEST worker's console never leaves a
+                // phone, so a watchpoint or block trace armed there was otherwise unreadable.
+                vitaslop_runtime::call_table::note_trace_hit(&line);
+                web_sys::console::log_1(&JsValue::from_str(&line));
             }) as Box<dyn FnMut(i32)>))
         } else {
             None
@@ -3066,6 +3289,7 @@ impl BrowserEngine {
             work_read: None,
             arm_total: 0,
             exports,
+            dispatch_p: None,
             reset,
             thid: thid_cell,
             abandoned,
@@ -3073,6 +3297,8 @@ impl BrowserEngine {
             early,
             patch: None,
             smp_words,
+            dispatch_cell,
+            forward_gc,
         })
     }
 }
@@ -3106,6 +3332,99 @@ impl GuestEngine for BrowserEngine {
 
 /// Build the pending-Promise a suspended thread parks on, and signal the scheduler
 /// with the stop reason. Returned from the import closure so the guest stack suspends.
+/// What a host call that called back into the title needs to finish - see
+/// [`guest_call_chain`]. Every piece is per INSTANCE, cloned out of its import closure.
+#[derive(Clone)]
+struct GuestCallCtx {
+    host: Host,
+    rt_cell: Rc<RefCell<Option<Rc<ThreadRt>>>>,
+    thid: Rc<Cell<i32>>,
+    signal: Rc<RefCell<Option<Function>>>,
+    abandoned: Rc<Cell<bool>>,
+    /// `WebAssembly.promising` over the instance's dispatcher - set by `make_thread`.
+    dispatch: Rc<RefCell<Option<Function>>>,
+    /// The instance's own import closure, as a function: the host call is re-dispatched
+    /// through exactly the path the guest's own call took, forwarding included.
+    reimport: Rc<RefCell<Option<Function>>>,
+}
+
+/// >>> A HOST CALL THAT CALLS BACK INTO THE TITLE (`SvcOutcome::CallGuest`), ON THE BROWSER.
+///
+/// Returned to the guest's suspending import as the Promise its stack parks on. It then:
+/// runs the guest function on a NESTED JSPI stack of the same instance (a `promising` call of
+/// the dispatcher - guest code that blocks in it suspends that stack and reports to the
+/// scheduler through the same step channel as any other), puts the register file back,
+/// reports r0/r1 to the host, and dispatches the host call again through the instance's own
+/// import closure - which may ask for the next guest call (another chain, awaited here), park,
+/// forward, or finish. When it finishes the Promise resolves and the guest's stack resumes
+/// past its call, exactly as it would from any other park.
+fn guest_call_chain(g: GuestCallCtx, selector: i32) -> JsValue {
+    let fail = {
+        let (signal, abandoned) = (g.signal.clone(), g.abandoned.clone());
+        move |msg: String| {
+            abandoned.set(true);
+            deliver(&signal, &Ev::Error(msg));
+            never()
+        }
+    };
+    wasm_bindgen_futures::future_to_promise(async move {
+        let thid = g.thid.get();
+        let Some(rt) = g.rt_cell.borrow().as_ref().cloned() else {
+            return Ok(fail(format!("thread {thid:#x}: a guest call with no register file")));
+        };
+        let Some(call) = crate::smp::lock_host(&g.host).take_guest_call(thid) else {
+            return Ok(fail(format!(
+                "host call selector {selector} on thread {thid:#x} asked for a guest call and left none to run"
+            )));
+        };
+        let Some(dispatch) = g.dispatch.borrow().clone() else {
+            return Ok(fail("a guest call on an instance with no dispatcher".into()));
+        };
+        // The whole file, ARM and VFP lanes - `read_file` reads only the narrow set.
+        let saved: Vec<u32> = (0..FILE_LEN).map(|i| rt.read_reg(i)).collect();
+        let mut seeded: [u32; abi::REG_COUNT] = std::array::from_fn(|i| saved[i]);
+        {
+            let mut mem: &GuestMem = &rt.view;
+            call.seed(&mut seeded, &mut mem, rt.base);
+        }
+        for (i, &v) in seeded.iter().enumerate() {
+            if v != saved[i] {
+                rt.set_reg(i, v);
+            }
+        }
+        let nested = dispatch
+            .call2(&JsValue::UNDEFINED, &JsValue::from(call.entry & !1), &JsValue::from(0u32))
+            .map(|p| p.unchecked_into::<Promise>());
+        let ran = match nested {
+            Ok(p) => JsFuture::from(p).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = ran {
+            let msg = e.as_string().unwrap_or_else(|| format!("{e:?}"));
+            return Ok(fail(format!("thread {thid:#x}: guest call {:#010x} trapped: {msg}", call.entry)));
+        }
+        let (r0, r1) = (rt.read_reg(0), rt.read_reg(1));
+        for (i, &v) in saved.iter().enumerate() {
+            rt.set_reg(i, v);
+        }
+        {
+            let mem: &GuestMem = &rt.view;
+            let mut h = crate::smp::lock_host(&g.host);
+            h.set_current_thread(thid);
+            h.guest_call_returned(thid, r0, r1, &mem, rt.base);
+        }
+        let Some(reimport) = g.reimport.borrow().clone() else {
+            return Ok(fail("a guest call on an instance with no import closure".into()));
+        };
+        let v = reimport.call1(&JsValue::UNDEFINED, &JsValue::from(selector))?;
+        if let Some(p) = v.dyn_ref::<Promise>() {
+            JsFuture::from(p.clone()).await?;
+        }
+        Ok(JsValue::UNDEFINED)
+    })
+    .into()
+}
+
 fn suspend(
     signal: &Rc<RefCell<Option<Function>>>,
     cont: &Rc<RefCell<Option<Function>>>,
@@ -3209,6 +3528,28 @@ const IDLE_ROUNDS_PER_EVENT_LOOP_TURN: u64 = 64;
 /// title's thread count does.
 const OWED_TURN_MIN_MS: f64 = 2.0;
 
+/// What an exiting thread's stack is rejected with - see [`exit_unwinds`].
+const EXIT_UNWIND_SENTINEL: &str = "vitaslop: guest thread exit (stack unwound)";
+
+/// Whether a guest thread that EXITS through a host call (`sceKernelExitThread`,
+/// `sceKernelExitDeleteThread`) has its JSPI stack UNWOUND - resumed into a rejection that runs
+/// no guest code and propagates out of the entry - instead of parked forever on a promise that
+/// never settles. `VITASLOP_BROWSER_EXIT_UNWIND=0` is the arm back.
+///
+/// >>> A PARKED STACK CANNOT BE RESET, SO ITS INSTANCE WAS DROPPED, AND EVERY SPAWN BUILT A NEW
+/// ONE. MEASURED (desktop browser, SMP, a fighting title's character select): its job threads
+/// all leave through ExitDeleteThread, so `release` found every one "abandoned" and discarded
+/// the instance - 141 -> 784 instantiations in 850 frames, each slower than the last as V8
+/// carried hundreds of live instances (2 ms -> 315 ms; 39.7 s spent instantiating), with every
+/// guest worker idle behind each one: the select screen ran at ~8% speed. A thread that
+/// RETURNS from its entry was always pooled; this makes the exit path the same.
+fn exit_unwinds() -> bool {
+    thread_local! {
+        static ON: bool = !matches!(vitaslop_runtime::knobs::var("VITASLOP_BROWSER_EXIT_UNWIND").as_deref(), Ok("0"));
+    }
+    ON.with(|v| *v)
+}
+
 /// A Promise that never resolves - a finished thread's stack parks here forever (it is
 /// never resumed), the browser analog of a fiber that has returned.
 fn never() -> JsValue {
@@ -3306,6 +3647,11 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
             // file still holds the faulting thread's values.
             let rt_err = t.rt.clone();
             let on_err = Closure::once(Box::new(move |e: JsValue| {
+                // A thread that EXITED unwinds through here (see `exit_unwinds`): its exit was
+                // already delivered from the host call, so this rejection is not a trap.
+                if e.as_string().as_deref() == Some(EXIT_UNWIND_SENTINEL) {
+                    return;
+                }
                 let msg = e.as_string().unwrap_or_else(|| format!("{e:?}"));
                 let mut regs = String::from("
   guest registers AT THE TRAP:");
@@ -3329,6 +3675,35 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
                         "
   the guest block executing at the trap: {pc:#010x} (VITASLOP_TRACK_PC)"
                     ));
+                }
+                // >>> THE OBJECTS THE REGISTERS POINT AT, AT THE TRAP. A register dump says a
+                // loaded field was NULL; it cannot say whether the whole object around it was
+                // zeroed (freed, recycled, never built) or only that field - and those have
+                // different causes. MEASURED on the phone: Uncharted's job worker faulted on a
+                // job whose argument word read 0, with the job pointer still in r5 and no way to
+                // see the job. So every register that points into guest memory (sp and lr
+                // excluded, pc is 0) gets its 64 bytes printed, each address once.
+                let mut seen: Vec<u32> = Vec::new();
+                for i in 0..=12usize {
+                    let v = rt_err.read_reg(i) & !3;
+                    if v < 0x0010_0000 || seen.contains(&v) {
+                        continue;
+                    }
+                    seen.push(v);
+                    if let Some(w) = rt_err.words_at(v) {
+                        regs.push_str(&format!("
+  [r{i}={v:#010x}]"));
+                        for x in w {
+                            regs.push_str(&format!(" {x:08x}"));
+                        }
+                    }
+                }
+                if let Some(w) = rt_err.words_at(rt_err.read_reg(abi::SP)) {
+                    regs.push_str(&format!("
+  [sp={:#010x}]", rt_err.read_reg(abi::SP) & !3));
+                    for x in w {
+                        regs.push_str(&format!(" {x:08x}"));
+                    }
                 }
                 regs.push_str(
                     "
@@ -3356,6 +3731,7 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
             // it would over a call this worker had dispatched itself.
             if let Some(p) = t.patch.take() {
                 t.rt.write_file_changed(&p.before, &p.regs, &p.vfp);
+                t.forward_gc.set(p.guest_call);
             }
             // A timed wait that expired owes this thread a return code other than the
             // 0 it parked with (a WAIT_TIMEOUT); write it into r0 before the guest
@@ -3770,6 +4146,7 @@ impl BrowserSched {
         main_sp: u32,
         env: VitaEnv,
     ) -> Result<BrowserSched, JsValue> {
+        let main_prio = env.state.main_thread_priority();
         let (engine, host) =
             build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env)?;
         let main = engine.make_thread(
@@ -3780,7 +4157,7 @@ impl BrowserSched {
             0,
             0,
             main_sp,
-            vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
+            main_prio,
         )?;
         let core = SchedCore::new(engine, host.clone(), main);
         Ok(BrowserSched { core: Some(core), host, smp: None })
@@ -3803,6 +4180,7 @@ impl BrowserSched {
         main_sp: u32,
         env: VitaEnv,
     ) -> Result<BrowserSched, JsValue> {
+        let main_prio = env.state.main_thread_priority();
         let (engine, host) =
             build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env)?;
         let main = engine.make_thread(
@@ -3813,7 +4191,7 @@ impl BrowserSched {
             0,
             0,
             main_sp,
-            vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
+            main_prio,
         )?;
         let core = SchedCore::new(engine, host.clone(), main);
         Ok(BrowserSched { core: Some(core), host, smp: None })
@@ -4078,6 +4456,26 @@ impl BrowserEngine {
         (out, early)
     }
 
+    /// The SUBMIT half of a forwarded movie decode: dispatch the call on COPIES of its
+    /// registers with `avcdec::set_submit_only`, so the decoder has the unit while the caller
+    /// waits for its answer (`SmpRun::catch_up_movie_decoder`). The real dispatch follows and
+    /// only delivers. The pass reads guest memory and writes nothing the guest can see.
+    pub(crate) fn presubmit_forwarded(
+        &self,
+        thid: i32,
+        selector: u32,
+        regs: &[u32; abi::REG_COUNT],
+        vfp: &[u32; VFP_ARG_COUNT],
+    ) {
+        let mut mem: &GuestMem = &self.view;
+        let mut host = crate::smp::lock_host(&self.host);
+        host.set_current_thread(thid);
+        let (mut regs, mut vfp) = (*regs, *vfp);
+        vitaslop_runtime::vita::avcdec::set_submit_only(&mut host.state, true);
+        let _ = host.dispatch(selector, &mut regs, &mut vfp, &mut mem, self.base);
+        vitaslop_runtime::vita::avcdec::set_submit_only(&mut host.state, false);
+    }
+
     /// >>> A SYNC POINT'S RESOLVE-ONLY PARK, SETTLED ON THE GUEST'S OWN WORKER.
     ///
     /// `sceGxmFinish` (and a notification wait) hands its geometry to the resolver worker and
@@ -4151,15 +4549,25 @@ impl BrowserEngine {
     pub(crate) fn write_guest(&self, addr: u32, bytes: &[u8]) {
         self.view.write_at(addr.wrapping_sub(self.base) as usize, bytes);
     }
+
+    /// Compare-and-swap a guest word from outside a host call - see `GuestMemory::cas_u32`.
+    pub(crate) fn cas_guest(&self, addr: u32, expect: u32, new: u32) -> u32 {
+        let mut mem: &GuestMem = &self.view;
+        mem.cas_u32(addr.wrapping_sub(self.base) as usize, expect, new)
+    }
 }
 
 /// Guest address of each transpiled function, indexed by wasm function index minus
-/// `abi::IMPORT_FUNC_COUNT`. Recorded once, when the module is built.
-static FUNC_ADDRS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+/// `abi::IMPORT_FUNC_COUNT`. Recorded when the module is built, and REPLACED by a later build -
+/// the native twin (`vitaslop_native::threaded::record_function_addresses`) says why: a title
+/// that execs its real executable builds a second module, and a latch kept the launcher's.
+static FUNC_ADDRS: std::sync::RwLock<Vec<u32>> = std::sync::RwLock::new(Vec::new());
 
 /// Record the emitted module's function table so a trap backtrace can name guest code.
 pub fn record_function_addresses(addrs: Vec<u32>) {
-    let _ = FUNC_ADDRS.set(addrs);
+    if let Ok(mut g) = FUNC_ADDRS.write() {
+        *g = addrs;
+    }
 }
 
 /// Rewrite `wasm-function[N]` in a V8 stack to name the GUEST function it is.
@@ -4176,7 +4584,10 @@ pub fn record_function_addresses(addrs: Vec<u32>) {
 /// guest `0x81134030` and that the repeating frame is the INDIRECT-CALL DISPATCHER - i.e.
 /// a guest routine recursing through function pointers, which is a description of the bug.
 pub fn name_guest_frames(s: &str) -> String {
-    let Some(addrs) = FUNC_ADDRS.get() else { return s.to_string() };
+    let Ok(addrs) = FUNC_ADDRS.read() else { return s.to_string() };
+    if addrs.is_empty() {
+        return s.to_string();
+    }
     const MARK: &str = "wasm-function[";
     let mut out = String::with_capacity(s.len() + 32);
     let mut rest = s;

@@ -346,9 +346,16 @@ pub enum Op {
     /// truncating numeric cast, not a normalize. `bits` is the destination width (8, 16 or 32)
     /// and `signed` its signedness; the result is stored as the integer's two's-complement bit
     /// pattern in the destination lane, which is the same representation the integer groups
-    /// (VBW, the integer MADs) read and write. The normalized (`scale` set) and C10/O8 forms
-    /// stay blocked - they change the value by a factor this does not model.
-    PackToInt { bits: u8, signed: bool, src_half: bool },
+    /// (VBW, the integer MADs) read and write. The C10/O8 forms stay blocked.
+    ///
+    /// `norm` is the NORMALIZED form (`scale` set): the float is clamped to [-1, 1] (signed) or
+    /// [0, 1] and scaled to the integer's full range - `v * 127` for S8, `v * 65535` for U16 -
+    /// then rounded as the U8 normalized store rounds (`+ 0.5`, then truncated toward -inf), so
+    /// the whole normalized family agrees; the hardware's own tie rule is not established. The
+    /// NORMALIZED U8 form is [`Op::PackUnorm8`] instead, which the fx8 register view carries.
+    /// MEASURED need: a retail title's fragment programs packing F16 normals to S8 (26 pairs
+    /// dropped whole while it was blocked).
+    PackToInt { bits: u8, signed: bool, src_half: bool, norm: bool },
     /// VPCK converting a 16-BIT INTEGER source to a FLOAT destination with `scale` clear - the
     /// exact mirror of [`Op::PackToInt`], and the same truncating-cast reading: a widening
     /// integer-to-float convert changes no value, so there is nothing here to guess once the

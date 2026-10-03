@@ -19,6 +19,9 @@
       .say { color: #7fd0ff; font-weight: 600; } .ok { color: #6be38a; } .warn { color: #ffcc55; } .bad { color: #ff6b6b; }
       #log { font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; background: #12121b; border-radius: 6px; padding: 8px; max-height: 50vh; overflow: auto; }
       small { color: #8a8a99; }
+      #desk { font: 12px/1.35 system-ui, sans-serif; background: #10202c; border-left: 3px solid #7fd0ff; border-radius: 6px; padding: 4px 8px; margin: 4px 0; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+      #desk:empty { display: none; }
+      #desk .t { color: #8a8a99; font-weight: 400; }
     </style>
   </head>
   <body>
@@ -38,6 +41,7 @@
       <p><small>Leave this page open and in front, plugged in. Jobs are short (seconds, never more than 90 s each; a LIVE game run, shown above the log, up to 6 min)
         and come from the desktop. Backgrounding or locking pauses it; coming back resumes it - a job that was
         interrupted is simply run again.</small></p>
+      <div id="desk" class="say"></div>
       <div id="log"></div>
     </main>
     <script type="module" src="./runner.js"></script>

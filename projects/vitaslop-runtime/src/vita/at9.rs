@@ -346,9 +346,27 @@ pub(crate) struct At9Voice {
     /// "voice AUDIBLE" report. Separate from [`Self::heard`] because a voice that is mixed
     /// every grain at gain 0 and one that is never mixed look identical without it.
     heard_audible: bool,
+    /// `VITASLOP_NGS_VOICE_PEAKS=1` only: this voice's lifetime source peak, sum of squares and
+    /// sample count as mixed - see [`voice_peaks_enabled`].
+    life_peak: u16,
+    life_sumsq: f64,
+    life_samples: u64,
+    /// The source those three describe (`data_ptr`), so a voice handle reused for the next
+    /// sound starts a fresh row instead of accumulating every sound it ever played.
+    life_src: u32,
 }
 
 impl At9Voice {
+    /// The source kind as a static label, for the peak census.
+    fn kind_name(&self) -> &'static str {
+        match (self.kind, self.format) {
+            (SourceKind::At9, _) => "at9",
+            (SourceKind::Pcm, PcmFormat::Adpcm) => "adpcm",
+            (SourceKind::Pcm, _) => "pcm",
+            (SourceKind::None, _) => "none",
+        }
+    }
+
     /// Report, ONCE per distinct reason, why this voice will not be heard.
     ///
     /// Unconditional (WARN, no env gate) for the same reason a shader fallback is:
@@ -380,6 +398,10 @@ impl At9Voice {
         At9Voice {
             heard: false,
             heard_audible: false,
+            life_peak: 0,
+            life_sumsq: 0.0,
+            life_samples: 0,
+            life_src: 0,
             kind: SourceKind::None,
             data_ptr: 0,
             data_bytes: 0,
@@ -1701,6 +1723,33 @@ fn note_mix_grain(
 /// nothing and decoded in full, because its source has to advance or it would resume from a
 /// stale position. If most playing voices are inaudible, that is where the decode time is
 /// going and the trade is worth measuring; if they are all audible, the decoder itself is.
+/// `VITASLOP_NGS_VOICE_PEAKS=1`: keep every voice's lifetime source peak and RMS and report the
+/// loudest at exit (`mix_report`). Diagnostic - it walks every sample a second time, which the
+/// mix loop otherwise never does.
+///
+/// >>> WHO DRIVES THE MIX INTO THE CLAMP. One title's NGS mix peaked at 5.2x full scale with
+/// every applied gain at exactly 1.000 and no level, patch or port volume written anywhere -
+/// so the question is no longer "which attenuation is missing" but "which sources sum to it",
+/// and the first-grain peak the debug line carries cannot answer that.
+fn voice_peaks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VITASLOP_NGS_VOICE_PEAKS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `(source pointer, kind, source bytes) -> (peak, sum of squares, samples)`, latest per sound.
+#[allow(clippy::type_complexity)]
+static VOICE_PEAKS: std::sync::Mutex<Vec<((u32, &'static str, u32), (u16, f64, u64))>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn note_voice_peak(src: u32, kind: &'static str, bytes: u32, peak: u16, sumsq: f64, samples: u64) {
+    let mut g = VOICE_PEAKS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (src, kind, bytes);
+    match g.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, v)) => *v = (peak, sumsq, samples),
+        None => g.push((key, (peak, sumsq, samples))),
+    }
+}
+
 pub fn report_mix() {
     for line in mix_report() {
         tracing::info!(target: "vitaslop::perf", "{line}");
@@ -1831,6 +1880,22 @@ pub fn mix_report() -> Vec<String> {
         out.push(format!(
             "ngs adpcm: {idx_oor} HE-VAG block(s) named a predictor index past the 128-entry table and were decoded with index 0. The index is 8 bits across both header bytes, so a count here means the header reading is wrong, not that the title is odd."
         ));
+    }
+    // >>> AND, WHEN ASKED, THE LOUDEST SOURCES - see `voice_peaks_enabled`.
+    {
+        let mut g = VOICE_PEAKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !g.is_empty() {
+            g.sort_by(|a, b| (b.1 .1 / b.1 .2.max(1) as f64).total_cmp(&(a.1 .1 / a.1 .2.max(1) as f64)));
+            let rows: Vec<String> = g
+                .iter()
+                .take(16)
+                .map(|((h, k, bytes), (peak, sumsq, n))| {
+                    let rms = (sumsq / (*n).max(1) as f64).sqrt();
+                    format!("{h:#x} {k} {bytes}B peak {peak} rms {rms:.0} over {n}")
+                })
+                .collect();
+            out.push(format!("ngs voice peaks ({} source sets, loudest RMS first): {}", g.len(), rows.join("; ")));
+        }
     }
     // >>> AND THE VOICES THE TITLE IS HOLDING MUTED. See `At9Voice::take_level`.
     let unset = LEVEL_UNSET.load(Relaxed);
@@ -2354,6 +2419,17 @@ impl At9Bank {
             if !src.iter().any(|&s| s != 0) {
                 silent += 1;
             } else {
+                if voice_peaks_enabled() {
+                    if v.life_src != v.data_ptr {
+                        (v.life_src, v.life_peak, v.life_sumsq, v.life_samples) = (v.data_ptr, 0, 0.0, 0);
+                    }
+                    for &s in src {
+                        v.life_peak = v.life_peak.max(s.unsigned_abs());
+                        v.life_sumsq += f64::from(s) * f64::from(s);
+                    }
+                    v.life_samples += src.len() as u64;
+                    note_voice_peak(v.life_src, v.kind_name(), v.data_bytes, v.life_peak, v.life_sumsq, v.life_samples);
+                }
                 match (vc, port_channels) {
                     // >>> THE STEREO PORT TAKES THE PATCH MATRIX: a mono source reaches L and R
                     // through row 0's two cells, a stereo source's L and R each through their

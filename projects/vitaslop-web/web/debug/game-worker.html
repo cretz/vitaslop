@@ -29,7 +29,7 @@
       import { forwardInput } from "../worker-input.js";
       import { importTitle, isImported } from "../opfs.js";
       import { startAudio } from "../audio.js";
-      const canvas = document.getElementById("screen");
+      let canvas = document.getElementById("screen");
       const status = document.getElementById("status");
 
       // Driven by the Playwright harness (game-boot.mjs WORKER=1): fetch the container
@@ -138,6 +138,33 @@
           } else if (d.type === "error") {
             status.textContent = "worker error: " + d.message;
             console.error("[worker]", d.message);
+          } else if (d.type === "note" && d.text.startsWith("[exec] ")) {
+            // The title exec'd one of its own executables (`sceAppMgrLoadExec`): the process
+            // is replaced, so boot again with that as the main executable, on a fresh canvas
+            // (the old one was transferred) - the same restart the product page does.
+            const path = d.text.slice(7).trim();
+            console.log(`[exec] rebooting with ${path} as the main executable`);
+            // Close the title's files BEFORE the worker is torn down and the next boot opens
+            // them again - terminating alone leaves the nested storage worker's OPFS handles
+            // open, and the reboot died on "this title's files are still open in another
+            // worker" (30c). The product page's `stop` does the same; 3 s bounds a worker that
+            // cannot answer.
+            const w = worker;
+            const reboot = () => {
+              clearTimeout(timer);
+              w.terminate();
+              const next = canvas.cloneNode(false);
+              canvas.replaceWith(next);
+              canvas = next;
+              window.__boot(recipe, maxFrames, maxRounds, { ...(knobs || {}), VITASLOP_MAIN_EXEC: path }, titleId);
+            };
+            const timer = setTimeout(reboot, 3000);
+            w.addEventListener("message", (e) => e.data && e.data.type === "released" && reboot());
+            try {
+              w.postMessage({ type: "release" });
+            } catch {
+              reboot();
+            }
           }
         };
         // A worker that fails to START, or dies in a way it cannot report itself, would

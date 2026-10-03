@@ -563,6 +563,38 @@ mod tests {
         }
     }
 
+    /// Diagnostic: write the eboot's decrypted inner ELF to `VITASLOP_DUMP_DIR/eboot.elf`, so
+    /// the `disasm` example can read a title's code (it cannot read an encrypted SELF).
+    /// Needs VITASLOP_GAME_PKG + VITASLOP_GAME_WORK; nothing is written into the repo.
+    #[test]
+    #[ignore = "diagnostic: needs VITASLOP_GAME_PKG + VITASLOP_GAME_WORK + VITASLOP_DUMP_DIR"]
+    fn dump_eboot_elf() {
+        let (Some(pkg_path), Some(work_path), Some(out)) = (
+            std::env::var_os("VITASLOP_GAME_PKG"),
+            std::env::var_os("VITASLOP_GAME_WORK"),
+            std::env::var_os("VITASLOP_DUMP_DIR"),
+        ) else {
+            eprintln!("set VITASLOP_GAME_PKG, VITASLOP_GAME_WORK and VITASLOP_DUMP_DIR");
+            return;
+        };
+        let pkg = std::fs::read(pkg_path).expect("read pkg");
+        let work = std::fs::read(work_path).expect("read work.bin");
+        let pkgo = crate::ingest::pkg::Pkg::open(&pkg).expect("open");
+        let mut vfs = pkgo.extract().expect("extract");
+        vfs.insert("sce_sys/package/work.bin", work.clone());
+        use crate::ingest::{filesdb::FilesDb, pfs::PfsImage, rif::Rif, unicv::UnicvDb, self2elf::self2elf};
+        let fdb = FilesDb::parse(&vfs.read("sce_pfs/files.db").unwrap()).unwrap();
+        let ucv = UnicvDb::parse(&vfs.read("sce_pfs/unicv.db").unwrap()).unwrap();
+        let rif = Rif::parse(&work).unwrap();
+        let img = PfsImage::new(fdb, ucv).unwrap();
+        let crypto = crate::ingest::pfscrypt::GameData::from_klicensee(&rif.key);
+        let self_bytes = img.decrypt("eboot.bin", &vfs.read("eboot.bin").unwrap(), &rif.key, &crypto).unwrap();
+        let elf = self2elf(&self_bytes, &rif.key).expect("self2elf");
+        let path = std::path::Path::new(&out).join("eboot.elf");
+        std::fs::write(&path, &elf).expect("write eboot.elf");
+        eprintln!("wrote {} ({} bytes)", path.display(), elf.len());
+    }
+
     /// Diagnostic: dump the decrypted-but-still-SELF eboot head (the `SCE\0`
     /// container header) from a PFS dir dump, as a known-plaintext reference.
     #[test]

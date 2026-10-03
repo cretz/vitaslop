@@ -334,6 +334,7 @@ impl RetailGuest {
         env.state.audio_dec = Box::new(vitaslop_platform::audio_dec::AacFactory);
         env.state.set_alloc_base(linked.alloc_base);
         env.state.set_process_param(linked.process_param);
+        env.state.set_main_thread_request(linked.main_thread_request());
         env.state.set_modules(linked.loaded_modules.clone());
         env.state.set_tls_template(linked.tls_template);
         env.state.set_preemptive(true);
@@ -361,11 +362,18 @@ impl RetailGuest {
             println!("loaded: RUST HEAP before transpile - live {live} MB, peak {peak} MB");
         }
         vitaslop_platform::heap::reset_peak();
-        // `VITASLOP_HEAP_TRACE=<min MB>`: keep a backtrace for every live allocation of at
-        // least that size, and name the holders on every heap line - see `heap::trace_large`.
-        if let Some(mb) = std::env::var("VITASLOP_HEAP_TRACE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
-            vitaslop_platform::heap::trace_large(mb * 1024 * 1024);
-            println!("loaded: heap ledger armed - every live allocation of {mb} MB or more keeps its backtrace");
+        // `VITASLOP_HEAP_TRACE=<min MB>` (or `<min KB>K`): keep a backtrace for every live
+        // allocation of at least that size, and name the holders on every heap line - see
+        // `heap::trace_large`. KB because 1 MB named only 133 of Madden's 421 MB live in play.
+        if let Some(bytes) = std::env::var("VITASLOP_HEAP_TRACE").ok().and_then(|v| {
+            let v = v.trim();
+            match v.strip_suffix(['K', 'k']) {
+                Some(kb) => kb.parse::<usize>().ok().map(|kb| kb * 1024),
+                None => v.parse::<usize>().ok().map(|mb| mb * 1024 * 1024),
+            }
+        }) {
+            vitaslop_platform::heap::trace_large(bytes);
+            println!("loaded: heap ledger armed - every live allocation of {} KB or more keeps its backtrace", bytes / 1024);
         }
         // The compiled module is kept beside the game (see `vitaslop_native::compile_cache`), so
         // only the first boot after a build pays the transpile and the Cranelift compile.
@@ -1895,6 +1903,7 @@ pub fn headless_check(
             if !scenes.is_empty() {
                 frame_shape = (scenes.len(), scenes.iter().map(|s| s.draws.len()).sum());
                 let t = std::time::Instant::now();
+                r.set_presented(guest.current_presents());
                 let _ = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
                 writeback = r.rtt_writebacks();
@@ -1928,6 +1937,7 @@ pub fn headless_check(
             if !scenes.is_empty() {
                 vitaslop_runtime::capsule::maybe_write_frame(scenes, display.0, display.1, CLEAR, f as u64);
                 let t = std::time::Instant::now();
+                r.set_presented(guest.current_presents());
                 let fb = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
                 writeback = r.rtt_writebacks();
@@ -2201,6 +2211,11 @@ pub fn headless_check(
     );
     print!("{}", guest.idle_attribution());
     print!("{}", guest.blocked_threads());
+    // The CALL TABLE (`VITASLOP_CALL_TABLE=<from>-<to>`) was only ever printed by the browser's
+    // panel, so a native run that armed it collected the rows and printed nothing.
+    if vitaslop_runtime::call_table::spec().is_some() {
+        println!("headless: CALL TABLE\n{}", vitaslop_runtime::call_table::report());
+    }
     // AUDIO AGAINST THE CLOCK IT IS PACED ON. `sceAudioOutOutput` parks one grain of
     // VIRTUAL time, so this is 1.00 on a healthy path whatever the frame rate - and it stays
     // 1.00 when the CLOCK itself is wrong, which is why the period count above is the other
@@ -2240,6 +2255,12 @@ pub fn headless_check(
             "headless: movie delivery digest {:#018x} over {calls} calls ({au} access units, {pics} pictures). TWO RUNS OF ONE RECIPE MUST AGREE ON THIS.",
             vitaslop_runtime::vita::avcdec::delivery_digest(),
         );
+    }
+    // The movie's SOUND path, whether or not the title ever closed the file: a title that
+    // keeps its intro open for an attract loop never reaches `sceMp4CloseFile`, and that is
+    // the only other place this line is printed on the desktop.
+    if let Some(line) = vitaslop_runtime::vita::video::movie_audio_report() {
+        println!("headless: {line}");
     }
     // The emitted work counter against wasmtime's own metering, over the same intervals.
     // Both engines preempt on that counter and the game clock is billed from it, and

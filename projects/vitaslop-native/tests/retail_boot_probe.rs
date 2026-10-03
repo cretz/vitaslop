@@ -405,6 +405,7 @@ fn retail_boot_probe() {
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
+    env.state.set_main_thread_request(linked.main_thread_request());
     env.state.set_modules(linked.loaded_modules.clone());
     env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);

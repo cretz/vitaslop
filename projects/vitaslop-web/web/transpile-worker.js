@@ -62,12 +62,18 @@ self.onmessage = async (e) => {
     // emit settings and this host offset, is loaded instead of transpiled - and the game's files
     // are not even opened. `VITASLOP_TRANSPILE_CACHE=0` bypasses it (neither read nor written).
     const useCache = !!titleId && String((knobs || {}).VITASLOP_TRANSPILE_CACHE ?? "") !== "0";
+    // A process the title EXEC'd (`VITASLOP_MAIN_EXEC`) is a different program from the one its
+    // eboot boots, so it is cached under its own name - one namespace per executable, or the
+    // launcher and the game it execs would evict each other on every boot (a miss clears the
+    // namespace it looked in).
+    const mainExec = String((knobs || {}).VITASLOP_MAIN_EXEC ?? "").trim();
+    const variant = tcache.variantSuffix(mainExec);
     let name = null;
     let invalidated = "";
     if (useCache) {
       const tKey = performance.now();
       const build = await tcache.buildToken(SMP_BUNDLE ? "./pkg-threads/" : "./pkg/");
-      name = `${build}-${transpile_settings_key()}-${hostOff.toString(16)}`;
+      name = `${build}-${transpile_settings_key()}-${hostOff.toString(16)}${variant}`;
       const swept = await tcache.sweepOtherBuilds(build);
       const hit = await tcache.lookup(titleId, name);
       if (hit) {
@@ -90,7 +96,7 @@ self.onmessage = async (e) => {
       }
       // Invalidated or never made: whatever this title held goes BEFORE the transpile, so the
       // stale module's space is free for the new one.
-      const cleared = await tcache.clearTitle(titleId);
+      const cleared = await tcache.clearTitle(titleId, variant);
       invalidated = `${swept} module(s) from older builds and ${cleared} of this title's with other settings deleted`;
     }
 
@@ -122,10 +128,10 @@ self.onmessage = async (e) => {
           mirrorOff: built.mirrorOff,
           dirtyOff: built.dirtyOff,
           funcAddrs: Array.from(built.funcAddrs),
-        });
+        }, variant);
         built.split = `transpile cache MISS (${invalidated}), stored in ${Math.round(performance.now() - tStore)} ms; ${built.split}`;
       } catch (err) {
-        await tcache.clearTitle(titleId);
+        await tcache.clearTitle(titleId, variant);
         built.split = `transpile cache MISS, NOT stored (${err}); ${built.split}`;
       }
     }

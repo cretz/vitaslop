@@ -308,6 +308,14 @@ pub const SMP_PROF_SLOT_STRIDE: u32 = 16;
 pub const SMP_CLOCK64_SLOT: u32 = 8184;
 pub const SMP_RTC64_SLOT: u32 = 8186;
 
+/// SMP: the EXCLUSIVE-MONITOR VERSION TABLE - [`SMP_EXCL_VER_COUNT`] words from this host-mirror
+/// slot, the upper quarter of the one-page block, which nothing else uses. A successful `STREX`
+/// bumps the word its address hashes to (`(guest address >> 2) & (COUNT - 1)`), and a `STREX`
+/// succeeds only if that word still holds what the arming `LDREX` read - see
+/// `emit::emit_store_excl` for why a compare-and-swap of the VALUE alone is not ARM's monitor.
+pub const SMP_EXCL_VER_SLOT: u32 = 12288;
+pub const SMP_EXCL_VER_COUNT: u32 = 4096;
+
 /// SMP builds only: the exports of the per-instance thread words (`InlineOp::ThreadWord`)
 /// and the elided-yield run counter (`InlineOp::SmpDelayYield`), which the host sets before
 /// every resume.
@@ -401,7 +409,14 @@ pub const DISPATCH_MISS_NAME: &str = "dispatch_miss";
 /// WASM page size in bytes.
 pub const PAGE_SIZE: u32 = 65536;
 
-/// Exported name of the wasm function for the guest function at `addr`.
+/// Exported name of the module's own indirect dispatcher, `(i32 target) -> ()`: it finds
+/// the translated function for guest address `target` and calls it, exactly as an indirect
+/// branch in guest code does. Always exported. It is how a host that does not take the
+/// per-function exports ([`func_export`]) enters guest code - a thread's entry, a callback.
+pub const DISPATCH_EXPORT: &str = "dispatch";
+
+/// Exported name of the wasm function for the guest function at `addr`. Present only while
+/// `emit::function_exports()` is on - see there for why the browser turns it off.
 pub fn func_export(addr: u32) -> String {
     format!("f_{addr:x}")
 }

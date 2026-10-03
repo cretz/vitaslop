@@ -305,6 +305,25 @@ impl StagingBelt {
         }
     }
 
+    /// VITASLOP PATCH: destroy free chunks beyond `keep`, largest first, and return how many.
+    ///
+    /// The free list only ever grows, so one burst (a level load uploading far more than a
+    /// frame) leaves its high-water chunk count mapped and allocated for the life of the belt -
+    /// measured at ~147 MB in a browser run whose steady frame needs one or two chunks. A free
+    /// chunk is referenced by no command, so destroying it is always safe.
+    pub fn trim_free(&mut self, keep: usize) -> usize {
+        self.receive_chunks();
+        if self.free_chunks.len() <= keep {
+            return 0;
+        }
+        self.free_chunks.sort_by_key(|c| c.buffer.size());
+        let dropped = self.free_chunks.len() - keep;
+        for chunk in self.free_chunks.drain(keep..) {
+            chunk.buffer.destroy();
+        }
+        dropped
+    }
+
     /// Move all chunks that the GPU is done with (and are now mapped again)
     /// from `self.receiver` to `self.free_chunks`.
     fn receive_chunks(&mut self) {

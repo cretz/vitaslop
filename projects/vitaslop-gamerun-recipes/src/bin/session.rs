@@ -42,6 +42,14 @@ use vitaslop_runtime::Recipe;
 const POLL: Duration = Duration::from_millis(20);
 
 fn main() -> ExitCode {
+    // The recompiled-shader path, as every headless run uses it (`anyrun`, `frame-replay`):
+    // without it a `shot` drops every draw that carries the guest's own shaders, and a title
+    // that draws only through them (all retail 3D) shoots as a bare clear colour. Set it
+    // explicitly to 0 to see the fixed-function approximation.
+    if std::env::var_os("VITASLOP_GXP_LIVE").is_none() {
+        // SAFETY: single-threaded, before anything reads the environment.
+        unsafe { std::env::set_var("VITASLOP_GXP_LIVE", "1") };
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(vitaslop_runtime::knobs::log_filter()))
         .with_writer(std::io::stderr)

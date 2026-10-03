@@ -50,7 +50,7 @@
 use vitaslop_gxp_shader::gxpwrite::{self, ProgramSpec, VertexOutputs};
 use vitaslop_gxp_shader::interp::{self, RegFile};
 use vitaslop_gxp_shader::ir::{Bank, Op};
-use vitaslop_gxp_shader::usse::asm::{self, Dest, Src, MAD_F32_XY};
+use vitaslop_gxp_shader::usse::asm::{self, Dest, Src, MAD_F32_XYZ};
 use vitaslop_gxp_shader::wgsl::{
     wrap_compute_module_for, wrap_render_case_module_ramped, CASE_BANK_LANES, CASE_RAMP_DX,
     CASE_RAMP_DY, CASE_RAMP_LANE,
@@ -267,9 +267,9 @@ fn case_mad_write_mask() -> Case {
         false,
         Dest::new(Bank::Output, 0),
         [true, true, false, false],
-        Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XY),
-        Src::reg(Bank::SecondaryAttr, 0).swz(MAD_F32_XY),
-        Src::reg(Bank::SecondaryAttr, 2).swz(MAD_F32_XY),
+        Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XYZ),
+        Src::reg(Bank::SecondaryAttr, 0).swz(MAD_F32_XYZ),
+        Src::reg(Bank::SecondaryAttr, 2).swz(MAD_F32_XYZ),
     )
     .unwrap();
     // The combination the two published tables do not cover: lane 2 alone.
@@ -277,9 +277,9 @@ fn case_mad_write_mask() -> Case {
         false,
         Dest::new(Bank::Output, 0),
         [false, false, true, false],
-        Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XY),
-        Src::reg(Bank::SecondaryAttr, 0).swz(MAD_F32_XY),
-        Src::reg(Bank::SecondaryAttr, 2).swz(MAD_F32_XY),
+        Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XYZ),
+        Src::reg(Bank::SecondaryAttr, 0).swz(MAD_F32_XYZ),
+        Src::reg(Bank::SecondaryAttr, 2).swz(MAD_F32_XYZ),
     )
     .unwrap();
     Case {
@@ -287,10 +287,9 @@ fn case_mad_write_mask() -> Case {
         checks: "the mad's three mask bits are ONE per-lane bitmask: en=lane0, m32=lane1, m16=lane2",
         spec: vertex_spec(vec![base, lane2]),
         intent: |regs| {
-            // Both instructions carry the `xy` operand swizzle, so every channel reads either
-            // channel x or channel y of its source - channel c of the product is
-            // `pa[c & 1] * sa[c & 1] + sa[2 + (c & 1)]`.
-            let term = |c: usize| regs.pa[c & 1] * regs.sa[c & 1] + regs.sa[2 + (c & 1)];
+            // Both instructions carry the `xyzw` operand swizzle, so lane c reads register c of
+            // each source - channel c of the product is `pa[c] * sa[c] + sa[2 + c]`.
+            let term = |c: usize| regs.pa[c] * regs.sa[c] + regs.sa[2 + c];
             vec![
                 f32_lane(Bank::Output, 0, term(0)),
                 f32_lane(Bank::Output, 1, term(1)),

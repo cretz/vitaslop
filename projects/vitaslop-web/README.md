@@ -132,3 +132,7 @@ All of it is in the origin's private file system; nothing leaves the browser.
 - Presents through the shared pipeline in `vitaslop-platform`, the same one the
   native headless oracle uses, so a browser frame and a native frame are
   comparable by construction.
+- WebGPU objects live in the browser, not the wasm heap, so no Rust-side panel can
+  see them leak. `VITASLOP_GPU_CENSUS=1` makes the run worker (`gpu-census.js`)
+  count live buffers/textures/bind groups/pipelines and log live buffers by label
+  every 10 s - read that when the GPU or renderer process grows.

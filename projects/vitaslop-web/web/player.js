@@ -87,6 +87,8 @@ export function createPlayer({ onExit, onRestart }) {
   const buildStampNow = () =>
     `${runsThreads ? stamps.threads : stamps.single} (this run's bundle: ${runsThreads ? "pkg-threads" : "pkg"}; other: ${runsThreads ? stamps.single : stamps.threads})`;
   const notes = [];
+  /// The executable the last run `sceAppMgrLoadExec`'d, for the restart that boots it.
+  let execNext = null;
   let fatalText = "";
   let hiddenCount = 0;
   let hardPauses = 0;
@@ -515,6 +517,7 @@ export function createPlayer({ onExit, onRestart }) {
   // ----- start / stop -----
   async function start(m, eff, { fullscreen = false, onSetting } = {}) {
     if (running) stop();
+    await released;
     if (!fresh) {
       // The canvas was transferred to a previous run's worker and cannot be again, so
       // this run gets a new element in its place: same id and size, nothing drawn yet.
@@ -563,6 +566,10 @@ export function createPlayer({ onExit, onRestart }) {
     try {
       if (!(await isComplete(m.titleId))) throw new Error("this title's import is incomplete - remove it and import it again");
       const knobs = { ...(await runKnobs(settings)), ...linkKnobs() };
+      // A run the previous one exec'd into (see the `[exec] ` note below). Used once: a
+      // restart after it is a fresh process, which starts from the title's own eboot again.
+      if (execNext) knobs.VITASLOP_MAIN_EXEC = execNext;
+      execNext = null;
       window.__runKnobs = knobs;
       gamedata.setProfile(settings.profile);
 
@@ -624,8 +631,17 @@ export function createPlayer({ onExit, onRestart }) {
             // The first present is the moment the loading screen has nothing to say.
             if (/present|frame|fps/i.test(d.text)) $("loading").hidden = true;
           }
-        } else if (d.type === "note") note(d.text);
-        else if (d.type === "error") fatal("ERROR\n" + d.message);
+        } else if (d.type === "note") {
+          note(d.text);
+          // The title exec'd one of its own executables (`sceAppMgrLoadExec`): the process is
+          // replaced, so the emulator is rebooted with that one as the main executable - see
+          // vitaslop-web `with_main_exec`. Deferred a turn so this handler is not torn down
+          // from inside itself.
+          if (d.text.startsWith("[exec] ")) {
+            execNext = d.text.slice(7).trim();
+            setTimeout(restart, 0);
+          }
+        } else if (d.type === "error") fatal("ERROR\n" + d.message);
         else if (d.type === "panic") fatal("RUST PANIC\n" + d.message);
         else if (d.type === "setup") {
           note(`[setup] ${d.status}`);
@@ -706,8 +722,14 @@ export function createPlayer({ onExit, onRestart }) {
     const id = meta.titleId;
     const full = isFull();
     stop(false);
-    onRestart(id, full);
+    // After the old run has let go of the title's files: an exec reboot opens the SAME files,
+    // and opening them while the old worker's storage worker still held them failed with
+    // "this title's files are still open in another worker" (Uncharted, desktop page, 30b).
+    released.then(() => onRestart(id, full));
   }
+
+  /// Settles once the last stopped run's worker has closed the title's files (see `stop`).
+  let released = Promise.resolve();
 
   /// `exit` false keeps the player on screen for a restart that follows at once.
   function stop(exit = true) {
@@ -722,8 +744,24 @@ export function createPlayer({ onExit, onRestart }) {
       } catch {}
       const w = worker;
       worker = null;
-      // Give the flush a moment to land before the worker is torn down.
-      setTimeout(() => w.terminate(), 500);
+      // Close the title's files BEFORE the worker is torn down - terminating alone leaves the
+      // nested storage worker's OPFS handles open, and the next run of the same title cannot
+      // open them. The runner's `releaseAndTerminate` does the same. `release` queues behind
+      // the flush; 3 s is the bound on a worker that cannot answer.
+      released = new Promise((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          w.terminate();
+          resolve();
+        };
+        const timer = setTimeout(done, 3000);
+        w.addEventListener("message", (e) => e.data && e.data.type === "released" && done());
+        try {
+          w.postMessage({ type: "release" });
+        } catch {
+          done();
+        }
+      });
     }
     // Page-level listeners installed for this run come off with it. `document` and `window`
     // outlive a run, so anything left here is still live for the next game.
