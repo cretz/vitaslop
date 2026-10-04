@@ -1698,7 +1698,7 @@ fn attribute_order(
 ///
 /// # Why the attribute order was not enough
 /// [`attribute_order`] takes a passthrough program's outputs to sit in its inputs' PA order.
-/// That is a convention, and MLB's boot splash program refutes it: attributes position@PA0,
+/// That is a convention, and a baseball title's boot splash program refutes it: attributes position@PA0,
 /// `aUV`@PA4, `aColor`@PA8, and the code MOVES the colour to o4..o7 and the UV to o8..o9. The
 /// attribute order put TexCoord(0)@4 and Color0@6, so the fragment sampled at the COLOUR (1,1 -
 /// the texture's black corner block) and 1,400 frames of logos and the health warning were a
@@ -2365,7 +2365,7 @@ mod tests {
 
     #[test]
     fn the_prefetch_field_names_the_lookup_kind() {
-        // mlb's infield grass (`frag_843cda78`), descriptors 2..4 verbatim: a plain prefetch of
+        // a baseball title's infield grass (`frag_843cda78`), descriptors 2..4 verbatim: a plain prefetch of
         // unit 3 from TEXCOORD4 (field value 1), the PROJECTIVE prefetch of unit 4 -
         // `PlayerShadowsTarget` - from TEXCOORD0 (value 2), and a plain one of unit 5 (value 1).
         // A cube descriptor (value 3) from a gloss material, and the one value-5 descriptor in

@@ -159,8 +159,8 @@ fn whole_word_copy_source(instr: &Instr, prec: Prec) -> Option<&Operand> {
 /// lane. A full-precision MOVE breaks that: it copies a whole 32-bit word, and if the word held
 /// two halves it still holds two halves afterwards. The instruction is F32; the CONTENT is not.
 ///
-/// MEASURED, and it was the two loudest rows in the corpus remainder. `mk-corpus-roof__frag_86c41b20`
-/// and `mk-corpus4__frag_9125fc80` both ended with `Mov o[0].xy <- pa[0].xyxy` at full
+/// MEASURED, and it was the two loudest rows in the corpus remainder. `__frag_86c41b20`
+/// and `__frag_9125fc80` (a fighting title's) both ended with `Mov o[0].xy <- pa[0].xyxy` at full
 /// precision, over a `pa[0]` that eleven half-precision instructions had filled. Read as an f32
 /// the two sides were `-4.2865e37` against `+4.2699e37` - **4,227,955,712 ULP, the largest
 /// numbers in the whole differential**. The raw words were `0xfe00fe00` and `0x7e007e00`: every

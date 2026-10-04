@@ -903,8 +903,16 @@ const HALF_HELPERS_PORTABLE: &str = include_str!("f16rounding/portable.wgsl");
 /// It is a `select`, not an `if`: the helper is inlined at every half store (960 in one skinned
 /// vertex program), and a branch per store measured ~20% of that module's pipeline build in
 /// Chrome (0.89 s against 1.05-1.18 s) for the same result.
-/// The test is on the BIT PATTERN rather than on `abs(v)` so that a NaN - which no comparison
-/// answers usefully - falls through untouched instead of being clamped into a number.
+/// The test is two FLOAT comparisons on `abs(v)` - above 65504, at most the largest finite f32 -
+/// and both are false for a NaN, so a NaN falls through untouched instead of being clamped into
+/// a number, and an infinity (above every finite value) does too. It used to be the same test on
+/// the BIT PATTERN (`m > 0x477fe000 && m < 0x7f800000`), which is identical for every input -
+/// positive floats order as their bits - but the device's compiler does not see it that way.
+/// MEASURED on the phone (PowerVR, salted `pipeline-compile`, the three biggest golf modules):
+/// 584/555/502 ms with the bit test, 509/439/421 with the float one (-13..-21%), and
+/// `f16-helper-equiv` 0 mismatches over all 2^32 inputs on that device, NaN-lost 0. The upper
+/// bound is the largest FINITE f32 rather than infinity because WGSL rejects an infinite
+/// constant (`bitcast<f32>(0x7f800000u)` in a constant expression invalidates the module).
 ///
 /// >>> AND THE BITS COME OUT THROUGH `pack2x16float`, WHICH IS THE TRUNCATING BUILTIN THIS
 /// >>> WHOLE CHANGE EXISTS TO STOP USING. That is not a contradiction, it is the point: its
@@ -933,6 +941,36 @@ const HALF_HELPERS_PACK: &str = include_str!("f16rounding/pack.wgsl");
 /// All five are emitted together whenever any is called. WGSL has no dead-function warning and
 /// a backend drops what nothing calls, so splitting them per call site would buy nothing and
 /// would be five more ways for the text to disagree with itself.
+/// The f16 saturation test in the form this build uses - see [`crate::link::F16_FCMP_ARM`]. The
+/// `src/f16rounding` texts carry the CLAMP form (what the phone proved and what the browser
+/// ships): one finite test, and `clamp(v, -65504, 65504)`, which a finite value inside the range
+/// clamps to itself. With the arm off the two clamp lines go back to the BIT-pattern test.
+///
+/// >>> WHY `clamp` AND NOT `sign(v) * 65504` BEHIND TWO COMPARES. The phone's compiler pays for
+/// the saturation at every one of the ~250 f16 narrowings a skinned vertex program makes.
+/// MEASURED (PowerVR, salted `pipeline-compile`, the three largest golf-title modules, two runs
+/// each): the two-compare float form 333-355 ms, this form 277-297 ms (-17..-19%); the bit-test
+/// form it replaced was 13-21% dearer again. The saturation value by sign bit alone (`(bits &
+/// 0x80000000) | 0x477fe000`) was -12..-20%, so the `sign()` was most of it and the second compare
+/// the rest.
+pub fn f16_clamp_form(text: &str) -> std::borrow::Cow<'_, str> {
+    if crate::link::f16_fcmp_on() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.replace(
+            "  return select(v, clamp(v, -65504.0, 65504.0), abs(v) <= 3.40282346638528859812e+38f);",
+            "  let m = bitcast<u32>(v) & 0x7fffffffu;
+  return select(v, sign(v) * 65504.0, m > 0x477fe000u && m < 0x7f800000u);",
+        )
+        .replace(
+            "  let c = select(v, clamp(v, vec2<f32>(-65504.0), vec2<f32>(65504.0)), abs(v) <= vec2<f32>(3.40282346638528859812e+38f));",
+            "  let m = bitcast<vec2<u32>>(v) & vec2<u32>(0x7fffffffu);
+  let c = select(v, sign(v) * 65504.0, (m > vec2<u32>(0x477fe000u)) & (m < vec2<u32>(0x7f800000u)));",
+        ),
+    )
+}
+
 fn half_helper_text() -> (String, bool) {
     let (narrow, enable) = match (crate::link::arm(crate::link::F16_ROUND_ARM), native_f16()) {
         (Some("0"), _) => (HALF_HELPERS_PACK, false),
@@ -943,7 +981,7 @@ fn half_helper_text() -> (String, bool) {
         (_, true) => (HALF_HELPERS_NATIVE, true),
         (_, false) => (HALF_HELPERS_PORTABLE, false),
     };
-    (format!("{narrow}{HALF_HELPERS_COMMON}"), enable)
+    (format!("{}{HALF_HELPERS_COMMON}", f16_clamp_form(narrow)), enable)
 }
 
 /// Whether the module's store helpers are the NATIVE arm (`enable f16;` and the language's own
@@ -1190,7 +1228,7 @@ pub fn emit_body_marked(shader: &Shader) -> Result<String, EmitError> {
     // lane); the guard would wrongly reject those, so it applies to fragment programs only.
     //
     // >>> AND ONLY WHERE THE VALUE IS LIVE. The guard as first written refused on the read
-    // ALONE, and that is what dropped fifteen of Madden's twenty-one unrecompilable fragment
+    // ALONE, and that is what dropped fifteen of a football title's twenty-one unrecompilable fragment
     // blobs - a dropped pair means its mesh is ABSENT from the frame. MEASURED over every
     // captured corpus (`undefined_internal_reads_that_are_actually_live`): 57 fragment reads of
     // an unwritten internal lane, and **not one of them is live** - every single one is a
@@ -3518,8 +3556,8 @@ fn emit_instr(
         Op::Bitwise { kind, imm, lane_bits } => {
             emit_bitwise(s, instr, dest, kind, imm, lane_bits).ok_or_else(unmapped)
         }
-        Op::PackToInt { bits, signed, .. } => {
-            emit_pack_to_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
+        Op::PackToInt { bits, signed, norm, .. } => {
+            emit_pack_to_int(s, instr, dest, mask, bits, signed, norm).ok_or_else(unmapped)
         }
         Op::PackFromInt { bits, signed } => {
             emit_pack_from_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
@@ -3621,11 +3659,11 @@ fn block(stmts: &str, staged: bool) -> String {
 /// the stores are right there in [`Dest`] - moves a store past whatever sits between them, and
 /// what sits between them can be a READ of the same register: [`dest_aliases_source`] only
 /// looks four registers either side of the destination, and a repeated instruction reaches
-/// further than that. MEASURED: pairing structurally changed mlb's frame on 31% of its pixels.
+/// further than that. MEASURED: pairing structurally changed a baseball title's frame on 31% of its pixels.
 /// Adjacent lines cannot have anything between them, so there is nothing to move past.
 ///
 /// It is worth this care because a 16-bit program pays the pack/unpack emulation on EVERY
-/// fragment: mlb's world-family blend is 54 packs and 118 unpacks per evaluation over three
+/// fragment: that title's world-family blend is 54 packs and 118 unpacks per evaluation over three
 /// million samples a frame, which a desktop GPU shrugs off and a phone's does not
 /// [[phone-gpu-has-four-times-the-headroom]].
 fn fold_halves(stmts: &str) -> String {
@@ -3666,7 +3704,7 @@ fn fold_halves(stmts: &str) -> String {
 ///
 /// A 16-bit source operand reads one HALF of a register, so a four-channel instruction over
 /// two registers spells `unpack2x16float(pa[2])` four times for two distinct registers, and a
-/// three-source instruction spells each of its sources' registers four times over. mlb's
+/// three-source instruction spells each of its sources' registers four times over. A baseball title's
 /// world-family blend emits 118 unpacks per evaluation where 40-odd registers are read; the
 /// rest is the same call again. A desktop compiler folds them and the run never notices; the
 /// phone's does not, and this shader is three million fragments a frame
@@ -3841,10 +3879,13 @@ fn emit_pack_to_int(
     mask: [bool; 4],
     bits: u8,
     signed: bool,
+    norm: bool,
 ) -> Option<()> {
     let s1 = instr.srcs.first()?;
     let sp = Prec::src_of(instr);
     let lane_mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+    // The NORMALIZED form's scale: the integer's largest magnitude - see `Op::PackToInt::norm`.
+    let norm_scale = if signed { (1u64 << (bits - 1)) - 1 } else { (1u64 << bits) - 1 };
     for c in 0..4 {
         if !mask[c] {
             continue;
@@ -3853,10 +3894,11 @@ fn emit_pack_to_int(
         // `trunc` before the cast, not `i32()` alone: WGSL's float->int conversion truncates
         // toward zero already, but saying so keeps the rounding explicit next to the mask, and
         // the clamp keeps a NaN or a huge float from being an undefined conversion.
-        let conv = if signed {
-            format!("bitcast<u32>(i32(clamp(trunc({f}), -2147483000.0, 2147483000.0)))")
-        } else {
-            format!("u32(clamp(trunc({f}), 0.0, 4294967000.0))")
+        let conv = match (norm, signed) {
+            (true, true) => format!("bitcast<u32>(i32(floor(clamp({f}, -1.0, 1.0) * {norm_scale}.0 + 0.5)))"),
+            (true, false) => format!("u32(floor(clamp({f}, 0.0, 1.0) * {norm_scale}.0 + 0.5))"),
+            (false, true) => format!("bitcast<u32>(i32(clamp(trunc({f}), -2147483000.0, 2147483000.0)))"),
+            (false, false) => format!("u32(clamp(trunc({f}), 0.0, 4294967000.0))"),
         };
         let e = if lane_mask == u32::MAX { conv } else { format!("({conv} & {lane_mask:#x}u)") };
         // >>> A 16-BIT RESULT IS HALF A REGISTER, NOT A WHOLE ONE. Two lanes share one
@@ -4824,7 +4866,7 @@ fn emit_int_mad(
     //
     // >>> A CLEAR BIT IS THE LOW HALF, NOT THE WHOLE REGISTER. This is a 16x16 multiply, and
     // the two readings differ only where src1's high half is non-zero - which is exactly a
-    // PACKED PAIR, the case the select bit exists for. MEASURED (MLB, the pitcher's shadow
+    // PACKED PAIR, the case the select bit exists for. MEASURED (a baseball title, the pitcher's shadow
     // skinning, pairs 82529743a5ff9842 / 6faa30c99e818ce2, 2026-09-25): two bone indices packed
     // in one register, `pa[4] = 64 * (pa[3] >> 16) + base` for the high one and
     // `64 * pa[3] + base` for the low one - which added `64 * idx_hi << 16` to every low-bone
@@ -5655,7 +5697,7 @@ mod tests {
     }
 
     /// The other half of the guard: the same read, into a temporary nothing goes on to consume,
-    /// TRANSLATES. This is the shape that was dropping fifteen of Madden's fragment blobs - an
+    /// TRANSLATES. This is the shape that was dropping fifteen of a football title's fragment blobs - an
     /// F32 write of lane 0 followed by a narrower consumer whose second channel is thrown away -
     /// and refusing it removed the pair's whole mesh from the frame over a value no one reads.
     #[test]
@@ -6681,5 +6723,22 @@ mod tests {
             wrap_render_case_module_for(odd, ProgramKind::Fragment, &[], &units).expect("module");
         assert_eq!(rewrites.samples, 0, "an unparsed sample was counted as rewritten:\n{module}");
         assert!(module.contains("textureSample(t1, s1, someOtherCoord)"), "left alone:\n{module}");
+    }
+}
+
+#[cfg(test)]
+mod f16_fcmp_tests {
+    /// A NATIVE build keeps the bit-pattern saturation test - the oracle must not move - and the
+    /// swap back from the shipped float form must hit BOTH clamp lines, or one helper would
+    /// silently stay in the other form.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_native_build_emits_the_bit_test_clamp() {
+        for text in [super::HALF_HELPERS_NATIVE, include_str!("f16rounding/q2vec.wgsl")] {
+            assert!(text.contains("clamp(v, "), "the shipped source carries the clamp form");
+            let out = super::f16_clamp_form(text);
+            assert!(!out.contains("abs(v)"), "native must swap every float clamp back:\n{out}");
+            assert!(out.contains("0x477fe000u"), "{out}");
+        }
     }
 }

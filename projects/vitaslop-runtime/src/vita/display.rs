@@ -87,6 +87,18 @@ pub(super) fn wait_set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcO
     // already held that queueing thread to the panel's latch rate. Parking here as well
     // charges the title a SECOND display period for one frame - see
     // [`VitaState::take_present_since_wait`] for the 2.99x that measured.
+    // The latch of the buffer the last `sceDisplaySetFrameBuf` named, when there is one - see
+    // [`VitaState::take_frame_buf_latch`]. Only with NO buffer named since the last wait does
+    // the present-based rule below decide.
+    if let Some(latch) = st.take_frame_buf_latch() {
+        st.take_present_since_wait();
+        let park = latch.saturating_sub(st.now_us());
+        if park == 0 {
+            return SvcOutcome::Reschedule;
+        }
+        st.sleep_park(park);
+        return SvcOutcome::Block;
+    }
     let latched = st.take_present_since_wait();
     // Diagnostic (`RUST_LOG=vitaslop::display=trace`): WHO waited and whether the wait cost a
     // vblank. `present_since_wait` is ONE flag for every thread, so the first waiter after a
@@ -125,8 +137,20 @@ pub(super) fn wait_set_frame_buf_multi(ctx: &mut GuestCtx, st: &mut VitaState) -
     if vcount == 0 {
         return SvcOutcome::Reschedule;
     }
-    // `vcount` counts vblanks AFTER the latch. The latch itself has already happened when a
-    // present is outstanding (see [`wait_set_frame_buf`]), so only the remainder is a wait.
+    // `vcount` counts vblanks from the latch: the named buffer's own latch edge when there is
+    // one (see [`wait_set_frame_buf`]), then `vcount - 1` more.
+    if let Some(latch) = st.take_frame_buf_latch() {
+        st.take_present_since_wait();
+        let edge = latch.saturating_add((vcount as u64 - 1).saturating_mul(VBLANK_US));
+        let park = edge.saturating_sub(st.now_us());
+        if park == 0 {
+            return SvcOutcome::Reschedule;
+        }
+        st.sleep_park(park);
+        return SvcOutcome::Block;
+    }
+    // With no buffer named: the latch itself has already happened when a present is
+    // outstanding, so only the remainder is a wait.
     let after_latch = if st.take_present_since_wait() { vcount as u64 - 1 } else { vcount as u64 };
     if after_latch == 0 {
         return SvcOutcome::Reschedule;
@@ -260,6 +284,8 @@ fn report_geometry_once(pitch: u32, fmt: u32, w: u32, h: u32) {
 #[hostcall]
 pub(super) fn set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr, sync: i32) -> i32 {
     st.set_display_sync(sync as u32);
+    // SCE_DISPLAY_SETBUF_IMMEDIATE is 0; NEXTFRAME (1) latches at the next vblank.
+    st.note_set_frame_buf(sync == 0);
     let base = ctx.read_u32(param.addr() + 4);
     // >>> THE GEOMETRY THE GUEST DECLARES, reported once per distinct shape.
     //

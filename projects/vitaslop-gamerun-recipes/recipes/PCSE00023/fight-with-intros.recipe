@@ -1,0 +1,387 @@
+@title  PCSE00023 - reach the first fight WITHOUT skipping the pre-fight intros, then FIGHT
+@game   PCSE00023
+# fight-hard.recipe's front end, minus its f1850/f2000 cross presses: those cut Scorpion's
+# intro short and skipped Jax's entirely (round 1 was on screen by f2025), so no run ever
+# measured the intro frames. Here the VS screen and BOTH intros play out; the attack
+# inputs are fight-hard's, shifted by 400 frames to start once round 1 is live.
+0: @todo no @assert yet - this recipe is judged by its shots, so conformance has nothing
+0: @todo to check. A watched round timer or health value would give it one.
+0: @section boot
+200: cross
+212:
+350: cross
+362:
+500: cross
+512:
+650: cross
+662:
+800: cross
+812:
+950: cross
+962:
+1100: cross
+1112:
+1250: cross
+1262:
+1400: cross
+1412:
+1550: cross
+1562:
+1700: cross
+1712:
+2440: right square
+2450:
+2460: right triangle
+2470:
+2480: circle
+2490:
+2500: down square
+2510:
+2520: cross
+2530:
+2540: left triangle
+2550:
+2560: square
+2570:
+2580: triangle
+2590:
+2600: right square
+2610:
+2620: right triangle
+2630:
+2640: circle
+2650:
+2660: down square
+2670:
+2680: cross
+2690:
+2700: left triangle
+2710:
+2720: square
+2730:
+2740: l r
+2750:
+2760: triangle
+2770:
+2780: right square
+2790:
+2800: right triangle
+2810:
+2820: circle
+2830:
+2840: down square
+2850:
+2860: cross
+2870:
+2880: left triangle
+2890:
+2900: square
+2910:
+2920: triangle
+2930:
+2940: right square
+2950:
+2960: right triangle
+2970:
+2980: circle
+2990:
+3000: down square
+3010:
+3020: cross
+3030:
+3040: l r
+3050:
+3060: left triangle
+3070:
+3080: square
+3090:
+3100: triangle
+3110:
+3120: right square
+3130:
+3140: right triangle
+3150:
+3160: circle
+3170:
+3180: down square
+3190:
+3200: cross
+3210:
+3220: left triangle
+3230:
+3240: square
+3250:
+3260: triangle
+3270:
+3280: right square
+3290:
+3300: right triangle
+3310:
+3320: circle
+3330:
+3340: l r
+3350:
+3360: down square
+3370:
+3380: cross
+3390:
+3400: left triangle
+3410:
+3420: square
+3430:
+3440: triangle
+3450:
+3460: right square
+3470:
+3480: right triangle
+3490:
+3500: circle
+3510:
+3520: down square
+3530:
+3540: cross
+3550:
+3560: left triangle
+3570:
+3580: square
+3590:
+3600: triangle
+3610:
+3620: right square
+3630:
+3640: l r
+3650:
+3660: right triangle
+3670:
+3680: circle
+3690:
+3700: down square
+3710:
+3720: cross
+3730:
+3740: left triangle
+3750:
+3760: square
+3770:
+3780: triangle
+3790:
+3800: right square
+3810:
+3820: right triangle
+3830:
+3840: circle
+3850:
+3860: down square
+3870:
+3880: cross
+3890:
+3900: left triangle
+3910:
+3920: square
+3930:
+3940: l r
+3950:
+3960: triangle
+3970:
+3980: right square
+3990:
+4000: right triangle
+4010:
+4020: circle
+4030:
+4040: down square
+4050:
+4060: cross
+4070:
+4080: left triangle
+4090:
+4100: square
+4110:
+4120: triangle
+4130:
+4140: right square
+4150:
+4160: right triangle
+4170:
+4180: circle
+4190:
+4200: down square
+4210:
+4220: cross
+4230:
+4240: l r
+4250:
+4260: left triangle
+4270:
+4280: square
+4290:
+4300: triangle
+4310:
+4320: right square
+4330:
+4340: right triangle
+4350:
+4360: circle
+4370:
+4380: down square
+4390:
+4400: cross
+4410:
+4420: left triangle
+4430:
+4440: square
+4450:
+4460: triangle
+4470:
+4480: right square
+4490:
+4500: right triangle
+4510:
+4520: circle
+4530:
+4540: l r
+4550:
+4560: down square
+4570:
+4580: cross
+4590:
+4600: left triangle
+4610:
+4620: square
+4630:
+4640: triangle
+4650:
+4660: right square
+4670:
+4680: right triangle
+4690:
+4700: circle
+4710:
+4720: down square
+4730:
+4740: cross
+4750:
+4760: left triangle
+4770:
+4780: square
+4790:
+4800: triangle
+4810:
+4820: right square
+4830:
+4840: l r
+4850:
+4860: right triangle
+4870:
+4880: circle
+4890:
+4900: down square
+4910:
+4920: cross
+4930:
+4940: left triangle
+4950:
+4960: square
+4970:
+4980: triangle
+4990:
+5000: right square
+5010:
+5020: right triangle
+5030:
+5040: circle
+5050:
+5060: down square
+5070:
+5080: cross
+5090:
+5100: left triangle
+5110:
+5120: square
+5130:
+5140: l r
+5150:
+5160: triangle
+5170:
+5180: right square
+5190:
+5200: right triangle
+5210:
+5220: circle
+5230:
+5240: down square
+5250:
+5260: cross
+5270:
+5280: left triangle
+5290:
+5300: square
+5310:
+5320: triangle
+5330:
+5340: right square
+5350:
+5360: right triangle
+5370:
+5380: circle
+5390:
+5400: down square
+5410:
+5420: cross
+5430:
+5440: l r
+5450:
+5460: left triangle
+5470:
+5480: square
+5490:
+5500: triangle
+5510:
+5520: right square
+5530:
+5540: right triangle
+5550:
+5560: circle
+5570:
+5580: down square
+5590:
+5600: cross
+5610:
+5620: left triangle
+5630:
+5640: square
+5650:
+5660: triangle
+5670:
+5680: right square
+5690:
+5700: right triangle
+5710:
+5720: circle
+5730:
+5740: l r
+5750:
+5760: down square
+5770:
+5780: cross
+5790:
+5800: left triangle
+5810:
+5820: square
+5830:
+5840: triangle
+5850:
+5860: right square
+5870:
+5880: right triangle
+5890:
+5900: circle
+5910:
+5920: down square
+5930:
+5940: cross
+5950:
+5960: left triangle
+5970:
+5980: square
+5990:

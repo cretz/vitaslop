@@ -45,7 +45,7 @@ const features = process.env.PROFILE_SYMBOLS
 // run and transpile workers pick it from `?smp=1`, and `smp-worker.js` always uses it).
 //
 // WHY NOT ONE BUNDLE: the threads build costs the one-worker engine 5-8% of its frame
-// (MEASURED `ab25a`, desktop Chrome, same source: Madden 14.4 -> 15.0 ms, MK 6.3 -> 6.6, golf
+// (MEASURED `ab25a`, desktop Chrome, same source: football 14.4 -> 15.0 ms, fighting 6.3 -> 6.6, golf
 // 5.4 -> 5.9) - atomics in every lock, TLS through a global, glue that re-checks a shared
 // buffer. A run-time switch that taxed the deterministic default would not be a switch.
 //

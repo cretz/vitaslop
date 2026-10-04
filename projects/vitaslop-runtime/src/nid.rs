@@ -288,6 +288,10 @@ pub mod gxm {
     /// it is writing (programmable blending). Answered from the program itself - see
     /// `vita::gxm::program_is_frag_color_used`.
     pub const PROGRAM_IS_FRAG_COLOR_USED: u32 = 0x104F_23F4;
+    /// `sceGxmProgramIsDiscardUsed` - see `vita::gxm::program_is_discard_used`.
+    pub const PROGRAM_IS_DISCARD_USED: u32 = 0x029B_4F1C;
+    /// `sceGxmProgramIsDepthReplaceUsed` - see `vita::gxm::program_is_depth_replace_used`.
+    pub const PROGRAM_IS_DEPTH_REPLACE_USED: u32 = 0x8961_3EF2;
     /// The texture's minimum mip LEVEL, which unlike every other sampler field is split
     /// across control words 2 and 3 (`psp2/gxm.h`'s `lod_min0`/`lod_min1`).
     pub const TEXTURE_SET_LOD_MIN: u32 = 0xB79E_43DD;
@@ -1103,8 +1107,8 @@ pub mod services {
     /// and branches on the first two words - it is the FRAME FETCH. See
     /// `vita::video::mp4_get_next_unit` for the field map and what in it is inferred.
     pub const MP4_GET_NEXT_UNIT_8BE0E3D3: u32 = 0x8BE0_E3D3;
-    /// The same function under the NID DOA5 links - the henkaku wiki names it
-    /// `sceMp4GetStreamInfo` - and DOA5's consumer copies the result field for field
+    /// The same function under the NID a fighting title links - the henkaku wiki names it
+    /// `sceMp4GetStreamInfo` - and that title's consumer copies the result field for field
     /// exactly as the first title's does (+0x08/+0x0c -> +0x60/+0x64, +0x30 -> +0x78, the
     /// halfwords to +0x6e/+0x70, the bytes to +0x6c/+0x6d, +0x20 -> +0x20).
     pub const MP4_GET_STREAM_INFO: u32 = 0xD5B2_6179;
@@ -1132,6 +1136,26 @@ pub mod services {
     /// An unnamed SceNearUtil export the title imports ("near" is the offline-social
     /// app; present in no vita-headers revision). Serviced as an offline success.
     pub const NEAR_UTIL_UNKNOWN_A412E9CA: u32 = 0xA412_E9CA;
+    /// Another unnamed SceNearUtil export (an action title's near thread). Eight arguments; the
+    /// caller tests the result `> 0` and skips its handling otherwise - a count of near
+    /// results - so the offline answer is 0: nothing nearby.
+    pub const NEAR_UTIL_UNKNOWN_49A97D5F: u32 = 0x49A9_7D5F;
+    /// The REST of the unnamed SceNearUtil surface that title imports (13 in all, every call site
+    /// in one component, 0x81282162..0x81283870). The readable sites treat 0 / an untouched
+    /// out-parameter as "nothing": a status tested `== 1`, a loop that continues on non-zero, a
+    /// count tested `> 0`. With no Near peers anywhere, that IS the offline answer - the same
+    /// one [`NEAR_UTIL_UNKNOWN_A412E9CA`] already gives.
+    pub const NEAR_UTIL_UNKNOWN_1AA394BA: u32 = 0x1AA3_94BA;
+    pub const NEAR_UTIL_UNKNOWN_1AE3EC1C: u32 = 0x1AE3_EC1C;
+    pub const NEAR_UTIL_UNKNOWN_69EE6FB3: u32 = 0x69EE_6FB3;
+    pub const NEAR_UTIL_UNKNOWN_76C4807C: u32 = 0x76C4_807C;
+    pub const NEAR_UTIL_UNKNOWN_8095FDEF: u32 = 0x8095_FDEF;
+    pub const NEAR_UTIL_UNKNOWN_88540CEC: u32 = 0x8854_0CEC;
+    pub const NEAR_UTIL_UNKNOWN_9B3F2DCE: u32 = 0x9B3F_2DCE;
+    pub const NEAR_UTIL_UNKNOWN_9FB9277B: u32 = 0x9FB9_277B;
+    pub const NEAR_UTIL_UNKNOWN_BF2BBE1F: u32 = 0xBF2B_BE1F;
+    pub const NEAR_UTIL_UNKNOWN_CA742B97: u32 = 0xCA74_2B97;
+    pub const NEAR_UTIL_UNKNOWN_E608000B: u32 = 0xE608_000B;
     /// `sceRtcParseRFC3339(SceRtcTick *utc, const char *pszDateTime)`: the inverse of
     /// [`RTC_FORMAT_RFC3339_LOCAL_TIME`]. A real parse - see `vita::services::rtc_parse_rfc3339`.
     pub const RTC_PARSE_RFC3339: u32 = 0x2D18_AEEC;
@@ -1413,7 +1437,7 @@ pub mod sync {
     pub const CLEAR_EVENT_FLAG: u32 = 0x4CB8_7CA7;
     pub const DELETE_EVENT_FLAG: u32 = 0x5840_162C;
 
-    // --- SIMPLE EVENTS: create/delete/set/wait are dispatched since DOA5 CALLS them and its
+    // --- SIMPLE EVENTS: create/delete/set/wait are dispatched since a fighting title CALLS them and its
     // call sites pin the argument positions (see `vita::sync::create_simple_event`). The
     // history below is why the rest (open/close/poll/cancel) still are not. ---
     //
@@ -2497,6 +2521,18 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::IME_DIALOG_TERM => "sceImeDialogTerm",
         sv::NP_TROPHY_SETUP_DIALOG_GET_RESULT => "sceNpTrophySetupDialogGetResult",
         sv::NEAR_UTIL_UNKNOWN_A412E9CA => "SceNearUtil_A412E9CA",
+        sv::NEAR_UTIL_UNKNOWN_49A97D5F => "SceNearUtil_49A97D5F",
+        sv::NEAR_UTIL_UNKNOWN_1AA394BA => "SceNearUtil_1AA394BA",
+        sv::NEAR_UTIL_UNKNOWN_1AE3EC1C => "SceNearUtil_1AE3EC1C",
+        sv::NEAR_UTIL_UNKNOWN_69EE6FB3 => "SceNearUtil_69EE6FB3",
+        sv::NEAR_UTIL_UNKNOWN_76C4807C => "SceNearUtil_76C4807C",
+        sv::NEAR_UTIL_UNKNOWN_8095FDEF => "SceNearUtil_8095FDEF",
+        sv::NEAR_UTIL_UNKNOWN_88540CEC => "SceNearUtil_88540CEC",
+        sv::NEAR_UTIL_UNKNOWN_9B3F2DCE => "SceNearUtil_9B3F2DCE",
+        sv::NEAR_UTIL_UNKNOWN_9FB9277B => "SceNearUtil_9FB9277B",
+        sv::NEAR_UTIL_UNKNOWN_BF2BBE1F => "SceNearUtil_BF2BBE1F",
+        sv::NEAR_UTIL_UNKNOWN_CA742B97 => "SceNearUtil_CA742B97",
+        sv::NEAR_UTIL_UNKNOWN_E608000B => "SceNearUtil_E608000B",
 
         // --- kernel core -----------------------------------------------------
         s::SET_GPO => "sceKernelSetGPO",
@@ -2561,6 +2597,8 @@ pub fn name(func_nid: u32) -> &'static str {
         g::WAIT_EVENT => "sceGxmWaitEvent",
         g::SET_BACK_STENCIL_REF => "sceGxmSetBackStencilRef",
         g::PROGRAM_IS_FRAG_COLOR_USED => "sceGxmProgramIsFragColorUsed",
+        g::PROGRAM_IS_DISCARD_USED => "sceGxmProgramIsDiscardUsed",
+        g::PROGRAM_IS_DEPTH_REPLACE_USED => "sceGxmProgramIsDepthReplaceUsed",
         g::TEXTURE_SET_LOD_MIN => "sceGxmTextureSetLodMin",
         g::TEXTURE_GET_LOD_MIN => "sceGxmTextureGetLodMin",
         g::TEXTURE_SET_MIPMAP_COUNT => "sceGxmTextureSetMipmapCount",

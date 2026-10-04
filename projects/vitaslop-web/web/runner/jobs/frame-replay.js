@@ -13,7 +13,7 @@
 //   knobs?:    { NAME: "value" } on top of the live page's base knobs (below)
 // }
 // The LIVE page's base knobs are applied first: the renderer's defaults are NOT the product's,
-// and a replay without `VITASLOP_GXP_LIVE=1` drew MLB's frame through the fixed-function
+// and a replay without `VITASLOP_GXP_LIVE=1` drew a baseball title's frame through the fixed-function
 // fallback - a whole-screen white HUD draw - while the page it was meant to reproduce was right.
 const BASE_KNOBS = { VITASLOP_GXP_LIVE: "1", VITASLOP_FRAME_TOPUP: "0" };
 // Per prefix: a hash of the pixels, the mean colour, and a 16x9 grid of cell means - enough to

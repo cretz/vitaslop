@@ -152,7 +152,7 @@ pub fn base_knobs() -> BTreeMap<String, String> {
     // frame mean is 121,101,97 and with them it is 215,199,161 - the washed-out frame the user
     // is reporting from the device.
     //
-    // They do it by being SLOW. mlb drives its exposure from a light probe the renderer copies
+    // They do it by being SLOW. A baseball title drives its exposure from a light probe the renderer copies
     // back into guest memory asynchronously, and that loop is marginal: add a few hundred
     // microseconds a frame and the copies land late, the probe is read stale or unwritten, and
     // the auto-exposure pins itself. So a diagnostic armed by default here would have shipped

@@ -278,8 +278,8 @@ const DIALOG_STATUS_FINISHED: i32 = 2;
 ///
 /// # Why a dialog that finishes INSTANTLY is not faithful
 /// A console dialog is on screen for at least the frames it takes a person to press a
-/// button, and titles are written against that. MEASURED on a fighting title's boot
-/// (PCSE00235): its scene opens the autosave notice and, on the NEXT frame, waits to see
+/// button, and titles are written against that. MEASURED on a fighting title's boot:
+/// its scene opens the autosave notice and, on the NEXT frame, waits to see
 /// its dialog manager BUSY before advancing to the state that waits for the result. With
 /// instant completion the manager opened, saw FINISHED, closed and went idle inside the
 /// frame that opened it, so the scene never saw it busy and waited on a black screen

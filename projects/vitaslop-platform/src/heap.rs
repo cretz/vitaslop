@@ -146,10 +146,15 @@ mod ledger {
     }
 
     /// The workspace frames of a backtrace, innermost first, up to six of them - the frames
-    /// of the allocator, of `alloc::` and of this module are noise on every trace.
+    /// of the allocator, of `alloc::` and of this module are noise on every trace. Led by the
+    /// innermost frame OUTSIDE the workspace and the standard library when one sits below the
+    /// first workspace frame (`[wgpu_core::...]`): a football title's largest holder read only
+    /// "194 MB in 1191 allocation(s): headless_check" - a dependency allocated it, and the
+    /// workspace frames alone could not say which.
     fn site_of(trace: &std::backtrace::Backtrace) -> String {
         let text = format!("{trace}");
         let mut frames = Vec::new();
+        let mut external: Option<String> = None;
         for line in text.lines() {
             let line = line.trim();
             // `N: symbol` lines carry the function; the `at file:line` lines follow them.
@@ -157,8 +162,21 @@ mod ledger {
                 continue;
             }
             let Some((_, sym)) = line.split_once(": ") else { continue };
-            if !sym.starts_with("vitaslop") || sym.contains("heap::") {
+            if sym.contains("heap::") {
                 continue;
+            }
+            if !sym.starts_with("vitaslop") && !sym.starts_with("<vitaslop") {
+                const NOISE: [&str; 8] =
+                    ["alloc::", "std::", "core::", "<alloc::", "<std::", "<core::", "__rust", "backtrace"];
+                if frames.is_empty() && external.is_none() && !NOISE.iter().any(|n| sym.starts_with(n)) {
+                    external = Some(format!("[{}]", sym.chars().take(96).collect::<String>()));
+                }
+                continue;
+            }
+            if frames.is_empty()
+                && let Some(ext) = external.take()
+            {
+                frames.push(ext);
             }
             let short: String = sym.chars().take(96).collect();
             frames.push(short);

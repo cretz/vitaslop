@@ -50,7 +50,7 @@
 use vitaslop_gxp_shader::gxpwrite::{self, ProgramSpec, VertexOutputs};
 use vitaslop_gxp_shader::interp::{self, RegFile};
 use vitaslop_gxp_shader::ir::{Bank, Op};
-use vitaslop_gxp_shader::usse::asm::{self, Dest, Src, MAD_F32_XY};
+use vitaslop_gxp_shader::usse::asm::{self, Dest, Src, MAD_F32_XYZ};
 use vitaslop_gxp_shader::wgsl::{
     wrap_compute_module_for, wrap_render_case_module_ramped, CASE_BANK_LANES, CASE_RAMP_DX,
     CASE_RAMP_DY, CASE_RAMP_LANE,
@@ -267,9 +267,9 @@ fn case_mad_write_mask() -> Case {
         false,
         Dest::new(Bank::Output, 0),
         [true, true, false, false],
-        Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XY),
-        Src::reg(Bank::SecondaryAttr, 0).swz(MAD_F32_XY),
-        Src::reg(Bank::SecondaryAttr, 2).swz(MAD_F32_XY),
+        Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XYZ),
+        Src::reg(Bank::SecondaryAttr, 0).swz(MAD_F32_XYZ),
+        Src::reg(Bank::SecondaryAttr, 2).swz(MAD_F32_XYZ),
     )
     .unwrap();
     // The combination the two published tables do not cover: lane 2 alone.
@@ -277,9 +277,9 @@ fn case_mad_write_mask() -> Case {
         false,
         Dest::new(Bank::Output, 0),
         [false, false, true, false],
-        Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XY),
-        Src::reg(Bank::SecondaryAttr, 0).swz(MAD_F32_XY),
-        Src::reg(Bank::SecondaryAttr, 2).swz(MAD_F32_XY),
+        Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XYZ),
+        Src::reg(Bank::SecondaryAttr, 0).swz(MAD_F32_XYZ),
+        Src::reg(Bank::SecondaryAttr, 2).swz(MAD_F32_XYZ),
     )
     .unwrap();
     Case {
@@ -287,10 +287,9 @@ fn case_mad_write_mask() -> Case {
         checks: "the mad's three mask bits are ONE per-lane bitmask: en=lane0, m32=lane1, m16=lane2",
         spec: vertex_spec(vec![base, lane2]),
         intent: |regs| {
-            // Both instructions carry the `xy` operand swizzle, so every channel reads either
-            // channel x or channel y of its source - channel c of the product is
-            // `pa[c & 1] * sa[c & 1] + sa[2 + (c & 1)]`.
-            let term = |c: usize| regs.pa[c & 1] * regs.sa[c & 1] + regs.sa[2 + (c & 1)];
+            // Both instructions carry the `xyzw` operand swizzle, so lane c reads register c of
+            // each source - channel c of the product is `pa[c] * sa[c] + sa[2 + c]`.
+            let term = |c: usize| regs.pa[c] * regs.sa[c] + regs.sa[2 + c];
             vec![
                 f32_lane(Bank::Output, 0, term(0)),
                 f32_lane(Bank::Output, 1, term(1)),
@@ -1430,7 +1429,7 @@ fn case_mem_load() -> Case {
 /// **A BUFFER DECLARED WITH SEMANTIC 1 IS AN OPEN ARRAY: A LOAD PAST ITS ONE DECLARED ELEMENT
 /// READS GUEST MEMORY, NOT ZERO.**
 ///
-/// A fighting title (PCSE00235) declares its skinning palette as ONE 48-byte bone under a
+/// A fighting title declares its skinning palette as ONE 48-byte bone under a
 /// semantic-1 uniform buffer and loads bone `n` at `pointer + n * 48`. Windowed at the declared
 /// 48 bytes, every bone past the first read zero, every skinned vertex collapsed onto the
 /// projection's translation, and its characters drew nothing. Here bone 5 (byte 240) is loaded
@@ -1460,7 +1459,7 @@ fn local_word(store: bool, off: u64, data_or_dest: u64) -> u64 {
 
 /// **LOCAL MEMORY: A STORE TAKES ITS DATA FROM SRC2, AND ONLY AN OFFSET'S LOW 16 BITS ADDRESS.**
 ///
-/// A fighting title (PCSE00235) builds its image-based lighting in a per-invocation scratch
+/// A fighting title builds its image-based lighting in a per-invocation scratch
 /// area: nine stores to offsets `0x00240000..0x00240020` (the upper half, 0x24, is the area's
 /// size, not a displacement) and a loop reading them back by computed index. Refused, the pass
 /// that lights every character never ran.
@@ -1487,7 +1486,7 @@ fn scalar30_word(op: u64, dest: u64, src: u64, comp: u64, dest_f16: bool, src_f1
 /// **A SCALAR `rcp`/`log` READS ITS SOURCE AT THE SOURCE'S OWN WIDTH, NOT THE DESTINATION'S.**
 ///
 /// Group 0x30 carries a data type for its destination AND one for its source. A fighting title
-/// (PCSE00235) clamps `dot(N,H)` at half precision and takes its `log` at full precision in one
+/// clamps `dot(N,H)` at half precision and takes its `log` at full precision in one
 /// word; read at the destination's width, the packed half became a tiny negative float, the
 /// log went NaN and every character rendered black.
 ///
@@ -1843,7 +1842,7 @@ fn case_imad() -> Case {
                 (1, b),
                 (2, d),
                 // src1_high CLEAR reads src1's LOW half (sign-extended when signed), not the
-                // whole register: MEASURED on MLB's shadow skinning, where two bone indices share
+                // whole register: MEASURED on a baseball title's shadow skinning, where two bone indices share
                 // one register (`wgsl::emit_int_mad`). This case predated that and expected the
                 // whole-register read; `VITASLOP_GXP_IMAD_SRC1_WHOLE=1` is still that reading.
                 (4, lo_u.wrapping_mul(b & 0xffff).wrapping_add(d)),
@@ -2098,7 +2097,7 @@ fn case_pack_to_int() -> Case {
 }
 
 // ---------------------------------------------------------------------------------------
-// THE MADDEN GROUP. Each of these is a shape a football title's stadium actually draws, and
+// THE FOOTBALL GROUP. Each of these is a shape a football title's stadium actually draws, and
 // each was a defect that took a session of title-level debugging to name. They are here so
 // the next regression costs five milliseconds instead.
 // ---------------------------------------------------------------------------------------
@@ -2544,7 +2543,7 @@ fn case_repeating_dot_is_a_matrix_transform() -> Case {
 /// **A REPEATING DOT WITH BITS 47 AND 48 SET STEPS ITS VECTOR SOURCE BY THE SMLSI's SRC1 BYTE,
 /// TWO REGISTERS A UNIT.**
 ///
-/// mlb's crowd-people program runs a two-iteration 4-channel DOT over `InstanceMatrix3x4` under
+/// A baseball title's crowd-people program runs a two-iteration 4-channel DOT over `InstanceMatrix3x4` under
 /// `SMLSI [1,1,4,4]` and computes row 1 with a separate dot, so the repeat must read rows 0 and 2
 /// - eight registers apart. The intrinsic four read row 1 twice over; world z became a copy of
 /// world y and every crowd member rasterised as a diagonal line of dots.
@@ -2565,7 +2564,7 @@ fn case_bit47_dot_repeat_steps_by_the_smlsi() -> Case {
 
 /// **THE SAME RULE WALKS BACKWARDS: `SMLSI [1,1,-10,-10]` STEPS THE SOURCE MINUS TWENTY.**
 ///
-/// mk's skinning program pairs bone B's rows 0 and 1 this way (`Temp36` then `Temp16`), the
+/// A fighting title's skinning program pairs bone B's rows 0 and 1 this way (`Temp36` then `Temp16`), the
 /// pairing its own MADs use. A negative byte is a signed increment, and the pair scaling applies
 /// to it just the same.
 fn case_bit47_dot_repeat_steps_backwards() -> Case {
@@ -2607,8 +2606,8 @@ fn bit47_dot_program(state: [vitaslop_gxp_shader::usse::decode::SmlsiSlot; 4], f
 
 /// **WITH BIT 48 CLEAR THE OTHER SOURCE WALKS: op1 HOLDS AND THE INTERNAL op2 STEPS ONE REGISTER.**
 ///
-/// mlb's `vert_84377374` loads `i1 = sa40`, `i2 = sa36` and repeats a DOT against `i1` twice -
-/// `(dot(pa8, sa40), dot(pa8, sa36))`, a planar UV projection; Madden has the same idiom as a
+/// A baseball title's `vert_84377374` loads `i1 = sa40`, `i2 = sa36` and repeats a DOT against `i1` twice -
+/// `(dot(pa8, sa40), dot(pa8, sa36))`, a planar UV projection; a football title has the same idiom as a
 /// four-row matrix (fragment) and a 3x3 transform (vertex). It is intrinsic: the SMLSI here is
 /// the crowd's `[1,1,4,4]`, under which the bit-48-set reading would jump op1 eight registers.
 ///
@@ -2667,7 +2666,7 @@ fn bit47_dot_intent(regs: &RegFile, rows: [usize; 2]) -> Vec<Lane> {
 /// where a doubled reading would name `sa[7]`).
 /// **A FOUR-LANE (GROUP 0x28) WORD READS ITS EXTENDED SWIZZLE TABLE: `op2i` ENTRY 21 IS `wzwz`.**
 ///
-/// The four-lane group has its own swizzle tables. A fighting title's (PCSE00235) fragment
+/// The four-lane group has its own swizzle tables. A fighting title's fragment
 /// program carries `0x2ce430d6d0d11388`, whose `op2i` names extended entry 5 - `wzwz` - and was
 /// refused while only the splats and identity were known; its pair's surfaces were missing.
 ///
@@ -3490,7 +3489,7 @@ fn write_every_conformance_case_for_the_gpu_runner() {
 ///
 /// `sceGxmShaderPatcherCreateFragmentProgram` takes a vertex program and builds the fragment's
 /// varying iteration from ITS output layout; the hardware then reads the bound vertex's output
-/// buffer at those lane positions. A fighting title (PCSE00235) binds its character fragment
+/// buffer at those lane positions. A fighting title binds its character fragment
 /// with a vertex program that declares neither TEXCOORD5 nor TEXCOORD9, both of which the
 /// fragment reads - linked by usage, every one of those draws was refused.
 ///

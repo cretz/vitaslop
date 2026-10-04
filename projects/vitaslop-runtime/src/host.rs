@@ -70,6 +70,16 @@ impl Ptr {
 pub trait GuestWords {
     fn word(&self, addr: u32) -> u32;
     fn set_word(&mut self, addr: u32, value: u32);
+    /// Store `new` at `addr` if it reads `expect`; return what it read. Atomic where guest
+    /// code on other workers can write the word concurrently - see
+    /// [`GuestMemory::cas_u32`]. The default is exact for a single-baton backing.
+    fn cas_word(&mut self, addr: u32, expect: u32, new: u32) -> u32 {
+        let cur = self.word(addr);
+        if cur == expect {
+            self.set_word(addr, new);
+        }
+        cur
+    }
 }
 
 pub trait GuestMemory {
@@ -129,6 +139,22 @@ pub trait GuestMemory {
     /// which for the browser means stamping the guest-store dirty map.
     fn write_u32(&mut self, off: usize, v: u32) {
         self.write(off, &v.to_le_bytes());
+    }
+
+    /// Compare-and-swap the little-endian u32 at rebased offset `off`: store `new` if it
+    /// reads `expect`, and return what it read either way.
+    ///
+    /// The default is a read and a conditional write, which is exact for a backing only one
+    /// guest thread touches at a time. A backing that guest code on OTHER workers writes
+    /// concurrently (the browser's parallel run) must make it one atomic operation - the
+    /// lightweight mutex's inline SMP form races the host on exactly this word (see
+    /// `vita::lwwork`). An overriding implementation owes `write`'s side effects on a store.
+    fn cas_u32(&mut self, off: usize, expect: u32, new: u32) -> u32 {
+        let cur = self.read_u32(off);
+        if cur == expect {
+            self.write_u32(off, new);
+        }
+        cur
     }
 
     /// Borrow `len` bytes at rebased offset `off` directly, without copying, if this
@@ -776,6 +802,18 @@ impl GuestWords for GuestCtx<'_> {
     fn set_word(&mut self, addr: u32, value: u32) {
         self.write_u32(addr, value);
     }
+    fn cas_word(&mut self, addr: u32, expect: u32, new: u32) -> u32 {
+        match self.offset(addr) {
+            Some(o) if o + 4 <= self.mem.len() => {
+                let cur = self.mem.cas_u32(o, expect, new);
+                if cur == expect {
+                    report_host_write(self, addr, 4, &new.to_le_bytes());
+                }
+                cur
+            }
+            _ => 0,
+        }
+    }
 }
 
 /// `VITASLOP_HOST_WRITE_WATCH=<hex addr>[,...]`: report every write a HOST CALL makes to one
@@ -1223,6 +1261,18 @@ pub const SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID: u32 = 0x8002_8021;
 /// `sceKernelSendSignal` to a thread whose last signal is still unconsumed (a latch of one).
 pub const SCE_KERNEL_ERROR_ALREADY_SENT: u32 = 0x8002_8121;
 
+/// Whether a fiber's backing thread runs at its runner's priority (the hardware: a fiber IS its
+/// runner) rather than [`DEFAULT_THREAD_PRIORITY`]. OFF by default; `VITASLOP_FIBER_RUNNER_PRIORITY=1`
+/// turns it on. MEASURED (phone job 532, with the SMP fiber-near arm `smp::fiber_near_on`
+/// also on): a fighting title's intro movie stalled again - main's fibers at main's 0x56 on main's worker outrank the
+/// movie player's threads (0x8e-0x96) that inherit the same core, and on a phone that runs guest
+/// code several times slower than a Vita they leave the demuxer too little time before the
+/// player's first buffering check. Faithful on paper, wrong on this CPU until the A/B says how.
+fn fiber_runner_priority() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::knobs::var("VITASLOP_FIBER_RUNNER_PRIORITY").as_deref().map(str::trim) == Ok("1"))
+}
+
 /// Resolve a `sceKernelCreateThread` priority argument to a concrete scheduler
 /// priority. Absolute user priorities (small numbers, ~0x40..0xBF) pass through;
 /// the relative range around [`SCE_KERNEL_DEFAULT_PRIORITY`] (e.g. the sentinel
@@ -1341,6 +1391,10 @@ struct SemaWaiter {
     thid: i32,
     need: i32,
     deadline: Option<u64>,
+    /// Clock and its sources `(clock, quanta, wall, idle)` when the wait began - so a wait that
+    /// TIMES OUT can say what produced the guest time it waited through. See
+    /// [`timed_out_waits`].
+    began: (u64, u64, u64, u64),
 }
 
 /// A thread parked in `sceKernelWaitEventFlag`: which flag, which thread, the bit
@@ -1405,13 +1459,78 @@ pub struct Reentry {
     pub priority: i32,
 }
 
+/// A guest function a host call runs on its CALLER's thread before it returns - see
+/// [`SvcOutcome::CallGuest`] and [`VitaState::call_guest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestCall {
+    /// The function, as the title handed it over (the Thumb bit is the engine's to clear).
+    pub entry: u32,
+    /// Its arguments in AAPCS order: the first four in r0..r3, the rest on the stack. A
+    /// 64-bit argument is passed as its two halves, already placed at the slot AAPCS gives
+    /// it (an even register pair, or an 8-byte-aligned stack slot).
+    pub args: Vec<u32>,
+}
+
+/// Bytes kept below the caller's stack pointer before a guest call's own frame starts.
+///
+/// The call is made from inside a library function the title called, and a real library
+/// has a frame of its own at that point; nothing reads this gap, it only keeps the callee's
+/// frame clear of anything the engine's call sequence might have left just under `sp`.
+const GUEST_CALL_GAP: u32 = 64;
+
+impl GuestCall {
+    /// Seed `regs` - the caller's register file, as the host call saw it - for this call:
+    /// r0..r3 from the arguments, the rest written to a fresh stack frame below the caller's
+    /// `sp` (8-byte aligned at the call, as AAPCS requires), `sp` pointed at it. Every other
+    /// register keeps the caller's value, which is what a call from inside a library
+    /// function leaves in them.
+    pub fn seed(&self, regs: &mut [u32; REG_COUNT], mem: &mut dyn GuestMemory, base: u32) {
+        for i in 0..4 {
+            regs[i] = self.args.get(i).copied().unwrap_or(0);
+        }
+        let stacked = self.args.len().saturating_sub(4) as u32;
+        let sp = (regs[SP].wrapping_sub(GUEST_CALL_GAP + stacked * 4)) & !7;
+        for (i, &w) in self.args.iter().skip(4).enumerate() {
+            let off = sp.wrapping_add(i as u32 * 4).wrapping_sub(base) as usize;
+            mem.write(off, &w.to_le_bytes());
+        }
+        regs[SP] = sp;
+    }
+}
+
+/// What a finished [`GuestCall`] left behind: its r0/r1 (r1 is the high half of a 64-bit
+/// return), and the bytes of the region the caller asked to have captured the moment the
+/// call returned - see [`VitaState::call_guest`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuestCallResult {
+    pub r0: u32,
+    pub r1: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// One host call in progress that is making guest calls: what they answered so far, and the
+/// one it is waiting on. See [`VitaState::call_guest`].
+#[derive(Default)]
+struct GuestCallFrame {
+    /// Each finished call WITH the call it answers - a replay hands a result back only to the
+    /// same call (see [`VitaState::call_guest`]).
+    results: Vec<(GuestCall, GuestCallResult)>,
+    /// How many of `results` the running replay has consumed.
+    cursor: usize,
+    /// The call asked for and not yet run, with the region to capture when it returns.
+    pending: Option<(GuestCall, Option<(u32, u32)>)>,
+    /// Set when the pending call has returned: the next dispatch on this thread is the
+    /// replay, and runs against this frame rather than pushing one.
+    resume: bool,
+}
+
 /// One open file descriptor: which path it refers to, the read/write cursor, and
 /// the access mode decoded from the open flags.
 /// >>> THE BOOT I/O JOURNAL - every guest file operation, in order, for the first [`CAP`] of
 /// them, ALWAYS ON.
 ///
 /// # Why
-/// 2026-09-26: MLB died at frame 328 on the PHONE, deterministically (two runs, identical
+/// 2026-09-26: a baseball title died at frame 328 on the PHONE, deterministically (two runs, identical
 /// registers), and booted on every desktop arm. The dump showed the guest's FIOS falling
 /// through for every `wadC:` path - the archive mount had failed - but not ONE of the file
 /// operations that mount made, so the only way forward left was knob arms on the device. A
@@ -3664,6 +3783,13 @@ fn wall_step_ms() -> f64 {
     })
 }
 
+/// `VITASLOP_IO_WALL_FLOOR` (default on): the wall-clock floor that advances the game clock
+/// advances the storage clock too - see `VitaState::wall_floor_tick`.
+fn io_wall_floor() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_IO_WALL_FLOOR").ok().as_deref() != Some("0"))
+}
+
 fn defer_window_bytes() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -3678,7 +3804,7 @@ fn defer_window_bytes() -> bool {
 /// of a scene - see [`defer_window_bytes`] for the golf bake that established that.
 ///
 /// >>> `slot` IS REFUTED AS A FIX FOR A MESH THAT RENDERS ONLY PART OF ITSELF, and the census
-/// >>> below is how. It was written for Madden, whose players render from the waist up: the
+/// >>> below is how. It was written for a football title, whose players render from the waist up: the
 /// reasoning was that a bone palette partly filled at the draw keeps zero rows, and a vertex
 /// weighted to a zero matrix collapses. The rule fires there in quantity - 631,134 of 3,290,724
 /// windows tested in one run are partly unwritten - and the frame is **bit-identical** to the
@@ -3686,7 +3812,7 @@ fn defer_window_bytes() -> bool {
 /// those rows are still zero at the guest's own GPU wait, and nothing fills them late.
 ///
 /// The same census carries the fact that sent this the wrong way: **`blank` fires ZERO times on
-/// this title**. The late-fill mechanism is entirely inert for Madden, so whatever empties its
+/// this title**. The late-fill mechanism is entirely inert for that title, so whatever empties its
 /// legs is not this path, and a reader should not spend a second run here.
 /// [[vitaslop-a-refuted-diagnosis-left-in-place-reads-as-a-finding]]
 #[derive(Clone, Copy, PartialEq)]
@@ -5207,7 +5333,7 @@ impl TextureSnapshots {
         // This function charges `DrawVertexGather`, but both of its callers sit OUTSIDE the
         // `DrawVertices` timer the non-instanced vertex path is wrapped in - so an instanced
         // draw's gather was billed to the child and to nothing above it. MEASURED in the browser
-        // on mlb, whose crowd is instanced: the gather read **1.06 ms/frame against its own
+        // on a baseball title, whose crowd is instanced: the gather read **1.06 ms/frame against its own
         // parent's 0.99**, which is impossible for a nested phase and is how much of that
         // subtree was unattributed.
         //
@@ -5782,7 +5908,7 @@ impl TextureSnapshots {
         // SAME bytes (a static mesh rebuilt every frame), and the path below allocated and
         // copied the whole buffer only to find that out and throw the copy away. The answer is
         // the same buffer either way; this just skips the allocation and the copy when it is.
-        // MLB moves ~4 MB/frame (desktop) - ~9 on a phone - through this read, on the game's
+        // A baseball title moves ~4 MB/frame (desktop) - ~9 on a phone - through this read, on the game's
         // render thread, which is the phone's critical path (ovl26b).
         if inplace_compare()
             && let Some(p) = self.vertex_entries.get(&(addr, len))
@@ -5830,7 +5956,7 @@ impl TextureSnapshots {
                 // recognised through THIS path - the single-stream snapshot path, which is most
                 // draws of most frames - was served from the index and then looked untouched to
                 // the very next eviction. So the index evicted exactly the entries it was
-                // answering from: MEASURED on one mlb run, **96,281 entries and 2,770 MB shed**,
+                // answering from: MEASURED on one baseball-title run, **96,281 entries and 2,770 MB shed**,
                 // ending at 485 entries against an 8,192 cap and 3 MB against a 64 MB budget,
                 // while ~95 draws a frame arrived in a fresh allocation whose bytes the
                 // renderer's packed cache still held. `VITASLOP_VERTEX_INTERN_USE=0` is the OFF
@@ -8307,6 +8433,9 @@ pub struct VitaState {
     /// Whether a frame has been presented since the last `sceDisplayWaitSetFrameBuf`.
     /// See [`VitaState::take_present_since_wait`].
     present_since_wait: bool,
+    /// The vblank edge the buffer named by the last `sceDisplaySetFrameBuf` latches on, until
+    /// a `sceDisplayWaitSetFrameBuf*` takes it - see [`Self::take_frame_buf_latch`].
+    frame_buf_latch_us: Option<u64>,
     /// The `sync` argument of the most recent `sceDisplaySetFrameBuf`, which is what
     /// decides whether a present waits for the scanout. See
     /// [`VitaState::set_display_sync`].
@@ -8361,7 +8490,7 @@ pub struct VitaState {
     program_blobs: FxHashMap<u32, std::sync::Arc<[u8]>>,
     /// The blend compiled into each fragment program's epilogue (`vitaslop_gxp_shader::rop_blend`),
     /// by header - a pure function of the blob `program_blobs` holds for that header, and cleared
-    /// with it. A title that re-creates its fragment programs every frame (Madden: ~46) paid a
+    /// with it. A title that re-creates its fragment programs every frame (a football title: ~46) paid a
     /// whole-shader parse and decode per create to re-derive the same answer.
     pub(crate) rop_blend_memo: FxHashMap<u32, Option<vitaslop_gxp_shader::RopBlend>>,
     /// Whether (and how) each VERTEX program's 0xE8 memory loads need guest-memory windows
@@ -8497,6 +8626,19 @@ pub struct VitaState {
     /// space rather than once per failure - see `vita::libkernel::mspace_alloc`.
     pub(crate) mspace_exhausted: std::collections::HashSet<u32>,
     pending_reentry: Option<Reentry>,
+    /// Host calls in progress that are calling back into the title, by thread, innermost
+    /// last - see [`Self::call_guest`]. A stack because the guest function a call runs may
+    /// itself make host calls that call back, and each needs a record of its own.
+    guest_call_frames: FxHashMap<i32, Vec<GuestCallFrame>>,
+    /// The frame the RUNNING dispatch records into and replays from, as an index into its
+    /// thread's stack; `None` until the handler first asks for a guest call. Set per
+    /// dispatch by [`Self::guest_call_begin`], under the host lock, so one field serves
+    /// every thread.
+    guest_call_active: Option<usize>,
+    /// The guest buffer a movie read through the title's file functions lands in when the
+    /// title gave the library no allocator - one for the run, allocated on first use. See
+    /// [`Self::mp4_io_scratch`].
+    mp4_io_scratch: u32,
     // Synchronization objects. Bring-up model: one thread of control (workers run
     // synchronously to completion), so nothing ever actually blocks; a semaphore's
     // count and an event flag's bit pattern are still tracked so their observable
@@ -8608,7 +8750,15 @@ pub struct VitaState {
     /// its return value can be applied when the delivery thread ends.
     kcb_threads: Vec<(i32, i32)>,
     pending_spawns: Vec<Reentry>,
+    /// Fiber threads and the REAL thread that first ran them: `(fiber thid, runner)`. A fiber
+    /// is not a thread on the hardware - it runs on its caller's core at its caller's priority -
+    /// so a multi-worker scheduler places the thread backing it beside that runner (see
+    /// [`Self::spawn_near`]).
+    spawn_near: Vec<(i32, i32)>,
     pending_wakes: Vec<i32>,
+    /// Threads released by a TIME passing (a timed wait expiring, a sleep ending) since the
+    /// scheduler last asked - see [`Self::take_timeout_wakes`].
+    timeout_wakes: Vec<i32>,
     /// `(woken, waker thid, source line)` per wake while [`Self::trace_wakes`] is on - who
     /// released whom, for the SMP timeline (a wake is drained by whichever worker gets there first).
     wake_causes: Vec<(i32, i32, u32)>,
@@ -8694,6 +8844,11 @@ pub struct VitaState {
     /// `sceKernelGetProcessParam`. libc's crt reads the `SceLibcParam` it points to
     /// for the heap configuration, so this must be a real address (0 would fault).
     process_param: u32,
+    /// What the title's `SceProcessParam` asks the MAIN thread to run at (see
+    /// `LinkedProgram::main_thread_request`): its priority and its CPU affinity mask (0 =
+    /// every user core). The main thread has no create record, so these stand in for one.
+    main_priority: i32,
+    main_affinity: i32,
     /// The modules in the linked image (from [`crate::link::LinkedProgram`]), which
     /// is what the kernel's module queries answer from. Set once before the run.
     modules: Vec<crate::link::LoadedModule>,
@@ -8819,7 +8974,7 @@ pub struct VitaState {
     /// >>> A FLIP MUST NOT WAIT FOR THE RESOLVER. The async flip resolve reads the frame's
     /// geometry on its own worker WITH this cache locked, starting the moment the flip queues
     /// it; the flip then reached `on_frame_boundary` - holding the SMP state lock AND the host
-    /// lock - and blocked on this mutex for the whole resolve. MEASURED on the phone at MLB's
+    /// lock - and blocked on this mutex for the whole resolve. MEASURED on the phone at a baseball title's
     /// at-bat: 7-11 ms per frame during which no guest thread ran, no idle clock step could be
     /// taken and the run worker could not even read the scheduler state (~9 of ~58 ms a frame).
     snaps_frames_pending: std::sync::atomic::AtomicU32,
@@ -9113,6 +9268,7 @@ impl VitaState {
             display_latches: std::collections::VecDeque::new(),
             display_queue_max_pending: 0,
             present_since_wait: false,
+            frame_buf_latch_us: None,
             flip_candidates: std::collections::HashSet::new(),
             exec_request: None,
             back_visibility: FxHashMap::default(),
@@ -9163,6 +9319,9 @@ impl VitaState {
             avcdec: crate::vita::avcdec::AvcdecState::default(),
             mspace_exhausted: std::collections::HashSet::new(),
             pending_reentry: None,
+            guest_call_frames: FxHashMap::default(),
+            guest_call_active: None,
+            mp4_io_scratch: 0,
             semaphores: Vec::new(),
             timers: Vec::new(),
             event_flags: Vec::new(),
@@ -9201,7 +9360,9 @@ impl VitaState {
             kcallbacks: Vec::new(),
             kcb_threads: Vec::new(),
             pending_spawns: Vec::new(),
+            spawn_near: Vec::new(),
             pending_wakes: Vec::new(),
+            timeout_wakes: Vec::new(),
             wake_causes: Vec::new(),
             trace_wakes: false,
             pending_stat_writes: Vec::new(),
@@ -9226,6 +9387,8 @@ impl VitaState {
             location: crate::vita::location::LocationState::default(),
             halt_on_terminate: false,
             process_param: 0,
+            main_priority: DEFAULT_THREAD_PRIORITY,
+            main_affinity: 0,
             modules: Vec::new(),
             tls_slots: Vec::new(),
             tls_template: (0, 0, 0),
@@ -9365,6 +9528,31 @@ impl VitaState {
     /// can hand it to libc. Set once before the run.
     pub fn set_process_param(&mut self, addr: u32) {
         self.process_param = addr;
+    }
+
+    /// Record what the title asks its main thread to run at
+    /// ([`crate::link::LinkedProgram::main_thread_request`]); `None` keeps the default. Set
+    /// once before the run, beside [`Self::set_process_param`]. Every scheduler starts the
+    /// main thread at [`Self::main_thread_priority`], and a thread the main thread creates
+    /// with mask 0 inherits [`Self::main_affinity`].
+    pub fn set_main_thread_request(&mut self, request: (Option<i32>, Option<i32>)) {
+        if let Some(p) = request.0 {
+            self.main_priority = p;
+        }
+        if let Some(m) = request.1 {
+            self.main_affinity = m;
+        }
+    }
+
+    /// The priority the main thread starts at - [`DEFAULT_THREAD_PRIORITY`] unless the title's
+    /// `SceProcessParam` names one.
+    pub fn main_thread_priority(&self) -> i32 {
+        self.main_priority
+    }
+
+    /// The main thread's CPU affinity mask (0 = every user core).
+    pub fn main_affinity(&self) -> i32 {
+        self.main_affinity
     }
 
     /// Record the linked image's modules so the kernel's module queries can answer
@@ -10198,6 +10386,16 @@ impl VitaState {
         std::mem::take(&mut self.pending_wakes)
     }
 
+    /// Take the threads that TIME released since the last call - a timed wait that expired or
+    /// a sleep that ended - as opposed to another thread's signal. A scheduler may let such a
+    /// thread yield to ones already waiting for the CPU: when the clock is pushed forward in
+    /// steps (the wall-clock floor), a short timed wait can expire as it begins, and a poller
+    /// that never actually waits starves every lower-priority thread on its core. On the
+    /// console a 1 ms wait hands the core over for 1 ms.
+    pub fn take_timeout_wakes(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.timeout_wakes)
+    }
+
     /// How many live thread records is so many that the guest must be in a retry loop.
     ///
     /// No real title holds thousands of threads at once; a title that reaches this is
@@ -10263,6 +10461,24 @@ impl VitaState {
         // scheduler comparison against it (and against the main thread's default)
         // is meaningful.
         let priority = resolve_priority(priority);
+        // >>> MASK 0 INHERITS THE CREATOR'S MASK (`SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT`:
+        // "Inherit calling thread affinity mask", vitasdk). It used to be stored as 0 and read
+        // as "any core", so a title that pins its main thread and lets its helpers inherit
+        // the pin had them scattered over every worker. MEASURED (phone, a fighting title,
+        // 10-02): main asks for core 0 (`SceProcessParam`) and creates its movie player's
+        // controller, decoders and demuxer with mask 0; spread over three workers the
+        // controller's buffering check ran BESIDE the demuxer and found its queues empty 9-17
+        // ms into playback, declared buffering and the movie never resumed (black screen); on
+        // one core, strict priority runs the demuxer (142) before the controller (149).
+        let cpu_affinity = if cpu_affinity == 0 {
+            if self.current == MAIN_THID {
+                self.main_affinity
+            } else {
+                self.threads.iter().find(|t| t.uid == self.current).map_or(0, |t| t.cpu_affinity)
+            }
+        } else {
+            cpu_affinity
+        };
         tracing::trace!(
             target: "vitaslop::thread",
             uid,
@@ -10323,6 +10539,12 @@ impl VitaState {
     /// "which thread am I" - `sceKernelGetThreadId`, `sceKernelGetTLSAddr` - has to ask
     /// this rather than the raw scheduler id, or a fiber-based job system sees a
     /// different worker identity (and a different TLS block) each time it switches.
+    /// The thread a newly spawned `thid` should be placed BESIDE, if any: a fiber's first real
+    /// runner (see `fiber_dispatch`). `None` for an ordinary thread.
+    pub fn spawn_near(&self, thid: i32) -> Option<i32> {
+        self.spawn_near.iter().rev().find(|(t, _)| *t == thid).map(|(_, r)| *r)
+    }
+
     pub fn logical_thread(&self, thid: i32) -> i32 {
         match self.fibers.iter().find(|f| f.thid == thid && f.started && !f.finalized) {
             Some(f) if f.runner != 0 => self.logical_thread(f.runner),
@@ -10417,10 +10639,32 @@ impl VitaState {
         if runner_tls != 0 {
             self.tls_bases.push((thid, runner_tls));
         }
+        // >>> A FIBER RUNS ON ITS RUNNER'S CORE AT ITS RUNNER'S PRIORITY - it is user-mode
+        // context switching inside that thread, not a thread of its own. The default priority
+        // here, and a placement anywhere, made every Run/Switch a CROSS-WORKER handoff under
+        // SMP. MEASURED (phone, a fighting title's fight, SMP trace job 528): main (prio 0x56,
+        // core 0) blocked in sceFiberRun 7.7 ms a frame while its fibers ran on another worker,
+        // the frame chain came to 27 ms and the title paced itself at 30 fps (60 on a Vita).
+        let logical_runner = self.logical_thread(runner);
+        let runner_priority = if fiber_runner_priority() {
+            self.threads
+                .iter()
+                .find(|t| t.uid == logical_runner)
+                .map_or(if logical_runner == MAIN_THID { self.main_priority } else { DEFAULT_THREAD_PRIORITY }, |t| t.priority)
+        } else {
+            DEFAULT_THREAD_PRIORITY
+        };
+        let runner_mask = self.thread_cpu_affinity(logical_runner);
         if let Some(t) = self.threads.iter_mut().find(|t| t.uid == thid) {
             t.started = true;
             t.stack_top = stack_top;
+            t.priority = runner_priority;
+            t.init_priority = runner_priority;
+            if runner_mask > 0 && fiber_runner_priority() {
+                t.cpu_affinity = runner_mask;
+            }
         }
+        self.spawn_near.push((thid, logical_runner));
         self.pending_spawns.push(Reentry {
             entry,
             // `void entry(SceUInt32 argOnInitialize, SceUInt32 argOnRun)`.
@@ -10430,7 +10674,7 @@ impl VitaState {
             r3: 0,
             stack_top,
             thid,
-            priority: DEFAULT_THREAD_PRIORITY,
+            priority: runner_priority,
         });
     }
 
@@ -10684,6 +10928,9 @@ impl VitaState {
     /// [`Self::set_thread_cpu_affinity`].
     pub fn thread_cpu_affinity(&self, thid: i32) -> i32 {
         let target = if thid == 0 { self.current } else { thid };
+        if target == MAIN_THID && !self.threads.iter().any(|t| t.uid == MAIN_THID) {
+            return if self.main_affinity == 0 { crate::vita::threadmgr::CPU_MASK_USER_ALL } else { self.main_affinity };
+        }
         match self.threads.iter().find(|t| t.uid == target) {
             // A thread created with 0 ("inherit") has never named a set, and the kernel
             // answers with the real one it may run on rather than the sentinel.
@@ -10698,7 +10945,7 @@ impl VitaState {
         self.threads
             .iter()
             .find(|t| t.uid == self.current)
-            .map_or(DEFAULT_THREAD_PRIORITY, |t| t.priority)
+            .map_or(if self.current == MAIN_THID { self.main_priority } else { DEFAULT_THREAD_PRIORITY }, |t| t.priority)
     }
 
     /// Start a thread. In the single-thread model this raises a *synchronous*
@@ -10717,7 +10964,7 @@ impl VitaState {
     /// Both used to be missing. The exit code of a thread's FIRST run was never cleared, so
     /// `sceKernelWaitThreadEnd` on every later run returned at once, while the thread was still
     /// going - and the next `sceKernelStartThread` then launched a second run of the SAME thread
-    /// on the SAME stack while the first was still using it. MEASURED on the phone (MLB, two
+    /// on the SAME stack while the first was still using it. MEASURED on the phone (a baseball title, two
     /// runs of ~30): a per-frame job worker (entry 0x8104ecfe) whose command cursor lives in its
     /// 12 KB stack frame read garbage commands and called a null handler - `GUEST FAULT` at
     /// f3978 and f4321, `pc=0`, callee-saved registers clobbered. The kernel keeps a started
@@ -10772,6 +11019,140 @@ impl VitaState {
     /// Take the pending thread-run request, if any (drained by the engine host).
     pub fn take_reentry(&mut self) -> Option<Reentry> {
         self.pending_reentry.take()
+    }
+
+    /// >>> CALL A GUEST FUNCTION FROM INSIDE A HOST CALL, ON THE CALLER'S THREAD.
+    ///
+    /// Returns the call's result when this dispatch has already had it run, and `None` when
+    /// it has not: the handler must then RETURN at once (any value - the register file is
+    /// restored for it) and the engine runs `call`, then dispatches the same host call
+    /// again. `capture` names a guest region `(addr, len)` to copy the moment the call
+    /// returns, into [`GuestCallResult::bytes`] - a read callback's buffer, which a later
+    /// call may reuse before the replay gets back to it.
+    ///
+    /// # The replay contract
+    /// A dispatch that makes N guest calls runs N+1 times, each run answering one more call
+    /// from the record. So up to its LAST guest call a handler must be a pure function of
+    /// its arguments, the guest memory it reads and the results it is handed: anything it
+    /// changes before then (host state, guest memory, a counter) happens once per replay.
+    /// Do the reading first and the changing after - which is also the order a library
+    /// that can fail half-way has to keep anyway.
+    ///
+    /// # Why replay, and not a suspended host function
+    /// A host call holds `&mut VitaState` for its whole run, and the guest function it waits
+    /// on makes host calls of its own, which need the same state - so the handler cannot be
+    /// suspended mid-body holding it. Re-running it is the one shape that needs no second
+    /// copy of the state and no unsafe aliasing, and every engine can drive it: native nests a
+    /// wasm call, the browser nests a JSPI stack.
+    pub fn call_guest(&mut self, call: GuestCall, capture: Option<(u32, u32)>) -> Option<GuestCallResult> {
+        let thid = self.current;
+        let frames = self.guest_call_frames.entry(thid).or_default();
+        let idx = match self.guest_call_active {
+            Some(i) => i,
+            None => {
+                frames.push(GuestCallFrame::default());
+                let i = frames.len() - 1;
+                self.guest_call_active = Some(i);
+                i
+            }
+        };
+        let frame = &mut frames[idx];
+        // >>> A RESULT GOES BACK ONLY TO THE CALL IT ANSWERS, NOT TO WHOEVER ASKS NEXT.
+        //
+        // The replay is positional when the handler repeats itself exactly - but a handler may
+        // NOT repeat itself: one that caches what an earlier pass read skips that read on the
+        // next pass, and the call after it would then be handed the SKIPPED call's result.
+        // MEASURED on a fighting title's intro movie: the audio look-ahead reads several samples per call,
+        // the first was served from the read cache on the replay, and the second sample
+        // received the first one's bytes - corrupt units, 4 decodes, a black silent movie.
+        if frame.cursor < frame.results.len() && frame.results[frame.cursor].0 == call {
+            frame.cursor += 1;
+            return Some(frame.results[frame.cursor - 1].1.clone());
+        }
+        if let Some((_, r)) = frame.results.iter().find(|(c, _)| *c == call) {
+            return Some(r.clone());
+        }
+        frame.pending = Some((call, capture));
+        None
+    }
+
+    /// The engine's movie I/O buffer in guest memory (`size` bytes, the first request fixes
+    /// it): where a title's read function puts a movie's bytes when the title gave SceMp4
+    /// no allocator of its own. One per run - the heap it comes from is a bump allocator
+    /// with no free, and only one movie is open at a time.
+    pub(crate) fn mp4_io_scratch(&mut self, size: u32) -> u32 {
+        if self.mp4_io_scratch == 0 {
+            self.mp4_io_scratch = self.galloc(size, 64);
+        }
+        self.mp4_io_scratch
+    }
+
+    /// Whether the running dispatch has asked for a guest call it does not have yet - a
+    /// helper deep in a handler returns a neutral value, and the handler checks this before
+    /// reading that value as a failure.
+    pub fn guest_call_pending(&self) -> bool {
+        let Some(i) = self.guest_call_active else { return false };
+        self.guest_call_frames
+            .get(&self.current)
+            .and_then(|f| f.get(i))
+            .is_some_and(|f| f.pending.is_some())
+    }
+
+    /// Before a dispatch: pick the record it replays against - the innermost frame of this
+    /// thread when that frame's call has just returned, none otherwise (a new call, or a host
+    /// call the guest function itself is making).
+    pub(crate) fn guest_call_begin(&mut self) {
+        self.guest_call_active = None;
+        if self.guest_call_frames.is_empty() {
+            return;
+        }
+        if let Some(frames) = self.guest_call_frames.get_mut(&self.current)
+            && let Some(top) = frames.last_mut()
+            && top.resume
+        {
+            top.resume = false;
+            top.cursor = 0;
+            self.guest_call_active = Some(frames.len() - 1);
+        }
+    }
+
+    /// After a dispatch: whether it is waiting on a guest call ([`SvcOutcome::CallGuest`]).
+    /// A dispatch that finished drops its record.
+    pub(crate) fn guest_call_end(&mut self) -> bool {
+        let Some(idx) = self.guest_call_active.take() else { return false };
+        let thid = self.current;
+        let Some(frames) = self.guest_call_frames.get_mut(&thid) else { return false };
+        if frames.get(idx).is_some_and(|f| f.pending.is_some()) {
+            return true;
+        }
+        frames.truncate(idx);
+        if frames.is_empty() {
+            self.guest_call_frames.remove(&thid);
+        }
+        false
+    }
+
+    /// The guest call thread `thid`'s last dispatch is waiting on.
+    pub fn take_guest_call(&mut self, thid: i32) -> Option<GuestCall> {
+        let top = self.guest_call_frames.get_mut(&thid)?.last_mut()?;
+        top.pending.as_ref().map(|(c, _)| c.clone())
+    }
+
+    /// The guest call thread `thid` was waiting on has returned: record its result (and the
+    /// capture it asked for) so the replay that follows finds it.
+    pub fn guest_call_returned(&mut self, thid: i32, r0: u32, r1: u32, mem: &dyn GuestMemory, base: u32) {
+        let Some(top) = self.guest_call_frames.get_mut(&thid).and_then(|f| f.last_mut()) else { return };
+        let Some((call, capture)) = top.pending.take() else { return };
+        let bytes = match capture {
+            Some((addr, len)) if len > 0 => {
+                let mut b = vec![0u8; len as usize];
+                mem.read(addr.wrapping_sub(base) as usize, &mut b);
+                b
+            }
+            _ => Vec::new(),
+        };
+        top.results.push((call, GuestCallResult { r0, r1, bytes }));
+        top.resume = true;
     }
 
     /// Record a finished thread's return value (set by the engine host after the
@@ -10968,7 +11349,8 @@ impl VitaState {
     /// `SCE_KERNEL_ERROR_WAIT_TIMEOUT` even if no signal arrives.
     pub fn sema_block(&mut self, uid: i32, need: i32, timeout_us: u32) {
         let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
-        self.sema_waiters.push(SemaWaiter { uid, thid: self.current, need, deadline });
+        let began = (self.virtual_us, self.clock_from_quanta_us, self.clock_from_wall_us, self.clock_from_idle_us);
+        self.sema_waiters.push(SemaWaiter { uid, thid: self.current, need, deadline, began });
     }
 
     /// Signal semaphore `uid` by `n`, then release every parked waiter the new
@@ -11270,12 +11652,7 @@ impl VitaState {
         if lwwork::fast_lock(w, work, cur, 1) {
             return true;
         }
-        // Contended, or a work area the fast path will not serve. Take it anyway if it is
-        // free or ours - the fast path also refuses on a parked waiter, and the host is
-        // exactly the side allowed to barge past that.
-        let held = lwwork::count(w, work);
-        if held == 0 || lwwork::owner(w, work) == cur {
-            lwwork::set_owner_count(w, work, cur, held + 1);
+        if self.lwmutex_take_for(w, work, cur) {
             return true;
         }
         let deadline = timeout_us.map(|us| self.virtual_us + us as u64);
@@ -11286,10 +11663,73 @@ impl VitaState {
         false
     }
 
+    /// Take the lightweight mutex at `work` for `thid` if it is free or already `thid`'s, or
+    /// else mark it [`lwwork::CONTENDED`] so its owner's release comes to the host - in which
+    /// case the caller parks `thid`. Returns whether it was taken.
+    ///
+    /// >>> A LOOP, because under the parallel run the owner releases and recurses INLINE on
+    /// another worker while this runs (`InlineOp::LwMutexLockSmp`): every decision is a
+    /// compare-and-swap from the word just read, and a lost swap means "decide again". The
+    /// park in particular happens only if the mark succeeded from a HELD value - parking on a
+    /// mutex released in between would wait for a release that already happened. On a
+    /// single-baton backing every swap succeeds and this is the old one-pass decision.
+    ///
+    /// Taking a free mutex past parked threads (`queued`) is the host's barge, as before.
+    fn lwmutex_take_for(&mut self, w: &mut dyn GuestWords, work: u32, thid: i32) -> bool {
+        let queued = self.lwmutexes.iter().any(|m| m.work == work && !m.waiters.is_empty());
+        loop {
+            let raw = lwwork::count_word(w, work);
+            let held = raw & !lwwork::CONTENDED;
+            if held == 0 {
+                if lwwork::take_free(w, work, thid, queued) {
+                    return true;
+                }
+                continue;
+            }
+            if lwwork::owner(w, work) == thid {
+                // `thid` is not running guest code (it is this call's caller, or parked), and
+                // only the owner changes a held count - a plain store is exact.
+                lwwork::set_held(w, work, held + 1, queued);
+                return true;
+            }
+            if raw & lwwork::CONTENDED != 0 || lwwork::mark_contended(w, work, raw) {
+                return false;
+            }
+        }
+    }
+
     /// Whether locking the lightweight mutex at `work` now would contend (another
-    /// thread owns it). Used by `sceKernelTryLockLwMutex`, which fails rather than blocks.
+    /// thread owns it). A snapshot: under the parallel run it can change the moment it is
+    /// read, so a decision that acts on it is [`Self::lwmutex_try_lock`] instead.
     pub fn lwmutex_contended(&self, w: &dyn GuestWords, work: u32) -> bool {
         lwwork::count(w, work) != 0 && lwwork::owner(w, work) != self.current
+    }
+
+    /// `sceKernelTryLockLwMutex`: take the lightweight mutex at `work` for the current thread
+    /// if that needs no wait. ONE decision, never a park - a check followed by a separate take
+    /// would let an inline take on another worker land in between and queue a caller that
+    /// was promised it would not wait.
+    pub fn lwmutex_try_lock(&mut self, w: &mut dyn GuestWords, work: u32) -> bool {
+        let cur = self.current;
+        if lwwork::fast_lock(w, work, cur, 1) {
+            return true;
+        }
+        let queued = self.lwmutexes.iter().any(|m| m.work == work && !m.waiters.is_empty());
+        loop {
+            let raw = lwwork::count_word(w, work);
+            let held = raw & !lwwork::CONTENDED;
+            if held == 0 {
+                if lwwork::take_free(w, work, cur, queued) {
+                    return true;
+                }
+                continue;
+            }
+            if lwwork::owner(w, work) == cur {
+                lwwork::set_held(w, work, held + 1, queued);
+                return true;
+            }
+            return false;
+        }
     }
 
     /// Unlock the lightweight mutex at `work`. On full release, hand ownership to the
@@ -11310,24 +11750,25 @@ impl VitaState {
         }
         let remaining = held - 1;
         if remaining != 0 {
-            lwwork::set_count(w, work, remaining);
+            let queued = self.lwmutexes.iter().any(|m| m.work == work && !m.waiters.is_empty());
+            lwwork::set_held(w, work, remaining, queued);
             return;
         }
         // Fully released. Hand it straight to the next parked thread rather than freeing
         // it - a woken waiter that had to race for it could lose to a barging inline take
         // and park again, forever.
-        let next = {
+        let (next, still_queued) = {
             let m = self.lwmutex_rec(work);
             let next = (!m.waiters.is_empty()).then(|| m.waiters.remove(0).thid);
             lwwork::set_waiters(w, work, m.waiters.len());
-            next
+            (next, !m.waiters.is_empty())
         };
         match next {
             Some(thid) => {
-                lwwork::set_owner_count(w, work, thid, 1);
+                lwwork::hand_to(w, work, thid, still_queued);
                 push_wake!(self, thid);
             }
-            None => lwwork::set_count(w, work, 0),
+            None => lwwork::release(w, work),
         }
     }
 
@@ -11345,9 +11786,7 @@ impl VitaState {
     /// behind the owner and is woken when the owner unlocks. Work-keyed twin of
     /// [`mutex_acquire_for`](Self::mutex_acquire_for).
     fn lwmutex_acquire_for(&mut self, w: &mut dyn GuestWords, work: u32, thid: i32) {
-        let held = lwwork::count(w, work);
-        if held == 0 || lwwork::owner(w, work) == thid {
-            lwwork::set_owner_count(w, work, thid, held + 1);
+        if self.lwmutex_take_for(w, work, thid) {
             push_wake!(self, thid);
             return;
         }
@@ -11713,7 +12152,7 @@ impl VitaState {
     /// The clock advances by charged quanta (a flat amount per quantum of guest execution) and
     /// by idle jumps. On a device whose guest executes slower than a Vita's core, the quanta
     /// arrive slower than real time, so the clock - and every vblank edge on it - falls behind
-    /// the wall. MEASURED on the phone (MLB at-bat, trace 059): the main thread parked in
+    /// the wall. MEASURED on the phone (a baseball at-bat, trace 059): the main thread parked in
     /// `sceCtrlReadBufferPositive` (next vblank) for 23.8 ms/f and was released only ~5 ms
     /// after the render thread flipped, because the edge it waited for was reached only by the
     /// render thread's own quanta. On hardware the vblank is real time and main's next update
@@ -11731,7 +12170,7 @@ impl VitaState {
     /// so it held the guest longer, which advanced the clock further - MEASURED on the phone
     /// (062): frames alternating ~30 / ~100 ms with 40-60 ms of nothing running, 16 fps.
     ///
-    /// >>> AND NOT A LINE ANCHORED TO THE WALL. Tried 27c (phone job 025, MLB pitches): with
+    /// >>> AND NOT A LINE ANCHORED TO THE WALL. Tried 27c (phone job 025, a baseball title's pitches): with
     /// the whole wall recovered the clock read 97% speed, but the guest's own frame period went
     /// from 45 to 80 ms (11 fps), the audio thread fell to 0.66x of the clock and the ring
     /// underran 35% of the time - worse on every axis the player sees. Pushing the clock does
@@ -11740,7 +12179,7 @@ impl VitaState {
     /// >>> HELD TIME IS SKIPPED, SO THE CLAMP CAN COVER A WHOLE QUANTUM. `held` (the frame gate
     /// is shut or the guest is paused) moves the tick's anchor without advancing anything, so
     /// the clamp no longer has to be what keeps a hold out. It was 4 ms, and a phone resume
-    /// runs 5-7 ms between two ticks: MEASURED (029, MLB pitches) the main thread parked 17 ms
+    /// runs 5-7 ms between two ticks: MEASURED (029, a baseball title's pitches) the main thread parked 17 ms
     /// for a vblank while the render thread drew, released only by the render thread's own
     /// quanta, because every tick threw away a third of the wall that had passed.
     /// `VITASLOP_CLOCK_WALL_STEP_MS` sets the clamp (default 12).
@@ -11761,7 +12200,7 @@ impl VitaState {
         // >>> THE FLOOR TRAILS A CLOCK THAT RAN AHEAD; IT DOES NOT JUMP UP TO IT. It used to be
         // `max(floor + step, clock)`: every idle jump (the clock running AHEAD of the wall) reset
         // the floor to the clock, and the next ticks added wall on top - a ratchet that pushes a
-        // guest past real time. MEASURED on the phone (042, MLB pitches) once ticks came often
+        // guest past real time. MEASURED on the phone (042, a baseball title's pitches) once ticks came often
         // (idle workers now wake for wall parks): `% speed` mean 104.7%. Kept at most
         // `WALL_FLOOR_LAG_US` below the clock, so an idle jump is paid back by wall time first
         // and a long idle stretch is not banked.
@@ -11769,6 +12208,18 @@ impl VitaState {
         let floor = (floor + (step * 1000.0) as u64).max(self.virtual_us.saturating_sub(WALL_FLOOR_LAG_US));
         self.wall_floor = Some((wall_ms, floor));
         if floor > self.virtual_us {
+            // >>> THE STORAGE CLOCK GETS THE SAME FLOOR. A Vita's card streams in real time; the
+            // storage clock otherwise moves only on flips, quanta and idle jumps, and a title
+            // that polls a load with short delays from two threads (a fighting title's sound banks: main and
+            // render each `sceKernelDelayThread(100)` ~2000 times a frame) is never globally
+            // idle and never flips. MEASURED on the phone (job 098): AsyncIOSystem parked
+            // 180-240 ms per 128 KB pread modelled at ~2.7 ms, frames of 530 ms; the desktop
+            // goes idle between polls and never saw it. Charged like an idle jump, so a flip
+            // nets it out and a rendering title still streams one frame per frame.
+            // `VITASLOP_IO_WALL_FLOOR=0` is the arm back.
+            if io_wall_floor() {
+                self.charge_io_idle(floor - self.virtual_us);
+            }
             self.clock_source = ClockSource::Wall;
             self.advance_time_to(floor);
             return true;
@@ -11896,7 +12347,7 @@ impl VitaState {
     ///
     /// For a wait the DEVICE times in real time whatever the guest clock does - the audio
     /// output's DAC (see `vita::audio::out_output`). A virtual-clock park there stretches with
-    /// every stall of the virtual clock: MEASURED on the phone (MLB pitches, 040) a ~10 ms audio
+    /// every stall of the virtual clock: MEASURED on the phone (a baseball title's pitches, 040) a ~10 ms audio
     /// park lasted 50-85 ms of wall 27 times in 4.4 s, while every guest thread was parked and
     /// the run worker presented. Served only by an engine that expires them
     /// ([`wall_parks_served`]); the caller falls back to [`Self::sleep_park`] otherwise.
@@ -12179,7 +12630,7 @@ impl VitaState {
         // a serial callback thread and never bounded the queue behind it, so a title whose
         // callback completes less often than it queues runs away.
         //
-        // MEASURED on PCSE00120's front-end movie (`displayQueueMaxPendingCount = 2`): the
+        // MEASURED on a role-playing title's front-end movie (`displayQueueMaxPendingCount = 2`): the
         // guest queued 60 entries a second and the callback completed 30, and by frame 2700 the
         // backlog was **1,348 entries deep**. The callback-data ring is
         // [`Self::DISPLAY_CB_SLOT_COUNT`] slots, so it had wrapped 168 times and EVERY callback
@@ -12240,6 +12691,33 @@ impl VitaState {
     /// when it returned at once (frame 3, 34.3 million thread resumes).
     pub fn take_present_since_wait(&mut self) -> bool {
         core::mem::take(&mut self.present_since_wait)
+    }
+
+    /// `sceDisplaySetFrameBuf` named a buffer: it reaches the panel AT ONCE with an immediate
+    /// sync, and at the next vblank edge otherwise - the edge `sceDisplayWaitSetFrameBuf` waits
+    /// for.
+    pub fn note_set_frame_buf(&mut self, immediate: bool) {
+        let latch = if immediate {
+            self.virtual_us
+        } else {
+            Self::at_or_after_vblank(self.virtual_us.saturating_add(1), crate::vita::display::VBLANK_US)
+        };
+        self.frame_buf_latch_us = Some(latch);
+    }
+
+    /// The latch edge of the last `sceDisplaySetFrameBuf`, taken: `None` when no buffer was
+    /// named since the last wait, which keeps the older present-based rule for that case.
+    ///
+    /// >>> A WAIT AFTER A SetFrameBuf WAITS FOR THAT BUFFER'S LATCH, PRESENT OR NOT. The rule
+    /// that a wait after a present has nothing left to wait for was written for a callback
+    /// whose only wait is this one. A fighting title's display callback, in its 30 fps
+    /// cinematics, is `SetFrameBuf`, `WaitSetFrameBuf`, then `WaitVblankStart` - two vblanks a
+    /// frame on hardware, the latch and the one after it. Skipping the latch made it ONE, and
+    /// the cinematics ran at 60 fps: twice their speed, each one cut away before its voice line
+    /// finished (a 5-6 s line stopped 22% in, measured). Its fights' callback has no
+    /// `WaitVblankStart` and stays at 60.
+    pub fn take_frame_buf_latch(&mut self) -> Option<u64> {
+        self.frame_buf_latch_us.take()
     }
 
     /// Record `SceGxmInitializeParams::displayQueueMaxPendingCount`. See [`Self::pace_flip`].
@@ -12467,9 +12945,9 @@ impl VitaState {
             // >>> RAISING THIS TO `SCE_KERNEL_HIGHEST_PRIORITY_USER` WAS TRIED AND REVERTED.
             // GXM creates this thread itself and the SDK's samples put it at the top of the
             // user band, so that looked more faithful - and it MEASURED as no change at all:
-            // PCSE00120's callback rate stayed at one per two vblanks (it is the title's own
-            // TWO `sceDisplayWaitVblankStart` calls that set it, see `pace_flip`), and Ridge
-            // Racer's race was identical either way. What it did do is move the schedule, so
+            // The role-playing title's callback rate stayed at one per two vblanks (it is the title's own
+            // TWO `sceDisplayWaitVblankStart` calls that set it, see `pace_flip`), and a
+            // racer's race was identical either way. What it did do is move the schedule, so
             // it is not carried on an argument alone.
             priority: DEFAULT_THREAD_PRIORITY - 0x10,
         });
@@ -12869,6 +13347,8 @@ impl VitaState {
         self.clock_source = ClockSource::Idle;
         self.virtual_us = self.virtual_us.max(to_us);
         let now = self.virtual_us;
+        // Every wake pushed below is released by TIME - see `take_timeout_wakes`.
+        let wakes_before = self.pending_wakes.len();
         // Timed lightweight-cond waits: like the heavyweight cond, a timed-out
         // WaitLwCond re-acquires its bound mutex before resuming, so collect the
         // expirees, then hand each to its mutex (or wake directly if none is bound).
@@ -12881,6 +13361,7 @@ impl VitaState {
             _ => true,
         });
         for (thid, work) in expired_lw {
+            self.timeout_wakes.push(thid);
             self.pending_resume_codes.push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
             match self.lwcond_mutex_of(work) {
                 // No guest memory is reachable here (see `resolve_deferred_lwmutex`), and
@@ -12919,10 +13400,24 @@ impl VitaState {
         });
         // Timed semaphore waits whose deadline passed: wake with WAIT_TIMEOUT. The
         // count is untouched (nothing was available to consume).
+        let (q, wl, idl) = (self.clock_from_quanta_us, self.clock_from_wall_us, self.clock_from_idle_us);
+        let frame = self.cur_frame();
         self.sema_waiters.retain(|w| match w.deadline {
             Some(d) if d <= now => {
                 push_wake!(self, w.thid);
                 self.pending_resume_codes.push((w.thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+                note_timed_out_wait(format!(
+                    "f{frame} sema {:#x} thread {:#x}: timeout {} us expired after {} us of guest time = quanta {} + wall floor {} + idle jumps {} (+ other {})",
+                    w.uid,
+                    w.thid,
+                    d.saturating_sub(w.began.0),
+                    now.saturating_sub(w.began.0),
+                    q.saturating_sub(w.began.1),
+                    wl.saturating_sub(w.began.2),
+                    idl.saturating_sub(w.began.3),
+                    now.saturating_sub(w.began.0)
+                        .saturating_sub(q.saturating_sub(w.began.1) + wl.saturating_sub(w.began.2) + idl.saturating_sub(w.began.3)),
+                ));
                 false
             }
             _ => true,
@@ -12949,6 +13444,7 @@ impl VitaState {
             // resumes - the same deferral `pending_lwmutex_acquires` already makes, and for
             // the same reason. See `resolve_deferred_lwmutex`.
             self.pending_mutex_acquires.push((mutex, thid));
+            self.timeout_wakes.push(thid);
         }
         // Timed event flag waits whose deadline passed: wake with WAIT_TIMEOUT and the
         // CURRENT pattern written through outBits (the caller reads the pattern back
@@ -12982,6 +13478,10 @@ impl VitaState {
             }
             _ => true,
         });
+        if self.pending_wakes.len() > wakes_before {
+            let woke = self.pending_wakes[wakes_before..].to_vec();
+            self.timeout_wakes.extend(woke);
+        }
     }
 
     /// Mint a fresh SceUID (for a mutex, semaphore, event flag, ...).
@@ -13310,7 +13810,7 @@ impl VitaState {
         uid
     }
 
-    /// `attr` bit of a simple event read as AUTO-RESET. DOA5 creates its task events with
+    /// `attr` bit of a simple event read as AUTO-RESET. A fighting title creates its task events with
     /// exactly this bit and uses each as a one-shot wake between a producer and one waiter.
     pub const SIMPLE_EVENT_AUTO_RESET: u32 = 0x100;
 
@@ -14885,7 +15385,7 @@ impl VitaState {
     /// written the guest may have unmapped that memory and its allocator may have handed the
     /// block to something that is not an image. Writing pixels over it then corrupts whatever
     /// now lives there, and the failure arrives much later and looks nothing like a renderer
-    /// bug: PCSE00084 dies at frame 1263 with `pc=0x00000000`, a call through a pointer that
+    /// bug: a football title dies at frame 1263 with `pc=0x00000000`, a call through a pointer that
     /// used to be a pointer. The desktop writes back SYNCHRONOUSLY inside the same frame and
     /// does not have the window, which is why the same run survives there.
     ///
@@ -15389,14 +15889,14 @@ impl VitaState {
     /// the guest's pointer ARRAY in one go.
     ///
     /// >>> THIS IS THE SAME WRITES IN TWO CROSSINGS INSTEAD OF EIGHTY-FOUR, and it is the
-    /// > > > largest single block of boundary traffic a Madden frame made.
+    /// > > > largest single block of boundary traffic a football-title frame made.
     ///
     /// Per-index it used to be a `read_u32` of the array (one crossing), an
     /// `ensure_state_block` that re-read the state's magic AND block words (two more) and a
     /// `write_u32` into the table (three, counting the dirty-map stamp) - eighty-four
     /// crossings for fourteen pointers, on a title that calls this ONCE PER DRAW, 1,026 times
     /// a frame. It is where 41,333 of that frame's single-word guest reads came from, against
-    /// mlb's 1,436 in total.
+    /// a baseball title's 1,436 in total.
     ///
     /// The guest cannot run during a host call and the two tables are fourteen CONTIGUOUS
     /// words in either block, so the array is read whole, the block is resolved once, and the
@@ -15678,7 +16178,7 @@ impl VitaState {
         // [[vitaslop-poison-separates-a-guest-zero-from-an-unwritten-one]] - and copying it
         // over the context DESTROYS a binding the guest made directly.
         //
-        // MEASURED on PCSE00120, which is what found this: the title makes 19,603 direct
+        // MEASURED on a role-playing title, which is what found this: the title makes 19,603 direct
         // `sceGxmSetFragmentTexture` binds, puts a texture into a precomputed state **0 times**
         // (a complete count - those setters are never inlined), and binds ~1,286 states a
         // frame. A store watchpoint on unit 0's slot caught the sequence exactly: the guest
@@ -16939,7 +17439,7 @@ impl VitaState {
             // >>> AND THE VERTEX WINDOWS, AS FLOATS, because a TRANSFORM can live in one.
             //
             // Only the fragment side was printed, on the reading that a windowed uniform is a
-            // blend coefficient. It is not always: MEASURED on PCSA00002, a screen-space quad's
+            // blend coefficient. It is not always: MEASURED on a baseball title, a screen-space quad's
             // vertex program loads sixteen words through its window and MADs them against the
             // position - its whole MODEL-VIEW-PROJECTION is in there, and the `TRANSFORM` line
             // above says `STALE-ubuf`/`composed=no` because the matrix is in no bank that line
@@ -17520,6 +18020,15 @@ impl VitaState {
                 let at = b.base_sa as usize * 4;
                 let n = (b.size_regs as usize * 4).min(img.len().saturating_sub(at));
                 ctx.read_into(addr, &mut img[at..at + n]);
+                if watch_uniform_rewrites() {
+                    UNIFORM_WATCH.lock().unwrap_or_else(|e| e.into_inner()).push((
+                        addr,
+                        n as u32,
+                        stream_watch_hash(&img[at..at + n]),
+                        header,
+                        b.buffer_index,
+                    ));
+                }
             }
         }
         // The SA-resident path assembles a fresh image, so this one conversion is unavoidable
@@ -17565,7 +18074,7 @@ impl VitaState {
         // `VitaState::mem_windows_zero_tested`) - and silent after `MAX_REPORTS`.
         //
         // It used to run for every window of every draw: a byte scan, then a SipHash of every
-        // byte and a global lock to dedupe a warning that had already fired - on MLB's at-bat
+        // byte and a global lock to dedupe a warning that had already fired - on a baseball title's at-bat
         // that is 231 crowd draws a frame, each with a 3,776-byte skinning window that is all
         // zero at the draw (a job thread fills it later). Measured on the phone, removing the
         // hash alone did NOT move the window-snapshot phase, so this is waste, not the phase's
@@ -17824,7 +18333,7 @@ impl VitaState {
         // capture block opens one and calls this twice, once per stage), so a scope here bills
         // the SAME wall interval to the same phase three times over.
         //
-        // MEASURED in the browser on mlb: `draw: gxp blob + SA bytes` read **1.03 ms/frame over
+        // MEASURED in the browser on a baseball title: `draw: gxp blob + SA bytes` read **1.03 ms/frame over
         // 1,739 entries against 459 draws** - 3.79 scopes a draw - and 26% of DRAW TOTAL, which
         // made it the largest named row in the table and the one 16d's ranking put first. A
         // phase that double-counts is worse than one that is missing: it reads as the thing to
@@ -17905,7 +18414,7 @@ impl VitaState {
                 // >>> NOT BEHIND THE RESOLVER. The cache only keeps a window's IDENTITY stable
                 // for the renderer's push memo; when the resolver holds the snapshot lock for a
                 // chunk of its flip read, reading the few KB straight out of guest memory costs
-                // less than the wait - MEASURED on the phone (MLB pitches, 048) 1.36 ms/f of the
+                // less than the wait - MEASURED on the phone (a baseball title's pitches, 048) 1.36 ms/f of the
                 // render thread's frame queued here over ~4 takes. The bytes are the same either
                 // way (both read guest memory now). `VITASLOP_WINDOW_WAIT=1` is the arm back.
                 let bytes = match self.texture_snapshots.try_lock() {
@@ -18362,7 +18871,7 @@ impl VitaState {
             // Containers 0..13 are the ordinary uniform buffers (`sceGxmSetVertexUniformBuffer`)
             // and 14 is the DEFAULT one; `resource_index` is an offset inside the parameter's
             // OWN container. Reading every parameter out of the default buffer therefore prints
-            // one buffer's bytes under another buffer's names. MEASURED on PCSA00002's field
+            // one buffer's bytes under another buffer's names. MEASURED on a baseball title's field
             // decal (`vert_842dce60`): `MaterialColor_V0` (container 14, res 0) and
             // `UVP_ViewProjectionMatrix` (res 0 of its own container) both printed from float 0
             // of the default buffer, so the view-projection read as `[1,1,1,1,0,...]` - not a
@@ -18673,7 +19182,7 @@ impl VitaState {
     /// # Why this may wait past the flip
     /// The hardware does: a flip QUEUES the frame, and the GPU reads that frame's vertex
     /// buffers after it, while the CPU is already building the next one. A title therefore
-    /// cannot rewrite them at the flip (MLB double-buffers and syncs on nothing else - no
+    /// cannot rewrite them at the flip (a baseball title double-buffers and syncs on nothing else - no
     /// notification wait, no `sceGxmFinish`, over a 30-frame at-bat window). Every sync point
     /// that COULD make a rewrite safe (`sceGxmFinish`, a notification wait) still resolves
     /// everything first, through `resolve_deferred_geometry`.
@@ -18969,6 +19478,30 @@ impl VitaState {
             if now != was {
                 eprintln!(
                     "STREAM REWRITTEN AFTER ITS DRAW: {addr:#x} {len} bytes changed between sceGxmDraw and sceGxmEndScene - this draw's captured vertices are STALE"
+                );
+            }
+        }
+        let uwatch = std::mem::take(&mut *UNIFORM_WATCH.lock().unwrap_or_else(|e| e.into_inner()));
+        if !uwatch.is_empty() {
+            let mut stale: std::collections::BTreeMap<(u32, u32), (u32, u32)> = Default::default();
+            for &(addr, len, was, header, bi) in &uwatch {
+                if stream_watch_hash(&ctx.read_bytes(addr, len as usize)) != was {
+                    let e = stale.entry((header, bi)).or_insert((0, addr));
+                    e.0 += 1;
+                }
+            }
+            if !stale.is_empty() {
+                let list: Vec<String> = stale
+                    .iter()
+                    .map(|(&(h, bi), &(n, a))| format!("prog {h:#x} buf {bi} x{n} (e.g. {a:#x})"))
+                    .collect();
+                tracing::warn!(
+                    target: "vitaslop::gxm",
+                    "f{} UNIFORM BUFFER REWRITTEN AFTER ITS DRAW ({} of {} reads): {}",
+                    self.cur_frame,
+                    stale.values().map(|v| v.0).sum::<u32>(),
+                    uwatch.len(),
+                    list.join(", ")
                 );
             }
         }
@@ -20835,7 +21368,7 @@ fn build_texture_template(
     //
     // The pitch is the explicit stride `sceGxmTextureInitLinearStrided` was given (the control
     // words spread it over three fields whose composition is not published, so it rides in the
-    // host shadow - see `vita::gxm::texture_init`). MEASURED on a fighting title (PCSE00235): its
+    // host shadow - see `vita::gxm::texture_init`). MEASURED on a fighting title: its
     // bloom samples each mip level as a 128- or 256-wide strided window onto ONE 512-wide
     // surface. Read at the width's pitch, every row after the first came from the wrong place
     // (four texture rows to one surface row), and a renderer resolving the window against the
@@ -21181,6 +21714,12 @@ impl NidDigest {
 /// host. Engine-agnostic: the host passes the raw register file and rebased guest
 /// memory, and any register the handler changes is written back.
 pub trait ImportDispatch {
+    /// The priority the MAIN thread starts at - what the title's `SceProcessParam` asks for
+    /// (`VitaState::main_thread_priority`); the default for a host that has no title.
+    fn main_thread_priority(&self) -> i32 {
+        DEFAULT_THREAD_PRIORITY
+    }
+
     fn dispatch(
         &mut self,
         index: u32,
@@ -21202,6 +21741,24 @@ pub trait ImportDispatch {
 
     /// Record a re-entered thread's return value.
     fn set_thread_exit(&mut self, _thid: i32, _code: u32) {}
+
+    /// The guest call thread `thid`'s last dispatch returned [`SvcOutcome::CallGuest`] for.
+    /// The engine runs it (see that variant), then reports through
+    /// [`guest_call_returned`](Self::guest_call_returned). A host that never asks for one
+    /// (default) has none.
+    fn take_guest_call(&mut self, _thid: i32) -> Option<GuestCall> {
+        None
+    }
+
+    /// Record the r0/r1 a guest call left, before the engine re-dispatches the host call
+    /// that asked for it.
+    fn guest_call_returned(&mut self, _thid: i32, _r0: u32, _r1: u32, _mem: &dyn GuestMemory, _base: u32) {}
+
+    /// The thread the host takes to be running - for an engine that keeps no thread ids of
+    /// its own (the run-to-completion `Vm`) and has to name one to the calls above.
+    fn running_thread(&self) -> i32 {
+        0
+    }
 
     // --- preemptive scheduler hooks (default no-ops) -----------------------
     //
@@ -21408,6 +21965,10 @@ pub trait ImportDispatch {
 }
 
 impl ImportDispatch for VitaEnv {
+    fn main_thread_priority(&self) -> i32 {
+        self.state.main_thread_priority()
+    }
+
     fn dispatch(
         &mut self,
         index: u32,
@@ -21458,12 +22019,17 @@ impl ImportDispatch for VitaEnv {
             .copied()
             .unwrap_or((0, 0));
         self.state.capture.record_call(func_nid, self.state.current);
+        // A recipe `@wait call` holding its input for this call - see `recipe::WaitDecl`.
+        crate::recipe::wait_call::note(func_nid);
         // The cross-engine divergence instrument, off unless asked for. Placed HERE - after
         // the selector resolves to a NID and before the handler runs - because that is the
         // one point both engines share and the arguments are still the guest's own.
         if nid_digest_spec().is_some() {
             let frame = self.state.cur_frame();
             self.nid_digest.record(frame, func_nid, self.state.current, regs);
+        }
+        if crate::call_table::spec().is_some() {
+            crate::call_table::record(self.state.cur_frame(), func_nid, self.state.current, regs[14], &regs[..13]);
         }
         // Diagnostic (`RUST_LOG=vitaslop::display=trace`): EVERY host call the guest's
         // display-queue callback makes, in order. GXM runs that callback once per queued
@@ -21480,12 +22046,36 @@ impl ImportDispatch for VitaEnv {
                 "display callback host call"
             );
         }
-        let mut ctx = GuestCtx::new(regs, vfp, mem, base);
-        vita::dispatch(library_nid, func_nid, &mut ctx, &mut self.state)
+        self.state.guest_call_begin();
+        // Any handler may stop to wait on a guest call, and must then leave the register
+        // file exactly as the guest handed it over - the engine re-dispatches from it. See
+        // `VitaState::call_guest`. (A 128-byte copy; the call around it costs far more.)
+        let saved = (*regs, *vfp);
+        let out = {
+            let mut ctx = GuestCtx::new(regs, vfp, mem, base);
+            vita::dispatch(library_nid, func_nid, &mut ctx, &mut self.state)
+        };
+        if self.state.guest_call_end() {
+            (*regs, *vfp) = saved;
+            return SvcOutcome::CallGuest;
+        }
+        out
     }
 
     fn take_reentry(&mut self) -> Option<Reentry> {
         self.state.take_reentry()
+    }
+
+    fn take_guest_call(&mut self, thid: i32) -> Option<GuestCall> {
+        self.state.take_guest_call(thid)
+    }
+
+    fn guest_call_returned(&mut self, thid: i32, r0: u32, r1: u32, mem: &dyn GuestMemory, base: u32) {
+        self.state.guest_call_returned(thid, r0, r1, mem, base);
+    }
+
+    fn running_thread(&self) -> i32 {
+        self.state.current_thread()
     }
 
     fn set_thread_exit(&mut self, thid: i32, code: u32) {
@@ -21887,6 +22477,18 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
 
     fn set_thread_exit(&mut self, thid: i32, code: u32) {
         self.borrow_mut().set_thread_exit(thid, code);
+    }
+
+    fn take_guest_call(&mut self, thid: i32) -> Option<GuestCall> {
+        self.borrow_mut().take_guest_call(thid)
+    }
+
+    fn guest_call_returned(&mut self, thid: i32, r0: u32, r1: u32, mem: &dyn GuestMemory, base: u32) {
+        self.borrow_mut().guest_call_returned(thid, r0, r1, mem, base);
+    }
+
+    fn running_thread(&self) -> i32 {
+        self.borrow().running_thread()
     }
 
     fn set_current_thread(&mut self, thid: i32) {
@@ -22970,6 +23572,33 @@ mod preemptive_tests {
         assert_eq!(st.take_wakes(), vec![2]);
     }
 
+    /// `cpuAffinityMask` 0 is "inherit calling thread affinity mask": a thread the main thread
+    /// creates with 0 gets main's mask (from the title's `SceProcessParam`), a grandchild
+    /// created with 0 gets its creator's, and a named mask is kept as named.
+    #[test]
+    fn a_zero_affinity_mask_inherits_the_creators() {
+        let mut st = state();
+        st.set_main_thread_request((Some(0x56), Some(0x10000)));
+        assert_eq!(st.main_thread_priority(), 0x56);
+        st.set_current(MAIN_THID);
+        assert_eq!(st.thread_cpu_affinity(0), 0x10000, "main reports its requested mask");
+        let child = st.create_thread(0x2000, 0x1000, 0x8e, 0, 0);
+        assert_eq!(st.thread_cpu_affinity(child), 0x10000, "mask 0 inherits main's pin");
+        let named = st.create_thread(0x2000, 0x1000, 0x8e, 0, 0x40000);
+        assert_eq!(st.thread_cpu_affinity(named), 0x40000, "a named mask is kept");
+        st.set_current(named);
+        let grandchild = st.create_thread(0x2000, 0x1000, 0x8e, 0, 0);
+        assert_eq!(st.thread_cpu_affinity(grandchild), 0x40000, "inherits its own creator's");
+        let mut plain = state();
+        plain.set_current(MAIN_THID);
+        let t = plain.create_thread(0x2000, 0x1000, 0x8e, 0, 0);
+        assert_eq!(
+            plain.thread_cpu_affinity(t),
+            crate::vita::threadmgr::CPU_MASK_USER_ALL,
+            "no request anywhere: every user core, as before"
+        );
+    }
+
     #[test]
     fn join_parks_until_the_target_thread_exits() {
         let mut st = state();
@@ -23015,6 +23644,64 @@ mod preemptive_tests {
         st.set_thread_exit(worker, 9);
         assert_eq!(st.take_wakes(), vec![MAIN_THID]);
         assert!(!st.thread_running(worker));
+    }
+
+    /// A host call that makes two guest calls runs three times: each replay answers the
+    /// calls already made from the record, a guest call's OWN host calls get records of their
+    /// own (they must not consume or clear the outer one), and a finished call leaves none.
+    #[test]
+    fn a_host_call_replays_its_guest_calls_from_the_record() {
+        let mut st = state();
+        st.set_current(MAIN_THID);
+        let mem = SliceMemory(&mut []);
+        // The "handler": two guest calls, then the sum of their results.
+        let handler = |st: &mut VitaState| -> Option<u32> {
+            let a = st.call_guest(GuestCall { entry: 0x100, args: vec![1] }, None)?;
+            let b = st.call_guest(GuestCall { entry: 0x200, args: vec![a.r0] }, None)?;
+            Some(a.r0 + b.r0)
+        };
+        let dispatch = |st: &mut VitaState| {
+            st.guest_call_begin();
+            let r = handler(st);
+            (r, st.guest_call_end())
+        };
+        assert_eq!(dispatch(&mut st), (None, true));
+        assert_eq!(st.take_guest_call(MAIN_THID).map(|c| c.entry), Some(0x100));
+        // The guest call makes a host call of its own, which asks for nothing.
+        st.guest_call_begin();
+        assert!(!st.guest_call_end());
+        st.guest_call_returned(MAIN_THID, 5, 0, &mem, 0);
+        assert_eq!(dispatch(&mut st), (None, true));
+        assert_eq!(st.take_guest_call(MAIN_THID), Some(GuestCall { entry: 0x200, args: vec![5] }));
+        // A nested host call that ITSELF calls back gets its own record and finishes in it.
+        let nested = |st: &mut VitaState| {
+            st.guest_call_begin();
+            let r = st.call_guest(GuestCall { entry: 0x300, args: vec![] }, None);
+            (r.map(|r| r.r0), st.guest_call_end())
+        };
+        assert_eq!(nested(&mut st), (None, true));
+        assert_eq!(st.take_guest_call(MAIN_THID).map(|c| c.entry), Some(0x300));
+        st.guest_call_returned(MAIN_THID, 99, 0, &mem, 0);
+        assert_eq!(nested(&mut st), (Some(99), false));
+        // Back to the outer call's second guest call.
+        st.guest_call_returned(MAIN_THID, 7, 0, &mem, 0);
+        assert_eq!(dispatch(&mut st), (Some(12), false));
+        assert!(st.guest_call_frames.is_empty(), "a finished call leaves no record");
+    }
+
+    /// Arguments past the fourth go on a fresh, 8-byte-aligned frame below the caller's sp.
+    #[test]
+    fn a_guest_call_seeds_registers_and_stacks_the_rest() {
+        let mut bytes = vec![0u8; 0x1000];
+        let mut regs = [0u32; REG_COUNT];
+        regs[SP] = 0x0ffc;
+        let call = GuestCall { entry: 0x8100_0001, args: vec![10, 11, 12, 13, 14] };
+        call.seed(&mut regs, &mut SliceMemory(&mut bytes), 0);
+        assert_eq!(&regs[..4], &[10, 11, 12, 13]);
+        assert_eq!(regs[SP] % 8, 0);
+        assert!(regs[SP] + 4 <= 0x0ffc - GUEST_CALL_GAP);
+        let at = regs[SP] as usize;
+        assert_eq!(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()), 14);
     }
 
     #[test]
@@ -23617,6 +24304,19 @@ mod game_data_tests {
 /// engine can tell that apart from a wrong stride.
 static STREAM_WATCH: std::sync::Mutex<Vec<(u32, u32, u64)>> = std::sync::Mutex::new(Vec::new());
 
+/// [`watch_uniform_rewrites`] only: `(address, length, checksum, program header, buffer index)`
+/// of every SA-resident uniform buffer a draw read, re-read at `sceGxmEndScene` by
+/// [`VitaState::report_stream_rewrites`]. The uniform twin of [`STREAM_WATCH`]: the GPU loads a
+/// bound uniform buffer when the scene EXECUTES, and this engine copies it at the draw call.
+static UNIFORM_WATCH: std::sync::Mutex<Vec<(u32, u32, u64, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// `VITASLOP_WATCH_UNIFORM_REWRITES=1`: watch every SA uniform buffer a draw read for a guest
+/// write between `sceGxmDraw` and `sceGxmEndScene` - see [`UNIFORM_WATCH`].
+fn watch_uniform_rewrites() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_WATCH_UNIFORM_REWRITES").ok().as_deref() == Some("1"))
+}
+
 /// `VITASLOP_DUMP_STREAM_BYTES[=<n>]`: with the per-draw dump on, print each vertex stream's
 /// raw guest bytes from the window the GATHER reads, and watch every such window for a rewrite.
 ///
@@ -23806,7 +24506,7 @@ fn compute_posted_resolve_job(
 /// `VITASLOP_RESOLVE_CHUNK=<draws>`: how many draws the RESOLVER reads per hold of the snapshot
 /// lock (default 16); `0` holds it for the whole job, which is what this did before. 16, not 64:
 /// the render thread's `sceGxmDraw` window capture waits on whole chunks - MEASURED on the phone
-/// (MLB pitches, the lock's waits-by-holder line) 1.07 ms/f at 64, 0.70 at 16 (039).
+/// (a baseball title's pitches, the lock's waits-by-holder line) 1.07 ms/f at 64, 0.70 at 16 (039).
 fn resolve_chunk() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| crate::knobs::var("VITASLOP_RESOLVE_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16))
@@ -23977,8 +24677,8 @@ fn compute_resolve_job(snaps: &mut TextureSnapshots, ctx: &GuestCtx, job: &mut R
     // (indices, single-stream vertices, windows, the gather memo) answer from the dirty
     // map without a read for anything the guest has not stored into since - most of a
     // steady frame. The first cut of this table fetched every range regardless, and the
-    // DESKTOP, where a crossing was already cheap, paid for it: mlb cpu p10 10.7 -> 12.1
-    // ms, Madden 16.2 -> 19.2, every byte of a hit copied into the overlay and then never
+    // DESKTOP, where a crossing was already cheap, paid for it: a baseball title's cpu p10 10.7 -> 12.1
+    // ms, a football title's 16.2 -> 19.2, every byte of a hit copied into the overlay and then never
     // looked at. So the stamp copy is taken FIRST, each candidate is probed against its
     // cache exactly as the read below will probe it, and a hit stays out of the table.
     // The probe is the same test the read makes, on the same copy of the map, so a range
@@ -24334,6 +25034,22 @@ fn async_flip_resolve() -> bool {
     ASYNC_FLIP_RESOLVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Which of the draw-deferral switches are on, as one line - geometry read at end of scene,
+/// texture sets proven by the resolver, and the conditions the second rests on. For an engine's
+/// run report: `defer_textures` is decided ONCE, at the first draw, so a resolver attached after
+/// it is a resolver nobody hands texture work to.
+pub fn deferral_report() -> String {
+    format!(
+        "deferral: geometry {}, textures {} (resolver attached {}, flip resolve async {}, gxp live {}, fixed-function wanted {})",
+        defer_geometry(),
+        defer_textures(),
+        resolver_attached(),
+        async_flip_resolve(),
+        gxp_live_capture(),
+        fixed_function_wanted()
+    )
+}
+
 fn defer_geometry() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Through `crate::knobs`, not `std::env`: this is a DEFAULT-BEARING arm, and the browser
@@ -24487,4 +25203,35 @@ fn report_patched_against_other_vertex(fheader: u32, vheader: u32, patched: u32)
         target: "vitaslop::gxm",
         "draw binds fragment program {fheader:#010x} with vertex program {vheader:#010x}, but the          fragment was PATCHED against vertex program {patched:#010x} - its varyings are fed by          output-lane position as that program laid them out"
     );
+}
+
+/// >>> TIMED WAITS THAT EXPIRED, with what produced the guest time they waited through.
+///
+/// A timeout the console would never reach is a timeout this engine's CLOCK reached: the guest
+/// time between the wait and its deadline came from somewhere - threads running (quanta), the
+/// wall-clock floor pushing the clock to real time, or idle jumps to the next deadline - and on
+/// a slow device the answer is what decides whether a title's handshake survives. MEASURED why
+/// (runner jobs 061/062): a movie's sound thread timed out on a semaphore on a phone, quit, and
+/// the movie never advanced; the desktop never timed out. Always on - an expiry is rare and one
+/// line; capped at [`TIMED_OUT_CAP`], newest kept first-come.
+static TIMED_OUT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+pub const TIMED_OUT_CAP: usize = 200;
+static TIMED_OUT_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_timed_out_wait(line: String) {
+    if let Ok(mut v) = TIMED_OUT.lock() {
+        if v.len() < TIMED_OUT_CAP {
+            v.push(line);
+        } else {
+            TIMED_OUT_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// The expired timed waits so far (see [`note_timed_out_wait`]), and how many past the cap.
+pub fn timed_out_waits() -> (Vec<String>, u64) {
+    (
+        TIMED_OUT.lock().map(|v| v.clone()).unwrap_or_default(),
+        TIMED_OUT_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }

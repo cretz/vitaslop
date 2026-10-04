@@ -34,6 +34,12 @@ use vitaslop_native::{run_recipe, RunOpts};
 use vitaslop_runtime::Recipe;
 
 fn main() -> ExitCode {
+    // The recompiled-shader path, as every headless run uses it - see the same default in
+    // `session`: without it a shader-driven title's @shot is a bare clear colour.
+    if std::env::var_os("VITASLOP_GXP_LIVE").is_none() {
+        // SAFETY: single-threaded, before anything reads the environment.
+        unsafe { std::env::set_var("VITASLOP_GXP_LIVE", "1") };
+    }
     // Surface the engine's `tracing` diagnostics on stderr (the report goes to stdout,
     // so the two stay separable). Without this the filter is accepted and ignored.
     // `VITASLOP_LOG` first, `RUST_LOG` as the fallback - see `knobs::log_filter`.

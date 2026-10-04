@@ -31,6 +31,7 @@ let run_game_worker,
   reserve_guest_region;
 import { openTitleCached } from "./opfs.js";
 import * as gamedata from "./gamedata.js";
+import { installGpuCensus } from "./gpu-census.js";
 
 // >>> THE SYSTEM FONT, IF THE DEPLOYMENT SUPPLIES ONE.
 //
@@ -65,7 +66,7 @@ for (const level of ["log", "info", "warn", "error"]) {
   console[level] = (...a) => {
     const text = a.map((x) => (typeof x === "string" ? x : String(x))).join(" ");
     // `rtt probe:` = `VITASLOP_RTT_PROBE_LOG`'s per-frame line (reaches the console under VITASLOP_CONSOLE=1).
-    if (text.startsWith("smptrace") || text.startsWith("presentlog") || text.startsWith("drawnote") || text.startsWith("presentshot") || text.includes("rtt probe:") || text.includes("host write watch") || text.startsWith("jsprofile") || text.startsWith("guestprof")) self.postMessage({ type: "note", text });
+    if (text.startsWith("[exec] ") || text.startsWith("smptrace") || text.startsWith("presentlog") || text.startsWith("drawnote") || text.startsWith("presentshot") || text.includes("rtt probe:") || text.includes("host write watch") || text.startsWith("jsprofile") || text.startsWith("guestprof")) self.postMessage({ type: "note", text });
     else if (forwardConsole > 0) {
       forwardConsole -= 1;
       self.postMessage({ type: "note", text: `console.${level}: ${text.slice(0, 60000)}` });
@@ -169,7 +170,7 @@ const glue = import(SMP_BUNDLE ? "./pkg-threads/vitaslop_web.js" : "./pkg/vitasl
 let readyP = null;
 // >>> THE PAGE HANDS US THE BUNDLE ALREADY COMPILED, when it can. Each worker used to fetch and
 // compile the 9 MB bundle itself, and a phone on the dev server's self-signed certificate gets
-// NO HTTP cache: MEASURED (runner, MLB) 8.7 s and the full 9 MB over the wire, per worker, per
+// NO HTTP cache: MEASURED (runner, a baseball title) 8.7 s and the full 9 MB over the wire, per worker, per
 // play. The page compiles it once (web/bundle.js) and posts the `WebAssembly.Module` with the
 // reserve; the first caller decides, and a page that sends none (the debug pages) gets the old
 // self-fetch.
@@ -202,6 +203,8 @@ const bundle = (module) =>
 // the page's `flush-game-data` message can reach it - that arrives on the way out, long
 // after the start message has returned.
 let saveSink = null;
+/// The title source the current run opened (`{ kind, payload }`), for `release`.
+let activeSource = null;
 
 // The live loop runs as a DETACHED future (`spawn_local`), so nothing it throws reaches
 // the try/catch around the start message - it surfaces as an unhandled rejection, or as a
@@ -339,6 +342,18 @@ self.onmessage = async (e) => {
     return;
   }
 
+  // `release`: close the title's files (the storage worker's sync handles) and say so. The
+  // device runner sends it before terminating this worker - see `openTitleCached`'s close.
+  if (d.type === "release") {
+    try {
+      if (activeSource && activeSource.kind === "opfs") await activeSource.payload.close();
+    } catch (err) {
+      console.error(`[storage] release failed: ${err}`);
+    }
+    activeSource = null;
+    self.postMessage({ type: "released" });
+    return;
+  }
   if (d.type === "flush-game-data") {
     if (!saveSink) return;
     try {
@@ -369,6 +384,8 @@ self.onmessage = async (e) => {
     // A worker is its own wasm instance, so it needs the knobs set here, not on the page.
     for (const [k, v] of Object.entries(knobs || {})) set_knob(k, String(v));
     consoleOn = String((knobs || {}).VITASLOP_CONSOLE ?? "") === "1";
+    // Before the run makes its device: see gpu-census.js.
+    if (String((knobs || {}).VITASLOP_GPU_CENSUS ?? "") === "1") installGpuCensus((t) => console.log(t));
     await loadSystemFont();
     // Forward each (id, text) metric the run publishes to the page.
     //
@@ -400,6 +417,7 @@ self.onmessage = async (e) => {
     let source;
     if (titleId) {
       source = { kind: "opfs", payload: await openTitleCached(titleId) };
+      activeSource = source;
     } else if (files) {
       source = { kind: "memory", payload: files };
     } else {

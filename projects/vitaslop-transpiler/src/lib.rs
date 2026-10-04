@@ -17,6 +17,9 @@ mod emit;
 pub use emit::arm_at_frame;
 pub use emit::set_fuel_interval;
 pub use emit::{set_shared_host_memory, set_smp, smp};
+/// Whether emitted modules export every translated function by name - see
+/// [`emit::set_function_exports`] for why the browser turns it off.
+pub use emit::{function_exports, set_function_exports};
 /// Whether emitted modules hold the ARM register file in wasm LOCALS along each
 /// straight-line run (`VITASLOP_PROMOTE_REGS`), and the per-thread override a test uses
 /// to emit both arms in one process. See [`promote`].
@@ -55,7 +58,7 @@ pub use emit::StmtKind;
 /// [`DIRTY_MAP_OFF`]). A host that stamps its own reads against the epoch can prove a
 /// region of guest memory unchanged without reading it.
 pub use emit::{
-    set_dirty_run_marks, set_dirty_tracking, DIRTY_EPOCH_OFF, DIRTY_MAP_OFF, DIRTY_PAGE_BYTES,
+    set_dirty_mark_tested, set_dirty_run_marks, set_dirty_tracking, DIRTY_EPOCH_OFF, DIRTY_MAP_OFF, DIRTY_PAGE_BYTES,
     DIRTY_SHIFT,
 };
 mod flags;
@@ -888,6 +891,27 @@ pub enum InlineOp {
     /// (a word beside its preempt word, see [`abi::SMP_RUNNABLE_SLOT_OFFSET`]) and the run
     /// counter is an instance global ([`abi::ELIDE_EXPORT`]), reset by the host at each resume.
     SmpDelayYield { cap: u32 },
+    /// >>> SMP ONLY. [`InlineOp::LwMutexLock`] (`lock`) / [`InlineOp::LwMutexUnlock`] made
+    /// safe on several workers at once: every change to the COUNT word is a
+    /// compare-and-swap, the current thread is the instance global ([`InlineOp::ThreadWord`]),
+    /// and the "somebody is parked" test is the CONTENDED bit (bit 31) of the count word
+    /// itself, not the waiters word - see `vitaslop_runtime::vita::lwwork::CONTENDED` for why
+    /// one word is what makes the race with the host's park exact.
+    ///
+    /// ```text
+    /// guard: r1 == 1 & r0 % 4 == 0 & id == r0 & (c = count) & BIT == 0
+    /// lock:   c == 0             -> CAS(count, 0, 1) ok    -> owner = cur;      r0 = 0
+    ///         c != 0 & owner==cur -> CAS(count, c, c + 1) ok ->                  r0 = 0
+    /// unlock: c != 0 & owner==cur -> c == 1: owner = NO_OWNER; CAS(count, 1, 0) ok -> r0 = 0
+    ///                                        (a lost swap puts owner back)
+    ///                               c > 1:  CAS(count, c, c - 1) ok           -> r0 = 0
+    /// anything else, a lost swap included -> the host call
+    /// ```
+    ///
+    /// A device does exactly this: the uncontended take is a userspace LDREX/STREX of the work
+    /// area. MEASURED why it matters (a fighting title's sound/asset load, phone job 101): ~82k allocs and
+    /// ~81k frees in two frames, each a lock and an unlock - 356k host crossings, 1.3 s.
+    LwMutexSmp { layout: LwMutexLayout, lock: bool },
 }
 
 /// The answer `sceClibMemcmp` gives for `a` and `b`: the difference of the first differing
@@ -986,7 +1010,7 @@ pub struct BindStateLayout {
     /// slot is an UNWRITTEN value, not a guest request to unbind, and copying it over the
     /// context destroys a binding the guest made through `sceGxmSetFragmentTexture`.
     ///
-    /// MEASURED on PCSE00120: 19,603 direct binds, **0** textures ever put into a state, ~1,286
+    /// MEASURED on a role-playing title: 19,603 direct binds, **0** textures ever put into a state, ~1,286
     /// state binds a frame - and its title-screen art did not draw, because the state binds
     /// erased the sprite texture between the bind and the immediate `sceGxmDraw` that sampled
     /// it. The handler skips empty slots for that reason and this exists so the emitted form
@@ -1003,6 +1027,19 @@ pub struct BindStateLayout {
     ///
     /// Zero keeps the plain bulk `memory.copy`, which nothing uses today.
     pub copy_slot_stride: u32,
+    /// A second, WHOLESALE copy: `table_bytes` bytes from `block + table_src` to
+    /// `ctx + table_dst` (zero bytes = none). The fragment state's NON-DEFAULT UNIFORM-BUFFER
+    /// table sits behind its texture array in the block and lands far from the context's
+    /// texture array, so it cannot ride the texture copy - and it has to land, replace-not-merge,
+    /// exactly as the handler (`bind_precomputed_fragment_state`) writes it.
+    ///
+    /// MEASURED on a retail title that binds fragment uniform buffers ONLY through precomputed
+    /// state: without this the inline bind left the context's fragment table empty, and every
+    /// draw whose fragment program loads from a non-default buffer was DROPPED for an unbound
+    /// window (about 37 draws a scene) - an inline form leaving different state from its handler.
+    pub table_src: u32,
+    pub table_dst: u32,
+    pub table_bytes: u32,
     /// Context slot the program handle is stored to, when `has_prog`.
     pub ctx_prog: u32,
     pub has_prog: bool,
@@ -1037,10 +1074,19 @@ impl BindStateLayout {
     pub fn ctx_top(self) -> u32 {
         let mut top = self.ctx_magic_at.max(self.ctx_record + 8);
         top = top.max(self.copy_dst + self.copy_bytes - 4);
+        if self.table_bytes != 0 {
+            top = top.max(self.table_dst + self.table_bytes - 4);
+        }
         if self.has_prog {
             top = top.max(self.ctx_prog);
         }
         top
+    }
+
+    /// How many bytes are read from the ARRAYS block - the texture copy or the table copy,
+    /// whichever reaches further.
+    pub fn blk_bytes(self) -> u32 {
+        if self.table_bytes != 0 { self.copy_bytes.max(self.table_src + self.table_bytes) } else { self.copy_bytes }
     }
 
     /// The highest offset reached from the STATE STRUCT pointer.
@@ -1227,7 +1273,8 @@ impl InlineOp {
             InlineOp::ThreadWord { .. }
             | InlineOp::LoadClock64 { .. }
             | InlineOp::StoreClock64 { .. }
-            | InlineOp::SmpDelayYield { .. } => 0,
+            | InlineOp::SmpDelayYield { .. }
+            | InlineOp::LwMutexSmp { .. } => 0,
         }
     }
 
@@ -1305,6 +1352,8 @@ impl InlineOp {
             | InlineOp::LoadClock64 { .. }
             | InlineOp::StoreClock64 { .. }
             | InlineOp::SmpDelayYield { .. } => None,
+            // Reads three words and swaps one, like its single-baton twin.
+            InlineOp::LwMutexSmp { .. } => None,
         }
     }
 
@@ -1372,7 +1421,8 @@ impl InlineOp {
             InlineOp::ThreadWord { .. }
             | InlineOp::LoadClock64 { .. }
             | InlineOp::StoreClock64 { .. }
-            | InlineOp::SmpDelayYield { .. } => None,
+            | InlineOp::SmpDelayYield { .. }
+            | InlineOp::LwMutexSmp { .. } => None,
         }
     }
 
@@ -1442,7 +1492,9 @@ pub struct Artifact {
     pub expansion: emit::Expansion,
 }
 
-/// A transpiled function: the guest address it starts at and its wasm export.
+/// A transpiled function: the guest address it starts at and its wasm export. The export
+/// exists only in a module emitted with [`emit::function_exports`] on (the native default);
+/// a browser module has none, and is entered through [`abi::DISPATCH_EXPORT`].
 pub struct FuncExport {
     pub addr: u32,
     pub export: String,
@@ -1548,19 +1600,50 @@ fn scan_materialized_code_pointers(code: &[u8], base: u32) -> Vec<u32> {
         Some((((hw2 >> 8) & 0xF) as u8, (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8))
     };
 
+    // A 16-bit register COPY (`dst`, `src`): `mov rd, rm` (T1, high registers included) and
+    // `adds rd, rn, #0`, which compilers emit as a flag-setting move.
+    let copy = |o: usize| -> Option<(u8, u8)> {
+        if o + 2 > code.len() {
+            return None;
+        }
+        let hw = rd16(o);
+        if hw & 0xFF00 == 0x4600 {
+            return Some(((((hw >> 7) & 1) << 3 | (hw & 7)) as u8, ((hw >> 3) & 0xF) as u8));
+        }
+        if hw & 0xFFC0 == 0x1C00 {
+            return Some(((hw & 7) as u8, ((hw >> 3) & 7) as u8));
+        }
+        None
+    };
+
     let mut out = Vec::new();
     let mut o = 0usize;
     while o + 4 <= code.len() {
         if let Some((rd, lo)) = parts(o, false) {
+            // The registers holding the low half. The value can MOVE before its `movt`:
+            // MEASURED `movw lr, #lo; ...; mov r3, lr; movt r3, #hi` in a retail title - a
+            // callback pointer the same-register pairing never found, so a call through it
+            // missed the dispatcher at run time.
+            let mut holders: u16 = 1 << rd;
             let mut p = o + 4;
             while p + 4 <= code.len() && p < o + 4 + PAIR_WINDOW * 2 {
                 if let Some((rd2, hi)) = parts(p, true)
-                    && rd2 == rd {
+                    && holders & (1 << rd2) != 0 {
                         let value = (hi << 16) | lo;
-                        if value & 1 == 1 && looks_like_thumb_entry(code, base, value & !1) {
+                        // A pair that sets the Thumb bit on an address in this image's code is
+                        // already the evidence; the prologue test would drop every LEAF
+                        // callback (MEASURED: `ldr r0,[r0]; dmb; ...; bx lr`, reached only
+                        // through such a pointer). A wrong guess costs nothing - the target is
+                        // tentative and a malformed lift of it is discarded.
+                        let off = (value & !1).wrapping_sub(base) as usize;
+                        if value & 1 == 1 && value & !1 >= base && off + 2 <= code.len() {
                             out.push(value & !1);
                         }
                         break;
+                    }
+                if let Some((dst, src)) = copy(p)
+                    && holders & (1 << src) != 0 {
+                        holders |= 1 << dst;
                     }
                 p += 2;
             }
@@ -1576,10 +1659,13 @@ fn scan_materialized_code_pointers(code: &[u8], base: u32) -> Vec<u32> {
 /// lands inside one already-understood function can be skipped. Approximate on purpose:
 /// the last block's own length is not counted, which keeps the test to two comparisons
 /// and can only ever admit a candidate, never wrongly reject one.
-fn discovered_spans(funcs: &BTreeMap<u32, ir::Func>) -> Vec<(u32, u32)> {
+fn discovered_spans(funcs: &BTreeMap<u32, Found>) -> Vec<(u32, u32)> {
     funcs
-        .values()
-        .filter_map(|f| Some((f.addr, f.blocks.last()?.addr)))
+        .iter()
+        .filter_map(|(&addr, f)| match *f {
+            Found::Lifted { last_block, .. } => Some((addr, last_block?)),
+            _ => None,
+        })
         .collect()
 }
 
@@ -1807,7 +1893,28 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         program.redirects.iter().map(|r| (r.addr, (r.target, r.thumb))).collect();
     let imports = Imports::new(&import_map, &redirect_map);
 
-    let mut funcs: BTreeMap<u32, ir::Func> = BTreeMap::new();
+    // >>> WHAT WAS FOUND, NOT THE IR: A RECORD PER FUNCTION, AND THE IR IS LIFTED AGAIN AT EMIT.
+    //
+    // Holding every function's IR from discovery to emission was the allocation peak of a
+    // whole boot: a football title's 7.6 M guest instructions lift to 9.3 M statements in 1.1 M
+    // blocks, and the transpile peaked 1,967 MB above where it started - inside a browser
+    // worker whose ceiling is 4,096 MB, on a phone. Discovery needs only which addresses are
+    // functions (and, for the sweep, where each one ends); emission needs one function at a
+    // time. `lower::discover` is a pure function of the image and the address, so the
+    // function lifted again at emit IS the one discovery accepted (its block count is
+    // checked), and the module is byte-identical. Discovery's lift skips the flag passes
+    // (`lower::discover_shape`), which only rewrite statements.
+    //
+    // A second lift is not free (that title: 6.5 s on the desktop, on top of 8.9 s of
+    // discovery), so IR is KEPT while it fits [`KEEP_IR_BYTES`] and lifted again only past
+    // it: a title whose IR fits pays nothing, and one that does not has its peak bounded by
+    // the budget instead of by its size.
+    let mut funcs: BTreeMap<u32, Found> = BTreeMap::new();
+    let mut kept: BTreeMap<u32, ir::Func> = BTreeMap::new();
+    let mut kept_bytes: usize = 0;
+    // Guest instructions, which the flag passes do not move; the rest of the size report
+    // is counted at emit, where the statements are final.
+    let mut arm_total: u64 = 0;
     let mut stubbed = Vec::new();
     // Decode gaps inside functions that DID lift; see `LenientArtifact::decode_gaps`.
     let mut decode_gaps: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
@@ -1855,7 +1962,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
             if import_map.contains_key(&addr) || redirect_map.contains_key(&addr) {
                 continue;
             }
-            match lower::discover(
+            match lower::discover_shape(
                 program.code,
                 program.base,
                 addr,
@@ -1875,15 +1982,36 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
                     work.extend(found.callees.into_iter().map(|(a, t)| callee(a, t)));
                     work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
                     work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
-                    funcs.insert(addr, found.func);
+                    arm_total += found.func.blocks.iter().map(|b| u64::from(b.arm_count)).sum::<u64>();
+                    funcs.insert(
+                        addr,
+                        Found::Lifted {
+                            thumb,
+                            blocks: found.func.blocks.len(),
+                            last_block: found.func.blocks.last().map(|b| b.addr),
+                        },
+                    );
+                    let bytes = ir_bytes_estimate(&found.func);
+                    if kept_bytes + bytes <= KEEP_IR_BYTES {
+                        kept_bytes += bytes;
+                        let mut func = found.func;
+                        lower::finish_flags(&mut func);
+                        kept.insert(addr, func);
+                    }
                 }
                 // A tentative code pointer that does not decode was never a function.
                 Err(_) if tentative => {}
                 // A hard callee we cannot lower becomes a trapping stub, so the rest of
                 // the program still builds and runs.
-                Err(_) => {
+                Err(e) => {
+                    // WHY it could not be lowered, with the instruction - a stub traps as a
+                    // bare `unreachable` in the middle of a run, and the count alone names
+                    // neither the function a trap is in nor what to implement.
+                    if std::env::var_os("VITASLOP_LOG").is_some() || std::env::var_os("RUST_LOG").is_some() {
+                        eprintln!("transpile: function {addr:#010x} is a TRAPPING STUB: {e:?}");
+                    }
                     stubbed.push(addr);
-                    funcs.insert(addr, ir::Func::new_stub(addr));
+                    funcs.insert(addr, Found::Stub);
                 }
             }
         }
@@ -1898,28 +2026,34 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     // cannot know. A redirect whose target did not survive discovery gets no thunk, so a
     // dispatch to it stays a loud miss rather than a call into nothing.
     for (&addr, &import) in &import_map {
-        funcs.insert(addr, ir::Func::new_import_thunk(addr, true, import));
+        funcs.insert(addr, Found::ImportThunk(import));
     }
     for (&addr, &(target, _)) in &redirect_map {
         if import_map.contains_key(&addr) || !funcs.contains_key(&target) {
             continue;
         }
-        funcs.insert(addr, ir::Func::new_redirect_thunk(addr, true, target));
+        funcs.insert(addr, Found::RedirectThunk(target));
+    }
+    // Stubs and thunks are built, not lifted - count their instructions the same way.
+    for (&addr, found) in &funcs {
+        if !matches!(found, Found::Lifted { .. }) {
+            arm_total += found.build(program, &imports, addr).blocks.iter().map(|b| u64::from(b.arm_count)).sum::<u64>();
+        }
     }
 
-    report_lifted_size(&funcs);
-    let ordered: Vec<ir::Func> = funcs.into_values().collect();
-    let func_index: BTreeMap<u32, u32> = ordered
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
-        .collect();
-    let funcs = ordered
-        .iter()
-        .map(|f| FuncExport { addr: f.addr, export: abi::func_export(f.addr) })
-        .collect();
-    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, expansion } = emit::emit_module(
-        ordered,
+    let mut stats = LiftStats::default();
+    let addrs: Vec<u32> = funcs.keys().copied().collect();
+    let func_index: BTreeMap<u32, u32> =
+        addrs.iter().enumerate().map(|(i, &a)| (a, emit::IMPORT_FUNCS + i as u32)).collect();
+    let exports = addrs.iter().map(|&addr| FuncExport { addr, export: abi::func_export(addr) }).collect();
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, expansion } = emit::emit_module_streamed(
+        addrs,
+        arm_total,
+        funcs.iter().map(|(&addr, found)| {
+            let f = kept.remove(&addr).unwrap_or_else(|| found.build(program, &imports, addr));
+            stats.add(&f);
+            f
+        }),
         &func_index,
         program.base,
         program.mem_bytes,
@@ -1927,10 +2061,11 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         program.import_memory,
         program.host_off,
     );
+    report_lifted_size(&stats, funcs.len());
     stubbed.sort_unstable();
     let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
     LenientArtifact {
-        artifact: Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off, expansion },
+        artifact: Artifact { wasm, funcs: exports, mem_pages, arm_word_off, mirror_off, dirty_off, expansion },
         stubbed,
         stub_wasm_indices,
         decode_gaps: decode_gaps.into_iter().collect(),
@@ -2084,19 +2219,94 @@ pub fn transpile_report(program: &Program) -> Report {
 /// change, so a byte estimate here would be a number that silently goes stale. The counts are
 /// what scale with the title, and `size_of` is printed beside them so the product is available
 /// without pinning it.
-fn report_lifted_size(funcs: &std::collections::BTreeMap<u32, ir::Func>) {
-    let blocks: usize = funcs.values().map(|f| f.blocks.len()).sum();
-    let stmts: usize = funcs.values().flat_map(|f| &f.blocks).map(|b| b.stmts.len()).sum();
-    let arm: u64 = funcs.values().flat_map(|f| &f.blocks).map(|b| b.arm_count as u64).sum();
-    let stubs = funcs.values().filter(|f| f.stub).count();
+/// How much lifted IR [`transpile_lenient`] holds between discovery and emission before it
+/// starts lifting functions a second time instead, by [`ir_bytes_estimate`].
+///
+/// The whole-program IR is the peak of a boot, and the browser builds it inside a worker
+/// whose ceiling is 4,096 MB - on a phone. A football title's is ~2 GB; with this budget its
+/// transpile peaks ~400 MB above where it started plus this, and smaller titles, whose IR
+/// fits, lift once as before.
+const KEEP_IR_BYTES: usize = 384 << 20;
+
+/// What one function's IR costs on the heap, estimated from its statement count: MEASURED
+/// on that title as the transpile's whole peak over its statements (1,967 MB / 9.3 M = ~211 B),
+/// which carries the boxed value trees and the blocks along with the 80-byte `Stmt`.
+fn ir_bytes_estimate(f: &ir::Func) -> usize {
+    const BYTES_PER_STMT: usize = 211;
+    f.blocks.iter().map(|b| b.stmts.len()).sum::<usize>() * BYTES_PER_STMT
+}
+
+/// What [`transpile_lenient`] knows about one function between discovery and emission -
+/// enough to build its IR again, and no more (see the note where it is collected).
+enum Found {
+    /// Lifted by `lower::discover` in this mode; `blocks` and `last_block` are what that
+    /// lift produced - the first to check the second lift against, the second for the sweep.
+    Lifted { thumb: bool, blocks: usize, last_block: Option<u32> },
+    /// A hard callee that could not be lowered: a trapping stub.
+    Stub,
+    /// An import stub's callable thunk, by dense import index.
+    ImportThunk(u32),
+    /// A redirect stub's callable thunk, to its target.
+    RedirectThunk(u32),
+}
+
+impl Found {
+    /// The function's IR, built again - identical to the one discovery saw.
+    fn build(&self, program: &Program, imports: &Imports, addr: u32) -> ir::Func {
+        match *self {
+            Found::Lifted { thumb, blocks, .. } => {
+                let found = lower::discover(
+                    program.code,
+                    program.base,
+                    addr,
+                    thumb,
+                    imports,
+                    program.noreturn_svc,
+                    program.discover_code_pointers,
+                    true,
+                )
+                .unwrap_or_else(|e| panic!("{addr:#010x} lifted in discovery but not at emit: {e:?}"));
+                assert_eq!(
+                    found.func.blocks.len(),
+                    blocks,
+                    "{addr:#010x} lifted differently at emit than in discovery - `lower::discover` must be a pure function of its inputs",
+                );
+                found.func
+            }
+            Found::Stub => ir::Func::new_stub(addr),
+            Found::ImportThunk(import) => ir::Func::new_import_thunk(addr, true, import),
+            Found::RedirectThunk(target) => ir::Func::new_redirect_thunk(addr, true, target),
+        }
+    }
+}
+
+/// The lifted program's size, summed as functions are found (their IR is not kept).
+#[derive(Default)]
+struct LiftStats {
+    blocks: usize,
+    stmts: usize,
+    arm: u64,
+    stubs: usize,
+}
+
+impl LiftStats {
+    fn add(&mut self, f: &ir::Func) {
+        self.blocks += f.blocks.len();
+        self.stmts += f.blocks.iter().map(|b| b.stmts.len()).sum::<usize>();
+        self.arm += f.blocks.iter().map(|b| u64::from(b.arm_count)).sum::<u64>();
+        self.stubs += usize::from(f.stub);
+    }
+}
+
+fn report_lifted_size(stats: &LiftStats, funcs: usize) {
+    let LiftStats { blocks, stmts, arm, stubs } = *stats;
     // Only when a log filter was NAMED: this crate has no tracing, and a run nobody
     // configured prints nothing. (`VITASLOP_LOG=warn` is a debugging session.)
     if std::env::var_os("VITASLOP_LOG").is_some() || std::env::var_os("RUST_LOG").is_some() {
     eprintln!(
-        "transpile: lifted {} functions ({stubs} stubs), {blocks} blocks, {stmts} statements, \
-         {arm} guest instructions; size_of::<Stmt>()={} B, so the statement vectors alone are \
-         about {:.0} MB",
-        funcs.len(),
+        "transpile: lifted {funcs} functions ({stubs} stubs), {blocks} blocks, {stmts} statements, \
+         {arm} guest instructions; size_of::<Stmt>()={} B, so the statement vectors alone would \
+         be about {:.0} MB (held one function at a time)",
         std::mem::size_of::<ir::Stmt>(),
         (stmts * std::mem::size_of::<ir::Stmt>()) as f64 / 1e6,
     );

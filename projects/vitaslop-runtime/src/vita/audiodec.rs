@@ -116,6 +116,7 @@ pub struct AudiodecState {
     /// One-shot reports.
     reported_open: bool,
     reported_starved: bool,
+    reported_mismatch: bool,
     reported_resync: bool,
     /// Decoded audio frames discarded to keep the queue in step with the title's own access
     /// unit. Counted for the whole run even though the report fires once - a single resync
@@ -715,6 +716,25 @@ pub(crate) fn do_decode(ctx: &mut GuestCtx, st: &mut VitaState, p_ctrl: Ptr) -> 
         // with a failure: the title stops playing the movie's sound entirely on a negative
         // result.
         report_starved(st);
+        // >>> NOTHING MATCHED, BUT FRAMES ARE QUEUED: not a decoder that is behind - the title
+        // and the demuxer disagree about what this unit IS. Said once, with both sides.
+        if es != 0
+            && !st.audiodec.reported_mismatch
+            && let Some((queued, q_size, q_head)) = crate::vita::video::decoded_audio_head(st)
+        {
+            st.audiodec.reported_mismatch = true;
+            let n = es_offered.clamp(1, 16) as usize;
+            let offered = ctx.read_bytes(es, n);
+            tracing::warn!(
+                target: "vitaslop::movie",
+                queued,
+                offered_size = es_offered,
+                offered_head = format_args!("{:02x?}", offered),
+                queued_head_size = q_size,
+                queued_head = format_args!("{:02x?}", q_head),
+                "sceAudiodecDecode: the unit the title offered matches NONE of the decoded frames                  queued - so its sound is silence though the decoder is not behind. The title and                  the demuxer disagree about what an access unit is: compare the two heads"
+            );
+        }
         let bytes = max_pcm.min(1024 * 2 * channels.max(1)) as usize;
         if pcm_dest != 0 && bytes > 0 {
             ctx.write_bytes(pcm_dest, &vec![0u8; bytes]);

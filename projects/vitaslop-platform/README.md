@@ -38,3 +38,23 @@ which only holds if the two differ in their trait impls and nothing else.
   after.
 - The recompiler's lib half is wasm-safe, which keeps the browser on the same
   path rather than on a permanent fallback.
+
+## Known limitation: first-draw pipeline compile stalls
+
+Understood, measured, deliberately NOT patched around. Read before chasing "shader hitches".
+
+- **Symptom.** The picture holds ~0.5-1.2 s on a phone (~0.1-0.25 s on desktop) when a title
+  first draws a batch of new shader pairs (an intro, a round start). Draws are never skipped.
+- **Cause.** Not translation (patcher-named pairs are translated at load, as the hardware's
+  patcher does). It is the DRIVER compile of a whole PIPELINE: depth, stencil, cull, blend,
+  target format and vertex layout are baked in, where the Vita applies them per draw - so the
+  state is first known at the draw. Mobile compilers are slow and translated shaders are large.
+- **Scale.** PowerVR/Chrome: 5-40 ms per plain pair, 100-180 ms skinned, ~2 in parallel, no
+  reuse across state; one fighting title's intro needs 21-32 new pipelines.
+- **Rejected.** Guessing state at load (27-62% hit rate; misses steal the compiler); WGSL
+  emission tweaks (near noise); a persistent cache of our own (helps only a second play, and a
+  run must not depend on the one before).
+- **Real fixes (heavy).** An interpreter ("ubershader") pipeline per depth/stencil/blend/format
+  variant that draws any pair from data while the real one compiles (Dolphin's approach); or
+  WebGPU dynamic depth/stencil/blend state (gpuweb/gpuweb#4014 - open, milestone "4+", no
+  implementer as of 2026-10), which would make building at the patcher call exact. Revisit then.

@@ -162,6 +162,12 @@ fn stmt_effect(s: &Stmt) -> (FlagMask, FlagMask) {
             }
             (r, FlagMask::NONE)
         }
+        Stmt::MulHigh { rn, rm, ra, .. } => (
+            value_reads(rn)
+                .union(value_reads(rm))
+                .union(ra.as_ref().map_or(FlagMask::NONE, value_reads)),
+            FlagMask::NONE,
+        ),
         // Writes all four. Its own operands may read C (the carry-in of `adc`/`sbc`), and
         // that read happens BEFORE the write - the walk below applies them in that order.
         Stmt::FlagsAdd { a, b, cin, .. } => (
@@ -238,6 +244,13 @@ fn for_each_value(s: &Stmt, f: &mut impl FnMut(&Value)) {
         Stmt::MulLong { rn, rm, .. } => {
             f(rn);
             f(rm);
+        }
+        Stmt::MulHigh { rn, rm, ra, .. } => {
+            f(rn);
+            f(rm);
+            if let Some(a) = ra {
+                f(a);
+            }
         }
         Stmt::FlagsAdd { a, b, cin, .. } => {
             f(a);

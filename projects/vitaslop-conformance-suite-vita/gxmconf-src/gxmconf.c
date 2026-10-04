@@ -509,7 +509,7 @@ int main(void) {
 	 * initialised as U2F10F10F10 - a format whose top bit lives in control word 0 -
 	 * then set to A8B8G8R8, then COPIED. The copy carries no call history, only its
 	 * control words, so it reads what SetFormat left there. A fighting title
-	 * (PCSE00235) does exactly this with its image-based-lighting cubes. */
+	 * does exactly this with its image-based-lighting cubes. */
 	SceUID setfmt_uid;
 	unsigned int *setfmt_texels = gpu_alloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
 		CUBE_FACE * CUBE_FACE * 6 * 4, SCE_GXM_MEMORY_ATTRIB_READ, &setfmt_uid);
@@ -529,7 +529,7 @@ int main(void) {
 
 	/* Scenes 16-17: a 64x64 target, and a texture naming its bottom-right
 	 * quadrant through an INTERIOR address at the target's own pitch - how a
-	 * fighting title (PCSE00235) samples the levels of its bloom chain, all
+	 * fighting title samples the levels of its bloom chain, all
 	 * packed into one surface. */
 	SceUID quad_uid;
 	unsigned int *quad_buffer = gpu_alloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
@@ -857,7 +857,7 @@ int main(void) {
 	/* ================================================================== *
 	 *  scene 8 - REVERSED DEPTH: the depth surface clears to 0.0 and the
 	 *  test is GREATER_EQUAL, so LARGER z is nearer - the range a fighting
-	 *  title (PCSE00235) draws its whole world in.
+	 *  title draws its whole world in.
 	 *
 	 *  The NEAR quad (z 0.9, green) over the right half is drawn FIRST,
 	 *  then the FAR quad (z 0.1, red) over everything. Left must be red and
@@ -915,7 +915,7 @@ int main(void) {
 	 *  (0x800000ff) over the whole viewport into a single-channel U8_A
 	 *  surface. Its one byte per pixel must be the ALPHA, 0x80. A renderer
 	 *  that treats the one channel as red stores 0xff - which is what a
-	 *  fighting title's (PCSE00235) glow mask was, a solid block.
+	 *  fighting title's glow mask was, a solid block.
 	 * ================================================================== */
 	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
 		sync, &alpha_surface, &depth_surface);
@@ -976,7 +976,7 @@ int main(void) {
 	 *  numbers A as bit 0, then R, G, B: the left half must turn red over
 	 *  the clear's green and blue, the right keep the clear's colour. A
 	 *  reader that takes bit 0 for red paints the left GREEN and the right
-	 *  RED - a fighting title's (PCSE00235) hair pass, mask RGB-no-alpha,
+	 *  RED - a fighting title's hair pass, mask RGB-no-alpha,
 	 *  lost its red that way and came out cyan.
 	 * ================================================================== */
 	sceGxmBeginScene(context, 0, render_target, NULL, NULL,

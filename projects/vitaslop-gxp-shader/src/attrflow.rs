@@ -48,10 +48,10 @@
 //! pinned to 1.0 without asking the walk; see [`lane_fill`] for the frame that settled that.
 //!
 //! # What it changes, measured
-//! Ridge Racer, the title whose picture fixed the old 1.0 default, is **BIT-IDENTICAL** under
+//! A racer, the title whose picture fixed the old 1.0 default, is **BIT-IDENTICAL** under
 //! this analysis and under `VITASLOP_GXP_ATTR_FILL=one`: 11 of 11 frame-pinned headless shots
 //! at zero mean absolute error, including `f004800`, the front end that a wrong answer blanks
-//! completely. Mortal Kombat's boot and logo stretch is identical too (4 of 4 shots); its
+//! completely. A fighting title's boot and logo stretch is identical too (4 of 4 shots); its
 //! gameplay is an attract-mode demo that picks a different match per run, so a pixel A/B over
 //! that stretch answers nothing and none was claimed
 //! [[vitaslop-a-verdict-over-a-broken-key-is-void]].
@@ -306,8 +306,8 @@ pub fn lane_fill(
     // bind into a declared `vec4` is a convention rather than a choice - and the convention is
     // the one thing the two readings this module arbitrates between AGREE on.
     //
-    // It is pinned because letting the walk answer it was MEASURED to destroy a title. Ridge
-    // Racer binds a three-component POSITION into a four-component parameter on four pairs; the
+    // It is pinned because letting the walk answer it was MEASURED to destroy a title. A
+    // racer binds a three-component POSITION into a four-component parameter on four pairs; the
     // walk correctly finds `w` reaching a multiply-ADD (it multiplies the transform's fourth
     // matrix column) and answered ZERO, which is the projection's translation term deleted. The
     // whole front end went BLACK, every frame from f000800 on, against a control run of the same

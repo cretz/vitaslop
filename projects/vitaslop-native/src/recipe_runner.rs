@@ -184,7 +184,24 @@ pub fn boot_retail(
     world: Box<dyn vitaslop_runtime::World + Send>,
     quantum_fuel: u64,
 ) -> Result<ThreadedScheduler<VitaEnv>, String> {
-    let game = decrypt_container(&mut DirVfs::new(dir)).map_err(|e| format!("decrypt: {e:?}"))?;
+    boot_retail_exec(dir, world, quantum_fuel, None)
+}
+
+/// [`boot_retail`] with `main_exec` - an `sceAppMgrLoadExec` path - in the main executable's
+/// place: the process a title's launcher exec'd into. A tool that boots a launcher-style title
+/// takes `state.exec_request` when the run finishes and boots again through this.
+pub fn boot_retail_exec(
+    dir: &str,
+    world: Box<dyn vitaslop_runtime::World + Send>,
+    quantum_fuel: u64,
+    main_exec: Option<&str>,
+) -> Result<ThreadedScheduler<VitaEnv>, String> {
+    let mut game = decrypt_container(&mut DirVfs::new(dir)).map_err(|e| format!("decrypt: {e:?}"))?;
+    if let Some(path) = main_exec
+        && !game.with_main_exec(path)
+    {
+        return Err(format!("sceAppMgrLoadExec(\"{path}\"): the app carries no such executable"));
+    }
     let modules: Vec<loader::Module> = game
         .modules
         .iter()
@@ -214,6 +231,7 @@ pub fn boot_retail(
     env.state.audio_dec = Box::new(vitaslop_platform::audio_dec::AacFactory);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
+    env.state.set_main_thread_request(linked.main_thread_request());
     env.state.set_modules(linked.loaded_modules.clone());
     // The TLS template seeds each thread's thread-local block; without it an early
     // thread-local access reads uninitialized memory and traps (MemoryOutOfBounds at

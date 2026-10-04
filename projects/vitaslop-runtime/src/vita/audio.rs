@@ -100,9 +100,12 @@ pub struct AudioState {
     /// squared off at full scale, heard on the device as static with the real sound
     /// underneath it.
     ngs_port: Option<i32>,
-    /// Optional raw-s16le capture of the mixed output stream (env
-    /// `VITASLOP_AUDIO_RAW`), for headless verification. `None` = disabled.
-    capture: Option<std::fs::File>,
+    /// Optional raw-s16le capture of the output, ONE FILE PER PORT (env `VITASLOP_AUDIO_RAW`
+    /// names the base path; port `n` goes to `<base>.p<n>`), for headless verification.
+    /// Per port because ports play AT THE SAME TIME: appended into one file, a movie or SFX
+    /// port interleaves grains with the music and the file is neither stream at either length.
+    capture: Vec<(i32, std::fs::File)>,
+    capture_base: Option<std::path::PathBuf>,
     capture_inited: bool,
     /// Scratch buffers for one grain of output, reused across calls.
     ///
@@ -144,7 +147,7 @@ impl AudioState {
     ///   clock it is paced on. Measured 0.95-0.99 on all five titles.
     /// * **clock per displayed frame, in display periods** is the title's own vblank divisor
     ///   - a WHOLE number (1 for 60 fps, 2 for 30). That is the one that catches a clock
-    ///   running fast, and it is NOT visible in the ratio above: PCSA00009 read 0.985 sound /
+    ///   running fast, and it is NOT visible in the ratio above: a golf title read 0.985 sound /
     ///   clock while charging **2.99 periods a frame for a limiter that asks for two**, and
     ///   that extra period is what made the guest produce 1.7 s of audio per second of real
     ///   time on a phone, fill the ring, drop a third of it, and starve on the next hitch.
@@ -272,16 +275,21 @@ impl AudioState {
         self.ngs_param_bufs.iter().find(|(k, _)| *k == key).map(|(_, a)| *a)
     }
 
-    /// Append one grain of mixed PCM to the raw-s16le capture file, if
-    /// `VITASLOP_AUDIO_RAW` names one. Diagnostic; opens the file on first use.
-    fn capture_pcm(&mut self, pcm: &[i16]) {
+    /// Append one grain of a port's PCM to that port's raw-s16le capture file, if
+    /// `VITASLOP_AUDIO_RAW` names a base path. Diagnostic; each file opens on first use.
+    fn capture_pcm(&mut self, port: i32, pcm: &[i16]) {
         if !self.capture_inited {
             self.capture_inited = true;
-            if let Some(path) = std::env::var_os("VITASLOP_AUDIO_RAW") {
-                self.capture = std::fs::File::create(path).ok();
-            }
+            self.capture_base = std::env::var_os("VITASLOP_AUDIO_RAW").map(std::path::PathBuf::from);
         }
-        if let Some(f) = self.capture.as_mut() {
+        let Some(base) = self.capture_base.as_ref() else { return };
+        if !self.capture.iter().any(|(p, _)| *p == port) {
+            let mut path = base.clone().into_os_string();
+            path.push(format!(".p{port}"));
+            let Ok(f) = std::fs::File::create(path) else { return };
+            self.capture.push((port, f));
+        }
+        if let Some((_, f)) = self.capture.iter_mut().find(|(p, _)| *p == port) {
             use std::io::Write;
             let mut bytes = Vec::with_capacity(pcm.len() * 2);
             for s in pcm {
@@ -508,7 +516,7 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             }
             st.audio_state.scratch_bytes = bytes;
         }
-        st.audio_state.capture_pcm(&pcm);
+        st.audio_state.capture_pcm(port, &pcm);
         // Counted where the grain is SUBMITTED, so it measures what the guest actually
         // handed the device rather than what it mixed - see `produced_seconds`.
         match st.audio_state.submitted.iter_mut().find(|(p, ..)| *p == port) {
@@ -538,7 +546,7 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     // queue has room - when the PREVIOUS grain has finished and this one starts. This used to
     // sleep one grain's length from the moment of the call, which bills every microsecond the
     // audio thread spends between calls (its own mixing, a lock, a late wake) on top of the
-    // grain, so the port drifts behind the clock for ever. MEASURED on the phone, MLB menu and
+    // grain, so the port drifts behind the clock for ever. MEASURED on the phone, a baseball title's menu and
     // at-bat alike: sound 0.86-0.87x of the clock in every window, underrunning ~9 s in 42 s
     // (the hiccups). With the schedule, a thread that ran late is released at once and the
     // port catches up to the clock; one that is early waits exactly as the device makes it.
@@ -548,7 +556,7 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     // >>> ON THE WALL CLOCK WHEN THERE IS ONE - the device's audio hardware drains in real time.
     //
     // Paced on the guest's virtual clock, a port plays exactly as fast as that clock runs, and on
-    // a device slower than a Vita the clock runs below real time: MEASURED on the phone (MLB
+    // a device slower than a Vita the clock runs below real time: MEASURED on the phone (a baseball title's
     // pitches, 026) 73% speed and the ring underran 28% of the time - the music hiccups. On the
     // hardware the audio thread is released by the DAC draining its queue, whatever the game's
     // own frame rate; the music keeps its tempo and it is the PICTURE that drops frames. So the

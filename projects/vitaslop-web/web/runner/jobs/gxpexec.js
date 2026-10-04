@@ -2,7 +2,7 @@
 // THIS device's GPU and grade them against the reference, exactly as `e2e/gxpexec.mjs` does on
 // the desktop: the batch code is the same file (../gxpbatch.js).
 //
-// params: { cases: "<dir under runner assets>", prefix?: "mlb", offset?: N, limit?: N }
+// params: { cases: "<dir under runner assets>", prefix?: "<corpus>", offset?: N, limit?: N }
 // `prefix` keeps the case names that start with it; `offset`/`limit` take a SLICE, which is how
 // a big directory is split into jobs that each fit the runner's short-job contract.
 // Put a case directory in place with:

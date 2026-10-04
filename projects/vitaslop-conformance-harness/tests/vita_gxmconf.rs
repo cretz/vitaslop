@@ -613,7 +613,7 @@ fn reversed_depth_failure(fb: &Framebuffer, backend: &str) -> Option<String> {
 
 /// **SCENE 8 - A REVERSED DEPTH RANGE: THE PASS STARTS FROM THE SURFACE'S BACKGROUND DEPTH.**
 ///
-/// >>> THIS IS A FIGHTING TITLE'S (PCSE00235) WHOLE WORLD, AS A TEST.
+/// >>> THIS IS A FIGHTING TITLE'S WHOLE WORLD, AS A TEST.
 ///
 /// Every one of its scenes sets `sceGxmDepthStencilSurfaceSetBackgroundDepth(0.0)` and draws
 /// with `GREATER_EQUAL`. The renderer cleared every pass to a fixed 1.0, so no surface ever

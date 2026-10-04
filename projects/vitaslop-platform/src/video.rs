@@ -222,6 +222,19 @@ pub trait VideoDecode: Send {
     /// synchronous decoder that has already answered by the time `submit` returns.
     fn drain_owed(&mut self) {}
 
+    /// True while more access units are unanswered than the STREAM's own reordering allows
+    /// (`max_num_reorder_frames`, or the DPB size where the SPS does not say). A decoder at or
+    /// under that depth has produced every picture the bitstream lets it produce; one over it
+    /// is only slow, and on the console the decode call would not have returned yet.
+    ///
+    /// For a host that answers asynchronously (WebCodecs) and so cannot wait inside the call:
+    /// the engine that owns the decoder gives it time BEFORE the next decode call while this
+    /// holds - see `vitaslop_runtime::vita::avcdec::decoder_behind`. The default (a synchronous
+    /// decoder, or one that waits in [`drain_owed`](Self::drain_owed)) is never behind.
+    fn behind_stream(&mut self) -> bool {
+        false
+    }
+
     /// Discard everything for a seek.
     fn reset(&mut self) -> Result<(), VideoError>;
 
@@ -264,6 +277,16 @@ impl VideoDecode for VideoDecoder {
 
     fn owes_frames(&self) -> bool {
         VideoDecoder::owes_frames(self)
+    }
+
+    fn behind_stream(&mut self) -> bool {
+        // A failed decoder answers nothing further; `poll` reports the failure, and waiting on
+        // it would only delay that.
+        if self.collect().is_err() {
+            return false;
+        }
+        let Some(info) = self.inner.stream_info() else { return false };
+        self.outstanding > info.max_reorder_frames as usize
     }
 
     fn reset(&mut self) -> Result<(), VideoError> {

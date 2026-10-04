@@ -418,7 +418,7 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
             "gxm depth: this adapter offers `depth-clip-control`. It is NOT taken by default - \
              it disables the near and far z clip planes TOGETHER, and without the near one a \
              primitive straddling the camera plane is drawn AT the plane instead of being cut \
-             (mlb's post-hit wedge). `VITASLOP_GXP_UNCLIPPED_DEPTH=1` turns the clamp back on."
+             (a baseball title's post-hit wedge). `VITASLOP_GXP_UNCLIPPED_DEPTH=1` turns the clamp back on."
         );
     } else {
         report_warn!(
@@ -434,7 +434,7 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     // far geometry at the plane rather than losing it. The near plane is a different story,
     // and this is what it cost:
     //
-    // MEASURED on mlb, the post-hit "wedge" the user has reported since this title was first
+    // MEASURED on a baseball title, the post-hit "wedge" the user has reported since it was first
     // playable. It is the field-decal pair `764e083d01208aa3`, four vertices of a flat ground
     // quad (y = 0, x in [-132.6, 132.6], z in [-164.4, 100.75]) textured with the 512x512
     // top-down infield atlas `0x8ca7efc0`. Through the draw's own view-projection (read out of
@@ -933,7 +933,7 @@ pub(crate) fn arena_floor_bytes() -> u64 {
 /// >>> with the other wash instruments.
 ///
 /// # The question, which nobody has actually asked the machine
-/// The RTT WRITEBACK fixes one mlb scene and breaks another, and holding its three probe targets
+/// The RTT WRITEBACK fixes one baseball-title scene and breaks another, and holding its three probe targets
 /// back is now REFUTED as a fix (it loses the wide shot). The standing explanation is that "the
 /// consumer is on our side and is unfound", and the obvious candidate - that we sample the
 /// bytes we wrote back INSTEAD of the live render target - has only ever been argued, never
@@ -1020,6 +1020,31 @@ pub(crate) fn probe_flush(frame: u64) {
 /// buffer of its own, which is the case worth avoiding rather than the case worth forbidding.
 pub(crate) const GXP_STAGING_CHUNK: u64 = 4 * 1024 * 1024;
 
+/// Whether a frame whose last scene is not a flipped (display) buffer shows its last display
+/// scene - or, with none, the flipped buffer's kept image - instead of that last scene
+/// (default) - see `GxmRenderer::display_choice`. `VITASLOP_GXM_HOLD_FLIP=0` is the old rule.
+pub(crate) fn hold_flip_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| crate::knobs::var("VITASLOP_GXM_HOLD_FLIP").map(|v| v.trim() != "0").unwrap_or(true))
+}
+
+/// The 2026-09-28 memory bounds, each with its arm back (`=0`): `VITASLOP_SUBRECT_POOL`
+/// (reuse sub-rectangle copy textures), `VITASLOP_RESIDENT_COMPACT_EARLY` (compact a resident
+/// heap below its budget instead of doubling), `VITASLOP_ARENA_TRIM` (drop idle trailing pass
+/// arenas), `VITASLOP_STAGING_TRIM` (destroy surplus free staging chunks).
+pub(crate) fn memory_bound_on(name: &'static str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CELL: OnceLock<Mutex<HashMap<&'static str, bool>>> = OnceLock::new();
+    let mut m = CELL.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    *m.entry(name).or_insert_with(|| crate::knobs::var(name).map(|v| v.trim() != "0").unwrap_or(true))
+}
+
+/// Free staging-belt chunks kept across the periodic trim - see the recall site in
+/// `encode_chain`. A steady frame uses one or two; the rest of the reserve absorbs a burst.
+const STAGING_KEEP_CHUNKS: usize = 6;
+
 /// Whether the arena upload goes through the STAGING BELT (default) rather than
 /// `queue.write_buffer`. `VITASLOP_GXM_STAGING=0` is the arm back, so the two paths can be
 /// compared from ONE build.
@@ -1100,6 +1125,70 @@ pub(crate) fn dest_split_ab() -> Option<u32> {
 /// renderer, so every pass in one frame agrees on which arm it is in - a counter bumped per PASS
 /// would split a single frame across both arms and average the answer away.
 pub(crate) static DEST_AB_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// >>> A TEXTURE'S ETC2 ENCODE IS SPREAD OVER LATER FRAMES, AND THE FRAME THAT BINDS IT DRAWS
+/// >>> THE EXACT DECODE MEANWHILE - see `texenc::Transcoder::run_deferred`.
+///
+/// MEASURED on the phone (a fighting title, runner jobs 078/085): screens that bind dozens of new textures
+/// spent 240-955 ms of GPU in ONE frame encoding them, freezing the display for up to 1.4 s.
+/// `VITASLOP_TEX_ENCODE_DEFER=0` is the arm back: every encode inline, in the frame that binds it.
+#[cfg(feature = "gpu")]
+pub(crate) fn tex_encode_defer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_TEX_ENCODE_DEFER").ok().as_deref() != Some("0"))
+}
+
+/// Block WORK UNITS the deferred encoder spends per frame (`VITASLOP_TEX_ENCODE_DEFER_UNITS`):
+/// an RGB block is one, an RGBA block two. MEASURED on the phone (`texenc-bench`, job 084): about
+/// 0.8 us of GPU per RGB block in a big dispatch, so the default is ~5 ms of the frame; a
+/// texture's small levels cost a dispatch's latency (1-2 ms) whatever the budget.
+#[cfg(feature = "gpu")]
+pub(crate) fn tex_encode_defer_units() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        crate::knobs::var("VITASLOP_TEX_ENCODE_DEFER_UNITS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n: &u64| *n > 0)
+            .unwrap_or(6144)
+    })
+}
+
+/// Whether `warm_pipelines` predicts a never-encoded target's pipelines from its guest colour
+/// format (`GxmRenderer::pass_shapes_by_format`). `VITASLOP_WARM_BY_FORMAT=0` is the arm back.
+#[cfg(feature = "gpu")]
+pub(crate) fn warm_by_format() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_WARM_BY_FORMAT").ok().as_deref() != Some("0"))
+}
+
+/// Deferred encodes swapped into the view cache, and finished after their entry had already
+/// gone (evicted) - for the report beside `texenc::defer_stats`.
+static DEFER_SWAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DEFER_ORPHANED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The guest frame the frontend is on, set once per frame (see [`set_frame_tag`]). This crate
+/// has no scheduler of its own, and a GPU measurement that cannot be named by guest frame cannot
+/// be lined up with the page's display-gap and slow-frame panels, which are.
+static FRAME_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tell the renderer which guest frame it is drawing, for its reports. Diagnostic only.
+pub fn set_frame_tag(frame: u64) {
+    FRAME_TAG.store(frame, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn frame_tag() -> u64 {
+    FRAME_TAG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A timestamp pair for a texture-transcode compute pass, if the frame being prepared is
+/// measured - see `gxm::lent_ts_pair`. `None` outside a frame's texture preparation.
+#[cfg(feature = "gpu")]
+pub(crate) fn transcode_ts_pair(
+    label: impl FnOnce() -> String,
+) -> Option<(std::sync::Arc<wgpu::QuerySet>, u32)> {
+    gxm::lent_ts_pair(label)
+}
 
 /// Whether THIS frame is in the arm that takes splits. `true` whenever the A/B is off, so the
 /// ordinary path is unchanged.
@@ -1214,7 +1303,7 @@ pub(crate) fn gxp_cull() -> bool {
 /// them - see [`gxm::GxmRenderer::precompile_pairs`]. OFF; `VITASLOP_GXP_PRECOMPILE=1` arms it.
 ///
 /// >>> OFF BECAUSE OF WHAT THE PATCHER NAMES, NOT BECAUSE OF THE KEY. MEASURED on the phone
-/// (Madden, job 105): the patcher named 4,096 pairs (the list cap), the walk translated them in
+/// (a football title, job 105): the patcher named 4,096 pairs (the list cap), the walk translated them in
 /// 8,072 ms of render-worker time, and 43 draws used one - 1% of the work, spread as up to 6 ms
 /// of every frame across the loads and the coin toss. The translation speedups and the draw-time
 /// memo (`vitaslop_gxp_shader::link_programs_memo`) are unconditional and are what cut the
@@ -1223,7 +1312,7 @@ pub(crate) fn gxp_cull() -> bool {
 /// This replaced a warmer that was OFF for good reason: it created shader MODULES filed under
 /// the two blobs alone while the draw looked them up under a key folded with the blend, raw-slot
 /// and vertex-layout state, so for every skinned pair it paid the work and the draw paid it
-/// again (Madden hitches -81% worse at the worst window with it on). The translation memo keys on
+/// again (the football title's hitches -81% worse at the worst window with it on). The translation memo keys on
 /// the link's FULL inputs, and the patcher-time entry carries the vertex layout the title created
 /// its program with, so the draw's lookup is the same key by construction.
 pub(crate) fn gxp_precompile() -> bool {
@@ -1240,13 +1329,29 @@ pub(crate) fn gxp_precompile() -> bool {
 /// MEASURED on the user's phone (runner job kind `pipeline-compile`, 100 real corpus pairs): a
 /// synchronous `createRenderPipeline` compiles on Chrome's GPU MAIN thread - the compositor - so
 /// after 10 of them a submit + `onSubmittedWorkDone` probe took 2,024 ms (idle: 1.7 ms) and the
-/// whole browser froze (Hot Shots 5.6 s, MLB 7.8 s). With 10 `createRenderPipelineAsync` in
+/// whole browser froze (a golf title 5.6 s, a baseball title 7.8 s). With 10 `createRenderPipelineAsync` in
 /// flight the same probe took 193 ms.
 pub(crate) fn async_pipelines() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
     *CELL.get_or_init(|| {
         crate::knobs::var("VITASLOP_ASYNC_PIPELINES").map(|v| v.trim() != "0").unwrap_or(true)
+    })
+}
+
+/// Draws linked with / without the vertex program their fragment was patched against - the
+/// form `GxmRenderer::premodule_pairs` builds ahead in.
+static DRAWS_PATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAWS_UNPATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Native: a frame's new pipelines are built on several threads ahead of the encode - see
+/// `GxmRenderer::prebuild_pipelines`. `VITASLOP_PARALLEL_PIPELINES=0` is the arm back.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn parallel_pipelines() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_PARALLEL_PIPELINES").map(|v| v.trim() != "0").unwrap_or(true)
     })
 }
 
@@ -1283,22 +1388,28 @@ fn add_build_ms(slot: &std::sync::atomic::AtomicU64, ms: f64) {
 /// of it could be moved.
 pub fn take_pipeline_build_split() -> (f64, f64, f64) {
     use std::sync::atomic::Ordering::Relaxed;
-    (
-        PIPE_LINK_US.swap(0, Relaxed) as f64 / 1000.0,
-        PIPE_MODULE_US.swap(0, Relaxed) as f64 / 1000.0,
-        PIPE_CREATE_US.swap(0, Relaxed) as f64 / 1000.0,
-    )
+    let (l, m, c) = (PIPE_LINK_US.swap(0, Relaxed), PIPE_MODULE_US.swap(0, Relaxed), PIPE_CREATE_US.swap(0, Relaxed));
+    RUN_LINK_US.fetch_add(l, Relaxed);
+    RUN_MODULE_US.fetch_add(m, Relaxed);
+    RUN_CREATE_US.fetch_add(c, Relaxed);
+    (l as f64 / 1000.0, m as f64 / 1000.0, c as f64 / 1000.0)
 }
 
-/// The same three totals WITHOUT resetting them - for a caller that differences two reads
-/// around one slow span while the panel keeps its own `take`. A difference across a `take`
-/// in between reads negative, so the caller clamps.
+/// What every `take_pipeline_build_split` has taken, for the run - so a span's difference of
+/// two peeks does not read a panel window's reset as zero (see `run_encode_work`).
+static RUN_LINK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RUN_MODULE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RUN_CREATE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The same three as RUN totals (taken + not yet taken) - for a caller that differences two
+/// reads around one slow span while the panel keeps its own `take`; a `take` in between does
+/// not move them.
 pub fn peek_pipeline_build_split() -> (f64, f64, f64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
-        PIPE_LINK_US.load(Relaxed) as f64 / 1000.0,
-        PIPE_MODULE_US.load(Relaxed) as f64 / 1000.0,
-        PIPE_CREATE_US.load(Relaxed) as f64 / 1000.0,
+        (RUN_LINK_US.load(Relaxed) + PIPE_LINK_US.load(Relaxed)) as f64 / 1000.0,
+        (RUN_MODULE_US.load(Relaxed) + PIPE_MODULE_US.load(Relaxed)) as f64 / 1000.0,
+        (RUN_CREATE_US.load(Relaxed) + PIPE_CREATE_US.load(Relaxed)) as f64 / 1000.0,
     )
 }
 
@@ -1647,7 +1758,7 @@ pub struct GxmTexture {
     /// invented, which the Vita never had"); the decoded path could not, because these two facts
     /// stopped at the runtime and never reached here.
     ///
-    /// MEASURED on PCSA00009's character select: the 1024x512 system-font atlas at `0x8f8b4c00`
+    /// MEASURED on a golf title's character select: the 1024x512 system-font atlas at `0x8f8b4c00`
     /// is written by the guest at one level, and the club-bar label minifies it several times
     /// over - with an invented chain that is a soft grey smear where the device draws small
     /// sharp text.
@@ -2719,7 +2830,7 @@ pub struct RttTarget {
 /// crowd reads it back as a U32U32 texture. Through an 8-bit UNORM attachment those bits
 /// were float-converted and clamped, the atlas held nothing usable, and the stands were empty.
 /// The 32-bit floating formats (F16F16, F32, F11F11F10, U2F10F10F10...) are NOT this: they
-/// stay on the UNORM attachment with the clamp the surface-format report describes.
+/// are converted colours on an `Rgba16Float` attachment - see [`float_color_format`].
 pub fn raw64_color_format(format: u32) -> bool {
     // F16F16F16F16 and F32F32 - the two 64-bit members of the colour-format enum.
     matches!(format & 0xff80_0000, 0x0100_0000 | 0x1100_0000)
@@ -2736,11 +2847,29 @@ pub fn raw64_color_format(format: u32) -> bool {
 ///
 /// One difference remains, named: the format has no alpha channel, so on the console a sample
 /// of it reads alpha 1.0, while this attachment keeps whatever alpha the fragment wrote.
+///
+/// # The other 32-bit float formats take the same attachment
+/// `U2F10F10F10`, `F16`, `F16F16` and `F32` are HDR surfaces too, and on the UNORM attachment
+/// they clamped exactly as F11F11F10 did. MEASURED on an action title: it renders
+/// its whole world into a 720x408 `U2F10F10F10` target and its exposure through 32x32 `F32`
+/// ones; clamped, the tone-map read a world capped at 1.0 against a clamped average and the
+/// night prologue came out near-black. The 10-bit unsigned floats and F16 are EXACT in f16 (5
+/// exponent bits, fewer mantissa bits); F32 keeps its range but rounds to f16's 11-bit
+/// significand - a named difference from the console, far smaller than a clamp at 1.0. As
+/// with F11F11F10, `U2F10F10F10`'s 2-bit alpha is kept at the fragment's full precision.
+/// `VITASLOP_GXM_FLOAT_TARGETS_WIDE=0` is the arm back to F11F11F10 alone.
 pub fn float_color_format(format: u32) -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    matches!(format & 0xff80_0000, 0x2100_0000)
-        && *ON.get_or_init(|| crate::knobs::var("VITASLOP_GXM_FLOAT_TARGETS").map(|v| v.trim() != "0").unwrap_or(true))
+    static WIDE: OnceLock<bool> = OnceLock::new();
+    let member = match format & 0xff80_0000 {
+        0x2100_0000 => true,
+        0x4100_0000 | 0xF000_0000 | 0x0080_0000 | 0x1080_0000 => *WIDE.get_or_init(|| {
+            crate::knobs::var("VITASLOP_GXM_FLOAT_TARGETS_WIDE").map(|v| v.trim() != "0").unwrap_or(true)
+        }),
+        _ => false,
+    };
+    member && *ON.get_or_init(|| crate::knobs::var("VITASLOP_GXM_FLOAT_TARGETS").map(|v| v.trim() != "0").unwrap_or(true))
 }
 
 /// Whether a guest `SceGxmColorFormat` is a SINGLE-CHANNEL surface that stores the fragment's
@@ -2751,7 +2880,7 @@ pub fn float_color_format(format: u32) -> bool {
 /// reads back (see `rtt_writeback::encode_row`). So for an `_A` surface the fragment's alpha has
 /// to be the value that lands in red: the link splats it (`LinkOptions::alpha_to_red`), the
 /// pipeline blends that channel by the guest's ALPHA equation, and the guest's alpha write bit
-/// gates it. MEASURED on a fighting title (PCSE00235): its fight renders four draws a frame into
+/// gates it. MEASURED on a fighting title: its fight renders four draws a frame into
 /// a 128x256 `U8_A` target (0x80900000), which stored red instead.
 /// `VITASLOP_GXM_ALPHA_SINGLE=0` is the arm back to storing red.
 pub fn alpha_single_color_format(format: u32) -> bool {
@@ -2803,6 +2932,51 @@ pub(crate) fn report_subrect(addr: u32, base: u32, x0: u32, y0: u32, w: u32, h: 
         tracing::info!(
             target: "vitaslop::render",
             "gxm rtt subrect: a sampler at {addr:#x} reads the {w}x{h} window at ({x0}, {y0}) of the target at {base:#x} (same pitch) - bound as that window, not the whole target"
+        );
+    }
+}
+
+/// Whether a sampler reading one 32-bit word of a raw 64-bit surface as a double-width texture
+/// is bound to that word view (see the pass encoder). `VITASLOP_RAW_WORD_VIEW=0` is the arm back.
+/// Whether a depth-stencil surface's FORCE_LOAD / FORCE_STORE bits carry its depth between passes
+/// (see `GxmRenderer::depth_saved`). `VITASLOP_GXM_ZLS=0` is the arm back.
+pub(crate) fn zls_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_GXM_ZLS").map(|v| v.trim() != "0").unwrap_or(true))
+}
+
+/// Say, once per depth address, that a FORCE_LOAD pass could not be given the stored depth (a
+/// multisampled attachment, or a stored copy of another extent or format) and started cleared.
+pub(crate) fn report_zls_unserved(addr: u32, w: u32, h: u32) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(addr) {
+        tracing::warn!(
+            target: "vitaslop::render",
+            "gxm depth FORCE_LOAD at {addr:#x} ({w}x{h}): a pass asks to start from the depth a FORCE_STORE pass left there, but its attachment is multisampled or of another size/format than the stored copy - it starts CLEARED instead, and its depth tests run against nothing"
+        );
+    }
+}
+
+pub(crate) fn raw_word_view() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_RAW_WORD_VIEW").map(|v| v.trim() != "0").unwrap_or(true))
+}
+
+/// Say, once per address, that a sampler was bound to a word view of a raw 64-bit surface.
+pub(crate) fn report_raw_word_view(addr: u32, base: u32, w: u32, h: u32, base_format: u32) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(addr) {
+        tracing::info!(
+            target: "vitaslop::render",
+            "gxm rtt raw word view: a sampler at {addr:#x} (base format {base_format:#x}) reads word {} of the raw 64-bit surface at {base:#x} ({w}x{h}) as a {}x{h} texture - bound to that word view",
+            (addr - base) / 4,
+            w * 2
         );
     }
 }
@@ -2875,7 +3049,7 @@ pub struct RenderScene {
     /// The depth this scene's depth-stencil surface clears to - its `backgroundDepth`
     /// (`sceGxmDepthStencilSurfaceSetBackgroundDepth`, 1.0 after `...Init`).
     ///
-    /// MEASURED on a fighting title (PCSE00235): every scene sets it to 0.0 and draws its world
+    /// MEASURED on a fighting title: every scene sets it to 0.0 and draws its world
     /// with `GREATER_EQUAL` - a REVERSED depth range. Cleared to a fixed 1.0, no surface could
     /// pass its test, the world target held only the always-pass light shafts, and the frame
     /// tone-mapped those into a flat cyan. `VITASLOP_GXM_BACKGROUND_DEPTH=0` is the arm back to
@@ -2903,6 +3077,12 @@ pub struct RenderScene {
     /// agreed extent is a measurement and needs no comment, while a disagreement means every
     /// later pass sampling this depth inherits a resolution no single draw asked for.
     pub depth_extent_ambiguous: bool,
+    /// The depth-stencil surface's `zlsControl` word, 0 when the scene has none. Its
+    /// FORCE_LOAD bit (0x2) makes the tiler LOAD the surface's depth and stencil from memory at
+    /// the start of the scene, and FORCE_STORE (0x4) STORE them at the end - which is how a
+    /// deferred renderer carries the depth its geometry pass wrote into a later pass that
+    /// draws into a DIFFERENT colour target. See `GxmRenderer::depth_saved`.
+    pub zls_control: u32,
 }
 
 #[cfg(feature = "gpu")]
@@ -2916,11 +3096,11 @@ pub use gxm::{
     take_worst_write_us,
     write_stall_census,
     GPU_SUBMITS_IN_FLIGHT,
-    take_encode_work, peek_encode_work, take_prepare_split, take_sampler_bg_counts, take_sampler_bg_pass,
+    take_encode_work, peek_encode_work, run_encode_work, take_prepare_split, take_sampler_bg_counts, take_sampler_bg_pass,
     take_sampler_bg_prev,
     wasm_clock_installed,
     EncodePhases, EncodeWork, PrepareSplit,
-    GxmRenderer, PipelineWarm, PipelinesReady,
+    GxmRenderer, PipeFuture, PipelineWarm, PipelinesReady, pipe_rebuilds,
     vertex_plan_census_line,
 };
 
@@ -3652,7 +3832,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// the one instrument that says what a draw LEFT in the target it drew into, live, on the
     /// real pipeline - `VITASLOP_GXM_DRAW_COVERAGE` says whether it rasterised, a capsule says
     /// what it would draw alone, and neither can say that its live output was zero. Built for
-    /// mlb's reflection-cube faces, whose lower half reads back black after a draw the
+    /// a baseball title's reflection-cube faces, whose lower half reads back black after a draw the
     /// coverage query says painted it.
     /// `VITASLOP_GXP_TEXCOORD_NUDGE=<eps>`: add `eps` (normalised units) to every 2-D
     /// `textureSample` coordinate - see [`nudge_texcoords`].
@@ -3665,7 +3845,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// Rewrite every `textureSample(t, s, vec2<f32>(..)..)` so its coordinate is `gxp_nudge2(..)`:
     /// the coordinate plus a tiny positive epsilon. A coordinate computed in f16 (the GXP's half
     /// registers, emulated bit-exactly) lands EXACTLY on texel boundaries, and a point sample
-    /// there is a tie each GPU breaks its own way - measured on the PowerVR phone: MLB's boot
+    /// there is a tie each GPU breaks its own way - measured on the PowerVR phone: a baseball title's boot
     /// light-cell blur read the cells' black gutters and came out darker from identical input.
     fn nudge_texcoords(wgsl: &str, eps: f32) -> String {
         const CALL: &str = "textureSample(";
@@ -4054,7 +4234,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // applying opposite rules to one question is exactly the kind of split this codebase
         // fixes elsewhere.
         //
-        // **It was tried to explain PCSA00009's smudged club label, and it did not: MEASURED at
+        // **It was tried to explain a golf title's smudged club label, and it did not: MEASURED at
         // f2400, ZERO of the 2400 pixels in the label's own box moved.** What DID move was
         // 0.256% of the frame, confined to (282,313)-(424,466) - a patch of the golfer's lower
         // legs - and there is no evidence that patch is more faithful rather than less. A change
@@ -4116,6 +4296,23 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// [[vitaslop-caches-that-clear-whole-are-the-long-run-degradation]] - and it is scaled to
     /// the device like every other budget here. `VITASLOP_PACKED_CACHE_MB` sets it; `=0` removes
     /// the byte bound entirely, which is the arm back to the entry cap alone.
+    /// How often (in resident-heap frames) [`ResidentHeap::forget_idle`] sweeps.
+    const RESIDENT_SWEEP_EVERY: u64 = 120;
+
+    /// Frames a resident slice may go unbound before its record (and the stream it pins) is
+    /// dropped - see [`ResidentHeap::forget_idle`]. Default 600 (ten seconds at 60 Hz); `0`
+    /// never drops one, which is the old behaviour.
+    fn resident_idle_frames() -> u64 {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<u64> = OnceLock::new();
+        *CELL.get_or_init(|| {
+            crate::knobs::var("VITASLOP_RESIDENT_IDLE_FRAMES")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(600)
+        })
+    }
+
     fn packed_cache_budget_bytes() -> usize {
         use std::sync::OnceLock;
         static CELL: OnceLock<usize> = OnceLock::new();
@@ -4665,11 +4862,39 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         vcap: u64,
         icap: u64,
         ucap: u64,
-        /// Bumped whenever `ubo` is RE-created (a grow). The bind groups over it name that
+        /// Changed whenever `ubo` is RE-created (a grow). The bind groups over it name that
         /// specific buffer, so they have to be rebuilt when it changes and - the whole point
-        /// of pooling - must NOT be rebuilt when it does not.
+        /// of pooling - must NOT be rebuilt when it does not. Drawn from one RUN-WIDE counter
+        /// ([`next_arena_generation`]), never counted per slot: a slot the trim dropped and a
+        /// later pass re-created must not reuse a generation its old bind groups were cached
+        /// under, or they would bind a destroyed buffer.
         generation: u64,
+        /// The chain frame that last used this slot - see the trim in `encode_chain`.
+        last_used: u64,
     }
+
+    /// What a frame whose last scene is not a display buffer shows - see
+    /// [`GxmRenderer::display_choice`].
+    #[derive(Clone, Copy, Debug)]
+    enum DisplayChoice {
+        /// This display buffer's scene (the last one drawing into a flipped address).
+        Scene(u32),
+        /// Nothing drew a display buffer: this flipped buffer's kept image.
+        Hold(u32),
+    }
+
+    /// See [`GxpArenaSlot::generation`].
+    fn next_arena_generation() -> u64 {
+        static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A pass-arena slot unused this many chain frames is dropped if it is at the TAIL.
+    const ARENA_IDLE_FRAMES: u64 = 600;
+
+    /// Sub-rectangle copy textures kept for reuse across frames - see `subrect_free`. A frame
+    /// makes a handful; the cap only has to cover one frame's worth plus shape changes.
+    const SUBRECT_FREE_CAP: usize = 32;
 
     /// One bump-allocated GPU buffer holding geometry that has NOT CHANGED since the renderer
     /// first saw it, uploaded once and left there.
@@ -4818,6 +5043,43 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             self.slices.len()
         }
 
+        /// A COUNT IS NOT A COST: the bytes the slices' `Arc`s keep alive on the RUST heap (each
+        /// distinct allocation once), and the GPU buffer's used/cap. The first is not bounded by
+        /// the second's budget in time - it only drops when the heap fills and compacts.
+        fn pinned_bytes(&self) -> (u64, u64, u64) {
+            let mut seen: HashSet<usize> = HashSet::default();
+            let pinned = self
+                .slices
+                .values()
+                .filter(|(a, ..)| seen.insert(std::sync::Arc::as_ptr(a) as *const u8 as usize))
+                .map(|(a, ..)| a.len() as u64)
+                .sum();
+            (pinned, self.used, self.cap)
+        }
+
+        /// >>> FORGET THE SLICES NO DRAW HAS BOUND FOR `idle` FRAMES - their `Arc`s are RUST
+        /// >>> MEMORY, and nothing else ever releases it until the GPU heap fills.
+        ///
+        /// A slice pins the guest stream it was built from (see the type's doc comment), and
+        /// the only thing that dropped a slice was a compaction or a reset - both triggered by
+        /// the GPU buffer filling at its 128 MB budget. MEASURED in the desktop browser, a
+        /// fighting title walking fights (`long1`): 35,703 vertex + 26,864 index slices at f19986 and
+        /// no compaction yet, the Rust heap climbing 572 -> 899 MB at ~1 MB per second of play
+        /// while every byte-budgeted cache sat under its budget. The snapshot caches had evicted
+        /// those streams long before; the slices were what kept them allocated.
+        ///
+        /// Dropping the RECORD is sound at a frame boundary: a prepared draw carries an offset,
+        /// not the record, and none is in flight here. Its GPU bytes become dead space that the
+        /// next compaction drops, exactly like any other dead slice, and a mesh that returns is
+        /// promoted and placed again. `VITASLOP_RESIDENT_IDLE_FRAMES=0` is the arm back.
+        fn forget_idle(&mut self, idle: u64) {
+            if idle == 0 || !self.stamp.is_multiple_of(RESIDENT_SWEEP_EVERY) {
+                return;
+            }
+            let keep_from = self.stamp.saturating_sub(idle);
+            self.slices.retain(|_, (.., used)| *used >= keep_from);
+        }
+
         fn grow_or_reset(
             &mut self,
             device: &wgpu::Device,
@@ -4828,13 +5090,35 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         ) -> Option<wgpu::Buffer> {
             self.stamp += 1;
             self.frames_since_reset += 1;
+            self.forget_idle(resident_idle_frames());
             if !self.want_grow && self.buf.is_some() {
                 return None;
             }
             self.want_grow = false;
+            // The live set: every slice some draw bound in the last two frames.
+            let keep_from = self.stamp.saturating_sub(2);
+            let live: u64 = self
+                .slices
+                .values()
+                .filter(|(_, _, _, used)| *used >= keep_from)
+                .map(|(_, _, len, _)| len.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT).max(4))
+                .sum();
             // First use: start small and let the title's own working set size this.
             let want = if self.buf.is_none() {
                 (self.cap.max(1024 * 1024)).min(budget)
+            } else if self.cap < budget
+                && live <= self.cap / 2
+                && super::memory_bound_on("VITASLOP_RESIDENT_COMPACT_EARLY")
+            {
+                // >>> A HEAP THAT FILLED WITH DEAD GEOMETRY COMPACTS; IT DOES NOT DOUBLE.
+                // A bump allocator fills with meshes the title stopped drawing, so "full" says
+                // nothing about the working set. Doubling on every fill took both heaps to their
+                // 128 MB budget and then kept a same-size compaction spare beside each: MEASURED
+                // in the desktop browser (a golf title, `long3` GPU census) 287 + 143 MB of
+                // resident-heap buffers holding a live set of 15-25 MB. Grow only when the live
+                // set itself needs the room.
+                self.compact(device, queue, keep_from, label);
+                return None;
             } else if self.cap < budget {
                 (self.cap * 2).min(budget)
             } else {
@@ -4855,13 +5139,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 //
                 // If the live set alone is most of the budget, compaction buys nothing and the
                 // heap is genuinely too small: reset wholesale and SAY so, exactly as before.
-                let keep_from = self.stamp.saturating_sub(2);
-                let live: u64 = self
-                    .slices
-                    .values()
-                    .filter(|(_, _, _, used)| *used >= keep_from)
-                    .map(|(_, _, len, _)| len.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT).max(4))
-                    .sum();
                 if live >= self.cap / 4 * 3 {
                     report_resident_heap_reset(label, self.cap, self.slices.len(), self.frames_since_reset);
                     self.resets += 1;
@@ -4870,6 +5147,51 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     self.slices.clear();
                     return None;
                 }
+                self.compact(device, queue, keep_from, label);
+                return None;
+            };
+            enc_buffer_created();
+            // COPY_SRC so a later compaction (above) can copy the live set out of this buffer.
+            let t_create = Stopwatch::start();
+            let new = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: want,
+                usage: usage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            enc_create_us((t_create.ms() * 1000.0) as u64);
+            self.cap = want;
+            // The compaction spare is the OLD size now and can never be taken again - see
+            // `compact`. Destroy it rather than leave it for a collector: its last use (a
+            // compaction's copy) was submitted at an earlier frame boundary.
+            if let Some(s) = self.spare.take() {
+                s.destroy();
+            }
+            // >>> CARRY THE LIVE BYTES OVER ON THE GPU, AT THE SAME OFFSETS. The new buffer is
+            // larger, so every slice fits where it was, and ONE copy of `[0, used)` keeps them
+            // all valid. This used to clear every slice and let the draws re-place them, which
+            // re-uploaded the title's whole resident working set from the CPU over the next
+            // frames - a phone's worst present read `buffers 1.0 created, 13.81 MB written`
+            // against ~1.9 MB normally, with `prepare` at 1,990 ms. Submitted here, before the
+            // frame's own encoder, like the compaction above.
+            if let Some(old_buf) = self.buf.as_ref().filter(|_| self.used > 0) {
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("resident-heap-grow"),
+                });
+                encoder.copy_buffer_to_buffer(old_buf, 0, &new, 0, self.used);
+                queue.submit([encoder.finish()]);
+            } else {
+                self.used = 0;
+                self.slices.clear();
+            }
+            self.buf.replace(new)
+        }
+
+        /// Copy the slices bound since `keep_from` to the front of a same-size buffer and drop
+        /// the rest - at a frame boundary only, for the reasons in `grow_or_reset`.
+        fn compact(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, keep_from: u64, label: &str) {
+            let usage = self.buf.as_ref().map_or(wgpu::BufferUsages::empty(), |b| b.usage());
+            {
                 let new = match self.spare.take() {
                     Some(b) if b.size() == self.cap => b,
                     _ => {
@@ -4921,37 +5243,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 );
                 // Kept as the next compaction's destination rather than retired - see `spare`.
                 self.spare = old;
-                return None;
-            };
-            enc_buffer_created();
-            // COPY_SRC so a later compaction (above) can copy the live set out of this buffer.
-            let t_create = Stopwatch::start();
-            let new = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: want,
-                usage: usage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            enc_create_us((t_create.ms() * 1000.0) as u64);
-            self.cap = want;
-            // >>> CARRY THE LIVE BYTES OVER ON THE GPU, AT THE SAME OFFSETS. The new buffer is
-            // larger, so every slice fits where it was, and ONE copy of `[0, used)` keeps them
-            // all valid. This used to clear every slice and let the draws re-place them, which
-            // re-uploaded the title's whole resident working set from the CPU over the next
-            // frames - a phone's worst present read `buffers 1.0 created, 13.81 MB written`
-            // against ~1.9 MB normally, with `prepare` at 1,990 ms. Submitted here, before the
-            // frame's own encoder, like the compaction above.
-            if let Some(old_buf) = self.buf.as_ref().filter(|_| self.used > 0) {
-                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("resident-heap-grow"),
-                });
-                encoder.copy_buffer_to_buffer(old_buf, 0, &new, 0, self.used);
-                queue.submit([encoder.finish()]);
-            } else {
-                self.used = 0;
-                self.slices.clear();
             }
-            self.buf.replace(new)
         }
     }
 
@@ -5129,12 +5421,53 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// ordinal is printed and the gap from the previous pass's end is computed here, where
         /// the raw GPU ticks still exist - the report only sees milliseconds.
         last_passes: Vec<(usize, String, f64, f64)>,
+        /// The guest frame (see [`super::set_frame_tag`]) the readback in flight was encoded on.
+        in_flight_tag: u64,
+        /// >>> THE COSTLIEST MEASURED FRAMES OF THE RUN, WITH EVERY PASS - `(summed ms, span ms,
+        /// >>> guest frame, passes)`, costliest first, at most [`Self::WORST_KEPT`].
+        ///
+        /// `last_passes` is whichever frame landed last, so the one frame worth reading - a fighting
+        /// title's round start, measured at 1,034 ms of GPU on the phone (job 078) - was overwritten a
+        /// frame later and the panel could only say it had happened. A frame that expensive is
+        /// rare by construction, so it is KEPT, named by guest frame so it lines up with the
+        /// page's LONGEST DISPLAY GAPS, and printed pass by pass - including the texture
+        /// transcodes, which take pairs of their own (see [`lent_ts_pair`]).
+        worst: Vec<(f64, f64, u64, Vec<(usize, String, f64, f64)>)>,
+    }
+
+    thread_local! {
+        /// The frame's [`GpuTimestamps`], LENT for the span of `GxpLive::prepare` - see
+        /// [`lent_ts_pair`].
+        static LENT_TS: std::cell::RefCell<Option<GpuTimestamps>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// >>> A TEXTURE TRANSCODE IS GPU WORK IN THE FRAME, AND UNTIMED IT HID INSIDE THE NEXT PASS.
+    ///
+    /// The transcoder (`crate::texenc`) submits its compute passes while a frame's textures are
+    /// prepared, ahead of the frame's own render passes. On a tiling GPU the first timed pass
+    /// after them then absorbs their whole cost, so a fighting title's round start read `1,034 ms` against a
+    /// render pass with the transcodes invisible. The renderer lends its timestamps here around
+    /// the prepare, and the transcoder takes a labelled pair per pass like any render pass.
+    pub(crate) fn lent_ts_pair(
+        label: impl FnOnce() -> String,
+    ) -> Option<(std::sync::Arc<wgpu::QuerySet>, u32)> {
+        LENT_TS.with(|c| c.borrow_mut().as_mut().and_then(|t| t.take(label)))
+    }
+
+    fn lend_ts(ts: Option<GpuTimestamps>) {
+        LENT_TS.with(|c| *c.borrow_mut() = ts);
+    }
+
+    fn reclaim_ts() -> Option<GpuTimestamps> {
+        LENT_TS.with(|c| c.borrow_mut().take())
     }
 
     impl GpuTimestamps {
         /// Query pairs a frame may take. A retail frame is 11-14 passes; the rest is headroom
         /// for a title that draws more scenes, and anything past it is simply unmeasured.
         const PAIRS: u32 = 1024;
+        /// Frames kept in [`Self::worst`].
+        const WORST_KEPT: usize = 4;
 
         fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
             if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
@@ -5178,6 +5511,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 ab_split: (0, 0.0),
                 ab_nosplit: (0, 0.0),
                 last_passes: Vec::new(),
+                in_flight_tag: 0,
+                worst: Vec::new(),
             })
         }
 
@@ -5209,6 +5544,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             encoder.resolve_query_set(&self.set, 0..n * 2, &self.resolve, 0);
             encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.read, 0, (n * 2 * 8) as u64);
             self.in_flight = Some((n, std::mem::take(&mut self.labels), super::dest_split_armed()));
+            self.in_flight_tag = super::frame_tag();
             self.state.store(1, std::sync::atomic::Ordering::Relaxed);
             self.armed = false;
         }
@@ -5284,6 +5620,11 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 return;
             }
             let span = (last - first) as f64 * ns / 1.0e6;
+            if self.worst.len() < Self::WORST_KEPT || self.worst.last().is_some_and(|w| w.0 < sum) {
+                self.worst.push((sum, span, self.in_flight_tag, self.last_passes.clone()));
+                self.worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                self.worst.truncate(Self::WORST_KEPT);
+            }
             self.win_frames += 1;
             self.latest_ms = sum;
             self.latest_seq += 1;
@@ -5361,6 +5702,32 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 self.win_frames,
                 top.join(", "),
             );
+            // The run's costliest measured frames, every pass of each in frame order - see `worst`.
+            let worst: Vec<String> = self
+                .worst
+                .iter()
+                .map(|(sum, span, tag, passes)| {
+                    let list: Vec<String> = passes
+                        .iter()
+                        .map(|(i, l, ms, gap)| {
+                            if *gap >= 1.0 {
+                                format!("#{i} {l} {ms:.1} (gap {gap:.1})")
+                            } else {
+                                format!("#{i} {l} {ms:.1}")
+                            }
+                        })
+                        .collect();
+                    format!("f{tag} {sum:.1} ms summed / {span:.1} span: {}", list.join(", "))
+                })
+                .collect();
+            let out = if worst.is_empty() {
+                out
+            } else {
+                format!(
+                    "{out} | >>> COSTLIEST MEASURED FRAMES THIS RUN (guest frame, GPU ms summed                      over passes / first-start-to-last-end span, then EVERY pass in frame order                      with its ms; a `texenc` pass is a texture transcode): {}",
+                    worst.join(" || ")
+                )
+            };
             self.last_mean_ms = self.win_sum_ms / n;
             self.win_frames = 0;
             self.win_sum_ms = 0.0;
@@ -5568,7 +5935,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // The grouping above rests on "draws of one pair either all cover something or
                 // all do not", which is true of the question it was built for (a black frame)
                 // and NOT of the question "which one draw painted over everything". MEASURED on
-                // PCSA00002: a pair whose eight draws total 1,520,090 samples hides whichever of
+                // a baseball title: a pair whose eight draws total 1,520,090 samples hides whichever of
                 // them is the 160,000-sample one, and reading the per-pair list named the WRONG
                 // draw - a suppression run then showed the artefact still there. One ranked line
                 // per pass costs nothing and answers it outright.
@@ -5761,7 +6128,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         ///
         /// This was `HashMap<u32, RttSurface>`, and `ensure_rtt` read a changed extent at a
         /// known address as "the guest resized its target" and REBUILT it - which discards the
-        /// image. MEASURED on a retail baseball title (PCSA00002), every frame:
+        /// image. MEASURED on a retail baseball title, every frame:
         ///
         ///   colour 0x8e20b030 rasterised through render target 0x40000337 (256x256)  - 41 draws
         ///   colour 0x8e20b030 rasterised through render target 0x40000010 (512x1024) -  4 draws
@@ -5873,6 +6240,14 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// The sub-rectangle copies this frame's passes bind (see `encode_pass`), kept alive
         /// until the next frame's encode, after the frame that used them was submitted.
         subrect_keep: Vec<wgpu::Texture>,
+        /// Last frames' sub-rectangle copies, free for reuse by `(width, height, format)`.
+        ///
+        /// A copy used to be a NEW texture every frame, dropped at the next frame's head and
+        /// left to the browser's collector: MEASURED in the desktop browser (a fighting title's
+        /// GPU census `long3`) 3,748 `gxm-rtt-subrect` textures made over ~100 s, none destroyed,
+        /// 680 / 106 MB of them live at once waiting on a GC - GPU memory the process could not
+        /// get back on its own schedule. Reused here, and destroyed past `SUBRECT_FREE_CAP`.
+        subrect_free: HashMap<(u32, u32, wgpu::TextureFormat), Vec<wgpu::Texture>>,
         /// Every offscreen target this renderer has rendered into on some EARLIER frame, by
         /// the same `(address, width, height)` key `rtt` uses - so the frame's first pass into
         /// it can LOAD what the last frame left instead of clearing.
@@ -5912,6 +6287,13 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// that logic to keep in step. A target never encoded before is not predicted - its
         /// first pipelines build synchronously, as they always did, and count as UNWARMED.
         pass_shapes: HashMap<Option<(u32, u32, u32, u32)>, Vec<(wgpu::TextureFormat, u32, bool)>>,
+        /// The same shapes by the target's GUEST COLOUR FORMAT alone - the fallback
+        /// `warm_pipelines` predicts a never-encoded target from. MEASURED (a fighting title, desktop Chrome,
+        /// 30c): the worst display gap left, 770 ms at the fight intro, was 16 pipelines built
+        /// SYNCHRONOUSLY for a target at a new address - the title allocates a fresh surface of
+        /// a format it has drawn before. A wrong guess costs one background compile nobody
+        /// waits for; a right one moves those compiles off the GPU queue.
+        pass_shapes_by_format: HashMap<u32, Vec<(wgpu::TextureFormat, u32, bool)>>,
         /// The pipeline that unpacks a RAW 64-bit surface into its `Rgba16Float` companion
         /// (`RawSurface::float_view`), built on first use. See `convert_raw_to_float`.
         raw_to_float: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
@@ -5951,6 +6333,14 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// match - and matching it would mean rasterising the display pass at the guest's
         /// resolution, which is a quality loss no defect here justifies.
         display_images: HashMap<u32, DisplayImage>,
+        /// Native: shader modules built AHEAD on background threads for the pairs the guest's
+        /// patcher named, `(module key, module)`, waiting to join `GxpLive::modules` - see
+        /// [`GxmRenderer::premodule_pairs`].
+        #[cfg(not(target_arch = "wasm32"))]
+        premodules: std::sync::Arc<std::sync::Mutex<Vec<(u64, wgpu::ShaderModule)>>>,
+        /// The allocation pairs already handed to [`GxmRenderer::premodule_pairs`].
+        #[cfg(not(target_arch = "wasm32"))]
+        premodule_seen: HashSet<(usize, usize)>,
         /// Fixed-function bind groups over a rendered target, keyed by (address, linear,
         /// reading-the-snapshot). The snapshot flag is part of the key because the two
         /// views are different textures - binding the live one where the snapshot is meant
@@ -5977,7 +6367,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         ///
         /// # A cube face IS a GXM render target, and this renderer assumed it was not
         /// Both render-target sampler paths are 2D-only, on that stated assumption. MEASURED on
-        /// PCSA00009: ten shader pairs bind a cube at unit 11 naming `0x891e6520`, and the frame
+        /// a golf title: ten shader pairs bind a cube at unit 11 naming `0x891e6520`, and the frame
         /// renders six 256x256 passes at exactly `0x891e6520 + n*0x40000` - six faces of one
         /// 256x256 RGBA8 cube, laid out back to back the way GXM lays out a cube's faces. With
         /// the assumption in place the cube fell through to an upload of GUEST MEMORY, which the
@@ -6026,8 +6416,16 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         ///
         /// A flip address is the guest's own statement that a buffer is a display buffer, so
         /// this is evidence rather than a heuristic about extents. It is used ONLY to rescue
-        /// the straddling case - see `encode_chain`.
+        /// the straddling case - see `encode_chain` - and by `display_choice`.
         presented: Vec<u32>,
+        /// Whether a flipped address has ever equalled a scene target on this run - the
+        /// evidence `display_choice` needs before it trusts a frame that matched none.
+        presented_matched: bool,
+        /// Every address the guest has flipped this run (bounded) - its display buffers. See
+        /// `display_choice`.
+        flipped_ever: Vec<u32>,
+        /// The most recent flipped address, for a frame that flipped nothing.
+        last_flipped: Option<u32>,
         /// Addresses whose entry in `rtt_rendered` is currently the snapshot rather than
         /// the live target (the pass being encoded draws into that address).
         ///
@@ -6143,6 +6541,31 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// The pass currently being encoded writes into a target whose depth is sampled later,
         /// so its depth attachment must be STORED rather than discarded.
         keep_depth: bool,
+        /// The pass currently being encoded starts from a depth-stencil LOADED from
+        /// `depth_saved` (its surface's FORCE_LOAD bit) instead of clearing it.
+        depth_load_now: bool,
+        /// >>> THE DEPTH-STENCIL A FORCE_STORE PASS LEFT IN MEMORY, by (depth address, width,
+        /// >>> height) - what a later FORCE_LOAD pass at that address starts from.
+        ///
+        /// Every render target here has its OWN depth attachment, so two passes into different
+        /// colour targets never shared depth - and on the console they do whenever the guest
+        /// says so: the tiler stores a surface's depth at the end of a scene with FORCE_STORE
+        /// and loads it at the start of one with FORCE_LOAD (`zlsControl`, see
+        /// [`RenderScene::zls_control`]). MEASURED on an action title: its deferred
+        /// frame draws the world into a G-buffer with depth at 0x8a8dee00 (store), then lights
+        /// it into an HDR target with 49 draws testing EQUAL / LEQUAL / GREATER against that
+        /// same depth (load + store). Each started from a CLEARED buffer, so every light and
+        /// every re-drawn surface failed its test, and the lit image held only the always-pass
+        /// backdrop - fog and a distant rock where the daylit ruins and the player were.
+        /// Single-sample passes only (a copy needs matching sample counts); a multisampled
+        /// FORCE_LOAD pass is reported. `VITASLOP_GXM_ZLS=0` is the arm back.
+        depth_saved: HashMap<(u32, u32, u32), wgpu::Texture>,
+        /// The word views of raw 64-bit surfaces (see the pass encoder's `raw_word_view` block),
+        /// by (sampled address, width, height, format): the staging buffer the words go through
+        /// and the texture a sampler binds. REUSED every frame - made fresh they were ~5 MB of
+        /// GPU objects per view per frame left to the garbage collector, the churn that took
+        /// a fighting title's GPU process to 2.3 GB (`subrect_free`).
+        word_views: HashMap<(u32, u32, u32, wgpu::TextureFormat), (wgpu::Buffer, wgpu::Texture, wgpu::TextureView)>,
         /// TEMPORARY: readbacks pending for `VITASLOP_GXM_DRAW_PROBE`. See [`draw_probe_spec`].
         draw_probes: Vec<DrawProbe>,
         /// Draws in the current chain that sampled a target this frame rendered. Zero over
@@ -6157,7 +6580,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// This was `Option<String>`, holding the last line, on the reasoning that "a title
         /// whose frame structure is stable pays one line for a run". A race's structure is not
         /// stable - it CYCLES, and a one-slot memo turns a cycle of N shapes into N reports per
-        /// cycle, for ever. MEASURED in the browser on PCSA00015's race: 16,218 of these lines
+        /// cycle, for ever. MEASURED in the browser on a racer's race: 16,218 of these lines
         /// in one run, and with the `gxp: scene has` tally beside it **58,418 warn lines**, worth
         /// **1.9 ms of a 5.0 ms render** - 38% of the browser's whole renderer
         /// ([[vitaslop-a-diagnostic-can-bury-the-findings]] is the same lesson from the other
@@ -6481,11 +6904,36 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 $($mname: std::sync::atomic::AtomicU64::new(0),)+
             };
 
+            /// Everything any `take_encode_work` has taken, for the whole run - never reset.
+            static RUN: EncodeCounters = EncodeCounters {
+                $($name: std::sync::atomic::AtomicU64::new(0),)+
+                $($mname: std::sync::atomic::AtomicU64::new(0),)+
+            };
+
             /// Take and RESET every encode counter. The caller owns the window it divides by.
+            /// What it takes is also folded into the run's total (see [`run_encode_work`]).
             pub fn take_encode_work() -> EncodeWork {
+                use std::sync::atomic::Ordering::Relaxed;
+                let w = EncodeWork {
+                    $($name: ENC.$name.swap(0, Relaxed),)+
+                    $($mname: ENC.$mname.swap(0, Relaxed),)+
+                };
+                $(RUN.$name.fetch_add(w.$name, Relaxed);)+
+                $(RUN.$mname.fetch_max(w.$mname, Relaxed);)+
+                w
+            }
+
+            /// >>> THE RUN'S CUMULATIVE ENCODE WORK, SAFE TO DIFFERENCE ACROSS ANY SPAN.
+            ///
+            /// `peek_encode_work` reads counters the live renderer TAKES (resets) on every
+            /// present, so a difference of two peeks across a present reads the reset as zero:
+            /// the slowest-frames list and the stall note both said "passes 0 draws 0" for a
+            /// 165 ms present. This is the taken total plus what is not yet taken.
+            pub fn run_encode_work() -> EncodeWork {
+                use std::sync::atomic::Ordering::Relaxed;
                 EncodeWork {
-                    $($name: ENC.$name.swap(0, std::sync::atomic::Ordering::Relaxed),)+
-                    $($mname: ENC.$mname.swap(0, std::sync::atomic::Ordering::Relaxed),)+
+                    $($name: RUN.$name.load(Relaxed) + ENC.$name.load(Relaxed),)+
+                    $($mname: RUN.$mname.load(Relaxed).max(ENC.$mname.load(Relaxed)),)+
                 }
             }
 
@@ -6694,6 +7142,10 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// Uploads that asked for a GPU transcode and were declined by it, falling back to the
         /// CPU decode. Never a wrong picture - only a slower one.
         tex_gpu_encode_refused,
+        /// Of `tex_encoded_on_gpu`, the ones the ETC2 ENCODER made (`texenc::Transcoder::run`),
+        /// as opposed to a decode straight to RGBA8 (`expand_rgba8`). The two cost very
+        /// differently on a phone GPU and the shared counter could not say which a stall was.
+        tex_etc2_encoded,
         ;
         @max
         /// >>> THE WORST SINGLE `queue.write_buffer` OF THE WINDOW, IN MICROSECONDS, AND THE
@@ -7929,14 +8381,14 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // texture they are copied into, under an address that is not their own. Without this
         // the biggest pass in a frame that renders a cube map is reported as "renders into a
         // target nothing reads" forever, which is how this read before cube maps were bound
-        // from their renders at all: face 5 of PCSA00009's environment cube carries 356 draws,
+        // from their renders at all: face 5 of a golf title's environment cube carries 356 draws,
         // the most of any pass in the frame, and only face 0 shares the cube's address.
         cube_faces: &HashSet<u32>,
         // The answer this function reached on the PREVIOUS frame, and it is load-bearing.
         // `cube_faces` comes from `rtt_cubes`, which is filled BETWEEN passes - i.e. after
         // this runs - so on the first frame of a scene it is empty and every cube face looks
         // orphaned. This report fires once and never again, so firing it there pins a false
-        // alarm for the whole run: PCSA00009's course reported its 423-draw environment-cube
+        // alarm for the whole run: the golf title's course reported its 423-draw environment-cube
         // face as "MISSING from the picture" in the same dump whose next line assembled that
         // cube. Requiring the same address twice costs one frame of latency and closes the
         // window, because a cube known on frame N is known on every frame after it.
@@ -7995,11 +8447,23 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// samples it later can be matched to it by the texture's data pointer.
     /// A 64-bit colour surface rendered as RAW words - see [`GxmRenderer::rtt_raw`]. One
     /// `Rg32Uint` colour attachment (also sampled, as `texture_2d<u32>`) and its own depth.
+    /// Whether a scene's depth-stencil surface asks the tiler to LOAD it from memory at the start
+    /// of the scene / STORE it at the end - see `GxmRenderer::depth_saved`.
+    fn zls_load(scene: &RenderScene) -> bool {
+        scene.depth_addr != 0 && scene.zls_control & 0x2 != 0 && super::zls_on()
+    }
+
+    fn zls_store(scene: &RenderScene) -> bool {
+        scene.depth_addr != 0 && scene.zls_control & 0x4 != 0 && super::zls_on()
+    }
+
     struct RawSurface {
         width: u32,
         height: u32,
         color: wgpu::Texture,
         color_view: wgpu::TextureView,
+        /// The depth attachment behind `depth_view` - see `GxmRenderer::depth_saved`.
+        depth: wgpu::Texture,
         depth_view: wgpu::TextureView,
         /// The same words read as F16F16F16F16 - what a sampler declaring that format over this
         /// memory reads, FILTERED. Re-filled after every raw pass into the surface
@@ -8371,6 +8835,58 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// `GxpLive::pipelines`' key: (pair, colour format, samples, cull, vertex layout, raster).
     type PipeCacheKey = (u64, wgpu::TextureFormat, u32, u32, u64, u64);
 
+    /// Pipelines built this process, and how many of them had a key built before - see `log_pipe`.
+    pub static PIPE_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static PIPE_REBUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// `(built, of them an identical key built before)` for the whole process.
+    pub fn pipe_rebuilds() -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (PIPE_BUILDS.load(Relaxed), PIPE_REBUILDS.load(Relaxed))
+    }
+
+    /// `VITASLOP_PIPE_LOG=1`: one status line per pipeline built - the frame, the pair, and the
+    /// baked state it was built under (format, samples, cull, vertex layout, raster = depth,
+    /// stencil, blend). The question it answers: how many distinct STATES a title draws each pair
+    /// with, which decides whether a pipeline can be built at the patcher call (a loading
+    /// screen) - on the phone a state variant is a whole compile (30b, ~100 ms each).
+    fn log_pipe(how: &str, k: &PipeCacheKey, g: &GxpRecompile) {
+        use std::sync::OnceLock;
+        // ALWAYS: count the build, and whether this exact key was built before anywhere in the
+        // process - a rebuild of an identical pipeline is a whole compile paid twice (a fighting title, native:
+        // 32 of 65 pairs built twice), and nothing else can say whether the browser does it too.
+        {
+            use std::hash::{Hash, Hasher};
+            static SEEN: std::sync::Mutex<Option<HashSet<u64>>> = std::sync::Mutex::new(None);
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            k.hash(&mut h);
+            let fresh = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::default).insert(h.finish());
+            PIPE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !fresh {
+                PIPE_REBUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| crate::knobs::flag("VITASLOP_PIPE_LOG")) {
+            return;
+        }
+        report_status!(
+            "pipe {how} pair {:016x} fmt {:?} samples {} cull {} layout {:016x} raster {:016x} | depth func {} write {} stencil {:x?} blend {} {:?} two_sided {}",
+            k.0,
+            k.1,
+            k.2,
+            k.3,
+            k.4,
+            k.5,
+            g.depth_func,
+            g.depth_write,
+            &g.stencil[..4],
+            g.blend,
+            g.blend_state,
+            g.two_sided
+        );
+    }
+
     /// What [`GxpLive::pipe_key`] computes for one draw.
     struct PipeKey {
         raw_units: u64,
@@ -8380,11 +8896,12 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     }
 
     /// A pipeline `createRenderPipelineAsync` is compiling - see `GxmRenderer::warm_pipelines`.
-    type PipeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<wgpu::RenderPipeline, String>>>>;
+    pub type PipeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<wgpu::RenderPipeline, String>>>>;
 
     /// Pipelines [`GxmRenderer::warm_pipelines`] STARTED. The browser compiles them off its GPU
     /// main thread; [`Self::wait`] resolves them and [`GxmRenderer::install_pipelines`] puts
     /// them where the encode looks.
+    #[derive(Default)]
     pub struct PipelineWarm {
         items: Vec<(PipeCacheKey, GxpPipelineOf<PipeFuture>)>,
     }
@@ -8398,28 +8915,75 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             self.items.is_empty()
         }
 
+        /// Replace each compile's future with `f(future)` - how the browser front end times when
+        /// a compile really SETTLES, which a poll from the present loop cannot see (it only
+        /// learns of a settled promise the next time it polls).
+        pub fn map_futures(&mut self, mut f: impl FnMut(u64, PipeFuture) -> PipeFuture) {
+            for (k, p) in self.items.iter_mut() {
+                let fut = std::mem::replace(&mut p.pipeline, Box::pin(std::future::pending()));
+                p.pipeline = f(k.0, fut);
+            }
+        }
+
+        /// Hold `other`'s compiles with these - a caller that keeps pipelines in flight ACROSS
+        /// presents adds each frame's newly started ones here.
+        pub fn absorb(&mut self, other: PipelineWarm) {
+            self.items.extend(other.items);
+        }
+
+        /// The compiles that have ALREADY settled, taken out without waiting on the rest.
+        ///
+        /// Polled with a no-op waker: the promise's own callbacks record its result whether or
+        /// not anything is waiting on it, so a later poll finds it. What is still compiling
+        /// stays here for the next call (or [`Self::wait`]).
+        pub fn take_ready(&mut self) -> PipelinesReady {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut ready = PipelinesReady { items: Vec::new(), settled: Vec::new() };
+            let mut i = 0;
+            while i < self.items.len() {
+                match std::future::Future::poll(self.items[i].1.pipeline.as_mut(), &mut cx) {
+                    std::task::Poll::Pending => i += 1,
+                    std::task::Poll::Ready(r) => {
+                        let (k, p) = self.items.remove(i);
+                        ready.settle(k, r, p.swap(()).1);
+                    }
+                }
+            }
+            ready
+        }
+
         /// Every started pipeline, resolved. One the browser REJECTS is left out and named: the
         /// encode then builds it synchronously, which reports the validation error through the
         /// device's error scope exactly as it always has.
         pub async fn wait(self) -> PipelinesReady {
-            let mut items = Vec::with_capacity(self.items.len());
+            let mut ready = PipelinesReady { items: Vec::with_capacity(self.items.len()), settled: Vec::new() };
             for (k, p) in self.items {
                 let (fut, shell) = p.swap(());
-                match fut.await {
-                    Ok(pipe) => items.push((k, shell.swap(pipe).1)),
-                    Err(e) => report_status!(
-                        "gxp pair {:016x}: createRenderPipelineAsync REJECTED ({e}) - the frame builds it synchronously instead",
-                        k.0
-                    ),
-                }
+                ready.settle(k, fut.await, shell);
             }
-            PipelinesReady { items }
+            ready
         }
     }
 
     /// Resolved pipelines, for [`GxmRenderer::install_pipelines`].
     pub struct PipelinesReady {
         items: Vec<(PipeCacheKey, GxpPipeline)>,
+        /// Every key whose compile SETTLED, including the rejected ones `items` leaves out - so
+        /// the renderer stops counting them as in flight and the encode may build them.
+        settled: Vec<PipeCacheKey>,
+    }
+
+    impl PipelinesReady {
+        fn settle(&mut self, k: PipeCacheKey, r: Result<wgpu::RenderPipeline, String>, shell: GxpPipelineOf<()>) {
+            self.settled.push(k);
+            match r {
+                Ok(pipe) => self.items.push((k, shell.swap(pipe).1)),
+                Err(e) => report_status!(
+                    "gxp pair {:016x}: createRenderPipelineAsync REJECTED ({e}) - the frame builds it synchronously instead",
+                    k.0
+                ),
+            }
+        }
     }
 
     impl<P> GxpPipelineOf<P> {
@@ -8726,6 +9290,14 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// so a pipeline the encode still has to build synchronously is a pre-pass MISS and is
         /// counted as `pipelines_unwarmed`. False on every path that never warms (native).
         warm_used: bool,
+        /// Pipelines `createRenderPipelineAsync` is still compiling, which the caller holds (a
+        /// [`PipelineWarm`] it may keep across presents - see `LivePlayback::warm_pipelines`).
+        /// `warm_pipelines` does not start one of these again; [`GxmRenderer::install_pipelines`]
+        /// clears a key when its compile SETTLES, resolved or rejected.
+        in_flight: HashSet<PipeCacheKey>,
+        /// The pipeline keys the frame last passed to `warm_pipelines` draws with - what
+        /// [`GxmRenderer::frame_waits_on_compile`] checks against `in_flight`.
+        frame_needs: Vec<PipeCacheKey>,
         /// Compiled WGSL modules, by shader PAIR.
         ///
         /// # A pair's module does not depend on the pipeline variant, and it used to be rebuilt
@@ -9288,6 +9860,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     .unwrap_or_default(),
                 pipelines: HashMap::default(),
                 warm_used: false,
+                in_flight: HashSet::default(),
+                frame_needs: Vec::new(),
                 modules: HashMap::default(),
                 pair_keys: HashMap::default(),
                 views: HashMap::default(),
@@ -9595,7 +10169,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // projection) a single full-screen quad silently decides the whole pass.
             //
             // MEASURED before it was acted on, over every title that renders: across
-            // PCSA00027, PCSE00341, PCSA00015 and PCSE00001 the two verdicts agree on EVERY
+            // an RC racer, a skating title and two racers, the two verdicts agree on EVERY
             // pass, and they disagree on exactly ONE pass anywhere - a golf title's 960x544
             // world, where 241 perspective draws put 2,058 sampled vertices behind the eye and
             // two screen-space quads put 4 in front. Those four vertices were the whole reason
@@ -9617,7 +10191,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // SETTLE on the first frame that produced any evidence at all - the original
             // rule, and it is the right one now that the KEY distinguishes the passes that
             // share a buffer. Waiting for a PERSPECTIVE draw instead was tried and MEASURED
-            // wrong: a PCSA00015 pass whose fit comes from a draw with no vertex inside the
+            // wrong: a racer's pass whose fit comes from a draw with no vertex inside the
             // frustum then never settles at all, so it re-decides every frame - which
             // re-interprets every pair of the pass per frame (the cost this cache exists to
             // avoid) and lets its stored depth fit drift with the camera. It moved three of
@@ -10179,6 +10753,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 report_unfed_uniforms(key, "vertex", &gxp.vprog);
                 report_unfed_uniforms(key, "fragment", &gxp.fprog);
                 enc(&ENC.pipelines_built, 1);
+                log_pipe("sync", &cache_key, gxp);
                 if self.warm_used {
                     enc(&ENC.pipelines_unwarmed, 1);
                 }
@@ -10981,6 +11556,44 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 .expect("prepared key present")
         }
 
+        /// >>> ENCODE A SLICE OF THE DEFERRED ETC2 TEXTURES AND SWAP IN THE ONES THAT FINISHED.
+        ///
+        /// Called once per frame, before anything is prepared, so a swap never lands between a
+        /// draw that named the interim and the submit that reads it. The finished texture's copy
+        /// is on the pump's submit, which precedes this frame's, so its first sampler sees the
+        /// blocks. The interim is DESTROYED, not dropped (WebGPU completes any work already
+        /// submitted against it first), and every cached sampler group naming its entry is
+        /// dropped exactly as an eviction drops them.
+        fn pump_deferred_encodes(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+            use std::sync::atomic::Ordering;
+            let Some(te) = self.texenc.as_ref() else { return };
+            te.pump(device, queue, super::tex_encode_defer_units());
+            for (key, tex) in te.take_finished() {
+                let k = (key, SamplerDim::Two);
+                match self.views.get_mut(&k) {
+                    Some(entry) => {
+                        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                            dimension: Some(SamplerDim::Two.view_dimension()),
+                            ..Default::default()
+                        });
+                        let (old, _) = std::mem::replace(entry, (tex, view));
+                        note_texture_destroyed();
+                        old.destroy();
+                        self.sampler_bgs.retain(|_, (_, named, _)| !named.contains(&k));
+                        self.last_sampler_bg = None;
+                        self.sampler_pre.clear();
+                        super::DEFER_SWAPPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Evicted while it encoded: nothing names it, and a later bind re-uploads.
+                    None => {
+                        note_texture_destroyed();
+                        tex.destroy();
+                        super::DEFER_ORPHANED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
         /// Build the group2 sampler bind group: for each declared sampler unit, upload the
         /// bound texture and bind it with the matching filter sampler. `None` (fall back) if a
         /// unit has no bound texture or needs a 3D texture (not yet mapped).
@@ -11219,7 +11832,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // GUEST MEMORY - which the GPU wrote and the guest never did, so the reflection
                 // sampled stale or empty bytes and nothing said so
                 // ([[vitaslop-a-render-target-reads-empty-in-guest-memory]]). MEASURED on
-                // PCSA00009: ten pairs sample a cube at unit 11 naming `0x891e6520`, whose six
+                // a golf title: ten pairs sample a cube at unit 11 naming `0x891e6520`, whose six
                 // faces the same frame renders as six 256x256 passes 0x40000 apart.
                 //
                 // Checked BEFORE the two 2D paths for the same reason the depth path is: an
@@ -11266,6 +11879,18 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     .then(|| {
                         usable.and_then(|gt| {
                             let a = gt.tex.data_addr;
+                            // >>> A COMPRESSED TEXTURE IS NEVER A DEPTH SURFACE. The depth map
+                            // is carried across frames for as long as its target lives, so an
+                            // address a title frees and re-allocates keeps answering with the
+                            // old distance. Base formats 0x80 and up are block families (PVRTC,
+                            // UBC, ETC) that no GPU pass writes. MEASURED on a fighting title:
+                            // stage 1's 512x512 shadow depth sat at the address stage 2 loaded a
+                            // 1024x512 UBC1 graffiti wall into, and the wall sampled the stale
+                            // depth - a flat red slab across the background.
+                            if gt.tex.base_format >= 0x80 && depth_rendered.contains_key(&a) {
+                                report_depth_alias_refused_compressed(a, gt.tex.base_format);
+                                return None;
+                            }
                             match (depth_rendered.get(&a), rendered.contains_key(&a)) {
                                 // A depth-ONLY pass owns its address: `encode_depth_only_pass`
                                 // keys the target BY the depth address and its colour
@@ -11550,6 +12175,9 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                                 // A cube VIEW needs six layers whatever the guest bound - see
                                 // the `usable` test above.
                                 if want == SamplerDim::Cube { 6 } else { 1 },
+                                // Only a plain 2D view is swapped in later; every other kind
+                                // of binding encodes inline, as before.
+                                (want == SamplerDim::Two).then_some(gt.tex.key),
                             );
                             let view = tex.create_view(&wgpu::TextureViewDescriptor {
                                 dimension: Some(want.view_dimension()),
@@ -11703,7 +12331,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // None of them says what the renderer ended up NAMING, and those differ by design -
             // a render target this frame drew, a depth buffer, a cube, a cached decode of guest
             // bytes, or a fallback are five different answers to one descriptor. MEASURED on
-            // PCSA00002: one draw's descriptor is an 8x8 texture and the pixels it paints are
+            // a baseball title: one draw's descriptor is an 8x8 texture and the pixels it paints are
             // plainly a 512x512 image, and no existing line could say which of those the
             // sampler was given. Reported at `warn` so it survives the default filter, and
             // once per (pair, plan shape) so a 500-draw pass cannot flood the log.
@@ -11937,11 +12565,11 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// NEAREST one is read rather than a blend of two.
     ///
     /// # Why it matters more than a softer or sharper picture
-    /// A texture can carry DATA in a channel. mlb's player material reads a colorization ROW
+    /// A texture can carry DATA in a channel. A baseball title's player material reads a colorization ROW
     /// out of its base texture's 4-bit alpha - `floor(alpha * 15.99)` - and the guest turned
     /// mip filtering off for it. Blending two levels hands that `floor` a fraction of two
     /// indices, and the leg guards came out speckled with other rows' colours (red and white
-    /// dots on a black guard, `vitaslop-mlb` batter and catcher alike).
+    /// dots on a black guard, batter and catcher alike).
     const MIP_NEAREST_SAMPLER_FLAG: u32 = 0x4000_0000;
 
     /// The sampler-mode key of a guest texture: its filter, its address modes, and whether it
@@ -12177,6 +12805,9 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // one, so the one image is REPLICATED into all six. See the `usable` test in
         // `make_sampler_bg` for the measurement and for why this beats refusing the draw.
         want_layers: u32,
+        // The view-cache key a DEFERRED ETC2 encode is swapped in under when it finishes, or
+        // `None` where the caller cannot swap one in - see `GxpLive::pump_deferred_encodes`.
+        defer_key: Option<u64>,
     ) -> wgpu::Texture {
         let (w, h) = (t.width.max(1), t.height.max(1));
         // A cube map uploads as six array layers; the view below then reads them as a cube.
@@ -12264,7 +12895,13 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // every shape it declines falls through to the ordinary decode below, which produces
             // the same picture and only costs more.
             if let (CompressedData::Gpu(plan), 1) = (&c.data, repeat) {
-                if let Some(tex) = texenc.run(device, queue, c, plan, t.gamma) {
+                // DEFERRED where the caller can swap the finished texture in (`defer_key`),
+                // inline otherwise - see `super::tex_encode_defer`.
+                let deferred = defer_key
+                    .filter(|_| super::tex_encode_defer())
+                    .and_then(|key| texenc.run_deferred(device, queue, c, plan, t.gamma, key));
+                if let Some(tex) = deferred.or_else(|| texenc.run(device, queue, c, plan, t.gamma)) {
+                    enc(&ENC.tex_etc2_encoded, 1);
                     enc(&ENC.tex_uploaded, 1);
                     enc_tex_upload(c.byte_len() as u64);
                     enc(&ENC.tex_uploaded_compressed, 1);
@@ -12279,7 +12916,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // (A GPU plan with `repeat > 1` - a flat texture bound to a CUBE sampler - lands
             // neither here nor in the arm above: the transcoder makes only the source's own
             // layers, so it takes the ordinary decode below. This was an `unreachable!` that
-            // PANICKED the phone's Madden run at the coin toss, job 067.)
+            // PANICKED the phone's football-title run at the coin toss, job 067.)
             enc(&ENC.tex_uploaded, 1);
             enc_tex_upload(c.byte_len() as u64);
             enc(&ENC.tex_uploaded_compressed, 1);
@@ -13679,8 +14316,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         let u16at = |o: usize| -> Option<u16> { buf.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]])) };
         match gxm_format {
             // F32, and UNTYPED (10): a 32-bit word the fetch hands the shader UNCONVERTED, so the
-            // f32 carrying exactly those bits is that word. MEASURED on a fighting title
-            // (PCSE00235): its engine clears a target with a fullscreen triangle whose only
+            // f32 carrying exactly those bits is that word. MEASURED on a fighting title:
+            // its engine clears a target with a fullscreen triangle whose only
             // attribute is UNTYPED x2 - float positions. Reading it as 0.0 collapsed the triangle
             // to a point, the clear drew nothing, and a map the game clears to alpha 1 stayed at
             // alpha 0 - which its character shader multiplies every surface colour by.
@@ -14064,7 +14701,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// # A REPORT THAT EXISTS IS NOT A DIAGNOSTIC A READER CAN COUNT
     /// `report_vertex_plan_ok` and `report_vertex_repack` already say, per pair, which of the
     /// three plans it got. They cannot be COUNTED: both go through panels that keep 96 distinct
-    /// lines and drop the rest (one mlb run dropped 379 from STATUS and 293 from the warnings
+    /// lines and drop the rest (one baseball-title run dropped 379 from STATUS and 293 from the warnings
     /// panel), so grepping a log for them answers a question about the panel's capacity.
     /// MEASURED against that: two changes that each took pipelines off the repack moved the
     /// per-frame `packed_passthrough` counter by 95 -> 140 draws of 605 while the log said every
@@ -14763,8 +15400,14 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         ///
         /// The two now call one function. This test is what stops a second copy appearing: a
         /// duplicated default is invisible precisely because SETTING the knob moves both.
+        /// Both tests below write the one global working set; run in parallel, one's store
+        /// landed between the other's store and its assertion.
+        #[cfg(test)]
+        static WORKING_SET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
         #[test]
         fn the_pressure_signal_prices_the_budget_the_same_way_the_uploader_does() {
+            let _g = WORKING_SET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             // 0 is the "no frame has finished" sentinel, which is pressure by design, so the
             // comparison is made at a working set that is unambiguously below any threshold.
             super::super::LAST_WORKING_SET.store(1, std::sync::atomic::Ordering::Relaxed);
@@ -14794,6 +15437,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// budget, and pressure is unmoved by it.
         #[test]
         fn bounding_retention_does_not_tighten_the_re_encode_gate() {
+            let _g = WORKING_SET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let budget = super::tex_cache_budget_bytes();
             let retain = super::tex_retain_budget_bytes();
             assert!(
@@ -15058,9 +15702,9 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// (`api` = the graphics API's `(0, 0, 0, 1)`, `zero`, `one`).
     ///
     /// # ONE CONSTANT CANNOT SERVE TWO TITLES - MEASURED, BOTH DIRECTIONS
-    /// Ridge Racer's cows are correct at 1.0 and turn BRIGHT GREEN/CYAN under a zero
+    /// A racer's cows are correct at 1.0 and turn BRIGHT GREEN/CYAN under a zero
     /// (`f008800` is the discriminating frame; 10 of its 12 oracle frames are identical either
-    /// way). Mortal Kombat's effect meshes do the exact reverse: `Input.Color` with BLUE pinned
+    /// way). A fighting title's effect meshes do the exact reverse: `Input.Color` with BLUE pinned
     /// to 1.0 is a saturated cyan mass, and `Input.CornerIndex` with two lanes pinned to 1 is a
     /// stretched quad. The obvious discriminator - the guest's attribute FORMAT - is refuted:
     /// both titles carry over-wide attributes on plain F32. What separates them is what each
@@ -15764,7 +16408,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // PowerVR CLAMPS window depth; it does not clip on it. The default arm leaves that clamp
         // to the rasteriser (`unclipped_depth`), which only a device offering
         // `depth-clip-control` can grant - and a PowerVR phone does not offer it. There every
-        // vertex whose depth fell outside [0, w] was CLIPPED: MLB's boot splash quads sit at clip
+        // vertex whose depth fell outside [0, w] was CLIPPED: a baseball title's boot splash quads sit at clip
         // z = -1 with no viewport set, so all 1,400 frames of logos and the health warning were
         // clipped away and the only thing left on screen was the title's black fade quad
         // (measured on the device: `VITASLOP_GXP_KEYCOLOR` + `VITASLOP_GXP_NODEPTH` with the fade
@@ -15988,7 +16632,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // [[vitaslop-a-render-target-reads-empty-in-guest-memory]]. That case only ever looks at
         // textures bound at a target's OWN address, so a recycled allocation that starts a few
         // bytes INTO a freed target came through here unchecked and was handed the old target.
-        // MEASURED (Madden, desktop browser, 2026-09-25): the scoreboard's EA SPORTS badge bound
+        // MEASURED (a football title, desktop browser, 2026-09-25): the scoreboard's publisher badge bound
         // `rendered@0x9257ab00` - a 32x64 target last drawn in the front end - and drew as a flat
         // RED SQUARE; native bound the guest's decode only because a slower run had already aged
         // the target out after its one-minute TTL. Real guest bytes: sample those.
@@ -16196,7 +16840,16 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         // Publish the frame's working set whether or not it is a new high, so the CPU side can
         // ask whether compressing anything further is still buying something. See
         // [`texture_budget_pressure`].
-        crate::gpu::LAST_WORKING_SET.store(bytes, Ordering::Relaxed);
+        //
+        // >>> AT LEAST ONE BYTE: ZERO IS RESERVED FOR "NO FRAME HAS FINISHED YET", WHICH COUNTS
+        // >>> AS PRESSURE. A frame that bound no textures - a loading screen, a black fade -
+        // published a real 0 here, so the NEXT screen's first frames read as "unknown" and
+        // re-encoded every BC texture they bound to ETC2 on a phone whose working set was 22 MB
+        // of 477. MEASURED (a fighting title, runner job 085): the two worst display gaps of the run, 1.46 s
+        // and 1.40 s, were 46 and 56 textures transcoded at a screen's first frame, almost all
+        // `Bc -> Etc2Rgba8` - a second lossy step the budget never asked for, at ~17 ms of GPU
+        // each on that device.
+        crate::gpu::LAST_WORKING_SET.store(bytes.max(1), Ordering::Relaxed);
         let mb = bytes / (1024 * 1024);
         let prev = WORST.load(Ordering::Relaxed);
         if mb < prev + if prev == 0 { 1 } else { STEP_MB } {
@@ -16358,7 +17011,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// >>> two render targets sharing one colour address being mistaken for one that resized.
     ///
     /// `rtt` is keyed by `(address, width, height)` now, so a different extent at a known
-    /// address is a different target and a first sighting. MEASURED on PCSA00002: this line
+    /// address is a different target and a first sighting. MEASURED on a baseball title: this line
     /// fired every frame on the three stadium-board addresses 0x8e55a090, 0x8e79c2e0 and
     /// 0x8ec4a8e0, where a 4-draw 512x1024 pass and a 41-draw 256x256 pass share a colour
     /// surface - and each recreation threw the other pass's image away. Those boards rendered
@@ -16591,6 +17244,33 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(addr) {
             report_warn!(
                 "gxm rtt {addr:#x} is registered as BOTH a rendered colour target and a converted DEPTH surface. Binding the COLOUR: a sampler naming a colour target wants the image, and the depth path is consulted first, so this would otherwise hand it a distance. One of the two registrations is wrong."
+            );
+        }
+    }
+
+    /// Say - once per address - that a colour pass began into an address that held a converted
+    /// DEPTH surface, which was retired so no later sampler binds it there. See the scene loop.
+    fn report_depth_retired_by_colour(addr: u32) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
+        if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(addr) {
+            report_status!(
+                "gxm rtt {addr:#x}: a COLOUR pass began into memory a depth pass used, so the depth converted there is retired - a sampler naming {addr:#x} now gets the colour image (or the guest's bytes), not a distance"
+            );
+        }
+    }
+
+    /// Say - once per address - that a carried-forward DEPTH surface was NOT bound for a
+    /// sampler naming its address, because the bound texture is a compressed format no GPU pass
+    /// can have written: the guest re-allocated that memory, and its own texture is decoded.
+    fn report_depth_alias_refused_compressed(addr: u32, base_format: u32) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
+        if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(addr) {
+            report!(
+                "gxm rtt {addr:#x} is held as a render target's DEPTH surface, but a draw binds a                  COMPRESSED texture (base format {base_format:#x}) there - the guest re-allocated                  the memory, so the alias is refused and its own texture is sampled"
             );
         }
     }
@@ -17956,8 +18636,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // >>> THE GUEST'S ATTRIBUTE FORMAT, because it is the only variable left that
                 // >>> could make ONE rule right for two titles that need opposite fills.
                 //
-                // MEASURED both ways on this machine: Ridge Racer's cows are correct at a fill
-                // of 1.0 and turn BRIGHT GREEN/CYAN under the API's `(0,0,0,1)`; MK's effect
+                // MEASURED both ways on this machine: a racer's cows are correct at a fill
+                // of 1.0 and turn BRIGHT GREEN/CYAN under the API's `(0,0,0,1)`; a fighting title's effect
                 // meshes do the reverse - `Input.Color` with blue pinned to 1.0 is the
                 // saturated mass a user photographed. `component_count` is the guest's own word
                 // (read straight off `SceGxmVertexAttribute`), so this is not a case of
@@ -18459,6 +19139,12 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     ^ gxp_attr_interface_fold(&linked.vertex_bindings.attributes)
             }
         };
+        // Which form the title's draws take - see `premodule_pairs`.
+        if gxp.fprog_patched_vprog.is_empty() {
+            super::DRAWS_UNPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            super::DRAWS_PATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let module = modules
             .entry(mkey)
             .or_insert_with(|| {
@@ -19581,17 +20267,26 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 rtt_rendered: HashMap::default(),
                 rtt_pitch: HashMap::default(),
                 subrect_keep: Vec::new(),
+                subrect_free: HashMap::default(),
                 rtt_ever_rendered: HashSet::default(),
                 rtt_raw: HashMap::default(),
                 pass_shapes: HashMap::default(),
+                pass_shapes_by_format: HashMap::default(),
                 raw_to_float: None,
                 rtt_rendered_raw: HashMap::default(),
                 display_images: HashMap::default(),
+                #[cfg(not(target_arch = "wasm32"))]
+                premodules: std::sync::Arc::default(),
+                #[cfg(not(target_arch = "wasm32"))]
+                premodule_seen: HashSet::default(),
                 rtt_binds: HashMap::default(),
                 offscreen_only: false,
                 rtt_cubes: HashMap::default(),
                 orphan_candidate: None,
                 presented: Vec::new(),
+                presented_matched: false,
+                flipped_ever: Vec::new(),
+                last_flipped: None,
                 rtt_used: HashMap::default(),
                 rtt_alias_block: HashSet::default(),
                 cube_faces_copied: HashSet::default(),
@@ -19604,6 +20299,9 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 buffer_pool: BufferPool::default(),
                 retired_textures: Vec::new(),
                 keep_depth: false,
+                depth_load_now: false,
+                depth_saved: HashMap::default(),
+                word_views: HashMap::default(),
                 draw_probes: Vec::new(),
                 rtt_hits: 0,
                 chain_shapes_seen: HashSet::default(),
@@ -20032,7 +20730,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     vcap: Self::cap_for(v),
                     icap: Self::cap_for(i),
                     ucap: Self::cap_for(u),
-                    generation: 0,
+                    generation: next_arena_generation(),
+                    last_used: 0,
                 });
                 *create_ms += t_create.ms();
             }
@@ -20065,7 +20764,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // Only the UNIFORM arena's identity is baked into a bind group, so only its
             // re-creation has to invalidate one.
             if grow(&mut a.ubo, &mut a.ucap, uneed, wgpu::BufferUsages::UNIFORM, "gxp-ubo", retired) {
-                a.generation += 1;
+                a.generation = next_arena_generation();
             }
             *create_ms += t_grow.ms();
             let t_write = Stopwatch::start();
@@ -20131,7 +20830,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     // wgpu's web `BufferViewMut` is a COPY: the first write pulls the whole
                     // mapped range into the wasm heap (`Uint8Array::to_vec`), and the drop
                     // `set`s it all back - three passes over every uploaded byte, MEASURED at
-                    // 1.4% + 0.5% of the busy worker on mlb. The read view's `Uint8Array` is
+                    // 1.4% + 0.5% of the busy worker on a baseball title. The read view's `Uint8Array` is
                     // the mapped `ArrayBuffer` itself, and WebGPU does not care which kind of
                     // view a mapped range is written through, so one `set` from a view of
                     // `data` does the whole upload. Same allocation, same copy command as
@@ -20342,7 +21041,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// the hardware writes. A later program that declares an F16F16F16F16 TEXTURE over the
         /// same memory samples those words as four halves - FILTERED, through its own sample
         /// instruction - and an `Rg32Uint` texture can be neither filtered nor sampled.
-        /// MEASURED on a fighting title (PCSE00235): its image-based lighting renders 12x72 and
+        /// MEASURED on a fighting title: its image-based lighting renders 12x72 and
         /// 24x144 F16F16F16F16 intermediates and filters them into the lighting cubes; with
         /// only the raw view the cube pass was refused and every character was unlit.
         fn convert_raw_to_float(
@@ -20466,13 +21165,16 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: depth_format(),
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                // COPY_*: a FORCE_STORE / FORCE_LOAD surface's depth moves through `depth_saved`.
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
             let color_view = color.create_view(&Default::default());
             let depth_view = depth.create_view(&Default::default());
-            // The depth TEXTURE itself is not kept: a view holds its texture alive, and a
-            // second handle to it is one more thing that can be mistaken for the live one.
+            // The depth TEXTURE is kept now, for one reason: `depth_saved` copies it (a view
+            // cannot be a copy source). It is the attachment `depth_view` renders into.
             let _ = depth;
             let float_view = device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -20488,7 +21190,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 .create_view(&Default::default());
             self.rtt_raw.insert(
                 (addr, width, height),
-                RawSurface { width, height, color, color_view, depth_view, float_view },
+                RawSurface { width, height, color, color_view, depth, depth_view, float_view },
             );
         }
 
@@ -20673,11 +21375,13 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: depth_format(),
+                // COPY_*: a FORCE_STORE / FORCE_LOAD surface's depth moves through `depth_saved`.
                 usage: if sample_depth {
                     wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
                 } else {
                     wgpu::TextureUsages::RENDER_ATTACHMENT
-                },
+                } | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
             let color_view = color.create_view(&Default::default());
@@ -20732,7 +21436,11 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     mip_level_count: 1,
                     sample_count: samples,
                     dimension: wgpu::TextureDimension::D2,
-                    format: self.color_format,
+                    // The colour texture's OWN format, which a float surface overrides: a resolve
+                    // must land in a texture of the attachment's format. MEASURED on a racer:
+                    // a multisampled F16 target resolved an Rgba8Unorm attachment
+                    // into its Rgba16Float `color`, wgpu refused every pass, and the frame was black.
+                    format: want_format,
                     // RENDER_ATTACHMENT only: nothing samples the multisampled image. What
                     // downstream reads is `color`, which this resolves into.
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -21387,7 +22095,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// scene (a viewport per face) and binds the address as a cube, and on hardware nothing
         /// converts anything.
         ///
-        /// MEASURED on a fighting title (PCSE00235): at stage load it renders its image-based
+        /// MEASURED on a fighting title: at stage load it renders its image-based
         /// lighting into three such targets (`0x93379000` 16x96, `0x9337a800` 16x96,
         /// `0x9337c000` 32x192) with one pair, and every character draw afterwards samples them
         /// as 16x16 / 32x32 CUBES - its diffuse and specular light. Nothing assembled them, the
@@ -21641,8 +22349,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// the layout its vertex program was created with) is linked into the translation memo
         /// under the SAME options the draw path computes for its common case - see
         /// `vitaslop_gxp_shader::link_programs_memo`. The draw then finds it and pays a hash,
-        /// not a translation: MEASURED, our translation was 731-780 ms of in-frame time a Hot
-        /// Shots session and the whole of the "new character appears" stall on MK. A draw whose
+        /// not a translation: MEASURED, our translation was 731-780 ms of in-frame time a golf
+        /// title's session and the whole of the "new character appears" stall on a fighting title. A draw whose
         /// state differs (a dual-source blend, a raw sampler slot, a masked colour) misses and
         /// translates as before, so this can cost work but never a picture.
         ///
@@ -21668,6 +22376,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     );
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            self.premodule_pairs(_device, pairs);
             if !self.gxp.enabled || pairs.is_empty() || !super::gxp_precompile() {
                 return;
             }
@@ -21730,12 +22440,18 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 return PipelineWarm { items };
             }
             self.gxp.warm_used = true;
+            self.gxp.frame_needs.clear();
             let mut started: HashSet<PipeCacheKey> = HashSet::default();
             for scene in scenes {
                 if scene.draws.is_empty() {
                     continue;
                 }
-                let Some(shapes) = self.pass_shapes.get(&Self::pass_id(scene)).cloned() else {
+                let Some(shapes) = self.pass_shapes.get(&Self::pass_id(scene)).cloned().or_else(|| {
+                    scene
+                        .target
+                        .filter(|_| super::warm_by_format())
+                        .and_then(|t| self.pass_shapes_by_format.get(&t.format).cloned())
+                }) else {
                     continue;
                 };
                 for d in &scene.draws {
@@ -21754,12 +22470,17 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                         let pk = GxpLive::pipe_key(g, key, noop_keeps_depth, fmt, alpha_single, samples, |k| {
                             rtt_raw.contains_key(k)
                         });
+                        if self.gxp.in_flight.contains(&pk.cache_key) {
+                            self.gxp.frame_needs.push(pk.cache_key);
+                            continue;
+                        }
                         if self.gxp.pipelines.contains_key(&pk.cache_key) || !started.insert(pk.cache_key) {
                             continue;
                         }
                         report_unfed_uniforms(key, "vertex", &g.vprog);
                         report_unfed_uniforms(key, "fragment", &g.fprog);
                         enc(&ENC.pipelines_built, 1);
+                        log_pipe("async", &pk.cache_key, g);
                         enc(&ENC.pipelines_async, 1);
                         let l = &mut self.gxp;
                         let built = build_gxp_pipeline(
@@ -21782,7 +22503,11 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                             |d, desc| d.create_render_pipeline_async(desc),
                         );
                         match built {
-                            Some(p) => items.push((pk.cache_key, p)),
+                            Some(p) => {
+                                self.gxp.in_flight.insert(pk.cache_key);
+                                self.gxp.frame_needs.push(pk.cache_key);
+                                items.push((pk.cache_key, p));
+                            }
                             // Refused by our own link: cached as refused, as the encode would.
                             None => {
                                 self.gxp.pipelines.insert(pk.cache_key, None);
@@ -21794,9 +22519,237 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             PipelineWarm { items }
         }
 
+        /// >>> NATIVE: TRANSLATE AND COMPILE THE PAIRS THE PATCHER NAMED, ON BACKGROUND THREADS,
+        /// >>> WHILE THE TITLE IS STILL LOADING - so the frame that first draws them finds both.
+        ///
+        /// [`Self::prebuild_pipelines`] spreads a frame's new pairs over threads, but the shader
+        /// MODULE half does not parallelise much (MEASURED: 127-177 ms of module work in a
+        /// 126-189 ms present at a fighting title's intro starts), and those presents still
+        /// emptied the audio lead. The patcher names those very pairs during the loading screen
+        /// before them, where there is time to spare. So each newly named pair is translated
+        /// with the options the draw computes for its common case (the same guess as the
+        /// translation-only [`Self::precompile_pairs`]: the translation memo then serves the
+        /// draw), run through the same clip fixup, compiled into a module, and filed under the
+        /// draw path's own module key. A draw whose state differs (dual-source, raw units, a
+        /// masked colour, an alpha target) computes another key and builds as before - work,
+        /// never a different picture. Off under the WGSL override and keycolour diagnostics,
+        /// which change the module per pair.
+        #[cfg(not(target_arch = "wasm32"))]
+        fn premodule_pairs(&mut self, device: &wgpu::Device, pairs: &[vitaslop_gxp_shader::PatcherPair]) {
+            if !self.gxp.enabled || pairs.is_empty() || !super::parallel_pipelines() {
+                return;
+            }
+            if crate::knobs::var("VITASLOP_GXP_WGSL_OVERRIDE_DIR").is_ok()
+                || crate::knobs::var("VITASLOP_GXP_WGSL_OVERRIDE_TEXT").is_ok()
+                || crate::knobs::var("VITASLOP_GXP_KEYCOLOR").is_ok()
+            {
+                return;
+            }
+            if self.premodule_seen.len() >= PRECOMPILE_SEEN_CAP {
+                self.premodule_seen.clear();
+            }
+            let fresh: Vec<vitaslop_gxp_shader::PatcherPair> = pairs
+                .iter()
+                .filter(|p| {
+                    let akey = (
+                        std::sync::Arc::as_ptr(&p.vprog) as *const u8 as usize,
+                        std::sync::Arc::as_ptr(&p.fprog) as *const u8 as usize,
+                    );
+                    self.premodule_seen.insert(akey)
+                })
+                .cloned()
+                .collect();
+            if fresh.is_empty() {
+                return;
+            }
+            let (zfix, yflip, solid) = (self.gxp.zfix, self.gxp.yflip, self.gxp.solid);
+            // >>> THE FORM THE TITLE'S DRAWS ACTUALLY TAKE. A draw carries the vertex program its
+            // fragment was patched against on some titles and not on others (MEASURED: a
+            // fighting title's every draw linked UNPATCHED, so modules built for the patched
+            // form - the translation-only precompile's assumption - matched none of them). The
+            // draws so far decide; before any, the patched form, as the precompile always took.
+            let patched = {
+                use std::sync::atomic::Ordering::Relaxed;
+                super::DRAWS_PATCHED.load(Relaxed) >= super::DRAWS_UNPATCHED.load(Relaxed)
+            };
+            // Modest on purpose: MEASURED, eight threads here slowed the in-frame builds they
+            // compete with (a fight start's present 218 -> 282 ms) more than they saved.
+            let threads = std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4).min(fresh.len());
+            let fresh = std::sync::Arc::new(fresh);
+            for t in 0..threads {
+                let (device, out, fresh) = (device.clone(), self.premodules.clone(), fresh.clone());
+                let _ = std::thread::Builder::new().name("gxp-premodule".into()).spawn(move || {
+                    for p in fresh.iter().skip(t).step_by(threads) {
+                        let opts = vitaslop_gxp_shader::LinkOptions {
+                            guest_attrs: p.attrs.clone(),
+                            patched_against: patched.then(|| p.vprog.clone()),
+                            ..Default::default()
+                        };
+                        let Ok(linked) = vitaslop_gxp_shader::link_programs_memo(&p.vprog, &p.fprog, opts) else { continue };
+                        // The draw path's key for this case - see the `mkey` in `build_gxp_pipeline`.
+                        let mkey = GxpLive::module_key(&p.vprog, &p.fprog)
+                            ^ if patched { GxpLive::module_key(&p.vprog, b"patched").rotate_left(17) } else { 0 }
+                            ^ gxp_attr_interface_fold(&linked.vertex_bindings.attributes);
+                        let Some(wgsl) = inject_clip_fixup(&linked.wgsl, zfix, yflip, solid, None, true) else { continue };
+                        let wgsl = vitaslop_gxp_shader::wgsl::hoist_diagnostics(&wgsl);
+                        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: Some(&format!("gxp-linked:{mkey:016x}")),
+                            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+                        });
+                        out.lock().unwrap_or_else(|e| e.into_inner()).push((mkey, module));
+                    }
+                });
+            }
+        }
+
+        /// Move the modules [`Self::premodule_pairs`] finished into the cache the draws read.
+        #[cfg(not(target_arch = "wasm32"))]
+        fn take_premodules(&mut self) {
+            let done = std::mem::take(&mut *self.premodules.lock().unwrap_or_else(|e| e.into_inner()));
+            for (k, m) in done {
+                self.gxp.modules.entry(k).or_insert(m);
+            }
+        }
+
+        /// >>> NATIVE: BUILD EVERY PIPELINE THESE SCENES WILL NEED AND DO NOT HAVE, ON SEVERAL
+        /// >>> THREADS, BEFORE THE ENCODE - the desktop's form of [`Self::warm_pipelines`].
+        ///
+        /// A native device has no asynchronous create, so a frame that introduces a dozen pairs
+        /// built them one after another inside the encode, on the one thread the guest's next
+        /// frame waits behind. MEASURED in a fighting title's window at the start of each
+        /// pre-fight intro: a 254-286 ms present, of it 46-57 ms our translation, 110-139 ms
+        /// shader modules and 36-45 ms pipelines - long enough to empty the 120 ms audio lead,
+        /// which is the choppy sound on the intros the user heard. The three are independent per
+        /// pair and a native `wgpu::Device` is thread-safe, so they are split across threads
+        /// here, each with its own module map, and merged into the caches the encode reads.
+        ///
+        /// Predicted with the same keys and pass shapes as the browser's warm; what that cannot
+        /// predict still builds in the encode exactly as before. A refused pair is cached as
+        /// refused, as the encode would. `VITASLOP_PARALLEL_PIPELINES=0` is the arm back.
+        #[cfg(not(target_arch = "wasm32"))]
+        pub fn prebuild_pipelines(&mut self, device: &wgpu::Device, scenes: &[RenderScene]) {
+            if !self.gxp.enabled || !super::parallel_pipelines() {
+                return;
+            }
+            self.take_premodules();
+            struct Job<'a> {
+                g: &'a GxpRecompile,
+                key: u64,
+                fmt: wgpu::TextureFormat,
+                alpha_single: bool,
+                samples: u32,
+                noop_keeps_depth: bool,
+                pk: PipeKey,
+            }
+            let mut jobs: Vec<Job> = Vec::new();
+            let mut seen: HashSet<PipeCacheKey> = HashSet::default();
+            for scene in scenes {
+                if scene.draws.is_empty() {
+                    continue;
+                }
+                let Some(shapes) = self.pass_shapes.get(&Self::pass_id(scene)).cloned().or_else(|| {
+                    scene
+                        .target
+                        .filter(|_| super::warm_by_format())
+                        .and_then(|t| self.pass_shapes_by_format.get(&t.format).cloned())
+                }) else {
+                    continue;
+                };
+                for d in &scene.draws {
+                    let Some(g) = &d.gxp else { continue };
+                    if g.index_count == 0 || g.vertices.is_empty() {
+                        continue;
+                    }
+                    let key = self.gxp.pair_key(g);
+                    if (!self.gxp.keys.is_empty() && !self.gxp.keys.contains(&key)) || self.gxp.exclude.contains(&key) {
+                        continue;
+                    }
+                    let noop_keeps_depth = g.depth_write && draw_colour_is_noop(g);
+                    for &(fmt, samples, alpha_single) in &shapes {
+                        let rtt_raw = &self.rtt_raw;
+                        let pk = GxpLive::pipe_key(g, key, noop_keeps_depth, fmt, alpha_single, samples, |k| {
+                            rtt_raw.contains_key(k)
+                        });
+                        if self.gxp.pipelines.contains_key(&pk.cache_key) || !seen.insert(pk.cache_key) {
+                            continue;
+                        }
+                        jobs.push(Job { g, key, fmt, alpha_single, samples, noop_keeps_depth, pk });
+                    }
+                }
+            }
+            // One pipeline gains nothing from a thread; the encode builds it as it always has.
+            if jobs.len() < 2 {
+                return;
+            }
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8).min(jobs.len());
+            let (zfix, yflip, solid, nodepth, noblend) =
+                (self.gxp.zfix, self.gxp.yflip, self.gxp.solid, self.gxp.nodepth, self.gxp.noblend);
+            #[allow(clippy::type_complexity)]
+            let results: Vec<(Vec<(PipeCacheKey, Option<GxpPipeline>)>, HashMap<u64, wgpu::ShaderModule>)> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let jobs = &jobs;
+                            s.spawn(move || {
+                                let mut modules: HashMap<u64, wgpu::ShaderModule> = HashMap::default();
+                                let mut built = Vec::new();
+                                // By PAIR, not by job: a pair's pass shapes share its translation
+                                // and module, and dealing them to two threads built both twice.
+                                for j in jobs.iter().filter(|j| (j.key % threads as u64) as usize == t) {
+                                    report_unfed_uniforms(j.key, "vertex", &j.g.vprog);
+                                    report_unfed_uniforms(j.key, "fragment", &j.g.fprog);
+                                    enc(&ENC.pipelines_built, 1);
+                                    log_pipe("prebuilt", &j.pk.cache_key, j.g);
+                                    let p = build_gxp_pipeline(
+                                        device,
+                                        j.fmt,
+                                        j.alpha_single,
+                                        j.samples,
+                                        j.g.cull_mode,
+                                        j.g,
+                                        j.key,
+                                        zfix,
+                                        yflip,
+                                        solid,
+                                        nodepth,
+                                        noblend,
+                                        j.noop_keeps_depth,
+                                        j.pk.raw_units,
+                                        j.pk.f32_units,
+                                        &mut modules,
+                                        |d, desc| d.create_render_pipeline(desc),
+                                    );
+                                    built.push((j.pk.cache_key, p));
+                                }
+                                (built, modules)
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                });
+            for (built, modules) in results {
+                for (k, m) in modules {
+                    self.gxp.modules.entry(k).or_insert(m);
+                }
+                for (k, p) in built {
+                    self.gxp.pipelines.entry(k).or_insert(p);
+                }
+            }
+        }
+
+        /// Whether a pipeline the frame last warmed draws with is still being compiled - the
+        /// frame cannot be encoded without building it synchronously. Compiles the frame does
+        /// NOT use do not count: they are some other frame's, and this one can go ahead.
+        pub fn frame_waits_on_compile(&self) -> bool {
+            self.gxp.frame_needs.iter().any(|k| self.gxp.in_flight.contains(k))
+        }
+
         /// Put what [`PipelineWarm::wait`] resolved where the encode looks for it. A key the
         /// encode built in the meantime keeps the encode's.
         pub fn install_pipelines(&mut self, ready: PipelinesReady) {
+            for k in &ready.settled {
+                self.gxp.in_flight.remove(k);
+            }
             for (k, p) in ready.items {
                 self.gxp.pipelines.entry(k).or_insert(Some(p));
             }
@@ -21830,8 +22783,24 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // `GxmRenderer::dest_color`.
             color_texture: Option<&wgpu::Texture>,
         ) {
-            // Last frame's sub-rectangle copies were bound by work already submitted.
-            self.subrect_keep.clear();
+            // Last frame's sub-rectangle copies were bound by work already submitted, so they
+            // are free for this frame's copies (queue order puts the new copy after that
+            // work). Kept for reuse up to a cap; the rest destroyed, never left to a collector.
+            {
+                let mut held: usize = self.subrect_free.values().map(Vec::len).sum();
+                let pool = super::memory_bound_on("VITASLOP_SUBRECT_POOL");
+                for t in self.subrect_keep.drain(..) {
+                    if !pool {
+                        // The old behaviour: dropped, left to the collector.
+                        drop(t);
+                    } else if held < SUBRECT_FREE_CAP {
+                        held += 1;
+                        self.subrect_free.entry((t.width(), t.height(), t.format())).or_default().push(t);
+                    } else {
+                        t.destroy();
+                    }
+                }
+            }
             // Release the previous frame's arena buffers on OUR schedule. The caller submitted
             // that frame's encoder before returning here, so their work is in flight or done
             // and `destroy()` is defined for both. See `retired_buffers` for what leaving this
@@ -21846,6 +22815,13 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // line needs it to say which frame a shape was first seen on.
             self.chain_frames_seen += 1;
             self.drain_draw_probes(device);
+            // The deferred ETC2 encodes' slice for this frame - see `pump_deferred_encodes`.
+            // Timed on the frame's clock like the transcodes themselves (`lent_ts_pair`).
+            if self.gxp.texenc.as_ref().is_some_and(|t| t.deferred_pending() > 0) {
+                lend_ts(self.ts.take());
+                self.gxp.pump_deferred_encodes(device, queue);
+                self.ts = reclaim_ts();
+            }
             // >>> LAST FRAME'S STAGING CHUNKS COME BACK HERE, and here is the only place they
             // safely can. `recall` may only run once the submit that consumed them has
             // happened, and this renderer does not own the submit - the encoder is the
@@ -21854,6 +22830,15 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // one went through. See `GxmRenderer::gxp_staging`.
             if let Some(belt) = self.gxp_staging.as_mut() {
                 belt.recall();
+                // >>> AND GIVE A BURST'S CHUNKS BACK. The belt's free list never shrinks, so a
+                // course load's high-water mark stayed mapped for the whole run: MEASURED in the
+                // desktop browser (a golf title's GPU census `long4`) 36 chunks / 147 MB, against a
+                // steady frame that uses one or two. Every ten seconds, keep a reserve and
+                // destroy the rest (the vendored `trim_free`, a marked VITASLOP PATCH).
+                if self.chain_frames_seen.is_multiple_of(600) && super::memory_bound_on("VITASLOP_STAGING_TRIM") {
+                    let n = belt.trim_free(super::STAGING_KEEP_CHUNKS);
+                    enc(&ENC.buffers_destroyed, n as u64);
+                }
             }
             // THE WHOLE FUNCTION, from here, so the split can CLOSE rather than just list -
             // see `EncodePhases::chain_head_ms`. Everything above this line is comments and one
@@ -21872,6 +22857,25 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             let precompile_ms = t_precompile.ms();
             let evicted = std::mem::take(&mut self.gxp.depth_retired);
             self.retired_buffers.extend(evicted);
+            // >>> DROP THE PASS ARENAS ONLY A LOAD FRAME REACHED. A slot exists per pass ORDINAL
+            // (times the ring), so the count is the most passes any one frame ever opened and
+            // each slot keeps the largest size it ever needed: MEASURED in the desktop browser
+            // (a golf title's GPU census `long4`) ~300 `gxp-vbo` + ~250 `gxp-ubo`/`gxp-ibo`,
+            // ~137 MB, sized by course loads. Trailing slots idle for `ARENA_IDLE_FRAMES` go
+            // to the graveyard with the rest; their last use was hundreds of submits ago. A
+            // pass that reaches that ordinal again re-creates the slot under a fresh
+            // generation - see `GxpArenaSlot::generation` for why that matters.
+            if self.chain_frames_seen.is_multiple_of(120) && super::memory_bound_on("VITASLOP_ARENA_TRIM") {
+                let now = self.chain_frames_seen;
+                while self
+                    .gxp_arenas
+                    .last()
+                    .is_some_and(|a| now.saturating_sub(a.last_used) > ARENA_IDLE_FRAMES)
+                {
+                    let a = self.gxp_arenas.pop().expect("checked by last()");
+                    self.retired_buffers.extend([a.vbo, a.ibo, a.ubo]);
+                }
+            }
             enc(&ENC.buffers_destroyed, self.retired_buffers.len() as u64);
             // >>> TIMED AND COUNTED, because freeing GPU memory is GPU-PROCESS work and the
             // stall report had no lane for it. See `RESOURCES_DESTROYED_THIS_FRAME`.
@@ -22014,7 +23018,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // exists to make that geometry free.
             // >>> ...BUT NOT ON EVERY FRAME, BECAUSE THE DEVICE PRICED IT AND IT IS NOT FREE.
             //
-            // MEASURED on the user's phone, mlb's stadium: `head 1.4 ms (sweeps 1.1 + scans 0.2
+            // MEASURED on the user's phone, a baseball title's stadium: `head 1.4 ms (sweeps 1.1 + scans 0.2
             // + rtt 0.0)` - so this block and the promotion sweep below were **1.1-1.4 ms of a
             // 35 ms frame**, almost all of it spent deciding that nothing needed doing. Both
             // walks are proportional to what the caches HOLD, not to what the frame draws:
@@ -22191,6 +23195,30 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // The display buffer is whatever the final scene draws to. Any earlier scene
             // naming the same address is part of the same image, not an offscreen pass.
             let display = if self.offscreen_only { None } else { last.target.map(|t| t.data_addr) };
+            // >>> ...UNLESS THAT SCENE IS NOT A DISPLAY BUFFER AT ALL.
+            //
+            // "The last scene's target is the display" put an OFFSCREEN pass on the screen
+            // whenever a captured frame ended on one: MEASURED on a fighting title's K.O.
+            // (browser run `web1`, native runs `79` f6600/f7050 and `80` f6900) the frame closes
+            // with the NEXT frame's 128x256 fighter-silhouette pass at 0x93394000, so the whole
+            // screen became that silhouette - natively on black, in the browser as a black box
+            // over the last picture. The console shows the buffer the guest FLIPPED.
+            //
+            // So the display is the last scene into an address the guest has flipped, the
+            // passes after it render offscreen (the next frame samples them), and a frame that
+            // drew no display buffer at all keeps the flipped buffer's image. Narrow on purpose
+            // - see `display_choice`; an ordinary frame ends on its display buffer and is
+            // untouched.
+            let choice = if self.ss_scale > 1 { None } else { self.display_choice(scenes, display) };
+            let held_flip = match choice {
+                Some(DisplayChoice::Hold(a)) => Some(a),
+                _ => None,
+            };
+            let display = match choice {
+                Some(DisplayChoice::Scene(a)) => Some(a),
+                Some(DisplayChoice::Hold(_)) => None,
+                None => display,
+            };
             // The faces of every cube already assembled from renders. Known from `rtt_cubes`,
             // which persists, so this is empty only until the first cube is built.
             let cube_faces: HashSet<u32> = self
@@ -22321,7 +23349,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                         // all-zero buffer is not evidence of a dead target - it is evidence of a
                         // LIVE one, and blocking it hands the draw an empty texture.
                         //
-                        // MEASURED on PCSE00120, which is what found this: its title-screen logo
+                        // MEASURED on a role-playing title, which is what found this: its title-screen logo
                         // is rendered into an 840x476 target and sampled through a 1024x1024
                         // descriptor, and blocking the alias drew the logo as an untextured
                         // gradient band. The 192x192-against-1024x1024 cases the block was built
@@ -22396,7 +23424,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 if !cube_bases.is_empty() {
                     self.assemble_rendered_cubes(device, encoder, &cube_bases);
                 }
-                let to_display = !self.offscreen_only && (i + 1 == n)
+                let to_display = !self.offscreen_only && choice.is_none() && (i + 1 == n)
                     || (scene.target.map(|t| t.data_addr) == display && display.is_some())
                     // The straddled case - see `extra_display`. The pass is composited into the
                     // SAME kept image as the rest of the frame, in scene order, so the world
@@ -22637,16 +23665,18 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     let raw_key = (t.data_addr, t.width, t.height);
                     let first_pass_here = !self.rtt_rendered_raw.contains_key(&raw_key);
                     let clear = first_pass_here.then_some(wgpu::Color::TRANSPARENT);
-                    let (cv, dv) = {
+                    let (cv, dv, dtex) = {
                         let s = &self.rtt_raw[&raw_key];
-                        (s.color_view.clone(), s.depth_view.clone())
+                        (s.color_view.clone(), s.depth_view.clone(), s.depth.clone())
                     };
                     self.rtt_reads_snapshot.clear();
                     self.keep_depth = false;
+                    self.load_saved_depth(encoder, scene, t.width, t.height, Some(&dtex));
                     self.encode_pass(
                         device, queue, encoder, &cv, &dv, RAW64_FORMAT, scene, t.width, t.height,
                         t.width, t.height, clear, 1, None, None,
                     );
+                    self.save_depth(device, encoder, scene, t.width, t.height, &dtex);
                     self.rtt_rendered_raw.insert(raw_key, cv);
                     self.convert_raw_to_float(device, encoder, raw_key);
                     continue;
@@ -22675,6 +23705,23 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // address 0x8e20b030 in the same frame, and an address-only lookup here handed
                 // the 4-draw pass the 41-draw pass's target and then rebuilt it.
                 let key = (t.data_addr, t.width, t.height);
+                // >>> A COLOUR PASS INTO AN ADDRESS RETIRES THE DEPTH CONVERTED THERE.
+                //
+                // A title may reuse one block of memory as a pass's DEPTH and, later in the
+                // frame, as another pass's COLOUR target. Once the colour pass begins, that memory
+                // is a colour image's, so the converted depth registered at the address - which
+                // the sampler side consults FIRST, by exact address - no longer describes it. Left
+                // in place it is bound for any draw naming the address before the colour pass is
+                // registered as rendered (the colour pass sampling its own target), and the depth
+                // conversion holds its distance in the RED channel. MEASURED (a fighting title, every fight):
+                // the 128x256 shadow pass's depth sits at 0x93ca1000, which is also the 512x128
+                // glow atlas; the atlas's second draw sampled the depth as its first level, and
+                // the glow added a translucent RED band x 480-720 over 5-9% of desktop frames, and
+                // a red wash over the whole fight in the browser.
+                if self.rtt_depth_rendered.remove(&t.data_addr).is_some() {
+                    self.rtt_depth_addrs.remove(&t.data_addr);
+                    report_depth_retired_by_colour(t.data_addr);
+                }
                 // Drawing into a buffer this frame already filled, which this pass may also
                 // sample: hand it a snapshot to read so the live buffer is a target only.
                 self.rtt_reads_snapshot.clear();
@@ -22822,6 +23869,27 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     );
                 }
                 self.keep_depth = want_depth;
+                // The single-sample depth attachment, which is the only one `depth_saved` can
+                // copy into or out of; a multisampled pass is reported by the load.
+                let dtex = (!use_msaa).then(|| self.rtt[&key].depth.clone());
+                self.load_saved_depth(encoder, scene, t.width, t.height, dtex.as_ref());
+                // >>> A LOADED DEPTH THAT IS SAMPLED IS CONVERTED BEFORE THE PASS, so a draw that
+                // >>> reads it reads THIS frame's. The depth came from an earlier pass - on a
+                // deferred title the G-buffer pass, which renders RAW and converts nothing - and
+                // the newest conversion at the address was otherwise last frame's. MEASURED on
+                // an action title: its lighting samples 0x8a8dee00 while it tests
+                // against it, and read the previous frame's depth to rebuild positions.
+                let loaded = self.depth_load_now;
+                if loaded && want_depth {
+                    self.convert_gxm_depth(device, queue, encoder, key, scene.depth_min, scene.depth_scale);
+                    if let Some(v) = self.rtt.get(&key).and_then(|s| s.gxm_depth.as_ref()) {
+                        self.rtt_depth_rendered.insert(scene.depth_addr, v.view.clone());
+                        self.rtt_depth_addrs.insert(scene.depth_addr, key);
+                    }
+                }
+                // Whether any draw of the pass can change the depth. A fixed-function draw is
+                // taken to, not proven not to.
+                let writes_depth = scene.draws.iter().any(|d| d.gxp.as_ref().is_none_or(|g| g.depth_write));
                 self.encode_pass(
                     // Target extent and attachment extent are the same here: an offscreen
                     // pass rasterises at the size the guest gave its render target.
@@ -22829,11 +23897,17 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     t.width, t.height, clear, pass_samples, resolve.as_ref(), rtt_ctex.as_ref(),
                 );
                 self.keep_depth = false;
+                if let Some(d) = dtex.as_ref() {
+                    self.save_depth(device, encoder, scene, t.width, t.height, d);
+                }
+                self.depth_load_now = false;
                 self.rtt_rendered.insert(key, cv);
                 self.rtt_ever_rendered.insert(key);
                 // Convert this pass's depth NOW: the next pass into the same target clears the
-                // depth attachment, so afterwards there is nothing left to convert.
-                if want_depth {
+                // depth attachment, so afterwards there is nothing left to convert. A pass that
+                // LOADED its depth and wrote none of it already converted it above - the same
+                // pixels again would be a full-screen pass for nothing (3.2 ms of a phone frame).
+                if want_depth && (!loaded || writes_depth) {
                     self.convert_gxm_depth(
                         device,
                         queue,
@@ -22994,6 +24068,9 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             //
             // Binding `view_srgb` here instead would DECODE on the way in and store linear,
             // undoing the encode the pass just did and putting the frame back where it was.
+            if held_flip.is_some() {
+                display_blit_addr = held_flip;
+            }
             if let Some(addr) = display_blit_addr
                 && let Some(view) = self.display_images.get(&addr).map(|d| &d.view) {
                     queue.write_buffer(&self.resolve_scale_buf, 0, &1u32.to_le_bytes());
@@ -23152,6 +24229,48 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// caller's business ([`encode_chain`](Self::encode_chain) picks the views and
         /// resolves once), so this is a plain pass.
         #[allow(clippy::too_many_arguments)]
+        /// Before a pass: when its surface FORCE_LOADs, copy the depth-stencil a FORCE_STORE pass
+        /// left at that address and extent into `dst`, and have the pass LOAD it. See
+        /// [`Self::depth_saved`].
+        fn load_saved_depth(&mut self, encoder: &mut wgpu::CommandEncoder, scene: &RenderScene, w: u32, h: u32, dst: Option<&wgpu::Texture>) {
+            self.depth_load_now = false;
+            if !zls_load(scene) {
+                return;
+            }
+            let Some(src) = self.depth_saved.get(&(scene.depth_addr, w, h)) else { return };
+            let Some(dst) = dst.filter(|d| d.sample_count() == 1 && d.format() == src.format() && d.size() == src.size()) else {
+                super::report_zls_unserved(scene.depth_addr, w, h);
+                return;
+            };
+            encoder.copy_texture_to_texture(src.as_image_copy(), dst.as_image_copy(), src.size());
+            self.depth_load_now = true;
+        }
+
+        /// After a pass: when its surface FORCE_STOREs, keep its depth-stencil for a later
+        /// FORCE_LOAD pass at the same address. See [`Self::depth_saved`].
+        fn save_depth(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, scene: &RenderScene, w: u32, h: u32, src: &wgpu::Texture) {
+            self.depth_load_now = false;
+            if !zls_store(scene) || src.sample_count() != 1 {
+                return;
+            }
+            let key = (scene.depth_addr, w, h);
+            if self.depth_saved.get(&key).is_none_or(|t| t.format() != src.format() || t.size() != src.size()) {
+                let t = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("gxm-depth-saved"),
+                    size: src.size(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: src.format(),
+                    usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                self.depth_saved.insert(key, t);
+            }
+            let dst = &self.depth_saved[&key];
+            encoder.copy_texture_to_texture(src.as_image_copy(), dst.as_image_copy(), src.size());
+        }
+
         fn encode_pass(
             &mut self,
             device: &wgpu::Device,
@@ -23304,6 +24423,15 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     }
                     shapes.push(shape);
                 }
+                if let Some(t) = scene.target {
+                    let by_fmt = self.pass_shapes_by_format.entry(t.format).or_default();
+                    if !by_fmt.contains(&shape) {
+                        if by_fmt.len() >= 4 {
+                            by_fmt.remove(0);
+                        }
+                        by_fmt.push(shape);
+                    }
+                }
             }
             let mut gxp_prepared: Vec<GxpPrepared> = Vec::new();
             let mut order: Vec<Enc> = Vec::with_capacity(scene.draws.len());
@@ -23376,7 +24504,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             //
             // Rule 1 can only ever fire where an address holds more than one target, which is
             // why `declared` below is not even collected otherwise: with one target per address
-            // - every title measured before PCSA00002 - every candidate scores identically on
+            // - every title measured before the baseball title - every candidate scores identically on
             // it and this produces precisely the map it always did.
             let ambiguous: HashSet<u32> = {
                 // The DISTINCT keys of the two maps, unioned first. A rendered target is
@@ -23451,8 +24579,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             //
             // A target held from an EARLIER frame at such an address with a DIFFERENT extent is
             // stale: the memory it stood for has since been rewritten as the other surface, so
-            // its image is no longer what those bytes hold. MEASURED on a fighting title
-            // (PCSE00235): its bloom builds a mip chain inside ONE 512x128 surface and reads
+            // its image is no longer what those bytes hold. MEASURED on a fighting title:
+            // its bloom builds a mip chain inside ONE 512x128 surface and reads
             // level 0 back through a 256x128 texture at the surface's own address; the extent
             // match handed that draw a 256x128 target left over from the character-select
             // screen - a red-only image - and every bloom level after it, and the final frame,
@@ -23555,12 +24683,130 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     sample_views.entry(addr).or_insert_with(|| raw.float_view.clone());
                 }
             }
+            // >>> ONE 32-BIT WORD OF A RAW 64-BIT SURFACE, READ AS A DOUBLE-WIDTH TEXTURE.
+            //
+            // A 64-bit pixel is two words in memory, so a title can sample the SAME surface as a
+            // 32-bit texture twice as wide, with the surface's own row pitch: at the base address
+            // every even texel is a pixel's first word, at base+4 its second. MEASURED on an
+            // action title: its deferred lighting reads its F32F32 G-buffer
+            // (0x8ac5fec0, 720x408) as a 1440x408 U8U8U8U8 texture (albedo) and again at +4 as
+            // S8S8S8S8 (normals). Neither matched the held raw surface, and the address's entry
+            // in `sample_views` was LAST frame's final RGBA8 image, which the frame writes over the
+            // G-buffer's memory later on - so the lighting lit the previous picture instead of the
+            // G-buffer, fed back into itself, and the daylit ruins came out as a near-black scene
+            // that barely moved. The words are copied out through a buffer - a byte
+            // reinterpretation, which is what the memory is - into a texture of the sampled
+            // format, and bound at the address the guest named. `VITASLOP_RAW_WORD_VIEW=0` is the
+            // arm back.
+            if super::raw_word_view() {
+                let wants: Vec<(u32, u32, u32, u32, u32)> = scene
+                    .draws
+                    .iter()
+                    .flat_map(|d| d.gxp.iter().flat_map(|g| g.textures.iter().chain(g.vertex_textures.iter())))
+                    .map(|t| (t.tex.data_addr, t.tex.width, t.tex.height, t.tex.row_bytes, t.tex.base_format))
+                    .collect();
+                let mut done: HashSet<u32> = HashSet::default();
+                for (addr, w, h, row_bytes, base_format) in wants {
+                    if addr == 0 || !done.insert(addr) {
+                        continue;
+                    }
+                    let format = match base_format {
+                        0x0c => wgpu::TextureFormat::Rgba8Unorm,
+                        0x0d => wgpu::TextureFormat::Rgba8Snorm,
+                        _ => continue,
+                    };
+                    let hit = rendered_raw.keys().copied().find(|&(base, rw, rh)| {
+                        (addr == base || addr == base.wrapping_add(4))
+                            && w == rw * 2
+                            && h == rh
+                            && row_bytes == rw * 8
+                            && Some(base) != current_target
+                    });
+                    let Some(key3) = hit else { continue };
+                    let Some(raw) = self.rtt_raw.get(&key3) else { continue };
+                    let (rw, rh) = (key3.1, key3.2);
+                    let off = u64::from(addr - key3.0);
+                    let bpr = (rw * 8).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+                    let vkey = (addr, w, h, format);
+                    if !self.word_views.contains_key(&vkey) {
+                        // Bounded: a title has a handful of these; a runaway set is dropped whole.
+                        if self.word_views.len() >= 16 {
+                            self.word_views.clear();
+                        }
+                        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("gxm-rtt-raw64-words"),
+                            size: u64::from(bpr) * u64::from(rh) + 8,
+                            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        let tex = device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("gxm-rtt-raw64-wordview"),
+                            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                        let view = tex.create_view(&Default::default());
+                        self.word_views.insert(vkey, (staging, tex, view));
+                    }
+                    let (staging, view_tex, view) = {
+                        let (b, t, v) = &self.word_views[&vkey];
+                        (b.clone(), t.clone(), v.clone())
+                    };
+                    encoder.copy_texture_to_buffer(
+                        raw.color.as_image_copy(),
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &staging,
+                            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(rh) },
+                        },
+                        wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
+                    );
+                    // At +4 a row's LAST texel is the next row's first word, as the memory
+                    // runs; the padded staging rows hold that in the next row's first bytes,
+                    // so every row but the last is copied whole and then that one texel is
+                    // taken from the following row. The surface's final texel lies past its
+                    // end and stays zero.
+                    let (whole_w, fix_last) = if off == 0 { (w, false) } else { (w - 1, true) };
+                    encoder.copy_buffer_to_texture(
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &staging,
+                            layout: wgpu::TexelCopyBufferLayout { offset: off, bytes_per_row: Some(bpr), rows_per_image: Some(rh) },
+                        },
+                        view_tex.as_image_copy(),
+                        wgpu::Extent3d { width: whole_w, height: h, depth_or_array_layers: 1 },
+                    );
+                    if fix_last && h > 1 {
+                        encoder.copy_buffer_to_texture(
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: &staging,
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: u64::from(bpr),
+                                    bytes_per_row: Some(bpr),
+                                    rows_per_image: Some(rh - 1),
+                                },
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &view_tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d { x: w - 1, y: 0, z: 0 },
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::Extent3d { width: 1, height: h - 1, depth_or_array_layers: 1 },
+                        );
+                    }
+                    sample_views.insert(addr, view);
+                    super::report_raw_word_view(addr, key3.0, rw, rh, base_format);
+                }
+            }
             // >>> A TEXTURE THAT NAMES A SUB-RECTANGLE OF A TARGET THIS FRAME RENDERED.
             //
             // Its address lies INSIDE the target and its row stride IS the target's pitch, so on
             // the hardware it reads exactly the texels at `(offset / 4) % pitch`,
             // `(offset / 4) / pitch` onward - a window onto the surface, clamped at its own
-            // edges. MEASURED on a fighting title (PCSE00235): its bloom builds a mip chain
+            // edges. MEASURED on a fighting title: its bloom builds a mip chain
             // inside ONE 512x128 surface and its final composite samples level 2 as a 128x64
             // texture 1536 bytes in. The range alias (`rendered_alias`) bound the WHOLE surface
             // at its origin, so the composite stretched all three levels across the screen and
@@ -23621,15 +24867,21 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                         continue;
                     }
                     let size = wgpu::Extent3d { width: w * sx, height: h * sy, depth_or_array_layers: 1 };
-                    let sub = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("gxm-rtt-subrect"),
-                        size,
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: src.color.format(),
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
+                    let reused = self
+                        .subrect_free
+                        .get_mut(&(size.width, size.height, src.color.format()))
+                        .and_then(Vec::pop);
+                    let sub = reused.unwrap_or_else(|| {
+                        device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("gxm-rtt-subrect"),
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: src.color.format(),
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        })
                     });
                     encoder.copy_texture_to_texture(
                         wgpu::TexelCopyTextureInfo {
@@ -23868,7 +25120,15 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                             .filter(|t| sample_views.contains_key(&t.tex.data_addr))
                             .count();
                         if let Some(mut prep) =
-                            self.gxp.prepare(device, queue, color_format, alpha_single, samples, g, [scene.depth_min, scene.depth_scale], &sample_views, &depth_rendered, &depth_only, &rendered_cubes, &rendered_raw, &reads_snapshot, &mut gvdata, &mut gidata, &mut gudata, ubo_align, dest_binding)
+                            {
+                                // Lent for the prepare so a transcode can time its passes -
+                                // see `lent_ts_pair`. Reclaimed before anything else here can
+                                // reach for `self.ts`.
+                                lend_ts(self.ts.take());
+                                let r = self.gxp.prepare(device, queue, color_format, alpha_single, samples, g, [scene.depth_min, scene.depth_scale], &sample_views, &depth_rendered, &depth_only, &rendered_cubes, &rendered_raw, &reads_snapshot, &mut gvdata, &mut gidata, &mut gudata, ubo_align, dest_binding);
+                                self.ts = reclaim_ts();
+                                r
+                            }
                         {
                             if self.gxp.solid {
                                 prep.blend = false; // REPLACE + depth-Always variant (see make)
@@ -24129,6 +25389,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     &mut arena_create_ms,
                     &mut arena_write_ms,
                 );
+                self.gxp_arenas[slot].last_used = self.chain_frames_seen;
                 slot
             });
             self.last_phases.arena_ms = t_arena.ms();
@@ -24372,14 +25633,18 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                                 // Same rule as the colour: a later segment carries on with the
                                 // depth the earlier ones wrote, or every draw after a split would
                                 // sort against an empty buffer.
-                                load: if seg == 0 { wgpu::LoadOp::Clear(scene.depth_clear) } else { wgpu::LoadOp::Load },
+                                load: if seg == 0 && !self.depth_load_now {
+                                    wgpu::LoadOp::Clear(scene.depth_clear)
+                                } else {
+                                    wgpu::LoadOp::Load
+                                },
                                 // Discarded by default - nothing reads a depth attachment once its
                                 // pass is over. A pass whose depth a LATER pass samples has to keep
                                 // it, and only that pass pays the store.
                                 // A middle segment ALWAYS stores: the next one loads it. Only the
                                 // last segment gets to discard, and only under the same rule as
                                 // before (a pass whose depth a later pass samples keeps it).
-                                store: if self.keep_depth || !last_seg {
+                                store: if self.keep_depth || !last_seg || zls_store(scene) {
                                     wgpu::StoreOp::Store
                                 } else {
                                     wgpu::StoreOp::Discard
@@ -24390,12 +25655,12 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                             // what the earlier ones marked - a HUD's `EQUAL` fills after a split
                             // would otherwise test against a cleared buffer.
                             stencil_ops: (!super::stencil_disabled()).then(|| wgpu::Operations {
-                                load: if seg == 0 {
+                                load: if seg == 0 && !self.depth_load_now {
                                     wgpu::LoadOp::Clear(u32::from(scene.stencil_clear))
                                 } else {
                                     wgpu::LoadOp::Load
                                 },
-                                store: if !last_seg { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard },
+                                store: if !last_seg || zls_store(scene) { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard },
                             }),
                         }),
                         timestamp_writes: Self::ts_writes(&seg_ts),
@@ -24615,7 +25880,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                                 // exactly the same thing to wgpu with no allocator in the loop. The
                                 // browser is where that matters: the allocator is a measured 7.3% of
                                 // the busy worker on this title's race
-                                // (PCSA00015, the race), and a wasm malloc
+                                // (a racer, the race), and a wasm malloc
                                 // is dearer than a native one. The bytes handed to `set_bind_group`
                                 // are unchanged, so the frame is bit-identical.
                                 //
@@ -24848,6 +26113,65 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             self.presented.extend_from_slice(addrs);
         }
 
+        /// Which image this frame shows when its LAST scene is not a display buffer - see the
+        /// call site in `encode_chain`. `None` is the ordinary rule (the last scene's target).
+        ///
+        /// A display buffer is an address the guest has FLIPPED (`sceDisplaySetFrameBuf`) at
+        /// some point in the run - its own statement, kept in `flipped_ever`. The capture does
+        /// not end exactly on a flip, so a frame can close with the NEXT frame's opening pass
+        /// (MEASURED, a fighting title, native run `80` f6900: `... 0x9257e000:2 0x93394000:4`, the display
+        /// composite then the 128x256 silhouette target). Then:
+        ///   * `Scene(a)`: the last scene drawing into a display buffer is the display, and the
+        ///     trailing passes are offscreen - they still render, in order, for the next frame.
+        ///   * `Hold(a)`: no scene draws into any display buffer; the most recently flipped
+        ///     buffer's kept image stays on screen, as it does on the console.
+        ///
+        /// Only once a flipped address has equalled a scene target on this run (so the two
+        /// address spaces agree - otherwise a title whose flips never match would freeze).
+        /// `VITASLOP_GXM_HOLD_FLIP=0` is the arm back.
+        fn display_choice(&mut self, scenes: &[RenderScene], last_target: Option<u32>) -> Option<DisplayChoice> {
+            for &a in &self.presented {
+                if !self.flipped_ever.contains(&a) {
+                    // A title rotates a handful of display buffers; this only bounds a title
+                    // that allocates new ones for ever.
+                    if self.flipped_ever.len() >= 16 {
+                        self.flipped_ever.remove(0);
+                    }
+                    self.flipped_ever.push(a);
+                }
+            }
+            if let Some(&a) = self.presented.last() {
+                self.last_flipped = Some(a);
+            }
+            if self.offscreen_only || !super::hold_flip_enabled() || self.flipped_ever.is_empty() {
+                return None;
+            }
+            let is_display = |a: u32| self.flipped_ever.contains(&a);
+            let last_display_scene =
+                scenes.iter().rev().find_map(|s| s.target.map(|t| t.data_addr).filter(|a| is_display(*a)));
+            if last_display_scene.is_some() {
+                self.presented_matched = true;
+            }
+            if !self.presented_matched || last_target.is_none_or(is_display) {
+                return None;
+            }
+            let choice = match last_display_scene {
+                Some(a) => DisplayChoice::Scene(a),
+                None => {
+                    let a = self.last_flipped?;
+                    if !self.display_images.contains_key(&a) {
+                        return None;
+                    }
+                    DisplayChoice::Hold(a)
+                }
+            };
+            report_status!(
+                "gxm display: this frame's last scene targets {:#x}, which the guest has never flipped - an offscreen pass (the capture closed on the next frame's opening pass). Showing {choice:?} instead, the buffer the console would. See `GxmRenderer::display_choice`.",
+                last_target.unwrap_or(0)
+            );
+            Some(choice)
+        }
+
         pub fn cache_sizes(&self) -> String {
             // The promotion maps' PRUNE, beside their occupancy: an occupancy alone cannot tell
             // a map that has never reached its cap from one that reaches it every few minutes
@@ -24875,8 +26199,11 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // `texenc::RAW_BATCH_MOST`.
             let (batch_submits, batch_textures) = crate::texenc::raw_batch_counts();
             let (batch_most, batch_multi, batch_window_one) = crate::texenc::raw_batch_shape();
+            const MB: u64 = 1024 * 1024;
+            let rv = self.gxp.resident_v.pinned_bytes();
+            let ri = self.gxp.resident_i.pinned_bytes();
             format!(
-                "renderer caches: pipelines {}, sampler bind groups {}, texture views {} ({} stamped, {} dead, {} slots), packed geometry {} by content / {} by allocation, holding {} MB by content + {} MB by allocation (the two share their buffers, so the heap pays the union, not the sum) against a {} MB budget each, resident slices {} vertex / {} index, resident seen {} / {} ({} prunes, {} dead entries reclaimed), ubo bind groups {}, samplers {}, rtt targets {} holding {} MB ({} reclaimed as stale, {} MB released) ({} colour binds, {} depth addrs, {} cubes), fixed-function views {} / binds {} | RETAINED BYTES: recompiler views {} MB (entries sum to {} MB; ONE FRAME needs {} MB, learned floor {} MB) against a {} MB retention bound of a {} MB texture budget, fixed-function views {} MB | EVICTIONS: {} | GPU texture expansions {} in {} submits (largest batch {}, {} submits carried more than one, {} expansions had room for no second texture)",
+                "renderer caches: pipelines {}, sampler bind groups {}, texture views {} ({} stamped, {} dead, {} slots), packed geometry {} by content / {} by allocation, holding {} MB by content + {} MB by allocation (the two share their buffers, so the heap pays the union, not the sum) against a {} MB budget each, resident slices {} vertex / {} index PINNING {} + {} MB of streams on the Rust heap (GPU heaps {}/{} + {}/{} MB used/cap), resident seen {} / {} ({} prunes, {} dead entries reclaimed; {} MB of DEAD streams still allocated behind their Weak), ubo bind groups {}, samplers {}, rtt targets {} holding {} MB ({} reclaimed as stale, {} MB released) ({} colour binds, {} depth addrs, {} cubes), fixed-function views {} / binds {} | RETAINED BYTES: recompiler views {} MB (entries sum to {} MB; ONE FRAME needs {} MB, learned floor {} MB) against a {} MB retention bound of a {} MB texture budget, fixed-function views {} MB | EVICTIONS: {} | GPU texture expansions {} in {} submits (largest batch {}, {} submits carried more than one, {} expansions had room for no second texture) | DEFERRED ETC2 ENCODES (`VITASLOP_TEX_ENCODE_DEFER`, {} units/frame): {}",
                 self.gxp.pipelines.len(),
                 self.gxp.sampler_bgs.len(),
                 self.gxp.views.len(),
@@ -24897,10 +26224,27 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 packed_cache_budget_bytes() / (1024 * 1024),
                 self.gxp.resident_v.slice_count(),
                 self.gxp.resident_i.slice_count(),
+                rv.0 / MB,
+                ri.0 / MB,
+                rv.1 / MB,
+                rv.2 / MB,
+                ri.1 / MB,
+                ri.2 / MB,
                 self.gxp.resident_v_seen.len(),
                 self.gxp.resident_i_seen.len(),
                 prunes,
                 pruned,
+                // A `Weak<[u8]>` frees the CONTENTS of a dead allocation, but `[u8]` has no
+                // destructor and the ALLOCATION is only returned when the last Weak goes - so a
+                // promotion-map entry whose stream died still holds all of its bytes.
+                self.gxp
+                    .resident_v_seen
+                    .iter()
+                    .chain(self.gxp.resident_i_seen.iter())
+                    .filter(|(_, (w, _))| w.strong_count() == 0)
+                    .map(|(k, _)| k.2 as u64)
+                    .sum::<u64>()
+                    / MB,
                 self.gxp.ubo_bgs.len(),
                 self.gxp.samplers_by_mode.len(),
                 self.rtt.len(),
@@ -24934,6 +26278,28 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 batch_most,
                 batch_multi,
                 batch_window_one,
+                super::tex_encode_defer_units(),
+                {
+                    use std::sync::atomic::Ordering;
+                    let d = crate::texenc::defer_stats();
+                    let pending = self.gxp.texenc.as_ref().map_or(0, |t| t.deferred_pending());
+                    if !super::tex_encode_defer() {
+                        "OFF - every encode inline, in the frame that binds it".to_string()
+                    } else {
+                        format!(
+                            "{} queued, {} finished ({} swapped in, {} after their entry was evicted), {} pending; {} blocks queued, {} work units encoded over {} pumps; the longest wait for an ETC2 was {} frames. While it waits a texture draws from the EXACT decode (RGBA8)",
+                            d.queued,
+                            d.finished,
+                            super::DEFER_SWAPPED.load(Ordering::Relaxed),
+                            super::DEFER_ORPHANED.load(Ordering::Relaxed),
+                            pending,
+                            d.blocks_queued,
+                            d.units,
+                            d.pumps,
+                            d.frames_waited_max,
+                        )
+                    }
+                },
             )
         }
 
@@ -24991,7 +26357,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         ///
         /// Separate from [`Self::rtt_targets`] because [`Self::rtt_raw`] is a separate map, and
         /// that is why a dump built on `rtt_targets` alone has never contained one: a title's
-        /// 64-bit surface is invisible to it. On PCSA00002 that surface is the CROWD ATLAS its
+        /// 64-bit surface is invisible to it. On a baseball title that surface is the CROWD ATLAS its
         /// sprite pass reads as two packed words a texel - the last unmeasured input of that
         /// title's washed-out close-up, and unreadable until this existed.
         pub fn rtt_raw_targets(&self) -> Vec<(u32, &wgpu::Texture, u32, u32)> {

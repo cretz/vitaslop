@@ -1243,6 +1243,7 @@ fn switch_why(tb_addr: u32) -> bool {
 }
 
 /// Discover and lower the function at `entry`.
+#[allow(clippy::too_many_arguments)]
 pub fn discover(
     code: &[u8],
     base: u32,
@@ -1252,6 +1253,55 @@ pub fn discover(
     noreturn_svc: &[u32],
     discover_pointers: bool,
     isolate: bool,
+) -> Result<Discovered, Error> {
+    discover_with(code, base, entry, thumb, imports, noreturn_svc, discover_pointers, isolate, true)
+}
+
+/// [`discover`] without the flag passes that run once the function is complete - for a
+/// caller that wants only what the function REACHES and its block SHAPE (every block,
+/// every terminator), and will lift it again with [`discover`] before emitting it: the
+/// whole-program walk in `transpile_lenient`. The passes rewrite statements inside
+/// blocks and nothing else, so the reach, the blocks, the terminators and the outcome
+/// (`Ok` or which `Err`) are exactly [`discover`]'s.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn discover_shape(
+    code: &[u8],
+    base: u32,
+    entry: u32,
+    thumb: bool,
+    imports: &Imports,
+    noreturn_svc: &[u32],
+    discover_pointers: bool,
+    isolate: bool,
+) -> Result<Discovered, Error> {
+    discover_with(code, base, entry, thumb, imports, noreturn_svc, discover_pointers, isolate, false)
+}
+
+/// The passes [`discover`] runs on a complete function and [`discover_shape`] leaves out:
+/// `discover_shape` then this is `discover`.
+pub(crate) fn finish_flags(func: &mut Func) {
+    // Fold runs of same-condition predication (a Thumb `IT` block) into one guard BEFORE
+    // liveness runs, so the analysis sees the shape the emitter will actually emit.
+    for b in &mut func.blocks {
+        crate::flags::merge_guards(&mut b.stmts);
+    }
+    crate::flags::annotate(func);
+    // And with liveness settled, a flag statement whose four flags are ALL dead and whose
+    // sum nothing reads back is not a cheaper statement - it is no statement at all.
+    crate::flags::drop_dead_flag_adds(func);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn discover_with(
+    code: &[u8],
+    base: u32,
+    entry: u32,
+    thumb: bool,
+    imports: &Imports,
+    noreturn_svc: &[u32],
+    discover_pointers: bool,
+    isolate: bool,
+    flag_passes: bool,
 ) -> Result<Discovered, Error> {
     let decoder = InstDecoder::default().with_thumb_mode(thumb);
 
@@ -1356,7 +1406,13 @@ pub fn discover(
                 if !isolate || addr == entry {
                     return Err(e);
                 }
-                trap_leaders.insert(addr);
+                // Named like the lowering gaps below: a block that traps at its first
+                // instruction is otherwise a bare `unreachable` in a function that lifted.
+                if trap_leaders.insert(addr)
+                    && (std::env::var_os("VITASLOP_LOG").is_some() || std::env::var_os("RUST_LOG").is_some())
+                {
+                    eprintln!("transpile: block {addr:#010x} in {entry:#010x} does not decode (it traps): {e:?}");
+                }
                 leaders.insert(addr);
                 continue;
             }
@@ -1770,8 +1826,15 @@ pub fn discover(
                     // that no census named: a run that reached one reported
                     // `UnreachableCodeReached` at an address absent from every list the
                     // build printed, which reads as a decode failure that is not there.
-                    Err(_) if isolate => {
-                        lower_gaps.insert(cursor);
+                    Err(e) if isolate => {
+                        // Named with its instruction, under a named log filter: a trap in the
+                        // middle of a run is otherwise a bare `unreachable` in a block that
+                        // decodes fine, and which instruction to implement is the whole fix.
+                        if lower_gaps.insert(cursor)
+                            && (std::env::var_os("VITASLOP_LOG").is_some() || std::env::var_os("RUST_LOG").is_some())
+                        {
+                            eprintln!("transpile: {cursor:#010x} is not lowered (its block traps there): {e:?}");
+                        }
                         break Term::Unreachable;
                     }
                     Err(e) => return Err(e),
@@ -1887,15 +1950,9 @@ pub fn discover(
     // build path that forgot the pass would silently emit the slow code and pass every
     // test, which is the shape of defect this project keeps meeting.
     let mut func = Func { addr: entry, thumb, blocks, stub: false };
-    // Fold runs of same-condition predication (a Thumb `IT` block) into one guard BEFORE
-    // liveness runs, so the analysis sees the shape the emitter will actually emit.
-    for b in &mut func.blocks {
-        crate::flags::merge_guards(&mut b.stmts);
+    if flag_passes {
+        finish_flags(&mut func);
     }
-    crate::flags::annotate(&mut func);
-    // And with liveness settled, a flag statement whose four flags are ALL dead and whose
-    // sum nothing reads back is not a cheaper statement - it is no statement at all.
-    crate::flags::drop_dead_flag_adds(&mut func);
 
     Ok(Discovered {
         func,
@@ -1997,16 +2054,20 @@ fn shift_operand(rs: &RegShift) -> Option<Value> {
                         bin(BinOp::Shl, base, Value::Imm(n))
                     }
                 }
+                // The decoder spells a shift of 32 two ways: the A32 field's raw `#0`, and
+                // `DecodeImmShift`'s (Thumb-2) already-expanded `32`. Both must land here,
+                // because a wasm shift by 32 is a shift by NOTHING (the count is taken mod
+                // 32) - `lsr #32` would return the register instead of zero.
                 ShiftStyle::LSR => {
-                    if n == 0 {
+                    if n == 0 || n >= 32 {
                         Value::Imm(0) // LSR #32
                     } else {
                         bin(BinOp::Lsr, base, Value::Imm(n))
                     }
                 }
                 ShiftStyle::ASR => {
-                    // ASR #0 means ASR #32: fill with the sign bit.
-                    bin(BinOp::Asr, base, Value::Imm(if n == 0 { 31 } else { n }))
+                    // ASR #32: fill with the sign bit.
+                    bin(BinOp::Asr, base, Value::Imm(if n == 0 || n >= 32 { 31 } else { n }))
                 }
                 ShiftStyle::ROR => {
                     if n == 0 {
@@ -2378,7 +2439,11 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
 
     let mut out = Vec::new();
     match inst.opcode {
-        NOP | IT | HINT => {}
+        // The hint space. `YIELD`/`WFE`/`WFI`/`SEV` only ever tune how a core waits - the guest
+        // scheduler preempts spin loops on its own - and `CSDB`/`DBG` have no architectural
+        // effect here. A title's NEON audio mixer pads its loop with ARM `NOP`s, which the
+        // decoder used to leave undecoded: the block trapped the first time it ran.
+        NOP | IT | HINT | YIELD | WFE | WFI | SEV | CSDB | DBG => {}
 
         // Memory barriers and cache preload hints have no effect on the guest's
         // observable state in our memory model (one guest CPU worker, sequential
@@ -2631,15 +2696,23 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
 
         LSL | LSR | ASR => {
             let (rd, rn, sh) = dataproc(inst, pc_const).ok_or_else(err)?;
-            if let Value::Imm(_) = sh {
+            if let Value::Imm(n) = sh {
                 // Immediate-amount shift: the amount is known at lowering, so wasm's
-                // masked shift and the constant-folded `shift_carry` are already exact.
+                // masked shift and the constant-folded `shift_carry` are exact - except at
+                // 32 (`lsr/asr #32`, which Thumb-2 decodes as the literal 32), where wasm's
+                // count-mod-32 would shift by nothing.
                 let binop = match inst.opcode {
                     LSL => BinOp::Shl,
                     LSR => BinOp::Lsr,
                     _ => BinOp::Asr,
                 };
-                let result = bin(binop, rn.clone(), sh.clone());
+                // `#0` is the A32 spelling of the same 32 (a zero LSR/ASR does not exist;
+                // `shift_carry` reads it that way too).
+                let result = match (inst.opcode, n) {
+                    (LSR, n) if n == 0 || n >= 32 => Value::Imm(0),
+                    (ASR, n) if n == 0 || n >= 32 => bin(BinOp::Asr, rn.clone(), Value::Imm(31)),
+                    _ => bin(binop, rn.clone(), sh.clone()),
+                };
                 if sets_flags {
                     let carry = shift_carry(inst.opcode, &rn, &sh);
                     out.push(Stmt::FlagsLogic {
@@ -2798,6 +2871,96 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 word
             };
             out.push(Stmt::SetReg(rd, result));
+        }
+        // Dual signed 16x16 multiplies: rd = lo(rn)*lo(m) +/- hi(rn)*hi(m) [+ ra], where m is
+        // rm with its halves exchanged for the `x` forms. The 32-bit wrap is ARM's result;
+        // only the Q flag an overflow sets is not modelled (nothing here reads Q).
+        SMUAD | SMUADX | SMLAD | SMLADX | SMUSD | SMUSDX | SMLSD | SMLSDX => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            let rm = operand_value(&ops[2], pc_const).ok_or_else(err)?;
+            let m = if matches!(inst.opcode, SMUADX | SMLADX | SMUSDX | SMLSDX) {
+                bin(BinOp::Ror, rm, Value::Imm(16))
+            } else {
+                rm
+            };
+            let lo = |v: Value| bin(BinOp::Asr, bin(BinOp::Shl, v, Value::Imm(16)), Value::Imm(16));
+            let hi = |v: Value| bin(BinOp::Asr, v, Value::Imm(16));
+            let p_lo = bin(BinOp::Mul, lo(rn.clone()), lo(m.clone()));
+            let p_hi = bin(BinOp::Mul, hi(rn), hi(m));
+            let dual = if matches!(inst.opcode, SMUSD | SMUSDX | SMLSD | SMLSDX) {
+                bin(BinOp::Sub, p_lo, p_hi)
+            } else {
+                bin(BinOp::Add, p_lo, p_hi)
+            };
+            let result = if matches!(inst.opcode, SMLAD | SMLADX | SMLSD | SMLSDX) {
+                let ra = operand_value(&ops[3], pc_const).ok_or_else(err)?;
+                bin(BinOp::Add, dual, ra)
+            } else {
+                dual
+            };
+            out.push(Stmt::SetReg(rd, result));
+        }
+        // Most-significant-word multiplies: the high word of a signed 64-bit product,
+        // optionally plus/minus `ra << 32` and rounded (`r`).
+        SMMUL | SMMULR | SMMLA | SMMLAR | SMMLS | SMMLSR => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            let rm = operand_value(&ops[2], pc_const).ok_or_else(err)?;
+            let ra = if matches!(inst.opcode, SMMUL | SMMULR) {
+                None
+            } else {
+                Some(operand_value(&ops[3], pc_const).ok_or_else(err)?)
+            };
+            out.push(Stmt::MulHigh {
+                rd,
+                rn,
+                rm,
+                ra,
+                sub: matches!(inst.opcode, SMMLS | SMMLSR),
+                round: matches!(inst.opcode, SMMULR | SMMLAR | SMMLSR),
+            });
+        }
+        // usad8 rd, rn, rm [, ra]: the sum of the four unsigned byte differences' absolute
+        // values [+ ra]. |d| is `(d ^ s) - s` with s = d >> 31 (arithmetic), per byte.
+        USAD8 | USADA8 => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            let rm = operand_value(&ops[2], pc_const).ok_or_else(err)?;
+            let byte = |v: &Value, k: u32| {
+                bin(BinOp::And, bin(BinOp::Lsr, v.clone(), Value::Imm(8 * k)), Value::Imm(0xFF))
+            };
+            let mut sum: Option<Value> = None;
+            for k in 0..4 {
+                let d = bin(BinOp::Sub, byte(&rn, k), byte(&rm, k));
+                let s = bin(BinOp::Asr, d.clone(), Value::Imm(31));
+                let abs = bin(BinOp::Sub, bin(BinOp::Xor, d, s.clone()), s);
+                sum = Some(match sum {
+                    None => abs,
+                    Some(acc) => bin(BinOp::Add, acc, abs),
+                });
+            }
+            let mut result = sum.expect("four bytes");
+            if inst.opcode == USADA8 {
+                let ra = operand_value(&ops[3], pc_const).ok_or_else(err)?;
+                result = bin(BinOp::Add, result, ra);
+            }
+            out.push(Stmt::SetReg(rd, result));
+        }
+        // pkhbt rd, rn, rm, lsl #n: bottom half from rn, top half from the shifted rm.
+        // pkhtb rd, rn, rm, asr #n: top half from rn, bottom half from the shifted rm.
+        PKHBT | PKHTB => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            let rm = operand_value(&ops[2], pc_const).ok_or_else(err)?;
+            let (keep, take) =
+                if inst.opcode == PKHBT { (0x0000_FFFF, 0xFFFF_0000) } else { (0xFFFF_0000, 0x0000_FFFF) };
+            let value = bin(
+                BinOp::Or,
+                bin(BinOp::And, rn, Value::Imm(keep)),
+                bin(BinOp::And, rm, Value::Imm(take)),
+            );
+            out.push(Stmt::SetReg(rd, value));
         }
         // mla rd, rn, rm, ra => rd = rn*rm + ra; mls => rd = ra - rn*rm.
         MLA | MLS => {
@@ -4062,6 +4225,10 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         VHSUB => NeonStmt::Bin { op: NeonBin::HSub, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VRHADD => NeonStmt::Bin { op: NeonBin::RHAdd, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VMVN => NeonStmt::Not { dst: r(0)?, src: r(1)? },
+        VCNT => NeonStmt::PopCount { dst: r(0)?, src: r(1)? },
+        VCLZ | VCLS => {
+            NeonStmt::CountLeading { bits: ty.bits, sign: op == VCLS, dst: r(0)?, src: r(1)? }
+        }
         VQABS => NeonStmt::SatAbsNeg { ty, neg: false, dst: r(0)?, src: r(1)? },
         VQNEG => NeonStmt::SatAbsNeg { ty, neg: true, dst: r(0)?, src: r(1)? },
         VMAX => NeonStmt::Bin { op: NeonBin::Max, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
@@ -4279,8 +4446,8 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
             let (NeonReg::D(dst), NeonReg::D(index)) = (r(0)?, r(2)?) else { return None };
             NeonStmt::TableLookup { dst, table: first, len: count, index, extend: op == VTBX }
         }
-        // VSWP is decoded but not lifted yet (it would land here as a permute swap).
-        VSWP => return None,
+        // VSWP exchanges the two registers whole: the permute whose results are each other's input.
+        VSWP => NeonStmt::Permute { op: crate::ir::PermuteOp::Swp, esize: 8, a: r(0)?, b: r(1)? },
     };
     neon_emittable(&st).then_some(st)
 }
@@ -4381,9 +4548,11 @@ fn neon_emittable(s: &NeonStmt) -> bool {
                 ty.bits != 64
             }
         }
-        // Per-lane variable shift is emitted lane-by-lane over i32; the 8/16/32-bit unsaturated
-        // form is supported. The saturating VQSHL and the 64-bit form lift as unsupported.
-        NeonStmt::ShiftReg { sat, ty, .. } => !sat && ty.bits != 64,
+        // Per-lane variable shift is emitted lane-by-lane (over i64 for the 64-bit form - see
+        // `emit_shift_reg_64`). The saturating VQSHL lifts as unsupported.
+        NeonStmt::ShiftReg { sat, .. } => !sat,
+        // The decoder gives no 64-bit element for vclz/vcls; refuse one rather than guess.
+        NeonStmt::CountLeading { bits, .. } => *bits != 64,
         _ => true,
     }
 }
@@ -4634,7 +4803,7 @@ mod switch_bound_tests {
     /// the rebase - and the entries that fall off the end are silently routed to the
     /// switch's default instead of their case bodies.
     ///
-    /// These are the real bytes at guest `0x81c566c8` in PCSE00084's query-language
+    /// These are the real bytes at guest `0x81c566c8` in a football title's query-language
     /// lexer, whose nine cases are identifier LENGTHS 2..10. Read as seven, the
     /// ten-character keyword `fastcursor` degraded to a plain identifier, the cursor it
     /// declared bound no columns, and the title faulted four hundred frames later inside

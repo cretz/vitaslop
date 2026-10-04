@@ -113,6 +113,7 @@ export function mountTouchPad(root, worker, keymap, opts = {}) {
     pad.addEventListener("pointerdown", (e) => {
       stop(e);
       active = e.pointerId;
+      pad.dataset.touched = "1";
       try {
         pad.setPointerCapture(e.pointerId);
       } catch {}
@@ -127,6 +128,7 @@ export function mountTouchPad(root, worker, keymap, opts = {}) {
       if (active !== e.pointerId) return;
       stop(e);
       active = null;
+      delete pad.dataset.touched;
       knob.style.transform = "";
       worker.postMessage({ type: "stick", stick: which, x: 128, y: 128, active: false });
     };
@@ -136,6 +138,21 @@ export function mountTouchPad(root, worker, keymap, opts = {}) {
   }
 
   return {
+    /// Move a stick's knob for a stick pushed by something else (a gamepad), `nx`/`ny` in
+    /// -1..1 - the stick's own form of `setHeld`. A finger on that stick wins.
+    setStick: (which, nx, ny) => {
+      const pad = root.querySelector(`[data-stick="${which}"]`);
+      if (!pad || pad.dataset.touched) return;
+      const knob = pad.querySelector(".tp-knob");
+      const r = pad.getBoundingClientRect();
+      const radius = Math.min(r.width, r.height) / 2;
+      const mag = Math.hypot(nx, ny);
+      if (mag > 1) {
+        nx /= mag;
+        ny /= mag;
+      }
+      knob.style.transform = nx || ny ? `translate(${nx * radius * 0.6}px, ${ny * radius * 0.6}px)` : "";
+    },
     /// Light a control pressed by something else (a keyboard, a gamepad), so the
     /// picture agrees with the game whichever way the button was pushed.
     setHeld: (name, held) => {

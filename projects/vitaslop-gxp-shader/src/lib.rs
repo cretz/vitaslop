@@ -349,6 +349,9 @@ pub struct RopBlend {
     /// field table (`docs-re/usse-spec-sop2.md`) rather than the two pinned shapes. `None` for
     /// the pinned shapes, whose callers keep their established mapping.
     pub factors: Option<(u8, u8, u8, u8)>,
+    /// `(color_func, alpha_func)` as `SceGxmBlendFunc` values: 1 ADD, 3 REVERSE_SUBTRACT (the
+    /// swapped orientation's `dst - src`). Only meaningful with `factors`; ADD otherwise.
+    pub funcs: (u8, u8),
 }
 
 /// `SceGxmBlendFactor` for a plain-SOP2 factor selector, with the ORIENTATION of this reading
@@ -356,22 +359,29 @@ pub struct RopBlend {
 /// DESTINATION). `colour` picks between the 3-bit colour table and the 2-bit alpha table.
 /// `None` for a selector the spec does not establish.
 fn sop2_gxm_factor(sel: u32, complement: bool, colour: bool) -> Option<u8> {
+    sop2_gxm_factor_oriented(sel, complement, colour, false)
+}
+
+/// [`sop2_gxm_factor`] with the orientation as an argument: `swapped` = SRC1 is the output
+/// register (the DESTINATION) and SRC2 the shader colour (the SOURCE).
+fn sop2_gxm_factor_oriented(sel: u32, complement: bool, colour: bool, swapped: bool) -> Option<u8> {
     // SceGxmBlendFactor: 0 ZERO, 1 ONE, 2 SRC_COLOR, 3 1-SRC_COLOR, 4 SRC_ALPHA, 5 1-SRC_ALPHA,
     // 6 DST_COLOR, 7 1-DST_COLOR, 8 DST_ALPHA, 9 1-DST_ALPHA.
+    let (src1_colour, src2_colour, src1_alpha, src2_alpha) = if swapped { (6, 2, 8, 4) } else { (2, 6, 4, 8) };
     let base = if colour {
         match sel {
             0 => 0, // zero
-            1 => 2, // src1 colour = the source colour
-            2 => 6, // src2 colour = the destination colour
-            3 => 4, // src1 alpha
-            4 => 8, // src2 alpha
+            1 => src1_colour,
+            2 => src2_colour,
+            3 => src1_alpha,
+            4 => src2_alpha,
             _ => return None,
         }
     } else {
         match sel {
             0 => 0,
-            1 => 4,
-            2 => 8,
+            1 => src1_alpha,
+            2 => src2_alpha,
             _ => return None,
         }
     };
@@ -519,6 +529,70 @@ pub fn fragment_uses_frag_color(bytes: &[u8]) -> bool {
     module::reads_output_bank(&usse::decode_shader(&program))
 }
 
+/// Whether a FRAGMENT blob can DISCARD a fragment - the question `sceGxmProgramIsDiscardUsed`
+/// asks of a program, answered from the program itself: whether any instruction is a `kill`,
+/// predicated or not (a kill that only sometimes fires still makes the program one that
+/// discards, which is what a title asks this to decide - its depth/stencil setup).
+///
+/// A blob that does not parse, or is not a fragment program, answers `false`: a vertex program
+/// has no fragment to discard.
+pub fn fragment_uses_discard(bytes: &[u8]) -> bool {
+    let Ok(program) = Program::parse(bytes) else { return false };
+    if program.kind != ProgramKind::Fragment {
+        return false;
+    }
+    usse::decode_shader(&program).instrs.iter().any(|i| matches!(i.op, Op::Kill))
+}
+
+/// Whether a FRAGMENT blob REPLACES the fragment's depth - `sceGxmProgramIsDepthReplaceUsed`,
+/// answered from the program itself: whether any instruction is a `depthf` (see [`Op::DepthF`]:
+/// one makes the whole shader depth-replacing). A blob that does not parse, or is not a
+/// fragment program, answers `false`.
+pub fn fragment_replaces_depth(bytes: &[u8]) -> bool {
+    let Ok(program) = Program::parse(bytes) else { return false };
+    if program.kind != ProgramKind::Fragment {
+        return false;
+    }
+    usse::decode_shader(&program).instrs.iter().any(|i| matches!(i.op, Op::DepthF))
+}
+
+/// The swapped-orientation SOP2 epilogue read through the spec's field table - see
+/// `rop_blend`. `None`: not this shape. `Some(None)`: this shape with a selector the spec does
+/// not establish (refuse). The guard matches `decode_grp_sop2`'s `swapped_spec`; the caller
+/// has already checked the destination is `o[0]`.
+fn swapped_spec_rop_blend(w: u64) -> Option<Option<RopBlend>> {
+    let bit = |hi, lo| usse::decode::bits(w, hi, lo);
+    let shape = bit(58, 57) == 0
+        && bit(51, 51) == 0
+        && bit(49, 49) == 0
+        && bit(48, 48) == 0
+        && bit(46, 44) == 0
+        && bit(20, 20) == 0
+        && bit(15, 14) == 0
+        && bit(19, 18) <= 1
+        && bit(17, 16) <= 1
+        && bit(31, 30) == 1
+        && bit(13, 7) == 0
+        && bit(29, 28) == 2;
+    if !shape {
+        return None;
+    }
+    let cd = sop2_gxm_factor_oriented(bit(40, 38), bit(56, 56) == 1, true, true);
+    let cs = sop2_gxm_factor_oriented(bit(37, 35), bit(47, 47) == 1, true, true);
+    let ad = sop2_gxm_factor_oriented(bit(53, 52), bit(43, 43) == 1, false, true);
+    let as_ = sop2_gxm_factor_oriented(bit(42, 41), bit(34, 34) == 1, false, true);
+    let (Some(cs), Some(cd), Some(as_), Some(ad)) = (cs, cd, as_, ad) else { return Some(None) };
+    // SceGxmBlendFunc: 1 ADD, 3 REVERSE_SUBTRACT (`T1 - T2` with T1 the destination).
+    let func = |op: u32| if op == 1 { 3 } else { 1 };
+    let dst = if cd == 5 { RopDstFactor::OneMinusSrcAlpha } else { RopDstFactor::One };
+    Some(Some(RopBlend {
+        dst,
+        alpha_op_differs: false,
+        factors: Some((cs, cd, as_, ad)),
+        funcs: (func(bit(19, 18)), func(bit(17, 16))),
+    }))
+}
+
 pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
 
     let program = Program::parse(bytes).ok()?;
@@ -527,7 +601,7 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
     }
     let shader = usse::decode_shader(&program);
     let mut found = None;
-    for instr in &shader.instrs {
+    for (at, instr) in shader.instrs.iter().enumerate() {
         if instr.group != 0x80 {
             continue;
         }
@@ -581,10 +655,30 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
             if found.is_some() {
                 return None;
             }
-            found = Some(RopBlend { dst: RopDstFactor::One, alpha_op_differs: false, factors: None });
+            found = Some(RopBlend { dst: RopDstFactor::One, alpha_op_differs: false, factors: None, funcs: (1, 1) });
             continue;
         }
-        if !dest_is_output || !src2_is_output {
+        // >>> EVERY OTHER SWAPPED WORD, READ THROUGH THE SPEC'S TABLE in that orientation: SRC1 =
+        // the output register (destination), SRC2 = the shader colour (source); op 0 ADD, op 1
+        // `T1 - T2` = dst - src = REVERSE_SUBTRACT. The guard is `decode_grp_sop2`'s
+        // `swapped_spec`, so a word admitted there is always given its equation here.
+        // MEASURED: `0x81800c2160050000` = `dst - src*src.a` on colour and alpha - a fighting
+        // title's selected-menu-item label, black text knocked out of a white bar.
+        if dest_is_output
+            && let Some(read) = swapped_spec_rop_blend(w)
+        {
+            let blend = read?;
+            if found.is_some() {
+                return None;
+            }
+            found = Some(blend);
+            continue;
+        }
+        // A PRIMARY-ATTRIBUTE destination moved to `o[0]` by the program's one final identity
+        // copy is the same epilogue one register away (`usse::sop2_pa_epilogue_tail_ok`).
+        let dest_reaches_output = dest_is_output
+            || (bit(33, 32) == 2 && bit(51, 51) == 0 && usse::sop2_pa_epilogue_tail_ok(&shader.instrs, at));
+        if !dest_reaches_output || !src2_is_output {
             continue;
         }
         // Every field this reading does not establish, pinned to its one observed value.
@@ -626,7 +720,7 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
                     }
                     // The legacy summary fields, for the callers and reports that read them.
                     let dst = if cd == 5 { RopDstFactor::OneMinusSrcAlpha } else { RopDstFactor::One };
-                    found = Some(RopBlend { dst, alpha_op_differs: bit(42, 41) != 0, factors: Some((cs, cd, as_, ad)) });
+                    found = Some(RopBlend { dst, alpha_op_differs: bit(42, 41) != 0, factors: Some((cs, cd, as_, ad)), funcs: (1, 1) });
                     continue;
                 }
                 return None;
@@ -647,7 +741,25 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
         if found.is_some() {
             return None;
         }
-        found = Some(RopBlend { dst, alpha_op_differs, factors: None });
+        found = Some(RopBlend { dst, alpha_op_differs, factors: None, funcs: (1, 1) });
     }
     found
+}
+
+#[cfg(test)]
+mod rop_blend_tests {
+    use super::*;
+
+    /// A fighting title's selected-menu-item label: `0x81800c2160050000`, the swapped orientation
+    /// (SRC1 = `o[0]`, SRC2 = the packed colour) read through the spec's table - colour
+    /// `dst*1 - src*src.a`, alpha `dst.a*1 - src.a*src.a`: REVERSE_SUBTRACT, SRC_ALPHA, ONE.
+    #[test]
+    fn the_swapped_subtract_epilogue_is_a_reverse_subtract_blend() {
+        let blend = swapped_spec_rop_blend(0x8180_0c21_6005_0000).expect("the shape").expect("established");
+        assert_eq!(blend.factors, Some((4, 1, 4, 1)), "(color_src, color_dst, alpha_src, alpha_dst)");
+        assert_eq!(blend.funcs, (3, 3));
+        // The two pinned swapped words are NOT this arm's: `rop_blend` checks them first, and a
+        // MIN op (19:18 = 2) is not the shape at all.
+        assert!(swapped_spec_rop_blend(0x8180_0c21_6005_0000 | (1 << 19)).is_none());
+    }
 }

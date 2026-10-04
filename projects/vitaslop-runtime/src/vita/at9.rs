@@ -173,6 +173,11 @@ const OFF_PCM_RATE: u32 = 0x38;
 /// an untouched level looks like.
 const OFF_PCM_LEVEL: u32 = 0x3c;
 const OFF_PCM_CHANNELS: u32 = 0x4c;
+/// `start_bytes` (i32) and `start_buffer` (i8): where a key-on begins playing. A streaming
+/// chain of `[0] 0 bytes -> [1] looping -> [2]` names slot 1 here, which is why its empty
+/// slot 0 is never a lead-in anything has to step off. (Layout as Vita3K's player module.)
+const OFF_PCM_START_BYTES: u32 = 0x48;
+const OFF_PCM_START_BUFFER: u32 = 0x51;
 /// Selects how the source bytes are encoded: 0 = raw signed-16, 1 = PS-ADPCM.
 ///
 /// EVIDENCE, and it is the byte that stopped this generator playing NOISE. The source
@@ -272,6 +277,10 @@ pub(crate) struct At9Voice {
     /// callback the title is owed. See [`PlayerEvent`].
     events: Vec<PlayerEvent>,
     playing: bool,
+    /// `sceNgsVoicePause`d: kept, position and all, but neither decoded nor mixed until
+    /// `sceNgsVoiceResume`. A play on a paused voice starts it STILL PAUSED - the way a
+    /// streaming engine starts a voice silently, configures it, then lets it go.
+    paused: bool,
     /// Recreated on play; `None` until first play or if the config is unset.
     decoder: Option<Atrac9Decoder>,
     superframe_bytes: u32,
@@ -282,6 +291,13 @@ pub(crate) struct At9Voice {
     /// [`At9::state_words`]).
     generated_keyon: u32,
     generated_total: u32,
+    /// Source bytes consumed out of buffers already LEFT (a lap or a swap), since key-on
+    /// and over the voice's life - the state words add the current buffer's position.
+    bytes_keyon_done: u32,
+    bytes_total_done: u32,
+    /// PCM only: where a key-on starts, `start_buffer` / `start_bytes` of the player params.
+    start_buffer: usize,
+    start_bytes: u32,
     /// PCM only: the source's own sample rate, from its params.
     rate: u32,
     /// PCM only: how the source bytes are encoded.
@@ -346,9 +362,27 @@ pub(crate) struct At9Voice {
     /// "voice AUDIBLE" report. Separate from [`Self::heard`] because a voice that is mixed
     /// every grain at gain 0 and one that is never mixed look identical without it.
     heard_audible: bool,
+    /// `VITASLOP_NGS_VOICE_PEAKS=1` only: this voice's lifetime source peak, sum of squares and
+    /// sample count as mixed - see [`voice_peaks_enabled`].
+    life_peak: u16,
+    life_sumsq: f64,
+    life_samples: u64,
+    /// The source those three describe (`data_ptr`), so a voice handle reused for the next
+    /// sound starts a fresh row instead of accumulating every sound it ever played.
+    life_src: u32,
 }
 
 impl At9Voice {
+    /// The source kind as a static label, for the peak census.
+    fn kind_name(&self) -> &'static str {
+        match (self.kind, self.format) {
+            (SourceKind::At9, _) => "at9",
+            (SourceKind::Pcm, PcmFormat::Adpcm) => "adpcm",
+            (SourceKind::Pcm, _) => "pcm",
+            (SourceKind::None, _) => "none",
+        }
+    }
+
     /// Report, ONCE per distinct reason, why this voice will not be heard.
     ///
     /// Unconditional (WARN, no env gate) for the same reason a shader fallback is:
@@ -380,6 +414,10 @@ impl At9Voice {
         At9Voice {
             heard: false,
             heard_audible: false,
+            life_peak: 0,
+            life_sumsq: 0.0,
+            life_samples: 0,
+            life_src: 0,
             kind: SourceKind::None,
             data_ptr: 0,
             data_bytes: 0,
@@ -392,11 +430,16 @@ impl At9Voice {
             discard_pending: 0,
             events: Vec::new(),
             playing: false,
+            paused: false,
             decoder: None,
             superframe_bytes: 0,
             consumed: 0,
             generated_keyon: 0,
             generated_total: 0,
+            bytes_keyon_done: 0,
+            bytes_total_done: 0,
+            start_buffer: 0,
+            start_bytes: 0,
             rate: 0,
             format: PcmFormat::S16,
             gain: 1.0,
@@ -524,10 +567,24 @@ impl At9Voice {
     fn set_chain(&mut self, bufs: [BufDesc; PLAYER_BUFFERS]) {
         self.bufs = bufs;
         if !self.playing {
-            self.cur = 0;
+            self.cur = self.start_buffer;
             self.laps = 0;
         }
         self.select(self.cur);
+    }
+
+    /// How far into its CURRENT buffer this voice has read, in bytes of the source. Per
+    /// KIND, because the read cursor is not one field: the s16 path advances a FRACTIONAL
+    /// frame cursor (`resample_pos`, so a rate conversion does not drop a sample at a grain
+    /// boundary) while the block formats advance a byte cursor (`consumed`).
+    fn byte_in_buffer(&self) -> u32 {
+        match (self.kind, self.format) {
+            (SourceKind::Pcm, PcmFormat::S16) => {
+                let frame_bytes = u32::from(self.channels.max(1) as u16) * 2;
+                (self.resample_pos as u32).saturating_mul(frame_bytes)
+            }
+            _ => self.consumed,
+        }
     }
 
     /// Make `bufs[index]` the buffer the decode paths read.
@@ -545,6 +602,10 @@ impl At9Voice {
     fn advance(&mut self) -> bool {
         let b = self.bufs[self.cur];
         let index = self.cur as u32;
+        // The buffer being left is consumed bytes, for the state words - see `state_words`.
+        let left = self.byte_in_buffer();
+        self.bytes_keyon_done = self.bytes_keyon_done.wrapping_add(left);
+        self.bytes_total_done = self.bytes_total_done.wrapping_add(left);
         // Carry the fractional part so a looping source does not gain or lose a sample
         // every lap, which would drift audibly over a long ambience bed.
         self.resample_pos -= self.resample_pos.floor();
@@ -556,10 +617,15 @@ impl At9Voice {
         // call, which parks the whole worker. The chain's own `next` is the only way out of an
         // empty slot, so take it. A slot that HAS bytes is unaffected, which is every slot
         // this branch was written for.
-        // EXPERIMENT (`VITASLOP_NGS_NEG_LOOP=end`): does a negative loop count mean "play
-        // once" rather than "loop forever"? A slot that names a `next` is telling you the
-        // loop is finite.
-        let forever = b.loop_count < 0 && !neg_loop_ends();
+        // >>> -1 LOOPS FOREVER, AND A STREAMING RING IS BUILT ON IT. A player's `loop_count`
+        // of -1 is the continuous loop; any other count is how many repeats before `next`.
+        // FMOD's software mix reaches NGS as ONE 8 KB slot looping at -1 that the title
+        // refills behind the play cursor. Reading -1 as "play once" ended that voice after
+        // its first lap - MEASURED on a fighting title: one grain of its software mix, then
+        // nothing for the run, which is every piece of music it has. (The chain that reading
+        // came from, `[0] 0 bytes -> [1] looping -> [2]`, starts at slot 1 by its params'
+        // `start_buffer`, so it never needed it.)
+        let forever = b.loop_count == -1;
         if !b.is_empty() && (forever || self.laps < i32::from(b.loop_count)) {
             self.laps += 1;
             self.events.push(PlayerEvent::Looped { buffer: index });
@@ -681,6 +747,11 @@ impl At9Voice {
         });
         let rate = f32::from_bits(ctx.read_u32(params_addr + OFF_PCM_RATE)) as i64;
         let channels = u32::from(ctx.read_bytes(params_addr + OFF_PCM_CHANNELS, 1)[0]);
+        // Where a key-on starts. An out-of-range slot is not a start this reading can
+        // explain, so slot 0 stands - the old behaviour - rather than a guess.
+        let start_buffer = usize::from(ctx.read_bytes(params_addr + OFF_PCM_START_BUFFER, 1)[0]);
+        self.start_buffer = if start_buffer < PLAYER_BUFFERS { start_buffer } else { 0 };
+        self.start_bytes = ctx.read_u32(params_addr + OFF_PCM_START_BYTES);
         // The first slot with bytes: what the format checks below are asked of, and what the
         // head dump reads. Slot 0's own values still drive `select(0)`, because that is where
         // the hardware starts playing.
@@ -790,17 +861,24 @@ impl At9Voice {
 
     /// (Re)start playback from the beginning of the current source.
     fn start(&mut self) {
-        // From the head of the chain, whatever slot a previous play ended in.
+        // From the params' start slot (slot 0 unless a PCM player names another), whatever
+        // slot a previous play ended in.
         self.laps = 0;
-        self.select(0);
+        self.select(self.start_buffer);
         self.enter_buffer();
         self.events.clear();
         self.generated_keyon = 0;
+        self.bytes_keyon_done = 0;
         if self.kind == SourceKind::Pcm {
             // Nothing to construct: the source is already samples, and playing it is a
-            // read cursor over guest memory.
-            self.consumed = 0;
-            self.resample_pos = 0.0;
+            // read cursor over guest memory - placed at the params' `start_bytes`, in whole
+            // frames (s16) or whole interleaved block groups (ADPCM).
+            let start = self.start_bytes.min(self.data_bytes);
+            let ch = u32::from(self.channels.max(1) as u16);
+            (self.consumed, self.resample_pos) = match self.format {
+                PcmFormat::S16 => (0, f64::from(start / (ch * 2))),
+                PcmFormat::Adpcm => (start / (ADPCM_BLOCK_BYTES * ch) * (ADPCM_BLOCK_BYTES * ch), 0.0),
+            };
             self.adpcm_hist = [[0; 4]; 2];
             self.src_pending.clear();
             self.pending.clear();
@@ -850,6 +928,7 @@ impl At9Voice {
             note_voice_stopped();
         }
         self.playing = false;
+        self.paused = false;
     }
 
     /// The voice loops if its loop count is non-zero (a negative count is the
@@ -1272,7 +1351,7 @@ impl At9Voice {
             if tail < sf_bytes {
                 let b = self.bufs[self.cur];
                 let will_loop = !b.is_empty()
-                    && ((b.loop_count < 0 && !neg_loop_ends()) || self.laps < i32::from(b.loop_count));
+                    && (b.loop_count == -1 || self.laps < i32::from(b.loop_count));
                 let next_has_bytes = usize::try_from(b.next)
                     .ok()
                     .and_then(|n| self.bufs.get(n))
@@ -1421,12 +1500,6 @@ fn note_level_unset() {
     LEVEL_UNSET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// A NEGATIVE `nLoopCount` means "play this buffer once and move on", not "repeat it
-/// forever" (`VITASLOP_NGS_NEG_LOOP=forever` restores the old reading).
-///
-/// The evidence: one title's music chain is
-/// `[0] 0 bytes (next 1) -> [1] 51,196 bytes (loop -1, next 2) -> [2] 4 bytes (next -1)`, and
-/// a slot that names a NEXT is not a slot that plays forever.
 /// A level of exactly 0.0 is a field the title never wrote, so unity stands
 /// (`VITASLOP_NGS_ZERO_LEVEL=silent` restores taking it literally). MEASURED: under `silent`
 /// this title has no sound at all outside its movies; under unity its front end, menus and
@@ -1458,14 +1531,6 @@ fn mat_mul(a: &[[f32; 2]; 2], b: &[[f32; 2]; 2]) -> [[f32; 2]; 2] {
 
 fn mat_scale(m: &[[f32; 2]; 2], s: f32) -> [[f32; 2]; 2] {
     [[m[0][0] * s, m[0][1] * s], [m[1][0] * s, m[1][1] * s]]
-}
-
-fn neg_loop_ends() -> bool {
-    use std::sync::OnceLock;
-    static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| {
-        crate::knobs::var("VITASLOP_NGS_NEG_LOOP").map(|v| v.trim() != "forever").unwrap_or(true)
-    })
 }
 
 /// HE-VAG blocks whose 8-bit predictor index named a row past the 128-entry table. Counted
@@ -1701,6 +1766,72 @@ fn note_mix_grain(
 /// nothing and decoded in full, because its source has to advance or it would resume from a
 /// stale position. If most playing voices are inaudible, that is where the decode time is
 /// going and the trade is worth measuring; if they are all audible, the decoder itself is.
+/// `VITASLOP_NGS_VOICE_PEAKS=1`: keep every voice's lifetime source peak and RMS and report the
+/// loudest at exit (`mix_report`). Diagnostic - it walks every sample a second time, which the
+/// mix loop otherwise never does.
+///
+/// >>> WHO DRIVES THE MIX INTO THE CLAMP. One title's NGS mix peaked at 5.2x full scale with
+/// every applied gain at exactly 1.000 and no level, patch or port volume written anywhere -
+/// so the question is no longer "which attenuation is missing" but "which sources sum to it",
+/// and the first-grain peak the debug line carries cannot answer that.
+fn voice_peaks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VITASLOP_NGS_VOICE_PEAKS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `VITASLOP_NGS_VOICE_RAW=<base>`: every voice's decoded grain, BEFORE any gain, appended to
+/// `<base>.<handle>.<channels>ch.raw` as s16le at the port rate, plus one line per voice per
+/// grain in `<base>.csv` - `grain,voice,rms,gain` - so a voice's loudness can be read against
+/// TIME (the raw files hold only the grains it played). The port's output capture
+/// is the sum, and a sum cannot say which voice carries the music or
+/// which one is too hot. Diagnostic; native only (the browser has no filesystem).
+fn capture_voice(handle: u32, channels: usize, gain: f32, src: &[i16]) {
+    static BASE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static FILES: std::sync::Mutex<Vec<(u32, std::fs::File)>> = std::sync::Mutex::new(Vec::new());
+    let Some(base) = BASE.get_or_init(|| std::env::var("VITASLOP_NGS_VOICE_RAW").ok().filter(|v| !v.is_empty())) else {
+        return;
+    };
+    use std::io::Write;
+    let mut files = FILES.lock().unwrap_or_else(|e| e.into_inner());
+    let at = match files.iter().position(|(h, _)| *h == handle) {
+        Some(i) => i,
+        None => {
+            let Ok(f) = std::fs::File::create(format!("{base}.{handle:08x}.{channels}ch.raw")) else { return };
+            files.push((handle, f));
+            files.len() - 1
+        }
+    };
+    let bytes: Vec<u8> = src.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let _ = files[at].1.write_all(&bytes);
+    // The timeline, under the same lock; voice 0 names the CSV's own slot.
+    let rms = (src.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>() / src.len().max(1) as f64).sqrt();
+    let grain = MIX_GRAINS.load(std::sync::atomic::Ordering::Relaxed);
+    let at = match files.iter().position(|(h, _)| *h == 0) {
+        Some(i) => i,
+        None => {
+            let Ok(f) = std::fs::File::create(format!("{base}.csv")) else { return };
+            files.push((0, f));
+            files.len() - 1
+        }
+    };
+    let _ = writeln!(files[at].1, "{grain},{handle:08x},{rms:.0},{gain:.3}");
+}
+
+/// `(source pointer, kind, source bytes) -> (peak, sum of squares, samples)`, latest per sound.
+#[allow(clippy::type_complexity)]
+static VOICE_PEAKS: std::sync::Mutex<Vec<((u32, &'static str, u32), (u16, f64, u64))>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn note_voice_peak(src: u32, kind: &'static str, bytes: u32, peak: u16, sumsq: f64, samples: u64) {
+    let mut g = VOICE_PEAKS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (src, kind, bytes);
+    match g.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, v)) => *v = (peak, sumsq, samples),
+        None => g.push((key, (peak, sumsq, samples))),
+    }
+}
+
 pub fn report_mix() {
     for line in mix_report() {
         tracing::info!(target: "vitaslop::perf", "{line}");
@@ -1831,6 +1962,22 @@ pub fn mix_report() -> Vec<String> {
         out.push(format!(
             "ngs adpcm: {idx_oor} HE-VAG block(s) named a predictor index past the 128-entry table and were decoded with index 0. The index is 8 bits across both header bytes, so a count here means the header reading is wrong, not that the title is odd."
         ));
+    }
+    // >>> AND, WHEN ASKED, THE LOUDEST SOURCES - see `voice_peaks_enabled`.
+    {
+        let mut g = VOICE_PEAKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !g.is_empty() {
+            g.sort_by(|a, b| (b.1 .1 / b.1 .2.max(1) as f64).total_cmp(&(a.1 .1 / a.1 .2.max(1) as f64)));
+            let rows: Vec<String> = g
+                .iter()
+                .take(16)
+                .map(|((h, k, bytes), (peak, sumsq, n))| {
+                    let rms = (sumsq / (*n).max(1) as f64).sqrt();
+                    format!("{h:#x} {k} {bytes}B peak {peak} rms {rms:.0} over {n}")
+                })
+                .collect();
+            out.push(format!("ngs voice peaks ({} source sets, loudest RMS first): {}", g.len(), rows.join("; ")));
+        }
     }
     // >>> AND THE VOICES THE TITLE IS HOLDING MUTED. See `At9Voice::take_level`.
     let unset = LEVEL_UNSET.load(Relaxed);
@@ -2125,6 +2272,25 @@ impl At9Bank {
         }
     }
 
+    /// `sceNgsVoicePause` / `sceNgsVoiceResume`. Answers whether the state changed - the
+    /// call fails on a voice already in the asked-for state.
+    pub(crate) fn set_paused(&mut self, voice: u32, paused: bool) -> bool {
+        let v = self.voices.entry(voice).or_insert_with(At9Voice::empty);
+        let changed = v.paused != paused;
+        v.paused = paused;
+        changed
+    }
+
+    /// The byte length of the buffer `voice` is reading - for the stop diagnostic.
+    pub(crate) fn buffer_bytes(&self, voice: u32) -> u32 {
+        self.voices.get(&voice).map_or(0, |v| v.data_bytes)
+    }
+
+    /// Whether `voice` is held by `sceNgsVoicePause`.
+    pub(crate) fn is_paused(&self, voice: u32) -> bool {
+        self.voices.get(&voice).is_some_and(|v| v.paused)
+    }
+
     /// Any voice currently producing audio.
     pub(crate) fn any_playing(&self) -> bool {
         self.voices.values().any(|v| v.playing)
@@ -2135,18 +2301,10 @@ impl At9Bank {
         self.voices.get(&voice).is_some_and(|v| v.playing)
     }
 
-    /// How far into its CURRENT buffer this voice has played, in bytes of the source - the
-    /// one field of the player's state a title has been seen to read. `None` when the voice
-    /// is not playing.
-    ///
-    /// Per KIND, because the read cursor is not one field: the s16 path advances a
-    /// FRACTIONAL frame cursor (`resample_pos`, so a rate conversion does not drop a sample
-    /// at a grain boundary) while the block formats advance a byte cursor (`consumed`).
-    /// Reporting `consumed` for all of them would report a permanent zero for exactly the
-    /// format a streaming title uses.
     /// >>> THE PLAYER MODULE'S STATE BLOCK, the 24 bytes `sceNgsVoiceGetStateData` hands a
-    /// title: `{ current byte, current buffer, samples generated since key-on, samples
-    /// generated total, decoded samples, 0 }`. `None` when the voice is not playing (the
+    /// title: `{ byte position in the current buffer, current buffer, samples generated
+    /// since key-on, BYTES consumed since key-on, samples generated total, bytes consumed
+    /// total }` (samples count every channel). `None` when the voice is not playing (the
     /// block then reads as zeros, which is what an idle player reports).
     ///
     /// MEASURED on a baseball title's menu music (2026-09-18), read off its eboot at
@@ -2156,16 +2314,23 @@ impl At9Bank {
     /// only word 0 written and the rest zero it never queued anything: every chunk played
     /// to its end, the voice went AVAILABLE, and the title restarted with another track -
     /// the "split-second fragments of different songs" heard on the device.
+    ///
+    /// >>> WORDS 3 AND 5 ARE BYTES, NOT FRAMES. They used to carry frame counts (and word 5
+    /// a zero) - a cursor a quarter of the way behind for any streamer that tracks its ring by
+    /// bytes consumed. The layout is the player module's in Vita3K, which agrees with the one
+    /// word the baseball title's eboot was read for.
     pub(crate) fn state_words(&self, voice: u32) -> Option<[u32; 6]> {
         let v = self.voices.get(&voice).filter(|v| v.playing)?;
-        let byte = match (v.kind, v.format) {
-            (SourceKind::Pcm, PcmFormat::S16) => {
-                let frame_bytes = u32::from(v.channels.max(1) as u16) * 2;
-                (v.resample_pos as u32).saturating_mul(frame_bytes)
-            }
-            _ => v.consumed,
-        };
-        Some([byte, v.cur as u32, v.generated_keyon, v.generated_total, v.generated_total, 0])
+        let byte = v.byte_in_buffer();
+        let ch = u32::from(v.channels.max(1) as u16);
+        Some([
+            byte,
+            v.cur as u32,
+            v.generated_keyon.wrapping_mul(ch),
+            v.bytes_keyon_done.wrapping_add(byte),
+            v.generated_total.wrapping_mul(ch),
+            v.bytes_total_done.wrapping_add(byte),
+        ])
     }
 
     /// Every buffer boundary any voice crossed since the last drain, as `(voice, event)`
@@ -2201,7 +2366,7 @@ impl At9Bank {
         let routed: Vec<(u32, f32, [[f32; 2]; 2])> = self
             .voices
             .iter()
-            .filter(|(_, v)| v.playing)
+            .filter(|(_, v)| v.playing && !v.paused)
             .map(|(&handle, _)| (handle, self.buss_gain(handle), self.buss_matrix(handle)))
             .collect();
         // Playing voices with nothing to route them anywhere - see `MIX_UNROUTED`.
@@ -2351,9 +2516,21 @@ impl At9Bank {
             // those zeros anyway. Adding zero is a no-op, so skipping is bit-identical and it
             // is a sixth of the mixing loop. The scan itself short-circuits on the first
             // nonzero sample, so a voice that IS audible pays almost nothing for it.
+            capture_voice(handle, vc, gain, src);
             if !src.iter().any(|&s| s != 0) {
                 silent += 1;
             } else {
+                if voice_peaks_enabled() {
+                    if v.life_src != v.data_ptr {
+                        (v.life_src, v.life_peak, v.life_sumsq, v.life_samples) = (v.data_ptr, 0, 0.0, 0);
+                    }
+                    for &s in src {
+                        v.life_peak = v.life_peak.max(s.unsigned_abs());
+                        v.life_sumsq += f64::from(s) * f64::from(s);
+                    }
+                    v.life_samples += src.len() as u64;
+                    note_voice_peak(v.life_src, v.kind_name(), v.data_bytes, v.life_peak, v.life_sumsq, v.life_samples);
+                }
                 match (vc, port_channels) {
                     // >>> THE STEREO PORT TAKES THE PATCH MATRIX: a mono source reaches L and R
                     // through row 0's two cells, a stereo source's L and R each through their

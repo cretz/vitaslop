@@ -135,6 +135,13 @@ pub fn smp_linking() -> bool {
 /// A NID whose handler needs the RUN worker's JavaScript (see
 /// [`smp_owner_only`]) may not take the non-suspending trap either: the parallel scheduler can
 /// only forward a call it is allowed to suspend.
+/// `VITASLOP_SMP_LWMUTEX_INLINE` (default on): whether a parallel link inlines the lightweight
+/// mutex as compare-and-swaps (`InlineOp::LwMutexSmp`) rather than refusing it.
+fn smp_lwmutex_inline() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_SMP_LWMUTEX_INLINE").ok().as_deref() != Some("0"))
+}
+
 fn smp_inline_filter(func_nid: u32, op: vitaslop_transpiler::InlineOp) -> Option<vitaslop_transpiler::InlineOp> {
     use vitaslop_transpiler::InlineOp as I;
     let global_slot = |s: u32| s == mirror::SLOT_VCOUNT || s == mirror::SLOT_SA_BANK;
@@ -156,6 +163,11 @@ fn smp_inline_filter(func_nid: u32, op: vitaslop_transpiler::InlineOp) -> Option
         I::LoadMirrorPair { slot } => clock(slot).map(|rtc| I::LoadClock64 { rtc }),
         I::StoreMirrorPair { slot } => clock(slot).map(|rtc| I::StoreClock64 { rtc }),
         I::DelayYield { cap, .. } => Some(I::SmpDelayYield { cap }),
+        // The lightweight mutex has a compare-and-swap spelling (see `I::LwMutexSmp` and
+        // `lwwork::CONTENDED`) - the device's own userspace take. `VITASLOP_SMP_LWMUTEX_INLINE=0`
+        // is the arm back to the host call.
+        I::LwMutexLock { layout, .. } if smp_lwmutex_inline() => Some(I::LwMutexSmp { layout, lock: true }),
+        I::LwMutexUnlock { layout, .. } if smp_lwmutex_inline() => Some(I::LwMutexSmp { layout, lock: false }),
         I::LwMutexLock { .. }
         | I::LwMutexUnlock { .. }
         | I::KernelMutexLock { .. }
@@ -194,7 +206,7 @@ pub fn smp_owner_only(func_nid: u32) -> bool {
 /// of the title's storage ring: when they do, the pure file families (`sceIo`, `sceFios`) run
 /// where they are made. `VITASLOP_SMP_FORWARD` still wins - it is the bisection override.
 ///
-/// MEASURED why (`tel25h`, MLB): with audio off the forward list, `sceIoPread` was the only
+/// MEASURED why (`tel25h`, a baseball title): with audio off the forward list, `sceIoPread` was the only
 /// per-frame forward left, and each one parked its thread and held the idle clock for the
 /// length of a present.
 pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
@@ -207,8 +219,8 @@ pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
         "sceAudiodec",
         // NOT sceAudioOut: its sink writes a SharedArrayBuffer ring through per-WORKER views
         // (`vitaslop_web::audio::install_ring`), so it runs on whichever worker calls it.
-        // MEASURED forwarded (tel25f/g): it was the per-frame forward that parked MLB's and
-        // Madden's audio threads behind every present.
+        // MEASURED forwarded (tel25f/g): it was the per-frame forward that parked a baseball and
+        // a football title's audio threads behind every present.
         "sceAudioIn",
         "sceLocation",
         "sceAppUtil",
@@ -233,13 +245,13 @@ pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
     // A family's COMMON DIALOG calls (`sceSaveDataDialog*`, `sceNpTrophySetupDialog*`) are the
     // dialog state machine in `services` - host state only, no file and no JavaScript - and a
     // title polls their status once a frame. Forwarded, each poll parked its thread until the
-    // run worker's present was over (Madden: 62 of 158 forwards a window).
+    // run worker's present was over (a football title: 62 of 158 forwards a window).
     if name.contains("Dialog") {
         return false;
     }
     // The system/app PARAMETER getters answer constants (`services::apputil_*_param_get_*`) -
-    // no state, no file, no JavaScript - and a title may poll them every frame: MEASURED DOA5
-    // (`sw25r-doa`) 96 forwards a window of `sceAppUtilSystemParamGetInt`.
+    // no state, no file, no JavaScript - and a title may poll them every frame: MEASURED a fighting
+    // title (`sw25r`) 96 forwards a window of `sceAppUtilSystemParamGetInt`.
     if name.starts_with("sceAppUtilSystemParam") || name.starts_with("sceAppUtilAppParam") {
         return false;
     }
@@ -257,7 +269,7 @@ pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
 /// locally when it says so, and forwards it otherwise.
 ///
 /// `sceAudiodecDecode` serves two codecs under one NID: AT9 (pure Rust) and a movie's AAC (the
-/// run worker's WebCodecs). MEASURED (`sw25r-doa`): 200 AT9 decodes a window were forwarded,
+/// run worker's WebCodecs). MEASURED (`sw25r`): 200 AT9 decodes a window were forwarded,
 /// each parking its audio thread until the run worker's present was over.
 pub fn smp_forward_per_call(func_nid: u32) -> bool {
     matches!(func_nid, ad_nid::DECODE | ad_nid::DECODE_N_FRAMES)
@@ -342,7 +354,7 @@ include!(concat!(env!("OUT_DIR"), "/dispatch_cont_only.rs"));
 /// `sceSharedFbEnd` (`Flip`), every wait (sema, cond, event flag, thread end, vblank,
 /// framebuffer), `sceKernelDelayThread`, the thread and process exits, the blocking IO reads,
 /// the fibers, and the audio/camera inputs. [`FAST_EXCLUDED`] exists for a handler that IS
-/// `cont!` yet must not be fast anyway; it is empty, and an entry there needs a named reason.
+/// `cont!` yet must not be fast anyway, and an entry there needs a named reason.
 ///
 /// `sceGxmEndScene` is out for the same structural reason - its arm returns an `SvcOutcome` -
 /// and it is worth saying why that is still right now that the arm happens to return
@@ -399,12 +411,23 @@ fn fast_admissible(func_nid: u32) -> bool {
 /// A NID whose dispatch arm IS `cont!(..)` and which must still not be routed through the
 /// non-suspending trap, with the reason it is held back.
 ///
-/// EMPTY, and that is a finding rather than an oversight: the parking handlers all return
-/// their own `SvcOutcome` already, so the shape test refuses them without help. The list
-/// exists because the next one will not be like that - a handler that returns nothing but
-/// whose fast form is wrong for a reason outside the type system needs somewhere to be
-/// written down with its reason, and a reason in a list beats a reason in a commit message.
-pub const FAST_EXCLUDED: &[(u32, &str)] = &[];
+/// The parking handlers all return their own `SvcOutcome`, so the shape test refuses them
+/// without help. What lands here is the kind the type system cannot see: a handler that
+/// returns a plain value and can still leave its call unfinished - today, the SceMp4 arms that
+/// call back into the title (`SvcOutcome::CallGuest` is decided by the dispatch wrapper, not
+/// by the arm's shape). A reason in a list beats a reason in a commit message.
+pub const FAST_EXCLUDED: &[(u32, &str)] = &[
+    // SceMp4 reading a movie through the TITLE's own file functions calls back into the guest
+    // mid-call (`SvcOutcome::CallGuest`, see `video::MovieSource::Guest`), and the browser runs
+    // that on a nested JSPI stack the guest's stack has to suspend for. Every arm that can reach
+    // a read - open (the header), the unit fetches, and the two teardowns (the title's close
+    // and its allocator's free) - is `cont!` in shape and must still take the suspending trap.
+    (sv_nid::MP4_OPEN_FILE, "can call the title's file functions (CallGuest)"),
+    (sv_nid::MP4_CLOSE_FILE, "can call the title's file functions (CallGuest)"),
+    (sv_nid::MP4_STOP_FILE_STREAMING_C05DFF01, "can call the title's file functions (CallGuest)"),
+    (sv_nid::MP4_GET_NEXT_UNIT_8BE0E3D3, "can call the title's file functions (CallGuest)"),
+    (sv_nid::MP4_GET_STREAM_INFO, "can call the title's file functions (CallGuest)"),
+];
 
 /// The hand-written fast list as it stood before the set was derived, and still the DEFAULT
 /// until the derived set is priced - it is the middle point of the A/B, so one build can hold
@@ -485,8 +508,15 @@ fn no_fast_import() -> bool {
 /// # What these cost, which is why a no-op is worth inlining at all
 /// MEASURED in desktop Chrome on a retail racer's race: `sceNgsPatchGetInfo` and
 /// `sceNgsVoicePatchSetVolumesMatrix` are **198 calls per guest frame each**, together 32% of
-/// every host call the title makes, at ~1.14 us of pure crossing each. Nothing is computed on
-/// either side of that.
+/// every host call the title makes, at ~1.14 us of pure crossing each.
+///
+/// >>> THE TWO PATCH-VOLUME CALLS ARE NOT HERE ANY MORE, AND THEY NEVER SHOULD HAVE BEEN.
+/// They were listed when they were stubs; they then grew the bodies that apply a routing
+/// volume to the mixer, and stayed listed - so every build that inlines played every NGS
+/// voice at unity while the dispatch arm looked right. MEASURED on a fighting title: the mix
+/// peaked at 3.1x full scale and clipped 16% of its grains, its stage music buried under
+/// full-level crowd and effects. `the_inlined_stubs_are_stubs` could not catch it: the bodies
+/// change only HOST state, and the test compares guest memory.
 ///
 /// `sceKernelSetGPO` is here for the same reason and needs one extra word: its handler writes
 /// `VitaState::gpo`, which NOTHING reads - it is a devkit LED - and logs at `vitaslop::gpo`.
@@ -501,11 +531,8 @@ fn stub_inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
         n::SYSTEM_SET_FLAGS
             | n::SYSTEM_RELEASE
             | n::RACK_RELEASE
-            | n::VOICE_RESUME
             | n::VOICE_BYPASS_MODULE
             | n::VOICE_GET_PARAMS_OUT_OF_RANGE
-            | n::VOICE_PATCH_SET_VOLUMES_MATRIX
-            | n::VOICE_PATCH_SET_VOLUME
             | n::PATCH_GET_INFO
             | n::PATCH_REMOVE_ROUTING
             | n::SYSTEM_LOCK
@@ -1697,6 +1724,8 @@ fn dispatch_inner(
         gxm_nid::SHADER_PATCHER_SET_USER_DATA => cont!(gxm::shader_patcher_set_user_data(ctx, st)),
         gxm_nid::SHADER_PATCHER_GET_USER_DATA => cont!(gxm::shader_patcher_get_user_data(ctx, st)),
         gxm_nid::PROGRAM_IS_FRAG_COLOR_USED => cont!(gxm::program_is_frag_color_used(ctx, st)),
+        gxm_nid::PROGRAM_IS_DISCARD_USED => cont!(gxm::program_is_discard_used(ctx, st)),
+        gxm_nid::PROGRAM_IS_DEPTH_REPLACE_USED => cont!(gxm::program_is_depth_replace_used(ctx, st)),
         // The one GXM wait with no published prototype - see `gxm::wait_event`. It gives up
         // the CPU rather than returning inline, so it is not in the `ok` group above.
         gxm_nid::WAIT_EVENT => gxm::wait_event(ctx, st),
@@ -2118,7 +2147,6 @@ fn dispatch_inner(
         ngs_nid::SYSTEM_SET_FLAGS
         | ngs_nid::SYSTEM_RELEASE
         | ngs_nid::RACK_RELEASE
-        | ngs_nid::VOICE_RESUME
         | ngs_nid::VOICE_BYPASS_MODULE
         | ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE
         | ngs_nid::PATCH_GET_INFO
@@ -2135,9 +2163,9 @@ fn dispatch_inner(
         ngs_nid::VOICE_PATCH_SET_VOLUMES_MATRIX => {
             cont!(ngs::voice_patch_set_volumes_matrix(ctx, st))
         }
-        ngs_nid::VOICE_KEY_OFF | ngs_nid::VOICE_KILL | ngs_nid::VOICE_PAUSE => {
-            cont!(ngs::voice_stop(ctx, st))
-        }
+        ngs_nid::VOICE_KEY_OFF | ngs_nid::VOICE_KILL => cont!(ngs::voice_stop(ctx, st)),
+        ngs_nid::VOICE_PAUSE => cont!(ngs::voice_set_paused(ctx, st, true)),
+        ngs_nid::VOICE_RESUME => cont!(ngs::voice_set_paused(ctx, st, false)),
         ngs_nid::VOICE_INIT => cont!(ngs::voice_init(ctx, st)),
         ngs_nid::VOICE_GET_INFO => cont!(ngs::voice_get_info(ctx, st)),
         audio_nid::OUT_OPEN_PORT => cont!(audio::out_open_port(ctx, st)),
@@ -2716,6 +2744,18 @@ fn dispatch_inner(
         // Unnamed exports absent from every vita-headers revision, serviced as an
         // offline no-op success so they are handled rather than left as gaps.
         | sv_nid::NEAR_UTIL_UNKNOWN_A412E9CA
+        | sv_nid::NEAR_UTIL_UNKNOWN_49A97D5F
+        | sv_nid::NEAR_UTIL_UNKNOWN_1AA394BA
+        | sv_nid::NEAR_UTIL_UNKNOWN_1AE3EC1C
+        | sv_nid::NEAR_UTIL_UNKNOWN_69EE6FB3
+        | sv_nid::NEAR_UTIL_UNKNOWN_76C4807C
+        | sv_nid::NEAR_UTIL_UNKNOWN_8095FDEF
+        | sv_nid::NEAR_UTIL_UNKNOWN_88540CEC
+        | sv_nid::NEAR_UTIL_UNKNOWN_9B3F2DCE
+        | sv_nid::NEAR_UTIL_UNKNOWN_9FB9277B
+        | sv_nid::NEAR_UTIL_UNKNOWN_BF2BBE1F
+        | sv_nid::NEAR_UTIL_UNKNOWN_CA742B97
+        | sv_nid::NEAR_UTIL_UNKNOWN_E608000B
         | lk_nid::UNKNOWN_023EAA62 => cont!(ctx.ret(0)),
 
         // --- SceCommonDialog: system dialogs complete instantly offline ---------
@@ -2900,6 +2940,7 @@ mod frame_boundary_tests {
             SvcOutcome::Continue => "Continue",
             SvcOutcome::Halt => "Halt",
             SvcOutcome::ThreadExit => "ThreadExit",
+            SvcOutcome::CallGuest => "CallGuest",
             SvcOutcome::Fatal(m) => panic!("dispatch refused the call: {m}"),
         }
     }
@@ -3066,11 +3107,8 @@ mod frame_boundary_tests {
             ngs_nid::SYSTEM_SET_FLAGS,
             ngs_nid::SYSTEM_RELEASE,
             ngs_nid::RACK_RELEASE,
-            ngs_nid::VOICE_RESUME,
             ngs_nid::VOICE_BYPASS_MODULE,
             ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE,
-            ngs_nid::VOICE_PATCH_SET_VOLUMES_MATRIX,
-            ngs_nid::VOICE_PATCH_SET_VOLUME,
             ngs_nid::PATCH_GET_INFO,
             ngs_nid::PATCH_REMOVE_ROUTING,
             ngs_nid::SYSTEM_LOCK,
@@ -3123,6 +3161,7 @@ mod frame_boundary_tests {
             SvcOutcome::Block => "Block",
             SvcOutcome::Halt => "Halt",
             SvcOutcome::ThreadExit => "ThreadExit",
+            SvcOutcome::CallGuest => "CallGuest",
             SvcOutcome::Fatal(m) => panic!("dispatch refused the call: {m}"),
         };
         (outcome, regs[0], bytes != before)
@@ -3236,11 +3275,22 @@ mod smp_policy_tests {
             smp_inline_filter(0, I::DelayYield { free_slot: 10, run_slot: 11, cap: 4 }),
             Some(I::SmpDelayYield { cap: 4 })
         );
-        // Check-then-store locks are not atomic across workers.
+        // Check-then-store locks are not atomic across workers: the lightweight mutex becomes
+        // its compare-and-swap spelling, the kernel mutex stays on the host.
         let layout = LwMutexLayout { id: 0, owner: 4, count: 8, waiters: 12 };
         let thread_slot = mirror::SLOT_CURRENT_THREAD;
-        assert_eq!(smp_inline_filter(0, I::LwMutexLock { layout, thread_slot }), None);
-        assert_eq!(smp_inline_filter(0, I::LwMutexUnlock { layout, thread_slot }), None);
+        assert_eq!(
+            smp_inline_filter(0, I::LwMutexLock { layout, thread_slot }),
+            Some(I::LwMutexSmp { layout, lock: true })
+        );
+        assert_eq!(
+            smp_inline_filter(0, I::LwMutexUnlock { layout, thread_slot }),
+            Some(I::LwMutexSmp { layout, lock: false })
+        );
+        assert_eq!(
+            smp_inline_filter(0, I::KernelMutexLock { layout, thread_slot, table_slot: 0, entries: 64 }),
+            None
+        );
         // Guest-owned reads and bulk ops are what they are on hardware: unchanged.
         assert_eq!(smp_inline_filter(0, I::MemCopy), Some(I::MemCopy));
         // The non-suspending trap is refused for a call that has to be forwarded.

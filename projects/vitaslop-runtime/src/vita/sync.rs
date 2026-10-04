@@ -729,7 +729,7 @@ pub(super) fn wait_event_flag(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutc
 ///     const void *opt)
 ///
 /// # Where the prototypes come from
-/// No allowed source publishes them; these are read off DOA5's own call sites (the first
+/// No allowed source publishes them; these are read off a fighting title's own call sites (the first
 /// title to CALL them): create `(name "Task::Event", 0x100, 0, NULL)`; set
 /// `(uid, 0xff000000, r2:r3 = 0)` - a u64 user data in the aligned register pair; wait
 /// `(uid, 0xff000000, NULL, NULL, [sp] = NULL)` - result-pattern, user-data and timeout
@@ -770,7 +770,7 @@ pub(super) fn set_event(ctx: &mut GuestCtx, st: &mut VitaState) {
 
 /// int sceKernelClearEvent(SceUID uid, SceUInt32 pattern)
 ///
-/// Read like `sceKernelClearEventFlag`: the bits KEPT are `pattern` (`pattern &= arg`). DOA5's
+/// Read like `sceKernelClearEventFlag`: the bits KEPT are `pattern` (`pattern &= arg`). That title's
 /// one call site clears with 0 right after creating the event with pattern 0, where both
 /// readings agree - so the choice is consistency with the event flag, not evidence.
 pub(super) fn clear_event(ctx: &mut GuestCtx, st: &mut VitaState) {
@@ -830,7 +830,7 @@ const SCE_KERNEL_ERROR_EVF_COND: u32 = 0x8002_80E3;
 /// names no event flag.
 ///
 /// >>> THIS IS THE DIFFERENCE BETWEEN AN ERROR AND A PERMANENT STALL, AND IT WAS MEASURED.
-/// PCSE00084's loader thread calls `sceKernelWaitEventFlag(0x0, 1, 4, 0)` - uid **0**, an
+/// A football title's loader thread calls `sceKernelWaitEventFlag(0x0, 1, 4, 0)` - uid **0**, an
 /// uninitialised `SceUID` - exactly once, and parked there for the rest of the run. The title
 /// screen then kept queueing UI commands with nothing draining them until it overran its own
 /// 256 KB command buffer and faulted 400 frames later, which is a very long way from the

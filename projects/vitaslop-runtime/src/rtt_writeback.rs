@@ -85,7 +85,7 @@ pub fn writeback_fill_rows() -> Option<(usize, usize)> {
 /// TEMPORARY TELEMETRY (`VITASLOP_RTT_PROBE_LOG=1`): print every written-back target's
 /// texel(24,1) EVERY frame, not once. The trajectory of that value across frames is the input
 /// side of the feedback loop the writeback closes; a once-only line shows only its first step.
-/// An entry may also be a SIZE, `<w>x<h>`: a heap target's address moves from boot to boot (MLB's
+/// An entry may also be a SIZE, `<w>x<h>`: a heap target's address moves from boot to boot (a baseball title's
 /// 32x32 exposure probe: 0x957a3950 in one phone run, 0x957a5050 in the next), its size does not.
 fn probe_log(addr: u32, w: u32, h: u32) -> bool {
     static SIZES: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
@@ -134,7 +134,7 @@ fn probe_log(addr: u32, w: u32, h: u32) -> bool {
 
 /// TEMPORARY TELEMETRY (`VITASLOP_RTT_PROBE_FIND=<rrggbb>[+<rrggbb>...]`): name every
 /// written-back target that CONTAINS one of those colours - with the first pixel found, how many
-/// match, and the frame. For "the guest took this colour from a pixel - which target is it" (MLB's
+/// match, and the frame. For "the guest took this colour from a pixel - which target is it" (a baseball title's
 /// load bake clears to (24,208,107)/255 on the phone and (38,46,68)/255 on the desktop).
 fn report_probe_find(addr: u32, w: u32, h: u32, rgba: &[u8]) {
     static SPEC: std::sync::OnceLock<Vec<[u8; 3]>> = std::sync::OnceLock::new();
@@ -288,7 +288,17 @@ pub fn apply_one(
     // every target as 8-bit RGBA whatever the guest asked for, so a writeback of a narrower
     // surface has to CONVERT - writing 4 bytes where the guest reads 2 shears the image, which
     // is why this used to refuse outright. See `writeback_bytes_per_pixel`.
-    let Some(bpp) = writeback_bytes_per_pixel(c.format) else {
+    // >>> A FLOAT SURFACE IS HELD AS `Rgba16Float` AND READ BACK AS HALVES (8 bytes a texel), and
+    // is encoded from those - see `encode_row_float`. Every other surface comes back as RGBA8.
+    let float_held = vitaslop_platform::gpu::float_color_format(c.format);
+    // `VITASLOP_RTT_WRITEBACK_FLOAT=0`: the arm back - a float surface is not written back.
+    if float_held && !float_writeback_on() {
+        report_writeback_skipped(addr, c.format);
+        return false;
+    }
+    let texel_bytes = if float_held { 8 } else { 4 };
+    let bpp = if float_held { float_writeback_bytes_per_pixel(c.format) } else { writeback_bytes_per_pixel(c.format) };
+    let Some(bpp) = bpp else {
         report_writeback_skipped(addr, c.format);
         return false;
     };
@@ -296,7 +306,7 @@ pub fn apply_one(
     if writeback_skipped(addr) || writeback_skips_write() {
         return false;
     }
-    if (w as usize) * (h as usize) * 4 > rgba.len() {
+    if (w as usize) * (h as usize) * texel_bytes > rgba.len() {
         return false;
     }
     report_probe_find(addr, w, h, rgba);
@@ -369,7 +379,7 @@ pub fn apply_one(
     // TEMPORARY TELEMETRY. The per-frame form of the line below: the probe texel EVERY frame,
     // which is the input side of the feedback loop, plus the frame's own mean so the loop can
     // be read as a trajectory rather than a first step.
-    if probe_log(addr, w, h) {
+    if !float_held && probe_log(addr, w, h) {
         let t = if w > 24 && h > 1 { &rgba[(w as usize + 24) * 4..(w as usize + 24) * 4 + 4] } else { &[][..] };
         let sum: u64 = rgba.iter().map(|b| *b as u64).sum();
         // Eight ROW means down the target (rgb only), so the readback answers for the whole
@@ -391,7 +401,7 @@ pub fn apply_one(
         // whose alpha is under 0.75 (`frag_90b70060`: `pf0.w - 0.75 >= 0` or `discard`), so
         // "how much of this target would pass that test" is the whole question for it and an
         // RGB mean cannot answer it. Reported as a PERCENTAGE of texels at or above 191/255.
-        // EVERY row's rgb mean, one hex byte each, for a narrow target (MLB's 64x512 ambient-cube
+        // EVERY row's rgb mean, one hex byte each, for a narrow target (a baseball title's 64x512 ambient-cube
         // atlas is written one 6-row band a frame, and eight sampled rows never land on the band).
         let all_rows: String = if w <= 64 && h <= 512 {
             (0..h as usize)
@@ -429,11 +439,12 @@ pub fn apply_one(
     let mut packed: Vec<u8> = Vec::new();
     let mut written = FNV_BASIS;
     for y in 0..rows {
-        let src = y * (w as usize) * 4;
+        let src = y * (w as usize) * texel_bytes;
         let filled = band.is_none_or(|(lo, hi)| y >= lo && y <= hi);
         let row = match constant.as_deref() {
-            Some(c) if filled => c,
-            _ => &rgba[src..src + cols * 4],
+            // The telemetry fill is RGBA8; a float surface's readback is halves, so it takes none.
+            Some(c) if filled && !float_held => c,
+            _ => &rgba[src..src + cols * texel_bytes],
         };
         // The telemetry fill and the rendered pixels are both RGBA8, so the conversion is the
         // LAST step and both arms of a `fill=` sweep go through it.
@@ -441,7 +452,10 @@ pub fn apply_one(
         // The test is the FORMAT, not the pixel width: `U2F10F10F10` is four bytes a pixel and
         // is not the readback's layout, and keying this on `bpp == 4` wrote its packed HDR
         // words out as plain RGBA8.
-        let row = if c.format & 0xF180_0000 == 0 {
+        let row = if float_held {
+            encode_row_float(c.format, row, &mut packed);
+            &packed
+        } else if c.format & 0xF180_0000 == 0 {
             row
         } else {
             encode_row(c.format, row, &mut packed);
@@ -464,7 +478,7 @@ pub fn apply_one(
 /// [`writeback_still_ours`] fingerprints the first row, because on the one-worker engine the
 /// guest is not running while pixels land and the recycling it guards against rewrites the
 /// start of a pooled block. Under `VITASLOP_SMP` other guest threads keep running while a
-/// readback is in flight, and MEASURED (PCSE00084, `bis25a`/`bis25b`, 4 of 5 runs trapped at
+/// readback is in flight, and MEASURED (a football title, `bis25a`/`bis25b`, 4 of 5 runs trapped at
 /// frame ~1255): the guest reused a 128x64 target's memory from row 8 on as a structure, the
 /// first row still held our pixels, and the next write-back painted `0xff353535` over a saved
 /// return address - the render thread then jumped to it.
@@ -534,7 +548,7 @@ mod whole_region_tests {
         )
     }
 
-    /// The PCSE00084 frame-1255 shape: the guest reuses a written-back target from row 8 on,
+    /// The football title's frame-1255 shape: the guest reuses a written-back target from row 8 on,
     /// the first row still holds our pixels, and the next write-back must NOT land.
     #[test]
     fn a_target_recycled_past_its_first_row_is_not_written_back_under_smp() {
@@ -629,7 +643,7 @@ fn writeback_bytes_per_pixel(format: u32) -> Option<usize> {
         0x3000_0000 | 0x4000_0000 => Some(2), // U5U6U5, U1U5U5U5
         // >>> U4U4U4U4, AND LEAVING IT OUT HID A TARGET AN ALPHA TEST READS.
         //
-        // MEASURED on PCSE00084: its CROWD atlas (0x94111900, 1024x128, painted by 103
+        // MEASURED on a football title: its CROWD atlas (0x94111900, 1024x128, painted by 103
         // draws in four 256-wide tiles) is this format, so it was refused here and no
         // instrument in the project could read a texel of it - while the crowd program
         // that samples it DISCARDS every fragment whose alpha is under 0.75, which is
@@ -641,7 +655,7 @@ fn writeback_bytes_per_pixel(format: u32) -> Option<usize> {
         // >>> U8 AND U8U8 - the SINGLE-CHANNEL family, and leaving it out left a whole class of
         // >>> target with no write-back at all AND no way to look at one.
         //
-        // MEASURED on PCSE00084: its shadow chain is U8 throughout - a 720x408 target the player
+        // MEASURED on the football title: its shadow chain is U8 throughout - a 720x408 target the player
         // meshes are rendered into and several 960x544 targets a blur pass filters it through -
         // and every one of them was refused here by format, so nothing has ever read a texel of
         // any of them back. That is not only a lost write-back: it is the reason "what does the
@@ -655,6 +669,84 @@ fn writeback_bytes_per_pixel(format: u32) -> Option<usize> {
         0xB080_0000 => Some(2),               // U8U8
         _ => None,
     }
+}
+
+fn float_writeback_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_RTT_WRITEBACK_FLOAT").map(|v| v.trim() != "0").unwrap_or(true))
+}
+
+/// Bytes a guest pixel of a FLOAT surface the renderer holds as `Rgba16Float` (see
+/// `gpu::float_color_format`) - the formats `encode_row_float` writes.
+fn float_writeback_bytes_per_pixel(format: u32) -> Option<usize> {
+    match format & 0xF180_0000 {
+        0xF000_0000 => Some(2),                                         // F16
+        0x0080_0000 | 0x1080_0000 | 0x2100_0000 | 0x4100_0000 => Some(4), // F16F16, F32, F11F11F10, U2F10F10F10
+        _ => None,
+    }
+}
+
+/// >>> A FLOAT SURFACE WRITTEN BACK FROM ITS OWN HALVES, in the guest's own float format.
+///
+/// These surfaces are held as `Rgba16Float` so values above 1.0 survive, and before this they
+/// had no write-back at all: the guest's memory kept whatever it held. MEASURED on an action
+/// title: its exposure is computed on the CPU from a RING of three 32x32 `F32`
+/// luminance targets (0x8b234d00 / 0x8b235d00 / 0x8b236d00, one rendered a frame, read two
+/// frames later), and with none of them written back the tone-map ran on stale memory. `row` is
+/// RGBA halves, 8 bytes a texel, little endian. F16 and F16F16 are copied as halves - exact;
+/// F32 widens the red half - exact for what the attachment holds; the packed unsigned formats
+/// round to nearest, in the lane order `render.rs`'s decoder reads them.
+fn encode_row_float(format: u32, row: &[u8], out: &mut Vec<u8>) {
+    let swizzle = (format >> 20) & 3;
+    out.clear();
+    for px in row.chunks_exact(8) {
+        let c = |i: usize| crate::render::half_to_f32(u16::from_le_bytes([px[2 * i], px[2 * i + 1]]));
+        match format & 0xF180_0000 {
+            0xF000_0000 => out.extend_from_slice(&px[0..2]),
+            0x0080_0000 => out.extend_from_slice(&px[0..4]),
+            0x1080_0000 => out.extend_from_slice(&c(0).to_le_bytes()),
+            0x2100_0000 => {
+                let (r, g, b) = (c(0), c(1), c(2));
+                // Swizzle 1 puts red in the 10-bit lane at the top, as the decoder reads it.
+                let (l0, l1, l2) = if swizzle == 1 { (b, g, r) } else { (r, g, b) };
+                let w = unsigned_float(l0, 6) | (unsigned_float(l1, 6) << 11) | (unsigned_float(l2, 5) << 22);
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+            0x4100_0000 => {
+                let (r, g, b, a) = (c(0), c(1), c(2), c(3));
+                let (hi, mid, lo) = if swizzle == 1 { (r, g, b) } else { (b, g, r) };
+                let a2 = ((a.clamp(0.0, 1.0) * 3.0).round() as u32) & 3;
+                let w = (a2 << 30) | (unsigned_float(hi, 5) << 20) | (unsigned_float(mid, 5) << 10) | unsigned_float(lo, 5);
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `v` as an UNSIGNED small float - 5 exponent bits (bias 15) over `mant` mantissa bits, no sign,
+/// the lanes of F11F11F10 and U2F10F10F10 - rounded to nearest. Negative, zero and NaN write 0;
+/// anything past the largest finite value saturates to it.
+fn unsigned_float(v: f32, mant: u32) -> u32 {
+    if v.is_nan() || v <= 0.0 {
+        return 0;
+    }
+    let max_finite = (30 << mant) | ((1 << mant) - 1);
+    let bits = v.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let frac = bits & 0x7f_ffff;
+    let (full, shift) = if exp >= 1 {
+        ((exp as u32) << 23 | frac, 23 - mant)
+    } else {
+        // Denormal in the small format: shift the implicit one down into the mantissa.
+        let s = (23 - mant) as i32 + 1 - exp;
+        if s >= 32 {
+            return 0;
+        }
+        (frac | 0x80_0000, s as u32)
+    };
+    let r = (full + (1 << (shift - 1))) >> shift;
+    r.min(max_finite)
 }
 
 /// Pack one RGBA8 row into the guest's 16-bit colour format, into `out`.
@@ -854,7 +946,7 @@ fn fold_str(s: &str) -> u64 {
 /// Whether a bounded prefix of a buffer says NOTHING HAS BEEN WRITTEN HERE.
 ///
 /// One repeated 4-byte word, which is what a zero fill and an allocator's poison fill both are
-/// - MLB 12 fills a fresh allocation with `0xBAADCAFE` - and which no composed image is. A
+/// - a baseball title fills a fresh allocation with `0xBAADCAFE` - and which no composed image is. A
 /// shorter prefix than one word cannot answer the question and is not treated as empty.
 pub fn nothing_written_here(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes.chunks_exact(4).all(|word| word == &bytes[..4])
@@ -1346,4 +1438,37 @@ pub fn report_once(key: u64) -> bool {
     };
     LOCAL.with(|l| l.borrow_mut().insert(key));
     first
+}
+
+#[cfg(test)]
+mod float_writeback_tests {
+    use super::unsigned_float;
+
+    /// The decoder's reading of one unsigned small-float lane (`render.rs`, F11F11F10 / U2F10).
+    fn decode(bits: u32, mant: u32) -> f32 {
+        let exp = bits >> mant;
+        let m = bits & ((1 << mant) - 1);
+        let scale = (1u32 << mant) as f32;
+        if exp == 0 {
+            m as f32 / scale * 2f32.powi(-14)
+        } else {
+            (1.0 + m as f32 / scale) * 2f32.powi(exp as i32 - 15)
+        }
+    }
+
+    #[test]
+    fn an_unsigned_small_float_round_trips_through_the_decoders_layout() {
+        for mant in [5u32, 6] {
+            // Every representable value encodes to exactly its own bits.
+            for bits in 0..(31u32 << mant) {
+                let v = decode(bits, mant);
+                assert_eq!(unsigned_float(v, mant), bits, "mant {mant} bits {bits:#x} value {v}");
+            }
+            assert_eq!(unsigned_float(-1.0, mant), 0);
+            assert_eq!(unsigned_float(f32::NAN, mant), 0);
+            assert_eq!(unsigned_float(1.0e9, mant), (30 << mant) | ((1 << mant) - 1));
+        }
+        // Halfway between 1.0 and the next value up rounds away from 1.0.
+        assert_eq!(unsigned_float(1.0 + 1.0 / 128.0, 6), (15 << 6) | 1);
+    }
 }

@@ -93,9 +93,11 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
-# >>> VENDORED wgpu 30.0.0 with one addition: `Device::create_render_pipeline_async`
+# >>> VENDORED wgpu 30.0.0 with two additions: `Device::create_render_pipeline_async`
 # >>> (`GPUDevice.createRenderPipelineAsync`), which wgpu's public API does not expose. A sync
 # >>> `createRenderPipeline` compiles on Chrome's GPU main thread - the compositor - and froze the
-# >>> whole browser for seconds on the phone. Every change is marked `VITASLOP PATCH`.
+# >>> whole browser for seconds on the phone. And `StagingBelt::trim_free`: the belt's free list
+# >>> never shrinks, so a load burst's chunks (~147 MB measured) stayed mapped for the whole run.
+# >>> Every change is marked `VITASLOP PATCH`.
 [patch.crates-io]
 wgpu = { path = "vendor/wgpu" }

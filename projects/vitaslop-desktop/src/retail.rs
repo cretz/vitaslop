@@ -12,12 +12,11 @@ use std::time::{Duration, Instant};
 
 use vitaslop_native::{RunReport, ThreadedScheduler};
 use crate::gfx::{acquire, ACQUIRE_FAILURE_LIMIT};
-use vitaslop_platform::gpu::{depth_format, GxmRenderer};
+use vitaslop_platform::gpu::depth_format;
 use vitaslop_runtime::capture::Scene;
 use vitaslop_runtime::ingest::pipeline::decrypt_container;
 use vitaslop_runtime::ingest::vfs::MemVfs;
 use vitaslop_runtime::link::link;
-use vitaslop_runtime::render::RenderSceneBuilder;
 use vitaslop_runtime::{CtrlFrame, TouchFrame, VitaEnv, World};
 use vitaslop_loader as loader;
 
@@ -42,9 +41,6 @@ pub(crate) const PANEL_SCALE: f32 = 2.0;
 /// Background clear color, matching the software oracle and the browser.
 const CLEAR: [u8; 4] = [16, 16, 24, 255];
 
-/// Step one guest frame per 1/60 s of wall time (60 Hz), regardless of the monitor's
-/// refresh, so the game runs at its intended speed.
-pub(crate) const FRAME_DT: Duration = Duration::from_micros(16_666);
 
 /// Scheduler quantum + per-frame round cap. The quantum matches the retail boot probe
 /// (a fuel slice large enough that most between-host-call work finishes in one slice);
@@ -219,6 +215,9 @@ pub struct RetailGuest {
     save: Option<vitaslop_native::SaveStore>,
     /// Decrypt + link + transpile + instantiate time, measured once at construction.
     pub build_ms: f64,
+    /// The GAME time the last [`RetailGuest::advance`] frame took - what a live window paces
+    /// its next frame by (see `Session::tick`).
+    last_advance_us: u64,
 }
 
 impl RetailGuest {
@@ -311,11 +310,17 @@ impl RetailGuest {
     // refreshed at its resume point - which is what lets the RTC tick be read inline.
     // See `vitaslop_runtime::vita::set_preemptive_linking`.
     vitaslop_runtime::vita::set_preemptive_linking(true);
+    // And whether its guest threads will run AT ONCE (`VITASLOP_SMP`, which the shell's
+    // settings set as the browser's do): that refuses the inline forms that assume one thread
+    // runs at a time. See `vita::set_smp_linking` and `vitaslop_native::smp`.
+    let smp = vitaslop_native::smp::enabled();
+    vitaslop_runtime::vita::set_smp_linking(smp);
     let linked = link(modules);
     // Reset at once: the flag is process-wide and read only by `link`, so left set it would
     // make a later link in this process (a test, a second title) inline a clock read its
     // scheduler does not refresh.
     vitaslop_runtime::vita::set_preemptive_linking(false);
+    vitaslop_runtime::vita::set_smp_linking(false);
     let linked = linked.map_err(|e| format!("link: {e:?}"))?;
 
         let world: Box<dyn World + Send> = match recipe {
@@ -334,6 +339,7 @@ impl RetailGuest {
         env.state.audio_dec = Box::new(vitaslop_platform::audio_dec::AacFactory);
         env.state.set_alloc_base(linked.alloc_base);
         env.state.set_process_param(linked.process_param);
+        env.state.set_main_thread_request(linked.main_thread_request());
         env.state.set_modules(linked.loaded_modules.clone());
         env.state.set_tls_template(linked.tls_template);
         env.state.set_preemptive(true);
@@ -361,19 +367,34 @@ impl RetailGuest {
             println!("loaded: RUST HEAP before transpile - live {live} MB, peak {peak} MB");
         }
         vitaslop_platform::heap::reset_peak();
-        // `VITASLOP_HEAP_TRACE=<min MB>`: keep a backtrace for every live allocation of at
-        // least that size, and name the holders on every heap line - see `heap::trace_large`.
-        if let Some(mb) = std::env::var("VITASLOP_HEAP_TRACE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
-            vitaslop_platform::heap::trace_large(mb * 1024 * 1024);
-            println!("loaded: heap ledger armed - every live allocation of {mb} MB or more keeps its backtrace");
+        // `VITASLOP_HEAP_TRACE=<min MB>` (or `<min KB>K`): keep a backtrace for every live
+        // allocation of at least that size, and name the holders on every heap line - see
+        // `heap::trace_large`. KB because 1 MB named only 133 of a football title's 421 MB live in play.
+        if let Some(bytes) = std::env::var("VITASLOP_HEAP_TRACE").ok().and_then(|v| {
+            let v = v.trim();
+            match v.strip_suffix(['K', 'k']) {
+                Some(kb) => kb.parse::<usize>().ok().map(|kb| kb * 1024),
+                None => v.parse::<usize>().ok().map(|mb| mb * 1024 * 1024),
+            }
+        }) {
+            vitaslop_platform::heap::trace_large(bytes);
+            println!("loaded: heap ledger armed - every live allocation of {} KB or more keeps its backtrace", bytes / 1024);
         }
         // The compiled module is kept beside the game (see `vitaslop_native::compile_cache`), so
         // only the first boot after a build pays the transpile and the Cranelift compile.
         // `VITASLOP_COMPILE_CACHE=0` bypasses it (neither read nor written).
         let cache = (std::env::var("VITASLOP_COMPILE_CACHE").as_deref() != Ok("0"))
             .then(|| vitaslop_native::compile_cache::CompileCache::new(dir, main_exec.unwrap_or("eboot.bin")));
-        let (sched, _stubs) = ThreadedScheduler::from_linked_with_cache(&linked, env, QUANTUM_FUEL, cache.as_ref())
-            .map_err(|e| format!("scheduler: {e:?}"))?;
+        let (sched, _stubs) = if smp {
+            println!(
+                "loaded: PARALLEL guest threads on {} worker(s) (VITASLOP_SMP) - not deterministic",
+                vitaslop_native::smp::worker_count()
+            );
+            ThreadedScheduler::from_linked_smp(&linked, env, QUANTUM_FUEL, cache.as_ref())
+        } else {
+            ThreadedScheduler::from_linked_with_cache(&linked, env, QUANTUM_FUEL, cache.as_ref())
+        }
+        .map_err(|e| format!("scheduler: {e:?}"))?;
         {
             let (live, peak) = vitaslop_platform::heap::live_peak_mb();
             println!("loaded: RUST HEAP after transpile+instantiate - live {live} MB, TRANSPILE PEAK {peak} MB");
@@ -390,7 +411,7 @@ impl RetailGuest {
             .capture
             .set_signature_wanted(vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE"));
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        Ok(RetailGuest { sched, scenes: Vec::new(), presents: Vec::new(), finished: false, err: None, ended_by: None, save: None, build_ms })
+        Ok(RetailGuest { sched, scenes: Vec::new(), presents: Vec::new(), finished: false, err: None, ended_by: None, save: None, build_ms, last_advance_us: 0 })
     }
 
     /// Keep this title's saved state under `root`, and put back whatever a previous run
@@ -454,7 +475,15 @@ impl RetailGuest {
             return;
         }
         let target = self.sched.frames() + 1;
+        let clock_before = self.sched.host().state.now_us();
         let report = self.sched.run_frames(target, PER_FRAME_ROUNDS);
+        // An OVERLAPPED parallel run: the guest ran this frame during the last present and runs
+        // the next one now, so the clock around this call is not this frame's - its own two
+        // flips are. The browser's rule (`frame_advance_us`).
+        self.last_advance_us = match self.sched.frame_advance_us(target) {
+            Some(us) if self.sched.overlapped() => us,
+            _ => self.sched.host().state.now_us().saturating_sub(clock_before),
+        };
         {
             let mut host = self.sched.host();
             let cap = &mut host.state.capture;
@@ -486,8 +515,16 @@ impl RetailGuest {
             // flip finds nothing to read into. MEASURED on a football title's intro: every
             // draw of every frame "carried no vertices", scenes_held=0 at each resolve. Such a
             // scene stays in the capture and is taken at the next boundary, after its flip.
-            let (pending, ready): (Vec<_>, Vec<_>) =
-                std::mem::take(&mut cap.scenes).into_iter().partition(|s| s.deferred_id != 0);
+            // >>> OVERLAPPED (`vitaslop_native::smp::overlap`), the guest is already building the
+            // NEXT frame while this one is taken: only the scenes before this frame's flip are
+            // its own. `take_scenes_through_flip` leaves the pending ones exactly as the
+            // partition below does.
+            let overlapped = self.sched.overlapped();
+            let (pending, ready): (Vec<_>, Vec<_>) = if overlapped {
+                (Vec::new(), cap.take_scenes_through_flip())
+            } else {
+                std::mem::take(&mut cap.scenes).into_iter().partition(|s| s.deferred_id != 0)
+            };
             if !ready.is_empty() {
                 self.scenes = ready;
                 // Kept with the scenes they belong to, and for the same reason: these are the
@@ -497,7 +534,9 @@ impl RetailGuest {
                 // `GxmRenderer::set_presented`.
                 self.presents = cap.presents.clone();
             }
-            cap.scenes = pending;
+            if !overlapped {
+                cap.scenes = pending;
+            }
             cap.trace.clear();
             cap.trace_thid.clear();
             cap.presents.clear();
@@ -541,6 +580,39 @@ impl RetailGuest {
     /// differs, not merely that the totals do.
     pub fn clock_sources(&mut self) -> (u64, u64, u64) {
         self.sched.host().state.clock_sources()
+    }
+
+    /// The game time the last advanced frame took, in microseconds.
+    pub fn last_advance_us(&self) -> u64 {
+        self.last_advance_us
+    }
+
+    /// Game time the clock's WALL FLOOR has added so far (`VitaState::clock_from_wall_us`) - the
+    /// pull a slow guest gets toward real time, which a pacer must not charge as game time.
+    pub fn clock_from_wall_us(&mut self) -> u64 {
+        self.sched.host().state.clock_from_wall_us()
+    }
+
+    /// Stop the guest for a write into memory it may also be writing - see
+    /// `ThreadedScheduler::pause_guest`. Nothing on the one-at-a-time engine.
+    pub fn pause_guest(&mut self) {
+        self.sched.pause_guest();
+    }
+
+    pub fn resume_guest(&mut self) {
+        self.sched.resume_guest();
+    }
+
+    /// The parallel engine's per-worker line (`VITASLOP_SMP`), `None` on the one-at-a-time one.
+    pub fn smp_report(&self) -> Option<String> {
+        self.sched.smp_report()
+    }
+
+    /// Where the guest's `sceAudioOut` grains go. Left alone they go nowhere (`NullSink`),
+    /// which is what every headless and measurement run wants; the window installs
+    /// [`crate::audio_out::NativeAudioSink`] over the speakers.
+    pub fn set_audio_sink(&mut self, sink: Box<dyn vitaslop_runtime::AudioSink + Send>) {
+        self.sched.host().state.audio = sink;
     }
 
     /// Seconds of sound the guest has submitted through `sceAudioOutOutput`.
@@ -656,6 +728,36 @@ impl RetailGuest {
     /// anything has ever been written there.
     pub fn read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
         self.sched.read_guest(addr, len)
+    }
+
+    /// The `top` host calls by total time since the profiler was last reset, one line each -
+    /// `VITASLOP_PERF` only (the bench binary's table, for the window).
+    pub fn host_call_report(&mut self, top: usize, frames: f64) -> Vec<String> {
+        let s = vitaslop_native::perf::snapshot();
+        let host = self.sched.host();
+        let mut out = vec![format!(
+            "host calls: {} ({:.0} per frame), {:.2} ms per frame in the import closure, of which {:.2} ms in handlers",
+            s.calls,
+            s.calls as f64 / frames,
+            s.import_ns as f64 / 1e6 / frames,
+            s.dispatch_ns as f64 / 1e6 / frames
+        )];
+        for c in s.by_selector.iter().take(top) {
+            let name = match host.import_at(c.selector) {
+                Some((_, func_nid)) => match vitaslop_runtime::nid::name(func_nid) {
+                    "" | "?" => format!("{func_nid:#010x}"),
+                    n => n.to_string(),
+                },
+                None => format!("selector {}", c.selector),
+            };
+            out.push(format!(
+                "  {name:<40} {:>8.1} calls/frame {:>7.3} ms/frame {:>8.2} us/call",
+                c.calls as f64 / frames,
+                c.ns as f64 / 1e6 / frames,
+                c.ns as f64 / 1e3 / c.calls.max(1) as f64
+            ));
+        }
+        out
     }
 
     pub fn scheduler_report(&self) -> String {
@@ -796,7 +898,11 @@ fn peek_regions(guest: &RetailGuest) {
 }
 
 /// The window's GPU surface + the general GXM renderer. Presents a captured scene each
-/// frame through the same `GxmRenderer` the browser canvas uses (so pixels match). The
+/// frame through the same `GxmRenderer` the browser canvas uses (so pixels match), held in
+/// the headless oracle's [`vitaslop_native::GeneralRenderer`] so the window also does that
+/// renderer's other two jobs: the guest's own small-target completions at `sceGxmEndScene`
+/// ([`RetailGfx::completion_hook`]) and the write-back of small targets into guest memory
+/// after each present ([`RetailGfx::present`]'s return). The
 /// guest draws in 960x544 game space; the renderer projects against that and fills the
 /// (possibly larger) window, stretching to fit.
 pub(crate) struct RetailGfx {
@@ -804,17 +910,39 @@ pub(crate) struct RetailGfx {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    gxm: GxmRenderer,
-    builder: RenderSceneBuilder,
-    depth: wgpu::TextureView,
+    /// Shared with the guest's `sceGxmEndScene` hook, which completes small targets on the
+    /// SAME renderer the frame presents through - its targets, caches and pipelines.
+    renderer: Arc<Mutex<vitaslop_native::GeneralRenderer>>,
+    /// The depth buffer the stage's frame renders against, and the stage size it was made for.
+    depth: Option<((u32, u32), wgpu::TextureView)>,
     render_format: wgpu::TextureFormat,
+    /// The guest's picture, rendered ONCE per guest frame into its stage at the guest's display
+    /// size, then scaled onto the surface by every present - see [`Self::frame`].
+    scaler: vitaslop_platform::present_scale::Scaler,
+    /// How the stage is fitted to the window - the settings' `scaling`.
+    scaling: vitaslop_frontend::settings::Scaling,
     /// Presents in a row that produced no surface texture - see [`acquire`], which is where
     /// this stops being a transient and becomes a black window nobody is told about.
     acquire_failures: u32,
     /// Set by the device-lost callback installed in `new`. `Some` means every GPU object this
     /// renderer holds is invalid and the run is over.
     lost: Arc<Mutex<Option<String>>>,
+    /// Where to write the NEXT presented frame, read back off the swapchain texture itself - see
+    /// [`RetailGfx::request_capture`]. `None` when nothing asked, or the surface cannot be copied.
+    capture: Option<std::path::PathBuf>,
+    /// Whether the surface was configured copyable (`COPY_SRC` - not every platform offers it).
+    capturable: bool,
+    /// Whether the NEXT capture reads the game's own picture (the stage: no letterbox, no
+    /// overlay) rather than the window - the in-game menu's Screenshot.
+    capture_game: bool,
     adapter_name: String,
+    /// Milliseconds spent in each step of [`Self::present`], summed: `[acquire, encode, submit,
+    /// write-back]` - the write-back waits for the GPU to finish the frame it reads from.
+    pub(crate) timing: [f64; 4],
+    /// The guest's `sceGxmEndScene` completions ([`Self::completion_hook`]), summed:
+    /// `[calls, ms waiting for the renderer, ms rendering + reading back]`. They run on the
+    /// guest's own thread, so every millisecond here is a millisecond the guest is not running.
+    pub(crate) completions: Arc<Mutex<[f64; 3]>>,
 }
 
 impl RetailGfx {
@@ -875,8 +1003,15 @@ impl RetailGfx {
         // format is already non-sRGB, so this is a no-op there.
         let render_format = format.remove_srgb_suffix();
         let view_formats = if render_format == format { vec![] } else { vec![render_format] };
+        // COPY_SRC where the platform offers it: what makes `request_capture` read back the
+        // pixels the window actually SHOWED rather than a second render of them.
+        let capturable = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if capturable {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: w,
@@ -888,37 +1023,26 @@ impl RetailGfx {
         };
         surface.configure(&device, &config);
 
-        let mut gxm = GxmRenderer::new(&device, &queue, render_format);
-        // ONE sample by default, because that is what the guest asks for. The display buffer's
-        // render target is created `SCE_GXM_MULTISAMPLE_NONE` on every title measured here -
-        // the console composites the front buffer at one sample - and the antialiasing the
-        // title DOES ask for now happens where it asked for it, on the render targets it
-        // created multisampled (`gpu::gxm_sample_count`).
-        //
-        // This used to default to 2, and the desktop defaulted differently from the browser,
-        // which is the shape of bug that makes a phone look broken next to a review shot. It
-        // was also not doing what it was believed to do: MEASURED on the front end, a 2x
-        // supersampled GAME MODE differs from a 1x one by 3.31% of pixels and a mean of
-        // 0.20/255, and its text edges come out very slightly SOFTER (mean |dx| 1.807 against
-        // 1.900). Supersampling the display was never the answer to a sharpness complaint.
-        //
-        // `VITASLOP_SSAA` survives as a review instrument - it is what the software oracle's
-        // parity probe compares against - not as a setting anything should ship with.
-        let ssaa = std::env::var("VITASLOP_SSAA").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n >= 1).unwrap_or(1);
-        gxm.set_supersample(ssaa);
-        let depth = make_depth(&device, w, h);
+        let gxm = make_renderer(&device, &queue, render_format, &adapter_name);
+        let scaler = vitaslop_platform::present_scale::Scaler::new(&device, render_format);
         Ok(RetailGfx {
             surface,
             device,
             queue,
             config,
-            gxm,
-            builder: RenderSceneBuilder::new(),
-            depth,
+            renderer: Arc::new(Mutex::new(gxm)),
+            depth: None,
             render_format,
+            scaler,
+            scaling: vitaslop_frontend::settings::Scaling::Fit,
             acquire_failures: 0,
             lost,
+            capture: None,
+            capturable,
+            capture_game: false,
             adapter_name,
+            timing: [0.0; 4],
+            completions: Arc::new(Mutex::new([0.0; 3])),
         })
     }
 
@@ -929,13 +1053,109 @@ impl RetailGfx {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        self.depth = make_depth(&self.device, w, h);
     }
 
     /// `display` is the size the GUEST declared to `sceDisplaySetFrameBuf`, which is what
     /// the frame is projected against. See the `encode_chain` call below.
-    pub(crate) fn present(&mut self, scenes: &[Scene], display: (u32, u32), presents: &[u32]) -> Result<(), String> {
-        self.frame(Some((scenes, display, presents)), |_, _, _, _, _| {})
+    /// Present a frame, then read back every small render target for the guest - the
+    /// `(guest colour address, width, height, RGBA)` list `vitaslop_native::apply_rtt_writebacks`
+    /// takes. Empty when the frame drew none (or `VITASLOP_GXM_RTT_WRITEBACK=0`), and when
+    /// `fresh` is false: a repeat of a frame already presented only re-scales its stage, and
+    /// its targets were read back the first time.
+    pub(crate) fn present(
+        &mut self,
+        scenes: &[Scene],
+        display: (u32, u32),
+        presents: &[u32],
+        fresh: bool,
+    ) -> Result<Vec<(u32, u32, u32, Vec<u8>)>, String> {
+        let game = if fresh { GameDraw::Fresh(scenes, display, presents) } else { GameDraw::Again };
+        self.frame(game, |_, _, _, _, _| {})?;
+        if !fresh {
+            return Ok(Vec::new());
+        }
+        let t = Instant::now();
+        let wb = self.rtt_writebacks();
+        self.timing[3] += t.elapsed().as_secs_f64() * 1000.0;
+        Ok(wb)
+    }
+
+    /// The frame rendered OFFSCREEN through this window's own renderer - its targets, caches and
+    /// write-back state - at the guest's display size: what `VITASLOP_WINDOW_SHOT` saves.
+    pub(crate) fn snapshot(&self, scenes: &[Scene], display: (u32, u32), presents: &[u32]) -> vitaslop_runtime::render::Framebuffer {
+        let mut r = self.renderer.lock().unwrap_or_else(|e| e.into_inner());
+        r.set_presented(presents);
+        r.render_frame(scenes, display.0.max(1), display.1.max(1), CLEAR)
+    }
+
+    /// A NEW renderer on the same device, for a new title: the renderer reads several knobs
+    /// (the GXP recompiler's switch among them) when it is MADE, and the shell makes its window before
+    /// any title's settings are in the environment - so every shell run drew with the knobs of
+    /// no title at all. MEASURED: a fighting title's main menu, whose background is a draw only
+    /// the GXP recompiler can represent, came out as trails of older frames in the shell and
+    /// clean in the `--game` window. Call it before the new guest's completion hook is
+    /// installed (the hook holds the renderer it was given).
+    pub(crate) fn rebuild_renderer(&mut self) {
+        let gxm = make_renderer(&self.device, &self.queue, self.render_format, &self.adapter_name);
+        self.renderer = Arc::new(Mutex::new(gxm));
+        self.depth = None;
+    }
+
+    pub(crate) fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    /// How the game's picture is fitted to the window from the next present on.
+    pub(crate) fn set_scaling(&mut self, scaling: vitaslop_frontend::settings::Scaling) {
+        self.scaling = scaling;
+    }
+
+    /// Where in the window the game's picture is drawn, `(x, y, w, h)` in physical pixels -
+    /// what the mouse-as-touch maps from.
+    pub(crate) fn game_rect(&self) -> (u32, u32, u32, u32) {
+        game_rect(self.scaling, (self.config.width, self.config.height))
+    }
+
+    /// [`Self::request_capture`] of the game's own picture: no letterbox bars, no overlay.
+    pub(crate) fn request_game_capture(&mut self, path: std::path::PathBuf) -> bool {
+        self.capture_game = true;
+        self.request_capture(path)
+    }
+
+    /// Write the NEXT presented frame to `path` - the swapchain texture itself, after the frame
+    /// and any overlay are drawn: exactly what the window shows, which an offscreen re-render
+    /// ([`Self::snapshot`]) is not. Returns false when the surface is not copyable here.
+    pub(crate) fn request_capture(&mut self, path: std::path::PathBuf) -> bool {
+        if self.capturable {
+            self.capture = Some(path);
+        }
+        self.capturable
+    }
+
+    /// Every small render target's pixels, read back for the guest after a frame that drew the
+    /// game - see `GeneralRenderer::rtt_writebacks`.
+    pub(crate) fn rtt_writebacks(&self) -> Vec<(u32, u32, u32, Vec<u8>)> {
+        self.renderer.lock().unwrap_or_else(|e| e.into_inner()).rtt_writebacks()
+    }
+
+    /// The guest's `sceGxmEndScene` completion over this window's renderer - see
+    /// `VitaState::complete_scene_now`. Install it on the guest the window presents.
+    pub(crate) fn completion_hook(&self) -> Box<dyn FnMut(&[Scene]) -> Vec<(u32, u32, u32, Vec<u8>)> + Send> {
+        let r = self.renderer.clone();
+        let sums = self.completions.clone();
+        Box::new(move |scenes| {
+            let t0 = Instant::now();
+            let mut renderer = r.lock().unwrap_or_else(|e| e.into_inner());
+            let t1 = Instant::now();
+            let out = renderer.complete_scenes(scenes);
+            drop(renderer);
+            if let Ok(mut s) = sums.lock() {
+                s[0] += 1.0;
+                s[1] += (t1 - t0).as_secs_f64() * 1000.0;
+                s[2] += t1.elapsed().as_secs_f64() * 1000.0;
+            }
+            out
+        })
     }
 
     pub(crate) fn device(&self) -> &wgpu::Device {
@@ -951,18 +1171,27 @@ impl RetailGfx {
         (self.config.width, self.config.height)
     }
 
-    /// One surface frame: the guest's scenes (or a clear, when there are none), then
+    /// One surface frame: the game's picture (or a clear, when there is none), then
     /// `overlay` on top in the same encoder - the shell draws its UI there. A LOST
     /// device is an `Err`, not a panic: every GPU object built from it is invalid and
     /// nothing this run draws can reach the screen, but the caller decides what to do.
+    ///
+    /// >>> A GUEST FRAME'S SCENES ARE ENCODED EXACTLY ONCE ([`GameDraw::Fresh`]), into the
+    /// stage; every present after that until the next guest frame - a menu or overlay repaint,
+    /// a resize, a pause - re-scales the stage ([`GameDraw::Again`]). Re-encoding was not merely
+    /// wasted work: a title whose menu SAMPLES the previous displayed frame as its background
+    /// (a feedback effect, the renderer's display images) had the effect applied once per
+    /// encode, and the shell, which repaints for its overlay, drew a fighting title's main menu
+    /// over trails of older frames that the `--game` window, encoding once, did not.
     pub(crate) fn frame(
         &mut self,
-        scenes: Option<(&[Scene], (u32, u32), &[u32])>,
+        game: GameDraw<'_>,
         overlay: impl FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView, (u32, u32)),
     ) -> Result<(), String> {
         if let Some(why) = self.lost.lock().ok().and_then(|s| s.clone()) {
             return Err(format!("the GPU device was lost ({why})"));
         }
+        let t_acquire = Instant::now();
         let Some(frame) = acquire(
             &self.surface,
             &self.device,
@@ -976,15 +1205,37 @@ impl RetailGfx {
             format: Some(self.render_format),
             ..Default::default()
         });
+        let t_encode = Instant::now();
+        self.timing[0] += (t_encode - t_acquire).as_secs_f64() * 1000.0;
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let (fw, fh) = (frame.texture.width(), frame.texture.height());
-        match scenes {
-            Some((scenes, (dw, dh), presents)) => {
-                let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
-                self.gxm.set_presented(presents);
-                self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, dw, dh, fw, fh, CLEAR, Some(&frame.texture));
+        // >>> HELD FROM THE ENCODE THROUGH THE SUBMIT. The renderer recalls its staging belt at
+        // the top of each chain, trusting that the previous chain's encoder has been SUBMITTED
+        // (`GxmRenderer::gxp_staging`). On the parallel engine the guest's `sceGxmEndScene`
+        // completes small targets on this same renderer from a worker thread, and one taken in
+        // the gap between this encode and this submit recalled the chunks this encoder still
+        // referenced - MEASURED: `Queue::submit ... StagingBelt staging buffer is still mapped`,
+        // fatal, in the first overlapped baseball-title window run.
+        let mut held = None;
+        if let GameDraw::Fresh(scenes, display, presents) = game {
+            // The new guest frame into the stage, at the guest's own display size.
+            let (dw, dh) = (display.0.max(1), display.1.max(1));
+            self.scaler.stage(&self.device, self.render_format, dw, dh);
+            if self.depth.as_ref().map(|d| d.0) != Some((dw, dh)) {
+                self.depth = Some(((dw, dh), make_depth(&self.device, dw, dh)));
             }
-            None => {
+            let stage = self.scaler.current().expect("the stage was just made");
+            let mut r = self.renderer.lock().unwrap_or_else(|e| e.into_inner());
+            r.encode_present(&mut encoder, &stage.view, &self.depth.as_ref().unwrap().1, &stage.texture, scenes, presents, (dw, dh), CLEAR);
+            held = Some(r);
+        }
+        let staged = self.scaler.current().is_some();
+        match game {
+            GameDraw::Fresh(..) | GameDraw::Again if staged => {
+                let rect = game_rect(self.scaling, (fw, fh));
+                self.scaler.encode_rect(&self.queue, &mut encoder, &view, rect);
+            }
+            _ => {
                 let c = wgpu::Color { r: 11.0 / 255.0, g: 11.0 / 255.0, b: 18.0 / 255.0, a: 1.0 };
                 let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("shell clear"),
@@ -1001,11 +1252,124 @@ impl RetailGfx {
                 });
             }
         }
-        overlay(&self.device, &self.queue, &mut encoder, &view, (fw, fh));
+        // A game-only capture reads the stage - the picture at the guest's own size, no bars, no
+        // overlay; a window capture (the rigs') reads the surface after the overlay.
+        let game_only = std::mem::take(&mut self.capture_game);
+        let game_tex = self.scaler.current().filter(|_| game_only && staged && !matches!(game, GameDraw::Clear)).map(|st| st.texture.clone());
+        let mut overlay = Some(overlay);
+        if game_tex.is_none()
+            && let Some(o) = overlay.take()
+        {
+            o(&self.device, &self.queue, &mut encoder, &view, (fw, fh));
+        }
+        let source = game_tex.unwrap_or_else(|| frame.texture.clone());
+        let capture = self.capture.take().filter(|_| self.capturable).map(|path| {
+            let (fw, fh) = (source.width(), source.height());
+            let bpr = (fw * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("window capture"),
+                size: u64::from(bpr) * u64::from(fh),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &source, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(fh) } },
+                wgpu::Extent3d { width: fw, height: fh, depth_or_array_layers: 1 },
+            );
+            (path, buf, bpr, fw, fh)
+        });
+        if let Some(o) = overlay.take() {
+            o(&self.device, &self.queue, &mut encoder, &view, (fw, fh));
+        }
+        let t_submit = Instant::now();
+        self.timing[1] += (t_submit - t_encode).as_secs_f64() * 1000.0;
         self.queue.submit([encoder.finish()]);
+        drop(held);
+        self.timing[2] += t_submit.elapsed().as_secs_f64() * 1000.0;
+        if let Some((path, buf, bpr, fw, fh)) = capture {
+            let bgra = matches!(self.render_format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            if let Ok(view) = buf.slice(..).get_mapped_range() {
+                let mut rgba = Vec::with_capacity((fw * fh * 4) as usize);
+                for row in 0..fh as usize {
+                    rgba.extend_from_slice(&view[row * bpr as usize..row * bpr as usize + fw as usize * 4]);
+                }
+                drop(view);
+                if bgra {
+                    for px in rgba.chunks_exact_mut(4) {
+                        px.swap(0, 2);
+                    }
+                }
+                for px in rgba.chunks_exact_mut(4) {
+                    px[3] = 255;
+                }
+                let fb = vitaslop_runtime::render::Framebuffer { width: fw, height: fh, rgba };
+                if let Err(e) = std::fs::write(&path, fb.to_png()) {
+                    eprintln!("window capture: could not write {}: {e}", path.display());
+                }
+            }
+            buf.unmap();
+        }
         self.queue.present(frame);
         Ok(())
     }
+}
+
+/// The window's GXM renderer over `device`.
+fn make_renderer(device: &wgpu::Device, queue: &wgpu::Queue, render_format: wgpu::TextureFormat, adapter_name: &str) -> vitaslop_native::GeneralRenderer {
+    let mut gxm = vitaslop_native::GeneralRenderer::from_device(device.clone(), queue.clone(), render_format, adapter_name.to_string(), false);
+    // ONE sample by default, because that is what the guest asks for. The display buffer's
+    // render target is created `SCE_GXM_MULTISAMPLE_NONE` on every title measured here -
+    // the console composites the front buffer at one sample - and the antialiasing the
+    // title DOES ask for now happens where it asked for it, on the render targets it
+    // created multisampled (`gpu::gxm_sample_count`).
+    //
+    // This used to default to 2, and the desktop defaulted differently from the browser,
+    // which is the shape of bug that makes a phone look broken next to a review shot. It
+    // was also not doing what it was believed to do: MEASURED on the front end, a 2x
+    // supersampled GAME MODE differs from a 1x one by 3.31% of pixels and a mean of
+    // 0.20/255, and its text edges come out very slightly SOFTER (mean |dx| 1.807 against
+    // 1.900). Supersampling the display was never the answer to a sharpness complaint.
+    //
+    // `VITASLOP_SSAA` survives as a review instrument - it is what the software oracle's
+    // parity probe compares against - not as a setting anything should ship with.
+    let ssaa = std::env::var("VITASLOP_SSAA").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n >= 1).unwrap_or(1);
+    gxm.set_supersample(ssaa);
+    gxm
+}
+
+/// What a surface frame shows of the game - see [`RetailGfx::frame`].
+#[derive(Clone, Copy)]
+pub(crate) enum GameDraw<'a> {
+    /// No game: the shell's own background.
+    Clear,
+    /// A NEW guest frame: its scenes, the guest's display size, and the buffers it flipped.
+    Fresh(&'a [Scene], (u32, u32), &'a [u32]),
+    /// The frame already staged, presented again.
+    Again,
+}
+
+/// The rectangle of a `(sw, sh)` window the 960x544 picture is drawn into - the browser
+/// player's rules (`player.js`): `Fit` is the largest 960:544 box, `Integer` the largest whole
+/// multiple of 960x544 (falling back to `Fit` in a window too small for one), `Stretch` the whole
+/// window. Centred, in physical pixels.
+pub(crate) fn game_rect(scaling: vitaslop_frontend::settings::Scaling, (sw, sh): (u32, u32)) -> (u32, u32, u32, u32) {
+    use vitaslop_frontend::settings::Scaling;
+    let (sw, sh) = (sw.max(1), sh.max(1));
+    let (w, h) = match scaling {
+        Scaling::Stretch => return (0, 0, sw, sh),
+        Scaling::Integer if sw >= GAME_W && sh >= GAME_H => {
+            let k = (sw / GAME_W).min(sh / GAME_H).max(1);
+            (GAME_W * k, GAME_H * k)
+        }
+        _ => {
+            let k = (sw as f64 / GAME_W as f64).min(sh as f64 / GAME_H as f64);
+            (((GAME_W as f64 * k).round() as u32).clamp(1, sw), ((GAME_H as f64 * k).round() as u32).clamp(1, sh))
+        }
+    };
+    ((sw - w) / 2, (sh - h) / 2, w, h)
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -1087,7 +1451,7 @@ fn report_device_budget() -> bool {
     // So it stays a printed row with no verdict until someone shows a draw that NEEDED the
     // bound buffer and got the SA bank instead. What is NOT settled by that A/B: both arms can
     // be wrong the same way - a degenerate transform lands offscreen either way - so this is
-    // "unproven", not "harmless". mlb's 3.3 million is 30% of its draws and wants an answer.
+    // "unproven", not "harmless". A baseball title's 3.3 million is 30% of its draws and wants an answer.
     let stale = vitaslop_runtime::host::stale_uniform_draws();
     rows.push(vitaslop_platform::gpu::BudgetRow {
         name: "draws on the SA-bank fallback",
@@ -1644,7 +2008,7 @@ pub fn headless_check(
     // >>> WRITTEN SHOT, because a narrow window is not a faithful picture of this title.
     //
     // The window above bounds BOTH what is rendered and what is written, and that conflation
-    // has a measured cost. MEASURED on PCSA00002 (`hit1`, shots every 4 from f11280): every
+    // has a measured cost. MEASURED on a baseball title (`hit1`, shots every 4 from f11280): every
     // player model is BLOWN OUT white-yellow, and in a full replay of the same recipe the
     // same batter is the grey-and-blue uniform the device shows. Nothing in the log says a
     // layer is stale - the draw counts agree - because the thing that is missing is a
@@ -1895,6 +2259,7 @@ pub fn headless_check(
             if !scenes.is_empty() {
                 frame_shape = (scenes.len(), scenes.iter().map(|s| s.draws.len()).sum());
                 let t = std::time::Instant::now();
+                r.set_presented(guest.current_presents());
                 let _ = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
                 writeback = r.rtt_writebacks();
@@ -1928,6 +2293,7 @@ pub fn headless_check(
             if !scenes.is_empty() {
                 vitaslop_runtime::capsule::maybe_write_frame(scenes, display.0, display.1, CLEAR, f as u64);
                 let t = std::time::Instant::now();
+                r.set_presented(guest.current_presents());
                 let fb = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
                 writeback = r.rtt_writebacks();
@@ -2201,6 +2567,11 @@ pub fn headless_check(
     );
     print!("{}", guest.idle_attribution());
     print!("{}", guest.blocked_threads());
+    // The CALL TABLE (`VITASLOP_CALL_TABLE=<from>-<to>`) was only ever printed by the browser's
+    // panel, so a native run that armed it collected the rows and printed nothing.
+    if vitaslop_runtime::call_table::spec().is_some() {
+        println!("headless: CALL TABLE\n{}", vitaslop_runtime::call_table::report());
+    }
     // AUDIO AGAINST THE CLOCK IT IS PACED ON. `sceAudioOutOutput` parks one grain of
     // VIRTUAL time, so this is 1.00 on a healthy path whatever the frame rate - and it stays
     // 1.00 when the CLOCK itself is wrong, which is why the period count above is the other
@@ -2240,6 +2611,12 @@ pub fn headless_check(
             "headless: movie delivery digest {:#018x} over {calls} calls ({au} access units, {pics} pictures). TWO RUNS OF ONE RECIPE MUST AGREE ON THIS.",
             vitaslop_runtime::vita::avcdec::delivery_digest(),
         );
+    }
+    // The movie's SOUND path, whether or not the title ever closed the file: a title that
+    // keeps its intro open for an attract loop never reaches `sceMp4CloseFile`, and that is
+    // the only other place this line is printed on the desktop.
+    if let Some(line) = vitaslop_runtime::vita::video::movie_audio_report() {
+        println!("headless: {line}");
     }
     // The emitted work counter against wasmtime's own metering, over the same intervals.
     // Both engines preempt on that counter and the game clock is billed from it, and
@@ -2294,13 +2671,84 @@ pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> R
     let settings = vitaslop_frontend::settings::Settings::default();
     let event_loop = EventLoop::new().map_err(|e| format!("create event loop: {e}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
+    // `VITASLOP_WINDOW_FRAMES=<n>`: close the window once the guest reaches frame n - a
+    // scripted window run (with a recipe) that ends by itself, so its exit report can be read.
+    let exit_at = std::env::var("VITASLOP_WINDOW_FRAMES").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let mut app = RetailApp {
-        session: Session::new(guest, input, Input::new(&settings), pause_on_blur),
+        session: Session::new(guest, input.clone(), Input::new(&settings), pause_on_blur),
+        boot: Boot { dir, recipe, save_dir, input, pause_on_blur },
         window: None,
         gfx: None,
+        exit_at,
+        shot_every: shot_every(),
+        shot_last: 0,
+        final_shot: std::env::var("VITASLOP_WINDOW_SHOT").ok().map(std::path::PathBuf::from),
+        final_requested: false,
+        split: [0.0; 4],
+        presented: None,
+        force_present: true,
+        perf_from: None,
     };
     let ended = event_loop.run_app(&mut app);
     app.session.guest.flush_save(true);
+    app.session.report_audio();
+    let [n, tick, present, presents] = app.split;
+    if n > 0.0 {
+        println!(
+            "window thread: {n:.0} redraws, tick {:.2} ms + present {:.2} ms per redraw",
+            tick / n,
+            present / n
+        );
+    }
+    if let (Some(g), true) = (app.gfx.as_ref(), presents > 0.0) {
+        let [acq, enc, sub, wb] = g.timing.map(|t| t / presents);
+        println!(
+            "window presents: {presents:.0}, per present acquire {acq:.2} + encode {enc:.2} + submit {sub:.2} + write-back {wb:.2} ms"
+        );
+        let [n, wait, work] = *g.completions.lock().unwrap_or_else(|e| e.into_inner());
+        println!(
+            "guest completions: {n:.0} ({:.2} per present), {wait:.0} ms waiting for the renderer + {work:.0} ms rendering",
+            n / presents
+        );
+    }
+    if let Some(r) = app.session.guest.smp_report() {
+        println!("{r}");
+    }
+    // `VITASLOP_PERF` + `VITASLOP_PERF_FROM=<frame>`: where the guest's time went from that frame
+    // to the exit - the runtime's phase table and the host calls, per guest frame.
+    if let Some((from, t0)) = app.perf_from.filter(|_| vitaslop_runtime::perf::enabled()) {
+        let frames = app.session.guest.frames().saturating_sub(from).max(1) as f64;
+        println!("perf: {frames:.0} frames over {:.1} s of wall from frame {from}", t0.elapsed().as_secs_f64());
+        for row in vitaslop_runtime::perf::table() {
+            println!("perf phase: {row}");
+        }
+        println!(
+            "perf dirty epoch: {} wraps, {} rebases (a wrap drops every texture's proof of being untouched)",
+            vitaslop_runtime::perf::epoch_wraps(),
+            vitaslop_runtime::perf::epoch_rebases()
+        );
+        for row in app.session.guest.host_call_report(20, frames) {
+            println!("perf {row}");
+        }
+    }
+    // `VITASLOP_WINDOW_SHOT=<png>`: the exit frame as the window SHOWED it - read off the surface
+    // at its present (see `RetailApp::final_shot`). Only where the surface cannot be copied is it
+    // re-rendered offscreen instead, and that is NOT the window's picture: a frame re-rendered on
+    // its own lacks targets earlier frames baked - MEASURED, a fighting title's fights came
+    // out HUD over black that way while the window drew them whole.
+    if let (Ok(path), Some(g)) = (std::env::var("VITASLOP_WINDOW_SHOT"), app.gfx.as_ref()) {
+        if std::path::Path::new(&path).exists() {
+            println!("window shot: frame {} -> {path}", app.session.guest.frames());
+        } else {
+            let (scenes, display, presents) = app.session.scenes();
+            let fb = g.snapshot(scenes, display, presents);
+            let path = path.replace(".png", "-offscreen.png");
+            match std::fs::write(&path, fb.to_png()) {
+                Ok(()) => println!("window shot (offscreen re-render - see above): frame {} -> {path}", app.session.guest.frames()),
+                Err(e) => eprintln!("window shot: could not write {path}: {e}"),
+            }
+        }
+    }
     ended.map_err(|e| format!("run event loop: {e}"))?;
     Ok(())
 }
@@ -2309,8 +2757,93 @@ pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> R
 /// statistics in the title bar.
 struct RetailApp {
     session: Session,
+    /// How this title was booted - what an exec (`Session::take_exec`) boots again with.
+    boot: Boot,
     window: Option<Arc<Window>>,
     gfx: Option<RetailGfx>,
+    exit_at: Option<u64>,
+    /// `VITASLOP_WINDOW_SHOT_EVERY` - see [`shot_every`].
+    shot_every: Option<(u64, std::path::PathBuf)>,
+    shot_last: u64,
+    /// `VITASLOP_WINDOW_SHOT`: the exit frame, captured off the surface at its present (the
+    /// run exits on the redraw after), and whether that capture has been asked for.
+    final_shot: Option<std::path::PathBuf>,
+    final_requested: bool,
+    /// The window thread's time per redraw, summed: `[redraws, tick ms, present ms]` - the
+    /// tick is input + the guest step (its wait for the frame), the present is the encode,
+    /// submit and render-target write-back. On the overlapped parallel engine the guest may
+    /// run only one frame ahead of this thread, so a slow present is a slow guest.
+    split: [f64; 4],
+    /// The guest frame last presented, and whether the next redraw must present anyway (a
+    /// resize). See [`RetailApp::about_to_wait`].
+    presented: Option<u64>,
+    force_present: bool,
+    /// The frame (and the moment) the profilers were reset at - see `VITASLOP_PERF_FROM`.
+    perf_from: Option<(u64, Instant)>,
+}
+
+/// `VITASLOP_PERF_FROM=<frame>`: reset the profilers when the guest reaches this frame, so the
+/// exit report covers gameplay and not the boot. 0 (the default) measures the whole run.
+fn perf_from_frame() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("VITASLOP_PERF_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// `VITASLOP_WINDOW_SHOT_FROM=<frame>`: the periodic shots start at this frame - a dense
+/// sequence around one moment without paying a surface readback on every frame before it.
+fn shot_from() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("VITASLOP_WINDOW_SHOT_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// What a `--game` window booted its title from.
+struct Boot {
+    dir: PathBuf,
+    recipe: Option<String>,
+    save_dir: Option<PathBuf>,
+    input: SharedInput,
+    pause_on_blur: bool,
+}
+
+impl RetailApp {
+    /// The guest replaced its own process (`sceAppMgrLoadExec`): boot that executable in its
+    /// place, with the same input, recipe and saves - the headless run's rule. The window waits
+    /// for the build (a compile-cache hit after the first time).
+    fn follow_exec(&mut self, path: &str) -> Result<(), String> {
+        println!("frame {}: the title exec'd {path} - booting it", self.session.guest.frames());
+        self.session.guest.flush_save(true);
+        let b = &self.boot;
+        let mut guest = RetailGuest::new_with_exec(&b.dir, b.input.clone(), b.recipe.as_deref(), Some(path))?;
+        if let Some(root) = b.save_dir.as_deref() {
+            guest.persist_to(root, &b.dir)?;
+        }
+        if let Some(g) = self.gfx.as_ref() {
+            guest.install_complete_scene_hook(g.completion_hook());
+        }
+        let settings = vitaslop_frontend::settings::Settings::default();
+        self.session = Session::new(guest, b.input.clone(), Input::new(&settings), b.pause_on_blur);
+        self.shot_last = 0;
+        self.presented = None;
+        Ok(())
+    }
+}
+
+/// `VITASLOP_WINDOW_SHOT_EVERY=<n>`: also save the frame every `n` guest frames, through the
+/// window's own renderer, as `f<frame>.png` in the directory of `VITASLOP_WINDOW_SHOT` - a
+/// scripted window run's picture sequence, for runs nobody watches.
+fn shot_every() -> Option<(u64, std::path::PathBuf)> {
+    let n: u64 = std::env::var("VITASLOP_WINDOW_SHOT_EVERY").ok()?.trim().parse().ok().filter(|&n| n > 0)?;
+    let shot = std::path::PathBuf::from(std::env::var("VITASLOP_WINDOW_SHOT").ok()?);
+    Some((n, shot.parent().map(|p| p.to_path_buf()).unwrap_or_default()))
+}
+
+/// `VITASLOP_WINDOW_SIZE=<w>x<h>`: open a window (the `--game` window or the library shell) at
+/// another size - a run sees the SCALED present a resized window does rather than the 1:1 one,
+/// and a shot rig sees a whole page.
+pub(crate) fn window_size_knob() -> Option<(u32, u32)> {
+    let v = std::env::var("VITASLOP_WINDOW_SIZE").ok()?;
+    let (w, h) = v.split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
 impl ApplicationHandler for RetailApp {
@@ -2318,13 +2851,13 @@ impl ApplicationHandler for RetailApp {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title("vitaslop")
-            .with_inner_size(LogicalSize::new(GAME_W, GAME_H));
+        let (w, h) = window_size_knob().unwrap_or((GAME_W, GAME_H));
+        let attrs = crate::icon::with_icon(Window::default_attributes()).with_title("vitaslop").with_inner_size(LogicalSize::new(w, h));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         match RetailGfx::new(window.clone()) {
             Ok(g) => {
                 println!("presenting on GPU: {}", g.adapter_name);
+                self.session.guest.install_complete_scene_hook(g.completion_hook());
                 self.gfx = Some(g);
             }
             Err(e) => {
@@ -2348,6 +2881,7 @@ impl ApplicationHandler for RetailApp {
                 if let Some(g) = self.gfx.as_mut() {
                     g.resize(size.width, size.height);
                 }
+                self.force_present = true;
             }
             WindowEvent::KeyboardInput { event: k, .. } => {
                 let pressed = k.state == ElementState::Pressed;
@@ -2363,15 +2897,105 @@ impl ApplicationHandler for RetailApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let t_tick = Instant::now();
                 self.session.tick(size);
-                if let Some(gfx) = self.gfx.as_mut() {
-                    let (scenes, display, presents) = self.session.scenes();
-                    if !scenes.is_empty()
-                        && let Err(e) = gfx.present(scenes, display, presents) {
-                            eprintln!("error: {e}");
-                            event_loop.exit();
-                            return;
+                if self.perf_from.is_none() && self.session.guest.frames() >= perf_from_frame() {
+                    vitaslop_runtime::perf::reset();
+                    vitaslop_native::perf::reset();
+                    self.perf_from = Some((self.session.guest.frames(), Instant::now()));
+                }
+                self.split[0] += 1.0;
+                self.split[1] += t_tick.elapsed().as_secs_f64() * 1000.0;
+                if let Some(path) = self.session.take_exec()
+                    && let Err(e) = self.follow_exec(&path)
+                {
+                    eprintln!("error: booting the exec'd {path}: {e}");
+                    event_loop.exit();
+                    return;
+                }
+                let f = self.session.guest.frames();
+                if let (Some((n, dir)), Some(g)) = (self.shot_every.as_ref(), self.gfx.as_mut())
+                    && f / n > self.shot_last / n
+                    && f >= shot_from()
+                {
+                    self.shot_last = f;
+                    // `VITASLOP_FRAME_CAPSULE`: the frame this shot shows, for `frame-replay` - the
+                    // window reaches frames a headless run's timing does not.
+                    {
+                        let (scenes, display, _) = self.session.scenes();
+                        vitaslop_runtime::capsule::maybe_write_frame(scenes, display.0, display.1, CLEAR, f);
+                    }
+                    // The window's own pixels, read off the surface at this frame's present.
+                    if !g.request_capture(dir.join(format!("f{f:06}.png"))) {
+                        let (scenes, display, presents) = self.session.scenes();
+                        if !scenes.is_empty() {
+                            let fb = g.snapshot(scenes, display, presents);
+                            let _ = std::fs::write(dir.join(format!("f{f:06}-offscreen.png")), fb.to_png());
                         }
+                    }
+                }
+                if self.exit_at.is_some_and(|n| f >= n) {
+                    // The exit frame's own pixels first: asked for here, written by this redraw's
+                    // present, and the run ends on the next redraw.
+                    let capture_now = !self.final_requested
+                        && match (self.final_shot.clone(), self.gfx.as_mut()) {
+                            (Some(path), Some(g)) => g.request_capture(path),
+                            _ => false,
+                        };
+                    self.final_requested = true;
+                    if !capture_now {
+                        event_loop.exit();
+                        return;
+                    }
+                }
+                if let Some(gfx) = self.gfx.as_mut() {
+                    // >>> A FRAME IS PRESENTED ONCE. Re-rendering an unchanged frame every display
+                    // period cost a whole chain encode per redraw and, the guest running only one
+                    // frame ahead of this thread, held the guest back by it - MEASURED (an action title):
+                    // 16.26 ms of present per redraw, game clock 80% of the wall.
+                    let frame_now = self.session.guest.frames();
+                    // A NEW guest frame is encoded; a forced or paused present only re-scales the
+                    // stage (see `RetailGfx::frame` for what re-encoding did to a feedback effect).
+                    let new_frame = self.presented != Some(frame_now);
+                    let fresh = self.force_present || new_frame || !self.session.live();
+                    let (scenes, display, presents) = self.session.scenes();
+                    if fresh && !scenes.is_empty() {
+                        self.presented = Some(frame_now);
+                        self.force_present = false;
+                        let t_present = Instant::now();
+                        let build0 = vitaslop_platform::gpu::peek_pipeline_build_split();
+                        let presented = gfx.present(scenes, display, presents, new_frame);
+                        if let Ok(wb) = &presented {
+                            self.session.apply_writebacks(wb);
+                        }
+                        let present_ms = t_present.elapsed().as_secs_f64() * 1000.0;
+                        self.split[2] += present_ms;
+                        self.split[3] += 1.0;
+                        // A present long enough to starve the sound is named with its frame: the
+                        // run line's per-present average cannot say WHERE a hitch was.
+                        if present_ms > 30.0 {
+                            // Of it, the shader work: our translation, the driver's module and
+                            // pipeline compiles - which half a fix would have to move.
+                            let b = vitaslop_platform::gpu::peek_pipeline_build_split();
+                            tracing::info!(
+                                target: "vitaslop::status",
+                                frame = frame_now,
+                                ms = present_ms as u64,
+                                translate_ms = (b.0 - build0.0) as u64,
+                                module_ms = (b.1 - build0.1) as u64,
+                                pipeline_ms = (b.2 - build0.2) as u64,
+                                "slow window present"
+                            );
+                        }
+                        match presented {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                event_loop.exit();
+                                return;
+                            }
+                        }
+                    }
                 }
                 if let (Some(stats), Some(w)) = (self.session.stats(Instant::now()), self.window.as_ref()) {
                     w.set_title(&format!("vitaslop  |  {}", stats.title_line()));
@@ -2383,9 +3007,17 @@ impl ApplicationHandler for RetailApp {
         self.session.event(&event, size);
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(w) = self.window.as_ref() {
-            w.request_redraw();
+    /// While the guest steps, SLEEP until its next frame is due rather than redraw at once: a
+    /// redraw with nothing new to show is skipped anyway (see the present above).
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let due = if self.session.live() && !self.force_present { self.session.due_in() } else { Duration::ZERO };
+        if due > Duration::from_millis(1) {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + due));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Poll);
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
         }
     }
 }

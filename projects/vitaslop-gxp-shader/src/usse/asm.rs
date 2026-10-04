@@ -659,11 +659,10 @@ pub fn mov(half: bool, dest: Dest, mask: [bool; 4], src: Src) -> Result<u64, Asm
     alu(Op::Add, half, dest, mask, Src::cnst(0).swz([4, 4, 4, 4]), src)
 }
 
-/// The four-channel swizzle a group-0x00 mad can give an F32 operand, from its own tables:
-/// `xy`, padded. The F32 mad is a TWO-LANE operation (its write mask reaches lanes 0..2 and its
-/// operand tables hold two-lane patterns), so a caller asking for `xyzw` there is asking for
-/// something the encoding does not have.
-pub const MAD_F32_XY: [u8; 4] = [0, 1, 0, 0];
+/// The identity swizzle of a group-0x00 mad's F32 operand. The F32 mad writes lanes 0..2 (its
+/// mask has no bit for channel 3), and its operand tables are the F16 four-lane patterns read
+/// one register per lane (see `decode::rswz2_mad`), so lane 2 of `xyzw` reads `z`.
+pub const MAD_F32_XYZ: [u8; 4] = [0, 1, 2, 3];
 
 /// The numeric format a [`pack`] operand is stored in. These are the encoding's own format
 /// numbers, so a case can say exactly which conversion it means.
@@ -783,12 +782,31 @@ pub fn pack(
     // this function - `decode::pack_comp0_high_bit` is the single statement of it, and asking
     // it rather than restating it is the rule the whole assembler is built on. Comps 1..3 have
     // their own two-bit fields.
-    let c0 = u64::from(swizzle[0]);
+    //
+    // `swizzle` is CHANNEL-aligned (lane c's selector in slot c), the form the decoder returns.
+    // Each enabled lane's selector goes in the SLOT that lane reads - `decode::pack_lane_slots`,
+    // the decoder's own statement of the rule, inverted. A float-to-float pack keeps its
+    // disabled lanes' selectors too (every slot is positional there).
+    let is_float = |f: PackFmt| matches!(f, PackFmt::F16 | PackFmt::F32);
+    let float_to_float = is_float(src_fmt) && is_float(dest_fmt);
+    let lane_slots = decode::pack_lane_slots(src_fmt.bits() as u32, dest_fmt.bits() as u32, scale, mask);
+    let slots: [u8; 4] = if float_to_float {
+        swizzle
+    } else {
+        let mut v = [0u8; 4];
+        for (c, slot) in lane_slots.iter().enumerate() {
+            if let Some(s) = slot {
+                v[*s] = swizzle[c];
+            }
+        }
+        v
+    };
+    let c0 = u64::from(slots[0]);
     word |= c0 & 1;
     word |= ((c0 >> 1) & 1) << decode::pack_comp0_high_bit(src_fmt.bits() as u32);
-    word |= u64::from(swizzle[1]) << 16;
-    word |= u64::from(swizzle[2]) << 14;
-    word |= u64::from(swizzle[3]) << 19;
+    word |= u64::from(slots[1]) << 16;
+    word |= u64::from(slots[2]) << 14;
+    word |= u64::from(slots[3]) << 19;
     let mask_bits = (0..4).fold(0u64, |acc, c| acc | (u64::from(mask[c]) << c));
     word |= mask_bits << 34;
 
@@ -805,8 +823,11 @@ pub fn pack(
     }
     // ONE source: the decoder adds a second only when the pair is NOT contiguous, and a word that
     // reads its upper components from anywhere but `src + 2` is not the vec4 asked for.
+    // A re-cycled pack names selectors for its ENABLED lanes only; the rest carry none.
+    let same_selectors =
+        |got: [u8; 4]| (0..4).all(|c| got[c] == swizzle[c] || (!float_to_float && !mask[c]));
     match got.srcs.as_slice() {
-        [s] if s.bank == src_bank && s.index == src_reg && s.swizzle == swizzle => {}
+        [s] if s.bank == src_bank && s.index == src_reg && same_selectors(s.swizzle) => {}
         _ => return Err(AsmError::RoundTrip { what: "pack source" }),
     }
     Ok(word)
@@ -2853,9 +2874,11 @@ mod tests {
     /// >>> THE SWEEP CORRECTED ITS OWN PREMISE TWICE, which is the whole argument for sweeping.
     ///
     /// First it fed both precisions plain `.xyzw` operands, and the F32 arm refused all sixteen
-    /// masks - for a reason that has nothing to do with masks. The F32 mad is a TWO-LANE
-    /// operation whose operand tables hold two-lane patterns ([`MAD_F32_XY`]); a sweep that fed
-    /// both the same operand reports the operand table's refusal as a fact about the mask.
+    /// masks - for a reason that had nothing to do with masks: the decoder then held two-lane F32
+    /// operand tables, so the operand was what it refused. (Those tables are now the F16
+    /// patterns read one register per lane - see `decode::rswz2_mad` - and [`MAD_F32_XYZ`] is
+    /// `xyzw`.) A sweep that fed both the same operand reported the operand table's refusal as
+    /// a fact about the mask.
     ///
     /// Then it expected sixteen masks at F16 and found FOUR. `mask_table_mad`'s own note says
     /// why, and this is the assembler side of it: the three bits are one bitmask over the
@@ -2873,7 +2896,7 @@ mod tests {
         let lane2 = std::env::var("VITASLOP_GXP_MAD_MASK16").as_deref() != Ok("0");
         let mut accepted_at: Vec<Vec<[bool; 4]>> = Vec::new();
         for half in [false, true] {
-            let swz = if half { [0, 1, 2, 3] } else { MAD_F32_XY };
+            let swz = if half { [0, 1, 2, 3] } else { MAD_F32_XYZ };
             let mut accepted = Vec::new();
             for bits in 0u8..16 {
                 let mask = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0];
@@ -2970,9 +2993,9 @@ mod tests {
             false,
             Dest::new(Bank::Output, 0),
             [true, true, true, false],
-            Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XY),
-            Src::reg(Bank::SecondaryAttr, 4).swz(MAD_F32_XY),
-            Src::reg(Bank::Temp, 2).swz(MAD_F32_XY),
+            Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XYZ),
+            Src::reg(Bank::SecondaryAttr, 4).swz(MAD_F32_XYZ),
+            Src::reg(Bank::Temp, 2).swz(MAD_F32_XYZ),
         )
         .expect("a three-lane f32 mad is encodable");
         let got = decode::decode(word);
@@ -2985,21 +3008,20 @@ mod tests {
                 false,
                 Dest::new(Bank::Output, 0),
                 [true, true, true, true],
-                Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XY),
-                Src::reg(Bank::SecondaryAttr, 4).swz(MAD_F32_XY),
-                Src::reg(Bank::Temp, 2).swz(MAD_F32_XY),
+                Src::reg(Bank::PrimaryAttr, 0).swz(MAD_F32_XYZ),
+                Src::reg(Bank::SecondaryAttr, 4).swz(MAD_F32_XYZ),
+                Src::reg(Bank::Temp, 2).swz(MAD_F32_XYZ),
             ),
             Err(AsmError::WriteMask([true, true, true, true])),
             "a 32-bit mad has no mask bit for channel 3"
         );
     }
 
-    /// The F16 mad is the FOUR-lane form of the same group - its operand tables carry
-    /// four-channel patterns and its mask covers all four channels as two register pairs. The
-    /// two precisions are not the same instruction with a flag, and the assembler expresses
-    /// the difference by refusing each what the other has.
+    /// The F16 mad is the FOUR-channel form of the same group - its mask covers all four
+    /// channels as two register pairs. The F32 mad reads the SAME operand patterns one register
+    /// per lane, but its mask has no bit for channel 3, and the assembler says so with a refusal.
     #[test]
-    fn the_f16_mad_reaches_four_channels_where_the_f32_mad_reaches_two() {
+    fn the_f16_mad_reaches_four_channels_where_the_f32_mad_reaches_three() {
         let word = mad(
             true,
             Dest::new(Bank::Temp, 0),
@@ -3014,17 +3036,29 @@ mod tests {
         assert_eq!(got.write_mask, [true, true, true, true]);
         assert_eq!(got.srcs[0].swizzle, [0, 1, 2, 3]);
 
+        let word = mad(
+            false,
+            Dest::new(Bank::Temp, 0),
+            [true, true, true, false],
+            Src::reg(Bank::PrimaryAttr, 0),
+            Src::reg(Bank::SecondaryAttr, 4),
+            Src::reg(Bank::Temp, 2),
+        )
+        .expect("a three-lane f32 mad over xyzw operands is encodable");
+        let got = decode::decode(word);
+        assert!(!got.half_precision);
+        assert_eq!(got.srcs[0].swizzle, [0, 1, 2, 3], "lane 2 of an F32 xyzw operand reads z");
         assert_eq!(
             mad(
                 false,
                 Dest::new(Bank::Temp, 0),
-                [true, false, false, false],
+                [true, true, true, true],
                 Src::reg(Bank::PrimaryAttr, 0),
                 Src::reg(Bank::SecondaryAttr, 4),
                 Src::reg(Bank::Temp, 2),
             ),
-            Err(AsmError::Swizzle { which: 1, want: [0, 1, 2, 3] }),
-            "the F32 mad's operand tables hold two-lane patterns only"
+            Err(AsmError::WriteMask([true, true, true, true])),
+            "the F32 mad has no mask bit for channel 3"
         );
     }
 
@@ -3157,20 +3191,23 @@ mod tests {
     /// `scale` bit is what tells them apart. A case that meant one must not assemble the other.
     #[test]
     fn the_normalised_and_plain_integer_conversions_are_different_instructions() {
+        // `[0, 1, 0, 1]`: a plain (unscaled) U8 pack writing all four lanes reads its selectors
+        // CYCLED - lane i reads slot `i mod 2` (`decode::pack_lane_slots`) - so a square whose
+        // lanes 2 and 3 differ from lanes 0 and 1 does not exist in this form.
         let plain = pack(
             Dest::new(Bank::Temp, 0),
             PackFmt::U8,
             Bank::PrimaryAttr,
             0,
             PackFmt::F32,
-            [0, 1, 2, 3],
+            [0, 1, 0, 1],
             [true; 4],
             false,
         )
         .expect("a truncating float -> u8 cast");
         assert_eq!(
             decode::decode(plain).op,
-            Op::PackToInt { bits: 8, signed: false, src_half: false }
+            Op::PackToInt { bits: 8, signed: false, src_half: false, norm: false }
         );
 
         let normalised = pack(
@@ -3411,9 +3448,13 @@ mod tests {
                 selectors += here;
                 if here > 0 {
                     pairs += 1;
+                    // The one exception is the ISA's own: an unscaled pack with a U8 side writing
+                    // all four lanes CYCLES its selectors (lane i reads slot `i mod 2`), so only
+                    // the squares whose lanes 2,3 repeat lanes 0,1 exist - 4 x 4 of them.
+                    let cycled = matches!(src_fmt, PackFmt::U8) || matches!(dest_fmt, PackFmt::U8);
                     assert_eq!(
                         here,
-                        256,
+                        if cycled { 16 } else { 256 },
                         "{} -> {} encodes SOME selectors but not all - a per-channel selector \
                          that depends on the value it selects is not a selector",
                         name(src_fmt),
@@ -3446,7 +3487,9 @@ mod tests {
                         Bank::PrimaryAttr,
                         0,
                         src_fmt,
-                        [0, 1, 2, 3],
+                        // Encodable under every lane->slot mapping, the U8 cycling one included:
+                        // the mask, not the selector, is what this sweep is about.
+                        [0, 1, 0, 1],
                         *m,
                         false,
                     )

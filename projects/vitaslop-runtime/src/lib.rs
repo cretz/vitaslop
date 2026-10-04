@@ -32,6 +32,7 @@ pub mod ingest;
 pub mod link;
 pub mod nid;
 pub mod knobs;
+pub mod call_table;
 pub mod mp4;
 pub mod mspace;
 pub mod perf;
@@ -47,7 +48,7 @@ pub mod vita;
 pub mod world;
 
 pub use host::{
-    GuestCtx, GuestMemory, ImportDispatch, Ptr, Reentry, SliceMemory,
+    GuestCall, GuestCallResult, GuestCtx, GuestMemory, ImportDispatch, Ptr, Reentry, SliceMemory,
     SvcDispatch, VitaEnv, VitaState, VFP_ARG_COUNT,
 };
 pub use audio::{AudioFormat, AudioSink, NullSink};
@@ -140,4 +141,19 @@ pub enum SvcOutcome {
     /// this as [`RunReport::Error`](crate::sched::RunReport::Error) with the message,
     /// which names the exact call - so the fix is "implement this NID", pinpointed.
     Fatal(String),
+    /// >>> THE CALL IS NOT FINISHED: IT NEEDS A GUEST FUNCTION RUN FIRST.
+    ///
+    /// A system library on the Vita runs in the CALLER's thread and may call back into the
+    /// title mid-call - `sceMp4OpenFile` given the title's own file-I/O functions reads the
+    /// movie THROUGH them, before it returns. The handler asked for one such call
+    /// ([`VitaState::call_guest`]) and returned early with the register file untouched.
+    ///
+    /// The engine then: takes the call ([`ImportDispatch::take_guest_call`]), saves the whole
+    /// register file, seeds the call ([`GuestCall::seed`]) on the caller's stack, runs it
+    /// to completion on THIS thread (it may block and be rescheduled like any guest code),
+    /// restores the file, reports r0/r1 ([`ImportDispatch::guest_call_returned`]) and
+    /// dispatches the SAME selector again. The handler replays: every call it asked for
+    /// before now answers from the record, and it either asks for the next one or finishes.
+    /// See [`VitaState::call_guest`] for the replay contract a handler must keep.
+    CallGuest,
 }

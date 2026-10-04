@@ -9,8 +9,13 @@
 # the first fight, pressing cross (light attack) through it.
 #
 # HOW IT WAS AUTHORED
-# - Title screen wants START three times (a logo skip, the press-start prompt, the
-#   save check). DOWN + CROSS at 3400/3460 picks "do not sign in" on the PSN dialog.
+# - START at 3000 skips the intro movie. Then the timeline HOLDS (`@wait call
+#   sceCtrlPeekBufferPositive`) until the title screen reads the pad - f3148 natively, about
+#   f4100 on a phone, whose loads take more frames - and every later INPUT line runs late by
+#   the hold, so input frames below 3240 are 140 earlier than the screens they hit natively.
+#   START answers "press any button"; DOWN + CROSS picks "do not sign in" on the PSN dialog
+#   (a CROSS on YES fails offline and re-asks forever - what a frame-timed DOWN did on the
+#   phone). `@section`/`@shot` frames are display frames and do not move.
 # - Every later menu is a CROSS every 150 frames: the character select takes three
 #   (main + two assists), then the stage select, then a fade to white and NOW LOADING.
 # - The character select and stage select are the screens the F32F32 matrix-palette
@@ -20,74 +25,73 @@
 0: @section boot
 3000: start
 3006:
-3120: start
-3126:
-3240: start
-3246:
-3400: down
-3406:
-3460: cross
-3466:
-3700: cross
-3706:
-3850: cross
-3856:
-4000: cross
-4006:
-4150: cross
-4156:
-4300: cross
-4306:
-4450: cross
-4456:
-4600: cross
-4606:
-4750: cross
-4756:
-4900: cross
-4906:
-5050: cross
-5056:
-5200: cross
-5206:
-5350: cross
-5356:
-5500: cross
-5506:
-5650: cross
-5656:
-5800: cross
-5806:
-5950: cross
-5956:
-6100: cross
-6106:
-6250: cross
-6256:
-6400: cross
-6406:
-6550: cross
-6556:
-6700: cross
-6706:
-6850: cross
-6856:
-7000: cross
-7006:
-7150: cross
-7156:
-7300: cross
-7306:
-7450: cross
-7456:
-7600: cross
-7606:
-7750: cross
-7756:
-7900: cross
-7906:
-8050: cross
-8056:
-8200: cross
-8206:
-8400:
+3010: @wait call sceCtrlPeekBufferPositive   # the title screen starts reading the pad (f3148 native, ~f4100 phone)
+3100: start
+3106:
+3260: down
+3266:
+3320: cross
+3326:
+3560: cross
+3566:
+3710: cross
+3716:
+3860: cross
+3866:
+4010: cross
+4016:
+4160: cross
+4166:
+4310: cross
+4316:
+4460: cross
+4466:
+4610: cross
+4616:
+4760: cross
+4766:
+4910: cross
+4916:
+5060: cross
+5066:
+5210: cross
+5216:
+5360: cross
+5366:
+5510: cross
+5516:
+5660: cross
+5666:
+5810: cross
+5816:
+5960: cross
+5966:
+6110: cross
+6116:
+6260: cross
+6266:
+6410: cross
+6416:
+6560: cross
+6566:
+6710: cross
+6716:
+6860: cross
+6866:
+7010: cross
+7016:
+7160: cross
+7166:
+7310: cross
+7316:
+7460: cross
+7466:
+7610: cross
+7616:
+7760: cross
+7766:
+7910: cross
+7916:
+8060: cross
+8066:
+8260:

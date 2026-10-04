@@ -7,6 +7,7 @@
 //! the W3C codes, and gilrs' buttons map onto the standard positions below.
 
 use std::collections::{BTreeMap, HashSet};
+use std::time::{Duration, Instant};
 
 use gilrs::{Axis, Button, Gilrs};
 use vitaslop_frontend::input::invert;
@@ -16,6 +17,10 @@ use winit::keyboard::KeyCode;
 
 const CENTER: u8 = 128;
 
+/// Start and select held together this long open the shell's in-game menu - the browser's
+/// `MENU_HOLD_MS`, and the way in that every pad has (not every pad exposes `home`).
+const MENU_HOLD: Duration = Duration::from_millis(1000);
+
 pub struct Input {
     keys: HashSet<String>,
     gilrs: Option<Gilrs>,
@@ -24,6 +29,18 @@ pub struct Input {
     /// Standard Gamepad control -> button bits.
     padmap: BTreeMap<String, u32>,
     deadzone: f32,
+    /// Pad buttons the game must not see until they are released: the start+select chord once
+    /// it opened the menu, `home` when it did, and whatever was held when the menu handed the
+    /// pad back (the press that picked "Resume"). See [`Self::hand_back`].
+    ignore: HashSet<Button>,
+    /// When start and select both went down, while they are both held.
+    chord_since: Option<Instant>,
+    /// The menu was asked for and not yet taken - see [`Self::take_menu_request`].
+    menu_request: bool,
+    /// What the on-screen controls hold this frame (the mouse on them): button bits OR'd in,
+    /// and each stick's position while it is dragged - see `shell::touchpad`.
+    pub overlay_buttons: u32,
+    pub overlay_sticks: [Option<(u8, u8)>; 2],
 }
 
 impl Input {
@@ -35,7 +52,18 @@ impl Input {
                 None
             }
         };
-        let mut me = Input { keys: HashSet::new(), gilrs, keymap: BTreeMap::new(), padmap: BTreeMap::new(), deadzone: 0.14 };
+        let mut me = Input {
+            keys: HashSet::new(),
+            gilrs,
+            keymap: BTreeMap::new(),
+            padmap: BTreeMap::new(),
+            deadzone: 0.14,
+            ignore: HashSet::new(),
+            chord_since: None,
+            menu_request: false,
+            overlay_buttons: 0,
+            overlay_sticks: [None, None],
+        };
         me.apply(settings);
         me
     }
@@ -59,12 +87,51 @@ impl Input {
         self.keys.clear();
     }
 
-    /// Drain pending gilrs events so the gamepad state read below is current.
+    /// Drain pending gilrs events so the gamepad state read below is current, and watch for the
+    /// pad's way into the shell's menu: `home` (unless a Vita button is mapped to it, which makes
+    /// it the game's), or start+select held for [`MENU_HOLD`]. The browser's rule.
     pub fn pump_gamepad(&mut self) {
-        if let Some(g) = self.gilrs.as_mut() {
-            while let Some(ev) = g.next_event() {
-                g.update(&ev);
+        let Some(g) = self.gilrs.as_mut() else { return };
+        while let Some(ev) = g.next_event() {
+            g.update(&ev);
+        }
+        let Some((_, pad)) = g.gamepads().find(|(_, p)| p.is_connected()) else {
+            self.ignore.clear();
+            self.chord_since = None;
+            return;
+        };
+        let held: HashSet<Button> = ALL_BUTTONS.iter().copied().filter(|b| pad.is_pressed(*b)).collect();
+        self.ignore.retain(|b| held.contains(b));
+        if held.contains(&Button::Mode) && !self.ignore.contains(&Button::Mode) && !self.padmap.contains_key("home") {
+            self.ignore.insert(Button::Mode);
+            self.menu_request = true;
+        }
+        let chord = [Button::Start, Button::Select];
+        if chord.iter().all(|b| held.contains(b) && !self.ignore.contains(b)) {
+            let since = *self.chord_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= MENU_HOLD {
+                // The game sees both RELEASED from here (not a stuck pair) - see `ctrl_frame`.
+                self.ignore.extend(chord);
+                self.chord_since = None;
+                self.menu_request = true;
             }
+        } else {
+            self.chord_since = None;
+        }
+    }
+
+    /// Whether the pad asked for the menu since the last call.
+    pub fn take_menu_request(&mut self) -> bool {
+        std::mem::take(&mut self.menu_request)
+    }
+
+    /// The menu closed and the pad is the game's again: whatever is held now (the press that
+    /// closed the menu) is ignored until it is released, so it does not reach the game.
+    pub fn hand_back(&mut self) {
+        self.keys.clear();
+        self.chord_since = None;
+        if let Some((_, pad)) = self.gilrs.as_ref().and_then(|g| g.gamepads().find(|(_, p)| p.is_connected())) {
+            self.ignore = ALL_BUTTONS.iter().copied().filter(|b| pad.is_pressed(*b)).collect();
         }
     }
 
@@ -83,7 +150,8 @@ impl Input {
             && let Some((_, pad)) = g.gamepads().next() {
                 for (control, bits) in &self.padmap {
                     if let Some(b) = gilrs_button(control)
-                        && pad.is_pressed(b) {
+                        && pad.is_pressed(b)
+                        && !self.ignore.contains(&b) {
                             buttons |= bits;
                         }
                 }
@@ -94,12 +162,40 @@ impl Input {
                 rx = axis_to_byte(x, false);
                 ry = axis_to_byte(y, true);
             }
+        buttons |= self.overlay_buttons;
+        if let Some((x, y)) = self.overlay_sticks[0] {
+            (lx, ly) = (x, y);
+        }
+        if let Some((x, y)) = self.overlay_sticks[1] {
+            (rx, ry) = (x, y);
+        }
         CtrlFrame { buttons, lx, ly, rx, ry }
     }
 }
 
+/// Every pad button [`gilrs_button`] names - what the hand-over reads as held.
+const ALL_BUTTONS: [Button; 17] = [
+    Button::South,
+    Button::East,
+    Button::West,
+    Button::North,
+    Button::LeftTrigger,
+    Button::RightTrigger,
+    Button::LeftTrigger2,
+    Button::RightTrigger2,
+    Button::Select,
+    Button::Start,
+    Button::LeftThumb,
+    Button::RightThumb,
+    Button::DPadUp,
+    Button::DPadDown,
+    Button::DPadLeft,
+    Button::DPadRight,
+    Button::Mode,
+];
+
 /// The gilrs button at a Standard Gamepad position.
-fn gilrs_button(control: &str) -> Option<Button> {
+pub(crate) fn gilrs_button(control: &str) -> Option<Button> {
     Some(match control {
         "south" => Button::South,
         "east" => Button::East,
@@ -149,12 +245,27 @@ mod tests {
     #[test]
     fn winit_key_names_are_the_w3c_codes_the_settings_use() {
         let s = Settings::default();
-        let mut i = Input { keys: HashSet::new(), gilrs: None, keymap: BTreeMap::new(), padmap: BTreeMap::new(), deadzone: 0.1 };
+        let mut i = Input {
+            keys: HashSet::new(),
+            gilrs: None,
+            keymap: BTreeMap::new(),
+            padmap: BTreeMap::new(),
+            deadzone: 0.1,
+            ignore: HashSet::new(),
+            chord_since: None,
+            menu_request: false,
+            overlay_buttons: 0,
+            overlay_sticks: [None, None],
+        };
         i.apply(&s);
         i.set_key(KeyCode::KeyZ, true);
         i.set_key(KeyCode::ArrowUp, true);
         let f = i.ctrl_frame();
         assert_eq!(f.buttons, 0x4000 | 0x10, "Z is cross and ArrowUp is up by default");
         assert!(vitaslop_frontend::input::GAMEPAD_CONTROLS.iter().all(|c| gilrs_button(c).is_some()));
+        assert!(
+            vitaslop_frontend::input::GAMEPAD_CONTROLS.iter().all(|c| ALL_BUTTONS.contains(&gilrs_button(c).unwrap())),
+            "the hand-over reads every button a control can name"
+        );
     }
 }

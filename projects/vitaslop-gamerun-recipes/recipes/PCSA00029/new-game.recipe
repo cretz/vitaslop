@@ -1,0 +1,57 @@
+@title  PCSA00029 - New Game: title screen, main menu, New Game, Start New Campaign, the Journal tutorial gate, the prologue's opening, the Jumping and Climbing tutorial, FIRST PLAYER CONTROL
+@game   PCSA00029
+@shot-every 1000
+
+# WHAT THIS RECIPE PROVES
+# ----------------------
+# The title boots from its launcher into the game executable (LoadExec), reaches its title
+# screen, starts a NEW GAME through the main menu and the "Start New Campaign?" prompt, passes
+# the Journal tutorial on the loading overlay, and ends in the prologue under player control:
+# the player character stands in the jungle ruins and walks when the stick is pushed. The
+# prologue is a DEFERRED renderer - a G-buffer pass into an F32F32 target, HDR lighting into
+# U2F10F10F10 with the G-buffer's depth carried across by the surface's FORCE_LOAD/STORE bits,
+# a skinned character whose bone palette is read by index - so these shots are the check for
+# all of that.
+#
+# EVERY INPUT IS A TOUCH OR THE STICK. The front end is touch-driven (panel coordinates are
+# screen x2). Three things cost a session if they are not written down:
+#  * The loading overlay's "Tutorial: Journal" is a TAP GATE: tap the journal icon, then the
+#    page-curl icon; the CURL is what passes it.
+#  * The prologue opens on a dark shot that WAITS FOR THE STICK - with no input it holds
+#    there for ever, looking like a hang or a black-screen bug. Pushing forward starts play,
+#    and the "Jumping and Climbing" tutorial panel comes up over it.
+#  * That panel is dismissed with the same page-curl icon (1844,830).
+# The load before gameplay ends anywhere in f7700..8500 between runs, so the stick is held
+# from 8300 to 8700 and the panel is dismissed at 9000.
+
+0: @section boot
+1000: @shot title-screen
+1300: touch=960,700
+1308:
+1600: @section new-game
+1600: @shot main-menu
+1600: touch=960,710
+1608:
+1900: touch=960,440
+1908:
+2300: @shot start-new-campaign
+2300: touch=1250,874
+2308:
+5000: @section journal-gate
+5000: @shot journal-gate
+5000: touch=1756,380
+5008:
+5400: touch=1844,830
+5408:
+8300: @section prologue
+8300: ly=0
+8700:
+8900: @shot tutorial-panel
+9000: touch=1844,830
+9008:
+9100: @section player-control
+9100: @shot player-control
+9150: ly=0
+9200: @shot walked
+9230:
+9300:

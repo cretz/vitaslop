@@ -408,6 +408,15 @@ fn bind_import(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
                         SvcOutcome::Fatal(msg) => {
                             return Err(wasmtime::Error::msg(msg));
                         }
+                        // A library calling back into the title mid-call is run by the
+                        // preemptive engines only; this one stops loudly rather than return
+                        // a result the call never finished computing.
+                        SvcOutcome::CallGuest => {
+                            return Err(wasmtime::Error::msg(format!(
+                                "host call selector {selector} needs to call back into the guest \
+                                 (SvcOutcome::CallGuest), which only the threaded scheduler runs"
+                            )));
+                        }
                     }
                     Ok(())
                 })

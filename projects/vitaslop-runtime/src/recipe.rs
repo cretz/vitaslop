@@ -79,6 +79,9 @@
 //! - `<frame>: @note <text>` / `<frame>: @todo <text>` - a durable note or an open
 //!   task for whoever (agent or human) picks up the recipe next. Heavy commenting is
 //!   strongly encouraged: record why an input is timed as it is and what was learned.
+//! - `<frame>: @wait call <function> [pulse <button> <every>]` - hold the input timeline here until the guest makes
+//!   that host call, then run every later input line late by the hold (see [`WaitDecl`]).
+//!   Anchors presses to a screen that appears after a LOAD, whose length varies by device.
 //!
 //! ```text
 //! @title Tutorial - first lesson
@@ -254,6 +257,57 @@ pub struct InputSegment {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Timeline {
     segments: Vec<InputSegment>,
+    /// `@wait` holds in recipe-frame order, and the first one not yet released.
+    waits: Vec<WaitDecl>,
+    next_wait: usize,
+    /// Display frames spent holding so far: recipe frame = display frame - `shift`.
+    shift: u64,
+    /// Whether `waits[next_wait]` is holding the timeline right now.
+    holding: bool,
+    /// The display frame the current hold began on - the phase of its `pulse`.
+    held_from: u64,
+}
+
+/// The host-call side of `@wait call` - see [`WaitDecl`]. Process-wide because the call is
+/// made on whichever guest thread (and, in the browser, whichever worker) the title uses, far
+/// from the world that reads the pad; one recipe runs per process.
+pub mod wait_call {
+    use std::sync::atomic::{
+        AtomicBool,
+        Ordering::{Acquire, Release},
+    };
+    use std::sync::Mutex;
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    static WANT: Mutex<String> = Mutex::new(String::new());
+
+    /// Start waiting for `call`. Only calls made from now on count.
+    pub fn arm(call: &str) {
+        if let Ok(mut w) = WANT.lock() {
+            *w = call.to_string();
+        }
+        FIRED.store(false, Release);
+        ARMED.store(true, Release);
+    }
+
+    /// Whether the armed call has been made since [`arm`].
+    pub fn fired() -> bool {
+        FIRED.load(Acquire)
+    }
+
+    /// Every serviced host call, by NID. One atomic load when nothing is armed.
+    #[inline]
+    pub fn note(func_nid: u32) {
+        if !ARMED.load(Acquire) {
+            return;
+        }
+        let hit = WANT.lock().map(|w| crate::nid::name(func_nid) == w.as_str()).unwrap_or(false);
+        if hit {
+            ARMED.store(false, Release);
+            FIRED.store(true, Release);
+        }
+    }
 }
 
 /// A [`Timeline`] shared between the world the guest polls and whoever drives it.
@@ -265,16 +319,79 @@ impl Timeline {
     /// among entries sharing a frame, so the last one written wins).
     pub fn new(mut segments: Vec<InputSegment>) -> Timeline {
         segments.sort_by_key(|s| s.frame);
-        Timeline { segments }
+        Timeline { segments, ..Timeline::default() }
     }
 
-    /// The input state in effect at `frame`: the last segment at or before it, or
-    /// neutral before any segment starts.
+    /// This timeline with `@wait` holds - see [`WaitDecl`].
+    pub fn with_waits(mut self, mut waits: Vec<WaitDecl>) -> Timeline {
+        waits.sort_by_key(|w| w.frame);
+        self.waits = waits;
+        self
+    }
+
+    /// The recipe frame a DISPLAY frame maps to, after every hold so far.
+    fn recipe_frame(&self, frame: u64) -> u64 {
+        if self.holding {
+            return self.waits[self.next_wait].frame;
+        }
+        frame.saturating_sub(self.shift)
+    }
+
+    /// Move the holds on to display frame `frame` (once per frame, before the pad is read):
+    /// arm the next `@wait` when its frame is reached, keep holding while its call has not
+    /// been made, and release it - every later line now `shift` frames later - once it has.
+    pub fn advance(&mut self, frame: u64) {
+        while let Some(w) = self.waits.get(self.next_wait) {
+            if !self.holding {
+                if frame.saturating_sub(self.shift) < w.frame {
+                    return;
+                }
+                wait_call::arm(&w.call);
+                self.holding = true;
+                self.held_from = frame;
+                tracing::info!(
+                    target: "vitaslop::recipe",
+                    "recipe @wait at f{}: holding the input until the guest calls {}",
+                    w.frame,
+                    w.call
+                );
+            }
+            if !wait_call::fired() {
+                self.shift = frame.saturating_sub(w.frame);
+                return;
+            }
+            self.holding = false;
+            self.shift = frame.saturating_sub(w.frame);
+            tracing::info!(
+                target: "vitaslop::recipe",
+                "recipe @wait at f{}: {} called at display frame {frame} - later input runs {} frame(s) late",
+                w.frame,
+                w.call,
+                self.shift
+            );
+            self.next_wait += 1;
+        }
+    }
+
+    /// The input state in effect at display frame `frame`: the last segment at or before its
+    /// recipe frame, or neutral before any segment starts.
     pub fn at(&self, frame: u64) -> (CtrlFrame, TouchFrame) {
-        match self.segments.iter().rev().find(|s| s.frame <= frame) {
+        // A held `pulse` taps its button in the LAST `PULSE_FRAMES` of every `every` frames, so
+        // the first tap comes a whole period into the hold, never on the frame it starts.
+        let tap = match (self.holding, self.waits.get(self.next_wait).and_then(|w| w.pulse)) {
+            (true, Some((bit, every))) => {
+                let held = frame.saturating_sub(self.held_from);
+                if held % every >= every - PULSE_FRAMES { bit } else { 0 }
+            }
+            _ => 0,
+        };
+        let frame = self.recipe_frame(frame);
+        let (mut input, touch) = match self.segments.iter().rev().find(|s| s.frame <= frame) {
             Some(s) => (s.input, s.touch),
             None => (CtrlFrame::default(), TouchFrame::default()),
-        }
+        };
+        input.buttons |= tap;
+        (input, touch)
     }
 
     /// Append a segment, keeping the timeline frame-sorted. A segment pushed at a
@@ -393,6 +510,43 @@ pub struct ShotDecl {
     pub name: String,
 }
 
+/// `<frame>: @wait call <function>` - HOLD the input timeline at `frame` until the guest makes
+/// the named host call (at or after the moment the timeline reaches `frame`), then resume with
+/// every later input line shifted by however many frames the hold lasted.
+///
+/// # Why a recipe needs one
+/// A recipe is keyed to display frames, and how many frames a LOAD takes is not a property of
+/// the title: the storage clock is floored at the wall (`host.rs` `wall_floor_tick`), so a
+/// slower device spends more frames on the same load. MEASURED on a fighting title: the title
+/// screen took input at f3148 natively and around f4100 on a phone, so a frame-timed DOWN meant
+/// for the PSN sign-in dialog landed before the dialog existed, and every later CROSS answered
+/// "sign in" - which fails offline and re-asks, forever. A recipe that names the moment the
+/// screen ACCEPTS input (`sceCtrlPeekBufferPositive`: the title starts reading the pad) instead
+/// of guessing its frame plays the same on both.
+///
+/// While held the pad is whatever the last line before the wait set - write a release line
+/// before it. Only INPUT moves: `@shot`, `@assert` and `@section` frames stay on the display
+/// frame count.
+///
+/// `@wait call <function> pulse <button> <every>` also TAPS `button` for [`PULSE_FRAMES`]
+/// frames every `every` held frames, for a screen that may or may not still be up when the
+/// hold starts. MEASURED on a fighting title: its "play style set" OK dialog opened after the
+/// recipe's CROSS on a phone, and a silent hold for the main menu behind it waited for ever -
+/// the menu cannot open until the dialog is answered, and no call names the dialog itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitDecl {
+    pub frame: u64,
+    /// The host call's name as the NID table spells it (`crate::nid::name`).
+    pub call: String,
+    /// `(button bits, every)`: tap while held - see above.
+    pub pulse: Option<(u32, u64)>,
+}
+
+/// How many display frames one `pulse` tap holds its button down - long enough for a title
+/// that samples the pad once a frame, short enough that a tap landing as the awaited screen
+/// opens has little chance of being read by it.
+pub const PULSE_FRAMES: u64 = 2;
+
 /// A named region of the run, starting at `frame` (ending at the next section or the
 /// run end).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -448,6 +602,8 @@ pub struct Recipe {
     pub shots: Vec<ShotDecl>,
     pub sections: Vec<Section>,
     pub notes: Vec<NoteDecl>,
+    /// `@wait` holds, frame-sorted - see [`WaitDecl`].
+    pub waits: Vec<WaitDecl>,
     /// The input timeline, frame-sorted.
     segments: Vec<InputSegment>,
 }
@@ -571,6 +727,28 @@ impl Recipe {
             "assert" => {
                 let kind = parse_assert(args, line_no)?;
                 self.asserts.push(AssertDecl { frame, kind });
+            }
+            "wait" => {
+                let words: Vec<&str> = args.split_whitespace().collect();
+                let pulse = match words.as_slice() {
+                    ["call", _] => Some(None),
+                    ["call", _, "pulse", button, every] => match (button_bit(button), every.parse::<u64>()) {
+                        (Some(bit), Ok(every)) if every > PULSE_FRAMES => Some(Some((bit, every))),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(pulse) = pulse else {
+                    return Err(RecipeError {
+                        line: line_no,
+                        reason: format!(
+                            "@wait expects `call <function name> [pulse <button> <every frames > {PULSE_FRAMES}>]`, got {:?}",
+                            args.trim()
+                        ),
+                    });
+                };
+                self.waits.push(WaitDecl { frame, call: words[1].to_string(), pulse });
+                self.waits.sort_by_key(|w| w.frame);
             }
             other => {
                 return Err(RecipeError {
@@ -935,9 +1113,9 @@ impl RecipeWorld {
 
     /// Build a world from an already-parsed recipe.
     pub fn from_recipe(recipe: Recipe) -> Self {
-        RecipeWorld::from_timeline(std::sync::Arc::new(std::sync::Mutex::new(Timeline::new(
-            recipe.segments,
-        ))))
+        RecipeWorld::from_timeline(std::sync::Arc::new(std::sync::Mutex::new(
+            Timeline::new(recipe.segments).with_waits(recipe.waits),
+        )))
     }
 
     /// Build a world over an externally-owned timeline. A live session holds the
@@ -996,6 +1174,7 @@ impl World for RecipeWorld {
     }
     fn set_frame(&mut self, frame: u64) {
         self.frame = frame;
+        self.timeline.lock().unwrap().advance(frame);
         // Keep the virtual clock roughly in step with frames so a title polling
         // elapsed time still advances (the preemptive scheduler's own virtual clock
         // drives pacing; this only backstops a title that reads monotonic_us).
@@ -1043,6 +1222,59 @@ mod tests {
         // ...and released at 45.
         w.set_frame(45);
         assert_eq!(w.poll_ctrl(0).buttons, 0);
+    }
+
+    /// `@wait call` HOLDS the input at its frame until the named call is made, then every later
+    /// line runs late by exactly the hold - so a press meant for a screen that appears after a
+    /// load lands on that screen whatever the load took.
+    #[test]
+    fn a_wait_holds_the_timeline_until_its_call_and_shifts_what_follows() {
+        let _one_at_a_time = WAIT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let peek = crate::nid::name(crate::nid::ctrl::PEEK_BUFFER_POSITIVE);
+        let text = format!("10: start\n12:\n20: @wait call {peek}\n30: cross\n32:\n");
+        let mut w = RecipeWorld::parse(&text).unwrap();
+        let at = |w: &mut RecipeWorld, f: u64| {
+            w.set_frame(f);
+            w.poll_ctrl(0).buttons
+        };
+        assert_eq!(at(&mut w, 10), 0x0008, "before the wait the timeline runs on its frames");
+        assert_eq!(at(&mut w, 20), 0);
+        // Held: frame 30 is NOT the cross while the call has not been made.
+        assert_eq!(at(&mut w, 30), 0, "a held timeline must not reach the lines after the wait");
+        assert_eq!(at(&mut w, 39), 0);
+        // The call arrives during display frame 40; the hold releases on the next advance.
+        wait_call::note(crate::nid::ctrl::PEEK_BUFFER_POSITIVE);
+        assert_eq!(at(&mut w, 40), 0, "released at display 40 = recipe 20");
+        assert_eq!(at(&mut w, 49), 0);
+        assert_eq!(at(&mut w, 50), 0x4000, "the cross written at 30 now lands 20 frames late");
+        assert_eq!(at(&mut w, 52), 0);
+    }
+
+    /// `wait_call` is process-wide, so the tests that arm it must not overlap.
+    static WAIT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `pulse` TAPS its button while held - first a whole period in, never on the hold's first
+    /// frame - and stops the moment the call releases the hold.
+    #[test]
+    fn a_pulsed_wait_taps_while_held_and_stops_on_release() {
+        let _one_at_a_time = WAIT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let peek = crate::nid::name(crate::nid::ctrl::PEEK_BUFFER_POSITIVE);
+        let text = format!("20: @wait call {peek} pulse cross 10\n30: down\n32:\n");
+        let mut w = RecipeWorld::parse(&text).unwrap();
+        let at = |w: &mut RecipeWorld, f: u64| {
+            w.set_frame(f);
+            w.poll_ctrl(0).buttons
+        };
+        let held: Vec<u32> = (20..42).map(|f| at(&mut w, f)).collect();
+        let taps: Vec<u64> = (20..42).filter(|f| held[(*f - 20) as usize] == 0x4000).collect();
+        assert_eq!(taps, vec![28, 29, 38, 39], "two-frame taps at the end of each 10-frame period");
+        wait_call::note(crate::nid::ctrl::PEEK_BUFFER_POSITIVE);
+        assert_eq!(at(&mut w, 48), 0, "released at display 48 (a tap phase): no tap once released");
+        assert_eq!(at(&mut w, 57), 0);
+        assert_eq!(at(&mut w, 58), 0x0040, "the down written at 30 lands 28 frames late");
+        assert_eq!(at(&mut w, 60), 0);
+        assert!(RecipeWorld::parse(&format!("0: @wait call {peek} pulse cross 2\n")).is_err());
+        assert!(RecipeWorld::parse(&format!("0: @wait call {peek} pulse nosuch 30\n")).is_err());
     }
 
     #[test]

@@ -17,6 +17,8 @@ pub mod sched;
 pub use sched::{FrameStop, Scheduler};
 
 pub mod threaded;
+/// Parallel guest threads on OS threads - see the module docs.
+pub mod smp;
 pub use threaded::{dump_block_hist, RunReport, ThreadSpawn, ThreadedScheduler};
 
 /// The desktop's cache of compiled guest modules, beside each game - see its module docs.
@@ -38,7 +40,7 @@ pub mod gamedata_disk;
 pub use gamedata_disk::SaveStore;
 
 pub mod recipe_runner;
-pub use recipe_runner::{boot_retail, run_recipe, RecipeReport, RunOpts};
+pub use recipe_runner::{boot_retail, boot_retail_exec, run_recipe, RecipeReport, RunOpts};
 
 pub mod session;
 pub use session::{ControlDir, Session, SessionOpts};
@@ -654,6 +656,13 @@ fn bind_import(linker: &mut Linker<Host>) -> Result<(), RunError> {
             for (i, &v) in vfp.iter().enumerate() {
                 write_vfp(&mut caller, i, v);
             }
+            // A library calling back into the title before it returns - see
+            // `SvcOutcome::CallGuest`. Run-to-completion here, so each call is a plain
+            // re-entrant wasm call.
+            let mut outcome = outcome;
+            while matches!(outcome, SvcOutcome::CallGuest) {
+                outcome = run_guest_call(&mut caller, selector as u32)?;
+            }
             if let SvcOutcome::Halt = outcome {
                 caller.data_mut().halted = true;
                 return Err(HaltUnwind.into());
@@ -687,6 +696,59 @@ fn bind_dispatch_miss(linker: &mut Linker<Host>) -> Result<(), RunError> {
         },
     )?;
     Ok(())
+}
+
+/// Run the guest call the last dispatch of `selector` asked for, then dispatch it again -
+/// the run-to-completion twin of the threaded engine's `run_guest_call`.
+fn run_guest_call(caller: &mut Caller<'_, Host>, selector: u32) -> Result<SvcOutcome, wasmtime::Error> {
+    let thid = caller.data().import_env.as_ref().map_or(0, |e| e.running_thread());
+    let call = caller.data_mut().import_env.as_mut().and_then(|e| e.take_guest_call(thid));
+    let Some(call) = call else {
+        return Ok(SvcOutcome::Fatal(format!("host call selector {selector} asked for a guest call and left none to run")));
+    };
+    let saved_regs: [u32; abi::REG_COUNT] = std::array::from_fn(|i| read_reg(caller, i));
+    let saved_vfp: [u32; vitaslop_runtime::VFP_ARG_COUNT] = std::array::from_fn(|i| read_vfp(caller, i));
+    let mut seeded = saved_regs;
+    let mem = caller.get_export(abi::MEMORY_EXPORT).and_then(|e| e.into_memory()).expect("module exports memory");
+    {
+        let (bytes, host) = mem.data_and_store_mut(&mut *caller);
+        call.seed(&mut seeded, &mut vitaslop_runtime::SliceMemory(bytes), host.base);
+    }
+    for (i, &v) in seeded.iter().enumerate() {
+        write_reg(caller, i, v);
+    }
+    let dispatch = caller
+        .get_export(abi::DISPATCH_EXPORT)
+        .and_then(|e| e.into_func())
+        .ok_or_else(|| wasmtime::Error::msg("module exports no dispatcher"))?
+        .typed::<(i32, i32), ()>(&*caller)?;
+    dispatch.call(&mut *caller, ((call.entry & !1) as i32, 0))?;
+    let (r0, r1) = (read_reg(caller, 0), read_reg(caller, 1));
+    for (i, &v) in saved_regs.iter().enumerate() {
+        write_reg(caller, i, v);
+    }
+    for (i, &v) in saved_vfp.iter().enumerate() {
+        write_vfp(caller, i, v);
+    }
+    let (mut regs, mut vfp) = (saved_regs, saved_vfp);
+    let outcome = {
+        let (bytes, host) = mem.data_and_store_mut(&mut *caller);
+        let base = host.base;
+        match host.import_env.as_mut() {
+            Some(env) => {
+                env.guest_call_returned(thid, r0, r1, &vitaslop_runtime::SliceMemory(&mut *bytes), base);
+                env.dispatch(selector, &mut regs, &mut vfp, &mut vitaslop_runtime::SliceMemory(bytes), base)
+            }
+            None => SvcOutcome::Fatal("a guest call was asked for with no import environment".into()),
+        }
+    };
+    for (i, &v) in regs.iter().enumerate() {
+        write_reg(caller, i, v);
+    }
+    for (i, &v) in vfp.iter().enumerate() {
+        write_vfp(caller, i, v);
+    }
+    Ok(outcome)
 }
 
 /// Run every pending guest re-entry the last import call raised.

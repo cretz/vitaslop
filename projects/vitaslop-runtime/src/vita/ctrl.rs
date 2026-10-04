@@ -58,7 +58,7 @@ fn buffer_count(count: i32) -> u32 {
 /// this ring should hold is not invented, it is the input the world ALREADY GAVE, one
 /// sample per display frame, and the engine simply was not keeping it.
 ///
-/// MEASURED on PCSE00120's difficulty select, which ignored up and down while `cross` worked
+/// MEASURED on a role-playing title's difficulty select, which ignored up and down while `cross` worked
 /// at every other screen: a d-pad press moved 9.9 MB of guest heap - the title saw it - and
 /// no cursor index changed. A title tests "held now AND NOT held one sample ago" before it
 /// moves a cursor, precisely so that holding a direction does not scroll a menu at 60 Hz;
@@ -126,7 +126,7 @@ impl CtrlHistory {
             // title polling every OTHER vblank (a 30 fps menu) that asks for 8 buffers gets 8
             // vblanks, 2 of them new. This ring used to add a sample only per READ: each 30 fps
             // read brought ONE new sample, and a title that takes "the last two" as new saw
-            // every press edge twice. MEASURED: Madden reads `count=8` every 2 vblanks from one
+            // every press edge twice. MEASURED: a football title reads `count=8` every 2 vblanks from one
             // site (0x8169ae05), and on the desktop browser one d-pad press moved its menu
             // cursor twice unless the key was only tapped (the user, 2026-09-25).
             //
@@ -301,13 +301,13 @@ fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) -> SvcO
     // since the previous `Read` on that port (at least one - it blocks for the next one
     // otherwise), and RETURNS how many (Vita3K: `min(count, vcount - last_vcount[port])`).
     // Returning `count` told a title that reads every 2-3 vblanks with `count = 8` that the pad
-    // had been held for 8 samples each time - MEASURED on Madden's front end (read site lr
+    // had been held for 8 samples each time - MEASURED on a football title's front end (read site lr
     // 0x8169ae05, count 8, every 2-3 vblanks): a held d-pad scrolled 4 rows in 12 frames,
     // its hold-timer running ~3x fast. The slots keep this ring's order (oldest first, newest
     // last), so a title reading `buf[ret - 1]` gets the current sample exactly as before.
-    // >>> OPT-IN (`VITASLOP_CTRL_READ_NEW=1`), NOT THE DEFAULT: it did NOT change Madden's
+    // >>> OPT-IN (`VITASLOP_CTRL_READ_NEW=1`), NOT THE DEFAULT: it did NOT change that title's
     // held-d-pad rate (ctl26fn vs ctl26fo, team wheel, identical cadence) and it DOES change
-    // OlliOlli's pushing recipe (2 of 2 shots differ; READ_ALL restores them byte-identical),
+    // a skating title's pushing recipe (2 of 2 shots differ; READ_ALL restores them byte-identical),
     // with no ground truth for which reading is the hardware's. Default = `count` samples.
     let vblank = u64::from(super::display::vcount(st));
     let count = if read_all() {
@@ -328,7 +328,7 @@ fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) -> SvcO
         new.clamp(1, u64::from(buffer_count(count))) as i32
     };
     let n = fill_ctrl(ctx, st, port, data, negative, count);
-    tracing::trace!(target: "vitaslop::input", port, asked = ctx.arg(2), returned = n, vblank, lr = format_args!("{:#010x}", ctx.regs[14]), "ctrl read");
+    tracing::trace!(target: "vitaslop::input", port, asked = ctx.arg(2), returned = n, vblank, frame = st.cur_frame(), lr = format_args!("{:#010x}", ctx.regs[14]), "ctrl read");
     ctx.ret(n as u32);
     if !st.is_preemptive() {
         return SvcOutcome::Continue;

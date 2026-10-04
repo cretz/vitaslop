@@ -370,6 +370,12 @@ pub fn decode(word: u64) -> Instr {
 /// what it copies, a copy is wrong by exactly that factor. It would show as the title's 2D UI
 /// being uniformly too bright or too dark against the same shader's other variant, which is on
 /// screen beside it.
+/// The refusal a group-0x80 epilogue with a PA destination carries until the program-level
+/// check (`usse::validate_sop2_pa_epilogues`) sees its result moved to `o[0]` and nothing else.
+pub(crate) const SOP2_PA_DEST_PENDING: &str =
+    "0x80 SOP2 blend into a PA register whose value does not reach o[0] through one final \
+     identity copy - the blend is established only as that epilogue";
+
 fn decode_grp_sop2(word: u64) -> Instr {
     let mut blocked: Option<&'static str> = None;
     // Every field the epilogue evidence does NOT establish, pinned to the value it has in the
@@ -425,11 +431,42 @@ fn decode_grp_sop2(word: u64) -> Instr {
         && bits(word, 48, 48) == 0
         && bits(word, 46, 44) == 0
         && bits(word, 20, 14) == 0
-        && bits(word, 33, 32) == 1 && bits(word, 27, 21) == 0      // dest o[0]
+        && ((bits(word, 33, 32) == 1 && bits(word, 27, 21) == 0)   // dest o[0]
+            || bits(word, 33, 32) == 2)                            // ...or a PA register (below)
         && bits(word, 29, 28) == 1 && bits(word, 6, 0) == 0        // src2 o[0]
         && bits(word, 40, 38) <= 4 && bits(word, 37, 35) <= 4      // colour selectors 0-4
         && bits(word, 53, 52) <= 2 && bits(word, 42, 41) <= 2;     // alpha selectors 0-2
-    if !established && !swapped && !general {
+    // A PA destination is the same epilogue with its result parked in a primary-attribute
+    // register and MOVED to `o[0]` by the program's last instruction. Only that program shape
+    // makes it the blend, which one word cannot see - so it blocks here with a reason that
+    // `super::validate_sop2_pa_epilogues` clears when the whole stream has that shape.
+    if general && bits(word, 33, 32) == 2 {
+        blocked = blocked.or(Some(SOP2_PA_DEST_PENDING));
+    }
+    // >>> THE SWAPPED ORIENTATION READ THROUGH THE SPEC'S FIELD TABLE: SRC1 the output register
+    // fed back (the blend DESTINATION), SRC2 the shader colour (the SOURCE), every established
+    // selector and complement, and the colour/alpha ops ADD or SUBTRACT (`T1 - T2` = dst - src,
+    // a REVERSE subtract). The copy of SRC2 is what the shader emits; the equation becomes the
+    // pipeline blend (`crate::rop_blend`). The two pinned `swapped` words above keep their
+    // measured readings - this arm only admits words they do not.
+    // MEASURED: a fighting title's main menu draws its SELECTED item's label through
+    // `0x81800c2160050000` (`dst - src*src.a` on colour and alpha) over a white highlight bar -
+    // white glyphs subtracted out of white leave black text, the one reading in which that label
+    // is legible at all. Refused, the label was simply absent.
+    let swapped_spec = !swapped && !established
+        && bits(word, 58, 57) == 0
+        && bits(word, 51, 51) == 0
+        && bits(word, 49, 49) == 0
+        && bits(word, 48, 48) == 0
+        && bits(word, 46, 44) == 0                                   // no repeat
+        && bits(word, 20, 20) == 0 && bits(word, 15, 14) == 0       // no src1/alpha/dest modifier
+        && bits(word, 19, 18) <= 1 && bits(word, 17, 16) <= 1       // ADD or SUBTRACT
+        && bits(word, 33, 32) == 1 && bits(word, 27, 21) == 0       // dest o[0]
+        && bits(word, 31, 30) == 1 && bits(word, 13, 7) == 0        // src1 o[0]
+        && bits(word, 29, 28) == 2                                  // src2 the PA bank
+        && bits(word, 40, 38) <= 4 && bits(word, 37, 35) <= 4       // colour selectors 0-4
+        && bits(word, 53, 52) <= 2 && bits(word, 42, 41) <= 2;      // alpha selectors 0-2
+    if !established && !swapped && !general && !swapped_spec {
         blocked = blocked.or(Some(
             "0x80 SOP2 in a form outside the fragment epilogue this corpus establishes - its \
              coefficient and op fields are not read, only pinned (see `decode_grp_sop2`)",
@@ -441,7 +478,7 @@ fn decode_grp_sop2(word: u64) -> Instr {
     // read through, and it is what makes the swapped shape the same instruction rather than a
     // second reading of it.
     let (s1_bank, s1_index) = r7_source_bank_index(bits(word, 31, 30) as u8, bits(word, 13, 7));
-    let src1 = if swapped {
+    let src1 = if swapped || swapped_spec {
         let sel = bits(word, 29, 28) as u8;
         let (bank, index) = r7_source_bank_index(sel, bits(word, 6, 0));
         Operand::plain(bank, index, sel)
@@ -1685,22 +1722,31 @@ fn swz_str(s: &str) -> [u8; 4] {
 }
 
 /// The RSWZ2 swizzle for a mad-group source operand, from the henkaku per-operand tables
-/// indexed by (swz_alt << 2 | op_swz). f32 mode uses 2-lane swizzles, f16 mode 4-lane.
-/// `which` is 1/2/3 for op1/op2/op3 (each has its own table).
-fn rswz2_mad(which: u8, half: bool, swz_alt: u32, op_swz: u32) -> [u8; 4] {
+/// indexed by (swz_alt << 2 | op_swz). `which` is 1/2/3 for op1/op2/op3 (each has its own
+/// table).
+///
+/// >>> ONE TABLE FOR BOTH WIDTHS. The henkaku f32 tables are TWO lanes wide, and every one of
+/// their 24 entries is exactly the first two lanes of the f16 entry at the same index. But a
+/// 32-bit mad can write a THIRD lane (`mask_table_mad`), and the two-lane tables say nothing
+/// about what it reads - padding it with `x` made lane 2 read lane 0's selector. The f16
+/// pattern's third lane is what the programs compute:
+/// * An action title's foliage wind (vprog 6a583bbed9fe6ea1 #22, `0x00a22b807f03c119`) is
+///   `frc(p + 0.5) * 2 - 1` over xyz - op1 entry 4 must read `z` and op3 entry 1 (`yy`, the
+///   -1 in SA51) must read `y`. Padded, z became `2 * frc.x + 3` and the leaves flew off the
+///   plant as giant flat shards.
+/// * A fighting title's decal skinning (vert_86119530 #64/#65) computes `I4.xy = pa13 * sa0.xy + sa12.xy`
+///   and then the lane-2-only tail `I4.z = pa12.[yy] * sa2 + sa14` - `pa13` again under the
+///   f16 pattern, the unrelated `pa12` under the padding.
+/// `f32_mads_that_write_lane_2` (tests/corpus.rs) lists every instruction this reaches.
+fn rswz2_mad(which: u8, _half: bool, swz_alt: u32, op_swz: u32) -> [u8; 4] {
     let idx = (((swz_alt & 1) << 2) | (op_swz & 3)) as usize;
-    let f32t: [[&str; 8]; 3] = [
-        ["xx", "yy", "zz", "ww", "xy", "yz", "xy", "zw"], // op1
-        ["xx", "yy", "zz", "ww", "xy", "xy", "yy", "wy"], // op2
-        ["xx", "yy", "zz", "ww", "xy", "xz", "xx", "xy"], // op3
-    ];
-    let f16t: [[&str; 8]; 3] = [
+    let table: [[&str; 8]; 3] = [
         ["xxxx", "yyyy", "zzzz", "wwww", "xyzw", "yzxw", "xyww", "zwxy"], // op1
         ["xxxx", "yyyy", "zzzz", "wwww", "xyzw", "xyyz", "yyww", "wyzw"], // op2
         ["xxxx", "yyyy", "zzzz", "wwww", "xyzw", "xzww", "xxyz", "xyzz"], // op3
     ];
     let row = (which as usize).saturating_sub(1).min(2);
-    swz_str(if half { f16t[row][idx] } else { f32t[row][idx] })
+    swz_str(table[row][idx])
 }
 
 /// [`rswz2_mad`] for the ASSEMBLER, which searches this table for the field values producing a
@@ -1752,8 +1798,8 @@ pub(crate) fn mask_table_mad_for(half: bool, m16: u32, m32: u32, en: u32) -> [bo
 ///
 /// >>> AND THAT COMBINATION IS REAL AND ITS OLD READING WAS IMPOSSIBLE. `instructions_whose_
 /// >>> write_mask_is_empty` censuses every corpus on disk: the ONLY instruction anywhere that
-/// >>> decodes to an empty destination mask is exactly `df=0 m16=1 m32=0 en=0` - 45 in mlb, 5 in
-/// >>> ridgeracer, 1 in mk, 0 in seven other titles - and a shipped compiler does not emit an
+/// >>> decodes to an empty destination mask is exactly `df=0 m16=1 m32=0 en=0` - 45 in a baseball title, 5 in
+/// >>> a racer, 1 in a fighting title, 0 in seven other titles - and a shipped compiler does not emit an
 /// >>> instruction that writes nothing. Under the bitmask it writes lane 2, which is the third
 /// >>> component of a vec3, and that is what those instructions are: the tail of a skinning
 /// >>> accumulate whose first two lanes are the MAD before it.
@@ -2766,7 +2812,7 @@ fn decode_grp_30(word: u64, hi: u32, lo: u32) -> Instr {
 /// * F32 source, F16 destination: the op at F32 into `scratch`, then a pack of it to F16 into
 ///   the destination.
 ///
-/// MEASURED on a fighting title (PCSE00235): its character vertex programs clamp `dot(N,H)` with
+/// MEASURED on a fighting title: its character vertex programs clamp `dot(N,H)` with
 /// a half-precision `max` into `pa0.x` and `log` it at full precision. Reading that half as an
 /// F32 took the packed pair's bits as a float (a tiny negative), the log was NaN, the NaN rode a
 /// varying into the fragment's colour arithmetic, and every character was drawn black.
@@ -3966,6 +4012,36 @@ pub(crate) fn pack_comp0_high_bit(src_fmt: u32) -> u32 {
     if from_bit7 { 7 } else { 1 }
 }
 
+/// For each destination lane of a 0x40 VPCK, the component-select SLOT it reads (`None` for a
+/// lane the mask leaves alone). Facts from docs-re/usse-spec-vpck-selectors.md:
+///
+/// * POSITIONAL - enabled lane i reads slot i - when both formats are float (F16/F32, any mix),
+///   or when `scale` is set and either format is U8 (code 0; S8 and O8 do not count).
+/// * One CYCLING case: either format U8 with all four lanes enabled (which occurs only with
+///   `scale` clear) - lane i reads slot `i mod 2`.
+/// * IN ORDER otherwise - the k-th enabled lane reads slot k, and slots past the enabled count
+///   are ignored.
+pub(crate) fn pack_lane_slots(src_fmt: u32, dest_fmt: u32, scale: bool, mask: [bool; 4]) -> [Option<usize>; 4] {
+    let is_float = |f: u32| f == 5 || f == 6;
+    let u8_side = src_fmt == 0 || dest_fmt == 0;
+    let mut out = [None; 4];
+    let mut k = 0;
+    for c in 0..4 {
+        if !mask[c] {
+            continue;
+        }
+        out[c] = Some(if (is_float(src_fmt) && is_float(dest_fmt)) || (scale && u8_side) {
+            c
+        } else if u8_side && mask == [true; 4] {
+            c % 2
+        } else {
+            k
+        });
+        k += 1;
+    }
+    out
+}
+
 fn decode_grp_pack(word: u64) -> Instr {
     let src_fmt = bits(word, 43, 41);
     let dest_fmt = bits(word, 40, 38);
@@ -4038,11 +4114,16 @@ fn decode_grp_pack(word: u64) -> Instr {
     // widths (S8/U16/S16) have no such representation and stay blocked below.
     let unorm8_from_float = scale && is_float(src_fmt) && dest_fmt == 0;
     let unorm8_to_float = scale && src_fmt == 0 && is_float(dest_fmt);
+    // The OTHER normalized float->integer widths (S8, U16, S16): the value is scaled into the
+    // integer's range and stored as its bit pattern, exactly where the truncating cast stores
+    // one - see `Op::PackToInt::norm`. U8 is the fx8 path above.
+    let norm_from_float = scale && is_float(src_fmt) && int_dest.is_some() && dest_fmt != 0;
     if (!is_float(src_fmt) || !is_float(dest_fmt))
         && !float_to_int
         && !int_to_float
         && !unorm8_from_float
         && !unorm8_to_float
+        && !norm_from_float
         && int_copy.is_none()
     {
         blocked = blocked.or(Some("0x40 pack non-float<->float conversion (int-normalize / C10 / O8) not modeled"));
@@ -4157,6 +4238,28 @@ fn decode_grp_pack(word: u64) -> Instr {
     if s1.bank == Bank::Indexed {
         s1.swizzle = [0, 1, 2, 3];
     }
+    // >>> WHICH SELECTOR SLOT A DESTINATION LANE READS - see `pack_lane_slots`, and the spec
+    // docs-re/usse-spec-vpck-selectors.md. Stored here as a CHANNEL-aligned swizzle (lane i's
+    // own selector in slot i), the form every reader of `swizzle[c]` already takes - the
+    // emitter, the reference interpreter and the register-span analysis - so the rule lives in
+    // one place.
+    //
+    // MEASURED: a foliage G-buffer program packs its normal with `pack.int o.xy <- pa2.[0,1]`
+    // then `pack.int o.zw <- pa2.[2,3,0,0]` (F16 -> S8, normalized). Read by channel, z and w
+    // took slots 2 and 3 (both 0) and wrote normal.x twice - sixteen of one scene's G-buffer
+    // programs lit their surfaces with a normal whose z was its x. The rule is NOT "only
+    // float-to-float is positional": a colour pass-through packs its alpha with
+    // `pack.unorm8 o.w <- c.[0,0,0,3]` (F16 -> U8, normalized) and means c.w - the U8 +
+    // scale case is positional too.
+    if s1.bank != Bank::Indexed {
+        let mask = write_mask4(bits(word, 37, 34));
+        let sel = s1.swizzle;
+        for (c, slot) in pack_lane_slots(src_fmt, dest_fmt, bits(word, 18, 18) != 0, mask).into_iter().enumerate() {
+            if let Some(slot) = slot {
+                s1.swizzle[c] = sel[slot];
+            }
+        }
+    }
 
     // >>> A 32-BIT SOURCE IS A REGISTER PAIR, SO COMPONENTS 2 AND 3 COME FROM `src2`.
     //
@@ -4201,8 +4304,8 @@ fn decode_grp_pack(word: u64) -> Instr {
             Op::PackUnorm8 { to_unorm8: false, float_half: dest_fmt == 5 }
         } else {
             match (int_dest, int_src) {
-                (Some((bits_, signed)), _) if float_to_int => {
-                    Op::PackToInt { bits: bits_, signed, src_half: src_fmt == 5 }
+                (Some((bits_, signed)), _) if float_to_int || norm_from_float => {
+                    Op::PackToInt { bits: bits_, signed, src_half: src_fmt == 5, norm: norm_from_float }
                 }
                 (_, Some((bits_, signed))) if int_to_float => {
                     Op::PackFromInt { bits: bits_, signed }
@@ -5019,7 +5122,7 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             // This used to advance by the number of channels the DP SUMS (3 or 4 from bit 52),
             // which is right for a 4-component DP and wrong for a 3-component one - and a
             // 3-component DP over a matrix is exactly how a program transforms a NORMAL.
-            // PCSA00009's world material opens with a three-iteration 3-component DP whose
+            // A golf title's world material opens with a three-iteration 3-component DP whose
             // source is `PrimaryAttr[28]`; its rows are the `modelWorldX/Y/Z` attributes, which
             // the container declares at lanes 28, 32 and 36 - FOUR apart, because each is a
             // declared float4. Stepping by three read `pa[28]`, `pa[31]`, `pa[34]`: row 0
@@ -5035,7 +5138,7 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             // >>> correction the DESTINATION above already carries, for the same reason.
             // Routing it through the SMLSI source byte is invisible while the state is
             // `Increment(1)`, which is what every repeating DP that motivated the stride-4
-            // reading runs under, and wrong the moment a program programs anything else. mlb's
+            // reading runs under, and wrong the moment a program programs anything else. A baseball title's
             // CROWD-ATLAS bake (`vert_843ba650`, pair 713e7c1416ebf530) opens
             // `SMLSI [2, 2, 2, 2]` and then builds its clip position with a three-iteration
             // 4-component DP whose source is `PrimaryAttr[20]`. Its rows are the
@@ -5051,7 +5154,7 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             //
             // The intrinsic reading is the only one that fits all three witnesses at once: this
             // program (SMLSI 2, rows 4 apart), its sibling `vert_843b9ce8` (SMLSI 1, rows 4
-            // apart, which the MOE reading also gets right) and PCSA00009's world material
+            // apart, which the MOE reading also gets right) and the golf title's world material
             // (rows 4 apart). A MOE-governed source would have to read a different stride out
             // of each, and there is no stride that does.
             let _ = bits(word, 52, 52);
@@ -5060,7 +5163,7 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             // The intrinsic four is right for every repeating DP whose bit 47 is CLEAR - golf's
             // `modelWorldX/Y/Z` transforms under the default state, and the crowd-atlas bake above
             // under `SMLSI [2,2,2,2]`, which a MOE reading would have sent to pa[20]/pa[28]/pa[36].
-            // It is wrong for the two whose bit 47 is SET. mlb's crowd-PEOPLE program
+            // It is wrong for the two whose bit 47 is SET. The baseball title's crowd-PEOPLE program
             // (`vert_843b87e4`) and its sibling (`vert_843b9ce8`) run a TWO-iteration 4-channel DP
             // over `InstanceMatrix3x4` under `SMLSI [1,1,4,4]`, and compute row 1 with a SEPARATE
             // dot - so the repeat must read rows 0 and 2, eight registers apart. Stepping four
@@ -5075,17 +5178,17 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
             // repeating DP in the corpus has them equal. `VITASLOP_GXP_DP_MOE_BIT47=0` restores the
             // intrinsic four for every DP.
             //
-            // >>> AND BIT 48 SAYS WHICH SOURCE WALKS. Set (the crowd pair, mk's two bone dots):
+            // >>> AND BIT 48 SAYS WHICH SOURCE WALKS. Set (the crowd pair, a fighting title's two bone dots):
             // op1 steps as above. CLEAR: op1 HOLDS and the INTERNAL op2 steps one register per
             // iteration, whatever the SMLSI says - three programs, three SMLSIs ([1,1,-2,-2],
             // [1,1,2,2], swizzle mode), one answer, and each proven by a load that is otherwise
-            // dead. mlb's `vert_84377374` loads `i1 = sa40`, `i2 = sa36` and never reads `i2`
+            // dead. The baseball title's `vert_84377374` loads `i1 = sa40`, `i2 = sa36` and never reads `i2`
             // again: the repeat is `(dot(pa8, sa40), dot(pa8, sa36))`, a planar UV projection.
-            // Madden's `frag_9091b740` loads `i1 = sa72`, `i2 = sa76`, repeats twice, then carries
+            // A football title's `frag_9091b740` loads `i1 = sa72`, `i2 = sa76`, repeats twice, then carries
             // on BY HAND with `i2 = sa80` and `sa84` - four matrix rows against one `Temp8`.
-            // Madden's `vert_90c06100` loads `i0,i1,i2 = t0,t4,t8` and writes `i0.xyz`: a 3x3
+            // Its `vert_90c06100` loads `i0,i1,i2 = t0,t4,t8` and writes `i0.xyz`: a 3x3
             // transform of `pa8`. Stepping op1 instead read the raw Normal/UV1 attributes as
-            // matrix rows (mlb) and overwrote the operand it was reading (Madden vert).
+            // matrix rows (baseball) and overwrote the operand it was reading (football vert).
             if bits(word, 47, 47) == 1 && crate::link::arm_on(crate::link::DP_MOE_BIT47_ARM) {
                 if bits(word, 48, 48) == 0 {
                     return Some(vec![fixed(1), fixed(0), fixed(4)]);
@@ -5755,7 +5858,7 @@ fn decode_grp_mem_load(word: u64) -> Instr {
     // component was zero, so the world's final `colour * exposure` multiplied by exactly 0.
     //
     // PROVABLY INERT ON EVERY OTHER TITLE: the same census reports ZERO `moe_expand` loads in
-    // the mk, golf, p4 and OlliOlli corpora - the bit is set nowhere else, so this row cannot
+    // the fighting, golf, role-playing and skating corpora - the bit is set nowhere else, so this row cannot
     // move a shader that does not use it.
     //
     // A field of 0 would be ambiguous under a bias of one and does not occur; it refuses by name
@@ -6554,6 +6657,31 @@ mod tests {
         assert_eq!((ops[2].slot, ops[2].stride), (3, 0));
     }
 
+    /// A VPCK's destination lane reads the selector SLOT `pack_lane_slots` names: in order for
+    /// most conversions, positional for float<->float and for a normalized U8 side. Pinned on
+    /// real shipped words whose intent the code around them makes plain.
+    #[test]
+    fn a_pack_lane_reads_the_selector_slot_its_formats_name() {
+        let lanes = |w: u64| {
+            let i = decode(w);
+            let s = i.srcs[0].swizzle;
+            (0..4).filter(|&c| i.write_mask[c]).map(|c| s[c]).collect::<Vec<u8>>()
+        };
+        // F16 -> S8, normalized: a G-buffer normal's x,y then its z and a gloss term - IN ORDER.
+        assert_eq!(lanes(0x40810a4ea0250100), vec![0, 1]);
+        assert_eq!(lanes(0x40810a72a0270102), vec![2, 3], "z,w <- src.z,w, not src.x twice");
+        // F16 -> U8, normalized: a vertex colour's ALPHA into the alpha lane - POSITIONAL.
+        assert_eq!(lanes(0x40810a22a01c0000), vec![3], "w <- src.w, not src.x");
+        // F32 -> S16, plain: a lone .y after an .x of another value - IN ORDER.
+        assert_eq!(lanes(0x40c10d0aa0a00101), vec![1], "y <- src.y");
+        // F32 -> U16, plain, x only.
+        assert_eq!(lanes(0x40c10cc6a0a00300), vec![0]);
+        // Float -> float stays positional: `[...w] <- .[0,0,0,3]`.
+        assert_eq!(pack_lane_slots(5, 6, false, [false, false, false, true]), [None, None, None, Some(3)]);
+        // A U8 side, unscaled, all four lanes: the one CYCLING case.
+        assert_eq!(pack_lane_slots(6, 0, false, [true; 4]), [Some(0), Some(1), Some(0), Some(1)]);
+    }
+
     /// Bit 47 rides ALONGSIDE the count, and the one value no corpus contains still blocks.
     #[test]
     fn a_dot_repeat_field_reads_the_count_from_bits_46_44() {
@@ -6907,6 +7035,21 @@ mod tests {
         assert!(ins.blocked.is_none() && ins.is_supported(), "plain 2D tex must emit: {:?}", ins.blocked);
     }
 
+    /// A 32-bit mad that writes lane 2 reads lane 2 through the F16 four-lane pattern. The real
+    /// word is an action title's foliage wind (`frc(p + 0.5) * 2 - 1` over xyz): op1 entry 4 (`xy` in
+    /// the two-lane table) must read `z`, and op3 entry 1 (`yy`, the -1) must read `y`. Padded
+    /// with `x`, lane 2 computed `2 * frc.x + 3` and flung the leaves off every plant.
+    #[test]
+    fn an_f32_mad_reads_lane_two_through_the_four_lane_pattern() {
+        let ins = decode(0x00a22b807f03c119);
+        assert_eq!(ins.op, Op::Mad);
+        assert!(!ins.half_precision);
+        assert_eq!(ins.write_mask, [true, true, true, false]);
+        assert_eq!(&ins.srcs[0].swizzle[..3], &[0, 1, 2], "op1 entry 4 is xyzw");
+        assert_eq!((ins.srcs[2].bank, ins.srcs[2].index), (Bank::SecondaryAttr, 50));
+        assert_eq!(&ins.srcs[2].swizzle[..3], &[1, 1, 1], "op3 entry 1 is yyyy");
+    }
+
     #[test]
     fn pack_float_to_float_is_swizzled_copy() {
         // VPCK F16<-F32 (dest_fmt=5, src_fmt=6): dest is R7 (direct) temp reg 3 -> r3; src1 is
@@ -7006,13 +7149,14 @@ mod tests {
     /// DIFFERENT operations. The unscaled form is what a shader computing an array INDEX in
     /// float emits before indexing with it; the scaled U8 form is a fragment epilogue writing
     /// an 8-bit surface, and it is emittable because `Prec::Fx8` already carries the packed
-    /// representation. The scaled forms of the OTHER widths do not have one and stay blocked.
+    /// representation. The scaled forms of the OTHER widths are the truncating cast's own store
+    /// (a byte or a half of the register) with the value scaled first - `PackToInt { norm }`.
     #[test]
-    fn pack_float_to_int_converts_unscaled_and_normalizes_only_into_u8() {
+    fn pack_float_to_int_converts_unscaled_and_normalizes() {
         // VPCK U8<-F32 (src_fmt=6, dest_fmt=0), scale (bit 18) clear: a truncating cast.
         let w = word_bits(&[(0x08, 63, 59), (6, 43, 41), (0, 40, 38)]);
         let ins = decode(w);
-        assert_eq!(ins.op, Op::PackToInt { bits: 8, signed: false, src_half: false });
+        assert_eq!(ins.op, Op::PackToInt { bits: 8, signed: false, src_half: false, norm: false });
         assert!(ins.blocked.is_none(), "unscaled float->int converts: {:?}", ins.blocked);
         // The same word with `scale` set is the NORMALIZED conversion - a different number by a
         // factor of 255, and a different operation.
@@ -7023,13 +7167,18 @@ mod tests {
         // ...and the other direction, U8 -> float, is the same conversion run backwards.
         let back = word_bits(&[(0x08, 63, 59), (0, 43, 41), (5, 40, 38), (1, 18, 18)]);
         assert_eq!(decode(back).op, Op::PackUnorm8 { to_unorm8: false, float_half: true });
-        // A normalized S16 has no packed representation in this register model, so it stays
-        // blocked where the U8 form no longer does.
+        // A normalized S16 is the S16 cast's half-register store with the value scaled first.
         let s16_norm = word_bits(&[(0x08, 63, 59), (6, 43, 41), (4, 40, 38), (1, 18, 18)]);
-        assert!(decode(s16_norm).blocked.is_some(), "normalized S16 must stay blocked");
+        let ins = decode(s16_norm);
+        assert_eq!(ins.op, Op::PackToInt { bits: 16, signed: true, src_half: false, norm: true });
+        assert!(ins.blocked.is_none(), "normalized S16 converts: {:?}", ins.blocked);
+        // The retail word itself: F16 -> S8 normalized, two channels (a packed normal).
+        let s8 = decode(0x4081_0a4e_a025_0100);
+        assert_eq!(s8.op, Op::PackToInt { bits: 8, signed: true, src_half: true, norm: true });
+        assert!(s8.blocked.is_none(), "F16 -> snorm8 converts: {:?}", s8.blocked);
         // S16<-F32 is the width the one shader that needs this uses, and it is SIGNED.
         let s16 = word_bits(&[(0x08, 63, 59), (6, 43, 41), (4, 40, 38)]);
-        assert_eq!(decode(s16).op, Op::PackToInt { bits: 16, signed: true, src_half: false });
+        assert_eq!(decode(s16).op, Op::PackToInt { bits: 16, signed: true, src_half: false, norm: false });
         // C10 (7) on the destination is a packed representation this model does not carry.
         let c10 = word_bits(&[(0x08, 63, 59), (6, 43, 41), (7, 40, 38)]);
         assert!(decode(c10).blocked.is_some(), "C10 destination must stay blocked");
@@ -7073,9 +7222,9 @@ mod tests {
         );
         let dest = swapped.dest.as_ref().expect("a destination");
         assert_eq!((dest.bank, dest.index), (Bank::Output, 0));
-        // ...and the shape is pinned: the same word with `mod2` set is a form nothing
-        // establishes and must block rather than emit a copy.
-        assert!(decode(0x8190_0021_6004_0000u64 | (1 << 47)).blocked.is_some());
+        // ...and a field the spec does not establish still blocks: the same word with
+        // `asrc1_mod` (bit 15) set must not emit a copy.
+        assert!(decode(0x8190_0021_6004_0000u64 | (1 << 15)).blocked.is_some());
 
         // The plain-SOP2 field table (`docs-re/usse-spec-sop2.md`) admits the epilogue with ANY
         // established factor pair: a fighting title's ONE-alpha and ONE,ONE words copy the shader
@@ -7086,6 +7235,17 @@ mod tests {
             assert!(ins.blocked.is_none(), "{word:#x}: {:?}", ins.blocked);
             assert_eq!(crate::usse::decode::repeat_extra_iterations(word), Some(0), "{word:#x}");
         }
+        // The SWAPPED orientation through the same table: a fighting title's selected-menu-item
+        // label ends in `0x81800c2160050000` (`dst - src*src.a`). The shader copies SRC2, the
+        // packed colour; the reverse subtract is the pipeline's.
+        let sub = decode(0x8180_0c21_6005_0000u64);
+        assert_eq!(sub.op, Op::CopyFx8);
+        assert!(sub.blocked.is_none(), "{:?}", sub.blocked);
+        let src = sub.srcs.first().expect("one source");
+        assert_eq!((src.bank, src.index), (Bank::PrimaryAttr, 0), "the source is SRC2, the colour");
+        // ...but a MIN/MAX op (19:18 = 2) there is not established and blocks.
+        assert!(decode(0x8180_0c21_6005_0000u64 | (1 << 19)).blocked.is_some());
+
         // What the spec does NOT establish still refuses: a SUBTRACT colour op (bit 18) and a
         // colour selector of 5 (40:38) - a copy would drop the equation they describe.
         let op_sub = 0x8090_80d9_9000_0000u64 | (1 << 18);
@@ -7607,7 +7767,7 @@ mod tests {
             ])
         );
         // With bits 47 AND 48 SET the vector source is MOE-governed instead: the SMLSI's src1
-        // slot, two registers a unit (mlb's crowd `[1,1,4,4]` reads rows 0 and 2; mk's
+        // slot, two registers a unit (the baseball crowd `[1,1,4,4]` reads rows 0 and 2; the fighting title's
         // `[1,1,-10,-10]` steps back twenty).
         assert_eq!(
             repeat_operands(dp | (1 << 47) | (1 << 48)),

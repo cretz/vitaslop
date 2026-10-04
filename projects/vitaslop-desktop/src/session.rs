@@ -5,12 +5,18 @@
 use std::time::{Duration, Instant};
 
 use vitaslop_runtime::capture::Scene;
-use vitaslop_runtime::TouchFrame;
+use vitaslop_runtime::{CtrlFrame, TouchFrame};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::PhysicalKey;
 
+use crate::audio_out::AudioOut;
 use crate::input::Input;
-use crate::retail::{DesktopInput, RetailGuest, SharedInput, FRAME_DT, GAME_H, GAME_W, PANEL_SCALE};
+use crate::retail::{DesktopInput, RetailGuest, SharedInput, GAME_H, GAME_W, PANEL_SCALE};
+
+/// One display period, in ms.
+const FRAME_MS: f64 = 1000.0 / 60.0;
+/// The most wall time either direction may bank - the browser's `MAX_CATCHUP_MS`.
+const MAX_CATCHUP_MS: f64 = 4.0 * FRAME_MS;
 
 pub(crate) struct Session {
     pub guest: RetailGuest,
@@ -26,7 +32,13 @@ pub(crate) struct Session {
     pub game_rect: Option<(f64, f64, f64, f64)>,
     cursor: (f64, f64),
     mouse_down: bool,
-    acc: Duration,
+    /// Wall time owed to the guest, in ms - NEGATIVE when the last frame advanced more game
+    /// time than the wall has since (a 30 fps title's two-period frame). See `tick`.
+    acc_ms: f64,
+    /// Floor charges banked to be refunded by the next long frame, and the wall-floor game time
+    /// already accounted for - see `tick`.
+    pace_debt_ms: f64,
+    floor_seen_us: u64,
     pub last_tick: Instant,
     fps_since: Instant,
     fps_frames: u32,
@@ -34,6 +46,19 @@ pub(crate) struct Session {
     fps: f64,
     guest_fps: f64,
     reported_exit: bool,
+    /// The controller state the guest was last handed - what the on-screen controls light.
+    pub last_ctrl: CtrlFrame,
+    /// The mouse is on the on-screen controls, so it is not touching the game screen.
+    pub overlay_pointer: bool,
+    /// `VITASLOP_CLOCK_EVERY` - see [`Self::report_clock`]: `(frame, wall, game us, audio s)`.
+    clock_mark: Option<(u64, Instant, u64, f64, f64)>,
+    /// The game clock at the last [`Self::stats`] window - for its `% speed`.
+    clock_since: u64,
+    /// The speakers, when this machine has any. `None` plays silent, as a headless run does.
+    pub audio: Option<AudioOut>,
+    /// When the guest's first frame was asked for, and the game clock then - for the run line
+    /// [`Session::report_audio`] prints (the window title's speed is a 250 ms window).
+    run_start: Option<(Instant, u64)>,
 }
 
 pub(crate) struct Stats {
@@ -67,8 +92,29 @@ impl Stats {
 }
 
 impl Session {
-    pub fn new(guest: RetailGuest, input_shared: SharedInput, input: Input, pause_on_blur: bool) -> Session {
+    pub fn new(mut guest: RetailGuest, input_shared: SharedInput, input: Input, pause_on_blur: bool) -> Session {
+        let clock_since = guest.clock_us();
+        // The window is where sound belongs; the guest is built with no sink at all (headless
+        // runs keep it that way), so the speakers are attached here, before its first frame.
+        let audio = match AudioOut::open() {
+            Ok(out) => {
+                println!("audio: {}", out.device);
+                // `VITASLOP_AUDIO_MUTE=1`: start muted. The device still consumes, so every
+                // counter (underrun above all) reads as it would aloud.
+                if std::env::var("VITASLOP_AUDIO_MUTE").is_ok_and(|v| v.trim() == "1") {
+                    out.set_muted(true);
+                }
+                guest.set_audio_sink(Box::new(out.sink()));
+                Some(out)
+            }
+            Err(e) => {
+                eprintln!("audio: {e} - the title will run silent");
+                None
+            }
+        };
         Session {
+            audio,
+            run_start: None,
             guest,
             input_shared,
             input,
@@ -78,7 +124,9 @@ impl Session {
             game_rect: None,
             cursor: (0.0, 0.0),
             mouse_down: false,
-            acc: Duration::ZERO,
+            acc_ms: 0.0,
+            pace_debt_ms: 0.0,
+            floor_seen_us: 0,
             last_tick: Instant::now(),
             fps_since: Instant::now(),
             fps_frames: 0,
@@ -86,6 +134,10 @@ impl Session {
             fps: 0.0,
             guest_fps: 0.0,
             reported_exit: false,
+            last_ctrl: CtrlFrame::default(),
+            overlay_pointer: false,
+            clock_mark: None,
+            clock_since,
         }
     }
 
@@ -138,26 +190,37 @@ impl Session {
     pub fn tick(&mut self, window_size: Option<(f64, f64)>) {
         self.input.pump_gamepad();
         let ctrl = self.input.ctrl_frame();
-        let touch = self.mouse_touch(window_size);
+        self.last_ctrl = ctrl;
+        // A press on the on-screen controls is theirs, not a touch on the screen under them.
+        let touch = if self.overlay_pointer { None } else { self.mouse_touch(window_size) };
         *self.input_shared.lock().unwrap() = DesktopInput { ctrl, touch };
 
         let now = Instant::now();
-        self.acc += now.duration_since(self.last_tick);
+        self.acc_ms += now.duration_since(self.last_tick).as_secs_f64() * 1000.0;
         self.last_tick = now;
 
-        if self.paused || self.paused_by_blur {
-            self.acc = Duration::ZERO;
+        let paused = self.paused || self.paused_by_blur;
+        if let Some(a) = &self.audio {
+            a.set_paused(paused);
+        }
+        if paused {
+            self.acc_ms = 0.0;
         } else {
+            if self.run_start.is_none() {
+                self.run_start = Some((Instant::now(), self.guest.clock_us()));
+            }
             if self.guest.current().is_empty() {
                 self.guest.advance(); // bootstrap the first frame (runs the whole boot)
             }
-            if self.acc >= FRAME_DT {
-                self.acc -= FRAME_DT;
+            if self.acc_ms >= FRAME_MS {
                 self.guest.advance();
+                let charge = self.charge();
+                self.acc_ms = (self.acc_ms - charge).max(-MAX_CATCHUP_MS);
+                self.report_clock();
             }
-            if self.acc > FRAME_DT * 4 {
-                self.acc = Duration::ZERO;
-            }
+            // Neither direction banks more than four frames: a stall's surplus is dropped rather
+            // than run back at speed.
+            self.acc_ms = self.acc_ms.min(MAX_CATCHUP_MS);
         }
 
         if self.guest.finished() && !self.reported_exit {
@@ -169,9 +232,139 @@ impl Session {
         }
     }
 
+    /// `VITASLOP_CLOCK_EVERY=<frames>`: every that many guest frames, one line of how far the
+    /// GAME clock, the WALL and the SOUND moved over the window. The run line at exit is a whole
+    /// run's average, and a cutscene that plays fast for ten seconds of a five-minute run does
+    /// not move it.
+    fn report_clock(&mut self) {
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let every = *EVERY.get_or_init(|| std::env::var("VITASLOP_CLOCK_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+        if every == 0 {
+            return;
+        }
+        let f = self.guest.frames();
+        let underrun = self.audio.as_ref().map_or(0.0, |a| a.stats().underrun_s);
+        let now = (f, Instant::now(), self.guest.clock_us(), self.guest.audio_produced_seconds(), underrun);
+        match self.clock_mark {
+            Some((f0, t0, c0, a0, u0)) if f >= f0 + every => {
+                let wall = now.1.duration_since(t0).as_secs_f64();
+                let game = now.2.saturating_sub(c0) as f64 / 1e6;
+                println!(
+                    "clock: f{f0}-f{f} wall {wall:.2} s game {game:.2} s ({:.0}%) sound {:.2} s ({:.0}% of game), underrun {:.3} s | {:.1} guest fps",
+                    100.0 * game / wall.max(1e-9),
+                    now.3 - a0,
+                    100.0 * (now.3 - a0) / game.max(1e-9),
+                    now.4 - u0,
+                    (f - f0) as f64 / wall.max(1e-9)
+                );
+                self.clock_mark = Some(now);
+            }
+            Some(_) => {}
+            None => self.clock_mark = Some(now),
+        }
+    }
+
+    /// >>> A FRAME COSTS THE WALL TIME OF THE GAME TIME IT ADVANCED - two display periods on a
+    /// 30 fps title, not one. The browser's pacer (`vitaslop-web/src/lib.rs`, the live loop's
+    /// `advanced_ms`), rule for rule.
+    ///
+    /// This charged a flat 1/60 s per frame, which paced one guest FLIP per display period: a
+    /// title whose frame waits for two vblanks ran at twice real time. MEASURED in this window
+    /// (a fighting title's menus and cutscenes, 7,000 frames): 59.4 fps with the game clock
+    /// at 127% of the wall. The browser measured the same thing first (`fps 53 (177% speed)`).
+    ///
+    /// - A frame advancing less than a period is charged a whole one, and the overcharge is
+    ///   BANKED (to four frames) and refunded out of the frames that advance more - so over any
+    ///   stretch the charge is the clock's own advance.
+    /// - The wall FLOOR's pull is not charged: a slow guest's clock pulled up to the wall is
+    ///   wall time already in `acc_ms`.
+    fn charge(&mut self) -> f64 {
+        let advanced = self.guest.last_advance_us() as f64 / 1000.0;
+        let floor = self.guest.clock_from_wall_us();
+        let gain = floor.saturating_sub(self.floor_seen_us) as f64 / 1000.0;
+        self.floor_seen_us = floor;
+        let mut c = (advanced - gain).max(0.0);
+        let give = self.pace_debt_ms.min((c - FRAME_MS).max(0.0));
+        c -= give;
+        self.pace_debt_ms -= give;
+        if c < FRAME_MS {
+            self.pace_debt_ms = (self.pace_debt_ms + FRAME_MS - c).min(MAX_CATCHUP_MS);
+            c = FRAME_MS;
+        }
+        c
+    }
+
     pub fn scenes(&mut self) -> (&[Scene], (u32, u32), &[u32]) {
         let display = self.guest.display_size();
         (self.guest.current(), display, self.guest.current_presents())
+    }
+
+    /// Whether the guest is stepping (not paused by the person or the window, not ended).
+    pub fn live(&self) -> bool {
+        !self.paused && !self.paused_by_blur && !self.guest.finished()
+    }
+
+    /// How long until [`Self::tick`] will step the guest again - what a window SLEEPS for
+    /// instead of re-presenting an unchanged frame every display period. Zero when it is due.
+    pub fn due_in(&self) -> Duration {
+        let owed = self.acc_ms + self.last_tick.elapsed().as_secs_f64() * 1000.0;
+        Duration::from_secs_f64(((FRAME_MS - owed) / 1000.0).max(0.0))
+    }
+
+    /// The executable the guest's `sceAppMgrLoadExec` asked to be REPLACED by, once its process
+    /// has halted for it - taken, so the owner boots it once. The browser and the headless run
+    /// boot it in place; a window that did not left a launcher-first title (an action title)
+    /// sitting on a halted launcher, unplayable.
+    pub fn take_exec(&mut self) -> Option<String> {
+        if !self.guest.finished() {
+            return None;
+        }
+        self.guest.take_exec_request()
+    }
+
+    /// Put a frame's rendered small targets back in guest memory - see
+    /// `vitaslop_native::apply_rtt_writebacks`, and `RetailGfx::rtt_writebacks` for where they
+    /// come from. A title that reads a target it drew on the CPU otherwise reads its own
+    /// allocator poison.
+    pub fn apply_writebacks(&mut self, wb: &[(u32, u32, u32, Vec<u8>)]) {
+        if wb.is_empty() {
+            return;
+        }
+        let scenes = self.guest.current().to_vec();
+        // On the parallel engine the guest keeps running between frames: it PAUSES for the
+        // write, so no guest store lands between the whole-region check and the bytes - the
+        // browser's `pause_guest`.
+        self.guest.pause_guest();
+        let guest = &self.guest;
+        vitaslop_native::apply_rtt_writebacks(wb, &scenes, |a, n| guest.read_guest(a, n), |a, b| guest.write_guest(a, b));
+        self.guest.resume_guest();
+    }
+
+    /// One line on what reached the speakers: the guest's own production beside the device's
+    /// counters. Underrun is the emulator not keeping up (a performance number, as in the
+    /// browser's panel); overrun and latency skips are audio produced ahead of the device.
+    pub fn report_audio(&mut self) {
+        if let Some((t0, c0)) = self.run_start {
+            let wall = t0.elapsed().as_secs_f64();
+            let game = self.guest.clock_us().saturating_sub(c0) as f64 / 1e6;
+            let frames = self.guest.frames();
+            println!(
+                "run: {frames} frames over {wall:.1} s of wall = {:.1} fps; game clock {game:.1} s = {:.0}% of the wall",
+                frames as f64 / wall.max(1e-9),
+                100.0 * game / wall.max(1e-9)
+            );
+        }
+        let produced = self.guest.audio_produced_seconds();
+        match &self.audio {
+            Some(a) => {
+                let s = a.stats();
+                println!(
+                    "audio: produced {produced:.1} s, peak {:.3}, underrun {:.2} s, overrun {:.2} s, latency skip {:.2} s, rejoins {}",
+                    s.peak, s.underrun_s, s.overrun_s, s.latency_skip_s, s.rejoins
+                );
+            }
+            None => println!("audio: produced {produced:.1} s, no output device"),
+        }
     }
 
     /// Fresh statistics every 250 ms, `None` in between.
@@ -183,16 +376,20 @@ impl Session {
         }
         let secs = since.as_secs_f64();
         let guest_now = self.guest.frames();
+        let clock_now = self.guest.clock_us();
+        // `% speed` is emulated time over real time - NOT guest frames over 60: a title running
+        // its own 30 fps scenes at full speed is 100%, not 50%.
+        let speed_pct = clock_now.saturating_sub(self.clock_since) as f64 / 1e6 / secs * 100.0;
+        self.clock_since = clock_now;
         self.fps = self.fps_frames as f64 / secs;
         self.guest_fps = guest_now.saturating_sub(self.guest_frames_since) as f64 / secs;
         self.fps_frames = 0;
         self.guest_frames_since = guest_now;
         self.fps_since = now;
-        let target = 1.0 / FRAME_DT.as_secs_f64();
         Some(Stats {
             fps: self.fps,
             guest_fps: self.guest_fps,
-            speed_pct: self.guest_fps / target * 100.0,
+            speed_pct,
             frames: guest_now,
             finished: self.guest.finished(),
             paused: self.paused,

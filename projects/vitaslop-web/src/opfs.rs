@@ -42,7 +42,7 @@ pub struct OpfsReader {
 ///
 /// # Why a guest worker reads files itself
 /// Under `VITASLOP_SMP` a file read used to be FORWARDED to the run worker, and a forward waits
-/// for whatever that worker is doing - a present, usually. MEASURED (MLB, `tel25f`): after the
+/// for whatever that worker is doing - a present, usually. MEASURED (a baseball title, `tel25f`): after the
 /// audio forwards were removed, `sceIoPread` was the last per-frame forward, and every one parked
 /// its thread and blocked the idle clock for the length of a present. The ring is a
 /// SharedArrayBuffer every worker can view; only the JS handles are per worker. Its single

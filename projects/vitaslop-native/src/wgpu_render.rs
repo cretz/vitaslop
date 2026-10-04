@@ -152,6 +152,11 @@ pub struct GeneralRenderer {
     queue: wgpu::Queue,
     gxm: GxmRenderer,
     builder: RenderSceneBuilder,
+    /// The colour format every target of this renderer is built in: `OUTPUT_FORMAT` for the
+    /// headless oracle, the window SURFACE's format for the desktop window (see
+    /// [`Self::from_device`]) - which on most native surfaces is BGRA, and a BGRA texel read
+    /// back is swapped to the memory-order RGBA the guest and the PNGs expect.
+    format: wgpu::TextureFormat,
     /// The adapter name, for logging which GPU serviced the render.
     pub adapter_name: String,
     /// The adapter is a SOFTWARE rasteriser (`DeviceType::Cpu`, or a Microsoft adapter - WARP,
@@ -279,16 +284,70 @@ impl GeneralRenderer {
             // what a frame contains. See `vitaslop_platform::gpu::note_device_error`.
             vitaslop_platform::gpu::note_device_error("wgpu", &msg);
         }));
-        let gxm = GxmRenderer::new(&device, &queue, OUTPUT_FORMAT);
-        Some(GeneralRenderer {
+        Some(Self::from_device(device, queue, OUTPUT_FORMAT, adapter_name, software))
+    }
+
+    /// A renderer over a device someone else opened - the desktop WINDOW's, whose surface it
+    /// presents to ([`Self::encode_present`]) - with every target in `format`.
+    ///
+    /// # Why the window renders through this type at all
+    /// The headless oracle and the browser each run ONE renderer for both jobs a frame has:
+    /// presenting it, and the guest's own `sceGxmEndScene` completions plus the write-back of
+    /// small targets into guest memory ([`Self::complete_scenes`], [`Self::rtt_writebacks`]).
+    /// The window used to hold a bare `GxmRenderer` and did only the first, so a title that
+    /// reads a target it drew on the CPU read its allocator's poison there and nowhere else -
+    /// a baseball title's light probe, whose absence washes its players out white.
+    pub fn from_device(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        format: wgpu::TextureFormat,
+        adapter_name: String,
+        software: bool,
+    ) -> Self {
+        let gxm = GxmRenderer::new(&device, &queue, format);
+        GeneralRenderer {
             device,
             queue,
             gxm,
             builder: RenderSceneBuilder::new(),
+            format,
             adapter_name,
             software,
             last_split: RenderSplit::default(),
-        })
+        }
+    }
+
+    /// Encode a whole captured frame onto someone else's target - the window's surface -
+    /// as [`Self::render_frame`] does onto its own: one builder frame, the early-completed
+    /// scenes left out (their targets already hold the image), the chain encoded. `display`
+    /// is the size the guest declared for its display buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_present(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        target: &wgpu::Texture,
+        scenes: &[Scene],
+        presents: &[u32],
+        (dw, dh): (u32, u32),
+        clear: [u8; 4],
+    ) {
+        self.builder.begin_frame();
+        let built: Vec<_> = scenes.iter().filter(|s| !s.completed_early).map(|s| self.builder.build(s)).collect();
+        self.gxm.set_presented(presents);
+        let (fw, fh) = (target.width(), target.height());
+        // The frame's new pipelines on several threads first - see `prebuild_pipelines`.
+        self.gxm.prebuild_pipelines(&self.device, &built);
+        self.gxm.encode_chain(&self.device, &self.queue, encoder, view, depth, &built, dw, dh, fw, fh, clear, Some(target));
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
     }
 
     /// Set the GPU supersample factor (1 = off). Mirrors the software oracle's
@@ -305,6 +364,13 @@ impl GeneralRenderer {
     /// scene is not a frame.
     pub fn render_scene(&mut self, scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> Framebuffer {
         self.render_frame(std::slice::from_ref(scene), width, height, clear)
+    }
+
+    /// The buffers the guest flipped while the next frame's scenes were captured - see
+    /// `GxmRenderer::set_presented`. The headless oracle has to be told exactly as the browser
+    /// and the window are, or it decides which scene is the display by a different rule.
+    pub fn set_presented(&mut self, addrs: &[u32]) {
+        self.gxm.set_presented(addrs);
     }
 
     /// Render a whole captured FRAME - every scene the guest submitted between flips, in
@@ -328,7 +394,7 @@ impl GeneralRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: OUTPUT_FORMAT,
+            format: self.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -453,8 +519,11 @@ impl GeneralRenderer {
         // The frame's pass timestamps rode that submit: the map was asked for after it and
         // has completed with the wait above, so `take_gpu_time_report` describes THIS render.
         self.gxm.ts_poll();
-        let rgba = unpad_rows(&slice.get_mapped_range().unwrap(), width, height, bytes_per_row);
+        let mut rgba = unpad_rows(&slice.get_mapped_range().unwrap(), width, height, bytes_per_row);
         readback.unmap();
+        if is_bgra(self.format) {
+            swap_red_blue(&mut rgba);
+        }
         // ...and now that the submit has completed, say what every draw of that frame covered.
         // Inert unless `VITASLOP_GXM_DRAW_COVERAGE` is set.
         self.gxm.coverage_report_blocking(&self.device);
@@ -541,9 +610,12 @@ impl GeneralRenderer {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gxm-rtt-writeback") });
-        let mut staged: Vec<(u32, u32, u32, u32, wgpu::Buffer)> = Vec::new();
+        let mut staged: Vec<(u32, u32, u32, u32, u32, bool, wgpu::Buffer)> = Vec::new();
         let skip_sampled = vitaslop_runtime::rtt_writeback::writeback_skips_sampled();
-        for (addr, tex, w, h) in self.gxm.rtt_targets() {
+        // The FLOAT targets too, read back as halves (8 bytes a texel) - `apply_one` encodes
+        // them into the guest's own float format. See `rtt_writeback::encode_row_float`.
+        let targets = self.gxm.rtt_targets().into_iter().chain(self.gxm.rtt_float_targets());
+        for (addr, tex, w, h) in targets {
             // `skip=sampled`: a target the GPU consumes is not the CPU-read probe this seam
             // exists for. See `rtt_writeback::writeback_spec`.
             if skip_sampled && self.gxm.frame_samples(addr) {
@@ -553,7 +625,8 @@ impl GeneralRenderer {
             if w * h > cap {
                 continue;
             }
-            let padded = (w * 4).div_ceil(ALIGN) * ALIGN;
+            let texel_bytes = tex.format().block_copy_size(None).unwrap_or(4);
+            let padded = (w * texel_bytes).div_ceil(ALIGN) * ALIGN;
             let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("gxm-rtt-writeback"),
                 size: (padded * h) as u64,
@@ -577,22 +650,28 @@ impl GeneralRenderer {
                 },
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
-            staged.push((addr, w, h, padded, readback));
+            staged.push((addr, w, h, padded, texel_bytes, texel_bytes == 4 && is_bgra(tex.format()), readback));
         }
         if staged.is_empty() {
             return Vec::new();
         }
         self.queue.submit([enc.finish()]);
-        for (_, _, _, _, buf) in &staged {
+        for (_, _, _, _, _, _, buf) in &staged {
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         }
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         let mut out = Vec::with_capacity(staged.len());
-        for (addr, w, h, padded, buf) in &staged {
+        for (addr, w, h, padded, texel_bytes, bgra, buf) in &staged {
             let Ok(view) = buf.slice(..).get_mapped_range() else { continue };
-            out.push((*addr, *w, *h, unpad_rows(&view, *w, *h, *padded)));
+            let mut texels = unpad_rows_bytes(&view, *w * *texel_bytes, *h, *padded);
             drop(view);
             buf.unmap();
+            // A target held in BGRA (the window's surface format) goes back to the guest in
+            // its memory order, RGBA - the browser's writeback swaps for the same reason.
+            if *bgra {
+                swap_red_blue(&mut texels);
+            }
+            out.push((*addr, *w, *h, texels));
         }
         out
     }
@@ -649,7 +728,7 @@ impl GeneralRenderer {
             // endian, row by row with the copy padding stripped - and leaves the decode to the
             // reader, who is the only one who knows what the program packed into them
             // [[vitaslop-a-captured-texel-dump-is-not-what-the-draw-samples]]. MEASURED need:
-            // PCSA00002's crowd atlas (`0x8e20b030`, 256x256) is the last unmeasured input of
+            // A baseball title's crowd atlas (`0x8e20b030`, 256x256) is the last unmeasured input of
             // its washed-out close-up, and no instrument here could read it.
             let half = tex.format() == wgpu::TextureFormat::Rgba16Float;
             let texel_bytes = if tex.format() == vitaslop_platform::gpu::RAW64_FORMAT || half { 8 } else { 4 };
@@ -864,8 +943,23 @@ impl GeneralRenderer {
 pub use vitaslop_runtime::rtt_writeback::apply_rtt_writebacks;
 use vitaslop_runtime::rtt_writeback::rtt_writeback_texels;
 
+fn is_bgra(f: wgpu::TextureFormat) -> bool {
+    matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb)
+}
+
+fn swap_red_blue(texels: &mut [u8]) {
+    for px in texels.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+}
+
 fn unpad_rows(padded: &[u8], width: u32, height: u32, bytes_per_row: u32) -> Vec<u8> {
-    let tight = (width * 4) as usize;
+    unpad_rows_bytes(padded, width * 4, height, bytes_per_row)
+}
+
+/// [`unpad_rows`] for a row of `row_bytes` tight bytes, whatever the texel size.
+fn unpad_rows_bytes(padded: &[u8], row_bytes: u32, height: u32, bytes_per_row: u32) -> Vec<u8> {
+    let tight = row_bytes as usize;
     if bytes_per_row as usize == tight {
         return padded.to_vec();
     }
@@ -943,7 +1037,7 @@ mod writeback_tests {
     fn a_uniform_fill_is_unwritten_and_an_image_is_not() {
         // Zeros - a freshly mapped page.
         assert!(nothing_written_here(&[0u8; 64]));
-        // 0xBAADCAFE - MLB 12's allocator poison, the case that found this.
+        // 0xBAADCAFE - a baseball title's allocator poison, the case that found this.
         let poison: Vec<u8> = [0xFEu8, 0xCA, 0xAD, 0xBA].repeat(16);
         assert!(nothing_written_here(&poison));
         // One texel written into the poison is enough to make it the guest's.

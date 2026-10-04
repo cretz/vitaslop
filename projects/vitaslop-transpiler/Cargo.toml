@@ -16,7 +16,7 @@ workspace = true
 # only this machine could build the repo - CI failed on every runner at once.
 # To co-develop again, point it back at `path = "../../../yaxpeax-arm"` locally,
 # then push the fork and re-pin here before merging.
-yaxpeax-arm = { git = "https://github.com/cretz/yaxpeax-arm", rev = "57a5099a88647d981d611a6e5c5489a7fd0c70aa", default-features = false, features = ["non-exhaustive-enums"] }
+yaxpeax-arm = { git = "https://github.com/cretz/yaxpeax-arm", rev = "06161b6fd6ac0e2ecd10e41b6039f9c139240e9c", default-features = false, features = ["non-exhaustive-enums"] }
 yaxpeax-arch = { version = "0.3.1", default-features = false }
 # WASM backend.
 wasm-encoder = "0.253"

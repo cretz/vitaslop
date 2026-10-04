@@ -179,7 +179,7 @@ impl StmtKind {
             Stmt::Svc(..) => StmtKind::Svc,
             Stmt::Import(..) => StmtKind::Import,
             Stmt::Rbit { .. } => StmtKind::Rbit,
-            Stmt::MulLong { .. } => StmtKind::MulLong,
+            Stmt::MulLong { .. } | Stmt::MulHigh { .. } => StmtKind::MulLong,
             Stmt::Call { .. } => StmtKind::Call,
             Stmt::CallIndirect { .. } => StmtKind::CallIndirect,
             Stmt::Guard(..) => StmtKind::Guard,
@@ -797,6 +797,12 @@ fn shift_by_host_off(i: &W) -> Option<W<'static>> {
         W::I32AtomicLoad8U(m) => W::I32AtomicLoad8U(s(m)),
         W::I32AtomicLoad16U(m) => W::I32AtomicLoad16U(s(m)),
         W::I64AtomicLoad(m) => W::I64AtomicLoad(s(m)),
+        // The lightweight mutex's owner word (`emit_lock_take_smp`). Missing at first, and
+        // the owner landed `host_off` bytes BELOW the work area: every inline take left the
+        // owner reading NO_OWNER, and the next recursive take parked the title's main thread
+        // on its own mutex at boot.
+        W::I32AtomicStore(m) => W::I32AtomicStore(s(m)),
+        W::I64AtomicStore(m) => W::I64AtomicStore(s(m)),
         W::I32AtomicRmwCmpxchg(m) => W::I32AtomicRmwCmpxchg(s(m)),
         W::I32AtomicRmw8CmpxchgU(m) => W::I32AtomicRmw8CmpxchgU(s(m)),
         W::I32AtomicRmw16CmpxchgU(m) => W::I32AtomicRmw16CmpxchgU(s(m)),
@@ -1088,22 +1094,71 @@ fn emit_dirty_mark(f: &mut Body, addr_local: u32) {
     }
     f.dirty_marks += 1;
     let mark = f.unbilled_mark();
+    let map = MemArg { offset: off + DIRTY_MAP_OFF, align: 0, memory_index: 0 };
+    let epoch = MemArg { offset: off + DIRTY_EPOCH_OFF, align: 0, memory_index: 0 };
     f.untolled(&W::LocalTee(addr_local));
-    f.untolled(&W::I32Const(DIRTY_SHIFT as i32));
-    f.untolled(&W::I32ShrU);
-    f.untolled(&W::I32Const(0));
-    f.untolled(&W::I32Load8U(MemArg {
-        offset: off + DIRTY_EPOCH_OFF,
-        align: 0,
-        memory_index: 0,
-    }));
-    f.untolled(&W::I32Store8(MemArg {
-        offset: off + DIRTY_MAP_OFF,
-        align: 0,
-        memory_index: 0,
-    }));
+    if dirty_mark_tested() {
+        // map[page] != epoch ? map[page] = epoch : nothing. See [`dirty_mark_tested`].
+        f.untolled(&W::I32Const(DIRTY_SHIFT as i32));
+        f.untolled(&W::I32ShrU);
+        f.untolled(&W::I32Load8U(map));
+        f.untolled(&W::I32Const(0));
+        f.untolled(&W::I32Load8U(epoch));
+        f.untolled(&W::I32Ne);
+        f.untolled(&W::If(BlockType::Empty));
+        f.untolled(&W::LocalGet(addr_local));
+        f.untolled(&W::I32Const(DIRTY_SHIFT as i32));
+        f.untolled(&W::I32ShrU);
+        f.untolled(&W::I32Const(0));
+        f.untolled(&W::I32Load8U(epoch));
+        f.untolled(&W::I32Store8(map));
+        f.untolled(&W::End);
+    } else {
+        f.untolled(&W::I32Const(DIRTY_SHIFT as i32));
+        f.untolled(&W::I32ShrU);
+        f.untolled(&W::I32Const(0));
+        f.untolled(&W::I32Load8U(epoch));
+        f.untolled(&W::I32Store8(map));
+    }
     f.untolled(&W::LocalGet(addr_local));
     f.charge_unbilled_dirty(mark);
+}
+
+/// >>> UNDER SMP THE MARK IS WRITTEN ONLY WHEN THE BYTE DIFFERS FROM THE EPOCH.
+///
+/// One map byte covers a 4 KB page, so one 64-byte CACHE LINE of the map covers 256 KB of
+/// guest memory - every thread's stack, the title's heap neighbourhoods. An unconditional
+/// `store8` of a byte that already holds the epoch changes nothing, but it still takes that
+/// line EXCLUSIVE, and with guest threads storing on several cores at once every store pulls
+/// the line from the core that stamped it last: false sharing on the hottest path in a module.
+/// MEASURED symptom (phone, an arcade fighter's fight, 10-02): the same render thread's guest work took
+/// 2.5 ms a frame on ONE worker and 6-10 ms on three, while a bare compute benchmark on the
+/// same phone lost only 10-30% per worker under the same concurrency (job 372). A load keeps
+/// the line SHARED on every core; the store happens once per page per epoch.
+///
+/// The map's contents are the same either way (a store of an equal byte is a no-op), so
+/// readers see exactly what they did. ON for SMP builds; `VITASLOP_DIRTY_MARK_TEST=0` is the
+/// arm back to the unconditional store. The one-thread build keeps the unconditional form: it
+/// has no second core to share a line with, and the test costs it a load and a branch.
+fn dirty_mark_tested() -> bool {
+    use std::sync::OnceLock;
+    static FROM_ENV: OnceLock<bool> = OnceLock::new();
+    smp()
+        && match DIRTY_MARK_TEST.with(|c| c.get()) {
+            u8::MAX => *FROM_ENV.get_or_init(|| !matches!(emit_var("VITASLOP_DIRTY_MARK_TEST").as_deref(), Ok("0"))),
+            n => n != 0,
+        }
+}
+
+thread_local! {
+    /// [`set_dirty_mark_tested`]'s override; `u8::MAX` = not set, read the environment.
+    static DIRTY_MARK_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(u8::MAX) };
+}
+
+/// Override [`dirty_mark_tested`] for modules emitted on this thread - the browser's route to
+/// the `VITASLOP_DIRTY_MARK_TEST` arm, which has no environment to read.
+pub fn set_dirty_mark_tested(on: bool) {
+    DIRTY_MARK_TEST.with(|c| c.set(u8::from(on)));
 }
 
 /// Stamp every page `[addr_local, addr_local + len_local)` touches with the current epoch,
@@ -1226,6 +1281,9 @@ pub const EMIT_KNOBS_OVERRIDABLE: &[&str] = &[
     "VITASLOP_WATCH_READ",
     "VITASLOP_WATCH_READ_SKIP",
     "VITASLOP_ARM_AT_FRAME",
+    // Read at LINK time by the runtime (`vita::smp_lwmutex_inline`), but it decides which
+    // inline form is emitted, so it has to name the module in the transpile cache.
+    "VITASLOP_SMP_LWMUTEX_INLINE",
 ];
 
 /// Diagnostic store watchpoint. When `VITASLOP_WATCH_STORE=<hex guest addr>` is set
@@ -2384,6 +2442,8 @@ const EXCL_SLOT: u32 = 9;
 // precisely so `LDREX` always has somewhere to record.
 thread_local! {
     static EXCL_OFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Layout offset of the SMP monitor version table ([`abi::SMP_EXCL_VER_SLOT`]).
+    static EXCL_VER_OFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 // >>> SMP CODEGEN, and the SHARED host memory it needs. Both thread-local for the reason
@@ -2402,6 +2462,32 @@ thread_local! {
 thread_local! {
     static SHARED_HOST_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FUNCTION_EXPORTS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether modules emitted on this thread export EVERY translated function by name
+/// ([`abi::func_export`]). On by default, and native keeps it: wasmtime resolves an export
+/// when it is asked for one, so the list costs nothing there.
+///
+/// # >>> WHY THE BROWSER TURNS IT OFF: V8 MATERIALISES EVERY EXPORT, PER INSTANCE
+/// Building an instance's `exports` object gives every exported function its JS wrapper -
+/// a `JSFunction`, a `SharedFunctionInfo`, `WasmExportedFunctionData`, `WasmInternalFunction`,
+/// a `WasmFuncRef` and its name string - and each of those holds entries in V8's pointer
+/// tables, which are FINITE and shared by the whole renderer process. The browser gives
+/// every guest thread its own instance. MEASURED (an arcade fighter, `v8.gc_stats` trace):
+/// 42,746 exports x 67 instances = 2,864,025 live wrappers in the first 11 s of a run, with
+/// nothing ever reading more than a handful of them; the renderer then died at
+/// `V8 process OOM (ExternalEntityTable::AllocateEntry)` once ordinary churn used up what
+/// was left - every run, 1.15-1.37 M thread switches in, on Chrome 147 and 153, one worker
+/// or four. Off, the host enters guest code through [`abi::DISPATCH_EXPORT`] instead.
+pub fn set_function_exports(on: bool) {
+    FUNCTION_EXPORTS.with(|c| c.set(on));
+}
+
+/// Whether modules emitted on this thread carry the per-function exports - see
+/// [`set_function_exports`].
+pub fn function_exports() -> bool {
+    FUNCTION_EXPORTS.with(|c| c.get())
 }
 
 /// Declare that the host memory a `host_off` module imports is a SHARED memory (a wasm
@@ -2458,6 +2544,9 @@ const PREEMPT_GLOBAL: u32 = abi::WORK_GLOBAL + 4;
 const THREAD_ID_GLOBAL: u32 = abi::WORK_GLOBAL + 5;
 const CUR_THREAD_GLOBAL: u32 = abi::WORK_GLOBAL + 6;
 const ELIDE_GLOBAL: u32 = abi::WORK_GLOBAL + 7;
+/// >>> SMP ONLY: the monitor VERSION the last `LDREX` read for its address's bucket - see
+/// [`abi::SMP_EXCL_VER_SLOT`] and `emit_store_excl`.
+const EXCL_VER_GLOBAL: u32 = abi::WORK_GLOBAL + 8;
 
 /// Assemble the full wasm module for `funcs`. `func_index` maps a guest function
 /// address to its wasm function index. `mem_bytes` sizes the guest linear memory;
@@ -2482,6 +2571,40 @@ pub fn emit_module(
     import_memory: bool,
     host_off: u32,
 ) -> EmitOutput {
+    let addrs: Vec<u32> = funcs.iter().map(|f| f.addr).collect();
+    let guest_instructions: u64 =
+        funcs.iter().flat_map(|f| f.blocks.iter()).map(|b| u64::from(b.arm_count)).sum();
+    emit_module_streamed(
+        addrs,
+        guest_instructions,
+        funcs.into_iter(),
+        func_index,
+        base,
+        mem_bytes,
+        inline_imports,
+        import_memory,
+        host_off,
+    )
+}
+
+/// [`emit_module`] for functions that are PRODUCED as they are emitted: `funcs` yields
+/// them one at a time, in the ascending order of `addrs` (which names every one up front,
+/// since the address table and the funcref table are sized before the code section), and
+/// `guest_instructions` is their total `arm_count`. A caller that lifts each function
+/// just before it is written holds ONE function's IR at a time instead of the program's -
+/// see `transpile_lenient`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_module_streamed(
+    addrs: Vec<u32>,
+    guest_instructions: u64,
+    funcs: impl Iterator<Item = Func>,
+    func_index: &BTreeMap<u32, u32>,
+    base: u32,
+    mem_bytes: u32,
+    inline_imports: &[crate::InlineImport],
+    import_memory: bool,
+    host_off: u32,
+) -> EmitOutput {
     // Every emitted memory access on this thread is shifted by this from here on - see
     // `Body::raw`. A host offset only makes sense for an imported memory: a self-contained
     // module's memory starts where its layout starts.
@@ -2498,9 +2621,6 @@ pub fn emit_module(
     // phone hits. Emission now frees each function's IR as its body is written, and the
     // bodies go straight into the final byte vector (see the code section below), so the
     // peak is the IR alone and the module grows into the room the IR gives back.
-    let addrs: Vec<u32> = funcs.iter().map(|f| f.addr).collect();
-    let guest_instructions: u64 =
-        funcs.iter().flat_map(|f| f.blocks.iter()).map(|b| u64::from(b.arm_count)).sum();
     let mut types = TypeSection::new();
     types.ty().function([ValType::I32], []); // svc / import: (i32) -> ()
     let host_ty = 0;
@@ -2514,7 +2634,7 @@ pub fn emit_module(
     // more pages than the guest itself uses. `addr_table_off` is the byte offset of
     // that table, and `n` its entry count (one 4-byte ascending guest address per
     // translated function).
-    let n = funcs.len() as u32;
+    let n = addrs.len() as u32;
     let guest_pages = (mem_bytes as u64).div_ceil(abi::PAGE_SIZE as u64).max(1);
     let addr_table_off = guest_pages * abi::PAGE_SIZE as u64;
     // The BUCKET INDEX rides directly behind the address table (see `dispatch_buckets`):
@@ -2566,6 +2686,7 @@ pub fn emit_module(
     ARM_WORD_OFF.with(|c| c.set(arm_word_off.unwrap_or(0)));
     // Where the exclusive monitor's word landed, for the `LDREX`/`STREX` emission below.
     EXCL_OFF.with(|c| c.set(mirror_off.map_or(0, |base| base + EXCL_SLOT as u64 * 4)));
+    EXCL_VER_OFF.with(|c| c.set(mirror_off.map_or(0, |base| base + u64::from(abi::SMP_EXCL_VER_SLOT) * 4)));
     WATCH_COUNT_OFF.with(|c| {
         c.set(if watch_store_addr().is_some() { diag_off.map_or(0, |o| o + 4) } else { 0 })
     });
@@ -2667,7 +2788,7 @@ pub fn emit_module(
     }
 
     let mut function_section = FunctionSection::new();
-    for _ in &funcs {
+    for _ in &addrs {
         function_section.function(func_ty);
     }
     // The indirect-call dispatcher: `(target, caller)`. It binary-searches the address
@@ -2752,6 +2873,7 @@ pub fn emit_module(
         globals.global(i32_global, &ConstExpr::i32_const(0)); // THREAD_ID_GLOBAL
         globals.global(i32_global, &ConstExpr::i32_const(0)); // CUR_THREAD_GLOBAL
         globals.global(i32_global, &ConstExpr::i32_const(0)); // ELIDE_GLOBAL
+        globals.global(i32_global, &ConstExpr::i32_const(0)); // EXCL_VER_GLOBAL
     }
 
     let mut exports = ExportSection::new();
@@ -2801,9 +2923,12 @@ pub fn emit_module(
         elements.active(Some(0), &ConstExpr::i32_const(0), Elements::Functions(Cow::Owned(entries)));
     }
 
-    for (i, addr) in addrs.iter().enumerate() {
-        exports.export(&abi::func_export(*addr), ExportKind::Func, IMPORT_FUNCS + i as u32);
+    if function_exports() {
+        for (i, addr) in addrs.iter().enumerate() {
+            exports.export(&abi::func_export(*addr), ExportKind::Func, IMPORT_FUNCS + i as u32);
+        }
     }
+    exports.export(abi::DISPATCH_EXPORT, ExportKind::Func, IMPORT_FUNCS + n);
     exports.export(abi::RESET_EXPORT, ExportKind::Func, IMPORT_FUNCS + n + 1);
 
     // The dispatcher's search array: each function's guest address as a little-endian
@@ -2853,10 +2978,14 @@ pub fn emit_module(
     let contents_at = wasm.len();
     (n + 2).encode(&mut wasm);
     let mut expansion = Expansion::default();
+    let mut emitted = 0usize;
     for func in funcs {
+        assert_eq!(func.addr, addrs[emitted], "functions must arrive in the order `addrs` names them");
         emit_func(&func, func_index, base, &inline, &mut expansion).encode(&mut wasm);
+        emitted += 1;
         // `func` drops here: its IR is not needed again.
     }
+    assert_eq!(emitted, addrs.len(), "every function `addrs` names must be emitted");
     emit_dispatch(n, addr_table_off, buckets.as_ref().map(|(base, b)| (*base, b.len() as u32 - 1))).encode(&mut wasm);
     emit_reset().encode(&mut wasm);
     let contents_len = u32::try_from(wasm.len() - contents_at)
@@ -3329,7 +3458,7 @@ pub fn set_promote_registers(on: bool) {
 pub fn codegen_fingerprint() -> String {
     use std::fmt::Write;
     let mut s = format!(
-        "dirty{};runmarks{};names{};pc{};prof{};fuel{};widec{};dispatchall{};shared{};smp{};neon{};promote{}",
+        "dirty{};runmarks{};names{};pc{};prof{};fuel{};widec{};dispatchall{};shared{};smp{};neon{};promote{};fexports{}",
         u8::from(dirty_tracking()),
         u8::from(dirty_run_marks()),
         u8::from(emit_wasm_names()),
@@ -3342,6 +3471,7 @@ pub fn codegen_fingerprint() -> String {
         u8::from(smp()),
         u8::from(neon_cache()),
         u8::from(promote_registers()),
+        u8::from(function_exports()),
     );
     let blocks = trace_blocks_ranges();
     if !blocks.is_empty() {
@@ -4021,7 +4151,7 @@ fn emit_stmt_inner(
         }
         Stmt::LoadExcl { rt, rt2, addr, size } => emit_load_excl(f, *rt, *rt2, addr, *size, base),
         Stmt::StoreExcl { rd, rt, rt2, addr, size } => {
-            emit_store_excl(f, *rd, *rt, *rt2, addr, *size, base)
+            emit_store_excl(f, *rd, *rt, *rt2, addr, *size, base, func_addr)
         }
         Stmt::ClearExcl => {
             f.instruction(&W::I32Const(0));
@@ -4099,6 +4229,32 @@ fn emit_stmt_inner(
             f.instruction(&W::I64ShrU);
             f.instruction(&W::I32WrapI64); // high 32 bits
             f.instruction(&W::GlobalSet(abi::reg_global(*rdhi as usize)));
+        }
+        Stmt::MulHigh { rd, rn, rm, ra, sub, round } => {
+            // All in i64, wrapping: ARM computes the 64-bit sum modulo 2^64 and keeps bits
+            // 63:32, which is what an arithmetic shift of the wrapped sum yields.
+            if let Some(a) = ra {
+                emit_value(f, a, base);
+                f.instruction(&W::I64ExtendI32U);
+                f.instruction(&W::I64Const(32));
+                f.instruction(&W::I64Shl);
+            }
+            emit_value(f, rn, base);
+            f.instruction(&W::I64ExtendI32S);
+            emit_value(f, rm, base);
+            f.instruction(&W::I64ExtendI32S);
+            f.instruction(&W::I64Mul);
+            if ra.is_some() {
+                f.instruction(&if *sub { W::I64Sub } else { W::I64Add });
+            }
+            if *round {
+                f.instruction(&W::I64Const(0x8000_0000));
+                f.instruction(&W::I64Add);
+            }
+            f.instruction(&W::I64Const(32));
+            f.instruction(&W::I64ShrS);
+            f.instruction(&W::I32WrapI64);
+            f.instruction(&W::GlobalSet(abi::reg_global(*rd as usize)));
         }
         Stmt::Call { target } => {
             // A direct call to a discovered function. In the strict build every callee
@@ -4526,6 +4682,8 @@ fn count_neon_regs(s: &crate::ir::NeonStmt, q: &mut [u32; 8], d: &mut [u32; 8]) 
         | CmpZero { dst, src, .. }
         | Rev { dst, src, .. }
         | Not { dst, src }
+        | PopCount { dst, src }
+        | CountLeading { dst, src, .. }
         | SatAbsNeg { dst, src, .. }
         | NarrowShift { dst, src, .. }
         | WidenShift { dst, src, .. }
@@ -4611,6 +4769,7 @@ fn neon_run_member(stmt: &Stmt) -> bool {
             | Stmt::FlagsLogic { .. }
             | Stmt::Rbit { .. }
             | Stmt::MulLong { .. }
+            | Stmt::MulHigh { .. }
             | Stmt::Uadd8 { .. }
             | Stmt::Sel { .. }
             | Stmt::ShiftRegFlags { .. }
@@ -5177,6 +5336,91 @@ fn emit_vfp_mem(
 // widen the low 64 bits of a `v128` - exactly the NEON long/wide semantics.
 
 /// Push NEON register `reg` as a `v128` (a `D` lands in the low 64 bits).
+/// `vshl.s64`/`vshl.u64` by register: each 64-bit lane of `src` shifted by the signed low
+/// byte of the matching `amt` lane - left for a positive amount, right for a negative one
+/// (arithmetic when signed), and a shift of 64 or more leaves 0 (or the sign, shifting right
+/// signed). The same per-lane walk as the narrower forms, on `i64`: wasm SIMD has no
+/// variable per-lane shift at any width. A D-register operand uses lane 0; lane 1 is
+/// computed and discarded by the D write.
+///
+/// MEASURED need: a retail title's bit-stream reader (`vshl.u64 d1, d0, d1` building a
+/// mask) - refused as unsupported, its block trapped as soon as a new game started.
+fn emit_shift_reg_64(
+    f: &mut Body,
+    signed: bool,
+    dst: crate::ir::NeonReg,
+    src: crate::ir::NeonReg,
+    amt: crate::ir::NeonReg,
+) {
+    neon_get(f, src);
+    f.instruction(&W::LocalSet(L_V128A));
+    neon_get(f, amt);
+    f.instruction(&W::LocalSet(L_V128B));
+    neon_get(f, src);
+    f.instruction(&W::LocalSet(L_V128C)); // result accumulator, lanes overwritten below
+    for k in 0..2u8 {
+        // s = sign-extended low byte of amt lane k.
+        f.instruction(&W::LocalGet(L_V128B));
+        f.instruction(&W::I64x2ExtractLane(k));
+        f.instruction(&W::I32WrapI64);
+        f.instruction(&W::I32Const(24));
+        f.instruction(&W::I32Shl);
+        f.instruction(&W::I32Const(24));
+        f.instruction(&W::I32ShrS);
+        f.instruction(&W::LocalSet(L_T0));
+        f.instruction(&W::LocalGet(L_V128A));
+        f.instruction(&W::I64x2ExtractLane(k));
+        f.instruction(&W::LocalSet(L_D64)); // x
+        f.instruction(&W::LocalGet(L_V128C));
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Const(0));
+        f.instruction(&W::I32GeS);
+        f.instruction(&W::If(BlockType::Result(ValType::I64)));
+        {
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Const(64));
+            f.instruction(&W::I32GeS);
+            f.instruction(&W::If(BlockType::Result(ValType::I64)));
+            f.instruction(&W::I64Const(0));
+            f.instruction(&W::Else);
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I64ExtendI32U);
+            f.instruction(&W::I64Shl);
+            f.instruction(&W::End);
+        }
+        f.instruction(&W::Else);
+        {
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Sub);
+            f.instruction(&W::LocalSet(L_T2)); // r = -s
+            f.instruction(&W::LocalGet(L_T2));
+            f.instruction(&W::I32Const(64));
+            f.instruction(&W::I32GeS);
+            f.instruction(&W::If(BlockType::Result(ValType::I64)));
+            if signed {
+                f.instruction(&W::LocalGet(L_D64));
+                f.instruction(&W::I64Const(63));
+                f.instruction(&W::I64ShrS);
+            } else {
+                f.instruction(&W::I64Const(0));
+            }
+            f.instruction(&W::Else);
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::LocalGet(L_T2));
+            f.instruction(&W::I64ExtendI32U);
+            f.instruction(&if signed { W::I64ShrS } else { W::I64ShrU });
+            f.instruction(&W::End);
+        }
+        f.instruction(&W::End);
+        f.instruction(&W::I64x2ReplaceLane(k));
+        f.instruction(&W::LocalSet(L_V128C));
+    }
+    f.instruction(&W::LocalGet(L_V128C));
+    neon_set(f, dst);
+}
+
 fn neon_get(f: &mut Body, reg: crate::ir::NeonReg) {
     use crate::ir::NeonReg::*;
     match reg {
@@ -6351,6 +6595,9 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             f.instruction(&W::I8x16Shuffle(mask));
             neon_set(f, *dst);
         }
+        ShiftReg { sat: _, ty, dst, src, amt } if ty.bits == 64 => {
+            emit_shift_reg_64(f, ty.signed, *dst, *src, *amt);
+        }
         ShiftReg { sat: _, ty, dst, src, amt } => {
             // Per-lane variable shift-left by a signed amount (`vshl` register form): each lane of
             // `src` is shifted by the signed low byte of the matching `amt` lane; a negative amount
@@ -6542,6 +6789,53 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
         Not { dst, src } => {
             neon_get(f, *src);
             f.instruction(&W::V128Not);
+            neon_set(f, *dst);
+        }
+        PopCount { dst, src } => {
+            neon_get(f, *src);
+            f.instruction(&W::I8x16Popcnt);
+            neon_set(f, *dst);
+        }
+        CountLeading { bits, sign, dst, src } => {
+            // wasm SIMD has no lane count-leading, so each lane goes through `i32.clz`. The
+            // lane is widened to i32 (zero-extended for vclz, sign-extended for vcls) and the
+            // count taken at 32 bits, less the `32 - bits` the widening added. vcls counts the
+            // bits after the sign that EQUAL it: `clz(x ^ (x >> 31)) - 1` on the sign-extended
+            // value.
+            let w = *bits as i32;
+            let lanes = 128 / w as u8;
+            neon_get(f, *src);
+            f.instruction(&W::LocalSet(L_V128A));
+            neon_get(f, *src);
+            f.instruction(&W::LocalSet(L_V128C));
+            let (extract, replace) = match (*bits, *sign) {
+                (8, false) => (W::I8x16ExtractLaneU as fn(u8) -> W<'static>, W::I8x16ReplaceLane as fn(u8) -> W<'static>),
+                (8, true) => (W::I8x16ExtractLaneS as fn(u8) -> W<'static>, W::I8x16ReplaceLane as fn(u8) -> W<'static>),
+                (16, false) => (W::I16x8ExtractLaneU as fn(u8) -> W<'static>, W::I16x8ReplaceLane as fn(u8) -> W<'static>),
+                (16, true) => (W::I16x8ExtractLaneS as fn(u8) -> W<'static>, W::I16x8ReplaceLane as fn(u8) -> W<'static>),
+                _ => (W::I32x4ExtractLane as fn(u8) -> W<'static>, W::I32x4ReplaceLane as fn(u8) -> W<'static>),
+            };
+            for k in 0..lanes {
+                f.instruction(&W::LocalGet(L_V128C));
+                f.instruction(&W::LocalGet(L_V128A));
+                f.instruction(&extract(k));
+                if *sign {
+                    f.instruction(&W::LocalTee(L_T0));
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::I32Const(31));
+                    f.instruction(&W::I32ShrS);
+                    f.instruction(&W::I32Xor);
+                    f.instruction(&W::I32Clz);
+                    f.instruction(&W::I32Const(1 + (32 - w)));
+                } else {
+                    f.instruction(&W::I32Clz);
+                    f.instruction(&W::I32Const(32 - w));
+                }
+                f.instruction(&W::I32Sub);
+                f.instruction(&replace(k));
+                f.instruction(&W::LocalSet(L_V128C));
+            }
+            f.instruction(&W::LocalGet(L_V128C));
             neon_set(f, *dst);
         }
         SatAbsNeg { ty, neg, dst, src } => {
@@ -6850,6 +7144,13 @@ fn permute_masks(op: crate::ir::PermuteOp, esize: u8, q: bool) -> ([u8; 16], [u8
             }
             for j in 0..n {
                 b_el.push(c(2 * j + 1));
+            }
+        }
+        Swp => {
+            // Each result is the other input, element for element.
+            for j in 0..n {
+                a_el.push((true, j));
+                b_el.push((false, j));
             }
         }
     }
@@ -7216,6 +7517,11 @@ fn emit_load_excl(f: &mut Body, rt: u8, rt2: Option<u8>, addr: &Value, size: Mem
     f.instruction(&W::I32Const(base as i32));
     f.instruction(&W::I32Add);
     f.instruction(&W::GlobalSet(EXCL_ADDR_GLOBAL));
+    // The monitor VERSION of this address's bucket, read BEFORE the value: a `STREX` anywhere
+    // that lands between this and our own `STREX` bumps it - see `emit_store_excl`.
+    emit_excl_bucket(f);
+    f.instruction(&W::I32AtomicLoad(excl_ver_arg()));
+    f.instruction(&W::GlobalSet(EXCL_VER_GLOBAL));
     f.instruction(&W::LocalGet(L_T0));
     match rt2 {
         None => {
@@ -7247,6 +7553,20 @@ fn emit_load_excl(f: &mut Body, rt: u8, rt2: Option<u8>, addr: &Value, size: Mem
     }
 }
 
+/// Push the byte offset, within the version table, of the bucket the armed `LDREX` address
+/// (`EXCL_ADDR_GLOBAL`) hashes to: `((addr >> 2) & (COUNT - 1)) * 4`, i.e. one mask.
+fn emit_excl_bucket(f: &mut Body) {
+    f.instruction(&W::GlobalGet(EXCL_ADDR_GLOBAL));
+    f.instruction(&W::I32Const(((abi::SMP_EXCL_VER_COUNT - 1) << 2) as i32));
+    f.instruction(&W::I32And);
+}
+
+/// The atomic `MemArg` of a version word: the table's layout offset as the immediate, so the
+/// host-offset shift applies to it like every other mirror access.
+fn excl_ver_arg() -> MemArg {
+    MemArg { offset: EXCL_VER_OFF.with(|c| c.get()), align: 2, memory_index: 0 }
+}
+
 /// SMP `STREX{,B,H,D}` - see [`Stmt::StoreExcl`]. A compare-and-swap against the value the
 /// arming `LDREX` read, taken only when this instance's monitor holds THIS address; `rd` gets
 /// ARM's status (0 stored, 1 refused) and the monitor is spent either way.
@@ -7262,14 +7582,58 @@ fn emit_store_excl(
     addr: &Value,
     size: MemSize,
     base: u32,
+    func_addr: u32,
 ) {
     emit_addr(f, addr, base);
     emit_dirty_mark(f, L_DIRTY);
     f.instruction(&W::LocalSet(L_T0));
+    // The store watchpoint covers exclusive stores too - an atomic state word written only by
+    // `STREX` otherwise reads as "never written" (MEASURED: a player state machine's every
+    // transition is `LDREX`/`STREX`, and the watch reported one plain initialising store).
+    // Logged/trapped on the ATTEMPT, refused or not; a refused one is retried at once.
+    let n = match (size, rt2) {
+        (_, Some(_)) => 8,
+        (MemSize::Byte, None) => 1,
+        (MemSize::Half, None) => 2,
+        (MemSize::Word, None) => 4,
+    };
+    emit_watch_store_extent(f, base, WatchExtent::Const(n), func_addr);
+    // >>> ARM'S MONITOR, NOT A COMPARE-AND-SWAP OF THE VALUE. On hardware ANY other store to
+    // the address between `LDREX` and `STREX` fails the `STREX`; a CAS against the value read
+    // succeeds whenever the value is back to what it was - the ABA hole, which a lock-free
+    // POINTER list falls straight through (a head popped and pushed back between our `LDREX` and
+    // `STREX` reads as unchanged, and two consumers take one node). MEASURED on a retail
+    // title's job system (SceUlt queues, phone job 113): one job record completed by two
+    // worker threads at boot, then a call through a reset record - the frame 0..6 GUEST FAULT
+    // seen ~1 boot in 10-27, only under the parallel run.
+    //
+    // So every successful `STREX` also bumps a VERSION word for its address's bucket
+    // ([`abi::SMP_EXCL_VER_SLOT`]), and a `STREX` takes effect only if that word is what the
+    // arming `LDREX` read. The bucket is LOCKED around the value swap by moving its version
+    // from even `v` to odd `v + 1`, and released at `v + 2` whether the swap won or not, so the
+    // check and the swap are one step to every other `STREX`. An odd version read by `LDREX`
+    // (a swap in flight elsewhere) fails at once - the guest's own loop retries, which is what
+    // a `STREX` failure is for. Plain stores do not bump it; for those the value compare still
+    // stands where it always did.
     f.instruction(&W::GlobalGet(EXCL_ADDR_GLOBAL));
     f.instruction(&W::LocalGet(L_T0));
     f.instruction(&W::I32Const(base as i32));
     f.instruction(&W::I32Add);
+    f.instruction(&W::I32Eq);
+    f.instruction(&W::GlobalGet(EXCL_VER_GLOBAL));
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::I32And);
+    f.instruction(&W::I32Eqz);
+    f.instruction(&W::I32And);
+    f.instruction(&W::If(BlockType::Result(ValType::I32)));
+    // Lock the bucket: CAS(version, v, v + 1) == v.
+    emit_excl_bucket(f);
+    f.instruction(&W::GlobalGet(EXCL_VER_GLOBAL));
+    f.instruction(&W::GlobalGet(EXCL_VER_GLOBAL));
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::I32AtomicRmwCmpxchg(excl_ver_arg()));
+    f.instruction(&W::GlobalGet(EXCL_VER_GLOBAL));
     f.instruction(&W::I32Eq);
     f.instruction(&W::If(BlockType::Result(ValType::I32)));
     f.instruction(&W::LocalGet(L_T0));
@@ -7301,6 +7665,18 @@ fn emit_store_excl(
             f.instruction(&W::I64Ne);
         }
     }
+    // Release the bucket at v + 2 (a new version, so every other armed `LDREX` on it fails),
+    // keeping the swap's status.
+    f.instruction(&W::LocalSet(L_T1));
+    emit_excl_bucket(f);
+    f.instruction(&W::GlobalGet(EXCL_VER_GLOBAL));
+    f.instruction(&W::I32Const(2));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::I32AtomicStore(excl_ver_arg()));
+    f.instruction(&W::LocalGet(L_T1));
+    f.instruction(&W::Else);
+    f.instruction(&W::I32Const(1)); // the bucket moved since `LDREX`: refused
+    f.instruction(&W::End);
     f.instruction(&W::Else);
     f.instruction(&W::I32Const(1));
     f.instruction(&W::End);
@@ -7669,6 +8045,10 @@ enum InlineLowering {
     /// pointer form, and on its own predicate besides - see
     /// [`crate::InlineOp::LwMutexLock`].
     LwMutex { layout: crate::LwMutexLayout, thread_off: u64, limit: u32, lock: bool },
+    /// The parallel-run spelling of [`InlineLowering::LwMutex`]: compare-and-swaps of the
+    /// count word, the current thread from its instance global - see
+    /// [`crate::InlineOp::LwMutexSmp`].
+    LwMutexSmp { layout: crate::LwMutexLayout, limit: u32, lock: bool },
     /// The same take/release over a KERNEL mutex, whose state is the four words at `layout`
     /// from entry `r0 & mask` of a table at `table_off` in the host-mirror block. No pointer
     /// guard: the address is a constant inside a page this module reserved and the mask keeps
@@ -7784,6 +8164,10 @@ impl InlineImports {
                 Some(InlineLowering::SmpStoreClock64 { off: base + slot as u64 * 4, limit })
             }
             crate::InlineOp::SmpDelayYield { cap } => Some(InlineLowering::SmpDelayYield { cap }),
+            crate::InlineOp::LwMutexSmp { layout, lock } => {
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(layout.top())?;
+                Some(InlineLowering::LwMutexSmp { layout, limit, lock })
+            }
             crate::InlineOp::LoadMirror { slot } => {
                 // The block is reserved by the same layout pass that fills `mirror_off`
                 // from these very ops, so a mirror op without a block is a bug here, not
@@ -7922,7 +8306,7 @@ impl InlineImports {
                 // Three pointers, three bounds, each against the LAST byte it reaches.
                 let ctx_limit = self.mem_bytes.checked_sub(4)?.checked_sub(layout.ctx_top())?;
                 let st_limit = self.mem_bytes.checked_sub(4)?.checked_sub(layout.st_top())?;
-                let blk_limit = self.mem_bytes.checked_sub(layout.copy_bytes)?;
+                let blk_limit = self.mem_bytes.checked_sub(layout.blk_bytes())?;
                 Some(InlineLowering::BindState { layout, ctx_limit, st_limit, blk_limit })
             }
             crate::InlineOp::SetAllUniformBuffers { layout } => {
@@ -8085,6 +8469,117 @@ fn emit_lock_take(
     f.instruction(&W::Else);
     f.instruction(&W::I32Const(index as i32));
     f.instruction(&W::Call(IMPORT_FUNC));
+}
+
+/// The body of [`crate::InlineOp::LwMutexSmp`]: the entry is in `L_T0` (rebased, aligned).
+/// Leaves every `if` it opens closed; every refusal and every LOST compare-and-swap ends in
+/// the host call, which settles the case under the host mutex.
+fn emit_lock_take_smp(f: &mut Body, layout: crate::LwMutexLayout, lock: bool, base: u32, index: u32) {
+    /// The count word's CONTENDED bit (`vitaslop_runtime::vita::lwwork::CONTENDED`).
+    const BIT: i32 = i32::MIN;
+    /// The owner word of a free mutex (`vitaslop_runtime::vita::lwwork::NO_OWNER`).
+    const NO_OWNER: i32 = -1;
+    let count = MemArg { offset: layout.count as u64, align: 2, memory_index: 0 };
+    let fallback = |f: &mut Body| {
+        f.instruction(&W::I32Const(index as i32));
+        f.instruction(&W::Call(IMPORT_FUNC));
+    };
+    // t2 = the current thread (this instance's global), t1 = the count word as stored.
+    f.instruction(&W::GlobalGet(CUR_THREAD_GLOBAL));
+    f.instruction(&W::LocalSet(L_T2));
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32AtomicLoad(count));
+    f.instruction(&W::LocalSet(L_T1));
+
+    // The predicate; every term a comparison, so the `and`s are bitwise-safe.
+    // r1 == 1 (the lock/unlock count argument)...
+    f.instruction(&W::GlobalGet(abi::reg_global(1)));
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::I32Eq);
+    // ...the work area names itself (not a byte copy, not uncreated)...
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Load(word_at(layout.id)));
+    f.instruction(&W::GlobalGet(abi::reg_global(0)));
+    f.instruction(&W::I32Eq);
+    f.instruction(&W::I32And);
+    // ...and nobody is parked: the CONTENDED bit, in the very word the swap expects.
+    f.instruction(&W::LocalGet(L_T1));
+    f.instruction(&W::I32Const(BIT));
+    f.instruction(&W::I32And);
+    f.instruction(&W::I32Eqz);
+    f.instruction(&W::I32And);
+    if lock {
+        // ...free, or already mine.
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Load(word_at(layout.owner)));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::I32Or);
+        f.instruction(&W::I32And);
+    } else {
+        // ...held, and held by me.
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::I32And);
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Load(word_at(layout.owner)));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::I32And);
+    }
+    f.instruction(&W::If(BlockType::Empty));
+    emit_watch_store_inline(f, base, L_T0, layout.count, 4, index);
+    emit_watch_store_inline(f, base, L_T0, layout.owner, 4, index);
+    if !lock {
+        // A release to zero clears the owner FIRST - see `lwwork::NO_OWNER`.
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Const(1));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::If(BlockType::Empty));
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Const(NO_OWNER));
+        f.instruction(&W::I32AtomicStore(MemArg { offset: layout.owner as u64, align: 2, memory_index: 0 }));
+        f.instruction(&W::End);
+    }
+    // CAS(count, t1, t1 +- 1) == t1 ?
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::LocalGet(L_T1));
+    f.instruction(&W::LocalGet(L_T1));
+    f.instruction(&W::I32Const(1));
+    f.instruction(if lock { &W::I32Add } else { &W::I32Sub });
+    f.instruction(&W::I32AtomicRmwCmpxchg(count));
+    f.instruction(&W::LocalGet(L_T1));
+    f.instruction(&W::I32Eq);
+    f.instruction(&W::If(BlockType::Empty));
+    if lock {
+        // owner = cur, AFTER the swap - a no-op on the recursive arm.
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32AtomicStore(MemArg { offset: layout.owner as u64, align: 2, memory_index: 0 }));
+    }
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::GlobalSet(abi::reg_global(0)));
+    f.instruction(&W::Else);
+    if !lock {
+        // Lost the swap (the host marked it contended): this thread still holds it, so the
+        // owner goes back before the host settles the release.
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Const(1));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::If(BlockType::Empty));
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32AtomicStore(MemArg { offset: layout.owner as u64, align: 2, memory_index: 0 }));
+        f.instruction(&W::End);
+    }
+    fallback(f);
+    f.instruction(&W::End); // the swap's `if`
+    f.instruction(&W::Else);
+    fallback(f);
+    f.instruction(&W::End); // the predicate's `if`
 }
 
 fn emit_pointer_guard(f: &mut Body, base: u32, limit: u32, index: u32) {
@@ -8621,6 +9116,23 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::End); // the pointer guard's `if`
             return;
         }
+        Some(InlineLowering::LwMutexSmp { layout, limit, lock }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // An atomic access to a misaligned address TRAPS, so alignment is its own guard
+            // ahead of every word read - not a term of the predicate, whose loads would all
+            // run before the `and` could refuse.
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Const(3));
+            f.instruction(&W::I32And);
+            f.instruction(&W::If(BlockType::Empty));
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.instruction(&W::Else);
+            emit_lock_take_smp(f, layout, lock, base, index);
+            f.instruction(&W::End); // the alignment `if`
+            f.instruction(&W::End); // the pointer guard's `if`
+            return;
+        }
         Some(InlineLowering::ReserveUniforms { layout: l, limit, prog_limit, out_limit }) => {
             emit_pointer_guard(f, base, limit, index);
             // The context block is in range, so its words may be READ - but nothing may be
@@ -9010,6 +9522,21 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::LocalGet(L_T1));
             f.instruction(&W::I32Load(word_at(l.st_header_at)));
             f.instruction(&W::I32Store(word_at(l.ctx_record + 8)));
+            if l.table_bytes != 0 {
+                // The non-default uniform-buffer table, WHOLESALE - see
+                // `BindStateLayout::table_src`: the handler writes it replace-not-merge.
+                emit_watch_store_inline(f, base, L_T0, l.table_dst, l.table_bytes, index);
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::I32Const(l.table_dst as i32));
+                f.instruction(&W::I32Add);
+                emit_host_off(f);
+                f.instruction(&W::LocalGet(L_T2));
+                f.instruction(&W::I32Const(l.table_src as i32));
+                f.instruction(&W::I32Add);
+                emit_host_off(f);
+                f.instruction(&W::I32Const(l.table_bytes as i32));
+                f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+            }
             if l.has_prog {
                 // Binding a fragment state leaves the context bound to its program, so the
                 // handle goes where `sceGxmSetFragmentProgram` puts it.

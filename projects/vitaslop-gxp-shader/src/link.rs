@@ -471,7 +471,7 @@ fn memo_store(v: &[u8], f: &[u8], opts: LinkOptions, r: Result<std::sync::Arc<Li
 /// [`link_programs_with`], memoised on EXACTLY its inputs - both blobs by content and the whole
 /// [`LinkOptions`] - so a hit is by construction the module a fresh link would produce.
 ///
-/// MEASURED: a Hot Shots session spent 731-780 ms of in-frame time in OUR translation (USSE ->
+/// MEASURED: a golf title's session spent 731-780 ms of in-frame time in OUR translation (USSE ->
 /// IR -> WGSL), against 20-45 ms in the browser's compile and pipeline creation - every new pair
 /// a hitch in the frame that first drew it (the "new fighter appears" stall, the load stutter).
 /// On the console the equivalent work happens when the title calls
@@ -515,8 +515,8 @@ type RcMemo<T> = std::sync::Mutex<Option<std::collections::HashMap<u64, Vec<(std
 static VERTEX_RC_MEMO: RcMemo<crate::RecompiledVertex> = std::sync::Mutex::new(None);
 static FRAGMENT_RC_MEMO: RcMemo<crate::RecompiledFragment> = std::sync::Mutex::new(None);
 
-/// A program's decode, done once per distinct blob. A title pairs one program with many (Hot
-/// Shots creates 1,087 fragment programs against a few hundred vertex programs), and every link
+/// A program's decode, done once per distinct blob. A title pairs one program with many (a golf
+/// title creates 1,087 fragment programs against a few hundred vertex programs), and every link
 /// of every pair used to decode BOTH from scratch - 22% of a link's time on a 596-pair corpus.
 /// The decode is a function of the blob's bytes alone, so the memo is exact; failures are not
 /// kept (they are rare and report on each attempt, as before).
@@ -857,6 +857,9 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
     // the shader - see `resolve_static_mem_reads`.
     let vbody = crate::module::resolve_static_mem_reads(&vbody, &vplan.mem_windows, "gxp_mem");
     let fbody = crate::module::resolve_static_mem_reads(&fbody, &fplan.mem_windows, "gxp_fmem");
+    // What stays dynamic, four words at a time where the body reads them so - `quad_mem_reads`.
+    let vbody = crate::module::quad_mem_reads(&vbody, "gxp_mem");
+    let fbody = crate::module::quad_mem_reads(&fbody, "gxp_fmem");
 
     prof.lap(2);
     let wgsl = build_linked_module(
@@ -1193,7 +1196,9 @@ struct Interface {
     /// pixels in x/y, the depth-buffer value in z, and `1/w` in w - which is what Sony's Cg
     /// front end gives a fragment program's `POSITION`/`WPOS` semantic. See
     /// [`plan_interface`] for the corpus measurement that settles it.
-    window_position: Option<u32>,
+    /// ...and how many of its F32 registers the fragment declares: the window coordinate's
+    /// PREFIX (x, y[, z[, 1/w]]), the same prefix rule a texcoord follows.
+    window_position: Option<(u32, u32)>,
 }
 
 /// Match the vertex's declared varying outputs to the fragment's declared interpolants BY
@@ -2793,10 +2798,15 @@ fn plan_interface_with(
         let data_base = it.pa_base as u32;
         if it.usage == VaryingUsage::Position && reads(data_base..data_base + it.register_count as u32)
         {
-            // Four full-precision registers is the only shape the window coordinate has; a
-            // half-precision or narrower declaration would mean the descriptor means something
-            // else here, and guessing a routing for it would feed the shader silent zeros.
-            if it.half || it.register_count != 4 {
+            // Full precision, one register per component. A declaration of FEWER than four is
+            // the coordinate's PREFIX - the rule a texcoord follows (see below): the iterator
+            // fills what the fragment asked for. MEASURED: a fighting title's smoke and dust
+            // fragments declare POSITION as TWO F32 registers (window x, y - a screen-space
+            // lookup) and refusing them dropped 1-5 particle draws a scene for the whole fight,
+            // leaving hard-edged white blobs. A HALF-precision declaration would pack two
+            // components per register in a layout no corpus program establishes, so it still
+            // refuses.
+            if it.half || it.register_count == 0 || it.register_count > 4 {
                 return Err(LinkError::VaryingSizeMismatch {
                     usage: it.usage,
                     fragment_registers: it.register_count as u32,
@@ -2804,8 +2814,8 @@ fn plan_interface_with(
                     half: it.half,
                 });
             }
-            iface.window_position = Some(data_base);
-            for r in data_base..data_base + 4 {
+            iface.window_position = Some((data_base, it.register_count as u32));
+            for r in data_base..data_base + it.register_count as u32 {
                 fed[r as usize] = true;
             }
         } else if reads(data_base..data_base + it.register_count as u32) {
@@ -2814,7 +2824,7 @@ fn plan_interface_with(
             //
             // The fill for registers a vertex output does not reach is established below (a
             // shipping title's draws, correct on the device); a texcoord with NO vertex output is
-            // that rule with nothing written. MEASURED need: a fighting title (PCSE00235) creates
+            // that rule with nothing written. MEASURED need: a fighting title creates
             // a character-cloth fragment reading TEXCOORD5/9 against a vertex program declaring
             // neither - created by the title itself with that pairing - and refusing it dropped
             // the garment from every frame. Colours and fog keep the refusal: no default is
@@ -3175,7 +3185,7 @@ pub(crate) fn secondary_attr_init(
     let mut needed_strict = std::collections::BTreeSet::new();
     // >>> A SECONDARY INSTRUCTION WHOSE SA RESULT NOTHING READS OWES NOTHING. Its inputs cannot
     // reach a pixel, so demanding a source for them refuses a program over a value it throws
-    // away. MEASURED on a fighting title (PCSE00235): its image-based-lighting program's
+    // away. MEASURED on a fighting title: its image-based-lighting program's
     // secondary computes the per-thread LOCAL-memory base `sa[0] = special * 2304 + sa[0]` from
     // the driver's thread-buffer slot - a base the local-memory model does not add (the area is
     // private to the invocation), so no instruction reads the result, and the pass that lights
@@ -3682,7 +3692,7 @@ fn build_linked_module(
     // algebra), and the straightforward way to get that is a function called twice. But the
     // PREFIX - everything before the first instruction that reads the output bank - reads
     // varyings, uniforms and textures and nothing that differs between the two calls, so
-    // running it twice is pure waste. On mlb's world-family blend, which paints 78% of the
+    // running it twice is pure waste. On a baseball title's world-family blend, which paints 78% of the
     // world pass's fragments, that prefix is most of the body.
     //
     // So when the body can be cut, `fs_main` IS the body: the prefix once, then the suffix
@@ -3720,9 +3730,9 @@ fn build_linked_module(
     // way here - the clip-`w` sign correction and the depth remap - and re-encodes the depth
     // the way the guest's own depth buffer holds it, so that a shader comparing its own
     // POSITION against a sampled depth surface compares two values in ONE space.
-    if let Some(base) = iface.window_position {
+    if let Some((base, count)) = iface.window_position {
         let _ = writeln!(m, "  let gxp_wpos = gxp_window_position(in.frag_coord);");
-        for c in 0..4u32 {
+        for c in 0..count {
             let _ = writeln!(m, "  pa[{}] = bitcast<u32>(gxp_wpos.{});", base + c, comp(c));
         }
     }
@@ -4066,7 +4076,7 @@ fn split_dual_body(fbody: &str, split: Option<usize>) -> Option<(String, String)
 fn emit_dual_split_tail(m: &mut String, tail: &str, color: &str, precision: ColorPrecision) {
     // >>> RE-RUNNING ONLY THE DESTINATION-DEPENDENT STATEMENTS WAS TRIED 2026-09-12g AND IS A
     // >>> NULL ON THE PAIR IT WAS AIMED AT. The suffix is cut at the first instruction that
-    // READS the destination, so "after the cut" is a POSITION and not a dependence, and on mlb's
+    // READS the destination, so "after the cut" is a POSITION and not a dependence, and on a baseball title's
     // world-family blend only three of its 82 statements touch the destination. But a second
     // evaluation that skips the other 79 is only correct if none of them overwrites a register a
     // dependent statement wrote - and this program reuses `r[]` heavily, so every one of them
@@ -4135,7 +4145,7 @@ fn fs_main(in: FsIn) -> GxpDual {
 /// two halves and the emitter spells every read `unpack2x16float(r[n])[k]` and every write
 /// `r[n] = gxp_hlo(r[n], ...)`, which is a narrowing plus a masked merge. Those are
 /// CONVERSIONS, and a fragment
-/// program runs them per fragment: mlb's world-family blend emits 466 of them, and that pair
+/// program runs them per fragment: a baseball title's world-family blend emits 466 of them, and that pair
 /// paints 78% of the samples in the pass that is the phone's most expensive
 /// [[vitaslop-f16-emulation-is-the-phones-world-pass]]. A desktop GPU's compiler folds most of
 /// them away and prices this at zero [[vitaslop-desktop-cannot-price-a-count-win]]; a tiler
@@ -4390,7 +4400,7 @@ fn stray_bank_refs_by_name(text: &str) -> Vec<Result<(&'static str, usize), &'st
 /// (`VITASLOP_GXP_HALF_REGS=0` is the arm back), and the reason is a PICTURE on the phone.
 ///
 /// >>> THE PACKED FORM IS COMPUTED WRONG ON THE POWERVR PHONE (img-tec d-series), DATA-DEPENDENTLY.
-/// MLB's boot light-cell blur (`frag_842e7990`/`frag_842e875c`) replayed from one captured frame
+/// A baseball title's boot light-cell blur (`frag_842e7990`/`frag_842e875c`) replayed from one captured frame
 /// halved the light on every pass on the phone (cell grid 8 -> 4 -> 2) while the desktop kept it
 /// (8 -> 8 -> 8); this arm on the phone gave 8 -> 8 -> 8. That chain feeds the players' ambient
 /// cubes through the game's own CPU-side colour pick, so the whole at-bat rendered warm and
@@ -4403,9 +4413,9 @@ fn stray_bank_refs_by_name(text: &str) -> Vec<Result<(&'static str, usize), &'st
 ///
 /// The earlier measurements, kept because they are what the default used to rest on:
 ///
-/// The pass removes 70% of the f16 conversions a corpus emits (mlb: 4,459 -> 1,330), and on the
+/// The pass removes 70% of the f16 conversions a corpus emits (a baseball title: 4,459 -> 1,330), and on the
 /// only engine here that can price it - the DESKTOP BROWSER, whose shader compiler is the
-/// phone's family - it is worth NOTHING: mlb's world pass reads p50 0.91 and 0.88 ms across two
+/// phone's family - it is worth NOTHING: that title's world pass reads p50 0.91 and 0.88 ms across two
 /// runs of the SAME arm, and both arms of the change land inside that. It also moves pixels on
 /// five of seven titles (a mean of 0.02-0.07 of 255, on glyph edges and stipple, where a rounding
 /// difference flips an edge blend) and grows a pair's declared register storage 228 -> 332 words,
@@ -4424,7 +4434,7 @@ fn half_regs_on() -> bool {
 
 /// A register's occurrences, split into the LIVE RANGES a whole-register write separates.
 ///
-/// A program reuses one register at two precisions: mlb's world blend keeps a prefetched texel
+/// A program reuses one register at two precisions: a baseball title's world blend keeps a prefetched texel
 /// pair in `pa[2]` as two halves for fifty reads, then overwrites the whole register with an
 /// `f32` and uses it as a texture coordinate. Under a per-REGISTER rule that one `f32` use costs
 /// all fifty half reads their unpacked home. Under a per-RANGE rule it costs only its own range,
@@ -5329,15 +5339,18 @@ pub fn set_arm(name: &str, value: &str) {
     if !matches!(
         name,
         SIZE_BANKS_ARM
+            | BOUND_READS_ARM
             | SA_DIRECT_ARM
             | MEM_OFFSET16_ARM
             | STATIC_MEM_ARM
+            | MEM_QUAD_ARM
             | HALF_REGS_ARM
             | IDX_REGDEST_ARM
             | PACK_COMP0_ARM
             | IDX_MUL_ARM
             | F16_ROUND_ARM
             | Q2_VEC_ARM
+            | F16_FCMP_ARM
             | CASE_TEX_ARM
             | DP_MOE_BIT47_ARM
             | DP_B48_BOTH_ARM
@@ -5345,6 +5358,7 @@ pub fn set_arm(name: &str, value: &str) {
             | IEEE_RCP_ARM
             | IMAD_SRC1_WHOLE_ARM
             | PREFETCH_U8_ARM
+            | INDEXED_REACH_ARM
             // >>> THE SHADER PROBES, for the same reason as the arms above and more urgently.
             //
             // These are the only instruments that can say WHICH term of a lit material is the
@@ -5383,6 +5397,9 @@ pub fn arms_line() -> String {
 
 /// `0` declares every register bank at the full [`BANK_REGS`] - see [`size_register_banks`].
 pub const SIZE_BANKS_ARM: &str = "VITASLOP_GXP_SIZE_BANKS";
+/// `0` keeps a bank read dynamically at the full [`BANK_REGS`] - the A/B arm for
+/// [`bound_dynamic_reads`].
+pub const BOUND_READS_ARM: &str = "VITASLOP_GXP_BOUND_READS";
 /// `0` restores the SA copy loop, `unroll` the constant-subscript copy - see [`resolve_sa_init`].
 pub const SA_DIRECT_ARM: &str = "VITASLOP_GXP_SA_DIRECT";
 /// `1` gives a 16-bit register an UNPACKED home ([`unpack_half_registers`]); unset or `0` keeps
@@ -5393,6 +5410,9 @@ pub const HALF_REGS_ARM: &str = "VITASLOP_GXP_HALF_REGS";
 /// `0` reads a one-register prefetch as one full-precision component even where the program
 /// reads it as four packed 8-bit channels - see the one-register case in `build_linked_module`.
 pub const PREFETCH_U8_ARM: &str = "VITASLOP_GXP_PREFETCH_U8";
+
+/// `0` sizes an indexed table's window as declared again - see `module::indexed_reach`.
+pub const INDEXED_REACH_ARM: &str = "VITASLOP_GXP_INDEXED_REACH";
 
 /// >>> HOW AN f32 NARROWS TO AN f16 - THE NEGATIVE CONTROL FOR THE ROUNDING FIX.
 ///
@@ -5415,13 +5435,31 @@ pub const F16_ROUND_ARM: &str = "VITASLOP_GXP_F16_RTE";
 /// - see [`GXP_Q2_VEC`]. Default ON in the BROWSER build only; `1` turns it on natively.
 pub const Q2_VEC_ARM: &str = "VITASLOP_GXP_Q2_VEC";
 
+/// `1`/`0`: the f16 SATURATION as a finite test and a `clamp` (`1`) or as a bit-pattern test
+/// (`0`) - see [`crate::wgsl::f16_clamp_form`] and the measurement at `HALF_HELPERS_NATIVE`.
+/// Default ON in the BROWSER build only, like [`Q2_VEC_ARM`] and for the same reason: the two
+/// forms are identical for every input as helpers (0 mismatches over 2^32 on the phone, for the
+/// two-compare float form and again for the clamp form) and the float forms build faster there
+/// (two compares 13-21%, the clamp a further 17-19%), but a NATIVE replay moved ~11-13 thousand golf pixels
+/// by one level (naga's backends round differently around it), and the native renderer is the
+/// oracle - it must not move.
+pub const F16_FCMP_ARM: &str = "VITASLOP_GXP_F16_FCMP";
+
+pub(crate) fn f16_fcmp_on() -> bool {
+    match arm(F16_FCMP_ARM) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => cfg!(target_arch = "wasm32"),
+    }
+}
+
 /// Whether [`GXP_Q2_VEC`] is emitted.
 ///
 /// >>> ON WHERE IT IS PROVEN, AND ONLY THERE. The equivalence is a measurement of a COMPILER,
 /// not an identity of the language: `f16-helper-equiv` found 0 mismatches over all 2^32 inputs
 /// under Chrome's Tint on the phone (PowerVR) AND on the desktop (D3D12), but the NATIVE
 /// renderer compiles through naga, and a native frame replay moved 12 pixels by one level
-/// (Madden kickoff f2300, 2,089,727 bytes; the alias peephole alone left it byte-identical). So
+/// (a football title's kickoff f2300, 2,089,727 bytes; the alias peephole alone left it byte-identical). So
 /// the browser - the product, where the build cost is paid - takes it by default, and the
 /// native renderer, which is the regression oracle, keeps the scalar form unless asked.
 fn q2_vec_on() -> bool {
@@ -5446,6 +5484,10 @@ pub const MEM_OFFSET16_ARM: &str = "VITASLOP_GXP_MEM_OFFSET16";
 /// resolving a load whose address is a window's own base register plus a constant at emit
 /// time - see [`crate::module::resolve_static_mem_reads`], which carries the measurement.
 pub const STATIC_MEM_ARM: &str = "VITASLOP_GXP_STATIC_MEM";
+
+/// `0` keeps four consecutive word loads as four `_word` calls instead of one `_quad` read -
+/// see [`crate::module::quad_mem_reads`], which carries the measurement.
+pub const MEM_QUAD_ARM: &str = "VITASLOP_GXP_MEM_QUAD";
 
 
 /// `<bank><idx>[@<instr>][:f32|:bits=<hex>]` - return that register AS the colour. See
@@ -5520,7 +5562,7 @@ pub const PACK_COMP0_ARM: &str = "VITASLOP_GXP_PACK_COMP0";
 /// The multiplier the ORDINARY-REGISTER index load applies to its source, as a decimal string.
 /// Default 1, which is what the corpus grammar decodes today.
 ///
-/// >>> IT IS A QUESTION, NOT A SETTING. Madden's matrix palette is THREE float4 rows per bone
+/// >>> IT IS A QUESTION, NOT A SETTING. A football title's matrix palette is THREE float4 rows per bone
 /// (measured: rows 0,1,2 of the bound window are one affine transform, 3,4,5 the next, and so
 /// on for every group), and its `IN.blendIndices` are plain consecutive BONE numbers - 31, 32,
 /// 33 - so the row a bone's matrix starts at is `3 * index`, not `index`. No field of the
@@ -5602,6 +5644,7 @@ fn finish_linked_module(m: &str) -> String {
     sub.lap(6);
     let c = unpack_half_registers(&b);
     sub.lap(7);
+    let c = bound_dynamic_reads(&c);
     let d = size_register_banks(&c);
     sub.lap(8);
     let out = fold_literal_unpacks(&d);
@@ -5650,7 +5693,7 @@ fn folded_unpack(word: u32) -> String {
 /// constant folding: bit-identical by construction (every f16 is exact in f32, see
 /// [`f16_bits_to_f32_bits`]) and fewer instructions in the shader.
 ///
-/// It is also what a real device needs. MEASURED on the PowerVR phone (Madden's crowd,
+/// It is also what a real device needs. MEASURED on the PowerVR phone (a football title's crowd,
 /// `ae75f4bf0fc3cc0c`, replayed from one captured frame): the translated module is valid and
 /// the desktop browser computes `unpack2x16float(0x3c002c00u)` as (0.0625, 1.0), while the phone
 /// returned 0.0625 for component 1 too - its crowd texcoord came out at a quarter of its value,
@@ -5818,7 +5861,8 @@ fn size_register_banks(module: &str) -> String {
     let mut q2_vec = false;
     if out.contains("gxp_q2(") {
         q2_vec = crate::wgsl::native_f16_arm() && q2_vec_on();
-        out.insert_str(directives_end(&out), if q2_vec { GXP_Q2_VEC } else { GXP_Q2 });
+        let q2 = if q2_vec { crate::wgsl::f16_clamp_form(GXP_Q2_VEC) } else { std::borrow::Cow::Borrowed(GXP_Q2) };
+        out.insert_str(directives_end(&out), &q2);
     }
     // ...and the f16 STORE helpers, which `gxp_q2` is itself written in terms of - so they must
     // be inserted AFTER it, because each insertion goes at the same place and the last one in
@@ -5866,6 +5910,13 @@ fn bank_extent(region: &str, bank: &str) -> Option<usize> {
             any = true;
             continue;
         }
+        // A CLAMPED subscript, `min(<anything>, Ku)`, never exceeds K - the form
+        // [`bound_dynamic_reads`] leaves and `indexed_element` emits.
+        if let Some(k) = clamped_subscript_bound(sub) {
+            high = high.max(k);
+            any = true;
+            continue;
+        }
         // The default-uniform copy loop is bounded by its own literal; every other dynamic
         // subscript is not bounded at all.
         if let Some(tail) = sub.strip_prefix("gxp_sa_k]") {
@@ -5879,6 +5930,150 @@ fn bank_extent(region: &str, bank: &str) -> Option<usize> {
         return None;
     }
     Some(if any { high + 1 } else { 0 })
+}
+
+/// The subscript text that starts at `sub` (just past a `[`), up to its matching `]`.
+fn subscript_text(sub: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (i, c) in sub.char_indices() {
+        match c {
+            '[' | '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            ']' if depth == 0 => return Some(&sub[..i]),
+            ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `K` when the subscript starting at `sub` is `min(<expr>, Ku)` - bounded by K whatever `<expr>`.
+fn clamped_subscript_bound(sub: &str) -> Option<usize> {
+    let text = subscript_text(sub)?;
+    let inner = text.strip_prefix("min(")?.strip_suffix("u)")?;
+    let comma = inner.rfind(", ")?;
+    // The comma must be at the top level of `min(`, not inside `<expr>`.
+    let (expr, k) = (&inner[..comma], &inner[comma + 2..]);
+    let balanced = expr.chars().try_fold(0i32, |d, c| match c {
+        '(' | '[' => Some(d + 1),
+        ')' | ']' => (d > 0).then_some(d - 1),
+        _ => Some(d),
+    }) == Some(0);
+    if !balanced {
+        return None;
+    }
+    k.parse().ok()
+}
+
+/// >>> A BANK READ DYNAMICALLY BUT WRITTEN ONLY AT KNOWN REGISTERS IS SIZED TO THOSE REGISTERS.
+///
+/// An indexed read (`indexed_element`) clamps its subscript to `BANK_REGS - 1`, so
+/// [`size_register_banks`] had to keep that bank at all 512 registers - a 2 KB private array a
+/// shader indexes at run time. MEASURED (a fighting title's fight shaders, one module compiled per pipeline on a
+/// desktop GPU): every module slower than 140 ms had one - a skinned vertex program reading its
+/// bone palette out of `sa` - and those compiles are the in-fight display freezes (the browser
+/// declines presents until the pipeline exists: 234 ms desktop, ~500 ms on the phone).
+///
+/// When every WRITE to the bank is at a literal register (or the bounded uniform copy loop), the
+/// registers past the highest one written are never written and hold zero, so a dynamic read
+/// `bank[min(i, 511u)]` equals `select(0u, bank[min(i, (N-1)u)], i < Nu)` with `N` the written
+/// extent - which only needs an array of N. A bank with any DYNAMIC write is left alone: what
+/// it holds past N cannot be bounded from the text.
+fn bound_dynamic_reads(module: &str) -> String {
+    if !arm_on(SIZE_BANKS_ARM) || !arm_on(BOUND_READS_ARM) {
+        return module.to_string();
+    }
+    let mut out = String::with_capacity(module.len());
+    let mut rest = module;
+    // Region by region (stage by stage), as `size_register_banks` sizes them.
+    loop {
+        let (region, next) = match rest.find(BANKS_MARKER) {
+            Some(at) => {
+                let after = at + BANKS_MARKER.len();
+                let end = rest[after..].find(BANKS_MARKER).map_or(rest.len(), |n| after + n);
+                out.push_str(&rest[..after]);
+                (&rest[after..end], &rest[end..])
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        };
+        let mut region = region.to_string();
+        for bank in ["r", "o", "i", "pa", "sa"] {
+            if let Some(r) = bound_bank_reads(&region, bank) {
+                region = r;
+            }
+        }
+        out.push_str(&region);
+        rest = next;
+    }
+    out
+}
+
+/// [`bound_dynamic_reads`] for one bank of one stage region; `None` when it does not apply.
+fn bound_bank_reads(region: &str, bank: &str) -> Option<String> {
+    const CLAMP: &str = "u32(max(";
+    let full = format!(", {}u)", BANK_REGS - 1);
+    let bytes = region.as_bytes();
+    let mut written_high: Option<usize> = None;
+    let mut reads: Vec<(usize, usize, String)> = Vec::new(); // (start of `bank[`, end past `]`, index expr)
+    let mut from = 0usize;
+    while let Some(rel) = region[from..].find(bank) {
+        let start = from + rel;
+        from = start + bank.len();
+        if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+            continue;
+        }
+        if bytes.get(from) != Some(&b'[') {
+            continue;
+        }
+        let sub = subscript_text(&region[from + 1..])?;
+        let end = from + 1 + sub.len() + 1;
+        let is_write = {
+            let t = region[end..].trim_start();
+            t.starts_with('=') && !t.starts_with("==")
+        };
+        if let Ok(n) = sub.parse::<usize>() {
+            // A literal register: a read of it past every write is zero too, but it has to be
+            // IN the array, so it counts toward the extent either way.
+            written_high = Some(written_high.map_or(n, |h| h.max(n)));
+            continue;
+        }
+        if sub == format!("gxp_{bank}_k") {
+            let bound = uniform_loop_bound(region)?;
+            if bound > 0 {
+                written_high = Some(written_high.map_or(bound - 1, |h| h.max(bound - 1)));
+            }
+            continue;
+        }
+        // The only dynamic form handled: `indexed_element`'s full-bank clamp, READ.
+        let expr = sub.strip_prefix("min(")?.strip_suffix(&full)?;
+        if is_write || !expr.starts_with(CLAMP) {
+            return None;
+        }
+        reads.push((start, end, expr.to_string()));
+    }
+    if reads.is_empty() {
+        return None;
+    }
+    let n = written_high.map_or(0, |h| h + 1);
+    if n >= BANK_REGS {
+        return None;
+    }
+    let mut out = String::with_capacity(region.len());
+    let mut at = 0usize;
+    for (start, end, expr) in reads {
+        out.push_str(&region[at..start]);
+        if n == 0 {
+            out.push_str("0u");
+        } else {
+            let _ = write!(out, "select(0u, {bank}[min({expr}, {}u)], {expr} < {n}u)", n - 1);
+        }
+        at = end;
+    }
+    out.push_str(&region[at..]);
+    Some(out)
 }
 
 /// The literal register count the SA copy loop emitted by [`emit_secondary_attrs`] runs to.
@@ -6031,6 +6226,26 @@ mod bank_sizing_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A bank written only at literal registers and read dynamically is bounded to its writes,
+    /// with a read past them returning zero; one written dynamically is left at full size.
+    #[test]
+    fn a_bank_read_dynamically_but_written_at_known_registers_is_sized_to_them() {
+        use super::{bank_extent, bound_bank_reads};
+        let region = "  sa[3] = 7u;\n  sa[10] = 1u;\n  o[0] = sa[min(u32(max(idx[0] + 2i, 0i)), 511u)];\n";
+        let r = bound_bank_reads(region, "sa").expect("bounded");
+        assert!(
+            r.contains("o[0] = select(0u, sa[min(u32(max(idx[0] + 2i, 0i)), 10u)], u32(max(idx[0] + 2i, 0i)) < 11u);"),
+            "{r}"
+        );
+        assert_eq!(bank_extent(&r, "sa"), Some(11));
+        // A dynamic WRITE leaves the bank as it was.
+        let written = "  sa[min(u32(max(idx[0], 0i)), 511u)] = 1u;\n  o[0] = sa[min(u32(max(idx[1], 0i)), 511u)];\n";
+        assert!(bound_bank_reads(written, "sa").is_none());
+        // Nothing written: every dynamic read is zero.
+        let unwritten = "  o[0] = sa[min(u32(max(idx[0], 0i)), 511u)];\n";
+        assert_eq!(bound_bank_reads(unwritten, "sa").unwrap(), "  o[0] = 0u;\n");
+    }
+
     use super::*;
     use crate::container::{
         Interpolant, OutputVarying, ParamCategory, ParamType, Parameter, ProgramKind, SamplePrefetch,
@@ -6102,7 +6317,7 @@ mod tests {
         assert!(f32::from_bits(f16_bits_to_f32_bits(0x7e00)).is_nan(), "NaN stays NaN");
     }
 
-    /// Madden's crowd program: a literal SA register read through `unpack2x16float` folds to
+    /// A football title's crowd program: a literal SA register read through `unpack2x16float` folds to
     /// its exact halves; a register written twice, or a bank with a dynamic store, does not.
     #[test]
     fn a_literal_register_unpack_folds_and_nothing_else_does() {
@@ -6116,7 +6331,7 @@ mod tests {
         let dynamic = "fn vs_main() {\n  sa[59] = 0x3c002c00u;\n  sa[idx[0] + 1] = 0u;\n  let u = unpack2x16float(sa[59]);\n}\n";
         assert!(fold_literal_unpacks(dynamic).contains("unpack2x16float(sa[59])"), "an indexed store may hit it");
         // The bank's own INIT LOOP (a dynamic store) runs BEFORE the literal and cannot clobber
-        // it - Madden's crowd stage is exactly this shape; a read BEFORE the literal is not one.
+        // it - that crowd stage is exactly this shape; a read BEFORE the literal is not one.
         let init = "fn vs_main() {\n  let early = unpack2x16float(sa[59]);\n  for (var k: u32 = 0u; k < 56u; k = k + 1u) { sa[k] = vs_sa.data[k / 4u][k % 4u]; }\n  sa[59] = 0x3c002c00u;\n  let u = unpack2x16float(sa[59]);\n}\n";
         let f = fold_literal_unpacks(init);
         assert!(f.contains("let early = unpack2x16float(sa[59]);"), "{f}");
@@ -6253,7 +6468,7 @@ mod tests {
     /// The second copy reads what the PREFIX left, not what the first copy wrote. Carrying the
     /// first copy's range ids into the second put a read in a range that never reached it, and
     /// when one of those ranges lived unpacked and the other packed, the second copy read a word
-    /// nothing had written: mlb's whole frame came back BLACK.
+    /// nothing had written: a baseball title's whole frame came back BLACK.
     #[test]
     fn the_dual_source_split_rewinds_the_ranges_with_the_register_file() {
         let out = unpack_half_registers(&half_region(
@@ -6906,7 +7121,7 @@ mod tests {
     }
 
     /// The fragment of `a_projective_prefetch_*`: TEXCOORD1's data in PA[0..2] and unit 4's
-    /// sample in PA[2..4], coordinated by TEXCOORD0 - mlb's grass sampling `PlayerShadowsTarget`.
+    /// sample in PA[2..4], coordinated by TEXCOORD0 - a baseball title's grass sampling `PlayerShadowsTarget`.
     fn projective_pair(texcoord0_width: u32) -> (Program, Program) {
         let mut vprog = vertex_program(0, Vec::new(), 0);
         vprog.output_varyings = vec![texcoord_out(0, 6, texcoord0_width), texcoord_out(1, 10, 4)];
@@ -6948,7 +7163,7 @@ mod tests {
     fn a_projective_prefetch_samples_at_xy_over_w() {
         // The emitted sample, against the plain reading as its negative control: the same pair
         // with the descriptor's lookup field at 1 samples the raw (x', y') - which is what wrapped
-        // `PlayerShadowsTarget` across mlb's whole infield as a grid of dark dashes.
+        // `PlayerShadowsTarget` across that title's whole infield as a grid of dark dashes.
         let emit = |projective: bool| {
             let (vprog, mut fprog) = projective_pair(4);
             if !projective {

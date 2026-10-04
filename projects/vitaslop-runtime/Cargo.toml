@@ -78,7 +78,7 @@ vitaslop-platform = { path = "../vitaslop-platform", features = ["aac"] }
 
 # Dev-only: the `disasm` example prints guest instructions when recovering an
 # undocumented library from its call sites. The transpiler already decodes with this.
-yaxpeax-arm = { git = "https://github.com/cretz/yaxpeax-arm", rev = "57a5099a88647d981d611a6e5c5489a7fd0c70aa", default-features = false, features = ["non-exhaustive-enums"] }
+yaxpeax-arm = { git = "https://github.com/cretz/yaxpeax-arm", rev = "06161b6fd6ac0e2ecd10e41b6039f9c139240e9c", default-features = false, features = ["non-exhaustive-enums"] }
 yaxpeax-arch = { version = "0.3.1", default-features = false }
 # Validates the whole-program wasm the linker+transpiler emit, in the fixture tests.
 wasmparser = "0.253"

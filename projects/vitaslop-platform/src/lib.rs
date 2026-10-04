@@ -26,6 +26,10 @@ pub mod heap;
 pub mod fasthash;
 pub mod gpu;
 pub mod knobs;
+/// The last step of a present - the console's picture scaled crisply onto the window or canvas.
+/// Shared so the desktop letterboxes and scales exactly as the browser does.
+#[cfg(feature = "gpu")]
+pub mod present_scale;
 /// The GPU texture transcoder: guest blocks -> compressed blocks, in compute shaders, with no
 /// CPU decode and no readback. Behind the `gpu` feature for the same reason the pipelines are -
 /// the engine-agnostic runtime depends on this crate for the neutral types and must not pull in

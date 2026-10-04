@@ -17,14 +17,21 @@
 //! shared memory is the one object that legally crosses stores (the wasm threads
 //! proposal), so it is what we lean on.
 //!
-//! # Why cooperative and single-threaded
-//! Only one guest thread runs at any instant; a thread yields control only at a
-//! host call (a blocking primitive, or a fuel-quantum preemption). Because no two
-//! guest threads ever touch memory truly concurrently, the shared memory needs no
-//! atomics for correctness here, and scheduling stays deterministic - the same
-//! inputs drive the same interleaving. Real SMP (several guests running at once on
-//! several OS threads) is a later step; this establishes the faithful blocking
-//! semantics single-worker run-to-completion could not express.
+//! # Why cooperative and single-threaded - by default
+//! Under [`ThreadedScheduler`]'s one-at-a-time engine only one guest thread runs at any
+//! instant; a thread yields control only at a host call (a blocking primitive, or a
+//! fuel-quantum preemption). No two guest threads touch memory truly concurrently, and
+//! scheduling is deterministic - the same inputs drive the same interleaving, which every
+//! recipe, capsule and test depends on.
+//!
+//! The PARALLEL engine (`crate::smp`, `VITASLOP_SMP`) runs these same instances on several
+//! OS threads at once, over the same shared memory, with a module built for it (atomics, the
+//! per-instance exclusive monitor, preempt words). There the "no fiber runs" arguments below
+//! hold only for the thread making the access: host-side copies are the browser's parallel
+//! engine's plain shared-memory accesses (racy, as wasm shared memory is, never torn below a
+//! byte), and the one place a race would be WRONG rather than merely racy - a host-side
+//! compare-and-swap on a word guest atomics also use - is a real atomic
+//! (`SharedView::cas_u32`).
 //!
 //! # The switch points
 //! Each host call returns an [`SvcOutcome`]. [`Continue`](SvcOutcome::Continue)
@@ -162,6 +169,85 @@ struct ThreadData<H: ImportDispatch + Send + 'static> {
     /// the module contains is a property of the module, and a runtime reading of it must
     /// not depend on which thread asks.
     fuel_interval: u32,
+    /// Set when this thread runs under the PARALLEL scheduler (`crate::smp`): its worker, that
+    /// worker's PREEMPT word and runnable counts, and the elided-yield global the module resets
+    /// against. `None` on the one-at-a-time engine.
+    smp: Option<SmpThread>,
+}
+
+/// What a thread's host-call closure needs on a parallel run - the native form of the
+/// browser's `SmpHooks` (`vitaslop-web/src/browser_sched.rs`).
+pub(crate) struct SmpThread {
+    /// The worker this thread is bound to for life (`crate::smp`): it never moves.
+    worker: usize,
+    /// Linear ADDRESS of that worker's PREEMPT word in the shared memory. A thread spinning
+    /// through host calls never reaches a loop back edge, so the call that returns is where
+    /// it yields when another worker asked for the CPU.
+    preempt: usize,
+    /// Runnable threads per worker, kept by the scheduler: "would a yield find anyone to
+    /// yield to" is a question about THIS worker's queue, asked per call.
+    runnable: Arc<[std::sync::atomic::AtomicUsize]>,
+    /// The per-thread words the inline forms read (`InlineOp::ThreadWord`): the scheduler's
+    /// current thread and the id `sceKernelGetThreadId` reports. NOT constant - a thread
+    /// running a fiber reports its runner, and that mapping moves at `sceFiberSwitch`/`Run`
+    /// (which block the caller) - so the worker writes them into `words` before every resume
+    /// and the closure applies them where the resume lands: right after its suspend, or at the
+    /// fiber's start for the first run. The browser's `set_smp_words`, from inside the store.
+    words: Arc<[std::sync::atomic::AtomicU32; 2]>,
+    cur_thread: wasmtime::Global,
+    thread_id: wasmtime::Global,
+    /// The module's elided-yield run counter (`abi::ELIDE_EXPORT`), zeroed at every resume.
+    elide: wasmtime::Global,
+}
+
+impl SmpThread {
+    fn preempt_requested(&self) -> bool {
+        // SAFETY: an aligned i32 inside the shared memory's reserved mirror page, which lives
+        // as long as the memory; read atomically.
+        unsafe { &*(self.preempt as *const std::sync::atomic::AtomicI32) }.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+}
+
+/// Apply a resume's per-thread words to this instance - see [`SmpThread::words`].
+fn apply_smp_words(mut store: impl wasmtime::AsContextMut, s: &SmpThreadGlobals) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _ = s.cur_thread.set(&mut store, Val::I32(s.words[0].load(Relaxed) as i32));
+    let _ = s.thread_id.set(&mut store, Val::I32(s.words[1].load(Relaxed) as i32));
+    let _ = s.elide.set(&mut store, Val::I32(0));
+}
+
+/// The handles [`apply_smp_words`] needs, cloned out of [`SmpThread`] so they can be used while
+/// the store is mutably borrowed.
+struct SmpThreadGlobals {
+    words: Arc<[std::sync::atomic::AtomicU32; 2]>,
+    cur_thread: wasmtime::Global,
+    thread_id: wasmtime::Global,
+    elide: wasmtime::Global,
+}
+
+impl SmpThread {
+    fn globals(&self) -> SmpThreadGlobals {
+        SmpThreadGlobals {
+            words: self.words.clone(),
+            cur_thread: self.cur_thread,
+            thread_id: self.thread_id,
+            elide: self.elide,
+        }
+    }
+}
+
+/// How the parallel scheduler (`crate::smp`) asks for a thread: the worker it is bound to,
+/// that worker's PREEMPT word as a LAYOUT offset (what the module's back-edge check loads) and
+/// as a linear address (what the host-call closure reads), the runnable counts, and the
+/// per-thread words the inline forms read (`InlineOp::ThreadWord`) - constant for a thread.
+pub(crate) struct SmpSpawn {
+    pub(crate) worker: usize,
+    pub(crate) preempt_off: u32,
+    pub(crate) preempt_ptr: usize,
+    pub(crate) runnable: Arc<[std::sync::atomic::AtomicUsize]>,
+    /// Shared with the scheduler, which writes `[current thread, reported id]` before every
+    /// resume - see [`SmpThread::words`].
+    pub(crate) words: Arc<[std::sync::atomic::AtomicU32; 2]>,
 }
 
 /// The wasm globals holding the guest register file, resolved once per thread.
@@ -320,9 +406,9 @@ pub struct WasmtimeEngine<H: ImportDispatch + Send + 'static> {
     ///
     /// >>> A SPAWN IS A FULL INSTANTIATION, AND A TITLE SPAWNS ONE PER FLIP.
     ///
-    /// MEASURED with the phase table: Madden takes **3,834 spawns over 3,800 frames** - 1.009
+    /// MEASURED with the phase table: a football title takes **3,834 spawns over 3,800 frames** - 1.009
     /// per flip, exactly the display-queue-callback-as-a-thread shape `Phase::ThreadSpawn`'s
-    /// own doc predicts - at **507 us each**, which is 1.94 s of an 8.16 s draw budget. mlb
+    /// own doc predicts - at **507 us each**, which is 1.94 s of an 8.16 s draw budget. A baseball title
     /// takes 13,233 at 224 us.
     ///
     /// Building a fresh `Linker`, re-wrapping its three host functions and re-resolving every
@@ -350,6 +436,7 @@ pub struct WasmtimeEngine<H: ImportDispatch + Send + 'static> {
     /// carries it to the host-call view.
     dirty_off: Option<u64>,
 }
+
 
 impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
     type Thread = WasmtimeThread;
@@ -448,7 +535,60 @@ fn diag_armed() -> bool {
 /// scheduling loop. All the discipline (priority, deadlock/timed-wait, frame
 /// counting) is in `vitaslop_runtime::sched`, shared with the browser scheduler.
 pub struct ThreadedScheduler<H: ImportDispatch + Send + 'static> {
-    inner: Scheduler<WasmtimeEngine<H>, H>,
+    inner: Inner<H>,
+}
+
+/// How a linked title's main thread starts: every `module_start` in load order then the eboot's
+/// entry, its launch arguments, its stack, and the priority its `SceProcessParam` asks for.
+struct MainBirth {
+    entries: Vec<u32>,
+    args: [u32; 4],
+    sp: u32,
+    priority: i32,
+}
+
+/// One guest thread at a time (deterministic - every recipe, capsule and test), or several at
+/// once on OS threads (`crate::smp`, `VITASLOP_SMP`).
+enum Inner<H: ImportDispatch + Send + 'static> {
+    Baton(Box<Scheduler<WasmtimeEngine<H>, H>>),
+    Smp(Box<dyn SmpOps<H>>),
+}
+
+/// What [`ThreadedScheduler`] asks of a parallel run. A trait object because only the title
+/// host (`VitaEnv`) has the scheduling state a parallel run needs - see `crate::smp`.
+pub(crate) trait SmpOps<H>: Send {
+    fn host(&self) -> std::sync::MutexGuard<'_, H>;
+    fn engine_read_guest(&self, addr: u32, len: usize) -> Vec<u8>;
+    fn engine_read_guest_into(&self, addr: u32, buf: &mut [u8]) -> bool;
+    fn engine_write_guest(&self, addr: u32, bytes: &[u8]);
+    fn guest_region(&self) -> (u32, usize);
+    fn with_host_words_dyn(&mut self, f: &mut dyn FnMut(&mut H, &mut dyn vitaslop_runtime::host::GuestWords));
+    fn frames(&self) -> u64;
+    fn resumes(&self) -> u64;
+    fn census(&self) -> (usize, usize);
+    fn fuel_report(&self) -> (u64, u64, u64);
+    fn arm_report(&self) -> u64;
+    fn report(&self) -> String;
+    fn run_frames(&mut self, target: u64) -> RunReport;
+    fn pause_guest(&mut self);
+    fn resume_guest(&mut self);
+    fn frame_advance_us(&self, frame: u64) -> Option<u64>;
+}
+
+impl ThreadedScheduler<vitaslop_runtime::VitaEnv> {
+    /// [`Self::from_linked_with_cache`] as a PARALLEL run (`crate::smp`): the module is built for
+    /// it, and the guest's threads run at once on [`crate::smp::worker_count`] OS threads. The
+    /// link must have been made for it too (`vita::set_smp_linking`), which is the caller's.
+    pub fn from_linked_smp(
+        linked: &vitaslop_runtime::link::LinkedProgram,
+        host: vitaslop_runtime::VitaEnv,
+        quantum_fuel: u64,
+        cache: Option<&crate::compile_cache::CompileCache>,
+    ) -> Result<(Self, Vec<(u32, u32)>), RunError> {
+        let (engine, main, stubs) = Self::build_linked(linked, host, quantum_fuel, cache, true)?;
+        let run = crate::smp::SmpRun::start(engine, main.entries, main.args, main.sp)?;
+        Ok((ThreadedScheduler { inner: Inner::Smp(Box::new(run)) }, stubs))
+    }
 }
 
 impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
@@ -562,7 +702,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             main_stack_top(base, mem_bytes),
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
         )?;
-        Ok(ThreadedScheduler { inner: Scheduler::new(engine, host, main) })
+        Ok(ThreadedScheduler { inner: Inner::Baton(Box::new(Scheduler::new(engine, host, main))) })
     }
 
     /// Stand up a preemptive run of a multi-module linked title
@@ -591,6 +731,47 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         quantum_fuel: u64,
         cache: Option<&crate::compile_cache::CompileCache>,
     ) -> Result<(ThreadedScheduler<H>, Vec<(u32, u32)>), RunError> {
+        let (engine, main, stubs) = Self::build_linked(linked, host, quantum_fuel, cache, false)?;
+        let main = engine.instantiate_thread_seq(
+            vitaslop_runtime::host::MAIN_THID,
+            main.entries,
+            main.args[0],
+            main.args[1],
+            main.args[2],
+            main.args[3],
+            main.sp,
+            main.priority,
+            None,
+        )?;
+        let host = engine.host_handle();
+        Ok((ThreadedScheduler { inner: Inner::Baton(Box::new(Scheduler::new(engine, host, main))) }, stubs))
+    }
+
+    /// Transpile (or load from `cache`), compile and seed a linked title, and say how its main
+    /// thread starts - everything both schedulers share. `smp` builds the PARALLEL module
+    /// (`transpiler::set_smp`: atomics, the per-instance exclusive monitor, preempt words) and
+    /// is restored afterwards, the transpiler's flag being a thread-local the next build on this
+    /// thread would otherwise inherit.
+    fn build_linked(
+        linked: &vitaslop_runtime::link::LinkedProgram,
+        host: H,
+        quantum_fuel: u64,
+        cache: Option<&crate::compile_cache::CompileCache>,
+        smp: bool,
+    ) -> Result<(WasmtimeEngine<H>, MainBirth, Vec<(u32, u32)>), RunError> {
+        let was_smp = transpiler::smp();
+        transpiler::set_smp(smp);
+        let built = Self::build_linked_inner(linked, host, quantum_fuel, cache);
+        transpiler::set_smp(was_smp);
+        built
+    }
+
+    fn build_linked_inner(
+        linked: &vitaslop_runtime::link::LinkedProgram,
+        host: H,
+        quantum_fuel: u64,
+        cache: Option<&crate::compile_cache::CompileCache>,
+    ) -> Result<(WasmtimeEngine<H>, MainBirth, Vec<(u32, u32)>), RunError> {
         // >>> THE RETAIL PATH EMITS THE WORK COUNTER, AND PREEMPTS ON IT. This is what
         // lets native bill its game clock in GUEST INSTRUCTIONS like the browser does,
         // rather than in wasm operators - see `WasmtimeThread::arm_retired` for the
@@ -897,6 +1078,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         write_shared(&shared_mem, (arg_ptr - linked.base) as usize, arg_block);
         let arg_len = arg_block.len() as u32;
 
+        let main_prio = host.main_thread_priority();
         let host = Arc::new(Mutex::new(host));
         // Let the stall watchdog read the sync state from outside the run. Registered here
         // rather than on the raw-image path because this is the retail one - the only one a
@@ -951,16 +1133,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // The main thread runs every module_start in load order, then (as the last
         // entry) the eboot's - which is where a render loop lives.
         let sp = main_stack_top(linked.base, linked.mem_bytes);
-        let main = engine.instantiate_thread_seq(
-            vitaslop_runtime::host::MAIN_THID,
-            linked.module_inits.clone(),
-            arg_len,
-            arg_ptr,
-            0,
-            0,
-            sp,
-            vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
-        )?;
+        let main = MainBirth { entries: linked.module_inits.clone(), args: [arg_len, arg_ptr, 0, 0], sp, priority: main_prio };
 
         // >>> EVERY DECODE GAP INSIDE A LIFTED FUNCTION, REPORTED UNCONDITIONALLY.
         //
@@ -1033,12 +1206,61 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             .copied()
             .zip(layout.stub_wasm_indices.iter().copied())
             .collect();
-        Ok((ThreadedScheduler { inner: Scheduler::new(engine, host, main) }, stubs))
+        let _ = &host;
+        Ok((engine, main, stubs))
     }
 
     /// Borrow the shared host (e.g. to read captured output after the run).
     pub fn host(&self) -> std::sync::MutexGuard<'_, H> {
-        self.inner.engine().host.lock().unwrap()
+        match &self.inner {
+            Inner::Baton(b) => b.engine().host.lock().unwrap(),
+            Inner::Smp(s) => s.host(),
+        }
+    }
+
+    /// Whether this run is the PARALLEL engine (`crate::smp`).
+    pub fn is_smp(&self) -> bool {
+        matches!(self.inner, Inner::Smp(_))
+    }
+
+    /// Whether a frame's scenes must be taken THROUGH ITS FLIP only - the parallel engine
+    /// overlapped (`crate::smp::overlap`), where the next frame's are already arriving.
+    pub fn overlapped(&self) -> bool {
+        matches!(self.inner, Inner::Smp(_)) && crate::smp::overlap()
+    }
+
+    /// Stop the guest at a switch point for a write into memory it may be writing (a render
+    /// target's write-back), and let it go again. Nothing on the one-at-a-time engine, where no
+    /// guest runs between frames.
+    pub fn pause_guest(&mut self) {
+        if let Inner::Smp(s) = &mut self.inner {
+            s.pause_guest();
+        }
+    }
+
+    pub fn resume_guest(&mut self) {
+        if let Inner::Smp(s) = &mut self.inner {
+            s.resume_guest();
+        }
+    }
+
+    /// The game time display frame `frame` took, flip to flip, when the parallel engine
+    /// remembers it - see `crate::smp::SmpRun::frame_advance_us`. `None` on the one-at-a-time
+    /// engine, where the clock around the step that ran the frame IS that frame's.
+    pub fn frame_advance_us(&self, frame: u64) -> Option<u64> {
+        match &self.inner {
+            Inner::Smp(s) => s.frame_advance_us(frame),
+            Inner::Baton(_) => None,
+        }
+    }
+
+    /// The parallel engine's per-worker line for an end-of-run report; `None` on the
+    /// one-at-a-time engine.
+    pub fn smp_report(&self) -> Option<String> {
+        match &self.inner {
+            Inner::Smp(s) => Some(s.report()),
+            Inner::Baton(_) => None,
+        }
     }
 
     /// Run `f` against the host WITH guest memory in hand - the accessor for anything that
@@ -1048,19 +1270,37 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         &mut self,
         f: impl FnOnce(&mut H, &mut dyn vitaslop_runtime::host::GuestWords) -> R,
     ) -> R {
-        self.inner.core_mut().with_host_words(f)
+        match &mut self.inner {
+            Inner::Baton(b) => b.core_mut().with_host_words(f),
+            Inner::Smp(s) => {
+                let mut f = Some(f);
+                let mut out = None;
+                s.with_host_words_dyn(&mut |h, w| {
+                    if let Some(f) = f.take() {
+                        out = Some(f(h, w));
+                    }
+                });
+                out.expect("with_host_words_dyn runs its closure once")
+            }
+        }
     }
 
     /// Read `len` bytes of guest memory at guest address `addr` (diagnostic; the
     /// shared image outlives any trap, so a probe can inspect object state after a
     /// fault). Returns an empty vec if the range is out of bounds.
     pub fn read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
-        self.inner.engine().read_guest(addr, len)
+        match &self.inner {
+            Inner::Baton(b) => b.engine().read_guest(addr, len),
+            Inner::Smp(s) => s.engine_read_guest(addr, len),
+        }
     }
 
     /// Diagnostic: overwrite guest memory at `addr` (used by the probe's POKE knob).
     pub fn write_guest(&self, addr: u32, bytes: &[u8]) {
-        self.inner.engine().write_guest(addr, bytes)
+        match &self.inner {
+            Inner::Baton(b) => b.engine().write_guest(addr, bytes),
+            Inner::Smp(s) => s.engine_write_guest(addr, bytes),
+        }
     }
 
     /// Bulk-read `buf.len()` bytes of guest memory at `addr` into `buf`. Returns
@@ -1068,72 +1308,163 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
     /// whole-region read a memory scanner does repeatedly, so it is one block copy
     /// rather than [`read_guest`](Self::read_guest)'s allocate-and-loop.
     pub fn read_guest_into(&self, addr: u32, buf: &mut [u8]) -> bool {
-        self.inner.engine().read_guest_into(addr, buf)
+        match &self.inner {
+            Inner::Baton(b) => b.engine().read_guest_into(addr, buf),
+            Inner::Smp(s) => s.engine_read_guest_into(addr, buf),
+        }
     }
 
     /// The guest address range backed by linear memory, as `(base, len)`. A memory
     /// scanner needs it to know what there is to search.
     pub fn guest_region(&self) -> (u32, usize) {
-        let e = self.inner.engine();
-        (e.base, e.shared_mem.data().len())
+        match &self.inner {
+            Inner::Baton(b) => {
+                let e = b.engine();
+                (e.base, e.shared_mem.data().len())
+            }
+            Inner::Smp(s) => s.guest_region(),
+        }
     }
 
     /// Display frame boundaries (flips) observed so far. A live windowed front-end
     /// steps one frame per redraw via `run_frames(frames() + 1, ..)`.
     pub fn frames(&self) -> u64 {
-        self.inner.frames()
+        match &self.inner {
+            Inner::Baton(b) => b.frames(),
+            Inner::Smp(s) => s.frames(),
+        }
     }
 
     /// Thread resumes so far - the scheduler's own activity, for a profiler that has
     /// to separate the guest's work from the cost of switching between guest threads.
     pub fn rounds_total(&self) -> u64 {
-        self.inner.rounds_total()
+        match &self.inner {
+            Inner::Baton(b) => b.rounds_total(),
+            Inner::Smp(s) => s.resumes(),
+        }
     }
 
     /// `(live, finished)` guest threads - see
     /// [`vitaslop_runtime::sched::SchedCore::thread_census`].
     pub fn thread_census(&self) -> (usize, usize) {
-        self.inner.thread_census()
+        match &self.inner {
+            Inner::Baton(b) => b.thread_census(),
+            Inner::Smp(s) => s.census(),
+        }
     }
 
     /// Who actually got the CPU - see
     /// [`vitaslop_runtime::sched::SchedCore::cpu_share_report`].
     pub fn cpu_share_report(&self) -> String {
-        self.inner.cpu_share_report()
+        match &self.inner {
+            Inner::Baton(b) => b.cpu_share_report(),
+            Inner::Smp(s) => s.report(),
+        }
     }
 
     /// How much of the device's parallelism the run used - see
     /// [`vitaslop_runtime::sched::SchedCore::runnable_report`].
     pub fn runnable_report(&self) -> String {
-        self.inner.runnable_report(vitaslop_runtime::host::guest_cores())
+        match &self.inner {
+            Inner::Baton(b) => b.runnable_report(vitaslop_runtime::host::guest_cores()),
+            Inner::Smp(s) => s.report(),
+        }
     }
 
     /// `(total fuel burned, samples, largest single burn)` - see
     /// [`vitaslop_runtime::sched::SchedCore::fuel_report`].
     pub fn fuel_report(&self) -> (u64, u64, u64) {
-        self.inner.fuel_report()
+        match &self.inner {
+            Inner::Baton(b) => b.fuel_report(),
+            Inner::Smp(s) => s.fuel_report(),
+        }
     }
 
     /// Cumulative retired guest ARM instructions - see
     /// [`vitaslop_runtime::sched::SchedCore::arm_report`].
     pub fn arm_report(&self) -> u64 {
-        self.inner.arm_report()
+        match &self.inner {
+            Inner::Baton(b) => b.arm_report(),
+            Inner::Smp(s) => s.arm_report(),
+        }
     }
 
     /// Run cooperatively until the process halts, every thread finishes, or the run
     /// deadlocks / errors. Delegates to the shared scheduler policy.
     pub fn run(&mut self) -> RunReport {
-        self.inner.run()
+        match &mut self.inner {
+            Inner::Baton(b) => b.run(),
+            Inner::Smp(s) => s.run_frames(u64::MAX),
+        }
     }
 
     /// Like [`run`](Self::run) but stop after `max_frames` frame boundaries; `max_rounds`
     /// caps thread resumes so a busy-waiting guest cannot run unbounded.
     pub fn run_frames(&mut self, max_frames: u64, max_rounds: u64) -> RunReport {
-        self.inner.run_frames(max_frames, max_rounds)
+        match &mut self.inner {
+            Inner::Baton(b) => b.run_frames(max_frames, max_rounds),
+            // No round cap: the parallel engine bounds a run by its frame gate, and a worker
+            // that spins is preempted by its own quantum.
+            Inner::Smp(s) => s.run_frames(max_frames),
+        }
     }
 }
 
 impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
+    /// `(guest base, bytes)` of the shared memory.
+    pub(crate) fn region(&self) -> (u32, usize) {
+        (self.base, self.shared_mem.data().len())
+    }
+
+    /// The shared host, for a scheduler that owns the run (`crate::smp`).
+    /// Run `f` over a guest-memory view of the shared linear memory and the region's base -
+    /// for a worker that reads guest memory with no guest thread of its own (the SMP resolver).
+    pub(crate) fn with_guest_view<R>(&self, f: impl FnOnce(&mut dyn vitaslop_runtime::GuestMemory, u32) -> R) -> R {
+        let mut view = SharedView::new(&self.shared_mem, self.dirty_off);
+        f(&mut view, self.base)
+    }
+
+    pub(crate) fn host_handle(&self) -> Arc<Mutex<H>> {
+        self.host.clone()
+    }
+
+    /// Layout offset of the host-mirror block, when the module has one.
+    pub(crate) fn mirror_off(&self) -> Option<u64> {
+        self.mirror_off
+    }
+
+    /// The LINEAR address (a host pointer) of layout offset `off` in the shared memory, or `None`
+    /// past its end - for words the scheduler and the guest both touch atomically.
+    pub(crate) fn linear_address(&self, off: u64) -> Option<usize> {
+        let data = self.shared_mem.data();
+        ((off as usize) < data.len()).then(|| data.as_ptr() as usize + off as usize)
+    }
+
+    /// Guest word `addr` as an atomic, when it is in range and aligned - for a parallel run's
+    /// compare-and-swap, which must be one step to the guest threads running beside it.
+    pub(crate) fn guest_atomic_u32(&self, addr: u32) -> Option<&std::sync::atomic::AtomicU32> {
+        let off = addr.wrapping_sub(self.base) as usize;
+        if !off.is_multiple_of(4) || off + 4 > self.shared_mem.data().len() {
+            return None;
+        }
+        let a = self.linear_address(off as u64)?;
+        // SAFETY: in range and 4-aligned (the memory's base is page-aligned); shared memory is
+        // accessed atomically by the guest's own atomics and lives as long as `self`.
+        Some(unsafe { &*(a as *const std::sync::atomic::AtomicU32) })
+    }
+
+    /// The frame-boundary engine hook (`GuestEngine::on_frame`) for a scheduler holding `&self`.
+    pub(crate) fn note_frame(&self, frames: u64) {
+        CURRENT_FRAME.store(frames, std::sync::atomic::Ordering::Relaxed);
+        let (Some(off), Some(at)) = (self.arm_word_off, transpiler::arm_at_frame()) else {
+            return;
+        };
+        if frames == at {
+            write_shared(&self.shared_mem, off as usize, &1u32.to_le_bytes());
+            DIAG_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Read `len` bytes of guest memory at guest address `addr`. Returns an empty vec
     /// if the range is out of bounds.
     fn read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
@@ -1153,7 +1484,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
     }
 
     /// Bulk-read guest memory into `buf`; false if the range is out of bounds.
-    fn read_guest_into(&self, addr: u32, buf: &mut [u8]) -> bool {
+    pub(crate) fn read_guest_into(&self, addr: u32, buf: &mut [u8]) -> bool {
         let off = addr.wrapping_sub(self.base) as usize;
         let data = self.shared_mem.data();
         let Some(end) = off.checked_add(buf.len()) else { return false };
@@ -1174,7 +1505,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
     }
 
     /// Diagnostic write into guest memory. No-op if out of bounds.
-    fn write_guest(&self, addr: u32, bytes: &[u8]) {
+    pub(crate) fn write_guest(&self, addr: u32, bytes: &[u8]) {
         let off = addr.wrapping_sub(self.base) as usize;
         let data = self.shared_mem.data();
         if off + bytes.len() > data.len() {
@@ -1200,7 +1531,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         sp: u32,
         priority: i32,
     ) -> Result<WasmtimeThread, RunError> {
-        self.instantiate_thread_seq(thid, vec![entry], r0, r1, r2, r3, sp, priority)
+        self.instantiate_thread_seq(thid, vec![entry], r0, r1, r2, r3, sp, priority, None)
     }
 
     /// Build one thread that runs `entries` in sequence on a single fiber, resetting
@@ -1210,7 +1541,8 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
     /// and the last entry (the eboot's) is the one that may spin a render loop. Only
     /// the first entry receives `(r0, r1)`; the rest are called with no arguments,
     /// matching how a loader invokes `module_start(0, NULL)`.
-    fn instantiate_thread_seq(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn instantiate_thread_seq(
         &self,
         thid: i32,
         entries: Vec<u32>,
@@ -1220,6 +1552,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         r3: u32,
         sp: u32,
         priority: i32,
+        smp: Option<SmpSpawn>,
     ) -> Result<WasmtimeThread, RunError> {
         let signal =
             Arc::new(Mutex::new(Signal { stop: Stop::Quantum, fuel: 0, arm: 0, host_suspends: 0 }));
@@ -1238,6 +1571,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             sw_last: 0,
             sw_wasmtime_last: 0,
             fuel_interval: self.fuel_interval,
+            smp: None,
         };
         let mut store = Store::new(&self.engine, data);
         store.set_fuel(u64::MAX).map_err(|e| RunError::Wasm(e.to_string()))?;
@@ -1275,6 +1609,37 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         // only a comparison run turns on.
         let sw_fuel = instance.get_global(&mut store, abi::FUEL_EXPORT);
         store.data_mut().sw_fuel = sw_fuel;
+        // >>> A PARALLEL THREAD: point this instance's back-edge check at its worker's PREEMPT
+        // word (per INSTANCE, for life - the thread never leaves its worker) and resolve the
+        // per-thread words it is given at every resume. A module built without
+        // `transpiler::set_smp` has none of these exports, which is a scheduler/module mismatch
+        // and is said so here rather than running a parallel thread that cannot be preempted.
+        let smp_globals = match smp {
+            Some(sp) => {
+                let g = |store: &mut Store<ThreadData<H>>, name: &str| {
+                    instance.get_global(&mut *store, name).ok_or_else(|| {
+                        RunError::Wasm(format!("a parallel run was handed a module built WITHOUT SMP (no `{name}` export)"))
+                    })
+                };
+                let preempt = g(&mut store, abi::PREEMPT_EXPORT)?;
+                preempt
+                    .set(&mut store, Val::I32(sp.preempt_off as i32))
+                    .map_err(|e| RunError::Wasm(e.to_string()))?;
+                let t = SmpThread {
+                    worker: sp.worker,
+                    preempt: sp.preempt_ptr,
+                    runnable: sp.runnable,
+                    words: sp.words,
+                    cur_thread: g(&mut store, abi::CUR_THREAD_EXPORT)?,
+                    thread_id: g(&mut store, abi::THREAD_ID_EXPORT)?,
+                    elide: g(&mut store, abi::ELIDE_EXPORT)?,
+                };
+                let globals = t.globals();
+                store.data_mut().smp = Some(t);
+                Some(globals)
+            }
+            None => None,
+        };
 
         // This thread's thread-local-storage: a private block whose base becomes the
         // thread pointer (TPIDRURO). Copy the template's initialized `.tdata` head into
@@ -1291,6 +1656,10 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             // The thread pointer is a per-thread constant: set it once before running
             // any entry (a `MRC p15,0,Rt,c13,c0,3` reads it via the `tp` global).
             set_tp_store(&mut store, &instance, tp);
+            // A parallel thread's first resume lands HERE, not after a suspend.
+            if let Some(g) = &smp_globals {
+                apply_smp_words(&mut store, g);
+            }
             let mut last_r0 = 0u32;
             let last = entries.len().saturating_sub(1);
             for (i, &entry) in entries.iter().enumerate() {
@@ -1397,6 +1766,7 @@ fn build_instance_pre<H: ImportDispatch + Send + 'static>(
             sw_last: 0,
             sw_wasmtime_last: 0,
             fuel_interval: 0,
+            smp: None,
         },
     );
     linker
@@ -2026,7 +2396,16 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                         let base = data.base;
                         let shared = data.shared_mem.clone();
                         let mut view = SharedView::new(&shared, data.dirty_off);
+                        let t_lock = data.smp.is_some().then(std::time::Instant::now);
                         let mut host = data.host.lock().unwrap();
+                        if let Some(t) = t_lock {
+                            HOST_CALL_WAIT.note(t);
+                        }
+                        if let Some(s) = &data.smp {
+                            // "Would a yield find anyone to yield to" is a question about THIS
+                            // worker's runnable threads on a parallel run, asked per call.
+                            host.note_runnable_others(s.runnable[s.worker].load(std::sync::atomic::Ordering::Relaxed));
+                        }
                         host.set_current_thread(thid);
                         host.dispatch(selector as u32, &mut regs, &mut vfp, &mut view, base)
                     };
@@ -2093,18 +2472,37 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                         }
                     }
 
+                    // A library calling back into the title before it returns - see
+                    // `SvcOutcome::CallGuest`. Each round runs one guest call and replays
+                    // the host call, until it finishes with an ordinary outcome.
+                    let mut outcome = outcome;
+                    while matches!(outcome, SvcOutcome::CallGuest) {
+                        outcome = run_guest_call(&mut caller, selector as u32).await?;
+                    }
+
                     match outcome {
+                        // Another worker asked for this one's CPU (a better-priority wake, the
+                        // frame gate closing) and the thread is spinning through host calls,
+                        // which never reach a loop back edge: the call that returns yields.
+                        SvcOutcome::Continue if caller.data().smp.as_ref().is_some_and(SmpThread::preempt_requested) => {
+                            note_suspend(&mut caller, Stop::Quantum, selector as u32);
+                            YieldNow(false).await;
+                            resumed_smp(&mut caller);
+                        }
                         SvcOutcome::Continue => {}
+                        SvcOutcome::CallGuest => unreachable!("drained above"),
                         SvcOutcome::Reschedule => {
                             // Stay runnable but suspend so the scheduler re-picks by
                             // priority now (a higher-priority thread just became
                             // runnable and must preempt us).
                             note_suspend(&mut caller, Stop::Quantum, selector as u32);
                             YieldNow(false).await;
+                            resumed_smp(&mut caller);
                         }
                         SvcOutcome::Block => {
                             note_suspend(&mut caller, Stop::Blocked, selector as u32);
                             YieldNow(false).await;
+                            resumed_smp(&mut caller);
                             // Resumed. A timed wait that expired owes this thread a
                             // return code other than the 0 it parked with (a
                             // WAIT_TIMEOUT); apply it to r0 before returning to the
@@ -2121,6 +2519,7 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                         SvcOutcome::Flip => {
                             note_suspend(&mut caller, Stop::Flip, selector as u32);
                             YieldNow(false).await;
+                            resumed_smp(&mut caller);
                         }
                         SvcOutcome::ThreadExit => {
                             caller.data_mut().thread_exit = true;
@@ -2148,6 +2547,68 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
         .alias(abi::IMPORT_MODULE, abi::IMPORT_NAME, abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME)
         .map_err(|e| RunError::Wasm(e.to_string()))?;
     Ok(())
+}
+
+/// A parallel thread has just been RESUMED (its suspend in the host-call closure returned):
+/// give the instance this resume's per-thread words - see [`SmpThread::words`]. Nothing on the
+/// one-at-a-time engine, whose mirror refresh covers the same words.
+fn resumed_smp<H: ImportDispatch + Send + 'static>(caller: &mut Caller<'_, ThreadData<H>>) {
+    if let Some(g) = caller.data().smp.as_ref().map(SmpThread::globals) {
+        apply_smp_words(&mut *caller, &g);
+    }
+}
+
+/// Run the guest call the last dispatch of `selector` asked for, on THIS thread, then
+/// dispatch `selector` again - see `SvcOutcome::CallGuest`.
+///
+/// The call nests on this thread's own instance and fiber: `call_async` of the module's
+/// dispatcher from inside the host call, so guest code that blocks in it suspends this whole
+/// stack, exactly as it would inside any other guest function the thread called. The register
+/// file is saved around it; only r0/r1 (its result) and its effects on memory survive.
+async fn run_guest_call<H: ImportDispatch + Send + 'static>(
+    caller: &mut Caller<'_, ThreadData<H>>,
+    selector: u32,
+) -> Result<SvcOutcome, wasmtime::Error> {
+    let thid = caller.data().thid;
+    let Some(call) = caller.data().host.lock().unwrap().take_guest_call(thid) else {
+        return Ok(SvcOutcome::Fatal(format!(
+            "host call selector {selector} on thread {thid:#x} asked for a guest call and left none to run"
+        )));
+    };
+    let mut saved = ([0u32; abi::REG_COUNT], [0u32; VFP_ARG_COUNT]);
+    read_guest_regs(caller, &mut saved.0, &mut saved.1);
+    let mut seeded = saved.0;
+    {
+        let data = caller.data();
+        let mut view = SharedView::new(&data.shared_mem, data.dirty_off);
+        call.seed(&mut seeded, &mut view, data.base);
+    }
+    write_guest_regs(caller, &saved, &seeded, &saved.1);
+    let dispatch = caller
+        .get_export(abi::DISPATCH_EXPORT)
+        .and_then(|e| e.into_func())
+        .ok_or_else(|| wasmtime::Error::msg("module exports no dispatcher"))?
+        .typed::<(i32, i32), ()>(&*caller)?;
+    dispatch.call_async(&mut *caller, ((call.entry & !1) as i32, 0)).await?;
+    let (r0, r1) = (get_reg(caller, 0), get_reg(caller, 1));
+    // Back to the file the host call was made with - every lane, whatever the call left.
+    let mut now = ([0u32; abi::REG_COUNT], [0u32; VFP_ARG_COUNT]);
+    read_guest_regs(caller, &mut now.0, &mut now.1);
+    write_guest_regs(caller, &now, &saved.0, &saved.1);
+
+    let (mut regs, mut vfp) = saved;
+    let outcome = {
+        let data = caller.data();
+        let base = data.base;
+        let shared = data.shared_mem.clone();
+        let mut view = SharedView::new(&shared, data.dirty_off);
+        let mut host = data.host.lock().unwrap();
+        host.set_current_thread(thid);
+        host.guest_call_returned(thid, r0, r1, &view, base);
+        host.dispatch(selector, &mut regs, &mut vfp, &mut view, base)
+    };
+    write_guest_regs(caller, &saved, &regs, &vfp);
+    Ok(outcome)
 }
 
 /// Record that this thread is about to suspend at `stop`, and sample the fuel it has
@@ -2426,13 +2887,46 @@ impl vitaslop_runtime::GuestMemory for SharedView {
         }
         self.stamp_written(off, bytes.len());
     }
+    /// A REAL compare-and-swap - the browser's `GuestMem::cas_u32`. On the parallel engine
+    /// (`crate::smp`) guest code on other workers writes this memory while a host call runs: the
+    /// lightweight mutex's inline SMP form takes and releases the very word its host handler
+    /// compares-and-swaps (see `vita::lwwork`), and the default read-then-write lost that race -
+    /// MEASURED, about one arcade-fighter boot in five died on a garbage object pointer within its first
+    /// 60 frames on three workers, never on one. A misaligned word cannot be atomic and never
+    /// needs to be: the inline form refuses one, so only the host (under its mutex) touches it.
+    fn cas_u32(&mut self, off: usize, expect: u32, new: u32) -> u32 {
+        if off.checked_add(4).is_none_or(|end| end > self.len) {
+            return 0;
+        }
+        // SAFETY: bounds checked; the atomic arm only for an aligned address.
+        let p = unsafe { self.ptr.add(off) };
+        let cur = if (p as usize) & 3 == 0 {
+            let a = unsafe { &*(p as *const std::sync::atomic::AtomicU32) };
+            match a.compare_exchange(expect, new, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst) {
+                Ok(v) | Err(v) => v,
+            }
+        } else {
+            let cur = unsafe { std::ptr::read_unaligned(p as *const u32) };
+            if cur == expect {
+                unsafe { std::ptr::write_unaligned(p as *mut u32, new) };
+            }
+            cur
+        };
+        if cur == expect {
+            self.stamp_written(off, 4);
+        }
+        cur
+    }
     fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
         if off.checked_add(len)? > self.len {
             return None;
         }
-        // SAFETY: bounds checked above, and the scheduler is cooperative - no fiber
-        // runs while a host call holds this borrow, so the bytes cannot change under
-        // it. The lifetime is tied to `&self`, which lives only for the host call.
+        // SAFETY: bounds checked above; the lifetime is tied to `&self`, which lives only
+        // for the host call. On the one-at-a-time engine no fiber runs while a host call
+        // holds this borrow, so the bytes cannot change under it. On the parallel engine
+        // another worker's guest code CAN write them meanwhile - exactly as in the browser's
+        // parallel run, whose borrow is the same - so a comparison against a borrow is only
+        // as stable as the guest's own synchronisation makes it there.
         Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off), len) })
     }
 
@@ -2604,18 +3098,27 @@ fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
 }
 
 /// Guest address of each transpiled function, indexed by wasm function index minus
-/// [`abi::IMPORT_FUNC_COUNT`]. Recorded once, when the module is built.
-static FUNC_ADDRS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+/// [`abi::IMPORT_FUNC_COUNT`]. Recorded when the module is built - and REPLACED when a new one
+/// is, see [`record_function_addresses`].
+static FUNC_ADDRS: std::sync::RwLock<Vec<u32>> = std::sync::RwLock::new(Vec::new());
 
 /// Record the emitted module's function table so a trap backtrace can name guest code.
 ///
-/// # Why a process-wide latch rather than plumbing
-/// A trap surfaces deep inside a fiber closure that has no reference to the artifact, and
-/// the module is built exactly once per run. Threading the table down to that point would
-/// touch every layer between for a diagnostic; a `OnceLock` set at build time reaches it
-/// from anywhere and cannot be set twice.
+/// # Why a process-wide slot rather than plumbing
+/// A trap surfaces deep inside a fiber closure that has no reference to the artifact.
+/// Threading the table down to that point would touch every layer between for a diagnostic;
+/// a static set at build time reaches it from anywhere.
+///
+/// # >>> AND THE LATEST MODULE WINS: A RUN CAN BUILD MORE THAN ONE.
+/// This was a `OnceLock`, on the belief that a run builds one module. A title that
+/// `sceAppMgrLoadExec`s its real executable builds two, and the latch kept the LAUNCHER's
+/// table: every frame of every later trap was named from the wrong module. MEASURED on
+/// an action title: a fault in the game's own code read as `wasm function 12901 = dispatcher/reset
+/// (not guest code)`, which sent a whole investigation after the dispatcher.
 pub fn record_function_addresses(addrs: Vec<u32>) {
-    let _ = FUNC_ADDRS.set(addrs);
+    if let Ok(mut g) = FUNC_ADDRS.write() {
+        *g = addrs;
+    }
 }
 
 /// Rewrite `<wasm function N>` in a trap backtrace to name the GUEST function it is.
@@ -2633,7 +3136,10 @@ pub fn record_function_addresses(addrs: Vec<u32>) {
 /// repeat is a guest routine recursing through the indirect-call dispatcher, which is a
 /// description of the bug.
 fn name_guest_frames(s: &str) -> String {
-    let Some(addrs) = FUNC_ADDRS.get() else { return s.to_string() };
+    let Ok(addrs) = FUNC_ADDRS.read() else { return s.to_string() };
+    if addrs.is_empty() {
+        return s.to_string();
+    }
     const MARK: &str = "<wasm function ";
     let mut out = String::with_capacity(s.len() + 32);
     let mut rest = s;
@@ -2810,3 +3316,30 @@ fn get_reg_store<T>(store: &mut Store<T>, instance: &Instance, i: usize) -> u32 
 /// The scheduler wants `Reentry` (shared with the synchronous re-entry path) as
 /// its spawn descriptor; re-export the type so hosts naming it need only this crate.
 pub use vitaslop_runtime::Reentry as ThreadSpawn;
+
+/// Time the guest's host calls spent WAITING for the host lock on a parallel run - summed over
+/// every worker, with the call count. Busy time in the SMP report includes this wait: a guest
+/// thread blocked on the window thread (or another worker) holding the host looks busy there.
+pub struct LockWait {
+    calls: std::sync::atomic::AtomicU64,
+    wait_ns: std::sync::atomic::AtomicU64,
+}
+
+impl LockWait {
+    fn note(&self, since: std::time::Instant) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.calls.fetch_add(1, Relaxed);
+        self.wait_ns.fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+    }
+
+    /// `(calls, seconds waited)` since the run began.
+    pub fn read(&self) -> (u64, f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.calls.load(Relaxed), self.wait_ns.load(Relaxed) as f64 / 1e9)
+    }
+}
+
+/// See [`LockWait`].
+pub static HOST_CALL_WAIT: LockWait =
+    LockWait { calls: std::sync::atomic::AtomicU64::new(0), wait_ns: std::sync::atomic::AtomicU64::new(0) };
+

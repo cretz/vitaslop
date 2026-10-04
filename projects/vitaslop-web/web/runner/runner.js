@@ -133,6 +133,7 @@ function runInWorker(job) {
     );
     const beat = setInterval(() => {
       fetch(`/runner/beat?device=${device}&job=${job.id}`, { method: "POST" }).catch(() => {});
+      pollSay().catch(() => {});
       if (document.visibilityState !== "visible") finish({ status: "interrupted", error: "page hidden mid-job" });
     }, 5000);
   });
@@ -150,6 +151,7 @@ function runInFrame(job) {
     // In the page, not over it: the runner's log and state stay readable under the game.
     f.style.cssText = "display:block;width:100%;aspect-ratio:960/590;border:0;background:#000;margin:8px 0";
     let settled = false;
+    let stopping = false;
     // Sent with every heartbeat, so the desktop sees a stall as soon as the phone does.
     let lastProgress = "";
     const onMsg = (e) => {
@@ -173,12 +175,20 @@ function runInFrame(job) {
       resolve(result);
     };
     addEventListener("message", onMsg);
-    document.querySelector("main").insertBefore(f, $("log"));
+    document.querySelector("main").insertBefore(f, $("desk"));
     const timer = setTimeout(() => finish({ status: "timeout", error: `killed at ${job.timeoutMs} ms` }), job.timeoutMs);
     const beat = setInterval(() => {
+      pollSay().catch(() => {});
       fetch(`/runner/beat?device=${device}&job=${job.id}&p=${encodeURIComponent(lastProgress)}`, { method: "POST" })
         .then((r) => r.json())
-        .then((r) => r.cancel && finish({ status: "cancelled", error: "cancelled from the desktop (POST /runner/cancel)" }))
+        .then((r) => {
+          if (!r.cancel || stopping) return;
+          // Ask the game page to stop and REPORT (its result carries the reports a bare
+          // cancel threw away); end it ourselves only if it cannot answer in 15 s.
+          stopping = true;
+          f.contentWindow?.postMessage({ type: "stop" }, location.origin);
+          setTimeout(() => finish({ status: "cancelled", error: "cancelled from the desktop; the page did not report within 15 s" }), 15_000);
+        })
         .catch(() => {});
       if (document.visibilityState !== "visible") finish({ status: "interrupted", error: "page hidden mid-job" });
     }, 5000);
@@ -187,17 +197,25 @@ function runInFrame(job) {
 
 // Notes the desktop sends (POST /runner/say), printed in this page's log - the one screen the
 // person holding the phone can see. Only notes newer than the page load, plus the last few.
+// The newest one is also PINNED, three lines at most, between the game frame and the log
+// (#desk): in the log alone it was buried under a running job's progress lines, and polled
+// only between jobs - the user saw none. Kept small: the frame must stay on screen.
 let sayFrom = -1;
+const pin = (m) => {
+  $("desk").innerHTML = `<span class="t">${new Date(m.at).toLocaleTimeString()}</span> ${m.text.replace(/[<&]/g, (c) => (c === "<" ? "&lt;" : "&amp;"))}`;
+};
 async function pollSay() {
   const r = await fetch(`/runner/say?since=${Math.max(sayFrom, 0)}`);
   const says = await r.json();
   if (sayFrom < 0) {
     sayFrom = says.length ? says.at(-1).n : 0;
-    for (const m of says.slice(-3)) log(`DESKTOP: ${m.text}`, "say");
+    for (const m of says.slice(-3)) log(`DESKTOP: ${m.text}`, "say"), pin(m);
     return;
   }
   for (const m of says) {
+    if (m.n <= sayFrom) continue;
     log(`DESKTOP: ${m.text}`, "say");
+    pin(m);
     sayFrom = m.n;
   }
 }
@@ -230,6 +248,13 @@ async function tick() {
   }
   await fetch(`/runner/result?device=${device}&job=${job.id}`, { method: "POST", body: JSON.stringify(result) });
   log(`  ${result.status} in ${result.ms} ms${result.summary ? " - " + result.summary : ""}${result.error ? " - " + result.error : ""}`, result.status === "ok" ? "ok" : "bad");
+  // >>> EVERY LIVE JOB STARTS IN A FRESH TAB. Whatever one game run leaves behind (GPU
+  // objects, a worker the browser has not reaped) is the next one's to inherit otherwise: the
+  // phone Aw-Snapped at f0 on the seventh back-to-back action-title soak in one tab (30b, 059).
+  if (job.kind === "live") {
+    log("fresh tab for the next live job - reloading");
+    location.reload();
+  }
 }
 
 async function loop() {

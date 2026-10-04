@@ -1260,7 +1260,7 @@ fn a_full_precision_move_carries_the_view_of_what_it_moved() {
     let o = |i: u8| Operand::plain(Bank::Output, i, 1);
 
     // Half-precision arithmetic fills `pa[0]`/`pa[1]`, then a FULL-PRECISION move copies those
-    // two whole words into `o[0]`/`o[1]` - the exact shape `mk-corpus-roof__frag_86c41b20` ends
+    // two whole words into `o[0]`/`o[1]` - the exact shape `__frag_86c41b20` ends
     // with, and the one that made a NaN sign bit read as 4,227,955,712 ULP.
     let mut mov = make(Op::Mov, o(0), vec![pa(0)], [true, true, false, false], false);
     mov.srcs[0].swizzle = [0, 1, 0, 1];
@@ -2032,7 +2032,7 @@ fn only_an_unmixed_lane_is_substituted_and_a_truncated_one_gets_a_float() {
     // pa[4] is read ONLY by the float-to-int cast; pa[8] by an ordinary float multiply as well.
     let shader = pin_shader(vec![
         pin_instr(
-            Op::PackToInt { bits: 32, signed: true, src_half: false },
+            Op::PackToInt { bits: 32, signed: true, src_half: false, norm: false },
             Some(Operand::plain(Bank::Temp, 0, 0)),
             [true, false, false, false],
             vec![Operand::plain(Bank::PrimaryAttr, 4, 0)],

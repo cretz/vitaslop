@@ -251,7 +251,7 @@ mod tests {
 
         // A one-entry `param.sfo`, built here rather than exported from the parser's own
         // tests: a builder nothing ships has no business being public API.
-        let (key, val) = (b"TITLE_ID ", b"PCSA00009 ");
+        let (key, val) = (b"TITLE_ID ", b"PCSA99999 ");
         let mut sfo = Vec::new();
         sfo.extend_from_slice(b" PSF");
         sfo.extend_from_slice(&0x0101_0000u32.to_le_bytes()); // version
@@ -267,7 +267,7 @@ mod tests {
         sfo.extend_from_slice(val);
         assert_eq!(
             SaveStore::title_for("C:/games/titleone/extracted", Some(&sfo)),
-            ("PCSA00009".to_string(), true),
+            ("PCSA99999".to_string(), true),
         );
         // No container, or one that carries no usable id: the path, and the caller is told.
         assert_eq!(

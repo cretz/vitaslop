@@ -1,0 +1,1753 @@
+@title  PCSE00235 - title -> FIGHT -> VERSUS -> Solo Match -> three full matches, FIGHT AGAIN between them
+@game   PCSE00235
+@shot-every 300
+
+# WHAT THIS RECIPE IS FOR
+# ----------------------
+# Rendering and frame-rate coverage of Dead or Alive 5 Plus GAMEPLAY: several whole matches,
+# every round, the K.O./"YOU LOSE" screens, the post-match menu and fresh stages. The Vita runs
+# DOA5+ fights at a locked 60 fps, so on a measured window from f3600 the expectation is 60
+# presented frames a second at 100% speed.
+#
+# WHAT A RUN OF THIS LOOKS LIKE (2026-10-02, native headless, doafull1002c):
+#   f000150-f001500  Tecmo Koei logo, the Team Ninja intro movie `ninja_vi.mp4`, Team Ninja logo
+#   f001673          the autosave notice (sceMsgDialogInit) - the @wait anchor below
+#   f001833-f003153  title, play style, main menu (times before the second hold was added) -> FIGHT -> VERSUS -> Solo Match, Kasumi vs
+#                    Ayane, stage select (the versus-fight.recipe front end, 33 frames late)
+#   f003600-f006300  match 1 (circus stage, "SHOW TIME"), lost; f6600 the post-match menu
+#   f007000-f011700  match 2 (D.W.A. wrestling ring) after FIGHT AGAIN
+#   f012000-f015600  match 3 (oil rig), and the post-match menu again at ~f15900
+#
+# HOW IT WAS AUTHORED
+# - The boot HOLDS at 1640 until the title opens its autosave dialog (`@wait call
+#   sceMsgDialogInit`: f1673 natively, later on a phone whose movie and loads take longer), so
+#   every later input line runs late by the hold. The anchor must ARM BEFORE the call: at 1673
+#   itself it armed in the frame the call was made, never saw it, and held input for ever.
+# - The fight loop is FACE BUTTONS ONLY (triangle PUNCH, circle KICK, cross THROW, square HOLD,
+#   triangle+circle), 120-frame cycles to the end. A direction in the loop moved the post-match
+#   menu's cursor off FIGHT AGAIN and walked into the options pages for good (doafull1002);
+#   with face buttons only, the CROSS in each cycle confirms FIGHT AGAIN (the default item) and
+#   the run keeps fighting, whatever frame each match happens to end on.
+# - A SECOND HOLD at 2000 waits for the main menu itself (`@wait call
+#   sceAppUtilSystemParamGetString`, called once as it opens: f2054 natively). Without it the
+#   phone's slower trip from the play-style dialog to the menu dropped the DOWN, and the CROSS
+#   that followed opened STORY instead of FIGHT (phone job 521 played the story cutscenes).
+#   The hold PULSES CROSS (a 2-frame tap every 60 held frames): on a phone the "Play style set
+#   to casual" OK dialog opened AFTER the 1980 CROSS, and a silent hold for a menu that cannot
+#   open until that dialog is answered waited for ever (phone job 533). No host call names the
+#   dialog, so the hold answers whatever play-style screen is still up instead.
+0: @section boot
+1640: @wait call sceMsgDialogInit
+1800: @section title
+1800: start
+1812:
+1860: cross
+1872:
+1980: cross
+1992:
+2000: @wait call sceAppUtilSystemParamGetString pulse cross 60   # the main menu opens (f2054 native; later on a phone)
+2100: @section main-menu
+2100: down
+2106:
+2160: cross
+2172:
+2280: @section versus-solo-select
+2280: cross
+2292:
+2400: cross
+2412:
+2520: cross
+2532:
+2640: cross
+2652:
+2760: cross
+2772:
+2880: cross
+2892:
+3000: cross
+3012:
+3120: @section stage-select
+3120: cross
+3132:
+3300: @section fight
+3400: @section fight-loop
+3400: triangle
+3404:
+3412: triangle
+3416:
+3424: circle
+3428:
+3440: triangle circle
+3444:
+3456: circle
+3460:
+3472: triangle
+3476:
+3484: cross
+3488:
+3500: square
+3504:
+3520: triangle
+3524:
+3532: triangle
+3536:
+3544: circle
+3548:
+3560: triangle circle
+3564:
+3576: circle
+3580:
+3592: triangle
+3596:
+3604: cross
+3608:
+3620: square
+3624:
+3640: triangle
+3644:
+3652: triangle
+3656:
+3664: circle
+3668:
+3680: triangle circle
+3684:
+3696: circle
+3700:
+3712: triangle
+3716:
+3724: cross
+3728:
+3740: square
+3744:
+3760: triangle
+3764:
+3772: triangle
+3776:
+3784: circle
+3788:
+3800: triangle circle
+3804:
+3816: circle
+3820:
+3832: triangle
+3836:
+3844: cross
+3848:
+3860: square
+3864:
+3880: triangle
+3884:
+3892: triangle
+3896:
+3904: circle
+3908:
+3920: triangle circle
+3924:
+3936: circle
+3940:
+3952: triangle
+3956:
+3964: cross
+3968:
+3980: square
+3984:
+4000: triangle
+4004:
+4012: triangle
+4016:
+4024: circle
+4028:
+4040: triangle circle
+4044:
+4056: circle
+4060:
+4072: triangle
+4076:
+4084: cross
+4088:
+4100: square
+4104:
+4120: triangle
+4124:
+4132: triangle
+4136:
+4144: circle
+4148:
+4160: triangle circle
+4164:
+4176: circle
+4180:
+4192: triangle
+4196:
+4204: cross
+4208:
+4220: square
+4224:
+4240: triangle
+4244:
+4252: triangle
+4256:
+4264: circle
+4268:
+4280: triangle circle
+4284:
+4296: circle
+4300:
+4312: triangle
+4316:
+4324: cross
+4328:
+4340: square
+4344:
+4360: triangle
+4364:
+4372: triangle
+4376:
+4384: circle
+4388:
+4400: triangle circle
+4404:
+4416: circle
+4420:
+4432: triangle
+4436:
+4444: cross
+4448:
+4460: square
+4464:
+4480: triangle
+4484:
+4492: triangle
+4496:
+4504: circle
+4508:
+4520: triangle circle
+4524:
+4536: circle
+4540:
+4552: triangle
+4556:
+4564: cross
+4568:
+4580: square
+4584:
+4600: triangle
+4604:
+4612: triangle
+4616:
+4624: circle
+4628:
+4640: triangle circle
+4644:
+4656: circle
+4660:
+4672: triangle
+4676:
+4684: cross
+4688:
+4700: square
+4704:
+4720: triangle
+4724:
+4732: triangle
+4736:
+4744: circle
+4748:
+4760: triangle circle
+4764:
+4776: circle
+4780:
+4792: triangle
+4796:
+4804: cross
+4808:
+4820: square
+4824:
+4840: triangle
+4844:
+4852: triangle
+4856:
+4864: circle
+4868:
+4880: triangle circle
+4884:
+4896: circle
+4900:
+4912: triangle
+4916:
+4924: cross
+4928:
+4940: square
+4944:
+4960: triangle
+4964:
+4972: triangle
+4976:
+4984: circle
+4988:
+5000: triangle circle
+5004:
+5016: circle
+5020:
+5032: triangle
+5036:
+5044: cross
+5048:
+5060: square
+5064:
+5080: triangle
+5084:
+5092: triangle
+5096:
+5104: circle
+5108:
+5120: triangle circle
+5124:
+5136: circle
+5140:
+5152: triangle
+5156:
+5164: cross
+5168:
+5180: square
+5184:
+5200: triangle
+5204:
+5212: triangle
+5216:
+5224: circle
+5228:
+5240: triangle circle
+5244:
+5256: circle
+5260:
+5272: triangle
+5276:
+5284: cross
+5288:
+5300: square
+5304:
+5320: triangle
+5324:
+5332: triangle
+5336:
+5344: circle
+5348:
+5360: triangle circle
+5364:
+5376: circle
+5380:
+5392: triangle
+5396:
+5404: cross
+5408:
+5420: square
+5424:
+5440: triangle
+5444:
+5452: triangle
+5456:
+5464: circle
+5468:
+5480: triangle circle
+5484:
+5496: circle
+5500:
+5512: triangle
+5516:
+5524: cross
+5528:
+5540: square
+5544:
+5560: triangle
+5564:
+5572: triangle
+5576:
+5584: circle
+5588:
+5600: triangle circle
+5604:
+5616: circle
+5620:
+5632: triangle
+5636:
+5644: cross
+5648:
+5660: square
+5664:
+5680: triangle
+5684:
+5692: triangle
+5696:
+5704: circle
+5708:
+5720: triangle circle
+5724:
+5736: circle
+5740:
+5752: triangle
+5756:
+5764: cross
+5768:
+5780: square
+5784:
+5800: triangle
+5804:
+5812: triangle
+5816:
+5824: circle
+5828:
+5840: triangle circle
+5844:
+5856: circle
+5860:
+5872: triangle
+5876:
+5884: cross
+5888:
+5900: square
+5904:
+5920: triangle
+5924:
+5932: triangle
+5936:
+5944: circle
+5948:
+5960: triangle circle
+5964:
+5976: circle
+5980:
+5992: triangle
+5996:
+6004: cross
+6008:
+6020: square
+6024:
+6040: triangle
+6044:
+6052: triangle
+6056:
+6064: circle
+6068:
+6080: triangle circle
+6084:
+6096: circle
+6100:
+6112: triangle
+6116:
+6124: cross
+6128:
+6140: square
+6144:
+6160: triangle
+6164:
+6172: triangle
+6176:
+6184: circle
+6188:
+6200: triangle circle
+6204:
+6216: circle
+6220:
+6232: triangle
+6236:
+6244: cross
+6248:
+6260: square
+6264:
+6280: triangle
+6284:
+6292: triangle
+6296:
+6304: circle
+6308:
+6320: triangle circle
+6324:
+6336: circle
+6340:
+6352: triangle
+6356:
+6364: cross
+6368:
+6380: square
+6384:
+6400: triangle
+6404:
+6412: triangle
+6416:
+6424: circle
+6428:
+6440: triangle circle
+6444:
+6456: circle
+6460:
+6472: triangle
+6476:
+6484: cross
+6488:
+6500: square
+6504:
+6520: triangle
+6524:
+6532: triangle
+6536:
+6544: circle
+6548:
+6560: triangle circle
+6564:
+6576: circle
+6580:
+6592: triangle
+6596:
+6604: cross
+6608:
+6620: square
+6624:
+6640: triangle
+6644:
+6652: triangle
+6656:
+6664: circle
+6668:
+6680: triangle circle
+6684:
+6696: circle
+6700:
+6712: triangle
+6716:
+6724: cross
+6728:
+6740: square
+6744:
+6760: triangle
+6764:
+6772: triangle
+6776:
+6784: circle
+6788:
+6800: triangle circle
+6804:
+6816: circle
+6820:
+6832: triangle
+6836:
+6844: cross
+6848:
+6860: square
+6864:
+6880: triangle
+6884:
+6892: triangle
+6896:
+6904: circle
+6908:
+6920: triangle circle
+6924:
+6936: circle
+6940:
+6952: triangle
+6956:
+6964: cross
+6968:
+6980: square
+6984:
+7000: triangle
+7004:
+7012: triangle
+7016:
+7024: circle
+7028:
+7040: triangle circle
+7044:
+7056: circle
+7060:
+7072: triangle
+7076:
+7084: cross
+7088:
+7100: square
+7104:
+7120: triangle
+7124:
+7132: triangle
+7136:
+7144: circle
+7148:
+7160: triangle circle
+7164:
+7176: circle
+7180:
+7192: triangle
+7196:
+7204: cross
+7208:
+7220: square
+7224:
+7240: triangle
+7244:
+7252: triangle
+7256:
+7264: circle
+7268:
+7280: triangle circle
+7284:
+7296: circle
+7300:
+7312: triangle
+7316:
+7324: cross
+7328:
+7340: square
+7344:
+7360: triangle
+7364:
+7372: triangle
+7376:
+7384: circle
+7388:
+7400: triangle circle
+7404:
+7416: circle
+7420:
+7432: triangle
+7436:
+7444: cross
+7448:
+7460: square
+7464:
+7480: triangle
+7484:
+7492: triangle
+7496:
+7504: circle
+7508:
+7520: triangle circle
+7524:
+7536: circle
+7540:
+7552: triangle
+7556:
+7564: cross
+7568:
+7580: square
+7584:
+7600: triangle
+7604:
+7612: triangle
+7616:
+7624: circle
+7628:
+7640: triangle circle
+7644:
+7656: circle
+7660:
+7672: triangle
+7676:
+7684: cross
+7688:
+7700: square
+7704:
+7720: triangle
+7724:
+7732: triangle
+7736:
+7744: circle
+7748:
+7760: triangle circle
+7764:
+7776: circle
+7780:
+7792: triangle
+7796:
+7804: cross
+7808:
+7820: square
+7824:
+7840: triangle
+7844:
+7852: triangle
+7856:
+7864: circle
+7868:
+7880: triangle circle
+7884:
+7896: circle
+7900:
+7912: triangle
+7916:
+7924: cross
+7928:
+7940: square
+7944:
+7960: triangle
+7964:
+7972: triangle
+7976:
+7984: circle
+7988:
+8000: triangle circle
+8004:
+8016: circle
+8020:
+8032: triangle
+8036:
+8044: cross
+8048:
+8060: square
+8064:
+8080: triangle
+8084:
+8092: triangle
+8096:
+8104: circle
+8108:
+8120: triangle circle
+8124:
+8136: circle
+8140:
+8152: triangle
+8156:
+8164: cross
+8168:
+8180: square
+8184:
+8200: triangle
+8204:
+8212: triangle
+8216:
+8224: circle
+8228:
+8240: triangle circle
+8244:
+8256: circle
+8260:
+8272: triangle
+8276:
+8284: cross
+8288:
+8300: square
+8304:
+8320: triangle
+8324:
+8332: triangle
+8336:
+8344: circle
+8348:
+8360: triangle circle
+8364:
+8376: circle
+8380:
+8392: triangle
+8396:
+8404: cross
+8408:
+8420: square
+8424:
+8440: triangle
+8444:
+8452: triangle
+8456:
+8464: circle
+8468:
+8480: triangle circle
+8484:
+8496: circle
+8500:
+8512: triangle
+8516:
+8524: cross
+8528:
+8540: square
+8544:
+8560: triangle
+8564:
+8572: triangle
+8576:
+8584: circle
+8588:
+8600: triangle circle
+8604:
+8616: circle
+8620:
+8632: triangle
+8636:
+8644: cross
+8648:
+8660: square
+8664:
+8680: triangle
+8684:
+8692: triangle
+8696:
+8704: circle
+8708:
+8720: triangle circle
+8724:
+8736: circle
+8740:
+8752: triangle
+8756:
+8764: cross
+8768:
+8780: square
+8784:
+8800: triangle
+8804:
+8812: triangle
+8816:
+8824: circle
+8828:
+8840: triangle circle
+8844:
+8856: circle
+8860:
+8872: triangle
+8876:
+8884: cross
+8888:
+8900: square
+8904:
+8920: triangle
+8924:
+8932: triangle
+8936:
+8944: circle
+8948:
+8960: triangle circle
+8964:
+8976: circle
+8980:
+8992: triangle
+8996:
+9004: cross
+9008:
+9020: square
+9024:
+9040: triangle
+9044:
+9052: triangle
+9056:
+9064: circle
+9068:
+9080: triangle circle
+9084:
+9096: circle
+9100:
+9112: triangle
+9116:
+9124: cross
+9128:
+9140: square
+9144:
+9160: triangle
+9164:
+9172: triangle
+9176:
+9184: circle
+9188:
+9200: triangle circle
+9204:
+9216: circle
+9220:
+9232: triangle
+9236:
+9244: cross
+9248:
+9260: square
+9264:
+9280: triangle
+9284:
+9292: triangle
+9296:
+9304: circle
+9308:
+9320: triangle circle
+9324:
+9336: circle
+9340:
+9352: triangle
+9356:
+9364: cross
+9368:
+9380: square
+9384:
+9400: triangle
+9404:
+9412: triangle
+9416:
+9424: circle
+9428:
+9440: triangle circle
+9444:
+9456: circle
+9460:
+9472: triangle
+9476:
+9484: cross
+9488:
+9500: square
+9504:
+9520: triangle
+9524:
+9532: triangle
+9536:
+9544: circle
+9548:
+9560: triangle circle
+9564:
+9576: circle
+9580:
+9592: triangle
+9596:
+9604: cross
+9608:
+9620: square
+9624:
+9640: triangle
+9644:
+9652: triangle
+9656:
+9664: circle
+9668:
+9680: triangle circle
+9684:
+9696: circle
+9700:
+9712: triangle
+9716:
+9724: cross
+9728:
+9740: square
+9744:
+9760: triangle
+9764:
+9772: triangle
+9776:
+9784: circle
+9788:
+9800: triangle circle
+9804:
+9816: circle
+9820:
+9832: triangle
+9836:
+9844: cross
+9848:
+9860: square
+9864:
+9880: triangle
+9884:
+9892: triangle
+9896:
+9904: circle
+9908:
+9920: triangle circle
+9924:
+9936: circle
+9940:
+9952: triangle
+9956:
+9964: cross
+9968:
+9980: square
+9984:
+10000: triangle
+10004:
+10012: triangle
+10016:
+10024: circle
+10028:
+10040: triangle circle
+10044:
+10056: circle
+10060:
+10072: triangle
+10076:
+10084: cross
+10088:
+10100: square
+10104:
+10120: triangle
+10124:
+10132: triangle
+10136:
+10144: circle
+10148:
+10160: triangle circle
+10164:
+10176: circle
+10180:
+10192: triangle
+10196:
+10204: cross
+10208:
+10220: square
+10224:
+10240: triangle
+10244:
+10252: triangle
+10256:
+10264: circle
+10268:
+10280: triangle circle
+10284:
+10296: circle
+10300:
+10312: triangle
+10316:
+10324: cross
+10328:
+10340: square
+10344:
+10360: triangle
+10364:
+10372: triangle
+10376:
+10384: circle
+10388:
+10400: triangle circle
+10404:
+10416: circle
+10420:
+10432: triangle
+10436:
+10444: cross
+10448:
+10460: square
+10464:
+10480: triangle
+10484:
+10492: triangle
+10496:
+10504: circle
+10508:
+10520: triangle circle
+10524:
+10536: circle
+10540:
+10552: triangle
+10556:
+10564: cross
+10568:
+10580: square
+10584:
+10600: triangle
+10604:
+10612: triangle
+10616:
+10624: circle
+10628:
+10640: triangle circle
+10644:
+10656: circle
+10660:
+10672: triangle
+10676:
+10684: cross
+10688:
+10700: square
+10704:
+10720: triangle
+10724:
+10732: triangle
+10736:
+10744: circle
+10748:
+10760: triangle circle
+10764:
+10776: circle
+10780:
+10792: triangle
+10796:
+10804: cross
+10808:
+10820: square
+10824:
+10840: triangle
+10844:
+10852: triangle
+10856:
+10864: circle
+10868:
+10880: triangle circle
+10884:
+10896: circle
+10900:
+10912: triangle
+10916:
+10924: cross
+10928:
+10940: square
+10944:
+10960: triangle
+10964:
+10972: triangle
+10976:
+10984: circle
+10988:
+11000: triangle circle
+11004:
+11016: circle
+11020:
+11032: triangle
+11036:
+11044: cross
+11048:
+11060: square
+11064:
+11080: triangle
+11084:
+11092: triangle
+11096:
+11104: circle
+11108:
+11120: triangle circle
+11124:
+11136: circle
+11140:
+11152: triangle
+11156:
+11164: cross
+11168:
+11180: square
+11184:
+11200: triangle
+11204:
+11212: triangle
+11216:
+11224: circle
+11228:
+11240: triangle circle
+11244:
+11256: circle
+11260:
+11272: triangle
+11276:
+11284: cross
+11288:
+11300: square
+11304:
+11320: triangle
+11324:
+11332: triangle
+11336:
+11344: circle
+11348:
+11360: triangle circle
+11364:
+11376: circle
+11380:
+11392: triangle
+11396:
+11404: cross
+11408:
+11420: square
+11424:
+11440: triangle
+11444:
+11452: triangle
+11456:
+11464: circle
+11468:
+11480: triangle circle
+11484:
+11496: circle
+11500:
+11512: triangle
+11516:
+11524: cross
+11528:
+11540: square
+11544:
+11560: triangle
+11564:
+11572: triangle
+11576:
+11584: circle
+11588:
+11600: triangle circle
+11604:
+11616: circle
+11620:
+11632: triangle
+11636:
+11644: cross
+11648:
+11660: square
+11664:
+11680: triangle
+11684:
+11692: triangle
+11696:
+11704: circle
+11708:
+11720: triangle circle
+11724:
+11736: circle
+11740:
+11752: triangle
+11756:
+11764: cross
+11768:
+11780: square
+11784:
+11800: triangle
+11804:
+11812: triangle
+11816:
+11824: circle
+11828:
+11840: triangle circle
+11844:
+11856: circle
+11860:
+11872: triangle
+11876:
+11884: cross
+11888:
+11900: square
+11904:
+11920: triangle
+11924:
+11932: triangle
+11936:
+11944: circle
+11948:
+11960: triangle circle
+11964:
+11976: circle
+11980:
+11992: triangle
+11996:
+12004: cross
+12008:
+12020: square
+12024:
+12040: triangle
+12044:
+12052: triangle
+12056:
+12064: circle
+12068:
+12080: triangle circle
+12084:
+12096: circle
+12100:
+12112: triangle
+12116:
+12124: cross
+12128:
+12140: square
+12144:
+12160: triangle
+12164:
+12172: triangle
+12176:
+12184: circle
+12188:
+12200: triangle circle
+12204:
+12216: circle
+12220:
+12232: triangle
+12236:
+12244: cross
+12248:
+12260: square
+12264:
+12280: triangle
+12284:
+12292: triangle
+12296:
+12304: circle
+12308:
+12320: triangle circle
+12324:
+12336: circle
+12340:
+12352: triangle
+12356:
+12364: cross
+12368:
+12380: square
+12384:
+12400: triangle
+12404:
+12412: triangle
+12416:
+12424: circle
+12428:
+12440: triangle circle
+12444:
+12456: circle
+12460:
+12472: triangle
+12476:
+12484: cross
+12488:
+12500: square
+12504:
+12520: triangle
+12524:
+12532: triangle
+12536:
+12544: circle
+12548:
+12560: triangle circle
+12564:
+12576: circle
+12580:
+12592: triangle
+12596:
+12604: cross
+12608:
+12620: square
+12624:
+12640: triangle
+12644:
+12652: triangle
+12656:
+12664: circle
+12668:
+12680: triangle circle
+12684:
+12696: circle
+12700:
+12712: triangle
+12716:
+12724: cross
+12728:
+12740: square
+12744:
+12760: triangle
+12764:
+12772: triangle
+12776:
+12784: circle
+12788:
+12800: triangle circle
+12804:
+12816: circle
+12820:
+12832: triangle
+12836:
+12844: cross
+12848:
+12860: square
+12864:
+12880: triangle
+12884:
+12892: triangle
+12896:
+12904: circle
+12908:
+12920: triangle circle
+12924:
+12936: circle
+12940:
+12952: triangle
+12956:
+12964: cross
+12968:
+12980: square
+12984:
+13000: triangle
+13004:
+13012: triangle
+13016:
+13024: circle
+13028:
+13040: triangle circle
+13044:
+13056: circle
+13060:
+13072: triangle
+13076:
+13084: cross
+13088:
+13100: square
+13104:
+13120: triangle
+13124:
+13132: triangle
+13136:
+13144: circle
+13148:
+13160: triangle circle
+13164:
+13176: circle
+13180:
+13192: triangle
+13196:
+13204: cross
+13208:
+13220: square
+13224:
+13240: triangle
+13244:
+13252: triangle
+13256:
+13264: circle
+13268:
+13280: triangle circle
+13284:
+13296: circle
+13300:
+13312: triangle
+13316:
+13324: cross
+13328:
+13340: square
+13344:
+13360: triangle
+13364:
+13372: triangle
+13376:
+13384: circle
+13388:
+13400: triangle circle
+13404:
+13416: circle
+13420:
+13432: triangle
+13436:
+13444: cross
+13448:
+13460: square
+13464:
+13480: triangle
+13484:
+13492: triangle
+13496:
+13504: circle
+13508:
+13520: triangle circle
+13524:
+13536: circle
+13540:
+13552: triangle
+13556:
+13564: cross
+13568:
+13580: square
+13584:
+13600: triangle
+13604:
+13612: triangle
+13616:
+13624: circle
+13628:
+13640: triangle circle
+13644:
+13656: circle
+13660:
+13672: triangle
+13676:
+13684: cross
+13688:
+13700: square
+13704:
+13720: triangle
+13724:
+13732: triangle
+13736:
+13744: circle
+13748:
+13760: triangle circle
+13764:
+13776: circle
+13780:
+13792: triangle
+13796:
+13804: cross
+13808:
+13820: square
+13824:
+13840: triangle
+13844:
+13852: triangle
+13856:
+13864: circle
+13868:
+13880: triangle circle
+13884:
+13896: circle
+13900:
+13912: triangle
+13916:
+13924: cross
+13928:
+13940: square
+13944:
+13960: triangle
+13964:
+13972: triangle
+13976:
+13984: circle
+13988:
+14000: triangle circle
+14004:
+14016: circle
+14020:
+14032: triangle
+14036:
+14044: cross
+14048:
+14060: square
+14064:
+14080: triangle
+14084:
+14092: triangle
+14096:
+14104: circle
+14108:
+14120: triangle circle
+14124:
+14136: circle
+14140:
+14152: triangle
+14156:
+14164: cross
+14168:
+14180: square
+14184:
+14200: triangle
+14204:
+14212: triangle
+14216:
+14224: circle
+14228:
+14240: triangle circle
+14244:
+14256: circle
+14260:
+14272: triangle
+14276:
+14284: cross
+14288:
+14300: square
+14304:
+14320: triangle
+14324:
+14332: triangle
+14336:
+14344: circle
+14348:
+14360: triangle circle
+14364:
+14376: circle
+14380:
+14392: triangle
+14396:
+14404: cross
+14408:
+14420: square
+14424:
+14440: triangle
+14444:
+14452: triangle
+14456:
+14464: circle
+14468:
+14480: triangle circle
+14484:
+14496: circle
+14500:
+14512: triangle
+14516:
+14524: cross
+14528:
+14540: square
+14544:
+14560: triangle
+14564:
+14572: triangle
+14576:
+14584: circle
+14588:
+14600: triangle circle
+14604:
+14616: circle
+14620:
+14632: triangle
+14636:
+14644: cross
+14648:
+14660: square
+14664:
+14680: triangle
+14684:
+14692: triangle
+14696:
+14704: circle
+14708:
+14720: triangle circle
+14724:
+14736: circle
+14740:
+14752: triangle
+14756:
+14764: cross
+14768:
+14780: square
+14784:
+14800: triangle
+14804:
+14812: triangle
+14816:
+14824: circle
+14828:
+14840: triangle circle
+14844:
+14856: circle
+14860:
+14872: triangle
+14876:
+14884: cross
+14888:
+14900: square
+14904:
+14920: triangle
+14924:
+14932: triangle
+14936:
+14944: circle
+14948:
+14960: triangle circle
+14964:
+14976: circle
+14980:
+14992: triangle
+14996:
+15004: cross
+15008:
+15020: square
+15024:
+15040: triangle
+15044:
+15052: triangle
+15056:
+15064: circle
+15068:
+15080: triangle circle
+15084:
+15096: circle
+15100:
+15112: triangle
+15116:
+15124: cross
+15128:
+15140: square
+15144:
+15160: triangle
+15164:
+15172: triangle
+15176:
+15184: circle
+15188:
+15200: triangle circle
+15204:
+15216: circle
+15220:
+15232: triangle
+15236:
+15244: cross
+15248:
+15260: square
+15264:
+15280: triangle
+15284:
+15292: triangle
+15296:
+15304: circle
+15308:
+15320: triangle circle
+15324:
+15336: circle
+15340:
+15352: triangle
+15356:
+15364: cross
+15368:
+15380: square
+15384:
+15400: triangle
+15404:
+15412: triangle
+15416:
+15424: circle
+15428:
+15440: triangle circle
+15444:
+15456: circle
+15460:
+15472: triangle
+15476:
+15484: cross
+15488:
+15500: square
+15504:
+15520: triangle
+15524:
+15532: triangle
+15536:
+15544: circle
+15548:
+15560: triangle circle
+15564:
+15576: circle
+15580:
+15592: triangle
+15596:
+15604: cross
+15608:
+15620: square
+15624:
+15640: triangle
+15644:
+15652: triangle
+15656:
+15664: circle
+15668:
+15680: triangle circle
+15684:
+15696: circle
+15700:
+15712: triangle
+15716:
+15724: cross
+15728:
+15740: square
+15744:
+15760: triangle
+15764:
+15772: triangle
+15776:
+15784: circle
+15788:
+15800: triangle circle
+15804:
+15816: circle
+15820:
+15832: triangle
+15836:
+15844: cross
+15848:
+15860: square
+15864:
+15880: triangle
+15884:
+15892: triangle
+15896:
+15904: circle
+15908:
+15920: triangle circle
+15924:
+15936: circle
+15940:
+15952: triangle
+15956:
+15964: cross
+15968:
+15980: square
+15984:

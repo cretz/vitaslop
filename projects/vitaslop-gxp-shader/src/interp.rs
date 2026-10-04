@@ -310,7 +310,7 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // what the GPU runs - gives `0.3`. For any negative operand the two differ by exactly
         // 1.0, and a fractional part is normally the range reduction in front of a polynomial,
         // so that 1.0 is squared and scaled into a completely different number. The corpus-wide
-        // differential found it on seven 99-instruction mk vertex programs whose outputs were
+        // differential found it on seven 99-instruction fighting-title vertex programs whose outputs were
         // ~10^4 times the GPU's.
         Op::Frc => {
             let v = s(0, c)?;
@@ -487,10 +487,16 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // lane - which is what the integer ops above then read. Matching `emit_pack_to_int`,
         // including its clamp: the source can be a NaN or a huge float, and an unclamped
         // conversion of either is undefined rather than merely wrong.
-        Op::PackToInt { bits, signed, .. } => {
+        Op::PackToInt { bits, signed, norm, .. } => {
             let f = s(0, c)?;
             let lane_mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
-            let raw = if signed {
+            // The NORMALIZED form, rounded exactly as the emitter rounds it.
+            let scale = if signed { ((1u64 << (bits - 1)) - 1) as f32 } else { ((1u64 << bits) - 1) as f32 };
+            let raw = if norm && signed {
+                (f.clamp(-1.0, 1.0) * scale + 0.5).floor() as i32 as u32
+            } else if norm {
+                (f.clamp(0.0, 1.0) * scale + 0.5).floor() as u32
+            } else if signed {
                 f.trunc().clamp(-2_147_483_000.0, 2_147_483_000.0) as i32 as u32
             } else {
                 f.trunc().clamp(0.0, 4_294_967_000.0) as u32
@@ -1561,7 +1567,7 @@ fn test_channels(
             // MEASURED: this ONE default was the first divergence in **five** of the corpus
             // remainder's programs, across THREE titles (`cw-rr-corpus__frag_8668a340` and
             // `__frag_86689800`, `atlas-bin__frag_843f1518` and `__vert_84315b14`,
-            // `mlb-corpus__frag_843f3d24`) - every one of them located by the per-instruction
+            // `__frag_843f3d24`) - every one of them located by the per-instruction
             // trace naming `vtst`, and none of them findable by reading a hundred instructions.
             //
             // The `Fx8Sub` arm above already took its precision explicitly and says why; the
@@ -1654,7 +1660,7 @@ mod tests {
     }
 
     /// src1 with its half bit CLEAR is the LOW 16 bits of a packed pair, not the whole
-    /// register - two bone indices packed in one register (MLB's skinned shadow, 2026-09-25):
+    /// register - two bone indices packed in one register (a baseball title's skinned shadow, 2026-09-25):
     /// the whole-register read added `stride * idx_hi << 16` to the low bone's address.
     #[test]
     fn int_mad_reads_the_low_half_of_a_packed_src1() {

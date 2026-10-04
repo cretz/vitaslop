@@ -230,7 +230,7 @@ impl WebAudioSink {
         // refused grain still advances the port, it never comes back: the run is SILENT from
         // then on. MEASURED: every desktop browser run, single-worker and SMP, read
         // `written 0.6-1.3 s` for the whole run against millions of `overrun` frames, and the
-        // user heard no audio at all in MLB and none in-game in Madden (2026-09-25). Game time
+        // user heard no audio at all in a baseball title and none in-game in a football title (2026-09-25). Game time
         // outruns wall time whenever the clock jumps over idle stretches - a load, a
         // fast-forward - and the audio thread submits by game time. Dropping the audio that
         // ran ahead is right (it can never be played in time); losing everything after is not.

@@ -3,7 +3,7 @@
 //
 // Each worker used to fetch and compile the 9 MB bundle for itself. On a phone reaching the dev
 // server through its self-signed certificate there is no HTTP cache at all, so that was the whole
-// 9 MB over the LAN per worker per play - MEASURED (runner, MLB) 8.7 s each, twice before frame 1.
+// 9 MB over the LAN per worker per play - MEASURED (runner, a baseball title) 8.7 s each, twice before frame 1.
 // A compiled module posts between workers without copying its code, so one compile serves both,
 // and a second play from the same page pays nothing.
 //

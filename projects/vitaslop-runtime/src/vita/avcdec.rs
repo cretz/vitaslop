@@ -168,6 +168,16 @@ pub struct AvcdecState {
     /// Pictures handed to the guest so far, which is what `VITASLOP_MOVIE_PICTURE_HASH`
     /// keys its per-picture line on. See [`report_picture_hash`].
     pub pictures_written: u64,
+    /// Set by [`set_submit_only`] around a dispatch whose only job is to SUBMIT the call's
+    /// access unit, so an engine whose decoder answers on its event loop can wait for that
+    /// answer before the real call delivers pictures. See [`decoder_behind`].
+    pub submit_only: bool,
+    /// The units submit-only passes handed the decoder, `(handle, es_ptr, pts)`: the real
+    /// dispatch of the SAME call finds its own here, removes it, and does not submit it twice.
+    /// A list, not one slot: the browser parks several decode calls at once (`smp.rs`
+    /// `parked_decodes`), and a later call's pass must not overwrite an earlier one's entry -
+    /// which would make both submit their unit twice.
+    pub presubmitted: Vec<(u32, u32, u64)>,
 }
 
 impl AvcdecState {
@@ -492,6 +502,7 @@ fn do_avcdec_delete_decoder(ctx: &mut GuestCtx, st: &mut VitaState, decoder: Ptr
         return SCE_AVCDEC_ERROR_INVALID_PARAM;
     };
     let session = st.avcdec.sessions.remove(index);
+    st.avcdec.presubmitted.retain(|p| p.0 != handle);
     // Whatever this decoder still owed goes with it - see `pictures_owed`.
     PICTURES_OWED.store(0, std::sync::atomic::Ordering::Relaxed);
     // >>> THE ERROR IS DECIDED HERE, AT THE END, WHERE IT CAN BE TRUE.
@@ -567,7 +578,16 @@ fn do_avcdec_decode(
     let es_size = ctx.read_u32(au_ptr.addr() + au::ES_SIZE);
     let pts = ((ctx.read_u32(au_ptr.addr() + au::PTS_UPPER) as u64) << 32)
         | ctx.read_u32(au_ptr.addr() + au::PTS_LOWER) as u64;
-    if es_ptr != 0 && es_size != 0 {
+    // The submit-only pass submitted this very unit already (see `presubmitted`).
+    let already = !st.avcdec.submit_only
+        && match st.avcdec.presubmitted.iter().position(|p| *p == (handle, es_ptr, pts)) {
+            Some(at) => {
+                st.avcdec.presubmitted.remove(at);
+                true
+            }
+            None => false,
+        };
+    if es_ptr != 0 && es_size != 0 && !already {
         let bytes = ctx.read_bytes(es_ptr, es_size as usize);
         // What the guest actually handed over. An Annex B access unit starts with a start
         // code, so the first four bytes say at once whether the pointer and the length the
@@ -590,8 +610,22 @@ fn do_avcdec_decode(
             );
             return SCE_AVCDEC_ERROR_INVALID_STATE;
         }
+        if st.avcdec.submit_only {
+            st.avcdec.presubmitted.push((handle, es_ptr, pts));
+        }
+    }
+    if st.avcdec.submit_only {
+        return 0;
     }
     deliver_pictures(ctx, st, handle, array.addr())
+}
+
+/// Make the next dispatches SUBMIT a decode call's access unit and nothing else - no picture
+/// is delivered and the guest's registers from that pass are discarded by the caller. The
+/// engine then waits for [`decoder_behind`] to clear and dispatches the call for real, which
+/// finds its unit in `presubmitted` and only delivers. Guest memory is only READ by the pass.
+pub fn set_submit_only(st: &mut VitaState, on: bool) {
+    st.avcdec.submit_only = on;
 }
 
 /// int sceAvcdecDecodeStop(const SceAvcdecCtrl *decoder, SceAvcdecArrayPicture *array)
@@ -849,8 +883,50 @@ fn note_destination(addr: u32) {
 /// 819 access units submitted against 160 pictures, i.e. essentially the whole backlog was
 /// the fast-forward. Leaving that in the total makes paced play look like a decoder five
 /// times behind whatever it is actually doing.
+/// >>> WHETHER A MOVIE DECODER IS FURTHER BEHIND ITS INPUT THAN ITS STREAM ALLOWS, for an
+/// engine whose decoder answers on its own event loop (WebCodecs) to give it that time BEFORE
+/// the next decode call is dispatched.
+///
+/// On the console a decode returns with the picture its access unit is owed, give or take the
+/// stream's own reordering. A title may build on that: MEASURED on a phone (runner job 052), a
+/// title's demux thread holds each access unit's ES buffer until that unit's picture comes
+/// back, in a pool that fits ~8 units. The phone's decoder was slow to answer during a heavy
+/// boot, 5 calls in a row came back with no picture, the pool filled, the title stopped
+/// calling decode at all - and the pictures that then arrived sat in our queue for ever: a
+/// black screen from the intro movie on, at 100% speed. The same decoder, given event-loop
+/// turns, answers each unit one call later (the stream's `max_num_reorder_frames` = 1) -
+/// `decoder-latency` runner job 054.
+///
+/// Polls every session's decoder (so call it on the worker that owns them) and says whether
+/// any is behind. See [`VideoDecode::behind_stream`].
+pub fn decoder_behind(st: &mut VitaState) -> bool {
+    // NOT `any`: `behind_stream` also collects each decoder's finished pictures, so a
+    // short-circuit would leave every session after the first lagging one uncollected.
+    st.avcdec.sessions.iter_mut().fold(false, |behind, s| s.decoder.behind_stream() | behind)
+}
+
+/// A decode call that waited for [`decoder_behind`] to clear: how long, and whether it gave up.
+pub fn note_catch_up(waited_ms: f64, gave_up: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CATCH_UP_CALLS.fetch_add(1, Relaxed);
+    CATCH_UP_US.fetch_add((waited_ms * 1000.0) as u64, Relaxed);
+    CATCH_UP_MAX_US.fetch_max((waited_ms * 1000.0) as u64, Relaxed);
+    if gave_up {
+        CATCH_UP_GAVE_UP.fetch_add(1, Relaxed);
+    }
+}
+
+static CATCH_UP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CATCH_UP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CATCH_UP_MAX_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CATCH_UP_GAVE_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn reset_movie_counters() {
     use std::sync::atomic::Ordering::Relaxed;
+    CATCH_UP_CALLS.store(0, Relaxed);
+    CATCH_UP_US.store(0, Relaxed);
+    CATCH_UP_MAX_US.store(0, Relaxed);
+    CATCH_UP_GAVE_UP.store(0, Relaxed);
     AU_SUBMITTED.store(0, Relaxed);
     PICTURES_DELIVERED.store(0, Relaxed);
     DECODE_CALLS.store(0, Relaxed);
@@ -948,6 +1024,20 @@ pub fn movie_report(frames: u64) -> Vec<String> {
             "movie decoder at the last EMPTY call: {}",
             LAST_EMPTY_DECODER.lock().map(|g| g.clone()).unwrap_or_default()
         ),
+        {
+            let n = CATCH_UP_CALLS.load(Relaxed);
+            let total = CATCH_UP_US.load(Relaxed) as f64 / 1000.0;
+            format!(
+                "movie catch-up: {n} decode call(s) waited for the decoder to answer down to the \
+                 stream's reorder depth before dispatch, {total:.1} ms in all ({:.2} ms each, \
+                 worst {:.1} ms), {} gave up at the cap. Zero calls is a decoder that kept up; a \
+                 give-up is one that stayed behind, and the title then sees an empty call - see \
+                 `avcdec::decoder_behind`",
+                if n > 0 { total / n as f64 } else { 0.0 },
+                CATCH_UP_MAX_US.load(Relaxed) as f64 / 1000.0,
+                CATCH_UP_GAVE_UP.load(Relaxed),
+            )
+        },
     ]
 }
 
@@ -1124,6 +1214,11 @@ fn write_picture(
     ctx.write_u32(i + info::TIME_SCALE, time_scale);
     ctx.write_u32(i + info::PTS_UPPER, (pic.pts as u64 >> 32) as u32);
     ctx.write_u32(i + info::PTS_LOWER, pic.pts as u32);
+    tracing::debug!(
+        target: "vitaslop::movie",
+        pts = pic.pts, dest = format_args!("{dest:#010x}"), w = pic.width, h = pic.height,
+        "sceAvcdecDecode: picture written"
+    );
 
     if !st.avcdec.reported_pixel_format {
         st.avcdec.reported_pixel_format = true;
@@ -1690,7 +1785,7 @@ pub(super) fn avcdec_decode(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcom
     let (decoder, au_ptr, array) = (Ptr(ctx.arg(0)), Ptr(ctx.arg(1)), Ptr(ctx.arg(2)));
     let status = do_avcdec_decode(ctx, st, decoder, au_ptr, array);
     ctx.ret(status as u32);
-    if status < 0 || !st.is_preemptive() {
+    if status < 0 || !st.is_preemptive() || st.avcdec.submit_only {
         return SvcOutcome::Continue;
     }
     let handle = ctx.read_u32(decoder.addr() + ctrl::HANDLE);
@@ -1735,7 +1830,7 @@ pub(super) fn videodec_term_library(
 
 /// int sceAvcdecDecodeAvailableSize(SceAvcdecCtrl *decoder)
 ///
-/// Undocumented: no header or wiki gives its meaning. DOA5, its one caller, passes the
+/// Undocumented: no header or wiki gives its meaning. A fighting title, its one caller, passes the
 /// decoder control block and prints the result as `"Available size: %d"` - nothing reads
 /// it otherwise. Answered with the size of the frame buffer the title gave the decoder
 /// (`SceAvcdecCtrl.frameBuf.size`, the one "size" this call can see), never an error.

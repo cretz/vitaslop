@@ -159,6 +159,46 @@ impl LoadedModule {
 }
 
 impl LinkedProgram {
+    /// The word at guest address `addr` in the linked image, or `None` outside it.
+    fn image_word(&self, addr: u32) -> Option<u32> {
+        let off = addr.checked_sub(self.base)? as usize;
+        let b = self.image.get(off..off + 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// >>> WHAT THE TITLE ASKS ITS MAIN THREAD TO RUN AT: `(priority, cpu affinity mask)` from
+    /// its `SceProcessParam`, each `None` when the title leaves it to the kernel default.
+    ///
+    /// The block (`size, "PSP2", version, fw, name*, priority*, stacksize*, attr, process
+    /// name*, preload*, affinity*, libc param*`) holds POINTERS to the title's
+    /// `sceUserMainThreadPriority` / `sceUserMainThreadCpuAffinityMask` variables; Vita3K reads
+    /// them the same way and starts the main thread with them. Measured across ten titles
+    /// (2026-10-02): eight leave both unset or at the default (`0x10000100` = default
+    /// priority, `0x70000` = every user core); a fighting title asks for priority 0x56 and
+    /// mask `0x1`.
+    ///
+    /// # A mask without bits 16..18 is read as its low bits naming the cores
+    /// The kernel's masks name user cores in bits 16..18 (`SCE_KERNEL_CPU_MASK_USER_0 =
+    /// 0x10000`). That title's `0x1` sets none of them; read as low bits it names core 0, the only
+    /// core any reading of it names. That pins the title's main thread to core 0, and every
+    /// thread it creates with mask 0 inherits that (see `VitaState::create_thread`).
+    pub fn main_thread_request(&self) -> (Option<i32>, Option<i32>) {
+        let p = self.process_param;
+        if p == 0 || self.image_word(p + 4) != Some(u32::from_le_bytes(*b"PSP2")) {
+            return (None, None);
+        }
+        let deref = |field: u32| -> Option<u32> {
+            let ptr = self.image_word(p + field)?;
+            if ptr == 0 { None } else { self.image_word(ptr) }
+        };
+        let priority = deref(0x14).map(|v| crate::host::resolve_priority(v as i32));
+        let affinity = deref(0x28).and_then(|m| {
+            let m = if m & 0x0007_0000 == 0 { (m & 0x7) << 16 } else { m & 0x0007_0000 };
+            (m != 0).then_some(m as i32)
+        });
+        (priority, affinity)
+    }
+
     /// Borrow the linked image as a transpiler [`Program`]. The whole program is
     /// Thumb-2 (Vita user code, confirmed by its Thumb-only relocations); code
     /// pointers are discovered so address-taken thread entries and callbacks are
@@ -802,6 +842,12 @@ fn blit(image: &mut [u8], image_base: u32, seg: &Segment) {
     );
 }
 
+/// Whether variable-import fixups apply the code word's addend - see [`apply_var_fixups`].
+/// `VITASLOP_LINK_VAR_ADDEND=0` drops it, as the linker did before 2026-09-28: an A/B arm.
+fn var_addend_on() -> bool {
+    !matches!(crate::knobs::var("VITASLOP_LINK_VAR_ADDEND").as_deref(), Ok("0"))
+}
+
 /// Apply one variable import's fixup blob, binding every listed site to the
 /// resolved symbol address `sym`.
 ///
@@ -810,10 +856,19 @@ fn blit(image: &mut [u8], image_base: u32, seg: &Segment) {
 /// `{ code_word: u32, site_offset: u32 }` entries. `code_word`'s byte 1 is an
 /// `R_ARM_*` relocation code; `site_offset` is the fixup site's byte offset from the
 /// importing module's link base, so its runtime address is `module_base +
-/// site_offset`. The addend is always zero for a variable import (the site holds no
-/// prior displacement). Supports the codes Vita variable imports emit: the Thumb
+/// site_offset`. Supports the codes Vita variable imports emit: the Thumb
 /// `MOVW`/`MOVT` pair that materializes the address in a register, and `ABS32` for a
 /// plain pointer word.
+///
+/// # >>> THE CODE WORD'S HIGH HALF IS AN ADDEND, AND C++ RTTI DEPENDS ON IT.
+/// This read "the addend is always zero for a variable import" and wrote the bare symbol.
+/// MEASURED on an action title: 1,747 of its ABS32 sites carry `code_word = 0x00080201` - type 2
+/// (`ABS32`) in byte 1, and **8** in the high half. They are `type_info` objects importing
+/// SceLibc's `__si_class_type_info` VTABLE: a vptr must point 8 bytes INTO a vtable (past
+/// offset-to-top and the type_info pointer), which is exactly the `+ 8`. Without it every
+/// virtual call on those `type_info`s ran the slot two before the one asked for, so a
+/// `dynamic_cast` of a `GuiPageFlipWidget` to its OWN type returned null and the game stored
+/// through it. The MOVW/MOVT sites in the same module carry 0 there, consistently.
 fn apply_var_fixups(
     image: &mut [u8],
     module_base: u32,
@@ -841,15 +896,19 @@ fn apply_var_fixups(
         let rcode = ((code_word >> 8) & 0xFF) as u8;
         let site = module_base.wrapping_add(site_offset);
         let off = site.wrapping_sub(IMAGE_BASE) as usize;
+        // Signed: a symbol-relative displacement. Only 0 and +8 have been seen.
+        // `VITASLOP_LINK_VAR_ADDEND=0` is the old arm (addend dropped), for A/B only.
+        let addend = if var_addend_on() { (code_word >> 16) as u16 as i16 as i32 } else { 0 };
+        let target = sym.wrapping_add(addend as u32);
         match rcode {
             code::NONE => {}
-            code::THM_MOVW_ABS_NC => vitaslop_loader::patch_thumb_mov(image, off, (sym & 0xFFFF) as u16)?,
-            code::THM_MOVT_ABS => vitaslop_loader::patch_thumb_mov(image, off, (sym >> 16) as u16)?,
+            code::THM_MOVW_ABS_NC => vitaslop_loader::patch_thumb_mov(image, off, (target & 0xFFFF) as u16)?,
+            code::THM_MOVT_ABS => vitaslop_loader::patch_thumb_mov(image, off, (target >> 16) as u16)?,
             code::ABS32 | code::TARGET1 => {
                 let slot = image
                     .get_mut(off..off + 4)
                     .ok_or(vitaslop_loader::Error::OutOfBounds("var fixup abs32 site"))?;
-                slot.copy_from_slice(&sym.to_le_bytes());
+                slot.copy_from_slice(&target.to_le_bytes());
             }
             other => return Err(vitaslop_loader::Error::UnsupportedReloc(other)),
         }
