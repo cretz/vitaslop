@@ -573,7 +573,7 @@ export function createPlayer({ onExit, onRestart }) {
       window.__runKnobs = knobs;
       gamedata.setProfile(settings.profile);
 
-      status("preparing the title (a few seconds on a desktop, up to a minute on a phone)...");
+      status("preparing the title (the first start translates it and can take a minute or more; later starts are quicker)...");
       // The RUN worker comes first: it reserves the guest's memory inside its own and says
       // where, and the throwaway transpile worker builds the module for that place (see
       // worker.js's "reserve" message). The run worker then idles until the start message.
@@ -673,7 +673,8 @@ export function createPlayer({ onExit, onRestart }) {
         settings,
         (msg) => note("[pad] " + msg),
         (name, down) => touch && touch.setHeld(name, down),
-        () => running && !menuOpen && openMenu(true)
+        () => running && !menuOpen && openMenu(true),
+        (slot, nx, ny) => touch && touch.setStick(slot, nx, ny)
       );
       // Keyboard presses light the on-screen control they map to.
       const byCode = {};

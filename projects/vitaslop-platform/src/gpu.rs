@@ -1339,6 +1339,22 @@ pub(crate) fn async_pipelines() -> bool {
     })
 }
 
+/// Draws linked with / without the vertex program their fragment was patched against - the
+/// form `GxmRenderer::premodule_pairs` builds ahead in.
+static DRAWS_PATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAWS_UNPATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Native: a frame's new pipelines are built on several threads ahead of the encode - see
+/// `GxmRenderer::prebuild_pipelines`. `VITASLOP_PARALLEL_PIPELINES=0` is the arm back.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn parallel_pipelines() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_PARALLEL_PIPELINES").map(|v| v.trim() != "0").unwrap_or(true)
+    })
+}
+
 /// Microseconds spent inside `create_shader_module` and `create_render_pipeline` for recompiled
 /// pairs, and how many pipelines that was. See the timing site in `build_gxp_pipeline`.
 static PIPE_MODULE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -6317,6 +6333,14 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// match - and matching it would mean rasterising the display pass at the guest's
         /// resolution, which is a quality loss no defect here justifies.
         display_images: HashMap<u32, DisplayImage>,
+        /// Native: shader modules built AHEAD on background threads for the pairs the guest's
+        /// patcher named, `(module key, module)`, waiting to join `GxpLive::modules` - see
+        /// [`GxmRenderer::premodule_pairs`].
+        #[cfg(not(target_arch = "wasm32"))]
+        premodules: std::sync::Arc<std::sync::Mutex<Vec<(u64, wgpu::ShaderModule)>>>,
+        /// The allocation pairs already handed to [`GxmRenderer::premodule_pairs`].
+        #[cfg(not(target_arch = "wasm32"))]
+        premodule_seen: HashSet<(usize, usize)>,
         /// Fixed-function bind groups over a rendered target, keyed by (address, linear,
         /// reading-the-snapshot). The snapshot flag is part of the key because the two
         /// views are different textures - binding the live one where the snapshot is meant
@@ -19115,6 +19139,12 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     ^ gxp_attr_interface_fold(&linked.vertex_bindings.attributes)
             }
         };
+        // Which form the title's draws take - see `premodule_pairs`.
+        if gxp.fprog_patched_vprog.is_empty() {
+            super::DRAWS_UNPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            super::DRAWS_PATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let module = modules
             .entry(mkey)
             .or_insert_with(|| {
@@ -20245,6 +20275,10 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 raw_to_float: None,
                 rtt_rendered_raw: HashMap::default(),
                 display_images: HashMap::default(),
+                #[cfg(not(target_arch = "wasm32"))]
+                premodules: std::sync::Arc::default(),
+                #[cfg(not(target_arch = "wasm32"))]
+                premodule_seen: HashSet::default(),
                 rtt_binds: HashMap::default(),
                 offscreen_only: false,
                 rtt_cubes: HashMap::default(),
@@ -22342,6 +22376,8 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     );
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            self.premodule_pairs(_device, pairs);
             if !self.gxp.enabled || pairs.is_empty() || !super::gxp_precompile() {
                 return;
             }
@@ -22481,6 +22517,224 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 }
             }
             PipelineWarm { items }
+        }
+
+        /// >>> NATIVE: TRANSLATE AND COMPILE THE PAIRS THE PATCHER NAMED, ON BACKGROUND THREADS,
+        /// >>> WHILE THE TITLE IS STILL LOADING - so the frame that first draws them finds both.
+        ///
+        /// [`Self::prebuild_pipelines`] spreads a frame's new pairs over threads, but the shader
+        /// MODULE half does not parallelise much (MEASURED: 127-177 ms of module work in a
+        /// 126-189 ms present at a fighting title's intro starts), and those presents still
+        /// emptied the audio lead. The patcher names those very pairs during the loading screen
+        /// before them, where there is time to spare. So each newly named pair is translated
+        /// with the options the draw computes for its common case (the same guess as the
+        /// translation-only [`Self::precompile_pairs`]: the translation memo then serves the
+        /// draw), run through the same clip fixup, compiled into a module, and filed under the
+        /// draw path's own module key. A draw whose state differs (dual-source, raw units, a
+        /// masked colour, an alpha target) computes another key and builds as before - work,
+        /// never a different picture. Off under the WGSL override and keycolour diagnostics,
+        /// which change the module per pair.
+        #[cfg(not(target_arch = "wasm32"))]
+        fn premodule_pairs(&mut self, device: &wgpu::Device, pairs: &[vitaslop_gxp_shader::PatcherPair]) {
+            if !self.gxp.enabled || pairs.is_empty() || !super::parallel_pipelines() {
+                return;
+            }
+            if crate::knobs::var("VITASLOP_GXP_WGSL_OVERRIDE_DIR").is_ok()
+                || crate::knobs::var("VITASLOP_GXP_WGSL_OVERRIDE_TEXT").is_ok()
+                || crate::knobs::var("VITASLOP_GXP_KEYCOLOR").is_ok()
+            {
+                return;
+            }
+            if self.premodule_seen.len() >= PRECOMPILE_SEEN_CAP {
+                self.premodule_seen.clear();
+            }
+            let fresh: Vec<vitaslop_gxp_shader::PatcherPair> = pairs
+                .iter()
+                .filter(|p| {
+                    let akey = (
+                        std::sync::Arc::as_ptr(&p.vprog) as *const u8 as usize,
+                        std::sync::Arc::as_ptr(&p.fprog) as *const u8 as usize,
+                    );
+                    self.premodule_seen.insert(akey)
+                })
+                .cloned()
+                .collect();
+            if fresh.is_empty() {
+                return;
+            }
+            let (zfix, yflip, solid) = (self.gxp.zfix, self.gxp.yflip, self.gxp.solid);
+            // >>> THE FORM THE TITLE'S DRAWS ACTUALLY TAKE. A draw carries the vertex program its
+            // fragment was patched against on some titles and not on others (MEASURED: a
+            // fighting title's every draw linked UNPATCHED, so modules built for the patched
+            // form - the translation-only precompile's assumption - matched none of them). The
+            // draws so far decide; before any, the patched form, as the precompile always took.
+            let patched = {
+                use std::sync::atomic::Ordering::Relaxed;
+                super::DRAWS_PATCHED.load(Relaxed) >= super::DRAWS_UNPATCHED.load(Relaxed)
+            };
+            // Modest on purpose: MEASURED, eight threads here slowed the in-frame builds they
+            // compete with (a fight start's present 218 -> 282 ms) more than they saved.
+            let threads = std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4).min(fresh.len());
+            let fresh = std::sync::Arc::new(fresh);
+            for t in 0..threads {
+                let (device, out, fresh) = (device.clone(), self.premodules.clone(), fresh.clone());
+                let _ = std::thread::Builder::new().name("gxp-premodule".into()).spawn(move || {
+                    for p in fresh.iter().skip(t).step_by(threads) {
+                        let opts = vitaslop_gxp_shader::LinkOptions {
+                            guest_attrs: p.attrs.clone(),
+                            patched_against: patched.then(|| p.vprog.clone()),
+                            ..Default::default()
+                        };
+                        let Ok(linked) = vitaslop_gxp_shader::link_programs_memo(&p.vprog, &p.fprog, opts) else { continue };
+                        // The draw path's key for this case - see the `mkey` in `build_gxp_pipeline`.
+                        let mkey = GxpLive::module_key(&p.vprog, &p.fprog)
+                            ^ if patched { GxpLive::module_key(&p.vprog, b"patched").rotate_left(17) } else { 0 }
+                            ^ gxp_attr_interface_fold(&linked.vertex_bindings.attributes);
+                        let Some(wgsl) = inject_clip_fixup(&linked.wgsl, zfix, yflip, solid, None, true) else { continue };
+                        let wgsl = vitaslop_gxp_shader::wgsl::hoist_diagnostics(&wgsl);
+                        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: Some(&format!("gxp-linked:{mkey:016x}")),
+                            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+                        });
+                        out.lock().unwrap_or_else(|e| e.into_inner()).push((mkey, module));
+                    }
+                });
+            }
+        }
+
+        /// Move the modules [`Self::premodule_pairs`] finished into the cache the draws read.
+        #[cfg(not(target_arch = "wasm32"))]
+        fn take_premodules(&mut self) {
+            let done = std::mem::take(&mut *self.premodules.lock().unwrap_or_else(|e| e.into_inner()));
+            for (k, m) in done {
+                self.gxp.modules.entry(k).or_insert(m);
+            }
+        }
+
+        /// >>> NATIVE: BUILD EVERY PIPELINE THESE SCENES WILL NEED AND DO NOT HAVE, ON SEVERAL
+        /// >>> THREADS, BEFORE THE ENCODE - the desktop's form of [`Self::warm_pipelines`].
+        ///
+        /// A native device has no asynchronous create, so a frame that introduces a dozen pairs
+        /// built them one after another inside the encode, on the one thread the guest's next
+        /// frame waits behind. MEASURED in a fighting title's window at the start of each
+        /// pre-fight intro: a 254-286 ms present, of it 46-57 ms our translation, 110-139 ms
+        /// shader modules and 36-45 ms pipelines - long enough to empty the 120 ms audio lead,
+        /// which is the choppy sound on the intros the user heard. The three are independent per
+        /// pair and a native `wgpu::Device` is thread-safe, so they are split across threads
+        /// here, each with its own module map, and merged into the caches the encode reads.
+        ///
+        /// Predicted with the same keys and pass shapes as the browser's warm; what that cannot
+        /// predict still builds in the encode exactly as before. A refused pair is cached as
+        /// refused, as the encode would. `VITASLOP_PARALLEL_PIPELINES=0` is the arm back.
+        #[cfg(not(target_arch = "wasm32"))]
+        pub fn prebuild_pipelines(&mut self, device: &wgpu::Device, scenes: &[RenderScene]) {
+            if !self.gxp.enabled || !super::parallel_pipelines() {
+                return;
+            }
+            self.take_premodules();
+            struct Job<'a> {
+                g: &'a GxpRecompile,
+                key: u64,
+                fmt: wgpu::TextureFormat,
+                alpha_single: bool,
+                samples: u32,
+                noop_keeps_depth: bool,
+                pk: PipeKey,
+            }
+            let mut jobs: Vec<Job> = Vec::new();
+            let mut seen: HashSet<PipeCacheKey> = HashSet::default();
+            for scene in scenes {
+                if scene.draws.is_empty() {
+                    continue;
+                }
+                let Some(shapes) = self.pass_shapes.get(&Self::pass_id(scene)).cloned().or_else(|| {
+                    scene
+                        .target
+                        .filter(|_| super::warm_by_format())
+                        .and_then(|t| self.pass_shapes_by_format.get(&t.format).cloned())
+                }) else {
+                    continue;
+                };
+                for d in &scene.draws {
+                    let Some(g) = &d.gxp else { continue };
+                    if g.index_count == 0 || g.vertices.is_empty() {
+                        continue;
+                    }
+                    let key = self.gxp.pair_key(g);
+                    if (!self.gxp.keys.is_empty() && !self.gxp.keys.contains(&key)) || self.gxp.exclude.contains(&key) {
+                        continue;
+                    }
+                    let noop_keeps_depth = g.depth_write && draw_colour_is_noop(g);
+                    for &(fmt, samples, alpha_single) in &shapes {
+                        let rtt_raw = &self.rtt_raw;
+                        let pk = GxpLive::pipe_key(g, key, noop_keeps_depth, fmt, alpha_single, samples, |k| {
+                            rtt_raw.contains_key(k)
+                        });
+                        if self.gxp.pipelines.contains_key(&pk.cache_key) || !seen.insert(pk.cache_key) {
+                            continue;
+                        }
+                        jobs.push(Job { g, key, fmt, alpha_single, samples, noop_keeps_depth, pk });
+                    }
+                }
+            }
+            // One pipeline gains nothing from a thread; the encode builds it as it always has.
+            if jobs.len() < 2 {
+                return;
+            }
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8).min(jobs.len());
+            let (zfix, yflip, solid, nodepth, noblend) =
+                (self.gxp.zfix, self.gxp.yflip, self.gxp.solid, self.gxp.nodepth, self.gxp.noblend);
+            #[allow(clippy::type_complexity)]
+            let results: Vec<(Vec<(PipeCacheKey, Option<GxpPipeline>)>, HashMap<u64, wgpu::ShaderModule>)> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let jobs = &jobs;
+                            s.spawn(move || {
+                                let mut modules: HashMap<u64, wgpu::ShaderModule> = HashMap::default();
+                                let mut built = Vec::new();
+                                // By PAIR, not by job: a pair's pass shapes share its translation
+                                // and module, and dealing them to two threads built both twice.
+                                for j in jobs.iter().filter(|j| (j.key % threads as u64) as usize == t) {
+                                    report_unfed_uniforms(j.key, "vertex", &j.g.vprog);
+                                    report_unfed_uniforms(j.key, "fragment", &j.g.fprog);
+                                    enc(&ENC.pipelines_built, 1);
+                                    log_pipe("prebuilt", &j.pk.cache_key, j.g);
+                                    let p = build_gxp_pipeline(
+                                        device,
+                                        j.fmt,
+                                        j.alpha_single,
+                                        j.samples,
+                                        j.g.cull_mode,
+                                        j.g,
+                                        j.key,
+                                        zfix,
+                                        yflip,
+                                        solid,
+                                        nodepth,
+                                        noblend,
+                                        j.noop_keeps_depth,
+                                        j.pk.raw_units,
+                                        j.pk.f32_units,
+                                        &mut modules,
+                                        |d, desc| d.create_render_pipeline(desc),
+                                    );
+                                    built.push((j.pk.cache_key, p));
+                                }
+                                (built, modules)
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                });
+            for (built, modules) in results {
+                for (k, m) in modules {
+                    self.gxp.modules.entry(k).or_insert(m);
+                }
+                for (k, p) in built {
+                    self.gxp.pipelines.entry(k).or_insert(p);
+                }
+            }
         }
 
         /// Whether a pipeline the frame last warmed draws with is still being compiled - the

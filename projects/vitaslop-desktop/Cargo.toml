@@ -53,6 +53,11 @@ wgpu.workspace = true
 pollster.workspace = true
 cpal = "0.18"
 
+# Windows only: re-attaching the parent's console for the terminal entry points of a binary
+# linked as a GUI program (see `src/console.rs`). The version the dependency tree already uses.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+
 # Windows only: stamps `assets/icon.ico` into the executable as its icon (Explorer, the
 # taskbar, the title bar). Needs the SDK's rc.exe, which the msvc toolchain brings.
 [target.'cfg(windows)'.build-dependencies]

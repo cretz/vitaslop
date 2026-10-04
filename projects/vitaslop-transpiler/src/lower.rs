@@ -2439,7 +2439,11 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
 
     let mut out = Vec::new();
     match inst.opcode {
-        NOP | IT | HINT => {}
+        // The hint space. `YIELD`/`WFE`/`WFI`/`SEV` only ever tune how a core waits - the guest
+        // scheduler preempts spin loops on its own - and `CSDB`/`DBG` have no architectural
+        // effect here. A title's NEON audio mixer pads its loop with ARM `NOP`s, which the
+        // decoder used to leave undecoded: the block trapped the first time it ran.
+        NOP | IT | HINT | YIELD | WFE | WFI | SEV | CSDB | DBG => {}
 
         // Memory barriers and cache preload hints have no effect on the guest's
         // observable state in our memory model (one guest CPU worker, sequential

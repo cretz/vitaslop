@@ -37,6 +37,10 @@ pub struct Input {
     chord_since: Option<Instant>,
     /// The menu was asked for and not yet taken - see [`Self::take_menu_request`].
     menu_request: bool,
+    /// What the on-screen controls hold this frame (the mouse on them): button bits OR'd in,
+    /// and each stick's position while it is dragged - see `shell::touchpad`.
+    pub overlay_buttons: u32,
+    pub overlay_sticks: [Option<(u8, u8)>; 2],
 }
 
 impl Input {
@@ -57,6 +61,8 @@ impl Input {
             ignore: HashSet::new(),
             chord_since: None,
             menu_request: false,
+            overlay_buttons: 0,
+            overlay_sticks: [None, None],
         };
         me.apply(settings);
         me
@@ -156,6 +162,13 @@ impl Input {
                 rx = axis_to_byte(x, false);
                 ry = axis_to_byte(y, true);
             }
+        buttons |= self.overlay_buttons;
+        if let Some((x, y)) = self.overlay_sticks[0] {
+            (lx, ly) = (x, y);
+        }
+        if let Some((x, y)) = self.overlay_sticks[1] {
+            (rx, ry) = (x, y);
+        }
         CtrlFrame { buttons, lx, ly, rx, ry }
     }
 }
@@ -182,7 +195,7 @@ const ALL_BUTTONS: [Button; 17] = [
 ];
 
 /// The gilrs button at a Standard Gamepad position.
-fn gilrs_button(control: &str) -> Option<Button> {
+pub(crate) fn gilrs_button(control: &str) -> Option<Button> {
     Some(match control {
         "south" => Button::South,
         "east" => Button::East,
@@ -241,6 +254,8 @@ mod tests {
             ignore: HashSet::new(),
             chord_since: None,
             menu_request: false,
+            overlay_buttons: 0,
+            overlay_sticks: [None, None],
         };
         i.apply(&s);
         i.set_key(KeyCode::KeyZ, true);

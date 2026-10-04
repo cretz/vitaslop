@@ -42,7 +42,6 @@ mod input;
 mod location;
 mod logging;
 mod opfs;
-mod present_scale;
 mod smp;
 mod web_vm;
 
@@ -55,6 +54,7 @@ use std::sync::{Arc, Mutex};
 use input::{BrowserWorld, InputState};
 use vitaslop_loader as loader;
 use vitaslop_platform::gpu::{CubeRenderer, GxmRenderer};
+use vitaslop_platform::present_scale;
 use vitaslop_runtime::capture::Scene;
 use vitaslop_runtime::render::RenderSceneBuilder;
 use vitaslop_runtime::{CtrlFrame, RecipeWorld, RunReport, VitaEnv, World};
@@ -8874,7 +8874,15 @@ fn settle_times_line() -> String {
 /// the TOTAL frozen time unchanged (32.3 vs 32.3 s, 48.5 vs 47.3 s: compile throughput sets it)
 /// and mean speed 1-3.5 points lower, because the game clock now really waits. A Vita never
 /// drops a frame to compile; a hitch is the faithful failure, a jump is not.
-const PIPE_DEFER_MAX_MS_DEFAULT: f64 = 100.0;
+///
+/// >>> AND THEN 0: NOT EVEN 100 MS. A desktop browser on a cold shader cache still declined 74
+/// presents across one fighting title's pre-fight intros - ~6 frames skipped per compile batch,
+/// a dozen batches - and the user saw the intros "blast right through very fast" (diag,
+/// 2026-10-04: 29% of computed frames discarded). A frame that draws with a pipeline still
+/// compiling now WAITS for it; a frame that does not is presented without waiting either way
+/// (`frame_waits_on_compile`). The cost is a short freeze on a title's first play, which is the
+/// failure the title itself would show.
+const PIPE_DEFER_MAX_MS_DEFAULT: f64 = 0.0;
 
 /// `VITASLOP_PIPELINE_DEFER_MAX_MS`: overrides [`PIPE_DEFER_MAX_MS_DEFAULT`]. Every declined
 /// present is a frame the guest computed and nobody saw, so a long run of them plays as a jump

@@ -508,8 +508,15 @@ fn no_fast_import() -> bool {
 /// # What these cost, which is why a no-op is worth inlining at all
 /// MEASURED in desktop Chrome on a retail racer's race: `sceNgsPatchGetInfo` and
 /// `sceNgsVoicePatchSetVolumesMatrix` are **198 calls per guest frame each**, together 32% of
-/// every host call the title makes, at ~1.14 us of pure crossing each. Nothing is computed on
-/// either side of that.
+/// every host call the title makes, at ~1.14 us of pure crossing each.
+///
+/// >>> THE TWO PATCH-VOLUME CALLS ARE NOT HERE ANY MORE, AND THEY NEVER SHOULD HAVE BEEN.
+/// They were listed when they were stubs; they then grew the bodies that apply a routing
+/// volume to the mixer, and stayed listed - so every build that inlines played every NGS
+/// voice at unity while the dispatch arm looked right. MEASURED on a fighting title: the mix
+/// peaked at 3.1x full scale and clipped 16% of its grains, its stage music buried under
+/// full-level crowd and effects. `the_inlined_stubs_are_stubs` could not catch it: the bodies
+/// change only HOST state, and the test compares guest memory.
 ///
 /// `sceKernelSetGPO` is here for the same reason and needs one extra word: its handler writes
 /// `VitaState::gpo`, which NOTHING reads - it is a devkit LED - and logs at `vitaslop::gpo`.
@@ -524,11 +531,8 @@ fn stub_inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
         n::SYSTEM_SET_FLAGS
             | n::SYSTEM_RELEASE
             | n::RACK_RELEASE
-            | n::VOICE_RESUME
             | n::VOICE_BYPASS_MODULE
             | n::VOICE_GET_PARAMS_OUT_OF_RANGE
-            | n::VOICE_PATCH_SET_VOLUMES_MATRIX
-            | n::VOICE_PATCH_SET_VOLUME
             | n::PATCH_GET_INFO
             | n::PATCH_REMOVE_ROUTING
             | n::SYSTEM_LOCK
@@ -2143,7 +2147,6 @@ fn dispatch_inner(
         ngs_nid::SYSTEM_SET_FLAGS
         | ngs_nid::SYSTEM_RELEASE
         | ngs_nid::RACK_RELEASE
-        | ngs_nid::VOICE_RESUME
         | ngs_nid::VOICE_BYPASS_MODULE
         | ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE
         | ngs_nid::PATCH_GET_INFO
@@ -2160,9 +2163,9 @@ fn dispatch_inner(
         ngs_nid::VOICE_PATCH_SET_VOLUMES_MATRIX => {
             cont!(ngs::voice_patch_set_volumes_matrix(ctx, st))
         }
-        ngs_nid::VOICE_KEY_OFF | ngs_nid::VOICE_KILL | ngs_nid::VOICE_PAUSE => {
-            cont!(ngs::voice_stop(ctx, st))
-        }
+        ngs_nid::VOICE_KEY_OFF | ngs_nid::VOICE_KILL => cont!(ngs::voice_stop(ctx, st)),
+        ngs_nid::VOICE_PAUSE => cont!(ngs::voice_set_paused(ctx, st, true)),
+        ngs_nid::VOICE_RESUME => cont!(ngs::voice_set_paused(ctx, st, false)),
         ngs_nid::VOICE_INIT => cont!(ngs::voice_init(ctx, st)),
         ngs_nid::VOICE_GET_INFO => cont!(ngs::voice_get_info(ctx, st)),
         audio_nid::OUT_OPEN_PORT => cont!(audio::out_open_port(ctx, st)),
@@ -3104,11 +3107,8 @@ mod frame_boundary_tests {
             ngs_nid::SYSTEM_SET_FLAGS,
             ngs_nid::SYSTEM_RELEASE,
             ngs_nid::RACK_RELEASE,
-            ngs_nid::VOICE_RESUME,
             ngs_nid::VOICE_BYPASS_MODULE,
             ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE,
-            ngs_nid::VOICE_PATCH_SET_VOLUMES_MATRIX,
-            ngs_nid::VOICE_PATCH_SET_VOLUME,
             ngs_nid::PATCH_GET_INFO,
             ngs_nid::PATCH_REMOVE_ROUTING,
             ngs_nid::SYSTEM_LOCK,

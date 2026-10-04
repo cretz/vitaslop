@@ -93,6 +93,7 @@ pub(super) fn voice_play(ctx: &mut GuestCtx, st: &mut VitaState) {
     let voice = ctx.arg(0);
     let silent_before = super::at9::voices_no_source();
     st.audio_state.at9.play(voice);
+    tracing::debug!(target: "vitaslop::ngs", voice = format_args!("{voice:#x}"), frame = st.cur_frame(), "voice played");
     if super::at9::voices_no_source() > silent_before {
         report_silent_play(st, voice);
     }
@@ -173,6 +174,8 @@ const NGS_VOICE_INFO_STATE_OFF: u32 = 0;
 const NGS_VOICE_STATE_AVAILABLE: u32 = 0;
 /// `SCE_NGS_VOICE_STATE_ACTIVE`: the voice is playing.
 const NGS_VOICE_STATE_ACTIVE: u32 = 1;
+/// `SCE_NGS_VOICE_STATE_PAUSED`, OR'd onto the state while `sceNgsVoicePause` holds the voice.
+const NGS_VOICE_STATE_PAUSED: u32 = 0x20;
 
 /// SceInt32 sceNgsVoiceGetInfo(SceNgsHVoice voice, SceNgsVoiceInfo *info)
 ///
@@ -194,11 +197,12 @@ const NGS_VOICE_STATE_ACTIVE: u32 = 1;
 #[hostcall]
 pub(super) fn voice_get_info(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, info: Ptr) -> i32 {
     if info.addr() != 0 {
-        let state = if st.audio_state.at9.is_playing(voice) {
+        let bank = &st.audio_state.at9;
+        let state = if bank.is_playing(voice) {
             NGS_VOICE_STATE_ACTIVE
         } else {
             NGS_VOICE_STATE_AVAILABLE
-        };
+        } | if bank.is_paused(voice) { NGS_VOICE_STATE_PAUSED } else { 0 };
         ctx.write_u32(info.addr() + NGS_VOICE_INFO_STATE_OFF, state);
     }
     0
@@ -297,7 +301,35 @@ pub(super) fn deliver_player_events(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// Voice key-off / kill / pause - stop producing audio from this voice.
 pub(super) fn voice_stop(ctx: &mut GuestCtx, st: &mut VitaState) {
     let voice = ctx.arg(0);
+    // A sound the title stops part-way is the evidence for a "cut off" line: which voice,
+    // when, and how far through its source it had got (`RUST_LOG=vitaslop::ngs=debug`).
+    if let Some(w) = st.audio_state.at9.state_words(voice) {
+        tracing::debug!(
+            target: "vitaslop::ngs",
+            voice = format_args!("{voice:#x}"),
+            frame = st.cur_frame(),
+            buffer = w[1],
+            byte = w[0],
+            bytes_since_keyon = w[3],
+            buffer_bytes = st.audio_state.at9.buffer_bytes(voice),
+            "voice stopped while playing"
+        );
+    }
     st.audio_state.at9.stop(voice);
+    ctx.ret(0);
+}
+
+/// SceInt32 sceNgsVoicePause(SceNgsHVoice voice) / sceNgsVoiceResume(SceNgsHVoice voice)
+///
+/// >>> A PAUSE IS NOT A STOP. Both used to be wrong in the same direction: pause STOPPED the
+/// voice and resume was a constant `return 0`, so any sound paused mid-play (a game's pause
+/// menu, a streaming engine parking a channel) never came back. A paused voice keeps its
+/// source and position and is skipped by the mixer; resume carries on from there. A streaming
+/// engine also pauses a voice BEFORE playing it, so it starts silent until it is resumed -
+/// the order one fighting title's sound engine uses for every voice it starts.
+pub(super) fn voice_set_paused(ctx: &mut GuestCtx, st: &mut VitaState, paused: bool) {
+    let voice = ctx.arg(0);
+    st.audio_state.at9.set_paused(voice, paused);
     ctx.ret(0);
 }
 

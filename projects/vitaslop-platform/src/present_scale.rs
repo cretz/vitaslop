@@ -34,7 +34,7 @@ pub struct Stage {
 }
 
 const SHADER: &str = r#"
-struct U { src: vec2<f32>, dst: vec2<f32> };
+struct U { src: vec2<f32>, dst: vec2<f32>, org: vec2<f32>, pad: vec2<f32> };
 @group(0) @binding(0) var img: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;
 @group(0) @binding(2) var<uniform> u: U;
@@ -49,8 +49,8 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   // Source texels per output pixel, per axis.
   let d = u.src / u.dst;
-  // This output pixel's centre, in source texel units.
-  let t = pos.xy * d;
+  // This output pixel's centre, in source texel units (relative to the viewport's corner).
+  let t = (pos.xy - u.org) * d;
   // The nearest source-pixel seam; within half an output pixel of it the sample slides across
   // the seam linearly (one output pixel of blend), elsewhere it sits on a texel centre.
   let seam = floor(t + 0.5);
@@ -137,7 +137,7 @@ impl Scaler {
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("present-scale"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -182,10 +182,23 @@ impl Scaler {
 
     /// Scale the stage onto `dst` (the surface view, `dw`x`dh` device pixels).
     pub fn encode(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::TextureView, dw: u32, dh: u32) {
+        self.encode_rect(queue, encoder, dst, (0, 0, dw, dh));
+    }
+
+    /// Scale the stage into the `(x, y, w, h)` rectangle of `dst`, clearing the rest of it to
+    /// black - the desktop window, whose surface is the whole window and whose picture is
+    /// letterboxed inside it (the browser sizes its canvas to the picture instead).
+    pub fn encode_rect(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::TextureView,
+        (x, y, dw, dh): (u32, u32, u32, u32),
+    ) {
         let Some(stage) = self.stage.as_ref() else { return };
         let (sw, sh) = (stage.texture.width() as f32, stage.texture.height() as f32);
-        let mut u = [0u8; 16];
-        for (i, v) in [sw, sh, dw as f32, dh as f32].into_iter().enumerate() {
+        let mut u = [0u8; 32];
+        for (i, v) in [sw, sh, dw as f32, dh as f32, x as f32, y as f32, 0.0, 0.0].into_iter().enumerate() {
             u[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         queue.write_buffer(&self.uniform, 0, &u);
@@ -202,6 +215,7 @@ impl Scaler {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        pass.set_viewport(x as f32, y as f32, dw.max(1) as f32, dh.max(1) as f32, 0.0, 1.0);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &stage.bind, &[]);
         pass.draw(0..3, 0..1);

@@ -59,7 +59,7 @@
             bytes += buf.byteLength;
             if (i % 40 === 0) status.textContent = `fetching ${i}/${manifest.length} (${(bytes/1e6)|0} MB)`;
           }
-          status.textContent = `loaded ${manifest.length} files (${(bytes/1e6)|0} MB); starting (one-time decrypt + transpile takes a few seconds)...`;
+          status.textContent = `loaded ${manifest.length} files (${(bytes/1e6)|0} MB); starting (one-time decrypt + transpile can take a minute or more)...`;
 
           const worker = new Worker("../worker.js", { type: "module" });
           worker.onmessage = (e) => {

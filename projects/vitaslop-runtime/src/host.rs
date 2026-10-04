@@ -8433,6 +8433,9 @@ pub struct VitaState {
     /// Whether a frame has been presented since the last `sceDisplayWaitSetFrameBuf`.
     /// See [`VitaState::take_present_since_wait`].
     present_since_wait: bool,
+    /// The vblank edge the buffer named by the last `sceDisplaySetFrameBuf` latches on, until
+    /// a `sceDisplayWaitSetFrameBuf*` takes it - see [`Self::take_frame_buf_latch`].
+    frame_buf_latch_us: Option<u64>,
     /// The `sync` argument of the most recent `sceDisplaySetFrameBuf`, which is what
     /// decides whether a present waits for the scanout. See
     /// [`VitaState::set_display_sync`].
@@ -9265,6 +9268,7 @@ impl VitaState {
             display_latches: std::collections::VecDeque::new(),
             display_queue_max_pending: 0,
             present_since_wait: false,
+            frame_buf_latch_us: None,
             flip_candidates: std::collections::HashSet::new(),
             exec_request: None,
             back_visibility: FxHashMap::default(),
@@ -12687,6 +12691,33 @@ impl VitaState {
     /// when it returned at once (frame 3, 34.3 million thread resumes).
     pub fn take_present_since_wait(&mut self) -> bool {
         core::mem::take(&mut self.present_since_wait)
+    }
+
+    /// `sceDisplaySetFrameBuf` named a buffer: it reaches the panel AT ONCE with an immediate
+    /// sync, and at the next vblank edge otherwise - the edge `sceDisplayWaitSetFrameBuf` waits
+    /// for.
+    pub fn note_set_frame_buf(&mut self, immediate: bool) {
+        let latch = if immediate {
+            self.virtual_us
+        } else {
+            Self::at_or_after_vblank(self.virtual_us.saturating_add(1), crate::vita::display::VBLANK_US)
+        };
+        self.frame_buf_latch_us = Some(latch);
+    }
+
+    /// The latch edge of the last `sceDisplaySetFrameBuf`, taken: `None` when no buffer was
+    /// named since the last wait, which keeps the older present-based rule for that case.
+    ///
+    /// >>> A WAIT AFTER A SetFrameBuf WAITS FOR THAT BUFFER'S LATCH, PRESENT OR NOT. The rule
+    /// that a wait after a present has nothing left to wait for was written for a callback
+    /// whose only wait is this one. A fighting title's display callback, in its 30 fps
+    /// cinematics, is `SetFrameBuf`, `WaitSetFrameBuf`, then `WaitVblankStart` - two vblanks a
+    /// frame on hardware, the latch and the one after it. Skipping the latch made it ONE, and
+    /// the cinematics ran at 60 fps: twice their speed, each one cut away before its voice line
+    /// finished (a 5-6 s line stopped 22% in, measured). Its fights' callback has no
+    /// `WaitVblankStart` and stays at 60.
+    pub fn take_frame_buf_latch(&mut self) -> Option<u64> {
+        self.frame_buf_latch_us.take()
     }
 
     /// Record `SceGxmInitializeParams::displayQueueMaxPendingCount`. See [`Self::pace_flip`].

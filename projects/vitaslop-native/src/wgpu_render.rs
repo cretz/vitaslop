@@ -337,6 +337,8 @@ impl GeneralRenderer {
         let built: Vec<_> = scenes.iter().filter(|s| !s.completed_early).map(|s| self.builder.build(s)).collect();
         self.gxm.set_presented(presents);
         let (fw, fh) = (target.width(), target.height());
+        // The frame's new pipelines on several threads first - see `prebuild_pipelines`.
+        self.gxm.prebuild_pipelines(&self.device, &built);
         self.gxm.encode_chain(&self.device, &self.queue, encoder, view, depth, &built, dw, dh, fw, fh, clear, Some(target));
     }
 

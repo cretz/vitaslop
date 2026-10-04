@@ -11,6 +11,13 @@
 //! is released, on both sides: the press that opened the menu does not also pick "Resume", and
 //! the press that closed it does not reach the game.
 //!
+//! # Capturing a binding
+//! The remap screens ask for "the next pad button pressed" ([`NavPad::begin_capture`]). While
+//! a capture is armed the navigator does not navigate: every standard control is watched, the
+//! ones already held when it was armed (the south press that opened it) are skipped until
+//! released, and the first fresh press is reported as its Standard Gamepad name. That press
+//! then counts as held at a hand-over, so it does not also click whatever has focus.
+//!
 //! It owns a `Gilrs` of its own (the session's input has another): the shell exists with no
 //! session at all, and the two never read the pad at the same time.
 
@@ -18,6 +25,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use gilrs::{Axis, Button, Gilrs};
+use vitaslop_frontend::input::GAMEPAD_CONTROLS;
 
 /// The stick deflection that counts as a direction.
 const STICK: f32 = 0.5;
@@ -39,11 +47,13 @@ pub struct NavFrame {
     pub south: bool,
     pub east: bool,
     pub start: bool,
+    /// The control an armed capture caught (see [`NavPad::begin_capture`]).
+    pub captured: Option<&'static str>,
 }
 
 impl NavFrame {
     pub fn is_empty(&self) -> bool {
-        self.moves.is_empty() && !self.south && !self.east && !self.start
+        self.moves.is_empty() && !self.south && !self.east && !self.start && self.captured.is_none()
     }
 }
 
@@ -74,6 +84,8 @@ pub struct NavPad {
     /// Down at the hand-over: inert until released once.
     ignore: HashSet<Control>,
     repeat: Option<(Dir, Instant)>,
+    /// An armed capture, and the controls held when it was armed (inert until released).
+    capture: Option<HashSet<&'static str>>,
 }
 
 impl NavPad {
@@ -83,7 +95,35 @@ impl NavPad {
 
     /// A navigator that reads no pad - a stand-in while the real one is borrowed.
     pub fn inert() -> NavPad {
-        NavPad { gilrs: None, attached: false, down: HashSet::new(), ignore: HashSet::new(), repeat: None }
+        NavPad { gilrs: None, attached: false, down: HashSet::new(), ignore: HashSet::new(), repeat: None, capture: None }
+    }
+
+    /// Arm a capture: the next pad button pressed is reported in [`NavFrame::captured`]
+    /// instead of navigating. Whatever is held right now does not count.
+    pub fn begin_capture(&mut self) {
+        self.pump();
+        self.capture = Some(self.raw_pressed());
+    }
+
+    /// Disarm a capture that was cancelled another way (Esc, the mouse).
+    pub fn cancel_capture(&mut self) {
+        self.capture = None;
+    }
+
+    #[cfg(test)]
+    fn capturing(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// One poll of an armed capture over the controls held `now`: the first fresh press, which
+    /// also disarms it.
+    fn capture_step(&mut self, now: &HashSet<&'static str>) -> Option<&'static str> {
+        let held_at_arm = self.capture.as_mut()?;
+        held_at_arm.retain(|c| now.contains(c));
+        // In the table's order, so two buttons landing in one poll resolve the same way each time.
+        let hit = GAMEPAD_CONTROLS.iter().copied().find(|c| now.contains(c) && !held_at_arm.contains(c))?;
+        self.capture = None;
+        Some(hit)
     }
 
     /// Take the pad (`true`) or give it up. Taking it ignores whatever is held right now.
@@ -102,6 +142,17 @@ impl NavPad {
     /// what was asked this frame.
     pub fn poll(&mut self) -> NavFrame {
         self.pump();
+        if self.capture.is_some() {
+            let now = self.raw_pressed();
+            let captured = self.capture_step(&now);
+            if captured.is_some() {
+                // The press that was captured must not also click what has focus.
+                self.ignore = self.pressed();
+                self.down = HashSet::new();
+                self.repeat = None;
+            }
+            return NavFrame { captured, ..NavFrame::default() };
+        }
         if !self.attached {
             return NavFrame::default();
         }
@@ -158,6 +209,13 @@ impl NavPad {
         }
     }
 
+    /// Every standard control held, by its settings name.
+    fn raw_pressed(&self) -> HashSet<&'static str> {
+        let Some(g) = self.gilrs.as_ref() else { return HashSet::new() };
+        let Some((_, pad)) = g.gamepads().find(|(_, p)| p.is_connected()) else { return HashSet::new() };
+        GAMEPAD_CONTROLS.iter().copied().filter(|c| crate::input::gilrs_button(c).is_some_and(|b| pad.is_pressed(b))).collect()
+    }
+
     fn pressed(&self) -> HashSet<Control> {
         let mut out = HashSet::new();
         let Some(g) = self.gilrs.as_ref() else { return out };
@@ -198,7 +256,7 @@ mod tests {
     use super::*;
 
     fn pad() -> NavPad {
-        NavPad { gilrs: None, attached: true, down: HashSet::new(), ignore: HashSet::new(), repeat: None }
+        NavPad { gilrs: None, attached: true, down: HashSet::new(), ignore: HashSet::new(), repeat: None, capture: None }
     }
 
     fn held(cs: &[Control]) -> HashSet<Control> {
@@ -226,6 +284,19 @@ mod tests {
         assert!(!p.step(held(&[Control::South]), t).south);
         assert!(!p.step(HashSet::new(), t).south);
         assert!(p.step(held(&[Control::South]), t).south);
+    }
+
+    #[test]
+    fn a_capture_skips_the_press_that_armed_it_and_takes_the_next() {
+        let mut p = pad();
+        p.capture = Some(["south"].into_iter().collect());
+        let now = |cs: &[&'static str]| cs.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(p.capture_step(&now(&["south"])), None, "still the press that opened the capture");
+        assert_eq!(p.capture_step(&now(&[])), None);
+        assert!(p.capturing());
+        assert_eq!(p.capture_step(&now(&["r2"])), Some("r2"));
+        assert!(!p.capturing(), "one capture, one press");
+        assert_eq!(p.capture_step(&now(&["east"])), None);
     }
 
     #[test]

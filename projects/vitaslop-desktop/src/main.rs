@@ -1,3 +1,8 @@
+// A release build is a WINDOWS program, not a console one: double-clicking it opens the shell and
+// no terminal beside it. The terminal entry points re-attach their parent's console - see
+// `console`. Debug builds and tests stay console programs, where a console is wanted.
+#![cfg_attr(all(windows, not(debug_assertions), not(test)), windows_subsystem = "windows")]
+
 //! Native desktop app: the same load -> transpile -> run -> capture -> wgpu path
 //! as the browser, in a live winit window with real keyboard and gamepad input.
 //!
@@ -21,8 +26,11 @@ static ALLOC: vitaslop_platform::heap::Counting<std::alloc::System> =
     vitaslop_platform::heap::Counting(std::alloc::System);
 
 mod audio_out;
+mod bindings;
+mod console;
 mod diskvfs;
 mod gfx;
+mod icon;
 mod input;
 mod library;
 mod live;
@@ -32,6 +40,7 @@ mod retail;
 mod serve;
 mod session;
 mod shell;
+mod vitapic;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,6 +69,8 @@ fn main() {
     // -> preemptive scheduler -> general GXM renderer) in a live window. With no
     // argument, the shell opens.
     let args: Vec<String> = std::env::args().collect();
+    // Before anything prints: a terminal entry point's output goes where it was started from.
+    console::attach_parent(args.len() > 1);
     // >>> THE PLAYING PRODUCTS RUN THE PARALLEL ENGINE BY DEFAULT, as the browser page does: the
     // shell and the `--game` window take `VITASLOP_SMP=1` unless the caller set it. Without it a
     // title runs every guest thread on one, and the flip's draw resolve on the drawing thread -
@@ -84,8 +95,22 @@ fn main() {
     match args.get(1).map(String::as_str) {
         None => {
             log::init_quiet();
+            // The shell keeps a log on disk and never dies silently - see `log`.
+            if let Err(e) = log::open_log_file(&library::logs_dir()) {
+                eprintln!("could not open a run log under {}: {e}", library::logs_dir().display());
+            }
+            log::install_panic_hook(true);
             if let Err(e) = shell::run() {
+                log::file_line(&format!("error: {e}"));
                 eprintln!("error: {e}");
+                let _ = rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("vitaslop")
+                    .set_description(format!(
+                        "vitaslop could not start: {e}\n\nThe log is at {}",
+                        log::log_path().map_or_else(|| "(no log file)".into(), |p| p.display().to_string())
+                    ))
+                    .show();
                 std::process::exit(1);
             }
             return;
@@ -245,7 +270,7 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return; // Already have a window (e.g. a spurious second resume).
         }
-        let attrs = Window::default_attributes()
+        let attrs = icon::with_icon(Window::default_attributes())
             .with_title("vitaslop - cube")
             .with_inner_size(LogicalSize::new(WIDTH, HEIGHT));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));

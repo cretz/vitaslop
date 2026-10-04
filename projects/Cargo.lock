@@ -4135,6 +4135,7 @@ dependencies = [
  "vitaslop-platform",
  "vitaslop-runtime",
  "wgpu",
+ "windows-sys 0.59.0",
  "winit",
  "winresource",
 ]
@@ -5425,7 +5426,7 @@ dependencies = [
 [[package]]
 name = "yaxpeax-arm"
 version = "0.4.0"
-source = "git+https://github.com/cretz/yaxpeax-arm?rev=8b9f3cc99bc192ad03f673c7c922eae619bb9cf3#8b9f3cc99bc192ad03f673c7c922eae619bb9cf3"
+source = "git+https://github.com/cretz/yaxpeax-arm?rev=06161b6fd6ac0e2ecd10e41b6039f9c139240e9c#06161b6fd6ac0e2ecd10e41b6039f9c139240e9c"
 dependencies = [
  "bitvec",
  "yaxpeax-arch",

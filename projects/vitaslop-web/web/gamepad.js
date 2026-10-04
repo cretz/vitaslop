@@ -18,7 +18,9 @@
 const HOME = 16;
 const MENU_HOLD_MS = 1000;
 
-export function installGamepad(worker, vocab, settings, onStatus = () => {}, onButton = () => {}, onMenu = () => {}) {
+// `onStick(slot, nx, ny)` hears every stick move (-1..1, 0 inside the dead zone), so the on-screen
+// sticks can follow a physical pad the way its buttons light.
+export function installGamepad(worker, vocab, settings, onStatus = () => {}, onButton = () => {}, onMenu = () => {}, onStick = () => {}) {
   if (!navigator.getGamepads) {
     onStatus("no Gamepad API in this browser");
     return { stop: () => {}, update: () => {}, suspend: () => {} };
@@ -40,7 +42,10 @@ export function installGamepad(worker, vocab, settings, onStatus = () => {}, onB
   const releaseAll = () => {
     for (const name of held) post(name, false);
     held.clear();
-    for (const s of [0, 1]) worker.postMessage({ type: "stick", stick: s, x: 128, y: 128, active: false });
+    for (const s of [0, 1]) {
+      worker.postMessage({ type: "stick", stick: s, x: 128, y: 128, active: false });
+      onStick(s, 0, 0);
+    }
     lastStick = [null, null];
   };
 
@@ -128,6 +133,7 @@ export function installGamepad(worker, vocab, settings, onStatus = () => {}, onB
       if (now === lastStick[slot]) continue;
       lastStick[slot] = now;
       worker.postMessage({ type: "stick", stick: slot, x, y, active: !centred });
+      onStick(slot, centred ? 0 : nx, centred ? 0 : ny);
     }
     requestAnimationFrame(tick);
   };

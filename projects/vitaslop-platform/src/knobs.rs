@@ -569,7 +569,6 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_MP4_READ_AHEAD_MS",
     // One params state per voice: a params block and a lock/unlock write the same thing.
     "VITASLOP_NGS_BLOCK_STATE",
-    "VITASLOP_NGS_NEG_LOOP",
     "VITASLOP_NGS_VOICE_HANDLE_MEMO",
     "VITASLOP_NGS_ZERO_LEVEL",
     // The falsifier for the voice-handle LOOKUP: with it off, every query for a rack's
