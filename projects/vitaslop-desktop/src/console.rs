@@ -23,7 +23,9 @@
 //! -NoNewWindow -RedirectStandardOutput ... -RedirectStandardError ...`.
 
 /// Whether the parent's console should be attached: arguments were given (a terminal entry
-/// point, not the double-clicked shell) and at least one output stream has no handle.
+/// point, not the double-clicked shell) and at least one output stream has no handle. Only
+/// Windows asks; the rule's test runs everywhere.
+#[cfg(any(windows, test))]
 pub fn wants_console(cli: bool, stdout_ok: bool, stderr_ok: bool) -> bool {
     cli && !(stdout_ok && stderr_ok)
 }

@@ -4,7 +4,7 @@
 // params: { titleId }. Resumable: every file is sized first (HEAD), and a file already stored at
 // that size is kept, so a job cut off by its time limit is simply queued again.
 
-import { importTitle, isComplete, storageRoom, requestPersistence } from "../../opfs.js";
+import { importTitle, isComplete, isImported, storageRoom, requestPersistence } from "../../opfs.js";
 import { readTitle, writeTitle } from "../../store.js";
 
 /// The library's record for the title (what the main page's import writes after its files), so it
@@ -58,20 +58,17 @@ function parseSfo(b) {
 export async function run(params, ctx) {
   const id = params.titleId;
   if (!id) throw new Error("params.titleId is required");
-  if (await isComplete(id)) {
-    const q = encodeURIComponent(id);
-    const url = (p) => `/game/${q}/${p.split("/").map(encodeURIComponent).join("/")}`;
-    const had = await readTitle(id);
-    if (!had) {
-      const paths = await (await fetch(`/game-manifest.json?title=${q}`)).json();
-      await writeLibraryRecord(id, url, 0, paths.length);
-    }
-    return { summary: `${id} already imported` + (had ? "" : "; library record written"), meta: await readTitle(id) };
-  }
   const q = encodeURIComponent(id);
   const res = await fetch(`/game-manifest.json?title=${q}`);
   if (!res.ok) throw new Error(`manifest for ${id}: HTTP ${res.status}`);
   const paths = await res.json();
+  // Done only by the same test the import itself applies (`isImported`: this file count, the
+  // current marker version) AND with its library record. Anything else takes the full path
+  // below: an older-version import is redone under the size checks (files already stored at
+  // their sizes are kept), and a missing record is written with the real byte total.
+  if ((await isImported(id, paths.length)) && (await readTitle(id))) {
+    return { summary: `${id} already imported`, meta: await readTitle(id) };
+  }
   const url = (p) => `/game/${q}/${p.split("/").map(encodeURIComponent).join("/")}`;
   const sizes = [];
   for (let i = 0; i < paths.length; i++) {
