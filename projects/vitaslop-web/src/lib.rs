@@ -6181,8 +6181,10 @@ async fn live_loop(
                 // An OVERLAPPED parallel run (`smp::overlap`): the guest was already running
                 // this frame during the last present, and is running the next one now, so the
                 // clock around this call is not this frame's. Its own two flips are.
+                // Several flips after a slow present the guest ran on through
+                // (`smp::late_present`): all their game time, taken together.
                 let flips = match sched.smp() {
-                    Some(s) if smp::overlap() => s.frame_advance_us(sched.frames()),
+                    Some(s) if smp::overlap() => s.frame_span_us(target - 1, sched.frames()),
                     _ => None,
                 };
                 flips.unwrap_or_else(|| after.saturating_sub(clock_before_us)) as f64 / 1000.0
@@ -6316,8 +6318,11 @@ async fn live_loop(
                     }
                 }
                 // Overlapped (`smp::overlap`): the next frame's scenes may already be arriving,
-                // so only this frame's - the ones before its flip - are taken.
-                let scenes = if smp_overlap { cap.take_scenes_through_flip() } else { cap.take_frame_scenes() };
+                // so only this frame's - the ones before its flip - are taken. After a slow
+                // present the guest ran on through (`smp::late_present`), every frame it made
+                // since, in order, and the newest is shown.
+                let taken = sched.frames().saturating_sub(target - 1).max(1) as usize;
+                let scenes = if smp_overlap { cap.take_scenes_through_flips(taken) } else { cap.take_frame_scenes() };
                 cap.trace.clear();
                 cap.trace_thid.clear();
                 // >>> TAKEN, NOT DISCARDED. These are the buffers the guest FLIPPED while this
@@ -6813,7 +6818,34 @@ async fn live_loop(
             // shadowing it here silently retyped it.
             let (scene, flips) = scene;
             let stall_mark = StallMark::now();
+            // The guest runs on through a slow present (a pipeline compile it waits for)
+            // instead of freezing with its sound - see `smp::late_present`.
+            if let Some(s) = sched.smp() {
+                s.late_begin();
+            }
+            // What the guest did WHILE this present ran - the game time it moved, the sound it
+            // made, how long the speakers went dry - named on a slow one.
+            let around = |sched: &browser_sched::BrowserSched| {
+                let st = &sched.host.lock().unwrap().state;
+                (st.now_us(), st.audio_produced_seconds(), audio::ring_underrun_frames().unwrap_or(0))
+            };
+            let around0 = around(&sched);
             let outcome = playback.present(&scene, display, &flips).await;
+            if let Some(s) = sched.smp() {
+                s.late_end();
+            }
+            let present_wall_ms = now() - r0;
+            note_audio_gaps(sched.frames());
+            if present_wall_ms > 100.0 {
+                let around1 = around(&sched);
+                logging::note(&format!(
+                    "[late] f{} present {present_wall_ms:.0} ms: game {} ms, sound made {:.0} ms, dry {:.0} ms",
+                    sched.frames(),
+                    around1.0.saturating_sub(around0.0) / 1000,
+                    (around1.1 - around0.1) * 1000.0,
+                    f64::from(around1.2.saturating_sub(around0.2)) / 48.0,
+                ));
+            }
             stall_note("present", &stall_mark);
             last_present_ms += now() - r0;
             last_present_shown &= outcome == PresentOutcome::Presented;
@@ -8883,6 +8915,27 @@ fn settle_times_line() -> String {
 /// (`frame_waits_on_compile`). The cost is a short freeze on a title's first play, which is the
 /// failure the title itself would show.
 const PIPE_DEFER_MAX_MS_DEFAULT: f64 = 0.0;
+
+/// Every 120 presented frames, name a stretch in which the speakers went dry for more than
+/// 20 ms: `[audio-gap] fA-fB: dry X ms`. The run's underrun total cannot say WHERE it was spent,
+/// and the slow-present line (`[late]`) only covers the present itself.
+fn note_audio_gaps(frame: u64) {
+    thread_local! {
+        static MARK: std::cell::Cell<Option<(u64, u32)>> = const { std::cell::Cell::new(None) };
+    }
+    let Some(under) = audio::ring_underrun_frames() else { return };
+    MARK.with(|m| match m.get() {
+        Some((f0, u0)) if frame >= f0 + 120 => {
+            let dry_ms = f64::from(under.saturating_sub(u0)) / 48.0;
+            if dry_ms > 20.0 {
+                logging::note(&format!("[audio-gap] f{f0}-f{frame}: dry {dry_ms:.0} ms"));
+            }
+            m.set(Some((frame, under)));
+        }
+        Some(_) => {}
+        None => m.set(Some((frame, under))),
+    });
+}
 
 /// `VITASLOP_PIPELINE_DEFER_MAX_MS`: overrides [`PIPE_DEFER_MAX_MS_DEFAULT`]. Every declined
 /// present is a frame the guest computed and nobody saw, so a long run of them plays as a jump

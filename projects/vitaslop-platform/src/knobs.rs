@@ -243,8 +243,6 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_GXM_COLOR_MASK_ORDER",
     "VITASLOP_GXM_DEST_SPLIT_AB",
     "VITASLOP_GXM_DRAW_COVERAGE",
-    // TEMPORARY: per-draw attachment readback. See `draw_probe_spec`.
-    "VITASLOP_GXM_DRAW_PROBE",
     "VITASLOP_GXM_FLOAT_TARGETS",
     "VITASLOP_GXM_FLOAT_TARGETS_WIDE",
     // `0`: a frame whose last scene is not a flipped (display) buffer shows that LAST SCENE
@@ -677,8 +675,6 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_PRESENT_PROBE",
     // With VITASLOP_PRESENT_PROBE: each sampled surface, half size, as a base64 console line (lib.rs).
     "VITASLOP_PRESENT_SHOT",
-    // The per-draw sample probe in the renderer's draw loop (`gpu::probe_watch`).
-    "VITASLOP_PROBE_SAMPLE",
     // Hold the ARM register file in wasm LOCALS along each straight-line run instead of on
     // its globals (`transpiler::promote`). Reachable from the browser because the browser is
     // the ONLY place it can be priced: promotion adds operators and removes none, so fuel,
@@ -792,6 +788,9 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_SMP_FORWARD",
     // Spin x times each guest slice on the SMP workers: a phone-slow guest on the desktop.
     "VITASLOP_SMP_GUEST_SLOW",
+    // `0`: a slow present holds the whole guest at the frame gate (default: it runs on in real
+    // time and the next present takes the newest frame - `smp::late_present`).
+    "VITASLOP_SMP_LATE_PRESENT",
     // `0`: a parallel link refuses the lightweight-mutex inline form (vita/mod.rs).
     "VITASLOP_SMP_LWMUTEX_INLINE",
     "VITASLOP_SMP_OVERLAP",
@@ -919,6 +918,9 @@ pub const OVERRIDABLE: &[&str] = &[
     // Whether a content-index HIT on the single-stream snapshot path counts as a USE. `=0` is
     // the old behaviour, in which it did not and the index evicted what it was answering from.
     "VITASLOP_VERTEX_INTERN_USE",
+    // `1`: a desktop guest movie decodes on the HARDWARE decoder (default software - video.rs
+    // `movie_hardware`; the browser keeps WebCodecs' own choice).
+    "VITASLOP_VIDEO_HARDWARE",
     // The format-keyed pipeline warm fallback (gpu.rs `warm_by_format`); `=0` is the arm back.
     "VITASLOP_WARM_BY_FORMAT",
     "VITASLOP_WASM_NAMES",

@@ -101,6 +101,13 @@ pub fn install_ring(ring: &JsValue) -> Option<(u32, u32, u32)> {
     Some((capacity, channels, sample_rate))
 }
 
+/// Frames of silence the device has played for want of data so far (the worklet's
+/// `CTL_UNDERRUN`), read through this worker's views; `None` before they are installed.
+pub fn ring_underrun_frames() -> Option<u32> {
+    const CTL_UNDERRUN: u32 = 2;
+    RING_VIEWS.with(|v| v.borrow().as_ref().map(|r| js_sys::Atomics::load(&r.ctl, CTL_UNDERRUN).unwrap_or(0) as u32))
+}
+
 /// Run `f` with this worker's ring views. A worker that never installed them has no ring to
 /// write, which is loud once rather than a silent drop: that is a worker the SMP setup forgot.
 fn with_ring<R>(f: impl FnOnce(&RingViews) -> R) -> Option<R> {

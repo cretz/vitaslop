@@ -573,6 +573,9 @@ pub(crate) trait SmpOps<H>: Send {
     fn pause_guest(&mut self);
     fn resume_guest(&mut self);
     fn frame_advance_us(&self, frame: u64) -> Option<u64>;
+    fn frame_span_us(&self, from: u64, to: u64) -> Option<u64>;
+    fn late_handle(&self) -> Option<crate::smp::LatePresent>;
+    fn late_opened(&self) -> u64;
 }
 
 impl ThreadedScheduler<vitaslop_runtime::VitaEnv> {
@@ -1251,6 +1254,32 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         match &self.inner {
             Inner::Smp(s) => s.frame_advance_us(frame),
             Inner::Baton(_) => None,
+        }
+    }
+
+    /// The game time from frame `from`'s flip to frame `to`'s on the parallel engine - see
+    /// `crate::smp::SmpRun::frame_span_us`. `None` on the one-at-a-time engine.
+    pub fn frame_span_us(&self, from: u64, to: u64) -> Option<u64> {
+        match &self.inner {
+            Inner::Smp(s) => s.frame_span_us(from, to),
+            Inner::Baton(_) => None,
+        }
+    }
+
+    /// The presenter's late-present handle (`crate::smp::late_present`): `None` on the
+    /// one-at-a-time engine and when it is off.
+    pub fn late_handle(&self) -> Option<crate::smp::LatePresent> {
+        match &self.inner {
+            Inner::Smp(s) => s.late_handle(),
+            Inner::Baton(_) => None,
+        }
+    }
+
+    /// Frames the guest ran during slow presents (`crate::smp::late_present`).
+    pub fn late_opened(&self) -> u64 {
+        match &self.inner {
+            Inner::Smp(s) => s.late_opened(),
+            Inner::Baton(_) => 0,
         }
     }
 

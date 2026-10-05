@@ -141,11 +141,12 @@ impl VideoDecodeFactory for H264Factory {
         avcc: &[u8],
         length_size: usize,
     ) -> Result<Box<dyn VideoDecode>, VideoError> {
-        off_thread(VideoDecoder::from_avcc(avcc, length_size)?)
+        let avcc = avcc.to_vec();
+        off_thread(move || VideoDecoder::from_avcc(&avcc, length_size))
     }
 
     fn open_h264_annex_b(&mut self) -> Result<Box<dyn VideoDecode>, VideoError> {
-        off_thread(VideoDecoder::annex_b()?)
+        off_thread(VideoDecoder::annex_b)
     }
 }
 
@@ -166,13 +167,17 @@ impl VideoDecodeFactory for H264Factory {
 /// wasm gets the decoder unwrapped: there is no thread to move it to, and its backend is
 /// asynchronous already.
 #[cfg(all(feature = "video", not(target_arch = "wasm32")))]
-fn off_thread(decoder: VideoDecoder) -> Result<Box<dyn VideoDecode>, VideoError> {
-    Ok(Box::new(ThreadedDecode::spawn(decoder)))
+fn off_thread(
+    build: impl FnOnce() -> Result<VideoDecoder, VideoError> + Send + 'static,
+) -> Result<Box<dyn VideoDecode>, VideoError> {
+    Ok(Box::new(ThreadedDecode::spawn(build)))
 }
 
 #[cfg(all(feature = "video", target_arch = "wasm32"))]
-fn off_thread(decoder: VideoDecoder) -> Result<Box<dyn VideoDecode>, VideoError> {
-    Ok(Box::new(decoder))
+fn off_thread(
+    build: impl FnOnce() -> Result<VideoDecoder, VideoError> + Send + 'static,
+) -> Result<Box<dyn VideoDecode>, VideoError> {
+    Ok(Box::new(build()?))
 }
 
 /// Video decoding, as the ENGINE declares it.
@@ -375,10 +380,17 @@ struct Answers {
 
 #[cfg(all(feature = "video", not(target_arch = "wasm32")))]
 impl ThreadedDecode {
-    fn spawn(mut decoder: VideoDecoder) -> ThreadedDecode {
+    /// `build` runs ON the decoder thread: opening a platform decoder is not free - MEASURED
+    /// (Media Foundation H.264, this desktop): 212-230 ms for the first in a process and 53-97 ms
+    /// for every one after it, the hardware decoder's device set-up - and on the guest's thread
+    /// it stalled a fighting title's movie start (the presenter's write-back waited 128 ms for
+    /// that thread; the speakers went dry 108 ms). On the device the open is immediate and the
+    /// decoder block readies itself. A build that fails answers every job with its error.
+    fn spawn(build: impl FnOnce() -> Result<VideoDecoder, VideoError> + Send + 'static) -> ThreadedDecode {
         let (work_tx, work_rx) = std::sync::mpsc::channel::<Job>();
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Answers {
-            detail: decoder.describe(),
+            // Until the build on the thread reports what it got (and each decode refines it).
+            detail: "the platform decoder, opening on its own thread".to_string(),
             ..Answers::default()
         }));
         let answered = std::sync::Arc::new(std::sync::Condvar::new());
@@ -387,6 +399,31 @@ impl ThreadedDecode {
         let worker = std::thread::Builder::new()
             .name("vitaslop-video".to_string())
             .spawn(move || {
+                let mut decoder = match build() {
+                    Ok(d) => {
+                        if let Ok(mut a) = worker_shared.lock() {
+                            a.detail = d.describe();
+                        }
+                        d
+                    }
+                    Err(e) => {
+                        if let Ok(mut a) = worker_shared.lock() {
+                            a.failed.get_or_insert(e.to_string());
+                        }
+                        // Every submit still gets its answer, or `drain_owed` waits for ever.
+                        while let Ok(job) = work_rx.recv() {
+                            if let Job::Submit { epoch, .. } = job {
+                                let Ok(mut a) = worker_shared.lock() else { return };
+                                match a.retired.iter_mut().find(|(e, _)| *e == epoch) {
+                                    Some((_, n)) => *n += 1,
+                                    None => a.retired.push((epoch, 1)),
+                                }
+                            }
+                            worker_answered.notify_all();
+                        }
+                        return;
+                    }
+                };
                 while let Ok(job) = work_rx.recv() {
                     // Only a SUBMIT is an input the caller is owed an answer for: it is the
                     // only job that incremented `outstanding`, and retiring a `Finish` against
@@ -635,6 +672,23 @@ impl From<vitaslop_h264::Error> for VideoError {
     }
 }
 
+/// >>> A GUEST MOVIE DECODES IN SOFTWARE ON THE DESKTOP. Opening the HARDWARE decoder sets up
+/// a video device each time - MEASURED (Media Foundation, this desktop): 212-230 ms for the
+/// first open in a process, 53-97 ms for every one after; software: 33 ms first, 0.3 ms after.
+/// The guest waits for its first picture, under the host lock, so that set-up stopped the whole
+/// emulator at a fighting title's movie start (the speakers went dry 80-108 ms). A Vita movie
+/// is at most 960x544 and decodes on its own thread ([`ThreadedDecode`]); H.264 decoding is
+/// bit-exact, so the picture is the same. The browser keeps WebCodecs' own choice.
+/// `VITASLOP_VIDEO_HARDWARE=1` is the arm back to the hardware decoder.
+#[cfg(feature = "video")]
+fn movie_hardware() -> Option<bool> {
+    if cfg!(target_arch = "wasm32") {
+        return None;
+    }
+    let on = crate::knobs::var("VITASLOP_VIDEO_HARDWARE").is_ok_and(|v| v.trim() == "1");
+    Some(on)
+}
+
 #[cfg(feature = "video")]
 impl VideoDecoder {
     /// Build a decoder for a stream whose parameter sets are the given avcC record, with
@@ -648,6 +702,7 @@ impl VideoDecoder {
             // ended. For a movie playing under a title's own clock that is a whole frame
             // of latency saved.
             packets_are_access_units: Some(true),
+            hardware: movie_hardware(),
             ..vitaslop_h264::DecoderConfig::default()
         };
         Ok(VideoDecoder {
@@ -673,6 +728,7 @@ impl VideoDecoder {
             // fills a pipeline first never lets that caller start. See
             // [`vitaslop_h264::DecoderConfig::low_latency`] for what it costs.
             low_latency: true,
+            hardware: movie_hardware(),
             ..vitaslop_h264::DecoderConfig::default()
         };
         Ok(VideoDecoder {

@@ -929,89 +929,6 @@ pub(crate) fn arena_floor_bytes() -> u64 {
     })
 }
 
-/// >>> TEMPORARY SCAFFOLDING (`VITASLOP_PROBE_SAMPLE=<hex>+<hex>...`). DELETE BEFORE COMMIT,
-/// >>> with the other wash instruments.
-///
-/// # The question, which nobody has actually asked the machine
-/// The RTT WRITEBACK fixes one baseball-title scene and breaks another, and holding its three probe targets
-/// back is now REFUTED as a fix (it loses the wide shot). The standing explanation is that "the
-/// consumer is on our side and is unfound", and the obvious candidate - that we sample the
-/// bytes we wrote back INSTEAD of the live render target - has only ever been argued, never
-/// measured. The nearest thing to evidence was that the snapshot caches are the same SIZE in
-/// both arms, which says nothing at all about their CONTENT.
-///
-/// So this counts, per frame and per watched address, the two things an argument cannot settle:
-///   * how many draws sampled it through the LIVE TARGET view (`sample_views` hit) versus
-///     through the GUEST BYTES behind the pointer;
-///   * a hash of the guest bytes that path would upload.
-/// Run it with the writeback on and off and DIFF the two. If the path counts move, the
-/// writeback is changing which thing we sample; if only the hash moves, it is changing what the
-/// guest bytes say; if neither moves, the consumer is somewhere else entirely and this whole
-/// line of thinking is dead - which is a result too.
-///
-/// `println!` rather than `tracing`: the rigs run at `RUST_LOG=warn` and an `info!` here would
-/// be a diagnostic that does not exist.
-pub(crate) fn probe_watch() -> &'static [u32] {
-    use std::sync::OnceLock;
-    static W: OnceLock<Vec<u32>> = OnceLock::new();
-    W.get_or_init(|| {
-        crate::knobs::var("VITASLOP_PROBE_SAMPLE")
-            .ok()
-            .map(|s| {
-                s.split('+')
-                    .filter_map(|a| {
-                        u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
-/// This frame's tally, per watched address: `(live-target draws, guest-byte draws, byte hash,
-/// byte length)`. See [`probe_watch`].
-static PROBE_FRAME: std::sync::Mutex<Option<std::collections::BTreeMap<u32, (u64, u64, u64, usize)>>> =
-    std::sync::Mutex::new(None);
-
-/// Note one draw sampling `addr`, and whether it resolved to the LIVE TARGET.
-pub(crate) fn probe_note(addr: u32, live_target: bool, pixels: &[u8]) {
-    if !probe_watch().contains(&addr) {
-        return;
-    }
-    // FNV-1a over the bytes the guest-byte path would upload. Whole-buffer, because a probe is
-    // 128x128 and the cost of hashing one is nothing next to being wrong about whether it moved.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in pixels {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-    }
-    let mut g = PROBE_FRAME.lock().unwrap_or_else(|e| e.into_inner());
-    let e = g.get_or_insert_with(Default::default).entry(addr).or_insert((0, 0, 0, 0));
-    if live_target {
-        e.0 += 1;
-    } else {
-        e.1 += 1;
-    }
-    e.2 = h;
-    e.3 = pixels.len();
-}
-
-/// Print and clear this frame's tally. Called once at the end of a chain.
-pub(crate) fn probe_flush(frame: u64) {
-    if probe_watch().is_empty() {
-        return;
-    }
-    let mut g = PROBE_FRAME.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = g.as_mut() else { return };
-    for (addr, (live, guest, hash, len)) in map.iter() {
-        println!(
-            "PROBE_SAMPLE f{frame} {addr:#010x}: live-target {live} draw(s), guest-bytes \
-             {guest} draw(s), bytes {len} hash {hash:#018x}"
-        );
-    }
-    map.clear();
-}
-
 /// One staging-belt chunk, in bytes - see `GxmRenderer::gxp_staging`.
 ///
 /// Above the largest arena write MEASURED on the user's device (2,315 KB) with room on top, so
@@ -3825,15 +3742,6 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         AllExcept(HashSet<u64>),
     }
 
-    /// >>> TEMPORARY TELEMETRY (`VITASLOP_GXM_DRAW_PROBE=<keyspec>`). DELETE BEFORE COMMIT.
-    ///
-    /// After every draw of a matching pair, CUT the pass and read the colour attachment back,
-    /// printing eight row means and the whole-image mean as `PROBE_DRAW ...` on stdout. This is
-    /// the one instrument that says what a draw LEFT in the target it drew into, live, on the
-    /// real pipeline - `VITASLOP_GXM_DRAW_COVERAGE` says whether it rasterised, a capsule says
-    /// what it would draw alone, and neither can say that its live output was zero. Built for
-    /// a baseball title's reflection-cube faces, whose lower half reads back black after a draw the
-    /// coverage query says painted it.
     /// `VITASLOP_GXP_TEXCOORD_NUDGE=<eps>`: add `eps` (normalised units) to every 2-D
     /// `textureSample` coordinate - see [`nudge_texcoords`].
     fn texcoord_nudge() -> Option<f32> {
@@ -3891,25 +3799,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         use std::sync::OnceLock;
         static S: OnceLock<KeySpec> = OnceLock::new();
         S.get_or_init(|| KeySpec::resolve("VITASLOP_GXP_RETURN_KEYS"))
-    }
-
-    fn draw_probe_spec() -> &'static KeySpec {
-        use std::sync::OnceLock;
-        static S: OnceLock<KeySpec> = OnceLock::new();
-        S.get_or_init(|| KeySpec::resolve("VITASLOP_GXM_DRAW_PROBE"))
-    }
-
-    /// One pending readback taken by [`draw_probe_spec`]: mapped and printed at the head of
-    /// the NEXT chain, once the caller has submitted the encoder that recorded the copy.
-    struct DrawProbe {
-        buf: wgpu::Buffer,
-        w: u32,
-        h: u32,
-        row_bytes: u32,
-        key: u64,
-        draw: usize,
-        target: u32,
-        frame: u64,
     }
 
     impl KeySpec {
@@ -6566,8 +6455,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// GPU objects per view per frame left to the garbage collector, the churn that took
         /// a fighting title's GPU process to 2.3 GB (`subrect_free`).
         word_views: HashMap<(u32, u32, u32, wgpu::TextureFormat), (wgpu::Buffer, wgpu::Texture, wgpu::TextureView)>,
-        /// TEMPORARY: readbacks pending for `VITASLOP_GXM_DRAW_PROBE`. See [`draw_probe_spec`].
-        draw_probes: Vec<DrawProbe>,
         /// Draws in the current chain that sampled a target this frame rendered. Zero over
         /// a frame with several passes means the composite is NOT reading them, which is a
         /// different problem from the passes not being drawn - and the two look identical
@@ -20302,7 +20189,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 depth_load_now: false,
                 depth_saved: HashMap::default(),
                 word_views: HashMap::default(),
-                draw_probes: Vec::new(),
                 rtt_hits: 0,
                 chain_shapes_seen: HashSet::default(),
                 chain_shapes_capped: false,
@@ -21696,102 +21582,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             );
         }
 
-        /// The colour attachment this pass is being encoded into, for the destination copy.
-        /// Only the DISPLAY and RTT arms have one; a depth-only pass has none and cannot carry a
-        /// draw that reads a destination colour.
-        /// TEMPORARY (`VITASLOP_GXM_DRAW_PROBE`): copy the colour attachment into a staging
-        /// buffer for every probe mark whose boundary is `at`. See [`draw_probe_spec`].
-        #[allow(clippy::too_many_arguments)]
-        fn record_draw_probes(
-            device: &wgpu::Device,
-            encoder: &mut wgpu::CommandEncoder,
-            source: &wgpu::Texture,
-            w: u32,
-            h: u32,
-            format: wgpu::TextureFormat,
-            target: u32,
-            frame: u64,
-            at: usize,
-            marks: &[(usize, u64, usize)],
-            out: &mut Vec<DrawProbe>,
-        ) {
-            let Some(bpp) = format.block_copy_size(None) else { return };
-            if bpp != 4 {
-                return;
-            }
-            let row_bytes = (w * bpp).div_ceil(256) * 256;
-            for &(b, key, draw) in marks {
-                if b != at {
-                    continue;
-                }
-                let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("gxm-draw-probe"),
-                    size: u64::from(row_bytes) * u64::from(h),
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                });
-                encoder.copy_texture_to_buffer(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: source,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &buf,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(row_bytes),
-                            rows_per_image: Some(h),
-                        },
-                    },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                );
-                out.push(DrawProbe { buf, w, h, row_bytes, key, draw, target, frame });
-            }
-        }
-
-        /// TEMPORARY (`VITASLOP_GXM_DRAW_PROBE`): map and print last frame's probes. Called at
-        /// the head of a chain, after the caller submitted the encoder that recorded them.
-        fn drain_draw_probes(&mut self, device: &wgpu::Device) {
-            let probes = std::mem::take(&mut self.draw_probes);
-            if probes.is_empty() {
-                return;
-            }
-            for p in &probes {
-                p.buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            }
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            for p in probes {
-                let Ok(data) = p.buf.slice(..).get_mapped_range() else { continue };
-                let rb = p.row_bytes as usize;
-                let rows: Vec<u32> = (0..8usize)
-                    .map(|i| {
-                        let y = (p.h as usize * i) / 8;
-                        let r = &data[y * rb..y * rb + p.w as usize * 4];
-                        let s: u64 = r.chunks_exact(4).map(|px| px[0] as u64 + px[1] as u64 + px[2] as u64).sum();
-                        (s / (3 * p.w as u64).max(1)) as u32
-                    })
-                    .collect();
-                let mut sum = 0u64;
-                let mut alpha = 0u64;
-                for y in 0..p.h as usize {
-                    for px in data[y * rb..y * rb + p.w as usize * 4].chunks_exact(4) {
-                        sum += px[0] as u64 + px[1] as u64 + px[2] as u64;
-                        alpha += px[3] as u64;
-                    }
-                }
-                let n = (p.w as u64 * p.h as u64).max(1);
-                println!(
-                    "PROBE_DRAW f{} target {:#010x} {}x{} after draw #{} key {:016x}: rows={:?} mean={:.1} alpha={:.1}",
-                    p.frame, p.target, p.w, p.h, p.draw, p.key, rows, sum as f64 / (3 * n) as f64, alpha as f64 / n as f64
-                );
-                drop(data);
-                p.buf.unmap();
-                p.buf.destroy();
-            }
-        }
-
         fn copy_attachment_to_dest(
             &self,
             encoder: &mut wgpu::CommandEncoder,
@@ -22814,7 +22604,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             // Once per FRAME, and the ONLY per-frame count this renderer keeps: the `gxm chain:`
             // line needs it to say which frame a shape was first seen on.
             self.chain_frames_seen += 1;
-            self.drain_draw_probes(device);
             // The deferred ETC2 encodes' slice for this frame - see `pump_deferred_encodes`.
             // Timed on the frame's clock like the transcodes themselves (`lent_ts_pair`).
             if self.gxp.texenc.as_ref().is_some_and(|t| t.deferred_pending() > 0) {
@@ -24178,8 +23967,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             if let Some(belt) = self.gxp_staging.as_mut() {
                 belt.finish();
             }
-            // TEMPORARY (`VITASLOP_PROBE_SAMPLE`) - one line per watched address per frame.
-            crate::gpu::probe_flush(self.chain_frames_seen);
             self.chain_phases.chain_tail_ms = t_chain_tail.ms();
         }
 
@@ -25076,30 +24863,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 if let Some(t) = &d.texture {
                     self.sampled_addrs.insert(t.data_addr);
                 }
-                // >>> TEMPORARY (`VITASLOP_PROBE_SAMPLE`) - see `probe_note`. Here because this
-                // is the ONE point that sees every sampled texture of both paths with
-                // `sample_views` in scope, so the live-target-versus-guest-bytes verdict is
-                // read off the same test the renderer itself uses rather than re-derived.
-                if !crate::gpu::probe_watch().is_empty() {
-                    // >>> ONLY WHAT IS ALREADY RESIDENT. `Texels` decodes LAZILY and the whole
-                    // point of that is that a texture the GPU takes compressed is never
-                    // expanded; reading one here to hash it would force a decode this run would
-                    // not otherwise do, and the instrument would be measuring a workload it had
-                    // itself created. `resident()` asks without forcing, and a non-resident
-                    // texture reports a zero hash, which is a reading and not a silence.
-                    let note = |t: &GxmTexture, live: bool| {
-                        let bytes: &[u8] = if t.rgba.resident() { &t.rgba } else { &[] };
-                        crate::gpu::probe_note(t.data_addr, live, bytes);
-                    };
-                    if let Some(t) = &d.texture {
-                        note(t, sample_views.contains_key(&t.data_addr));
-                    }
-                    if let Some(g) = &d.gxp {
-                        for t in g.textures.iter().chain(g.vertex_textures.iter()) {
-                            note(&t.tex, sample_views.contains_key(&t.tex.data_addr));
-                        }
-                    }
-                }
                 if let Some(g) = &d.gxp {
                     // Vertex samplers count too: `final-pass-sampled` is the list a reader
                     // checks a missing target against, and a target read only by a vertex
@@ -25453,22 +25216,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // frame's ONLY difference is the splits and their copies. The picture is wrong
                 // for those draws while it is off; that is the price of the stopwatch.
                 let ab_armed = super::dest_split_armed();
-                // TEMPORARY (`VITASLOP_GXM_DRAW_PROBE`): the segment END after each probed
-                // draw, with the draw's key and order index, so the boundary loop below can
-                // read the attachment back there. See `draw_probe_spec`.
-                let mut probe_marks: Vec<(usize, u64, usize)> = Vec::new();
-                let probe_spec = draw_probe_spec();
                 for (i, e) in order.iter().enumerate() {
-                    if let Enc::Gxp(idx) = e
-                        && !matches!(probe_spec, KeySpec::Off)
-                        && probe_spec.wants(gxp_prepared[*idx].key)
-                    {
-                        probe_marks.push((i + 1, gxp_prepared[*idx].key, i));
-                        if i + 1 < order.len() {
-                            bounds.push(i + 1);
-                            split_pairs.push(gxp_prepared[*idx].key);
-                        }
-                    }
                     let forced = split_every.is_some_and(|n| i > 0 && i % n == 0);
                     if forced {
                         bounds.push(i);
@@ -25484,13 +25232,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     }
                 }
                 bounds.push(order.len());
-                if !probe_marks.is_empty() {
-                    bounds.sort_unstable();
-                    bounds.dedup();
-                }
-                let mut new_probes: Vec<DrawProbe> = Vec::new();
-                let probe_target = scene.target.map_or(0, |t| t.data_addr);
-                let probe_frame = self.chain_frames_seen;
                 let mut ts = self.ts_pair(|| match scene.target.as_ref() {
                     Some(t) => format!("{}x{} {} draws", t.width, t.height, order.len()),
                     None => format!("depth-only {} draws", order.len()),
@@ -25583,7 +25324,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                     if seg > 0 {
                         if let Some(tex) = color_texture {
                             self.copy_attachment_to_dest(encoder, tex, dest_shape);
-                            Self::record_draw_probes(device, encoder, tex, att_w, att_h, target_format, probe_target, probe_frame, bounds[seg], &probe_marks, &mut new_probes);
                         }
                         splits_taken += 1;
                         enc(&ENC.dest_splits, 1);
@@ -25950,14 +25690,6 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                         }
                     }
                 }
-                // A probed draw that was the LAST of the pass has its boundary at `order.len()`,
-                // which no segment start reaches; take it here, after the final segment ended.
-                if let Some(tex) = color_texture
-                    && probe_marks.iter().any(|(b, _, _)| *b == order.len())
-                {
-                    Self::record_draw_probes(device, encoder, tex, att_w, att_h, target_format, probe_target, probe_frame, order.len(), &probe_marks, &mut new_probes);
-                }
-                self.draw_probes.extend(new_probes);
                 enc(&ENC.passes, splits_taken);
                 if splits_taken > 0 {
                     report_dest_split_count(splits_taken, order.len(), att_w, att_h, &split_pairs);

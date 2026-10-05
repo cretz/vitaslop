@@ -474,13 +474,16 @@ impl RetailGuest {
         if self.finished {
             return;
         }
-        let target = self.sched.frames() + 1;
+        let before = self.sched.frames();
         let clock_before = self.sched.host().state.now_us();
-        let report = self.sched.run_frames(target, PER_FRAME_ROUNDS);
+        let report = self.sched.run_frames(before + 1, PER_FRAME_ROUNDS);
+        // Usually one; more after a slow present the guest ran on through
+        // (`vitaslop_native::smp::late_present`), all taken now and the newest shown.
+        let taken = self.sched.frames().saturating_sub(before).max(1);
         // An OVERLAPPED parallel run: the guest ran this frame during the last present and runs
-        // the next one now, so the clock around this call is not this frame's - its own two
-        // flips are. The browser's rule (`frame_advance_us`).
-        self.last_advance_us = match self.sched.frame_advance_us(target) {
+        // the next one now, so the clock around this call is not this frame's - its own flips
+        // are. The browser's rule (`frame_advance_us`).
+        self.last_advance_us = match self.sched.frame_span_us(before, before + taken) {
             Some(us) if self.sched.overlapped() => us,
             _ => self.sched.host().state.now_us().saturating_sub(clock_before),
         };
@@ -521,7 +524,7 @@ impl RetailGuest {
             // partition below does.
             let overlapped = self.sched.overlapped();
             let (pending, ready): (Vec<_>, Vec<_>) = if overlapped {
-                (Vec::new(), cap.take_scenes_through_flip())
+                (Vec::new(), cap.take_scenes_through_flips(taken as usize))
             } else {
                 std::mem::take(&mut cap.scenes).into_iter().partition(|s| s.deferred_id != 0)
             };
@@ -591,6 +594,17 @@ impl RetailGuest {
     /// pull a slow guest gets toward real time, which a pacer must not charge as game time.
     pub fn clock_from_wall_us(&mut self) -> u64 {
         self.sched.host().state.clock_from_wall_us()
+    }
+
+    /// The presenter's mark for a present, so the parallel guest runs on through a slow one -
+    /// see `vitaslop_native::smp::late_present`. `None` on the one-at-a-time engine.
+    pub fn late_handle(&self) -> Option<vitaslop_native::smp::LatePresent> {
+        self.sched.late_handle()
+    }
+
+    /// Frames the guest ran during slow presents, for the exit report.
+    pub fn late_opened(&self) -> u64 {
+        self.sched.late_opened()
     }
 
     /// Stop the guest for a write into memory it may also be writing - see
@@ -2713,6 +2727,7 @@ pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> R
     }
     if let Some(r) = app.session.guest.smp_report() {
         println!("{r}");
+        println!("late present: the guest ran {} frame(s) on through slow presents", app.session.guest.late_opened());
     }
     // `VITASLOP_PERF` + `VITASLOP_PERF_FROM=<frame>`: where the guest's time went from that frame
     // to the exit - the runtime's phase table and the host calls, per guest frame.
@@ -2958,16 +2973,31 @@ impl ApplicationHandler for RetailApp {
                     // stage (see `RetailGfx::frame` for what re-encoding did to a feedback effect).
                     let new_frame = self.presented != Some(frame_now);
                     let fresh = self.force_present || new_frame || !self.session.live();
+                    // What the guest did WHILE this thread presents: the sound it made, the game
+                    // time it moved, and how long the speakers went dry. Named on a slow present.
+                    let underrun = |s: &Session| s.audio.as_ref().map_or(0.0, |a| a.stats().underrun_s);
+                    let around0 = (self.session.guest.audio_produced_seconds(), self.session.guest.clock_us(), underrun(&self.session));
+                    let late = self.session.guest.late_handle();
                     let (scenes, display, presents) = self.session.scenes();
                     if fresh && !scenes.is_empty() {
                         self.presented = Some(frame_now);
                         self.force_present = false;
                         let t_present = Instant::now();
                         let build0 = vitaslop_platform::gpu::peek_pipeline_build_split();
+                        if let Some(l) = &late {
+                            l.begin();
+                        }
                         let presented = gfx.present(scenes, display, presents, new_frame);
+                        if let Some(l) = &late {
+                            l.end();
+                        }
+                        // The write-backs PAUSE the parallel guest, so they wait for every worker
+                        // to reach a switch point - a long host call holds them up. Timed apart.
+                        let t_wb = Instant::now();
                         if let Ok(wb) = &presented {
                             self.session.apply_writebacks(wb);
                         }
+                        let writeback_ms = t_wb.elapsed().as_secs_f64() * 1000.0;
                         let present_ms = t_present.elapsed().as_secs_f64() * 1000.0;
                         self.split[2] += present_ms;
                         self.split[3] += 1.0;
@@ -2977,6 +3007,7 @@ impl ApplicationHandler for RetailApp {
                             // Of it, the shader work: our translation, the driver's module and
                             // pipeline compiles - which half a fix would have to move.
                             let b = vitaslop_platform::gpu::peek_pipeline_build_split();
+                            let around1 = (self.session.guest.audio_produced_seconds(), self.session.guest.clock_us(), underrun(&self.session));
                             tracing::info!(
                                 target: "vitaslop::status",
                                 frame = frame_now,
@@ -2984,6 +3015,10 @@ impl ApplicationHandler for RetailApp {
                                 translate_ms = (b.0 - build0.0) as u64,
                                 module_ms = (b.1 - build0.1) as u64,
                                 pipeline_ms = (b.2 - build0.2) as u64,
+                                writeback_ms = writeback_ms as u64,
+                                sound_made_ms = ((around1.0 - around0.0) * 1000.0) as u64,
+                                game_ms = around1.1.saturating_sub(around0.1) / 1000,
+                                dry_ms = ((around1.2 - around0.2) * 1000.0) as u64,
                                 "slow window present"
                             );
                         }

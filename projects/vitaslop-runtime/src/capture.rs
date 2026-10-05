@@ -919,6 +919,12 @@ pub struct Capture {
     /// reads it - there, the next frame's scenes can already be arriving when this one is
     /// taken - and every ordinary take clears it.
     flip_ends: std::collections::VecDeque<u64>,
+    /// At most this many flipped-but-untaken frames keep their scenes; an older one's are
+    /// retired as the next frame flips. Set by the parallel scheduler's late present, where the
+    /// guest can run many frames on through a slow present: the catch-up renders the last few
+    /// (enough for a frame that samples the one before) and shows the newest, and a long hold
+    /// must not hold every frame's vertex snapshots meanwhile. `None` (the default) keeps all.
+    pub untaken_frame_limit: Option<usize>,
 }
 
 /// Upper bound on retained trace entries. When the trace reaches this, the oldest
@@ -1367,11 +1373,49 @@ impl Capture {
         self.prev_frame_scenes = self.frame_scenes;
         self.frame_scenes = 0;
         self.flip_ends.push_back(self.scenes_pushed);
+        if let Some(keep) = self.untaken_frame_limit {
+            while self.flip_ends.len() > keep.max(1) {
+                self.retire_oldest_untaken_frame();
+            }
+        }
         // Bounded: a caller that never takes through a flip (every one-worker run) must not
         // grow this for the life of the run. Its ordinary take clears it anyway.
-        if self.flip_ends.len() > 8 {
+        if self.flip_ends.len() > 16 {
             self.flip_ends.pop_front();
         }
+    }
+
+    /// Retire the scenes of the oldest flipped-but-untaken frame - see `untaken_frame_limit`.
+    /// Folded into the signature as any evicted scene is; a scene whose geometry is still
+    /// pending stays, for its own resolve.
+    fn retire_oldest_untaken_frame(&mut self) {
+        let Some(end) = self.flip_ends.pop_front() else { return };
+        let first = self.scenes_pushed - self.scenes.len() as u64;
+        let n = end.saturating_sub(first).min(self.scenes.len() as u64) as usize;
+        let rest = self.scenes.split_off(n);
+        let old = std::mem::replace(&mut self.scenes, rest);
+        let mut kept = Vec::new();
+        for s in old {
+            if s.deferred_id != 0 {
+                kept.push(s);
+                continue;
+            }
+            if self.fold_disabled {
+                self.signature_incomplete = true;
+                self.retired_scenes += 1;
+                continue;
+            }
+            if self.retired_scenes == 0 && self.retired_digest == 0 {
+                self.retired_digest = FNV_OFFSET;
+            }
+            let mut h = self.retired_digest;
+            crate::perf::time(crate::perf::Phase::SceneFold, || fold_scene(&mut h, &s));
+            self.retired_digest = h;
+            self.retired_scenes += 1;
+        }
+        // Pending scenes keep their place at the front, as a take leaves them.
+        kept.append(&mut self.scenes);
+        self.scenes = kept;
     }
 
     /// Take the scenes of the OLDEST display frame whose flip has not been taken yet, and
@@ -1380,6 +1424,18 @@ impl Capture {
     /// build N+1). Falls back to the ordinary take when no flip is recorded. Scenes whose
     /// geometry is still pending stay, exactly as the ordinary take leaves them.
     pub fn take_scenes_through_flip(&mut self) -> Vec<Scene> {
+        self.take_scenes_through_flips(1)
+    }
+
+    /// [`Self::take_scenes_through_flip`] over the oldest `frames` untaken frames at once, in
+    /// order: a presenter catching up after a slow present renders every scene the guest made
+    /// meanwhile (a later frame may sample a target an earlier one drew) and shows the newest.
+    pub fn take_scenes_through_flips(&mut self, frames: usize) -> Vec<Scene> {
+        for _ in 1..frames {
+            if self.flip_ends.len() > 1 {
+                self.flip_ends.pop_front();
+            }
+        }
         let Some(end) = self.flip_ends.pop_front() else { return self.take_frame_scenes() };
         // Serial of `scenes[0]`: everything before it was evicted or taken. (A scene left
         // behind as pending by an earlier take keeps its slot at the front, so this reads it as
@@ -1549,6 +1605,35 @@ mod flip_take_tests {
         c.push_scene(Scene::default());
         // The flip taken above does not bound this one.
         assert_eq!(c.take_scenes_through_flip().len(), 1);
+    }
+
+    /// A late present's catch-up: several flipped frames taken at once, and with
+    /// `untaken_frame_limit` only the last few of a long hold kept.
+    #[test]
+    fn a_catch_up_takes_several_frames_and_a_long_hold_keeps_the_last_few() {
+        let mut c = Capture::new();
+        c.set_signature_wanted(false);
+        for n in [1usize, 2, 3] {
+            for _ in 0..n {
+                c.push_scene(Scene::default());
+            }
+            c.end_frame();
+        }
+        c.push_scene(Scene::default());
+        assert_eq!(c.take_scenes_through_flips(3).len(), 6, "all three frames, in order");
+        assert_eq!(c.scenes.len(), 1, "the frame under way stays");
+        c.take_frame_scenes();
+
+        c.untaken_frame_limit = Some(2);
+        for n in [5usize, 2, 3] {
+            for _ in 0..n {
+                c.push_scene(Scene::default());
+            }
+            c.end_frame();
+        }
+        assert_eq!(c.scenes.len(), 5, "the oldest untaken frame's 5 scenes are retired");
+        assert_eq!(c.take_scenes_through_flips(3).len(), 5, "what is left: the last two frames");
+        assert!(c.scenes.is_empty());
     }
 }
 

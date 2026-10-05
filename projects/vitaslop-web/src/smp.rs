@@ -82,6 +82,40 @@ pub fn overlap() -> bool {
     *ON.get_or_init(|| !matches!(vitaslop_runtime::knobs::var("VITASLOP_SMP_OVERLAP").as_deref().map(str::trim), Ok("0")))
 }
 
+/// A SLOW PRESENT DOES NOT FREEZE THE GAME. While the run worker is inside a present
+/// ([`SmpRun::late_begin`]..[`SmpRun::late_end`]), a guest worker held at the frame gate opens
+/// it one frame at a time for as long as the guest's clock is behind the wall time the present
+/// has taken, so the guest runs on in real time - its sound mixer above all - and the next
+/// `run_frames` takes the newest frame. On the Vita a late frame blocks only the thread that
+/// waits for the display. The desktop's `smp::late_present`, same knob: MEASURED there (a
+/// fighting title's round start, a 238 ms present of first-draw pipeline builds) game time moved
+/// 34 ms and the speakers went dry 179 ms without it; with it, 242 ms and 0.
+/// `VITASLOP_SMP_LATE_PRESENT=0` is the arm.
+pub fn late_present() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| overlap() && vitaslop_runtime::knobs::var("VITASLOP_SMP_LATE_PRESENT").as_deref().map(str::trim) != Ok("0"))
+}
+
+/// How far past the frame being presented a late present lets the guest run: a bound, not a
+/// pace (the pace is the wall clock). 1.5 s at 60 fps - this browser's first-draw pipeline
+/// waits reach 1.2 s - and under the frames `flip_clock` remembers ([`FLIP_CLOCK_KEEP`]). The
+/// scenes of all but the last [`LATE_KEEP_FRAMES`] are retired as they flip
+/// (`Capture::untaken_frame_limit`).
+const LATE_AHEAD_MAX: u64 = 90;
+
+/// A present only counts as LATE once it has run this long (ms); the gate is then opened for
+/// the whole of it. An ordinary present is never touched - the desktop's `LATE_AFTER`, MEASURED
+/// there: opening on every present of a title whose frames run slower than real time skipped a
+/// frame in twenty and took its underrun from 0.14 to 1.09 s.
+const LATE_AFTER_MS: f64 = 50.0;
+
+/// Frames whose flip clock is remembered - see [`LATE_AHEAD_MAX`].
+const FLIP_CLOCK_KEEP: usize = 128;
+
+/// Flipped-but-untaken frames that keep their scenes through a late present: the catch-up
+/// renders these (a frame may sample the one before) and shows the newest.
+const LATE_KEEP_FRAMES: usize = 4;
+
 /// A sync point's resolve-only park is settled on the guest's own worker - see
 /// `BrowserEngine::settle_sync_resolve`. `VITASLOP_SYNC_RESOLVE_ON_WORKER=0` is the arm back.
 /// See `Slot::rt`.
@@ -946,6 +980,13 @@ struct State {
     /// The run worker is writing guest memory the guest may also be writing (a render-target
     /// write-back): no worker picks a thread until it clears. See [`SmpRun::pause_guest`].
     paused: bool,
+    /// The present in progress - `(abs_ms, guest clock)` when it began - for [`late_present`].
+    late: Option<(f64, u64)>,
+    /// `SmpRun::consumed`, readable by the workers: the frame being presented, which a late
+    /// present's opening of the gate is bounded from.
+    consumed: u64,
+    /// Gate openings made during slow presents.
+    late_opened: u64,
 }
 
 /// Wake every worker blocked on `bell`.
@@ -1048,7 +1089,31 @@ impl State {
             preempt_prio: 0,
             flip_clock: VecDeque::new(),
             paused: false,
+            late: None,
+            consumed: 0,
+            late_opened: 0,
         }
+    }
+
+    /// [`late_present`]: open the gate one frame when the guest is held at it during a present
+    /// that has outlasted the guest's lead - its clock behind the wall time the present took.
+    fn late_open(&mut self, sh: &Shared) -> bool {
+        let Some((wall0, clock0)) = self.late else { return false };
+        if abs_ms() - wall0 < LATE_AFTER_MS || self.frames < self.gate || self.verdict.is_some() || self.paused || self.gate >= self.consumed + 1 + LATE_AHEAD_MAX {
+            return false;
+        }
+        let mut host = lock_host(&sh.host);
+        if host.clock_us() >= clock0 + ((abs_ms() - wall0).max(0.0) * 1000.0) as u64 {
+            return false;
+        }
+        // As `run_frames` does when it opens the gate: the hold so far is closed off on the
+        // wall floor rather than counted when the guest moves again.
+        if wall_floor(self.frames) {
+            host.state.wall_floor_tick(abs_ms(), true);
+        }
+        self.gate += 1;
+        self.late_opened += 1;
+        true
     }
 
     /// Thread `idx` just became runnable: if the thread running on its worker is of a WORSE
@@ -1398,7 +1463,7 @@ impl State {
             trace_ev(self.frames, TraceEv::W0 { kind: b'B', t0: tbl, t1: tbf });
             trace_ev(self.frames, TraceEv::W0 { kind: b'U', t0: tbf, t1: tbp });
             self.flip_clock.push_back((self.frames, host.clock_us()));
-            if self.flip_clock.len() > 16 {
+            if self.flip_clock.len() > FLIP_CLOCK_KEEP {
                 self.flip_clock.pop_front();
             }
         }
@@ -1891,6 +1956,8 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
     let stats = &sh.stats[w];
     let mut history = vitaslop_runtime::sched::SpinHistory::new();
     let mut last_waited_ms = 0.0f64;
+    // A present is in progress: a held worker re-checks the gate every 2 ms (`late_open`).
+    let mut late_waiting;
     loop {
         if sh.stop.load(Ordering::SeqCst) {
             break;
@@ -1916,6 +1983,10 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                 .copied()
                 .filter(|&i| st.threads[i].release)
                 .collect();
+            if st.late_open(sh) {
+                sh.ring_all();
+            }
+            late_waiting = st.late.is_some();
             let gated = st.frames >= st.gate;
             let job = if gated && st.verdict.is_none() && !st.paused && rt_through_gate() && let Some(i) = st.pick(w, true) {
                 // A real-time thread keeps running behind a shut gate - see `Slot::rt`.
@@ -2009,6 +2080,7 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                         }
                         None => 50_000_000,
                     };
+                    let timeout_ns = if late_waiting { timeout_ns.min(2_000_000) } else { timeout_ns };
                     bell_wait(&sh.bells[w], bell, timeout_ns);
                     if vitaslop_runtime::host::next_wall_park_us().is_some_and(|t| t <= (abs_ms() * 1000.0) as u64) {
                         sh.state.lock().unwrap().drain(sh, engine);
@@ -2504,6 +2576,9 @@ impl SmpRun {
         );
         // This engine expires wall parks (drain + idle workers) - `VitaState::wall_park`.
         vitaslop_runtime::host::set_wall_parks_served(true);
+        if late_present() {
+            lock_host(&sh.host).state.capture.untaken_frame_limit = Some(LATE_KEEP_FRAMES);
+        }
         Ok(SmpRun {
             sh,
             engine,
@@ -2515,12 +2590,31 @@ impl SmpRun {
         })
     }
 
-    /// The game time frame `frame` took: the virtual clock at its flip minus the clock at the
-    /// flip before it. `None` when either flip is no longer remembered.
-    pub fn frame_advance_us(&self, frame: u64) -> Option<u64> {
+    /// The game time from frame `from`'s flip to frame `to`'s - several frames when a late
+    /// present's catch-up takes them at once. `None` when either is no longer remembered.
+    pub fn frame_span_us(&self, from: u64, to: u64) -> Option<u64> {
         let st = self.sh.state.lock().unwrap();
         let at = |f: u64| st.flip_clock.iter().find(|(n, _)| *n == f).map(|(_, us)| *us);
-        Some(at(frame)?.saturating_sub(at(frame.checked_sub(1)?)?))
+        Some(at(to)?.saturating_sub(at(from)?))
+    }
+
+    /// A present begins - see [`late_present`]. Nothing when it is off.
+    pub fn late_begin(&self) {
+        if !late_present() {
+            return;
+        }
+        let mut st = self.sh.state.lock().unwrap();
+        let clock0 = lock_host(&self.sh.host).clock_us();
+        st.late = Some((abs_ms(), clock0));
+        drop(st);
+        self.sh.ring_all();
+    }
+
+    /// The present ended.
+    pub fn late_end(&self) {
+        if late_present() {
+            self.sh.state.lock().unwrap().late = None;
+        }
     }
 
     /// The frame the live loop is at: the last one taken for presenting under [`overlap`],
@@ -2652,9 +2746,10 @@ impl SmpRun {
         );
         let _ = write!(
             s,
-            " | preempts: gate {} prio {}",
+            " | preempts: gate {} prio {} | late-present frames {} (run)",
             st.preempt_gate - since.preempts.0,
             st.preempt_prio - since.preempts.1,
+            st.late_opened,
         );
         snap.preempts = (st.preempt_gate, st.preempt_prio);
         // The busiest threads over the run (or since VITASLOP_CPU_SHARE_FROM), with where they
@@ -2835,8 +2930,17 @@ impl SmpRun {
                 // Overlapped: the frame has flipped, so its scenes are complete - present it
                 // now, whatever the workers are doing on the next one.
                 if ahead == 1 && st.frames >= target {
-                    self.consumed = target;
-                    return RunReport::FramesReached(target);
+                    // A late present let the guest run on: take the NEWEST flipped frame (the
+                    // caller takes its scenes and those before it together) and stand the gate
+                    // one frame past it, as always.
+                    let newest = st.frames.max(target);
+                    self.consumed = newest;
+                    st.consumed = newest;
+                    if newest > target {
+                        st.gate = st.gate.max(newest + 1);
+                        self.sh.ring_all();
+                    }
+                    return RunReport::FramesReached(newest);
                 }
                 if st.frames >= target && st.running == 0 && st.forwards.is_empty() {
                     if let Some(t) = reached_at {

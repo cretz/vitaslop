@@ -921,6 +921,9 @@ impl Shell {
         let rect = gfx.game_rect();
         let mut drew_new = false;
         let no_game = self.session.is_none();
+        // Marks the present so the parallel guest runs on through a slow one (a first-draw
+        // pipeline build) instead of freezing with its sound - see `smp::late_present`.
+        let late = self.session.as_ref().and_then(|s| s.guest.late_handle());
         let game = match self.session.as_mut() {
             None => GameDraw::Clear,
             Some(s) => {
@@ -963,6 +966,10 @@ impl Shell {
                 eprintln!("VITASLOP_SHELL_SHOT: this surface cannot be read back");
             }
         }
+        let late = late.filter(|_| drew_new);
+        if let Some(l) = &late {
+            l.begin();
+        }
         let result = gfx.frame(game, |device, queue, encoder, view, _| {
             let cmds = renderer.update_buffers(device, queue, encoder, &prims, &desc);
             debug_assert!(cmds.is_empty());
@@ -983,6 +990,9 @@ impl Shell {
                 .forget_lifetime();
             renderer.render(&mut rpass, &prims, &desc);
         });
+        if let Some(l) = &late {
+            l.end();
+        }
         for id in &full.textures_delta.free {
             renderer.free_texture(id);
         }
