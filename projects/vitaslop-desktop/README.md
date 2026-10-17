@@ -49,7 +49,7 @@ in a window instead of a canvas.
   executable's identity (size + mtime), so every new build invalidates; `<settings>` the
   transpiler's resolved emit settings; `<exec>` which executable of the game. Storing an
   entry deletes other builds' entries and the same executable's older ones; deleting the
-  game deletes it. A hit skips the transpile and the Cranelift compile (MLB: 18.2 s -> 69 ms).
+  game deletes it. A hit skips the transpile and the Cranelift compile (a baseball title: 18.2 s -> 69 ms).
   `VITASLOP_COMPILE_CACHE=0` bypasses it. See `vitaslop_native::compile_cache`.
 - `--game <dir>` is unchanged and is what the measurement rigs drive; `session.rs` is
   the loop both it and the shell share.

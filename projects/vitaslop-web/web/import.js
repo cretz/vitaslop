@@ -82,7 +82,7 @@ export function probe(entries, onProgress = () => {}) {
 /// this?" and once inside the import - paid that twice for nothing.
 /// `onProgress({ stage, file, done, total, rate })`; `stage` is `reading` (identifying,
 /// `total` 0), `preparing`, then the import's own stages.
-export async function run(entries, onProbe = () => {}, onProgress = () => {}) {
+export async function run(entries, onProbe = () => {}, onProgress = () => {}, { addonFor = null } = {}) {
   await requestPersistence();
   return new Promise((resolve, reject) => {
     const w = spawn();
@@ -138,6 +138,6 @@ export async function run(entries, onProbe = () => {}, onProgress = () => {}) {
       w.terminate();
       reject(new Error(panic || e.message || "the import worker died"));
     };
-    w.postMessage({ type: "import", files: entries });
+    w.postMessage({ type: "import", files: entries, addonFor });
   });
 }

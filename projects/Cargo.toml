@@ -16,6 +16,7 @@ members = [
     "vitaslop-loader",
     "vitaslop-native",
     "vitaslop-platform",
+    "vitaslop-playbook",
     "vitaslop-runtime",
     "vitaslop-transpiler",
     "vitaslop-web",
@@ -101,3 +102,6 @@ panic = "abort"
 # >>> Every change is marked `VITASLOP PATCH`.
 [patch.crates-io]
 wgpu = { path = "vendor/wgpu" }
+
+[patch."https://github.com/cretz/yaxpeax-arm"]
+yaxpeax-arm = { path = "../../yaxpeax-arm" }

@@ -193,7 +193,7 @@ async function run(p) {
     const beat = setInterval(() => {
       check();
       if (error || (stopFrame && lastFrame >= stopFrame && traceDone) || wallUp()) return clearInterval(beat);
-      up({ type: "progress", text: `f${lastFrame} ${(reports.fps || "").replace(/^fps:\s*/, "")}${tabMem}` });
+      up({ type: "progress", text: `f${lastFrame} ${(reports.fps || "").replace(/^fps:\s*/, "")}${tabMem}${document.visibilityState === "hidden" ? " | PAGE HIDDEN" : ""}` });
     }, 5000);
   });
 
@@ -202,6 +202,33 @@ async function run(p) {
   // show a long frame and nothing else). A 100 ms interval that arrives late records the gap,
   // with the frame the run had reached - big gaps are browser/OS stalls, not our frame time.
   const hangs = [];
+  // >>> WHETHER THE RUNNER WAS ON SCREEN. A backgrounded tab throttles timers and stops
+  // animation frames and presentation, and a run carries on through it - so a result has to
+  // say when it happened - nothing used to, so a stalled run could not be cleared of it (one
+  // football title's boot stall was suspected of this and then refuted with this very field:
+  // the page stayed visible). `visibility` = every change with the frame it happened at.
+  const visibility = [{ atMs: 0, frame: 0, state: document.visibilityState }];
+  // >>> THE DEVICE'S OWN STATE at the start and the end - battery level, charging, the whole
+  // tab's memory. A boot stall came and went in STREAKS on one phone (10-06) with no code or
+  // knob change between a streak of good runs and a streak of stuck ones; these are the
+  // device-side variables a result could otherwise never be correlated against.
+  const deviceState = async () => {
+    const s = { atMs: Math.round(performance.now() - tReady), frame: lastFrame };
+    try {
+      const b = await navigator.getBattery?.();
+      if (b) Object.assign(s, { battery: Math.round(b.level * 100), charging: b.charging });
+    } catch {}
+    try {
+      const m = await performance.measureUserAgentSpecificMemory?.();
+      if (m) s.tabMB = Math.round(m.bytes / 1048576);
+    } catch {}
+    return s;
+  };
+  const device = [await deviceState()];
+  const onVisibility = () => {
+    if (visibility.length < 200) visibility.push({ atMs: Math.round(performance.now() - tReady), frame: lastFrame, state: document.visibilityState });
+  };
+  document.addEventListener("visibilitychange", onVisibility);
   let lastTick = performance.now();
   const watchdog = setInterval(() => {
     const t = performance.now();
@@ -214,7 +241,7 @@ async function run(p) {
 
   const offscreen = canvas.transferControlToOffscreen();
   worker.postMessage(
-    { offscreen, titleId, recipe, maxFrames: 0xffffffff, knobs, prebuilt, audioRing: audio ? audio.ring : undefined, profile: p.profile || "runner", noPersist: p.persist !== true, forwardConsole: p.console ? Number(p.console) || 5000 : 0, shots: knobs.VITASLOP_SHOT_FRAMES ? [] : p.shots || [] },
+    { offscreen, titleId, recipe, maxFrames: 0xffffffff, knobs, prebuilt, audioRing: audio ? audio.ring : undefined, profile: p.profile || "runner", noPersist: p.persist !== true, forwardConsole: p.console ? Number(p.console) || 5000 : 0, forwardFrom: Number(p.consoleFrom || 0),shots: knobs.VITASLOP_SHOT_FRAMES ? [] : p.shots || [] },
     [offscreen]
   );
   await finished;
@@ -286,7 +313,10 @@ async function run(p) {
     reports,
     notes,
     hangs,
+    visibility,
+    deviceState: [...device, await deviceState()],
   };
+  document.removeEventListener("visibilitychange", onVisibility);
   await releaseAndTerminate(worker);
   return result;
 }

@@ -70,14 +70,21 @@ export async function run(params, ctx) {
     return { summary: `${id} already imported`, meta: await readTitle(id) };
   }
   const url = (p) => `/game/${q}/${p.split("/").map(encodeURIComponent).join("/")}`;
-  const sizes = [];
-  for (let i = 0; i < paths.length; i++) {
-    const h = await fetch(url(paths[i]), { method: "HEAD" });
-    const n = Number(h.headers.get("content-length"));
-    if (!h.ok || !Number.isFinite(n)) throw new Error(`HEAD ${paths[i]}: HTTP ${h.status}, length ${h.headers.get("content-length")}`);
-    sizes.push(n);
-    if (i % 50 === 0) ctx.progress(`sizing ${i}/${paths.length}`);
-  }
+  // Several HEADs in flight at once: one at a time is a full network round trip per file, and a
+  // title of ~7,000 small files spent minutes here before downloading a byte.
+  const sizes = new Array(paths.length);
+  let next = 0, sized = 0;
+  const sizeOne = async () => {
+    while (next < paths.length) {
+      const i = next++;
+      const h = await fetch(url(paths[i]), { method: "HEAD" });
+      const n = Number(h.headers.get("content-length"));
+      if (!h.ok || !Number.isFinite(n)) throw new Error(`HEAD ${paths[i]}: HTTP ${h.status}, length ${h.headers.get("content-length")}`);
+      sizes[i] = n;
+      if (++sized % 200 === 0) ctx.progress(`sizing ${sized}/${paths.length}`);
+    }
+  };
+  await Promise.all(Array.from({ length: 16 }, sizeOne));
   const total = sizes.reduce((a, b) => a + b, 0);
   const room = await storageRoom();
   const persisted = await requestPersistence();

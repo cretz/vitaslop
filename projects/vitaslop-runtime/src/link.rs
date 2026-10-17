@@ -53,14 +53,26 @@ const HOST_VARS_BYTES: u32 = 0x1000;
 ///   flag word it points at, both in the image. Unresolved, the import's sites hold whatever
 ///   the image left there and the engine dereferences it - a sports title trapped at frame 0
 ///   right after that read.
+/// * SceLibKernel `__stack_chk_guard` (library `0xcae9ace6`, variable `0x93b8aa67`): the
+///   stack-protector canary WORD itself (not a pointer). A function built with the stack
+///   protector copies it into its frame on entry and compares on exit, calling
+///   `__stack_chk_fail` on a mismatch. The device picks a value per boot; any non-zero value
+///   held steady for the run is equivalent, so a fixed one keeps runs reproducible. Its low
+///   byte is zero, the usual terminator canary that stops a runaway string copy. Unresolved,
+///   every protected function reads its canary through whatever the image left in the slot.
 fn host_var_exports(image: &mut [u8], base: u32, var_exports: &mut HashMap<(u32, u32), u32>) {
     let off = base.wrapping_sub(IMAGE_BASE) as usize;
-    let Some(page) = image.get_mut(off..off + 8) else { return };
+    let Some(page) = image.get_mut(off..off + 12) else { return };
     let flag_addr = base + 4;
     page[0..4].copy_from_slice(&flag_addr.to_le_bytes());
     page[4..8].copy_from_slice(&0u32.to_le_bytes());
+    page[8..12].copy_from_slice(&STACK_CHK_GUARD.to_le_bytes());
     var_exports.entry((0x447f_047d, 0x936a_5f31)).or_insert(base);
+    var_exports.entry((0xcae9_ace6, 0x93b8_aa67)).or_insert(base + 8);
 }
+
+/// The stack-protector canary [`host_var_exports`] provides (low byte zero, see there).
+const STACK_CHK_GUARD: u32 = 0x5e3a_9c00;
 
 /// Total guest memory the unified program runs in (image + heap + stack), matching
 /// the order of magnitude of a Vita game partition (the console has 512 MiB of
@@ -99,6 +111,9 @@ pub struct LinkedProgram {
     /// from the import table here, because only the runtime knows what a NID means -
     /// see [`crate::vita::gxm::inline_op`].
     pub inline_imports: Vec<vitaslop_transpiler::InlineImport>,
+    /// The host imports (dense indices) that never return to the caller, so discovery
+    /// stops after a call to one - see [`crate::vita::never_returns`].
+    pub noreturn_imports: Vec<u32>,
     /// Each module's `module_start` entry, in load order (shared libraries first,
     /// then the eboot): the host runs these before the main entry so a library's
     /// constructors and TLS run before anything calls into it.
@@ -232,6 +247,7 @@ impl LinkedProgram {
             redirects: &self.redirects,
             inline_imports: &self.inline_imports,
             noreturn_svc: &[],
+            noreturn_imports: &self.noreturn_imports,
             mem_bytes: self.mem_bytes,
             discover_code_pointers: true,
             import_memory,
@@ -708,6 +724,12 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         .collect();
 
     let host_import_count = imports.len();
+    let noreturn_imports: Vec<u32> = imports
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(_, func_nid))| crate::vita::never_returns(func_nid))
+        .map(|(i, _)| i as u32)
+        .collect();
     // Which host imports the transpiler may emit inline. Derived from the finished
     // import table so the index a call site uses and the index carrying the inline op
     // are the same by construction.
@@ -761,6 +783,7 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         redirects,
         imports,
         inline_imports,
+        noreturn_imports,
         module_inits,
         main_entry,
         alloc_base: align_up(image_end, MODULE_ALIGN),
@@ -1053,6 +1076,7 @@ mod tests {
                 vitaslop_transpiler::Error::Decode { addr } => ("decode", addr),
                 vitaslop_transpiler::Error::Unsupported { addr, .. } => ("unsupported", addr),
                 vitaslop_transpiler::Error::Operand { addr } => ("operand", addr),
+                vitaslop_transpiler::Error::Runaway { last, .. } => ("runaway", last),
             };
             let off = (addr & !1).wrapping_sub(linked.base) as usize;
             if off + 2 > linked.image.len() {

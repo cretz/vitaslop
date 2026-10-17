@@ -119,6 +119,30 @@ const LATE_KEEP_FRAMES: usize = 4;
 /// A sync point's resolve-only park is settled on the guest's own worker - see
 /// `BrowserEngine::settle_sync_resolve`. `VITASLOP_SYNC_RESOLVE_ON_WORKER=0` is the arm back.
 /// See `Slot::rt`.
+/// >>> THE EMULATED CORES RUN IN LOCKSTEP. A Vita's cores retire guest code at ONE rate, so
+/// no core is ever milliseconds of work behind another; a host worker can be (a phone's busy
+/// core, an OS preemption). Each worker counts the guest instructions its resumes retire, and
+/// one more than this window ahead of a worker still INSIDE a resume does not pick until that
+/// worker folds - a host that cannot keep one core at Vita speed slows the whole guest
+/// uniformly, as a slower Vita would, instead of letting the other cores run away from it.
+/// MEASURED (a football title's boot, 10-07): its front-end thread's core falling ~1 ms of work
+/// behind the others per tick made its boot script miss the action that starts the intro
+/// movie - for ever (latched; phone streaks of 15/15 stalled boots, desktop repro with a 1 ms
+/// spin on that one thread). Uniform slowness never did. A window idle workers do not bank:
+/// an idle worker re-enters at the lagging minimum.
+///
+/// `VITASLOP_SMP_LOCKSTEP=<guest instructions>`, default [`LOCKSTEP_DEFAULT`] (one scheduling
+/// quantum, ~1.1 ms of Vita time); `0` is the arm back (cores run free).
+fn lockstep() -> Option<u64> {
+    static W: OnceLock<Option<u64>> = OnceLock::new();
+    *W.get_or_init(|| match vitaslop_runtime::knobs::var("VITASLOP_SMP_LOCKSTEP") {
+        Ok(v) => v.trim().parse().ok().filter(|&n| n > 0),
+        Err(_) => Some(LOCKSTEP_DEFAULT),
+    })
+}
+
+/// [`lockstep`]'s default window: one scheduling quantum of guest instructions.
+const LOCKSTEP_DEFAULT: u64 = 500_000;
 fn rt_through_gate() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| vitaslop_runtime::knobs::var("VITASLOP_SMP_RT_THROUGH_GATE").as_deref().map(str::trim) != Ok("0"))
@@ -953,10 +977,19 @@ struct State {
     /// Guest instructions retired per worker, decayed at every frame - the placement's idea
     /// of how busy a worker is.
     load: Vec<f64>,
+    /// Guest work each worker has retired, for [`lockstep`].
+    core_work: Vec<u64>,
+    /// The worker had nothing to pick since its last resume - [`lockstep`] does not bank it.
+    core_idle: Vec<bool>,
+    /// Picks [`lockstep`] declined.
+    lockstep_waits: u64,
     /// The last placements, newest last: `(thid, affinity mask, home, worker loads then)`.
     /// Printed on the SMP panel line - a thread's worker is decided ONCE, at its first run, and
     /// a busy worker's thread list cannot say whether that was its mask or the load rule.
     placed: VecDeque<(i32, i32, usize, Vec<f64>)>,
+    /// Every placed thread's affinity mask, for the `threads by work` rows: `placed` keeps only
+    /// the newest twelve, and a busy thread is usually one of the oldest.
+    mask_of: HashMap<i32, i32>,
     forwarded: u64,
     /// Forwarded calls by import selector since the last panel line (drained there).
     forwarded_by: HashMap<u32, u64>,
@@ -1076,7 +1109,11 @@ impl State {
             fuel_unreported: 0,
             fuel_idle: 0,
             load: vec![0.0; workers + 1],
+            core_work: vec![0; workers + 1],
+            core_idle: vec![true; workers + 1],
+            lockstep_waits: 0,
             placed: VecDeque::new(),
+            mask_of: HashMap::new(),
             forwarded: 0,
             forwarded_by: HashMap::new(),
             idle_jumps: 0,
@@ -1327,7 +1364,25 @@ impl State {
             .filter(|&i| !rt_only || self.threads[i].rt)
             .collect();
         if mine.is_empty() {
+            self.core_idle[w] = true;
             return None;
+        }
+        if let Some(win) = lockstep().filter(|_| !rt_only) {
+            // The slowest OTHER worker still inside a resume (real-time threads excepted).
+            let lag = (0..self.running_on.len())
+                .filter(|&v| v != w)
+                .filter(|&v| self.running_on[v].is_some_and(|j| !self.threads[j].rt))
+                .map(|v| self.core_work[v])
+                .min();
+            if let Some(lag) = lag {
+                if self.core_idle[w] {
+                    self.core_work[w] = self.core_work[w].max(lag);
+                } else if self.core_work[w] > lag.saturating_add(win) {
+                    self.lockstep_waits += 1;
+                    return None;
+                }
+            }
+            self.core_idle[w] = false;
         }
         if mine.iter().all(|&i| self.threads[i].cooled) {
             for &i in &mine {
@@ -1407,6 +1462,7 @@ impl State {
         }
         let home = self.threads[idx].home;
         self.load[home] += retired.unwrap_or(burned) as f64;
+        self.core_work[home] = self.core_work[home].saturating_add(retired.unwrap_or(burned));
         // The thread that just stopped counts: it was running when this work was retired.
         let runnable = 1 + self
             .live
@@ -1647,6 +1703,13 @@ impl State {
                 self.placed.pop_front();
             }
             self.placed.push_back((sp.thid, mask, home, self.load[1..].to_vec()));
+            // Bounded by the LIVE threads: a football title spawns ~25,000 short-lived pool
+            // threads by its kickoff, and a finished one has no row to print.
+            if self.mask_of.len() >= 4096 {
+                let live: std::collections::HashSet<i32> = self.live.iter().map(|&i| self.threads[i].thid).collect();
+                self.mask_of.retain(|t, _| live.contains(t));
+            }
+            self.mask_of.insert(sp.thid, mask);
             let birth = Birth { entries: vec![sp.entry], r: [sp.arg_len, sp.arg_ptr, sp.r2, sp.r3], sp: sp.stack_top };
             self.add_thread(sh, sp.thid, sp.priority, home, birth);
         }
@@ -2215,6 +2278,9 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                         trace_ev(st.frames, TraceEv::Run { w: w as u8, thid, t0: t1 - ran_ms, t1, stop, sel });
                     }
                     st.fold(sh, i, step, fuel, arm, forward, early, preempted);
+                    if lockstep().is_some() {
+                        sh.ring_all();
+                    }
                     if settle.is_some() {
                         st.early_serving += 1;
                     }
@@ -2359,6 +2425,7 @@ impl SmpRun {
             };
             let mut st = sh.state.lock().unwrap();
             let home = st.place(workers, main_mask, main_prio);
+            st.mask_of.insert(vitaslop_runtime::host::MAIN_THID, main_mask);
             st.add_thread(
                 &sh,
                 vitaslop_runtime::host::MAIN_THID,
@@ -2702,10 +2769,11 @@ impl SmpRun {
         let (dt, dc) = (taken - since.lock.0, cont - since.lock.1);
         let _ = write!(
             s,
-            " | host lock {dc} of {dt} contended ({:.1}%) | forwarded {} | idle jumps {}",
+            " | host lock {dc} of {dt} contended ({:.1}%) | forwarded {} | idle jumps {} | lockstep waits {} (run)",
             dc as f64 * 100.0 / dt.max(1) as f64,
             st.forwarded - since.forwarded,
             st.idle_jumps - since.idle_jumps,
+            st.lockstep_waits,
         );
         {
             let mut v: Vec<(u32, u64)> = forwarded_by.into_iter().collect();
@@ -2787,16 +2855,20 @@ impl SmpRun {
         for t in rows.iter().take(8) {
             let _ = write!(
                 s,
-                " {:#x}@w{} p{:#x} {:.1}% ({} picks, {} spun; run {:.2} queued {:.2} ms/f, {} waits>=5ms)",
+                " {:#x}@w{} p{:#x} mask {:#x} {:.1}% ({} picks, {} spun; run {:.2} queued {:.2} ms/f, {} waits>=5ms, {:.0} MIPS)",
                 t.thid,
                 t.home,
                 t.priority,
+                st.mask_of.get(&t.thid).copied().unwrap_or(0),
                 t.retired_total as f64 * 100.0 / total as f64,
                 t.picks,
                 t.quanta,
                 t.run_ms / per,
                 t.queued_ms / per,
-                t.queued_long
+                t.queued_long,
+                // Guest instructions retired per RUNNING ms (host calls inside a resume included):
+                // the translated code's effective speed on this engine, against a ~550 MIPS A9.
+                t.retired_total as f64 / 1e3 / t.run_ms.max(1e-9)
             );
         }
         // What the busiest callers call, this window: per thread, its fuel yields and its top

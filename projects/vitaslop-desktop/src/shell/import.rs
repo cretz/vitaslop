@@ -70,16 +70,31 @@ fn unrecognised(e: &str) -> bool {
 }
 
 impl Shell {
-    pub(super) fn ui_import(&mut self, ui: &mut egui::Ui) {
-        ui.label(bold("Add games").size(22.0).color(INK));
-        ui.label(RichText::new("vitaslop only works with games you own, from your own console. It provides no games and downloads nothing.").size(13.0));
+    /// The import screen; with `addon_for`, adding add-ons to that title (the same pickers and
+    /// containers, filed under the title).
+    pub(super) fn ui_import(&mut self, ui: &mut egui::Ui, addon_for: Option<&str>) {
+        match addon_for {
+            Some(id) => {
+                let name = self.titles.iter().find(|t| t.title_id == id).map_or_else(|| id.to_string(), |t| t.title.clone());
+                if let Some(to) = super::crumbs(ui, &[("Library", Some(Screen::Library)), (&name, Some(Screen::Title(id.to_string()))), ("Add add-ons", None)]) {
+                    self.screen = to;
+                    return;
+                }
+                ui.label(bold(format!("Add add-ons to {name}")).size(22.0).color(INK));
+                ui.label(RichText::new("vitaslop only works with games and add-ons you own, from your own console. It provides no games and downloads nothing.").size(13.0));
+            }
+            None => {
+                ui.label(bold("Add games").size(22.0).color(INK));
+                ui.label(RichText::new("vitaslop only works with games you own, from your own console. It provides no games and downloads nothing.").size(13.0));
+            }
+        }
         ui.add_space(6.0);
         let progress = self.import.as_ref().map(|p| p.lock().unwrap().clone());
         let running = progress.as_ref().is_some_and(|p| !p.finished);
         // The pickers go away while an import runs: a second pick would start a second import
         // into the same directory.
         if !running {
-            self.ui_import_pickers(ui);
+            self.ui_import_pickers(ui, addon_for.is_some());
         }
         let Some(g) = progress else { return };
         if !g.finished {
@@ -110,8 +125,13 @@ impl Shell {
                                 ui.label(bold(&p.title).size(16.0).color(INK));
                                 let kind = if p.kind == "vpk" { "homebrew".to_string() } else if p.zipped { format!("{} in a zip", p.kind) } else { p.kind.clone() };
                                 let version = if p.app_version.is_empty() { String::new() } else { format!(" - v{}", p.app_version) };
-                                let replacing = if p.replacing { " - replacing what is in the library (saved data is kept)" } else { "" };
-                                ui.label(RichText::new(format!("{}{version} - {kind} - {} files - {}{replacing}", p.title_id, p.files, fmt_bytes(p.bytes))).color(DIM).size(13.0));
+                                let replacing = match (p.replacing, self.import_addon_for.is_some()) {
+                                    (false, _) => "",
+                                    (true, false) => " - replacing what is in the library (saved data is kept)",
+                                    (true, true) => " - replacing the installed copy of this add-on",
+                                };
+                                let owner = if self.import_addon_for.is_some() { "add-on for " } else { "" };
+                                ui.label(RichText::new(format!("{owner}{}{version} - {kind} - {} files - {}{replacing}", p.title_id, p.files, fmt_bytes(p.bytes))).color(DIM).size(13.0));
                             }
                             None => {
                                 ui.label(bold(format!("Reading {files} file{}...", if files == 1 { "" } else { "s" })).size(16.0).color(INK));
@@ -141,7 +161,8 @@ impl Shell {
             });
         } else if let Some(e) = g.error {
             error_card(ui, |ui| {
-                let unknown = unrecognised(&e);
+                // "not an add-on" / "an add-on for X" are not containers this does not know.
+                let unknown = unrecognised(&e) && !e.contains("add-on");
                 ui.label(bold(if unknown { "Not a title this emulator recognises" } else { "Import failed" }).size(16.0).color(INK));
                 ui.label(RichText::new(&e).monospace().color(egui::Color32::from_rgb(0xff, 0xd9, 0xd9)));
                 if unknown {
@@ -153,6 +174,11 @@ impl Shell {
             self.import = None;
             self.pick_pkg = None;
             self.pick_work = None;
+            if self.import_addon_for.take().is_some() {
+                self.addons.remove(&id);
+                self.screen = Screen::Title(id);
+                return;
+            }
             self.titles = library::list_titles();
             self.icons.remove(&id);
             self.pictures.remove(&id);
@@ -160,7 +186,11 @@ impl Shell {
         }
     }
 
-    fn ui_import_pickers(&mut self, ui: &mut egui::Ui) {
+    fn ui_import_pickers(&mut self, ui: &mut egui::Ui, addon: bool) {
+        // An add-on is never homebrew.
+        if addon && self.import_tab == ImportTab::Vpk {
+            self.import_tab = ImportTab::Pkg;
+        }
         // `.tabs`: the chosen one filled with the accent, the card below joined to it.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -170,6 +200,9 @@ impl Shell {
                 (ImportTab::Zip, "Zip"),
                 (ImportTab::Vpk, "Homebrew (.vpk)"),
             ] {
+                if addon && tab == ImportTab::Vpk {
+                    continue;
+                }
                 let on = self.import_tab == tab;
                 let b = egui::Button::new(bold(label).color(if on { super::ACCENT_INK } else { DIM }))
                     .fill(if on { ACCENT } else { egui::Color32::TRANSPARENT })

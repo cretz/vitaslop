@@ -58,6 +58,9 @@ const MANIFEST = "vitaslop-opfs-manifest.json";
 /// > > > one by inspecting it, so the version is what forces it to be redone once.
 const MANIFEST_VERSION = 2;
 
+/// Files an import keeps in flight at once - see `importTitle`.
+const IMPORT_PARALLEL = 6;
+
 /// Whether `id` has a complete import, whatever its size. The marker is written last.
 export async function isComplete(id) {
   try {
@@ -70,13 +73,70 @@ export async function isComplete(id) {
   }
 }
 
-/// Remove every stored byte of `id`. The saves are elsewhere and untouched.
+/// Remove every stored byte of `id`, its add-ons included - an add-on is part of its title.
+/// The saves are elsewhere and untouched.
 export async function removeTitle(id) {
+  const root = await navigator.storage.getDirectory();
+  for (const top of ["games", ADDONS]) {
+    try {
+      const d = await root.getDirectoryHandle(top, { create: false });
+      await d.removeEntry(id, { recursive: true });
+    } catch {}
+  }
+}
+
+// ------------------------------- add-ons -------------------------------
+//
+// An add-on ("additional content") is stored like a title - the same flat, `%2F`-encoded dump
+// - under `addons/<title id>/<dir>/`, where `<dir>` is the label that ends its content id and
+// the name the title asks the system for. Its record `addon.json` and the completion marker sit
+// beside its files. It belongs to its title: listed, added and removed on that title's page,
+// and removed with it.
+
+const ADDONS = "addons";
+/// An add-on's record, beside its files. Not a dump path, so it is never served to the guest.
+export const ADDON_RECORD = "addon.json";
+
+/// The directory holding `id`'s add-ons.
+export async function addonsDir(id, { create = true } = {}) {
+  const root = await navigator.storage.getDirectory();
+  const top = await root.getDirectoryHandle(ADDONS, { create });
+  return top.getDirectoryHandle(id, { create });
+}
+
+/// Whether `dir` is a plain add-on directory name - it is joined onto storage paths.
+export function isAddonName(dir) {
+  return typeof dir === "string" && /^[A-Za-z0-9]{1,32}$/.test(dir);
+}
+
+/// The add-ons installed for `id` whose import completed, by title.
+export async function listAddons(id) {
+  let top;
   try {
-    const root = await navigator.storage.getDirectory();
-    const games = await root.getDirectoryHandle("games", { create: false });
-    await games.removeEntry(id, { recursive: true });
-  } catch {}
+    top = await addonsDir(id, { create: false });
+  } catch {
+    return [];
+  }
+  const out = [];
+  for await (const [name, h] of top.entries()) {
+    if (h.kind !== "directory") continue;
+    try {
+      const m = JSON.parse(await (await (await h.getFileHandle(MANIFEST)).getFile()).text());
+      const rec = JSON.parse(await (await (await h.getFileHandle(ADDON_RECORD)).getFile()).text());
+      if (m.complete === true && rec && rec.dir === name && rec.titleId === id) out.push(rec);
+    } catch {
+      // No marker or no record: an import that did not finish. Not an add-on.
+    }
+  }
+  out.sort((a, b) => (a.title || a.dir).localeCompare(b.title || b.dir) || a.dir.localeCompare(b.dir));
+  return out;
+}
+
+/// Remove one add-on of `id`.
+export async function removeAddon(id, dir) {
+  if (!isAddonName(dir)) throw new Error(`not an add-on name: ${dir}`);
+  const top = await addonsDir(id, { create: false });
+  await top.removeEntry(dir, { recursive: true });
 }
 
 /// Whether `id` is already imported and complete. Cheap: one read of the marker.
@@ -168,15 +228,24 @@ export async function importTitle(id, entries, onProgress = () => {}) {
   }
   const dir = await titleDir(id);
   let bytes = 0;
-  for (let i = 0; i < entries.length; i++) {
+  // Files finished, and the bytes of files still being written - progress counts both.
+  let done = 0;
+  let pending = 0;
+  // >>> SEVERAL FILES IN FLIGHT. One at a time, every file pays a whole fetch round trip plus
+  // an OPFS open and close before the next starts; a title of ~7,000 small files spent most of
+  // its import in those gaps rather than moving bytes. Each file is still stored and checked
+  // exactly as before - only their order of completion changes, and the marker below is still
+  // written after every one of them has finished.
+  let next = 0;
+  const importOne = async (i) => {
     // RESUME: an entry that names its `size` and is already stored at exactly that size (an
     // earlier import cut off part-way, e.g. by a runner job's time limit) is kept, not refetched.
     if (typeof entries[i].size === "number") {
       const have = await storedSize(dir, entries[i].path);
       if (have === entries[i].size) {
         bytes += have;
-        onProgress(i + 1, entries.length, bytes, false);
-        continue;
+        onProgress(++done, entries.length, bytes, false);
+        return;
       }
     }
     // Report DURING each file as well as after it, throttled to every 4 MB so a slow large
@@ -191,11 +260,13 @@ export async function importTitle(id, entries, onProgress = () => {}) {
     const body = src && typeof src === "object" && "body" in src ? src.body : src;
     const written = await storeOne(dir, entries[i].path, body, (n) => {
       inFlight += n;
+      pending += n;
       if (inFlight - reported >= 4 << 20) {
         reported = inFlight;
-        onProgress(i, entries.length, bytes + inFlight, false);
+        onProgress(done, entries.length, bytes + pending, false);
       }
     });
+    pending -= inFlight;
     // >>> A FILE THAT DID NOT ARRIVE WHOLE IS NOT A FILE, AND MUST NOT BE STORED AS ONE.
     //
     // A source that promises a length and delivers another has failed, whatever the transport
@@ -211,8 +282,15 @@ export async function importTitle(id, entries, onProgress = () => {}) {
       );
     }
     bytes += written;
-    onProgress(i + 1, entries.length, bytes, false);
-  }
+    onProgress(++done, entries.length, bytes, false);
+  };
+  // A failed file rejects its worker, and `Promise.all` rejects the import with it - the marker
+  // below is never written for a title with a file missing.
+  await Promise.all(
+    Array.from({ length: Math.min(IMPORT_PARALLEL, entries.length) }, async () => {
+      while (next < entries.length) await importOne(next++);
+    })
+  );
   // The marker goes last, so "present" always means "everything before it is there".
   const fh = await dir.getFileHandle(MANIFEST, { create: true });
   const w = await fh.createWritable();
@@ -227,7 +305,12 @@ export async function importTitle(id, entries, onProgress = () => {}) {
 /// `{ path: handle }`. Worker-only. This is the async step that buys synchronous reads
 /// later - the emulator cannot await inside a guest file read, so every handle it may
 /// need has to be open before the guest starts.
-export async function openTitleSync(id) {
+///
+/// `skip(path)`, when given, names paths that are LISTED but not opened (`handles.skipped`):
+/// the transpile worker reads only the manifest and the modules, and opening and then
+/// closing a title's data files cost it ~16 s on the phone for 7122 of them (`syncReader`
+/// reports a read of a skipped path as a failure rather than as a missing file).
+export async function openTitleSync(id, { skip } = {}) {
   // >>> A RELOAD RACES THE PREVIOUS WORKER'S TEARDOWN, AND THAT IS THE NORMAL PATH.
   //
   // A sync access handle is EXCLUSIVE per file. The run worker holds one per file for the
@@ -249,13 +332,47 @@ export async function openTitleSync(id) {
   let last;
   for (const wait of DELAYS_MS) {
     if (wait) await new Promise((r) => setTimeout(r, wait));
-    const dir = await titleDir(id, { create: false });
+    const t0 = performance.now();
     const handles = {};
+    const skipped = [];
     try {
-      for await (const [name, h] of dir.entries()) {
-        if (name === MANIFEST || h.kind !== "file") continue;
-        handles[decodeName(name)] = await h.createSyncAccessHandle();
+      const todo = await listTitleFiles(id);
+      if (skip) {
+        const keep = [];
+        for (const t of todo) (skip(t[0]) ? skipped : keep).push(t);
+        todo.length = 0;
+        todo.push(...keep);
+        for (let i = 0; i < skipped.length; i++) skipped[i] = skipped[i][0];
       }
+      const tListed = performance.now();
+      // >>> OPENED SEVERAL AT A TIME. Each `createSyncAccessHandle` is a round trip to the
+      // browser's storage process, and one at a time a title of 7122 files spent ~54 s of the
+      // phone's boot at f0 here - twice, once in the transpile worker and once in the storage
+      // worker. The cost is the trip, not the file, so the trips are overlapped. A failure
+      // still closes every handle opened so far (the `catch` below), after the rest settle.
+      const IN_FLIGHT = 32;
+      let next = 0;
+      let failed = null;
+      const lane = async () => {
+        while (next < todo.length && !failed) {
+          const [path, h] = todo[next++];
+          try {
+            handles[path] = await h.createSyncAccessHandle();
+          } catch (e) {
+            failed = failed || e;
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(IN_FLIGHT, todo.length) }, lane));
+      if (failed) throw failed;
+      // What the open cost, for the prepare split, and what was left shut - non-enumerable,
+      // so neither is a path.
+      Object.defineProperty(handles, "openStats", {
+        value:
+          `${todo.length} files: listed ${Math.round(tListed - t0)} ms, opened ${Math.round(performance.now() - tListed)} ms` +
+          (skipped.length ? ` (${skipped.length} data files listed, not opened)` : ""),
+      });
+      Object.defineProperty(handles, "skipped", { value: skipped });
       return handles;
     } catch (e) {
       for (const h of Object.values(handles)) {
@@ -278,13 +395,60 @@ export async function openTitleSync(id) {
   );
 }
 
+/// Every stored file of `id` as `[path, FileSystemFileHandle]`, NOT opened: the title's own
+/// files, then its installed add-ons' under `addons/<dir>/` - the prefix the engine looks for
+/// (`opfs.rs` ADDONS_PREFIX). Only complete add-ons: a half-imported add-on is not one.
+export async function listTitleFiles(id) {
+  const dir = await titleDir(id, { create: false });
+  const out = [];
+  for await (const [name, h] of dir.entries()) {
+    if (name === MANIFEST || h.kind !== "file") continue;
+    out.push([decodeName(name), h]);
+  }
+  for (const rec of await listAddons(id)) {
+    const adir = await (await addonsDir(id, { create: false })).getDirectoryHandle(rec.dir);
+    for await (const [name, h] of adir.entries()) {
+      if (name === MANIFEST || name === ADDON_RECORD || h.kind !== "file") continue;
+      out.push([`${ADDONS}/${rec.dir}/${decodeName(name)}`, h]);
+    }
+  }
+  return out;
+}
+
+/// ONE file's sync access handle, retried while a previous worker's handle on it is still
+/// being torn down - the reload race [`openTitleSync`] describes, met one file at a time by a
+/// reader that opens on first use (`storage-worker.js`).
+export async function openSyncRetrying(fileHandle) {
+  const DELAYS_MS = [0, 100, 200, 400, 800, 1500];
+  let last;
+  for (const wait of DELAYS_MS) {
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    try {
+      return await fileHandle.createSyncAccessHandle();
+    } catch (e) {
+      last = e;
+      if (!e || e.name !== "NoModificationAllowedError") throw e;
+    }
+  }
+  throw last;
+}
+
 /// A reader the wasm side calls: `size(path)` and `read(path, offset, into)`, both
 /// synchronous. `into` is a `Uint8Array` view the caller owns; the return is how many
 /// bytes were actually read (short at end of file, 0 for an unknown path).
 export function syncReader(handles) {
+  const skipped = new Set(handles.skipped || []);
+  // A skipped path the engine asked for: it would read as MISSING, which is a wrong answer,
+  // not an absent file - the caller checks `touchedSkipped()` and fails the run with it.
+  const touched = new Set();
   return {
-    paths: () => Object.keys(handles),
-    size: (path) => (handles[path] ? handles[path].getSize() : -1),
+    paths: () => Object.keys(handles).concat([...skipped]),
+    size: (path) => {
+      if (handles[path]) return handles[path].getSize();
+      if (skipped.has(path)) touched.add(path);
+      return -1;
+    },
+    touchedSkipped: () => [...touched],
     read: (path, offset, into) => {
       const h = handles[path];
       return h ? h.read(into, { at: offset }) : 0;
@@ -350,6 +514,7 @@ export async function openTitleCached(id) {
     }
   };
   const { paths, sizes } = ready;
+  if (ready.openStats) console.log(`[storage] title files ${ready.openStats}`);
   const reader = readerOverRing(sab, paths, sizes, () => workerError);
   return {
     ...reader,

@@ -457,6 +457,36 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // multiplier sees and whether its product is shifted back up; the two steps of a pair
         // sum to the whole product in wrapping 32-bit arithmetic, which is what the emitter
         // writes and what this must therefore agree with.
+        // Group 0x14 general I16MAD: the same arithmetic `wgsl::emit_int_mad16` writes - each
+        // operand's low half sign-extended, an immediate read as its integer, the sum wrapping.
+        Op::IntMad16 { negate_src2 } => {
+            let s16 = |n: usize| -> Result<i32, &'static str> {
+                let o = instr.srcs.get(n).ok_or("operand")?;
+                if matches!(o.bank, Bank::Immediate) {
+                    return Ok(i32::from(o.index));
+                }
+                Ok(i32::from(read_channel(regs, o, 0).ok_or("operand")?.to_bits() as u16 as i16))
+            };
+            let (a, b, c) = (s16(0)?, s16(1)?, s16(2)?);
+            let p = a.wrapping_mul(b);
+            f32::from_bits(if negate_src2 { p.wrapping_sub(c) } else { p.wrapping_add(c) } as u32)
+        }
+        // Group 0x13 IMA8: four unsigned bytes per lane, `src1 * src2 + src0` per byte, wrapped
+        // or saturated - the same arithmetic `wgsl::emit_int_mad8` writes.
+        Op::IntMad8 { sat } => {
+            let raw = |n: usize| -> Result<u32, &'static str> {
+                let o = instr.srcs.get(n).ok_or("operand")?;
+                Ok(read_channel(regs, o, 0).ok_or("operand")?.to_bits())
+            };
+            let (a, b, c) = (raw(0)?, raw(1)?, raw(2)?);
+            let mut r = 0u32;
+            for k in 0..4 {
+                let byte = |v: u32| (v >> (8 * k)) & 0xff;
+                let t = byte(b) * byte(c) + byte(a);
+                r |= (if sat { t.min(255) } else { t & 0xff }) << (8 * k);
+            }
+            f32::from_bits(r)
+        }
         Op::IntMadStep { signed, high_half } => {
             // >>> THE SIGNED FORM NEEDED NO EXTRA FACT, AND THE EMITTER SAYS SO.
             //
@@ -1285,9 +1315,10 @@ pub fn run_traced_env(
         // the same rule `store_raw_half`/`store_raw_byte` write by.
         //
         // MEASURED: 31 of the corpus's 82 interpreter refusals, the single largest group.
-        if let Op::PackIntCopy { bits } = instr.op {
+        if let Op::PackIntCopy { bits, dest_bits, signed } = instr.op {
             let bits = bits as u32;
-            if bits != 16 && bits != 8 {
+            let dest_bits = dest_bits as u32;
+            if (bits != 16 && bits != 8) || (dest_bits != 16 && dest_bits != 8) {
                 return Err(InterpError::UnsupportedOp {
                     index,
                     op: "pack.int.copy at a width other than 8 or 16",
@@ -1307,7 +1338,13 @@ pub fn run_traced_env(
                     .and_then(|b| b.get((s1.index as u32 + sel / per_reg) as usize))
                     .ok_or(InterpError::OutOfRange { index })?
                     .to_bits();
-                elems[c] = (word >> ((sel % per_reg) * bits)) & mask;
+                let e = (word >> ((sel % per_reg) * bits)) & mask;
+                // The width cast: a widened signed element carries its sign up.
+                elems[c] = if signed && dest_bits > bits && e >> (bits - 1) != 0 { e | !mask } else { e };
+            }
+            let mask = (1u32 << dest_bits) - 1;
+            for e in &mut elems {
+                *e &= mask;
             }
             let base = dest.index as u32;
             let bank = regs.bank_mut(dest.bank).ok_or(InterpError::OutOfRange { index })?;
@@ -1315,7 +1352,7 @@ pub fn run_traced_env(
                 if !instr.write_mask[c as usize] {
                     continue;
                 }
-                let (reg_off, sh) = crate::ir::packed_dest_slot(bits, c);
+                let (reg_off, sh) = crate::ir::packed_dest_slot(dest_bits, c);
                 let slot =
                     bank.get_mut((base + reg_off) as usize).ok_or(InterpError::OutOfRange { index })?;
                 let word = slot.to_bits();
@@ -1657,6 +1694,27 @@ mod tests {
         i.write_mask = [true, false, false, false];
         run(&shader(vec![i]), &mut regs).unwrap();
         assert_eq!(regs.pa[2].to_bits(), 7 * 48 + 1000);
+    }
+
+    /// Group 0x13 IMA8 per byte, on the corpus word's own operands: `sa23 = sa23 * 0x01010101 +
+    /// 0x00000001` over a 0-or-255 byte is a boolean NOT in byte 0 - 255 + 1 WRAPS to 0 - and the
+    /// saturating form clamps the same sum at 255 instead.
+    #[test]
+    fn int_mad8_wraps_each_byte_and_saturates_when_asked() {
+        for (sat, want) in [(false, 0x0000_ff00u32), (true, 0x0000_ffffu32)] {
+            let mut regs = RegFile::with_lanes(128);
+            regs.sa[23] = f32::from_bits(0x0000_ffff);
+            regs.sa[49] = f32::from_bits(0x0000_0001);
+            regs.sa[66] = f32::from_bits(0x0101_0101);
+            let d = Operand::plain(Bank::SecondaryAttr, 23, 2);
+            let src0 = Operand::plain(Bank::SecondaryAttr, 49, 2);
+            let src1 = Operand::plain(Bank::SecondaryAttr, 23, 2);
+            let src2 = Operand::plain(Bank::SecondaryAttr, 66, 2);
+            let mut i = instr(Op::IntMad8 { sat }, d, vec![src0, src1, src2]);
+            i.write_mask = [true, false, false, false];
+            run(&shader(vec![i]), &mut regs).unwrap();
+            assert_eq!(regs.sa[23].to_bits(), want, "sat {sat}");
+        }
     }
 
     /// src1 with its half bit CLEAR is the LOW 16 bits of a packed pair, not the whole

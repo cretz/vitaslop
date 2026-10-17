@@ -276,6 +276,7 @@ pub fn decode(word: u64) -> Instr {
         0x0a..=0x0d => decode_grp_bitwise(word, op1),
         0x10 => decode_grp_sop2(word),
         0x12 => decode_grp_sop2m(word),
+        0x13 => decode_grp_ima8(word),
         0x14 => decode_grp_i16mad(word),
         0x15 => decode_grp_imad32(word),
         0x1a => decode_grp_imad32_step(word),
@@ -509,6 +510,85 @@ fn decode_grp_sop2(word: u64) -> Instr {
         half_precision: false,
         raw: word,
         group: 0x80,
+        blocked,
+    }
+}
+
+/// Decode a group-0x98 IMA8, the 8-BIT INTEGER MULTIPLY-ADD (opcode1 0x13): per byte,
+/// `dest = src1 * src2 + src0`, wrapped to 8 bits or saturated at 255. See [`Op::IntMad8`].
+///
+/// | field | bits | | field | bits |
+/// |---|---|---|---|---|
+/// | `pred` (2-bit short form) | 58:57 | | `repeat` | 46:44 |
+/// | colour complement of src1 / src2 / addend | 56 / 47 / 42 | | `sat` | 43 |
+/// | colour addend select | 53:52 | | alpha addend select | 41 |
+/// | alpha complement of src2 / src1 / addend | 40 / 39 / 38 | | src1 / src2 alpha select | 37 / 36 |
+/// | addend negate | 35 | | `src0bank` (1 bit) | 34 |
+/// | `destbankext` / `src1bankext` / `src2bankext` | 51 / 49 / 48 | | banks | 33:32 / 31:30 / 29:28 |
+/// | `destnum` / `src0num` / `src1num` / `src2num` | 27:21 / 20:14 / 13:7 / 6:0 | | | |
+///
+/// # Only the own-byte form, and why that one is certain
+/// With every selector, complement and negate bit clear, each byte's terms are that byte of
+/// src0, src1 and src2 - the reading every description of the group agrees on. The numeric
+/// codes of the non-zero selectors come from a single description, so they are refused by name
+/// rather than wired. The corpus closes the own-byte form: its one word, in a vertex prologue,
+/// is `x = x * 0x01010101 + 0x00000001` over a register the preceding SOP left as 0 or 255 per
+/// byte, followed by a U8 unpack of byte 0 - a boolean NOT (255 -> 0, 0 -> 1) under this
+/// reading, which also pins the WRAP (a saturating add would leave 255 at 255).
+fn decode_grp_ima8(word: u64) -> Instr {
+    let mut blocked: Option<&'static str> = None;
+    let mut block = |reason: &'static str| {
+        if blocked.is_none() {
+            blocked = Some(reason);
+        }
+    };
+    if bits(word, 56, 56) != 0 || bits(word, 47, 47) != 0 || bits(word, 42, 42) != 0 || bits(word, 40, 38) != 0 {
+        block("0x98 IMA8: a term COMPLEMENT bit - which bit complements which term is not established");
+    }
+    if bits(word, 53, 52) != 0 || bits(word, 41, 41) != 0 || bits(word, 37, 36) != 0 {
+        block("0x98 IMA8: a non-zero term SELECTOR (alpha replication / addend source) - its numeric codes are not established");
+    }
+    if bits(word, 35, 35) != 0 {
+        block("0x98 IMA8: the addend NEGATE - not established");
+    }
+    if bits(word, 46, 44) != 0 {
+        block("0x98 IMA8: a repeat - the repeat grammar is not established for this group");
+    }
+    let dest = if bits(word, 51, 51) != 0 {
+        block("0x98 IMA8: an extended destination bank");
+        None
+    } else {
+        match r7_dest_bank_index(bits(word, 33, 32) as u8, bits(word, 27, 21)) {
+            Some((bank, index)) => Some(Operand::plain(bank, index, bits(word, 33, 32) as u8)),
+            None => {
+                block("0x98 IMA8: an index-mode destination");
+                None
+            }
+        }
+    };
+    let src0_sel = bits(word, 34, 34) as u8;
+    let src0_bank = if src0_sel == 0 { Bank::Temp } else { Bank::PrimaryAttr };
+    let src0 = Operand::plain(src0_bank, r7_reg_index(bits(word, 20, 14)), src0_sel);
+    let mut source = |ext: bool, sel: u8, field: u32| -> Operand {
+        if !ext {
+            let (bank, index) = r7_source_bank_index(sel, field);
+            return Operand::plain(bank, index, sel);
+        }
+        block("0x98 IMA8: an extended source bank (immediate / constant / indexed) - not established for this group");
+        Operand::plain(Bank::Temp, 0, sel)
+    };
+    let src1 = source(bits(word, 49, 49) != 0, bits(word, 31, 30) as u8, bits(word, 13, 7));
+    let src2 = source(bits(word, 48, 48) != 0, bits(word, 29, 28) as u8, bits(word, 6, 0));
+    Instr {
+        op: Op::IntMad8 { sat: bits(word, 43, 43) != 0 },
+        pred: short_predicate(bits(word, 58, 57)),
+        dest,
+        // One 32-bit lane, all four of its bytes - the group has no write mask.
+        write_mask: [true, false, false, false],
+        srcs: vec![src0, src1, src2],
+        half_precision: false,
+        raw: word,
+        group: 0x98,
         blocked,
     }
 }
@@ -767,6 +847,17 @@ fn decode_grp_test(word: u64) -> Instr {
         // the fixed-function approximation, which paints this title's world FLAT - a black
         // course at address and a flat green one at the ball - with no error anywhere.
         (1, 10) => (TestAlu::IntSub, false, false),
+        // The same family at op 7, and the same closure: what is tested is an INTEGER SWITCH.
+        // A newer title's material uber-shader (`BlendTexture1BlendModeOf{Color,Alpha}`, both
+        // declared `Uniform S32`) tests the mode register against the program's own literal
+        // registers - 10, 2, 3, 1, 4, 5, 6, 7, 8, 9 and 0, one case each - for EQUAL, plus one
+        // `mode >= 10` range guard ahead of them, every one followed by the branch to that
+        // case's blend. Small integers against small integer literals: `a - b` tests exactly
+        // the predicate each of those relations asks for, and so would any compare the op could
+        // be. What would REFUTE it is an operand that is not an integer the compare could
+        // overflow on, which a mode switch never has. Blocked, every draw of the shader was
+        // dropped - the title's Now Loading screen among them.
+        (1, 7) => (TestAlu::IntSub, false, false),
         _ => {
             blocked = blocked.or(Some("0x48 VTST ALU family/op not modeled"));
             (TestAlu::Sub, prec == 0, true)
@@ -1809,11 +1900,21 @@ pub(crate) fn mask_table_mad_for(half: bool, m16: u32, m32: u32, en: u32) -> [bo
 /// same capsule gives a compact standing figure, so the guest's data was never the problem.
 /// `VITASLOP_GXP_MAD_MASK16=0` is the arm back to the two-table reading.
 fn mask_table_mad(half: bool, swz_mask16: u32, swz_mask32: u32, swz_en: u32) -> [bool; 4] {
-    let (lane0, lane1) = (swz_en & 1 != 0, if half { swz_mask16 & 1 != 0 } else { swz_mask32 & 1 != 0 });
+    let lane0 = swz_en & 1 != 0;
     if half {
         // A lane is a REGISTER, and a register holds two f16 channels.
+        //
+        // >>> EITHER MASK BIT ENABLES THE SECOND REGISTER. Measured over a 108-program corpus:
+        // f16 mads into a primary-attribute register that write four channels set `swz_mask16`
+        // (20 of 20), while the eight into an INTERNAL register that set `swz_mask32` alone are
+        // all normal-map unpacks (`n = tex.wyzw * 2 - 1`) whose very next instructions read
+        // lane z. Reading `swz_mask16` alone left that lane holding whatever the register had
+        // before (a squared diffuse colour), which bent the normal through the surface and
+        // painted dark streaks over every player's kit and skin.
+        let lane1 = (swz_mask16 | swz_mask32) & 1 != 0;
         [lane0, lane0, lane1, lane1]
     } else {
+        let lane1 = swz_mask32 & 1 != 0;
         let lane2 = swz_mask16 & 1 != 0 && mad_mask16_lane2();
         [lane0, lane1, lane2, false]
     }
@@ -3517,6 +3618,9 @@ fn i16mad_addend(word: u64) -> i32 {
 /// What it would mean on some other encoding is not something this corpus can say, so every
 /// other bit still has to match and a word that differs anywhere else hard-fails.
 fn decode_grp_i16mad(word: u64) -> Instr {
+    if !i16mad_is_load_index(word) && i16mad_is_general(word) {
+        return decode_i16mad_general(word);
+    }
     let mut blocked = None;
     if !i16mad_is_load_index(word) {
         blocked = Some(
@@ -3604,6 +3708,90 @@ fn decode_grp_i16mad(word: u64) -> Instr {
         dest: Some(dest),
         write_mask: [true, false, false, false],
         srcs,
+        half_precision: false,
+        raw: word,
+        group: 0x14,
+        blocked,
+    }
+}
+
+/// The GENERAL group-0x14 encoding: every bit outside the operand fields of
+/// [`decode_i16mad_general`] and the src2 negate (53), and the index-register flag (51) clear.
+const I16MAD_GENERAL_WORD: u64 = 0xa080_0840_0000_0000;
+const I16MAD_GENERAL_VARIABLE: u64 = (0x1f << 21) // dest number
+    | (1 << 33) // dest bank
+    | (0x3f << 14) // src0 number
+    | (1 << 34) // src0 bank
+    | (0x7f << 7) | (0b11 << 30) | (1 << 49) // src1 number, bank, extension
+    | 0x7f | (0b11 << 28) | (1 << 48) // src2 number, bank, extension
+    | (1 << 53); // src2 negate
+
+fn i16mad_is_general(word: u64) -> bool {
+    word & !I16MAD_GENERAL_VARIABLE == I16MAD_GENERAL_WORD
+}
+
+/// Decode the GENERAL form of group 0x14: `dest = src0 * src1 +/- src2` on 16-bit operands.
+///
+/// >>> THE INDEX LOAD WAS ALWAYS THIS INSTRUCTION WITH TWO IMMEDIATES, AND THE FIELD THAT SAYS
+/// >>> SO IS THE ONE `resolve_index_load_stride` HAD TO INFER.
+///
+/// Read through group 0x15's operand layout (`src1` = ext 49, bank [31:30], number [13:7];
+/// `src2` = ext 48, bank [29:28], number [6:0]; ext + bank 2 = an inline immediate), every word
+/// the corpus already carried is `src0 * IMM + IMM`:
+///
+///  * the particle index loads read `src1` = 1 (bit 7, "set in every real word") and `src2` =
+///    the addend - `src * 1 + addend`, exactly the established decode;
+///  * the football skinning loads read `src1` = **3** (bits 8 and 7 - the "(b8,b51)" flag was
+///    bit 8 of this number) and `src2` = the matrix row - `bone * 3 + row`, the three-row stride
+///    `resolve_index_load_stride` reads off the program's maximum addend. The field and the
+///    inference agree on every word.
+///
+/// A football title's stadium tree IMPOSTORS then supply the first words with REGISTER
+/// operands, and the program closes only under this reading. Its `IN.tex0.x` is a U8 packing
+/// `corner * 64 + cell` (0..255 measured over 460 vertices; `quad` and `tex_offsets` are
+/// four-entry corner tables, `billboard_uvs` a 64-entry cell table), `T3 = tex0.x >> 6` is the
+/// corner, and the cell is fetched at `16 * pa0` after:
+///
+/// ```text
+///   #17  0xa0a2_0842_8000_c003   pa0 = T3 * 0 - T3          (= -corner)
+///   #18  0xa082_0846_a000_2004   pa0 = pa0 * 64 + pa4       (pa4 = int16(tex0.x))
+/// ```
+///
+/// which is `tex0.x - 64 * corner` = the cell. The two words differ in their operands and in
+/// BIT 53 alone, and #17 is the one whose result must be negative: read as an add it is
+/// `+corner` and every corner but 0 fetches cell + 128 (past the 64-entry table). Bit 53 is
+/// group 0x15's `src1_high`, but a half-select of an immediate 0 is still 0 and leaves #17 a
+/// plain copy - so in this group it is the subtract.
+///
+/// Operands are 16-bit and sign-extended (it is a 16-bit MAD); nothing in the corpus puts a
+/// value with a meaningful high half through it. The half selects of group 0x15 (56, 52) and
+/// every other bit are constant here and must match, or the word blocks.
+fn decode_i16mad_general(word: u64) -> Instr {
+    let mut blocked = None;
+    let bank1 = |sel: u32| if sel == 0 { Bank::Temp } else { Bank::PrimaryAttr };
+    let dsel = bits(word, 33, 33);
+    let dest = Operand::plain(bank1(dsel), bits(word, 25, 21) as u8, dsel as u8);
+    let ssel = bits(word, 34, 34);
+    let src0 = Operand::plain(bank1(ssel), bits(word, 19, 14) as u8, ssel as u8);
+    let mut source = |ext: bool, sel: u8, field: u32| -> Operand {
+        if !ext {
+            let (bank, index) = r7_source_bank_index(sel, field);
+            return Operand::plain(bank, index, sel);
+        }
+        if sel & 3 == 2 {
+            return Operand::plain(Bank::Immediate, (field & 0x7f) as u8, sel);
+        }
+        blocked = blocked.or(Some("0x14 I16MAD: an extended-bank source other than an immediate"));
+        Operand::plain(Bank::Temp, 0, sel)
+    };
+    let src1 = source(bits(word, 49, 49) != 0, bits(word, 31, 30) as u8, bits(word, 13, 7));
+    let src2 = source(bits(word, 48, 48) != 0, bits(word, 29, 28) as u8, bits(word, 6, 0));
+    Instr {
+        op: Op::IntMad16 { negate_src2: bits(word, 53, 53) != 0 },
+        pred: Predicate::Always,
+        dest: Some(dest),
+        write_mask: [true, false, false, false],
+        srcs: vec![src0, src1, src2],
         half_precision: false,
         raw: word,
         group: 0x14,
@@ -4103,8 +4291,10 @@ fn decode_grp_pack(word: u64) -> Instr {
         3 | 4 => Some(16u8),
         _ => None,
     };
+    // A MIXED integer width with `scale` clear is the same plain cast at a different element
+    // width - see `Op::PackIntCopy`'s `dest_bits` for the reading and the measurement.
     let int_copy = match (int_src, int_dest_width) {
-        (Some((sw, _)), Some(dw)) if sw == dw && !scale => Some(sw),
+        (Some((sw, signed)), Some(dw)) if !scale => Some((sw, dw, signed)),
         _ => None,
     };
     // The NORMALIZED U8 conversions, both directions. U8 is format 0, and it is the one
@@ -4311,7 +4501,7 @@ fn decode_grp_pack(word: u64) -> Instr {
                     Op::PackFromInt { bits: bits_, signed }
                 }
                 _ => match int_copy {
-                    Some(bits_) => Op::PackIntCopy { bits: bits_ },
+                    Some((bits_, dest_bits, signed)) => Op::PackIntCopy { bits: bits_, dest_bits, signed },
                     None => Op::Pack { src_half: src_fmt == 5 },
                 },
             }
@@ -4711,6 +4901,10 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // the channel the following test reads, and the complement is what turns the zero
         // coefficient into the copy the macro needs. A repeat count cannot also live there.
         0x12 => Some(0),
+        // 0x98 IMA8: its repeat count is 46:44, the position the 0x15/0x80 siblings use. Only a
+        // zero count is admitted - `decode_grp_ima8` blocks any other, since how a repeat steps
+        // this group's operands is not established.
+        0x13 if bits(word, 46, 44) == 0 => Some(0),
         // 0x14 I16MAD: the reference does not carry this group's layout, so there is no
         // documented repeat field to read. What IS known is that every occurrence in the corpus
         // is one fixed word outside its register-number field, so for that word the answer is
@@ -4734,6 +4928,9 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         0x14 if i16mad_is_load_index(word) => {
             Some(if load_index_repeats() { bits(word, 46, 44) } else { 0 })
         }
+        // The GENERAL form pins 46:44 to zero (they are outside its variable mask), so the
+        // count the load-index form reads there is zero on every word it admits.
+        0x14 if i16mad_is_general(word) => Some(0),
         // 0x15 IMAD32: a THREE-bit repeat count at 46:44, and bit 47 is a reserved zero rather
         // than the top of it. Reading it as the usual four bits at 47:44 would be harmless on
         // every word whose bit 47 is clear and would double the count on any word where it is
@@ -5946,9 +6143,10 @@ fn classified_stub(word: u64, op1: u8, _hi: u32, lo: u32) -> Instr {
         0x10 => Op::Todo("add.fx8"),
         0x11 => Op::Todo("add/sub.fx8"),
         0x12 => Op::Todo("add/sub/min/max.fx8"),
-        0x13 => Op::Todo("mad.u8"),
         0x14 | 0x15 => Op::Todo("mad (integer group)"),
-        0x19 => Op::Todo("mad.u8"),
+        // The NORMALISED fixed-point 8-bit multiply-add - not group 0x13's integer one, though
+        // both disassemble as "mad.u8".
+        0x19 => Op::Todo("mad.u8 (fixed point)"),
         0x1c => Op::Todo("tex"),               // 0xE0
         // 0x1d (0xE8 loads) is handled in decode() with full operand decode for the
         // established variant; only the STORE half of the memory-access format remains a stub.
@@ -6496,6 +6694,26 @@ mod tests {
             "an F16-result gather must block"
         );
     }
+    /// The group-0x13 IMA8 own-byte form on the one real word: `pa23 = pa23 * pa66 + pa49` per
+    /// byte, unpredicated, one iteration, nothing blocked - and a word that sets a term selector
+    /// or a complement still blocks rather than being read as the own-byte form.
+    #[test]
+    fn group_13_ima8_decodes_its_own_byte_form_and_blocks_the_rest() {
+        let instr = decode(0x9880_0006_a2ec_4bc2);
+        assert_eq!(instr.op, Op::IntMad8 { sat: false });
+        assert_eq!(instr.pred, Predicate::Always);
+        assert_eq!(instr.blocked, None);
+        let dest = instr.dest.expect("a decoded destination");
+        assert_eq!((dest.bank, dest.index), (Bank::PrimaryAttr, 23));
+        let srcs: Vec<_> = instr.srcs.iter().map(|o| (o.bank, o.index)).collect();
+        assert_eq!(srcs, vec![(Bank::PrimaryAttr, 49), (Bank::PrimaryAttr, 23), (Bank::PrimaryAttr, 66)]);
+        assert_eq!(repeat_extra_iterations(0x9880_0006_a2ec_4bc2), Some(0));
+        // The colour addend selector (53:52), a complement (56) and the negate (35), each alone.
+        for bit in [52u32, 56, 35] {
+            assert!(decode(0x9880_0006_a2ec_4bc2 | (1u64 << bit)).blocked.is_some(), "bit {bit}");
+        }
+    }
+
     /// The group-0x15 IMAD32 layout, checked against the one real word that established it -
     /// instruction #3 of a shipped vertex program, at code byte 0x18.
     ///
@@ -7934,6 +8152,50 @@ mod tests {
         // And a word outside the widened mask still blocks - bit 7 above the addend is set in
         // every real word and clear here.
         assert!(decode(0xa083_0940_a001_0100u64).blocked.is_some());
+    }
+
+    /// The general I16MAD form - register operands and the src2 subtract - decodes from the
+    /// impostor program's two words, and the operand fields read the SAME numbers off the words
+    /// the index-load decode already pinned (`src1` = 1 on the particle loads, 3 on the
+    /// skinning loads), so the two decodes are one layout.
+    #[test]
+    fn i16mad_general_form_decodes_the_impostor_cell_arithmetic() {
+        let neg = decode(0xa0a2_0842_8000_c003);
+        assert!(neg.blocked.is_none(), "{:?}", neg.blocked);
+        assert_eq!(neg.op, Op::IntMad16 { negate_src2: true });
+        let d = neg.dest.unwrap();
+        assert_eq!((d.bank, d.index), (Bank::PrimaryAttr, 0));
+        let s: Vec<_> = neg.srcs.iter().map(|o| (o.bank, o.index)).collect();
+        assert_eq!(s, [(Bank::Temp, 3), (Bank::Immediate, 0), (Bank::Temp, 3)]);
+
+        let mad = decode(0xa082_0846_a000_2004);
+        assert!(mad.blocked.is_none(), "{:?}", mad.blocked);
+        assert_eq!(mad.op, Op::IntMad16 { negate_src2: false });
+        let s: Vec<_> = mad.srcs.iter().map(|o| (o.bank, o.index)).collect();
+        assert_eq!(s, [(Bank::PrimaryAttr, 0), (Bank::Immediate, 64), (Bank::PrimaryAttr, 4)]);
+
+        // The established forms are untouched: they are not the general word, so they keep
+        // their own decode.
+        assert!(matches!(decode(0xa08b_0946_a022_0088).op, Op::LoadIndex { to_index: true, .. }));
+        assert!(matches!(decode(0xa083_0942_a000_c180).op, Op::LoadIndex { to_index: false, .. }));
+        // And their src1 field is the multiplier the index-load decode applies or infers.
+        assert_eq!(bits(0xa08b_0946_a022_0088, 13, 7), 1);
+        assert_eq!(bits(0xa083_0942_a000_c180, 13, 7), 3);
+        // A general word with a group-0x15 half-select set is outside what is established.
+        assert!(decode(0xa0a2_0842_8000_c003 | 1 << 56).blocked.is_some());
+    }
+
+    /// A normal-map unpack into an internal register sets `swz_mask32`, not `swz_mask16`, and
+    /// still writes all four channels - the next instruction reads lane z. Two-register and
+    /// one-register f16 mads into primary attributes keep their masks.
+    #[test]
+    fn an_f16_mad_into_an_internal_register_writes_lane_z_on_swz_mask32() {
+        let unpack = decode(0x0400_5984_bf30_076c);
+        assert_eq!(unpack.dest.map(|d| d.bank), Some(Bank::Internal));
+        assert!(unpack.half_precision);
+        assert_eq!(unpack.write_mask, [true; 4]);
+        assert_eq!(decode(0x04a0_9286_a040_1002).write_mask, [true; 4]);
+        assert_eq!(decode(0x0480_08a6_b180_51a3).write_mask, [true, true, false, false]);
     }
 
     #[test]

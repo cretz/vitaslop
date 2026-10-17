@@ -80,6 +80,8 @@ pub struct Probe {
     pub title: Option<String>,
     pub content_id: Option<String>,
     pub app_version: Option<String>,
+    /// `param.sfo` `CATEGORY` - `ac` for an add-on (see [`Probe::is_addcont`]).
+    pub category: Option<String>,
     /// Source bytes the import will read.
     pub bytes: u64,
     pub files: usize,
@@ -94,6 +96,14 @@ pub struct Probe {
     /// synchronous import call. A superset: a module-named file that turns out not to
     /// be a SELF is listed under `modules/` and never written.
     pub outputs: Vec<String>,
+}
+
+impl Probe {
+    /// Whether this is an add-on rather than a title: it belongs on its title's page, and
+    /// importing it over the title's own directory would wipe the game.
+    pub fn is_addcont(&self) -> bool {
+        self.category.as_deref().is_some_and(super::addcont::is_addcont_category)
+    }
 }
 
 const CHUNK: usize = 1 << 20;
@@ -635,7 +645,9 @@ fn is_exec_candidate_path(path: &str) -> bool {
 fn sfo_probe(probe: &mut Probe, sfo_bytes: &[u8]) {
     probe.title_id = sfo::title_id(sfo_bytes);
     probe.title = sfo::text_field(sfo_bytes, "TITLE").or_else(|| sfo::text_field(sfo_bytes, "STITLE"));
-    probe.app_version = sfo::text_field(sfo_bytes, "APP_VER");
+    // An add-on has no APP_VER; its own version is VERSION.
+    probe.app_version = sfo::text_field(sfo_bytes, "APP_VER").or_else(|| sfo::text_field(sfo_bytes, "VERSION"));
+    probe.category = sfo::text_field(sfo_bytes, "CATEGORY");
     if probe.content_id.is_none() {
         probe.content_id = sfo::text_field(sfo_bytes, "CONTENT_ID");
     }
@@ -652,6 +664,7 @@ pub fn probe(src: Rc<dyn ByteSource>) -> Result<Probe, Error> {
         title: None,
         content_id: None,
         app_version: None,
+        category: None,
         bytes: 0,
         files: 0,
         icon0: None,

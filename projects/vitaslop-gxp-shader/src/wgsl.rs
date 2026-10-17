@@ -1318,6 +1318,12 @@ struct Enclosing {
     /// A `loop`, which cannot be closed and re-entered at all: leaving it would run its
     /// remaining iterations outside the loop. See [`uniform_gap`].
     is_loop: bool,
+    /// The instruction index of the region's branch, which names its saved condition `gc<id>`.
+    id: usize,
+    /// Set by [`uniform_gap`] when it re-entered this region on the SAVED condition: the emitter
+    /// then declares `gc<id>` and assigns it just above the region's `if`. Shared by the then-
+    /// and else-arm of one `if`; `None` for a loop.
+    save: Option<std::rc::Rc<std::cell::Cell<bool>>>,
 }
 
 /// Close every enclosing region so control flow is UNIFORM, and re-enter them all - the text
@@ -1340,10 +1346,10 @@ struct Enclosing {
 /// not - and differencing them there is the same operation. A hoist, by contrast, would compute
 /// it as if every lane had taken the branch.
 ///
-/// Refuses two shapes rather than emitting something else:
-///   * an enclosing LOOP - closing it would run the rest of its iterations outside it;
-///   * a PREDICATE REGISTER written inside the region before this point, which would make the
-///     re-entry test a different condition than the one that let control in.
+/// An enclosing LOOP is not closed (the derivative stays in place - see below). A region whose
+/// tested PREDICATE REGISTER was rewritten inside it before this point is re-entered on its
+/// SAVED condition: an `if` reads its condition once, at entry, so the value saved there admits
+/// exactly the lanes it admitted - where re-reading the register would admit a different set.
 fn uniform_gap(
     shader: &Shader,
     enclosing: &[Enclosing],
@@ -1370,26 +1376,54 @@ fn uniform_gap(
         return Ok((format!("  {DERIVATIVE_IN_LOOP_MARKER}
 "), String::new()));
     }
-    // A write to ANY predicate register in the region counts: the conditions of the enclosing
-    // ifs are predicate reads, and re-testing one the region has rewritten would admit a
-    // different set of lanes to the rest of the block.
+    // >>> A REWRITTEN PREDICATE IS RE-ENTERED ON THE VALUE IT HAD AT ENTRY.
+    //
+    // Re-testing a predicate register the region has rewritten would admit a different set of
+    // lanes to the rest of the block, so such a region re-enters on its condition SAVED just
+    // above its `if` (`gc<id>`, see `Enclosing::save`). A region whose predicate was not written
+    // re-tests the register as before, which keeps its WGSL byte-identical. `TestMask` writes a
+    // general register, not a predicate, so it never counts. MEASURED need: a beach title's
+    // on-screen button prompt is drawn by a fragment program whose derivative follows a VTST of
+    // the very predicate its block branches on; refused, the pair was dropped and the prompt
+    // never appeared. A condition this cannot read as one predicate register counts as
+    // rewritten whenever ANY predicate is written - saving it is exact either way.
     let hi = index.min(shader.instrs.len());
-    if shader.instrs[from.min(hi)..hi]
+    let written: Vec<u8> = shader.instrs[from.min(hi)..hi]
         .iter()
-        .any(|i| matches!(i.op, Op::Test { .. } | Op::TestMask { .. }))
-    {
-        return blocked("a derivative inside a branch that rewrites a predicate register before                         it - the block cannot be re-entered on the same condition");
-    }
+        .filter_map(|i| match i.op {
+            Op::Test { pdst, .. } => Some(pdst),
+            _ => None,
+        })
+        .collect();
     let mut close = String::new();
     let mut reopen = String::new();
     for e in enclosing.iter().rev() {
         let _ = writeln!(close, "{}}}", e.pad);
     }
     for e in enclosing {
-        let c = if e.else_arm { format!("!({})", e.cond) } else { e.cond.clone() };
+        let rewritten = match predicate_read(&e.cond) {
+            Some(p) => written.contains(&p),
+            None => !written.is_empty(),
+        };
+        let cond = if rewritten {
+            let Some(save) = &e.save else {
+                return blocked("a derivative inside a region whose condition is rewritten and cannot be                         saved - the block cannot be re-entered on the same condition");
+            };
+            save.set(true);
+            format!("gc{}", e.id)
+        } else {
+            e.cond.clone()
+        };
+        let c = if e.else_arm { format!("!({cond})") } else { cond };
         let _ = writeln!(reopen, "{}if ({c}) {{", e.pad);
     }
     Ok((close, reopen))
+}
+
+/// The predicate register an enclosing region's condition reads - `p[n]` or `!p[n]`, the only
+/// two forms a branch condition is written in - or `None` for anything else.
+fn predicate_read(cond: &str) -> Option<u8> {
+    cond.strip_prefix('!').unwrap_or(cond).strip_prefix("p[")?.strip_suffix(']')?.parse().ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1598,6 +1632,7 @@ fn emit_range(
                 let mut arms = String::new();
                 let mut block_prelude = String::new();
                 let inner_start = cond_start.or(Some(index + 1));
+                let save = std::rc::Rc::new(std::cell::Cell::new(false));
                 {
                     let inner: &mut String =
                         if cond_start.is_some() { &mut *prelude } else { &mut block_prelude };
@@ -1610,6 +1645,8 @@ fn emit_range(
                         else_arm: false,
                         pad: pad.clone(),
                         is_loop: false,
+                        id: index,
+                        save: Some(save.clone()),
                     });
                     let mut inner_else: Vec<Enclosing> = enclosing.to_vec();
                     inner_else.push(Enclosing {
@@ -1617,6 +1654,8 @@ fn emit_range(
                         else_arm: true,
                         pad: pad.clone(),
                         is_loop: false,
+                        id: index,
+                        save: Some(save.clone()),
                     });
                     emit_range(
                         &mut arms,
@@ -1655,6 +1694,18 @@ fn emit_range(
                             let _ = writeln!(arms, "{pad}}}");
                         }
                     }
+                }
+                // A gap re-entered this region on its SAVED condition (see [`uniform_gap`]):
+                // declare it where the gap stands - the outermost block's prelude, which is the
+                // scope every gap closes to - and set it as control enters the `if`.
+                if save.get() {
+                    let decl = format!("{pad}var gc{index}: bool;\n");
+                    if cond_start.is_some() {
+                        prelude.push_str(&decl);
+                    } else {
+                        block_prelude.push_str(&decl);
+                    }
+                    arms = format!("{pad}gc{index} = {c};\n{arms}");
                 }
                 body.push_str(&block_prelude);
                 body.push_str(&arms);
@@ -1782,7 +1833,7 @@ fn emit_loop(
     let inner_encl: Vec<Enclosing> = enclosing
         .iter()
         .cloned()
-        .chain([Enclosing { cond: String::new(), else_arm: false, pad: pad.clone(), is_loop: true }])
+        .chain([Enclosing { cond: String::new(), else_arm: false, pad: pad.clone(), is_loop: true, id: head, save: None }])
         .collect();
     {
         let inner: &mut String =
@@ -3494,6 +3545,40 @@ fn emit_instr(
     } else {
         None
     };
+    // >>> AN IMPLICIT-LOD SAMPLE IS A DERIVATIVE TOO, AND GETS THE SAME TREATMENT.
+    //
+    // `textureSample` and `textureSampleBias` take the level of detail from the quad's
+    // derivatives of the coordinate, so WGSL holds them to uniform control flow exactly as it
+    // holds `dpdx`. MEASURED on a beach title: a sample inside `if (!p[0])` on a predicate
+    // tested from a VARYING - genuinely per-pixel - which naga compiled and Tint refused
+    // ("'textureSample' must only be called from uniform control flow"), so the browser lost
+    // the pipeline. As with `dsx`, the hardware computes the quad's LOD regardless and
+    // predicates only the write-back, so the sample is taken where control flow is uniform -
+    // above the instruction's own `if`, above the enclosing region, or in a uniform gap when
+    // the region itself computes the coordinate - and only the store stays conditional.
+    let hoisted_tex: Option<String> = match instr.op {
+        Op::Tex { unit, coords, coord_half, lod: lod @ (TexLod::Implicit | TexLod::Bias) }
+            if kind == ProgramKind::Fragment
+                && (cond_start.is_some() || !matches!(instr.pred, Predicate::Always)) =>
+        {
+            let call = tex_call(instr, unit, coords, coord_half, lod, kind).ok_or_else(unmapped)?;
+            let n = format!("gxp_texh{index}");
+            let line = format!("  let {n} = {call};\n");
+            let written = |from: usize| instr.srcs.iter().any(|s| writes_between(shader, from, index, s));
+            match cond_start {
+                Some(from) if written(from) => {
+                    let (close, reopen) = uniform_gap(shader, enclosing, from, index, index)?;
+                    body.push_str(&close);
+                    body.push_str(&line);
+                    body.push_str(&reopen);
+                }
+                Some(_) => prelude.push_str(&line),
+                None => body.push_str(&line),
+            }
+            Some(n)
+        }
+        _ => None,
+    };
     let r = match instr.op {
         Op::Mul => emit_binop(s, instr, dest, mask, "*", index).ok_or_else(unmapped),
         Op::Add => emit_binop(s, instr, dest, mask, "+", index).ok_or_else(unmapped),
@@ -3551,7 +3636,8 @@ fn emit_instr(
                 .ok_or_else(unmapped)
         }
         Op::Tex { unit, coords, coord_half, lod } => {
-            emit_tex(s, instr, dest, unit, coords, coord_half, lod, index, kind).ok_or_else(unmapped)
+            emit_tex(s, instr, dest, unit, coords, coord_half, lod, index, kind, hoisted_tex.as_deref())
+                .ok_or_else(unmapped)
         }
         Op::Bitwise { kind, imm, lane_bits } => {
             emit_bitwise(s, instr, dest, kind, imm, lane_bits).ok_or_else(unmapped)
@@ -3562,8 +3648,8 @@ fn emit_instr(
         Op::PackFromInt { bits, signed } => {
             emit_pack_from_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
         }
-        Op::PackIntCopy { bits } => {
-            emit_pack_int_copy(s, instr, dest, mask, bits).ok_or_else(unmapped)
+        Op::PackIntCopy { bits, dest_bits, signed } => {
+            emit_pack_int_copy(s, instr, dest, mask, bits, dest_bits, signed).ok_or_else(unmapped)
         }
         // The BYTE-WISE conditional move: one register, four independently selected bytes,
         // every operand a raw lane. There is no float view anywhere in it, which is why the
@@ -3577,9 +3663,13 @@ fn emit_instr(
         Op::IntMad { signed, bits, src0_high, src1_high } => {
             emit_int_mad(s, instr, dest, signed, bits, src0_high, src1_high).ok_or_else(unmapped)
         }
+        Op::IntMad16 { negate_src2 } => {
+            emit_int_mad16(s, instr, dest, negate_src2).ok_or_else(unmapped)
+        }
         Op::IntMadStep { signed, high_half } => {
             emit_int_mad_step(s, instr, dest, signed, high_half).ok_or_else(unmapped)
         }
+        Op::IntMad8 { sat } => emit_int_mad8(s, instr, dest, sat).ok_or_else(unmapped),
         // MEMORY LOAD: `elements` consecutive 32-bit guest words from byte address
         // `src0 + offset_bytes` into consecutive destination registers. WGSL has no raw
         // pointers, so the read goes through the draw's bound MEMORY WINDOW: a uniform
@@ -3998,10 +4088,16 @@ fn emit_pack_int_copy(
     dest: &Operand,
     mask: [bool; 4],
     bits: u8,
+    dest_bits: u8,
+    signed: bool,
 ) -> Option<()> {
-    debug_assert!(bits == 16 || bits == 8, "only the equal-width int copies decode to this op");
+    debug_assert!(bits == 16 || bits == 8, "only the 8- and 16-bit int widths decode to this op");
+    debug_assert!(dest_bits == 16 || dest_bits == 8, "only the 8- and 16-bit int widths decode to this op");
     let s1 = instr.srcs.first()?;
     let elems_per_reg = 32 / bits as u32;
+    // Only a WIDENING cast of a signed source moves a sign; equal widths and narrowing keep
+    // bits, and the destination store masks the element to its own width.
+    let extend = signed && dest_bits > bits;
     for c in 0..4 {
         if !mask[c] {
             continue;
@@ -4009,8 +4105,9 @@ fn emit_pack_int_copy(
         let sel = s1.swizzle[c] as u32;
         let reg = format!("{}[{}]", bank_prefix(s1.bank)?, s1.index as u32 + sel / elems_per_reg);
         let lo = (sel % elems_per_reg) * bits as u32;
-        let elem = raw_elem_expr(&reg, lo, bits as u32, false);
-        if bits == 16 {
+        let elem = raw_elem_expr(&reg, lo, bits as u32, extend);
+        let elem = if extend { format!("bitcast<u32>({elem})") } else { elem };
+        if dest_bits == 16 {
             body.store_raw_half(dest, c, &elem)?;
         } else {
             body.store_raw_byte(dest, c, &elem)?;
@@ -4696,16 +4793,36 @@ fn emit_tex(
     lod: TexLod,
     index: usize,
     kind: ProgramKind,
+    hoisted: Option<&str>,
 ) -> Option<()> {
+    const COMP: [&str; 4] = ["x", "y", "z", "w"];
+    let dp = Prec::of(instr);
+    // Sampled already, above the conditional that holds this instruction - see the hoist in
+    // `emit_instr`. Only the write-back is left here.
+    if let Some(tmp) = hoisted {
+        for c in 0..4 {
+            body.store(dest, c, &format!("{tmp}.{}", COMP[c]), dp)?;
+        }
+        return Some(());
+    }
+    let tmp = format!("_tex{index}");
+    let call = tex_call(instr, unit, coords, coord_half, lod, kind)?;
+    writeln!(body, "  let {tmp} = {call};").ok();
+    for c in 0..4 {
+        body.store(dest, c, &format!("{tmp}.{}", COMP[c]), dp)?;
+    }
+    Some(())
+}
+
+/// The sample call [`emit_tex`] makes, as WGSL text - `FUNC(tex, samp, vecK<f32>(...)EXTRA)`.
+fn tex_call(instr: &Instr, unit: u8, coords: u8, coord_half: bool, lod: TexLod, kind: ProgramKind) -> Option<String> {
     let (tex, samp) = sampler_names(kind, unit);
     let coord = instr.srcs.first()?;
     // The coordinate and the result carry INDEPENDENT precisions (`src0_type` vs
     // `fconv_type`): a shader routinely computes an F16 UV and asks for an F16 result, but
     // either can be F32, and reading the coordinate at the wrong width samples garbage.
     let cp = if coord_half { Prec::F16 } else { Prec::F32 };
-    let dp = Prec::of(instr);
     let cx = src_channel(coord, 0, cp)?;
-    let tmp = format!("_tex{index}");
     // 3-component samples (3D/cube) pass a vec3 direction/coordinate; 1D/2D pass a vec2
     // (1D pads Y to 0). The bound-texture type (2d/3d/cube) is chosen at pipeline-build.
     // The mip level, when the encoding supplies one. It is a scalar read at F32 (see the
@@ -4728,19 +4845,14 @@ fn emit_tex(
             )
         }
     };
-    if coords >= 3 {
+    Some(if coords >= 3 {
         let cy = src_channel(coord, 1, cp)?;
         let cz = src_channel(coord, 2, cp)?;
-        writeln!(body, "  let {tmp} = {func}({tex}, {samp}, vec3<f32>({cx}, {cy}, {cz}){extra});").ok();
+        format!("{func}({tex}, {samp}, vec3<f32>({cx}, {cy}, {cz}){extra})")
     } else {
         let cy = if coords >= 2 { src_channel(coord, 1, cp)? } else { "0.0".to_string() };
-        writeln!(body, "  let {tmp} = {func}({tex}, {samp}, vec2<f32>({cx}, {cy}){extra});").ok();
-    }
-    const COMP: [&str; 4] = ["x", "y", "z", "w"];
-    for c in 0..4 {
-        body.store(dest, c, &format!("{tmp}.{}", COMP[c]), dp)?;
-    }
-    Some(())
+        format!("{func}({tex}, {samp}, vec2<f32>({cx}, {cy}){extra})")
+    })
 }
 
 /// The 8-bit sum-of-products combiner ([`Op::Sop2`]), one statement per written channel:
@@ -4889,6 +5001,49 @@ fn emit_int_mad(
         format!("({a} * {b} + {c})")
     };
     writeln!(body, "  {}[{}] = {};", bank_prefix(dest.bank)?, dest.index as u32, expr).ok();
+    Some(())
+}
+
+/// Emit a group-0x14 general I16MAD: `dest = s16(src0) * s16(src1) +/- s16(src2)` - see
+/// [`Op::IntMad16`]. Each operand is a raw lane or an inline immediate, its low half
+/// sign-extended; the 32-bit sum wraps.
+fn emit_int_mad16(body: &mut Dest, instr: &Instr, dest: &Operand, negate_src2: bool) -> Option<()> {
+    let s16 = |o: &Operand| -> Option<String> {
+        if matches!(o.bank, Bank::Immediate) {
+            return Some(format!("{}i", o.index as i32));
+        }
+        let lane = format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32);
+        Some(format!("((bitcast<i32>({lane}) << 16u) >> 16u)"))
+    };
+    let a = s16(instr.srcs.first()?)?;
+    let b = s16(instr.srcs.get(1)?)?;
+    let c = s16(instr.srcs.get(2)?)?;
+    let op = if negate_src2 { '-' } else { '+' };
+    writeln!(
+        body,
+        "  {}[{}] = bitcast<u32>({a} * {b} {op} {c});",
+        bank_prefix(dest.bank)?,
+        dest.index as u32
+    )
+    .ok();
+    Some(())
+}
+
+/// Emit a group-0x13 IMA8: per byte, `dest.b = src1.b * src2.b + src0.b`, wrapped to 8 bits or
+/// clamped to 255 (`sat`). The register file is `array<u32>`, so each byte is a shift and mask
+/// of the raw lane, and the four results are reassembled into one lane. See [`Op::IntMad8`].
+fn emit_int_mad8(body: &mut Dest, instr: &Instr, dest: &Operand, sat: bool) -> Option<()> {
+    let raw = |o: &Operand| -> Option<String> { Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32)) };
+    let (a, b, c) = (raw(instr.srcs.first()?)?, raw(instr.srcs.get(1)?)?, raw(instr.srcs.get(2)?)?);
+    let byte = |v: &str, k: u32| format!("(({v} >> {}u) & 0xffu)", 8 * k);
+    let lanes: Vec<String> = (0..4u32)
+        .map(|k| {
+            let t = format!("({} * {} + {})", byte(&b, k), byte(&c, k), byte(&a, k));
+            let t = if sat { format!("min({t}, 255u)") } else { format!("({t} & 0xffu)") };
+            format!("({t} << {}u)", 8 * k)
+        })
+        .collect();
+    writeln!(body, "  {}[{}] = {};", bank_prefix(dest.bank)?, dest.index as u32, lanes.join(" | ")).ok();
     Some(())
 }
 
@@ -5242,7 +5397,7 @@ mod tests {
         // alone - the byte broadcast the same title emits (`sa[2]` bytes 1 and 2 from `sa[0]`
         // byte 0). A whole-register store would clear the partners.
         let mut copy =
-            instr(Op::PackIntCopy { bits: 8 }, Some(Operand::plain(Bank::SecondaryAttr, 2, 2)), vec![src(0)]);
+            instr(Op::PackIntCopy { bits: 8, dest_bits: 8, signed: false }, Some(Operand::plain(Bank::SecondaryAttr, 2, 2)), vec![src(0)]);
         copy.write_mask = [false, true, false, false];
         let wgsl = emit_fragment(&shader(vec![copy])).unwrap();
         assert!(
@@ -5538,6 +5693,31 @@ mod tests {
         let wgsl = emit_fragment(&shader(vec![ins])).unwrap();
         assert!(wgsl.contains(&st("o", 0, &format!("((-{}) + {})", rd("r", 11), rd("r", 20)))), "got:\n{wgsl}"); // ch0: -r[10+1]
         assert!(wgsl.contains(&st("o", 2, &format!("((-1.0) + {})", rd("r", 22)))), "got:\n{wgsl}"); // ch2: const 1.0
+    }
+
+    /// A predicated implicit-LOD sample is taken ABOVE its predicate's `if` and only the store
+    /// stays conditional - Tint refuses a `textureSample` in non-uniform control flow, and the
+    /// hardware computes the quad's LOD regardless (see the hoist in `emit_instr`).
+    #[test]
+    fn a_predicated_implicit_sample_is_hoisted_above_its_if() {
+        let d = Some(Operand::plain(Bank::Temp, 0, 0));
+        let uv = Operand::plain(Bank::Temp, 8, 0);
+        let mut ins = instr(Op::Tex { unit: 1, coords: 2, coord_half: false, lod: TexLod::Implicit }, d, vec![uv]);
+        ins.pred = Predicate::IfNotP(0);
+        let wgsl = emit_fragment(&shader(vec![ins])).unwrap();
+        let sample = wgsl.find("let gxp_texh0 = textureSample(t1, s1,").unwrap_or_else(|| panic!("not hoisted:\n{wgsl}"));
+        let cond = wgsl.find("if (!p[0]) {").unwrap_or_else(|| panic!("no predicate:\n{wgsl}"));
+        assert!(sample < cond, "the sample must precede the predicate's if:\n{wgsl}");
+        assert!(wgsl[cond..].contains("gxp_texh0.x"), "the store reads the hoisted sample:\n{wgsl}");
+        assert!(!wgsl[cond..].contains("textureSample("), "no sample left inside the if:\n{wgsl}");
+        // An unpredicated sample is emitted where it stands, as before.
+        let plain = emit_fragment(&shader(vec![instr(
+            Op::Tex { unit: 1, coords: 2, coord_half: false, lod: TexLod::Implicit },
+            Some(Operand::plain(Bank::Temp, 0, 0)),
+            vec![uv],
+        )]))
+        .unwrap();
+        assert!(plain.contains("let _tex0 = textureSample(t1, s1,") && !plain.contains("gxp_texh"), "got:\n{plain}");
     }
 
     #[test]
@@ -6100,10 +6280,11 @@ mod tests {
         assert!(with_derivative_directive(wgsl.clone()).starts_with("diagnostic(off, derivative_uniformity);"), "{wgsl}");
     }
 
-    /// A branch that rewrites a PREDICATE register before the derivative cannot be re-entered on
-    /// the same condition - the re-test would admit a different set of lanes - so it is refused.
+    /// A branch that rewrites ITS OWN predicate before the derivative cannot be re-entered by
+    /// re-testing the register - that would admit a different set of lanes - so it is re-entered
+    /// on the condition SAVED as control entered the `if`.
     #[test]
-    fn a_derivative_in_a_branch_that_rewrites_a_predicate_hard_fails() {
+    fn a_derivative_in_a_branch_that_rewrites_its_predicate_reenters_on_the_saved_condition() {
         // 0: br if p0 -> 4     (guards 1..3)
         // 1: mov r0
         // 2: vtst              (writes a predicate)
@@ -6125,14 +6306,53 @@ mod tests {
             Some(Operand::plain(Bank::Temp, 4, 0)),
             vec![Operand::plain(Bank::Temp, 0, 0)],
         );
-        let err = emit_fragment(&shader(vec![branch(4, Predicate::IfP(0)), mov(0), test, dsx]))
-            .unwrap_err();
-        match err {
-            EmitError::Blocked { reason, .. } => {
-                assert!(reason.contains("rewrites a predicate register"), "{reason}");
-            }
-            other => panic!("expected Blocked, got {other:?}"),
-        }
+        let wgsl = emit_fragment(&shader(vec![branch(4, Predicate::IfP(0)), mov(0), test, dsx]))
+            .expect("a rewritten predicate re-enters on its saved condition");
+        assert!(wgsl.contains("var gc0: bool;"), "the saved condition is declared:
+{wgsl}");
+        let (head, tail) = wgsl.split_once("dpdx").unwrap();
+        // Saved as control enters, BEFORE the block can rewrite p0...
+        let saved = head.find("gc0 = !p[0];").expect("saved at entry");
+        assert!(saved < head.find("if (!p[0]) {").unwrap(), "saved above the if:
+{wgsl}");
+        assert!(head.find("p[0] =").unwrap() > saved, "the rewrite comes after the save:
+{wgsl}");
+        // ...and the block is re-entered on the saved value, not on the rewritten register.
+        assert!(tail.contains("if (gc0) {"), "re-entered on the saved condition:
+{wgsl}");
+        assert!(!tail.contains("if (!p[0]) {"), "not on the rewritten register:
+{wgsl}");
+    }
+
+    /// ...but a predicate the enclosing `if` does NOT test leaves the re-entry condition reading
+    /// what it read at entry, so the derivative gets its gap.
+    #[test]
+    fn a_derivative_in_a_branch_that_writes_another_predicate_gets_a_uniform_gap() {
+        // 0: br if p0 -> 4     (guards 1..3)
+        // 1: mov r0
+        // 2: vtst              (writes p1, which nothing here branches on)
+        // 3: dsx r4 <- r0
+        let mut test = instr(
+            Op::Test {
+                alu: crate::ir::TestAlu::Sub,
+                cmp: crate::ir::TestCmp::Ne,
+                reduce: crate::ir::TestReduce::Channel(0),
+                pdst: 1,
+                write_back: false,
+            },
+            None,
+            vec![Operand::plain(Bank::Temp, 8, 0), Operand::plain(Bank::Temp, 9, 0)],
+        );
+        test.write_mask = [false; 4];
+        let dsx = instr(
+            Op::Dsx,
+            Some(Operand::plain(Bank::Temp, 4, 0)),
+            vec![Operand::plain(Bank::Temp, 0, 0)],
+        );
+        let wgsl = emit_fragment(&shader(vec![branch(4, Predicate::IfP(0)), mov(0), test, dsx]))
+            .expect("a write to an untested predicate does not block the gap");
+        assert_eq!(wgsl.matches("if (!p[0]) {").count(), 2, "the block is re-entered:\n{wgsl}");
+        assert!(wgsl.contains("p[1] ="), "the predicate write is kept:\n{wgsl}");
     }
 
     /// A branch whose target leaves the block an enclosing branch opened is irreducible - no

@@ -4,6 +4,7 @@
 //! ```text
 //! <home>/library/<TITLE_ID>/          the decrypted dump tree (what `--game` takes)
 //! <home>/library/<TITLE_ID>/meta.json the TitleMeta record; icon0.png, pic0.png beside it
+//! <home>/addons/<TITLE_ID>/<DIR>/     one installed add-on's dump tree; addon.json beside it
 //! <home>/saves/<profile>/<TITLE_ID>/  the guest's own saved state (SaveStore)
 //! <home>/settings.json                the global settings record
 //! <home>/titles/<TITLE_ID>.json       a title's settings patch
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use vitaslop_frontend::meta::TitleMeta;
+use vitaslop_frontend::meta::{AddonMeta, TitleMeta};
 use vitaslop_frontend::settings::{self, Settings};
 use vitaslop_runtime::ingest::stream::{self, ByteSource, DumpSink};
 use vitaslop_runtime::ingest::Error;
@@ -44,6 +45,11 @@ pub fn library_dir() -> PathBuf {
 }
 pub fn title_dir(id: &str) -> PathBuf {
     library_dir().join(id)
+}
+/// Where a title's add-ons live, one subdirectory each (what `RetailGuest::mount_addons`
+/// and `--addons` take).
+pub fn addons_dir(id: &str) -> PathBuf {
+    home().join("addons").join(id)
 }
 pub fn saves_dir(profile: &str) -> PathBuf {
     home().join("saves").join(if profile.is_empty() { "default" } else { profile })
@@ -296,8 +302,104 @@ pub fn write_meta(m: &TitleMeta) -> std::io::Result<()> {
     fs::write(dir.join("meta.json"), serde_json::to_string_pretty(m)?)
 }
 
+/// Remove a title and every add-on installed for it - an add-on is part of its title.
 pub fn remove_title(id: &str) -> std::io::Result<()> {
+    match fs::remove_dir_all(addons_dir(id)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     fs::remove_dir_all(title_dir(id))
+}
+
+// ------------------------------- add-ons -------------------------------
+
+const ADDON_META: &str = "addon.json";
+
+/// The add-ons installed for `id`, by name.
+pub fn list_addons(id: &str) -> Vec<AddonMeta> {
+    let mut out: Vec<AddonMeta> = fs::read_dir(addons_dir(id))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let m: AddonMeta = serde_json::from_str(&fs::read_to_string(e.path().join(ADDON_META)).ok()?).ok()?;
+            (e.file_name().to_string_lossy() == m.dir && m.title_id == id).then_some(m)
+        })
+        .collect();
+    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.dir.cmp(&b.dir)));
+    out
+}
+
+/// Remove one add-on of `id`.
+pub fn remove_addon(id: &str, dir: &str) -> std::io::Result<()> {
+    // The name came from the record, but it is joined onto a path: refuse anything that is
+    // not a plain add-on directory name.
+    if dir.is_empty() || !dir.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("not an add-on name: {dir:?}")));
+    }
+    fs::remove_dir_all(addons_dir(id).join(dir))
+}
+
+/// Import the add-on `src` holds for title `id` - from the same containers a title comes in.
+/// Refuses a title, and an add-on that belongs to another title. Re-importing one replaces it.
+pub fn import_addon_from(id: &str, src: DirSource, progress: &Arc<Mutex<ImportProgress>>) -> Result<AddonMeta, String> {
+    progress.lock().unwrap().picked = (src.files.len(), src.files.iter().filter_map(|(_, p)| fs::metadata(p).ok()).map(|m| m.len()).sum());
+    let src: Rc<dyn ByteSource> = Rc::new(src);
+    progress.lock().unwrap().stage = "reading".into();
+    let p = stream::probe(src.clone()).map_err(|e| e.to_string())?;
+    if !p.is_addcont() {
+        return Err(match &p.title_id {
+            Some(t) if p.category.is_some() => format!("this is not an add-on but a title ({t}) - import it from the library"),
+            _ => "this is not an add-on (its param.sfo does not say CATEGORY ac)".into(),
+        });
+    }
+    let owner = p.title_id.clone().unwrap_or_default();
+    if owner != id {
+        return Err(format!("this add-on belongs to {owner}, not {id}"));
+    }
+    if p.missing_work_bin {
+        return Err("this pkg has no work.bin and none was found beside it".into());
+    }
+    let cid = p.content_id.clone().unwrap_or_default();
+    let name = vitaslop_runtime::ingest::addcont::dir_name(&cid)
+        .ok_or_else(|| format!("content id {cid:?} names no add-on directory"))?
+        .to_string();
+    progress.lock().unwrap().probe = Some(ProbeCard {
+        title: p.title.clone().unwrap_or_else(|| name.clone()),
+        title_id: id.to_string(),
+        app_version: p.app_version.clone().unwrap_or_default(),
+        kind: p.kind.to_string(),
+        zipped: p.zipped,
+        files: p.files,
+        bytes: p.bytes,
+        icon0: None,
+        replacing: list_addons(id).iter().any(|a| a.dir == name),
+    });
+    let dir = addons_dir(id).join(&name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut sink = DirSink::new(dir.clone());
+    let mut report = |pr: stream::Progress<'_>| {
+        let mut g = progress.lock().unwrap();
+        g.stage = pr.stage.to_string();
+        g.file = pr.file.to_string();
+        g.done = pr.done;
+        g.total = pr.total;
+    };
+    let content_id = stream::import(src, &mut sink, &mut report).map_err(|e| e.to_string())?;
+    let meta = AddonMeta {
+        title_id: id.to_string(),
+        dir: name.clone(),
+        content_id,
+        title: p.title.clone().unwrap_or(name),
+        version: p.app_version.clone().unwrap_or_default(),
+        source_kind: p.kind.to_string(),
+        bytes: p.bytes,
+        files: p.files as u32,
+        imported_at: now_ms(),
+    };
+    fs::write(dir.join(ADDON_META), serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    Ok(meta)
 }
 
 pub fn now_ms() -> u64 {
@@ -480,6 +582,12 @@ pub fn import_from(src: DirSource, progress: &Arc<Mutex<ImportProgress>>) -> Res
     progress.lock().unwrap().stage = "reading".into();
     let p = stream::probe(src.clone()).map_err(|e| e.to_string())?;
     let id = p.title_id.clone().ok_or("no param.sfo, so no title id to file this under")?;
+    // Filed under its title's id, an add-on would replace the game itself.
+    if p.is_addcont() {
+        return Err(format!(
+            "this is an add-on for {id}, not a game - open that game in the library and add it under Add-ons"
+        ));
+    }
     if p.missing_work_bin {
         return Err("this pkg has no work.bin and none was found beside it".into());
     }

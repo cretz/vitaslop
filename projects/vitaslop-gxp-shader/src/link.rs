@@ -504,6 +504,44 @@ pub fn prelink(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions, now_ms: fn() -> 
     memo_store(vbytes, fbytes, opts, r);
 }
 
+/// Why a draw-time lookup for these inputs would MISS: `None` on a hit, else either "never
+/// translated" or the [`LinkOptions`] fields that differ from each translation already held for
+/// the same two blobs - i.e. which option a [`prelink`] guessed wrong. For the slow-link line.
+pub fn memo_miss_reason(v: &[u8], f: &[u8], opts: &LinkOptions) -> Option<String> {
+    let key = (blob_hash(v), blob_hash(f));
+    let g = LINK_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    let held: Vec<&LinkOptions> = g
+        .as_ref()
+        .and_then(|m| m.get(&key))
+        .map(|b| b.iter().filter(|e| &*e.0 == v && &*e.1 == f).map(|e| &e.2).collect())
+        .unwrap_or_default();
+    if held.contains(&opts) {
+        return None;
+    }
+    if held.is_empty() {
+        return Some("never translated".into());
+    }
+    let diffs: Vec<String> = held
+        .iter()
+        .map(|o| {
+            let mut d = Vec::new();
+            if o.dual_source != opts.dual_source { d.push(format!("dual_source {}->{}", o.dual_source, opts.dual_source)); }
+            if o.raw_units != opts.raw_units { d.push(format!("raw_units {:#x}->{:#x}", o.raw_units, opts.raw_units)); }
+            if o.raw64_output != opts.raw64_output { d.push(format!("raw64_output {}->{}", o.raw64_output, opts.raw64_output)); }
+            if o.guest_attrs != opts.guest_attrs { d.push(format!("guest_attrs {:?}->{:?}", o.guest_attrs, opts.guest_attrs)); }
+            if o.colour_output_masked_off != opts.colour_output_masked_off {
+                d.push(format!("colour_output_masked_off {}->{}", o.colour_output_masked_off, opts.colour_output_masked_off));
+            }
+            if o.alpha_to_red != opts.alpha_to_red { d.push(format!("alpha_to_red {}->{}", o.alpha_to_red, opts.alpha_to_red)); }
+            if o.patched_against != opts.patched_against {
+                d.push(format!("patched_against {}->{}", o.patched_against.is_some(), opts.patched_against.is_some()));
+            }
+            d.join(", ")
+        })
+        .collect();
+    Some(format!("held {} other option set(s): [{}]", held.len(), diffs.join("] [")))
+}
+
 /// `(ms translated ahead by [`prelink`], pairs, draw-time memo hits)` - cumulative.
 pub fn prelink_stats() -> (f64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;

@@ -40,7 +40,7 @@
       // own wasm instance). The browser has no environment, so this is the only way to
       // reach a VITASLOP_* knob - and one retail racer needs VITASLOP_FRAME_TOPUP=0 to
       // finish loading at all.
-      window.__boot = async (recipe, maxFrames, maxRounds, knobs, titleId = "default") => {
+      window.__boot = async (recipe, maxFrames, maxRounds, knobs, titleId = "default", playbook, profile) => {
       // Fetch one container file, refusing anything that is not a complete, successful
       // response.
       //
@@ -156,7 +156,7 @@
               const next = canvas.cloneNode(false);
               canvas.replaceWith(next);
               canvas = next;
-              window.__boot(recipe, maxFrames, maxRounds, { ...(knobs || {}), VITASLOP_MAIN_EXEC: path }, titleId);
+              window.__boot(recipe, maxFrames, maxRounds, { ...(knobs || {}), VITASLOP_MAIN_EXEC: path }, titleId, playbook, profile);
             };
             const timer = setTimeout(reboot, 3000);
             w.addEventListener("message", (e) => e.data && e.data.type === "released" && reboot());
@@ -202,6 +202,10 @@
             offscreen,
             titleId,
             recipe: recipe || "",
+            // `{ name, source }` when a playbook drives the run instead of a recipe.
+            playbook: playbook || undefined,
+            // The save profile (gamedata.js): a fresh name is a first boot with no saves.
+            profile: profile || undefined,
             maxFrames,
             knobs: knobs || {},
             prebuilt,

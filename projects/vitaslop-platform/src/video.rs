@@ -203,6 +203,15 @@ pub trait VideoDecode: Send {
     /// arrive", never a promise - see [`VideoDecoder::owes_frames`].
     fn owes_frames(&self) -> bool;
 
+    /// Access units submitted and not yet answered - how far ahead of the pictures taken the
+    /// decoder has been fed. A synchronous decoder has answered by the time `submit` returns,
+    /// so the default is 0; an asynchronous one (WebCodecs, [`ThreadedDecode`]) counts them, and
+    /// a caller that feeds "until a picture is ready" bounds itself on this instead, because on
+    /// those the picture is not ready until LATER, whatever is fed now.
+    fn in_flight(&self) -> usize {
+        0
+    }
+
     /// Block until every access unit already submitted has been ANSWERED by the decoder, so
     /// that a following [`poll`](Self::poll) sees a queue whose contents depend only on the
     /// input given and not on how far a host thread happened to get.
@@ -282,6 +291,10 @@ impl VideoDecode for VideoDecoder {
 
     fn owes_frames(&self) -> bool {
         VideoDecoder::owes_frames(self)
+    }
+
+    fn in_flight(&self) -> usize {
+        self.outstanding
     }
 
     fn behind_stream(&mut self) -> bool {
@@ -555,6 +568,10 @@ impl VideoDecode for ThreadedDecode {
         self.outstanding > 0
     }
 
+    fn in_flight(&self) -> usize {
+        self.outstanding
+    }
+
     /// Wait until the worker has retired every submit this decoder is still owed an answer
     /// for. See the trait method for why the movie path is wrong without it.
     fn drain_owed(&mut self) {
@@ -678,13 +695,17 @@ impl From<vitaslop_h264::Error> for VideoError {
 /// The guest waits for its first picture, under the host lock, so that set-up stopped the whole
 /// emulator at a fighting title's movie start (the speakers went dry 80-108 ms). A Vita movie
 /// is at most 960x544 and decodes on its own thread ([`ThreadedDecode`]); H.264 decoding is
-/// bit-exact, so the picture is the same. The browser keeps WebCodecs' own choice.
-/// `VITASLOP_VIDEO_HARDWARE=1` is the arm back to the hardware decoder.
+/// bit-exact, so the picture is the same.
+///
+/// >>> AND IN THE BROWSER TOO (WebCodecs `prefer-software`). Left to its own choice, Chrome on
+/// the target phone took the hardware decoder and handed every picture back as GPU-resident
+/// RGBA: MEASURED (job 009, a beach title's intro movie) `VideoFrame.copyTo` 19 ms a picture
+/// (worst 79) - a readback - plus 10.6 ms converting RGBA back to the 4:2:0 the title samples,
+/// all on the run worker, and the movie played at 11 fps. The software decoder hands over I420
+/// in CPU memory, which copies as bytes and needs no colour conversion.
+/// `VITASLOP_VIDEO_HARDWARE=1` is the arm back to the hardware decoder on every host.
 #[cfg(feature = "video")]
 fn movie_hardware() -> Option<bool> {
-    if cfg!(target_arch = "wasm32") {
-        return None;
-    }
     let on = crate::knobs::var("VITASLOP_VIDEO_HARDWARE").is_ok_and(|v| v.trim() == "1");
     Some(on)
 }

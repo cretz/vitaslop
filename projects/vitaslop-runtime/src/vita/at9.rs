@@ -256,6 +256,9 @@ enum SourceKind {
 /// samples.
 pub(crate) struct At9Voice {
     kind: SourceKind,
+    /// Set when this voice's decode failed, taken by the mix loop - see
+    /// [`At9Bank::take_failed`].
+    decode_failed: bool,
     /// The buffer being played NOW: a copy of `bufs[cur]`'s pointer and length, kept as
     /// plain fields because every decode path reads them per grain.
     data_ptr: u32,
@@ -412,6 +415,7 @@ impl At9Voice {
 
     fn empty() -> At9Voice {
         At9Voice {
+            decode_failed: false,
             heard: false,
             heard_audible: false,
             life_peak: 0,
@@ -1387,7 +1391,7 @@ impl At9Voice {
             let mut inner = 0usize;
             let last_superframe = self.consumed + 2 * self.superframe_bytes > self.data_bytes;
             let before = self.pending.len();
-            for _ in 0..frames {
+            for frame in 0..frames {
                 match dec.decode_frame(&sf[inner..], pcm) {
                     Ok(used) => {
                         // The descriptor's head discard: the encoder delay the title asks
@@ -1400,11 +1404,54 @@ impl At9Voice {
                     }
                     Err(e) => {
                         self.playing = false;
+                        self.decode_failed = true;
                         let consumed = self.consumed;
-                        self.refuse(format_args!(
+                        // What the failure needs to be judged from: which slot of which chain,
+                        // how far into it, the config the decoder was built from, and the bytes
+                        // of the superframe that failed. A bare offset says only that it failed.
+                        let chain: Vec<String> = self
+                            .bufs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, b)| {
+                                format!("[{i}] {:#010x}+{} loop {} next {}", b.ptr, b.bytes, b.loop_count, b.next)
+                            })
+                            .collect();
+                        let head: Vec<String> = sf.iter().take(16).map(|b| format!("{b:02x}")).collect();
+                        let (cur, data_bytes, config) = (self.cur, self.data_bytes, self.config);
+                        // >>> A SUPERFRAME THAT IS ONE BYTE REPEATED IS THE TITLE'S DATA RUNNING
+                        // >>> OUT, NOT A DECODER FAULT. MEASURED on a football title: its
+                        // streamed SFX rings end in ZERO padding the decoder reaches a few frames
+                        // before the title's own length check stops the voice (it stops it as
+                        // already-ended 3 frames later and replays it), and its menu music voice
+                        // is left playing over a bank the match load frees, which the allocator
+                        // refills with 0xCD. Either way the voice ends in silence, as it would on
+                        // the device. That case is reported at DEBUG; a failure on varied bytes
+                        // is a real decode fault and stays a WARN.
+                        let uniform = sf.iter().all(|&b| b == sf[0]);
+                        let text = format!(
                             "ATRAC9 decode failed {consumed} bytes into the source: {e:?} - the \
-                             voice stops here"
-                        ));
+                             voice stops here (slot {} of {}, {} bytes, superframe {sf_bytes} \
+                             bytes, frame {} at byte {inner}, spanning {spanning}, config \
+                             {:02x?}, superframe head {}){}",
+                            cur,
+                            chain.join(" | "),
+                            data_bytes,
+                            frame,
+                            config,
+                            head.join(""),
+                            if uniform {
+                                " - the superframe is one byte repeated, so the title's data ran \
+                                 out here (end-of-sound padding or freed memory)"
+                            } else {
+                                ""
+                            }
+                        );
+                        if uniform {
+                            self.refuse_quiet(format_args!("{text}"));
+                        } else {
+                            self.refuse(format_args!("{text}"));
+                        }
                         return;
                     }
                 }
@@ -2047,9 +2094,17 @@ pub(crate) struct At9Bank {
     /// its routing after starting the voice makes a perfectly ordinary buss look like a
     /// source that was never configured. `set_route` moves any voice it names out of here.
     no_source: std::collections::BTreeSet<u32>,
+    /// Voices whose decode failed since the last [`Self::take_failed`] - see
+    /// `ngs::report_failed_voices`.
+    failed: Vec<u32>,
 }
 
 impl At9Bank {
+    /// The voices whose decode failed since the last call, in the order they failed.
+    pub(crate) fn take_failed(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.failed)
+    }
+
     /// Handle `sceNgsVoiceUnlockParams` for the player module: capture the AT9 source
     /// the title just configured on `voice`.
     pub(crate) fn set_player_params(&mut self, ctx: &GuestCtx, voice: u32, params_addr: u32) {
@@ -2063,12 +2118,13 @@ impl At9Bank {
     /// whole path produces silence, so it SAYS so: the title asked for a sound and the
     /// engine has nothing to give it. Without this the only symptom is a correctly
     /// paced stream of zeroes, which looks like a working audio backend.
-    pub(crate) fn play(&mut self, voice: u32) {
+    pub(crate) fn play(&mut self, voice: u32, buss_rack: bool) {
         // A BUSS is played like any other voice and has no source of its own - that is
         // what a buss IS. Warning about it would be crying wolf on every mix graph, so
-        // a voice that other voices route INTO is reported quietly. Only a voice nobody
-        // routes into is genuinely a sound that will not be heard.
-        let is_buss = self.routes.values().any(|dst| *dst == voice);
+        // a voice of a buss rack (`buss_rack`), or one that other voices route INTO, is
+        // reported quietly. Only a voice nobody routes into is genuinely a sound that will
+        // not be heard.
+        let is_buss = buss_rack || self.routes.values().any(|dst| *dst == voice);
         match self.voices.get_mut(&voice) {
             Some(v) if v.data_ptr != 0 => {
                 // Counted HERE and not in `start`, which a loop calls again every lap: the
@@ -2126,6 +2182,12 @@ impl At9Bank {
         self.routes.values().any(|dst| *dst == voice)
     }
 
+    /// Whether a play on `voice` was counted as a sound with no source.
+    #[cfg(test)]
+    pub(crate) fn counted_without_source(&self, voice: u32) -> bool {
+        self.no_source.contains(&voice)
+    }
+
     /// Apply a non-source module's params to `voice`. Only the buss module is
     /// understood; every other module is a synthesiser stage nothing here runs.
     ///
@@ -2140,6 +2202,12 @@ impl At9Bank {
         if ctx.read_u32(params_addr) != BUSS_PARAMS_ID {
             return false;
         }
+        tracing::debug!(
+            target: "vitaslop::at9",
+            voice = format_args!("{voice:#x}"),
+            bytes = format_args!("{:02x?}", ctx.read_bytes(params_addr, 0x40)),
+            "buss module params"
+        );
         let v = self.voices.entry(voice).or_insert_with(At9Voice::empty);
         v.take_level(ctx, params_addr + OFF_BUSS_LEVEL);
         true
@@ -2414,6 +2482,9 @@ impl At9Bank {
             {
                 let _t = crate::perf::scope(crate::perf::Phase::AudioDecode);
                 v.fill(ctx, grain * vc, port_rate, &mut scratch);
+            }
+            if std::mem::take(&mut v.decode_failed) {
+                self.failed.push(handle);
             }
             // A voice the title has turned all the way down contributes nothing, so it
             // costs nothing: its samples are still CONSUMED below (the source has to

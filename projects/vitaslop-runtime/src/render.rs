@@ -1022,6 +1022,32 @@ pub fn level_offset(base_format: u32, tex_type: u32, width: u32, height: u32, le
     Some(off)
 }
 
+/// Bytes from one face of a cube map to the next: the face's FULL mip chain, down to 1x1,
+/// rounded up to 2 KB - whatever mip count the control word declares - except that a face whose
+/// level 0 is under 2 KB is packed at its level-0 size.
+///
+/// MEASURED from guest memory on three titles, decoding all six faces at each candidate stride
+/// (a wrong stride decodes faces 1-5 as strips of the face's own small levels or of whatever
+/// follows):
+/// - 128x128 UBC3, declaring ONE level: faces 22528 apart (chain 21872); three such cubes are
+///   allocated back to back 0x21000 = 6 x 22528 apart. Level 0 alone (16384) is wrong.
+/// - 128x128 UBC1, declaring eight: faces 12288 apart (chain 10936). 1 KB rounding (11264) is
+///   wrong, and the allocation is exactly 6 x 12288.
+/// - 64x64 UBC1, declaring seven: faces 4096 apart (chain 2744); 2048, 2744 and 3072 are wrong.
+/// - 16x16 UBC1, declaring one: the whole cube is 768 bytes before the next texture, i.e. six
+///   128-byte level-0 faces back to back - neither the chain (184) nor any rounding fits.
+///
+/// The size cut-off is the one fit for the last case; it is the least-measured part of the rule.
+pub fn cube_face_stride(base_format: u32, tex_type: u32, width: u32, height: u32) -> Option<u32> {
+    const ALIGN: u32 = 2048;
+    let level0 = level_layout(base_format, tex_type, width, height, 0)?.bytes;
+    if level0 < ALIGN {
+        return Some(level0);
+    }
+    let chain = level_offset(base_format, tex_type, width, height, max_mip_levels(width, height))?;
+    Some(align_up_to(chain, ALIGN))
+}
+
 /// One mip level of `t`, as a standalone single-face [`BoundTexture`] of that level's own
 /// dimensions.
 ///
@@ -1086,8 +1112,8 @@ fn block_format_for(base_format: u32) -> Option<BlockFormat> {
 ///    speckle" failure ([[vitaslop-textures-need-mips]]) - trading a memory defect for an image
 ///    defect, which is not a trade this makes silently.
 ///
-/// A cube map is excluded for the same reason its chain is not snapshotted: how six chains
-/// interleave in guest memory is not established.
+/// A cube map passes through face by face (see [`cube_face_stride`]); the two transcodes, which
+/// build one face, refuse it.
 fn compressed_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Option<CompressedUpload> {
     // Nothing here is worth doing on a GPU that cannot take the result - and this runs on the
     // texture decode path of every engine, including one whose adapter exposes ASTC and ETC2
@@ -1333,9 +1359,6 @@ fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
     if (t.swizzle >> 12) & 0x7 != 0 {
         return why("the channel swizzle is not the identity, and it is applied during the decode");
     }
-    if t.faces != 1 {
-        return why("it is a cube map, whose six mip chains' interleaving is not established");
-    }
     if !t.width.is_multiple_of(4) || !t.height.is_multiple_of(4) {
         return why("its size is not a multiple of the 4x4 block, which WebGPU requires");
     }
@@ -1363,10 +1386,13 @@ fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
     // bytes come to disagree.
     let bb = format.block_bytes();
     let swizzled = swizzled_type(t.tex_type);
-    let mut data: Vec<u8> = Vec::with_capacity(t.face_bytes as usize);
-    for level in 0..t.levels {
+    // A CUBE is six faces, each its own chain `face_bytes` apart (see `cube_face_stride`), which
+    // is the order the uploader hands WebGPU its layers in: every level of face 0, then face 1.
+    let faces = t.faces.max(1);
+    let mut data: Vec<u8> = Vec::with_capacity((t.face_bytes * faces) as usize);
+    for (face, level) in (0..faces).flat_map(|f| (0..t.levels).map(move |l| (f, l))) {
         let l = level_layout(t.base_format, t.tex_type, t.width, t.height, level)?;
-        let base = (level_offset(t.base_format, t.tex_type, t.width, t.height, level)?) as usize;
+        let base = (face * t.face_bytes + level_offset(t.base_format, t.tex_type, t.width, t.height, level)?) as usize;
         let (pw, ph) = (l.blocks_x.next_power_of_two(), l.blocks_y.next_power_of_two());
         for by in 0..l.blocks_y {
             for bx in 0..l.blocks_x {
@@ -1423,8 +1449,8 @@ pub fn raw_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpa
     if !matches!(t.base_format, 0x0c | 0x0d | 0x14 | 0x16) {
         return None;
     }
-    // One face only, like the transcode: a cube map's six chains' interleaving is not
-    // established, and the CPU path refuses them for the same reason.
+    // One face only, like the transcode: the expansion builds a single layer, so a cube takes
+    // the CPU decode, which walks all six.
     if t.faces != 1 {
         return None;
     }
@@ -1498,8 +1524,7 @@ pub fn block_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawEx
     if !matches!(t.base_format, 0x85..=0x87) {
         return None;
     }
-    // A cube map's six chains interleave in a way that is not established - the same refusal
-    // the passthrough and the transcode both make.
+    // The GPU transcoder builds one layer; a cube takes the CPU decode, which walks all six.
     if t.faces != 1 {
         return None;
     }
@@ -1615,7 +1640,7 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
         None
     };
     if t.faces != 1 {
-        return why("it is a cube map, whose six mip chains' interleaving is not established");
+        return why("it is a cube map, and the block transcode encodes one face");
     }
     if !t.width.is_multiple_of(4) || !t.height.is_multiple_of(4) {
         return why("its size is not a multiple of the 4x4 block, which WebGPU requires");
@@ -9973,10 +9998,48 @@ mod texture_tests {
         let mut tiny = build(0x87, 3, 4, 4);
         tiny.levels = 1;
         assert!(passthrough_source(&tiny).is_some(), "a 4x4 texture's chain is one level");
-        // A cube map: how six chains interleave is not established.
-        let mut cube = build(0x87, 2, 16, 8);
-        cube.faces = 6;
-        assert!(passthrough_source(&cube).is_none(), "a cube map's chain layout is not established");
+    }
+
+    /// A cube passes through as six chains, face after face, each read from `face_bytes` apart -
+    /// the order the uploader gives WebGPU its layers in.
+    #[test]
+    fn a_cube_passes_through_every_face_in_layer_order() {
+        let (w, h) = (64u32, 64u32);
+        let levels = max_mip_levels(w, h);
+        let chain = level_offset(0x87, 2, w, h, levels).unwrap();
+        let stride = cube_face_stride(0x87, 2, w, h).unwrap();
+        assert_eq!(chain, 5488);
+        assert_eq!(stride, 6144, "a 64x64 UBC3 chain rounded up to 2 KB");
+        // Each face's bytes carry its face number, so the output says where it read from.
+        let mut pixels = vec![0xeeu8; (stride * 6) as usize];
+        for f in 0..6 {
+            let at = (f * stride) as usize;
+            pixels[at..at + chain as usize].fill(f as u8);
+        }
+        let mut t = tex(0x87, 0, w, h, w.div_ceil(4) * 16, pixels);
+        t.tex_type = 2;
+        t.faces = 6;
+        t.levels = levels;
+        t.face_bytes = stride;
+        let c = passthrough_source(&t).expect("a cube with its chains passes through");
+        let vitaslop_platform::gpu::CompressedData::Cpu(data) = &c.data else { panic!("CPU bytes") };
+        assert_eq!(data.len(), (chain * 6) as usize);
+        for f in 0..6u32 {
+            let face = &data[(f * chain) as usize..((f + 1) * chain) as usize];
+            assert!(face.iter().all(|&b| b == f as u8), "face {f} read its own chain");
+        }
+    }
+
+    /// The two measured cubes - see [`cube_face_stride`]: 128x128 UBC3 faces 22528 apart (chain
+    /// 21872) and 128x128 UBC1 faces 12288 apart (chain 10936, which 1 KB rounding gets wrong).
+    #[test]
+    fn a_cube_face_stride_is_its_full_chain_rounded_to_two_kilobytes() {
+        assert_eq!(level_offset(0x87, 2, 128, 128, 8), Some(21872));
+        assert_eq!(cube_face_stride(0x87, 2, 128, 128), Some(22528));
+        assert_eq!(level_offset(0x85, 2, 128, 128, 8), Some(10936));
+        assert_eq!(cube_face_stride(0x85, 2, 128, 128), Some(12288));
+        assert_eq!(cube_face_stride(0x85, 2, 64, 64), Some(4096));
+        assert_eq!(cube_face_stride(0x85, 2, 16, 16), Some(128));
     }
 
     /// A refusal falls through to the TRANSCODE, not to the plain decode.

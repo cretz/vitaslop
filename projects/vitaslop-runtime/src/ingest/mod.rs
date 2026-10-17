@@ -26,6 +26,7 @@
 
 // Timing the per-byte crypto on the device running it. wasm only: elsewhere the `aes`
 // crate uses the CPU's AES instructions and the question does not arise.
+pub mod addcont;
 #[cfg(target_arch = "wasm32")]
 pub mod bench;
 pub mod filesdb;

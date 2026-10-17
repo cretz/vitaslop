@@ -79,9 +79,13 @@
 //! - `<frame>: @note <text>` / `<frame>: @todo <text>` - a durable note or an open
 //!   task for whoever (agent or human) picks up the recipe next. Heavy commenting is
 //!   strongly encouraged: record why an input is timed as it is and what was learned.
-//! - `<frame>: @wait call <function> [pulse <button> <every>]` - hold the input timeline here until the guest makes
+//! - `<frame>: @wait call <function> [pulse <button>[+<button>...] <every>]` - hold the input timeline here until the guest makes
 //!   that host call, then run every later input line late by the hold (see [`WaitDecl`]).
 //!   Anchors presses to a screen that appears after a LOAD, whose length varies by device.
+//! - `<frame>: @wait watch <name> <op> <value> [pulse ...]` - the same hold, released when the
+//!   `@watch` named `name` (declared above) meets `<op> <value>` (`== != < <= > >=`): pulse a
+//!   button to step a menu whose starting entry the recipe cannot choose until it names the
+//!   one wanted.
 //!
 //! ```text
 //! @title Tutorial - first lesson
@@ -106,6 +110,17 @@ use crate::world::{CtrlFrame, TouchFrame, World};
 
 /// The Vita `SceCtrlButtons` bit for each directive keyword (from the MIT
 /// vita-headers `psp2common/ctrl.h`).
+/// A `pulse` button: one name, or several joined by `+` and pressed TOGETHER (`start+cross`).
+///
+/// A combination is for a hold whose screens advance on DIFFERENT buttons with no call between
+/// them to split the hold on. MEASURED on a sports title: its title screen takes START and
+/// ignores CROSS, the autosave notice behind it takes CROSS and ignores START, and the only
+/// call that tells the two screens apart differs between engines - so a hold that pulses both
+/// answers whichever is up.
+fn pulse_bits(spec: &str) -> Option<u32> {
+    spec.split('+').try_fold(0u32, |bits, name| Some(bits | button_bit(name)?))
+}
+
 fn button_bit(name: &str) -> Option<u32> {
     // The canonical names come from BUTTON_NAMES (which is also what serialization
     // emits, so the two cannot drift); these are the accepted shorthands.
@@ -254,7 +269,7 @@ pub struct InputSegment {
 /// two are then the same object, which is what lets an interactive playthrough be
 /// written straight back out as a committed, reproducible recipe - the session does
 /// not approximate a recipe, it *is* one being authored.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Timeline {
     segments: Vec<InputSegment>,
     /// `@wait` holds in recipe-frame order, and the first one not yet released.
@@ -278,17 +293,49 @@ pub mod wait_call {
     };
     use std::sync::Mutex;
 
+    use super::{CmpOp, WaitOn, WatchDecl};
+
     static ARMED: AtomicBool = AtomicBool::new(false);
     static FIRED: AtomicBool = AtomicBool::new(false);
     static WANT: Mutex<String> = Mutex::new(String::new());
+    /// `@wait watch`: the condition, polled from the host-call site while it is armed.
+    static WATCH_ARMED: AtomicBool = AtomicBool::new(false);
+    static WATCH: Mutex<Option<(WatchDecl, CmpOp, f64)>> = Mutex::new(None);
 
-    /// Start waiting for `call`. Only calls made from now on count.
-    pub fn arm(call: &str) {
-        if let Ok(mut w) = WANT.lock() {
-            *w = call.to_string();
-        }
+    /// Start waiting for `on`. Only calls made (or values read) from now on count.
+    pub fn arm(on: &WaitOn) {
         FIRED.store(false, Release);
-        ARMED.store(true, Release);
+        match on {
+            WaitOn::Call(call) => {
+                if let Ok(mut w) = WANT.lock() {
+                    *w = call.clone();
+                }
+                ARMED.store(true, Release);
+            }
+            WaitOn::Watch { watch, op, value } => {
+                if let Ok(mut w) = WATCH.lock() {
+                    *w = Some((watch.clone(), *op, *value));
+                }
+                WATCH_ARMED.store(true, Release);
+            }
+        }
+    }
+
+    /// Whether an `@wait watch` condition is waiting to be polled. One atomic load.
+    #[inline]
+    pub fn watch_armed() -> bool {
+        WATCH_ARMED.load(Acquire)
+    }
+
+    /// Sample the armed `@wait watch` value from `mem` and fire when its condition holds.
+    /// Skips (rather than blocks) when another thread is polling at the same moment.
+    pub fn poll_watch(mem: &impl crate::recipe_eval::GuestRead) {
+        let Ok(w) = WATCH.try_lock() else { return };
+        let Some((watch, op, value)) = w.as_ref() else { return };
+        if crate::recipe_eval::sample_watch(mem, watch).is_some_and(|v| op.eval(v, *value, 0.0)) {
+            WATCH_ARMED.store(false, Release);
+            FIRED.store(true, Release);
+        }
     }
 
     /// Whether the armed call has been made since [`arm`].
@@ -346,14 +393,14 @@ impl Timeline {
                 if frame.saturating_sub(self.shift) < w.frame {
                     return;
                 }
-                wait_call::arm(&w.call);
+                wait_call::arm(&w.on);
                 self.holding = true;
                 self.held_from = frame;
                 tracing::info!(
                     target: "vitaslop::recipe",
-                    "recipe @wait at f{}: holding the input until the guest calls {}",
+                    "recipe @wait at f{}: holding the input until {}",
                     w.frame,
-                    w.call
+                    w.on
                 );
             }
             if !wait_call::fired() {
@@ -364,9 +411,9 @@ impl Timeline {
             self.shift = frame.saturating_sub(w.frame);
             tracing::info!(
                 target: "vitaslop::recipe",
-                "recipe @wait at f{}: {} called at display frame {frame} - later input runs {} frame(s) late",
+                "recipe @wait at f{}: {} at display frame {frame} - later input runs {} frame(s) late",
                 w.frame,
-                w.call,
+                w.on,
                 self.shift
             );
             self.next_wait += 1;
@@ -533,13 +580,37 @@ pub struct ShotDecl {
 /// hold starts. MEASURED on a fighting title: its "play style set" OK dialog opened after the
 /// recipe's CROSS on a phone, and a silent hold for the main menu behind it waited for ever -
 /// the menu cannot open until the dialog is answered, and no call names the dialog itself.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `@wait watch <name> <op> <value> [pulse ...]` holds instead until the `@watch` named
+/// `name` (declared above the line) satisfies `<op> <value>`. That is for a screen whose
+/// STARTING state is not the recipe's to choose - a menu that opens on a randomly picked entry
+/// under SMP scheduling - so a pulse steps it until the value names the entry wanted.
+#[derive(Clone, Debug, PartialEq)]
 pub struct WaitDecl {
     pub frame: u64,
-    /// The host call's name as the NID table spells it (`crate::nid::name`).
-    pub call: String,
+    pub on: WaitOn,
     /// `(button bits, every)`: tap while held - see above.
     pub pulse: Option<(u32, u64)>,
+}
+
+/// What a [`WaitDecl`] holds for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WaitOn {
+    /// The host call's name as the NID table spells it (`crate::nid::name`).
+    Call(String),
+    /// A watched memory value meeting `op value`.
+    Watch { watch: WatchDecl, op: CmpOp, value: f64 },
+}
+
+impl std::fmt::Display for WaitOn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WaitOn::Call(call) => write!(f, "the guest calls {call}"),
+            WaitOn::Watch { watch, op, value } => {
+                write!(f, "watch {} {} {}", watch.name, op.keyword(), crate::recipe_eval::format_f64(*value))
+            }
+        }
+    }
 }
 
 /// How many display frames one `pulse` tap holds its button down - long enough for a title
@@ -730,24 +801,35 @@ impl Recipe {
             }
             "wait" => {
                 let words: Vec<&str> = args.split_whitespace().collect();
-                let pulse = match words.as_slice() {
-                    ["call", _] => Some(None),
-                    ["call", _, "pulse", button, every] => match (button_bit(button), every.parse::<u64>()) {
-                        (Some(bit), Ok(every)) if every > PULSE_FRAMES => Some(Some((bit, every))),
-                        _ => None,
+                let usage = || RecipeError {
+                    line: line_no,
+                    reason: format!(
+                        "@wait expects `call <function name>` or `watch <name> <op> <value>`, then optionally `pulse <button>[+<button>...] <every frames > {PULSE_FRAMES}>`, got {:?}",
+                        args.trim()
+                    ),
+                };
+                let (on, tail) = match words.as_slice() {
+                    ["call", call, tail @ ..] => (WaitOn::Call(call.to_string()), tail),
+                    ["watch", name, op, value, tail @ ..] => {
+                        let watch = self.watches.iter().find(|w| w.name == *name).cloned().ok_or_else(|| RecipeError {
+                            line: line_no,
+                            reason: format!("@wait watch {name:?}: no @watch of that name is declared above this line"),
+                        })?;
+                        let op = CmpOp::parse(op).filter(|o| *o != CmpOp::Approx).ok_or_else(usage)?;
+                        let value: f64 = value.parse().map_err(|_| usage())?;
+                        (WaitOn::Watch { watch, op, value }, tail)
+                    }
+                    _ => return Err(usage()),
+                };
+                let pulse = match tail {
+                    [] => None,
+                    ["pulse", button, every] => match (pulse_bits(button), every.parse::<u64>()) {
+                        (Some(bit), Ok(every)) if every > PULSE_FRAMES => Some((bit, every)),
+                        _ => return Err(usage()),
                     },
-                    _ => None,
+                    _ => return Err(usage()),
                 };
-                let Some(pulse) = pulse else {
-                    return Err(RecipeError {
-                        line: line_no,
-                        reason: format!(
-                            "@wait expects `call <function name> [pulse <button> <every frames > {PULSE_FRAMES}>]`, got {:?}",
-                            args.trim()
-                        ),
-                    });
-                };
-                self.waits.push(WaitDecl { frame, call: words[1].to_string(), pulse });
+                self.waits.push(WaitDecl { frame, on, pulse });
                 self.waits.sort_by_key(|w| w.frame);
             }
             other => {
@@ -885,7 +967,7 @@ fn format_assert(kind: &AssertKind) -> String {
 /// The canonical directive keyword for each button bit, in the order a serialized
 /// line lists them. The single source of truth for the round trip: [`button_bit`]
 /// also accepts the aliases (`x`, `l`, `r`), which never round-trip out.
-const BUTTON_NAMES: &[(&str, u32)] = &[
+pub const BUTTON_NAMES: &[(&str, u32)] = &[
     ("select", 0x0000_0001),
     ("l3", 0x0000_0002),
     ("r3", 0x0000_0004),
@@ -1250,6 +1332,17 @@ mod tests {
         assert_eq!(at(&mut w, 52), 0);
     }
 
+    /// A `pulse` of `start+cross` presses both buttons together, and an unknown name in the
+    /// combination is a parse error rather than a pulse of the known half.
+    #[test]
+    fn a_pulse_can_press_a_button_combination() {
+        let text = "20: @wait call sceIoClose pulse start+cross 60\n";
+        let r = Recipe::parse(text).unwrap();
+        let bits = button_bit("start").unwrap() | button_bit("cross").unwrap();
+        assert_eq!(r.waits[0].pulse, Some((bits, 60)));
+        assert!(Recipe::parse("20: @wait call sceIoClose pulse start+nope 60\n").is_err());
+    }
+
     /// `wait_call` is process-wide, so the tests that arm it must not overlap.
     static WAIT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1275,6 +1368,38 @@ mod tests {
         assert_eq!(at(&mut w, 60), 0);
         assert!(RecipeWorld::parse(&format!("0: @wait call {peek} pulse cross 2\n")).is_err());
         assert!(RecipeWorld::parse(&format!("0: @wait call {peek} pulse nosuch 30\n")).is_err());
+    }
+
+    /// `@wait watch` pulses its button while the watched value does not meet the condition and
+    /// releases once a poll reads a value that does; a poll of a value that does not, changes
+    /// nothing.
+    #[test]
+    fn a_watch_wait_pulses_until_the_value_matches() {
+        struct Mem(u32);
+        impl crate::recipe_eval::GuestRead for Mem {
+            fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
+                out.copy_from_slice(&self.0.to_le_bytes()[..out.len()]);
+                addr == 0x8100_0010
+            }
+        }
+        let _one_at_a_time = WAIT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let text = "@watch place u32 0x81000010\n20: @wait watch place == 3 pulse right 10\n30: cross\n32:\n";
+        let mut w = RecipeWorld::parse(text).unwrap();
+        let at = |w: &mut RecipeWorld, f: u64| {
+            w.set_frame(f);
+            w.poll_ctrl(0).buttons
+        };
+        let right = button_bit("right").unwrap();
+        assert_eq!(at(&mut w, 20), 0, "the hold starts here");
+        assert_eq!(at(&mut w, 28), right, "held: the pulse steps the menu");
+        wait_call::poll_watch(&Mem(2));
+        assert_eq!(at(&mut w, 38), right, "a non-matching value keeps holding");
+        wait_call::poll_watch(&Mem(3));
+        assert_eq!(at(&mut w, 40), 0, "released at display 40 = recipe 20");
+        assert_eq!(at(&mut w, 50), 0x4000, "the cross written at 30 lands 20 frames late");
+        assert!(!wait_call::watch_armed());
+        assert!(Recipe::parse("20: @wait watch place == 3\n").is_err(), "an undeclared watch");
+        assert!(Recipe::parse("@watch place u32 0x81000010\n20: @wait watch place ~ 3\n").is_err());
     }
 
     #[test]

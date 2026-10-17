@@ -32,6 +32,12 @@ struct Row {
     /// caller's object pointers, which is what turns "this thread took the other branch" into
     /// an address a store watchpoint can be put on.
     regs: [u32; 13],
+    /// r0 when the handler last RETURNED to the guest (`None` before the first return), and
+    /// whether it has differed between returns. A loop that polls `TryLock` and never gets
+    /// the lock is one row with a constant error here - the table without it shows only that
+    /// the call is made.
+    ret: Option<u32>,
+    ret_varies: bool,
 }
 
 #[derive(Default)]
@@ -88,7 +94,23 @@ pub fn record(frame: u64, func_nid: u32, thid: i32, lr: u32, regs: &[u32]) {
     for (d, s) in first.iter_mut().zip(regs) {
         *d = *s;
     }
-    t.rows.insert(key, Row { seq, first_frame: frame, last_frame: frame, count: 1, arg0, arg0_varies: false, regs: first });
+    t.rows.insert(key, Row { seq, first_frame: frame, last_frame: frame, count: 1, arg0, arg0_varies: false, regs: first, ret: None, ret_varies: false });
+}
+
+/// Record what a call returned (r0 once its handler finished), on the row [`record`] made for
+/// the same (function, thread, return address). A call that blocked and returns later is not
+/// seen here; its row keeps the last immediate return.
+pub fn record_ret(frame: u64, func_nid: u32, thid: i32, lr: u32, r0: u32) {
+    let Some((from, to)) = spec() else { return };
+    if frame < from || frame > to {
+        return;
+    }
+    let Ok(mut g) = TABLE.lock() else { return };
+    let Some(r) = g.as_mut().and_then(|t| t.rows.get_mut(&(func_nid, thid, lr))) else { return };
+    if r.ret.is_some_and(|v| v != r0) {
+        r.ret_varies = true;
+    }
+    r.ret = Some(r0);
 }
 
 /// `[trace]` hits (block tracer, store watch log) kept for the diagnostics panel, so they can
@@ -151,6 +173,9 @@ pub fn report() -> String {
             r.arg0,
             if r.arg0_varies { "*" } else { "" }
         ));
+        if let Some(v) = r.ret {
+            s.push_str(&format!(" ret={v:#x}{}", if r.ret_varies { "*" } else { "" }));
+        }
         if regs_on {
             s.push_str(" regs=");
             for (i, v) in r.regs.iter().enumerate() {

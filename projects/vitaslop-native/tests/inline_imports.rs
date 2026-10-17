@@ -114,6 +114,7 @@ fn vm_with(op: InlineOp) -> Vm {
             redirects: &[],
             inline_imports: &inline,
             noreturn_svc: &[],
+            noreturn_imports: &[],
             mem_bytes: MEM_BYTES,
             discover_code_pointers: false,
             import_memory: false,

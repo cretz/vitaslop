@@ -32,6 +32,7 @@ pub mod ingest;
 pub mod link;
 pub mod nid;
 pub mod knobs;
+pub mod observer;
 pub mod call_table;
 pub mod mp4;
 pub mod mspace;

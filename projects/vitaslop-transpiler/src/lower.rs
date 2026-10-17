@@ -20,7 +20,7 @@ use yaxpeax_arm::armv7::{
 use crate::Error;
 use crate::ir::{
     Block, BinOp, ElemLane, FBinOp, FlagMask, Func, MemSize, NeonBin, NeonReg, NeonStmt, NeonType,
-    Stmt, Term, Value, VfpOp, VfpReg,
+    ParallelKind, ParallelLanes, ParallelOp, Stmt, Term, Value, VfpOp, VfpReg,
 };
 
 /// What lowering records for a flag statement's observable set.
@@ -48,14 +48,24 @@ const ALL_FLAGS: FlagMask = FlagMask::ALL;
 pub struct Imports<'a> {
     map: &'a BTreeMap<u32, u32>,
     redirects: &'a BTreeMap<u32, (u32, bool)>,
+    /// Import indices that never return (see `Program::noreturn_imports`).
+    noreturn: &'a [u32],
 }
 
 impl<'a> Imports<'a> {
-    pub fn new(map: &'a BTreeMap<u32, u32>, redirects: &'a BTreeMap<u32, (u32, bool)>) -> Self {
-        Imports { map, redirects }
+    pub fn new(
+        map: &'a BTreeMap<u32, u32>,
+        redirects: &'a BTreeMap<u32, (u32, bool)>,
+        noreturn: &'a [u32],
+    ) -> Self {
+        Imports { map, redirects, noreturn }
     }
     fn get(&self, addr: u32) -> Option<u32> {
         self.map.get(&addr).copied()
+    }
+    /// Whether the import stub at `addr` is one that never returns.
+    fn never_returns(&self, addr: u32) -> bool {
+        self.get(addr).is_some_and(|i| self.noreturn.contains(&i))
     }
     /// Rewrite an inter-module import stub address to the real callee address it
     /// resolves to; a non-redirected address is returned unchanged.
@@ -266,6 +276,8 @@ fn flow(
         Opcode::BL | Opcode::BLX => match branch_target(inst, addr, thumb)
             .map(|t| imports.resolve_call(t, if inst.opcode == Opcode::BLX { !thumb } else { thumb }))
         {
+            // A call to an import that never returns ends the path like a noreturn `svc`.
+            Some((t, _)) if imports.never_returns(t) => Flow::Halt,
             Some((t, _)) if imports.get(t).is_some() => Flow::Call { guest: None },
             Some((t, t_thumb)) => Flow::Call { guest: Some((t, t_thumb)) },
             // A register-target `blx rN` is an indirect call through a function
@@ -467,6 +479,7 @@ fn cond_from_u8(c: u8) -> ConditionCode {
 /// A statically-recovered `tbb`/`tbh` jump table: the index register, the resolved
 /// target block addresses (`targets[i]` for index `i`), and the out-of-range
 /// default block when the range-check branch is recognized.
+#[derive(Clone)]
 struct SwitchInfo {
     index: u8,
     targets: Vec<u32>,
@@ -615,6 +628,151 @@ fn mov_pc_ladder_switch(
         bias: 0u32.wrapping_sub(ladder) as i32,
         shift,
     })
+}
+
+/// The largest handler slot [`arm_slot_dispatch`] accepts, and the most slots it will read.
+const SLOT_STRIDE_MAX: u32 = 256;
+const SLOT_COUNT_MAX: u32 = 256;
+
+/// A hand-written COMPUTED-GOTO interpreter in ARM code: fixed-size handler slots, each of
+/// which reads the next opcode and jumps to its slot.
+///
+/// ```text
+///   adr  r10, slots                 ; once, in the prologue
+///   ...
+///   ldrb r4, [r0], #1               ; the next opcode
+///   add  sb, r10, r4, lsl #6        ; its 64-byte slot
+///   bx   sb
+/// slots:                            ; slot k = slots + k*64, nop-padded
+///   <handler 0> ... add sb, r10, r4, lsl #6 ; bx sb
+///   <handler 1> ...
+///   <last>      mov r0, r3 ; pop {..., pc}
+/// ```
+///
+/// A sports title converts vertex streams this way. With no static target the `bx` went to
+/// the dispatcher, which knows only function entries, and the run died on "indirect dispatch
+/// to unknown target" at the first slot.
+///
+/// Recognised at an unconditional ARM `bx rd`: walk back to `add rd, rb, ri, lsl #s`, then to
+/// the `adr` (or `add rb, pc, #imm`) that set `rb`. The slot COUNT is not in the code - the
+/// index is a byte read at runtime - so it is read off the slots themselves: slot `k` is
+/// accepted while every instruction in it decodes and it ends in either the same dispatch
+/// (`add rd, rb, _, lsl #s ; bx rd`, with `rb` never written inside the slot) or a function
+/// return. The first slot that does not stops the run; at least two must pass. That is
+/// positive evidence on every slot, so a lookalike `bx` over ordinary code finds no slots.
+///
+/// Returns the switch plus the `bx` sites INSIDE the slots, which dispatch through the same
+/// base register but sit too far from its `adr` for the walk back to find it.
+fn arm_slot_dispatch(
+    inst: &Instruction,
+    addr: u32,
+    thumb: bool,
+    decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
+    code: &[u8],
+    base: u32,
+) -> Option<(SwitchInfo, Vec<u32>)> {
+    if thumb || inst.opcode != Opcode::BX || inst.condition != ConditionCode::AL {
+        return None;
+    }
+    let rd = regnum(&inst.operands[0])?;
+    if rd == 15 || rd == 14 {
+        return None;
+    }
+    let ending_at = |at: u32| {
+        decoded
+            .range(..at)
+            .next_back()
+            .filter(|(a, (_, len, cond, _))| a.wrapping_add(*len) == at && *cond == ConditionCode::AL)
+            .map(|(a, (i, _, _, _))| (*a, i))
+    };
+    let writer_of = |from: u32, r: u8, max: usize| -> Option<(u32, &Instruction)> {
+        let mut cur = from;
+        for _ in 0..max {
+            let (a, i) = ending_at(cur)?;
+            if regnum(&i.operands[0]) == Some(r) && writes_first_operand(i) {
+                return Some((a, i));
+            }
+            cur = a;
+        }
+        None
+    };
+    // `add rd, rb, ri, lsl #s` -> (rb, s)
+    let slot_add = |i: &Instruction| -> Option<(u8, u32)> {
+        if i.opcode != Opcode::ADD || i.condition != ConditionCode::AL {
+            return None;
+        }
+        let (Operand::Reg(rb), Operand::RegShift(rs)) = (&i.operands[1], &i.operands[2]) else {
+            return None;
+        };
+        let RegShiftStyle::RegImm(sh) = rs.into_shift() else { return None };
+        if sh.stype() != ShiftStyle::LSL || rb.number() == 15 {
+            return None;
+        }
+        Some((rb.number(), sh.imm() as u32))
+    };
+    let (add_addr, add) = writer_of(addr, rd, 4)?;
+    let (rb, shift) = slot_add(add)?;
+    let stride = 1u32.checked_shl(shift)?;
+    if !(16..=SLOT_STRIDE_MAX).contains(&stride) {
+        return None;
+    }
+    let (adr_addr, adr) = writer_of(add_addr, rb, 8)?;
+    let slots = match (adr.opcode, &adr.operands[1], &adr.operands[2]) {
+        // The ARM decoder spells it `adr rb, pc, #imm`, with the offset third.
+        (Opcode::ADR, op1, op2) => adr_addr.wrapping_add(8).wrapping_add(imm(op2).or_else(|| imm(op1))?),
+        (Opcode::ADD, Operand::Reg(p), op) if p.number() == 15 => adr_addr.wrapping_add(8).wrapping_add(imm(op)?),
+        _ => return None,
+    };
+    let decoder = InstDecoder::default();
+    let mut targets = Vec::new();
+    let mut sites = Vec::new();
+    'slots: for k in 0..SLOT_COUNT_MAX {
+        let start = slots.wrapping_add(k * stride);
+        let mut slot_sites = Vec::new();
+        let mut ended = false;
+        // What the slot last wrote into the jump register: the dispatch must jump through
+        // the slot `add`, wherever in the slot it sits.
+        let mut rd_def: Option<(u8, u32)> = None;
+        let mut a = start;
+        while a < start.wrapping_add(stride) {
+            let Ok((i, _)) = decode_at(&decoder, code, base, a, false) else { break 'slots };
+            if regnum(&i.operands[0]) == Some(rb) && writes_first_operand(&i) {
+                break 'slots;
+            }
+            let is_return = (matches!(i.opcode, Opcode::POP | Opcode::LDM(..)) && writes_pc(&i))
+                || (i.opcode == Opcode::BX && regnum(&i.operands[0]) == Some(14));
+            let is_dispatch =
+                i.opcode == Opcode::BX && regnum(&i.operands[0]) == Some(rd) && rd_def == Some((rb, shift));
+            if i.condition == ConditionCode::AL && (is_return || is_dispatch) {
+                if is_dispatch {
+                    slot_sites.push(a);
+                }
+                ended = true;
+                break;
+            }
+            if regnum(&i.operands[0]) == Some(rd) && writes_first_operand(&i) {
+                rd_def = slot_add(&i);
+            }
+            a = a.wrapping_add(4);
+        }
+        if !ended {
+            break;
+        }
+        targets.push(start);
+        sites.extend(slot_sites);
+    }
+    if targets.len() < 2 {
+        return None;
+    }
+    if switch_why(addr) {
+        eprintln!(
+            "switch @{addr:#x}: SLOT INTERPRETER r{rd} = {slots:#x} + r?<<{shift}, {} slots, {} inner dispatch site(s)",
+            targets.len(),
+            sites.len()
+        );
+    }
+    let info = SwitchInfo { index: rd, targets, default: None, bias: 0u32.wrapping_sub(slots) as i32, shift };
+    Some((info, sites))
 }
 
 /// The index register of a pc-relative `tbb`/`tbh`. Returns `None` (leaving the
@@ -823,6 +981,15 @@ fn adjustment_step(ins: &Instruction, reg: u8, before: &RegConsts) -> (u8, u32) 
 /// entry count follows from `bound + k` (+1 when the bound is inclusive). Returns
 /// `(count, default)`; `count` is `None` when no such guard is recognized (the
 /// caller then falls back to reading the table's own extent).
+/// The most entries a recovered `tbb`/`tbh` table may have. A sanity bound, not an ISA one: a
+/// `tbh` table can address 64K entries. It was 1024, and a sports title's 1101-case
+/// switch (`cmp r0,#4 ; ble ; movw r1,#0x451 ; cmp r0,r1 ; bgt ; subs r1,r0,#5 ; tbh`)
+/// had every candidate count rejected, so the switch lowered to a trap and the title died the
+/// first time it ran. What keeps a wrong count out is the per-candidate validation in
+/// `resolve_switch`: targets near the table, and above 1024 entries also no more entries than
+/// the table's smallest offset allows.
+const MAX_SWITCH_ENTRIES: u32 = 4096;
+
 fn recover_switch_bound(
     decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
     tb_addr: u32,
@@ -991,7 +1158,7 @@ fn recover_switch_bound(
             _ => continue,                                // a lower bound: not the count
         };
         let count = max_index.wrapping_add(1);
-        if count == 0 || count > 1024 {
+        if count == 0 || count > MAX_SWITCH_ENTRIES {
             continue; // implausible: a wrong pairing (wrapped) - reject
         }
         let default = if in_range_taken { br_addr.wrapping_add(br_len) } else { gt };
@@ -1101,7 +1268,7 @@ fn resolve_switch(
         .map(|&l| l.wrapping_sub(pc))
         .filter(|span| *span % esize == 0)
         .map(|span| span / esize)
-        .filter(|c| *c > 0 && *c <= 1024)
+        .filter(|c| *c > 0 && *c <= MAX_SWITCH_ENTRIES)
         // CONSISTENCY, and this is load-bearing: a leader that merely happens to follow the
         // table does not prove the table reaches it. The table's own entries have to agree.
         // Every entry is a forward offset to a case body, so the table cannot contain more
@@ -1142,7 +1309,7 @@ fn resolve_switch(
                     break;
                 }
             }
-            if i >= 1024 {
+            if i >= MAX_SWITCH_ENTRIES {
                 return None; // runaway: not a table we understand
             }
             match read(i) {
@@ -1158,10 +1325,29 @@ fn resolve_switch(
     // count is wrong (we read code/data past the table's end as entries) - reject
     // that COUNT rather than seed far-flung leaders that would drag unrelated code
     // into this function (and trip the runaway span guard).
-    const MAX_REACH: u32 = 0x1_0000; // 64 KiB, matches the discovery span guard
+    const MAX_REACH: u32 = 0x1_0000; // 64 KiB, inside the discovery span guard
     let targets_for = |count: u32| -> Result<Vec<u32>, String> {
-        if count == 0 || count > 1024 {
+        if count == 0 || count > MAX_SWITCH_ENTRIES {
             return Err(format!("entry count {count} is out of range"));
+        }
+        // Every entry is a FORWARD offset to a case body, and the bodies follow the table, so
+        // a table cannot hold more entries than its smallest offset allows - the same
+        // consistency the abutment candidate is held to. Applied only ABOVE the old 1024 cap:
+        // below it, the counts every shipped title lifts with are left exactly as they were
+        // (a few validate today with entries that overlap code, and tightening them turned
+        // three resolved switches unresolved).
+        let mut min_entry = u32::MAX;
+        for i in 0..count {
+            let Some(entry) = read(i) else {
+                return Err(format!("entry {i} of {count} is off the image"));
+            };
+            min_entry = min_entry.min(entry);
+        }
+        let limit = if is_tbh { min_entry } else { 2 * min_entry };
+        if count > 1024 && count > limit {
+            return Err(format!(
+                "entry count {count} exceeds the smallest entry's reach ({limit}), so the table would overlap its own case bodies"
+            ));
         }
         let mut targets = Vec::with_capacity(count as usize);
         for i in 0..count {
@@ -1338,6 +1524,9 @@ fn discover_with(
     // Filled in pass 1 (where the whole decoded stream is available to read the
     // range check) and consumed in pass 2 to build the computed-jump terminator.
     let mut switches: BTreeMap<u32, SwitchInfo> = BTreeMap::new();
+    // The dispatch sites INSIDE a recognised slot interpreter's handlers, each with the
+    // switch it shares - see [`arm_slot_dispatch`].
+    let mut slot_sites: BTreeMap<u32, SwitchInfo> = BTreeMap::new();
     // Leaders whose first instruction failed to decode (a speculative target that ran
     // into data / an unlifted op). Pass 2 turns each into a single trapping block, so
     // one bad target does not stub the whole function. See the decode-failure arm.
@@ -1388,7 +1577,7 @@ fn discover_with(
         // function: as a tentative code pointer it is silently dropped; as a hard
         // callee it surfaces as a failure rather than a multi-megabyte wasm body.
         if decoded.len() >= MAX_FUNC_INSNS {
-            return Err(Error::Decode { addr });
+            return Err(Error::Runaway { first: entry, last: addr });
         }
         let (inst, len) = match decode_at(&decoder, code, base, addr, thumb) {
             Ok(v) => v,
@@ -1508,6 +1697,14 @@ fn discover_with(
         // pass 2 rather than marching the decoder into table data.
         if let Some(info) = arm_add_pc_switch(&inst, addr, thumb, code.len() as u32, base)
             .or_else(|| mov_pc_ladder_switch(&inst, addr, &decoded, code.len() as u32, base))
+            .or_else(|| slot_sites.get(&addr).cloned())
+            .or_else(|| {
+                let (info, sites) = arm_slot_dispatch(&inst, addr, thumb, &decoded, code, base)?;
+                for site in sites {
+                    slot_sites.insert(site, info.clone());
+                }
+                Some(info)
+            })
         {
             for &t in &info.targets {
                 leaders.insert(t);
@@ -1939,17 +2136,21 @@ fn discover_with(
     // failure; the lenient build stubs it cleanly (a loud trap on entry) rather than
     // emitting - and running - the garbage. Keyed on span, not block count, so a
     // legitimately large but contiguous function is unaffected.
-    const MAX_FUNC_SPAN: u32 = 0x1_0000; // 64 KiB - larger than any real function
+    //
+    // It was 64 KiB, and a sports title's match code has one REAL function spanning 77 KiB of
+    // Thumb (an 18 KB stack frame, one prologue, one epilogue): rejected, every call to it
+    // lowered to a trap and the title died a few seconds into its first match.
+    const MAX_FUNC_SPAN: u32 = 0x2_0000;
     if let (Some(first), Some(last)) = (blocks.first(), blocks.last())
         && last.addr.wrapping_sub(first.addr) > MAX_FUNC_SPAN {
-            return Err(Error::Decode { addr: last.addr });
+            return Err(Error::Runaway { first: first.addr, last: last.addr });
         }
 
     // The function is complete, so its flag liveness is knowable. Annotating HERE rather
     // than at each of the three `discover` call sites is what makes it unmissable: a
     // build path that forgot the pass would silently emit the slow code and pass every
     // test, which is the shape of defect this project keeps meeting.
-    let mut func = Func { addr: entry, thumb, blocks, stub: false };
+    let mut func = Func { addr: entry, thumb, blocks, stub: false, recursive: false };
     if flag_passes {
         finish_flags(&mut func);
     }
@@ -2138,6 +2339,53 @@ fn store_if(out: &mut Vec<Stmt>, addr: Value, data: Value, size: MemSize, mask: 
 
 fn bin(op: BinOp, a: Value, b: Value) -> Value {
     Value::Bin(op, Box::new(a), Box::new(b))
+}
+
+/// The [`ParallelOp`] of a parallel add/subtract opcode (callers pass only those).
+fn parallel_op(opcode: Opcode) -> ParallelOp {
+    use Opcode::*;
+    use ParallelKind::{Halve, Modulo, Saturate};
+    use ParallelLanes::{Add16, Add8, Asx, Sax, Sub16, Sub8};
+    let (kind, signed, lanes) = match opcode {
+        SADD8 => (Modulo, true, Add8),
+        SSUB8 => (Modulo, true, Sub8),
+        SADD16 => (Modulo, true, Add16),
+        SSUB16 => (Modulo, true, Sub16),
+        SASX => (Modulo, true, Asx),
+        SSAX => (Modulo, true, Sax),
+        QADD8 => (Saturate, true, Add8),
+        QSUB8 => (Saturate, true, Sub8),
+        QADD16 => (Saturate, true, Add16),
+        QSUB16 => (Saturate, true, Sub16),
+        QASX => (Saturate, true, Asx),
+        QSAX => (Saturate, true, Sax),
+        SHADD8 => (Halve, true, Add8),
+        SHSUB8 => (Halve, true, Sub8),
+        SHADD16 => (Halve, true, Add16),
+        SHSUB16 => (Halve, true, Sub16),
+        SHASX => (Halve, true, Asx),
+        SHSAX => (Halve, true, Sax),
+        UADD8 => (Modulo, false, Add8),
+        USUB8 => (Modulo, false, Sub8),
+        UADD16 => (Modulo, false, Add16),
+        USUB16 => (Modulo, false, Sub16),
+        UASX => (Modulo, false, Asx),
+        USAX => (Modulo, false, Sax),
+        UQADD8 => (Saturate, false, Add8),
+        UQSUB8 => (Saturate, false, Sub8),
+        UQADD16 => (Saturate, false, Add16),
+        UQSUB16 => (Saturate, false, Sub16),
+        UQASX => (Saturate, false, Asx),
+        UQSAX => (Saturate, false, Sax),
+        UHADD8 => (Halve, false, Add8),
+        UHSUB8 => (Halve, false, Sub8),
+        UHADD16 => (Halve, false, Add16),
+        UHSUB16 => (Halve, false, Sub16),
+        UHASX => (Halve, false, Asx),
+        UHSAX => (Halve, false, Sax),
+        other => unreachable!("not a parallel add/sub: {other:?}"),
+    };
+    ParallelOp { kind, signed, lanes }
 }
 
 /// The value tree for a full 32-bit byte reverse (ARM `rev`): move each byte to
@@ -2539,13 +2787,17 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             out.push(Stmt::SetReg(rd, value));
         }
 
-        UADD8 => {
-            // Byte-wise unsigned add setting the per-byte GE flags (consumed by
-            // `sel`). Operands: rd, rn, rm.
+        // The ARMv6 parallel add/subtract family: {s,q,sh,u,uq,uh} x {add8, sub8, add16,
+        // sub16, asx, sax}. The plain s/u forms set the per-lane GE flags `sel` consumes.
+        // Operands: rd, rn, rm.
+        SADD8 | SSUB8 | SADD16 | SSUB16 | SASX | SSAX | QADD8 | QSUB8 | QADD16 | QSUB16 | QASX
+        | QSAX | SHADD8 | SHSUB8 | SHADD16 | SHSUB16 | SHASX | SHSAX | UADD8 | USUB8 | UADD16
+        | USUB16 | UASX | USAX | UQADD8 | UQSUB8 | UQADD16 | UQSUB16 | UQASX | UQSAX | UHADD8
+        | UHSUB8 | UHADD16 | UHSUB16 | UHASX | UHSAX => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
             let rn = regnum(&ops[1]).ok_or_else(err)?;
             let rm = regnum(&ops[2]).ok_or_else(err)?;
-            out.push(Stmt::Uadd8 { rd, rn, rm });
+            out.push(Stmt::Parallel { op: parallel_op(inst.opcode), rd, rn, rm });
         }
         SEL => {
             // Byte-wise select by the GE flags a prior parallel add/sub set.
@@ -3041,6 +3293,42 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 _ => bin(BinOp::Asr, bin(BinOp::Shl, rm, Value::Imm(16)), Value::Imm(16)),
             };
             out.push(Stmt::SetReg(rd, bin(BinOp::Add, rn, ext)));
+        }
+        // Dual-lane extends: `uxtb16 rd, rm{, ror #rot}` zero-extends bytes 0 and 2 of the
+        // rotated source into the two halfwords; `sxtb16` sign-extends them; the `xtab16`
+        // forms add each extended byte to the matching halfword of rn (mod 2^16 per half).
+        UXTB16 | SXTB16 | UXTAB16 | SXTAB16 => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let accumulate = matches!(inst.opcode, UXTAB16 | SXTAB16);
+            let (rn, src, rot) = if accumulate {
+                (Some(operand_value(&ops[1], pc_const).ok_or_else(err)?), &ops[2], &ops[3])
+            } else {
+                (None, &ops[1], &ops[2])
+            };
+            let mut rm = operand_value(src, pc_const).ok_or_else(err)?;
+            if let Some(rot) = imm(rot).filter(|&r| r != 0) {
+                rm = bin(BinOp::Ror, rm, Value::Imm(rot));
+            }
+            let signed = matches!(inst.opcode, SXTB16 | SXTAB16);
+            // Byte `k` (0 or 2) of the rotated source, extended to a halfword value.
+            let ext = |k: u32| {
+                if signed {
+                    bin(BinOp::Asr, bin(BinOp::Shl, rm.clone(), Value::Imm(24 - 8 * k)), Value::Imm(24))
+                } else {
+                    bin(BinOp::And, bin(BinOp::Lsr, rm.clone(), Value::Imm(8 * k)), Value::Imm(0xFF))
+                }
+            };
+            let (mut lo, mut hi) = (ext(0), ext(2));
+            if let Some(rn) = rn {
+                lo = bin(BinOp::Add, bin(BinOp::And, rn.clone(), Value::Imm(0xFFFF)), lo);
+                hi = bin(BinOp::Add, bin(BinOp::Lsr, rn, Value::Imm(16)), hi);
+            }
+            let value = bin(
+                BinOp::Or,
+                bin(BinOp::And, lo, Value::Imm(0xFFFF)),
+                bin(BinOp::Shl, hi, Value::Imm(16)),
+            );
+            out.push(Stmt::SetReg(rd, value));
         }
         // Bitfield extract: ubfx rd, rn, #lsb, #width (zero-extended); sbfx
         // (sign-extended).
@@ -3604,29 +3892,6 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         }
         Neon { op, dt } => {
             out.push(Stmt::Neon(lower_neon(op, dt, ops).ok_or_else(err)?));
-        }
-
-        // `uadd16 Rd, Rn, Rm`: independent unsigned add of the two 16-bit halfwords
-        // (each wraps modulo 2^16). Rd[15:0] = Rn[15:0]+Rm[15:0], Rd[31:16] =
-        // Rn[31:16]+Rm[31:16]. The APSR.GE bits it also sets are not modeled (nothing
-        // in the engine reads them - there is no `sel`), matching how GE is elided
-        // everywhere else.
-        UADD16 => {
-            let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let rn = Value::Reg(regnum(&ops[1]).ok_or_else(err)?);
-            let rm = Value::Reg(regnum(&ops[2]).ok_or_else(err)?);
-            let bin = |op, a, b| Value::Bin(op, Box::new(a), Box::new(b));
-            let mask = |v| bin(BinOp::And, v, Value::Imm(0xffff));
-            // low halfword sum, truncated to 16 bits.
-            let lo = mask(bin(BinOp::Add, mask(rn.clone()), mask(rm.clone())));
-            // high halfword sum: shift each source down, add, truncate, shift back up.
-            let hi_sum = mask(bin(
-                BinOp::Add,
-                bin(BinOp::Lsr, rn, Value::Imm(16)),
-                bin(BinOp::Lsr, rm, Value::Imm(16)),
-            ));
-            let hi = bin(BinOp::Shl, hi_sum, Value::Imm(16));
-            out.push(Stmt::SetReg(rd, bin(BinOp::Or, lo, hi)));
         }
 
         _ => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
@@ -4829,6 +5094,63 @@ mod switch_bound_tests {
             "the compare tests a definition the table branch never sees, so it bounds \
              nothing; Some(7) here is the nine-entry table read as seven"
         );
+    }
+
+    /// A COMPUTED-GOTO slot interpreter: `adr r10, slots ; ... add sb, r10, r4, lsl #5 ; bx sb`
+    /// over 32-byte slots. Three slots end in the dispatch or a return; the fourth runs off
+    /// its end with neither, which is where the run stops.
+    #[test]
+    fn a_slot_interpreter_is_read_off_its_slots() {
+        const NOP: u32 = 0xe320_f000;
+        const LDRB: u32 = 0xe4d0_4001; // ldrb r4, [r0], #1
+        const ADD: u32 = 0xe08a_9284; // add sb, r10, r4, lsl #5
+        const BX: u32 = 0xe12f_ff19; // bx sb
+        let base = 0x8100_0000;
+        let mut words = vec![
+            0xe92d_4010, // push {r4, lr}
+            0xe28f_a014, // adr r10, slots (= base + 0x20)
+            LDRB, ADD, BX, NOP, NOP, NOP,
+        ];
+        words.extend([LDRB, ADD, BX, NOP, NOP, NOP, NOP, NOP]); // slot 0
+        words.extend([0xe281_1001, LDRB, ADD, BX, NOP, NOP, NOP, NOP]); // slot 1: add r1, r1, #1
+        words.extend([0xe8bd_8010, NOP, NOP, NOP, NOP, NOP, NOP, NOP]); // slot 2: pop {r4, pc}
+        words.extend([0xe1a0_0000; 8]); // slot 3: no dispatch, no return
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoder = InstDecoder::default();
+        let mut decoded = BTreeMap::new();
+        for a in (base..base + 0x14).step_by(4) {
+            let (inst, len) = decode_at(&decoder, &code, base, a, false).expect("decodes");
+            let c = inst.condition;
+            decoded.insert(a, (inst, len, c, false));
+        }
+        let bx = decoded[&(base + 0x10)].0;
+        let (info, sites) = arm_slot_dispatch(&bx, base + 0x10, false, &decoded, &code, base).expect("recognised");
+        assert_eq!(info.targets, vec![base + 0x20, base + 0x40, base + 0x60]);
+        assert_eq!((info.index, info.shift, info.bias), (9, 5, 0u32.wrapping_sub(base + 0x20) as i32));
+        assert_eq!(sites, vec![base + 0x28, base + 0x4c]);
+    }
+
+    /// A TABLE OVER 1024 ENTRIES IS STILL A TABLE. Real bytes from guest `0x8161a0a2` in a
+    /// sports title: `switch >= 5 && switch <= 0x451` (the bound a `movw` register), rebased by
+    /// `subs r1,r0,#5` = 1101 entries. The old 1024 cap rejected it, the switch lowered to a
+    /// trap, and the title died the first time it ran.
+    #[test]
+    fn a_table_over_a_thousand_entries_is_recovered() {
+        let base = 0x8161_a0a2;
+        let decoded = decode_thumb_run(
+            base,
+            &[
+                0x04, 0x28, // cmp r0, #4
+                0x41, 0xf3, 0xe6, 0x80, // b.wle (below the range)
+                0x40, 0xf2, 0x51, 0x41, // movw r1, #0x451
+                0x88, 0x42, // cmp r0, r1
+                0x01, 0xf3, 0xe1, 0x80, // b.wgt (above the range)
+                0x41, 0x1f, // subs r1, r0, #5
+                0xdf, 0xe8, 0x11, 0xf0, // tbh [pc, r1, lsl #1]
+            ],
+        );
+        let (count, _) = recover_switch_bound(&decoded, base + 18, 1);
+        assert_eq!(count, Some(0x44d));
     }
 
     /// AN ADJUSTMENT ABOVE THE GUARD IS ALREADY INSIDE THE BOUND. The golf title's

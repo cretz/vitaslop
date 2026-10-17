@@ -46,6 +46,8 @@ impl GuestMemory for JsGuestMemory {
     fn len(&self) -> usize {
         self.view.length() as usize
     }
+    /// No map, so nothing to stamp.
+    fn stamp_dirty_pages(&self, _off: usize, _len: usize) {}
     fn read(&self, off: usize, buf: &mut [u8]) {
         self.view
             .subarray(off as u32, (off + buf.len()) as u32)

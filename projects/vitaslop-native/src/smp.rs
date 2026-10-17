@@ -62,7 +62,7 @@ pub fn worker_count() -> usize {
 /// (`Capture::take_scenes_through_flip`). ON by default, as in the browser - whose measurement
 /// is the reason (the run worker's frame cost went to ~0 there); `VITASLOP_SMP_OVERLAP=0` makes
 /// every present wait for every worker to reach a switch point (stop-the-world). MEASURED here
-/// without it (MLB window, 13,500 frames): 52.5 fps with the three workers 10%, 12% and 3% busy -
+/// without it (baseball window, 13,500 frames): 52.5 fps with the three workers 10%, 12% and 3% busy -
 /// the guest frame and the present ran back to back on the window's one thread.
 pub fn overlap() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -186,7 +186,7 @@ fn late_loop(sh: &Shared) {
 /// presenter before it takes the frame - the browser's `VITASLOP_SMP_ASYNC_RESOLVE`, same knob,
 /// same default (on whenever [`overlap`] is). Without it every `sceGxmDraw` whose texture set
 /// changed snapshots and compares the textures inline on the drawing guest thread. MEASURED
-/// (Uncharted ruins, window, VITASLOP_PERF from f5500): `sceGxmDraw` 39 ms of a ~40 ms main
+/// (an action title's ruins, window, VITASLOP_PERF from f5500): `sceGxmDraw` 39 ms of a ~40 ms main
 /// thread per flip, all of it the fragment-set MISS decode (7.8 ms each, 5 a frame); game clock
 /// 80-84% of the wall where the browser, which runs this resolver, holds 100%.
 pub fn async_resolve() -> bool {
@@ -209,6 +209,31 @@ fn wall_floor() -> bool {
     *ON.get_or_init(|| vitaslop_runtime::knobs::var("VITASLOP_CLOCK_WALL_FLOOR").as_deref().map(str::trim) != Ok("0"))
 }
 
+/// >>> THE EMULATED CORES RUN IN LOCKSTEP. A Vita's cores retire guest code at ONE rate, so
+/// no core is ever milliseconds of work behind another; a host worker can be (a phone's busy
+/// core, an OS preemption). Each worker counts the guest instructions its resumes retire, and
+/// one more than this window ahead of a worker still INSIDE a resume does not pick until that
+/// worker folds - a host that cannot keep one core at Vita speed slows the whole guest
+/// uniformly, as a slower Vita would, instead of letting the other cores run away from it.
+/// MEASURED (a football title's boot, 10-07): its front-end thread's core falling ~1 ms of work
+/// behind the others per tick made its boot script miss the action that starts the intro
+/// movie - for ever (latched; phone streaks of 15/15 stalled boots, desktop repro with a 1 ms
+/// spin on that one thread). Uniform slowness never did. A window idle workers do not bank:
+/// an idle worker re-enters at the lagging minimum.
+///
+/// `VITASLOP_SMP_LOCKSTEP=<guest instructions>`, default [`LOCKSTEP_DEFAULT`] (one scheduling
+/// quantum, ~1.1 ms of Vita time); `0` is the arm back (cores run free).
+fn lockstep() -> Option<u64> {
+    static W: OnceLock<Option<u64>> = OnceLock::new();
+    *W.get_or_init(|| match vitaslop_runtime::knobs::var("VITASLOP_SMP_LOCKSTEP") {
+        Ok(v) => v.trim().parse().ok().filter(|&n| n > 0),
+        Err(_) => Some(LOCKSTEP_DEFAULT),
+    })
+}
+
+/// [`lockstep`]'s default window: one scheduling quantum of guest instructions.
+const LOCKSTEP_DEFAULT: u64 = 500_000;
+
 /// A thread released by TIME yields to the threads already runnable on its worker - see
 /// `drain` and the browser's measurement behind it. `VITASLOP_SMP_TIMEOUT_YIELDS=0`.
 fn timeout_yields() -> bool {
@@ -230,7 +255,7 @@ fn fiber_near_on() -> bool {
 }
 
 /// `VITASLOP_SMP_UNPIN_STARVED=1`: the browser's opt-in starvation unpin. OFF by default there and
-/// here (it breaks Dead or Alive 5 Plus's movie - see the browser's note).
+/// here (it breaks a fighting title's movie - see the browser's note).
 fn unpin_starved_on() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| vitaslop_runtime::knobs::var("VITASLOP_SMP_UNPIN_STARVED").as_deref().map(str::trim) == Ok("1"))
@@ -341,12 +366,18 @@ struct State {
     verdict: Option<RunReport>,
     /// Guest instructions retired per worker, decayed each frame - placement's idea of busy.
     load: Vec<f64>,
+    /// Guest work each worker has retired, for [`lockstep`].
+    core_work: Vec<u64>,
+    /// The worker had nothing to pick since its last resume - [`lockstep`] does not bank it.
+    core_idle: Vec<bool>,
     running_on: Vec<Option<usize>>,
     fuel_total: u64,
     fuel_samples: u64,
     fuel_max: u64,
     arm_total: u64,
     idle_jumps: u64,
+    /// Picks [`lockstep`] declined.
+    lockstep_waits: u64,
     resumes: u64,
     preempt_gate: u64,
     preempt_prio: u64,
@@ -489,12 +520,15 @@ impl State {
             running: 0,
             verdict: None,
             load: vec![0.0; workers + 1],
+            core_work: vec![0; workers + 1],
+            core_idle: vec![true; workers + 1],
             running_on: vec![None; workers + 1],
             fuel_total: 0,
             fuel_samples: 0,
             fuel_max: 0,
             arm_total: 0,
             idle_jumps: 0,
+            lockstep_waits: 0,
             resumes: 0,
             preempt_gate: 0,
             consumed: 0,
@@ -635,7 +669,25 @@ impl State {
             .filter(|&i| !rt_only || self.threads[i].rt)
             .collect();
         if mine.is_empty() {
+            self.core_idle[w] = true;
             return None;
+        }
+        if let Some(win) = lockstep().filter(|_| !rt_only) {
+            // The slowest OTHER worker still inside a resume (real-time threads excepted).
+            let lag = (0..self.running_on.len())
+                .filter(|&v| v != w)
+                .filter(|&v| self.running_on[v].is_some_and(|j| !self.threads[j].rt))
+                .map(|v| self.core_work[v])
+                .min();
+            if let Some(lag) = lag {
+                if self.core_idle[w] {
+                    self.core_work[w] = self.core_work[w].max(lag);
+                } else if self.core_work[w] > lag.saturating_add(win) {
+                    self.lockstep_waits += 1;
+                    return None;
+                }
+            }
+            self.core_idle[w] = false;
         }
         if mine.iter().all(|&i| self.threads[i].cooled) {
             for &i in &mine {
@@ -689,6 +741,7 @@ impl State {
         }
         let home = self.threads[idx].home;
         self.load[home] += retired.unwrap_or(burned) as f64;
+        self.core_work[home] = self.core_work[home].saturating_add(retired.unwrap_or(burned));
         let runnable = 1 + self
             .live
             .iter()
@@ -1034,6 +1087,9 @@ fn helper_loop(sh: &Arc<Shared>, w: usize) {
                     st.threads[i].life_run_ms += ran.as_secs_f64() * 1000.0;
                     st.fold(sh, i, step, fuel, arm, preempted);
                     st.drain(sh);
+                    if lockstep().is_some() {
+                        sh.ring_all();
+                    }
                     if st.paused && st.running == 0 {
                         sh.ring(0);
                     }
@@ -1048,7 +1104,7 @@ fn helper_loop(sh: &Arc<Shared>, w: usize) {
 
 /// The newest parallel run's number. The runtime's resolver and wall-park switches are process
 /// globals, and a run REPLACED by another (`sceAppMgrLoadExec`) is dropped AFTER its successor
-/// started - MEASURED: Uncharted's executable ran with the resolver detached and every texture
+/// started - MEASURED: an action title's executable ran with the resolver detached and every texture
 /// set proven inline on the drawing thread, because its launcher's drop cleared the switches the
 /// new run had just set. A run clears them only while it is still the newest.
 static RUN_GEN: AtomicU64 = AtomicU64::new(0);
@@ -1064,7 +1120,7 @@ pub struct SmpRun {
     /// The frame taken for presenting. Under [`overlap`] the guest may already be a frame past
     /// it, and everything the caller keys on a frame number - its next target above all - means
     /// the frame being PRESENTED, which is this. MEASURED without it: each `run_frames` asked for
-    /// one past the guest's own count, moved the gate two frames, and an MLB window ran at
+    /// one past the guest's own count, moved the gate two frames, and a baseball window ran at
     /// 93.9 fps with its game clock at 160% of the wall.
     consumed: u64,
 }
@@ -1273,11 +1329,12 @@ impl SmpRun {
             .collect();
         let (calls, waited) = crate::threaded::HOST_CALL_WAIT.read();
         format!(
-            "SMP {} worker(s): {} | {} resumes, {} idle jumps, preempts gate {} prio {} | {} host calls waited {:.1} s for the host | {}",
+            "SMP {} worker(s): {} | {} resumes, {} idle jumps, {} lockstep waits, preempts gate {} prio {} | {} host calls waited {:.1} s for the host | {}",
             self.sh.workers,
             busy.join("; "),
             st.resumes,
             st.idle_jumps,
+            st.lockstep_waits,
             st.preempt_gate,
             st.preempt_prio,
             calls,
@@ -1470,5 +1527,72 @@ impl crate::threaded::SmpOps<VitaEnv> for SmpRun {
     }
     fn resume_guest(&mut self) {
         SmpRun::resume_guest(self)
+    }
+}
+
+#[cfg(test)]
+mod lockstep_tests {
+    use super::*;
+
+    fn slot(thid: i32, home: usize, state: SState) -> Slot {
+        Slot {
+            thid,
+            priority: 0x60,
+            home,
+            state,
+            cooled: false,
+            rt: false,
+            fuel_seen: 0,
+            arm_seen: 0,
+            birth: None,
+            release: false,
+            born: 0.0,
+            life_run_ms: 0.0,
+            words: Arc::new([AtomicU32::new(0), AtomicU32::new(0)]),
+        }
+    }
+
+    /// Worker 1 is inside a resume of thread 0; worker 2 holds a runnable thread 1.
+    fn two_workers() -> State {
+        let mut st = State::new(2);
+        st.threads.push(slot(0x10, 1, SState::Running));
+        st.threads.push(slot(0x11, 2, SState::Runnable));
+        st.live = vec![0, 1];
+        st.running = 1;
+        st.running_on[1] = Some(0);
+        st
+    }
+
+    #[test]
+    fn a_worker_a_window_ahead_of_a_busy_core_waits_for_it() {
+        let mut st = two_workers();
+        st.core_idle[2] = false;
+        st.core_work[2] = LOCKSTEP_DEFAULT * 3;
+        assert_eq!(st.pick(2, false), None, "worker 2 is three windows ahead of the core still running");
+        assert_eq!(st.lockstep_waits, 1);
+        // The lagging core folds work and catches up to within one window: worker 2 may go.
+        st.core_work[1] = LOCKSTEP_DEFAULT * 2;
+        assert_eq!(st.pick(2, false), Some(1));
+    }
+
+    #[test]
+    fn an_idle_worker_reenters_at_the_lagging_minimum_instead_of_banking_its_idle() {
+        let mut st = two_workers();
+        st.core_work[1] = LOCKSTEP_DEFAULT * 5;
+        // Worker 2 idled at zero while worker 1 worked: it is BEHIND, not ahead, and must not be
+        // credited the gap either - it starts again level with the busy core.
+        assert!(st.core_idle[2]);
+        assert_eq!(st.pick(2, false), Some(1));
+        assert_eq!(st.core_work[2], LOCKSTEP_DEFAULT * 5);
+        assert!(!st.core_idle[2]);
+    }
+
+    #[test]
+    fn a_real_time_core_never_holds_the_others_back() {
+        let mut st = two_workers();
+        st.threads[0].rt = true;
+        st.core_idle[2] = false;
+        st.core_work[2] = LOCKSTEP_DEFAULT * 10;
+        assert_eq!(st.pick(2, false), Some(1), "the audio output's core is not a guest core to keep pace with");
     }
 }

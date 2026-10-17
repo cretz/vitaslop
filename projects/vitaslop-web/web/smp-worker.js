@@ -59,7 +59,10 @@ for (const level of ["log", "info", "warn"]) {
   const orig = console[level].bind(console);
   console[level] = (...a) => {
     const text = a.map((x) => (typeof x === "string" ? x : String(x))).join(" ");
-    if (text.startsWith("[trace]")) {
+    // ...and the runtime's own `tracing` lines (`vitaslop::<target>`), which only reach this
+    // console at all under `VITASLOP_CONSOLE=1` - a host call's log runs HERE, on the guest
+    // worker, so a phone job asking for `vitaslop::ngs=trace` brought back none of it.
+    if (text.startsWith("[trace]") || text.includes("vitaslop::")) {
       try {
         self.postMessage({ type: "jsprofile", message: text });
       } catch {}

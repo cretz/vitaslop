@@ -92,7 +92,15 @@ pub(super) fn voice_unlock_params(ctx: &mut GuestCtx, st: &mut VitaState) {
 pub(super) fn voice_play(ctx: &mut GuestCtx, st: &mut VitaState) {
     let voice = ctx.arg(0);
     let silent_before = super::at9::voices_no_source();
-    st.audio_state.at9.play(voice);
+    // >>> A VOICE OF A BUSS RACK IS A BUSS BEFORE ANYTHING IS ROUTED INTO IT. A title plays its
+    // mixer and master busses while it builds the graph, so judging by routing alone reported
+    // all four of one title's busses as silent plays every boot.
+    let a = &st.audio_state;
+    let buss_rack = a
+        .ngs_voice_handles
+        .iter()
+        .any(|&((rack, _), v)| v == voice && a.ngs_buss_racks.contains(&rack));
+    st.audio_state.at9.play(voice, buss_rack);
     tracing::debug!(target: "vitaslop::ngs", voice = format_args!("{voice:#x}"), frame = st.cur_frame(), "voice played");
     if super::at9::voices_no_source() > silent_before {
         report_silent_play(st, voice);
@@ -108,8 +116,45 @@ pub(super) fn trace_voice_call(st: &mut VitaState, nid: u32, args: [u32; 4]) {
         return;
     }
     let v = calls.entry(args[0]).or_default();
-    if v.len() < 24 {
-        v.push((nid, args));
+    // The MOST RECENT calls, not the first: a silent play is explained by what led up to it,
+    // and a decode failure deep into a stream (see `report_failed_voices`) by the refills
+    // just before it.
+    if v.len() >= VOICE_CALL_HISTORY {
+        v.remove(0);
+    }
+    v.push((nid, args));
+}
+
+/// How many of a voice's most recent `sceNgsVoice*` calls are kept for the reports.
+const VOICE_CALL_HISTORY: usize = 64;
+
+/// >>> A VOICE WHOSE DECODE FAILED, EXPLAINED BY WHAT THE TITLE LAST DID TO IT. At DEBUG on
+/// `vitaslop::ngs` (which also keeps the call history running past the silent-play reports):
+/// the failure line in `vita::at9` names the buffer and the bytes; this names the handle and
+/// the lock/unlock/state polls that should have refilled it.
+pub(super) fn report_failed_voices(st: &mut VitaState) {
+    let failed = st.audio_state.at9.take_failed();
+    if failed.is_empty() || !tracing::enabled!(target: "vitaslop::ngs", tracing::Level::DEBUG) {
+        return;
+    }
+    for voice in failed {
+        let calls: Vec<String> = st
+            .audio_state
+            .ngs_voice_calls
+            .get(&voice)
+            .map(|v| {
+                v.iter()
+                    .map(|(nid, g)| format!("{}({:#x},{:#x},{:#x},{:#x})", crate::nid::name(*nid), g[0], g[1], g[2], g[3]))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tracing::debug!(
+            target: "vitaslop::ngs",
+            voice = format_args!("{voice:#x}"),
+            frame = st.cur_frame(),
+            "decode FAILED; the title's last calls on this voice, oldest first: {}",
+            calls.join(" -> ")
+        );
     }
 }
 
@@ -314,6 +359,16 @@ pub(super) fn voice_stop(ctx: &mut GuestCtx, st: &mut VitaState) {
             buffer_bytes = st.audio_state.at9.buffer_bytes(voice),
             "voice stopped while playing"
         );
+    } else {
+        // The stop of a voice that had already ended - the title noticing late. Paired with a
+        // `decode FAILED` line for the same voice, it says how long the decoder ran past what
+        // the title considered the end of the sound.
+        tracing::debug!(
+            target: "vitaslop::ngs",
+            voice = format_args!("{voice:#x}"),
+            frame = st.cur_frame(),
+            "voice stopped after it had ended"
+        );
     }
     st.audio_state.at9.stop(voice);
     ctx.ret(0);
@@ -416,7 +471,13 @@ pub(super) fn rack_init(ctx: &mut GuestCtx, st: &mut VitaState, _system: u32, ra
             ctx.read_u32(d + 12),
             ctx.read_u32(d + 16),
         );
-        let name = match voice_def_name(st, defn) {
+        let def_name = voice_def_name(st, defn);
+        st.audio_state.ngs_rack_channels.retain(|(r, _)| *r != rack);
+        st.audio_state.ngs_rack_channels.push((rack, channels));
+        if def_name.is_some_and(|n| n.ends_with("Buss")) && !st.audio_state.ngs_buss_racks.contains(&rack) {
+            st.audio_state.ngs_buss_racks.push(rack);
+        }
+        let name = match def_name {
             Some(n) => n.to_string(),
             // A definition pointer this run never handed out means the title got it from
             // somewhere we do not model. Say the address rather than a name we do not have.
@@ -482,6 +543,36 @@ pub(super) fn rack_init(ctx: &mut GuestCtx, st: &mut VitaState, _system: u32, ra
 /// console whose rack holds tens. With the handle memoised the same title's race is a
 /// handful of voices, which is what a browser profile blaming ATRAC9 decode for a third of
 /// its thread was really measuring.
+/// SceInt32 sceNgsRackRelease(SceNgsHRack rack, SceNgsRackReleaseCallbackFunc callback)
+///
+/// >>> A RELEASED RACK'S VOICES STOP. This was a stub returning 0, so every voice of a
+/// released rack kept playing whatever its params last pointed at - and a title releases a
+/// rack precisely so it can free the memory those params point INTO. MEASURED on a football
+/// title: its menu music voice played on after the match load released its rack and freed
+/// the 992 KB bank, decoded the allocator's `0xCD` fill and failed; the small looping SFX
+/// rings did the same on zeros. The callback is not invoked - nothing here was invoking it
+/// before either, and the release completes synchronously.
+pub(super) fn rack_release(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let rack = ctx.arg(0);
+    let a = &mut st.audio_state;
+    for &((r, _), voice) in a.ngs_voice_handles.iter() {
+        if r == rack {
+            a.at9.stop(voice);
+        }
+    }
+    ctx.ret(0);
+}
+
+/// SceInt32 sceNgsSystemRelease(SceNgsHSynSystem system): every rack goes with the system, so
+/// every voice stops - see [`rack_release`].
+pub(super) fn system_release(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let a = &mut st.audio_state;
+    for &(_, voice) in a.ngs_voice_handles.iter() {
+        a.at9.stop(voice);
+    }
+    ctx.ret(0);
+}
+
 #[hostcall]
 pub(super) fn rack_get_voice_handle(ctx: &mut GuestCtx, st: &mut VitaState, rack: u32, index: u32, handle: Ptr) -> i32 {
     // The A/B arm: `VITASLOP_NGS_VOICE_HANDLE_MEMO=0` restores the fresh-handle-per-call
@@ -701,6 +792,7 @@ pub(super) fn patch_create_routing(ctx: &mut GuestCtx, st: &mut VitaState, info:
             "patch routing created"
         );
         st.audio_state.ngs_patch_voice.push((patch, source_voice));
+        st.audio_state.ngs_patch_dest.push((patch, destination_voice));
         st.audio_state.at9.set_route(source_voice, destination_voice);
     }
     0
@@ -739,6 +831,59 @@ pub(super) fn voice_get_output_patch(
         ctx.write_u32(patch.addr(), found);
     }
     0
+}
+
+/// SceInt32 sceNgsPatchGetInfo(SceNgsHPatch patch, SceNgsPatchInfo *info)
+///
+/// `SceNgsPatchInfo` is `{ SceInt32 nOutputChannels; SceInt32 nInputChannels; }` - the
+/// SOURCE voice's channels and the DESTINATION voice's, each its rack's channels per voice.
+///
+/// >>> A TITLE SIZES ITS VOLUME MATRIX FROM THIS, AND THE STUB HANDED IT STACK GARBAGE.
+/// EVIDENCE, off one title's mix code: it calls this with an 8-byte struct on its stack and
+/// the 2x2 matrix immediately after it, then writes ONLY the cells the two counts cover -
+/// `(1,1)` m00; `(1,2)` m00 and m01; `(2,1)` m00 and m10; `(2,2)` m00, m11 and zeros across -
+/// and passes the matrix to `sceNgsVoicePatchSetVolumesMatrix`. Stubbed to `ret(0)`, the
+/// counts were whatever the stack held: its stereo busses read as MONO, row 1 was never
+/// written, and the 4-byte word left there (3.4e18 as a float) became two buss gains -
+/// every voice mixed at ~1e37 and 68% of the title's audio grains clipped. That the struct
+/// is exactly two words is pinned by the same code: the matrix begins 8 bytes after it.
+#[hostcall]
+pub(super) fn patch_get_info(ctx: &mut GuestCtx, st: &mut VitaState, patch: u32, info: Ptr) -> i32 {
+    match patch_channels(st, patch) {
+        Some((out, input)) => {
+            if !info.is_null() {
+                ctx.write_u32(info.addr(), out);
+                ctx.write_u32(info.addr() + 4, input);
+            }
+        }
+        // Once: a title whose patches all come from a path not modelled here asks per call.
+        None => {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "vitaslop::at9",
+                    patch = format_args!("{patch:#x}"),
+                    "sceNgsPatchGetInfo on a patch whose voices' racks are not known here (not \
+                     created by sceNgsPatchCreateRouting) - the info is NOT written, so the title \
+                     reads whatever its buffer held"
+                );
+            }
+        }
+    }
+    0
+}
+
+/// `(output channels, input channels)` of `patch`: its source voice's rack channels and its
+/// destination voice's. `None` for a patch or voice this engine did not see created.
+fn patch_channels(st: &VitaState, patch: u32) -> Option<(u32, u32)> {
+    let a = &st.audio_state;
+    let channels_of = |voice: u32| -> Option<u32> {
+        let rack = a.ngs_voice_handles.iter().find(|(_, v)| *v == voice).map(|((r, _), _)| *r)?;
+        a.ngs_rack_channels.iter().find(|(r, _)| *r == rack).map(|(_, c)| *c)
+    };
+    let source = a.ngs_patch_voice.iter().find(|(p, _)| *p == patch).map(|(_, v)| *v)?;
+    let dest = a.ngs_patch_dest.iter().find(|(p, _)| *p == patch).map(|(_, v)| *v)?;
+    Some((channels_of(source)?, channels_of(dest)?))
 }
 
 /// SceInt32 sceNgsVoicePatchSetVolume(SceNgsHPatch patch, SceInt32 outputChannel,
@@ -792,7 +937,29 @@ pub(super) fn voice_patch_set_volumes_matrix(
         // Four f32 in memory order `[src0->dst0, src0->dst1, src1->dst0, src1->dst1]` -
         // `m[source][destination]`, copied whole. See `At9Voice::patch`.
         let cell = |i: u32| f32::from_bits(ctx.read_u32(matrix.addr() + i * 4));
-        let m = [[cell(0), cell(1)], [cell(2), cell(3)]];
+        let mut m = [[cell(0), cell(1)], [cell(2), cell(3)]];
+        // >>> ONLY THE CELLS THE PATCH HAS. A source with one output channel has one ROW and a
+        // destination with one input channel one COLUMN; a title fills exactly those (it sizes
+        // the matrix with `sceNgsPatchGetInfo`) and leaves the rest as whatever its stack held -
+        // a NaN or a huge word read as a float, which refused the whole matrix or became the
+        // gain. MEASURED on a beach title: every mono source's row 1 was uninitialised.
+        if let Some((out, input)) = patch_channels(st, patch) {
+            for (s, row) in m.iter_mut().enumerate() {
+                for (d, v) in row.iter_mut().enumerate() {
+                    if s as u32 >= out || d as u32 >= input {
+                        *v = 0.0;
+                    }
+                }
+            }
+        }
+        tracing::debug!(
+            target: "vitaslop::at9",
+            patch = format_args!("{patch:#x}"),
+            matrix = format_args!("{:#x}", matrix.addr()),
+            cells = format_args!("{m:?}"),
+            lr = format_args!("{:#x}", ctx.regs[14]),
+            "patch volume matrix"
+        );
         let loudest = m.iter().flatten().copied().filter(|v| v.is_finite()).fold(0.0f32, f32::max);
         if m.iter().flatten().all(|v| v.is_finite() && *v >= 0.0) {
             st.audio_state.set_patch_cells(patch, None, loudest, m);
@@ -1074,6 +1241,85 @@ mod lock_params_tests {
         h.call(voice_stop, [voice, 0, 0, 0]);
         h.call(voice_get_info, [voice, info, 0, 0]);
         assert_eq!(h.read_u32(info), 0, "a killed voice is AVAILABLE again");
+    }
+
+    /// Releasing a rack stops the voices it handed out, and only those: a title frees the
+    /// memory a released rack's params point into, so a voice left playing decodes freed
+    /// memory.
+    #[test]
+    fn a_released_rack_stops_its_voices() {
+        let mut h = Harness::new();
+        let (rack_a, rack_b, out) = (0x5000u32, 0x6000u32, 0x2100u32);
+        let voice_of = |h: &mut Harness, rack: u32| {
+            h.call(rack_get_voice_handle, [rack, 0, out, 0]);
+            let voice = h.read_u32(out);
+            let buf = h.lock(voice);
+            h.write_source(buf, 0x0020_0000, 0x3fc0);
+            h.call(voice_unlock_params, [voice, 0, 0, 0]);
+            h.call(voice_play, [voice, 0, 0, 0]);
+            voice
+        };
+        let (va, vb) = (voice_of(&mut h, rack_a), voice_of(&mut h, rack_b));
+        assert!(h.st.audio_state.at9.is_playing(va) && h.st.audio_state.at9.is_playing(vb));
+        h.call(rack_release, [rack_a, 0, 0, 0]);
+        assert!(!h.st.audio_state.at9.is_playing(va), "the released rack's voice must stop");
+        assert!(h.st.audio_state.at9.is_playing(vb), "another rack's voice must keep playing");
+        h.call(system_release, [0, 0, 0, 0]);
+        assert!(!h.st.audio_state.at9.any_playing(), "releasing the system stops every voice");
+    }
+
+    /// `sceNgsPatchGetInfo` reports the source voice's channels as the patch's OUTPUT channels
+    /// and the destination's as its INPUT channels, each its rack's channels per voice - the
+    /// counts a title sizes its volume matrix by.
+    #[test]
+    fn patch_info_reports_each_end_s_rack_channels() {
+        let mut h = Harness::new();
+        let (desc, handle, out, setup, info) = (0x3000u32, 0x3100u32, 0x3200u32, 0x3300u32, 0x3400u32);
+        let voice_in_rack = |h: &mut Harness, def_nid: u32, channels: u32| {
+            let def = voice_def_get_for(&mut h.st, def_nid);
+            h.write_u32(desc, def);
+            h.write_u32(desc + 4, 1);
+            h.write_u32(desc + 8, channels);
+            h.call(rack_init, [0, 0, desc, handle]);
+            let rack = h.read_u32(handle);
+            h.call(rack_get_voice_handle, [rack, 0, out, 0]);
+            h.read_u32(out)
+        };
+        let mono = voice_in_rack(&mut h, crate::nid::ngs::VOICE_DEF_GET_ATRAC9_VOICE, 1);
+        let buss = voice_in_rack(&mut h, crate::nid::ngs::VOICE_DEF_GET_MIXER_BUSS, 2);
+        h.write_u32(setup, mono);
+        h.write_u32(setup + 0x0c, buss);
+        h.call(patch_create_routing, [setup, handle, 0, 0]);
+        let patch = h.read_u32(handle);
+        h.write_u32(info, 0xdead_beef);
+        h.write_u32(info + 4, 0xdead_beef);
+        h.call(patch_get_info, [patch, info, 0, 0]);
+        assert_eq!((h.read_u32(info), h.read_u32(info + 4)), (1, 2), "mono source into a stereo buss");
+    }
+
+    /// A voice of a rack built from a BUSS definition is a buss from the start: playing it
+    /// before anything routes into it is not a sound without a source. A voice of a source
+    /// rack played the same way still is.
+    #[test]
+    fn a_buss_rack_voice_played_before_its_routing_is_not_a_silent_sound() {
+        let mut h = Harness::new();
+        let (desc, handle, out) = (0x3000u32, 0x3100u32, 0x3200u32);
+        let rack_of = |h: &mut Harness, def_nid: u32| {
+            let def = voice_def_get_for(&mut h.st, def_nid);
+            h.write_u32(desc, def);
+            h.write_u32(desc + 4, 1);
+            h.call(rack_init, [0, 0, desc, handle]);
+            let rack = h.read_u32(handle);
+            h.call(rack_get_voice_handle, [rack, 0, out, 0]);
+            h.read_u32(out)
+        };
+        let buss = rack_of(&mut h, crate::nid::ngs::VOICE_DEF_GET_MIXER_BUSS);
+        let source = rack_of(&mut h, crate::nid::ngs::VOICE_DEF_GET_ATRAC9_VOICE);
+        assert_ne!(buss, source);
+        h.call(voice_play, [buss, 0, 0, 0]);
+        h.call(voice_play, [source, 0, 0, 0]);
+        assert!(!h.st.audio_state.at9.counted_without_source(buss));
+        assert!(h.st.audio_state.at9.counted_without_source(source));
     }
 
     /// The PCM player's params descriptor id and the fields a raw-s16 source needs.

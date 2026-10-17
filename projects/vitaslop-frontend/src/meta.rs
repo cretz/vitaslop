@@ -35,3 +35,25 @@ impl TitleMeta {
         format!("{} {} {}", self.title, self.title_id, self.content_id).to_lowercase()
     }
 }
+
+/// The record kept per installed add-on, beside its decrypted files. An add-on belongs to
+/// one title and lives and dies with it: listed, added and removed on that title's page.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AddonMeta {
+    /// The title it belongs to.
+    pub title_id: String,
+    /// Its directory name, the label that ends its content id - what the title asks for.
+    pub dir: String,
+    pub content_id: String,
+    /// `param.sfo` `TITLE`, or the directory name when there is none.
+    pub title: String,
+    /// `param.sfo` `VERSION`.
+    pub version: String,
+    /// What it was imported from: `pkg`, `pfs`, `dump`.
+    pub source_kind: String,
+    pub bytes: u64,
+    pub files: u32,
+    /// Unix milliseconds.
+    pub imported_at: u64,
+}

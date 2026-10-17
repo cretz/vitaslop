@@ -6,7 +6,7 @@ import { ensureIsolation, checkFeatures, canPlay } from "./features.js";
 import * as store from "./store.js";
 import * as imp from "./import.js";
 import * as gamedata from "./gamedata.js";
-import { removeTitle } from "./opfs.js";
+import { removeTitle, listAddons, removeAddon } from "./opfs.js";
 import { writeZip, readZip } from "./zipstore.js";
 import { createPlayer } from "./player.js";
 import { renderVita } from "./vita.js";
@@ -71,7 +71,8 @@ function route() {
   document.body.dataset.screen = screen;
   if (screen === "play") navpad.detach();
   else padPages();
-  document.title = { library: "Library", settings: "Settings", import: "Add games", about: "About" }[screen] ? `${{ library: "Library", settings: "Settings", import: "Add games", about: "About" }[screen]} - vitaslop` : "vitaslop";
+  const names = { library: "Library", settings: "Settings", import: id ? "Add add-ons" : "Add games", about: "About" };
+  document.title = names[screen] ? `${names[screen]} - vitaslop` : "vitaslop";
   const fn = { library: renderLibrary, title: renderTitle, settings: renderSettings, import: renderImport, about: renderAbout, play: renderPlay }[screen];
   fn(id).catch((e) => {
     if (current !== me) return;
@@ -215,6 +216,12 @@ async function renderTitle(id) {
         <input id="gd-file" type="file" accept=".zip,application/zip" hidden />
       </div>
       <p class="dim">What the game saved - its save files and trophies - and nothing of the game itself. A download is a file you own; upload it on another device to continue there.</p>
+    </div>
+    <div class="card">
+      <h2>Add-ons <span class="dim" id="ad-count"></span></h2>
+      <ul id="ad-list" class="addons"></ul>
+      <p id="ad-none" class="dim" hidden>None installed. Add-ons you own for this game - costumes, tracks, characters - come in the same .pkg + work.bin, folder or zip a game does, and the game finds them the next time it starts.</p>
+      <div class="actions"><a class="btn" href="#/import/${esc(id)}">Add add-ons</a></div>
     </div>`;
   // The backdrop goes on through the element's style property: a `style="..."` attribute
   // in the markup is an inline style the page's Content-Security-Policy refuses.
@@ -225,8 +232,35 @@ async function renderTitle(id) {
       if (!stale(me) && $("t-size")) $("t-size").textContent = sizeText();
     });
   }
+  let addons = [];
+  const drawAddons = async () => {
+    addons = await listAddons(id);
+    if (stale(me) || !$("ad-list")) return;
+    $("ad-count").textContent = addons.length ? `${addons.length} installed` : "";
+    $("ad-none").hidden = addons.length > 0;
+    $("ad-list").innerHTML = addons
+      .map(
+        (a) => `<li><div><b>${esc(a.title)}</b><br><span class="dim">${esc(a.dir)}${a.version ? " &middot; v" + esc(a.version) : ""} &middot; ${store.fmtBytes(a.bytes)} &middot; added ${fmtDate(a.importedAt)}</span></div>
+          <button class="btn danger" data-addon="${esc(a.dir)}">Remove</button></li>`
+      )
+      .join("");
+    for (const b of $("ad-list").querySelectorAll("button[data-addon]")) {
+      b.addEventListener("click", async () => {
+        const a = addons.find((x) => x.dir === b.dataset.addon);
+        if (!a || !confirm(`Remove the add-on ${a.title} from ${meta.title}?\n\nThe game will not see it the next time it starts. Saved data is kept.`)) return;
+        try {
+          await removeAddon(id, a.dir);
+        } catch (err) {
+          alert(`Not removed: ${err.message || err}`);
+        }
+        drawAddons();
+      });
+    }
+  };
+  drawAddons();
   $("remove").addEventListener("click", async () => {
-    if (!confirm(`Remove ${meta.title} (${meta.titleId}) from this browser?\n\nThis deletes the imported game (${sizeText()}) and its prepared code. Saved data is kept; clear it separately if you want it gone.`)) return;
+    const withAddons = addons.length ? ` and its ${addons.length} add-on${addons.length === 1 ? "" : "s"}` : "";
+    if (!confirm(`Remove ${meta.title} (${meta.titleId}) from this browser?\n\nThis deletes the imported game (${sizeText()})${withAddons} and its prepared code. Saved data is kept; clear it separately if you want it gone.`)) return;
     await removeTitle(id);
     await store.removeTitleRecord(id);
     go("#/");
@@ -557,18 +591,30 @@ function featureList() {
 
 // ------------------------------- import -------------------------------
 
-async function renderImport() {
+/// The import screen. With `addonFor` (a title id: `#/import/<id>`) it adds ADD-ONS to that
+/// title instead of games to the library - the same pickers and the same containers, filed
+/// under the title rather than beside it.
+async function renderImport(addonFor) {
+  const me = current;
+  const owner = addonFor ? await store.readTitle(addonFor) : null;
+  if (stale(me)) return;
+  if (addonFor && !owner) {
+    view.innerHTML = `<div class="card"><h2>${esc(addonFor)}</h2><p>This title is not in the library, so it cannot take add-ons.</p><p><a class="btn" href="#/">Library</a></p></div>`;
+    return;
+  }
+  const what = addonFor ? "add-on" : "game";
   view.innerHTML = `
-    <h1>Add games</h1>
-    <p class="own">vitaslop only works with games you own, from your own console. It provides no games and downloads nothing.</p>
+    ${addonFor ? crumbs([{ text: "Library", href: "#/" }, { text: owner.title, href: `#/title/${addonFor}` }, { text: "Add add-ons" }]) : ""}
+    <h1>${addonFor ? `Add add-ons to ${esc(owner.title)}` : "Add games"}</h1>
+    <p class="own">vitaslop only works with games ${addonFor ? "and add-ons " : ""}you own, from your own console. It provides no games and downloads nothing.</p>
     <div class="tabs" id="tabs">
       <button class="tab on" data-mode="pkg">Package (.pkg + work.bin)</button>
       <button class="tab" data-mode="folder">Dumped folder</button>
       <button class="tab" data-mode="zip">Zip</button>
-      <button class="tab" data-mode="vpk">Homebrew (.vpk)</button>
+      ${addonFor ? "" : `<button class="tab" data-mode="vpk">Homebrew (.vpk)</button>`}
     </div>
     <div class="card mode" id="mode-pkg">
-      <p class="dim">A <code>.pkg</code> from a console and the <code>work.bin</code> licence that was made for it (from NoNpDrm or a dump). Both are needed: the pkg is encrypted and the licence holds its key.</p>
+      <p class="dim">A ${what}'s <code>.pkg</code> from a console and the <code>work.bin</code> licence that was made for it (from NoNpDrm or a dump). Both are needed: the pkg is encrypted and the licence holds its key.</p>
       <label class="pick"><span>1. The package</span><span class="inline"><button id="pick-pkg" class="btn">Choose .pkg</button><span id="pkg-name" class="dim">none chosen</span></span></label>
       <label class="pick"><span>2. Its licence</span><span class="inline"><button id="pick-work" class="btn">Choose work.bin</button><span id="work-name" class="dim">none chosen</span></span></label>
       <input id="f-pkg" type="file" accept=".pkg,application/octet-stream" hidden />
@@ -613,13 +659,14 @@ async function renderImport() {
     $("work-name").textContent = work ? work.name : "none chosen";
     armPkg();
   });
-  $("go-pkg").addEventListener("click", () => startImport([{ path: pkg.name, file: pkg }, { path: "work.bin", file: work }]));
+  const start = (entries) => startImport(entries, addonFor);
+  $("go-pkg").addEventListener("click", () => start([{ path: pkg.name, file: pkg }, { path: "work.bin", file: work }]));
   $("pick-dir").addEventListener("click", () => $("f-dir").click());
-  $("f-dir").addEventListener("change", (e) => e.target.files.length && startImport(imp.entriesFromFiles(e.target.files)));
+  $("f-dir").addEventListener("change", (e) => e.target.files.length && start(imp.entriesFromFiles(e.target.files)));
   $("pick-vpk").addEventListener("click", () => $("f-vpk").click());
-  $("f-vpk").addEventListener("change", (e) => e.target.files.length && startImport(imp.entriesFromFiles(e.target.files)));
+  $("f-vpk").addEventListener("change", (e) => e.target.files.length && start(imp.entriesFromFiles(e.target.files)));
   $("pick-zip").addEventListener("click", () => $("f-zip").click());
-  $("f-zip").addEventListener("change", (e) => e.target.files.length && startImport(imp.entriesFromFiles(e.target.files)));
+  $("f-zip").addEventListener("change", (e) => e.target.files.length && start(imp.entriesFromFiles(e.target.files)));
   const drop = $("drop");
   drop.addEventListener("dragover", (e) => {
     e.preventDefault();
@@ -630,7 +677,7 @@ async function renderImport() {
     e.preventDefault();
     drop.classList.remove("over");
     const entries = await imp.entriesFromDrop(e.dataTransfer);
-    if (entries.length) startImport(entries);
+    if (entries.length) start(entries);
   });
 }
 
@@ -653,7 +700,7 @@ function fmtLeft(secs) {
 // to look like a hang, and the confirmation bought a second read of the same bytes.
 // The card starts as a progress bar and fills in the title, icon and size as the
 // worker reports them, part way through the import it is already running.
-async function startImport(entries) {
+async function startImport(entries, addonFor = null) {
   const result = $("result");
   // The pickers go away while this runs: a second pick would start a second import
   // into the same directory.
@@ -680,7 +727,7 @@ async function startImport(entries) {
       entries,
       async (p) => {
         probe = p;
-        existingP = p.titleId ? store.readTitle(p.titleId) : null;
+        existingP = p.titleId && !addonFor ? store.readTitle(p.titleId) : null;
         const existing = existingP ? await existingP : null;
         if (p.icon0) {
           iconUrl = URL.createObjectURL(new Blob([p.icon0], { type: "image/png" }));
@@ -692,10 +739,10 @@ async function startImport(entries) {
         }
         const title = $("imp-title");
         const meta = $("imp-meta");
-        if (title) title.textContent = p.title || p.titleId || "Unknown title";
+        if (title) title.textContent = p.title || p.addonDir || p.titleId || "Unknown title";
         if (meta) {
           meta.textContent =
-            `${p.titleId || "no title id"}${p.appVersion ? " - v" + p.appVersion : ""} - ` +
+            `${p.isAddon ? `add-on ${p.addonDir || ""} for ` : ""}${p.titleId || "no title id"}${p.appVersion ? " - v" + p.appVersion : ""} - ` +
             `${p.kind === "vpk" ? "homebrew" : p.kind + (p.zipped ? " in a zip" : "")} - ${p.files} files - ${store.fmtBytes(p.bytes)}` +
             (existing ? ` - replacing what is in the library (saved data is kept)` : "");
         }
@@ -719,9 +766,16 @@ async function startImport(entries) {
         fill.style.width = `${pct}%`;
         const left = p.rate > 0 ? `, about ${fmtLeft((p.total - p.done) / p.rate)} left` : "";
         text.textContent = `${stageWord(p.stage)} ${store.fmtBytes(p.done)} / ${store.fmtBytes(p.total)}${p.rate ? ` at ${(p.rate / 1e6).toFixed(0)} MB/s` : ""}${left} - ${p.file}`;
-      }
+      },
+      { addonFor }
     );
     const id = done.titleId;
+    if (addonFor) {
+      fill.style.width = "100%";
+      text.textContent = "done";
+      go(`#/title/${addonFor}`);
+      return;
+    }
     const existing = existingP ? await existingP : null;
     const meta = {
       titleId: id,
@@ -744,7 +798,7 @@ async function startImport(entries) {
   } catch (err) {
     text.textContent = "";
     for (const el of hidden) el.hidden = false;
-    const unknown = /unknown container|not a|no param\.sfo|work\.bin/i.test(String(err.message || err));
+    const unknown = /unknown container|not a title|no param\.sfo|work\.bin/i.test(String(err.message || err));
     result.innerHTML = "";
     result.insertAdjacentHTML(
       "beforeend",

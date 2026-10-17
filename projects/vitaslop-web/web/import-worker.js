@@ -25,14 +25,19 @@
 // here beforehand, and the sink hands them out by name. A path that was planned but
 // never begun (a module-named file that was not a SELF) is closed and deleted after.
 //
-// Messages in:  { type: "import", files: [{ path, file }] }
+// Messages in:  { type: "import", files: [{ path, file }], addonFor?: titleId }
 //               { type: "probe",  files: [{ path, file }] }   (identify only)
 // Messages out: { type: "probe", probe } | { type: "progress", stage, file, done, total }
-//               { type: "done", titleId, contentId, count } | { type: "error", message }
+//               { type: "done", titleId, contentId, count, addon? } | { type: "error", message }
+//
+// With `addonFor`, the files must be an ADD-ON of that title (param.sfo CATEGORY `ac`, its
+// TITLE_ID), and they are stored under `addons/<title>/<dir>/` with an `addon.json` record
+// beside them (opfs.js). Without it, an add-on is refused: filed under its title's id it would
+// replace the game.
 //               { type: "panic", message }
 
 import init, { ingest_probe, ingest_import } from "./pkg/vitaslop_web.js";
-import { titleDir, encodeName, storageRoom } from "./opfs.js";
+import { titleDir, addonsDir, ADDON_RECORD, isAddonName, encodeName, storageRoom } from "./opfs.js";
 import { makeFileSource } from "./read-window.js";
 
 globalThis.__vitaslopPanic = (text) => {
@@ -88,6 +93,9 @@ function forPage(p) {
     title: p.title,
     contentId: p.contentId,
     appVersion: p.appVersion,
+    category: p.category,
+    isAddon: p.isAddon,
+    addonDir: p.addonDir,
     bytes: p.bytes,
     files: p.files,
     icon0: p.icon0,
@@ -133,6 +141,20 @@ self.onmessage = async (e) => {
       throw new Error("this package needs the work.bin licence that was made for it - pick both files together");
     }
     if (!titleId) throw new Error("no param.sfo was found in these files, so this title cannot be named or stored");
+    const addonFor = d.addonFor || null;
+    if (addonFor) {
+      if (!probe.isAddon) {
+        throw new Error(`this is not an add-on but a game (${titleId}) - import it from the library`);
+      }
+      if (titleId !== addonFor) throw new Error(`this add-on belongs to ${titleId}, not ${addonFor}`);
+      if (!isAddonName(probe.addonDir)) {
+        throw new Error(`this add-on's content id (${probe.contentId}) does not name the folder it installs as`);
+      }
+    } else if (probe.isAddon) {
+      throw new Error(
+        `this is an add-on for ${titleId}, not a game - open that game in the library and add it under Add-ons`
+      );
+    }
     const outputs = probe.outputs || [];
     if (outputs.length === 0) throw new Error("nothing to import from these files");
 
@@ -147,7 +169,9 @@ self.onmessage = async (e) => {
 
     // ---- open every output the import may write ----
     self.postMessage({ type: "progress", stage: "preparing", file: "", done: 0, total: 0 });
-    const dir = await titleDir(titleId, { create: true });
+    const dir = addonFor
+      ? await (await addonsDir(titleId, { create: true })).getDirectoryHandle(probe.addonDir, { create: true })
+      : await titleDir(titleId, { create: true });
     // A previous partial import leaves files behind; start from an empty directory
     // so the only entries afterwards are this import's.
     const stale = [];
@@ -215,7 +239,25 @@ self.onmessage = async (e) => {
     const w = await mh.createWritable();
     await w.write(JSON.stringify({ count, complete: true }));
     await w.close();
-    self.postMessage({ type: "done", titleId, contentId, count });
+    let addon = null;
+    if (addonFor) {
+      addon = {
+        titleId,
+        dir: probe.addonDir,
+        contentId,
+        title: probe.title || probe.addonDir,
+        version: probe.appVersion || "",
+        sourceKind: probe.kind,
+        bytes: probe.bytes,
+        files: count,
+        importedAt: Date.now(),
+      };
+      const rh = await dir.getFileHandle(ADDON_RECORD, { create: true });
+      const rw = await rh.createWritable();
+      await rw.write(JSON.stringify(addon));
+      await rw.close();
+    }
+    self.postMessage({ type: "done", titleId, contentId, count, addon });
   } catch (err) {
     self.postMessage({ type: "error", message: String((err && err.message) || err) });
   }

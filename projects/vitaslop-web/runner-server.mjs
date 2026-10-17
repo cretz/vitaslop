@@ -58,8 +58,11 @@ export function createRunner({ dir, coi, laneSrc, runnerWebDir }) {
   const safe = (s) => String(s || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
 
   const readJson = async (p) => JSON.parse(await readFile(p, "utf8"));
+  // A temp name per write: two overlapping writes to one path sharing a temp file interleave
+  // (the shorter payload leaves the longer one's tail), and the rename publishes the torn file.
+  let tmpSeq = 0;
   const writeJson = async (p, v) => {
-    const tmp = `${p}.tmp`;
+    const tmp = `${p}.${process.pid}.${++tmpSeq}.tmp`;
     await writeFile(tmp, JSON.stringify(v, null, 2));
     await rename(tmp, p);
   };

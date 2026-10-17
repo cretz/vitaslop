@@ -109,6 +109,14 @@ pub fn ingest_probe(source: JsValue) -> Result<JsValue, JsValue> {
     set(&out, "title", opt_str(&p.title));
     set(&out, "contentId", opt_str(&p.content_id));
     set(&out, "appVersion", opt_str(&p.app_version));
+    set(&out, "category", opt_str(&p.category));
+    // An add-on: the directory it installs as (see `ingest::addcont`), else null.
+    let addon_dir = p
+        .is_addcont()
+        .then(|| p.content_id.as_deref().and_then(vitaslop_runtime::ingest::addcont::dir_name).map(str::to_string))
+        .flatten();
+    set(&out, "isAddon", JsValue::from_bool(p.is_addcont()));
+    set(&out, "addonDir", opt_str(&addon_dir));
     set(&out, "bytes", JsValue::from_f64(p.bytes as f64));
     set(&out, "files", JsValue::from_f64(p.files as f64));
     set(&out, "icon0", opt_bytes(&p.icon0));

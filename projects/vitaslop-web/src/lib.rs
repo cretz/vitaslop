@@ -42,6 +42,7 @@ mod input;
 mod location;
 mod logging;
 mod opfs;
+mod playbook;
 mod smp;
 mod web_vm;
 
@@ -623,9 +624,9 @@ struct RttWriteback {
     newest_delivered: std::collections::HashMap<u32, u64>,
     /// Copies encoded this present, awaiting their map:
     /// `(addr, slot, w, h, padded row, surface, seq)`.
-    pending: Vec<(u32, u8, u32, u32, u32, vitaslop_runtime::capture::ColorSurface, u64)>,
+    pending: Vec<(u32, u8, u32, u32, u32, vitaslop_runtime::capture::ColorSurface, u64, u32)>,
     /// Copies whose map is outstanding from an earlier present.
-    in_flight: Vec<(u32, u8, u32, u32, u32, vitaslop_runtime::capture::ColorSurface, u64)>,
+    in_flight: Vec<(u32, u8, u32, u32, u32, vitaslop_runtime::capture::ColorSurface, u64, u32)>,
     /// Whether the surface the targets are held in is BGRA, so the bytes are swapped to the
     /// memory-order RGBA the guest expects.
     bgra: bool,
@@ -852,8 +853,10 @@ impl RttWriteback {
             let Some(surface) = vitaslop_runtime::rtt_writeback::surface_for(scenes, addr) else {
                 continue;
             };
-            // A FLOAT target reads back as halves, 8 bytes a texel - see `encode_row_float`.
-            let padded = (w * tex.format().block_copy_size(None).unwrap_or(4)).div_ceil(ALIGN) * ALIGN;
+            // The bytes a texel of the TEXTURE copies as - which is what lands in the buffer, and is
+            // not always what the guest's surface format implies (see `take`).
+            let tex_texel = tex.format().block_copy_size(None).unwrap_or(4);
+            let padded = (w * tex_texel).div_ceil(ALIGN) * ALIGN;
             let size = (padded * h) as u64;
             // A FREE SLOT for this target, rather than "is this target busy at all". See `RING`
             // and `ring_for`, which is why the size is computed first.
@@ -911,7 +914,7 @@ impl RttWriteback {
             let seq = *seq;
             self.captured += 1;
             self.captured_at.insert((addr, slot), Self::now_ms());
-            self.pending.push((addr, slot, w, h, padded, surface, seq));
+            self.pending.push((addr, slot, w, h, padded, surface, seq, tex_texel));
         }
     }
 
@@ -945,7 +948,7 @@ impl RttWriteback {
         let now = Self::now_ms();
         let mut i = 0;
         while i < self.in_flight.len() {
-            let (addr, slot, w, h, padded, _, seq) = self.in_flight[i];
+            let (addr, slot, w, h, padded, _, seq, tex_texel) = self.in_flight[i];
             let landed = self
                 .bufs
                 .get(&(addr, slot))
@@ -956,7 +959,9 @@ impl RttWriteback {
                 i += 1;
                 continue;
             }
-            let (_, _, _, _, _, surface, _) = self.in_flight.swap_remove(i);
+            let (_, _, _, _, _, surface, _, _) = self.in_flight.swap_remove(i);
+            // What the write-back reads: halves for a float surface, RGBA8 for every other - see
+            // `rtt_writeback::apply_one`.
             let texel_bytes = if vitaslop_platform::gpu::float_color_format(surface.format) { 8 } else { 4 };
             // Older than one already applied: unmap it and let it go. See `next_seq`.
             if self.newest_delivered.get(&addr).is_some_and(|newest| *newest >= seq) {
@@ -969,18 +974,40 @@ impl RttWriteback {
             let Some((buf, size, _)) = self.bufs.get(&(addr, slot)) else { continue };
             let want = (padded * h) as u64;
             if let Ok(view) = buf.slice(..want.min(*size)).get_mapped_range() {
-                let tight = (w * texel_bytes) as usize;
-                let mut rgba = Vec::with_capacity(tight * h as usize);
+                // >>> THE ROWS ARE THE TEXTURE'S, AND THE TEXTURE NEED NOT BE THE SURFACE'S FORMAT.
+                // A guest address can be held as RGBA8 while the scene that drew it names a float
+                // surface, or as `Rgba16Float` behind a 32-bit one (see the sub-rect window in
+                // gpu.rs). Rows cut at the SURFACE's width overran the buffer - MEASURED, a beach
+                // title's belongings screen: a 256x256 RGBA8 texture behind a float surface, a
+                // panic at index 263168 of 262144 - and the other way round they would hand the
+                // write-back half floats as 8-bit colour. So the copy is read at its own texel and
+                // converted to the one the write-back encodes from.
+                let tight = (w * tex_texel) as usize;
+                let mut raw = Vec::with_capacity(tight * h as usize);
                 for row in 0..h as usize {
                     let start = row * padded as usize;
-                    rgba.extend_from_slice(&view[start..start + tight]);
+                    raw.extend_from_slice(&view[start..start + tight]);
                 }
-                if self.bgra && texel_bytes == 4 {
-                    for px in rgba.chunks_exact_mut(4) {
+                drop(view);
+                if self.bgra && tex_texel == 4 {
+                    for px in raw.chunks_exact_mut(4) {
                         px.swap(0, 2);
                     }
                 }
-                drop(view);
+                let rgba = match (tex_texel, texel_bytes) {
+                    (4, 8) => raw
+                        .iter()
+                        .flat_map(|&c| vitaslop_runtime::render::f32_to_half(f32::from(c) / 255.0).to_le_bytes())
+                        .collect(),
+                    (8, 4) => raw
+                        .chunks_exact(2)
+                        .map(|c| {
+                            let v = vitaslop_runtime::render::half_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                            (v.clamp(0.0, 1.0) * 255.0).round() as u8
+                        })
+                        .collect(),
+                    _ => raw,
+                };
                 if let Some(t) = self.captured_at.get(&(addr, slot)) {
                     let age = (now - t).max(0.0);
                     self.age_sum_ms += age;
@@ -4801,6 +4828,8 @@ struct Mounted {
     backing: Option<Box<dyn vitaslop_runtime::host::FileBacking>>,
     /// Decrypted files held in the heap. `None` for the OPFS source.
     resident: Option<vitaslop_runtime::ingest::vfs::MemVfs>,
+    /// The add-ons `backing` also serves, by directory name (see `opfs::stored_addons`).
+    addons: Vec<String>,
     nfiles: usize,
     decrypt_ms: f64,
 }
@@ -4848,6 +4877,7 @@ async fn mount_and_link(source: JsValue) -> Result<Mounted, JsValue> {
     // or lazily backed), and how many files the title has.
     let mut backing: Option<Box<dyn vitaslop_runtime::host::FileBacking>> = None;
     let mut resident: Option<MemVfs> = None;
+    let mut addons: Vec<String> = Vec::new();
     let nfiles;
     let modules_elf;
 
@@ -4873,8 +4903,28 @@ async fn mount_and_link(source: JsValue) -> Result<Mounted, JsValue> {
             // Correctness of this read path is covered by `e2e/opfs.mjs` against a
             // fixture, not re-proven here: verifying a gigabyte-sized title would cost
             // more than the boot it precedes.
-            backing =
-                Some(Box::new(opfs::OpfsBacking::new(vfs.into_reader(), dump.files_prefix)));
+            let reader = vfs.into_reader();
+            let stored = opfs::stored_addons(&reader);
+            let mut b = opfs::OpfsBacking::new(reader, dump.files_prefix);
+            // The title's add-ons, served by the same reader under the mount the title
+            // lists. One whose content id does not name the folder it was stored in is
+            // refused: the name is what the title asks for, and a mismatch is an add-on
+            // that is installed and never appears.
+            for (dir, cid) in stored {
+                match vitaslop_runtime::ingest::addcont::dir_name(&cid) {
+                    Some(name) if name.eq_ignore_ascii_case(&dir) => {
+                        b.add_mount(&format!("{}{dir}/files/", opfs::ADDONS_PREFIX), &format!("addcont0:/{name}"));
+                        logging::note(&format!("add-on: {name}"));
+                        addons.push(name.to_string());
+                    }
+                    _ => {
+                        return Err(JsValue::from_str(&format!(
+                            "add-on {dir:?} carries content id {cid:?}, which names a different add-on"
+                        )))
+                    }
+                }
+            }
+            backing = Some(Box::new(b));
         }
 
         // Bytes in memory. Kept for fixtures and for a title small enough not to care.
@@ -4932,7 +4982,7 @@ async fn mount_and_link(source: JsValue) -> Result<Mounted, JsValue> {
         "[setup] heap after decrypt+link: {} MB",
         wasm_heap_mb()
     ));
-    Ok(Mounted { linked, backing, resident, nfiles, decrypt_ms })
+    Ok(Mounted { linked, backing, resident, addons, nfiles, decrypt_ms })
 }
 
 async fn setup_game(
@@ -4943,7 +4993,7 @@ async fn setup_game(
     audio_ring: &JsValue,
 ) -> Result<GameSetup, JsValue> {
     let perf = global_performance().ok_or_else(|| JsValue::from_str("no performance clock"))?;
-    let Mounted { linked, backing, resident, nfiles, decrypt_ms } = mount_and_link(source).await?;
+    let Mounted { linked, backing, resident, addons, nfiles, decrypt_ms } = mount_and_link(source).await?;
 
     // The input world: a scripted recipe (if given) overlaid with live pointer/keyboard
     // input, both feeding the same touch/pad seam the native probe drives.
@@ -5004,6 +5054,9 @@ async fn setup_game(
     // memory budget we run in).
     if let Some(backing) = backing {
         env.state.set_file_backing(backing);
+    }
+    for name in &addons {
+        env.state.note_addcont(name);
     }
     if let Some(files) = resident {
         for (path, bytes) in files.into_files() {
@@ -5335,6 +5388,8 @@ pub async fn run_game_worker(
     prebuilt: JsValue,
     audio_ring: JsValue,
     persist: JsValue,
+    // `{ name, source }`: a playbook to drive input with (see `playbook`), or undefined.
+    playbook: JsValue,
 ) -> Result<String, JsValue> {
     crate::logging::install_panic_hook();
     logging::init();
@@ -5414,6 +5469,12 @@ pub async fn run_game_worker(
 
     let status = setup.status("web worker");
     logging::note(&status);
+    // The playbook engine starts before the live loop runs a guest instruction, so it sees the
+    // first pad read. A recipe and a playbook both driving input is refused.
+    if !playbook.is_undefined() && !playbook.is_null() && setup.recipe.is_some() {
+        return Err(JsValue::from_str("a recipe and a playbook both drive input - pass one"));
+    }
+    playbook::start(&playbook)?;
     wasm_bindgen_futures::spawn_local(live_loop(
         setup.sched,
         playback,
@@ -5759,6 +5820,13 @@ async fn live_loop(
 
     let now = || perf.as_ref().map(|p| p.now()).unwrap_or(0.0);
     let mut acc = 0.0f64;
+    // The wall time this tick's clamp of `acc` cut off. A frame that advanced game time the
+    // guest RAN in that wall time - the catch-up after a slow present it ran on through
+    // (`smp::late_present`) - is charged against it before the clamp applies again; spent
+    // nowhere else, a plain stall's surplus is still dropped. MEASURED without it (a fighting
+    // title's full fight, browser): after every long present the charge of the frames run
+    // meanwhile floored `acc`, the loop held the guest back, and the speakers went dry 35-65 ms.
+    let mut acc_clamped_off: f64;
     let mut last = now();
     let mut last_console = 0.0f64;
     // Whether this run was started with debug capture on (`VITASLOP_DEBUG_CAPTURE`). Read ONCE,
@@ -5917,6 +5985,7 @@ async fn live_loop(
             saturated_ticks += 1;
         }
         acc = acc_raw.min(MAX_CATCHUP_MS);
+        acc_clamped_off = (acc_raw - MAX_CATCHUP_MS).max(0.0);
         last = t;
 
         // Fast-forward while below the target frame: ignore the wall clock and run as
@@ -6233,7 +6302,7 @@ async fn live_loop(
                 advanced_ms.max(FRAME_MS)
             };
             charged_ms += charge;
-            acc = (acc - charge).max(-MAX_CATCHUP_MS);
+            acc = (acc + std::mem::take(&mut acc_clamped_off) - charge).clamp(-MAX_CATCHUP_MS, MAX_CATCHUP_MS);
 
             // Take the scene presented this frame and drop the rest (render-to-texture
             // intermediates); clearing the per-frame capture vectors bounds the capture's
@@ -6322,7 +6391,9 @@ async fn live_loop(
                 // present the guest ran on through (`smp::late_present`), every frame it made
                 // since, in order, and the newest is shown.
                 let taken = sched.frames().saturating_sub(target - 1).max(1) as usize;
+                let front_pending = cap.scenes.iter().take_while(|s| s.deferred_id != 0).count();
                 let scenes = if smp_overlap { cap.take_scenes_through_flips(taken) } else { cap.take_frame_scenes() };
+                note_take(sched.frames(), taken, scenes.len(), front_pending, cap.scenes.len());
                 cap.trace.clear();
                 cap.trace_thid.clear();
                 // >>> TAKEN, NOT DISCARDED. These are the buffers the guest FLIPPED while this
@@ -6349,6 +6420,11 @@ async fn live_loop(
 
             let frames = sched.frames();
             mem_find_at(&sched, frames);
+            // A playbook's per-present step: resume its VM, which lives in this worker.
+            {
+                let guest_us = sched.host.lock().unwrap().state.guest_mono_us();
+                playbook::on_present(frames, guest_us);
+            }
             // Evaluate the recipe's observations for this frame. Shots are NAMED here and
             // logged rather than written: a worker has no filesystem, so the picture is
             // the harness's job (`SHOT_EVERY_MS` / the end-of-run capture) while WHICH
@@ -6642,6 +6718,9 @@ async fn live_loop(
                     logging::note(&format!(
                         "live run ended at frame {frames}: {report_step:?}"
                     ));
+                    // The speakers' silence from here is the run being over, not the
+                    // emulator falling behind - see `audio::mark_run_ended`.
+                    audio::mark_run_ended();
                     // >>> A PROCESS REPLACEMENT (`sceAppMgrLoadExec` of this app's own
                     // executable): the page reboots the emulator with it as the main
                     // executable (`VITASLOP_MAIN_EXEC`, see `with_main_exec`). This note is the
@@ -6830,6 +6909,7 @@ async fn live_loop(
                 (st.now_us(), st.audio_produced_seconds(), audio::ring_underrun_frames().unwrap_or(0))
             };
             let around0 = around(&sched);
+            vitaslop_platform::gpu::set_guest_frame(sched.frames());
             let outcome = playback.present(&scene, display, &flips).await;
             if let Some(s) = sched.smp() {
                 s.late_end();
@@ -8916,6 +8996,53 @@ fn settle_times_line() -> String {
 /// failure the title itself would show.
 const PIPE_DEFER_MAX_MS_DEFAULT: f64 = 0.0;
 
+/// Every 600 frames, how the frame TAKES went: how many came back EMPTY (no scene to show, so
+/// the previous picture stays and the next present renders two frames' worth - a repeat then a
+/// jump); how many takes found PENDING scenes at the front of the capture (a scene carried over
+/// from an earlier take), and how many of the empty ones followed such a take; and how many
+/// took several frames at once (a late present's catch-up).
+fn note_take(frame: u64, frames_taken: usize, got: usize, front_pending: usize, left: usize) {
+    #[derive(Clone, Copy, Default)]
+    struct Tally {
+        f0: u64,
+        takes: u32,
+        empty: u32,
+        front: u32,
+        empty_after_front: u32,
+        multi: u32,
+        left_at_empty: u32,
+        prev_front: bool,
+    }
+    thread_local! {
+        static T: std::cell::Cell<Tally> = std::cell::Cell::new(Tally::default());
+    }
+    T.with(|c| {
+        let mut t = c.get();
+        if t.takes == 0 {
+            t.f0 = frame;
+        }
+        t.takes += 1;
+        t.multi += u32::from(frames_taken > 1);
+        t.front += u32::from(front_pending > 0);
+        if got == 0 {
+            t.empty += 1;
+            t.left_at_empty += left as u32;
+            t.empty_after_front += u32::from(t.prev_front);
+        }
+        t.prev_front = front_pending > 0;
+        if frame >= t.f0 + 600 {
+            if t.empty > 0 || t.multi > 0 {
+                logging::note(&format!(
+                    "[takes] f{}-f{frame}: {} takes, {} EMPTY ({} right after a take with pending scenes at the front; {} scenes left at them), {} with pending at the front, {} multi-frame",
+                    t.f0, t.takes, t.empty, t.empty_after_front, t.left_at_empty, t.front, t.multi
+                ));
+            }
+            t = Tally { prev_front: t.prev_front, ..Tally::default() };
+        }
+        c.set(t);
+    });
+}
+
 /// Every 120 presented frames, name a stretch in which the speakers went dry for more than
 /// 20 ms: `[audio-gap] fA-fB: dry X ms`. The run's underrun total cannot say WHERE it was spent,
 /// and the slow-present line (`[late]`) only covers the present itself.
@@ -8933,7 +9060,13 @@ fn note_audio_gaps(frame: u64) {
             m.set(Some((frame, under)));
         }
         Some(_) => {}
-        None => m.set(Some((frame, under))),
+        None => {
+            let dry_ms = f64::from(under) / 48.0;
+            if dry_ms > 20.0 {
+                logging::note(&format!("[audio-gap] before f{frame} (boot): dry {dry_ms:.0} ms"));
+            }
+            m.set(Some((frame, under)));
+        }
     });
 }
 

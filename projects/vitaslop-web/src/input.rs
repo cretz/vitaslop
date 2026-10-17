@@ -125,6 +125,10 @@ impl World for BrowserWorld {
         self.wall_us
     }
     fn poll_ctrl(&mut self, port: u32) -> CtrlFrame {
+        // A playbook run owns the pad outright.
+        if let Some((ctrl, _)) = vitaslop_playbook::engine::input(port) {
+            return ctrl;
+        }
         let mut f = self.recipe.as_mut().map(|r| r.poll_ctrl(port)).unwrap_or_default();
         // Merge live keyboard buttons on top of any scripted state.
         let live = self.live.lock().unwrap();
@@ -142,6 +146,9 @@ impl World for BrowserWorld {
         f
     }
     fn poll_touch(&mut self, port: u32) -> TouchFrame {
+        if let Some((_, touch)) = vitaslop_playbook::engine::input(port) {
+            return touch;
+        }
         // A live pointer press overrides the scripted touch; otherwise the recipe (if
         // any) drives, and failing that there is no finger down.
         if port == 0

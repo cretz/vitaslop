@@ -101,8 +101,13 @@ self.onmessage = async (e) => {
     }
 
     let source;
+    let openStats = "";
     if (titleId) {
-      reader = syncReader(await openTitleSync(titleId));
+      // Only the manifest and the modules are read here (`mount_dump_lazy`): the guest's data
+      // files, the title's and its add-ons', are listed but stay shut - see `openTitleSync`.
+      const handles = await openTitleSync(titleId, { skip: (p) => /^(addons\/[^/]+\/)?files\//.test(p) });
+      openStats = handles.openStats || "";
+      reader = syncReader(handles);
       source = { kind: "opfs", payload: reader };
     } else if (files) {
       source = { kind: "memory", payload: files };
@@ -110,12 +115,22 @@ self.onmessage = async (e) => {
       throw new Error("transpile worker got neither titleId nor files");
     }
 
-    const built = await transpile_title(source, hostOff);
+    let built;
+    try {
+      built = await transpile_title(source, hostOff);
+    } finally {
+      const touched = reader ? reader.touchedSkipped() : [];
+      if (touched.length) {
+        throw new Error(`the transpile read data file(s) it did not open: ${touched.slice(0, 8).join(", ")} - widen its open in transpile-worker.js`);
+      }
+    }
     built.readyMs = readyMs;
     // Release the exclusive locks BEFORE the run worker is told to start, or its own
     // `createSyncAccessHandle` will fail on every file.
+    const tClose = performance.now();
     if (reader) reader.close();
     reader = null;
+    if (openStats) built.split = `title files ${openStats}, closed ${Math.round(performance.now() - tClose)} ms; ${built.split}`;
     const wasm = built.wasm;
     delete built.wasm;
     if (useCache) {

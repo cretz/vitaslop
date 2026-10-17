@@ -108,6 +108,10 @@ than expected.
 - **A pixel oracle.** Headless runs render deterministic frames that tests compare
   bit for bit, so a rendering change either matches the previous build exactly or
   says which draw moved.
+- **Playbooks.** Lua scripts play each title by waiting on what the game does, such
+  as a call it makes or a value in its memory, instead of pressing at frame numbers.
+  Run deterministically, a playbook records a tape that replays the run exactly; at
+  real speed, it adapts to the timing it gets.
 
 <a name="games-tried"></a>
 <details>

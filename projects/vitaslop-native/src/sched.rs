@@ -182,6 +182,7 @@ impl Scheduler {
             // so nothing here is known to be inlinable.
             inline_imports: &[],
             noreturn_svc: &[],
+            noreturn_imports: &[],
             mem_bytes,
             // Vita modules take function addresses (thread entries, callbacks).
             discover_code_pointers: true,

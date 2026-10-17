@@ -117,6 +117,12 @@ details.card[open] > summary::before { content: "\25BE"; }
 .checks li.ok b { color: var(--accent); }
 .checks li.warn b { color: var(--warn); }
 .checks li.fatal b { color: var(--danger); }
+/* A title's add-ons: one row each, the name and facts at the left, Remove at the right. */
+.addons { list-style: none; padding: 0; margin: 6px 0 0; }
+.addons li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid var(--edge); font-size: 14px; }
+.addons li:first-child { border-top: 0; }
+.addons li > div { min-width: 0; overflow-wrap: anywhere; }
+.addons li .btn { flex: none; }
 .empty { text-align: center; color: var(--dim); padding: 60px 0; }
 
 /* ---------- library ---------- */

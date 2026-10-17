@@ -42,6 +42,7 @@ impl Engine for WebEngine {
             // The ARM corpus has no NID imports at all, so nothing to inline.
             inline_imports: &[],
             noreturn_svc: NORETURN_SVC,
+            noreturn_imports: &[],
             mem_bytes: MEM_BYTES,
             // The ARM corpus is tightly controlled and takes no function
             // addresses; keep discovery off so output matches the native runner.

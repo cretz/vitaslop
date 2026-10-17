@@ -646,6 +646,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             // `from_linked`, which passes the linker's list.
             inline_imports: &[],
             noreturn_svc: &[],
+            noreturn_imports: &[],
             mem_bytes,
             discover_code_pointers: true,
             import_memory: true,
@@ -3035,6 +3036,12 @@ impl vitaslop_runtime::GuestMemory for SharedView {
         }
         block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize] = next;
         Some((next, false))
+    }
+
+    fn stamp_dirty_pages(&self, off: usize, len: usize) {
+        if off.checked_add(len).is_some_and(|end| end <= self.len()) {
+            self.stamp_written(off, len);
+        }
     }
 }
 

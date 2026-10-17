@@ -1355,22 +1355,16 @@ fn do_color_surface_init_disabled(ctx: &mut GuestCtx, st: &mut VitaState, addr: 
     0
 }
 
-/// Report - once per (surface data address, mode) - a colour surface created with a SCALE MODE
-/// we do not honour.
+/// Report - once per mode - a colour surface created with a SCALE MODE the renderer does not
+/// serve.
 ///
-/// `SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE` (1) means the pass RASTERISES at twice the
-/// surface's resolution in each axis and the hardware resolves 2x2 samples into each stored
-/// pixel. We rasterise at the surface's own resolution and store that, which is not a rounding
-/// difference: everything the guest derives from the two resolutions - a post-process pass's
-/// texel size, a screen-space scale/bias, a depth surface it then samples - is computed for a
-/// buffer twice the size of the one we produced.
-///
-/// It is a report rather than a fix because honouring it means rasterising a pass at 2x and
-/// resolving, which is a real piece of work; and an approximation that says nothing is
-/// indistinguishable on screen from a faithful render, which is exactly how a wrong frame
-/// survives being stared at. MEASURED on one retail racer: its world colour surface asks for
-/// MSAA_DOWNSCALE and the depth surface the guest then samples is described as exactly 2x2 the
-/// colour resolution - the two facts agree, and both disagree with what we render.
+/// `SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE` (1) is SERVED: the surface stores the resolved
+/// image, the render target's `multisampleMode` says how many samples the pass rasterised, and
+/// the renderer gives such a target a real multisampled attachment resolved into the stored
+/// size (`vitaslop_platform::gpu::gxm_sample_count`; `RttSurface::msaa_downscale`). Whether it
+/// did, target by target, is the renderer's own `MULTISAMPLE granted` / `REFUSED` report - so
+/// this used to warn "IGNORE the mode" on every title that asks for it, which was no longer
+/// true and sent a reader after a gap that is closed. Any OTHER mode is unknown and warns.
 fn report_color_surface_scale_mode(data_addr: u32, scale_mode: u32) {
     if scale_mode == 0 {
         return;
@@ -1396,19 +1390,13 @@ fn report_color_surface_scale_mode(data_addr: u32, scale_mode: u32) {
     if count > 1 && !matches!(count, 10 | 100 | 1_000 | 10_000 | 100_000 | 1_000_000) {
         return;
     }
-    let name = match scale_mode {
-        1 => "MSAA_DOWNSCALE (the guest rasterises this pass at 2x2 the stored resolution and \
-              resolves into it)",
-        _ => "an unrecognised scale mode",
-    };
-    // A WARNING: the mode is ignored, which is an approximation the picture cannot show, and
-    // honouring it (rasterise at 2x, resolve) is a real piece of work that is owed.
+    if scale_mode == 1 {
+        return;
+    }
     tracing::warn!(
         target: "vitaslop::gxm",
-        "gxm surface: colour surface(s) created with {name} - we rasterise at the stored \
-         resolution and IGNORE the mode, so anything the guest derives from the two resolutions \
-         is computed for a buffer twice the size of the one we produce. first={first:#x} \
-         count={count}"
+        "gxm surface: colour surface(s) created with an unrecognised scale mode {scale_mode} - \
+         rendered at the stored resolution. first={first:#x} count={count}"
     );
 }
 
@@ -1507,11 +1495,13 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
         (program_header, raw)
     });
     if let Some(handle) = key.as_ref().and_then(|k| st.share_program(k)) {
+        tracing::debug!(target: "vitaslop::gxm", handle = format_args!("{handle:#x}"), "createVertexProgram SHARED an existing program");
         ctx.write_u32(out, handle);
         ctx.ret(0);
         return;
     }
     let handle = st.new_program_handle(ctx, program_header);
+    tracing::debug!(target: "vitaslop::gxm", handle = format_args!("{handle:#x}"), "createVertexProgram made a new program");
     if let Some(k) = key {
         st.remember_shared_program(k, handle);
     }
@@ -2608,12 +2598,19 @@ pub(super) fn texture_get_format(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// scene rendered into": a golf title's final pass renders one buffer and flips another, and
 /// rejecting its flips moved its vblank pacing and with it every animation's phase.
 pub(super) fn display_queue_add_entry(ctx: &mut GuestCtx, st: &mut VitaState) {
+    // >>> THE FRAME'S GEOMETRY IS READ HERE WHETHER OR NOT A BUFFER IS NAMED. This call ends the
+    // display frame (the scheduler's boundary, and the capture's), every scene of it has ended
+    // and been queued, and the GPU may read its vertices from now on - so nothing the guest may
+    // legitimately write changes them. It was read only when the callback data named a known
+    // buffer, and otherwise only at the callback's `sceDisplaySetFrameBuf` a frame later: a
+    // presenter taking the frame in between found every scene pending and showed nothing.
+    // MEASURED (a fighting title's fight, browser): ~8% of frames never shown that way.
+    st.resolve_at_flip(ctx);
     let callback_data = ctx.arg(2);
     if callback_data != 0 {
         let words: Vec<u32> = (0..8).map(|i| ctx.read_u32(callback_data + i * 4)).collect();
         let named = words.iter().copied().find(|w| *w != 0 && st.flip_candidates.contains(w));
         if let Some(buffer) = named {
-            st.resolve_at_flip(ctx);
             st.present(buffer);
         }
     }
@@ -4401,6 +4398,49 @@ pub(crate) mod inline_op_tests {
                 "{name} leaves the cursor past the block it handed out"
             );
         }
+    }
+
+    /// A precomputed draw draws with its OWN program and streams and leaves the context's
+    /// sticky vertex state exactly as it was - by never writing the context at all.
+    ///
+    /// The rule is old (an immediate draw after a precomputed one must still see what the
+    /// setters bound); what this pins is that it now holds with no write-and-restore, so a
+    /// change that brought the writes back would fail on the block bytes, not only on the
+    /// two words a restore would have put back.
+    #[test]
+    fn a_precomputed_draw_leaves_the_context_block_untouched() {
+        use crate::vita::{gxmctx, gxmprog};
+        const CONTEXT: u32 = 0x400;
+        const VHANDLE: u32 = 0x800;
+        const PD_VHANDLE: u32 = 0x840;
+        const PDRAW: u32 = 0x900;
+        const STREAM: u32 = 0x2000;
+        const PD_STREAM: u32 = 0x3000;
+
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 0x4000];
+        let mut st = VitaState::new(0, 0x4000, Box::new(DeterministicWorld::default()));
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        gxmctx::init(&mut ctx, CONTEXT);
+        gxmprog::init(&mut ctx, VHANDLE, 0, 0x8100_0000);
+        gxmprog::init(&mut ctx, PD_VHANDLE, 0, 0x8200_0000);
+        gxmctx::set(&mut ctx, CONTEXT, gxmctx::off::VERTEX_PROGRAM, VHANDLE);
+        gxmctx::set_stream(&mut ctx, CONTEXT, 0, STREAM);
+        st.adopt_gxm_context(CONTEXT);
+        st.precomputed_draw_init(&mut ctx, PDRAW, PD_VHANDLE);
+        st.precomputed_draw_set_stream(&mut ctx, PDRAW, 0, PD_STREAM);
+        st.precomputed_draw_set_params(&mut ctx, PDRAW, 0, 0, 0, 3, 0);
+
+        let mut before = [0u8; gxmctx::BYTES as usize];
+        ctx.read_into(CONTEXT, &mut before);
+        st.draw_precomputed(&mut ctx, PDRAW);
+        let mut after = [0u8; gxmctx::BYTES as usize];
+        ctx.read_into(CONTEXT, &mut after);
+        assert_eq!(after, before, "the context block is byte-for-byte what the setters left");
+        assert_eq!(gxmctx::get(&ctx, CONTEXT, gxmctx::off::VERTEX_PROGRAM), VHANDLE);
+        assert_eq!(gxmctx::stream(&ctx, CONTEXT, 0), STREAM);
     }
 
     /// The emitted `sceGxmSetUniformDataF` and the handler behind it must read the SAME

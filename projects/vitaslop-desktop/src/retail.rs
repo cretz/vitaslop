@@ -101,6 +101,10 @@ impl World for DesktopWorld {
         self.wall_us
     }
     fn poll_ctrl(&mut self, port: u32) -> CtrlFrame {
+        // A playbook (or tape) run owns the pad outright.
+        if let Some((ctrl, _)) = vitaslop_playbook::engine::input(port) {
+            return ctrl;
+        }
         let live = self.input.lock().unwrap().ctrl;
         let Some(r) = self.recipe.as_mut() else { return live };
         // Recipe drives; live input is additive so the watcher can nudge. Buttons OR
@@ -117,6 +121,9 @@ impl World for DesktopWorld {
     fn poll_touch(&mut self, port: u32) -> TouchFrame {
         if port != 0 {
             return TouchFrame::default();
+        }
+        if let Some((_, touch)) = vitaslop_playbook::engine::input(port) {
+            return touch;
         }
         let live = self.input.lock().unwrap().touch.unwrap_or_default();
         let Some(r) = self.recipe.as_mut() else { return live };
@@ -422,6 +429,36 @@ impl RetailGuest {
     /// > > > descriptors on, so doing it mid-run corrupts exactly the state it is trying to keep.
     /// > > > Construction has just returned and the guest has not been stepped, which is why this
     /// > > > is a separate call taken immediately rather than a fourth argument to `new`.
+    /// Install every add-on under `root`: each subdirectory holding a decrypted dump (what an
+    /// add-on import writes - see `library::addons_dir`). Call before the first step, like
+    /// [`persist_to`](Self::persist_to). An add-on that will not mount fails the run: playing
+    /// on without content the player installed is a different game than the one they asked for.
+    pub fn mount_addons(&mut self, root: &Path) -> Result<usize, String> {
+        let Ok(rd) = std::fs::read_dir(root) else { return Ok(0) };
+        let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        dirs.sort();
+        let mut n = 0;
+        for dir in dirs {
+            let disk = crate::diskvfs::DiskVfs::open(&dir)?;
+            // The manifest is written last, so a folder without one is an import that did not
+            // finish - not an add-on yet.
+            let Some(droot) = vitaslop_runtime::ingest::pipeline::dump_root(&disk) else {
+                println!("add-on: {} holds no finished import, skipped", dir.display());
+                continue;
+            };
+            let dump = vitaslop_runtime::ingest::pipeline::mount_dump_lazy(&disk, &droot)
+                .map_err(|e| format!("add-on {}: {e:?}", dir.display()))?;
+            let name = vitaslop_runtime::ingest::addcont::dir_name(&dump.content_id)
+                .ok_or_else(|| format!("add-on {}: content id {:?} names no add-on directory", dir.display(), dump.content_id))?
+                .to_string();
+            let backing = crate::diskvfs::DiskBacking::new(disk.under(&dump.files_prefix));
+            println!("add-on: {name} ({} file(s), {:.1} MB)", backing.file_count(), backing.total_bytes() as f64 / 1e6);
+            self.sched.host().state.add_addcont(&name, Box::new(backing));
+            n += 1;
+        }
+        Ok(n)
+    }
+
     pub fn persist_to(&mut self, root: &Path, game_dir: &Path) -> Result<(), String> {
         // Asked of the container, not of the path - see `SaveStore::title_for`.
         let sfo = self.sched.host().state.read_file("app0:/sce_sys/param.sfo");
@@ -1161,12 +1198,30 @@ impl RetailGfx {
             let t0 = Instant::now();
             let mut renderer = r.lock().unwrap_or_else(|e| e.into_inner());
             let t1 = Instant::now();
+            let build0 = vitaslop_platform::gpu::peek_pipeline_build_split();
             let out = renderer.complete_scenes(scenes);
             drop(renderer);
+            let work_ms = t1.elapsed().as_secs_f64() * 1000.0;
             if let Ok(mut s) = sums.lock() {
                 s[0] += 1.0;
                 s[1] += (t1 - t0).as_secs_f64() * 1000.0;
-                s[2] += t1.elapsed().as_secs_f64() * 1000.0;
+                s[2] += work_ms;
+            }
+            // The guest WAITS on a completion (under the host lock), so a slow one stops the
+            // whole emulator - its sound included. Named, with its shader work, like a slow
+            // present.
+            if work_ms > 50.0 {
+                let b = vitaslop_platform::gpu::peek_pipeline_build_split();
+                tracing::info!(
+                    target: "vitaslop::status",
+                    ms = work_ms as u64,
+                    scenes = scenes.len(),
+                    draws = scenes.iter().map(|s| s.draws.len()).sum::<usize>(),
+                    translate_ms = (b.0 - build0.0) as u64,
+                    module_ms = (b.1 - build0.1) as u64,
+                    pipeline_ms = (b.2 - build0.2) as u64,
+                    "slow guest completion"
+                );
             }
             out
         })
@@ -1903,6 +1958,63 @@ fn report_frame_timing(
 /// stable median past the first-render pipeline/upload cost, cheap enough to always run.
 const WARM_RENDER_SAMPLES: usize = 60;
 
+/// What drives a headless run's input instead of a recipe.
+pub enum Play {
+    /// A playbook (`vitaslop-playbook`), which also records `<shot-dir>/playbook.tape`.
+    Playbook(PathBuf),
+    /// A tape a playbook run recorded, replayed input frame for input frame.
+    Tape(PathBuf),
+}
+
+/// Wall-clock milliseconds since the first call, for a playbook's per-phase speed.
+fn wall_ms() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+/// Start the playbook engine for `play` (or for discovery alone, which records calls while
+/// the built-in input runs). Before the guest is built, so the first pad read is seen.
+fn start_play(play: Option<&Play>, discover: bool, dir: &Path) -> Result<(), String> {
+    use vitaslop_playbook::engine;
+    let mode = if vitaslop_native::smp::enabled() { "real-speed (SMP)" } else { "deterministic (one-baton)" };
+    // The title's own id, from its param.sfo - the directory name of an extracted dump says
+    // nothing (they are all called `extracted`).
+    // An extracted dump keeps it under `files/`; a plain app tree at its root.
+    let title = [dir.join("files").join("sce_sys"), dir.join("sce_sys")]
+        .iter()
+        .find_map(|d| std::fs::read(d.join("param.sfo")).ok())
+        .and_then(|sfo| vitaslop_runtime::ingest::sfo::title_id(&sfo))
+        .unwrap_or_else(|| dir.display().to_string());
+    let header = vec![("title".to_string(), title), ("mode".to_string(), mode.to_string())];
+    match play {
+        Some(Play::Playbook(path)) => {
+            let source = std::fs::read_to_string(path).map_err(|e| format!("read playbook {}: {e}", path.display()))?;
+            let name = vitaslop_playbook::playbook_name(path);
+            println!("headless: input is the PLAYBOOK {name} ({mode})");
+            let opts = engine::StartOpts { name, header, discover, wall_ms: Some(wall_ms), drives_input: true };
+            engine::start(opts, &source, Some(Box::new(vitaslop_playbook::lua_mlua::MluaVm::new())))
+        }
+        Some(Play::Tape(path)) => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("read tape {}: {e}", path.display()))?;
+            let tape = vitaslop_playbook::tape::Tape::parse(&text)?;
+            println!("headless: input is the TAPE {} ({mode})", path.display());
+            engine::start_tape(tape, path.display().to_string(), discover, Some(wall_ms))
+        }
+        // Discovery with no playbook: an empty one, so the engine is running to record calls;
+        // the run's own input (a recipe or the built-in taps) still drives it.
+        None => {
+            let opts = engine::StartOpts {
+                name: "(discover)".into(),
+                header,
+                discover,
+                wall_ms: Some(wall_ms),
+                drives_input: false,
+            };
+            engine::start(opts, "", Some(Box::new(vitaslop_playbook::lua_mlua::MluaVm::new())))
+        }
+    }
+}
+
 pub fn headless_check(
     dir: PathBuf,
     shot_dir: PathBuf,
@@ -1915,6 +2027,12 @@ pub fn headless_check(
     // `<root>/<title>/`. OFF by default here on purpose - a headless run is the render and
     // timing oracle, and a save read back in changes what the title draws.
     save_dir: Option<PathBuf>,
+    // `--addons <root>`: install the add-ons under it (see `RetailGuest::mount_addons`).
+    addons: Option<PathBuf>,
+    // `--playbook` / `--tape`: what drives input instead of a recipe; `--discover`: record the
+    // call table cues are found from. See `vitaslop-playbook`.
+    play: Option<Play>,
+    discover: bool,
 ) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
     let env_recipe = std::env::var("VITASLOP_HEADLESS_RECIPE")
@@ -1929,13 +2047,30 @@ pub fn headless_check(
                         different recipes - pass one, not two".into());
         }
     let recipe = flag_recipe.or(env_recipe);
+    if recipe.is_some() && play.is_some() {
+        return Err("a recipe and a playbook/tape both drive input - pass one".into());
+    }
     // Say which way input is being driven, unconditionally. "Did the recipe apply" was
     // previously answerable only by recognising the final screenshot.
-    println!(
-        "headless: input is {}",
-        if recipe.is_some() { "a RECIPE" } else { "the built-in tap script (no recipe given)" }
-    );
+    if play.is_none() {
+        println!(
+            "headless: input is {}",
+            if recipe.is_some() { "a RECIPE" } else { "the built-in tap script (no recipe given)" }
+        );
+    }
+    // The playbook engine starts BEFORE the guest exists, so it sees the very first pad read.
+    if play.is_some() || discover {
+        start_play(play.as_ref(), discover, &dir)?;
+    }
+    // Screenshots a playbook asked for, written from the next rendered frame.
+    let mut play_shots: Vec<String> = Vec::new();
+    // The display frame the playbook finished on: the run stops a frame later, so a shot it
+    // asked for last is still written.
+    let mut play_over_at: Option<u64> = None;
     let mut guest = RetailGuest::new(&dir, input.clone(), recipe.as_deref())?;
+    if let Some(root) = addons.as_deref() {
+        guest.mount_addons(root)?;
+    }
     if let Some(root) = save_dir.as_deref() {
         guest.persist_to(root, &dir)?;
     }
@@ -1970,7 +2105,8 @@ pub fn headless_check(
     // The built-in Tutorial tap script (title menu navigation): used only when no
     // recipe is given and taps are not disabled. (active_from, active_until, x, y) - a
     // sticky tap held across a few frames then released.
-    let use_builtin_taps = recipe.is_none() && std::env::var_os("VITASLOP_HEADLESS_NO_TAPS").is_none();
+    let use_builtin_taps =
+        recipe.is_none() && play.is_none() && std::env::var_os("VITASLOP_HEADLESS_NO_TAPS").is_none();
     let taps = [
         (12u64, 19u64, 450u16, 674u16),
         (30, 37, 230, 230),
@@ -2087,7 +2223,7 @@ pub fn headless_check(
     // and targets the frame render built. See `VitaState::complete_scene_now`.
     let periodic_shared: std::sync::Arc<std::sync::Mutex<Option<vitaslop_native::GeneralRenderer>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
-    if shot_every > 0 {
+    if shot_every > 0 || play.is_some() {
         std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
         *periodic_shared.lock().unwrap() =
             Some(vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?);
@@ -2143,11 +2279,14 @@ pub fn headless_check(
         {
             println!("headless: frame {}: the title exec'd {path} - booting it", guest.frames());
             guest = RetailGuest::new_with_exec(&dir, input.clone(), recipe.as_deref(), Some(&path))?;
+            if let Some(root) = addons.as_deref() {
+                guest.mount_addons(root)?;
+            }
             if let Some(root) = save_dir.as_deref() {
                 guest.persist_to(root, &dir)?;
             }
         }
-        if guest.frames() >= target || guest.finished() {
+        if guest.frames() >= target || guest.finished() || play_over_at.is_some_and(|at| guest.frames() > at + 1) {
             break;
         }
         let f = guest.frames();
@@ -2267,8 +2406,12 @@ pub fn headless_check(
         // still borrowed and applied below once they are not.
         let mut writeback: Vec<(u32, u32, u32, Vec<u8>)> = Vec::new();
         let mut periodic = periodic_shared.lock().unwrap_or_else(|e| e.into_inner());
-        let writes_this_frame = shot_every > 0 && in_shot_window && f % shot_every == 0;
-        if let (Some(r), true) = (periodic.as_mut(), shot_every > 0 && in_render_window && !writes_this_frame) {
+        // A playbook run renders EVERY frame (the rule above: a shot is only faithful when the
+        // frames before it were rendered), and writes when its cadence or the playbook asks.
+        let renders = shot_every > 0 || play.is_some();
+        let periodic_due = shot_every > 0 && in_shot_window && f % shot_every == 0;
+        let writes_this_frame = periodic_due || !play_shots.is_empty();
+        if let (Some(r), true) = (periodic.as_mut(), renders && in_render_window && !writes_this_frame) {
             let scenes = guest.current();
             if !scenes.is_empty() {
                 frame_shape = (scenes.len(), scenes.iter().map(|s| s.draws.len()).sum());
@@ -2311,12 +2454,20 @@ pub fn headless_check(
                 let fb = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
                 writeback = r.rtt_writebacks();
-                let path = shot_dir.join(format!("f{f:06}.png"));
                 // Written at PANEL size whatever the guest declared, so a shot sequence is
                 // comparable frame to frame and against the browser. `scaled_to` is a copy
                 // when the two already agree, which is every title but one.
                 let fb = fb.scaled_to(GAME_W, GAME_H);
-                std::fs::write(&path, fb.to_png()).map_err(|e| format!("write png: {e}"))?;
+                let png = fb.to_png();
+                if periodic_due {
+                    let path = shot_dir.join(format!("f{f:06}.png"));
+                    std::fs::write(&path, &png).map_err(|e| format!("write png: {e}"))?;
+                }
+                for name in play_shots.drain(..) {
+                    let path = shot_dir.join(format!("{name}.png"));
+                    std::fs::write(&path, &png).map_err(|e| format!("write png: {e}"))?;
+                    println!("headless: playbook shot {name} at f{f} -> {}", path.display());
+                }
             }
             // The guest clock beside the frame, so its LOCAL rate is visible. A run-total
             // ratio of 1.00x hides a stretch that ran five times fast against a stretch
@@ -2409,7 +2560,44 @@ pub fn headless_check(
         } else {
             guest.advance();
         }
+        // The playbook's per-display-frame work: timeouts a game that stopped reading the pad
+        // would never reach, its log, the shots it asked for (written from the next render).
+        if play.is_some() || discover {
+            use vitaslop_playbook::engine;
+            engine::on_display_frame(guest.frames(), guest.clock_us());
+            for ev in engine::take_events() {
+                match ev {
+                    engine::Event::Log(line) => println!("{line}"),
+                    engine::Event::Shot(name) => play_shots.push(name),
+                }
+            }
+            if play.is_some() && play_over_at.is_none() && engine::status() != Some(engine::Status::Running) {
+                play_over_at = Some(guest.frames());
+            }
+        }
     }
+    // The playbook's verdict, its tape and its report, beside the shots.
+    let play_failed = match vitaslop_playbook::engine::finish() {
+        Some(report) => {
+            let text = report.render_text();
+            print!("{text}");
+            std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
+            std::fs::write(shot_dir.join("playbook.txt"), &text).map_err(|e| format!("write report: {e}"))?;
+            if matches!(play, Some(Play::Playbook(_))) {
+                let tape = shot_dir.join("playbook.tape");
+                std::fs::write(&tape, report.tape.render()).map_err(|e| format!("write tape: {e}"))?;
+                println!("headless: tape -> {}", tape.display());
+            }
+            match (&play, &report.status) {
+                (Some(_), vitaslop_playbook::engine::Status::Failed(m)) => Some(m.clone()),
+                (Some(_), vitaslop_playbook::engine::Status::Running) => {
+                    Some(format!("the run ended at frame {} before the playbook did", guest.frames()))
+                }
+                _ => None,
+            }
+        }
+        None => None,
+    };
     // Block-visit histogram (`VITASLOP_BLOCK_HIST=<top>`, with `VITASLOP_TRACE_BLOCKS=lo-hi`
     // emitting the hooks). It was only reachable from the boot-probe test, which cannot
     // replay a recipe - so the one case it is built for, "the title reached screen N and
@@ -2663,15 +2851,22 @@ pub fn headless_check(
     if stray != 0 {
         println!("headless: {stray} suspends were not produced by the emitted work check");
     }
+    // A playbook that failed fails the run, after everything above has been written out.
+    if let Some(msg) = play_failed {
+        return Err(format!("playbook: {msg}"));
+    }
     Ok(())
 }
 
 /// Run the retail title in `dir` in a live window until the window closes or the guest
 /// exits. Blocks until the event loop ends. With `recipe` set, a scripted playthrough
 /// replays in the window (live keyboard/mouse still nudges it).
-pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> Result<(), String> {
+pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>, addons: Option<PathBuf>) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
     let mut guest = RetailGuest::new(&dir, input.clone(), recipe.as_deref())?;
+    if let Some(root) = addons.as_deref() {
+        guest.mount_addons(root)?;
+    }
     if let Some(root) = save_dir.as_deref() {
         guest.persist_to(root, &dir)?;
     }
@@ -2690,7 +2885,7 @@ pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> R
     let exit_at = std::env::var("VITASLOP_WINDOW_FRAMES").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let mut app = RetailApp {
         session: Session::new(guest, input.clone(), Input::new(&settings), pause_on_blur),
-        boot: Boot { dir, recipe, save_dir, input, pause_on_blur },
+        boot: Boot { dir, recipe, save_dir, addons, input, pause_on_blur },
         window: None,
         gfx: None,
         exit_at,
@@ -2816,6 +3011,7 @@ struct Boot {
     dir: PathBuf,
     recipe: Option<String>,
     save_dir: Option<PathBuf>,
+    addons: Option<PathBuf>,
     input: SharedInput,
     pause_on_blur: bool,
 }
@@ -2829,6 +3025,9 @@ impl RetailApp {
         self.session.guest.flush_save(true);
         let b = &self.boot;
         let mut guest = RetailGuest::new_with_exec(&b.dir, b.input.clone(), b.recipe.as_deref(), Some(path))?;
+        if let Some(root) = b.addons.as_deref() {
+            guest.mount_addons(root)?;
+        }
         if let Some(root) = b.save_dir.as_deref() {
             guest.persist_to(root, &b.dir)?;
         }

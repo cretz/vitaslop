@@ -594,7 +594,87 @@ mod hostcalls {
         BULK_MANY.with(|c| c.get())
     }
 
+    /// >>> EVERY WORKER'S SAMPLES, MERGED.
+    ///
+    /// The per-selector tables above are per THREAD, and under SMP the panel is built on the
+    /// run worker while the guest's host calls run on the guest workers - so the per-NID table
+    /// read EMPTY on every SMP run. MEASURED: a phone match, where the render thread's draw
+    /// calls were the very cost being asked about, printed no rows at all. Each sample is
+    /// added here too; a sample is one call in ~33, so one lock per sample is noise beside the
+    /// call it timed, and the unsampled calls never touch it.
+    struct SharedSamples {
+        ms: Vec<f64>,
+        n: Vec<u64>,
+        words: Vec<u64>,
+        bulk: Vec<u64>,
+        prev_ms: Vec<f64>,
+        prev_n: Vec<u64>,
+        prev_words: Vec<u64>,
+        prev_bulk: Vec<u64>,
+    }
+    static SHARED_SAMPLES: std::sync::Mutex<Option<SharedSamples>> = std::sync::Mutex::new(None);
+
+    fn note_shared_sample(ms: f64, selector: u32, words: u64, bulk: u64) {
+        let i = selector as usize;
+        if i >= MAX_SELECTOR {
+            return;
+        }
+        let mut g = SHARED_SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+        let s = g.get_or_insert_with(|| SharedSamples {
+            ms: vec![0.0; MAX_SELECTOR],
+            n: vec![0; MAX_SELECTOR],
+            words: vec![0; MAX_SELECTOR],
+            bulk: vec![0; MAX_SELECTOR],
+            prev_ms: vec![0.0; MAX_SELECTOR],
+            prev_n: vec![0; MAX_SELECTOR],
+            prev_words: vec![0; MAX_SELECTOR],
+            prev_bulk: vec![0; MAX_SELECTOR],
+        });
+        s.ms[i] += ms;
+        s.n[i] += 1;
+        s.words[i] += words;
+        s.bulk[i] += bulk;
+    }
+
+    /// [`take_sampled_selector_window`] over EVERY worker's samples - see [`SharedSamples`].
+    ///
+    /// The per-selector call counts are per thread too, so the calls here are ESTIMATED from
+    /// the samples: one sample per [`SAMPLE_EVERY`] + 1 calls on average (the 0/1/2 skew in
+    /// `start_sample` averages one), on every worker alike.
+    pub fn take_shared_sampled_window(n: usize) -> Vec<(u32, u64, f64, u64, f64, f64)> {
+        let mut g = SHARED_SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = g.as_mut() else { return Vec::new() };
+        let stride = (SAMPLE_EVERY + 1) as f64;
+        let mut out = Vec::new();
+        for i in 0..MAX_SELECTOR {
+            let d_ms = s.ms[i] - s.prev_ms[i];
+            let d_n = s.n[i] - s.prev_n[i];
+            let d_words = s.words[i] - s.prev_words[i];
+            let d_bulk = s.bulk[i] - s.prev_bulk[i];
+            s.prev_ms[i] = s.ms[i];
+            s.prev_n[i] = s.n[i];
+            s.prev_words[i] = s.words[i];
+            s.prev_bulk[i] = s.bulk[i];
+            if d_n > 0 && d_ms > 0.0 {
+                out.push((
+                    i as u32,
+                    (d_n as f64 * stride) as u64,
+                    d_ms * stride,
+                    d_n,
+                    d_words as f64 / d_n as f64,
+                    d_bulk as f64 / d_n as f64,
+                ));
+            }
+        }
+        out.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
+        out.truncate(n);
+        out
+    }
+
     pub fn note_sample(ms: f64, selector: u32, words: u64, bulk: u64) {
+        if crate::smp::enabled() {
+            note_shared_sample(ms, selector, words, bulk);
+        }
         SAMPLED_SELECTOR_WORDS.with(|v| {
             if let Some(slot) = v.borrow_mut().get_mut(selector as usize) {
                 *slot += words;
@@ -813,8 +893,14 @@ pub fn bulk_many_totals() -> (u64, u64) {
     hostcalls::bulk_many()
 }
 
+/// Under SMP, every worker's samples (see [`hostcalls::take_shared_sampled_window`]): the
+/// guest's calls run on the guest workers, and this worker's own table holds almost none.
 pub fn take_host_calls_by_sampled_ms_window(n: usize) -> Vec<(u32, u64, f64, u64, f64, f64)> {
-    hostcalls::take_sampled_selector_window(n)
+    if crate::smp::enabled() {
+        hostcalls::take_shared_sampled_window(n)
+    } else {
+        hostcalls::take_sampled_selector_window(n)
+    }
 }
 
 /// Host calls made through the non-suspending trap so far - see [`hostcalls::note_fast_call`].
@@ -1099,6 +1185,11 @@ impl GuestMemory for SharedView {
     fn len(&self) -> usize {
         self.bytes.length() as usize
     }
+    fn stamp_dirty_pages(&self, off: usize, len: usize) {
+        if off.checked_add(len).is_some_and(|end| end <= self.len()) {
+            self.stamp_written(off, len);
+        }
+    }
     fn read_many(&self, ranges: &[(usize, usize)], out: &mut Vec<u8>) {
         let total: usize = ranges.iter().map(|&(_, l)| l).sum();
         out.clear();
@@ -1202,6 +1293,9 @@ impl GuestMemory for &'_ SharedView {
     }
     fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
         (**self).bump_dirty_epoch()
+    }
+    fn stamp_dirty_pages(&self, off: usize, len: usize) {
+        (**self).stamp_dirty_pages(off, len)
     }
     fn dirty_epoch(&self) -> Option<u8> {
         (**self).dirty_epoch()
@@ -1416,6 +1510,11 @@ impl GuestMemory for HostRegion {
         block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize] = next;
         Some((next, false))
     }
+    fn stamp_dirty_pages(&self, off: usize, len: usize) {
+        if self.in_bounds(off, len) {
+            self.stamp_written(off, len);
+        }
+    }
     // `dirty_stamps` stays `None` on purpose: a copy of the map exists to answer
     // `dirty_since` without crossings, and here the map is already a byte array.
 }
@@ -1555,6 +1654,9 @@ impl GuestMemory for GuestMem {
     fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
         guest_mem_delegate!(self, bump_dirty_epoch)
     }
+    fn stamp_dirty_pages(&self, off: usize, len: usize) {
+        guest_mem_delegate!(self, stamp_dirty_pages, off, len)
+    }
     fn dirty_epoch(&self) -> Option<u8> {
         guest_mem_delegate!(self, dirty_epoch)
     }
@@ -1625,6 +1727,9 @@ impl GuestMemory for &'_ GuestMem {
     }
     fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
         (**self).bump_dirty_epoch()
+    }
+    fn stamp_dirty_pages(&self, off: usize, len: usize) {
+        (**self).stamp_dirty_pages(off, len)
     }
     fn dirty_epoch(&self) -> Option<u8> {
         (**self).dirty_epoch()

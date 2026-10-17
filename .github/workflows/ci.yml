@@ -233,7 +233,7 @@ jobs:
           cargo clippy --locked --release --target wasm32-unknown-unknown
           -p vitaslop-web -p vitaslop-aac -p vitaslop-h264 -p vitaslop-platform -p vitaslop-runtime
           -p vitaslop-gxp-shader -p vitaslop-transpiler -p vitaslop-frontend -p vitaslop-hostcall
-          -p vitaslop-loader -p vitaslop-atrac9 -- -D warnings
+          -p vitaslop-loader -p vitaslop-atrac9 -p vitaslop-playbook -- -D warnings
 
       - name: Build the wasm bundle
         working-directory: projects/vitaslop-web
