@@ -330,6 +330,9 @@ pub mod display {
 /// SceCtrl function NIDs.
 pub mod ctrl {
     pub const PEEK_BUFFER_POSITIVE: u32 = 0xA9C3_CED6;
+    /// `sceCtrlPeekBufferPositive2`: the same call in the API that also reports the extra
+    /// buttons of an external (PS TV) controller - the built-in pad has none of them.
+    pub const PEEK_BUFFER_POSITIVE2: u32 = 0x15F8_1E8C;
     pub const READ_BUFFER_POSITIVE: u32 = 0x67E7_AB83;
     pub const PEEK_BUFFER_NEGATIVE: u32 = 0x104E_D1A7;
     pub const READ_BUFFER_NEGATIVE: u32 = 0x15F9_6FB0;
@@ -360,6 +363,10 @@ pub mod libkernel {
     pub const CLIB_VSNPRINTF: u32 = 0xFA6B_E467;
     // clib memory/string family (pure, everything uses them).
     pub const CLIB_MEMCPY: u32 = 0x14E9_DBD7;
+    /// `sceClibMemcpy_safe`: memcpy that tolerates overlapping ranges.
+    pub const CLIB_MEMCPY_SAFE: u32 = 0x2E3B_02A1;
+    /// `__stack_chk_fail`: a stack-protector canary check failed - the guest smashed a frame.
+    pub const STACK_CHK_FAIL: u32 = 0x3769_1BF8;
     pub const CLIB_MEMMOVE: u32 = 0x7367_53C8;
     pub const CLIB_MEMSET: u32 = 0x6329_80D7;
     pub const CLIB_MEMCMP: u32 = 0x9CC2_BFDF;
@@ -684,6 +691,9 @@ pub mod services {
     pub const RTC_GET_TIME64_T: u32 = 0xC995_DE02;
     /// `sceRtcGetTime_t`: the 32-bit `time_t` sibling of `RTC_GET_TIME64_T`.
     pub const RTC_GET_TIME_T: u32 = 0x8DE6_FEB7;
+    /// `sceRtcGetWin32FileTime`: a broken-down time as a Windows FILETIME (100 ns units since
+    /// 1601-01-01 UTC).
+    pub const RTC_GET_WIN32_FILE_TIME: u32 = 0x8A95_E119;
     pub const RTC_GET_CURRENT_NETWORK_TICK: u32 = 0xCDDD_25FE;
     pub const RTC_SET_TICK: u32 = 0xCD89_F464;
     pub const RTC_CONVERT_UTC_TO_LOCAL_TIME: u32 = 0x1282_C436;
@@ -1178,6 +1188,9 @@ pub mod services {
     /// `sceAppUtilStoreBrowse`: leave the game and open the PS Store app at a product.
     /// There is no store and no shell to switch to off-console.
     pub const APPUTIL_STORE_BROWSE: u32 = 0x85FA_94EE;
+    /// `sceAppUtilBgdlGetStatus`: the state of background (PS Store) downloads for this title.
+    /// There is no store off-console, so nothing is ever downloading.
+    pub const APPUTIL_BGDL_GET_STATUS: u32 = 0x96F4_78D6;
     /// SceNpBasic: send a title-defined message to another player. Needs a PSN session.
     pub const NP_BASIC_SEND_IN_GAME_DATA_MESSAGE: u32 = 0x7A50_20A5;
     /// SceNpManager: the cached sign-in parameters of the local account. No account
@@ -1402,6 +1415,16 @@ pub mod sync {
     /// SDK later re-exported as `CREATE_SEMA`. Titles built against an older SDK
     /// import this one; it dispatches to the identical handler.
     pub const CREATE_SEMA_16XX: u32 = 0x297A_A2AE;
+    /// Reader/writer locks: create and the two blocking locks are SceLibKernel wrappers, the
+    /// rest SceThreadmgr.
+    pub const CREATE_RW_LOCK: u32 = 0x8667_951D;
+    pub const DELETE_RW_LOCK: u32 = 0xE736_49CA;
+    pub const LOCK_READ_RW_LOCK: u32 = 0xFA67_0F0F;
+    pub const LOCK_WRITE_RW_LOCK: u32 = 0x67A1_87BB;
+    pub const TRY_LOCK_READ_RW_LOCK: u32 = 0xEFDD_A456;
+    pub const TRY_LOCK_WRITE_RW_LOCK: u32 = 0x206C_BB66;
+    pub const UNLOCK_READ_RW_LOCK: u32 = 0x3EF9_1145;
+    pub const UNLOCK_WRITE_RW_LOCK: u32 = 0xB415_1397;
     /// `sceKernelOpenSema`: resolve an EXISTING openable semaphore by name. Not a
     /// create - two modules share one semaphore this way.
     pub const OPEN_SEMA: u32 = 0xCBE2_35C7;
@@ -1569,6 +1592,28 @@ pub mod videodec {
     pub const CODEC_ENGINE_FREE_MEMORY_FROM_UNMAP_MEM_BLOCK: u32 = 0x6A31_831D;
 }
 
+/// SceAvPlayer (library `0xFA10CE65`): the system movie player - see `vita::avplayer`. NIDs from
+/// `db/360/SceAvPlayer.yml`.
+pub mod avplayer {
+    pub const INIT: u32 = 0x4C84_7ADF;
+    pub const ADD_SOURCE: u32 = 0xBC83_C8FD;
+    pub const START: u32 = 0x2ACB_4217;
+    pub const STOP: u32 = 0xBD35_E360;
+    pub const PAUSE: u32 = 0x34FD_744B;
+    pub const RESUME: u32 = 0x11FF_162D;
+    pub const CLOSE: u32 = 0x7AA2_9B2D;
+    pub const IS_ACTIVE: u32 = 0x2E4F_F35F;
+    pub const CURRENT_TIME: u32 = 0x804D_CECD;
+    pub const JUMP_TO_TIME: u32 = 0x5B7D_B4BC;
+    pub const SET_LOOPING: u32 = 0xEC10_3ADF;
+    pub const STREAM_COUNT: u32 = 0x2CD8_6FD6;
+    pub const GET_STREAM_INFO: u32 = 0x34E2_D370;
+    pub const ENABLE_STREAM: u32 = 0x7012_7AB8;
+    pub const DISABLE_STREAM: u32 = 0x1536_5ECE;
+    pub const GET_VIDEO_DATA: u32 = 0x8BC3_221B;
+    pub const GET_AUDIO_DATA: u32 = 0xA10F_C252;
+}
+
 /// SceAudiodec (library `0x2AA62046`): the guest's own audio decoder. A movie's sound
 /// track goes through this. NIDs from `db/360/SceAvcodecUser.yml`.
 pub mod audiodec {
@@ -1596,7 +1641,7 @@ pub const UNKNOWN_NAME: &str = "<unknown>";
 /// the unimplemented-call report. Falls back to the raw NIDs.
 pub fn name(func_nid: u32) -> &'static str {
     use {
-        audio as au, audiodec as ad, audioin, ctrl as c, display as d, fiber as fb, gxm as g, http,
+        audio as au, audiodec as ad, audioin, avplayer as avp, ctrl as c, display as d, fiber as fb, gxm as g, http,
         iofilemgr as io, livearea, pgf, xml,
         libkernel as lk, lwsync as lw, net as nt, ngs as ng, processmgr as pm, pvf as pv, services as sv,
         sync as sy, sysmem as s, threadmgr as tm, videodec as vd, voice as vo,
@@ -1621,6 +1666,24 @@ pub fn name(func_nid: u32) -> &'static str {
         vd::CODEC_ENGINE_FREE_MEMORY_FROM_UNMAP_MEM_BLOCK => {
             "sceCodecEngineFreeMemoryFromUnmapMemBlock"
         }
+        // SceAvPlayer.
+        avp::INIT => "sceAvPlayerInit",
+        avp::ADD_SOURCE => "sceAvPlayerAddSource",
+        avp::START => "sceAvPlayerStart",
+        avp::STOP => "sceAvPlayerStop",
+        avp::PAUSE => "sceAvPlayerPause",
+        avp::RESUME => "sceAvPlayerResume",
+        avp::CLOSE => "sceAvPlayerClose",
+        avp::IS_ACTIVE => "sceAvPlayerIsActive",
+        avp::CURRENT_TIME => "sceAvPlayerCurrentTime",
+        avp::JUMP_TO_TIME => "sceAvPlayerJumpToTime",
+        avp::SET_LOOPING => "sceAvPlayerSetLooping",
+        avp::STREAM_COUNT => "sceAvPlayerStreamCount",
+        avp::GET_STREAM_INFO => "sceAvPlayerGetStreamInfo",
+        avp::ENABLE_STREAM => "sceAvPlayerEnableStream",
+        avp::DISABLE_STREAM => "sceAvPlayerDisableStream",
+        avp::GET_VIDEO_DATA => "sceAvPlayerGetVideoData",
+        avp::GET_AUDIO_DATA => "sceAvPlayerGetAudioData",
         // SceAudiodec.
         ad::GET_CONTEXT_SIZE => "sceAudiodecGetContextSize",
         ad::CREATE_DECODER_EXTERNAL => "sceAudiodecCreateDecoderExternal",
@@ -1803,6 +1866,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_FRAGMENT_DEFAULT_UNIFORM_BUFFER => "sceGxmSetFragmentDefaultUniformBuffer",
         d::SET_FRAME_BUF => "sceDisplaySetFrameBuf",
         c::PEEK_BUFFER_POSITIVE => "sceCtrlPeekBufferPositive",
+        c::PEEK_BUFFER_POSITIVE2 => "sceCtrlPeekBufferPositive2",
         c::READ_BUFFER_POSITIVE => "sceCtrlReadBufferPositive",
         c::PEEK_BUFFER_NEGATIVE => "sceCtrlPeekBufferNegative",
         c::READ_BUFFER_NEGATIVE => "sceCtrlReadBufferNegative",
@@ -1814,6 +1878,8 @@ pub fn name(func_nid: u32) -> &'static str {
         lk::CLIB_SNPRINTF => "sceClibSnprintf",
         lk::CLIB_VSNPRINTF => "sceClibVsnprintf",
         lk::CLIB_MEMCPY => "sceClibMemcpy",
+        lk::CLIB_MEMCPY_SAFE => "sceClibMemcpy_safe",
+        lk::STACK_CHK_FAIL => "__stack_chk_fail",
         lk::CLIB_MEMMOVE => "sceClibMemmove",
         lk::CLIB_MEMSET => "sceClibMemset",
         lk::CLIB_MEMCMP => "sceClibMemcmp",
@@ -1926,6 +1992,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_BASIC_GET_FRIEND_LIST_ENTRY_COUNT => "sceNpBasicGetFriendListEntryCount",
         sv::RTC_GET_CURRENT_CLOCK => "sceRtcGetCurrentClock",
         sv::RTC_GET_CURRENT_TICK => "sceRtcGetCurrentTick",
+        sv::RTC_GET_WIN32_FILE_TIME => "sceRtcGetWin32FileTime",
         sv::RTC_GET_ACCUMULATIVE_TIME => "sceRtcGetAccumulativeTime",
         sv::RTC_GET_TICK_RESOLUTION => "sceRtcGetTickResolution",
         sv::RTC_SET_TIME64_T => "sceRtcSetTime64_t",
@@ -2164,6 +2231,14 @@ pub fn name(func_nid: u32) -> &'static str {
         sy::DELETE_MUTEX => "sceKernelDeleteMutex",
         sy::CLOSE_MUTEX => "sceKernelCloseMutex",
         sy::CREATE_SEMA | sy::CREATE_SEMA_16XX => "sceKernelCreateSema",
+        sy::CREATE_RW_LOCK => "sceKernelCreateRWLock",
+        sy::DELETE_RW_LOCK => "sceKernelDeleteRWLock",
+        sy::LOCK_READ_RW_LOCK => "sceKernelLockReadRWLock",
+        sy::LOCK_WRITE_RW_LOCK => "sceKernelLockWriteRWLock",
+        sy::TRY_LOCK_READ_RW_LOCK => "sceKernelTryLockReadRWLock",
+        sy::TRY_LOCK_WRITE_RW_LOCK => "sceKernelTryLockWriteRWLock",
+        sy::UNLOCK_READ_RW_LOCK => "sceKernelUnlockReadRWLock",
+        sy::UNLOCK_WRITE_RW_LOCK => "sceKernelUnlockWriteRWLock",
         sy::WAIT_SEMA => "sceKernelWaitSema",
         sy::SIGNAL_SEMA => "sceKernelSignalSema",
         sy::DELETE_SEMA => "sceKernelDeleteSema",
@@ -2627,6 +2702,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::ADHOC_MATCHING_GET_MEMBERS => "sceNetAdhocMatchingGetMembers",
         sv::ADHOC_MATCHING_SET_HELLO_OPT => "sceNetAdhocMatchingSetHelloOpt",
         sv::APPUTIL_STORE_BROWSE => "sceAppUtilStoreBrowse",
+        sv::APPUTIL_BGDL_GET_STATUS => "sceAppUtilBgdlGetStatus",
         sv::NP_BASIC_SEND_IN_GAME_DATA_MESSAGE => "sceNpBasicSendInGameDataMessage",
         sv::NP_MANAGER_GET_CACHED_PARAM => "sceNpManagerGetCachedParam",
         sv::NP_LOOKUP_NP_ID_ASYNC => "sceNpLookupNpIdAsync",

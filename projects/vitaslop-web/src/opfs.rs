@@ -309,6 +309,42 @@ impl OpfsBacking {
         OpfsBacking { reader, keys, by_key, window: std::cell::RefCell::new(ReadWindow::default()) }
     }
 
+    /// Also serve every stored path under `stored_prefix` at `mount` + its path below it: how
+    /// an add-on stored beside its title (`addons/<dir>/files/...`) appears to the guest at
+    /// `addcont0:/<dir>/...` through the SAME reader - one set of open handles, one storage
+    /// ring, which every guest worker already reads.
+    pub fn add_mount(&mut self, stored_prefix: &str, mount: &str) {
+        let mount = mount.trim_end_matches('/');
+        for stored in self.reader.paths() {
+            let Some(rel) = stored.strip_prefix(stored_prefix) else { continue };
+            let guest = format!("{mount}/{rel}");
+            let key = vfs_key(&guest);
+            if self.by_key.contains_key(&key) {
+                continue;
+            }
+            self.by_key.insert(key, stored.clone());
+            self.keys.push(guest);
+        }
+    }
+
+    /// Serve every stored path under `stored_prefix` at `mount` + its path below it, REPLACING
+    /// whatever already serves that guest path: how a rePatch overlay (`repatch/app/...`) lays
+    /// its files over the title's and an add-on's. `mount` empty is the title's own root.
+    pub fn overlay(&mut self, stored_prefix: &str, mount: &str) -> usize {
+        let mount = mount.trim_end_matches('/');
+        let mut n = 0;
+        for stored in self.reader.paths() {
+            let Some(rel) = stored.strip_prefix(stored_prefix) else { continue };
+            let guest = if mount.is_empty() { rel.to_string() } else { format!("{mount}/{rel}") };
+            let key = vfs_key(&guest);
+            if self.by_key.insert(key, stored.clone()).is_none() {
+                self.keys.push(guest);
+            }
+            n += 1;
+        }
+        n
+    }
+
     /// The stored path a normalised guest key maps back to.
     fn stored(&self, key: &str) -> Option<&str> {
         self.by_key.get(key).map(String::as_str)
@@ -458,6 +494,61 @@ impl FileBacking for OpfsBacking {
 /// The same storage seen as an ingest [`Vfs`], for the setup-time reads: the dump
 /// manifest and the loadable modules. Whole-file reads, which is right for those - they
 /// are a few megabytes and both consumers want the entire image.
+/// Where `web/opfs.js` `openTitleSync` puts a title's installed add-ons among its stored
+/// paths: `addons/<dir>/<dump-relative path>`.
+pub const ADDONS_PREFIX: &str = "addons/";
+
+/// The add-ons stored beside a title in `reader`: `(stored dir, content id)` for each one
+/// whose dump manifest is present.
+pub fn stored_addons(reader: &OpfsReader) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for p in reader.paths() {
+        let Some(rest) = p.strip_prefix(ADDONS_PREFIX) else { continue };
+        let Some(dir) = rest.strip_suffix(&format!("/{}", vitaslop_runtime::ingest::pipeline::DUMP_MANIFEST)) else {
+            continue;
+        };
+        if dir.contains('/') {
+            continue;
+        }
+        let Some(n) = reader.size(&p) else { continue };
+        let mut buf = vec![0u8; n];
+        let got = reader.read_at(&p, 0, &mut buf);
+        buf.truncate(got);
+        let text = String::from_utf8_lossy(&buf);
+        if let Some(cid) = text.lines().find_map(|l| l.strip_prefix("content_id=")) {
+            out.push((dir.to_string(), cid.trim().to_string()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Where a title's rePatch overlay is listed in its reader: `repatch/<stored path>`, the stored
+/// layout `vitaslop_runtime::ingest::repatch` describes. `opfs.js` lists it only while it is on.
+pub const REPATCH_PREFIX: &str = "repatch/";
+
+/// The rePatch overlay listed in `reader`: the `app0:` executables it replaces and the add-on
+/// directories it lays files over. Both empty when there is none (or it is turned off).
+pub fn stored_repatch(reader: &OpfsReader) -> (Vec<String>, Vec<String>) {
+    use vitaslop_runtime::ingest::repatch::{is_code_path, ADDCONT_DIR, APP_DIR};
+    let (mut code, mut addcont) = (Vec::new(), Vec::new());
+    for p in reader.paths() {
+        let Some(rest) = p.strip_prefix(REPATCH_PREFIX) else { continue };
+        if let Some(rel) = rest.strip_prefix(APP_DIR) {
+            if is_code_path(rel) {
+                code.push(rel.to_string());
+            }
+        } else if let Some((dir, _)) = rest.strip_prefix(ADDCONT_DIR).and_then(|r| r.split_once('/'))
+            && !addcont.iter().any(|d: &String| d == dir)
+        {
+            addcont.push(dir.to_string());
+        }
+    }
+    code.sort();
+    addcont.sort();
+    (code, addcont)
+}
+
 pub struct OpfsVfs {
     reader: OpfsReader,
 }
@@ -485,7 +576,10 @@ impl Vfs for OpfsVfs {
     fn exists(&self, path: &str) -> bool {
         self.reader.size(path).is_some()
     }
+    /// The TITLE's stored paths. Its add-ons are stored beside it under [`ADDONS_PREFIX`]
+    /// and are left out: each carries a dump manifest of its own, and detection takes the
+    /// first manifest it sees. Its rePatch overlay ([`REPATCH_PREFIX`]) is not the title either.
     fn list(&self) -> Vec<String> {
-        self.reader.paths()
+        self.reader.paths().into_iter().filter(|p| !p.starts_with(ADDONS_PREFIX) && !p.starts_with(REPATCH_PREFIX)).collect()
     }
 }

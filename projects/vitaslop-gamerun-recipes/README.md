@@ -1,5 +1,10 @@
 # vitaslop game-run recipes - how an agent plays a Vita game
 
+> **Replaced by playbooks** ([`vitaslop-playbook`](../vitaslop-playbook/)): Lua scripts that
+> wait on what the game does instead of pressing at frame numbers, and record tapes. Every
+> title here has a playbook covering its recipes; recipes stay until their remaining consumers
+> (runner jobs, the web player, these tools) move over. Write new playthroughs as playbooks.
+
 This crate is where playthroughs live, and where the tools an agent plays with live.
 A **recipe** is a plain-text, frame-keyed script that drives a real title through the
 emulator: it presses buttons, taps the touch panel, watches memory, asserts that the

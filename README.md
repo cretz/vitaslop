@@ -33,6 +33,26 @@ vitaslop only works with games you own, from your own console, or with homebrew.
 It provides no games and downloads nothing. Pirated games are not supported. The
 "Add games" screen lists what it accepts.
 
+#### What about add-ons and game updates?
+
+Add-ons work: add them from the game's own page, and switch each one on or off there.
+Game updates are not supported yet, and the importer refuses one rather than letting
+it replace the game.
+
+#### Can I use mods?
+
+Yes, the same overlays the console's rePatch plugin uses: decrypted or modified files
+laid over a game without changing it. Add one from the game's page as a folder or a
+`.zip`, in any of these shapes:
+
+- the console's own folders, `rePatch/<title id>/...` and `reAddcont/<title id>/<add-on>/...`
+- a folder named for the title id with nothing above it, or just its contents
+
+In the last two shapes, a folder the game has goes over the game and a folder named
+like an add-on goes over that add-on. The game's page says which it inferred.
+Anything nothing would read, or an executable that is still encrypted, is refused
+with the reason. An overlay can be switched off or removed at any time.
+
 #### This code was written by AI, right?
 
 Yes, 100%. vitaslop is an AI built and maintained project, and the code quality
@@ -108,12 +128,18 @@ than expected.
 - **A pixel oracle.** Headless runs render deterministic frames that tests compare
   bit for bit, so a rendering change either matches the previous build exactly or
   says which draw moved.
+- **Playbooks.** Lua scripts play each title by waiting on what the game does, such
+  as a call it makes or a value in its memory, instead of pressing at frame numbers.
+  Run deterministically, a playbook records a tape that replays the run exactly; at
+  real speed, it adapts to the timing it gets.
 
 <a name="games-tried"></a>
 <details>
-<summary><b>Games tried.</b> Not a compatibility list. Owned games the agent has played, all US releases, all playable and all still buggy. Anything not listed was never tried.</summary>
+<summary><b>Games tried.</b> Not a compatibility list. Owned games the agent has played, all US releases unless noted, all playable and all still buggy. Anything not listed was never tried.</summary>
 
 - Dead or Alive 5 Plus
+- Dead or Alive Xtreme 3: Venus (Asian release)
+- FIFA Soccer 13
 - Hot Shots Golf: World Invitational
 - Madden NFL 13
 - MLB 12: The Show

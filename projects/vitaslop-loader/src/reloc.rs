@@ -76,15 +76,21 @@ pub fn decode(blob: &[u8]) -> Result<Vec<Reloc>, crate::Error> {
         let w0 = rd(blob, o);
         let format = w0 & 0xF;
         match format {
-            // Short entry (8 bytes): the common case.
+            // Short entry (8 bytes). The second word is a 10-bit offset high part and a
+            // 22-bit addend - NOT the 20/12 split of the toolchain union this module was
+            // first written from. Measured on a retail title whose newer-SDK modules use
+            // short entries throughout: the 10/22 split puts every MOVW/MOVT fixup on a
+            // MOVW/MOVT instruction and every addend inside its symbol segment (3865 of
+            // 3865 in one eboot, 3814 of 3814 in a library); no other split does both.
+            // Older titles emit long entries only, so they never reached this arm.
             1 => {
                 let w1 = rd(blob, o + 4);
                 let sym_seg = ((w0 >> 4) & 0xF) as u8;
                 let code = ((w0 >> 8) & 0xFF) as u8;
                 let data_seg = ((w0 >> 16) & 0xF) as u8;
                 let offset_lo = (w0 >> 20) & 0xFFF; // 12 bits
-                let offset_hi = w1 & 0xF_FFFF; // 20 bits
-                let addend = (w1 >> 20) & 0xFFF; // 12 bits
+                let offset_hi = w1 & 0x3FF; // 10 bits
+                let addend = w1 >> 10; // 22 bits
                 out.push(Reloc {
                     code,
                     sym_seg,
@@ -128,4 +134,24 @@ pub fn decode(blob: &[u8]) -> Result<Vec<Reloc>, crate::Error> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_entry_splits_its_second_word_ten_and_twenty_two() {
+        // MOVW at data seg 0 offset 0x7dac against seg 1 + 0x35000: offset_lo 0xdac in w0,
+        // offset_hi 0x7 in the low 10 bits of w1, the addend in its upper 22 bits.
+        let w0: u32 = 1 | (1 << 4) | ((code::THM_MOVW_ABS_NC as u32) << 8) | (0xdac << 20);
+        let w1: u32 = 0x7 | (0x35000 << 10);
+        let mut blob = w0.to_le_bytes().to_vec();
+        blob.extend_from_slice(&w1.to_le_bytes());
+        let r = decode(&blob).unwrap();
+        assert_eq!(
+            r,
+            vec![Reloc { code: code::THM_MOVW_ABS_NC, sym_seg: 1, data_seg: 0, offset: 0x7dac, addend: 0x35000 }]
+        );
+    }
 }

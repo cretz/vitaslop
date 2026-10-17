@@ -26,7 +26,7 @@
 // evicted only by winning a compare-exchange from READY to FILLING, and pinned by the reader
 // only by winning READY to PINNED, so neither side can ever read or overwrite a slot the
 // other is using.
-import { openTitleSync, PAGE, SLOTS, DATA_OFF, H, TAG, STATE } from "./opfs.js";
+import { listTitleFiles, openSyncRetrying, PAGE, SLOTS, DATA_OFF, H, TAG, STATE } from "./opfs.js";
 
 /// Pages to read ahead of the last request, along the same file. Sixteen is a megabyte:
 /// enough that a streaming reader stays ahead of the guest, small enough that two
@@ -35,19 +35,49 @@ const AHEAD = 16;
 
 self.onmessage = async (e) => {
   const { id, sab } = e.data;
-  let handles;
+  // >>> SIZES UP FRONT, HANDLES ON FIRST READ.
+  //
+  // A sync access handle per file, opened before the guest starts, was the boot's cost on a
+  // title with thousands of files: MEASURED on the desktop browser (Windows), 7,124 handles in
+  // 7.1 s even 32 at a time - and a run touches a small fraction of them. The reader needs
+  // only every file's SIZE to start, and `getFile()` answers that in 0.6 s for the same title.
+  // This worker can wait, so a handle is opened when a request first names its file.
+  let files;
+  let sizes;
+  let stats;
   try {
-    handles = await openTitleSync(id);
+    const t0 = performance.now();
+    files = (await listTitleFiles(id)).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    const tListed = performance.now();
+    sizes = new Array(files.length);
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(32, files.length) }, async () => {
+        while (next < files.length) {
+          const i = next++;
+          sizes[i] = (await files[i][1].getFile()).size;
+        }
+      }),
+    );
+    stats = `${files.length} files: listed ${Math.round(tListed - t0)} ms, sized ${Math.round(performance.now() - tListed)} ms (handles open on first read)`;
   } catch (err) {
     self.postMessage({ type: "error", message: String((err && err.message) || err) });
     return;
   }
-  const paths = Object.keys(handles).sort();
-  const sizes = paths.map((p) => handles[p].getSize());
-  const hs = paths.map((p) => handles[p]);
+  const paths = files.map((f) => f[0]);
+  const hs = new Array(files.length).fill(null);
   const h = new Int32Array(sab);
   const data = new Uint8Array(sab, DATA_OFF, SLOTS * PAGE);
-  self.postMessage({ type: "ready", paths, sizes });
+  self.postMessage({ type: "ready", paths, sizes, openStats: stats });
+  // A file that cannot be opened fails its READ (reported, `H.ERR`), not the run's start.
+  const openFor = async (pid) => {
+    if (hs[pid] !== null) return;
+    try {
+      hs[pid] = await openSyncRetrying(files[pid][1]);
+    } catch (err) {
+      self.postMessage({ type: "error", message: `storage: could not open ${paths[pid]}: ${err}` });
+    }
+  };
 
   // A sync access handle reads into an `AllowSharedBufferSource`, so straight into the ring.
   // An older engine that refuses a shared view gets a bounce buffer and one extra copy.
@@ -57,6 +87,7 @@ self.onmessage = async (e) => {
     const want = Math.max(0, Math.min(PAGE, sizes[pid] - at));
     if (want === 0) return 0;
     const view = data.subarray(slot * PAGE, slot * PAGE + want);
+    if (hs[pid] === null) throw new Error("the file could not be opened");
     if (bounce === null) {
       try {
         return hs[pid].read(view, { at });
@@ -119,6 +150,7 @@ self.onmessage = async (e) => {
       const pid = Atomics.load(h, H.REQ_PATH);
       const page = Atomics.load(h, H.REQ_PAGE);
       const count = Atomics.load(h, H.REQ_COUNT);
+      await openFor(pid);
       for (let p = page; p < page + count; p++) ensure(pid, p);
       Atomics.store(h, H.REQ, 0);
       Atomics.add(h, H.ACK, 1);
@@ -135,6 +167,7 @@ self.onmessage = async (e) => {
     Atomics.wait(h, H.REQ, 0);
   }
   for (const hd of hs) {
+    if (hd === null) continue;
     try {
       hd.close();
     } catch {

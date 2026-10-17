@@ -101,6 +101,10 @@ impl World for DesktopWorld {
         self.wall_us
     }
     fn poll_ctrl(&mut self, port: u32) -> CtrlFrame {
+        // A playbook (or tape) run owns the pad outright.
+        if let Some((ctrl, _)) = vitaslop_playbook::engine::input(port) {
+            return ctrl;
+        }
         let live = self.input.lock().unwrap().ctrl;
         let Some(r) = self.recipe.as_mut() else { return live };
         // Recipe drives; live input is additive so the watcher can nudge. Buttons OR
@@ -117,6 +121,9 @@ impl World for DesktopWorld {
     fn poll_touch(&mut self, port: u32) -> TouchFrame {
         if port != 0 {
             return TouchFrame::default();
+        }
+        if let Some((_, touch)) = vitaslop_playbook::engine::input(port) {
+            return touch;
         }
         let live = self.input.lock().unwrap().touch.unwrap_or_default();
         let Some(r) = self.recipe.as_mut() else { return live };
@@ -188,6 +195,22 @@ fn read_dir_files(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(out)
 }
 
+/// A rePatch overlay a run lays over its title: its record and its files on disk.
+struct Overlay {
+    dir: PathBuf,
+    disk: crate::diskvfs::DiskVfs,
+    meta: vitaslop_frontend::meta::RepatchMeta,
+}
+
+impl Overlay {
+    fn open(dir: &Path) -> Result<Overlay, String> {
+        let record = dir.join(vitaslop_runtime::ingest::repatch::RECORD);
+        let text = std::fs::read_to_string(&record).map_err(|e| format!("rePatch {}: {e}", record.display()))?;
+        let meta = serde_json::from_str(&text).map_err(|e| format!("rePatch {}: {e}", record.display()))?;
+        Ok(Overlay { dir: dir.to_path_buf(), disk: crate::diskvfs::DiskVfs::open(dir)?, meta })
+    }
+}
+
 /// The retail guest, stepped live on the preemptive scheduler. Owns the scheduler and
 /// tracks the newest presented frame and whether the run has ended.
 pub struct RetailGuest {
@@ -225,20 +248,22 @@ impl RetailGuest {
     /// execution over the shared `input` cell. An optional scripted `recipe` (a
     /// frame-keyed TAS text) is overlaid on the live input so a recorded playthrough
     /// replays in the window.
-    pub fn new(dir: &Path, input: SharedInput, recipe: Option<&str>) -> Result<RetailGuest, String> {
-        Self::new_with_exec(dir, input, recipe, None)
-    }
-
-    /// [`Self::new`] with the app's executable `main_exec` (an `sceAppMgrLoadExec` path) in
+    ///
+    /// `main_exec`: the app's executable (an `sceAppMgrLoadExec` path) in
     /// the main executable's place - the process a title's `LoadExec` asked for. See
     /// [`Self::take_exec_request`].
+    ///
+    /// `repatch`: a rePatch overlay directory to lay over the title (see
+    /// `vitaslop_runtime::ingest::repatch` and `library::active_repatch`), or `None`.
     pub fn new_with_exec(
         dir: &Path,
         input: SharedInput,
         recipe: Option<&str>,
         main_exec: Option<&str>,
+        repatch: Option<&Path>,
     ) -> Result<RetailGuest, String> {
         let t0 = Instant::now();
+        let overlay = repatch.map(Overlay::open).transpose()?;
         // >>> THE DATA FILES STAY ON DISK. See `crate::diskvfs`.
         //
         // A decrypted-dump tree - which is what every extracted title here is - mounts LAZILY:
@@ -264,7 +289,7 @@ impl RetailGuest {
             .map(|root| vitaslop_runtime::ingest::pipeline::mount_dump_lazy(&disk, &root))
             .transpose()
             .map_err(|e| format!("mount dump: {e:?}"))?;
-        let (mut game_modules, execs, mut resident, backing) = match lazy {
+        let (mut game_modules, mut execs, mut resident, backing) = match lazy {
             Some(dump) => {
                 let backing =
                     crate::diskvfs::DiskBacking::new(disk.under(&dump.files_prefix));
@@ -285,6 +310,15 @@ impl RetailGuest {
                 (game.modules, game.execs, Some(game.files), None)
             }
         };
+        if let Some(o) = &overlay {
+            let code = vitaslop_runtime::ingest::repatch::read_code(&o.meta.code, |p| {
+                std::fs::read(o.dir.join(p)).map_err(|e| format!("rePatch {p}: {e}"))
+            })?;
+            for m in &code {
+                println!("rePatch: {} replaces the title's ({} KB)", m.path, m.elf.len() / 1024);
+            }
+            vitaslop_runtime::ingest::repatch::apply_code(&mut game_modules, &mut execs, code);
+        }
         if let Some(path) = main_exec {
             let rel = vitaslop_runtime::ingest::pipeline::exec_rel_path(path);
             let exec = execs
@@ -343,16 +377,38 @@ impl RetailGuest {
         env.state.set_modules(linked.loaded_modules.clone());
         env.state.set_tls_template(linked.tls_template);
         env.state.set_preemptive(true);
+        // A rePatch overlay goes in FIRST: the first backing to serve a path keeps it, which is
+        // the plugin's rule - an overlay file replaces the title's, anything else falls through.
+        let mut overlaid = std::collections::HashSet::new();
+        if let Some(o) = &overlay {
+            let files = o.disk.under(vitaslop_runtime::ingest::repatch::APP_DIR);
+            overlaid.extend(files.iter().map(|(p, _)| vitaslop_runtime::host::vfs_key(p)));
+            let b = crate::diskvfs::DiskBacking::new(files);
+            println!("rePatch: {} file(s), {:.1} MB laid over the title", b.file_count(), b.total_bytes() as f64 / 1e6);
+            env.state.set_file_backing(Box::new(b));
+        }
         // Either the disk serves the assets on demand, or - for a container that had to be
         // decrypted whole - they are MOVED (not cloned) into the guest filesystem.
         match (backing, resident.take()) {
             (Some(b), _) => env.state.set_file_backing(Box::new(b)),
             (None, Some(files)) => {
+                // A resident file would win over every backing, the overlay's included.
                 for (path, bytes) in files.into_files() {
-                    env.state.add_file(&path, bytes);
+                    if !overlaid.contains(&vitaslop_runtime::host::vfs_key(&path)) {
+                        env.state.add_file(&path, bytes);
+                    }
                 }
             }
             (None, None) => {}
+        }
+        // Its add-on directories, ahead of the add-ons themselves (`mount_addons`, later). One the
+        // player has not installed is present all the same, as the plugin reports it.
+        if let Some(o) = &overlay {
+            for name in &o.meta.addcont {
+                let files = o.disk.under(&format!("{}{name}/", vitaslop_runtime::ingest::repatch::ADDCONT_DIR));
+                println!("rePatch: {} file(s) laid over add-on {name}", files.len());
+                env.state.add_addcont(name, Box::new(crate::diskvfs::DiskBacking::new(files)));
+            }
         }
 
         // >>> THE BOOT'S OWN RESIDENCY, BRACKETED. See `vitaslop_platform::heap`.
@@ -384,7 +440,14 @@ impl RetailGuest {
         // only the first boot after a build pays the transpile and the Cranelift compile.
         // `VITASLOP_COMPILE_CACHE=0` bypasses it (neither read nor written).
         let cache = (std::env::var("VITASLOP_COMPILE_CACHE").as_deref() != Ok("0"))
-            .then(|| vitaslop_native::compile_cache::CompileCache::new(dir, main_exec.unwrap_or("eboot.bin")));
+            .then(|| {
+                let exec = main_exec.unwrap_or("eboot.bin");
+                let exec = match overlay.as_ref().map(|o| o.meta.code_hash.as_str()) {
+                    Some(h) if !h.is_empty() => format!("{exec}+rp{h}"),
+                    _ => exec.to_string(),
+                };
+                vitaslop_native::compile_cache::CompileCache::new(dir, &exec)
+            });
         let (sched, _stubs) = if smp {
             println!(
                 "loaded: PARALLEL guest threads on {} worker(s) (VITASLOP_SMP) - not deterministic",
@@ -422,6 +485,44 @@ impl RetailGuest {
     /// > > > descriptors on, so doing it mid-run corrupts exactly the state it is trying to keep.
     /// > > > Construction has just returned and the guest has not been stepped, which is why this
     /// > > > is a separate call taken immediately rather than a fourth argument to `new`.
+    /// Install every add-on under `root`: each subdirectory holding a decrypted dump (what an
+    /// add-on import writes - see `library::addons_dir`). Call before the first step, like
+    /// [`persist_to`](Self::persist_to). An add-on that will not mount fails the run: playing
+    /// on without content the player installed is a different game than the one they asked for.
+    pub fn mount_addons(&mut self, root: &Path) -> Result<usize, String> {
+        let Ok(rd) = std::fs::read_dir(root) else { return Ok(0) };
+        let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        dirs.sort();
+        let mut n = 0;
+        for dir in dirs {
+            // Turned off on the title page: kept, not installed. A folder with no record (one
+            // handed to `--addons` by hand) is on.
+            if let Ok(text) = std::fs::read_to_string(dir.join("addon.json"))
+                && serde_json::from_str::<vitaslop_frontend::meta::AddonMeta>(&text).is_ok_and(|m| m.disabled)
+            {
+                println!("add-on: {} is turned off, skipped", dir.display());
+                continue;
+            }
+            let disk = crate::diskvfs::DiskVfs::open(&dir)?;
+            // The manifest is written last, so a folder without one is an import that did not
+            // finish - not an add-on yet.
+            let Some(droot) = vitaslop_runtime::ingest::pipeline::dump_root(&disk) else {
+                println!("add-on: {} holds no finished import, skipped", dir.display());
+                continue;
+            };
+            let dump = vitaslop_runtime::ingest::pipeline::mount_dump_lazy(&disk, &droot)
+                .map_err(|e| format!("add-on {}: {e:?}", dir.display()))?;
+            let name = vitaslop_runtime::ingest::addcont::dir_name(&dump.content_id)
+                .ok_or_else(|| format!("add-on {}: content id {:?} names no add-on directory", dir.display(), dump.content_id))?
+                .to_string();
+            let backing = crate::diskvfs::DiskBacking::new(disk.under(&dump.files_prefix));
+            println!("add-on: {name} ({} file(s), {:.1} MB)", backing.file_count(), backing.total_bytes() as f64 / 1e6);
+            self.sched.host().state.add_addcont(&name, Box::new(backing));
+            n += 1;
+        }
+        Ok(n)
+    }
+
     pub fn persist_to(&mut self, root: &Path, game_dir: &Path) -> Result<(), String> {
         // Asked of the container, not of the path - see `SaveStore::title_for`.
         let sfo = self.sched.host().state.read_file("app0:/sce_sys/param.sfo");
@@ -474,13 +575,16 @@ impl RetailGuest {
         if self.finished {
             return;
         }
-        let target = self.sched.frames() + 1;
+        let before = self.sched.frames();
         let clock_before = self.sched.host().state.now_us();
-        let report = self.sched.run_frames(target, PER_FRAME_ROUNDS);
+        let report = self.sched.run_frames(before + 1, PER_FRAME_ROUNDS);
+        // Usually one; more after a slow present the guest ran on through
+        // (`vitaslop_native::smp::late_present`), all taken now and the newest shown.
+        let taken = self.sched.frames().saturating_sub(before).max(1);
         // An OVERLAPPED parallel run: the guest ran this frame during the last present and runs
-        // the next one now, so the clock around this call is not this frame's - its own two
-        // flips are. The browser's rule (`frame_advance_us`).
-        self.last_advance_us = match self.sched.frame_advance_us(target) {
+        // the next one now, so the clock around this call is not this frame's - its own flips
+        // are. The browser's rule (`frame_advance_us`).
+        self.last_advance_us = match self.sched.frame_span_us(before, before + taken) {
             Some(us) if self.sched.overlapped() => us,
             _ => self.sched.host().state.now_us().saturating_sub(clock_before),
         };
@@ -521,7 +625,7 @@ impl RetailGuest {
             // partition below does.
             let overlapped = self.sched.overlapped();
             let (pending, ready): (Vec<_>, Vec<_>) = if overlapped {
-                (Vec::new(), cap.take_scenes_through_flip())
+                (Vec::new(), cap.take_scenes_through_flips(taken as usize))
             } else {
                 std::mem::take(&mut cap.scenes).into_iter().partition(|s| s.deferred_id != 0)
             };
@@ -591,6 +695,17 @@ impl RetailGuest {
     /// pull a slow guest gets toward real time, which a pacer must not charge as game time.
     pub fn clock_from_wall_us(&mut self) -> u64 {
         self.sched.host().state.clock_from_wall_us()
+    }
+
+    /// The presenter's mark for a present, so the parallel guest runs on through a slow one -
+    /// see `vitaslop_native::smp::late_present`. `None` on the one-at-a-time engine.
+    pub fn late_handle(&self) -> Option<vitaslop_native::smp::LatePresent> {
+        self.sched.late_handle()
+    }
+
+    /// Frames the guest ran during slow presents, for the exit report.
+    pub fn late_opened(&self) -> u64 {
+        self.sched.late_opened()
     }
 
     /// Stop the guest for a write into memory it may also be writing - see
@@ -1147,12 +1262,30 @@ impl RetailGfx {
             let t0 = Instant::now();
             let mut renderer = r.lock().unwrap_or_else(|e| e.into_inner());
             let t1 = Instant::now();
+            let build0 = vitaslop_platform::gpu::peek_pipeline_build_split();
             let out = renderer.complete_scenes(scenes);
             drop(renderer);
+            let work_ms = t1.elapsed().as_secs_f64() * 1000.0;
             if let Ok(mut s) = sums.lock() {
                 s[0] += 1.0;
                 s[1] += (t1 - t0).as_secs_f64() * 1000.0;
-                s[2] += t1.elapsed().as_secs_f64() * 1000.0;
+                s[2] += work_ms;
+            }
+            // The guest WAITS on a completion (under the host lock), so a slow one stops the
+            // whole emulator - its sound included. Named, with its shader work, like a slow
+            // present.
+            if work_ms > 50.0 {
+                let b = vitaslop_platform::gpu::peek_pipeline_build_split();
+                tracing::info!(
+                    target: "vitaslop::status",
+                    ms = work_ms as u64,
+                    scenes = scenes.len(),
+                    draws = scenes.iter().map(|s| s.draws.len()).sum::<usize>(),
+                    translate_ms = (b.0 - build0.0) as u64,
+                    module_ms = (b.1 - build0.1) as u64,
+                    pipeline_ms = (b.2 - build0.2) as u64,
+                    "slow guest completion"
+                );
             }
             out
         })
@@ -1889,6 +2022,63 @@ fn report_frame_timing(
 /// stable median past the first-render pipeline/upload cost, cheap enough to always run.
 const WARM_RENDER_SAMPLES: usize = 60;
 
+/// What drives a headless run's input instead of a recipe.
+pub enum Play {
+    /// A playbook (`vitaslop-playbook`), which also records `<shot-dir>/playbook.tape`.
+    Playbook(PathBuf),
+    /// A tape a playbook run recorded, replayed input frame for input frame.
+    Tape(PathBuf),
+}
+
+/// Wall-clock milliseconds since the first call, for a playbook's per-phase speed.
+fn wall_ms() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+/// Start the playbook engine for `play` (or for discovery alone, which records calls while
+/// the built-in input runs). Before the guest is built, so the first pad read is seen.
+fn start_play(play: Option<&Play>, discover: bool, dir: &Path) -> Result<(), String> {
+    use vitaslop_playbook::engine;
+    let mode = if vitaslop_native::smp::enabled() { "real-speed (SMP)" } else { "deterministic (one-baton)" };
+    // The title's own id, from its param.sfo - the directory name of an extracted dump says
+    // nothing (they are all called `extracted`).
+    // An extracted dump keeps it under `files/`; a plain app tree at its root.
+    let title = [dir.join("files").join("sce_sys"), dir.join("sce_sys")]
+        .iter()
+        .find_map(|d| std::fs::read(d.join("param.sfo")).ok())
+        .and_then(|sfo| vitaslop_runtime::ingest::sfo::title_id(&sfo))
+        .unwrap_or_else(|| dir.display().to_string());
+    let header = vec![("title".to_string(), title), ("mode".to_string(), mode.to_string())];
+    match play {
+        Some(Play::Playbook(path)) => {
+            let source = std::fs::read_to_string(path).map_err(|e| format!("read playbook {}: {e}", path.display()))?;
+            let name = vitaslop_playbook::playbook_name(path);
+            println!("headless: input is the PLAYBOOK {name} ({mode})");
+            let opts = engine::StartOpts { name, header, discover, wall_ms: Some(wall_ms), drives_input: true };
+            engine::start(opts, &source, Some(Box::new(vitaslop_playbook::lua_mlua::MluaVm::new())))
+        }
+        Some(Play::Tape(path)) => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("read tape {}: {e}", path.display()))?;
+            let tape = vitaslop_playbook::tape::Tape::parse(&text)?;
+            println!("headless: input is the TAPE {} ({mode})", path.display());
+            engine::start_tape(tape, path.display().to_string(), discover, Some(wall_ms))
+        }
+        // Discovery with no playbook: an empty one, so the engine is running to record calls;
+        // the run's own input (a recipe or the built-in taps) still drives it.
+        None => {
+            let opts = engine::StartOpts {
+                name: "(discover)".into(),
+                header,
+                discover,
+                wall_ms: Some(wall_ms),
+                drives_input: false,
+            };
+            engine::start(opts, "", Some(Box::new(vitaslop_playbook::lua_mlua::MluaVm::new())))
+        }
+    }
+}
+
 pub fn headless_check(
     dir: PathBuf,
     shot_dir: PathBuf,
@@ -1901,6 +2091,14 @@ pub fn headless_check(
     // `<root>/<title>/`. OFF by default here on purpose - a headless run is the render and
     // timing oracle, and a save read back in changes what the title draws.
     save_dir: Option<PathBuf>,
+    // `--addons <root>`: install the add-ons under it (see `RetailGuest::mount_addons`).
+    addons: Option<PathBuf>,
+    // `--repatch <dir>`: lay that rePatch overlay over the title (see `ingest::repatch`).
+    repatch: Option<PathBuf>,
+    // `--playbook` / `--tape`: what drives input instead of a recipe; `--discover`: record the
+    // call table cues are found from. See `vitaslop-playbook`.
+    play: Option<Play>,
+    discover: bool,
 ) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
     let env_recipe = std::env::var("VITASLOP_HEADLESS_RECIPE")
@@ -1915,13 +2113,30 @@ pub fn headless_check(
                         different recipes - pass one, not two".into());
         }
     let recipe = flag_recipe.or(env_recipe);
+    if recipe.is_some() && play.is_some() {
+        return Err("a recipe and a playbook/tape both drive input - pass one".into());
+    }
     // Say which way input is being driven, unconditionally. "Did the recipe apply" was
     // previously answerable only by recognising the final screenshot.
-    println!(
-        "headless: input is {}",
-        if recipe.is_some() { "a RECIPE" } else { "the built-in tap script (no recipe given)" }
-    );
-    let mut guest = RetailGuest::new(&dir, input.clone(), recipe.as_deref())?;
+    if play.is_none() {
+        println!(
+            "headless: input is {}",
+            if recipe.is_some() { "a RECIPE" } else { "the built-in tap script (no recipe given)" }
+        );
+    }
+    // The playbook engine starts BEFORE the guest exists, so it sees the very first pad read.
+    if play.is_some() || discover {
+        start_play(play.as_ref(), discover, &dir)?;
+    }
+    // Screenshots a playbook asked for, written from the next rendered frame.
+    let mut play_shots: Vec<String> = Vec::new();
+    // The display frame the playbook finished on: the run stops a frame later, so a shot it
+    // asked for last is still written.
+    let mut play_over_at: Option<u64> = None;
+    let mut guest = RetailGuest::new_with_exec(&dir, input.clone(), recipe.as_deref(), None, repatch.as_deref())?;
+    if let Some(root) = addons.as_deref() {
+        guest.mount_addons(root)?;
+    }
     if let Some(root) = save_dir.as_deref() {
         guest.persist_to(root, &dir)?;
     }
@@ -1956,7 +2171,8 @@ pub fn headless_check(
     // The built-in Tutorial tap script (title menu navigation): used only when no
     // recipe is given and taps are not disabled. (active_from, active_until, x, y) - a
     // sticky tap held across a few frames then released.
-    let use_builtin_taps = recipe.is_none() && std::env::var_os("VITASLOP_HEADLESS_NO_TAPS").is_none();
+    let use_builtin_taps =
+        recipe.is_none() && play.is_none() && std::env::var_os("VITASLOP_HEADLESS_NO_TAPS").is_none();
     let taps = [
         (12u64, 19u64, 450u16, 674u16),
         (30, 37, 230, 230),
@@ -2073,7 +2289,7 @@ pub fn headless_check(
     // and targets the frame render built. See `VitaState::complete_scene_now`.
     let periodic_shared: std::sync::Arc<std::sync::Mutex<Option<vitaslop_native::GeneralRenderer>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
-    if shot_every > 0 {
+    if shot_every > 0 || play.is_some() {
         std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
         *periodic_shared.lock().unwrap() =
             Some(vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?);
@@ -2128,12 +2344,15 @@ pub fn headless_check(
             && let Some(path) = guest.take_exec_request()
         {
             println!("headless: frame {}: the title exec'd {path} - booting it", guest.frames());
-            guest = RetailGuest::new_with_exec(&dir, input.clone(), recipe.as_deref(), Some(&path))?;
+            guest = RetailGuest::new_with_exec(&dir, input.clone(), recipe.as_deref(), Some(&path), repatch.as_deref())?;
+            if let Some(root) = addons.as_deref() {
+                guest.mount_addons(root)?;
+            }
             if let Some(root) = save_dir.as_deref() {
                 guest.persist_to(root, &dir)?;
             }
         }
-        if guest.frames() >= target || guest.finished() {
+        if guest.frames() >= target || guest.finished() || play_over_at.is_some_and(|at| guest.frames() > at + 1) {
             break;
         }
         let f = guest.frames();
@@ -2252,16 +2471,30 @@ pub fn headless_check(
         // Rendered pixels that have to reach GUEST memory, collected while the scenes are
         // still borrowed and applied below once they are not.
         let mut writeback: Vec<(u32, u32, u32, Vec<u8>)> = Vec::new();
+        // A playbook run renders EVERY frame (the rule above: a shot is only faithful when the
+        // frames before it were rendered), and writes when its cadence or the playbook asks.
+        let renders = shot_every > 0 || play.is_some();
+        // A playbook watching the screen (`cue.pixels`) is handed every rendered frame.
+        let pixels = play.is_some() && vitaslop_playbook::engine::wants_pixels();
+        let periodic_due = shot_every > 0 && in_shot_window && f % shot_every == 0;
+        let writes_this_frame = periodic_due || !play_shots.is_empty();
+        // >>> THE CLOCK IS READ BEFORE THE RENDERER IS LOCKED. It takes the HOST lock, and a guest
+        // thread inside `sceGxmEndScene` holds the host lock while it waits for the renderer (the
+        // complete-scene hook above) - so under SMP, reading it with `periodic` held deadlocked
+        // both: one playbook run hung for good right after writing its last shot.
+        let shot_clock = writes_this_frame.then(|| (guest.clock_us(), guest.clock_sources()));
         let mut periodic = periodic_shared.lock().unwrap_or_else(|e| e.into_inner());
-        let writes_this_frame = shot_every > 0 && in_shot_window && f % shot_every == 0;
-        if let (Some(r), true) = (periodic.as_mut(), shot_every > 0 && in_render_window && !writes_this_frame) {
+        if let (Some(r), true) = (periodic.as_mut(), renders && in_render_window && !writes_this_frame) {
             let scenes = guest.current();
             if !scenes.is_empty() {
                 frame_shape = (scenes.len(), scenes.iter().map(|s| s.draws.len()).sum());
                 let t = std::time::Instant::now();
                 r.set_presented(guest.current_presents());
-                let _ = r.render_frame(scenes, display.0, display.1, CLEAR);
+                let fb = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
+                if pixels {
+                    vitaslop_playbook::engine::on_frame_pixels(fb.width, fb.height, &fb.rgba);
+                }
                 writeback = r.rtt_writebacks();
             }
         }
@@ -2297,22 +2530,33 @@ pub fn headless_check(
                 let fb = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
                 writeback = r.rtt_writebacks();
-                let path = shot_dir.join(format!("f{f:06}.png"));
+                if pixels {
+                    vitaslop_playbook::engine::on_frame_pixels(fb.width, fb.height, &fb.rgba);
+                }
                 // Written at PANEL size whatever the guest declared, so a shot sequence is
                 // comparable frame to frame and against the browser. `scaled_to` is a copy
                 // when the two already agree, which is every title but one.
                 let fb = fb.scaled_to(GAME_W, GAME_H);
-                std::fs::write(&path, fb.to_png()).map_err(|e| format!("write png: {e}"))?;
+                let png = fb.to_png();
+                if periodic_due {
+                    let path = shot_dir.join(format!("f{f:06}.png"));
+                    std::fs::write(&path, &png).map_err(|e| format!("write png: {e}"))?;
+                }
+                for name in play_shots.drain(..) {
+                    let path = shot_dir.join(format!("{name}.png"));
+                    std::fs::write(&path, &png).map_err(|e| format!("write png: {e}"))?;
+                    println!("headless: playbook shot {name} at f{f} -> {}", path.display());
+                }
             }
             // The guest clock beside the frame, so its LOCAL rate is visible. A run-total
             // ratio of 1.00x hides a stretch that ran five times fast against a stretch
             // that stalled, and a title paced off the clock behaves very differently in
             // the two.
-            let (clk_q, clk_topup, clk_idle) = guest.clock_sources();
+            let (clock_us, (clk_q, clk_topup, clk_idle)) = shot_clock.unwrap_or_default();
             println!(
                 "shot f{f:06}: guest clock {:.3}s ({:.3}s quanta + {:.3}s topup + {:.3}s idle), \
                  {scene_count} scenes / {draw_count} draws [{}] flipped=[{}]",
-                guest.clock_us() as f64 / 1e6,
+                clock_us as f64 / 1e6,
                 clk_q as f64 / 1e6,
                 clk_topup as f64 / 1e6,
                 clk_idle as f64 / 1e6,
@@ -2395,7 +2639,44 @@ pub fn headless_check(
         } else {
             guest.advance();
         }
+        // The playbook's per-display-frame work: timeouts a game that stopped reading the pad
+        // would never reach, its log, the shots it asked for (written from the next render).
+        if play.is_some() || discover {
+            use vitaslop_playbook::engine;
+            engine::on_display_frame(guest.frames(), guest.clock_us());
+            for ev in engine::take_events() {
+                match ev {
+                    engine::Event::Log(line) => println!("{line}"),
+                    engine::Event::Shot(name) => play_shots.push(name),
+                }
+            }
+            if play.is_some() && play_over_at.is_none() && engine::status() != Some(engine::Status::Running) {
+                play_over_at = Some(guest.frames());
+            }
+        }
     }
+    // The playbook's verdict, its tape and its report, beside the shots.
+    let play_failed = match vitaslop_playbook::engine::finish() {
+        Some(report) => {
+            let text = report.render_text();
+            print!("{text}");
+            std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
+            std::fs::write(shot_dir.join("playbook.txt"), &text).map_err(|e| format!("write report: {e}"))?;
+            if matches!(play, Some(Play::Playbook(_))) {
+                let tape = shot_dir.join("playbook.tape");
+                std::fs::write(&tape, report.tape.render()).map_err(|e| format!("write tape: {e}"))?;
+                println!("headless: tape -> {}", tape.display());
+            }
+            match (&play, &report.status) {
+                (Some(_), vitaslop_playbook::engine::Status::Failed(m)) => Some(m.clone()),
+                (Some(_), vitaslop_playbook::engine::Status::Running) => {
+                    Some(format!("the run ended at frame {} before the playbook did", guest.frames()))
+                }
+                _ => None,
+            }
+        }
+        None => None,
+    };
     // Block-visit histogram (`VITASLOP_BLOCK_HIST=<top>`, with `VITASLOP_TRACE_BLOCKS=lo-hi`
     // emitting the hooks). It was only reachable from the boot-probe test, which cannot
     // replay a recipe - so the one case it is built for, "the title reached screen N and
@@ -2649,15 +2930,22 @@ pub fn headless_check(
     if stray != 0 {
         println!("headless: {stray} suspends were not produced by the emitted work check");
     }
+    // A playbook that failed fails the run, after everything above has been written out.
+    if let Some(msg) = play_failed {
+        return Err(format!("playbook: {msg}"));
+    }
     Ok(())
 }
 
 /// Run the retail title in `dir` in a live window until the window closes or the guest
 /// exits. Blocks until the event loop ends. With `recipe` set, a scripted playthrough
 /// replays in the window (live keyboard/mouse still nudges it).
-pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> Result<(), String> {
+pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>, addons: Option<PathBuf>, repatch: Option<PathBuf>) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
-    let mut guest = RetailGuest::new(&dir, input.clone(), recipe.as_deref())?;
+    let mut guest = RetailGuest::new_with_exec(&dir, input.clone(), recipe.as_deref(), None, repatch.as_deref())?;
+    if let Some(root) = addons.as_deref() {
+        guest.mount_addons(root)?;
+    }
     if let Some(root) = save_dir.as_deref() {
         guest.persist_to(root, &dir)?;
     }
@@ -2676,7 +2964,7 @@ pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> R
     let exit_at = std::env::var("VITASLOP_WINDOW_FRAMES").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let mut app = RetailApp {
         session: Session::new(guest, input.clone(), Input::new(&settings), pause_on_blur),
-        boot: Boot { dir, recipe, save_dir, input, pause_on_blur },
+        boot: Boot { dir, recipe, save_dir, addons, repatch, input, pause_on_blur },
         window: None,
         gfx: None,
         exit_at,
@@ -2713,6 +3001,7 @@ pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> R
     }
     if let Some(r) = app.session.guest.smp_report() {
         println!("{r}");
+        println!("late present: the guest ran {} frame(s) on through slow presents", app.session.guest.late_opened());
     }
     // `VITASLOP_PERF` + `VITASLOP_PERF_FROM=<frame>`: where the guest's time went from that frame
     // to the exit - the runtime's phase table and the host calls, per guest frame.
@@ -2801,6 +3090,8 @@ struct Boot {
     dir: PathBuf,
     recipe: Option<String>,
     save_dir: Option<PathBuf>,
+    addons: Option<PathBuf>,
+    repatch: Option<PathBuf>,
     input: SharedInput,
     pause_on_blur: bool,
 }
@@ -2813,7 +3104,10 @@ impl RetailApp {
         println!("frame {}: the title exec'd {path} - booting it", self.session.guest.frames());
         self.session.guest.flush_save(true);
         let b = &self.boot;
-        let mut guest = RetailGuest::new_with_exec(&b.dir, b.input.clone(), b.recipe.as_deref(), Some(path))?;
+        let mut guest = RetailGuest::new_with_exec(&b.dir, b.input.clone(), b.recipe.as_deref(), Some(path), b.repatch.as_deref())?;
+        if let Some(root) = b.addons.as_deref() {
+            guest.mount_addons(root)?;
+        }
         if let Some(root) = b.save_dir.as_deref() {
             guest.persist_to(root, &b.dir)?;
         }
@@ -2958,16 +3252,31 @@ impl ApplicationHandler for RetailApp {
                     // stage (see `RetailGfx::frame` for what re-encoding did to a feedback effect).
                     let new_frame = self.presented != Some(frame_now);
                     let fresh = self.force_present || new_frame || !self.session.live();
+                    // What the guest did WHILE this thread presents: the sound it made, the game
+                    // time it moved, and how long the speakers went dry. Named on a slow present.
+                    let underrun = |s: &Session| s.audio.as_ref().map_or(0.0, |a| a.stats().underrun_s);
+                    let around0 = (self.session.guest.audio_produced_seconds(), self.session.guest.clock_us(), underrun(&self.session));
+                    let late = self.session.guest.late_handle();
                     let (scenes, display, presents) = self.session.scenes();
                     if fresh && !scenes.is_empty() {
                         self.presented = Some(frame_now);
                         self.force_present = false;
                         let t_present = Instant::now();
                         let build0 = vitaslop_platform::gpu::peek_pipeline_build_split();
+                        if let Some(l) = &late {
+                            l.begin();
+                        }
                         let presented = gfx.present(scenes, display, presents, new_frame);
+                        if let Some(l) = &late {
+                            l.end();
+                        }
+                        // The write-backs PAUSE the parallel guest, so they wait for every worker
+                        // to reach a switch point - a long host call holds them up. Timed apart.
+                        let t_wb = Instant::now();
                         if let Ok(wb) = &presented {
                             self.session.apply_writebacks(wb);
                         }
+                        let writeback_ms = t_wb.elapsed().as_secs_f64() * 1000.0;
                         let present_ms = t_present.elapsed().as_secs_f64() * 1000.0;
                         self.split[2] += present_ms;
                         self.split[3] += 1.0;
@@ -2977,6 +3286,7 @@ impl ApplicationHandler for RetailApp {
                             // Of it, the shader work: our translation, the driver's module and
                             // pipeline compiles - which half a fix would have to move.
                             let b = vitaslop_platform::gpu::peek_pipeline_build_split();
+                            let around1 = (self.session.guest.audio_produced_seconds(), self.session.guest.clock_us(), underrun(&self.session));
                             tracing::info!(
                                 target: "vitaslop::status",
                                 frame = frame_now,
@@ -2984,6 +3294,10 @@ impl ApplicationHandler for RetailApp {
                                 translate_ms = (b.0 - build0.0) as u64,
                                 module_ms = (b.1 - build0.1) as u64,
                                 pipeline_ms = (b.2 - build0.2) as u64,
+                                writeback_ms = writeback_ms as u64,
+                                sound_made_ms = ((around1.0 - around0.0) * 1000.0) as u64,
+                                game_ms = around1.1.saturating_sub(around0.1) / 1000,
+                                dry_ms = ((around1.2 - around0.2) * 1000.0) as u64,
                                 "slow window present"
                             );
                         }

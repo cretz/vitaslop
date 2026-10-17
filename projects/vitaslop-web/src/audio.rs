@@ -42,6 +42,8 @@ const CTL_SAMPLE_RATE: u32 = 6;
 /// end is silent for 95% of its running time) will show an empty ring on a run that
 /// produced minutes of sound. A high-water mark cannot miss it.
 const CTL_PEAK: u32 = 7;
+/// See `web/audio.js` `CTL_ENDED`: the run is over, so the consumer counts no underrun.
+const CTL_ENDED: u32 = 11;
 /// Slots 8 and 9 belong to the consumer (latency skip, live backlog); the header is
 /// sized past them so the layout has room to grow without moving the PCM.
 const CTL_HEADER_BYTES: u32 = 64;
@@ -101,6 +103,23 @@ pub fn install_ring(ring: &JsValue) -> Option<(u32, u32, u32)> {
     Some((capacity, channels, sample_rate))
 }
 
+/// The run has ended: from here the consumer plays silence without counting it as underrun
+/// (`CTL_ENDED`). Cleared by the next run's [`WebAudioSink::new`].
+pub fn mark_run_ended() {
+    RING_VIEWS.with(|v| {
+        if let Some(r) = v.borrow().as_ref() {
+            let _ = js_sys::Atomics::store(&r.ctl, CTL_ENDED, 1);
+        }
+    });
+}
+
+/// Frames of silence the device has played for want of data so far (the worklet's
+/// `CTL_UNDERRUN`), read through this worker's views; `None` before they are installed.
+pub fn ring_underrun_frames() -> Option<u32> {
+    const CTL_UNDERRUN: u32 = 2;
+    RING_VIEWS.with(|v| v.borrow().as_ref().map(|r| js_sys::Atomics::load(&r.ctl, CTL_UNDERRUN).unwrap_or(0) as u32))
+}
+
 /// Run `f` with this worker's ring views. A worker that never installed them has no ring to
 /// write, which is loud once rather than a silent drop: that is a worker the SMP setup forgot.
 fn with_ring<R>(f: impl FnOnce(&RingViews) -> R) -> Option<R> {
@@ -139,6 +158,12 @@ impl WebAudioSink {
     /// something to paper over.
     pub fn new(ring: &JsValue) -> Option<WebAudioSink> {
         let (capacity, channels, sample_rate) = install_ring(ring)?;
+        // A run attaching the ring is not over, whatever the previous run on it said.
+        RING_VIEWS.with(|v| {
+            if let Some(r) = v.borrow().as_ref() {
+                let _ = js_sys::Atomics::store(&r.ctl, CTL_ENDED, 0);
+            }
+        });
         Some(WebAudioSink {
             capacity,
             channels,

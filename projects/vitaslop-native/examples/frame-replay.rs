@@ -99,8 +99,9 @@ fn main() {
                 let h = |b: &[u8]| vitaslop_gxp_shader::Program::parse(b).map(|p| p.hash).unwrap_or(0);
                 let rs = &d.render_state;
                 eprintln!(
-                    "    draw {di} vprog {:016x} fprog {:016x} depth func {} write {} cull {}",
-                    h(&d.vprog), h(&d.fprog), rs.front_depth_func, rs.front_depth_write, rs.cull_mode
+                    "    draw {di} vprog {:016x} fprog {:016x} depth func {} write {} cull {} viewport {} {:?}",
+                    h(&d.vprog), h(&d.fprog), rs.front_depth_func, rs.front_depth_write, rs.cull_mode,
+                    if rs.viewport_enable == 0 { "on" } else { "OFF" }, rs.viewport
                 );
                 for t in d.textures.iter() {
                     eprintln!(
@@ -181,6 +182,10 @@ fn main() {
                 let out = format!("{dir}/tex-{want:08x}-{}.png", seen.len() - 1);
                 let fb = vitaslop_runtime::render::Framebuffer { width: w, height: hgt, rgba };
                 std::fs::write(&out, fb.to_png()).expect("write the texture png");
+                // The guest bytes as snapshotted, beside the decode, for a layout question the
+                // decoder itself would answer with its own assumptions.
+                std::fs::write(format!("{dir}/tex-{want:08x}-{}.bin", seen.len() - 1), &t.pixels[..])
+                    .expect("write the texture bytes");
                 eprintln!(
                     "  tex {want:#x} {}x{} fmt {:#x} swizzle {:#x} type {} bytes {} hash {id:016x} -> {out}",
                     t.width, t.height, t.base_format, t.swizzle, t.tex_type, t.pixels.len()
@@ -191,7 +196,13 @@ fn main() {
     }
     // `--ir <scene> <draw> [from] [to]`: that draw's VERTEX program decoded - index, raw word,
     // op, destination and sources - the listing the NaN-site report's `#N` indexes.
-    if let Some(at) = args.iter().position(|a| a == "--ir") {
+    // `--ir` decodes the VERTEX program; `--fir` the same for the FRAGMENT program.
+    if let Some((at, frag)) = args
+        .iter()
+        .position(|a| a == "--ir")
+        .map(|at| (at, false))
+        .or_else(|| args.iter().position(|a| a == "--fir").map(|at| (at, true)))
+    {
         let si: usize = args.get(at + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
         let di: usize = args.get(at + 2).and_then(|v| v.parse().ok()).unwrap_or(0);
         let from: usize = args.get(at + 3).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -200,10 +211,22 @@ fn main() {
             eprintln!("frame-replay: no scene {si} draw {di}");
             std::process::exit(2);
         };
-        let prog = vitaslop_gxp_shader::Program::parse(&d.vprog).expect("parse the vertex program");
+        let blob = if frag { &d.fprog } else { &d.vprog };
+        let prog = vitaslop_gxp_shader::Program::parse(blob).expect("parse the program");
         let sh = vitaslop_gxp_shader::usse::decode_shader(&prog);
         for (i, ins) in sh.instrs.iter().enumerate().skip(from).take(to.saturating_sub(from).saturating_add(1)) {
             println!("#{i} {:016x} g{:#04x} {:?} dest {:?} mask {:?} srcs {:?}{}", ins.raw, ins.group, ins.op, ins.dest, ins.write_mask, ins.srcs, ins.blocked.map_or(String::new(), |b| format!(" BLOCKED {b}")));
+        }
+        // The program's own literal registers and parameters, which the instructions above name.
+        for (sa, w) in &prog.literals {
+            println!("literal SA[{sa}] = {w:#010x} ({})", f32::from_bits(*w));
+        }
+        for q in &prog.parameters {
+            println!(
+                "param {:<32} {:?} type {:?} comps {} array {} res {} semantic {}/{} container {}",
+                q.name, q.category, q.ptype, q.component_count, q.array_size, q.resource_index, q.semantic,
+                q.semantic_index, q.container_index
+            );
         }
         return;
     }

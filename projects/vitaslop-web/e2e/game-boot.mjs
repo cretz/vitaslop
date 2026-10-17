@@ -23,6 +23,8 @@
 //       MAX_ROUNDS   scheduler round cap (default 50_000_000)
 //       TARGET_FRAME the flip to screenshot at
 //       RECIPE       scripted-input recipe path
+//       PLAYBOOK     a playbook (.lua) to drive input instead; worker mode (WORKER=1) only
+//       SAVE_PROFILE run under this save profile (worker mode); a new name = no saves
 //       KNOBS        {"VITASLOP_GXP_LIVE":"1",...} - the browser has no environment
 //       WAIT_MS      how long to wait for TARGET_FRAME
 //       SHOT_DIR     where the screenshot and summary land
@@ -67,6 +69,23 @@ const recipe = recipePath
       process.exit(2);
     })
   : "";
+// `PLAYBOOK=<file.lua>`: drive the run with a playbook (vitaslop-playbook) instead of a recipe.
+// Its shots, report and tape land in SHOT_DIR (`<name>.png`, `playbook.txt`, `playbook.tape`),
+// and the run ends when the playbook does. Named `<title dir>/<file>` as the desktop names it.
+const playbookPath = process.env.PLAYBOOK ?? "";
+const playbook = playbookPath
+  ? {
+      name: playbookPath.replace(/\\/g, "/").split("/").slice(-2).join("/"),
+      source: await readFile(playbookPath, "utf8").catch((e) => {
+        console.error(`[game] PLAYBOOK ${playbookPath} cannot be read (cwd ${process.cwd()}): ${e.message}`);
+        process.exit(2);
+      }),
+    }
+  : undefined;
+if (playbook && recipe) {
+  console.error("[game] RECIPE and PLAYBOOK both drive input - pass one");
+  process.exit(2);
+}
 
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".wasm": "application/wasm", ".json": "application/json" };
 
@@ -316,6 +335,36 @@ async function main() {
   // The whole run's console, verbatim, on disk. A death nine frames after an event is only
   // attributable if the log around it survived, and a terminal scrollback is not a record.
   const consoleLog = createWriteStream(join(shotDir, "console.log"), { flags: "w" });
+  // A playbook run's output arrives as the WORKER's console lines (src/playbook.rs): shots it
+  // names (taken by `playbookShotTimer` below), its report, and its tape, whose `end` line is
+  // the last thing a finished playbook prints - so it ends the run.
+  const playbookShots = [];
+  const playbookReport = playbook ? createWriteStream(join(shotDir, "playbook.txt"), { flags: "w" }) : null;
+  const playbookTape = playbook ? createWriteStream(join(shotDir, "playbook.tape"), { flags: "w" }) : null;
+  // The worker's lines reach this harness by TWO routes - mirrored to the page console
+  // (`VITASLOP_CONSOLE=1`) and through the CDP worker session - so each is handled once.
+  // MEASURED: the first browser run took only the CDP route here and saved no shots.
+  const playbookSeen = new Set();
+  // The report's first line is the verdict (`PLAYBOOK <name> DONE` / `FAILED: ...`). A playbook
+  // run is judged on it: it ends when the playbook does, usually well short of TARGET_FRAME.
+  let playbookVerdict = "";
+  const playbookLine = (text) => {
+    if (!playbook || !text.startsWith("[playbook-") || playbookSeen.has(text)) return;
+    playbookSeen.add(text);
+    const shot = /^\[playbook-shot\] (\S+) at frame (\d+)/.exec(text);
+    if (shot) playbookShots.push(shot[1]);
+    else if (text.startsWith("[playbook-report] ")) {
+      if (!playbookVerdict && text.startsWith("[playbook-report] PLAYBOOK ")) playbookVerdict = text.slice(18);
+      playbookReport.write(text.slice(18) + "\n");
+    }
+    else if (text.startsWith("[playbook-tape] ")) {
+      playbookTape.write(text.slice(16) + "\n");
+      if (text.startsWith("[playbook-tape] end ")) {
+        ended = true;
+        liveStatus = "the playbook finished";
+      }
+    }
+  };
   page.on("console", (m) => {
     const text = m.text();
     consoleLog.write(`${Date.now()} ${m.type()} ${text}\n`);
@@ -332,6 +381,7 @@ async function main() {
       const key = text.slice(0, 120);
       if (!gpuErrors.some((e) => e.slice(0, 120) === key)) gpuErrors.push(text);
     }
+    playbookLine(text);
     if (text.startsWith("[live] ")) {
       liveStatus = text.slice(7);
       const f = Number((liveStatus.match(/frame (\d+)/) || [])[1] ?? liveFrame);
@@ -413,6 +463,7 @@ async function main() {
         const text = (e.args || []).map((a) => a.value ?? a.description ?? a.type).join(" ");
         consoleLog.write(`${Date.now()} ${label}:${e.type} ${text}\n`);
         console.log(`[${label}:${e.type}] ${text}`);
+        playbookLine(text);
       });
       sessionOn("Runtime.exceptionThrown", (e) => {
         const d = e.exceptionDetails || {};
@@ -536,9 +587,15 @@ async function main() {
     // same title mounts what the first imported instead of re-importing it.
     const titleId = (process.env.TITLE_ID || gameDir).replace(/[^A-Za-z0-9._-]+/g, "_").slice(-64);
     console.log(`[game] OPFS title id: ${titleId} (profile ${profileDir})`);
+    if (playbook) console.log(`[game] playbook: ${playbook.name}`);
+    // `SAVE_PROFILE=<name>`: run under that save profile (worker mode). A name not used before
+    // has no saves, so the title boots as it does the first time - which is what a playbook
+    // written against a clean desktop run expects.
+    const saveProfile = process.env.SAVE_PROFILE || "";
+    if (saveProfile) console.log(`[game] save profile: ${saveProfile}`);
     const msg = await page.evaluate(
-      ([recipe, f, r, k, id]) => window.__boot(recipe, f, r, k, id),
-      [recipe, maxFrames, maxRounds, knobs, titleId]
+      ([recipe, f, r, k, id, pb, sp]) => window.__boot(recipe, f, r, k, id, pb, sp),
+      [recipe, maxFrames, maxRounds, knobs, titleId, playbook, saveProfile]
     );
     console.log("[game] SETUP:", msg);
     // The adapter the page ACTUALLY got. The wasm refuses to render on a software one
@@ -673,6 +730,24 @@ async function main() {
         }
       }, 40);
     }
+    // The shots a playbook names, as close to the frame that named them as the canvas allows.
+    let playbookShotTimer = null;
+    if (playbook) {
+      let busy = false;
+      playbookShotTimer = setInterval(async () => {
+        if (busy || !playbookShots.length) return;
+        busy = true;
+        const name = playbookShots.shift();
+        try {
+          await page.locator("#screen").screenshot({ path: join(shotDir, `${name}.png`), timeout: 20000 });
+          console.log(`[game] playbook shot ${name} at frame ${liveFrame}`);
+        } catch (e) {
+          console.log(`[game] playbook shot ${name} failed: ${e.message}`);
+        } finally {
+          busy = false;
+        }
+      }, 40);
+    }
     // `HIDE_SHOW_MS=N` (optionally `HIDE_FOR_MS=M`, `HIDE_FROM_FRAME=F`): every N ms, put
     // the page in the BACKGROUND for M ms and bring it back.
     //
@@ -758,6 +833,13 @@ async function main() {
     clearInterval(ticker);
     if (shotTimer) clearInterval(shotTimer);
     if (frameShotTimer) clearInterval(frameShotTimer);
+    if (playbookShotTimer) {
+      // Let the last named shots land before the page goes.
+      for (let i = 0; i < 100 && playbookShots.length; i++) await new Promise((r) => setTimeout(r, 100));
+      clearInterval(playbookShotTimer);
+      playbookReport.end();
+      playbookTape.end();
+    }
     if (hideTimer) {
       clearInterval(hideTimer);
       console.log(`[game] ${hideCycles} hide/show cycle(s) during the run`);
@@ -871,7 +953,8 @@ async function main() {
       ) + "\n"
     );
     console.log(`[game] live render ${fps} | ${perf} | ${status} -> screenshot ${shot}`);
-    ok = liveFrame >= targetFrame;
+    ok = playbook ? playbookVerdict.endsWith(" DONE") : liveFrame >= targetFrame;
+    if (playbook) console.log(`[game] playbook verdict: ${playbookVerdict || "(no report)"}`);
     if (requireLog && !sawRequired) {
       console.log(`[game] the run never logged ${JSON.stringify(requireLog)} - REQUIRE_LOG not met`);
       ok = false;

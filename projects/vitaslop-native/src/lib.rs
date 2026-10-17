@@ -211,6 +211,7 @@ impl Vm {
                 // Raw-image entry point: no NID import table, nothing known inlinable.
                 inline_imports: &[],
                 noreturn_svc: host_abi.noreturn_svc,
+                noreturn_imports: &[],
                 mem_bytes,
                 // Vita modules take function addresses (thread entries, GXM
                 // callbacks); discover them. Safe for the ARM corpus too - those
@@ -322,6 +323,7 @@ impl Vm {
             // Raw-image entry point: no NID import table, nothing known inlinable.
             inline_imports: &[],
             noreturn_svc: host_abi.noreturn_svc,
+            noreturn_imports: &[],
             mem_bytes,
             discover_code_pointers: true,
             import_memory: false,

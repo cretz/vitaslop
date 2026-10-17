@@ -52,6 +52,19 @@ async function run(p) {
   // (`convertToBlob` after the present) failed on the phone for 15 of 15 shots.
   if (p.shots && p.shots.length && !knobs.VITASLOP_SHOT_FRAMES) knobs.VITASLOP_SHOT_FRAMES = p.shots.join(",");
   const recipe = p.recipe ? await asset(p.recipe) : p.recipeText || "";
+  // `params.playbook` (a runner asset path) or `params.playbookText` (+ `playbookName`, named
+  // `<TITLE_ID>/<file>.lua` as the desktop names it): a playbook drives the input instead. The
+  // run then ends when the playbook does, and the result carries its verdict, report and tape.
+  const playbook = p.playbook
+    ? { name: p.playbook.split("/").slice(-2).join("/"), source: await asset(p.playbook) }
+    : p.playbookText
+      ? { name: p.playbookName || `${titleId}/job.lua`, source: p.playbookText }
+      : null;
+  if (playbook && recipe) throw new Error("a recipe and a playbook both drive input - pass one");
+  // The shots a playbook names are taken by the renderer's present probe (src/playbook.rs
+  // take_shot_request), which exists only when some shot is asked for: a frame no run reaches.
+  if (playbook && !knobs.VITASLOP_SHOT_FRAMES && !knobs.VITASLOP_PRESENT_PROBE) knobs.VITASLOP_SHOT_FRAMES = "4294967295";
+  const pb = playbook ? { name: playbook.name, verdict: "", report: [], tape: [], shots: [], ended: false } : null;
   const stopFrame = Number(p.stopFrame || 0);
   // A soak's stop: wall milliseconds of running (after the transpile), whatever frame it is.
   const wallMs = Number(p.wallMs || 0);
@@ -148,14 +161,18 @@ async function run(p) {
   // >>> A FROZEN GAME ENDS THE JOB WITH ITS REPORTS, instead of holding the phone until the
   // job's timeout (25 min for a soak) and then losing them.
   let frameMovedAt = performance.now();
-  const wallUp = () => wallMs > 0 && performance.now() - tReady >= wallMs;
+  // `params.capMs`: a stop measured from the JOB'S START, the prepare included - set it under the
+  // runner's kill (`timeoutMs`), which returns nothing at all. `wallMs` alone counts from the end
+  // of the prepare, and a long prepare plus the wrap-up ran two jobs into the kill with no data.
+  const capMs = Number(p.capMs || 0);
+  const wallUp = () => (wallMs > 0 && performance.now() - tReady >= wallMs) || (capMs > 0 && performance.now() - t0 >= capMs);
   const finished = new Promise((resolve) => {
     const check = () => {
       if (!error && lastFrame > 0 && performance.now() - frameMovedAt >= STALL_MS) {
         error = `stalled: no new frame for ${STALL_MS / 1000} s at f${lastFrame}`;
       }
       if (!error && stopAsked) error = `stopped by the desktop at f${lastFrame}`;
-      if (error || execPath || (stopFrame && lastFrame >= stopFrame && traceDone) || wallUp()) resolve();
+      if (error || execPath || (stopFrame && lastFrame >= stopFrame && traceDone) || (pb && pb.ended && traceDone) || wallUp()) resolve();
     };
     worker.onmessage = (e) => {
       const d = e.data;
@@ -175,6 +192,21 @@ async function run(p) {
           statusEl.textContent = `f${lastFrame} ${reports.fps || ""}`;
         }
         check();
+      } else if (d.type === "note" && pb && d.text.startsWith("[playbook-")) {
+        // A shot's name stays in `notes` too, just before the `presentshot` that pictures it.
+        const shot = /^\[playbook-shot\] (\S+) at frame (\d+)/.exec(d.text);
+        if (shot) {
+          pb.shots.push({ name: shot[1], frame: Number(shot[2]) });
+          notes.push(d.text);
+        } else if (d.text.startsWith("[playbook-report] ")) {
+          const line = d.text.slice(18);
+          if (!pb.verdict && line.startsWith("PLAYBOOK ")) pb.verdict = line;
+          pb.report.push(line);
+        } else if (d.text.startsWith("[playbook-tape] ")) {
+          pb.tape.push(d.text.slice(16));
+          if (d.text.startsWith("[playbook-tape] end ")) pb.ended = true;
+        } else notes.push(d.text);
+        check();
       } else if (d.type === "note") {
         notes.push(d.text);
         if (d.text.startsWith("[exec] ")) execPath = d.text.slice(7).trim();
@@ -193,7 +225,7 @@ async function run(p) {
     const beat = setInterval(() => {
       check();
       if (error || (stopFrame && lastFrame >= stopFrame && traceDone) || wallUp()) return clearInterval(beat);
-      up({ type: "progress", text: `f${lastFrame} ${(reports.fps || "").replace(/^fps:\s*/, "")}${tabMem}` });
+      up({ type: "progress", text: `f${lastFrame} ${(reports.fps || "").replace(/^fps:\s*/, "")}${tabMem}${document.visibilityState === "hidden" ? " | PAGE HIDDEN" : ""}` });
     }, 5000);
   });
 
@@ -202,6 +234,33 @@ async function run(p) {
   // show a long frame and nothing else). A 100 ms interval that arrives late records the gap,
   // with the frame the run had reached - big gaps are browser/OS stalls, not our frame time.
   const hangs = [];
+  // >>> WHETHER THE RUNNER WAS ON SCREEN. A backgrounded tab throttles timers and stops
+  // animation frames and presentation, and a run carries on through it - so a result has to
+  // say when it happened - nothing used to, so a stalled run could not be cleared of it (one
+  // football title's boot stall was suspected of this and then refuted with this very field:
+  // the page stayed visible). `visibility` = every change with the frame it happened at.
+  const visibility = [{ atMs: 0, frame: 0, state: document.visibilityState }];
+  // >>> THE DEVICE'S OWN STATE at the start and the end - battery level, charging, the whole
+  // tab's memory. A boot stall came and went in STREAKS on one phone (10-06) with no code or
+  // knob change between a streak of good runs and a streak of stuck ones; these are the
+  // device-side variables a result could otherwise never be correlated against.
+  const deviceState = async () => {
+    const s = { atMs: Math.round(performance.now() - tReady), frame: lastFrame };
+    try {
+      const b = await navigator.getBattery?.();
+      if (b) Object.assign(s, { battery: Math.round(b.level * 100), charging: b.charging });
+    } catch {}
+    try {
+      const m = await performance.measureUserAgentSpecificMemory?.();
+      if (m) s.tabMB = Math.round(m.bytes / 1048576);
+    } catch {}
+    return s;
+  };
+  const device = [await deviceState()];
+  const onVisibility = () => {
+    if (visibility.length < 200) visibility.push({ atMs: Math.round(performance.now() - tReady), frame: lastFrame, state: document.visibilityState });
+  };
+  document.addEventListener("visibilitychange", onVisibility);
   let lastTick = performance.now();
   const watchdog = setInterval(() => {
     const t = performance.now();
@@ -214,10 +273,27 @@ async function run(p) {
 
   const offscreen = canvas.transferControlToOffscreen();
   worker.postMessage(
-    { offscreen, titleId, recipe, maxFrames: 0xffffffff, knobs, prebuilt, audioRing: audio ? audio.ring : undefined, profile: p.profile || "runner", noPersist: p.persist !== true, forwardConsole: p.console ? Number(p.console) || 5000 : 0, shots: knobs.VITASLOP_SHOT_FRAMES ? [] : p.shots || [] },
+    { offscreen, titleId, recipe, playbook, maxFrames: 0xffffffff, knobs, prebuilt, audioRing: audio ? audio.ring : undefined, profile: p.profile || "runner", noPersist: p.persist !== true, forwardConsole: p.console ? Number(p.console) || 5000 : 0, forwardFrom: Number(p.consoleFrom || 0),shots: knobs.VITASLOP_SHOT_FRAMES ? [] : p.shots || [] },
     [offscreen]
   );
   await finished;
+  // A playbook the run is ending under (the cap, a stop) still reports: ask the worker for its
+  // report and tape, which arrive as notes ahead of the reply. Bounded, so an old bundle that
+  // never replies cannot hold the result.
+  if (pb && !pb.ended) {
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 5000);
+      const prev = worker.onmessage;
+      worker.onmessage = (e) => {
+        prev(e);
+        if (e.data && e.data.type === "playbook-finished") {
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+      worker.postMessage({ type: "playbook-finish" });
+    });
+  }
   clearInterval(watchdog);
   clearInterval(memTimer);
   // >>> A PROCESS REPLACEMENT: the title exec'd one of its own executables. Boot that one in
@@ -274,7 +350,8 @@ async function run(p) {
     : "";
   const audioSummary = audioResult ? ` | audio ${audioResult.state}: underrun ${audioResult.underrunS}s of ${audioResult.wallS}s (${audioResult.underrunPct}%), made ${audioResult.writtenS}s` : "";
   const result = {
-    summary: error ? error.slice(0, 200) : `reached f${lastFrame}; ${reports.fps || ""}${window}${audioSummary}`,
+    summary: error ? error.slice(0, 200) : `${pb ? `${pb.verdict || `playbook ${pb.name} did not finish`} | ` : ""}reached f${lastFrame}; ${reports.fps || ""}${window}${audioSummary}`,
+    playbook: pb,
     audio: audioResult,
     meter,
     error,
@@ -286,7 +363,10 @@ async function run(p) {
     reports,
     notes,
     hangs,
+    visibility,
+    deviceState: [...device, await deviceState()],
   };
+  document.removeEventListener("visibilitychange", onVisibility);
   await releaseAndTerminate(worker);
   return result;
 }

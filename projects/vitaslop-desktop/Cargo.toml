@@ -19,6 +19,8 @@ workspace = true
 # runtime (host calls, capture, World seam). Same stack the headless render tests
 # drive; here it is wrapped in a live window instead.
 vitaslop-native = { path = "../vitaslop-native" }
+# Playbook runs under `--headless` (`--playbook`, `--tape`, `--discover`).
+vitaslop-playbook = { path = "../vitaslop-playbook" }
 vitaslop-loader = { path = "../vitaslop-loader" }
 vitaslop-runtime = { path = "../vitaslop-runtime" }
 # The settings schema, input maps and title record shared with the browser front end.

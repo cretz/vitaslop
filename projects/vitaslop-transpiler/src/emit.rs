@@ -35,7 +35,13 @@ use wasm_encoder::{
 };
 
 use crate::abi;
-use crate::ir::{BinOp, Block, ConditionCode, FlagMask, Func, MemSize, Stmt, Term, Value};
+use crate::ir::{
+    BinOp, Block, ConditionCode, FlagMask, Func, MemSize, ParallelKind, ParallelLanes, ParallelOp, Stmt, Term, Value,
+};
+
+#[path = "structured.rs"]
+mod structured;
+pub(crate) use structured::recursive_functions;
 
 /// Wasmtime's own fuel cost for one operator, from `wasmtime_environ`'s
 /// `default_operator_cost`: an operator that generates no machine code costs nothing,
@@ -126,7 +132,7 @@ pub enum StmtKind {
     Neon,
     NeonMem,
     SetThreadPtr,
-    Uadd8,
+    Parallel,
     Sel,
     ShiftRegFlags,
     /// Arming or clearing the exclusive monitor (`LDREX`/`STREX`).
@@ -157,7 +163,7 @@ impl StmtKind {
         StmtKind::Neon,
         StmtKind::NeonMem,
         StmtKind::SetThreadPtr,
-        StmtKind::Uadd8,
+        StmtKind::Parallel,
         StmtKind::Sel,
         StmtKind::ShiftRegFlags,
         StmtKind::ExclSet,
@@ -191,7 +197,7 @@ impl StmtKind {
             Stmt::Neon(crate::ir::NeonStmt::ElemMem { .. }) => StmtKind::NeonMem,
             Stmt::Neon(..) => StmtKind::Neon,
             Stmt::SetThreadPtr(..) => StmtKind::SetThreadPtr,
-            Stmt::Uadd8 { .. } => StmtKind::Uadd8,
+            Stmt::Parallel { .. } => StmtKind::Parallel,
             Stmt::Sel { .. } => StmtKind::Sel,
             Stmt::ShiftRegFlags { .. } => StmtKind::ShiftRegFlags,
         }
@@ -215,7 +221,7 @@ impl StmtKind {
             StmtKind::Neon => "neon",
             StmtKind::NeonMem => "neon load/store",
             StmtKind::SetThreadPtr => "set-thread-ptr",
-            StmtKind::Uadd8 => "uadd8",
+            StmtKind::Parallel => "parallel add/sub",
             StmtKind::Sel => "sel",
             StmtKind::ShiftRegFlags => "shift-reg-flags",
             StmtKind::ExclSet => "excl-set",
@@ -314,6 +320,9 @@ struct Body {
     blocks: u64,
     fallthrough_blocks: u64,
     dispatch_reentries: u64,
+    /// Multi-block functions emitted structured, and those that kept the dispatch loop.
+    structured_funcs: u64,
+    dispatch_funcs: u64,
     /// What holding those moves in wasm LOCALS instead would cost and save, modelled
     /// over this same stream as it is emitted. See [`crate::promote`].
     promotion: crate::promote::RunTracker,
@@ -384,6 +393,14 @@ enum NqState {
     Dirty,
 }
 
+/// `VITASLOP_DIRTY_SP_MARKS=1`: mark SP-relative stores like any other - the arm back from
+/// leaving them to the host's stack stamping (see `plan_dirty_run`). Off by default.
+fn dirty_sp_marks() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(emit_var("VITASLOP_DIRTY_SP_MARKS").as_deref(), Ok("1")))
+}
+
 impl Body {
     /// A body that emits the register file straight to its globals, and MODELS what
     /// promoting it into locals would cost and save (see [`crate::promote`]).
@@ -420,6 +437,8 @@ impl Body {
             blocks: 0,
             fallthrough_blocks: 0,
             dispatch_reentries: 0,
+            structured_funcs: 0,
+            dispatch_funcs: 0,
             promotion: crate::promote::RunTracker::default(),
             cache,
             nq: [NqState::Absent; NQ_COUNT as usize],
@@ -975,20 +994,25 @@ fn store_extent(s: &Stmt) -> Option<(u8, i32, i32)> {
 /// overwritten - the same failure [`emit_dirty_range`] exists to prevent, and it surfaces
 /// frames later as stale pixels.
 ///
-/// # WHAT THIS IS INSTEAD OF, and why - because the obvious idea is the unsafe one
-/// The obvious cut is to drop the mark ENTIRELY on a store whose base is SP: a prologue, a
-/// spill, a local. It is the same population and roughly the same size - `dirty_sp_stores`
-/// says SP is the base of **21% (a fighting title), 44% (a golf title), 37% (a racer)** of
-/// the store sites this analysis can place, against the 21% / 39% / 38% the run coalescer
-/// actually elides - so it buys nothing extra, and it buys it with an argument that cannot
-/// be made from here. The claim would have to be "no GXM-visible buffer is ever on a thread
-/// stack", and the map does not only answer for textures: `TextureSnapshots` keeps
-/// `vertex_stamps` and `index_stamps` against the same pages, and a title assembling a
-/// handful of UI vertices in a stack array and handing them to `sceGxmDraw` is ordinary
-/// code. The transpiler cannot see that, the failure is silent, and it would surface as
-/// stale geometry frames later. The coalescer needs no such claim: it says only that two
-/// addresses a known distance apart are in the same page or the next one, which is
-/// arithmetic.
+/// # >>> A STORE WHOSE BASE IS SP CARRIES NO MARK AT ALL - THE HOST STAMPS THE STACKS
+/// A prologue, a spill, a local: SP-relative stores were three quarters of what the marks
+/// cost. MEASURED (desktop browser, a football title's match, SMP): the main thread retired
+/// 455 -> 495 guest MIPS (+8.6%) with them gone, against 508 with every mark gone. Under SMP
+/// the run coalescer below is off, so before this every one of them paid the tested mark.
+///
+/// The transpiler cannot know that no GXM-visible buffer is on a stack - a title assembling a
+/// few UI vertices in a stack array and handing them to `sceGxmDraw` is ordinary code - so it
+/// does not claim that. The HOST does the marking instead: it keeps every stack it hands out
+/// (`GuestStacks`) and stamps their pages with every epoch it advances to
+/// (`TextureSnapshots::stamp_stacks`), so a stack page reads as stored-into against every stamp
+/// anyone holds. A buffer on a stack is then re-read exactly as if the guest had stored into it
+/// that scene, which is the conservative answer, and nothing else changes. (A census of all 13
+/// titles found one GXM read overlapping a stack in ~100 M: a fixed-size uniform window running
+/// 368 bytes into the bottom of one. No title's SP left the stacks the host knows of.)
+///
+/// What it rests on: an SP-relative address lies in a stack the host handed out. A title that
+/// pointed SP at a buffer of its own would break that; none was seen. `VITASLOP_DIRTY_SP_MARKS=1`
+/// is the arm back to marking them.
 ///
 /// Also rejected: HOISTING the epoch load into a local per run. The epoch genuinely cannot
 /// change outside a host call, so it is sound over exactly the runs this analysis already
@@ -1009,11 +1033,14 @@ fn plan_dirty_run(f: &mut Body, stmts: &[Stmt]) -> Vec<bool> {
         match s {
             Stmt::Store { .. } | Stmt::VfpMem { load: false, .. } => match store_extent(s) {
                 Some((b, o, n)) => {
-                    // Counted in BOTH arms, so the census can price the alternative that
-                    // was rejected - skipping the mark on an SP-relative store outright -
-                    // without a build of its own. See the report in `dirty_sp_stores`.
+                    // SP-relative: no mark, the host stamps the stacks (see above). Counted in
+                    // both arms, for the `dirty_sp_stores` report.
                     if b == 13 {
                         f.dirty_sp_stores += 1;
+                        if !dirty_sp_marks() {
+                            out[i] = true;
+                            continue;
+                        }
                     }
                     if let Some((ab, ao)) = anchor
                         && ab == b
@@ -1284,6 +1311,10 @@ pub const EMIT_KNOBS_OVERRIDABLE: &[&str] = &[
     // Read at LINK time by the runtime (`vita::smp_lwmutex_inline`), but it decides which
     // inline form is emitted, so it has to name the module in the transpile cache.
     "VITASLOP_SMP_LWMUTEX_INLINE",
+    // `1`: mark SP-relative stores (`plan_dirty_run`) - the arm back from host stack stamping.
+    "VITASLOP_DIRTY_SP_MARKS",
+    // `0`: every function keeps the `br_table` dispatch loop (`structured`).
+    "VITASLOP_STRUCTURED_CF",
 ];
 
 /// Diagnostic store watchpoint. When `VITASLOP_WATCH_STORE=<hex guest addr>` is set
@@ -2205,7 +2236,7 @@ const L_T2: u32 = 3;
 /// immediate, or the C flag for adc/sbc).
 const L_T3: u32 = 4;
 /// The four APSR `GE` bits (bits [3:0]) that a byte-wise parallel add/sub
-/// (`uadd8`) deposits and a later `sel` reads. A dedicated local, not one of the
+/// (`uadd8`, any modulo [`Stmt::Parallel`]) deposits and a later `sel` reads. A dedicated local, not one of the
 /// `L_T*` scratches, because `sel` can be several instructions after the
 /// `uadd8` and the scratches are clobbered in between (the byte-search loop in
 /// `strlen` interleaves loads).
@@ -2379,6 +2410,11 @@ pub struct Expansion {
     pub blocks: u64,
     pub fallthrough_blocks: u64,
     pub dispatch_reentries: u64,
+    /// Multi-block functions emitted as structured control flow (`structured`), and those
+    /// that kept the dispatch loop (an irreducible graph, a very deep dominator tree, or
+    /// `VITASLOP_STRUCTURED_CF=0`). `dispatch_reentries` counts only the latter's.
+    pub structured_funcs: u64,
+    pub dispatch_funcs: u64,
     /// The low-bank NEON cache's static tally (see [`NqState`]): quads gathered from their
     /// globals, quads written back, and operand accesses served from a local without
     /// either. `hits` against `gathers + writebacks` is the ratio that says whether the
@@ -3343,6 +3379,8 @@ fn emit_func(
     expansion.blocks += f.blocks;
     expansion.fallthrough_blocks += f.fallthrough_blocks;
     expansion.dispatch_reentries += f.dispatch_reentries;
+    expansion.structured_funcs += f.structured_funcs;
+    expansion.dispatch_funcs += f.dispatch_funcs;
     expansion.neon_cache_gathers += f.nq_gathers;
     expansion.neon_cache_writebacks += f.nq_writebacks;
     expansion.neon_cache_hits += f.nq_hits;
@@ -3550,6 +3588,19 @@ fn emit_func_body(
         return f;
     }
 
+    // Structured where the graph allows (see `structured`); the dispatch loop below otherwise.
+    // ...but not a function the guest can recurse through - see `structured::recursive_functions`.
+    if structured::structured_cf()
+        && !func.recursive
+        && let Some(cfg) = structured::analyse(func)
+    {
+        structured::Emitter::new(&mut f, func, &cfg, func_index, base, inline).emit();
+        f.instruction(&W::End); // function body
+        f.structured_funcs += 1;
+        return f;
+    }
+    f.dispatch_funcs += 1;
+
     // Blocks are sorted by address and the dispatch index local starts at 0, so the
     // body would begin at the LOWEST block. A compiler places a function's entry
     // first, but newlib's hand-written routines (strcmp, memcpy) put a shared tail
@@ -3592,6 +3643,22 @@ fn emit_block(
     base: u32,
     inline: &InlineImports,
     loop_depth: u32,
+) {
+    emit_block_body(f, block, func, func_index, base, inline);
+    emit_term(f, &block.term, func, base, loop_depth, block.addr);
+}
+
+/// One basic block's code up to (not including) its terminator: the clock charge, the
+/// statements, and the NEON cache write-back the terminator needs. Shared by the dispatch
+/// emitter ([`emit_block`]) and the structured one (`structured`), which differ only in how
+/// a terminator reaches the next block.
+fn emit_block_body(
+    f: &mut Body,
+    block: &Block,
+    func: &Func,
+    func_index: &BTreeMap<u32, u32>,
+    base: u32,
+    inline: &InlineImports,
 ) {
     // >>> THE EMULATED CPU CLOCK'S UNIT. Add this block's GUEST INSTRUCTION count to the
     // per-thread counter both engines' schedulers read (`abi::ARM_COUNT_GLOBAL`).
@@ -3668,7 +3735,6 @@ fn emit_block(
     // state it hands on.
     nq_flush(f);
     f.nq_enabled = false;
-    emit_term(f, &block.term, func, base, loop_depth, block.addr);
 }
 
 /// Re-dispatch to the block at `target` address: set `$bb`, branch to the loop.
@@ -4058,9 +4124,23 @@ fn emit_stmt_inner(
                     f.instruction(&W::End);
                     f.instruction(&W::End);
                 } else {
+                    // >>> ANY STORE WHOSE BYTES OVERLAP THE WATCHED WORD, not only one starting
+                    // >>> exactly on it. The exact test let a byte-wise or unaligned copy rewrite
+                    // the word unseen - MEASURED on a football title, where the watch caught the
+                    // allocator's store to a list slot and then stayed silent while the slot
+                    // changed under it (a scene-end range watch saw the change). The store
+                    // covers [off, off+n) and the word [w, w+4); they overlap exactly when
+                    // `off - (w - n + 1)` is below `n + 3`, as an unsigned compare.
+                    let n = match size {
+                        MemSize::Byte => 1u32,
+                        MemSize::Half => 2,
+                        MemSize::Word => 4,
+                    };
                     f.instruction(&W::LocalGet(L_T0));
-                    f.instruction(&W::I32Const(w.wrapping_sub(base) as i32));
-                    f.instruction(&W::I32Eq);
+                    f.instruction(&W::I32Const(w.wrapping_sub(base).wrapping_sub(n - 1) as i32));
+                    f.instruction(&W::I32Sub);
+                    f.instruction(&W::I32Const((n + 3) as i32));
+                    f.instruction(&W::I32LtU);
                     if watch_store_nonzero() {
                         // AND value != 0.
                         f.instruction(&W::LocalGet(L_T1));
@@ -4327,7 +4407,7 @@ fn emit_stmt_inner(
             emit_value(f, v, base);
             f.instruction(&W::GlobalSet(abi::TP_GLOBAL));
         }
-        Stmt::Uadd8 { rd, rn, rm } => emit_uadd8(f, *rd, *rn, *rm),
+        Stmt::Parallel { op, rd, rn, rm } => emit_parallel(f, *op, *rd, *rn, *rm),
         Stmt::Sel { rd, rn, rm } => emit_sel(f, *rd, *rn, *rm),
         Stmt::ShiftRegFlags { kind, rd, rn, amount, set_flags, live } => {
             emit_shift_reg_flags(f, *kind, *rd, rn, amount, *set_flags, *live, base)
@@ -4346,42 +4426,115 @@ fn push_reg_byte(f: &mut Body, r: u8, i: u32) {
     f.instruction(&W::I32And);
 }
 
-/// `uadd8 rd, rn, rm`: four independent byte adds, each depositing its unsigned
-/// carry-out into an APSR GE bit (held in `L_GE`) for a later `sel`. The full
-/// result is staged in `L_T2` and the GE mask in `L_GE` before `rd` is written,
-/// so `rd` aliasing `rn`/`rm` (e.g. `uadd8 r2, r2, ip`) is safe.
-fn emit_uadd8(f: &mut Body, rd: u8, rn: u8, rm: u8) {
+/// Push the lane of register `r` that starts at bit `shift` and is `bits` wide, sign- or
+/// zero-extended to i32.
+fn push_reg_lane(f: &mut Body, r: u8, shift: u32, bits: u32, signed: bool) {
+    f.instruction(&W::GlobalGet(abi::reg_global(r as usize)));
+    if signed {
+        let up = 32 - shift - bits;
+        if up != 0 {
+            f.instruction(&W::I32Const(up as i32));
+            f.instruction(&W::I32Shl);
+        }
+        f.instruction(&W::I32Const((32 - bits) as i32));
+        f.instruction(&W::I32ShrS);
+    } else {
+        if shift != 0 {
+            f.instruction(&W::I32Const(shift as i32));
+            f.instruction(&W::I32ShrU);
+        }
+        f.instruction(&W::I32Const(((1u64 << bits) - 1) as i32));
+        f.instruction(&W::I32And);
+    }
+}
+
+/// A parallel add/subtract ([`Stmt::Parallel`]). Each lane's exact sum or difference
+/// (both lanes extended to i32, so it cannot overflow) lands in `L_T0`, is wrapped,
+/// clamped or halved there, and is or-ed into the result in `L_T2`. A modulo form also
+/// builds the GE mask in `L_T1` - per lane `sum >= 0` signed, the carry-out for an
+/// unsigned add, no borrow for an unsigned subtract, one GE bit per byte and two per
+/// halfword - and moves it to `L_GE` only at the end. Both are staged before `rd` is
+/// written, so `rd` aliasing `rn`/`rm` (e.g. `uadd8 r2, r2, ip`) is safe.
+fn emit_parallel(f: &mut Body, op: ParallelOp, rd: u8, rn: u8, rm: u8) {
+    use ParallelLanes as L;
+    // Per lane: (lane shift, rn's lane shift, rm's lane shift, add?).
+    let lanes: &[(u32, u32, bool)] = match op.lanes {
+        L::Add8 => &[(0, 0, true), (8, 8, true), (16, 16, true), (24, 24, true)],
+        L::Sub8 => &[(0, 0, false), (8, 8, false), (16, 16, false), (24, 24, false)],
+        L::Add16 => &[(0, 0, true), (16, 16, true)],
+        L::Sub16 => &[(0, 0, false), (16, 16, false)],
+        L::Asx => &[(0, 16, false), (16, 0, true)],
+        L::Sax => &[(0, 16, true), (16, 0, false)],
+    };
+    let bits = if matches!(op.lanes, L::Add8 | L::Sub8) { 8 } else { 16 };
+    let sets_ge = op.kind == ParallelKind::Modulo;
     f.instruction(&W::I32Const(0));
-    f.instruction(&W::LocalSet(L_T2)); // result accumulator
-    f.instruction(&W::I32Const(0));
-    f.instruction(&W::LocalSet(L_GE)); // GE bits accumulator
-    for i in 0..4u32 {
-        // L_T0 = rn.byte[i] + rm.byte[i]  (0..510)
-        push_reg_byte(f, rn, i);
-        push_reg_byte(f, rm, i);
-        f.instruction(&W::I32Add);
+    f.instruction(&W::LocalSet(L_T2));
+    if sets_ge {
+        f.instruction(&W::I32Const(0));
+        f.instruction(&W::LocalSet(L_T1));
+    }
+    for &(shift, m_shift, add) in lanes {
+        push_reg_lane(f, rn, shift, bits, op.signed);
+        push_reg_lane(f, rm, m_shift, bits, op.signed);
+        f.instruction(if add { &W::I32Add } else { &W::I32Sub });
         f.instruction(&W::LocalSet(L_T0));
-        // result |= (L_T0 & 0xff) << 8i
+        match op.kind {
+            ParallelKind::Modulo => {
+                // GE: signed lanes test sum >= 0; an unsigned add tests the carry-out
+                // (sum >= 2^bits); an unsigned subtract tests for no borrow (diff >= 0).
+                f.instruction(&W::LocalGet(L_T0));
+                let limit = if !op.signed && add { 1i32 << bits } else { 0 };
+                f.instruction(&W::I32Const(limit));
+                f.instruction(&W::I32GeS);
+                let ge_bits = if bits == 8 { 1 } else { 3 };
+                let ge_at = shift / 8;
+                f.instruction(&W::I32Const(ge_bits << ge_at));
+                f.instruction(&W::I32Mul);
+                f.instruction(&W::LocalGet(L_T1));
+                f.instruction(&W::I32Or);
+                f.instruction(&W::LocalSet(L_T1));
+            }
+            ParallelKind::Saturate => {
+                let (lo, hi) = if op.signed {
+                    (-(1i32 << (bits - 1)), (1i32 << (bits - 1)) - 1)
+                } else {
+                    (0, (1i32 << bits) - 1)
+                };
+                // L_T0 = min(L_T0, hi), then max(L_T0, lo) - signed compares, the exact
+                // result is a small signed i32 either way.
+                for (bound, cmp) in [(hi, W::I32GtS), (lo, W::I32LtS)] {
+                    f.instruction(&W::I32Const(bound));
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::I32Const(bound));
+                    f.instruction(&cmp);
+                    f.instruction(&W::Select);
+                    f.instruction(&W::LocalSet(L_T0));
+                }
+            }
+            ParallelKind::Halve => {
+                // The exact (bits+1)-bit result shifted right by one; an arithmetic
+                // shift is right for both signs - the lane keeps only its low bits.
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::I32Const(1));
+                f.instruction(&W::I32ShrS);
+                f.instruction(&W::LocalSet(L_T0));
+            }
+        }
         f.instruction(&W::LocalGet(L_T2));
         f.instruction(&W::LocalGet(L_T0));
-        f.instruction(&W::I32Const(0xff));
+        f.instruction(&W::I32Const(((1u64 << bits) - 1) as i32));
         f.instruction(&W::I32And);
-        if i != 0 {
-            f.instruction(&W::I32Const((8 * i) as i32));
+        if shift != 0 {
+            f.instruction(&W::I32Const(shift as i32));
             f.instruction(&W::I32Shl);
         }
         f.instruction(&W::I32Or);
         f.instruction(&W::LocalSet(L_T2));
-        // GE |= (L_T0 >> 8) << i   (the sum is <= 510, so bit 8 is the carry-out)
-        f.instruction(&W::LocalGet(L_GE));
-        f.instruction(&W::LocalGet(L_T0));
-        f.instruction(&W::I32Const(8));
-        f.instruction(&W::I32ShrU);
-        if i != 0 {
-            f.instruction(&W::I32Const(i as i32));
-            f.instruction(&W::I32Shl);
-        }
-        f.instruction(&W::I32Or);
+    }
+    if sets_ge {
+        f.instruction(&W::LocalGet(L_T1));
         f.instruction(&W::LocalSet(L_GE));
     }
     f.instruction(&W::LocalGet(L_T2));
@@ -4770,7 +4923,7 @@ fn neon_run_member(stmt: &Stmt) -> bool {
             | Stmt::Rbit { .. }
             | Stmt::MulLong { .. }
             | Stmt::MulHigh { .. }
-            | Stmt::Uadd8 { .. }
+            | Stmt::Parallel { .. }
             | Stmt::Sel { .. }
             | Stmt::ShiftRegFlags { .. }
     )
@@ -9942,22 +10095,38 @@ mod dirty_run_tests {
         plan_dirty_run(&mut f, stmts)
     }
 
-    /// A `push {r4-r11, lr}` is nine stores off sp within 36 bytes, and ONE of them has to
-    /// carry the mark. This is the whole point of the analysis, and 8 of 9 is what the
-    /// operator census is expected to show moving.
+    /// An `stmia r7, {r0-r8}` is nine stores off one base within 36 bytes, and ONE of them
+    /// has to carry the mark. This is the whole point of the analysis. (Off SP - a `push` -
+    /// none do: see `sp_relative_stores_carry_no_mark`.)
     #[test]
-    fn a_push_marks_once() {
+    fn a_store_multiple_marks_once() {
         let mut stmts = vec![Stmt::SetReg(
-            13,
-            Value::Bin(BinOp::Sub, Box::new(Value::Reg(13)), Box::new(Value::Imm(36))),
+            7,
+            Value::Bin(BinOp::Sub, Box::new(Value::Reg(7)), Box::new(Value::Imm(36))),
         )];
         for i in 0..9 {
-            stmts.push(store(13, i * 4, MemSize::Word));
+            stmts.push(store(7, i * 4, MemSize::Word));
         }
         let got = plan(&stmts);
-        assert!(!got[0], "the sp adjust is not a store");
+        assert!(!got[0], "the base adjust is not a store");
         assert!(!got[1], "the FIRST store carries the mark");
         assert!(got[2..].iter().all(|&c| c), "every later slot is covered by it: {got:?}");
+    }
+
+    /// A store whose base is SP carries no mark at all - the host stamps the stacks instead
+    /// (`plan_dirty_run`, `vitaslop_runtime::host::GuestStacks`) - core and VFP alike, wherever
+    /// it falls in a run, and it neither anchors nor ends the run of another base.
+    #[test]
+    fn sp_relative_stores_carry_no_mark() {
+        let vstore = Stmt::VfpMem { reg: VfpReg::D(8), addr: bin_add(Value::Reg(13), Value::Imm(8)), load: false };
+        let got = plan(&[
+            store(13, 0, MemSize::Word),
+            store(4, 0, MemSize::Word),
+            store(13, -64, MemSize::Byte),
+            vstore,
+            store(4, 4, MemSize::Word),
+        ]);
+        assert_eq!(got, vec![true, false, true, true, true]);
     }
 
     /// An extent of at most one page is exactly what the reader's one-page look-below can
@@ -10041,19 +10210,19 @@ mod dirty_run_tests {
     fn vfp_stores_join_the_run_and_vfp_loads_do_not_break_it() {
         let vstore = |off: u32| Stmt::VfpMem {
             reg: VfpReg::D(8),
-            addr: bin_add(Value::Reg(13), Value::Imm(off)),
+            addr: bin_add(Value::Reg(7), Value::Imm(off)),
             load: false,
         };
         let got = plan(&[vstore(0), vstore(8), vstore(16)]);
         assert_eq!(got, vec![false, true, true]);
         let with_load = plan(&[
-            store(13, 0, MemSize::Word),
+            store(7, 0, MemSize::Word),
             Stmt::VfpMem {
                 reg: VfpReg::D(0),
                 addr: bin_add(Value::Reg(9), Value::Imm(0)),
                 load: true,
             },
-            store(13, 4, MemSize::Word),
+            store(7, 4, MemSize::Word),
         ]);
         assert_eq!(with_load, vec![false, false, true]);
     }
@@ -10077,7 +10246,7 @@ mod dirty_run_tests {
         set_dirty_run_marks(false);
         let mut stmts = Vec::new();
         for i in 0..9 {
-            stmts.push(store(13, i * 4, MemSize::Word));
+            stmts.push(store(7, i * 4, MemSize::Word));
         }
         let got = plan(&stmts);
         set_dirty_run_marks(true);

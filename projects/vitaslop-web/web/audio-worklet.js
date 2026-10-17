@@ -67,6 +67,7 @@ const CTL_SAMPLE_RATE = 6;
 const CTL_PEAK = 7; // loudest sample this run, |s| * 32767
 const CTL_LATENCY_SKIP = 8; // frames skipped past to keep the backlog under the cap
 const CTL_FILL = 9; // frames of backlog at the last block - the live latency
+const CTL_ENDED = 11; // non-zero once the run has ended: play silence, count nothing (audio.js)
 const CTL_HEADER_BYTES = 64;
 
 /// How far the ring is allowed to run ahead of the device before old audio is skipped.
@@ -148,7 +149,7 @@ class VitaslopAudio extends AudioWorkletProcessor {
   process(_inputs, outputs) {
     const out = outputs[0];
     const frames = out[0].length;
-    if (this.paused) {
+    if (this.paused || Atomics.load(this.ctl, CTL_ENDED) !== 0) {
       for (let c = 0; c < out.length; c++) out[c].fill(0);
       // The envelope restarts from silence on resume, so the first block ramps in rather
       // than stepping - the same click the underrun edge is ramped for.

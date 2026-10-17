@@ -440,11 +440,20 @@ pub enum Op {
     /// pattern is the same whichever way each end is labelled, and the sign is applied by
     /// whoever later WIDENS the half ([`Op::PackFromInt`], the group-0x15 IMAD32s), not here.
     ///
-    /// `bits` is that shared width - 16, or 8 for the BYTE form, which is the same statement
+    /// `bits` is the SOURCE width - 16, or 8 for the BYTE form, which is the same statement
     /// one element down: the source byte's bits are the destination byte's bits, read as
     /// [`Op::PackFromInt`]'s 8-bit source reads one and written as [`Op::PackToInt`]'s 8-bit
     /// destination writes one.
-    PackIntCopy { bits: u8 },
+    ///
+    /// >>> `dest_bits` MAY DIFFER, and then it is an integer WIDTH CAST: a U8 source into a
+    /// U16 destination is the byte's VALUE in the 16-bit element (zero-extended; `signed`
+    /// sign-extends an S8), and a narrowing one keeps the low bits - the same plain numeric
+    /// cast `scale` clear means for every other VPCK pairing. MEASURED need: a retail title's
+    /// skinned vertex programs open with `U8 -> U16` packs of their four blend-index bytes,
+    /// read back by the index loads as 16-bit halves; blocked, every character mesh was
+    /// dropped and the island scenes rendered with nobody in them. The placement at each end
+    /// is the one this op already used - only the element width at the destination changed.
+    PackIntCopy { bits: u8, dest_bits: u8, signed: bool },
     /// VPCK converting between a FLOAT and a U8 with `scale` SET - the NORMALIZED
     /// conversion, where the byte range 0..255 maps onto 0.0..1.0. This is how a fragment
     /// program that computes in F16 writes an 8-bit-per-channel surface, and how it reads
@@ -486,6 +495,24 @@ pub enum Op {
     /// of five titles' corpora and so was refused by name; a sixth title's SKINNED vertex
     /// programs set it, and refusing it dropped every one of them.
     IntMad { signed: bool, bits: u8, src0_high: bool, src1_high: bool },
+    /// Group 0x14 (I16MAD) in its GENERAL form: `dest = s16(src0) * s16(src1) +/- s16(src2)`,
+    /// scalar, each operand a REGISTER or an inline IMMEDIATE, the sum a 32-bit integer bit
+    /// pattern. `negate_src2` (bit 53) subtracts `src2` instead of adding it.
+    ///
+    /// [`Op::LoadIndex`] is the same instruction with `src1` and `src2` both immediates - see
+    /// `decode_grp_i16mad` for the field closure that says so, and for why the two forms the
+    /// corpus already carried keep decoding exactly as they did.
+    IntMad16 { negate_src2: bool },
+    /// The 8-BIT INTEGER multiply-add (group 0x13): the register is four unsigned bytes, and
+    /// each byte of the destination is `src1.b * src2.b + src0.b`, a plain integer product with
+    /// no normalisation - wrapped to 8 bits, or clamped to 255 when `sat` is set. All four bytes
+    /// are written (the group has no write mask); like [`Op::IntMad`] it is one 32-bit lane.
+    ///
+    /// Only the configuration where every term is its OWN source byte is decoded: the group's
+    /// alpha/colour term selectors, per-term complements and addend negate are refused by name
+    /// (see `decode_grp_ima8`). Its fixed-point sibling, group 0x19, normalises the product and
+    /// is a different operation.
+    IntMad8 { sat: bool },
     /// One STEP of a 32-bit integer multiply-add (group 0x1a, the second 32-bit form):
     /// `dest = half(src0) * src1 + src2`, where `high_half` selects which 16-bit half of
     /// `src0` feeds the multiplier and whether its product is shifted back up:
@@ -643,6 +670,8 @@ impl Op {
                 | Op::Bitwise { .. }
                 | Op::Sop2 { .. }
                 | Op::IntMad { .. }
+                | Op::IntMad16 { .. }
+                | Op::IntMad8 { .. }
                 | Op::IntMadStep { .. }
                 | Op::LoadIndex { .. }
                 | Op::Test { .. } | Op::TestMask { .. } | Op::Kill | Op::DepthF
@@ -698,6 +727,10 @@ impl Op {
             }
             Op::CopyFx8 => "mov.fx8",
             Op::IntMad { .. } => "imad",
+            Op::IntMad16 { negate_src2: false } => "imad16",
+            Op::IntMad16 { negate_src2: true } => "imsb16",
+            Op::IntMad8 { sat: false } => "mad.u8",
+            Op::IntMad8 { sat: true } => "mad.sat.u8",
             Op::IntMadStep { high_half, .. } => {
                 if high_half {
                     "imad.step1"
@@ -810,7 +843,7 @@ impl Instr {
             // Both ends are 16-bit halves, so the packed width is the right span at both ends -
             // the same reason the integer->float convert reports it. The byte form is packed
             // bytes at both ends instead, and answers below.
-            Op::PackIntCopy { bits } => bits == 16,
+            Op::PackIntCopy { bits, .. } => bits == 16,
             // The normalized U8 convert reads its source at the FLOAT precision only when the
             // float is the source; in the other direction the source is the packed byte
             // register, whose four channels live in one word and are read through
@@ -845,7 +878,7 @@ impl Instr {
                 // register. Their `f32(byte)` is a numeric cast rather than `fx8`'s
                 // `byte/255`, but that is the VALUE, and this asks about the SPAN.
                 | Op::PackFromInt { bits: 8, .. }
-                | Op::PackIntCopy { bits: 8 }
+                | Op::PackIntCopy { bits: 8, .. }
         )
     }
 
@@ -878,8 +911,8 @@ impl Instr {
             // "which width does this instruction place at" has one answer too. They never
             // reach the reference's generic store - each has its own arm, which reads this -
             // so naming them changes no behaviour and removes a place to disagree.
-            Op::PackIntCopy { bits: 16 } => Some(16),
-            Op::PackIntCopy { bits: 8 } => Some(8),
+            Op::PackIntCopy { dest_bits: 16, .. } => Some(16),
+            Op::PackIntCopy { dest_bits: 8, .. } => Some(8),
             // A byte-select moves one RAW BYTE per channel, four to a register.
             Op::CmovU8 { .. } => Some(8),
             _ => None,

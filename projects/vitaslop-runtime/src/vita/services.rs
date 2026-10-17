@@ -1008,6 +1008,38 @@ fn rtc_get_time64_t_impl(ctx: &mut GuestCtx, time: Ptr, out: Ptr) -> i32 {
     }
 }
 
+/// int sceRtcGetWin32FileTime(const SceDateTime *time, SceUInt64 *ulWin32Time)
+///
+/// The same broken-down time as a Windows FILETIME: 100-nanosecond intervals since
+/// 1601-01-01 00:00 UTC, which is 11,644,473,600 seconds before the UNIX epoch. Validated by
+/// the one decoder every conversion shares, and written as a little-endian 64-bit value.
+#[hostcall]
+pub(super) fn rtc_get_win32_file_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, out: Ptr) -> i32 {
+    rtc_get_win32_file_time_impl(ctx, time, out)
+}
+
+/// UNIX seconds plus microseconds as a Windows FILETIME (100 ns units since 1601-01-01).
+fn win32_file_time(secs: i64, micro: i64) -> u64 {
+    /// Seconds from 1601-01-01 to 1970-01-01.
+    const FILETIME_UNIX_OFFSET_S: i64 = 11_644_473_600;
+    ((secs + FILETIME_UNIX_OFFSET_S) * 10_000_000 + micro * 10) as u64
+}
+
+fn rtc_get_win32_file_time_impl(ctx: &mut GuestCtx, time: Ptr, out: Ptr) -> i32 {
+    if time.is_null() || out.is_null() {
+        return SCE_RTC_ERROR_INVALID_POINTER;
+    }
+    match rtc_decode_broken_down(ctx, time) {
+        Err(e) => e,
+        Ok((secs, micro)) => {
+            let ft = win32_file_time(secs, micro);
+            ctx.write_u32(out.addr(), ft as u32);
+            ctx.write_u32(out.addr() + 4, (ft >> 32) as u32);
+            0
+        }
+    }
+}
+
 /// int sceRtcGetTime_t(const SceDateTime *time, time_t *piTime)
 ///
 /// The 32-bit sibling of [`rtc_get_time64_t`]: the same conversion, written as a single
@@ -1329,17 +1361,18 @@ pub(super) fn motion_reset(_ctx: &mut GuestCtx, _st: &mut VitaState) -> i32 {
     0
 }
 
-/// SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT: the queried additional content has no/// SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT: the queried additional content has no
+/// SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT: the queried additional content has no
 /// license on this device.
 const SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT: i32 = 0x8010_0660u32 as i32;
 
 /// int sceAppUtilDrmOpen(const SceAppUtilDrmAddcontId *dirName, SceAppUtilMountPoint *mountPoint)
-/// No additional content is installed offline, so every entitlement query fails
-/// with NO_ENTITLEMENT. A blanket-success stub here is a trap: the title then
-/// tries to mount/read the (absent) addcont data, fails, and retries the open
-/// every frame - wedging its boot flow on a DLC probe loop.
+///
+/// Entitled exactly when the add-on `dirName` is installed (see `VitaState::add_addcont`),
+/// whose files are then readable at `addcont0:<dirName>/...`; anything else fails with
+/// NO_ENTITLEMENT. A blanket success is a trap: the title then reads the absent add-on's
+/// data, fails, and retries the open every frame - wedging its boot flow on a probe loop.
 #[hostcall]
-pub(super) fn apputil_drm_open(ctx: &mut GuestCtx, _st: &mut VitaState, dir: Ptr, _mount: Ptr) -> i32 {
+pub(super) fn apputil_drm_open(ctx: &mut GuestCtx, st: &mut VitaState, dir: Ptr, _mount: Ptr) -> i32 {
     let name = if dir.is_null() {
         String::new()
     } else {
@@ -1347,8 +1380,26 @@ pub(super) fn apputil_drm_open(ctx: &mut GuestCtx, _st: &mut VitaState, dir: Ptr
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         String::from_utf8_lossy(&raw[..end]).into_owned()
     };
-    tracing::debug!(target: "vitaslop::cb", dir = %name, "sceAppUtilDrmOpen");
-    SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT
+    let entitled = !name.is_empty() && st.has_addcont(&name);
+    tracing::debug!(target: "vitaslop::cb", dir = %name, entitled, "sceAppUtilDrmOpen");
+    if entitled {
+        0
+    } else {
+        SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT
+    }
+}
+
+/// int sceAppUtilBgdlGetStatus(SceAppUtilBgdlStatus *stat)
+/// The 0x2C-byte status (type, add-ons ready / not ready to install, license ready, reserved)
+/// all zero: no background download exists, so none is pending or finished.
+#[hostcall]
+pub(super) fn apputil_bgdl_get_status(ctx: &mut GuestCtx, _st: &mut VitaState, stat: Ptr) -> i32 {
+    if stat.is_null() {
+        SCE_APPUTIL_ERROR_PARAMETER
+    } else {
+        ctx.write_bytes(stat.addr(), &[0u8; 0x2C]);
+        0
+    }
 }
 
 /// int sceAppUtilDrmClose(const SceAppUtilDrmAddcontId *dirName, SceAppUtilMountPoint *mountPoint)
@@ -2790,7 +2841,17 @@ mod calendar_tests {
     //! data, just the arithmetic. These exist because `sceRtcGetTick`/`sceRtcSetTick` are
     //! an INVERSE PAIR that titles round-trip through to do date arithmetic - and a
     //! calendar bug does not crash, it silently shifts a date by a day near a leap year.
-    use super::{civil_from_days, days_from_civil};
+    use super::{civil_from_days, days_from_civil, win32_file_time};
+
+    #[test]
+    fn a_win32_file_time_counts_100ns_from_1601() {
+        // The UNIX epoch is the well-known FILETIME 116444736000000000.
+        assert_eq!(win32_file_time(0, 0), 116_444_736_000_000_000);
+        // One second and one microsecond later.
+        assert_eq!(win32_file_time(1, 1), 116_444_736_010_000_010);
+        // 1601-01-01 itself is zero.
+        assert_eq!(win32_file_time(-11_644_473_600, 0), 0);
+    }
 
     #[test]
     fn civil_and_days_are_exact_inverses_over_the_whole_rtc_range() {

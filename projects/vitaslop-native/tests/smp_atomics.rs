@@ -56,6 +56,7 @@ fn race(smp: bool) -> u32 {
         redirects: &[],
         inline_imports: &[],
         noreturn_svc: &[],
+        noreturn_imports: &[],
         mem_bytes: MEM_BYTES,
         discover_code_pointers: false,
         // One shared memory, one instance per thread: the SMP shape exactly.

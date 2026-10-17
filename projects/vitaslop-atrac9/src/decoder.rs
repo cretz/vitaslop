@@ -518,7 +518,14 @@ fn bex_read_data(channel: &mut Channel, br: &mut BitReader, bex_band: i32) {
 fn read_extension_params(block: &mut Block, br: &mut BitReader) -> Result<(), Error> {
     let mut bex_band = 0;
     if block.band_extension_enabled {
-        bex_band = BEX_GROUP_INFO[(block.quantization_unit_count - 13) as usize].band_count;
+        // Band extension starts at quantisation unit 13, so a frame that enables it with fewer
+        // units is malformed - and `- 13` would index the table at -1. MEASURED: one such frame
+        // panicked the whole emulator out of an audio call (index 4294967295 of 8). A bad frame
+        // is the frame's error, not the run's; `apply_band_extension_channel` reads the same
+        // count later in this frame and is reached only past this check.
+        let group = (block.quantization_unit_count as usize).checked_sub(13).and_then(|i| BEX_GROUP_INFO.get(i));
+        let Some(group) = group else { return Err(Error::UnpackBandParamsInvalid) };
+        bex_band = group.band_count;
         if block.block_type == BlockType::Stereo {
             bex_read_header(&mut block.channels[1], br, bex_band);
         } else {

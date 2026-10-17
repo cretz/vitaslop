@@ -1,0 +1,699 @@
+@title Dead or Alive Xtreme 3 Venus - Day 1, beach volleyball
+@game  PCSH00250
+@shot-every 100   # shots through the run so a human can assess render quality
+@watch location u32 0x8178c788   # the activity-menu location card: 0 Niki Beach, 1 Tranquil Beach, 2 Pool, 4 Sports Shop
+
+# ============================================================================
+# WHAT THIS RECIPE DOES
+# Boots through the logos and the intro (autosave dialog, title screen, the island
+# arrival scenes and the Day 1 tutorial pages), steps the activity menu to NIKI BEACH,
+# picks PLAY BEACH VOLLEYBALL, starts the game from its controls screen and plays a
+# match by alternating circle (receive / toss) and cross (spike / serve).
+#
+# HOW IT WAS AUTHORED
+# - Boot: a circle TAP every 150 frames from 800 to 4750. A held press is ONE press to
+#   this title, so every press has a release line. The taps answer the autosave dialog
+#   (circle = confirm on the Asia build), PRESS ANY BUTTON, the menu's first entry
+#   (Travel to New Zack Island) and every dialogue / tutorial page up to "Activity 2".
+# - The activity menu opens on a location the title PICKS AT RANDOM: under SMP the pick
+#   follows thread timing, so runs land on Pool, Niki Beach or Tranquil Beach. RIGHT steps
+#   the location card (Pool -> Niki Beach -> Tranquil Beach -> Sports Shop). The
+#   `location` watch was found by value search over four dumps of one one-baton run, one
+#   per RIGHT press (VITASLOP_MEM_DUMP_AT with several frames): a u32 in the image's own
+#   data, so its address does not move. `@wait watch location == 0 pulse right 40` holds
+#   the input until the card reads Niki Beach.
+# - Niki Beach's list is Relax / Play Beach Volleyball / Play Beach Flags: circle opens
+#   it, DOWN + circle picks volleyball. Its controls screen says cross = START GAME,
+#   circle = receive / toss, square = receive and attack, cross = spike / block / serve.
+# ============================================================================
+
+0: @section boot
+800: circle
+806:
+950: circle
+956:
+1100: circle
+1106:
+1250: circle
+1256:
+1400: circle
+1406:
+1550: circle
+1556:
+1700: circle
+1706:
+1850: circle
+1856:
+2000: circle
+2006:
+2150: circle
+2156:
+2300: circle
+2306:
+2450: circle
+2456:
+2600: circle
+2606:
+2750: circle
+2756:
+2900: circle
+2906:
+3050: circle
+3056:
+3200: circle
+3206:
+3350: circle
+3356:
+3500: circle
+3506:
+3650: circle
+3656:
+3800: circle
+3806:
+3950: circle
+3956:
+4100: circle
+4106:
+4250: circle
+4256:
+4400: circle
+4406:
+4550: circle
+4556:
+4700: circle
+4706:
+4790: @section activity-menu
+4790: @wait watch location == 0 pulse right 40   # step the location card to Niki Beach
+4830: circle   # open Niki Beach's activity list
+4836:
+4900: down     # Play Beach Volleyball
+4906:
+4960: circle
+4966:
+5160: cross    # START GAME on the controls screen
+5166:
+5300: @section volleyball
+5400: circle
+5405:
+5412: cross
+5417:
+5424: circle
+5429:
+5436: cross
+5441:
+5448: circle
+5453:
+5460: cross
+5465:
+5472: circle
+5477:
+5484: cross
+5489:
+5496: circle
+5501:
+5508: cross
+5513:
+5520: circle
+5525:
+5532: cross
+5537:
+5544: circle
+5549:
+5556: cross
+5561:
+5568: circle
+5573:
+5580: cross
+5585:
+5592: circle
+5597:
+5604: cross
+5609:
+5616: circle
+5621:
+5628: cross
+5633:
+5640: circle
+5645:
+5652: cross
+5657:
+5664: circle
+5669:
+5676: cross
+5681:
+5688: circle
+5693:
+5700: cross
+5705:
+5712: circle
+5717:
+5724: cross
+5729:
+5736: circle
+5741:
+5748: cross
+5753:
+5760: circle
+5765:
+5772: cross
+5777:
+5784: circle
+5789:
+5796: cross
+5801:
+5808: circle
+5813:
+5820: cross
+5825:
+5832: circle
+5837:
+5844: cross
+5849:
+5856: circle
+5861:
+5868: cross
+5873:
+5880: circle
+5885:
+5892: cross
+5897:
+5904: circle
+5909:
+5916: cross
+5921:
+5928: circle
+5933:
+5940: cross
+5945:
+5952: circle
+5957:
+5964: cross
+5969:
+5976: circle
+5981:
+5988: cross
+5993:
+6000: circle
+6005:
+6012: cross
+6017:
+6024: circle
+6029:
+6036: cross
+6041:
+6048: circle
+6053:
+6060: cross
+6065:
+6072: circle
+6077:
+6084: cross
+6089:
+6096: circle
+6101:
+6108: cross
+6113:
+6120: circle
+6125:
+6132: cross
+6137:
+6144: circle
+6149:
+6156: cross
+6161:
+6168: circle
+6173:
+6180: cross
+6185:
+6192: circle
+6197:
+6204: cross
+6209:
+6216: circle
+6221:
+6228: cross
+6233:
+6240: circle
+6245:
+6252: cross
+6257:
+6264: circle
+6269:
+6276: cross
+6281:
+6288: circle
+6293:
+6300: cross
+6305:
+6312: circle
+6317:
+6324: cross
+6329:
+6336: circle
+6341:
+6348: cross
+6353:
+6360: circle
+6365:
+6372: cross
+6377:
+6384: circle
+6389:
+6396: cross
+6401:
+6408: circle
+6413:
+6420: cross
+6425:
+6432: circle
+6437:
+6444: cross
+6449:
+6456: circle
+6461:
+6468: cross
+6473:
+6480: circle
+6485:
+6492: cross
+6497:
+6504: circle
+6509:
+6516: cross
+6521:
+6528: circle
+6533:
+6540: cross
+6545:
+6552: circle
+6557:
+6564: cross
+6569:
+6576: circle
+6581:
+6588: cross
+6593:
+6600: circle
+6605:
+6612: cross
+6617:
+6624: circle
+6629:
+6636: cross
+6641:
+6648: circle
+6653:
+6660: cross
+6665:
+6672: circle
+6677:
+6684: cross
+6689:
+6696: circle
+6701:
+6708: cross
+6713:
+6720: circle
+6725:
+6732: cross
+6737:
+6744: circle
+6749:
+6756: cross
+6761:
+6768: circle
+6773:
+6780: cross
+6785:
+6792: circle
+6797:
+6804: cross
+6809:
+6816: circle
+6821:
+6828: cross
+6833:
+6840: circle
+6845:
+6852: cross
+6857:
+6864: circle
+6869:
+6876: cross
+6881:
+6888: circle
+6893:
+6900: cross
+6905:
+6912: circle
+6917:
+6924: cross
+6929:
+6936: circle
+6941:
+6948: cross
+6953:
+6960: circle
+6965:
+6972: cross
+6977:
+6984: circle
+6989:
+6996: cross
+7001:
+7008: circle
+7013:
+7020: cross
+7025:
+7032: circle
+7037:
+7044: cross
+7049:
+7056: circle
+7061:
+7068: cross
+7073:
+7080: circle
+7085:
+7092: cross
+7097:
+7104: circle
+7109:
+7116: cross
+7121:
+7128: circle
+7133:
+7140: cross
+7145:
+7152: circle
+7157:
+7164: cross
+7169:
+7176: circle
+7181:
+7188: cross
+7193:
+7200: circle
+7205:
+7212: cross
+7217:
+7224: circle
+7229:
+7236: cross
+7241:
+7248: circle
+7253:
+7260: cross
+7265:
+7272: circle
+7277:
+7284: cross
+7289:
+7296: circle
+7301:
+7308: cross
+7313:
+7320: circle
+7325:
+7332: cross
+7337:
+7344: circle
+7349:
+7356: cross
+7361:
+7368: circle
+7373:
+7380: cross
+7385:
+7392: circle
+7397:
+7404: cross
+7409:
+7416: circle
+7421:
+7428: cross
+7433:
+7440: circle
+7445:
+7452: cross
+7457:
+7464: circle
+7469:
+7476: cross
+7481:
+7488: circle
+7493:
+7500: cross
+7505:
+7512: circle
+7517:
+7524: cross
+7529:
+7536: circle
+7541:
+7548: cross
+7553:
+7560: circle
+7565:
+7572: cross
+7577:
+7584: circle
+7589:
+7596: cross
+7601:
+7608: circle
+7613:
+7620: cross
+7625:
+7632: circle
+7637:
+7644: cross
+7649:
+7656: circle
+7661:
+7668: cross
+7673:
+7680: circle
+7685:
+7692: cross
+7697:
+7704: circle
+7709:
+7716: cross
+7721:
+7728: circle
+7733:
+7740: cross
+7745:
+7752: circle
+7757:
+7764: cross
+7769:
+7776: circle
+7781:
+7788: cross
+7793:
+7800: circle
+7805:
+7812: cross
+7817:
+7824: circle
+7829:
+7836: cross
+7841:
+7848: circle
+7853:
+7860: cross
+7865:
+7872: circle
+7877:
+7884: cross
+7889:
+7896: circle
+7901:
+7908: cross
+7913:
+7920: circle
+7925:
+7932: cross
+7937:
+7944: circle
+7949:
+7956: cross
+7961:
+7968: circle
+7973:
+7980: cross
+7985:
+7992: circle
+7997:
+8004: cross
+8009:
+8016: circle
+8021:
+8028: cross
+8033:
+8040: circle
+8045:
+8052: cross
+8057:
+8064: circle
+8069:
+8076: cross
+8081:
+8088: circle
+8093:
+8100: cross
+8105:
+8112: circle
+8117:
+8124: cross
+8129:
+8136: circle
+8141:
+8148: cross
+8153:
+8160: circle
+8165:
+8172: cross
+8177:
+8184: circle
+8189:
+8196: cross
+8201:
+8208: circle
+8213:
+8220: cross
+8225:
+8232: circle
+8237:
+8244: cross
+8249:
+8256: circle
+8261:
+8268: cross
+8273:
+8280: circle
+8285:
+8292: cross
+8297:
+8304: circle
+8309:
+8316: cross
+8321:
+8328: circle
+8333:
+8340: cross
+8345:
+8352: circle
+8357:
+8364: cross
+8369:
+8376: circle
+8381:
+8388: cross
+8393:
+8400: circle
+8405:
+8412: cross
+8417:
+8424: circle
+8429:
+8436: cross
+8441:
+8448: circle
+8453:
+8460: cross
+8465:
+8472: circle
+8477:
+8484: cross
+8489:
+8496: circle
+8501:
+8508: cross
+8513:
+8520: circle
+8525:
+8532: cross
+8537:
+8544: circle
+8549:
+8556: cross
+8561:
+8568: circle
+8573:
+8580: cross
+8585:
+8592: circle
+8597:
+8604: cross
+8609:
+8616: circle
+8621:
+8628: cross
+8633:
+8640: circle
+8645:
+8652: cross
+8657:
+8664: circle
+8669:
+8676: cross
+8681:
+8688: circle
+8693:
+8700: cross
+8705:
+8712: circle
+8717:
+8724: cross
+8729:
+8736: circle
+8741:
+8748: cross
+8753:
+8760: circle
+8765:
+8772: cross
+8777:
+8784: circle
+8789:
+8796: cross
+8801:
+8808: circle
+8813:
+8820: cross
+8825:
+8832: circle
+8837:
+8844: cross
+8849:
+8856: circle
+8861:
+8868: cross
+8873:
+8880: circle
+8885:
+8892: cross
+8897:
+8904: circle
+8909:
+8916: cross
+8921:
+8928: circle
+8933:
+8940: cross
+8945:
+8952: circle
+8957:
+8964: cross
+8969:
+8976: circle
+8981:
+8988: cross
+8993:
+9000: circle
+9005:
+9012: cross
+9017:

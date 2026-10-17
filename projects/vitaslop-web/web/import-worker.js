@@ -25,14 +25,21 @@
 // here beforehand, and the sink hands them out by name. A path that was planned but
 // never begun (a module-named file that was not a SELF) is closed and deleted after.
 //
-// Messages in:  { type: "import", files: [{ path, file }] }
+// Messages in:  { type: "import", files: [{ path, file }], addonFor?: titleId }
 //               { type: "probe",  files: [{ path, file }] }   (identify only)
+//               { type: "repatch", files: [{ path, file }], titleId, pickedRoot, source }
+//                 (a rePatch overlay for titleId - see `repatchImport`)
 // Messages out: { type: "probe", probe } | { type: "progress", stage, file, done, total }
-//               { type: "done", titleId, contentId, count } | { type: "error", message }
+//               { type: "done", titleId, contentId, count, addon? } | { type: "error", message }
+//
+// With `addonFor`, the files must be an ADD-ON of that title (param.sfo CATEGORY `ac`, its
+// TITLE_ID), and they are stored under `addons/<title>/<dir>/` with an `addon.json` record
+// beside them (opfs.js). Without it, an add-on is refused: filed under its title's id it would
+// replace the game.
 //               { type: "panic", message }
 
-import init, { ingest_probe, ingest_import } from "./pkg/vitaslop_web.js";
-import { titleDir, encodeName, storageRoom } from "./opfs.js";
+import init, { ingest_probe, ingest_import, repatch_plan, repatch_import } from "./pkg/vitaslop_web.js";
+import { titleDir, addonsDir, ADDON_RECORD, isAddonName, encodeName, decodeName, storageRoom, repatchDir, readRepatch, REPATCH_RECORD, listAddons } from "./opfs.js";
 import { makeFileSource } from "./read-window.js";
 
 globalThis.__vitaslopPanic = (text) => {
@@ -88,6 +95,11 @@ function forPage(p) {
     title: p.title,
     contentId: p.contentId,
     appVersion: p.appVersion,
+    category: p.category,
+    isAddon: p.isAddon,
+    addonDir: p.addonDir,
+    isUpdate: p.isUpdate,
+    refusedAsTitle: p.refusedAsTitle,
     bytes: p.bytes,
     files: p.files,
     icon0: p.icon0,
@@ -112,6 +124,10 @@ self.onmessage = async (e) => {
       self.postMessage({ type: "probe", probe: forPage(ingest_probe(src)) });
       return;
     }
+    if (d.type === "repatch") {
+      await repatchImport(d, post);
+      return;
+    }
     if (d.type !== "import") throw new Error(`unknown message ${d.type}`);
 
     // ---- identify, reporting the bytes it reads ----
@@ -133,6 +149,23 @@ self.onmessage = async (e) => {
       throw new Error("this package needs the work.bin licence that was made for it - pick both files together");
     }
     if (!titleId) throw new Error("no param.sfo was found in these files, so this title cannot be named or stored");
+    const addonFor = d.addonFor || null;
+    if (addonFor) {
+      if (probe.isUpdate) throw new Error(probe.refusedAsTitle);
+      if (!probe.isAddon) {
+        throw new Error(`this is not an add-on but a game (${titleId}) - import it from the library`);
+      }
+      if (titleId !== addonFor) throw new Error(`this add-on belongs to ${titleId}, not ${addonFor}`);
+      if (!isAddonName(probe.addonDir)) {
+        throw new Error(`this add-on's content id (${probe.contentId}) does not name the folder it installs as`);
+      }
+    } else if (probe.refusedAsTitle) {
+      throw new Error(probe.refusedAsTitle);
+    } else if (probe.isAddon) {
+      throw new Error(
+        `this is an add-on for ${titleId}, not a game - open that game in the library and add it under Add-ons`
+      );
+    }
     const outputs = probe.outputs || [];
     if (outputs.length === 0) throw new Error("nothing to import from these files");
 
@@ -147,7 +180,9 @@ self.onmessage = async (e) => {
 
     // ---- open every output the import may write ----
     self.postMessage({ type: "progress", stage: "preparing", file: "", done: 0, total: 0 });
-    const dir = await titleDir(titleId, { create: true });
+    const dir = addonFor
+      ? await (await addonsDir(titleId, { create: true })).getDirectoryHandle(probe.addonDir, { create: true })
+      : await titleDir(titleId, { create: true });
     // A previous partial import leaves files behind; start from an empty directory
     // so the only entries afterwards are this import's.
     const stale = [];
@@ -215,8 +250,104 @@ self.onmessage = async (e) => {
     const w = await mh.createWritable();
     await w.write(JSON.stringify({ count, complete: true }));
     await w.close();
-    self.postMessage({ type: "done", titleId, contentId, count });
+    let addon = null;
+    if (addonFor) {
+      addon = {
+        titleId,
+        dir: probe.addonDir,
+        contentId,
+        title: probe.title || probe.addonDir,
+        version: probe.appVersion || "",
+        sourceKind: probe.kind,
+        bytes: probe.bytes,
+        files: count,
+        importedAt: Date.now(),
+      };
+      const rh = await dir.getFileHandle(ADDON_RECORD, { create: true });
+      const rw = await rh.createWritable();
+      await rw.write(JSON.stringify(addon));
+      await rw.close();
+    }
+    self.postMessage({ type: "done", titleId, contentId, count, addon });
   } catch (err) {
     self.postMessage({ type: "error", message: String((err && err.message) || err) });
   }
 };
+
+/// Copy a rePatch overlay (a picked folder, or one .zip) for `d.titleId` into a NEW generation
+/// directory beside the old one, then point the record at it and drop the old - so a failed copy
+/// leaves the overlay that was there. The rules (layout, refusing encrypted executables) are the
+/// runtime's: `ingest::repatch`.
+async function repatchImport(d, post) {
+  const src = fileSource(d.files);
+  // What the game holds - its stored paths and add-on directories - so each of the overlay's
+  // folders is placed over the game or over an add-on, and one nothing would read is refused.
+  const gamePaths = [];
+  for await (const [name, h] of (await titleDir(d.titleId, { create: false })).entries()) {
+    if (h.kind === "file") gamePaths.push(decodeName(name));
+  }
+  const addons = (await listAddons(d.titleId)).map((a) => a.dir);
+  const planned = repatch_plan(src, d.titleId, !!d.pickedRoot, gamePaths, addons);
+  const top = await repatchDir(d.titleId, { create: true });
+  const old = await readRepatch(d.titleId);
+  const gen = `g${Date.now().toString(36)}`;
+  const dir = await top.getDirectoryHandle(gen, { create: true });
+  const handles = new Map();
+  try {
+    let opened = 0;
+    await inParallel(planned, async (path) => {
+      const fh = await dir.getFileHandle(encodeName(path), { create: true });
+      handles.set(path, await fh.createSyncAccessHandle());
+      opened += 1;
+      post(false, () => ({ type: "progress", stage: "preparing", file: "", done: opened, total: planned.length, unit: "files" }));
+    });
+    let cur = null;
+    const sink = {
+      begin(path) {
+        const h = handles.get(path);
+        if (!h) throw new Error(`no handle prepared for ${path}`);
+        cur = { path, h, off: 0 };
+      },
+      write(bytes) {
+        cur.off += cur.h.write(bytes, { at: cur.off });
+      },
+      finish() {
+        cur.h.truncate(cur.off);
+        cur.h.flush();
+        cur.h.close();
+        handles.delete(cur.path);
+        cur = null;
+      },
+    };
+    const got = repatch_import(src, sink, d.titleId, !!d.pickedRoot, gamePaths, addons, (stage, file, done, total) => {
+      post(done >= total, () => ({ type: "progress", stage, file, done, total }));
+    });
+    const rec = {
+      titleId: d.titleId,
+      source: d.source || "",
+      bytes: got.bytes,
+      files: got.files,
+      code: got.code,
+      addcont: got.addcont,
+      appFiles: got.appFiles,
+      inferred: got.inferred,
+      codeHash: got.codeHash,
+      importedAt: Date.now(),
+      disabled: false,
+      gen,
+    };
+    const w = await (await top.getFileHandle(REPATCH_RECORD, { create: true })).createWritable();
+    await w.write(JSON.stringify(rec));
+    await w.close();
+    if (old && old.gen !== gen) await top.removeEntry(old.gen, { recursive: true }).catch(() => {});
+    self.postMessage({ type: "done", titleId: d.titleId, repatch: rec, ignored: got.ignored });
+  } catch (err) {
+    for (const h of handles.values()) {
+      try {
+        h.close();
+      } catch {}
+    }
+    await top.removeEntry(gen, { recursive: true }).catch(() => {});
+    throw err;
+  }
+}

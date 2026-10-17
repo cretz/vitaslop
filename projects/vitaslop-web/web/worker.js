@@ -15,6 +15,7 @@
 // See build.mjs for why there are two.
 const SMP_BUNDLE = new URL(self.location.href).searchParams.get("smp") === "1";
 let run_game_worker,
+  playbook_finish,
   set_knob,
   set_system_font,
   worker_input_key,
@@ -61,13 +62,18 @@ const note = (text) => {
 // `forwardConsole` in the start message (a device-runner live job's `params.console`) forwards
 // EVERY console line as well, capped, so any trace knob can be read off a phone.
 let forwardConsole = 0;
+// `forwardFrom` (a live job's `params.consoleFrom`): skip `[perf] frame N` panel lines before
+// frame N, so the cap is spent on the frames the run is FOR - a 2,500-line cap was used up by
+// the boot's panels at frame 1,755 of a run whose match starts at 7,000.
+let forwardFrom = 0;
+const panelFrame = /^\[perf\] frame (\d+) /;
 for (const level of ["log", "info", "warn", "error"]) {
   const orig = console[level].bind(console);
   console[level] = (...a) => {
     const text = a.map((x) => (typeof x === "string" ? x : String(x))).join(" ");
     // `rtt probe:` = `VITASLOP_RTT_PROBE_LOG`'s per-frame line (reaches the console under VITASLOP_CONSOLE=1).
-    if (text.startsWith("[exec] ") || text.startsWith("smptrace") || text.startsWith("presentlog") || text.startsWith("drawnote") || text.startsWith("presentshot") || text.includes("rtt probe:") || text.includes("host write watch") || text.startsWith("jsprofile") || text.startsWith("guestprof")) self.postMessage({ type: "note", text });
-    else if (forwardConsole > 0) {
+    if (text.startsWith("[exec] ") || text.startsWith("smptrace") || text.startsWith("presentlog") || text.startsWith("drawnote") || text.startsWith("presentshot") || text.includes("rtt probe:") || text.includes("host write watch") || text.startsWith("jsprofile") || text.startsWith("guestprof") || text.startsWith("[playbook")) self.postMessage({ type: "note", text });
+    else if (forwardConsole > 0 && !(forwardFrom > 0 && Number((panelFrame.exec(text) || [])[1] ?? Infinity) < forwardFrom)) {
       forwardConsole -= 1;
       self.postMessage({ type: "note", text: `console.${level}: ${text.slice(0, 60000)}` });
     }
@@ -88,6 +94,31 @@ async function loadSystemFont() {
   } catch (err) {
     note(`[font] system-font substitute not loaded (${err}); dynamic text will be BLANK`);
   }
+}
+
+// >>> A PLAYBOOK'S LUA VM LIVES HERE, in the run worker: C Lua 5.4 compiled to wasm (wasmoon,
+// vendored under vendor/wasmoon). The engine reaches it through exactly two functions - run a
+// chunk under a name, call a global with one string - which is the whole backend contract
+// (vitaslop-playbook's vm.rs), so another Lua would replace only this function.
+//
+// Chunks are loaded through Lua's own `load` so they keep the NAME the engine gives them:
+// the prelude finds the playbook's line in an error by skipping the frames named `=prelude`.
+// `io`, `os` and `package` go, as natively: a playbook reads the game, never the machine.
+async function loadPlaybookLua() {
+  await import("./vendor/wasmoon/wasmoon.js"); // UMD: defines self.wasmoon
+  const factory = new self.wasmoon.LuaFactory(new URL("./vendor/wasmoon/glue.wasm", import.meta.url).href);
+  const lua = await factory.createEngine({ injectObjects: false, enableProxy: false });
+  lua.doStringSync("io, os, package = nil, nil, nil");
+  self.__playbookLua = {
+    exec(name, source) {
+      lua.global.set("__chunk_name", name);
+      lua.global.set("__chunk_source", source);
+      lua.doStringSync("assert(load(__chunk_source, __chunk_name, 't'))()");
+    },
+    call(func, arg) {
+      return String(lua.global.get(func)(arg));
+    },
+  };
 }
 
 // >>> FALL BACK TO A COMPATIBILITY-MODE ADAPTER WHEN THE NORMAL ONE IS BLOCKLISTED.
@@ -180,6 +211,7 @@ const bundle = (module) =>
     loadTimes.given = !!module;
     ({
       run_game_worker,
+      playbook_finish,
       set_knob,
       set_system_font,
       worker_input_key,
@@ -354,6 +386,17 @@ self.onmessage = async (e) => {
     self.postMessage({ type: "released" });
     return;
   }
+  // `playbook-finish`: a harness ending the run itself (the device runner's time cap) asks for the
+  // playbook's report and tape first. They go out as console lines, so as notes, BEFORE the reply.
+  if (d.type === "playbook-finish") {
+    try {
+      if (playbook_finish) playbook_finish();
+    } catch (err) {
+      console.error(`[playbook] finish failed: ${err}`);
+    }
+    self.postMessage({ type: "playbook-finished" });
+    return;
+  }
   if (d.type === "flush-game-data") {
     if (!saveSink) return;
     try {
@@ -366,7 +409,7 @@ self.onmessage = async (e) => {
   }
 
   // Otherwise this is the start message:
-  // { offscreen, titleId | files, recipe, maxFrames, knobs }.
+  // { offscreen, titleId | files, recipe | playbook, maxFrames, knobs }.
   //
   // `titleId` is the OPFS path: the title was imported once (streamed to storage, never
   // fully resident) and is read a piece at a time from here on. `files` is the older
@@ -375,8 +418,9 @@ self.onmessage = async (e) => {
   // `audioRing` is the SharedArrayBuffer the page's AudioWorklet drains (see
   // web/audio.js). It is shared, not transferred, so it needs no transfer list - and a
   // start message without one simply runs silent, which the setup says on the console.
-  const { offscreen, titleId, files, recipe, maxFrames, knobs, prebuilt, audioRing, profile, noPersist } = d;
+  const { offscreen, titleId, files, recipe, playbook, maxFrames, knobs, prebuilt, audioRing, profile, noPersist } = d;
   forwardConsole = Number(d.forwardConsole || 0);
+  forwardFrom = Number(d.forwardFrom || 0);
   // Which game-data profile this run saves into; the page picked it from the settings.
   gamedata.setProfile(profile || "default");
   try {
@@ -387,6 +431,8 @@ self.onmessage = async (e) => {
     // Before the run makes its device: see gpu-census.js.
     if (String((knobs || {}).VITASLOP_GPU_CENSUS ?? "") === "1") installGpuCensus((t) => console.log(t));
     await loadSystemFont();
+    // `playbook` ({ name, source }): a run driven by a playbook needs its Lua VM up first.
+    if (playbook) await loadPlaybookLua();
     // Forward each (id, text) metric the run publishes to the page.
     //
     // `shots` (a device-runner live job's `params.shots`, frame numbers): the canvas as it
@@ -461,7 +507,8 @@ self.onmessage = async (e) => {
       report,
       prebuilt ?? undefined,
       audioRing ?? undefined,
-      persist
+      persist,
+      playbook ?? undefined
     );
     self.postMessage({ type: "setup", status });
   } catch (err) {

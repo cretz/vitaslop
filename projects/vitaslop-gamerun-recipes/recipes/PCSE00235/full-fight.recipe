@@ -19,10 +19,10 @@
 #   f012000-f015600  match 3 (oil rig), and the post-match menu again at ~f15900
 #
 # HOW IT WAS AUTHORED
-# - The boot HOLDS at 1640 until the title opens its autosave dialog (`@wait call
-#   sceMsgDialogInit`: f1673 natively, later on a phone whose movie and loads take longer), so
-#   every later input line runs late by the hold. The anchor must ARM BEFORE the call: at 1673
-#   itself it armed in the frame the call was made, never saw it, and held input for ever.
+# - There is NO hold on the autosave dialog any more: it used to hold at 1640 for
+#   `sceMsgDialogInit`, but the dialog now opens only AFTER START on the title screen (2026-10-15,
+#   native and browser), so that hold blocked the very START that opens it and the run sat on
+#   the title's storm backdrop for good. The menu hold below is what absorbs boot variance.
 # - The fight loop is FACE BUTTONS ONLY (triangle PUNCH, circle KICK, cross THROW, square HOLD,
 #   triangle+circle), 120-frame cycles to the end. A direction in the loop moved the post-match
 #   menu's cursor off FIGHT AGAIN and walked into the options pages for good (doafull1002);
@@ -37,7 +37,6 @@
 #   open until that dialog is answered waited for ever (phone job 533). No host call names the
 #   dialog, so the hold answers whatever play-style screen is still up instead.
 0: @section boot
-1640: @wait call sceMsgDialogInit
 1800: @section title
 1800: start
 1812:

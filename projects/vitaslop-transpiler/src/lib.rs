@@ -110,6 +110,12 @@ pub struct Program<'a> {
     /// Syscall numbers (guest r7) that do not return, so a `svc` with a
     /// statically-known one of them ends decoding (before trailing data).
     pub noreturn_svc: &'a [u32],
+    /// Host imports (dense import indices, as in [`Extern::import`]) that never return to
+    /// their caller - a fatal check like the stack protector's failure hook, or a process
+    /// exit. Discovery stops after a call to one, as it does after a noreturn `svc`: the
+    /// bytes that follow are padding or the next function's literals, and walking them as
+    /// code invents branches to nowhere that get a real function rejected.
+    pub noreturn_imports: &'a [u32],
     /// Total guest memory to provision, in bytes from `base`. The host keeps all
     /// guest allocations (image, stack, heap) within `[base, base + mem_bytes)`.
     pub mem_bytes: u32,
@@ -1512,6 +1518,11 @@ pub enum Error {
     },
     /// An operand had an unexpected shape for its opcode.
     Operand { addr: u32 },
+    /// Discovery ran away: the function's blocks span more than any real function does
+    /// (`first..=last`), or it decoded more instructions than one ever holds (`last` is where
+    /// the cap hit). Almost always data walked as code - a mis-recovered jump table or a
+    /// constant mistaken for a code pointer - so the function is rejected, not emitted.
+    Runaway { first: u32, last: u32 },
 }
 
 /// The linker inserts Thumb->ARM interworking veneers so Thumb code (e.g. newlib,
@@ -1769,7 +1780,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
     }
     let redirect_map: BTreeMap<u32, (u32, bool)> =
         program.redirects.iter().map(|r| (r.addr, (r.target, r.thumb))).collect();
-    let imports = Imports::new(&import_map, &redirect_map);
+    let imports = Imports::new(&import_map, &redirect_map, program.noreturn_imports);
 
     // Discover the transitive closure from the entries: direct callees are hard
     // (a decode failure is a real bug and propagates), while address-taken code
@@ -1891,7 +1902,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     }
     let redirect_map: BTreeMap<u32, (u32, bool)> =
         program.redirects.iter().map(|r| (r.addr, (r.target, r.thumb))).collect();
-    let imports = Imports::new(&import_map, &redirect_map);
+    let imports = Imports::new(&import_map, &redirect_map, program.noreturn_imports);
 
     // >>> WHAT WAS FOUND, NOT THE IR: A RECORD PER FUNCTION, AND THE IR IS LIFTED AGAIN AT EMIT.
     //
@@ -1912,6 +1923,8 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     let mut funcs: BTreeMap<u32, Found> = BTreeMap::new();
     let mut kept: BTreeMap<u32, ir::Func> = BTreeMap::new();
     let mut kept_bytes: usize = 0;
+    // Each lifted function's direct callees, for `emit::recursive_functions`.
+    let mut call_edges: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     // Guest instructions, which the flag passes do not move; the rest of the size report
     // is counted at emit, where the statements are final.
     let mut arm_total: u64 = 0;
@@ -1979,6 +1992,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
                     let callee: fn(u32, bool) -> WorkItem =
                         if tentative { WorkItem::tentative } else { WorkItem::hard };
                     decode_gaps.extend(found.trap_leaders.iter().copied());
+                    call_edges.insert(addr, found.callees.iter().map(|&(a, _)| a).collect());
                     work.extend(found.callees.into_iter().map(|(a, t)| callee(a, t)));
                     work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
                     work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
@@ -2033,6 +2047,18 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
             continue;
         }
         funcs.insert(addr, Found::RedirectThunk(target));
+        call_edges.insert(addr, vec![target]);
+    }
+    let recursive = emit::recursive_functions(&call_edges);
+    drop(call_edges);
+    if std::env::var_os("VITASLOP_LOG").is_some() || std::env::var_os("RUST_LOG").is_some() {
+        let mut sample: Vec<u32> = recursive.iter().copied().collect();
+        sample.sort_unstable();
+        eprintln!(
+            "transpile: {} function(s) on cycles of direct calls keep the dispatch loop (first: {:x?})",
+            recursive.len(),
+            &sample[..sample.len().min(24)]
+        );
     }
     // Stubs and thunks are built, not lifted - count their instructions the same way.
     for (&addr, found) in &funcs {
@@ -2050,7 +2076,8 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         addrs,
         arm_total,
         funcs.iter().map(|(&addr, found)| {
-            let f = kept.remove(&addr).unwrap_or_else(|| found.build(program, &imports, addr));
+            let mut f = kept.remove(&addr).unwrap_or_else(|| found.build(program, &imports, addr));
+            f.recursive = recursive.contains(&addr);
             stats.add(&f);
             f
         }),
@@ -2089,7 +2116,7 @@ pub fn dump_func(program: &Program, addr: u32) -> Option<String> {
     }
     let redirect_map: BTreeMap<u32, (u32, bool)> =
         program.redirects.iter().map(|r| (r.addr, (r.target, r.thumb))).collect();
-    let imports = Imports::new(&import_map, &redirect_map);
+    let imports = Imports::new(&import_map, &redirect_map, program.noreturn_imports);
     let seeded_thumb = !program.arm_entries.contains(&addr);
     let disc = |thumb: bool| {
         lower::discover(
@@ -2167,7 +2194,7 @@ pub fn transpile_report(program: &Program) -> Report {
         program.externs.iter().map(|e| (e.addr, e.import)).collect();
     let redirect_map: BTreeMap<u32, (u32, bool)> =
         program.redirects.iter().map(|r| (r.addr, (r.target, r.thumb))).collect();
-    let imports = Imports::new(&import_map, &redirect_map);
+    let imports = Imports::new(&import_map, &redirect_map, program.noreturn_imports);
 
     let mut done: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut ok = Vec::new();
@@ -2346,6 +2373,7 @@ mod tests {
                 redirects: &[],
                 inline_imports: &[],
                 noreturn_svc: &[],
+                noreturn_imports: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
                 import_memory: false, host_off: 0,
@@ -2443,6 +2471,7 @@ mod tests {
                 redirects: &[],
                 inline_imports: &[],
                 noreturn_svc: &[],
+                noreturn_imports: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
                 import_memory: false, host_off: 0,
@@ -2611,6 +2640,7 @@ mod tests {
             redirects: &[],
             inline_imports: &[],
             noreturn_svc: &[],
+            noreturn_imports: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
             import_memory: false, host_off: 0,
@@ -2674,6 +2704,7 @@ mod tests {
                 redirects: &[],
                 inline_imports: &[InlineImport { import: 0, op }],
                 noreturn_svc: &[],
+                noreturn_imports: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
                 import_memory: false, host_off: 0,
@@ -2739,6 +2770,7 @@ mod tests {
                 redirects: &[],
                 inline_imports: inline,
                 noreturn_svc: &[],
+                noreturn_imports: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
                 import_memory: false, host_off: 0,
@@ -2835,6 +2867,7 @@ mod tests {
             redirects: &[],
             inline_imports: &[],
             noreturn_svc: &[],
+            noreturn_imports: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
             import_memory: false, host_off: 0,
@@ -2883,6 +2916,7 @@ mod tests {
             redirects: &[],
             inline_imports: &[],
             noreturn_svc: &[],
+            noreturn_imports: &[],
             mem_bytes: 0x1_0000,
             discover_code_pointers: false,
             import_memory: false, host_off: 0,
@@ -2945,6 +2979,7 @@ mod tests {
             redirects: &[],
             inline_imports: &[],
             noreturn_svc: &[],
+            noreturn_imports: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
             import_memory: true,
@@ -3020,6 +3055,7 @@ mod tests {
                 redirects: &[],
             inline_imports: &[],
                 noreturn_svc: &[],
+                noreturn_imports: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
                 import_memory,
@@ -3093,6 +3129,7 @@ mod tests {
                 redirects: &[],
                 inline_imports: &[],
                 noreturn_svc: &[],
+                noreturn_imports: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,
                 import_memory: false, host_off: 0,

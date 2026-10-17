@@ -207,10 +207,10 @@ fn stmt_effect(s: &Stmt) -> (FlagMask, FlagMask) {
         // expression; the rest are register-to-register.
         Stmt::Neon(NeonStmt::ElemMem { addr, .. }) => (value_reads(addr), FlagMask::NONE),
         Stmt::Neon(_) => (FlagMask::NONE, FlagMask::NONE),
-        // `uadd8` writes the APSR GE bits and `sel` reads them. GE is modelled separately
+        // A modulo parallel add/sub writes the APSR GE bits and `sel` reads them. GE is modelled separately
         // from NZCV - it lives in a scratch local, not in a flag global - so neither
         // touches anything here. Both take register numbers, not expressions.
-        Stmt::Uadd8 { .. } | Stmt::Sel { .. } => (FlagMask::NONE, FlagMask::NONE),
+        Stmt::Parallel { .. } | Stmt::Sel { .. } => (FlagMask::NONE, FlagMask::NONE),
         // Everything that leaves this function - a host call, a guest call, an svc - is
         // treated as reading all four. The callee is not analysed, the host marshals the
         // flags as part of the register file, and a wrong answer here is a miscompile
@@ -278,7 +278,7 @@ fn for_each_value(s: &Stmt, f: &mut impl FnMut(&Value)) {
         // Carry no value expression at all.
         Stmt::Vfp(_)
         | Stmt::Neon(_)
-        | Stmt::Uadd8 { .. }
+        | Stmt::Parallel { .. }
         | Stmt::Sel { .. }
         | Stmt::Import(_)
         | Stmt::Svc(_)
@@ -642,6 +642,7 @@ mod tests {
             addr: 0,
             thumb: true,
             stub: false,
+            recursive: false,
             blocks: vec![
                 blk(0, vec![add(FlagMask::ALL)], Term::Branch { cond, taken: 8 }),
                 blk(4, vec![add(FlagMask::ALL)], Term::Halt),
@@ -681,6 +682,7 @@ mod tests {
             addr: 0,
             thumb: true,
             stub: false,
+            recursive: false,
             blocks: vec![blk(0, vec![add(FlagMask::ALL)], Term::Halt)],
         };
         annotate(&mut f);
@@ -695,6 +697,7 @@ mod tests {
             addr: 0,
             thumb: true,
             stub: false,
+            recursive: false,
             blocks: vec![
                 // 0x1000 is not a block here.
                 blk(
@@ -727,6 +730,7 @@ mod tests {
             addr: 0,
             thumb: true,
             stub: false,
+            recursive: false,
             blocks: vec![blk(0, vec![add(FlagMask::ALL)], Term::Return)],
         };
         annotate(&mut f);
@@ -807,6 +811,7 @@ mod tests {
             addr: 0,
             thumb: true,
             stub: false,
+            recursive: false,
             blocks: vec![
                 // 0: the loop header, which sets flags and falls through.
                 blk(0, vec![add(FlagMask::ALL)], Term::Fallthrough),

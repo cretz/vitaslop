@@ -48,6 +48,7 @@ fn newlib_memcpy_copies_every_length_and_alignment() {
             redirects: &[],
             inline_imports: &[],
             noreturn_svc: &[],
+            noreturn_imports: &[],
             mem_bytes: DEFAULT_MEM_BYTES,
             discover_code_pointers: false,
             import_memory: false,

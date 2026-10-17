@@ -61,6 +61,44 @@ pub enum Value {
     ExclAddr,
 }
 
+/// What a parallel add/subtract ([`Stmt::Parallel`]) does to each lane's exact sum or
+/// difference: wrap it (and set GE), clamp it to the lane's range, or halve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParallelKind {
+    /// `sadd8`/`uadd8`/...: the low lane bits; sets GE.
+    Modulo,
+    /// `qadd8`/`uqsub8`/...: saturated to the signed or unsigned lane range.
+    Saturate,
+    /// `shadd8`/`uhsub8`/...: the exact result shifted right by one.
+    Halve,
+}
+
+/// The lane shape and per-lane operation of a parallel add/subtract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParallelLanes {
+    /// Four byte lanes, each `rn + rm`.
+    Add8,
+    /// Four byte lanes, each `rn - rm`.
+    Sub8,
+    /// Two halfword lanes, each `rn + rm`.
+    Add16,
+    /// Two halfword lanes, each `rn - rm`.
+    Sub16,
+    /// `asx`: low half `rn.lo - rm.hi`, high half `rn.hi + rm.lo`.
+    Asx,
+    /// `sax`: low half `rn.lo + rm.hi`, high half `rn.hi - rm.lo`.
+    Sax,
+}
+
+/// One ARMv6 parallel add/subtract: lanes read signed or unsigned, combined per
+/// [`ParallelLanes`], then wrapped/saturated/halved per [`ParallelKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParallelOp {
+    pub kind: ParallelKind,
+    pub signed: bool,
+    pub lanes: ParallelLanes,
+}
+
 /// Binary operators over 32-bit values. Shifts are the logical/arithmetic wasm
 /// forms; ARM shift-amount masking is applied during lowering when needed.
 #[derive(Debug, Clone, Copy)]
@@ -583,15 +621,16 @@ pub enum Stmt {
     /// [`crate::abi::TP_GLOBAL`]). The kernel normally owns this register, but a
     /// module that manages its own thread pointer may write it.
     SetThreadPtr(Value),
-    /// Byte-wise unsigned parallel add (`uadd8`): for each of the four bytes,
-    /// `rd.byte[i] = (rn.byte[i] + rm.byte[i]) mod 256`, and set APSR `GE[i]` to
-    /// the unsigned carry-out (1 iff the byte sum is >= 256). The GE bits are held
-    /// in a scratch local for a later [`Sel`] to consume. This pair is the core of
-    /// the word-at-a-time zero-byte search in optimized `strlen`/`memchr`.
-    Uadd8 { rd: u8, rn: u8, rm: u8 },
+    /// An ARMv6 parallel add/subtract (`uadd8`, `uqsub8`, `shadd16`, `qasx`, ...): the
+    /// register is split into byte or halfword lanes and each lane is added or
+    /// subtracted independently - see [`ParallelOp`]. The modulo forms set the APSR GE
+    /// bits (held in a scratch local for a later [`Sel`] to consume); the saturating and
+    /// halving forms leave GE alone. `uadd8`/`sel` and `uqsub8` against `0x01010101` are
+    /// the word-at-a-time zero-byte searches of optimized `strlen`/`strcpy`/`memchr`.
+    Parallel { op: ParallelOp, rd: u8, rn: u8, rm: u8 },
     /// Byte-wise select by the GE flags (`sel`): for each byte, `rd.byte[i] =
     /// GE[i] ? rn.byte[i] : rm.byte[i]`, reading the GE bits a preceding parallel
-    /// add/sub (e.g. [`Uadd8`]) deposited.
+    /// add/sub (a modulo [`Parallel`]) deposited.
     Sel { rd: u8, rn: u8, rm: u8 },
     /// A register-controlled shift (`lsl/lsr/asr Rd, Rn, Rm`) where the amount is a
     /// runtime value (ARM uses `Rm[7:0]`, range 0..255). Both the result and the
@@ -695,6 +734,11 @@ pub struct Func {
     /// that the un-transpiled code is actually on the executed path. Used only by
     /// the lenient whole-program build ([`crate::transpile_lenient`]).
     pub stub: bool,
+    /// On a cycle of DIRECT calls (itself included), so the guest can recurse through it as
+    /// deep as its data goes - each level a nested wasm frame. Such a function keeps the
+    /// dispatch loop: see `structured::recursive_functions` for what the structured
+    /// form cost these frames. Set by the whole-program build; false where nobody asked.
+    pub recursive: bool,
 }
 
 impl Func {
@@ -705,7 +749,7 @@ impl Func {
 
     /// A trapping placeholder function at `addr` (see [`Func::stub`]).
     pub fn new_stub(addr: u32) -> Self {
-        Func { addr, thumb: true, blocks: Vec::new(), stub: true }
+        Func { addr, thumb: true, blocks: Vec::new(), stub: true, recursive: false }
     }
 
     /// A one-statement function that performs host import `idx` and returns.
@@ -737,6 +781,7 @@ impl Func {
             // operation (an import call, a redirect) the stub would have performed.
             blocks: vec![Block { addr, stmts: vec![stmt], term: Term::Return, arm_count: 1 }],
             stub: false,
+            recursive: false,
         }
     }
 

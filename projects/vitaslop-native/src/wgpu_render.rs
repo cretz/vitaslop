@@ -452,6 +452,11 @@ impl GeneralRenderer {
             .collect();
         let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
         let t_encode = std::time::Instant::now();
+        // The frame's new pipelines on several threads first, as `encode_present` does. This
+        // path renders a GUEST COMPLETION too (`complete_scenes`), which the guest waits on with
+        // the whole emulator stopped behind it - MEASURED (a golf title's course load, window):
+        // two completions of 1.4 s each, 1.1 s of it creating pipelines one after another.
+        self.gxm.prebuild_pipelines(&self.device, &built);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });

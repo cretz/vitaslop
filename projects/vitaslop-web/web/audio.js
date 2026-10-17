@@ -35,6 +35,11 @@ const CTL_FILL = 9;
 /// see `WebAudioSink::publish_into`. Each one is a stretch of game time that ran ahead of the
 /// wall clock (a load, a fast-forward) and whose audio could never have been played in time.
 const CTL_REJOINS = 10;
+/// Non-zero once the emulator's run has ENDED (set by `audio::mark_run_ended`, cleared when the
+/// next run attaches the ring): the consumer plays silence and counts no underrun, as for a
+/// pause. Without it every run's report carried the silence between the run's end and the stats
+/// being read - a constant ~1.8 s on every desktop-rig run, long or short.
+const CTL_ENDED = 11;
 const CTL_HEADER_BYTES = 64;
 
 /// Ring depth. Half a second is far more than a real backend needs, and that is
@@ -124,6 +129,8 @@ export async function startAudio(note = () => {}) {
     /// `fill` IS the latency a player hears between a sound being produced and heard.
     latencySkip: Atomics.load(ctl, CTL_LATENCY_SKIP),
     fill: Atomics.load(ctl, CTL_FILL),
+    /// The run has ended: nothing after this is counted.
+    ended: Atomics.load(ctl, CTL_ENDED) !== 0,
     rejoins: Atomics.load(ctl, CTL_REJOINS),
   });
 

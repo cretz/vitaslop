@@ -92,6 +92,8 @@ enum Screen {
     Title(String),
     Settings(Option<String>),
     Import,
+    /// The import screen adding ADD-ONS to this title rather than games to the library.
+    AddAddons(String),
     /// What this run reported. The warnings are captured whether or not anyone is watching
     /// stderr (see `crate::log`), so this screen is the only place a person who launched the
     /// app by double-clicking it can read them - beside the run log's path on disk.
@@ -141,6 +143,8 @@ struct Loading {
 /// `confirm()` dialogs, same wording.
 enum Ask {
     RemoveTitle(String),
+    RemoveAddon { id: String, dir: String, title: String },
+    RemoveRepatch(String),
     ClearSave { profile: String, id: String },
     RestoreSave { profile: String, id: String, zip: Vec<u8>, summary: String },
     ClearAll { profile: String },
@@ -199,6 +203,16 @@ pub(crate) struct Shell {
     /// The import's byte rate, over a trailing window - see `import::Rate`.
     import_rate: import::Rate,
     import_icon: Option<TextureHandle>,
+    /// The title the running import adds an add-on to, or `None` for a game import.
+    import_addon_for: Option<String>,
+    /// Each title's installed add-ons, read on first view and dropped when they change.
+    addons: HashMap<String, Vec<vitaslop_frontend::meta::AddonMeta>>,
+    /// Each title's rePatch overlay, read on first view and dropped when it changes.
+    repatch: HashMap<String, Option<vitaslop_frontend::meta::RepatchMeta>>,
+    /// A running rePatch overlay import: the title it lays over, and its progress.
+    repatch_import: Option<(String, Arc<Mutex<ImportProgress>>)>,
+    /// The last overlay action's outcome, shown on that title's card: `(title id, text)`.
+    repatch_note: Option<(String, String)>,
     /// Paths dropped on the window since the last frame: a drop of several files arrives as
     /// one event per file, and they are one import (a `.pkg` with its `work.bin`).
     dropped: Vec<PathBuf>,
@@ -539,6 +553,11 @@ impl Shell {
             pick_work: None,
             import_rate: import::Rate::default(),
             import_icon: None,
+            import_addon_for: None,
+            addons: HashMap::new(),
+            repatch: HashMap::new(),
+            repatch_import: None,
+            repatch_note: None,
             dropped: Vec::new(),
             drop_hover: false,
             ask: None,
@@ -921,6 +940,9 @@ impl Shell {
         let rect = gfx.game_rect();
         let mut drew_new = false;
         let no_game = self.session.is_none();
+        // Marks the present so the parallel guest runs on through a slow one (a first-draw
+        // pipeline build) instead of freezing with its sound - see `smp::late_present`.
+        let late = self.session.as_ref().and_then(|s| s.guest.late_handle());
         let game = match self.session.as_mut() {
             None => GameDraw::Clear,
             Some(s) => {
@@ -963,6 +985,10 @@ impl Shell {
                 eprintln!("VITASLOP_SHELL_SHOT: this surface cannot be read back");
             }
         }
+        let late = late.filter(|_| drew_new);
+        if let Some(l) = &late {
+            l.begin();
+        }
         let result = gfx.frame(game, |device, queue, encoder, view, _| {
             let cmds = renderer.update_buffers(device, queue, encoder, &prims, &desc);
             debug_assert!(cmds.is_empty());
@@ -983,6 +1009,9 @@ impl Shell {
                 .forget_lifetime();
             renderer.render(&mut rpass, &prims, &desc);
         });
+        if let Some(l) = &late {
+            l.end();
+        }
         for id in &full.textures_delta.free {
             renderer.free_texture(id);
         }
@@ -1012,7 +1041,10 @@ impl Shell {
         if busy {
             return;
         }
-        self.screen = Screen::Import;
+        // A drop on a title's add-on screen is an add-on; anywhere else it is a game.
+        if !matches!(self.screen, Screen::AddAddons(_)) {
+            self.screen = Screen::Import;
+        }
         match library::DirSource::open_many(&paths) {
             Ok(src) => self.start_import(src),
             Err(e) => self.error = Some(format!("could not read what was dropped: {e}")),
@@ -1024,6 +1056,10 @@ impl Shell {
         match l.rx.try_recv() {
             Ok(Ok(mut guest)) => {
                 let l = self.loading.take().unwrap();
+                if let Err(e) = guest.mount_addons(&library::addons_dir(&l.title_id)) {
+                    self.fatal = Some(format!("COULD NOT START\n{e}"));
+                    return;
+                }
                 if let Err(e) = guest.persist_to(&library::saves_dir(&l.settings.profile), &library::title_dir(&l.title_id)) {
                     self.fatal = Some(format!("COULD NOT START\n{e}"));
                     return;
@@ -1093,11 +1129,12 @@ impl Shell {
         let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
         let (tx, rx) = channel();
         let recipe = (!s.recipe.trim().is_empty()).then(|| s.recipe.clone());
+        let repatch = library::active_repatch(id);
         let input2 = input.clone();
         std::thread::Builder::new()
             .name("loader".into())
             .spawn(move || {
-                let r = RetailGuest::new_with_exec(&dir, input2, recipe.as_deref(), main_exec.as_deref());
+                let r = RetailGuest::new_with_exec(&dir, input2, recipe.as_deref(), main_exec.as_deref(), repatch.as_deref());
                 let _ = tx.send(r);
             })
             .expect("spawn the loader thread");
@@ -1210,21 +1247,32 @@ impl Shell {
         }
     }
 
+    /// Import `src`: a game into the library, or - on a title's add-on screen - an add-on of
+    /// that title.
     fn start_import(&mut self, src: library::DirSource) {
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let p2 = progress.clone();
+        let addon_for = match &self.screen {
+            Screen::AddAddons(id) => Some(id.clone()),
+            _ => None,
+        };
+        let owner = addon_for.clone();
         std::thread::Builder::new()
             .name("import".into())
             .spawn(move || {
-                let r = library::import_from(src, &p2);
+                let r = match owner {
+                    Some(id) => library::import_addon_from(&id, src, &p2).map(|m| m.title_id),
+                    None => library::import_from(src, &p2).map(|m| m.title_id),
+                };
                 let mut g = p2.lock().unwrap();
                 g.finished = true;
                 match r {
-                    Ok(m) => g.title_id = Some(m.title_id),
+                    Ok(id) => g.title_id = Some(id),
                     Err(e) => g.error = Some(e),
                 }
             })
             .expect("spawn the import thread");
+        self.import_addon_for = addon_for;
         self.import = Some(progress);
         self.import_rate = import::Rate::default();
         self.import_icon = None;
@@ -1302,6 +1350,7 @@ impl Shell {
             Screen::Library => "Library - vitaslop".to_string(),
             Screen::Settings(None) => "Settings - vitaslop".to_string(),
             Screen::Import => "Add games - vitaslop".to_string(),
+            Screen::AddAddons(id) => format!("Add add-ons to {} - vitaslop", self.titles.iter().find(|t| &t.title_id == id).map_or(id.as_str(), |t| t.title.as_str())),
             Screen::About => "About - vitaslop".to_string(),
             Screen::Diagnostics => "Diagnostics - vitaslop".to_string(),
             Screen::Title(id) => format!("{} - vitaslop", self.titles.iter().find(|t| &t.title_id == id).map_or(id.as_str(), |t| t.title.as_str())),
@@ -1369,7 +1418,8 @@ impl Shell {
                             Screen::Library => self.ui_library(ui),
                             Screen::Title(id) => self.ui_title(ui, &id),
                             Screen::Settings(_) => self.ui_settings(ui),
-                            Screen::Import => self.ui_import(ui),
+                            Screen::Import => self.ui_import(ui, None),
+                            Screen::AddAddons(id) => self.ui_import(ui, Some(&id)),
                             Screen::Diagnostics => self.ui_diagnostics(ui),
                             Screen::About => self.ui_about(ui),
                         }
@@ -1567,6 +1617,149 @@ impl Shell {
             }
             ui.label(RichText::new("What the game saved - its save files and trophies - and nothing of the game itself. A download is a file you own; upload it on another device to continue there.").color(DIM));
         });
+        let addons = self.addons.entry(id.to_string()).or_insert_with(|| library::list_addons(id)).clone();
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(bold("Add-ons").size(16.0));
+                if !addons.is_empty() {
+                    ui.label(RichText::new(format!("{} installed", addons.len())).color(DIM).size(16.0));
+                }
+            });
+            if addons.is_empty() {
+                ui.label(RichText::new("None installed. Add-ons you own for this game - costumes, tracks, characters - come in the same .pkg + work.bin, folder or zip a game does, and the game finds them the next time it starts.").color(DIM));
+            }
+            for a in &addons {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(bold(&a.title).color(INK));
+                        let version = if a.version.is_empty() { String::new() } else { format!("  \u{b7}  v{}", a.version) };
+                        ui.label(RichText::new(format!("{}{version}  \u{b7}  {}  \u{b7}  added {}", a.dir, fmt_bytes(a.bytes), fmt_date(a.imported_at))).color(DIM).size(13.0));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(danger("Remove")).clicked() {
+                            self.ask = Some(Ask::RemoveAddon { id: id.to_string(), dir: a.dir.clone(), title: a.title.clone() });
+                        }
+                        // Off keeps the add-on; the game does not see it until it is on again.
+                        let mut on = !a.disabled;
+                        if ui.checkbox(&mut on, "On").changed() {
+                            if let Err(e) = library::set_addon_enabled(id, &a.dir, on) {
+                                self.error = Some(e);
+                            }
+                            self.addons.remove(id);
+                        }
+                    });
+                });
+            }
+            if ui.button(bold("Add add-ons")).clicked() {
+                self.screen = Screen::AddAddons(id.to_string());
+            }
+        });
+        self.ui_repatch_card(ui, id);
+    }
+
+    /// The title page's rePatch card: the overlay laid over this title, its switch, and adding
+    /// or removing one. See `vitaslop_runtime::ingest::repatch`.
+    fn ui_repatch_card(&mut self, ui: &mut egui::Ui, id: &str) {
+        // A finished import reports here and drops the cached record.
+        if let Some((for_id, p)) = self.repatch_import.as_ref()
+            && p.lock().unwrap().finished
+        {
+            let g = p.lock().unwrap().clone();
+            let for_id = for_id.clone();
+            self.repatch_import = None;
+            self.repatch.remove(&for_id);
+            let note = g.error.map_or_else(|| "Overlay added. It applies the next time the game starts.".to_string(), |e| format!("Could not add the overlay: {e}"));
+            self.repatch_note = Some((for_id, note));
+        }
+        let rp = self.repatch.entry(id.to_string()).or_insert_with(|| library::read_repatch(id)).clone();
+        let importing = self.repatch_import.as_ref().filter(|(i, _)| i == id).map(|(_, p)| p.lock().unwrap().clone());
+        card(ui, |ui| {
+            ui.label(bold("rePatch overlay").size(16.0));
+            match &rp {
+                None => {
+                    ui.label(RichText::new(format!("None. An overlay lays your own modified or decrypted files over this game, as the rePatch plugin does on a Vita: pick a folder or .zip laid out like ux0:rePatch/{id}/ (a reAddcont/{id}/ folder beside it covers add-ons). Executables in it must be decrypted. The game itself is never changed - turn the overlay off or remove it here.")).color(DIM));
+                }
+                Some(m) => {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(bold(if m.source.is_empty() { "Overlay" } else { &m.source }).color(INK));
+                            let code = if m.code.is_empty() { "data only".to_string() } else { format!("replaces {}", m.code.join(", ")) };
+                            let addcont = if m.addcont.is_empty() { String::new() } else { format!("  \u{b7}  add-ons {}", m.addcont.join(", ")) };
+                            let split = format!("  \u{b7}  {} over the game, {} over add-ons", m.app_files, m.files.saturating_sub(m.app_files));
+                            ui.label(RichText::new(format!("{} files{split}  \u{b7}  {}  \u{b7}  {code}{addcont}  \u{b7}  added {}", m.files, fmt_bytes(m.bytes), fmt_date(m.imported_at))).color(DIM).size(13.0));
+                            // Where a bare pack's folders went, when that was inferred rather than named.
+                            for line in &m.inferred {
+                                ui.label(RichText::new(line).color(DIM).size(12.0));
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(danger("Remove")).clicked() {
+                                self.ask = Some(Ask::RemoveRepatch(id.to_string()));
+                            }
+                            let mut on = !m.disabled;
+                            if ui.checkbox(&mut on, "On").changed() {
+                                if let Err(e) = library::set_repatch_enabled(id, on) {
+                                    self.error = Some(e);
+                                }
+                                self.repatch.remove(id);
+                            }
+                        });
+                    });
+                }
+            }
+            if let Some(g) = &importing {
+                let pct = if g.total > 0 { g.done as f64 * 100.0 / g.total as f64 } else { 0.0 };
+                ui.label(RichText::new(format!("Copying {} - {pct:.0}%", g.file)).color(DIM));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            if let Some((for_id, note)) = &self.repatch_note
+                && for_id == id
+            {
+                ui.label(RichText::new(note).color(DIM).small());
+            }
+            let busy = self.repatch_import.is_some();
+            let verb = if rp.is_some() { "Replace with" } else { "Add from" };
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new(bold(format!("{verb} a folder")))).clicked()
+                    && let Some(p) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.start_repatch_import(id, &p);
+                }
+                if ui.add_enabled(!busy, egui::Button::new(bold(format!("{verb} a .zip")))).clicked()
+                    && let Some(p) = rfd::FileDialog::new().add_filter("Zip", &["zip", "ZIP"]).pick_file()
+                {
+                    self.start_repatch_import(id, &p);
+                }
+            });
+        });
+    }
+
+    /// Copy the overlay at `path` (a folder or a `.zip`) for title `id`, on a thread of its own.
+    fn start_repatch_import(&mut self, id: &str, path: &std::path::Path) {
+        let src = match library::DirSource::open(path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.repatch_note = Some((id.to_string(), format!("Could not read {}: {e}", path.display())));
+                return;
+            }
+        };
+        let source = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let p2 = progress.clone();
+        let owner = id.to_string();
+        std::thread::Builder::new()
+            .name("repatch-import".into())
+            .spawn(move || {
+                let r = library::import_repatch_from(&owner, src, &source, &p2);
+                let mut g = p2.lock().unwrap();
+                g.finished = true;
+                if let Err(e) = r {
+                    g.error = Some(e);
+                }
+            })
+            .expect("spawn the overlay import thread");
+        self.repatch_note = None;
+        self.repatch_import = Some((id.to_string(), progress));
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
@@ -1944,8 +2137,17 @@ impl Shell {
         let (text, yes) = match ask {
             Ask::RemoveTitle(id) => {
                 let size = self.titles.iter().find(|t| &t.title_id == id).map_or_else(String::new, |t| fmt_bytes(t.bytes));
-                (format!("Remove {} ({id}) from this computer?\n\nThis deletes the imported game ({size}) and its prepared code. Saved data is kept; clear it separately if you want it gone.", name(id)), "Remove")
+                let n = library::list_addons(id).len();
+                let addons = if n == 0 { String::new() } else { format!(" and its {n} add-on{}", if n == 1 { "" } else { "s" }) };
+                (format!("Remove {} ({id}) from this computer?\n\nThis deletes the imported game ({size}){addons} and its prepared code. Saved data is kept; clear it separately if you want it gone.", name(id)), "Remove")
             }
+            Ask::RemoveAddon { id, title, .. } => {
+                (format!("Remove the add-on {title} from {}?\n\nThe game will not see it the next time it starts. Saved data is kept.", name(id)), "Remove")
+            }
+            Ask::RemoveRepatch(id) => (
+                format!("Remove the rePatch overlay from {}?\n\nIts files are deleted; the game itself is untouched and runs without it from the next start. To keep it, turn it off instead.", name(id)),
+                "Remove",
+            ),
             Ask::ClearSave { id, .. } => (format!("Delete the saved data for {}? This cannot be undone.", name(id)), "Delete"),
             Ask::RestoreSave { profile, id, summary, .. } => {
                 let existing = library::gamedata_info(profile, id).map_or_else(String::new, |(b, _)| format!("\n\nThis REPLACES the {} already saved.", fmt_bytes(b)));
@@ -1989,8 +2191,18 @@ impl Shell {
             return;
         }
         let r: Result<(), String> = match ask {
+            Ask::RemoveAddon { id, dir, .. } => {
+                self.addons.remove(&id);
+                library::remove_addon(&id, &dir).map_err(|e| e.to_string())
+            }
+            Ask::RemoveRepatch(id) => {
+                self.repatch.remove(&id);
+                library::remove_repatch(&id).map_err(|e| e.to_string())
+            }
             Ask::RemoveTitle(id) => {
                 let r = library::remove_title(&id).map_err(|e| e.to_string());
+                self.addons.remove(&id);
+                self.repatch.remove(&id);
                 self.icons.remove(&id);
                 self.pictures.remove(&id);
                 self.titles = library::list_titles();
@@ -2565,7 +2777,9 @@ mod tests {
             push_key(&mut raw, *k);
         }
         let mut clicked = None;
-        let _ = ctx.run_ui(raw, |ui| {
+        // The output carries the font atlas upload, which egui (debug builds) refuses to see
+        // dropped unapplied; there is no renderer here to apply it to.
+        let mut out = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 for i in 0..3 {
                     if ui.button(format!("button {i}")).clicked() {
@@ -2574,6 +2788,7 @@ mod tests {
                 }
             });
         });
+        out.textures_delta.clear();
         clicked
     }
 
@@ -2613,13 +2828,14 @@ mod tests {
         let options = ["south", "east", "west"];
         let mut changed = false;
         let mut run = |nav: &mut Nav, value: &mut &str, focus: bool| {
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let r = ui.button("combo");
                 if focus {
                     r.request_focus();
                 }
                 changed |= combo_nav(&r, nav, value, &options);
             });
+            out.textures_delta.clear();
         };
         for _ in 0..4 {
             run(&mut nav, &mut value, true);

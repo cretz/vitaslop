@@ -908,6 +908,93 @@ fn do_poll_event_flag(
     }
 }
 
+// --- reader/writer lock ---
+
+/// `SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID` and siblings, from `psp2/kernel/error.h`.
+const SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID: u32 = 0x8002_81E1;
+const SCE_KERNEL_ERROR_RW_LOCK_RECURSIVE: u32 = 0x8002_81E2;
+const SCE_KERNEL_ERROR_RW_LOCK_NOT_OWNED: u32 = 0x8002_81E4;
+const SCE_KERNEL_ERROR_RW_LOCK_FAILED_TO_LOCK: u32 = 0x8002_81E6;
+
+/// The guest-facing code for a reader/writer lock answer that is not a park.
+fn rwlock_code(r: crate::host::RwLockResult) -> u32 {
+    use crate::host::RwLockResult as R;
+    match r {
+        R::Done => 0,
+        R::Busy => SCE_KERNEL_ERROR_RW_LOCK_FAILED_TO_LOCK,
+        R::Unknown => SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID,
+        R::Recursive => SCE_KERNEL_ERROR_RW_LOCK_RECURSIVE,
+        R::NotOwned => SCE_KERNEL_ERROR_RW_LOCK_NOT_OWNED,
+    }
+}
+
+/// SceUID sceKernelCreateRWLock(const char *name, SceUInt32 attr,
+///     const SceKernelRWLockOptParam *opt_param)
+#[hostcall]
+pub(super) fn create_rwlock(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, attr: u32, _opt: Ptr) -> i32 {
+    let name = if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    let id = st.create_rwlock(&name, attr);
+    tracing::trace!(target: "vitaslop::sema", id, attr = format_args!("{attr:#x}"), name, "rwlock create");
+    id
+}
+
+/// int sceKernelDeleteRWLock(SceUID rwlock_id)
+#[hostcall]
+pub(super) fn delete_rwlock(st: &mut VitaState, id: i32) -> i32 {
+    if st.delete_rwlock(id) { 0 } else { SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID as i32 }
+}
+
+/// int sceKernelLockReadRWLock(SceUID rwlock_id, unsigned int *timeout) and its Write
+/// sibling (`write`).
+///
+/// Takes the lock now if it can, else parks the caller until a release lets it in or the
+/// timeout passes (`SCE_KERNEL_ERROR_WAIT_TIMEOUT`, delivered at wake). A NULL `timeout` waits
+/// forever; a pointer to ZERO is a poll - see [`report_zero_timeout_poll`]. Outside the
+/// preemptive scheduler nothing can contend, so it is unconditional success, as for the mutex.
+pub(super) fn lock_rwlock(ctx: &mut GuestCtx, st: &mut VitaState, write: bool) -> SvcOutcome {
+    let id = ctx.arg(0) as i32;
+    let timeout_ptr = ctx.arg(1);
+    if !st.is_preemptive() {
+        ctx.ret(0);
+        return SvcOutcome::Continue;
+    }
+    let timeout_us = (timeout_ptr != 0).then(|| ctx.read_u32(timeout_ptr));
+    match st.rwlock_try(id, write) {
+        crate::host::RwLockResult::Busy => {}
+        r => {
+            ctx.ret(rwlock_code(r));
+            return SvcOutcome::Continue;
+        }
+    }
+    if timeout_us == Some(0) {
+        report_zero_timeout_poll("rwlock", id, st.current_thread());
+        ctx.ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+        return SvcOutcome::Continue;
+    }
+    tracing::trace!(
+        target: "vitaslop::sema",
+        id, write, thread = st.current_thread(), lr = format_args!("{:#010x}", ctx.regs[14]), "rwlock BLOCK"
+    );
+    ctx.ret(0);
+    st.rwlock_block(id, write, timeout_us);
+    SvcOutcome::Block
+}
+
+/// int sceKernelTryLockReadRWLock(SceUID) / sceKernelTryLockWriteRWLock(SceUID): the lock,
+/// refused with `SCE_KERNEL_ERROR_RW_LOCK_FAILED_TO_LOCK` instead of parking.
+pub(super) fn try_lock_rwlock(ctx: &mut GuestCtx, st: &mut VitaState, write: bool) {
+    let id = ctx.arg(0) as i32;
+    let code = if st.is_preemptive() { rwlock_code(st.rwlock_try(id, write)) } else { 0 };
+    ctx.ret(code);
+}
+
+/// int sceKernelUnlockReadRWLock(SceUID) / sceKernelUnlockWriteRWLock(SceUID).
+pub(super) fn unlock_rwlock(ctx: &mut GuestCtx, st: &mut VitaState, write: bool) {
+    let id = ctx.arg(0) as i32;
+    let code = if st.is_preemptive() { rwlock_code(st.rwlock_unlock(id, write)) } else { 0 };
+    ctx.ret(code);
+}
+
 // --- delete (shared: no teardown needed for these lightweight handles) ---
 
 /// int sceKernelDelete{Mutex,Sema,EventFlag}(SceUID id), and sceKernelCloseMutex - all
@@ -1045,6 +1132,43 @@ pub(super) fn get_timer_time_wide(ctx: &mut GuestCtx, st: &mut VitaState) {
     };
     ctx.regs[0] = us as u32;
     ctx.regs[1] = (us >> 32) as u32;
+    note_timer_step(st, id, us);
+}
+
+/// >>> A THREAD WHOSE TIMER STEPS FAR BETWEEN TWO OF ITS OWN READS, said once per (thread,
+/// timer). A title's front end that polls a kernel timer every tick and treats a long step as
+/// "the app was suspended" stops updating - a stall with every thread idle and nothing
+/// blocked. MEASURED (10-06, a football title on the phone): the front end skips its state
+/// update when more than 250 ms of timer time has passed since a stamp; whether the engine's
+/// clock ever hands a polling thread a step that size is what this line answers.
+fn note_timer_step(st: &VitaState, id: i32, us: u64) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<HashMap<(i32, i32), u64>>> = Mutex::new(None);
+    static SAID: Mutex<Vec<(i32, i32)>> = Mutex::new(Vec::new());
+    let key = (st.current_thread(), id);
+    let prev = {
+        let Ok(mut g) = LAST.lock() else { return };
+        g.get_or_insert_with(HashMap::new).insert(key, us)
+    };
+    let Some(prev) = prev else { return };
+    let step = us.saturating_sub(prev);
+    if step < 200_000 {
+        return;
+    }
+    let Ok(mut said) = SAID.lock() else { return };
+    if said.contains(&key) || said.len() >= 64 {
+        return;
+    }
+    said.push(key);
+    tracing::warn!(
+        target: "vitaslop::warning",
+        thread = format_args!("{:#x}", key.0).to_string(),
+        timer = format_args!("{id:#x}").to_string(),
+        frame = st.cur_frame(),
+        step_ms = step / 1000,
+        "a thread's kernel timer stepped this far between two of its own reads"
+    );
 }
 
 /// int sceKernelDeleteTimer(SceUID timerId)
@@ -1203,5 +1327,116 @@ mod zero_timeout_tests {
             assert!(matches!(wait_event_flag(ctx, st), SvcOutcome::Continue));
             assert_eq!(ctx.regs[0], 0, "a satisfied wait is not a timeout");
         });
+    }
+}
+
+#[cfg(test)]
+mod rwlock_tests {
+    use super::*;
+    use crate::host::RwLockResult as R;
+    use crate::world::DeterministicWorld;
+
+    const RECURSIVE: u32 = 0x02;
+
+    fn state() -> VitaState {
+        let mut st = VitaState::new(0, 0x4000, Box::new(DeterministicWorld::default()));
+        st.set_preemptive(true);
+        st.set_current(1);
+        st
+    }
+
+    fn as_thread(st: &mut VitaState, thid: i32) -> &mut VitaState {
+        st.set_current(thid);
+        st
+    }
+
+    /// Readers share; a writer parks behind them and is let in, and woken, by the LAST
+    /// reader's release - not the first.
+    #[test]
+    fn readers_share_and_the_last_release_admits_a_writer() {
+        let mut st = state();
+        let id = st.create_rwlock("l", 0);
+        assert_eq!(as_thread(&mut st, 1).rwlock_try(id, false), R::Done);
+        assert_eq!(as_thread(&mut st, 2).rwlock_try(id, false), R::Done);
+        assert_eq!(as_thread(&mut st, 3).rwlock_try(id, true), R::Busy);
+        st.rwlock_block(id, true, None);
+        assert_eq!(as_thread(&mut st, 1).rwlock_unlock(id, false), R::Done);
+        assert!(st.take_wakes().is_empty(), "one reader still holds it");
+        assert_eq!(as_thread(&mut st, 2).rwlock_unlock(id, false), R::Done);
+        assert_eq!(st.take_wakes(), vec![3]);
+        // Thread 3 now OWNS it for writing: its release is legal, another thread's is not.
+        assert_eq!(as_thread(&mut st, 1).rwlock_unlock(id, true), R::NotOwned);
+        assert_eq!(as_thread(&mut st, 3).rwlock_unlock(id, true), R::Done);
+    }
+
+    /// A queued writer holds back a reader that arrives after it, and the reader gets in once
+    /// the writer has been and gone.
+    #[test]
+    fn a_queued_writer_is_not_overtaken_by_a_later_reader() {
+        let mut st = state();
+        let id = st.create_rwlock("l", 0);
+        assert_eq!(as_thread(&mut st, 1).rwlock_try(id, false), R::Done);
+        assert_eq!(as_thread(&mut st, 2).rwlock_try(id, true), R::Busy);
+        st.rwlock_block(id, true, None);
+        assert_eq!(as_thread(&mut st, 3).rwlock_try(id, false), R::Busy);
+        st.rwlock_block(id, false, None);
+        as_thread(&mut st, 1).rwlock_unlock(id, false);
+        assert_eq!(st.take_wakes(), vec![2], "the writer first");
+        as_thread(&mut st, 2).rwlock_unlock(id, true);
+        assert_eq!(st.take_wakes(), vec![3]);
+    }
+
+    /// Re-taking a NON-recursive lock is refused with the kernel's error rather than parking
+    /// the thread on itself; a recursive one nests, read under write included.
+    #[test]
+    fn recursion_follows_the_attribute() {
+        let mut st = state();
+        let plain = st.create_rwlock("p", 0);
+        assert_eq!(st.rwlock_try(plain, true), R::Done);
+        assert_eq!(st.rwlock_try(plain, true), R::Recursive);
+        assert_eq!(st.rwlock_try(plain, false), R::Recursive);
+        let rec = st.create_rwlock("r", RECURSIVE);
+        assert_eq!(st.rwlock_try(rec, true), R::Done);
+        assert_eq!(st.rwlock_try(rec, true), R::Done);
+        assert_eq!(st.rwlock_try(rec, false), R::Done);
+        assert_eq!(st.rwlock_unlock(rec, false), R::Done);
+        assert_eq!(st.rwlock_unlock(rec, true), R::Done);
+        assert_eq!(as_thread(&mut st, 2).rwlock_try(rec, false), R::Busy, "still write-held once");
+        assert_eq!(as_thread(&mut st, 1).rwlock_unlock(rec, true), R::Done);
+        assert_eq!(as_thread(&mut st, 2).rwlock_try(rec, false), R::Done);
+    }
+
+    /// A timed writer that gives up leaves the queue with WAIT_TIMEOUT, and the reader it was
+    /// holding back is let in by its leaving.
+    #[test]
+    fn a_timed_out_writer_releases_the_readers_behind_it() {
+        let mut st = state();
+        let id = st.create_rwlock("l", 0);
+        assert_eq!(as_thread(&mut st, 1).rwlock_try(id, false), R::Done);
+        assert_eq!(as_thread(&mut st, 2).rwlock_try(id, true), R::Busy);
+        st.rwlock_block(id, true, Some(100));
+        assert_eq!(as_thread(&mut st, 3).rwlock_try(id, false), R::Busy);
+        st.rwlock_block(id, false, None);
+        let now = st.now_us();
+        st.advance_time_to(now + 100);
+        let mut woke = st.take_wakes();
+        woke.sort();
+        assert_eq!(woke, vec![2, 3]);
+        assert_eq!(st.take_resume_code(2), Some(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+        assert_eq!(st.take_resume_code(3), None, "the reader was GRANTED, not timed out");
+    }
+
+    /// Deleting a lock with parked lockers releases them with WAIT_DELETE.
+    #[test]
+    fn delete_wakes_the_parked_with_wait_delete() {
+        let mut st = state();
+        let id = st.create_rwlock("l", 0);
+        assert_eq!(st.rwlock_try(id, true), R::Done);
+        assert_eq!(as_thread(&mut st, 2).rwlock_try(id, true), R::Busy);
+        st.rwlock_block(id, true, None);
+        assert!(st.delete_rwlock(id));
+        assert_eq!(st.take_wakes(), vec![2]);
+        assert_eq!(st.take_resume_code(2), Some(crate::host::SCE_KERNEL_ERROR_WAIT_DELETE));
+        assert_eq!(st.rwlock_try(id, false), R::Unknown);
     }
 }

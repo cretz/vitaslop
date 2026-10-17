@@ -2449,21 +2449,65 @@ const OPEN_ARRAY_ELEMENTS: u32 = 256;
 /// matrix past 32 was a zero matrix, and the player character collapsed to nothing - the night
 /// prologue had no player in it. The console reads memory; the window has to cover what the
 /// index can reach for the shader's reads to be the console's.
-fn indexed_reach(base_sa: u32, shader: &Shader, secondary: &Shader) -> Option<u32> {
+///
+/// # AN INDEX CAN BE SCALED BEFORE IT IS USED
+/// A sports title stores its bone index as an 8-bit attribute and turns it into a ROW index in
+/// the shader: `pack.int16 norm (matrixIndex * 0.0000915555)` is `matrixIndex * 3` (three
+/// vec4 rows a bone), then `imad(row, 16, sa[1])`. The reach is then 256 elements of the ROW
+/// index's range, not of the attribute's - see [`index_scale`] - or every bone past the 85th
+/// reads zero and the skinned mesh flies apart.
+fn indexed_reach(base_sa: u32, program: &Program, shader: &Shader, secondary: &Shader) -> Option<u32> {
     let mut reach: Option<u32> = None;
-    for i in shader.instrs.iter().chain(secondary.instrs.iter()) {
-        let crate::ir::Op::IntMad { .. } = i.op else { continue };
-        let [_, stride, addend] = i.srcs.as_slice() else { continue };
-        if addend.bank != crate::ir::Bank::SecondaryAttr || u32::from(addend.index) != base_sa {
-            continue;
+    for stream in [shader, secondary] {
+        for (at, i) in stream.instrs.iter().enumerate() {
+            let crate::ir::Op::IntMad { .. } = i.op else { continue };
+            let [index, stride, addend] = i.srcs.as_slice() else { continue };
+            if addend.bank != crate::ir::Bank::SecondaryAttr || u32::from(addend.index) != base_sa {
+                continue;
+            }
+            if stride.bank != crate::ir::Bank::Immediate || stride.index == 0 {
+                continue;
+            }
+            let elements = match index_scale(program, &stream.instrs[..at], index) {
+                Some(scale) => ((OPEN_ARRAY_ELEMENTS - 1) * scale + 1).max(OPEN_ARRAY_ELEMENTS),
+                None => OPEN_ARRAY_ELEMENTS,
+            };
+            let r = u32::from(stride.index).saturating_mul(elements);
+            reach = Some(reach.map_or(r, |x: u32| x.max(r)));
         }
-        if stride.bank != crate::ir::Bank::Immediate || stride.index == 0 {
-            continue;
-        }
-        let r = u32::from(stride.index).saturating_mul(OPEN_ARRAY_ELEMENTS);
-        reach = Some(reach.map_or(r, |x: u32| x.max(r)));
     }
     reach
+}
+
+/// The integer factor an 8-bit index is scaled by before it reaches an `imad`, when the
+/// program forms it as `pack.int<bits> norm (x * literal)`: the normalised pack multiplies by
+/// its integer range (32767 for a signed 16-bit one), so the index is `x * literal * range`.
+/// `None` for any other shape (the index is then taken to be the 8-bit value itself), and for a
+/// factor that is not close to a small whole number - a fractional one is not an index scale.
+fn index_scale(program: &Program, before: &[crate::ir::Instr], index: &crate::ir::Operand) -> Option<u32> {
+    use crate::ir::{Bank, Op};
+    let last_def = |instrs: &[crate::ir::Instr], reg: &crate::ir::Operand| {
+        instrs.iter().rposition(|d| d.dest.as_ref().is_some_and(|x| x.bank == reg.bank && x.index == reg.index))
+    };
+    let at = last_def(before, index)?;
+    let pack = &before[at];
+    let Op::PackToInt { bits, signed, norm: true, .. } = pack.op else { return None };
+    let range = if signed { (1u32 << (bits - 1)) - 1 } else { (1u32 << bits) - 1 };
+    let src = pack.srcs.first()?;
+    let mul = &before[last_def(&before[..at], src)?];
+    if mul.op != Op::Mul || mul.half_precision {
+        return None;
+    }
+    let literal = mul.srcs.iter().find_map(|o| {
+        if o.bank != Bank::SecondaryAttr || o.swizzle.iter().any(|&c| c != o.swizzle[0]) {
+            return None;
+        }
+        let reg = u32::from(o.index) + u32::from(o.swizzle[0]);
+        program.literals.iter().find(|(sa, _)| *sa == reg).map(|(_, w)| f32::from_bits(*w))
+    })?;
+    let scale = f64::from(literal) * f64::from(range);
+    let whole = scale.round();
+    ((1.0..=64.0).contains(&whole) && (scale - whole).abs() < 0.01).then_some(whole as u32)
 }
 
 pub fn resolve_mem_windows(
@@ -2618,11 +2662,22 @@ pub fn resolve_mem_windows(
                 // view-projection, and the characters drew nothing. The window covers
                 // `OPEN_ARRAY_ELEMENTS` elements - the reach of the 8-bit blend-index attribute
                 // every captured skinned draw of the title binds.
-                Some(ub) if ub.semantic == 1 => ub.array_size.saturating_mul(OPEN_ARRAY_ELEMENTS),
+                //
+                // >>> UNLESS THE PROGRAM SAYS HOW FAR IT INDEXES, which is the better bound. A
+                // newer title declares the WHOLE palette (12,288 bytes = 256 bones of 48) under
+                // the same semantic, and multiplying that by 256 asked for a 3 MiB window - past
+                // any uniform binding - so every skinned pair was refused and the characters
+                // were absent. The index reach (`x * stride + pointer`, see `indexed_reach`) is
+                // what the shader's own arithmetic can address; for the one-element declaration
+                // it is the same 256 elements, so that title's windows are unchanged.
+                Some(ub) if ub.semantic == 1 => match indexed_reach(base_sa, program, shader, &secondary) {
+                    Some(r) if indexed_reach_on() => ub.array_size.max(r),
+                    _ => ub.array_size.saturating_mul(OPEN_ARRAY_ELEMENTS),
+                },
                 // A table the program indexes at run time reaches as far as its index does,
                 // not as far as its declaration - see `indexed_reach`. Never SMALLER than
                 // declared. `VITASLOP_GXP_INDEXED_REACH=0` is the arm back.
-                Some(ub) => match indexed_reach(base_sa, shader, &secondary) {
+                Some(ub) => match indexed_reach(base_sa, program, shader, &secondary) {
                     Some(r) if indexed_reach_on() => ub.array_size.max(r),
                     _ => ub.array_size,
                 },

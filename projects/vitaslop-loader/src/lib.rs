@@ -427,6 +427,7 @@ impl ProgramInputs {
             // Vita dispatches host calls through NID stubs (bl/blx to a stub
             // address), not `svc`, so there is no noreturn-syscall set here.
             noreturn_svc: &[],
+            noreturn_imports: &[],
             mem_bytes: self.mem_bytes,
             // Vita modules take function addresses (thread entries, GXM
             // callbacks) that the direct-call closure alone would miss.

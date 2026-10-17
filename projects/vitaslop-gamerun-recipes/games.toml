@@ -65,3 +65,13 @@ region = "NTSC"
 id = "PCSA00029"
 name = "Uncharted: Golden Abyss"
 region = "NTSC"
+
+[[game]]
+id = "PCSE00093"
+name = "FIFA Soccer 13"
+region = "NTSC"
+
+[[game]]
+id = "PCSH00250"
+name = "Dead or Alive Xtreme 3 Venus"
+region = "Asia"

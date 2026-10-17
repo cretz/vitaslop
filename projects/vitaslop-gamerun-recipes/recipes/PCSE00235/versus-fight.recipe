@@ -53,6 +53,9 @@
 1872:
 1980: cross
 1992:
+# Hold for the main menu itself (see full-fight.recipe): without it the DOWN below lands
+# before the menu is up and the CROSS opens STORY (seen 2026-10-15, native).
+2000: @wait call sceAppUtilSystemParamGetString pulse cross 60
 2100: @section main-menu
 2100: down
 2106:

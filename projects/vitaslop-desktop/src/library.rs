@@ -4,6 +4,8 @@
 //! ```text
 //! <home>/library/<TITLE_ID>/          the decrypted dump tree (what `--game` takes)
 //! <home>/library/<TITLE_ID>/meta.json the TitleMeta record; icon0.png, pic0.png beside it
+//! <home>/addons/<TITLE_ID>/<DIR>/     one installed add-on's dump tree; addon.json beside it
+//! <home>/repatch/<TITLE_ID>/          the title's rePatch overlay (app/, addcont/); repatch.json
 //! <home>/saves/<profile>/<TITLE_ID>/  the guest's own saved state (SaveStore)
 //! <home>/settings.json                the global settings record
 //! <home>/titles/<TITLE_ID>.json       a title's settings patch
@@ -18,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use vitaslop_frontend::meta::TitleMeta;
+use vitaslop_frontend::meta::{AddonMeta, RepatchMeta, TitleMeta};
 use vitaslop_frontend::settings::{self, Settings};
 use vitaslop_runtime::ingest::stream::{self, ByteSource, DumpSink};
 use vitaslop_runtime::ingest::Error;
@@ -44,6 +46,15 @@ pub fn library_dir() -> PathBuf {
 }
 pub fn title_dir(id: &str) -> PathBuf {
     library_dir().join(id)
+}
+/// Where a title's add-ons live, one subdirectory each (what `RetailGuest::mount_addons`
+/// and `--addons` take).
+pub fn addons_dir(id: &str) -> PathBuf {
+    home().join("addons").join(id)
+}
+/// Where a title's rePatch overlay lives (see `vitaslop_runtime::ingest::repatch`).
+pub fn repatch_dir(id: &str) -> PathBuf {
+    home().join("repatch").join(id)
 }
 pub fn saves_dir(profile: &str) -> PathBuf {
     home().join("saves").join(if profile.is_empty() { "default" } else { profile })
@@ -296,8 +307,228 @@ pub fn write_meta(m: &TitleMeta) -> std::io::Result<()> {
     fs::write(dir.join("meta.json"), serde_json::to_string_pretty(m)?)
 }
 
+/// Remove a title, every add-on installed for it and its rePatch overlay - both are part of
+/// its title.
 pub fn remove_title(id: &str) -> std::io::Result<()> {
+    for dir in [addons_dir(id), repatch_dir(id)] {
+        match fs::remove_dir_all(dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
     fs::remove_dir_all(title_dir(id))
+}
+
+// ------------------------------- add-ons -------------------------------
+
+const ADDON_META: &str = "addon.json";
+
+/// The add-ons installed for `id`, by name.
+pub fn list_addons(id: &str) -> Vec<AddonMeta> {
+    let mut out: Vec<AddonMeta> = fs::read_dir(addons_dir(id))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let m: AddonMeta = serde_json::from_str(&fs::read_to_string(e.path().join(ADDON_META)).ok()?).ok()?;
+            (e.file_name().to_string_lossy() == m.dir && m.title_id == id).then_some(m)
+        })
+        .collect();
+    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.dir.cmp(&b.dir)));
+    out
+}
+
+/// Remove one add-on of `id`.
+pub fn remove_addon(id: &str, dir: &str) -> std::io::Result<()> {
+    // The name came from the record, but it is joined onto a path: refuse anything that is
+    // not a plain add-on directory name.
+    if dir.is_empty() || !dir.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("not an add-on name: {dir:?}")));
+    }
+    fs::remove_dir_all(addons_dir(id).join(dir))
+}
+
+/// Turn one add-on of `id` on or off. Off keeps every file; the title just does not see it.
+pub fn set_addon_enabled(id: &str, dir: &str, on: bool) -> Result<(), String> {
+    let mut m = list_addons(id).into_iter().find(|a| a.dir == dir).ok_or_else(|| format!("{id} has no add-on {dir}"))?;
+    m.disabled = !on;
+    let path = addons_dir(id).join(&m.dir).join(ADDON_META);
+    fs::write(path, serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+/// Import the add-on `src` holds for title `id` - from the same containers a title comes in.
+/// Refuses a title, and an add-on that belongs to another title. Re-importing one replaces it.
+pub fn import_addon_from(id: &str, src: DirSource, progress: &Arc<Mutex<ImportProgress>>) -> Result<AddonMeta, String> {
+    progress.lock().unwrap().picked = (src.files.len(), src.files.iter().filter_map(|(_, p)| fs::metadata(p).ok()).map(|m| m.len()).sum());
+    let src: Rc<dyn ByteSource> = Rc::new(src);
+    progress.lock().unwrap().stage = "reading".into();
+    let p = stream::probe(src.clone()).map_err(|e| e.to_string())?;
+    if !p.is_addcont() {
+        return Err(match &p.title_id {
+            _ if p.is_update() => p.refused_as_title().unwrap_or_default(),
+            Some(t) if p.category.is_some() => format!("this is not an add-on but a title ({t}) - import it from the library"),
+            _ => "this is not an add-on (its param.sfo does not say CATEGORY ac)".into(),
+        });
+    }
+    let owner = p.title_id.clone().unwrap_or_default();
+    if owner != id {
+        return Err(format!("this add-on belongs to {owner}, not {id}"));
+    }
+    if p.missing_work_bin {
+        return Err("this pkg has no work.bin and none was found beside it".into());
+    }
+    let cid = p.content_id.clone().unwrap_or_default();
+    let name = vitaslop_runtime::ingest::addcont::dir_name(&cid)
+        .ok_or_else(|| format!("content id {cid:?} names no add-on directory"))?
+        .to_string();
+    progress.lock().unwrap().probe = Some(ProbeCard {
+        title: p.title.clone().unwrap_or_else(|| name.clone()),
+        title_id: id.to_string(),
+        app_version: p.app_version.clone().unwrap_or_default(),
+        kind: p.kind.to_string(),
+        zipped: p.zipped,
+        files: p.files,
+        bytes: p.bytes,
+        icon0: None,
+        replacing: list_addons(id).iter().any(|a| a.dir == name),
+    });
+    let dir = addons_dir(id).join(&name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut sink = DirSink::new(dir.clone());
+    let mut report = |pr: stream::Progress<'_>| {
+        let mut g = progress.lock().unwrap();
+        g.stage = pr.stage.to_string();
+        g.file = pr.file.to_string();
+        g.done = pr.done;
+        g.total = pr.total;
+    };
+    let content_id = stream::import(src, &mut sink, &mut report).map_err(|e| e.to_string())?;
+    let meta = AddonMeta {
+        title_id: id.to_string(),
+        dir: name.clone(),
+        content_id,
+        title: p.title.clone().unwrap_or(name),
+        version: p.app_version.clone().unwrap_or_default(),
+        source_kind: p.kind.to_string(),
+        bytes: p.bytes,
+        files: p.files as u32,
+        imported_at: now_ms(),
+        disabled: false,
+    };
+    fs::write(dir.join(ADDON_META), serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    Ok(meta)
+}
+
+// ---------------------------- rePatch overlay ----------------------------
+
+/// `id`'s rePatch overlay, if one finished importing.
+pub fn read_repatch(id: &str) -> Option<RepatchMeta> {
+    let s = fs::read_to_string(repatch_dir(id).join(vitaslop_runtime::ingest::repatch::RECORD)).ok()?;
+    let m: RepatchMeta = serde_json::from_str(&s).ok()?;
+    (m.title_id == id).then_some(m)
+}
+
+/// `id`'s overlay directory when it is installed AND on: what a run lays over the title.
+pub fn active_repatch(id: &str) -> Option<PathBuf> {
+    read_repatch(id).filter(|m| !m.disabled).map(|_| repatch_dir(id))
+}
+
+/// Turn `id`'s overlay on or off. Off keeps every file.
+pub fn set_repatch_enabled(id: &str, on: bool) -> Result<(), String> {
+    let mut m = read_repatch(id).ok_or_else(|| format!("{id} has no rePatch overlay"))?;
+    m.disabled = !on;
+    write_repatch_record(&repatch_dir(id), &m)
+}
+
+pub fn remove_repatch(id: &str) -> std::io::Result<()> {
+    match fs::remove_dir_all(repatch_dir(id)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    }
+}
+
+fn write_repatch_record(dir: &Path, m: &RepatchMeta) -> Result<(), String> {
+    let path = dir.join(vitaslop_runtime::ingest::repatch::RECORD);
+    fs::write(path, serde_json::to_string_pretty(m).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+/// Lay the rePatch overlay `src` holds (a folder, or a `.zip`) over title `id`, replacing any
+/// overlay it had. The new one is copied beside the old and swapped in only once it is whole,
+/// so a failed import leaves the title as it was.
+pub fn import_repatch_from(id: &str, src: DirSource, source: &str, progress: &Arc<Mutex<ImportProgress>>) -> Result<RepatchMeta, String> {
+    let meta = import_repatch_into(id, src, source, &repatch_dir(id), progress)?;
+    // Modules compiled for an overlay this one replaced can never be asked for again.
+    if let Ok(rd) = fs::read_dir(title_dir(id).join(vitaslop_native::compile_cache::DIR)) {
+        for f in rd.flatten() {
+            if f.file_name().to_string_lossy().contains("_rp") {
+                let _ = fs::remove_file(f.path());
+            }
+        }
+    }
+    Ok(meta)
+}
+
+/// What the library holds for `id` - its `app0:` top level and installed add-ons - for placing an
+/// overlay's files (see `repatch::GameIndex`). Empty, and so unchecked, for a title the library
+/// does not have (`--repatch` beside `--game <dir>`).
+fn repatch_game(id: &str) -> vitaslop_runtime::ingest::repatch::GameIndex {
+    let top: Vec<String> = fs::read_dir(title_dir(id).join("files"))
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    let addons: Vec<String> = list_addons(id).into_iter().map(|a| a.dir).collect();
+    vitaslop_runtime::ingest::repatch::GameIndex::new(top.iter().map(String::as_str), addons.iter().map(String::as_str))
+}
+
+/// [`import_repatch_from`] into any directory `dest` (what `--repatch` does with a folder that
+/// is not an installed overlay yet).
+pub fn import_repatch_into(id: &str, src: DirSource, source: &str, dest: &Path, progress: &Arc<Mutex<ImportProgress>>) -> Result<RepatchMeta, String> {
+    progress.lock().unwrap().picked = (src.files.len(), src.files.iter().filter_map(|(_, p)| fs::metadata(p).ok()).map(|m| m.len()).sum());
+    let mut staging = dest.as_os_str().to_owned();
+    staging.push(".new");
+    let staging = PathBuf::from(staging);
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let mut sink = DirSink::new(staging.clone());
+        let mut report = |pr: stream::Progress<'_>| {
+            let mut g = progress.lock().unwrap();
+            g.stage = pr.stage.to_string();
+            g.file = pr.file.to_string();
+            g.done = pr.done;
+            g.total = pr.total;
+        };
+        // A desktop folder pick lists paths below the folder, so there is no picked root to drop.
+        let got = vitaslop_runtime::ingest::repatch::import(Rc::new(src), id, false, &repatch_game(id), &mut sink, &mut report)?;
+        let meta = RepatchMeta {
+            title_id: id.to_string(),
+            source: source.to_string(),
+            bytes: got.bytes,
+            files: got.files,
+            code: got.code,
+            addcont: got.addcont,
+            app_files: got.app_files,
+            inferred: got.inferred,
+            code_hash: got.code_hash,
+            imported_at: now_ms(),
+            disabled: false,
+        };
+        write_repatch_record(&staging, &meta)?;
+        Ok(meta)
+    })();
+    let meta = match result {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+    match fs::remove_dir_all(dest) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+        _ => {}
+    }
+    fs::rename(&staging, dest).map_err(|e| e.to_string())?;
+    Ok(meta)
 }
 
 pub fn now_ms() -> u64 {
@@ -480,6 +711,10 @@ pub fn import_from(src: DirSource, progress: &Arc<Mutex<ImportProgress>>) -> Res
     progress.lock().unwrap().stage = "reading".into();
     let p = stream::probe(src.clone()).map_err(|e| e.to_string())?;
     let id = p.title_id.clone().ok_or("no param.sfo, so no title id to file this under")?;
+    // Filed under its title's id, an add-on or an update would replace the game itself.
+    if let Some(why) = p.refused_as_title() {
+        return Err(why);
+    }
     if p.missing_work_bin {
         return Err("this pkg has no work.bin and none was found beside it".into());
     }

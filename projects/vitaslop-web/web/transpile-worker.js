@@ -14,7 +14,7 @@
 // The sync access handles are opened and CLOSED here before the run worker opens its own:
 // an OPFS sync access handle is an exclusive lock, so the two workers must not hold the
 // same files at once.
-import { openTitleSync, syncReader } from "./opfs.js";
+import { openTitleSync, syncReader, repatchCodeSuffix } from "./opfs.js";
 import * as tcache from "./transpile-cache.js";
 
 // The same bundle as the run worker it builds for (`?smp=1` = `pkg-threads`): the module
@@ -40,6 +40,16 @@ const ready = (module) =>
     ({ transpile_title, set_knob, transpile_settings_key } = m);
     await m.default(module ? { module_or_path: module } : undefined);
   });
+
+/// A rePatch overlay's stored path that is DATA, not an executable (`ingest::repatch::is_code_path`).
+function isOverlayData(p) {
+  const m = /^repatch\/(.*)$/i.exec(p);
+  if (!m) return false;
+  const rest = m[1].toLowerCase();
+  if (!rest.startsWith("app/")) return true;
+  const rel = rest.slice(4);
+  return !(rel === "eboot.bin" || /^sce_module\/[^/]+\.suprx$/.test(rel) || /^[^/]+\.self$/.test(rel));
+}
 
 self.onmessage = async (e) => {
   // `hostOff` is where the RUN worker reserved the guest region in its own memory (see
@@ -67,7 +77,9 @@ self.onmessage = async (e) => {
     // launcher and the game it execs would evict each other on every boot (a miss clears the
     // namespace it looked in).
     const mainExec = String((knobs || {}).VITASLOP_MAIN_EXEC ?? "").trim();
-    const variant = tcache.variantSuffix(mainExec);
+    // An ENABLED rePatch overlay that replaces code is a different program again, so it adds its
+    // code hash: turning the overlay off goes back to the plain module without a re-transpile.
+    const variant = tcache.variantSuffix(mainExec) + (titleId ? await repatchCodeSuffix(titleId) : "");
     let name = null;
     let invalidated = "";
     if (useCache) {
@@ -101,8 +113,14 @@ self.onmessage = async (e) => {
     }
 
     let source;
+    let openStats = "";
     if (titleId) {
-      reader = syncReader(await openTitleSync(titleId));
+      // Only the manifest and the modules are read here (`mount_dump_lazy`): the guest's data
+      // files, the title's, its add-ons' and its overlay's, are listed but stay shut - see
+      // `openTitleSync`. An overlay's EXECUTABLES are read: they replace the title's.
+      const handles = await openTitleSync(titleId, { skip: (p) => /^(addons\/[^/]+\/)?files\//.test(p) || isOverlayData(p) });
+      openStats = handles.openStats || "";
+      reader = syncReader(handles);
       source = { kind: "opfs", payload: reader };
     } else if (files) {
       source = { kind: "memory", payload: files };
@@ -110,12 +128,22 @@ self.onmessage = async (e) => {
       throw new Error("transpile worker got neither titleId nor files");
     }
 
-    const built = await transpile_title(source, hostOff);
+    let built;
+    try {
+      built = await transpile_title(source, hostOff);
+    } finally {
+      const touched = reader ? reader.touchedSkipped() : [];
+      if (touched.length) {
+        throw new Error(`the transpile read data file(s) it did not open: ${touched.slice(0, 8).join(", ")} - widen its open in transpile-worker.js`);
+      }
+    }
     built.readyMs = readyMs;
     // Release the exclusive locks BEFORE the run worker is told to start, or its own
     // `createSyncAccessHandle` will fail on every file.
+    const tClose = performance.now();
     if (reader) reader.close();
     reader = null;
+    if (openStats) built.split = `title files ${openStats}, closed ${Math.round(performance.now() - tClose)} ms; ${built.split}`;
     const wasm = built.wasm;
     delete built.wasm;
     if (useCache) {

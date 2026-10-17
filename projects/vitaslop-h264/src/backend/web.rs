@@ -34,6 +34,10 @@ extern "C" {
     #[wasm_bindgen(js_name = VideoDecoder)]
     type JsVideoDecoder;
 
+    /// `performance.now()`, which a worker has as well as a page.
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    fn perf_now() -> f64;
+
     #[wasm_bindgen(constructor, js_class = "VideoDecoder", catch)]
     fn new(init: &Object) -> std::result::Result<JsVideoDecoder, JsValue>;
 
@@ -105,6 +109,15 @@ struct Shared {
     /// a software decode and a hardware one, and a run that renders nothing needs it on
     /// the record rather than inferred afterwards.
     layout: Option<String>,
+    /// What delivering a picture costs, over the backend's life: the `copyTo` wait (a GPU
+    /// readback when the decoder hands over GPU-resident frames) and this crate's own copy out
+    /// of the JS buffer into the frame's planes, summed and worst, over `copied` pictures.
+    copy_wait_ms: f64,
+    copy_wait_max_ms: f64,
+    unpack_ms: f64,
+    copied: u64,
+    /// The `hardwareAcceleration` preference `configure` asked for.
+    preference: &'static str,
 }
 
 impl Shared {
@@ -284,8 +297,13 @@ impl Backend for WebCodecsBackend {
         // pictures "still owed" looks the same from the guest side in all three cases.
         let s = self.shared.borrow();
         Some(format!(
-            "{} | outputs {} copying {} ready {} flushing {} queue {}{}",
+            "{} | asked {} | per picture: copyTo {:.2} ms (worst {:.1}), unpack {:.2} ms over {} | outputs {} copying {} ready {} flushing {} queue {}{}",
             s.layout.as_deref().unwrap_or("no frame yet"),
+            s.preference,
+            s.copy_wait_ms / s.copied.max(1) as f64,
+            s.copy_wait_max_ms,
+            s.unpack_ms / s.copied.max(1) as f64,
+            s.copied,
             s.outputs,
             s.copies,
             s.ready.len(),
@@ -333,6 +351,7 @@ impl Backend for WebCodecsBackend {
             "no-preference"
         };
         set(&cfg, "hardwareAcceleration", &JsValue::from_str(preference))?;
+        self.shared.borrow_mut().preference = preference;
         self.decoder
             .configure(&cfg)
             .map_err(|e| Error::platform("VideoDecoder.configure", 0, describe(&e)))?;
@@ -531,9 +550,11 @@ async fn read_frame(frame: &JsVideoFrame, shared: &Rc<RefCell<Shared>>) -> Resul
         .map_err(|e| Error::platform("VideoFrame.allocationSize", 0, describe(&e)))?;
 
     let buffer = Uint8Array::new_with_length(size);
+    let t_copy = perf_now();
     let layout = JsFuture::from(frame.copy_to(&buffer, &options))
         .await
         .map_err(|e| Error::platform("VideoFrame.copyTo", 0, describe(&e)))?;
+    let t_copied = perf_now();
 
     // `copyTo` reports where it actually put each plane, and HOW MANY - which is what
     // names the layout. Three planes (or four, the fourth being alpha) is 4:2:0 in
@@ -607,6 +628,14 @@ async fn read_frame(frame: &JsVideoFrame, shared: &Rc<RefCell<Shared>>) -> Resul
                 px.swap(0, 2);
             }
         }
+    }
+    {
+        let mut s = shared.borrow_mut();
+        let wait = t_copied - t_copy;
+        s.copy_wait_ms += wait;
+        s.copy_wait_max_ms = s.copy_wait_max_ms.max(wait);
+        s.unpack_ms += perf_now() - t_copied;
+        s.copied += 1;
     }
     Ok(out)
 }

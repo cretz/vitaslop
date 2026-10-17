@@ -32,6 +32,18 @@ fn transpile_peak() {
         game.modules.iter().map(|m| vitaslop_loader::load(&m.elf).expect("load module")).collect();
     let linked = link(modules).expect("link");
     let program = linked.shared_program();
+    // `VITASLOP_DUMP_WASM=<file>`: emit as the browser's SMP bundle does (vitaslop-web lib.rs
+    // `transpile`: fuel counter, shared host memory, SMP, no exports, dirty marks) and write
+    // the module out, so the code V8 runs can be read beside its ARM.
+    let dump = std::env::var("VITASLOP_DUMP_WASM").ok();
+    if dump.is_some() {
+        vitaslop_transpiler::set_fuel_interval(5_000_000);
+        vitaslop_transpiler::set_shared_host_memory(true);
+        vitaslop_transpiler::set_smp(true);
+        vitaslop_transpiler::set_function_exports(false);
+        vitaslop_transpiler::set_dirty_tracking(true);
+        vitaslop_transpiler::set_wasm_names(true);
+    }
     vitaslop_platform::heap::reset_peak();
     let (live0, _) = vitaslop_platform::heap::live_peak_mb();
     let t = std::time::Instant::now();
@@ -47,4 +59,8 @@ fn transpile_peak() {
         built.artifact.funcs.len(),
         built.stubbed.len(),
     );
+    if let Some(path) = dump {
+        std::fs::write(&path, &built.artifact.wasm).expect("write VITASLOP_DUMP_WASM");
+        eprintln!("transpile_peak: wrote {path}");
+    }
 }

@@ -82,6 +82,14 @@ fn main() {
         // exists yet to read the environment concurrently.
         unsafe { std::env::set_var("VITASLOP_SMP", "1") };
     }
+    // >>> A PLAYBOOK OR TAPE RUN PACES AUDIO ON THE GUEST CLOCK unless told otherwise. Wall-paced
+    // audio is a wall-clock input: it makes two runs of one playbook differ, and a headless clock
+    // races the wall so a movie's audio never drains and the movie never ends.
+    let drives = args.iter().any(|a| a == "--playbook" || a == "--tape");
+    if drives && args.iter().any(|a| a == "--headless") && std::env::var_os("VITASLOP_AUDIO_WALL").is_none() {
+        // SAFETY: as above - still before any thread exists.
+        unsafe { std::env::set_var("VITASLOP_AUDIO_WALL", "0") };
+    }
     // Subcommands. With no arguments the native shell opens (library, settings, play);
     // `--game <dir>` is the direct window the rigs drive; `--cube` the built-in demo.
     //
@@ -150,7 +158,8 @@ fn main() {
             println!("vitaslop import <pkg|zip|folder> add a title to the library ({})", library::library_dir().display());
             println!("vitaslop list                    list the library");
             println!("vitaslop serve [--port N]        host the web front end from this binary");
-            println!("vitaslop --game <dir> [--recipe <file>] [--headless <shot-dir>] [--save-dir <dir>]");
+            println!("vitaslop --game <dir> [--recipe <file>] [--headless <shot-dir>] [--save-dir <dir>] [--addons <dir>] [--repatch <dir>]");
+            println!("vitaslop --game <dir> --headless <out> (--playbook <file.lua> | --tape <file>) [--discover]");
             println!("vitaslop --cube                  the built-in demo");
             return;
         }
@@ -195,15 +204,53 @@ fn main() {
             .position(|a| a == "--save-dir")
             .and_then(|i| args.get(i + 1))
             .map(std::path::PathBuf::from);
+        // `--addons <root>`: install the add-ons under it - one decrypted add-on per
+        // subdirectory, as an add-on import writes them. Off unless asked for, like saves.
+        let addons = args
+            .iter()
+            .position(|a| a == "--addons")
+            .and_then(|i| args.get(i + 1))
+            .map(std::path::PathBuf::from);
+        // `--repatch <path>`: lay a rePatch overlay over the title - an installed one (a directory
+        // with `repatch.json`, as the shell keeps them), or a folder or `.zip` as a player has it
+        // (`rePatch/<title id>/...`), which is copied in beside the game first.
+        let repatch = match args.iter().position(|a| a == "--repatch").and_then(|i| args.get(i + 1)) {
+            Some(p) => match repatch_arg(std::path::Path::new(p), std::path::Path::new(&dir)) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    eprintln!("--repatch {p}: {e}");
+                    std::process::exit(2);
+                }
+            },
+            None => None,
+        };
+        // `--playbook <file.lua>` plays the title by a playbook; `--tape <file>` replays a tape a
+        // playbook run recorded; `--discover` adds the call/string-argument table cues are
+        // found from. Headless only. See `vitaslop-playbook`.
+        let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+        let play = match (flag("--playbook"), flag("--tape")) {
+            (Some(_), Some(_)) => {
+                eprintln!("--playbook and --tape are two ways to drive one run - pass one");
+                std::process::exit(2);
+            }
+            (Some(p), None) => Some(retail::Play::Playbook(p.into())),
+            (None, Some(t)) => Some(retail::Play::Tape(t.into())),
+            (None, None) => None,
+        };
+        let discover = args.iter().any(|a| a == "--discover");
+        if (play.is_some() || discover) && !args.iter().any(|a| a == "--headless") {
+            eprintln!("--playbook, --tape and --discover run under --headless <shot-dir>");
+            std::process::exit(2);
+        }
         let result = match args.iter().position(|a| a == "--headless") {
             Some(h) => match args.get(h + 1) {
-                Some(shot) => retail::headless_check(dir.into(), shot.into(), recipe, save_dir),
+                Some(shot) => retail::headless_check(dir.into(), shot.into(), recipe, save_dir, addons, repatch, play, discover),
                 None => {
                     eprintln!("--headless requires a shot directory");
                     std::process::exit(2);
                 }
             },
-            None => retail::run(dir.into(), recipe, save_dir),
+            None => retail::run(dir.into(), recipe, save_dir, addons, repatch),
         };
         if let Err(e) = result {
             eprintln!("error: {e}");
@@ -425,4 +472,36 @@ fn describe_ctrl(f: CtrlFrame) -> String {
         parts.push(format!("R({},{})", f.rx, f.ry));
     }
     if parts.is_empty() { "-".to_string() } else { parts.join(" ") }
+}
+
+/// `--repatch <path>`: the installed overlay directory to use. A path that is not one already is
+/// imported to `<game dir>.repatch` (beside the game, never inside it) for the title the game's
+/// dump names.
+fn repatch_arg(path: &std::path::Path, game: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if path.join(vitaslop_runtime::ingest::repatch::RECORD).is_file() {
+        return Ok(path.to_path_buf());
+    }
+    let manifest = std::fs::read_to_string(game.join(vitaslop_runtime::ingest::pipeline::DUMP_MANIFEST))
+        .map_err(|e| format!("the game at {} has no dump manifest to name its title ({e})", game.display()))?;
+    let id = manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("content_id="))
+        .and_then(vitaslop_runtime::ingest::addcont::title_id)
+        .ok_or("the game's dump manifest names no title id")?
+        .to_string();
+    let mut dest = game.as_os_str().to_owned();
+    dest.push(".repatch");
+    let dest = std::path::PathBuf::from(dest);
+    let src = library::DirSource::open(path).map_err(|e| e.to_string())?;
+    let source = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(library::ImportProgress::default()));
+    let m = library::import_repatch_into(&id, src, &source, &dest, &progress)?;
+    println!(
+        "rePatch: {} file(s), {:.1} MB copied to {} (code: {})",
+        m.files,
+        m.bytes as f64 / 1e6,
+        dest.display(),
+        if m.code.is_empty() { "none".to_string() } else { m.code.join(", ") }
+    );
+    Ok(dest)
 }

@@ -32,7 +32,7 @@ pub mod wgsl;
 
 pub use container::{Parameter, ParamCategory, ParamType, Program, ProgramKind};
 pub use ir::{Instr, Op, Shader};
-pub use link::{LinkOptions, link_programs_with, link_programs, link_programs_memo, prelink, prelink_stats, guest_attr_spec, PatcherPair, LinkError, LinkedProgram, MAX_VARYINGS};
+pub use link::{LinkOptions, link_programs_with, link_programs, link_programs_memo, memo_miss_reason, prelink, prelink_stats, guest_attr_spec, PatcherPair, LinkError, LinkedProgram, MAX_VARYINGS};
 pub use module::{
     BindingPlan, ColorOutput, ColorPrecision, FragmentModule, MemWindow, VertexAttribute,
     VertexBindingPlan, VertexModule,

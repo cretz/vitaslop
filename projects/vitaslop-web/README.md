@@ -24,7 +24,8 @@ is where it is either true or not.
 ## The front end
 
 - `web/index.html` + `app.js` is the product: a hash-routed library (`#/`), title page
-  (`#/title/<id>`), settings (`#/settings[/<id>]`), import (`#/import`) and the player.
+  (`#/title/<id>`), settings (`#/settings[/<id>]`), import (`#/import`), a title's add-on
+  import (`#/import/<id>`) and the player.
   Plain ES modules and CSS, no framework, no bundler; GitHub Pages is the target and
   `coi.js` (a service worker) supplies the cross-origin-isolation headers a static host
   cannot.
@@ -37,6 +38,10 @@ is where it is either true or not.
 - Importing streams: the page hands the picked `File`s to `import-worker.js`, which
   reads ranges with `FileReaderSync` and writes OPFS sync handles while the Rust
   streaming ingest peels zip/pkg/PFS/SELF. Nothing is ever resident.
+- Add-ons (param.sfo `CATEGORY` `ac`) come in the same containers and go through the same
+  import, started from their title's page (`#/import/<id>`); the title page lists them with
+  a Remove each. The library import refuses one - filed under its title's id it would
+  replace the game - and points at the title's page instead.
 - The old debug pages (the cube, conformance) live under `web/debug/`
   and the e2e rigs drive them there.
 - The title page draws before anything slow resolves: its size is remembered in the
@@ -61,6 +66,13 @@ All of it is in the origin's private file system; nothing leaves the browser.
   before transpiling, and every prepare sweeps other titles' entries from older builds.
   Only the first play after a build pays the transpile. `VITASLOP_TRANSPILE_CACHE=0`
   bypasses it. Lives under the title so removing the game removes it.
+- `addons/<titleId>/<dir>/` - one installed add-on, stored like a title (flat, `%2F`), with
+  its record `addon.json` and the same completion marker. `<dir>` is the label ending its
+  content id - the name the title lists `addcont0:` for and passes to `sceAppUtilDrmOpen`.
+  `openTitleSync` opens every complete one beside the title's own files as
+  `addons/<dir>/...`, so the storage worker, its page ring and every SMP guest worker carry
+  them with no change; the engine serves each one's `files/` at `addcont0:/<dir>/`.
+  Removing the title removes its add-ons.
 - `library/<titleId>/` - the library record: `meta.json` (title, sizes, dates) and the
   `icon0.png` / `pic0.png` taken from the package at import.
 - `gamedata/<titleId>/` (default profile) and `gamedata-profiles/<profile>/<titleId>/` -

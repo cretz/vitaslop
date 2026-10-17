@@ -10,8 +10,10 @@
 //!             the emulator invalidates every stored module - the browser keys the same way on its
 //!             bundle's build stamp (vitaslop-web's README);
 //!   settings  the transpiler's resolved emit settings (`codegen_fingerprint`), fuel included;
-//!   exec      which executable of the game this is (a title can chain-load another).
-//! The game itself is immutable after extraction, so it needs no hash. Storing an entry deletes
+//!   exec      which executable of the game this is (a title can chain-load another), plus the
+//!             code hash of a rePatch overlay replacing its executables when one is on.
+//! The game itself is immutable after extraction, so it needs no hash; an overlay's code is named
+//! by its hash, so turning one off finds the plain module again. Storing an entry deletes
 //! every entry from another build and every other entry of the same executable, so an
 //! invalidated module never lingers on disk.
 //!

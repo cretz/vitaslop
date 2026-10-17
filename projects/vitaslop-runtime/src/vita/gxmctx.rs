@@ -679,6 +679,27 @@ impl<'a> Block<'a> {
         Block::Copied(bytes)
     }
 
+    /// This snapshot with `words` laid over it from `offset` on - the guest's block is NOT
+    /// written. For a draw that binds something for itself alone (`sceGxmDrawPrecomputed`), so
+    /// every reader of the snapshot sees it without the context changing. A lent block becomes
+    /// a copy: one 652-byte memcpy, where writing guest memory and restoring it was a crossing
+    /// per word in the browser.
+    pub fn overlaid(self, offset: u32, words: &[u32]) -> Block<'a> {
+        let mut bytes = match self {
+            Block::Lent(b) => {
+                let mut c = [0u8; BYTES as usize];
+                c.copy_from_slice(&b[..BYTES as usize]);
+                c
+            }
+            Block::Copied(c) => c,
+        };
+        for (i, w) in words.iter().enumerate() {
+            let at = offset as usize + i * 4;
+            bytes[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        Block::Copied(bytes)
+    }
+
     /// The block's bytes, however they were obtained.
     fn bytes(&self) -> &[u8] {
         match self {
@@ -1083,6 +1104,9 @@ mod tests {
             fn write(&mut self, off: usize, bytes: &[u8]) {
                 self.0.write(off, bytes)
             }
+            fn stamp_dirty_pages(&self, off: usize, len: usize) {
+                self.0.stamp_dirty_pages(off, len)
+            }
             // The whole point: `None`, exactly as the browser's `SharedView` does.
         }
 
@@ -1174,6 +1198,9 @@ mod tests {
             }
             fn write(&mut self, off: usize, bytes: &[u8]) {
                 self.0.write(off, bytes)
+            }
+            fn stamp_dirty_pages(&self, off: usize, len: usize) {
+                self.0.stamp_dirty_pages(off, len)
             }
         }
 
@@ -1323,6 +1350,32 @@ pub fn texture_bindings_in_span(span: &[u8], out: &mut Vec<(u32, TexBinding)>) {
 #[cfg(test)]
 mod span_tests {
     use super::*;
+
+    /// An overlay changes exactly the words it names, in BOTH forms, and never the guest's
+    /// block: a precomputed draw's bindings are for that draw only, and a lent snapshot is the
+    /// guest's own memory.
+    #[test]
+    fn an_overlay_patches_its_words_and_not_the_guest_block() {
+        let mut guest = [0u8; BYTES as usize];
+        for (i, b) in guest.iter_mut().enumerate() {
+            *b = (i * 7 + 3) as u8;
+        }
+        let before = guest;
+        let streams = [0x1111_0000, 0x2222_0000, 0x3333_0000, 0x4444_0000];
+        for lent in [true, false] {
+            let blk = if lent { Block::Lent(&guest) } else { Block::Copied(guest) };
+            let blk = blk.overlaid(off::VERTEX_PROGRAM, &[0xabcd_ef01]).overlaid(off::STREAMS, &streams);
+            assert_eq!(blk.word(off::VERTEX_PROGRAM), 0xabcd_ef01, "lent={lent}");
+            assert_eq!(blk.streams()[..4], streams, "lent={lent}");
+            let mut expect = before;
+            expect[off::VERTEX_PROGRAM as usize..][..4].copy_from_slice(&0xabcd_ef01u32.to_le_bytes());
+            for (i, s) in streams.iter().enumerate() {
+                expect[off::STREAMS as usize + i * 4..][..4].copy_from_slice(&s.to_le_bytes());
+            }
+            assert_eq!(blk.span(0, BYTES as usize), &expect[..], "every other byte is the block's (lent={lent})");
+        }
+        assert_eq!(guest, before, "the guest's block is never written");
+    }
 
     /// The deferred parse and the block's own agree on every slot, bound or not.
     #[test]

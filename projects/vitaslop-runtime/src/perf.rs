@@ -269,10 +269,28 @@ pub enum Phase {
     /// Waiting for the snapshot-cache lock (`snaps!`) when another thread holds it - the resolver
     /// worker holds it for its whole flip-time read. Entries = contended acquisitions.
     SnapsLockWait,
+    /// The visibility accumulate and the stale-fragment-uniform check, before the reflect.
+    /// With [`Self::DrawGeometry`] and [`Self::DrawTexAll`] these make the top-level steps of
+    /// `record_draw` add up to [`Self::DrawTotal`]: MEASURED (a football title's match,
+    /// native) the named phases left ~30% of the draw total in no phase at all.
+    DrawPrelude,
+    /// The WHOLE geometry step - instanced read, indices and vertices, hit or miss - where
+    /// the per-path phases above count only the paths that do work.
+    DrawGeometry,
+    /// The WHOLE texture step (deferred or decoded now), where [`Self::DrawTextureBind`]
+    /// counts only the binding decode.
+    DrawTexAll,
+    /// HIT-ONLY counters for `get_or_read_window`'s three outcomes: proven by the dirty map,
+    /// proven by an in-place compare, and a MISS (a fresh read + insert; bytes counted). A
+    /// uniform window at a new address every draw - a ring buffer - is all misses, and then
+    /// the memo is pure cost.
+    WindowHitStamp,
+    WindowHitCompare,
+    WindowMiss,
 }
 
 impl Phase {
-    const COUNT: usize = 52;
+    const COUNT: usize = 58;
 
     pub(crate) fn index(self) -> usize {
         match self {
@@ -328,6 +346,12 @@ impl Phase {
             Phase::DrawGxpSaImage => 49,
             Phase::DrawGxpWindows => 50,
             Phase::SnapsLockWait => 51,
+            Phase::DrawPrelude => 52,
+            Phase::DrawGeometry => 53,
+            Phase::DrawTexAll => 54,
+            Phase::WindowHitStamp => 55,
+            Phase::WindowHitCompare => 56,
+            Phase::WindowMiss => 57,
         }
     }
 
@@ -336,8 +360,11 @@ impl Phase {
         [
             Phase::DrawTotal,
             Phase::DrawBlockRead,
+            Phase::DrawPrelude,
             Phase::DrawReflect,
             Phase::DrawRenderState,
+            Phase::DrawGeometry,
+            Phase::DrawTexAll,
             Phase::DrawIndices,
             Phase::DrawIndexScan,
             Phase::DrawVertices,
@@ -364,6 +391,9 @@ impl Phase {
             Phase::DrawGxpBlobs,
             Phase::DrawGxpSaImage,
             Phase::DrawGxpWindows,
+            Phase::WindowHitStamp,
+            Phase::WindowHitCompare,
+            Phase::WindowMiss,
             Phase::SnapsLockWait,
             Phase::DrawRecord,
             Phase::BuildClassify,
@@ -424,6 +454,12 @@ impl Phase {
             Phase::DrawGxpSaImage => "draw:   ...of which the SA images",
             Phase::DrawGxpWindows => "draw:   ...of which the memory-window snapshots",
             Phase::SnapsLockWait => "snapshot-cache lock WAIT (any caller; entries = contended takes)",
+            Phase::DrawPrelude => "draw: visibility + stale-uniform check",
+            Phase::DrawGeometry => "draw: the WHOLE geometry step (any path)",
+            Phase::DrawTexAll => "draw: the WHOLE texture step (any path)",
+            Phase::WindowHitStamp => "draw:     ...window proven by the DIRTY MAP",
+            Phase::WindowHitCompare => "draw:     ...window proven by an IN-PLACE compare",
+            Phase::WindowMiss => "draw:     ...window MISS (read + memo insert)",
             Phase::DrawRecord => "draw: build record + push scene",
             Phase::DrawUniforms => "draw: uniforms + material",
             Phase::BuildClassify => "build: classify the draw (interpret + layout) ONLY",
@@ -877,11 +913,12 @@ pub fn read(phase: Phase) -> (u64, u64, u64) {
 pub fn table() -> Vec<String> {
     let mut out = Vec::new();
     for p in Phase::all() {
-        let (ns, hits, _) = read(p);
+        let (ns, hits, bytes) = read(p);
         if ns == 0 && hits == 0 {
             continue;
         }
-        out.push(format!("{} {:.2} ms over {hits} entries", p.label(), ns as f64 / 1.0e6));
+        let kb = if bytes > 0 { format!(", {} KB", bytes / 1024) } else { String::new() };
+        out.push(format!("{} {:.2} ms over {hits} entries{kb}", p.label(), ns as f64 / 1.0e6));
     }
     out
 }

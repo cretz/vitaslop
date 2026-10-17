@@ -386,14 +386,17 @@ fn main() {
         if let Some(dir) = std::env::var_os("VITASLOP_CAPSULE_TEX_DIR") {
             let path = std::path::Path::new(&dir).join(format!("tex{}-{:08x}.png", t.unit, t.data_addr));
             let _ = std::fs::create_dir_all(&dir);
-            if let Err(e) = std::fs::write(&path, vitaslop_runtime::render::rgba_to_png(dw, dh, &rgba)) {
+            // A cube map decodes to its six faces stacked; write them all, one under another, so
+            // the dump shows every face rather than the first.
+            let rows = if dw == 0 { dh } else { (rgba.len() / (dw as usize * 4)) as u32 };
+            if let Err(e) = std::fs::write(&path, vitaslop_runtime::render::rgba_to_png(dw, rows, &rgba)) {
                 eprintln!("  cannot write {}: {e}", path.display());
             } else {
                 eprintln!("  wrote {}", path.display());
             }
         }
         eprintln!(
-            "  texture unit {} format {:#06x} swizzle {:#x} gamma {:#x} filter min {} mag {} mip {} type {} {}x{} stride {} mips {} faces {} at {:#010x}: {} bytes, mean {:.1}/255, {:.1}% non-zero; DECODED {}x{} mean {dmean:.1}/255",
+            "  texture unit {} format {:#06x} swizzle {:#x} gamma {:#x} filter min {} mag {} mip {} type {} {}x{} stride {} mips {} faces {} face_bytes {} at {:#010x}: {} bytes, mean {:.1}/255, {:.1}% non-zero; DECODED {}x{} mean {dmean:.1}/255",
             t.unit,
             t.base_format,
             t.swizzle,
@@ -407,6 +410,7 @@ fn main() {
             t.stride,
             t.levels,
             t.faces,
+            t.face_bytes,
             t.data_addr,
             t.pixels.len(),
             mean,

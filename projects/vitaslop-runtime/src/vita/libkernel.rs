@@ -1010,3 +1010,16 @@ pub(super) fn read_cstr_bytes(ctx: &GuestCtx, addr: u32) -> Vec<u8> {
     let n = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     bytes[..n].to_vec()
 }
+
+/// void __stack_chk_fail(void)
+/// A stack-protector epilogue found its frame's canary overwritten: the guest smashed its own
+/// stack (or we corrupted it). The device terminates the process, so the run stops here, naming
+/// the function whose check failed - `lr` is the return address inside it.
+pub(super) fn stack_chk_fail(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    SvcOutcome::Fatal(format!(
+        "__stack_chk_fail: thread {:#x} found its stack canary overwritten in the function \
+         returning to {:#010x} - a buffer overran a stack frame there",
+        st.current_thread(),
+        ctx.regs[14],
+    ))
+}

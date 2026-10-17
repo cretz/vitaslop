@@ -76,6 +76,10 @@ pub struct AudioState {
     /// array of voices and this is a LOOKUP - see `ngs::rack_get_voice_handle` for what
     /// allocating a fresh handle per query did to the mixer.
     pub(crate) ngs_voice_handles: Vec<((u32, u32), u32)>,
+    /// Racks whose `sceNgsRackInit` description names a BUSS definition. Every voice of one is a
+    /// buss - it mixes what is routed into it and has no source of its own - which is known
+    /// from the rack before any routing exists. See `ngs::voice_play`.
+    pub(crate) ngs_buss_racks: Vec<u32>,
     /// Every `sceNgsVoice*` call a title made, per voice handle, as `(nid, first four args)` -
     /// capped per voice and in voices. What a silent play is explained BY: see
     /// `ngs::report_silent_play`.
@@ -88,6 +92,12 @@ pub struct AudioState {
     /// `sceNgsPatchCreateRouting`. A routing volume names a PATCH; the mixer works in
     /// voices, and this is the only link between the two.
     pub(crate) ngs_patch_voice: Vec<(u32, u32)>,
+    /// The DESTINATION voice of each patch, as `(patch, voice)` - the other half of
+    /// `ngs_patch_voice`, which `sceNgsPatchGetInfo` needs for the patch's input channels.
+    pub(crate) ngs_patch_dest: Vec<(u32, u32)>,
+    /// Channels per voice of each rack, as `(rack, channels)`, from its `sceNgsRackInit`
+    /// description. A voice's channel count is its rack's - see `ngs::patch_get_info`.
+    pub(crate) ngs_rack_channels: Vec<(u32, u32)>,
     /// The ONE port the host-side NGS mix is written into - see the election in
     /// [`out_output`]. `None` until a port has been elected.
     ///
@@ -438,6 +448,7 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             mix.clear();
             mix.resize(samples, 0);
             st.audio_state.at9.mix_grain(ctx, &mut mix, grain, channels, format.sample_rate);
+            super::ngs::report_failed_voices(st);
             // >>> CLAMPED ONCE, INTO BOTH FORMS. The guest's buffer has to receive the mix
             // (the title may read its own buffer back, and on the device the DSP would have
             // written it), but the SUBMISSION does not have to come from there. It used to:
@@ -573,6 +584,9 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
                 // A port that fell behind (the ring underran, or the thread was not scheduled)
                 // restarts from now - the device does not replay silence it already played.
                 let start = p.play_end_wall_us.max(now_w);
+                if p.play_end_wall_us != 0 && p.play_end_wall_us < now_w {
+                    note_wall_fell_behind(now_w - p.play_end_wall_us);
+                }
                 p.play_end_wall_us = start + paced_us;
                 p.play_end_wall_us - now_w
             }
@@ -616,10 +630,37 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     }
 }
 
+/// A wall-paced port whose thread arrived AFTER its queue ran dry: the gap is play time the
+/// schedule restarts past and the listener hears as an underrun. Totalled and reported every
+/// 64 occurrences, so a run says how often its audio thread is late and by how much.
+fn note_wall_fell_behind(gap_us: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static N: AtomicU64 = AtomicU64::new(0);
+    static LOST: AtomicU64 = AtomicU64::new(0);
+    static WORST: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Relaxed) + 1;
+    let lost = LOST.fetch_add(gap_us, Relaxed) + gap_us;
+    let worst = WORST.fetch_max(gap_us, Relaxed).max(gap_us);
+    if n.is_multiple_of(64) {
+        tracing::info!(
+            target: "vitaslop::status",
+            "audio out: the port's thread arrived after its queue ran dry {n} time(s), {:.1} ms of \
+             play time lost in all (worst {:.1} ms) - a late audio thread, not a slow mix",
+            lost as f64 / 1000.0,
+            worst as f64 / 1000.0
+        );
+    }
+}
+
 /// Grains a port may queue ahead of the wall clock before `sceAudioOutOutput` parks - see
-/// [`out_output`]. Two: the one playing and one queued behind it, what a double-buffered output
-/// holds.
-const AUDIO_WALL_LEAD: u64 = 2;
+/// [`out_output`].
+///
+/// Four, not the two a double-buffered output holds: the port's thread is a guest thread, and on
+/// a browser it is not always scheduled the moment its queue would drain. MEASURED (desktop
+/// browser, SMP, 6000 frames each): a beach title's port arrived after its queue ran dry 1344
+/// times at two (6.7 s of underrun in 297 s) and 64 at four (0.13 s); a football and a baseball
+/// title were unchanged (0.07 -> 0.12 s, 0 -> 0). It costs two grains of output latency.
+const AUDIO_WALL_LEAD: u64 = 4;
 
 /// The host wall clock in microseconds when `sceAudioOutOutput` should pace on it (see
 /// [`out_output`]), else `None`: no clock installed, `VITASLOP_AUDIO_WALL=0`, or the run is

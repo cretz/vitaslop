@@ -1,0 +1,40 @@
+[package]
+name = "vitaslop-playbook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Playbooks: Lua scripts that play a title by reacting to it (calls it makes, values in its
+# memory) instead of pressing at frame numbers, the tapes their runs record, and the engine
+# that runs both. The per-title playbooks live here too (playbooks/<TITLE_ID>/*.lua).
+#
+# The engine reaches the running game only through the runtime's host-call observer, so this
+# crate depends on the runtime and never the reverse - the desktop headless runner and the
+# browser both host it.
+
+[lints]
+workspace = true
+
+[features]
+# The native Lua backend (PUC-Rio Lua 5.4 compiled from source by mlua). The browser build
+# turns it off and brings its own backend (wasmoon, in vitaslop-web).
+default = ["native"]
+native = ["dep:mlua"]
+
+[dependencies]
+vitaslop-runtime = { path = "../vitaslop-runtime" }
+serde_json = "1"
+
+# Native only, even with the feature on: C Lua does not build for wasm32-unknown-unknown, and a
+# one-invocation `cargo clippy --target wasm32 -p ... -p vitaslop-playbook` turns default
+# features on. `send`: the VM is resumed inside the input-frame tick, on whichever guest thread
+# reads the pad, so it lives behind a lock and must be Send.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mlua = { version = "0.11", features = ["lua54", "vendored", "send"], optional = true }
+
+[[bin]]
+name = "playbook"
+path = "src/bin/playbook.rs"
+required-features = ["native"]

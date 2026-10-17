@@ -59,7 +59,12 @@ function summarize(rgba, w, h) {
 async function png(rgba, w, h) {
   const c = new OffscreenCanvas(w, h);
   const ctx = c.getContext("2d");
-  ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength), w, h), 0, 0);
+  // The display scans out opaque, but the target still carries the title's ALPHA, and a 2D
+  // canvas premultiplies on the way in: a pitch written with alpha 0 came back black in the
+  // PNG while the summary's means (taken from the raw bytes) matched the native replay.
+  const opaque = new Uint8ClampedArray(rgba);
+  for (let i = 3; i < opaque.length; i += 4) opaque[i] = 255;
+  ctx.putImageData(new ImageData(opaque, w, h), 0, 0);
   const blob = await c.convertToBlob({ type: "image/png" });
   const bytes = new Uint8Array(await blob.arrayBuffer());
   let s = "";

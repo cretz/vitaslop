@@ -42,12 +42,13 @@ pub mod threadmgr;
 pub mod touch;
 pub mod audiodec;
 pub mod avcdec;
+pub mod avplayer;
 pub mod video;
 pub mod voice;
 
 use crate::host::{GuestCtx, VitaState};
 use crate::nid::{
-    audio as audio_nid, audiodec as ad_nid, ctrl as ctrl_nid, dbg as dbg_nid, display as display_nid,
+    audio as audio_nid, audiodec as ad_nid, avplayer as avp_nid, ctrl as ctrl_nid, dbg as dbg_nid, display as display_nid,
     fiber as fiber_nid, fios2 as fios2_nid, gxm as gxm_nid,
     audioin as audioin_nid, http as http_nid, iofilemgr as io_nid, libkernel as lk_nid,
     livearea as livearea_nid, lwsync as lw_nid, pgf as pgf_nid, xml as xml_nid,
@@ -216,6 +217,9 @@ pub fn smp_forwarded(func_nid: u32, storage_on_workers: bool) -> bool {
         "sceAvcdec",
         "sceVideodec",
         "sceMp4",
+        // The whole-movie player decodes through the same WebCodecs decoder the run worker
+        // owns. MEASURED: an SMP guest worker's GetVideoData reached it and panicked.
+        "sceAvPlayer",
         "sceAudiodec",
         // NOT sceAudioOut: its sink writes a SharedArrayBuffer ring through per-WORKER views
         // (`vitaslop_web::audio::install_ring`), so it runs on whichever worker calls it.
@@ -328,6 +332,15 @@ fn no_inline_delay() -> bool {
 // `dispatch_arm_is_cont_only`. See that script for why the set is generated, not written.
 include!(concat!(env!("OUT_DIR"), "/dispatch_cont_only.rs"));
 
+/// Host functions that never return to their guest caller: the handler always ends the run
+/// (or the calling thread for good), so the instructions after a call to one are never reached
+/// from it. The transpiler stops discovery there, as after a noreturn `svc`, instead of walking
+/// the padding and literals behind the call as code. Kept to calls whose handler can ONLY stop:
+/// `__stack_chk_fail` ([`libkernel::stack_chk_fail`]) is a fatal check by definition.
+pub fn never_returns(func_nid: u32) -> bool {
+    matches!(func_nid, lk_nid::STACK_CHK_FAIL)
+}
+
 /// Whether `func_nid`'s handler can only ever CONTINUE, so the transpiler may route the
 /// call through the non-suspending trap ([`vitaslop_transpiler::abi::IMPORT_FAST_NAME`]).
 ///
@@ -427,6 +440,28 @@ pub const FAST_EXCLUDED: &[(u32, &str)] = &[
     (sv_nid::MP4_STOP_FILE_STREAMING_C05DFF01, "can call the title's file functions (CallGuest)"),
     (sv_nid::MP4_GET_NEXT_UNIT_8BE0E3D3, "can call the title's file functions (CallGuest)"),
     (sv_nid::MP4_GET_STREAM_INFO, "can call the title's file functions (CallGuest)"),
+    // SceAvPlayer calls back into the title from EVERY arm: the event callback (a STOP at the
+    // movie's natural end is delivered from whichever call notices it), the frame allocator,
+    // and the title's own file functions for the source (`avplayer::deliver` and friends).
+    // MEASURED: a title's intro movie aborted the browser run at its first call after
+    // AddSource - "routed through the NON-SUSPENDING trap but its handler returned CallGuest".
+    (avp_nid::INIT, "calls the title's allocator / event callback (CallGuest)"),
+    (avp_nid::ADD_SOURCE, "calls the title's file functions (CallGuest)"),
+    (avp_nid::START, "delivers events to the title's callback (CallGuest)"),
+    (avp_nid::STOP, "delivers events to the title's callback (CallGuest)"),
+    (avp_nid::PAUSE, "delivers events to the title's callback (CallGuest)"),
+    (avp_nid::RESUME, "delivers events to the title's callback (CallGuest)"),
+    (avp_nid::CLOSE, "calls the title's free / file close (CallGuest)"),
+    (avp_nid::IS_ACTIVE, "can deliver the natural-end STOP event (CallGuest)"),
+    (avp_nid::CURRENT_TIME, "can deliver the natural-end STOP event (CallGuest)"),
+    (avp_nid::JUMP_TO_TIME, "reads through the title's file functions (CallGuest)"),
+    (avp_nid::SET_LOOPING, "can deliver the natural-end STOP event (CallGuest)"),
+    (avp_nid::STREAM_COUNT, "can deliver the natural-end STOP event (CallGuest)"),
+    (avp_nid::GET_STREAM_INFO, "can deliver the natural-end STOP event (CallGuest)"),
+    (avp_nid::ENABLE_STREAM, "can deliver the natural-end STOP event (CallGuest)"),
+    (avp_nid::DISABLE_STREAM, "can deliver the natural-end STOP event (CallGuest)"),
+    (avp_nid::GET_VIDEO_DATA, "allocates frames / reads through the title (CallGuest)"),
+    (avp_nid::GET_AUDIO_DATA, "reads through the title's file functions (CallGuest)"),
 ];
 
 /// The hand-written fast list as it stood before the set was derived, and still the DEFAULT
@@ -529,11 +564,8 @@ fn stub_inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     let is_stub = matches!(
         func_nid,
         n::SYSTEM_SET_FLAGS
-            | n::SYSTEM_RELEASE
-            | n::RACK_RELEASE
             | n::VOICE_BYPASS_MODULE
             | n::VOICE_GET_PARAMS_OUT_OF_RANGE
-            | n::PATCH_GET_INFO
             | n::PATCH_REMOVE_ROUTING
             | n::SYSTEM_LOCK
             | n::SYSTEM_UNLOCK
@@ -1300,11 +1332,17 @@ fn dispatch_inner(
             "call"
         );
     }
+    crate::host::VitaState::watch_guest_range_changes(
+        ctx,
+        st.cur_frame(),
+        Some((st.current_thread() as u32, ctx.regs[14], func_nid)),
+    );
     // Every `sceNgsVoice*` call, against the voice it names - see `ngs::report_silent_play`.
     // The library test first (a compare, where the name lookup is a large match and a string
     // test on EVERY host call), and nothing once the silent-play reports are spent.
     if library_nid == crate::nid::lib::SCE_NGS
-        && st.audio_state.ngs_silent_reported < 8
+        && (st.audio_state.ngs_silent_reported < 8
+            || tracing::enabled!(target: "vitaslop::ngs", tracing::Level::DEBUG))
         && crate::nid::name(func_nid).starts_with("sceNgsVoice")
     {
         ngs::trace_voice_call(st, func_nid, [ctx.arg(0), ctx.arg(1), ctx.arg(2), ctx.arg(3)]);
@@ -1350,6 +1388,15 @@ fn dispatch_inner(
         sync_nid::DELETE_MUTEX => cont!(sync::delete_object(ctx, st)),
         sync_nid::CLOSE_MUTEX => cont!(sync::delete_object(ctx, st)),
         sync_nid::CREATE_SEMA | sync_nid::CREATE_SEMA_16XX => cont!(sync::create_sema(ctx, st)),
+        sync_nid::CREATE_RW_LOCK => cont!(sync::create_rwlock(ctx, st)),
+        sync_nid::DELETE_RW_LOCK => cont!(sync::delete_rwlock(ctx, st)),
+        // The two locks can park; everything else answers at once.
+        sync_nid::LOCK_READ_RW_LOCK => sync::lock_rwlock(ctx, st, false),
+        sync_nid::LOCK_WRITE_RW_LOCK => sync::lock_rwlock(ctx, st, true),
+        sync_nid::TRY_LOCK_READ_RW_LOCK => cont!(sync::try_lock_rwlock(ctx, st, false)),
+        sync_nid::TRY_LOCK_WRITE_RW_LOCK => cont!(sync::try_lock_rwlock(ctx, st, true)),
+        sync_nid::UNLOCK_READ_RW_LOCK => cont!(sync::unlock_rwlock(ctx, st, false)),
+        sync_nid::UNLOCK_WRITE_RW_LOCK => cont!(sync::unlock_rwlock(ctx, st, true)),
         // `sceKernelWaitSemaCB` is the same wait, at which the kernel also delivers
         // the calling thread's pending async callbacks. Callback delivery here is
         // driven by the scheduler (the display queue runs its callbacks on its own
@@ -1404,7 +1451,10 @@ fn dispatch_inner(
         lk_nid::CLIB_VSNPRINTF => cont!(libkernel::clib_vsnprintf(ctx, st)),
         lk_nid::CLIB_VPRINTF => cont!(libkernel::clib_vprintf(ctx, st)),
         // memmove shares memcpy's read-then-write impl (tolerates overlap).
-        lk_nid::CLIB_MEMCPY | lk_nid::CLIB_MEMMOVE => cont!(libkernel::clib_memcpy(ctx, st)),
+        lk_nid::CLIB_MEMCPY | lk_nid::CLIB_MEMMOVE | lk_nid::CLIB_MEMCPY_SAFE => {
+            cont!(libkernel::clib_memcpy(ctx, st))
+        }
+        lk_nid::STACK_CHK_FAIL => libkernel::stack_chk_fail(ctx, st),
         lk_nid::CLIB_MEMSET => cont!(libkernel::clib_memset(ctx, st)),
         lk_nid::CLIB_MEMCMP => cont!(libkernel::clib_memcmp(ctx, st)),
         lk_nid::CLIB_STRNLEN => cont!(libkernel::clib_strnlen(ctx, st)),
@@ -1662,8 +1712,8 @@ fn dispatch_inner(
         // --- gxm: graphics ------------------------------------------------------
         gxm_nid::INITIALIZE | gxm_nid::VSH_INITIALIZE => cont!(gxm::initialize(ctx, st)),
         gxm_nid::FINISH => gxm::finish(ctx, st),
+        gxm_nid::DISPLAY_QUEUE_FINISH => gxm::display_queue_finish(ctx, st),
         gxm_nid::PAD_HEARTBEAT
-        | gxm_nid::DISPLAY_QUEUE_FINISH
         | gxm_nid::PROGRAM_CHECK
         | gxm_nid::DESTROY_CONTEXT
         | gxm_nid::DESTROY_RENDER_TARGET
@@ -2096,7 +2146,9 @@ fn dispatch_inner(
         display_nid::GET_REFRESH_RATE => cont!(display::get_refresh_rate(ctx, st)),
 
         // --- ctrl: input --------------------------------------------------------
-        ctrl_nid::PEEK_BUFFER_POSITIVE => cont!(ctrl::peek_buffer_positive(ctx, st)),
+        ctrl_nid::PEEK_BUFFER_POSITIVE | ctrl_nid::PEEK_BUFFER_POSITIVE2 => {
+            cont!(ctrl::peek_buffer_positive(ctx, st))
+        }
         ctrl_nid::READ_BUFFER_POSITIVE => ctrl::read_buffer_positive(ctx, st),
         ctrl_nid::PEEK_BUFFER_NEGATIVE => cont!(ctrl::peek_buffer_negative(ctx, st)),
         ctrl_nid::READ_BUFFER_NEGATIVE => ctrl::read_buffer_negative(ctx, st),
@@ -2144,18 +2196,20 @@ fn dispatch_inner(
         // callback and the voice-finished one. See `ngs::deliver_player_events`.
         ngs_nid::VOICE_SET_MODULE_CALLBACK => cont!(ngs::voice_set_module_callback(ctx, st)),
         ngs_nid::VOICE_SET_FINISHED_CALLBACK => cont!(ngs::voice_set_finished_callback(ctx, st)),
+        // Releasing a rack (or the whole system) stops its voices - see `ngs::rack_release`.
+        ngs_nid::RACK_RELEASE => cont!(ngs::rack_release(ctx, st)),
+        ngs_nid::SYSTEM_RELEASE => cont!(ngs::system_release(ctx, st)),
         ngs_nid::SYSTEM_SET_FLAGS
-        | ngs_nid::SYSTEM_RELEASE
-        | ngs_nid::RACK_RELEASE
         | ngs_nid::VOICE_BYPASS_MODULE
         | ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE
-        | ngs_nid::PATCH_GET_INFO
         | ngs_nid::PATCH_REMOVE_ROUTING
         // System lock/unlock guard the mix graph; single-thread-of-control here, so
         // there is no contention - both succeed immediately.
         | ngs_nid::SYSTEM_LOCK
         | ngs_nid::SYSTEM_UNLOCK
         | ngs_nid::AT9_GET_SECTION_DETAILS => cont!(ctx.ret(0)),
+        // Sizes the title's volume matrix - see `ngs::patch_get_info`.
+        ngs_nid::PATCH_GET_INFO => cont!(ngs::patch_get_info(ctx, st)),
         ngs_nid::VOICE_PLAY => cont!(ngs::voice_play(ctx, st)),
         // The routing volumes: without these every voice mixes at unity and the sum
         // clips. See `ngs::voice_patch_set_volume`.
@@ -2270,6 +2324,7 @@ fn dispatch_inner(
         }
         sv_nid::RTC_GET_TICK => cont!(services::rtc_get_tick(ctx, st)),
         sv_nid::RTC_GET_TIME64_T => cont!(services::rtc_get_time64_t(ctx, st)),
+        sv_nid::RTC_GET_WIN32_FILE_TIME => cont!(services::rtc_get_win32_file_time(ctx, st)),
         sv_nid::RTC_GET_TIME_T => cont!(services::rtc_get_time_t(ctx, st)),
         sv_nid::RTC_GET_CURRENT_NETWORK_TICK => {
             cont!(services::rtc_get_current_network_tick(ctx, st))
@@ -2357,6 +2412,7 @@ fn dispatch_inner(
         sv_nid::ADHOC_MATCHING_SET_HELLO_OPT => cont!(net::adhoc_matching_set_hello_opt(ctx, st)),
         sv_nid::NET_CTL_GET_NAT_INFO => cont!(services::netctl_get_nat_info(ctx, st)),
         sv_nid::APPUTIL_STORE_BROWSE => cont!(services::apputil_store_browse(ctx, st)),
+        sv_nid::APPUTIL_BGDL_GET_STATUS => cont!(services::apputil_bgdl_get_status(ctx, st)),
         sv_nid::NET_CHECK_DIALOG_GET_PS3_CONNECT_INFO => {
             cont!(services::net_check_dialog_get_ps3_connect_info(ctx, st))
         }
@@ -2394,6 +2450,23 @@ fn dispatch_inner(
         vd_nid::AVCDEC_DECODE_FLUSH => cont!(avcdec::avcdec_decode_flush(ctx, st)),
         // SceAudiodec: a movie's sound. Every one of these is synchronous - the decoding
         // itself happened when the demuxer handed the unit over, so nothing here waits.
+        avp_nid::INIT => cont!(avplayer::init(ctx, st)),
+        avp_nid::ADD_SOURCE => cont!(avplayer::add_source(ctx, st)),
+        avp_nid::START => cont!(avplayer::start(ctx, st)),
+        avp_nid::STOP => cont!(avplayer::stop(ctx, st)),
+        avp_nid::PAUSE => cont!(avplayer::pause(ctx, st)),
+        avp_nid::RESUME => cont!(avplayer::resume(ctx, st)),
+        avp_nid::CLOSE => cont!(avplayer::close(ctx, st)),
+        avp_nid::IS_ACTIVE => cont!(avplayer::is_active(ctx, st)),
+        avp_nid::CURRENT_TIME => cont!(avplayer::current_time(ctx, st)),
+        avp_nid::JUMP_TO_TIME => cont!(avplayer::jump_to_time(ctx, st)),
+        avp_nid::SET_LOOPING => cont!(avplayer::set_looping(ctx, st)),
+        avp_nid::STREAM_COUNT => cont!(avplayer::stream_count(ctx, st)),
+        avp_nid::GET_STREAM_INFO => cont!(avplayer::get_stream_info(ctx, st)),
+        avp_nid::ENABLE_STREAM => cont!(avplayer::enable_stream(ctx, st)),
+        avp_nid::DISABLE_STREAM => cont!(avplayer::disable_stream(ctx, st)),
+        avp_nid::GET_VIDEO_DATA => cont!(avplayer::get_video_data(ctx, st)),
+        avp_nid::GET_AUDIO_DATA => cont!(avplayer::get_audio_data(ctx, st)),
         ad_nid::GET_CONTEXT_SIZE => cont!(audiodec::audiodec_get_context_size(ctx, st)),
         ad_nid::CREATE_DECODER_EXTERNAL => {
             cont!(audiodec::audiodec_create_decoder_external(ctx, st))
@@ -3105,11 +3178,8 @@ mod frame_boundary_tests {
     fn the_inlined_stubs_are_stubs() {
         for nid_fn in [
             ngs_nid::SYSTEM_SET_FLAGS,
-            ngs_nid::SYSTEM_RELEASE,
-            ngs_nid::RACK_RELEASE,
             ngs_nid::VOICE_BYPASS_MODULE,
             ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE,
-            ngs_nid::PATCH_GET_INFO,
             ngs_nid::PATCH_REMOVE_ROUTING,
             ngs_nid::SYSTEM_LOCK,
             ngs_nid::SYSTEM_UNLOCK,

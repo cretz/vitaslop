@@ -82,7 +82,7 @@ export function probe(entries, onProgress = () => {}) {
 /// this?" and once inside the import - paid that twice for nothing.
 /// `onProgress({ stage, file, done, total, rate })`; `stage` is `reading` (identifying,
 /// `total` 0), `preparing`, then the import's own stages.
-export async function run(entries, onProbe = () => {}, onProgress = () => {}) {
+export async function run(entries, onProbe = () => {}, onProgress = () => {}, { addonFor = null } = {}) {
   await requestPersistence();
   return new Promise((resolve, reject) => {
     const w = spawn();
@@ -138,6 +138,33 @@ export async function run(entries, onProbe = () => {}, onProgress = () => {}) {
       w.terminate();
       reject(new Error(panic || e.message || "the import worker died"));
     };
-    w.postMessage({ type: "import", files: entries });
+    w.postMessage({ type: "import", files: entries, addonFor });
+  });
+}
+
+/// Lay a rePatch overlay (a picked folder's entries, or one .zip) over `titleId`, replacing any
+/// it had. Resolves to `{ repatch, ignored }`; `onProgress({ stage, file, done, total })`.
+/// `pickedRoot`: the entries come from a folder pick, whose first path segment is the folder.
+export async function runRepatch(entries, titleId, { pickedRoot = false, source = "" } = {}, onProgress = () => {}) {
+  await requestPersistence();
+  return new Promise((resolve, reject) => {
+    const w = spawn();
+    let panic = null;
+    w.onmessage = (e) => {
+      const d = e.data;
+      if (d.type === "progress") return onProgress(d);
+      if (d.type === "panic") {
+        panic = d.message;
+        return;
+      }
+      w.terminate();
+      if (d.type === "done") resolve(d);
+      else reject(new Error(d.message || panic || "the overlay could not be added"));
+    };
+    w.onerror = (e) => {
+      w.terminate();
+      reject(new Error(panic || e.message || "the import worker died"));
+    };
+    w.postMessage({ type: "repatch", files: entries, titleId, pickedRoot, source });
   });
 }

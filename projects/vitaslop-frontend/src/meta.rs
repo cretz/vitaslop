@@ -35,3 +35,54 @@ impl TitleMeta {
         format!("{} {} {}", self.title, self.title_id, self.content_id).to_lowercase()
     }
 }
+
+/// The record kept per installed add-on, beside its decrypted files. An add-on belongs to
+/// one title and lives and dies with it: listed, added and removed on that title's page.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AddonMeta {
+    /// The title it belongs to.
+    pub title_id: String,
+    /// Its directory name, the label that ends its content id - what the title asks for.
+    pub dir: String,
+    pub content_id: String,
+    /// `param.sfo` `TITLE`, or the directory name when there is none.
+    pub title: String,
+    /// `param.sfo` `VERSION`.
+    pub version: String,
+    /// What it was imported from: `pkg`, `pfs`, `dump`.
+    pub source_kind: String,
+    pub bytes: u64,
+    pub files: u32,
+    /// Unix milliseconds.
+    pub imported_at: u64,
+    /// Turned off on the title page: kept, but the title does not see it.
+    pub disabled: bool,
+}
+
+/// The record kept beside a title's rePatch overlay (see `vitaslop_runtime::ingest::repatch`),
+/// written last. One per title; turned off, replaced or removed without touching the title.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RepatchMeta {
+    /// The title it lays over.
+    pub title_id: String,
+    /// What it was added from: the picked folder's or zip's name.
+    pub source: String,
+    pub bytes: u64,
+    pub files: u32,
+    /// The executables it replaces or adds (`eboot.bin`, `sce_module/...`).
+    pub code: Vec<String>,
+    /// The add-on directories it lays files over.
+    pub addcont: Vec<String>,
+    /// Of `files`, how many lay over the game's own files (the rest are over add-ons).
+    pub app_files: u32,
+    /// Where a bare pack's folders were placed by inference, and why - one line per folder.
+    pub inferred: Vec<String>,
+    /// The compile caches' name for its code, empty when it carries none.
+    pub code_hash: String,
+    /// Unix milliseconds.
+    pub imported_at: u64,
+    /// Turned off on the title page: kept, but the title runs without it.
+    pub disabled: bool,
+}

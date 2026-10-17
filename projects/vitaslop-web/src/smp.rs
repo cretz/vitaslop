@@ -82,9 +82,67 @@ pub fn overlap() -> bool {
     *ON.get_or_init(|| !matches!(vitaslop_runtime::knobs::var("VITASLOP_SMP_OVERLAP").as_deref().map(str::trim), Ok("0")))
 }
 
+/// A SLOW PRESENT DOES NOT FREEZE THE GAME. While the run worker is inside a present
+/// ([`SmpRun::late_begin`]..[`SmpRun::late_end`]), a guest worker held at the frame gate opens
+/// it one frame at a time for as long as the guest's clock is behind the wall time the present
+/// has taken, so the guest runs on in real time - its sound mixer above all - and the next
+/// `run_frames` takes the newest frame. On the Vita a late frame blocks only the thread that
+/// waits for the display. The desktop's `smp::late_present`, same knob: MEASURED there (a
+/// fighting title's round start, a 238 ms present of first-draw pipeline builds) game time moved
+/// 34 ms and the speakers went dry 179 ms without it; with it, 242 ms and 0.
+/// `VITASLOP_SMP_LATE_PRESENT=0` is the arm.
+pub fn late_present() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| overlap() && vitaslop_runtime::knobs::var("VITASLOP_SMP_LATE_PRESENT").as_deref().map(str::trim) != Ok("0"))
+}
+
+/// How far past the frame being presented a late present lets the guest run: a bound, not a
+/// pace (the pace is the wall clock). 1.5 s at 60 fps - this browser's first-draw pipeline
+/// waits reach 1.2 s - and under the frames `flip_clock` remembers ([`FLIP_CLOCK_KEEP`]). The
+/// scenes of all but the last [`LATE_KEEP_FRAMES`] are retired as they flip
+/// (`Capture::untaken_frame_limit`).
+const LATE_AHEAD_MAX: u64 = 90;
+
+/// A present only counts as LATE once it has run this long (ms); the gate is then opened for
+/// the whole of it. An ordinary present is never touched - the desktop's `LATE_AFTER`, MEASURED
+/// there: opening on every present of a title whose frames run slower than real time skipped a
+/// frame in twenty and took its underrun from 0.14 to 1.09 s.
+const LATE_AFTER_MS: f64 = 50.0;
+
+/// Frames whose flip clock is remembered - see [`LATE_AHEAD_MAX`].
+const FLIP_CLOCK_KEEP: usize = 128;
+
+/// Flipped-but-untaken frames that keep their scenes through a late present: the catch-up
+/// renders these (a frame may sample the one before) and shows the newest.
+const LATE_KEEP_FRAMES: usize = 4;
+
 /// A sync point's resolve-only park is settled on the guest's own worker - see
 /// `BrowserEngine::settle_sync_resolve`. `VITASLOP_SYNC_RESOLVE_ON_WORKER=0` is the arm back.
 /// See `Slot::rt`.
+/// >>> THE EMULATED CORES RUN IN LOCKSTEP. A Vita's cores retire guest code at ONE rate, so
+/// no core is ever milliseconds of work behind another; a host worker can be (a phone's busy
+/// core, an OS preemption). Each worker counts the guest instructions its resumes retire, and
+/// one more than this window ahead of a worker still INSIDE a resume does not pick until that
+/// worker folds - a host that cannot keep one core at Vita speed slows the whole guest
+/// uniformly, as a slower Vita would, instead of letting the other cores run away from it.
+/// MEASURED (a football title's boot, 10-07): its front-end thread's core falling ~1 ms of work
+/// behind the others per tick made its boot script miss the action that starts the intro
+/// movie - for ever (latched; phone streaks of 15/15 stalled boots, desktop repro with a 1 ms
+/// spin on that one thread). Uniform slowness never did. A window idle workers do not bank:
+/// an idle worker re-enters at the lagging minimum.
+///
+/// `VITASLOP_SMP_LOCKSTEP=<guest instructions>`, default [`LOCKSTEP_DEFAULT`] (one scheduling
+/// quantum, ~1.1 ms of Vita time); `0` is the arm back (cores run free).
+fn lockstep() -> Option<u64> {
+    static W: OnceLock<Option<u64>> = OnceLock::new();
+    *W.get_or_init(|| match vitaslop_runtime::knobs::var("VITASLOP_SMP_LOCKSTEP") {
+        Ok(v) => v.trim().parse().ok().filter(|&n| n > 0),
+        Err(_) => Some(LOCKSTEP_DEFAULT),
+    })
+}
+
+/// [`lockstep`]'s default window: one scheduling quantum of guest instructions.
+const LOCKSTEP_DEFAULT: u64 = 500_000;
 fn rt_through_gate() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| vitaslop_runtime::knobs::var("VITASLOP_SMP_RT_THROUGH_GATE").as_deref().map(str::trim) != Ok("0"))
@@ -919,10 +977,19 @@ struct State {
     /// Guest instructions retired per worker, decayed at every frame - the placement's idea
     /// of how busy a worker is.
     load: Vec<f64>,
+    /// Guest work each worker has retired, for [`lockstep`].
+    core_work: Vec<u64>,
+    /// The worker had nothing to pick since its last resume - [`lockstep`] does not bank it.
+    core_idle: Vec<bool>,
+    /// Picks [`lockstep`] declined.
+    lockstep_waits: u64,
     /// The last placements, newest last: `(thid, affinity mask, home, worker loads then)`.
     /// Printed on the SMP panel line - a thread's worker is decided ONCE, at its first run, and
     /// a busy worker's thread list cannot say whether that was its mask or the load rule.
     placed: VecDeque<(i32, i32, usize, Vec<f64>)>,
+    /// Every placed thread's affinity mask, for the `threads by work` rows: `placed` keeps only
+    /// the newest twelve, and a busy thread is usually one of the oldest.
+    mask_of: HashMap<i32, i32>,
     forwarded: u64,
     /// Forwarded calls by import selector since the last panel line (drained there).
     forwarded_by: HashMap<u32, u64>,
@@ -946,6 +1013,13 @@ struct State {
     /// The run worker is writing guest memory the guest may also be writing (a render-target
     /// write-back): no worker picks a thread until it clears. See [`SmpRun::pause_guest`].
     paused: bool,
+    /// The present in progress - `(abs_ms, guest clock)` when it began - for [`late_present`].
+    late: Option<(f64, u64)>,
+    /// `SmpRun::consumed`, readable by the workers: the frame being presented, which a late
+    /// present's opening of the gate is bounded from.
+    consumed: u64,
+    /// Gate openings made during slow presents.
+    late_opened: u64,
 }
 
 /// Wake every worker blocked on `bell`.
@@ -1035,7 +1109,11 @@ impl State {
             fuel_unreported: 0,
             fuel_idle: 0,
             load: vec![0.0; workers + 1],
+            core_work: vec![0; workers + 1],
+            core_idle: vec![true; workers + 1],
+            lockstep_waits: 0,
             placed: VecDeque::new(),
+            mask_of: HashMap::new(),
             forwarded: 0,
             forwarded_by: HashMap::new(),
             idle_jumps: 0,
@@ -1048,7 +1126,31 @@ impl State {
             preempt_prio: 0,
             flip_clock: VecDeque::new(),
             paused: false,
+            late: None,
+            consumed: 0,
+            late_opened: 0,
         }
+    }
+
+    /// [`late_present`]: open the gate one frame when the guest is held at it during a present
+    /// that has outlasted the guest's lead - its clock behind the wall time the present took.
+    fn late_open(&mut self, sh: &Shared) -> bool {
+        let Some((wall0, clock0)) = self.late else { return false };
+        if abs_ms() - wall0 < LATE_AFTER_MS || self.frames < self.gate || self.verdict.is_some() || self.paused || self.gate >= self.consumed + 1 + LATE_AHEAD_MAX {
+            return false;
+        }
+        let mut host = lock_host(&sh.host);
+        if host.clock_us() >= clock0 + ((abs_ms() - wall0).max(0.0) * 1000.0) as u64 {
+            return false;
+        }
+        // As `run_frames` does when it opens the gate: the hold so far is closed off on the
+        // wall floor rather than counted when the guest moves again.
+        if wall_floor(self.frames) {
+            host.state.wall_floor_tick(abs_ms(), true);
+        }
+        self.gate += 1;
+        self.late_opened += 1;
+        true
     }
 
     /// Thread `idx` just became runnable: if the thread running on its worker is of a WORSE
@@ -1262,7 +1364,25 @@ impl State {
             .filter(|&i| !rt_only || self.threads[i].rt)
             .collect();
         if mine.is_empty() {
+            self.core_idle[w] = true;
             return None;
+        }
+        if let Some(win) = lockstep().filter(|_| !rt_only) {
+            // The slowest OTHER worker still inside a resume (real-time threads excepted).
+            let lag = (0..self.running_on.len())
+                .filter(|&v| v != w)
+                .filter(|&v| self.running_on[v].is_some_and(|j| !self.threads[j].rt))
+                .map(|v| self.core_work[v])
+                .min();
+            if let Some(lag) = lag {
+                if self.core_idle[w] {
+                    self.core_work[w] = self.core_work[w].max(lag);
+                } else if self.core_work[w] > lag.saturating_add(win) {
+                    self.lockstep_waits += 1;
+                    return None;
+                }
+            }
+            self.core_idle[w] = false;
         }
         if mine.iter().all(|&i| self.threads[i].cooled) {
             for &i in &mine {
@@ -1342,6 +1462,7 @@ impl State {
         }
         let home = self.threads[idx].home;
         self.load[home] += retired.unwrap_or(burned) as f64;
+        self.core_work[home] = self.core_work[home].saturating_add(retired.unwrap_or(burned));
         // The thread that just stopped counts: it was running when this work was retired.
         let runnable = 1 + self
             .live
@@ -1398,7 +1519,7 @@ impl State {
             trace_ev(self.frames, TraceEv::W0 { kind: b'B', t0: tbl, t1: tbf });
             trace_ev(self.frames, TraceEv::W0 { kind: b'U', t0: tbf, t1: tbp });
             self.flip_clock.push_back((self.frames, host.clock_us()));
-            if self.flip_clock.len() > 16 {
+            if self.flip_clock.len() > FLIP_CLOCK_KEEP {
                 self.flip_clock.pop_front();
             }
         }
@@ -1582,6 +1703,13 @@ impl State {
                 self.placed.pop_front();
             }
             self.placed.push_back((sp.thid, mask, home, self.load[1..].to_vec()));
+            // Bounded by the LIVE threads: a football title spawns ~25,000 short-lived pool
+            // threads by its kickoff, and a finished one has no row to print.
+            if self.mask_of.len() >= 4096 {
+                let live: std::collections::HashSet<i32> = self.live.iter().map(|&i| self.threads[i].thid).collect();
+                self.mask_of.retain(|t, _| live.contains(t));
+            }
+            self.mask_of.insert(sp.thid, mask);
             let birth = Birth { entries: vec![sp.entry], r: [sp.arg_len, sp.arg_ptr, sp.r2, sp.r3], sp: sp.stack_top };
             self.add_thread(sh, sp.thid, sp.priority, home, birth);
         }
@@ -1891,6 +2019,8 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
     let stats = &sh.stats[w];
     let mut history = vitaslop_runtime::sched::SpinHistory::new();
     let mut last_waited_ms = 0.0f64;
+    // A present is in progress: a held worker re-checks the gate every 2 ms (`late_open`).
+    let mut late_waiting;
     loop {
         if sh.stop.load(Ordering::SeqCst) {
             break;
@@ -1916,6 +2046,10 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                 .copied()
                 .filter(|&i| st.threads[i].release)
                 .collect();
+            if st.late_open(sh) {
+                sh.ring_all();
+            }
+            late_waiting = st.late.is_some();
             let gated = st.frames >= st.gate;
             let job = if gated && st.verdict.is_none() && !st.paused && rt_through_gate() && let Some(i) = st.pick(w, true) {
                 // A real-time thread keeps running behind a shut gate - see `Slot::rt`.
@@ -2009,6 +2143,7 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                         }
                         None => 50_000_000,
                     };
+                    let timeout_ns = if late_waiting { timeout_ns.min(2_000_000) } else { timeout_ns };
                     bell_wait(&sh.bells[w], bell, timeout_ns);
                     if vitaslop_runtime::host::next_wall_park_us().is_some_and(|t| t <= (abs_ms() * 1000.0) as u64) {
                         sh.state.lock().unwrap().drain(sh, engine);
@@ -2143,6 +2278,9 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
                         trace_ev(st.frames, TraceEv::Run { w: w as u8, thid, t0: t1 - ran_ms, t1, stop, sel });
                     }
                     st.fold(sh, i, step, fuel, arm, forward, early, preempted);
+                    if lockstep().is_some() {
+                        sh.ring_all();
+                    }
                     if settle.is_some() {
                         st.early_serving += 1;
                     }
@@ -2287,6 +2425,7 @@ impl SmpRun {
             };
             let mut st = sh.state.lock().unwrap();
             let home = st.place(workers, main_mask, main_prio);
+            st.mask_of.insert(vitaslop_runtime::host::MAIN_THID, main_mask);
             st.add_thread(
                 &sh,
                 vitaslop_runtime::host::MAIN_THID,
@@ -2504,6 +2643,9 @@ impl SmpRun {
         );
         // This engine expires wall parks (drain + idle workers) - `VitaState::wall_park`.
         vitaslop_runtime::host::set_wall_parks_served(true);
+        if late_present() {
+            lock_host(&sh.host).state.capture.untaken_frame_limit = Some(LATE_KEEP_FRAMES);
+        }
         Ok(SmpRun {
             sh,
             engine,
@@ -2515,12 +2657,31 @@ impl SmpRun {
         })
     }
 
-    /// The game time frame `frame` took: the virtual clock at its flip minus the clock at the
-    /// flip before it. `None` when either flip is no longer remembered.
-    pub fn frame_advance_us(&self, frame: u64) -> Option<u64> {
+    /// The game time from frame `from`'s flip to frame `to`'s - several frames when a late
+    /// present's catch-up takes them at once. `None` when either is no longer remembered.
+    pub fn frame_span_us(&self, from: u64, to: u64) -> Option<u64> {
         let st = self.sh.state.lock().unwrap();
         let at = |f: u64| st.flip_clock.iter().find(|(n, _)| *n == f).map(|(_, us)| *us);
-        Some(at(frame)?.saturating_sub(at(frame.checked_sub(1)?)?))
+        Some(at(to)?.saturating_sub(at(from)?))
+    }
+
+    /// A present begins - see [`late_present`]. Nothing when it is off.
+    pub fn late_begin(&self) {
+        if !late_present() {
+            return;
+        }
+        let mut st = self.sh.state.lock().unwrap();
+        let clock0 = lock_host(&self.sh.host).clock_us();
+        st.late = Some((abs_ms(), clock0));
+        drop(st);
+        self.sh.ring_all();
+    }
+
+    /// The present ended.
+    pub fn late_end(&self) {
+        if late_present() {
+            self.sh.state.lock().unwrap().late = None;
+        }
     }
 
     /// The frame the live loop is at: the last one taken for presenting under [`overlap`],
@@ -2608,10 +2769,11 @@ impl SmpRun {
         let (dt, dc) = (taken - since.lock.0, cont - since.lock.1);
         let _ = write!(
             s,
-            " | host lock {dc} of {dt} contended ({:.1}%) | forwarded {} | idle jumps {}",
+            " | host lock {dc} of {dt} contended ({:.1}%) | forwarded {} | idle jumps {} | lockstep waits {} (run)",
             dc as f64 * 100.0 / dt.max(1) as f64,
             st.forwarded - since.forwarded,
             st.idle_jumps - since.idle_jumps,
+            st.lockstep_waits,
         );
         {
             let mut v: Vec<(u32, u64)> = forwarded_by.into_iter().collect();
@@ -2652,9 +2814,10 @@ impl SmpRun {
         );
         let _ = write!(
             s,
-            " | preempts: gate {} prio {}",
+            " | preempts: gate {} prio {} | late-present frames {} (run)",
             st.preempt_gate - since.preempts.0,
             st.preempt_prio - since.preempts.1,
+            st.late_opened,
         );
         snap.preempts = (st.preempt_gate, st.preempt_prio);
         // The busiest threads over the run (or since VITASLOP_CPU_SHARE_FROM), with where they
@@ -2692,16 +2855,20 @@ impl SmpRun {
         for t in rows.iter().take(8) {
             let _ = write!(
                 s,
-                " {:#x}@w{} p{:#x} {:.1}% ({} picks, {} spun; run {:.2} queued {:.2} ms/f, {} waits>=5ms)",
+                " {:#x}@w{} p{:#x} mask {:#x} {:.1}% ({} picks, {} spun; run {:.2} queued {:.2} ms/f, {} waits>=5ms, {:.0} MIPS)",
                 t.thid,
                 t.home,
                 t.priority,
+                st.mask_of.get(&t.thid).copied().unwrap_or(0),
                 t.retired_total as f64 * 100.0 / total as f64,
                 t.picks,
                 t.quanta,
                 t.run_ms / per,
                 t.queued_ms / per,
-                t.queued_long
+                t.queued_long,
+                // Guest instructions retired per RUNNING ms (host calls inside a resume included):
+                // the translated code's effective speed on this engine, against a ~550 MIPS A9.
+                t.retired_total as f64 / 1e3 / t.run_ms.max(1e-9)
             );
         }
         // What the busiest callers call, this window: per thread, its fuel yields and its top
@@ -2835,8 +3002,17 @@ impl SmpRun {
                 // Overlapped: the frame has flipped, so its scenes are complete - present it
                 // now, whatever the workers are doing on the next one.
                 if ahead == 1 && st.frames >= target {
-                    self.consumed = target;
-                    return RunReport::FramesReached(target);
+                    // A late present let the guest run on: take the NEWEST flipped frame (the
+                    // caller takes its scenes and those before it together) and stand the gate
+                    // one frame past it, as always.
+                    let newest = st.frames.max(target);
+                    self.consumed = newest;
+                    st.consumed = newest;
+                    if newest > target {
+                        st.gate = st.gate.max(newest + 1);
+                        self.sh.ring_all();
+                    }
+                    return RunReport::FramesReached(newest);
                 }
                 if st.frames >= target && st.running == 0 && st.forwards.is_empty() {
                     if let Some(t) = reached_at {
