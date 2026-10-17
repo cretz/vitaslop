@@ -277,6 +277,23 @@ async function run(p) {
     [offscreen]
   );
   await finished;
+  // A playbook the run is ending under (the cap, a stop) still reports: ask the worker for its
+  // report and tape, which arrive as notes ahead of the reply. Bounded, so an old bundle that
+  // never replies cannot hold the result.
+  if (pb && !pb.ended) {
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 5000);
+      const prev = worker.onmessage;
+      worker.onmessage = (e) => {
+        prev(e);
+        if (e.data && e.data.type === "playbook-finished") {
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+      worker.postMessage({ type: "playbook-finish" });
+    });
+  }
   clearInterval(watchdog);
   clearInterval(memTimer);
   // >>> A PROCESS REPLACEMENT: the title exec'd one of its own executables. Boot that one in

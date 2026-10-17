@@ -421,8 +421,8 @@ during boot.
 | `VITASLOP_PERF` | vitaslop-desktop/src/retail.rs:849 | The `top` host calls by total time since the profiler was last reset, one line each - |
 | `VITASLOP_PERF_CONSOLE` | vitaslop-web/src/lib.rs:2545 | Whether the per-window performance report is also written to the browser CONSOLE |
 | `VITASLOP_PERF_FROM` | vitaslop-desktop/src/retail.rs:3070 | The frame (and the moment) the profilers were reset at - see `VITASLOP_PERF_FROM`. |
-| `VITASLOP_PIPELINE_DEFER` | vitaslop-web/src/lib.rs:8990 | >>> THE PIPELINES THIS FRAME NEEDS, CREATED ASYNC - see `GxmRenderer::warm_pipelines` |
-| `VITASLOP_PIPELINE_DEFER_MAX_MS` | vitaslop-web/src/lib.rs:9229 | `VITASLOP_PIPELINE_DEFER_MAX_MS`: overrides [`PIPE_DEFER_MAX_MS_DEFAULT`]. |
+| `VITASLOP_PIPELINE_DEFER` | vitaslop-web/src/lib.rs:8992 | >>> THE PIPELINES THIS FRAME NEEDS, CREATED ASYNC - see `GxmRenderer::warm_pipelines` |
+| `VITASLOP_PIPELINE_DEFER_MAX_MS` | vitaslop-web/src/lib.rs:9231 | `VITASLOP_PIPELINE_DEFER_MAX_MS`: overrides [`PIPE_DEFER_MAX_MS_DEFAULT`]. |
 | `VITASLOP_PIPE_LOG` | vitaslop-platform/src/gpu.rs:8831 | `VITASLOP_PIPE_LOG=1`: one status line per pipeline built - the frame, the pair, and the |
 | `VITASLOP_PIXEL_TRACE` | vitaslop-runtime/src/render.rs:5550 | Draw one scene onto an EXISTING framebuffer and depth buffer, composing with whatever |
 | `VITASLOP_PKG` | vitaslop-runtime/src/ingest/stream.rs:1126 | A pkg's item table, read over a source that only ever hands out RANGES |

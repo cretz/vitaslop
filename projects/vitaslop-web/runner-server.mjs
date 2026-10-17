@@ -40,6 +40,16 @@ import { pipeline } from "node:stream/promises";
 import { join, normalize, sep } from "node:path";
 import { createHash } from "node:crypto";
 
+/// The say log and the inbox are read, numbered and written back as one step each, and two
+/// requests interleaving those awaits would hand out the same `n` (a reader past it then skips
+/// the second). Every such step runs through this one queue, in arrival order.
+let queueTail = Promise.resolve();
+function serially(step) {
+  const run = queueTail.then(step);
+  queueTail = run.catch(() => {});
+  return run;
+}
+
 /// A job's longest allowed run. A phone that is needed "here and there" cannot host a sweep.
 export const MAX_TIMEOUT_MS = 90_000;
 /// A LIVE job (the installed game played by a recipe, web/runner/live.html) has to boot, reach
@@ -214,24 +224,32 @@ export function createRunner({ dir, coi, laneSrc, runnerWebDir }) {
       json(res, 200, { id, timeoutMs: job.timeoutMs });
       return true;
     }
+    const readSays = async () => {
+      try {
+        return await readJson(sub("say.json"));
+      } catch {
+        return [];
+      }
+    };
+    // Append one note to the say log with the next `n`. Call it under `serially`.
+    const appendSay = async (m) => {
+      const says = await readSays();
+      says.push({ n: (says.at(-1)?.n || 0) + 1, ...m });
+      await writeJson(sub("say.json"), says.slice(-200));
+      return says.at(-1).n;
+    };
     // Notes from the desktop to whoever is holding the phone: the runner page prints them in
     // its log, which is often the only screen that person can see.
     //   POST /runner/say   body = the text      GET /runner/say?since=<n>  -> [{n, at, text}]
     if (path === "/runner/say") {
-      const f = sub("say.json");
-      let says = [];
-      try {
-        says = await readJson(f);
-      } catch {}
       if (req.method === "POST") {
         const text = (await body(req)).trim().slice(0, 2000);
-        says.push({ n: (says.at(-1)?.n || 0) + 1, at: new Date(now).toISOString(), text });
-        await writeJson(f, says.slice(-200));
-        json(res, 200, { n: says.at(-1).n });
+        const n = await serially(() => appendSay({ at: new Date(now).toISOString(), text }));
+        json(res, 200, { n });
         return true;
       }
       const since = Number(url.searchParams.get("since") || 0);
-      json(res, 200, says.filter((m) => m.n > since));
+      json(res, 200, (await readSays()).filter((m) => m.n > since));
       return true;
     }
     // ...and back: what the person holding the phone types on the runner page, for the desktop
@@ -240,27 +258,29 @@ export function createRunner({ dir, coi, laneSrc, runnerWebDir }) {
     //   POST /runner/hear  body = the text      GET /runner/hear?since=<n>  -> [{n, at, text}]
     if (path === "/runner/hear") {
       const f = sub("inbox.jsonl");
-      let lines = [];
-      try {
-        lines = (await readFile(f, "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
-      } catch {}
+      const readInbox = async () => {
+        try {
+          return (await readFile(f, "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+        } catch {
+          return [];
+        }
+      };
       if (req.method === "POST") {
         const text = (await body(req)).trim().slice(0, 2000);
         if (!text) return json(res, 400, { error: "empty" }), true;
-        const m = { n: (lines.at(-1)?.n || 0) + 1, at: new Date(now).toISOString(), text };
-        await appendFile(f, JSON.stringify(m) + "\n");
-        const sf = sub("say.json");
-        let says = [];
-        try {
-          says = await readJson(sf);
-        } catch {}
-        says.push({ n: (says.at(-1)?.n || 0) + 1, at: m.at, text: `YOU: ${text}`, you: true });
-        await writeJson(sf, says.slice(-200));
-        json(res, 200, { n: m.n });
+        // Number and append under the one queue, so two sends never share an `n` and a reader
+        // that has seen `n` can never be handed a smaller one later.
+        const n = await serially(async () => {
+          const m = { n: ((await readInbox()).at(-1)?.n || 0) + 1, at: new Date(now).toISOString(), text };
+          await appendFile(f, JSON.stringify(m) + "\n");
+          await appendSay({ at: m.at, text: `YOU: ${text}`, you: true });
+          return m.n;
+        });
+        json(res, 200, { n });
         return true;
       }
       const since = Number(url.searchParams.get("since") || 0);
-      json(res, 200, lines.filter((m) => m.n > since));
+      json(res, 200, (await readInbox()).filter((m) => m.n > since));
       return true;
     }
     if (path === "/runner/hello" && req.method === "POST") {

@@ -15,6 +15,7 @@
 // See build.mjs for why there are two.
 const SMP_BUNDLE = new URL(self.location.href).searchParams.get("smp") === "1";
 let run_game_worker,
+  playbook_finish,
   set_knob,
   set_system_font,
   worker_input_key,
@@ -210,6 +211,7 @@ const bundle = (module) =>
     loadTimes.given = !!module;
     ({
       run_game_worker,
+      playbook_finish,
       set_knob,
       set_system_font,
       worker_input_key,
@@ -382,6 +384,17 @@ self.onmessage = async (e) => {
     }
     activeSource = null;
     self.postMessage({ type: "released" });
+    return;
+  }
+  // `playbook-finish`: a harness ending the run itself (the device runner's time cap) asks for the
+  // playbook's report and tape first. They go out as console lines, so as notes, BEFORE the reply.
+  if (d.type === "playbook-finish") {
+    try {
+      if (playbook_finish) playbook_finish();
+    } catch (err) {
+      console.error(`[playbook] finish failed: ${err}`);
+    }
+    self.postMessage({ type: "playbook-finished" });
     return;
   }
   if (d.type === "flush-game-data") {

@@ -104,14 +104,31 @@ pub fn on_present(frame: u64, guest_us: u64) {
         }
     }
     if engine::status() != Some(Status::Running) {
-        FINISHED.with(|f| f.set(true));
-        if let Some(report) = engine::finish() {
-            for line in report.render_text().lines() {
-                console(&format!("[playbook-report] {line}"));
-            }
-            for line in report.tape.render().lines() {
-                console(&format!("[playbook-tape] {line}"));
-            }
+        finish_now();
+    }
+}
+
+/// Print the playbook's report and tape, once. The per-present step calls it when the playbook is
+/// over, and the run's end calls it too (the frame budget, the guest exiting or faulting, a
+/// harness stopping the run): a playbook still running there is reported as STOPPED with
+/// everything it did up to that point, instead of the run ending with no report and no tape.
+pub fn finish_now() {
+    if FINISHED.with(|f| f.replace(true)) {
+        return;
+    }
+    if let Some(report) = engine::finish() {
+        for line in report.render_text().lines() {
+            console(&format!("[playbook-report] {line}"));
+        }
+        for line in report.tape.render().lines() {
+            console(&format!("[playbook-tape] {line}"));
         }
     }
+}
+
+/// [`finish_now`] for a harness that stops a run itself (the device runner's time cap), called
+/// from the run worker before the result is collected. A run with no playbook prints nothing.
+#[wasm_bindgen]
+pub fn playbook_finish() {
+    finish_now();
 }

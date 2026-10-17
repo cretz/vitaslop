@@ -6874,6 +6874,8 @@ async fn live_loop(
                     logging::note(&format!(
                         "live run ended at frame {frames}: {report_step:?}"
                     ));
+                    // A playbook the run outlived reports what it did before the run ended.
+                    playbook::finish_now();
                     // The speakers' silence from here is the run being over, not the
                     // emulator falling behind - see `audio::mark_run_ended`.
                     audio::mark_run_ended();
