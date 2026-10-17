@@ -103,5 +103,3 @@ panic = "abort"
 [patch.crates-io]
 wgpu = { path = "vendor/wgpu" }
 
-[patch."https://github.com/cretz/yaxpeax-arm"]
-yaxpeax-arm = { path = "../../yaxpeax-arm" }

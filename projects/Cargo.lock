@@ -5505,6 +5505,7 @@ dependencies = [
 [[package]]
 name = "yaxpeax-arm"
 version = "0.4.0"
+source = "git+https://github.com/cretz/yaxpeax-arm?rev=20d87c571f4c127a8341489baa4f39dfa517f94d#20d87c571f4c127a8341489baa4f39dfa517f94d"
 dependencies = [
  "bitvec",
  "yaxpeax-arch",
