@@ -144,6 +144,7 @@ struct Loading {
 enum Ask {
     RemoveTitle(String),
     RemoveAddon { id: String, dir: String, title: String },
+    RemoveRepatch(String),
     ClearSave { profile: String, id: String },
     RestoreSave { profile: String, id: String, zip: Vec<u8>, summary: String },
     ClearAll { profile: String },
@@ -206,6 +207,12 @@ pub(crate) struct Shell {
     import_addon_for: Option<String>,
     /// Each title's installed add-ons, read on first view and dropped when they change.
     addons: HashMap<String, Vec<vitaslop_frontend::meta::AddonMeta>>,
+    /// Each title's rePatch overlay, read on first view and dropped when it changes.
+    repatch: HashMap<String, Option<vitaslop_frontend::meta::RepatchMeta>>,
+    /// A running rePatch overlay import: the title it lays over, and its progress.
+    repatch_import: Option<(String, Arc<Mutex<ImportProgress>>)>,
+    /// The last overlay action's outcome, shown on that title's card: `(title id, text)`.
+    repatch_note: Option<(String, String)>,
     /// Paths dropped on the window since the last frame: a drop of several files arrives as
     /// one event per file, and they are one import (a `.pkg` with its `work.bin`).
     dropped: Vec<PathBuf>,
@@ -548,6 +555,9 @@ impl Shell {
             import_icon: None,
             import_addon_for: None,
             addons: HashMap::new(),
+            repatch: HashMap::new(),
+            repatch_import: None,
+            repatch_note: None,
             dropped: Vec::new(),
             drop_hover: false,
             ask: None,
@@ -1119,11 +1129,12 @@ impl Shell {
         let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
         let (tx, rx) = channel();
         let recipe = (!s.recipe.trim().is_empty()).then(|| s.recipe.clone());
+        let repatch = library::active_repatch(id);
         let input2 = input.clone();
         std::thread::Builder::new()
             .name("loader".into())
             .spawn(move || {
-                let r = RetailGuest::new_with_exec(&dir, input2, recipe.as_deref(), main_exec.as_deref());
+                let r = RetailGuest::new_with_exec(&dir, input2, recipe.as_deref(), main_exec.as_deref(), repatch.as_deref());
                 let _ = tx.send(r);
             })
             .expect("spawn the loader thread");
@@ -1628,6 +1639,14 @@ impl Shell {
                         if ui.add(danger("Remove")).clicked() {
                             self.ask = Some(Ask::RemoveAddon { id: id.to_string(), dir: a.dir.clone(), title: a.title.clone() });
                         }
+                        // Off keeps the add-on; the game does not see it until it is on again.
+                        let mut on = !a.disabled;
+                        if ui.checkbox(&mut on, "On").changed() {
+                            if let Err(e) = library::set_addon_enabled(id, &a.dir, on) {
+                                self.error = Some(e);
+                            }
+                            self.addons.remove(id);
+                        }
                     });
                 });
             }
@@ -1635,6 +1654,107 @@ impl Shell {
                 self.screen = Screen::AddAddons(id.to_string());
             }
         });
+        self.ui_repatch_card(ui, id);
+    }
+
+    /// The title page's rePatch card: the overlay laid over this title, its switch, and adding
+    /// or removing one. See `vitaslop_runtime::ingest::repatch`.
+    fn ui_repatch_card(&mut self, ui: &mut egui::Ui, id: &str) {
+        // A finished import reports here and drops the cached record.
+        if let Some((for_id, p)) = self.repatch_import.as_ref()
+            && p.lock().unwrap().finished
+        {
+            let g = p.lock().unwrap().clone();
+            let for_id = for_id.clone();
+            self.repatch_import = None;
+            self.repatch.remove(&for_id);
+            let note = g.error.map_or_else(|| "Overlay added. It applies the next time the game starts.".to_string(), |e| format!("Could not add the overlay: {e}"));
+            self.repatch_note = Some((for_id, note));
+        }
+        let rp = self.repatch.entry(id.to_string()).or_insert_with(|| library::read_repatch(id)).clone();
+        let importing = self.repatch_import.as_ref().filter(|(i, _)| i == id).map(|(_, p)| p.lock().unwrap().clone());
+        card(ui, |ui| {
+            ui.label(bold("rePatch overlay").size(16.0));
+            match &rp {
+                None => {
+                    ui.label(RichText::new(format!("None. An overlay lays your own modified or decrypted files over this game, as the rePatch plugin does on a Vita: pick a folder or .zip laid out like ux0:rePatch/{id}/ (a reAddcont/{id}/ folder beside it covers add-ons). Executables in it must be decrypted. The game itself is never changed - turn the overlay off or remove it here.")).color(DIM));
+                }
+                Some(m) => {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(bold(if m.source.is_empty() { "Overlay" } else { &m.source }).color(INK));
+                            let code = if m.code.is_empty() { "data only".to_string() } else { format!("replaces {}", m.code.join(", ")) };
+                            let addcont = if m.addcont.is_empty() { String::new() } else { format!("  \u{b7}  add-ons {}", m.addcont.join(", ")) };
+                            ui.label(RichText::new(format!("{} files  \u{b7}  {}  \u{b7}  {code}{addcont}  \u{b7}  added {}", m.files, fmt_bytes(m.bytes), fmt_date(m.imported_at))).color(DIM).size(13.0));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(danger("Remove")).clicked() {
+                                self.ask = Some(Ask::RemoveRepatch(id.to_string()));
+                            }
+                            let mut on = !m.disabled;
+                            if ui.checkbox(&mut on, "On").changed() {
+                                if let Err(e) = library::set_repatch_enabled(id, on) {
+                                    self.error = Some(e);
+                                }
+                                self.repatch.remove(id);
+                            }
+                        });
+                    });
+                }
+            }
+            if let Some(g) = &importing {
+                let pct = if g.total > 0 { g.done as f64 * 100.0 / g.total as f64 } else { 0.0 };
+                ui.label(RichText::new(format!("Copying {} - {pct:.0}%", g.file)).color(DIM));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            if let Some((for_id, note)) = &self.repatch_note
+                && for_id == id
+            {
+                ui.label(RichText::new(note).color(DIM).small());
+            }
+            let busy = self.repatch_import.is_some();
+            let verb = if rp.is_some() { "Replace with" } else { "Add from" };
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new(bold(format!("{verb} a folder")))).clicked()
+                    && let Some(p) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.start_repatch_import(id, &p);
+                }
+                if ui.add_enabled(!busy, egui::Button::new(bold(format!("{verb} a .zip")))).clicked()
+                    && let Some(p) = rfd::FileDialog::new().add_filter("Zip", &["zip", "ZIP"]).pick_file()
+                {
+                    self.start_repatch_import(id, &p);
+                }
+            });
+        });
+    }
+
+    /// Copy the overlay at `path` (a folder or a `.zip`) for title `id`, on a thread of its own.
+    fn start_repatch_import(&mut self, id: &str, path: &std::path::Path) {
+        let src = match library::DirSource::open(path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.repatch_note = Some((id.to_string(), format!("Could not read {}: {e}", path.display())));
+                return;
+            }
+        };
+        let source = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let p2 = progress.clone();
+        let owner = id.to_string();
+        std::thread::Builder::new()
+            .name("repatch-import".into())
+            .spawn(move || {
+                let r = library::import_repatch_from(&owner, src, &source, &p2);
+                let mut g = p2.lock().unwrap();
+                g.finished = true;
+                if let Err(e) = r {
+                    g.error = Some(e);
+                }
+            })
+            .expect("spawn the overlay import thread");
+        self.repatch_note = None;
+        self.repatch_import = Some((id.to_string(), progress));
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
@@ -2019,6 +2139,10 @@ impl Shell {
             Ask::RemoveAddon { id, title, .. } => {
                 (format!("Remove the add-on {title} from {}?\n\nThe game will not see it the next time it starts. Saved data is kept.", name(id)), "Remove")
             }
+            Ask::RemoveRepatch(id) => (
+                format!("Remove the rePatch overlay from {}?\n\nIts files are deleted; the game itself is untouched and runs without it from the next start. To keep it, turn it off instead.", name(id)),
+                "Remove",
+            ),
             Ask::ClearSave { id, .. } => (format!("Delete the saved data for {}? This cannot be undone.", name(id)), "Delete"),
             Ask::RestoreSave { profile, id, summary, .. } => {
                 let existing = library::gamedata_info(profile, id).map_or_else(String::new, |(b, _)| format!("\n\nThis REPLACES the {} already saved.", fmt_bytes(b)));
@@ -2066,9 +2190,14 @@ impl Shell {
                 self.addons.remove(&id);
                 library::remove_addon(&id, &dir).map_err(|e| e.to_string())
             }
+            Ask::RemoveRepatch(id) => {
+                self.repatch.remove(&id);
+                library::remove_repatch(&id).map_err(|e| e.to_string())
+            }
             Ask::RemoveTitle(id) => {
                 let r = library::remove_title(&id).map_err(|e| e.to_string());
                 self.addons.remove(&id);
+                self.repatch.remove(&id);
                 self.icons.remove(&id);
                 self.pictures.remove(&id);
                 self.titles = library::list_titles();

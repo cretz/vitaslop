@@ -158,6 +158,20 @@ for _, ty in ipairs({ "u8", "u16", "u32", "i8", "i16", "i32", "f32" }) do
   end
 end
 
+--- What the player SEES: how many pixels of a rectangle of the presented frame (960x544
+--- panel coordinates) are within `tol` (default 24) of `rgb` on every channel.
+--- `cue.pixels{ x = 470, y = 482, w = 6, h = 6, rgb = { 255, 255, 255 } }` - for a HUD element
+--- that has no memory cell to find, such as a shot gauge's moving cursor.
+function cue.pixels(o)
+  return declare({ kind = "pixels", x = o.x, y = o.y, w = o.w or 1, h = o.h or 1, rgb = o.rgb, tol = o.tol or 24 })
+end
+
+--- WHERE the first pixel of a colour is in a rectangle (rows top to bottom), for a marker that
+--- moves from shot to shot. Its value is `y * 1024 + x`; `:xy()` splits it (nil, nil if none).
+function cue.locate(o)
+  return declare({ kind = "locate", x = o.x, y = o.y, w = o.w or 1, h = o.h or 1, rgb = o.rgb, tol = o.tol or 24 })
+end
+
 --- Arm-relative durations: `n` input frames, or `s` guest seconds, after the wait begins.
 function cue.frames(n) return declare({ kind = "frames", n = n }) end
 function cue.seconds(s) return declare({ kind = "seconds", s = s }) end
@@ -185,6 +199,12 @@ function Cue:stable(n) return declare({ kind = "stable", src = self, n = n }) en
 function Cue:after(other) return declare({ kind = "after", a = self, b = other }) end
 --- The cue's value now: a call's count, a memory value, a condition's truth.
 function Cue:value() return req({ op = "value", cue = self }).v end
+--- A `cue.locate`'s position now: x, y in panel coordinates, or nil, nil.
+function Cue:xy()
+  local v = self:value()
+  if v == nil then return nil, nil end
+  return v % 1024, v // 1024
+end
 --- Log every change of this cue's value, under `label`.
 function Cue:trace(label) req({ op = "trace", cue = self, label = label or tostring(self) }); return self end
 

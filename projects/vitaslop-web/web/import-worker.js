@@ -27,6 +27,8 @@
 //
 // Messages in:  { type: "import", files: [{ path, file }], addonFor?: titleId }
 //               { type: "probe",  files: [{ path, file }] }   (identify only)
+//               { type: "repatch", files: [{ path, file }], titleId, pickedRoot, source }
+//                 (a rePatch overlay for titleId - see `repatchImport`)
 // Messages out: { type: "probe", probe } | { type: "progress", stage, file, done, total }
 //               { type: "done", titleId, contentId, count, addon? } | { type: "error", message }
 //
@@ -36,8 +38,8 @@
 // replace the game.
 //               { type: "panic", message }
 
-import init, { ingest_probe, ingest_import } from "./pkg/vitaslop_web.js";
-import { titleDir, addonsDir, ADDON_RECORD, isAddonName, encodeName, storageRoom } from "./opfs.js";
+import init, { ingest_probe, ingest_import, repatch_plan, repatch_import } from "./pkg/vitaslop_web.js";
+import { titleDir, addonsDir, ADDON_RECORD, isAddonName, encodeName, storageRoom, repatchDir, readRepatch, REPATCH_RECORD } from "./opfs.js";
 import { makeFileSource } from "./read-window.js";
 
 globalThis.__vitaslopPanic = (text) => {
@@ -118,6 +120,10 @@ self.onmessage = async (e) => {
         post(false, () => ({ type: "progress", stage: "reading", file: "", done: read, total: 0 }));
       });
       self.postMessage({ type: "probe", probe: forPage(ingest_probe(src)) });
+      return;
+    }
+    if (d.type === "repatch") {
+      await repatchImport(d, post);
       return;
     }
     if (d.type !== "import") throw new Error(`unknown message ${d.type}`);
@@ -262,3 +268,72 @@ self.onmessage = async (e) => {
     self.postMessage({ type: "error", message: String((err && err.message) || err) });
   }
 };
+
+/// Copy a rePatch overlay (a picked folder, or one .zip) for `d.titleId` into a NEW generation
+/// directory beside the old one, then point the record at it and drop the old - so a failed copy
+/// leaves the overlay that was there. The rules (layout, refusing encrypted executables) are the
+/// runtime's: `ingest::repatch`.
+async function repatchImport(d, post) {
+  const src = fileSource(d.files);
+  const planned = repatch_plan(src, d.titleId, !!d.pickedRoot);
+  const top = await repatchDir(d.titleId, { create: true });
+  const old = await readRepatch(d.titleId);
+  const gen = `g${Date.now().toString(36)}`;
+  const dir = await top.getDirectoryHandle(gen, { create: true });
+  const handles = new Map();
+  try {
+    let opened = 0;
+    await inParallel(planned, async (path) => {
+      const fh = await dir.getFileHandle(encodeName(path), { create: true });
+      handles.set(path, await fh.createSyncAccessHandle());
+      opened += 1;
+      post(false, () => ({ type: "progress", stage: "preparing", file: "", done: opened, total: planned.length, unit: "files" }));
+    });
+    let cur = null;
+    const sink = {
+      begin(path) {
+        const h = handles.get(path);
+        if (!h) throw new Error(`no handle prepared for ${path}`);
+        cur = { path, h, off: 0 };
+      },
+      write(bytes) {
+        cur.off += cur.h.write(bytes, { at: cur.off });
+      },
+      finish() {
+        cur.h.truncate(cur.off);
+        cur.h.flush();
+        cur.h.close();
+        handles.delete(cur.path);
+        cur = null;
+      },
+    };
+    const got = repatch_import(src, sink, d.titleId, !!d.pickedRoot, (stage, file, done, total) => {
+      post(done >= total, () => ({ type: "progress", stage, file, done, total }));
+    });
+    const rec = {
+      titleId: d.titleId,
+      source: d.source || "",
+      bytes: got.bytes,
+      files: got.files,
+      code: got.code,
+      addcont: got.addcont,
+      codeHash: got.codeHash,
+      importedAt: Date.now(),
+      disabled: false,
+      gen,
+    };
+    const w = await (await top.getFileHandle(REPATCH_RECORD, { create: true })).createWritable();
+    await w.write(JSON.stringify(rec));
+    await w.close();
+    if (old && old.gen !== gen) await top.removeEntry(old.gen, { recursive: true }).catch(() => {});
+    self.postMessage({ type: "done", titleId: d.titleId, repatch: rec, ignored: got.ignored });
+  } catch (err) {
+    for (const h of handles.values()) {
+      try {
+        h.close();
+      } catch {}
+    }
+    await top.removeEntry(gen, { recursive: true }).catch(() => {});
+    throw err;
+  }
+}

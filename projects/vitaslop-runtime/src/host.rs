@@ -9078,6 +9078,9 @@ pub struct VitaState {
     display_cb_next_slot: u32,
     display_cb_queue: std::collections::VecDeque<u32>,
     display_cb_running: Option<i32>,
+    /// Threads parked in `sceGxmDisplayQueueFinish` until every queued display callback has
+    /// run. See [`Self::display_queue_finish`].
+    display_finish_waiters: Vec<i32>,
     // NGS callback execution (preemptive mode; see [`Self::enqueue_ngs_callback`]):
     // the same shape as the display queue's - one dedicated guest stack, a ring of
     // `SceNgsCallbackInfo` slots, entries waiting to run as `(entry, info)`, and the
@@ -9726,6 +9729,7 @@ impl VitaState {
             display_cb_next_slot: 0,
             display_cb_queue: std::collections::VecDeque::new(),
             display_cb_running: None,
+            display_finish_waiters: Vec::new(),
             ngs_cb_stack: 0,
             ngs_cb_slots: 0,
             ngs_cb_next_slot: 0,
@@ -11626,6 +11630,11 @@ impl VitaState {
             if self.display_cb_running == Some(thid) {
                 self.display_cb_running = None;
                 self.pump_display_callback();
+                if self.display_cb_running.is_none() {
+                    for waiter in std::mem::take(&mut self.display_finish_waiters) {
+                        push_wake!(self, waiter);
+                    }
+                }
             }
             // ...and a finished NGS callback starts the next one, in event order.
             if self.ngs_cb_running == Some(thid) {
@@ -13478,6 +13487,39 @@ impl VitaState {
     /// Start the next queued display callback if none is in flight. Chained from
     /// [`Self::set_thread_exit`] when the in-flight one ends, preserving
     /// submission order.
+    /// `sceGxmDisplayQueueFinish`: whether the caller must park until every display-queue
+    /// entry submitted so far has had its callback run. Parks it (the caller returns
+    /// [`SvcOutcome::Block`]) when one is queued or running; the last one to finish wakes it.
+    ///
+    /// >>> RETURNING AT ONCE WAS A USE-AFTER-FREE. The callback is the title's own code and
+    /// > > > reads the entry's callback data, which can name the title's buffers; Finish is how a
+    /// > > > title knows no callback still holds one before it frees it. MEASURED (a golf title,
+    /// > > > a mode change): Finish returned with a callback still queued, the title freed a
+    /// > > > 192x192 RGB565 image and re-allocated the block, the queued callback then wrote the
+    /// > > > image's pixels over the new chunk's heap header, and the next `free` faulted inside
+    /// > > > the system C library.
+    ///
+    /// Never parks the callback thread itself: a Finish from inside the callback would wait
+    /// on its own return.
+    pub fn display_queue_finish(&mut self) -> bool {
+        if self.display_cb_running.is_none() && self.display_cb_queue.is_empty() {
+            return false;
+        }
+        if self.display_cb_running == Some(self.current) {
+            return false;
+        }
+        tracing::debug!(
+            target: "vitaslop::display",
+            thid = self.current,
+            queued = self.display_cb_queue.len(),
+            running = self.display_cb_running.is_some(),
+            frame = self.flip_count(),
+            "sceGxmDisplayQueueFinish waits for the display callbacks still pending"
+        );
+        self.display_finish_waiters.push(self.current);
+        true
+    }
+
     fn pump_display_callback(&mut self) {
         if self.display_cb_running.is_some() {
             return;

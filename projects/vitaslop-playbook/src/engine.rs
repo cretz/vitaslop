@@ -168,6 +168,9 @@ struct Cues {
     changed_now: Vec<bool>,
     /// Whether the cue has been sampled at least once.
     sampled: Vec<bool>,
+    /// A pixel cue's count in the last frame the host reported (see [`on_frame_pixels`]),
+    /// taken into `vals` at the next input frame like any other state.
+    pixels: Vec<Option<f64>>,
     input: u64,
     guest_us: u64,
 }
@@ -194,7 +197,7 @@ impl CueState for Cues {
 
     fn value(&self, id: CueId) -> Option<f64> {
         match &self.defs[id] {
-            CueDef::Call { .. } | CueDef::Mem { .. } => self.vals[id],
+            CueDef::Call { .. } | CueDef::Mem { .. } | CueDef::Pixels { .. } | CueDef::Locate { .. } => self.vals[id],
             CueDef::Cmp { src, op, value } => self.value(*src).map(|v| op.eval(v, *value) as u8 as f64),
             CueDef::Changed(src) => Some(self.changed_now[*src] as u8 as f64),
             CueDef::Stable(src, n) => {
@@ -297,6 +300,7 @@ fn new_engine(name: String, source: Source, header: Vec<(String, String)>, wall:
             changed_at: vec![],
             changed_now: vec![],
             sampled: vec![],
+            pixels: vec![],
             input: 0,
             guest_us: 0,
         },
@@ -371,6 +375,65 @@ pub fn on_display_frame(display: u64, guest_us: u64) {
         e.check_deadlines();
         e.pump_inline();
     }
+}
+
+/// Whether the running playbook has declared a pixel cue, so the host must report each
+/// presented frame's pixels ([`on_frame_pixels`]). A tape never needs them: it replays inputs.
+pub fn wants_pixels() -> bool {
+    ENGINE.lock().ok().is_some_and(|g| {
+        g.as_ref().is_some_and(|e| {
+            matches!(e.source, Source::Script { .. })
+                && e.cues.defs.iter().any(|d| matches!(d, CueDef::Pixels { .. } | CueDef::Locate { .. }))
+        })
+    })
+}
+
+/// The presented frame, as `w` x `h` tightly packed RGBA: every pixel cue counts its matches
+/// in it. A frame at another size than the 960x544 panel is sampled at the panel's
+/// coordinates, scaled.
+pub fn on_frame_pixels(w: u32, h: u32, rgba: &[u8]) {
+    if w == 0 || h == 0 || rgba.len() < (w * h * 4) as usize {
+        return;
+    }
+    if let Ok(mut g) = ENGINE.lock()
+        && let Some(e) = g.as_mut()
+    {
+        let c = &mut e.cues;
+        for i in 0..c.defs.len() {
+            match c.defs[i] {
+                CueDef::Pixels { x, y, w: rw, h: rh, rgb, tol } => {
+                    c.pixels[i] = Some(scan_pixels(w, h, rgba, (x, y, rw, rh), rgb, tol, false) as f64);
+                }
+                CueDef::Locate { x, y, w: rw, h: rh, rgb, tol } => {
+                    let at = scan_pixels(w, h, rgba, (x, y, rw, rh), rgb, tol, true);
+                    c.pixels[i] = (at != u32::MAX).then_some(at as f64);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// How many pixels of the panel rectangle `r` match `rgb` within `tol`, in a `w` x `h` frame -
+/// or, with `first`, where the first one is (`y * 1024 + x`, panel coordinates), `u32::MAX` for
+/// none.
+fn scan_pixels(w: u32, h: u32, rgba: &[u8], r: (u32, u32, u32, u32), rgb: [u8; 3], tol: u8, first: bool) -> u32 {
+    let (rx, ry, rw, rh) = r;
+    let mut n = 0;
+    for py in ry..ry + rh {
+        let sy = (py as u64 * h as u64 / 544) as u32;
+        for px in rx..rx + rw {
+            let sx = (px as u64 * w as u64 / 960) as u32;
+            let o = ((sy.min(h - 1) * w + sx.min(w - 1)) * 4) as usize;
+            if (0..3).all(|k| rgba[o + k].abs_diff(rgb[k]) <= tol) {
+                if first {
+                    return py * 1024 + px;
+                }
+                n += 1;
+            }
+        }
+    }
+    if first { u32::MAX } else { n }
 }
 
 /// Drive a VM the engine does not hold (the browser's): resume it until it blocks.
@@ -520,6 +583,7 @@ impl Engine {
             let v = match &c.defs[i] {
                 CueDef::Call { .. } => c.slot[i].map(|s| calls::count(s) as f64),
                 CueDef::Mem { ty, base, offs } => read_mem(mem, *ty, *base, offs),
+                CueDef::Pixels { .. } | CueDef::Locate { .. } => c.pixels[i],
                 _ => continue,
             };
             // A cue's FIRST sample is its starting value, not a change: a memory cue declared
@@ -661,7 +725,9 @@ impl Engine {
                 return Err(format!("cue#{c} does not exist"));
             }
         }
-        let is_state = |c: CueId| matches!(self.cues.defs[c], CueDef::Call { .. } | CueDef::Mem { .. });
+        let is_state = |c: CueId| {
+            matches!(self.cues.defs[c], CueDef::Call { .. } | CueDef::Mem { .. } | CueDef::Pixels { .. } | CueDef::Locate { .. })
+        };
         match &def {
             CueDef::Cmp { src, .. } | CueDef::Changed(src) | CueDef::Stable(src, _) if !is_state(*src) => {
                 return Err(format!("{} needs a call or memory cue, not {}", def.describe(&|c| format!("cue#{c}")), self.cues.label(*src)));
@@ -680,6 +746,7 @@ impl Engine {
         c.changed_at.push(c.input);
         c.changed_now.push(false);
         c.sampled.push(false);
+        c.pixels.push(None);
         Ok(n)
     }
 
@@ -1009,5 +1076,43 @@ mod tests {
         assert_eq!(replayed_shots, recorded_shots, "a replay asks for the recorded run's shots");
         let mid = |r: &Report| r.tape.notes.iter().find(|n| n.text == "shot mid").map(|n| n.input);
         assert_eq!(mid(&r), mid(&report), "...on the same input frame");
+    }
+}
+
+#[cfg(test)]
+mod pixel_tests {
+    use super::scan_pixels;
+
+    /// A frame of `w` x `h` black pixels with a white `s` x `s` block at panel `(bx, by)`.
+    fn frame(w: u32, h: u32, bx: u32, by: u32, s: u32) -> Vec<u8> {
+        let mut f = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let (px, py) = (x * 960 / w, y * 544 / h);
+                if px >= bx && px < bx + s && py >= by && py < by + s {
+                    let o = ((y * w + x) * 4) as usize;
+                    f[o..o + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn a_box_counts_the_pixels_of_a_colour_and_locate_finds_the_first() {
+        let f = frame(960, 544, 100, 200, 12);
+        let white = [255, 255, 255];
+        assert_eq!(scan_pixels(960, 544, &f, (90, 190, 20, 20), white, 30, false), 100, "10x10 of the block lies inside");
+        assert_eq!(scan_pixels(960, 544, &f, (0, 0, 50, 50), white, 30, false), 0);
+        assert_eq!(scan_pixels(960, 544, &f, (0, 150, 300, 100), white, 30, true), 200 * 1024 + 100);
+        assert_eq!(scan_pixels(960, 544, &f, (0, 0, 50, 50), white, 30, true), u32::MAX, "no match");
+        assert_eq!(scan_pixels(960, 544, &f, (90, 190, 20, 20), [250, 250, 250], 4, false), 0, "outside the tolerance");
+    }
+
+    #[test]
+    fn a_frame_at_another_size_is_read_at_panel_coordinates() {
+        // A 480x272 frame: each of its pixels covers 2x2 of the panel.
+        let f = frame(480, 272, 100, 200, 12);
+        assert_eq!(scan_pixels(480, 272, &f, (100, 200, 12, 12), [255, 255, 255], 30, false), 144);
     }
 }

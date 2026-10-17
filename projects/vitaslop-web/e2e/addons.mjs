@@ -128,6 +128,34 @@ try {
   const names = await page.locator("#ad-list li b").allTextContents();
   console.log(`[addons] listed: ${names.join(", ")}`);
 
+  // Turn the first OFF: its record says so, its files stay, and the run's file list (what the
+  // game is served - opfs.js listTitleFiles) leaves it out; ON brings it back.
+  const offDir = await page.locator("#ad-list input[data-addon-on]").first().getAttribute("data-addon-on");
+  const view = (dir) =>
+    page.evaluate(async ([id, dir]) => {
+      const opfs = await import("./opfs.js");
+      const rec = (await opfs.listAddons(id)).find((a) => a.dir === dir);
+      const served = (await opfs.listTitleFiles(id)).filter(([p]) => p.startsWith(`addons/${dir}/`)).length;
+      let stored = 0;
+      for await (const _ of (await (await opfs.addonsDir(id, { create: false })).getDirectoryHandle(dir)).entries()) stored += 1;
+      return { disabled: !!(rec && rec.disabled), served, stored };
+    }, [titleId, dir]);
+  const until = async (dir, disabled) => {
+    for (let i = 0; i < 100; i++) {
+      const v = await view(dir);
+      if (v.disabled === disabled) return v;
+      await page.waitForTimeout(100);
+    }
+    return view(dir);
+  };
+  await page.locator(`#ad-list input[data-addon-on="${offDir}"]`).uncheck();
+  let v = await until(offDir, true);
+  check(v.disabled && v.served === 0 && v.stored > 0, `turning ${offDir} off keeps its ${v.stored} stored files and serves none (${v.served})`);
+  await shot("3b-addon-off");
+  await page.locator(`#ad-list input[data-addon-on="${offDir}"]`).check();
+  v = await until(offDir, false);
+  check(!v.disabled && v.served > 0, `turning ${offDir} on serves its files again (${v.served})`);
+
   // Remove the first, then add it back.
   const firstDir = await page.locator("#ad-list button[data-addon]").first().getAttribute("data-addon");
   await page.locator("#ad-list button[data-addon]").first().click();

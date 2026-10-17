@@ -98,7 +98,7 @@ impl Tape {
         let mut notes = self.notes.iter().peekable();
         for c in &self.changes {
             while let Some(n) = notes.peek().filter(|n| n.input < c.input) {
-                let _ = writeln!(s, "# {} f{} {:.3}s {}", n.input, n.display, n.seconds, n.text);
+                note_line(&mut s, n);
                 notes.next();
             }
             let touch = match c.touch {
@@ -118,7 +118,7 @@ impl Tape {
             );
         }
         for n in notes {
-            let _ = writeln!(s, "# {} f{} {:.3}s {}", n.input, n.display, n.seconds, n.text);
+            note_line(&mut s, n);
         }
         if let Some((input, display)) = self.end {
             let _ = writeln!(s, "end {input} f{display}");
@@ -138,6 +138,14 @@ impl Tape {
             let line = raw.trim();
             let at = |e: String| format!("tape line {}: {e}", i + 1);
             if line.is_empty() {
+                continue;
+            }
+            // A note's further lines (a failure's traceback): `#| <line>`, onto the note before.
+            if let Some(more) = line.strip_prefix(NOTE_MORE) {
+                if let Some(n) = t.notes.last_mut() {
+                    n.text.push('\n');
+                    n.text.push_str(more);
+                }
                 continue;
             }
             if let Some(rest) = line.strip_prefix("# ") {
@@ -235,6 +243,19 @@ fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n - 1).collect::<String>() + "~" }
 }
 
+/// The prefix of a note's continuation lines. A note's text can span lines (a failure carries
+/// its Lua traceback), and written raw they read as malformed changes - which made the tape of a
+/// FAILED run, the one most worth replaying, refuse to load.
+const NOTE_MORE: &str = "#| ";
+
+fn note_line(s: &mut String, n: &Note) {
+    let mut lines = n.text.lines();
+    let _ = writeln!(s, "# {} f{} {:.3}s {}", n.input, n.display, n.seconds, lines.next().unwrap_or(""));
+    for more in lines {
+        let _ = writeln!(s, "{NOTE_MORE}{more}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +268,11 @@ mod tests {
                 Change { input: 0, display: 100, ctrl: CtrlFrame::default(), touch: None },
                 Change { input: 4, display: 104, ctrl: CtrlFrame { buttons: 0x4008, lx: 0, ..CtrlFrame::default() }, touch: Some((10, 20)) },
             ],
-            notes: vec![Note { input: 2, display: 102, seconds: 1.5, text: "split title".into() }],
+            notes: vec![
+                Note { input: 2, display: 102, seconds: 1.5, text: "split title".into() },
+                // A failure's note carries its traceback: lines that must not read as changes.
+                Note { input: 9, display: 109, seconds: 2.0, text: "FAILED x.lua:1: no\nstack traceback:\n\t[C]: in function 'error'".into() },
+            ],
             end: Some((9, 109)),
         };
         let text = t.render();

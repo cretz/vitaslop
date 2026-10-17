@@ -172,6 +172,36 @@ fn parse_cue(o: &Map<String, Value>) -> Result<CueDef, String> {
             };
             CueDef::Mem { ty, base: base as u32, offs }
         }
+        "pixels" | "locate" => {
+            let dim = |k: &str, max: f64| -> Result<u32, String> {
+                let n = num_of(o, k)?;
+                if !(0.0..=max).contains(&n) || n.fract() != 0.0 {
+                    return Err(format!("cue.pixels `{k}` must be a whole number 0..{max}, got {n}"));
+                }
+                Ok(n as u32)
+            };
+            let (x, y) = (dim("x", 959.0)?, dim("y", 543.0)?);
+            let (w, h) = (dim("w", 960.0)?.max(1), dim("h", 544.0)?.max(1));
+            if x + w > 960 || y + h > 544 {
+                return Err(format!("cue.pixels {w}x{h} at {x},{y} runs off the 960x544 frame"));
+            }
+            let rgb = match o.get("rgb") {
+                Some(Value::Array(a)) if a.len() == 3 => {
+                    let mut c = [0u8; 3];
+                    for (i, v) in a.iter().enumerate() {
+                        c[i] = v.as_u64().filter(|v| *v <= 255).ok_or("cue.pixels `rgb` is three numbers 0..255")? as u8;
+                    }
+                    c
+                }
+                _ => return Err("cue.pixels needs `rgb = { r, g, b }`".into()),
+            };
+            let tol = dim("tol", 255.0)? as u8;
+            if kind == "locate" {
+                CueDef::Locate { x, y, w, h, rgb, tol }
+            } else {
+                CueDef::Pixels { x, y, w, h, rgb, tol }
+            }
+        }
         "frames" => CueDef::Frames(frames_of(o, "n")?),
         "seconds" => CueDef::Seconds(num_of(o, "s")?),
         "cmp" => {
@@ -266,6 +296,16 @@ pub fn now(input: u64, display: u64, seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pixel_box_must_lie_on_the_frame() {
+        let ok = parse(r#"{"op":"cue","def":{"kind":"pixels","x":10,"y":20,"w":4,"h":5,"rgb":[255,0,1],"tol":9}}"#);
+        assert_eq!(ok, Ok(Request::Cue(CueDef::Pixels { x: 10, y: 20, w: 4, h: 5, rgb: [255, 0, 1], tol: 9 })));
+        let at = parse(r#"{"op":"cue","def":{"kind":"locate","x":0,"y":0,"w":960,"h":544,"rgb":[1,2,3],"tol":0}}"#);
+        assert_eq!(at, Ok(Request::Cue(CueDef::Locate { x: 0, y: 0, w: 960, h: 544, rgb: [1, 2, 3], tol: 0 })));
+        assert!(parse(r#"{"op":"cue","def":{"kind":"pixels","x":950,"y":0,"w":20,"h":1,"rgb":[0,0,0],"tol":0}}"#).is_err());
+        assert!(parse(r#"{"op":"cue","def":{"kind":"pixels","x":0,"y":0,"w":1,"h":1,"tol":0}}"#).is_err(), "no rgb");
+    }
 
     #[test]
     fn requests_parse_from_the_preludes_shapes() {

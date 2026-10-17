@@ -35,6 +35,7 @@ pub mod pfs;
 pub mod pfscrypt;
 pub mod pipeline;
 pub mod pkg;
+pub mod repatch;
 pub mod rif;
 pub mod self2elf;
 pub mod sfo;

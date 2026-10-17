@@ -149,6 +149,67 @@ pub fn ingest_import(source: JsValue, sink: JsValue, progress: Function) -> Resu
     stream::import(src, &mut sink, &mut report).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// The stored paths [`repatch_import`] will write for these picked files, so the worker can open
+/// their sync handles first (opening one is async; the import's writes are not). Throws what
+/// the import would refuse: an overlay for another title, or nothing to lay over.
+#[wasm_bindgen]
+pub fn repatch_plan(source: JsValue, title_id: &str, picked_root: bool) -> Result<JsValue, JsValue> {
+    crate::logging::install_panic_hook();
+    let src: Rc<dyn ByteSource> = Rc::new(JsSource(source));
+    let names = src.list();
+    let (names, picked_root) = match names.as_slice() {
+        [one] if one.to_ascii_lowercase().ends_with(".zip") => {
+            let z = stream::ZipSource::open(src.clone(), one).map_err(|e| JsValue::from_str(&format!("{one}: {e}")))?;
+            (z.list(), false)
+        }
+        _ => (names, picked_root),
+    };
+    let plan = vitaslop_runtime::ingest::repatch::plan(&names, title_id, picked_root).map_err(|e| JsValue::from_str(&e))?;
+    let out = js_sys::Array::new();
+    for (_, t) in &plan.files {
+        out.push(&JsValue::from_str(&t.stored()));
+    }
+    Ok(out.into())
+}
+
+/// Copy a rePatch overlay for `title_id` out of picked files (a folder, or one `.zip`) into
+/// `sink`, at its stored layout (see `vitaslop_runtime::ingest::repatch`). `picked_root`: the
+/// paths start with the picked folder's own name, as a folder pick spells them. The caller
+/// writes the record afterwards; this returns its fields:
+/// `{ files, bytes, code, addcont, codeHash, ignored }`.
+#[wasm_bindgen]
+pub fn repatch_import(source: JsValue, sink: JsValue, title_id: &str, picked_root: bool, progress: Function) -> Result<JsValue, JsValue> {
+    crate::logging::install_panic_hook();
+    let src: Rc<dyn ByteSource> = Rc::new(JsSource(source));
+    let mut sink = JsSink(sink);
+    let mut report = |p: stream::Progress<'_>| {
+        let _ = progress.call4(
+            &JsValue::NULL,
+            &JsValue::from_str(p.stage),
+            &JsValue::from_str(p.file),
+            &JsValue::from_f64(p.done as f64),
+            &JsValue::from_f64(p.total as f64),
+        );
+    };
+    let got = vitaslop_runtime::ingest::repatch::import(src, title_id, picked_root, &mut sink, &mut report)
+        .map_err(|e| JsValue::from_str(&e))?;
+    let strs = |v: &[String]| {
+        let a = js_sys::Array::new();
+        for s in v {
+            a.push(&JsValue::from_str(s));
+        }
+        JsValue::from(a)
+    };
+    let out = js_sys::Object::new();
+    set(&out, "files", JsValue::from_f64(got.files as f64));
+    set(&out, "bytes", JsValue::from_f64(got.bytes as f64));
+    set(&out, "code", strs(&got.code));
+    set(&out, "addcont", strs(&got.addcont));
+    set(&out, "codeHash", JsValue::from_str(&got.code_hash));
+    set(&out, "ignored", JsValue::from_f64(got.ignored as f64));
+    Ok(out.into())
+}
+
 /// Time the ingest's per-byte crypto on THIS device: pkg CTR, PFS HMAC-SHA1, PFS CBC,
 /// and all three chained, each for `budget_ms`, in MB/s.
 ///

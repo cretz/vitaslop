@@ -6,7 +6,7 @@ import { ensureIsolation, checkFeatures, canPlay } from "./features.js";
 import * as store from "./store.js";
 import * as imp from "./import.js";
 import * as gamedata from "./gamedata.js";
-import { removeTitle, listAddons, removeAddon } from "./opfs.js";
+import { removeTitle, listAddons, removeAddon, setAddonEnabled, readRepatch, setRepatchEnabled, removeRepatch } from "./opfs.js";
 import { writeZip, readZip } from "./zipstore.js";
 import { createPlayer } from "./player.js";
 import { renderVita } from "./vita.js";
@@ -84,6 +84,13 @@ window.addEventListener("hashchange", route);
 const stale = (me) => current !== me;
 
 // ------------------------------- library -------------------------------
+
+/// A rePatch overlay import outlives the page that started it: the title page can be redrawn
+/// (or left and come back to) while the worker copies, so its state is kept per title here and
+/// whichever title page is showing draws it. `{ busy, note }`.
+const repatchJobs = new Map();
+/// The showing title page's overlay card redraw, so a finished import can refresh it.
+let repatchCard = null;
 
 let sortMode = "recent";
 let query = "";
@@ -222,6 +229,18 @@ async function renderTitle(id) {
       <ul id="ad-list" class="addons"></ul>
       <p id="ad-none" class="dim" hidden>None installed. Add-ons you own for this game - costumes, tracks, characters - come in the same .pkg + work.bin, folder or zip a game does, and the game finds them the next time it starts.</p>
       <div class="actions"><a class="btn" href="#/import/${esc(id)}">Add add-ons</a></div>
+    </div>
+    <div class="card">
+      <h2>rePatch overlay</h2>
+      <ul id="rp-list" class="addons"></ul>
+      <p id="rp-none" class="dim" hidden>None. An overlay lays your own modified or decrypted files over this game, as the rePatch plugin does on a Vita: pick a folder or .zip laid out like ux0:rePatch/${esc(id)}/ (a reAddcont/${esc(id)}/ folder beside it covers add-ons). Executables in it must be decrypted. The game itself is never changed - turn the overlay off or remove it here.</p>
+      <p id="rp-note" class="dim" hidden></p>
+      <div class="actions">
+        <button id="rp-dir" class="btn">Add from a folder</button>
+        <button id="rp-zip" class="btn">Add from a .zip</button>
+        <input id="rp-dir-in" type="file" webkitdirectory hidden />
+        <input id="rp-zip-in" type="file" accept=".zip,application/zip" hidden />
+      </div>
     </div>`;
   // The backdrop goes on through the element's style property: a `style="..."` attribute
   // in the markup is an inline style the page's Content-Security-Policy refuses.
@@ -241,9 +260,21 @@ async function renderTitle(id) {
     $("ad-list").innerHTML = addons
       .map(
         (a) => `<li><div><b>${esc(a.title)}</b><br><span class="dim">${esc(a.dir)}${a.version ? " &middot; v" + esc(a.version) : ""} &middot; ${store.fmtBytes(a.bytes)} &middot; added ${fmtDate(a.importedAt)}</span></div>
+          <label class="row"><input type="checkbox" data-addon-on="${esc(a.dir)}" ${a.disabled ? "" : "checked"} /><span>On</span></label>
           <button class="btn danger" data-addon="${esc(a.dir)}">Remove</button></li>`
       )
       .join("");
+    // Off keeps the add-on; the game does not see it until it is on again.
+    for (const c of $("ad-list").querySelectorAll("input[data-addon-on]")) {
+      c.addEventListener("change", async () => {
+        try {
+          await setAddonEnabled(id, c.dataset.addonOn, c.checked);
+        } catch (err) {
+          alert(`Not changed: ${err.message || err}`);
+        }
+        drawAddons();
+      });
+    }
     for (const b of $("ad-list").querySelectorAll("button[data-addon]")) {
       b.addEventListener("click", async () => {
         const a = addons.find((x) => x.dir === b.dataset.addon);
@@ -258,9 +289,79 @@ async function renderTitle(id) {
     }
   };
   drawAddons();
+  // The rePatch overlay (see opfs.js): one per title, switched, replaced or removed here.
+  const job = () => repatchJobs.get(id) || { busy: false, note: "" };
+  const rpNote = (text) => {
+    repatchJobs.set(id, { ...job(), note: text || "" });
+    if (repatchCard && repatchCard.id === id) repatchCard.draw();
+  };
+  const drawRepatch = async () => {
+    const rp = await readRepatch(id);
+    if (stale(me) || !$("rp-list")) return;
+    const { busy, note } = job();
+    $("rp-note").hidden = !note;
+    $("rp-note").textContent = note;
+    $("rp-none").hidden = !!rp;
+    $("rp-dir").textContent = rp ? "Replace with a folder" : "Add from a folder";
+    $("rp-zip").textContent = rp ? "Replace with a .zip" : "Add from a .zip";
+    $("rp-dir").disabled = $("rp-zip").disabled = busy;
+    if (!rp) {
+      $("rp-list").innerHTML = "";
+      return;
+    }
+    const code = rp.code && rp.code.length ? `replaces ${rp.code.map(esc).join(", ")}` : "data only";
+    const addcont = rp.addcont && rp.addcont.length ? ` &middot; add-ons ${rp.addcont.map(esc).join(", ")}` : "";
+    $("rp-list").innerHTML = `<li><div><b>${esc(rp.source || "Overlay")}</b><br><span class="dim">${rp.files} files &middot; ${store.fmtBytes(rp.bytes)} &middot; ${code}${addcont} &middot; added ${fmtDate(rp.importedAt)}</span></div>
+      <label class="row"><input type="checkbox" id="rp-on" ${rp.disabled ? "" : "checked"} /><span>On</span></label>
+      <button class="btn danger" id="rp-rm">Remove</button></li>`;
+    $("rp-on").addEventListener("change", async () => {
+      try {
+        await setRepatchEnabled(id, $("rp-on").checked);
+      } catch (err) {
+        alert(`Not changed: ${err.message || err}`);
+      }
+      drawRepatch();
+    });
+    $("rp-rm").addEventListener("click", async () => {
+      if (!confirm(`Remove the rePatch overlay from ${meta.title}?\n\nIts files are deleted; the game itself is untouched and runs without it from the next start. To keep it, turn it off instead.`)) return;
+      await removeRepatch(id);
+      rpNote("");
+      drawRepatch();
+    });
+  };
+  const addRepatch = async (entries, pickedRoot, source) => {
+    if (!entries.length || job().busy) return;
+    repatchJobs.set(id, { busy: true, note: "Reading..." });
+    drawRepatch();
+    try {
+      const r = await imp.runRepatch(entries, id, { pickedRoot, source }, (p) => {
+        if (p.total && p.unit !== "files") rpNote(`Copying ${p.file} - ${Math.floor((p.done * 100) / p.total)}%`);
+      });
+      const left = r.ignored ? ` ${r.ignored} file(s) outside the overlay were left out.` : "";
+      rpNote(`Overlay added. It applies the next time the game starts.${left}`);
+    } catch (err) {
+      rpNote(`Could not add the overlay: ${err.message || err}`);
+    }
+    repatchJobs.set(id, { ...job(), busy: false });
+    if (repatchCard && repatchCard.id === id) repatchCard.draw();
+  };
+  $("rp-dir").addEventListener("click", () => $("rp-dir-in").click());
+  $("rp-zip").addEventListener("click", () => $("rp-zip-in").click());
+  $("rp-dir-in").addEventListener("change", (e) => {
+    const entries = imp.entriesFromFiles(e.target.files);
+    const source = entries.length ? entries[0].path.split("/")[0] : "";
+    addRepatch(entries, true, source);
+  });
+  $("rp-zip-in").addEventListener("change", (e) => {
+    const f = e.target.files[0];
+    if (f) addRepatch([{ path: f.name, file: f }], false, f.name);
+  });
+  repatchCard = { id, draw: drawRepatch };
+  drawRepatch();
   $("remove").addEventListener("click", async () => {
     const withAddons = addons.length ? ` and its ${addons.length} add-on${addons.length === 1 ? "" : "s"}` : "";
-    if (!confirm(`Remove ${meta.title} (${meta.titleId}) from this browser?\n\nThis deletes the imported game (${sizeText()})${withAddons} and its prepared code. Saved data is kept; clear it separately if you want it gone.`)) return;
+    const withOverlay = (await readRepatch(id)) ? " and its rePatch overlay" : "";
+    if (!confirm(`Remove ${meta.title} (${meta.titleId}) from this browser?\n\nThis deletes the imported game (${sizeText()})${withAddons}${withOverlay} and its prepared code. Saved data is kept; clear it separately if you want it gone.`)) return;
     await removeTitle(id);
     await store.removeTitleRecord(id);
     go("#/");

@@ -4,7 +4,9 @@
 //! on. Three families:
 //!
 //! - **event** - fires at a moment: a host call ([`CueDef::Call`]), a change, a duration.
-//! - **state** - has a value at every input frame: guest memory ([`CueDef::Mem`]).
+//! - **state** - has a value at every input frame: guest memory ([`CueDef::Mem`]), or the
+//!   pixels of the presented frame ([`CueDef::Pixels`]) - what the player sees, for a HUD
+//!   element with no memory cell to find.
 //! - **condition** - a truth over a state cue: [`CueDef::Cmp`], [`CueDef::Stable`].
 //!
 //! Waiting arms a fresh [`Armed`] tree over the cue, so arm-relative cues (durations,
@@ -77,6 +79,14 @@ pub enum CueDef {
     Call { name: String, filter: Option<(u8, String)> },
     /// Guest memory: start at `base`, follow `offs` (read a pointer, add the offset) for each.
     Mem { ty: MemTy, base: u32, offs: Vec<u32> },
+    /// The presented frame: how many pixels of the rectangle at `x`,`y` (`w` by `h`, in the
+    /// 960x544 panel's coordinates) are within `tol` of `rgb` on every channel. `None` until
+    /// the host has reported a frame.
+    Pixels { x: u32, y: u32, w: u32, h: u32, rgb: [u8; 3], tol: u8 },
+    /// The presented frame: WHERE the first pixel of the rectangle matching `rgb` within `tol`
+    /// is, scanning rows top to bottom, as `y * 1024 + x` in panel coordinates. `None` when no
+    /// pixel matches (or before the first frame) - for a marker that moves from shot to shot.
+    Locate { x: u32, y: u32, w: u32, h: u32, rgb: [u8; 3], tol: u8 },
     /// `n` input frames after the wait begins.
     Frames(u64),
     /// `s` guest seconds after the wait begins.
@@ -115,6 +125,12 @@ impl CueDef {
                     s.push_str(&format!("->+{o:#x}"));
                 }
                 s
+            }
+            CueDef::Pixels { x, y, w, h, rgb, tol } => {
+                format!("pixels {w}x{h}@{x},{y} ~#{:02x}{:02x}{:02x}/{tol}", rgb[0], rgb[1], rgb[2])
+            }
+            CueDef::Locate { x, y, w, h, rgb, tol } => {
+                format!("locate {w}x{h}@{x},{y} ~#{:02x}{:02x}{:02x}/{tol}", rgb[0], rgb[1], rgb[2])
             }
             CueDef::Frames(n) => format!("{n} input frames"),
             CueDef::Seconds(s) => format!("{s} s"),
@@ -163,7 +179,7 @@ impl Armed {
     pub fn arm(st: &dyn CueState, id: CueId) -> Armed {
         match st.def(id) {
             CueDef::Call { .. } => Armed::Count { id, base: st.value(id).unwrap_or(0.0) },
-            CueDef::Mem { .. } => Armed::Change { id, base: st.value(id) },
+            CueDef::Mem { .. } | CueDef::Pixels { .. } | CueDef::Locate { .. } => Armed::Change { id, base: st.value(id) },
             CueDef::Cmp { .. } | CueDef::Stable(..) => Armed::Level { id },
             CueDef::Changed(_) => Armed::Edge { id, armed_at: st.input_frame() },
             CueDef::Frames(n) => Armed::Frames { until: st.input_frame() + n },

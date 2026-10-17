@@ -1712,8 +1712,8 @@ fn dispatch_inner(
         // --- gxm: graphics ------------------------------------------------------
         gxm_nid::INITIALIZE | gxm_nid::VSH_INITIALIZE => cont!(gxm::initialize(ctx, st)),
         gxm_nid::FINISH => gxm::finish(ctx, st),
+        gxm_nid::DISPLAY_QUEUE_FINISH => gxm::display_queue_finish(ctx, st),
         gxm_nid::PAD_HEARTBEAT
-        | gxm_nid::DISPLAY_QUEUE_FINISH
         | gxm_nid::PROGRAM_CHECK
         | gxm_nid::DESTROY_CONTEXT
         | gxm_nid::DESTROY_RENDER_TARGET

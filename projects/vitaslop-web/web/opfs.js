@@ -73,11 +73,11 @@ export async function isComplete(id) {
   }
 }
 
-/// Remove every stored byte of `id`, its add-ons included - an add-on is part of its title.
-/// The saves are elsewhere and untouched.
+/// Remove every stored byte of `id`, its add-ons and rePatch overlay included - both are part
+/// of its title. The saves are elsewhere and untouched.
 export async function removeTitle(id) {
   const root = await navigator.storage.getDirectory();
-  for (const top of ["games", ADDONS]) {
+  for (const top of ["games", ADDONS, REPATCH]) {
     try {
       const d = await root.getDirectoryHandle(top, { create: false });
       await d.removeEntry(id, { recursive: true });
@@ -137,6 +137,74 @@ export async function removeAddon(id, dir) {
   if (!isAddonName(dir)) throw new Error(`not an add-on name: ${dir}`);
   const top = await addonsDir(id, { create: false });
   await top.removeEntry(dir, { recursive: true });
+}
+
+/// Turn one add-on of `id` on or off. Off keeps every file; the game just does not see it.
+export async function setAddonEnabled(id, dir, on) {
+  if (!isAddonName(dir)) throw new Error(`not an add-on name: ${dir}`);
+  const h = await (await addonsDir(id, { create: false })).getDirectoryHandle(dir);
+  const rec = JSON.parse(await (await (await h.getFileHandle(ADDON_RECORD)).getFile()).text());
+  rec.disabled = !on;
+  await writeJson(h, ADDON_RECORD, rec);
+}
+
+async function writeJson(dir, name, value) {
+  const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
+  await w.write(JSON.stringify(value));
+  await w.close();
+}
+
+// ------------------------------ rePatch overlay ------------------------------
+//
+// A player's own modified or decrypted files laid over a title, as the device's rePatch plugin
+// lays `ux0:rePatch/<id>/` over the game (see `ingest::repatch`). One per title, stored under
+// `repatch/<id>/<gen>/` in the same flat `%2F`-encoded form - `app/...` over the game,
+// `addcont/<dir>/...` over its add-ons - with the record `repatch/<id>/repatch.json` naming `gen`.
+// A replacement is copied into a NEW generation and the record rewritten last, so a failed one
+// leaves the old overlay in place (OPFS cannot rename a directory). The game itself is never
+// touched: the overlay is turned off, replaced or removed on its own.
+
+const REPATCH = "repatch";
+/// The overlay's record, written last: its presence is what makes an overlay complete.
+export const REPATCH_RECORD = "repatch.json";
+
+export async function repatchDir(id, { create = true } = {}) {
+  const root = await navigator.storage.getDirectory();
+  const top = await root.getDirectoryHandle(REPATCH, { create });
+  return top.getDirectoryHandle(id, { create });
+}
+
+/// The overlay installed for `id`, or null.
+export async function readRepatch(id) {
+  try {
+    const d = await repatchDir(id, { create: false });
+    const rec = JSON.parse(await (await (await d.getFileHandle(REPATCH_RECORD)).getFile()).text());
+    return rec && rec.titleId === id && typeof rec.gen === "string" ? rec : null;
+  } catch {
+    return null;
+  }
+}
+
+/// Turn `id`'s overlay on or off. Off keeps every file.
+export async function setRepatchEnabled(id, on) {
+  const rec = await readRepatch(id);
+  if (!rec) throw new Error(`${id} has no rePatch overlay`);
+  rec.disabled = !on;
+  await writeJson(await repatchDir(id, { create: false }), REPATCH_RECORD, rec);
+}
+
+export async function removeRepatch(id) {
+  const root = await navigator.storage.getDirectory();
+  try {
+    await (await root.getDirectoryHandle(REPATCH, { create: false })).removeEntry(id, { recursive: true });
+  } catch {}
+}
+
+/// The compile-cache name part an ENABLED overlay with code adds - see `transpile-worker.js`.
+/// Empty when there is none, so a title without one keeps the name it always had.
+export async function repatchCodeSuffix(id) {
+  const rec = await readRepatch(id);
+  return rec && !rec.disabled && rec.codeHash ? `-rp${rec.codeHash}` : "";
 }
 
 /// Whether `id` is already imported and complete. Cheap: one read of the marker.
@@ -397,7 +465,9 @@ export async function openTitleSync(id, { skip } = {}) {
 
 /// Every stored file of `id` as `[path, FileSystemFileHandle]`, NOT opened: the title's own
 /// files, then its installed add-ons' under `addons/<dir>/` - the prefix the engine looks for
-/// (`opfs.rs` ADDONS_PREFIX). Only complete add-ons: a half-imported add-on is not one.
+/// (`opfs.rs` ADDONS_PREFIX) - then its rePatch overlay's under `repatch/` (`REPATCH_PREFIX`).
+/// Only complete, ENABLED add-ons and overlays: a half-imported one is not one, and a turned-off
+/// one is not there as far as the game can tell.
 export async function listTitleFiles(id) {
   const dir = await titleDir(id, { create: false });
   const out = [];
@@ -406,10 +476,19 @@ export async function listTitleFiles(id) {
     out.push([decodeName(name), h]);
   }
   for (const rec of await listAddons(id)) {
+    if (rec.disabled) continue;
     const adir = await (await addonsDir(id, { create: false })).getDirectoryHandle(rec.dir);
     for await (const [name, h] of adir.entries()) {
       if (name === MANIFEST || name === ADDON_RECORD || h.kind !== "file") continue;
       out.push([`${ADDONS}/${rec.dir}/${decodeName(name)}`, h]);
+    }
+  }
+  const rp = await readRepatch(id);
+  if (rp && !rp.disabled) {
+    const gen = await (await repatchDir(id, { create: false })).getDirectoryHandle(rp.gen);
+    for await (const [name, h] of gen.entries()) {
+      if (h.kind !== "file") continue;
+      out.push([`${REPATCH}/${decodeName(name)}`, h]);
     }
   }
   return out;

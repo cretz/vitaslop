@@ -5985,6 +5985,13 @@ pub fn report_completed_early(addr: u32, w: u32, h: u32) {
 /// Block until every scene ended on the context has been rendered. The frame's scenes are
 /// completed here - and the CPU-readable ones written back to guest memory - so a read of a
 /// render target after this call sees its pixels. See [`complete_scenes_through`].
+/// `int sceGxmDisplayQueueFinish(void)`: block until every display-queue entry submitted so
+/// far has had its callback run - see [`VitaState::display_queue_finish`].
+pub(super) fn display_queue_finish(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOutcome {
+    ctx.ret(0);
+    if st.display_queue_finish() { crate::SvcOutcome::Block } else { crate::SvcOutcome::Continue }
+}
+
 pub(super) fn finish(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOutcome {
     let n = st.capture.scenes.len();
     let blocked = complete_scenes_through(ctx, st, n);

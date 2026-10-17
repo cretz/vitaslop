@@ -79,6 +79,11 @@ vitaslop --game <dir> --headless <out> --discover [--playbook <p.lua> | --recipe
   SMP it has been seen holding garbage; check every memory cue at real speed.
 - **A screen with no call and no cell is answered by repetition**: press its button until the
   NEXT screen's cue happens. Fixed waits are the last resort; say so in a comment when used.
+- **A HUD element with no cell is read off the screen**: `cue.pixels` / `cue.locate` look at the
+  presented frame in 960x544 panel coordinates. Measure boxes on shots taken every frame
+  (`VITASLOP_HEADLESS_SHOT_FROM/_TO`, `EVERY=1`). Press when a moving marker ENTERS a box short
+  of its target: desktop headless reads the frame it just rendered, the browser a frame or two
+  later. `grep -l cue.pixels playbooks/` finds one driving a shot gauge.
 
 ## The tools
 
@@ -127,6 +132,8 @@ end)
 | `cue.call(name, {arg=0, has="stage"})` | matching calls | ...whose C string in `r<arg>` contains `has` |
 | `cue.u8/u16/u32/i8/i16/i32/f32(addr)` | the value | when it differs from its value at the wait |
 | `cue.u32(ptr(base, off, ...))` | the value | (pointer chain: read a pointer at `base`, add `off`, repeat) |
+| `cue.pixels{x=, y=, w=, h=, rgb={r,g,b}, tol=24}` | matching pixels in the box | when the count differs from its value at the wait |
+| `cue.locate{x=, y=, w=, h=, rgb={r,g,b}, tol=24}` | first match, `y*1024+x` (`c:xy()` splits it) | when it moves |
 | `c:is(v)` `:isnt` `:above` `:below` `:atleast` `:atmost` | 1/0 | while it holds (at once if it already does) |
 | `c:happened()` | 1/0 | once call cue `c` has fired at all since `c` was declared (`:atleast(1)`) |
 | `c:changed()` | 1/0 | on a frame the value changed |
@@ -138,6 +145,8 @@ end)
 
 - Call cues count from every guest thread, lock-free.
 - Memory and conditions are sampled once per input frame.
+- Pixel cues hold the newest frame the host reported. Declaring one makes every frame of the run
+  rendered and read back (desktop: the frame it already renders; browser: a copy per present).
 - A cue name that never matched a call is a `WARN` in the report.
 - **A loop that presses while it waits must wait on a CONDITION.** `wait(c)` on a call
   cue fires on the next call after the wait begins, so in

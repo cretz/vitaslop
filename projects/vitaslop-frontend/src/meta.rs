@@ -56,4 +56,29 @@ pub struct AddonMeta {
     pub files: u32,
     /// Unix milliseconds.
     pub imported_at: u64,
+    /// Turned off on the title page: kept, but the title does not see it.
+    pub disabled: bool,
+}
+
+/// The record kept beside a title's rePatch overlay (see `vitaslop_runtime::ingest::repatch`),
+/// written last. One per title; turned off, replaced or removed without touching the title.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RepatchMeta {
+    /// The title it lays over.
+    pub title_id: String,
+    /// What it was added from: the picked folder's or zip's name.
+    pub source: String,
+    pub bytes: u64,
+    pub files: u32,
+    /// The executables it replaces or adds (`eboot.bin`, `sce_module/...`).
+    pub code: Vec<String>,
+    /// The add-on directories it lays files over.
+    pub addcont: Vec<String>,
+    /// The compile caches' name for its code, empty when it carries none.
+    pub code_hash: String,
+    /// Unix milliseconds.
+    pub imported_at: u64,
+    /// Turned off on the title page: kept, but the title runs without it.
+    pub disabled: bool,
 }

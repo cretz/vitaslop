@@ -1050,6 +1050,8 @@ struct LivePlayback {
     split: RenderSplit,
     /// Reads back WHAT WE PRESENTED, when `VITASLOP_PRESENT_PROBE` asks for it.
     probe: Option<PresentProbe>,
+    /// A playbook's pixel cues' view of the surface - see [`PixelTap`].
+    pixel_tap: PixelTap,
     /// ...and how bright each offscreen target of the chain is, on the same cadence.
     targets: Option<TargetProbe>,
     /// The rendered pixels of the small offscreen targets, on their way back to guest
@@ -1696,6 +1698,108 @@ impl TargetProbe {
             out.push('\n');
         }
         Some(out)
+    }
+}
+
+/// What a playbook's pixel cues read: the presented surface, copied on the frame's own encoder
+/// while `vitaslop_playbook::engine::wants_pixels` holds, mapped after the submit and handed to
+/// the engine (`on_frame_pixels`) on the present that finds the map done.
+///
+/// ONE copy in flight at a time, so a reading is the newest the GPU has finished, a frame or two
+/// behind the present - the latency a playbook's boxes are sized for (a cue fires when a moving
+/// marker ENTERS a box, and the box sits short of the target). A desktop headless run reads its
+/// rendered frame synchronously instead.
+struct PixelTap {
+    buffer: Option<wgpu::Buffer>,
+    bytes_per_row: u32,
+    size: (u32, u32),
+    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    in_flight: bool,
+    awaiting_submit: bool,
+}
+
+impl PixelTap {
+    fn new() -> PixelTap {
+        PixelTap {
+            buffer: None,
+            bytes_per_row: 0,
+            size: (0, 0),
+            ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_flight: false,
+            awaiting_submit: false,
+        }
+    }
+
+    /// Queue the copy of `texture` on `encoder`, BEFORE the present. Skipped while one is in flight.
+    fn capture(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) {
+        if self.in_flight {
+            return;
+        }
+        let (w, h) = (texture.width(), texture.height());
+        // A texture-to-buffer copy needs a 256-byte aligned row.
+        let bytes_per_row = (w * 4).div_ceil(256) * 256;
+        if self.size != (w, h) || self.buffer.is_none() {
+            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("playbook-pixels"),
+                size: u64::from(bytes_per_row) * u64::from(h),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }));
+            self.size = (w, h);
+            self.bytes_per_row = bytes_per_row;
+        }
+        let Some(buffer) = self.buffer.as_ref() else { return };
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.in_flight = true;
+        self.awaiting_submit = true;
+        self.ready.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Request the map AFTER the copy's submit - see `PresentProbe::begin_map` for why it cannot
+    /// be earlier.
+    fn begin_map(&mut self) {
+        if !self.awaiting_submit {
+            return;
+        }
+        self.awaiting_submit = false;
+        let Some(buffer) = self.buffer.as_ref() else { return };
+        let ready = self.ready.clone();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |_| {
+            ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    /// A finished read goes to the engine as tightly packed RGBA.
+    fn deliver(&mut self, swizzle_bgra: bool) {
+        if !self.in_flight || !self.ready.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let Some(buffer) = self.buffer.as_ref() else { return };
+        let (w, h) = self.size;
+        if let Ok(view) = buffer.slice(..).get_mapped_range() {
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for y in 0..h as usize {
+                let row = &view[y * self.bytes_per_row as usize..][..w as usize * 4];
+                if swizzle_bgra {
+                    for p in row.chunks_exact(4) {
+                        rgba.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
+                    }
+                } else {
+                    rgba.extend_from_slice(row);
+                }
+            }
+            drop(view);
+            vitaslop_playbook::engine::on_frame_pixels(w, h, &rgba);
+        }
+        buffer.unmap();
+        self.in_flight = false;
     }
 }
 
@@ -3028,6 +3132,7 @@ impl LivePlayback {
             perf: split_clock,
             split: RenderSplit::default(),
             targets: probe.is_some().then(TargetProbe::new),
+            pixel_tap: PixelTap::new(),
             scratch: None,
             writeback: RttWriteback::new(matches!(
                 format,
@@ -3466,6 +3571,13 @@ impl LivePlayback {
                 self.surface.configure(&self.device, &self.surface_config);
             }
         }
+        // A playbook that watches the screen (`cue.pixels`) reads the surface back, which needs
+        // `COPY_SRC` - asked for only once one does (see `surface_usage` at construction). A copy
+        // from a surface without it invalidates the frame's WHOLE command buffer: nothing renders.
+        if vitaslop_playbook::engine::wants_pixels() && !self.surface_config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+            self.surface_config.usage |= wgpu::TextureUsages::COPY_SRC;
+            self.surface.configure(&self.device, &self.surface_config);
+        }
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => {
                 self.acquire_failures = 0;
@@ -3625,6 +3737,9 @@ impl LivePlayback {
         self.presents_total += 1;
         let guest_frame = vitaslop_runtime::sched::current_frame();
         let sampling = self.probe.as_ref().is_some_and(|p| p.wants(self.presents_total, guest_frame));
+        if vitaslop_playbook::engine::wants_pixels() && target_tex.usage().contains(wgpu::TextureUsages::COPY_SRC) {
+            self.pixel_tap.capture(&self.device, &mut encoder, target_tex);
+        }
         if sampling {
             let n = self.presents_total;
             if let Some(probe) = self.probe.as_mut() {
@@ -3773,6 +3888,7 @@ impl LivePlayback {
         if let Some(probe) = self.probe.as_mut() {
             probe.begin_map();
         }
+        self.pixel_tap.begin_map();
         if let Some(tp) = self.targets.as_mut() {
             tp.begin_map();
         }
@@ -3854,6 +3970,7 @@ impl LivePlayback {
         // copy, so this is always a LATER frame than the one it describes - which is why the
         // description carries its own frame number.
         let bgra = self.probe_bgra;
+        self.pixel_tap.deliver(bgra);
         if let Some(text) = self.probe.as_mut().and_then(|p| p.take_report(bgra)) {
             self.last_probe = Some(text);
         }
@@ -4896,7 +5013,6 @@ async fn mount_and_link(source: JsValue) -> Result<Mounted, JsValue> {
             let dump = mount_dump_lazy(&vfs, &root)
                 .map_err(|e| JsValue::from_str(&format!("mount dump: {e:?}")))?;
             nfiles = dump.files.len();
-            modules_elf = with_main_exec(dump.modules, dump.execs)?;
             // The same open handles back the guest filesystem: a sync access handle takes
             // an exclusive lock, so opening a second set would fail rather than merely
             // cost something.
@@ -4904,6 +5020,27 @@ async fn mount_and_link(source: JsValue) -> Result<Mounted, JsValue> {
             // fixture, not re-proven here: verifying a gigabyte-sized title would cost
             // more than the boot it precedes.
             let reader = vfs.into_reader();
+            // A rePatch overlay's executables replace the title's before anything links.
+            let (rp_code, rp_addcont) = opfs::stored_repatch(&reader);
+            let (mut modules, mut execs) = (dump.modules, dump.execs);
+            if !rp_code.is_empty() {
+                let code = vitaslop_runtime::ingest::repatch::read_code(&rp_code, |p| {
+                    let path = format!("{}{p}", opfs::REPATCH_PREFIX);
+                    let n = reader.size(&path).ok_or_else(|| format!("rePatch {p}: not stored"))?;
+                    let mut buf = vec![0u8; n];
+                    let got = reader.read_at(&path, 0, &mut buf);
+                    if got != n {
+                        return Err(format!("rePatch {p}: read {got} of {n} bytes"));
+                    }
+                    Ok(buf)
+                })
+                .map_err(|e| JsValue::from_str(&e))?;
+                for m in &code {
+                    logging::note(&format!("rePatch: {} replaces the title's ({} KB)", m.path, m.elf.len() / 1024));
+                }
+                vitaslop_runtime::ingest::repatch::apply_code(&mut modules, &mut execs, code);
+            }
+            modules_elf = with_main_exec(modules, execs)?;
             let stored = opfs::stored_addons(&reader);
             let mut b = opfs::OpfsBacking::new(reader, dump.files_prefix);
             // The title's add-ons, served by the same reader under the mount the title
@@ -4922,6 +5059,19 @@ async fn mount_and_link(source: JsValue) -> Result<Mounted, JsValue> {
                             "add-on {dir:?} carries content id {cid:?}, which names a different add-on"
                         )))
                     }
+                }
+            }
+            // The overlay goes over all of it, replacing what it carries - the plugin's rule.
+            let n = b.overlay(&format!("{}{}", opfs::REPATCH_PREFIX, vitaslop_runtime::ingest::repatch::APP_DIR), "");
+            if n > 0 {
+                logging::note(&format!("rePatch: {n} file(s) laid over the title"));
+            }
+            for dir in rp_addcont {
+                let prefix = format!("{}{}{dir}/", opfs::REPATCH_PREFIX, vitaslop_runtime::ingest::repatch::ADDCONT_DIR);
+                let n = b.overlay(&prefix, &format!("addcont0:/{dir}"));
+                logging::note(&format!("rePatch: {n} file(s) laid over add-on {dir}"));
+                if !addons.iter().any(|a| a.eq_ignore_ascii_case(&dir)) {
+                    addons.push(dir);
                 }
             }
             backing = Some(Box::new(b));

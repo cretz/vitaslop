@@ -89,23 +89,59 @@ phase("front-end", { timeout = 180 }, function()
   split("hole 1 loading")
 end)
 
--- One stroke on the shot gauge, in input frames: CROSS starts the swing and the cursor climbs
--- from the impact mark toward 100%; CROSS after `power` sets the power; the cursor then comes
--- back and CROSS after `impact` more must land on the impact mark.
+-- One stroke on the shot gauge, driven by WHAT THE GAUGE SHOWS: CROSS starts the swing and the
+-- white cursor climbs the curve from the impact mark (bottom right) to 100% (top left); CROSS
+-- sets the power; the cursor comes straight back down and along the bottom, and CROSS must land
+-- it on the impact mark. A press freezes the cursor on the frame it is read, so the presses go
+-- when the cursor ENTERS a box just short of each target.
 --
--- MEASURED (shots every 2 frames through a swing): the climb's speed is CLUB-DEPENDENT - the
--- 3-iron is at 100% after ~55 frames, and a power press past the end of the climb CANCELS the
--- swing (a practice swing, then "Take the shot" again). From the top the cursor waits, then
--- returns and crosses the impact mark ~56 frames after the power press. No memory cell for the
--- cursor was found (value search over 256 MB of dumps found bones and camera matrices only),
--- so the timings are fixed and the hole is played as full swings:
---   * the DRIVE: power +66, impact +30 - 100% power with a perfect impact (the sparkle).
---   * every later stroke: power +60, impact +56. MEASURED: the 3-iron, an approach wedge and
---     one or two putts hole out - a bogey (one stroke is a penalty) deterministic and at real
---     speed. The recipe's shorter impact (+27) mishit every iron shot (46 yards at 100%).
-local function swing(power, impact)
-  tap("cross", 4, 0); idle(power - 4)
-  tap("cross", 4, 0); idle(impact - 4)
+-- No memory cell for the cursor exists to find: a value search over the whole 256 MB heap across
+-- a swing found only the golfer's pose. And fixed timings do not hold: MEASURED, the same
+-- approach-wedge swing returned to the impact mark 56 input frames after the power press in one
+-- run and 65 in another (one schedule change apart) - the second pressed 7 frames early, a bad
+-- hit (the full-screen inversion), 11 yards from 53. So the cues read the frame.
+--
+-- Panel coordinates (960x544), measured on shots every frame through swings of four clubs:
+--   * the cursor is a white block about 12x12; on the way back it moves 7-8 px a frame along the
+--     bottom straight to the impact mark, a STATIC white block at x 477-483 - so the impact box
+--     sits just left of it. The straight's height depends on the lie: cursor rows 478-494 from
+--     the fairway, 488-498 from the rough, so the box spans both.
+--   * the 100% end is not fixed: (90, 285) for the driver, wedge and putter from a clean lie,
+--     (115, 325) for a 3-iron from the rough (the lie shortens the gauge). The top box covers
+--     every end seen; the cursor enters it within the last few percent.
+--   * a shot that can reach the pin (the wedge, the putter) carries a red FLAG on the gauge: the
+--     power that reaches the pin. It sits up and right of the bar; the bar point it marks is
+--     ~12 px left of and ~12 px below its top-left pixel. Aiming the power there is what lets a
+--     putt finish - a full-power putt from four feet runs twenty-six past.
+local WHITE = { 255, 255, 255 }
+local FLAG_RED = { 210, 55, 40 }
+local top_point    = cue.pixels({ x = 84,  y = 282, w = 50, h = 56, rgb = WHITE, tol = 30 }):atleast(20)
+local impact_point = cue.pixels({ x = 460, y = 476, w = 12, h = 24, rgb = WHITE, tol = 30 }):atleast(12)
+-- Searched only over the gauge's own band: the scenery has red in it (a driver's tee shot shows
+-- the par sign at (354, 273)), and every flag seen lay within x 134-424, y 314-472.
+local flag         = cue.locate({ x = 80,  y = 290, w = 380, h = 192, rgb = FLAG_RED, tol = 40 })
+
+-- Power boxes by flag position, declared once per position seen (a few a hole).
+local aim_at = {}
+local function power_point()
+  local fx, fy = flag:xy()
+  if fx == nil then return top_point, "top" end
+  local key = fx .. "," .. fy
+  if not aim_at[key] then
+    aim_at[key] = cue.pixels({ x = fx - 20, y = fy + 5, w = 16, h = 14, rgb = WHITE, tol = 30 }):atleast(20)
+  end
+  return aim_at[key], "flag at " .. key
+end
+
+local function swing()
+  local power, aim = power_point()
+  log("swing: power " .. aim)
+  tap("cross", 4, 0)
+  -- The climb takes about a second on every club seen; a cursor that never arrives is a swing
+  -- that did not start (the shot was not ready), which the caller retries.
+  if not try_wait(power, 4) then return end
+  tap("cross", 4, 0)
+  if not try_wait(impact_point, 4) then return end
   tap("cross", 4, 4)
 end
 
@@ -136,7 +172,7 @@ phase("hole-1", { timeout = 900 }, function()
     shot(string.format("stroke-%02d", n))
     local tries = 0
     while true do
-      if n == 1 then swing(66, 30) else swing(60, 56) end
+      swing()
       if try_wait(in_flight, 4) then break end
       -- The ball did not leave. A lie the game will not play toward ("Cannot hit in this
       -- direction") needs a new aim: rotate left, then right, further each time.
@@ -147,10 +183,15 @@ phase("hole-1", { timeout = 900 }, function()
         idle(30)
       end
     end
-    -- Stroke play gives up a hole at its stroke limit (12 here, +8) and shows the scorecard.
-    if n >= 12 then fail("hole 1 was not holed out within 12 strokes") end
+    -- MEASURED: stroke play ends a par 4 at +5 (an X on the scorecard), so a ninth turn never
+    -- comes; this only guards a run that has lost track of the hole.
+    if n >= 9 then fail("hole 1 was still in play after 9 strokes") end
     ::continue::
   end
+  -- Every score plays one of the same jingles, the stroke limit's included: the game ends a par 4
+  -- at +5 (an X on the scorecard) after the 8th swing at the latest. A hole that ran that long
+  -- was given up, not holed.
+  if n >= 8 then fail(string.format("hole 1 ended after %d strokes - at the game's stroke limit, not in the cup", n)) end
   split("holed out")
   log(string.format("hole 1 holed out in %d strokes", n))
   -- The score banner ("BOGEY") is up as the jingle plays; the scorecard follows on its own.

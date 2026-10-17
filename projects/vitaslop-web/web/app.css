@@ -123,6 +123,9 @@ details.card[open] > summary::before { content: "\25BE"; }
 .addons li:first-child { border-top: 0; }
 .addons li > div { min-width: 0; overflow-wrap: anywhere; }
 .addons li .btn { flex: none; }
+/* An add-on's (or the overlay's) on/off switch, beside its Remove. */
+.addons li label.row { display: flex; align-items: center; gap: 6px; flex: none; margin-left: auto; cursor: pointer; }
+.addons li label.row + .btn { margin-left: 0; }
 .empty { text-align: center; color: var(--dim); padding: 60px 0; }
 
 /* ---------- library ---------- */
