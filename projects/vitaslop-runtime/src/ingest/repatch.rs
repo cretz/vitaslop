@@ -58,6 +58,56 @@ impl Target {
 pub struct Plan {
     pub files: Vec<(usize, Target)>,
     pub ignored: usize,
+    /// Every placement that was INFERRED rather than spelled out by a `rePatch`/`reAddcont`
+    /// folder, one line per top-level folder (`<folder>/ -> add-on <dir> (why)`), so a person
+    /// can see where a bare pack went.
+    pub inferred: Vec<String>,
+}
+
+/// What the title itself holds, which is what says where a file of an overlay can be read from.
+///
+/// A bare title folder (`<id>/...`) or a folder's contents is how mods are handed around for
+/// BOTH halves - the game's own files and its add-ons' - and a pack of add-on folders laid over
+/// `app0:` imports cleanly and is then read by nothing. So each top-level folder is placed by what
+/// it matches: one the game has goes over the game, one shaped like an add-on directory goes over
+/// that add-on (and the plan says so - see [`Plan::inferred`]), and anything else is refused by
+/// name. An EMPTY index (nothing known about the game) places everything over `app0:`, unchecked.
+#[derive(Debug, Default, Clone)]
+pub struct GameIndex {
+    /// The game's top-level `app0:` names, lowercased.
+    top: std::collections::BTreeSet<String>,
+    /// Its installed add-ons' directory names, lowercased.
+    addons: std::collections::BTreeSet<String>,
+}
+
+impl GameIndex {
+    /// From the game's `app0:`-relative file paths and its installed add-on directories.
+    pub fn new<'a>(app_paths: impl IntoIterator<Item = &'a str>, addons: impl IntoIterator<Item = &'a str>) -> GameIndex {
+        let top = app_paths
+            .into_iter()
+            .filter_map(|p| p.split(['/', '\\']).find(|s| !s.is_empty()))
+            .map(str::to_ascii_lowercase)
+            .collect();
+        GameIndex { top, addons: addons.into_iter().map(str::to_ascii_lowercase).collect() }
+    }
+
+    fn known(&self) -> bool {
+        !self.top.is_empty()
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.top.contains(&name.to_ascii_lowercase())
+    }
+
+    /// An installed add-on's directory, or a name of the shape every add-on directory has (the
+    /// 16-character label that ends its content id - see `addcont::dir_name`).
+    fn is_addon_dir(&self, name: &str) -> bool {
+        self.addons.contains(&name.to_ascii_lowercase()) || (name.len() == 16 && name.bytes().all(|b| b.is_ascii_alphanumeric()))
+    }
+
+    fn listing(&self) -> String {
+        self.top.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
+    }
 }
 
 /// `ABCD12345`: four letters and five digits, the shape every title id has.
@@ -87,7 +137,11 @@ fn is_litter(segs: &[&str]) -> bool {
 ///
 /// When any path names the title id, only paths below it are taken. An input that names a
 /// DIFFERENT title id and never this one is refused: it is an overlay for another game.
-pub fn plan(paths: &[String], title_id: &str, picked_root: bool) -> Result<Plan, String> {
+///
+/// With a known `game`, every `app0:` target is checked against it (see [`GameIndex`]): outside
+/// the device's `rePatch` folder a top-level folder the game lacks but shaped like an add-on
+/// directory goes over that add-on, and whatever nothing would read is refused.
+pub fn plan(paths: &[String], title_id: &str, picked_root: bool, game: &GameIndex) -> Result<Plan, String> {
     let split: Vec<Vec<&str>> = paths
         .iter()
         .map(|p| {
@@ -109,6 +163,8 @@ pub fn plan(paths: &[String], title_id: &str, picked_root: bool) -> Result<Plan,
         return Err(format!("this overlay is for {}, not {title_id}", other.to_ascii_uppercase()));
     }
     let mut plan = Plan::default();
+    // Top-level entries nothing would read, each named once however many files it holds.
+    let mut unread: Vec<String> = Vec::new();
     for (i, segs) in split.iter().enumerate() {
         if segs.is_empty() || is_litter(segs) {
             plan.ignored += 1;
@@ -127,10 +183,23 @@ pub fn plan(paths: &[String], title_id: &str, picked_root: bool) -> Result<Plan,
                 }
                 Target::Addcont { dir: rest[0].to_string(), path: rest[1..].join("/") }
             } else {
-                Target::App(rest.join("/"))
+                let explicit = at > 0 && segs[at - 1].eq_ignore_ascii_case("rePatch");
+                match place(rest, game, explicit, title_id, &mut plan.inferred) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        unread.push(e);
+                        continue;
+                    }
+                }
             }
         } else {
-            Target::App(segs.join("/"))
+            match place(segs, game, false, title_id, &mut plan.inferred) {
+                Ok(t) => t,
+                Err(e) => {
+                    unread.push(e);
+                    continue;
+                }
+            }
         };
         if let Target::Addcont { dir, .. } = &target
             && !dir.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -138,6 +207,11 @@ pub fn plan(paths: &[String], title_id: &str, picked_root: bool) -> Result<Plan,
             return Err(format!("{:?} is not an add-on directory name", dir));
         }
         plan.files.push((i, target));
+    }
+    if !unread.is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        unread.retain(|e| seen.insert(e.clone()));
+        return Err(unread.join("; "));
     }
     if plan.files.is_empty() {
         return Err("nothing in it to lay over the game".to_string());
@@ -150,6 +224,48 @@ pub fn plan(paths: &[String], title_id: &str, picked_root: bool) -> Result<Plan,
         }
     }
     Ok(plan)
+}
+
+/// Where an `app0:`-relative path (as segments) of an overlay goes, given what the game holds -
+/// or why nothing would read it. `explicit`: it came from inside the device's `rePatch/<id>/`
+/// folder, which is `app0:` and nothing else, so an add-on folder there is a misplaced one. An
+/// inferred add-on placement is noted in `inferred`, once per folder.
+fn place(segs: &[&str], game: &GameIndex, explicit: bool, title_id: &str, inferred: &mut Vec<String>) -> Result<Target, String> {
+    let path = segs.join("/");
+    if !game.known() {
+        return Ok(Target::App(path));
+    }
+    let first = segs[0];
+    if game.has(first) || (segs.len() == 1 && is_code_path(first)) {
+        return Ok(Target::App(path));
+    }
+    if segs.len() == 1 {
+        return Err(format!(
+            "{first} is not a file of this game, so nothing would read it (the game's top level: {})",
+            game.listing()
+        ));
+    }
+    if game.is_addon_dir(first) {
+        if explicit {
+            return Err(format!(
+                "rePatch/{title_id}/{first}/ is an add-on folder, not a folder of this game - add-on files go under \
+                 reAddcont/{title_id}/{first}/"
+            ));
+        }
+        let note = format!(
+            "{first}/ -> add-on {first} (inferred: not a folder of this game, named like an add-on{})",
+            if game.addons.contains(&first.to_ascii_lowercase()) { ", and that add-on is installed" } else { "" }
+        );
+        if !inferred.contains(&note) {
+            inferred.push(note);
+        }
+        return Ok(Target::Addcont { dir: first.to_string(), path: segs[1..].join("/") });
+    }
+    Err(format!(
+        "{first}/ is not a folder of this game (its top level: {}) and not an add-on folder (those are named by \
+         the 16 letters and digits that end the add-on's content id), so nothing would read it",
+        game.listing()
+    ))
 }
 
 /// Whether an `app0:` path is code the title links at boot, rather than data it reads.
@@ -202,6 +318,10 @@ pub struct Imported {
     pub code_hash: String,
     /// Inputs left out: outside the overlay, or litter.
     pub ignored: usize,
+    /// Of `files`, how many lay over the game's own files (the rest are over add-ons).
+    pub app_files: u32,
+    /// [`Plan::inferred`]: where a bare pack's folders went, and why.
+    pub inferred: Vec<String>,
 }
 
 /// Copy an overlay for `title_id` out of `src` (a picked folder, or one `.zip`) into `sink`,
@@ -213,6 +333,7 @@ pub fn import(
     src: Rc<dyn ByteSource>,
     title_id: &str,
     picked_root: bool,
+    game: &GameIndex,
     sink: &mut dyn DumpSink,
     progress: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Imported, String> {
@@ -224,9 +345,9 @@ pub fn import(
         _ => (src, picked_root),
     };
     let names = src.list();
-    let plan = plan(&names, title_id, picked_root)?;
+    let plan = plan(&names, title_id, picked_root, game)?;
     let total: u64 = plan.files.iter().filter_map(|(i, _)| src.size(&names[*i])).sum();
-    let mut out = Imported { ignored: plan.ignored, ..Imported::default() };
+    let mut out = Imported { ignored: plan.ignored, inferred: plan.inferred.clone(), ..Imported::default() };
     let mut code: Vec<(String, Vec<u8>)> = Vec::new();
     let mut done = 0u64;
     let mut buf = vec![0u8; 1 << 20];
@@ -261,6 +382,9 @@ pub fn import(
             }
             Target::Addcont { dir, .. } if !out.addcont.iter().any(|d| d.eq_ignore_ascii_case(dir)) => out.addcont.push(dir.clone()),
             _ => {}
+        }
+        if matches!(target, Target::App(_)) {
+            out.app_files += 1;
         }
         out.files += 1;
         out.bytes += size;
@@ -322,35 +446,79 @@ mod tests {
             ]),
             "PCSA00000",
             false,
+            &GameIndex::default(),
         )
         .unwrap();
         assert_eq!(targets(&plan), ["app/eboot.bin", "app/data/a.cpk", "addcont/LABEL01234567890/b.dat"]);
         assert_eq!(plan.ignored, 1, "the readme is outside the overlay");
     }
 
+    fn game() -> GameIndex {
+        GameIndex::new(["00/a.bin", "01/b.bin", "eboot.bin", "sce_module/libc.suprx", "sce_sys/param.sfo"], ["INSTALLED0000001"])
+    }
+
+    /// A bare title folder carrying ADD-ON folders (how one pack was handed over): each goes over
+    /// its add-on, and the plan says it inferred that. The game's own folders still go over the game.
+    #[test]
+    fn a_bare_title_folder_places_each_folder_by_what_it_matches() {
+        let bare = plan(
+            &p(&["PCSA00000/00/a.bin", "PCSA00000/00DLC00000000001/x.bin", "PCSA00000/00DLC00000000001/y/z.bin", "PCSA00000/INSTALLED0000001/w.bin"]),
+            "PCSA00000",
+            false,
+            &game(),
+        )
+        .unwrap();
+        assert_eq!(
+            targets(&bare),
+            ["app/00/a.bin", "addcont/00DLC00000000001/x.bin", "addcont/00DLC00000000001/y/z.bin", "addcont/INSTALLED0000001/w.bin"]
+        );
+        assert_eq!(bare.inferred.len(), 2, "one line per folder, not per file: {:?}", bare.inferred);
+        assert!(bare.inferred[0].starts_with("00DLC00000000001/ -> add-on 00DLC00000000001 (inferred"), "{:?}", bare.inferred);
+        assert!(bare.inferred[1].contains("installed"), "{:?}", bare.inferred);
+        // A folder's contents, with no title folder at all, the same.
+        let c = plan(&p(&["00DLC00000000001/x.bin", "eboot.bin"]), "PCSA00000", false, &game()).unwrap();
+        assert_eq!(targets(&c), ["addcont/00DLC00000000001/x.bin", "app/eboot.bin"]);
+    }
+
+    /// What nothing would read is refused by name instead of imported: a folder that is neither
+    /// the game's nor add-on shaped, a loose file the game does not have, and an add-on folder
+    /// inside the device's `rePatch` folder (which is `app0:` only).
+    #[test]
+    fn what_nothing_would_read_is_refused_by_name() {
+        let e = plan(&p(&["PCSA00000/mods/x.bin", "PCSA00000/mods/y.bin", "PCSA00000/00/a.bin"]), "PCSA00000", false, &game()).unwrap_err();
+        assert!(e.starts_with("mods/ is not a folder of this game") && e.contains("00, 01, eboot.bin"), "{e}");
+        assert_eq!(e.matches("mods/").count(), 1, "named once: {e}");
+        let e = plan(&p(&["readme.md", "00/a.bin"]), "PCSA00000", false, &game()).unwrap_err();
+        assert!(e.starts_with("readme.md is not a file of this game"), "{e}");
+        let e = plan(&p(&["rePatch/PCSA00000/00DLC00000000001/x.bin"]), "PCSA00000", false, &game()).unwrap_err();
+        assert!(e.contains("reAddcont/PCSA00000/00DLC00000000001/"), "{e}");
+        // New code is allowed at the top level: an overlay may add an executable.
+        assert!(plan(&p(&["new.self"]), "PCSA00000", false, &game()).is_ok());
+    }
+
     #[test]
     fn a_title_folder_or_its_contents_are_the_app_root() {
-        let a = plan(&p(&["PCSA00000/data/a.cpk"]), "PCSA00000", false).unwrap();
+        let a = plan(&p(&["PCSA00000/data/a.cpk"]), "PCSA00000", false, &GameIndex::default()).unwrap();
         assert_eq!(targets(&a), ["app/data/a.cpk"]);
-        let b = plan(&p(&["MyMod/data/a.cpk", "MyMod/eboot.bin"]), "PCSA00000", true).unwrap();
+        let b = plan(&p(&["MyMod/data/a.cpk", "MyMod/eboot.bin"]), "PCSA00000", true, &GameIndex::default()).unwrap();
         assert_eq!(targets(&b), ["app/data/a.cpk", "app/eboot.bin"], "a folder pick's own name is not a path");
-        let c = plan(&p(&["data/a.cpk", ".DS_Store", "__MACOSX/data/._a.cpk"]), "PCSA00000", false).unwrap();
+        let c = plan(&p(&["data/a.cpk", ".DS_Store", "__MACOSX/data/._a.cpk"]), "PCSA00000", false, &GameIndex::default()).unwrap();
         assert_eq!(targets(&c), ["app/data/a.cpk"]);
         assert_eq!(c.ignored, 2);
     }
 
     #[test]
     fn another_titles_overlay_is_refused() {
-        let e = plan(&p(&["rePatch/PCSA99999/eboot.bin"]), "PCSA00000", false).unwrap_err();
+        let e = plan(&p(&["rePatch/PCSA99999/eboot.bin"]), "PCSA00000", false, &GameIndex::default()).unwrap_err();
         assert!(e.contains("PCSA99999"), "{e}");
         // A file NAMED like a title id is a file, not a folder of another title's.
-        assert!(plan(&p(&["data/PCSA99999"]), "PCSA00000", false).is_ok());
+        assert!(plan(&p(&["data/PCSA99999"]), "PCSA00000", false, &GameIndex::default()).is_ok());
     }
 
     #[test]
     fn duplicates_and_empty_inputs_are_refused() {
-        assert!(plan(&p(&["a/PCSA00000/x", "b/PCSA00000/X"]), "PCSA00000", false).is_err());
-        assert!(plan(&p(&["readme.txt"]), "PCSA00000", true).is_err());
+        assert!(plan(&p(&["a/PCSA00000/x", "b/PCSA00000/X"]), "PCSA00000", false, &GameIndex::default()).is_err());
+        assert!(plan(&p(&["readme.txt"]), "PCSA00000", true, &GameIndex::default()).is_err());
     }
 
     #[test]
@@ -381,7 +549,7 @@ mod tests {
         use crate::ingest::stream::{MemSink, MemSource};
         let src = MemSource { files: files.iter().map(|(p, b)| (p.to_string(), b.to_vec())).collect() };
         let mut sink = MemSink::default();
-        let got = import(Rc::new(src), "PCSA00000", true, &mut sink, &mut |_| {})?;
+        let got = import(Rc::new(src), "PCSA00000", true, &GameIndex::default(), &mut sink, &mut |_| {})?;
         Ok((got, sink.files))
     }
 

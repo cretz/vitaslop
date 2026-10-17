@@ -1685,7 +1685,12 @@ impl Shell {
                             ui.label(bold(if m.source.is_empty() { "Overlay" } else { &m.source }).color(INK));
                             let code = if m.code.is_empty() { "data only".to_string() } else { format!("replaces {}", m.code.join(", ")) };
                             let addcont = if m.addcont.is_empty() { String::new() } else { format!("  \u{b7}  add-ons {}", m.addcont.join(", ")) };
-                            ui.label(RichText::new(format!("{} files  \u{b7}  {}  \u{b7}  {code}{addcont}  \u{b7}  added {}", m.files, fmt_bytes(m.bytes), fmt_date(m.imported_at))).color(DIM).size(13.0));
+                            let split = format!("  \u{b7}  {} over the game, {} over add-ons", m.app_files, m.files.saturating_sub(m.app_files));
+                            ui.label(RichText::new(format!("{} files{split}  \u{b7}  {}  \u{b7}  {code}{addcont}  \u{b7}  added {}", m.files, fmt_bytes(m.bytes), fmt_date(m.imported_at))).color(DIM).size(13.0));
+                            // Where a bare pack's folders went, when that was inferred rather than named.
+                            for line in &m.inferred {
+                                ui.label(RichText::new(line).color(DIM).size(12.0));
+                            }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.add(danger("Remove")).clicked() {

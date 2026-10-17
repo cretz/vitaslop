@@ -75,6 +75,10 @@ pub struct RepatchMeta {
     pub code: Vec<String>,
     /// The add-on directories it lays files over.
     pub addcont: Vec<String>,
+    /// Of `files`, how many lay over the game's own files (the rest are over add-ons).
+    pub app_files: u32,
+    /// Where a bare pack's folders were placed by inference, and why - one line per folder.
+    pub inferred: Vec<String>,
     /// The compile caches' name for its code, empty when it carries none.
     pub code_hash: String,
     /// Unix milliseconds.

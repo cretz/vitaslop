@@ -451,6 +451,15 @@ impl<'m> PrefetchedMemory<'m> {
         me
     }
 
+    /// Fetch `ranges` in one crossing and take NO copy of the dirty map: for a caller that only
+    /// reads bytes (one draw's uniform banks), where copying the whole map per call would cost
+    /// far more than the crossings it saves. `dirty_since` then asks the base, as before.
+    pub fn reads_only(base: &'m dyn GuestMemory, ranges: &[(usize, usize)]) -> Self {
+        let mut me = PrefetchedMemory { base, table: Vec::new(), data: Vec::new(), stamps: None };
+        me.extend(ranges);
+        me
+    }
+
     /// Fetch more ranges (a second stage whose addresses depend on the first), one crossing.
     /// Nothing is fetched over a DIRECT memory (see [`GuestMemory::direct`]): a read there is
     /// already a load, and the table would only copy bytes that `borrow` hands out for free.
@@ -544,6 +553,64 @@ impl GuestMemory for PrefetchedMemory<'_> {
     }
     fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
         self.base.rebase_dirty_epoch(floor)
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A memory across a boundary: every `read` and every `read_many` is one crossing, and it
+    /// counts whether anyone copied its dirty map.
+    struct Remote {
+        bytes: Vec<u8>,
+        crossings: Cell<u32>,
+        stamp_copies: Cell<u32>,
+    }
+
+    impl GuestMemory for Remote {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+        fn read(&self, off: usize, buf: &mut [u8]) {
+            self.crossings.set(self.crossings.get() + 1);
+            buf.copy_from_slice(&self.bytes[off..off + buf.len()]);
+        }
+        fn write(&mut self, _: usize, _: &[u8]) {}
+        fn stamp_dirty_pages(&self, _: usize, _: usize) {}
+        fn read_many(&self, ranges: &[(usize, usize)], out: &mut Vec<u8>) {
+            self.crossings.set(self.crossings.get() + 1);
+            out.clear();
+            for &(o, l) in ranges {
+                out.extend_from_slice(&self.bytes[o..o + l]);
+            }
+        }
+        fn dirty_stamps(&self) -> Option<(Vec<u8>, u32)> {
+            self.stamp_copies.set(self.stamp_copies.get() + 1);
+            Some((vec![0; 4], 12))
+        }
+    }
+
+    /// A draw's uniform banks: fetched in ONE crossing, read back from it exactly (whole ranges
+    /// and pieces of them), anything not fetched still read from the memory - and no copy of
+    /// the dirty map, which per draw would cost more than the crossings saved.
+    #[test]
+    fn a_reads_only_prefetch_serves_its_ranges_from_one_crossing() {
+        let mem = Remote { bytes: (0..=255u8).cycle().take(4096).collect(), crossings: Cell::new(0), stamp_copies: Cell::new(0) };
+        let pm = PrefetchedMemory::reads_only(&mem, &[(100, 64), (1000, 32)]);
+        assert_eq!((mem.crossings.get(), mem.stamp_copies.get()), (1, 0));
+        let mut a = [0u8; 64];
+        pm.read(100, &mut a);
+        assert_eq!(a[..], mem.bytes[100..164]);
+        let mut b = [0u8; 8];
+        pm.read(1010, &mut b);
+        assert_eq!(b[..], mem.bytes[1010..1018]);
+        assert_eq!(pm.borrow(1000, 32), Some(&mem.bytes[1000..1032]));
+        assert_eq!(mem.crossings.get(), 1, "every fetched byte came out of the one crossing");
+        pm.read(2000, &mut b);
+        assert_eq!(b[..], mem.bytes[2000..2008]);
+        assert_eq!(mem.crossings.get(), 2, "a range not fetched is read from the memory");
     }
 }
 
@@ -10173,7 +10240,7 @@ impl VitaState {
         ctx.read_f32s(bank + SA_BANK_DATA, len)
     }
 
-    /// The same bank as BYTES - see [`Self::current_vertex_uniform_bytes`] for why both forms
+    /// The same bank as BYTES - see `record_draw`'s vertex bank read for why both forms
     /// exist and why neither is derived from the other.
     fn sa_bank_bytes(&self, ctx: &GuestCtx) -> Arc<[u8]> {
         let bank = self.sa_bank;
@@ -17645,7 +17712,7 @@ impl VitaState {
                 // >>> WHAT THIS LINE USED TO SAY WAS NOT WHAT THE CODE DOES, and it cost a
                 // session. It read "renders with NO uniform bank at all", which sent a reader
                 // (me) to a device dump, a 12,000-frame A/B and a budget row gated at zero
-                // before anyone checked the fallback. `current_vertex_uniform_bytes` returns
+                // before anyone checked the fallback. `record_draw`'s vertex bank read takes
                 // `sa_bank_bytes` on this path: the draw renders with the
                 // `sceGxmSetUniformDataF` bank, which for a program that really sets its
                 // uniforms that way is the CORRECT bank. The A/B came back 24 of 24 shots
@@ -17695,24 +17762,6 @@ impl VitaState {
             }
         }
         (bound.size >= 4 && bound.buf != 0).then(|| (bound.buf, (bound.size / 4) as usize * 4))
-    }
-
-    /// This draw's vertex uniforms as BYTES, exactly as the guest wrote them - the form the
-    /// GXP recompiler wants. See [`Self::current_vertex_uniform_src`].
-    fn current_vertex_uniform_bytes(
-        &mut self,
-        ctx: &GuestCtx,
-        blk: &crate::vita::gxmctx::Block<'_>,
-    ) -> Arc<[u8]> {
-        // >>> STRAIGHT INTO THE `Arc`, because the ONLY consumer wants one. This returned a
-        // `Vec` that `record_draw` handed to `sa_uniform_image` and then converted with
-        // `Arc::<[u8]>::from`, which allocates AGAIN and copies the whole bank - an extra
-        // allocation, copy and free per draw per stage (~1,350 a frame on a retail title) for
-        // bytes nobody mutates. See `read_bytes_arc`.
-        match self.current_vertex_uniform_src(ctx, blk) {
-            Some((addr, len)) => ctx.read_bytes_arc(addr, len),
-            None => self.sa_bank_bytes(ctx),
-        }
     }
 
     #[allow(dead_code)]
@@ -17854,6 +17903,32 @@ impl VitaState {
             ),
         };
         drop(reflect_phase);
+        // >>> THE DRAW'S UNIFORM BANKS IN ONE CROSSING. Their addresses are known now (the block
+        // is in hand and the programs reflected), and the readers below - the fragment bank, the
+        // vertex bank, the SA-resident buffers of both stages - each used to cross into guest
+        // memory on their own: ~3.5 bulk reads a draw counting the block, at ~650 draws a frame,
+        // where a crossing is a call across the browser's shared-memory boundary. They read
+        // through `uctx` instead, which serves the prefetched bytes and falls through to guest
+        // memory for anything not fetched. A DIRECT memory (native) fetches nothing: a read
+        // there is already a load. The guest cannot run during a host call, so bytes fetched
+        // here are the bytes those reads would have seen.
+        let vert_src = if gxp_live_capture() { self.current_vertex_uniform_src(ctx, &blk) } else { None };
+        let mut uniform_ranges: Vec<(usize, usize)> = Vec::new();
+        if gxp_live_capture() && !ctx.mem.direct() {
+            let mut addrs: Vec<(u32, usize)> = Vec::new();
+            if frag_uniform.buf != 0 {
+                addrs.push((frag_uniform.buf, frag_uniform.size as usize));
+            }
+            addrs.extend(vert_src);
+            self.sa_uniform_ranges(ctx, &blk, vheader, UniformStage::Vertex, &mut addrs);
+            self.sa_uniform_ranges(ctx, &blk, fheader, UniformStage::Fragment, &mut addrs);
+            uniform_ranges.extend(
+                addrs.into_iter().filter_map(|(a, l)| ctx.offset(a).map(|o| (o, l.min(ctx.mem.len().saturating_sub(o))))),
+            );
+        }
+        let mut uniform_mem = PrefetchedMemory::reads_only(&*ctx.mem, &uniform_ranges);
+        let (mut uregs, mut uvfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let uctx = GuestCtx::new(&mut uregs, &mut uvfp, &mut uniform_mem, ctx.base);
         // Index element size: U16 (0) is 2 bytes, U32 is 4.
         let index_elem = if index_format == 0 { 2 } else { 4 };
         // Snapshot exactly the vertices this draw REFERENCES, not the whole prefix of the
@@ -17957,7 +18032,7 @@ impl VitaState {
             if gxp_live_capture() && frag_uniform.buf != 0 {
                 let _s = crate::perf::scope(crate::perf::Phase::DrawGxpFragSa);
                 // Into the `Arc`'s own allocation, not a `Vec` that is copied into one below.
-                ctx.read_bytes_arc(frag_uniform.buf, frag_uniform.size as usize)
+                uctx.read_bytes_arc(frag_uniform.buf, frag_uniform.size as usize)
             } else {
                 crate::capture::no_bytes()
             }
@@ -17992,7 +18067,13 @@ impl VitaState {
         // the recompiled path is no longer `uniforms.len()` (see the prefix note next).
         let mut bank_lanes_raw = None;
         let vert_sa_raw = if gxp_live_capture() {
-            let raw = self.current_vertex_uniform_bytes(ctx, &blk);
+            // >>> STRAIGHT INTO THE `Arc`, because the ONLY consumer wants one (an extra
+            // allocation and copy of the bank per draw per stage otherwise). `vert_src` was
+            // decided above, once, so a stale binding is reported once a draw.
+            let raw = match vert_src {
+                Some((addr, len)) => uctx.read_bytes_arc(addr, len),
+                None => self.sa_bank_bytes(ctx),
+            };
             crate::perf::note_bytes(crate::perf::Phase::DrawUniforms, raw.len());
             // >>> ONLY THE PREFIX THE REFLECTIONS CAN REACH. Still the vectorised conversion the
             // note above insists on, just shorter: a lane past `need` is read by nothing on this
@@ -18146,9 +18227,9 @@ impl VitaState {
             drop(blobs_phase);
             let _sa_phase = crate::perf::scope(crate::perf::Phase::DrawGxpSaImage);
             let vert_sa =
-                self.sa_uniform_image(ctx, &blk, vheader, UniformStage::Vertex, vert_sa_raw);
+                self.sa_uniform_image(&uctx, &blk, vheader, UniformStage::Vertex, vert_sa_raw);
             let frag_sa =
-                self.sa_uniform_image(ctx, &blk, fheader, UniformStage::Fragment, frag_sa);
+                self.sa_uniform_image(&uctx, &blk, fheader, UniformStage::Fragment, frag_sa);
             // >>> THE FRAGMENT BANK IS THE ONE ALREADY READ, NOT A SECOND READ OF THE SAME
             // BYTES. It was read above for the material's nine floats, under the identical
             // condition, and the guest cannot run between the two - so this used to copy the
@@ -18730,6 +18811,29 @@ impl VitaState {
     /// which is what they read as today. That is not silently fine, so it is REPORTED - once
     /// per program - by the caller's own diagnostic (`report_unfed_uniforms` on the renderer
     /// side names the program; this names the draw's missing bind).
+    /// The guest ranges [`Self::sa_uniform_image`] will read for `header`'s SA-resident buffers,
+    /// appended as `(address, length)` - so a draw can fetch them with its other uniform banks.
+    /// None for the usual program (default buffer at register 0, nothing else resident).
+    fn sa_uniform_ranges(
+        &mut self,
+        ctx: &GuestCtx,
+        blk: &crate::vita::gxmctx::Block<'_>,
+        header: u32,
+        stage: UniformStage,
+        out: &mut Vec<(u32, usize)>,
+    ) {
+        let layout = self.sa_uniform_layout(ctx, header);
+        for b in layout.buffers.iter() {
+            let addr = match stage {
+                UniformStage::Vertex => blk.vertex_uniform_buffer(b.buffer_index),
+                UniformStage::Fragment => blk.fragment_uniform_buffer(b.buffer_index),
+            };
+            if addr != 0 {
+                out.push((addr, b.size_regs as usize * 4));
+            }
+        }
+    }
+
     fn sa_uniform_image(
         &mut self,
         ctx: &GuestCtx,

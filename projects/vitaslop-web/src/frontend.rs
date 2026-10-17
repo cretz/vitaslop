@@ -117,6 +117,9 @@ pub fn ingest_probe(source: JsValue) -> Result<JsValue, JsValue> {
         .flatten();
     set(&out, "isAddon", JsValue::from_bool(p.is_addcont()));
     set(&out, "addonDir", opt_str(&addon_dir));
+    set(&out, "isUpdate", JsValue::from_bool(p.is_update()));
+    // Why this cannot be imported as a game (an add-on, an update), else null.
+    set(&out, "refusedAsTitle", opt_str(&p.refused_as_title()));
     set(&out, "bytes", JsValue::from_f64(p.bytes as f64));
     set(&out, "files", JsValue::from_f64(p.files as f64));
     set(&out, "icon0", opt_bytes(&p.icon0));
@@ -149,11 +152,21 @@ pub fn ingest_import(source: JsValue, sink: JsValue, progress: Function) -> Resu
     stream::import(src, &mut sink, &mut report).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// What the game holds, for placing and checking an overlay's files: its stored `files/...`
+/// paths and its installed add-ons' directories. See `repatch::GameIndex`.
+fn repatch_game(game_paths: &[String], addons: &[String]) -> vitaslop_runtime::ingest::repatch::GameIndex {
+    vitaslop_runtime::ingest::repatch::GameIndex::new(
+        game_paths.iter().filter_map(|p| p.strip_prefix("files/")),
+        addons.iter().map(String::as_str),
+    )
+}
+
 /// The stored paths [`repatch_import`] will write for these picked files, so the worker can open
 /// their sync handles first (opening one is async; the import's writes are not). Throws what
-/// the import would refuse: an overlay for another title, or nothing to lay over.
+/// the import would refuse: an overlay for another title, nothing to lay over, or files nothing
+/// would read. `game_paths` / `addons`: the stored title's paths and add-on directories.
 #[wasm_bindgen]
-pub fn repatch_plan(source: JsValue, title_id: &str, picked_root: bool) -> Result<JsValue, JsValue> {
+pub fn repatch_plan(source: JsValue, title_id: &str, picked_root: bool, game_paths: Vec<String>, addons: Vec<String>) -> Result<JsValue, JsValue> {
     crate::logging::install_panic_hook();
     let src: Rc<dyn ByteSource> = Rc::new(JsSource(source));
     let names = src.list();
@@ -164,7 +177,8 @@ pub fn repatch_plan(source: JsValue, title_id: &str, picked_root: bool) -> Resul
         }
         _ => (names, picked_root),
     };
-    let plan = vitaslop_runtime::ingest::repatch::plan(&names, title_id, picked_root).map_err(|e| JsValue::from_str(&e))?;
+    let game = repatch_game(&game_paths, &addons);
+    let plan = vitaslop_runtime::ingest::repatch::plan(&names, title_id, picked_root, &game).map_err(|e| JsValue::from_str(&e))?;
     let out = js_sys::Array::new();
     for (_, t) in &plan.files {
         out.push(&JsValue::from_str(&t.stored()));
@@ -176,9 +190,17 @@ pub fn repatch_plan(source: JsValue, title_id: &str, picked_root: bool) -> Resul
 /// `sink`, at its stored layout (see `vitaslop_runtime::ingest::repatch`). `picked_root`: the
 /// paths start with the picked folder's own name, as a folder pick spells them. The caller
 /// writes the record afterwards; this returns its fields:
-/// `{ files, bytes, code, addcont, codeHash, ignored }`.
+/// `{ files, bytes, code, addcont, codeHash, ignored, appFiles, inferred }`.
 #[wasm_bindgen]
-pub fn repatch_import(source: JsValue, sink: JsValue, title_id: &str, picked_root: bool, progress: Function) -> Result<JsValue, JsValue> {
+pub fn repatch_import(
+    source: JsValue,
+    sink: JsValue,
+    title_id: &str,
+    picked_root: bool,
+    game_paths: Vec<String>,
+    addons: Vec<String>,
+    progress: Function,
+) -> Result<JsValue, JsValue> {
     crate::logging::install_panic_hook();
     let src: Rc<dyn ByteSource> = Rc::new(JsSource(source));
     let mut sink = JsSink(sink);
@@ -191,7 +213,8 @@ pub fn repatch_import(source: JsValue, sink: JsValue, title_id: &str, picked_roo
             &JsValue::from_f64(p.total as f64),
         );
     };
-    let got = vitaslop_runtime::ingest::repatch::import(src, title_id, picked_root, &mut sink, &mut report)
+    let game = repatch_game(&game_paths, &addons);
+    let got = vitaslop_runtime::ingest::repatch::import(src, title_id, picked_root, &game, &mut sink, &mut report)
         .map_err(|e| JsValue::from_str(&e))?;
     let strs = |v: &[String]| {
         let a = js_sys::Array::new();
@@ -207,6 +230,8 @@ pub fn repatch_import(source: JsValue, sink: JsValue, title_id: &str, picked_roo
     set(&out, "addcont", strs(&got.addcont));
     set(&out, "codeHash", JsValue::from_str(&got.code_hash));
     set(&out, "ignored", JsValue::from_f64(got.ignored as f64));
+    set(&out, "appFiles", JsValue::from_f64(got.app_files as f64));
+    set(&out, "inferred", strs(&got.inferred));
     Ok(out.into())
 }
 

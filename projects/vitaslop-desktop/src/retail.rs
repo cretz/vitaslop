@@ -2471,7 +2471,6 @@ pub fn headless_check(
         // Rendered pixels that have to reach GUEST memory, collected while the scenes are
         // still borrowed and applied below once they are not.
         let mut writeback: Vec<(u32, u32, u32, Vec<u8>)> = Vec::new();
-        let mut periodic = periodic_shared.lock().unwrap_or_else(|e| e.into_inner());
         // A playbook run renders EVERY frame (the rule above: a shot is only faithful when the
         // frames before it were rendered), and writes when its cadence or the playbook asks.
         let renders = shot_every > 0 || play.is_some();
@@ -2479,6 +2478,12 @@ pub fn headless_check(
         let pixels = play.is_some() && vitaslop_playbook::engine::wants_pixels();
         let periodic_due = shot_every > 0 && in_shot_window && f % shot_every == 0;
         let writes_this_frame = periodic_due || !play_shots.is_empty();
+        // >>> THE CLOCK IS READ BEFORE THE RENDERER IS LOCKED. It takes the HOST lock, and a guest
+        // thread inside `sceGxmEndScene` holds the host lock while it waits for the renderer (the
+        // complete-scene hook above) - so under SMP, reading it with `periodic` held deadlocked
+        // both: one playbook run hung for good right after writing its last shot.
+        let shot_clock = writes_this_frame.then(|| (guest.clock_us(), guest.clock_sources()));
+        let mut periodic = periodic_shared.lock().unwrap_or_else(|e| e.into_inner());
         if let (Some(r), true) = (periodic.as_mut(), renders && in_render_window && !writes_this_frame) {
             let scenes = guest.current();
             if !scenes.is_empty() {
@@ -2547,11 +2552,11 @@ pub fn headless_check(
             // ratio of 1.00x hides a stretch that ran five times fast against a stretch
             // that stalled, and a title paced off the clock behaves very differently in
             // the two.
-            let (clk_q, clk_topup, clk_idle) = guest.clock_sources();
+            let (clock_us, (clk_q, clk_topup, clk_idle)) = shot_clock.unwrap_or_default();
             println!(
                 "shot f{f:06}: guest clock {:.3}s ({:.3}s quanta + {:.3}s topup + {:.3}s idle), \
                  {scene_count} scenes / {draw_count} draws [{}] flipped=[{}]",
-                guest.clock_us() as f64 / 1e6,
+                clock_us as f64 / 1e6,
                 clk_q as f64 / 1e6,
                 clk_topup as f64 / 1e6,
                 clk_idle as f64 / 1e6,

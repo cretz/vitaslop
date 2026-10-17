@@ -39,7 +39,7 @@
 //               { type: "panic", message }
 
 import init, { ingest_probe, ingest_import, repatch_plan, repatch_import } from "./pkg/vitaslop_web.js";
-import { titleDir, addonsDir, ADDON_RECORD, isAddonName, encodeName, storageRoom, repatchDir, readRepatch, REPATCH_RECORD } from "./opfs.js";
+import { titleDir, addonsDir, ADDON_RECORD, isAddonName, encodeName, decodeName, storageRoom, repatchDir, readRepatch, REPATCH_RECORD, listAddons } from "./opfs.js";
 import { makeFileSource } from "./read-window.js";
 
 globalThis.__vitaslopPanic = (text) => {
@@ -98,6 +98,8 @@ function forPage(p) {
     category: p.category,
     isAddon: p.isAddon,
     addonDir: p.addonDir,
+    isUpdate: p.isUpdate,
+    refusedAsTitle: p.refusedAsTitle,
     bytes: p.bytes,
     files: p.files,
     icon0: p.icon0,
@@ -149,6 +151,7 @@ self.onmessage = async (e) => {
     if (!titleId) throw new Error("no param.sfo was found in these files, so this title cannot be named or stored");
     const addonFor = d.addonFor || null;
     if (addonFor) {
+      if (probe.isUpdate) throw new Error(probe.refusedAsTitle);
       if (!probe.isAddon) {
         throw new Error(`this is not an add-on but a game (${titleId}) - import it from the library`);
       }
@@ -156,6 +159,8 @@ self.onmessage = async (e) => {
       if (!isAddonName(probe.addonDir)) {
         throw new Error(`this add-on's content id (${probe.contentId}) does not name the folder it installs as`);
       }
+    } else if (probe.refusedAsTitle) {
+      throw new Error(probe.refusedAsTitle);
     } else if (probe.isAddon) {
       throw new Error(
         `this is an add-on for ${titleId}, not a game - open that game in the library and add it under Add-ons`
@@ -275,7 +280,14 @@ self.onmessage = async (e) => {
 /// runtime's: `ingest::repatch`.
 async function repatchImport(d, post) {
   const src = fileSource(d.files);
-  const planned = repatch_plan(src, d.titleId, !!d.pickedRoot);
+  // What the game holds - its stored paths and add-on directories - so each of the overlay's
+  // folders is placed over the game or over an add-on, and one nothing would read is refused.
+  const gamePaths = [];
+  for await (const [name, h] of (await titleDir(d.titleId, { create: false })).entries()) {
+    if (h.kind === "file") gamePaths.push(decodeName(name));
+  }
+  const addons = (await listAddons(d.titleId)).map((a) => a.dir);
+  const planned = repatch_plan(src, d.titleId, !!d.pickedRoot, gamePaths, addons);
   const top = await repatchDir(d.titleId, { create: true });
   const old = await readRepatch(d.titleId);
   const gen = `g${Date.now().toString(36)}`;
@@ -307,7 +319,7 @@ async function repatchImport(d, post) {
         cur = null;
       },
     };
-    const got = repatch_import(src, sink, d.titleId, !!d.pickedRoot, (stage, file, done, total) => {
+    const got = repatch_import(src, sink, d.titleId, !!d.pickedRoot, gamePaths, addons, (stage, file, done, total) => {
       post(done >= total, () => ({ type: "progress", stage, file, done, total }));
     });
     const rec = {
@@ -317,6 +329,8 @@ async function repatchImport(d, post) {
       files: got.files,
       code: got.code,
       addcont: got.addcont,
+      appFiles: got.appFiles,
+      inferred: got.inferred,
       codeHash: got.codeHash,
       importedAt: Date.now(),
       disabled: false,

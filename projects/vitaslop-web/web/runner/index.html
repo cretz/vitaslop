@@ -42,6 +42,10 @@
         and come from the desktop. Backgrounding or locking pauses it; coming back resumes it - a job that was
         interrupted is simply run again.</small></p>
       <div id="desk" class="say"></div>
+      <form id="talk" class="row" autocomplete="off">
+        <input id="talk-text" placeholder="Message the desktop" style="flex:1;min-width:0;font-size:16px" />
+        <button>Send</button>
+      </form>
       <div id="log"></div>
     </main>
     <script type="module" src="./runner.js"></script>

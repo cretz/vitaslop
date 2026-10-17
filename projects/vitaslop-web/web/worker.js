@@ -71,7 +71,7 @@ for (const level of ["log", "info", "warn", "error"]) {
   console[level] = (...a) => {
     const text = a.map((x) => (typeof x === "string" ? x : String(x))).join(" ");
     // `rtt probe:` = `VITASLOP_RTT_PROBE_LOG`'s per-frame line (reaches the console under VITASLOP_CONSOLE=1).
-    if (text.startsWith("[exec] ") || text.startsWith("smptrace") || text.startsWith("presentlog") || text.startsWith("drawnote") || text.startsWith("presentshot") || text.includes("rtt probe:") || text.includes("host write watch") || text.startsWith("jsprofile") || text.startsWith("guestprof")) self.postMessage({ type: "note", text });
+    if (text.startsWith("[exec] ") || text.startsWith("smptrace") || text.startsWith("presentlog") || text.startsWith("drawnote") || text.startsWith("presentshot") || text.includes("rtt probe:") || text.includes("host write watch") || text.startsWith("jsprofile") || text.startsWith("guestprof") || text.startsWith("[playbook")) self.postMessage({ type: "note", text });
     else if (forwardConsole > 0 && !(forwardFrom > 0 && Number((panelFrame.exec(text) || [])[1] ?? Infinity) < forwardFrom)) {
       forwardConsole -= 1;
       self.postMessage({ type: "note", text: `console.${level}: ${text.slice(0, 60000)}` });

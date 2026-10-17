@@ -365,6 +365,7 @@ pub fn import_addon_from(id: &str, src: DirSource, progress: &Arc<Mutex<ImportPr
     let p = stream::probe(src.clone()).map_err(|e| e.to_string())?;
     if !p.is_addcont() {
         return Err(match &p.title_id {
+            _ if p.is_update() => p.refused_as_title().unwrap_or_default(),
             Some(t) if p.category.is_some() => format!("this is not an add-on but a title ({t}) - import it from the library"),
             _ => "this is not an add-on (its param.sfo does not say CATEGORY ac)".into(),
         });
@@ -468,6 +469,17 @@ pub fn import_repatch_from(id: &str, src: DirSource, source: &str, progress: &Ar
     Ok(meta)
 }
 
+/// What the library holds for `id` - its `app0:` top level and installed add-ons - for placing an
+/// overlay's files (see `repatch::GameIndex`). Empty, and so unchecked, for a title the library
+/// does not have (`--repatch` beside `--game <dir>`).
+fn repatch_game(id: &str) -> vitaslop_runtime::ingest::repatch::GameIndex {
+    let top: Vec<String> = fs::read_dir(title_dir(id).join("files"))
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    let addons: Vec<String> = list_addons(id).into_iter().map(|a| a.dir).collect();
+    vitaslop_runtime::ingest::repatch::GameIndex::new(top.iter().map(String::as_str), addons.iter().map(String::as_str))
+}
+
 /// [`import_repatch_from`] into any directory `dest` (what `--repatch` does with a folder that
 /// is not an installed overlay yet).
 pub fn import_repatch_into(id: &str, src: DirSource, source: &str, dest: &Path, progress: &Arc<Mutex<ImportProgress>>) -> Result<RepatchMeta, String> {
@@ -487,7 +499,7 @@ pub fn import_repatch_into(id: &str, src: DirSource, source: &str, dest: &Path, 
             g.total = pr.total;
         };
         // A desktop folder pick lists paths below the folder, so there is no picked root to drop.
-        let got = vitaslop_runtime::ingest::repatch::import(Rc::new(src), id, false, &mut sink, &mut report)?;
+        let got = vitaslop_runtime::ingest::repatch::import(Rc::new(src), id, false, &repatch_game(id), &mut sink, &mut report)?;
         let meta = RepatchMeta {
             title_id: id.to_string(),
             source: source.to_string(),
@@ -495,6 +507,8 @@ pub fn import_repatch_into(id: &str, src: DirSource, source: &str, dest: &Path, 
             files: got.files,
             code: got.code,
             addcont: got.addcont,
+            app_files: got.app_files,
+            inferred: got.inferred,
             code_hash: got.code_hash,
             imported_at: now_ms(),
             disabled: false,
@@ -697,11 +711,9 @@ pub fn import_from(src: DirSource, progress: &Arc<Mutex<ImportProgress>>) -> Res
     progress.lock().unwrap().stage = "reading".into();
     let p = stream::probe(src.clone()).map_err(|e| e.to_string())?;
     let id = p.title_id.clone().ok_or("no param.sfo, so no title id to file this under")?;
-    // Filed under its title's id, an add-on would replace the game itself.
-    if p.is_addcont() {
-        return Err(format!(
-            "this is an add-on for {id}, not a game - open that game in the library and add it under Add-ons"
-        ));
+    // Filed under its title's id, an add-on or an update would replace the game itself.
+    if let Some(why) = p.refused_as_title() {
+        return Err(why);
     }
     if p.missing_work_bin {
         return Err("this pkg has no work.bin and none was found beside it".into());

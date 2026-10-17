@@ -204,6 +204,22 @@ let sayFrom = -1;
 const pin = (m) => {
   $("desk").innerHTML = `<span class="t">${new Date(m.at).toLocaleTimeString()}</span> ${m.text.replace(/[<&]/g, (c) => (c === "<" ? "&lt;" : "&amp;"))}`;
 };
+// The other direction: what this person types goes to the desktop (POST /runner/hear), which
+// watches for it, and comes back into this log through the say feed as "YOU: ...".
+$("talk").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = $("talk-text").value.trim();
+  if (!text) return;
+  try {
+    const r = await fetch("/runner/hear", { method: "POST", body: text });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    $("talk-text").value = "";
+    pollSay().catch(() => {});
+  } catch (err) {
+    log(`not sent (${err.message || err}) - the server may need the update`, "bad");
+  }
+});
+
 async function pollSay() {
   const r = await fetch(`/runner/say?since=${Math.max(sayFrom, 0)}`);
   const says = await r.json();
@@ -214,7 +230,7 @@ async function pollSay() {
   }
   for (const m of says) {
     if (m.n <= sayFrom) continue;
-    log(`DESKTOP: ${m.text}`, "say");
+    log(m.you ? m.text : `DESKTOP: ${m.text}`, "say");
     pin(m);
     sayFrom = m.n;
   }

@@ -177,6 +177,17 @@ try {
   s = await stored();
   check(s && s.rec.gen !== oldGen && s.gens.length === 1 && s.gens[0] === s.rec.gen, `the replacement is a new generation and the old one is gone (${s && s.gens.join(",")})`);
   check(s && s.rec.source === folder.split(/[\\/]/).filter(Boolean).pop(), `the record names the folder: ${s && s.rec.source}`);
+  // A folder that names no rePatch/reAddcont folder has its add-on folders placed by INFERENCE,
+  // and the card says so, one line per folder, beside where the files went.
+  const inferred = (s && s.rec.inferred) || [];
+  const folderRow = (await page.locator("#rp-list li").textContent()).replace(/\s+/g, " ");
+  console.log(`[repatch] folder overlay: ${folderRow.trim()}`);
+  check(inferred.every((l) => folderRow.includes(l.replace(/\s+/g, " "))), `the card shows every inferred placement (${inferred.length})`);
+  check(s && s.rec.appFiles !== undefined && /over the game/.test(folderRow), "the card says how many files lay over the game");
+  if (process.env.EXPECT_ADDON) {
+    const dir = process.env.EXPECT_ADDON;
+    check(s.files.some((f) => f.startsWith(`addcont/${dir}/`)) && inferred.some((l) => l.includes(`add-on ${dir}`)), `${dir}/ went over add-on ${dir}, inferred`);
+  }
   await shot("4-replaced-folder");
 
   // ---- remove (or keep for a boot) ----

@@ -311,7 +311,11 @@ async function renderTitle(id) {
     }
     const code = rp.code && rp.code.length ? `replaces ${rp.code.map(esc).join(", ")}` : "data only";
     const addcont = rp.addcont && rp.addcont.length ? ` &middot; add-ons ${rp.addcont.map(esc).join(", ")}` : "";
-    $("rp-list").innerHTML = `<li><div><b>${esc(rp.source || "Overlay")}</b><br><span class="dim">${rp.files} files &middot; ${store.fmtBytes(rp.bytes)} &middot; ${code}${addcont} &middot; added ${fmtDate(rp.importedAt)}</span></div>
+    // Where the files went: over the game, over add-ons - and any folder whose place was INFERRED
+    // (a bare pack names no rePatch/reAddcont folder), with why.
+    const split = rp.appFiles !== undefined ? ` &middot; ${rp.appFiles} over the game, ${rp.files - rp.appFiles} over add-ons` : "";
+    const inferred = rp.inferred && rp.inferred.length ? `<br><span class="dim">${rp.inferred.map(esc).join("<br>")}</span>` : "";
+    $("rp-list").innerHTML = `<li><div><b>${esc(rp.source || "Overlay")}</b><br><span class="dim">${rp.files} files${split} &middot; ${store.fmtBytes(rp.bytes)} &middot; ${code}${addcont} &middot; added ${fmtDate(rp.importedAt)}</span>${inferred}</div>
       <label class="row"><input type="checkbox" id="rp-on" ${rp.disabled ? "" : "checked"} /><span>On</span></label>
       <button class="btn danger" id="rp-rm">Remove</button></li>`;
     $("rp-on").addEventListener("change", async () => {

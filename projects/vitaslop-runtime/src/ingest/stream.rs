@@ -104,6 +104,40 @@ impl Probe {
     pub fn is_addcont(&self) -> bool {
         self.category.as_deref().is_some_and(super::addcont::is_addcont_category)
     }
+
+    /// Whether this is a game UPDATE (`CATEGORY` `gp`): only the files the patch changes,
+    /// filed under its game's id. Updates are not supported, and importing one as a title
+    /// would replace the whole game with that handful of files.
+    pub fn is_update(&self) -> bool {
+        self.category.as_deref().is_some_and(is_update_category)
+    }
+
+    /// Why this source must not be imported as a title, or `None` if it can be - the one
+    /// wording every importer shows.
+    pub fn refused_as_title(&self) -> Option<String> {
+        let id = self.title_id.as_deref().unwrap_or("its game");
+        if self.is_addcont() {
+            return Some(format!(
+                "this is an add-on for {id}, not a game - open that game in the library and add it under Add-ons"
+            ));
+        }
+        if self.is_update() {
+            let v = self.app_version.as_deref().map(|v| format!(" (v{v})")).unwrap_or_default();
+            return Some(format!(
+                "this is an update{v} for {id}, not the game - game updates are not supported yet, \
+                 and importing one would replace the game"
+            ));
+        }
+        None
+    }
+}
+
+/// The `param.sfo` `CATEGORY` a game update carries.
+pub const UPDATE_CATEGORY: &str = "gp";
+
+/// Whether a `param.sfo` `CATEGORY` names a game update.
+pub fn is_update_category(category: &str) -> bool {
+    category.trim().eq_ignore_ascii_case(UPDATE_CATEGORY)
 }
 
 const CHUNK: usize = 1 << 20;
@@ -1015,6 +1049,33 @@ mod tests {
     use super::*;
     use crate::ingest::pipeline::{decrypt_container, dump_entries};
     use crate::ingest::vfs::{DirVfs, Vfs};
+
+    /// An update or an add-on is filed under its GAME's id, so a title import of either
+    /// would wipe that game: both are refused, a game is not.
+    #[test]
+    fn an_update_or_an_addon_is_refused_as_a_title() {
+        let probe = |category: &str| Probe {
+            kind: "pkg",
+            zipped: false,
+            title_id: Some("ABCD12345".into()),
+            title: None,
+            content_id: None,
+            app_version: Some("01.03".into()),
+            category: Some(category.into()),
+            bytes: 0,
+            files: 0,
+            icon0: None,
+            pic0: None,
+            missing_work_bin: false,
+            outputs: Vec::new(),
+        };
+        assert!(probe("gd").refused_as_title().is_none());
+        let up = probe("gp ");
+        assert!(up.is_update() && !up.is_addcont());
+        let why = up.refused_as_title().unwrap();
+        assert!(why.contains("update (v01.03) for ABCD12345"), "{why}");
+        assert!(probe("ac").refused_as_title().unwrap().contains("add-on for ABCD12345"));
+    }
 
     fn dir_source(root: &std::path::Path) -> MemSource {
         let vfs = DirVfs::new(root);

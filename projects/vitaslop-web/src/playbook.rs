@@ -45,6 +45,15 @@ fn wall_ms() -> f64 {
 
 thread_local! {
     static FINISHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Shots named since the renderer last looked - see [`take_shot_request`].
+    static SHOT_ASKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the playbook named a shot since the last call. The renderer's present probe (when
+/// one exists: a device-runner job asks for it) then copies the next present, so a phone run
+/// brings the named picture back as a `presentshot` line - a phone has no harness to take it.
+pub fn take_shot_request() -> bool {
+    SHOT_ASKED.with(|s| s.replace(false))
 }
 
 /// Start the playbook `{ name, source }` the page sent, if it sent one. Before the guest runs.
@@ -88,7 +97,10 @@ pub fn on_present(frame: u64, guest_us: u64) {
     for ev in engine::take_events() {
         match ev {
             Event::Log(line) => console(&line),
-            Event::Shot(name) => console(&format!("[playbook-shot] {name} at frame {frame}")),
+            Event::Shot(name) => {
+                console(&format!("[playbook-shot] {name} at frame {frame}"));
+                SHOT_ASKED.with(|s| s.set(true));
+            }
         }
     }
     if engine::status() != Some(Status::Running) {

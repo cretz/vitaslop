@@ -34,7 +34,7 @@
 //   GET  /runner/lane.js        the seeded case-input generator (e2e/caseinputs.mjs, ONE copy)
 //   GET  /runner-assets/<path>  a file under assets/; a directory with ?list gives its names
 
-import { readFile, writeFile, readdir, mkdir, rename, stat } from "node:fs/promises";
+import { readFile, writeFile, readdir, mkdir, rename, stat, appendFile } from "node:fs/promises";
 import { existsSync, createReadStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { join, normalize, sep } from "node:path";
@@ -232,6 +232,35 @@ export function createRunner({ dir, coi, laneSrc, runnerWebDir }) {
       }
       const since = Number(url.searchParams.get("since") || 0);
       json(res, 200, says.filter((m) => m.n > since));
+      return true;
+    }
+    // ...and back: what the person holding the phone types on the runner page, for the desktop
+    // to read without them leaving it. Appended to `inbox.jsonl` (one {n, at, text} a line), which
+    // a desktop session watches. It is echoed into the say log too, so the page shows the conversation.
+    //   POST /runner/hear  body = the text      GET /runner/hear?since=<n>  -> [{n, at, text}]
+    if (path === "/runner/hear") {
+      const f = sub("inbox.jsonl");
+      let lines = [];
+      try {
+        lines = (await readFile(f, "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      } catch {}
+      if (req.method === "POST") {
+        const text = (await body(req)).trim().slice(0, 2000);
+        if (!text) return json(res, 400, { error: "empty" }), true;
+        const m = { n: (lines.at(-1)?.n || 0) + 1, at: new Date(now).toISOString(), text };
+        await appendFile(f, JSON.stringify(m) + "\n");
+        const sf = sub("say.json");
+        let says = [];
+        try {
+          says = await readJson(sf);
+        } catch {}
+        says.push({ n: (says.at(-1)?.n || 0) + 1, at: m.at, text: `YOU: ${text}`, you: true });
+        await writeJson(sf, says.slice(-200));
+        json(res, 200, { n: m.n });
+        return true;
+      }
+      const since = Number(url.searchParams.get("since") || 0);
+      json(res, 200, lines.filter((m) => m.n > since));
       return true;
     }
     if (path === "/runner/hello" && req.method === "POST") {

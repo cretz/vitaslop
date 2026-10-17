@@ -3736,6 +3736,12 @@ impl LivePlayback {
         // read. The copy rides the same encoder, so it costs no extra submit.
         self.presents_total += 1;
         let guest_frame = vitaslop_runtime::sched::current_frame();
+        // A shot the playbook just named is this present (frame 0 = due now).
+        if playbook::take_shot_request()
+            && let Some(probe) = self.probe.as_mut()
+        {
+            probe.shots.push_front(0);
+        }
         let sampling = self.probe.as_ref().is_some_and(|p| p.wants(self.presents_total, guest_frame));
         if vitaslop_playbook::engine::wants_pixels() && target_tex.usage().contains(wgpu::TextureUsages::COPY_SRC) {
             self.pixel_tap.capture(&self.device, &mut encoder, target_tex);
