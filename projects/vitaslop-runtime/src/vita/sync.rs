@@ -606,7 +606,7 @@ pub(super) fn create_event_flag(
     ctx: &mut GuestCtx,
     st: &mut VitaState,
     name: Ptr,
-    _attr: u32,
+    attr: u32,
     init: u32,
     _opt: Ptr,
 ) -> i32 {
@@ -614,6 +614,7 @@ pub(super) fn create_event_flag(
         if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
     let id = st.create_event_flag(init);
     st.name_event_flag(id, &name);
+    st.record_event_flag_params(id, attr, init);
     tracing::trace!(
         target: "vitaslop::sema",
         id, init, name, thread = st.current_thread(),
@@ -643,6 +644,41 @@ pub(super) fn set_event_flag(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, bi
         st.event_set(id, bits);
     }
     0
+}
+
+/// `SceKernelEventFlagInfo` (psp2common/kernel/threadmgr.h): size, evfId, name[32], attr,
+/// initPattern, currentPattern, numWaitThreads - 0x38 bytes.
+const EVENT_FLAG_INFO_BYTES: u32 = 0x38;
+
+/// int sceKernelGetEventFlagInfo(SceUID evid, SceKernelEventFlagInfo *info)
+///
+/// Fills the caller's struct from the flag's own record. `info->size` is the caller's and is
+/// left as it is; only that many bytes (at most the struct) are written, so a caller that
+/// declares a shorter struct is not overrun. An unknown uid is `UNKNOWN_EVF_ID`.
+pub(super) fn get_event_flag_info(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let (uid, info) = (ctx.arg(0) as i32, ctx.arg(1));
+    let Some((attr, init, current, waiters)) = st.event_flag_info(uid) else {
+        ctx.ret(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+        return SvcOutcome::Continue;
+    };
+    if info == 0 {
+        return SvcOutcome::Fatal(format!(
+            "sceKernelGetEventFlagInfo(evid={uid:#x}, info=NULL): the kernel's answer to a NULL info is not implemented (no silent stub)"
+        ));
+    }
+    let size = ctx.read_u32(info).min(EVENT_FLAG_INFO_BYTES);
+    let mut bytes = vec![0u8; EVENT_FLAG_INFO_BYTES as usize];
+    bytes[0..4].copy_from_slice(&ctx.read_u32(info).to_le_bytes());
+    bytes[4..8].copy_from_slice(&uid.to_le_bytes());
+    let name = st.event_flag_name(uid).as_bytes();
+    let n = name.len().min(31);
+    bytes[8..8 + n].copy_from_slice(&name[..n]);
+    for (at, v) in [(0x28, attr), (0x2c, init), (0x30, current), (0x34, waiters)] {
+        bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    ctx.write_bytes(info, &bytes[..size as usize]);
+    ctx.ret(0);
+    SvcOutcome::Continue
 }
 
 /// int sceKernelClearEventFlag(SceUID evid, unsigned int bitPattern)
@@ -997,7 +1033,7 @@ pub(super) fn unlock_rwlock(ctx: &mut GuestCtx, st: &mut VitaState, write: bool)
 
 // --- delete (shared: no teardown needed for these lightweight handles) ---
 
-/// int sceKernelDelete{Mutex,Sema,EventFlag}(SceUID id), and sceKernelCloseMutex - all
+/// int sceKernelDelete{Mutex,Sema,EventFlag}(SceUID id), and sceKernelClose{Mutex,Sema,EventFlag} - all
 /// succeed. See `nid::sync::CLOSE_MUTEX` for why close and delete share this.
 #[hostcall]
 pub(super) fn delete_object(_st: &mut VitaState, _id: i32) -> i32 {
@@ -1438,5 +1474,48 @@ mod rwlock_tests {
         assert_eq!(st.take_wakes(), vec![2]);
         assert_eq!(st.take_resume_code(2), Some(crate::host::SCE_KERNEL_ERROR_WAIT_DELETE));
         assert_eq!(st.rwlock_try(id, false), R::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod event_flag_info_tests {
+    use super::*;
+    use crate::world::DeterministicWorld;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    const INFO: u32 = 0x1000;
+
+    /// The struct reads back the flag's own record at the vitasdk offsets, the caller's
+    /// `size` is left alone, and an unknown uid is refused rather than answered with zeros.
+    #[test]
+    fn info_reports_the_flag_at_the_published_offsets() {
+        let mut st = VitaState::new(0, 0x4000, Box::new(DeterministicWorld::default()));
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 0x4000];
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        let id = st.create_event_flag(0x5);
+        st.name_event_flag(id, "Flag");
+        st.record_event_flag_params(id, 0x200, 0x5);
+        st.event_set(id, 0x30);
+        ctx.write_u32(INFO, EVENT_FLAG_INFO_BYTES);
+        ctx.write_u32(INFO + EVENT_FLAG_INFO_BYTES, 0xdead_beef); // the word past the struct
+        (ctx.regs[0], ctx.regs[1]) = (id as u32, INFO);
+        assert!(matches!(get_event_flag_info(&mut ctx, &mut st), SvcOutcome::Continue));
+        assert_eq!(ctx.regs[0], 0);
+        assert_eq!(ctx.read_u32(INFO), EVENT_FLAG_INFO_BYTES, "size is the caller's");
+        assert_eq!(ctx.read_u32(INFO + 4), id as u32);
+        assert_eq!(ctx.read_bytes(INFO + 8, 5), b"Flag\0");
+        assert_eq!(ctx.read_u32(INFO + 0x28), 0x200, "attr");
+        assert_eq!(ctx.read_u32(INFO + 0x2c), 0x5, "initPattern");
+        assert_eq!(ctx.read_u32(INFO + 0x30), 0x35, "currentPattern");
+        assert_eq!(ctx.read_u32(INFO + 0x34), 0, "numWaitThreads");
+        assert_eq!(ctx.read_u32(INFO + EVENT_FLAG_INFO_BYTES), 0xdead_beef, "nothing past the struct");
+
+        (ctx.regs[0], ctx.regs[1]) = (0x7777, INFO);
+        assert!(matches!(get_event_flag_info(&mut ctx, &mut st), SvcOutcome::Continue));
+        assert_eq!(ctx.regs[0], SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
     }
 }

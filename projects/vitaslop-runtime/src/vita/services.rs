@@ -694,6 +694,178 @@ pub(super) fn rtc_get_day_of_week(_ctx: &mut GuestCtx, _st: &mut VitaState, year
     }
 }
 
+/// int sceRtcGetDaysInMonth(int year, int month)
+///
+/// The length of a month, February by the same leap rule as everything else here. Year and
+/// month are validated as [`rtc_get_day_of_week`] validates them.
+#[hostcall]
+pub(super) fn rtc_get_days_in_month(_ctx: &mut GuestCtx, _st: &mut VitaState, year: i32, month: i32) -> i32 {
+    if !(1..=9999).contains(&year) {
+        SCE_RTC_ERROR_INVALID_YEAR
+    } else if !(1..=12).contains(&month) {
+        SCE_RTC_ERROR_INVALID_MONTH
+    } else {
+        days_in_month(year as i64, month as i64) as i32
+    }
+}
+
+/// int sceRtcIsLeapYear(int year)
+///
+/// 1 for a leap year, 0 otherwise; a year outside the RTC's range is refused as every other
+/// member refuses it.
+#[hostcall]
+pub(super) fn rtc_is_leap_year(_ctx: &mut GuestCtx, _st: &mut VitaState, year: i32) -> i32 {
+    if !(1..=9999).contains(&year) {
+        SCE_RTC_ERROR_INVALID_YEAR
+    } else {
+        is_leap_year(year as i64) as i32
+    }
+}
+
+/// int sceRtcCheckValid(const SceDateTime *time)
+///
+/// 0 for a valid broken-down time, or the code for its first field out of range - exactly
+/// the validation every conversion out of broken-down time applies ([`rtc_decode_broken_down`]),
+/// so a date this passes is one they all accept.
+#[hostcall]
+pub(super) fn rtc_check_valid(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr) -> i32 {
+    if time.is_null() {
+        SCE_RTC_ERROR_INVALID_POINTER
+    } else {
+        rtc_decode_broken_down(ctx, time).map_or_else(|e| e, |_| 0)
+    }
+}
+
+/// int sceRtcCompareTick(const SceRtcTick *pTick1, const SceRtcTick *pTick2)
+///
+/// -1, 0 or 1 as the first tick is before, equal to or after the second. Ticks are
+/// unsigned microsecond counts from 0001-01-01, compared as such.
+#[hostcall]
+pub(super) fn rtc_compare_tick(ctx: &mut GuestCtx, _st: &mut VitaState, a: Ptr, b: Ptr) -> i32 {
+    if a.is_null() || b.is_null() {
+        SCE_RTC_ERROR_INVALID_POINTER
+    } else {
+        let (x, y) = (read_tick(ctx, a.addr()) as u64, read_tick(ctx, b.addr()) as u64);
+        match x.cmp(&y) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+}
+
+/// Write UNIX seconds plus microseconds into a broken-down `SceDateTime` at `time`, through
+/// the same [`civil_from_days`] expansion as `sceRtcSetTick`; a date outside the RTC's
+/// years is refused and nothing is written.
+fn write_date_time(ctx: &mut GuestCtx, time: u32, secs: i64, micro: i64) -> i32 {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    if !(1..=9999).contains(&y) {
+        return SCE_RTC_ERROR_INVALID_YEAR;
+    }
+    let sod = secs.rem_euclid(86_400);
+    let fields: [u16; 6] =
+        [y as u16, m as u16, d as u16, (sod / 3600) as u16, (sod / 60 % 60) as u16, (sod % 60) as u16];
+    let mut bytes = [0u8; 16];
+    for (i, f) in fields.iter().enumerate() {
+        bytes[i * 2..i * 2 + 2].copy_from_slice(&f.to_le_bytes());
+    }
+    bytes[12..16].copy_from_slice(&(micro as u32).to_le_bytes());
+    ctx.write_bytes(time, &bytes);
+    0
+}
+
+/// int sceRtcSetTime_t(SceDateTime *time, time_t iTime)
+///
+/// The inverse of [`rtc_get_time_t`]: a signed 32-bit UNIX second count (the Vita's
+/// `time_t`) broken down, so a date before 1970 expands to the right day.
+#[hostcall]
+pub(super) fn rtc_set_time_t(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, seconds: i32) -> i32 {
+    if time.is_null() {
+        SCE_RTC_ERROR_INVALID_POINTER
+    } else {
+        write_date_time(ctx, time.addr(), seconds as i64, 0)
+    }
+}
+
+/// int sceRtcSetWin32FileTime(SceDateTime *time, SceUInt64 ulWin32Time)
+///
+/// The inverse of [`rtc_get_win32_file_time`]: 100-nanosecond intervals since 1601-01-01
+/// broken down, the sub-microsecond remainder dropped (the field has no room for it). The
+/// 64-bit count arrives in the r2:r3 pair, as `sceRtcSetTime64_t`'s does.
+#[hostcall]
+pub(super) fn rtc_set_win32_file_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, _pad: u32, lo: u32, hi: u32) -> i32 {
+    if time.is_null() {
+        SCE_RTC_ERROR_INVALID_POINTER
+    } else {
+        const FILETIME_UNIX_OFFSET_S: i64 = 11_644_473_600;
+        let us = ((((hi as u64) << 32) | lo as u64) / 10) as i64;
+        write_date_time(ctx, time.addr(), us.div_euclid(1_000_000) - FILETIME_UNIX_OFFSET_S, us.rem_euclid(1_000_000))
+    }
+}
+
+/// int sceRtcGetDosTime(const SceDateTime *time, unsigned int *puiDosTime)
+///
+/// The MS-DOS packed form: `(year - 1980) << 25 | month << 21 | day << 16 | hour << 11 |
+/// minute << 5 | second / 2`. A valid date the form cannot hold (before 1980 or after
+/// 2107) is refused as a year out of range rather than wrapped.
+#[hostcall]
+pub(super) fn rtc_get_dos_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, out: Ptr) -> i32 {
+    rtc_get_dos_time_impl(ctx, time, out)
+}
+
+fn rtc_get_dos_time_impl(ctx: &mut GuestCtx, time: Ptr, out: Ptr) -> i32 {
+    if time.is_null() || out.is_null() {
+        return SCE_RTC_ERROR_INVALID_POINTER;
+    }
+    if let Err(e) = rtc_decode_broken_down(ctx, time) {
+        return e;
+    }
+    let raw = ctx.read_bytes(time.addr(), 12);
+    let f = |i: usize| u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]) as u32;
+    let year = f(0);
+    if !(1980..=2107).contains(&year) {
+        return SCE_RTC_ERROR_INVALID_YEAR;
+    }
+    let dos = ((year - 1980) << 25) | (f(1) << 21) | (f(2) << 16) | (f(3) << 11) | (f(4) << 5) | (f(5) / 2);
+    ctx.write_u32(out.addr(), dos);
+    0
+}
+
+/// int sceRtcSetDosTime(SceDateTime *time, unsigned int uiDosTime)
+///
+/// The inverse of [`rtc_get_dos_time`]. The packed fields are range-checked as any other
+/// broken-down time is (a DOS word can spell month 0 or second 60), and nothing is written
+/// for one that fails.
+#[hostcall]
+pub(super) fn rtc_set_dos_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, dos: u32) -> i32 {
+    rtc_set_dos_time_impl(ctx, time, dos)
+}
+
+fn rtc_set_dos_time_impl(ctx: &mut GuestCtx, time: Ptr, dos: u32) -> i32 {
+    if time.is_null() {
+        return SCE_RTC_ERROR_INVALID_POINTER;
+    }
+    let year = 1980 + (dos >> 25) as i64;
+    let (month, day) = ((dos >> 21 & 0xf) as i64, (dos >> 16 & 0x1f) as i64);
+    let (hour, minute, second) = ((dos >> 11 & 0x1f) as i64, (dos >> 5 & 0x3f) as i64, (dos & 0x1f) as i64 * 2);
+    if !(1..=12).contains(&month) {
+        return SCE_RTC_ERROR_INVALID_MONTH;
+    }
+    if day < 1 || day > days_in_month(year, month) {
+        return SCE_RTC_ERROR_INVALID_DAY;
+    }
+    if hour > 23 {
+        return SCE_RTC_ERROR_INVALID_HOUR;
+    }
+    if minute > 59 {
+        return SCE_RTC_ERROR_INVALID_MINUTE;
+    }
+    if second > 59 {
+        return SCE_RTC_ERROR_INVALID_SECOND;
+    }
+    write_date_time(ctx, time.addr(), days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second, 0)
+}
+
 /// int sceRtcFormatRFC3339LocalTime(char *pszDateTime, const SceRtcTick *utc)
 ///
 /// Format a tick as an RFC 3339 timestamp in LOCAL time. This engine's local time is UTC
@@ -711,11 +883,27 @@ pub(super) fn rtc_format_rfc3339_local_time(ctx: &mut GuestCtx, _st: &mut VitaSt
 }
 
 fn rtc_format_rfc3339_local_time_impl(ctx: &mut GuestCtx, out: Ptr, tick: Ptr) -> i32 {
+    rtc_format_rfc3339_impl(ctx, out, tick, 0)
+}
+
+/// int sceRtcFormatRFC3339(char *pszDateTime, const SceRtcTick *utc, int iTimeZoneMinutes)
+///
+/// [`rtc_format_rfc3339_local_time`] at an offset the caller names: the wall-clock fields
+/// are the UTC tick moved by `iTimeZoneMinutes`, and the offset printed is that same amount,
+/// so [`rtc_parse_rfc3339`] reading the text back lands on the tick it was given.
+#[hostcall]
+pub(super) fn rtc_format_rfc3339(ctx: &mut GuestCtx, _st: &mut VitaState, out: Ptr, tick: Ptr, tz_minutes: i32) -> i32 {
+    rtc_format_rfc3339_impl(ctx, out, tick, tz_minutes)
+}
+
+fn rtc_format_rfc3339_impl(ctx: &mut GuestCtx, out: Ptr, tick: Ptr, tz_minutes: i32) -> i32 {
     if out.is_null() || tick.is_null() {
         return SCE_RTC_ERROR_INVALID_POINTER;
     }
     let t = read_tick(ctx, tick.addr());
-    let us = t - RTC_UNIX_EPOCH_TICKS as i64;
+    let us = t - RTC_UNIX_EPOCH_TICKS as i64 + tz_minutes as i64 * 60_000_000;
+    let sign = if tz_minutes < 0 { '-' } else { '+' };
+    let tz_abs = (tz_minutes as i64).abs();
     let secs = us.div_euclid(1_000_000);
     let micro = us.rem_euclid(1_000_000);
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
@@ -724,10 +912,12 @@ fn rtc_format_rfc3339_local_time_impl(ctx: &mut GuestCtx, out: Ptr, tick: Ptr) -
     }
     let sod = secs.rem_euclid(86_400);
     let text = format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{micro:06}+00:00\0",
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{micro:06}{sign}{:02}:{:02}\0",
         sod / 3600,
         sod / 60 % 60,
-        sod % 60
+        sod % 60,
+        tz_abs / 60,
+        tz_abs % 60
     );
     ctx.write_bytes(out.addr(), text.as_bytes());
     0
@@ -2911,6 +3101,148 @@ mod calendar_tests {
         // The Unix epoch is day zero, which pins the offset rather than just the deltas.
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+}
+
+#[cfg(test)]
+mod rtc_call_tests {
+    //! The calendar calls through their guest-facing entry points: arguments in registers,
+    //! structs in guest memory. Each new member is checked against an INVERSE it must agree
+    //! with (a formatter against the parser, a setter against its getter), since a calendar
+    //! bug shifts a date silently rather than failing.
+    use super::*;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    const TIME: u32 = 0x100; // a SceDateTime
+    const TICK_A: u32 = 0x200;
+    const TICK_B: u32 = 0x208;
+    const OUT: u32 = 0x300;
+    const TEXT: u32 = 0x400;
+
+    /// Guest memory and host state that outlive any one call. Each call gets a FRESH
+    /// `GuestCtx`, as every engine dispatch does: `#[hostcall]` reads arguments through the
+    /// context's cursor, so a reused one would hand the second call the first call's tail.
+    struct Rig {
+        bytes: Vec<u8>,
+        st: VitaState,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            Rig { bytes: vec![0u8; 4096], st: VitaState::new(0, 4096, Box::new(crate::world::DeterministicWorld::default())) }
+        }
+
+        fn with<R>(&mut self, args: &[u32], f: impl FnOnce(&mut GuestCtx, &mut VitaState) -> R) -> R {
+            let mut regs = [0u32; REG_COUNT];
+            regs[..args.len()].copy_from_slice(args);
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            let mut mem = SliceMemory(&mut self.bytes);
+            let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            f(&mut ctx, &mut self.st)
+        }
+
+        fn call(&mut self, args: &[u32], f: fn(&mut GuestCtx, &mut VitaState)) -> i32 {
+            self.with(args, |ctx, st| {
+                f(ctx, st);
+                ctx.regs[0] as i32
+            })
+        }
+
+        fn date(&mut self) -> [u16; 6] {
+            let b = self.with(&[], |ctx, _| ctx.read_bytes(TIME, 12));
+            std::array::from_fn(|i| u16::from_le_bytes([b[i * 2], b[i * 2 + 1]]))
+        }
+
+        fn u32_at(&mut self, a: u32) -> u32 {
+            self.with(&[], |ctx, _| ctx.read_u32(a))
+        }
+    }
+
+    #[test]
+    fn days_in_month_and_leap_years_follow_the_gregorian_rules() {
+        let mut r = Rig::new();
+        {
+            assert_eq!(r.call(&[2024, 2], rtc_get_days_in_month), 29);
+            assert_eq!(r.call(&[1900, 2], rtc_get_days_in_month), 28);
+            assert_eq!(r.call(&[2025, 4], rtc_get_days_in_month), 30);
+            assert_eq!(r.call(&[2025, 13], rtc_get_days_in_month), SCE_RTC_ERROR_INVALID_MONTH);
+            assert_eq!(r.call(&[0, 1], rtc_get_days_in_month), SCE_RTC_ERROR_INVALID_YEAR);
+            assert_eq!(r.call(&[2000], rtc_is_leap_year), 1);
+            assert_eq!(r.call(&[2100], rtc_is_leap_year), 0);
+            assert_eq!(r.call(&[2024], rtc_is_leap_year), 1);
+        }
+    }
+
+    #[test]
+    fn a_dos_time_round_trips_and_an_impossible_one_is_refused() {
+        let mut r = Rig::new();
+        {
+            // 2026-10-19 16:42:58.
+            let dos = ((2026 - 1980) << 25) | (10 << 21) | (19 << 16) | (16 << 11) | (42 << 5) | (58 / 2);
+            assert_eq!(r.call(&[TIME, dos], rtc_set_dos_time), 0);
+            assert_eq!(r.date(), [2026, 10, 19, 16, 42, 58]);
+            assert_eq!(r.call(&[TIME], rtc_check_valid), 0);
+            assert_eq!(r.call(&[TIME, OUT], rtc_get_dos_time), 0);
+            assert_eq!(r.u32_at(OUT), dos);
+            // Second field 30 is 60 seconds; month 0 does not exist.
+            assert_eq!(r.call(&[TIME, dos | 30], rtc_set_dos_time), SCE_RTC_ERROR_INVALID_SECOND);
+            assert_eq!(r.call(&[TIME, dos & !(0xf << 21)], rtc_set_dos_time), SCE_RTC_ERROR_INVALID_MONTH);
+        }
+    }
+
+    #[test]
+    fn set_time_t_breaks_a_pre_1970_second_down_to_the_right_day() {
+        let mut r = Rig::new();
+        {
+            assert_eq!(r.call(&[TIME, -1i32 as u32], rtc_set_time_t), 0);
+            assert_eq!(r.date(), [1969, 12, 31, 23, 59, 59]);
+            assert_eq!(r.call(&[TIME, OUT], rtc_get_time_t), 0);
+            assert_eq!(r.u32_at(OUT) as i32, -1);
+        }
+    }
+
+    #[test]
+    fn a_win32_file_time_round_trips_through_the_broken_down_form() {
+        let mut r = Rig::new();
+        {
+            let ft = win32_file_time(1_760_000_000, 123_456);
+            assert_eq!(r.call(&[TIME, 0, ft as u32, (ft >> 32) as u32], rtc_set_win32_file_time), 0);
+            assert_eq!(r.call(&[TIME, OUT], rtc_get_win32_file_time), 0);
+            assert_eq!(r.u32_at(OUT) as u64 | (r.u32_at(OUT + 4) as u64) << 32, ft);
+        }
+    }
+
+    #[test]
+    fn rfc3339_at_an_offset_parses_back_to_the_same_tick() {
+        let mut r = Rig::new();
+        {
+            let t = RTC_UNIX_EPOCH_TICKS as i64 + 1_760_000_000 * 1_000_000 + 250_000;
+            r.with(&[], |ctx, _| write_tick(ctx, TICK_A, t));
+            for tz in [0i32, -300, 330, 60 * 13] {
+                assert_eq!(r.call(&[TEXT, TICK_A, tz as u32], rtc_format_rfc3339), 0);
+                let text = r.with(&[], |ctx, _| ctx.read_cstr(TEXT, 64));
+                assert_eq!(r.call(&[TICK_B, TEXT], rtc_parse_rfc3339), 0, "{text}");
+                assert_eq!(r.with(&[], |ctx, _| read_tick(ctx, TICK_B)), t, "tz {tz}: {text}");
+            }
+            // The wall clock moves with the offset, and the offset is printed as such.
+            r.call(&[TEXT, TICK_A, -300i32 as u32], rtc_format_rfc3339);
+            let text = r.with(&[], |ctx, _| ctx.read_cstr(TEXT, 64));
+            assert!(text.ends_with("-05:00"), "{text}");
+        }
+    }
+
+    #[test]
+    fn compare_tick_orders_ticks() {
+        let mut r = Rig::new();
+        {
+            r.with(&[], |ctx, _| write_tick(ctx, TICK_A, 5));
+            r.with(&[], |ctx, _| write_tick(ctx, TICK_B, 7));
+            assert_eq!(r.call(&[TICK_A, TICK_B], rtc_compare_tick), -1);
+            assert_eq!(r.call(&[TICK_B, TICK_A], rtc_compare_tick), 1);
+            assert_eq!(r.call(&[TICK_A, TICK_A], rtc_compare_tick), 0);
+            assert_eq!(r.call(&[0, TICK_A], rtc_compare_tick), SCE_RTC_ERROR_INVALID_POINTER);
+        }
     }
 }
 

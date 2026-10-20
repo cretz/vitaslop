@@ -1736,6 +1736,42 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                     return FiberEnd::Error(format!("{}\n{}", trap_detail(&e), regs));
                 }
             }
+            // The thread RETURNED from its entry. Its EXIT event handlers run on it now,
+            // before it counts as ended - on this instance, stack and thread pointer, as a
+            // C library's TLS destructor needs. (An `sceKernelExitThread` ends the thread
+            // through the host call instead, which runs them itself.)
+            let calls = store.data().host.lock().unwrap().thread_return_calls(thid, last_r0);
+            for call in calls {
+                let mut regs = [0u32; abi::REG_COUNT];
+                regs[abi::SP] = sp;
+                {
+                    let data = store.data();
+                    let mut view = SharedView::new(&data.shared_mem, data.dirty_off);
+                    call.seed(&mut regs, &mut view, data.base);
+                }
+                for r in [0, 1, 2, 3, abi::SP] {
+                    set_reg_store(&mut store, &instance, r, regs[r]);
+                }
+                let dispatch = match instance.get_typed_func::<(i32, i32), ()>(&mut store, abi::DISPATCH_EXPORT) {
+                    Ok(f) => f,
+                    Err(e) => return FiberEnd::Error(format!("thread exit handler: module exports no dispatcher: {e}")),
+                };
+                if let Err(e) = dispatch.call_async(&mut store, ((call.entry & !1) as i32, 0)).await {
+                    let d = store.data_mut();
+                    if let Some(msg) = d.fatal.take() {
+                        return FiberEnd::Error(msg);
+                    }
+                    if d.process_halt {
+                        return FiberEnd::ProcessHalt(last_r0);
+                    }
+                    // A handler that exits the thread itself ends it with the code it had.
+                    if d.thread_exit {
+                        return FiberEnd::ThreadExit(last_r0);
+                    }
+                    let regs = reg_dump(&mut store, &instance);
+                    return FiberEnd::Error(format!("thread exit handler {:#x}: {}\n{}", call.entry, trap_detail(&e), regs));
+                }
+            }
             FiberEnd::Returned(last_r0)
         });
 

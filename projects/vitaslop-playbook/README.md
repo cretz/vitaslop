@@ -12,10 +12,19 @@ Lua scripts that play a title by reacting to it, and the tapes their runs record
   replays byte for byte on the same build.
 - A real-speed (SMP) run adapts to whatever timing and randomness it gets.
 - Holds the engine, the Lua seam, the tape format, the tools, and the playbooks
-  (`playbooks/<TITLE_ID>/*.lua`). Replaces the recipes in
+  (`playbooks/[best-effort/]<TITLE_ID>/*.lua`, see Tiers). Replaces the recipes in
   [`vitaslop-gamerun-recipes`](../vitaslop-gamerun-recipes/).
 - **Playbooks (and recipes) are the only place a title is named.** The Rust stays
   game-agnostic: no title names or ids in source, comments or tests.
+
+## Tiers
+
+- `playbooks/<TITLE_ID>/` - kept working: a build that breaks one is a regression to fix.
+- `playbooks/best-effort/<TITLE_ID>/` - proved a title played through ONCE, on the build named
+  in its `-- last verified: <date> <build>` line (required; the compile test checks it). Nobody
+  keeps these green: a later build may leave one behind, and a stale one is a lead, not a
+  failure. A fix a best-effort run found is proved by a title-independent test instead.
+- Both tiers must COMPILE (`every_playbook_compiles`).
 
 ## Why
 

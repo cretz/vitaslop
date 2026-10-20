@@ -233,6 +233,7 @@ pub fn boot_retail_exec(
     env.state.set_process_param(linked.process_param);
     env.state.set_main_thread_request(linked.main_thread_request());
     env.state.set_modules(linked.loaded_modules.clone());
+    env.state.set_unhandled_imports(linked.unhandled_imports.clone());
     // The TLS template seeds each thread's thread-local block; without it an early
     // thread-local access reads uninitialized memory and traps (MemoryOutOfBounds at
     // boot). The boot probe sets this too - keep the shared helper in parity.

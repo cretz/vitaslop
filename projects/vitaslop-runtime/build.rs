@@ -70,6 +70,21 @@ fn main() {
         out.push('\n');
     }
     out.push_str("    )\n}\n");
+    // Every NID with ANY arm, whatever its body - what the linker checks a title's imports
+    // against, so the whole list of functions a title could stop on is known before it runs.
+    let handled = handled_nids(&src);
+    out.push_str(&format!(
+        "\n/// Every NID the dispatch table has an arm for ({} of them), whatever the arm does. A NID\n\
+         /// outside this set reaches the `_` arm and stops the run - see `link`'s unhandled imports.\n\
+         pub fn dispatch_handles(func_nid: u32) -> bool {{\n    matches!(\n        func_nid,\n",
+        handled.len()
+    ));
+    for (i, n) in handled.iter().enumerate() {
+        out.push_str(if i == 0 { "        " } else { "        | " });
+        out.push_str(n);
+        out.push('\n');
+    }
+    out.push_str("    )\n}\n");
     let dst = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR is set"))
         .join("dispatch_cont_only.rs");
     std::fs::write(&dst, out).expect("the generated table is writable");
@@ -110,6 +125,40 @@ fn cont_only_nids(src: &str) -> (Vec<String>, usize) {
         }
     }
     (nids, arms)
+}
+
+/// The NID constant paths of EVERY arm in `dispatch` but the final `_`, deduplicated in
+/// dispatch order. A guarded arm counts as handling its constants (the guard is a runtime
+/// choice between two handled paths). Any other pattern shape fails the build: a binding or
+/// range would make "has an arm" mean something this list cannot say.
+fn handled_nids(src: &str) -> Vec<String> {
+    let head = "let outcome = match func_nid {";
+    let start = src.find(head).expect("checked by cont_only_nids") + head.len();
+    let body = strip_comments_and_strings(&src[start..]);
+    let arms = split_arms(up_to_matching_close(&body));
+    let mut seen = std::collections::HashSet::new();
+    let mut nids = Vec::new();
+    let last = arms.len().saturating_sub(1);
+    for (i, (pat, _)) in arms.iter().enumerate() {
+        let pat = pat.split_once(" if ").map_or(pat.as_str(), |(p, _)| p).trim();
+        if pat == "_" {
+            assert_eq!(i, last, "a `_` arm in `dispatch` before the last arm hides the arms after it");
+            continue;
+        }
+        for part in pat.split('|') {
+            let part = part.trim();
+            assert!(
+                is_nid_const_path(part),
+                "the `dispatch` arm pattern `{pat}` has `{part}`, which is not a `module::CONST` \
+                 path - the handled-NID set the linker reports against cannot represent it"
+            );
+            if seen.insert(part.to_string()) {
+                nids.push(part.to_string());
+            }
+        }
+    }
+    assert!(nids.len() > 900, "only {} handled NIDs read from `dispatch` - the parse has come adrift", nids.len());
+    nids
 }
 
 /// `module::CONST` and nothing else - lowercase module, SCREAMING_CASE constant.

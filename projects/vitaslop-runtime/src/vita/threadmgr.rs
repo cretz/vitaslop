@@ -124,6 +124,72 @@ pub(super) fn delete_callback(st: &mut VitaState, uid: i32) -> i32 {
     if st.kcb_delete(uid) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
 }
 
+/// `SCE_KERNEL_ERROR_UNKNOWN_THREAD_EVENT_ID` (psp2/kernel/error.h).
+const ERR_UNKNOWN_THREAD_EVENT_ID: i32 = 0x8002_8061_u32 as i32;
+
+/// SceUID sceKernelRegisterThreadEventHandler(const char *name, SceUID thid,
+///     SceInt32 eventMask, SceKernelThreadEventHandler handler, void *common)
+///
+/// Records the handler; EXIT events are delivered on the ending thread (see
+/// `VitaState::thread_exit_event_calls`). Anything this cannot deliver faithfully stops the
+/// run naming it rather than registering a handler that would never be called: a START
+/// event (not delivered yet), a mask with bits outside START|EXIT, a NULL handler, or a
+/// target that is neither "every thread in the process" nor a thread this process has.
+pub(super) fn register_thread_event_handler(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    use crate::host::{THREAD_EVENT_ALL_IN_PROCESS, THREAD_EVENT_EXIT, THREAD_EVENT_START};
+    let (name_ptr, target, mask, handler, common) =
+        (ctx.arg(0), ctx.arg(1) as i32, ctx.arg(2), ctx.arg(3), ctx.arg(4));
+    let name = if name_ptr != 0 { ctx.read_cstr(name_ptr, 31) } else { String::new() };
+    // `SCE_KERNEL_THREAD_ID_SELF`: the calling thread.
+    let target = if target == 0 { st.current_thread() } else { target };
+    let refuse = if handler == 0 {
+        Some("a NULL handler")
+    } else if mask & THREAD_EVENT_START != 0 {
+        Some("a START event (only EXIT events are delivered so far)")
+    } else if mask & !(THREAD_EVENT_START | THREAD_EVENT_EXIT) != 0 || mask == 0 {
+        Some("an event mask outside START|EXIT")
+    } else if target != THREAD_EVENT_ALL_IN_PROCESS && !st.thread_exists(target) {
+        Some("a target that is not a thread of this process")
+    } else {
+        None
+    };
+    if let Some(why) = refuse {
+        return SvcOutcome::Fatal(format!(
+            "sceKernelRegisterThreadEventHandler(\"{name}\", thid={target:#x}, mask={mask:#x}, handler={handler:#x}): \
+             {why} - the kernel's answer to this is not implemented (no silent stub)"
+        ));
+    }
+    ctx.ret(st.register_thread_event_handler(target, mask, handler, common) as u32);
+    SvcOutcome::Continue
+}
+
+/// SceUID sceKernelUnregisterThreadEventHandler(SceUID id)
+#[hostcall]
+pub(super) fn unregister_thread_event_handler(st: &mut VitaState, uid: i32) -> i32 {
+    if st.unregister_thread_event_handler(uid) { 0 } else { ERR_UNKNOWN_THREAD_EVENT_ID }
+}
+
+/// The ending of the calling thread (`sceKernelExitThread` / `sceKernelExitDeleteThread`)
+/// under the preemptive scheduler: its EXIT handlers run on it first, then it ends.
+///
+/// Built for [`VitaState::call_guest`]'s replay: the claim (the one state change) happens
+/// only on the first pass, and the handler list is rebuilt purely on each. A handler that
+/// itself exits finds the thread already claimed and just ends it.
+pub(super) fn exit_thread(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let thid = st.current_thread();
+    let code = ctx.arg(0);
+    if !st.guest_call_replaying() && !st.claim_thread_exit_events(thid) {
+        return SvcOutcome::ThreadExit;
+    }
+    for call in st.thread_exit_event_calls(thid, code) {
+        if st.call_guest(call, None).is_none() {
+            // The wrapper turns this into `CallGuest` and restores the registers.
+            return SvcOutcome::Continue;
+        }
+    }
+    SvcOutcome::ThreadExit
+}
+
 /// int sceKernelNotifyCallback(SceUID cb, int arg2)
 #[hostcall]
 pub(super) fn notify_callback(st: &mut VitaState, uid: i32, arg: i32) -> i32 {

@@ -546,17 +546,34 @@ pub(super) fn aeabi_div0(_ctx: &mut GuestCtx, _st: &mut VitaState) -> SvcOutcome
 }
 
 /// void *sceKernelGetTLSAddr(int key)
-/// Returns this thread's storage slot for `key`, a stable zero-initialized pointer
-/// slot (see [`VitaState::tls_addr`]).
+/// Returns this thread's storage slot for `key`, word `key` of a stable zero-initialized
+/// per-thread array (see [`VitaState::tls_addr_of`]).
 #[hostcall]
 pub(super) fn get_tls_addr(st: &mut VitaState, key: u32) -> u32 {
-    st.tls_addr(key)
+    tls_slot_or_null(st.tls_addr(key), "sceKernelGetTLSAddr", 0, key)
 }
 
 /// void *sceKernelGetThreadTLSAddr(SceUID thid, int key)
 #[hostcall]
 pub(super) fn get_thread_tls_addr(st: &mut VitaState, thid: i32, key: u32) -> u32 {
-    st.tls_addr_of(thid, key)
+    tls_slot_or_null(st.tls_addr_of(thid, key), "sceKernelGetThreadTLSAddr", thid, key)
+}
+
+/// A key with no slot gets NULL, which is the kernel's answer to a bad key - said LOUDLY, once,
+/// because a title that dereferences it faults somewhere that no longer names the call. Not a
+/// FATAL: both calls stay on the fast `cont!` path (they are among the hottest a title makes).
+fn tls_slot_or_null(slot: Option<u32>, name: &str, thid: i32, key: u32) -> u32 {
+    slot.unwrap_or_else(|| {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!(
+                target: "vitaslop::err",
+                "{name}(thid={thid:#x}, key={key:#x}): NO SLOT - keys run 0..={:#x} (or guest memory ran                  out allocating the thread's slot array). Returned NULL; a fault that follows is this call",
+                crate::host::TLS_KEY_MAX
+            );
+        }
+        0
+    })
 }
 
 /// int sceKernelGetRandomNumber(void *buf, SceSize size)
@@ -654,6 +671,98 @@ pub(super) fn msg_pipe_receive(ctx: &mut GuestCtx, st: &mut VitaState, try_form:
     st.msgpipe_block(uid, buf, size, full, result, timeout);
     ctx.ret(0);
     SvcOutcome::Block
+}
+
+/// The read-modify-write each `sceKernelAtomic<Op><8|16|32>` performs (psp2/kernel/cpu.h).
+/// `XAndGet` returns the NEW value, `GetAndX` the OLD one; `Clear` is `& !value`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AtomicOp {
+    Set,
+    CompareAndSet,
+    AddAndGet,
+    SubAndGet,
+    AndAndGet,
+    OrAndGet,
+    XorAndGet,
+    ClearAndGet,
+    GetAndSet,
+    GetAndAdd,
+    GetAndSub,
+    GetAndAnd,
+    GetAndOr,
+    GetAndXor,
+    GetAndClear,
+    ClearMask,
+    AddUnless,
+}
+
+/// `sceKernelAtomic<op><bits>(store, value[, third])` for 8-, 16- and 32-bit stores.
+///
+/// One compare-and-swap loop on the aligned word holding the store, for every width: under
+/// SMP guest code on other workers writes the same word concurrently (its own `ldrex`/
+/// `strex`, or a neighbouring byte), and [`GuestWords::cas_word`] is the one primitive both
+/// engines make atomic against it - the same one the lightweight mutex races the guest on. A
+/// narrow store changes only its own bytes of the word, and a concurrent write to the rest
+/// fails the swap and retries rather than being overwritten.
+///
+/// Signed results (`SceInt8`/`SceInt16`) come back sign-extended, as AAPCS returns them;
+/// `AddUnless` returns `SceBool` - true when it added, i.e. the store did not hold `cmpv`.
+/// A NULL or misaligned store stops the run by name: the console faults there, and a
+/// handler that quietly read zero would hand the title a lock it does not hold.
+///
+/// (The 64-bit members need a 64-bit swap neither engine's memory offers yet, and
+/// `DecIfPositive` does not say whether it returns the old value or the decremented one;
+/// both stay unimplemented rather than guessed.)
+pub(super) fn atomic(ctx: &mut GuestCtx, op: AtomicOp, bits: u32) -> SvcOutcome {
+    use crate::host::GuestWords;
+    let (addr, value, third) = (ctx.arg(0), ctx.arg(1), ctx.arg(2));
+    let size = bits / 8;
+    if addr == 0 || addr % size != 0 {
+        return SvcOutcome::Fatal(format!(
+            "sceKernelAtomic{op:?}{bits}: store {addr:#010x} is NULL or not {size}-byte aligned - the console \
+             faults here (no silent stub)"
+        ));
+    }
+    let width_mask: u32 = if bits == 32 { u32::MAX } else { (1 << bits) - 1 };
+    let shift = (addr & 3) * 8;
+    let field = width_mask << shift;
+    let word_addr = addr & !3;
+    let (v, c) = (value & width_mask, third & width_mask);
+    let (old, ret) = loop {
+        let cur = ctx.word(word_addr);
+        let old = (cur & field) >> shift;
+        let new = match op {
+            AtomicOp::Set | AtomicOp::GetAndSet => Some(v),
+            AtomicOp::CompareAndSet => (old == v).then_some(c),
+            AtomicOp::AddAndGet | AtomicOp::GetAndAdd => Some(old.wrapping_add(v)),
+            AtomicOp::SubAndGet | AtomicOp::GetAndSub => Some(old.wrapping_sub(v)),
+            AtomicOp::AndAndGet | AtomicOp::GetAndAnd => Some(old & v),
+            AtomicOp::OrAndGet | AtomicOp::GetAndOr => Some(old | v),
+            AtomicOp::XorAndGet | AtomicOp::GetAndXor => Some(old ^ v),
+            AtomicOp::ClearAndGet | AtomicOp::GetAndClear | AtomicOp::ClearMask => Some(old & !v),
+            AtomicOp::AddUnless => (old != c).then_some(old.wrapping_add(v)),
+        }
+        .map(|n| n & width_mask);
+        let Some(new) = new else { break (old, old) };
+        if ctx.cas_word(word_addr, cur, (cur & !field) | (new << shift)) == cur {
+            break (old, new);
+        }
+    };
+    let sign_extend = |x: u32| ((x << (32 - bits)) as i32 >> (32 - bits)) as u32;
+    match op {
+        AtomicOp::Set | AtomicOp::ClearMask => {}
+        AtomicOp::AddUnless => ctx.ret((old != c) as u32),
+        AtomicOp::CompareAndSet
+        | AtomicOp::GetAndSet
+        | AtomicOp::GetAndAdd
+        | AtomicOp::GetAndSub
+        | AtomicOp::GetAndAnd
+        | AtomicOp::GetAndOr
+        | AtomicOp::GetAndXor
+        | AtomicOp::GetAndClear => ctx.ret(sign_extend(old)),
+        _ => ctx.ret(sign_extend(ret)),
+    }
+    SvcOutcome::Continue
 }
 
 /// int sceClibPrintf(const char *fmt, ...)
@@ -1022,4 +1131,92 @@ pub(super) fn stack_chk_fail(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutco
         st.current_thread(),
         ctx.regs[14],
     ))
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    //! `sceKernelAtomic*` against guest memory: the value each form returns (new vs old,
+    //! sign-extended), and that a narrow store leaves the rest of its word alone.
+    use super::*;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    const WORD: u32 = 0x100;
+
+    /// Run one op on a fresh context over `bytes`; returns (r0, outcome was Continue).
+    fn op(bytes: &mut [u8], o: AtomicOp, bits: u32, args: [u32; 3]) -> (u32, bool) {
+        let mut regs = [0u32; REG_COUNT];
+        regs[..3].copy_from_slice(&args);
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut mem = SliceMemory(bytes);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        let out = atomic(&mut ctx, o, bits);
+        (ctx.regs[0], matches!(out, SvcOutcome::Continue))
+    }
+
+    fn word(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes[WORD as usize..WORD as usize + 4].try_into().unwrap())
+    }
+
+    fn set_word(bytes: &mut [u8], v: u32) {
+        bytes[WORD as usize..WORD as usize + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn thirty_two_bit_forms_return_new_or_old_as_named() {
+        let mut b = vec![0u8; 0x200];
+        set_word(&mut b, 10);
+        assert_eq!(op(&mut b, AtomicOp::AddAndGet, 32, [WORD, 5, 0]).0, 15);
+        assert_eq!(op(&mut b, AtomicOp::GetAndSub, 32, [WORD, 3, 0]).0, 15);
+        assert_eq!(word(&b), 12);
+        assert_eq!(op(&mut b, AtomicOp::GetAndClear, 32, [WORD, 4, 0]).0, 12);
+        assert_eq!(word(&b), 8);
+        assert_eq!(op(&mut b, AtomicOp::OrAndGet, 32, [WORD, 3, 0]).0, 11);
+        assert_eq!(op(&mut b, AtomicOp::XorAndGet, 32, [WORD, 1, 0]).0, 10);
+        assert_eq!(op(&mut b, AtomicOp::GetAndSet, 32, [WORD, 0xFFFF_FFFF, 0]).0, 10);
+        assert_eq!(op(&mut b, AtomicOp::AndAndGet, 32, [WORD, 0xF0, 0]).0, 0xF0);
+    }
+
+    #[test]
+    fn compare_and_set_and_add_unless_store_only_on_their_condition() {
+        let mut b = vec![0u8; 0x200];
+        set_word(&mut b, 7);
+        // A mismatch returns the current value and stores nothing.
+        assert_eq!(op(&mut b, AtomicOp::CompareAndSet, 32, [WORD, 6, 99]).0, 7);
+        assert_eq!(word(&b), 7);
+        assert_eq!(op(&mut b, AtomicOp::CompareAndSet, 32, [WORD, 7, 99]).0, 7);
+        assert_eq!(word(&b), 99);
+        // AddUnless: false (nothing added) when the store holds `cmpv`.
+        assert_eq!(op(&mut b, AtomicOp::AddUnless, 32, [WORD, 1, 99]).0, 0);
+        assert_eq!(word(&b), 99);
+        assert_eq!(op(&mut b, AtomicOp::AddUnless, 32, [WORD, 1, 5]).0, 1);
+        assert_eq!(word(&b), 100);
+    }
+
+    #[test]
+    fn narrow_stores_touch_only_their_bytes_and_sign_extend() {
+        let mut b = vec![0u8; 0x200];
+        set_word(&mut b, 0x1122_3344);
+        // Byte 2 (0x22) + 0x70 = 0x92, a negative SceInt8: returned sign-extended.
+        assert_eq!(op(&mut b, AtomicOp::AddAndGet, 8, [WORD + 2, 0x70, 0]).0, 0xFFFF_FF92);
+        assert_eq!(word(&b), 0x1192_3344);
+        // The high halfword, wrapping: 0x1192 - 0x1193 = 0xFFFF = -1.
+        assert_eq!(op(&mut b, AtomicOp::SubAndGet, 16, [WORD + 2, 0x1193, 0]).0, 0xFFFF_FFFF);
+        assert_eq!(word(&b), 0xFFFF_3344);
+        // The low byte's CompareAndSet compares only its own bits.
+        assert_eq!(op(&mut b, AtomicOp::CompareAndSet, 8, [WORD, 0x44, 0x55]).0, 0x44);
+        assert_eq!(word(&b), 0xFFFF_3355);
+        // ClearMask is void: it changes the store and leaves r0 as the call left it.
+        op(&mut b, AtomicOp::ClearMask, 16, [WORD, 0x3300, 0]);
+        assert_eq!(word(&b), 0xFFFF_0055);
+    }
+
+    #[test]
+    fn a_null_or_misaligned_store_stops_the_run() {
+        let mut b = vec![0u8; 0x200];
+        assert!(!op(&mut b, AtomicOp::AddAndGet, 32, [0, 1, 0]).1);
+        assert!(!op(&mut b, AtomicOp::AddAndGet, 32, [WORD + 2, 1, 0]).1);
+        assert!(!op(&mut b, AtomicOp::AddAndGet, 16, [WORD + 1, 1, 0]).1);
+        assert!(op(&mut b, AtomicOp::AddAndGet, 8, [WORD + 3, 1, 0]).1);
+    }
 }

@@ -48,7 +48,7 @@ pub mod voice;
 
 use crate::host::{GuestCtx, VitaState};
 use crate::nid::{
-    audio as audio_nid, audiodec as ad_nid, avplayer as avp_nid, ctrl as ctrl_nid, dbg as dbg_nid, display as display_nid,
+    atomic as at_nid, audio as audio_nid, audiodec as ad_nid, avplayer as avp_nid, ctrl as ctrl_nid, dbg as dbg_nid, display as display_nid,
     fiber as fiber_nid, fios2 as fios2_nid, gxm as gxm_nid,
     audioin as audioin_nid, http as http_nid, iofilemgr as io_nid, libkernel as lk_nid,
     livearea as livearea_nid, lwsync as lw_nid, pgf as pgf_nid, xml as xml_nid,
@@ -1476,6 +1476,7 @@ fn dispatch_inner(
         lk_nid::GET_THREAD_ID => cont!(libkernel::get_thread_id(ctx, st)),
         lk_nid::GET_THREAD_EXIT_STATUS => cont!(libkernel::get_thread_exit_status(ctx, st)),
         lk_nid::GET_TLS_ADDR => cont!(libkernel::get_tls_addr(ctx, st)),
+        lk_nid::GET_EVENT_FLAG_INFO => sync::get_event_flag_info(ctx, st),
         lk_nid::CREATE_MSG_PIPE => cont!(libkernel::msg_pipe_create(ctx, st)),
         tm_nid::DELETE_MSG_PIPE => cont!(libkernel::msg_pipe_delete(ctx, st)),
         lk_nid::SEND_MSG_PIPE | lk_nid::TRY_SEND_MSG_PIPE => cont!(libkernel::msg_pipe_send(ctx, st)),
@@ -1500,14 +1501,67 @@ fn dispatch_inner(
         // here there - workers return normally instead).
         tm_nid::EXIT_THREAD | tm_nid::EXIT_DELETE_THREAD => {
             if st.is_preemptive() {
-                SvcOutcome::ThreadExit
+                threadmgr::exit_thread(ctx, st)
             } else {
                 SvcOutcome::Halt
             }
         }
+        tm_nid::REGISTER_THREAD_EVENT_HANDLER => threadmgr::register_thread_event_handler(ctx, st),
+        at_nid::ADD_AND_GET_16 => libkernel::atomic(ctx, libkernel::AtomicOp::AddAndGet, 16),
+        at_nid::ADD_AND_GET_32 => libkernel::atomic(ctx, libkernel::AtomicOp::AddAndGet, 32),
+        at_nid::ADD_AND_GET_8 => libkernel::atomic(ctx, libkernel::AtomicOp::AddAndGet, 8),
+        at_nid::ADD_UNLESS_16 => libkernel::atomic(ctx, libkernel::AtomicOp::AddUnless, 16),
+        at_nid::ADD_UNLESS_32 => libkernel::atomic(ctx, libkernel::AtomicOp::AddUnless, 32),
+        at_nid::ADD_UNLESS_8 => libkernel::atomic(ctx, libkernel::AtomicOp::AddUnless, 8),
+        at_nid::AND_AND_GET_16 => libkernel::atomic(ctx, libkernel::AtomicOp::AndAndGet, 16),
+        at_nid::AND_AND_GET_32 => libkernel::atomic(ctx, libkernel::AtomicOp::AndAndGet, 32),
+        at_nid::AND_AND_GET_8 => libkernel::atomic(ctx, libkernel::AtomicOp::AndAndGet, 8),
+        at_nid::CLEAR_AND_GET_16 => libkernel::atomic(ctx, libkernel::AtomicOp::ClearAndGet, 16),
+        at_nid::CLEAR_AND_GET_32 => libkernel::atomic(ctx, libkernel::AtomicOp::ClearAndGet, 32),
+        at_nid::CLEAR_AND_GET_8 => libkernel::atomic(ctx, libkernel::AtomicOp::ClearAndGet, 8),
+        at_nid::CLEAR_MASK_16 => libkernel::atomic(ctx, libkernel::AtomicOp::ClearMask, 16),
+        at_nid::CLEAR_MASK_32 => libkernel::atomic(ctx, libkernel::AtomicOp::ClearMask, 32),
+        at_nid::CLEAR_MASK_8 => libkernel::atomic(ctx, libkernel::AtomicOp::ClearMask, 8),
+        at_nid::COMPARE_AND_SET_16 => libkernel::atomic(ctx, libkernel::AtomicOp::CompareAndSet, 16),
+        at_nid::COMPARE_AND_SET_32 => libkernel::atomic(ctx, libkernel::AtomicOp::CompareAndSet, 32),
+        at_nid::COMPARE_AND_SET_8 => libkernel::atomic(ctx, libkernel::AtomicOp::CompareAndSet, 8),
+        at_nid::GET_AND_ADD_16 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndAdd, 16),
+        at_nid::GET_AND_ADD_32 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndAdd, 32),
+        at_nid::GET_AND_ADD_8 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndAdd, 8),
+        at_nid::GET_AND_AND_16 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndAnd, 16),
+        at_nid::GET_AND_AND_32 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndAnd, 32),
+        at_nid::GET_AND_AND_8 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndAnd, 8),
+        at_nid::GET_AND_CLEAR_16 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndClear, 16),
+        at_nid::GET_AND_CLEAR_32 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndClear, 32),
+        at_nid::GET_AND_CLEAR_8 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndClear, 8),
+        at_nid::GET_AND_OR_16 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndOr, 16),
+        at_nid::GET_AND_OR_32 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndOr, 32),
+        at_nid::GET_AND_OR_8 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndOr, 8),
+        at_nid::GET_AND_SET_16 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndSet, 16),
+        at_nid::GET_AND_SET_32 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndSet, 32),
+        at_nid::GET_AND_SET_8 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndSet, 8),
+        at_nid::GET_AND_SUB_16 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndSub, 16),
+        at_nid::GET_AND_SUB_32 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndSub, 32),
+        at_nid::GET_AND_SUB_8 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndSub, 8),
+        at_nid::GET_AND_XOR_16 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndXor, 16),
+        at_nid::GET_AND_XOR_32 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndXor, 32),
+        at_nid::GET_AND_XOR_8 => libkernel::atomic(ctx, libkernel::AtomicOp::GetAndXor, 8),
+        at_nid::OR_AND_GET_16 => libkernel::atomic(ctx, libkernel::AtomicOp::OrAndGet, 16),
+        at_nid::OR_AND_GET_32 => libkernel::atomic(ctx, libkernel::AtomicOp::OrAndGet, 32),
+        at_nid::OR_AND_GET_8 => libkernel::atomic(ctx, libkernel::AtomicOp::OrAndGet, 8),
+        at_nid::SET_16 => libkernel::atomic(ctx, libkernel::AtomicOp::Set, 16),
+        at_nid::SET_32 => libkernel::atomic(ctx, libkernel::AtomicOp::Set, 32),
+        at_nid::SET_8 => libkernel::atomic(ctx, libkernel::AtomicOp::Set, 8),
+        at_nid::SUB_AND_GET_16 => libkernel::atomic(ctx, libkernel::AtomicOp::SubAndGet, 16),
+        at_nid::SUB_AND_GET_32 => libkernel::atomic(ctx, libkernel::AtomicOp::SubAndGet, 32),
+        at_nid::SUB_AND_GET_8 => libkernel::atomic(ctx, libkernel::AtomicOp::SubAndGet, 8),
+        at_nid::XOR_AND_GET_16 => libkernel::atomic(ctx, libkernel::AtomicOp::XorAndGet, 16),
+        at_nid::XOR_AND_GET_32 => libkernel::atomic(ctx, libkernel::AtomicOp::XorAndGet, 32),
+        at_nid::XOR_AND_GET_8 => libkernel::atomic(ctx, libkernel::AtomicOp::XorAndGet, 8),
+        tm_nid::UNREGISTER_THREAD_EVENT_HANDLER => cont!(threadmgr::unregister_thread_event_handler(ctx, st)),
         tm_nid::DELETE_THREAD => cont!(threadmgr::delete_thread(ctx, st)),
         tm_nid::GET_PROCESS_ID => cont!(threadmgr::get_process_id(ctx, st)),
-        tm_nid::GET_THREAD_CURRENT_PRIORITY => {
+        tm_nid::GET_THREAD_CURRENT_PRIORITY | tm_nid::GET_THREAD_CURRENT_PRIORITY_LIBKERNEL => {
             cont!(threadmgr::get_thread_current_priority(ctx, st))
         }
         tm_nid::CHANGE_THREAD_CPU_AFFINITY_MASK => {
@@ -1517,7 +1571,7 @@ fn dispatch_inner(
             cont!(threadmgr::get_thread_cpu_affinity_mask(ctx, st))
         }
         // Closing a semaphore invalidates its id, same as deleting it in this model.
-        tm_nid::CLOSE_SEMA => cont!(sync::delete_object(ctx, st)),
+        tm_nid::CLOSE_SEMA | tm_nid::CLOSE_EVENT_FLAG => cont!(sync::delete_object(ctx, st)),
         tm_nid::CHANGE_THREAD_VFP_EXCEPTION => cont!(threadmgr::change_thread_vfp_exception(ctx, st)),
         sync_nid::CREATE_SIMPLE_EVENT => cont!(sync::create_simple_event(ctx, st)),
         sync_nid::DELETE_SIMPLE_EVENT => cont!(sync::delete_simple_event(ctx, st)),
@@ -1953,7 +2007,9 @@ fn dispatch_inner(
         gxm_nid::COLOR_SURFACE_SET_DATA => cont!(gxm::color_surface_set_data(ctx, st)),
         gxm_nid::PROGRAM_GET_TYPE => cont!(gxm::program_get_type(ctx, st)),
         gxm_nid::PROGRAM_GET_SIZE => cont!(gxm::program_get_size(ctx, st)),
-        gxm_nid::PROGRAM_FIND_PARAMETER_BY_SEMANTIC => cont!(gxm::find_parameter_by_semantic(ctx, st)),
+        gxm_nid::PROGRAM_FIND_PARAMETER_BY_SEMANTIC | gxm_nid::PROGRAM_FIND_PARAMETER_BY_SEMANTIC_PUBLIC => {
+            cont!(gxm::find_parameter_by_semantic(ctx, st))
+        }
         gxm_nid::RENDER_TARGET_GET_DRIVER_MEM_BLOCK => {
             cont!(gxm::render_target_get_driver_mem_block(ctx, st))
         }
@@ -2146,9 +2202,17 @@ fn dispatch_inner(
         display_nid::GET_REFRESH_RATE => cont!(display::get_refresh_rate(ctx, st)),
 
         // --- ctrl: input --------------------------------------------------------
-        ctrl_nid::PEEK_BUFFER_POSITIVE | ctrl_nid::PEEK_BUFFER_POSITIVE2 => {
+        ctrl_nid::PEEK_BUFFER_POSITIVE | ctrl_nid::PEEK_BUFFER_POSITIVE_EXT => {
             cont!(ctrl::peek_buffer_positive(ctx, st))
         }
+        // The "2" spellings report the shoulders as L1/R1 - see `ctrl::shoulders_as_l1_r1`.
+        ctrl_nid::PEEK_BUFFER_POSITIVE2 | ctrl_nid::PEEK_BUFFER_POSITIVE_EXT2 => {
+            cont!(ctrl::peek_buffer_v2(ctx, st, false))
+        }
+        ctrl_nid::PEEK_BUFFER_NEGATIVE2 => cont!(ctrl::peek_buffer_v2(ctx, st, true)),
+        ctrl_nid::READ_BUFFER_POSITIVE_EXT => ctrl::read_buffer(ctx, st, false, false),
+        ctrl_nid::READ_BUFFER_POSITIVE2 | ctrl_nid::READ_BUFFER_POSITIVE_EXT2 => ctrl::read_buffer(ctx, st, false, true),
+        ctrl_nid::READ_BUFFER_NEGATIVE2 => ctrl::read_buffer(ctx, st, true, true),
         ctrl_nid::READ_BUFFER_POSITIVE => ctrl::read_buffer_positive(ctx, st),
         ctrl_nid::PEEK_BUFFER_NEGATIVE => cont!(ctrl::peek_buffer_negative(ctx, st)),
         ctrl_nid::READ_BUFFER_NEGATIVE => ctrl::read_buffer_negative(ctx, st),
@@ -2357,6 +2421,15 @@ fn dispatch_inner(
         sv_nid::MOTION_GET_TILT_CORRECTION => cont!(services::motion_get_tuning(ctx, st, true)),
         sv_nid::MOTION_ROTATE_YAW => cont!(services::motion_rotate_yaw(ctx, st)),
         sv_nid::RTC_GET_DAY_OF_WEEK => cont!(services::rtc_get_day_of_week(ctx, st)),
+        sv_nid::RTC_FORMAT_RFC3339 => cont!(services::rtc_format_rfc3339(ctx, st)),
+        sv_nid::RTC_GET_DAYS_IN_MONTH => cont!(services::rtc_get_days_in_month(ctx, st)),
+        sv_nid::RTC_IS_LEAP_YEAR => cont!(services::rtc_is_leap_year(ctx, st)),
+        sv_nid::RTC_CHECK_VALID => cont!(services::rtc_check_valid(ctx, st)),
+        sv_nid::RTC_COMPARE_TICK => cont!(services::rtc_compare_tick(ctx, st)),
+        sv_nid::RTC_SET_TIME_T => cont!(services::rtc_set_time_t(ctx, st)),
+        sv_nid::RTC_SET_WIN32_FILE_TIME => cont!(services::rtc_set_win32_file_time(ctx, st)),
+        sv_nid::RTC_GET_DOS_TIME => cont!(services::rtc_get_dos_time(ctx, st)),
+        sv_nid::RTC_SET_DOS_TIME => cont!(services::rtc_set_dos_time(ctx, st)),
         sv_nid::RTC_FORMAT_RFC3339_LOCAL_TIME => {
             cont!(services::rtc_format_rfc3339_local_time(ctx, st))
         }
@@ -2637,6 +2710,8 @@ fn dispatch_inner(
         | sv_nid::NP_SCORE_RECORD_SCORE_ASYNC
         | sv_nid::NP_SCORE_GET_RANKING_BY_RANGE
         | sv_nid::NP_SCORE_GET_RANKING_BY_RANGE_ASYNC
+        | sv_nid::NP_SCORE_GET_RANKING_BY_NP_ID
+        | sv_nid::NP_SCORE_GET_RANKING_BY_NP_ID_ASYNC
         // The async poll: no request was ever accepted, so there is no operation whose
         // completion this could report.
         | sv_nid::NP_SCORE_POLL_ASYNC
@@ -2767,6 +2842,9 @@ fn dispatch_inner(
         | sv_nid::NP_MATCHING2_CONTEXT_STOP
         | sv_nid::NP_MATCHING2_ABORT_CONTEXT_START
         | sv_nid::NP_SCORE_DELETE_REQUEST
+        // Aborting a request is teardown too: no operation was ever accepted, so there is
+        // nothing outstanding to cancel, and the abort a title issues while unwinding succeeds.
+        | sv_nid::NP_SCORE_ABORT_REQUEST
         // Online-stack TEARDOWN. A title that finds itself offline unwinds the whole
         // stack it brought up; terminating a subsystem with no backing service, and
         // unregistering a callback that never fired, genuinely succeed.
@@ -2855,9 +2933,24 @@ fn dispatch_inner(
         sv_nid::NP_FRIEND_LIST_DIALOG_GET_STATUS => {
             cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NpFriendList))
         }
-        sv_nid::NP_FRIEND_LIST_DIALOG_TERM => {
+        sv_nid::NP_FRIEND_LIST_DIALOG_TERM | sv_nid::NP_FRIEND_LIST_DIALOG_ABORT => {
             cont!(services::dialog_term(ctx, st, services::DialogFamily::NpFriendList))
         }
+        // An abort closes its dialog, as IME/Msg aborts do above.
+        sv_nid::NET_CHECK_DIALOG_ABORT => cont!(services::dialog_term(ctx, st, services::DialogFamily::NetCheck)),
+        sv_nid::NP_SNS_FACEBOOK_DIALOG_ABORT | sv_nid::NP_SNS_FACEBOOK_DIALOG_TERM => {
+            cont!(services::dialog_term(ctx, st, services::DialogFamily::NpSnsFacebook))
+        }
+        sv_nid::NP_TROPHY_SETUP_DIALOG_ABORT => {
+            cont!(services::dialog_term(ctx, st, services::DialogFamily::NpTrophySetup))
+        }
+        // A progress bar on an open message / save-data dialog: nothing is drawn, so moving it
+        // succeeds and changes nothing a title can read back.
+        sv_nid::MSG_DIALOG_PROGRESS_BAR_INC
+        | sv_nid::MSG_DIALOG_PROGRESS_BAR_SET_MSG
+        | sv_nid::MSG_DIALOG_PROGRESS_BAR_SET_VALUE
+        | sv_nid::SAVEDATA_DIALOG_PROGRESS_BAR_INC
+        | sv_nid::SAVEDATA_DIALOG_PROGRESS_BAR_SET_VALUE => cont!(services::dialog_ok(ctx, st)),
         sv_nid::PHOTO_IMPORT_DIALOG_INIT => {
             cont!(services::dialog_init(ctx, st, services::DialogFamily::PhotoImport))
         }
@@ -2960,9 +3053,28 @@ fn dispatch_inner(
             // library reached through a table of one-line thunks is always the thunk -
             // the useful frame is the one above it. See [`guest_return_trail`].
             let trail = guest_return_trail(ctx, 96);
+            // ...and every OTHER import this title has no handler for. A run stops on the
+            // first one it calls, so without this each report names one gap and the next
+            // takes another round trip; the linker already knows the whole list.
+            let others: Vec<String> = st
+                .unhandled_imports()
+                .iter()
+                .filter(|&&(_, f)| f != func_nid)
+                .map(|(l, f)| format!("{l:08x}:{f:08x}"))
+                .collect();
+            let others = if others.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n  the title imports {} other function(s) with no handler (lib:nid), any of which \
+                     stops the run the same way if called:\n    {}",
+                    others.len(),
+                    others.join(" ")
+                )
+            };
             return SvcOutcome::Fatal(format!(
                 "unimplemented NID {name} (lib={library_nid:#010x} nid={func_nid:#010x})                  called by thread {:#x}; implement it (no silent stub)
-{arg_dump}                   return trail: {trail}",
+{arg_dump}                   return trail: {trail}{others}",
                 st.current_thread(),
             ));
         }

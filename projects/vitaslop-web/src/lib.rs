@@ -4517,6 +4517,10 @@ async fn next_tick() {
 /// rather than hanging the tab forever.
 const PER_FRAME_ROUNDS: u64 = 60_000_000;
 
+/// How much of the title's debug console the end-of-run report carries - enough for the last
+/// screenful of a log, small enough not to bury the rest of the diagnostics.
+const GUEST_CONSOLE_TAIL: usize = 2048;
+
 /// The heavy one-time setup shared by the main-thread and worker live paths: build the
 /// guest filesystem from the fetched container bytes, decrypt + link + transpile the
 /// title, and stand up the preemptive scheduler over a [`BrowserWorld`]. Returns the
@@ -4531,6 +4535,9 @@ struct GameSetup {
     decrypt_ms: f64,
     transpile_ms: f64,
     scripted: bool,
+    /// How many of the title's function imports have no handler - each one stops the run if
+    /// called. A count in the setup line; the list itself is in the report of the one that does.
+    unhandled_imports: usize,
     /// The parsed recipe, kept so the live loop can EVALUATE it - not just replay its
     /// input. Before this the browser shared the recipe's input timeline and none of its
     /// checks (they lived in `vitaslop-native`, which a wasm32 build cannot reach), so a
@@ -4542,13 +4549,14 @@ impl GameSetup {
     /// The one-line setup status, tagged with where the run lives (main thread / worker).
     fn status(&self, home: &str) -> String {
         format!(
-            "retail title live in browser ({home}): {} files, {} modules, image {} KiB | decrypt/link {:.0} ms + transpile {:.0} ms (one-time){} | rendering live via WebGPU",
+            "retail title live in browser ({home}): {} files, {} modules, image {} KiB | decrypt/link {:.0} ms + transpile {:.0} ms (one-time){} | {} imported function(s) unhandled | rendering live via WebGPU",
             self.nfiles,
             self.n_modules,
             self.image_kib,
             self.decrypt_ms,
             self.transpile_ms,
             if self.scripted { " | scripted recipe" } else { "" },
+            self.unhandled_imports,
         )
     }
 }
@@ -5183,6 +5191,7 @@ async fn setup_game(
     env.state.set_process_param(linked.process_param);
     env.state.set_main_thread_request(linked.main_thread_request());
     env.state.set_modules(linked.loaded_modules.clone());
+    env.state.set_unhandled_imports(linked.unhandled_imports.clone());
     env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);
     // Audio output. The page owns the AudioContext (a main-thread API) and hands us the
@@ -5297,6 +5306,7 @@ async fn setup_game(
         decrypt_ms,
         transpile_ms,
         scripted,
+        unhandled_imports: linked.unhandled_imports.len(),
         recipe: parsed_recipe,
     })
 }
@@ -6858,6 +6868,25 @@ async fn live_loop(
                         "status",
                         &format!("frame {frames} ENDED (live via WebGPU) | {report_step:?}"),
                     );
+                    // What the title printed to its debug console (`sceClibPrintf`), the
+                    // tail of it: a title's own log line is often the one that names what it
+                    // was doing when it stopped, and a homebrew test's whole verdict is there.
+                    {
+                        let host = sched.host.lock().unwrap();
+                        let out = &host.state.capture.stdout;
+                        if !out.is_empty() {
+                            let tail = &out[out.len().saturating_sub(GUEST_CONSOLE_TAIL)..];
+                            report.emit_final(
+                                "guest-console",
+                                &format!(
+                                    "guest console ({} bytes printed{}):\n{}",
+                                    out.len(),
+                                    if tail.len() < out.len() { ", the last part" } else { "" },
+                                    String::from_utf8_lossy(tail)
+                                ),
+                            );
+                        }
+                    }
                     // >>> A GUEST TRAP IS A FATAL OUTCOME AND BELONGS IN THE FATAL BOX.
                     // It is not a Rust panic, so the panic hook never sees it, and the
                     // status line it lands on is rebuilt away by the next panel refresh.

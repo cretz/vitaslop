@@ -2684,6 +2684,10 @@ pub struct GxpTex {
     pub unit: u8,
     /// The decoded, GPU-ready texture.
     pub tex: GxmTexture,
+    /// The texture's own LOD bias, in mip levels, which every implicit-LOD fragment sample of
+    /// this unit adds (the shader reads it from the per-draw `@group(3)` block). Per BINDING, not
+    /// on [`GxmTexture`]: one decoded image is bound at many biases, and the decode cache shares it.
+    pub lod_bias: f32,
 }
 
 /// Stride of the canonical [`GxmDraw`] vertex: pos(12) + uv(8) + color(4) + world-normal(12).
@@ -3916,6 +3920,10 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 .any(|k| crate::knobs::var(k).is_ok())
         })
     }
+
+    /// Bytes of the recompiled path's per-draw `@group(3)` block (`GxpDepth` in the linker): three
+    /// vec4s of depth and viewport state, then four of per-unit texture LOD bias.
+    const GXP_DEPTH_BLOCK_BYTES: u64 = 48 + 64;
 
     /// Cap on the depth-range bind-group cache, in ENTRIES - see [`GxpLive::depth_bgs`] for the
     /// leak this exists to stop and the numbers that found it.
@@ -9576,7 +9584,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         /// class of defect as [[vitaslop-browser-gpu-needs-destroy]], and invisible on a MENU
         /// (a constant depth range caches a handful of entries) while minting ~30 a frame in a
         /// RACE, which is the screen this has to survive.
-        depth_bgs: HashMap<(u64, (((u64, u32, u32, u32), u64), u64), bool), (wgpu::BindGroup, wgpu::Buffer)>,
+        depth_bgs: HashMap<(u64, ((((u64, u32, u32, u32), u64), u64), [u32; 16]), bool), (wgpu::BindGroup, wgpu::Buffer)>,
         /// Buffers evicted from `depth_bgs`, waiting to be destroyed on the renderer's frame
         /// schedule. They cannot be destroyed at the eviction itself: a clear happens during
         /// `prepare`, and a draw already prepared THIS frame may still name the bind group that
@@ -11375,6 +11383,17 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 }
             };
             let depth_key = (depth_key, dest.map(|(_, g)| g).unwrap_or(0));
+            // Lanes 12..28: each fragment sampler unit's TEXTURE LOD bias (`tex_bias` in the
+            // block). Per DRAW - one program draws a layer sharp and another blurred by binding
+            // the same image at different biases - so the exact bits join the key.
+            let mut tex_bias = [0f32; 16];
+            for t in gxp.textures.iter() {
+                if let Some(slot) = tex_bias.get_mut(t.unit as usize) {
+                    *slot = t.lod_bias;
+                }
+            }
+            let bias_key: [u32; 16] = tex_bias.map(f32::to_bits);
+            let depth_key = (depth_key, bias_key);
             if depth_bgs.contains_key(&(key, depth_key, corrected)) {
                 enc(&ENC.bind_groups_reused, 1);
             } else {
@@ -11394,7 +11413,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
             let (bg3, _) = depth_bgs.entry((key, depth_key, corrected)).or_insert_with(|| {
                 enc(&ENC.bind_groups_built, 1);
                 enc_buffer_created();
-                enc(&ENC.buffer_bytes, 48);
+                enc(&ENC.buffer_bytes, GXP_DEPTH_BLOCK_BYTES);
                 // >>> NOT `create_buffer_init`, AND THAT IS THE WHOLE POINT.
                 //
                 // `create_buffer_init` is `mappedAtCreation` on the web backend, so every call
@@ -11417,7 +11436,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 // not one arena allocation per buffer.
                 let dbuf = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("gxp-depth"),
-                    size: 48,
+                    size: GXP_DEPTH_BLOCK_BYTES,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
@@ -11440,6 +11459,9 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                         window[1].to_le_bytes(),
                         window[2].to_le_bytes(),
                     ]
+                    .into_iter()
+                    .chain(tex_bias.map(f32::to_le_bytes))
+                    .collect::<Vec<_>>()
                     .concat(),
                 );
                 let mut entries =

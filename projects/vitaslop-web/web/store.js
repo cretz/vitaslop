@@ -21,8 +21,42 @@ import init, {
 let ready = null;
 /// The wasm module, initialised once for the page. Cheap after the first call.
 export function wasm() {
-  if (!ready) ready = init();
+  if (!ready) {
+    ready = init().then(
+      (m) => {
+        try {
+          sessionStorage.removeItem(MIXED_BUILD_KEY);
+        } catch {}
+        return m;
+      },
+      (err) => recoverFromMixedBuild(err)
+    );
+  }
   return ready;
+}
+
+// >>> A PAGE LOADED DURING A DEPLOY CAN HOLD TWO BUILDS. The host lets a browser keep each file
+// for minutes, and the glue JS and the wasm are cached separately - so a visit soon after a
+// deploy can pair the new glue with the old wasm (or the reverse), and instantiating fails with
+// a LinkError ("function import requires a callable"). Seen on a phone right after a merge.
+// That error is fixed by fetching both bundles again past the cache and reloading, so the page
+// does exactly that - once per tab session, so a genuinely broken deploy shows its error instead
+// of reloading forever.
+const MIXED_BUILD_KEY = "vitaslop.mixed-build-reload";
+const BUNDLE_FILES = ["pkg/vitaslop_web.js", "pkg/vitaslop_web_bg.wasm", "pkg-threads/vitaslop_web.js", "pkg-threads/vitaslop_web_bg.wasm"];
+
+async function recoverFromMixedBuild(err) {
+  const linkError = err instanceof WebAssembly.LinkError || /LinkError/.test(String(err));
+  let tried = true;
+  try {
+    tried = sessionStorage.getItem(MIXED_BUILD_KEY) === "1";
+    if (linkError && !tried) sessionStorage.setItem(MIXED_BUILD_KEY, "1");
+  } catch {}
+  if (!linkError || tried) throw err;
+  // `cache: "reload"` fetches from the server AND stores the answer, so the reload finds fresh copies.
+  await Promise.all(BUNDLE_FILES.map((f) => fetch(new URL(f, import.meta.url), { cache: "reload" }).catch(() => {})));
+  location.reload();
+  return new Promise(() => {});
 }
 
 const GLOBAL_KEY = "vitaslop.settings";

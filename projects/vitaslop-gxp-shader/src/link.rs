@@ -3449,12 +3449,16 @@ fn comp(c: u32) -> char {
 /// the comparison a soft particle makes is between two different quantities - which renders as a
 /// fade that is stuck at 0 or 1 with nothing to point at.
 ///
+/// `tex_bias[u / 4][u % 4]` is fragment sampler unit `u`'s TEXTURE LOD bias, in mip levels - the
+/// bias the guest set on the texture itself (`sceGxmTextureSetLodBias`), which the hardware adds
+/// to every LOD it computes for that unit. See [`crate::wgsl::texture_bias`].
+///
 /// `vp.x` is the guest viewport's VERTICAL SENSE, +1 or -1. GXM maps ndc y to the framebuffer
 /// as `screen = yOffset + yScale * ndc`, and a pass that sets `yScale > 0` therefore puts ndc
 /// `+1` at the BOTTOM of its rectangle. A wgpu viewport requires a positive height and cannot
 /// express that, so the flip is done here instead - which is the only place it can be done at
 /// all, and it has to be per DRAW because the guest sets a viewport per draw.
-pub(crate) const GXP_DEPTH_DECL: &str = r#"struct GxpDepth { range: vec4<f32>, fit: vec4<f32>, vp: vec4<f32> };
+pub(crate) const GXP_DEPTH_DECL: &str = r#"struct GxpDepth { range: vec4<f32>, fit: vec4<f32>, vp: vec4<f32>, tex_bias: array<vec4<f32>, 4> };
 @group(3) @binding(0) var<uniform> gxp_depth: GxpDepth;
 
 // The value the GUEST's depth buffer holds for a fragment at clip `w`. A projection makes clip
@@ -3864,8 +3868,9 @@ fn build_linked_module(
         }
         let _ = writeln!(
             m,
-            "  let pf{i} = textureSample(t{0}, s{0}, vec{n}<f32>({coord}));",
-            pf.unit
+            "  let pf{i} = textureSampleBias(t{0}, s{0}, vec{n}<f32>({coord}), {1});",
+            pf.unit,
+            crate::wgsl::texture_bias(pf.unit)
         );
         if pf.regs == 4 {
             // Four registers: the same four components UNPACKED, one full-precision component
@@ -7227,11 +7232,11 @@ mod tests {
         };
         let proj = emit(true);
         assert!(
-            proj.contains("textureSample(t4, s4, vec2<f32>(vec2<f32>(in.v1.x, in.v1.y) / in.v1.z));"),
+            proj.contains("textureSampleBias(t4, s4, vec2<f32>(vec2<f32>(in.v1.x, in.v1.y) / in.v1.z), gxp_depth.tex_bias[1][0]);"),
             "{proj}"
         );
         let plain = emit(false);
-        assert!(plain.contains("textureSample(t4, s4, vec2<f32>(in.v1.x, in.v1.y));"), "{plain}");
+        assert!(plain.contains("textureSampleBias(t4, s4, vec2<f32>(in.v1.x, in.v1.y), gxp_depth.tex_bias[1][0]);"), "{plain}");
         assert!(!plain.contains(") / in.v"), "{plain}");
     }
 

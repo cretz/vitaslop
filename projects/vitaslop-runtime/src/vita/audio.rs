@@ -19,6 +19,11 @@ use crate::{hostcall, SvcOutcome};
 /// hands out, so the two families cannot be confused for each other.
 const IN_PORT_BASE: i32 = 0x100;
 
+/// The first port id `sceAudioOutOpenPort` hands out. Never 0: a title may test a port id
+/// with `> 0` rather than `>= 0`, and one that does reads port 0 as a failed open and shuts
+/// its audio (and with it the whole game) down at boot.
+const OUT_PORT_BASE: i32 = 1;
+
 /// One guest-visible audio port: the format it was opened with and the backend
 /// port id the sink handed back.
 struct AudioPort {
@@ -312,7 +317,7 @@ impl AudioState {
 
 /// int sceAudioOutOpenPort(SceAudioOutPortType type, int len, int freq, SceAudioOutMode mode)
 /// `len` is the grain (frames per output), `mode` 0 = mono / 1 = stereo. Returns
-/// the guest port number (>= 0).
+/// the guest port number (from [`OUT_PORT_BASE`], so always > 0).
 #[hostcall]
 pub(super) fn out_open_port(_ctx: &mut GuestCtx, st: &mut VitaState, ty: i32, len: i32, freq: i32, mode: i32) -> i32 {
     let channels = if mode == 1 { 2 } else { 1 };
@@ -325,7 +330,7 @@ pub(super) fn out_open_port(_ctx: &mut GuestCtx, st: &mut VitaState, ty: i32, le
     if backend_port < 0 {
         backend_port
     } else {
-        let guest_port = st.audio_state.next_guest_port;
+        let guest_port = OUT_PORT_BASE + st.audio_state.next_guest_port;
         st.audio_state.next_guest_port += 1;
         st.audio_state.ports.push(AudioPort {
             guest_port,
@@ -740,5 +745,37 @@ pub(super) fn out_release_port(_ctx: &mut GuestCtx, st: &mut VitaState, port: i3
         0
     } else {
         -1
+    }
+}
+
+#[cfg(test)]
+mod open_port_tests {
+    use crate::host::VitaState;
+    use crate::world::DeterministicWorld;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    /// `sceAudioOutOpenPort(MAIN, 1024, 48000, MONO)` on `st`, returning r0.
+    fn open(st: &mut VitaState) -> i32 {
+        let mut regs = [0u32; REG_COUNT];
+        (regs[0], regs[1], regs[2], regs[3]) = (0, 0x400, 48_000, 0);
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 64];
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        super::super::dispatch(crate::nid::lib::SCE_AUDIO, crate::nid::audio::OUT_OPEN_PORT, &mut ctx, st);
+        regs[0] as i32
+    }
+
+    /// The FIRST port is already a positive id - a title that tests `port > 0` takes 0 as a
+    /// failed open - and every open gets its own.
+    #[test]
+    fn the_first_port_is_positive_and_ports_are_distinct() {
+        let mut st = VitaState::new(0, 64, Box::new(DeterministicWorld::default()));
+        let a = open(&mut st);
+        let b = open(&mut st);
+        assert!(a > 0, "first port {a}");
+        assert!(b > 0 && b != a, "second port {b}");
+        assert!(b < super::IN_PORT_BASE, "out ports stay below the sceAudioIn range");
     }
 }

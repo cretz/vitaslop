@@ -478,6 +478,7 @@ export function createPlayer({ onExit, onRestart }) {
       `status: ${reports.status}`,
       audioLine(),
       fatalText ? `\nFATAL\n${fatalText}` : ``,
+      reports["guest-console"] ? `\n${reports["guest-console"]}` : ``,
       ``,
       reports.diag,
       ``,

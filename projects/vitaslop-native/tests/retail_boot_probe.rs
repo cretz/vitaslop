@@ -407,6 +407,7 @@ fn retail_boot_probe() {
     env.state.set_process_param(linked.process_param);
     env.state.set_main_thread_request(linked.main_thread_request());
     env.state.set_modules(linked.loaded_modules.clone());
+    env.state.set_unhandled_imports(linked.unhandled_imports.clone());
     env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);
     let mut preloaded = 0usize;

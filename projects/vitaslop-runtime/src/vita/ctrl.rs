@@ -181,6 +181,7 @@ fn fill_ctrl(
     data: u32,
     negative: bool,
     count: i32,
+    v2: bool,
 ) -> i32 {
     let frame = st.world.poll_ctrl(port);
     let ts = st.guest_mono_us();
@@ -231,7 +232,8 @@ fn fill_ctrl(
                     (base.0.saturating_sub(short * super::display::VBLANK_US), base.1)
                 }
             };
-            let bits = if negative { !pad.buttons } else { pad.buttons };
+            let buttons = if v2 { shoulders_as_l1_r1(pad.buttons) } else { pad.buttons };
+            let bits = if negative { !buttons } else { buttons };
             let mut buf = [0u8; CTRL_DATA_PREFIX];
             buf[0..8].copy_from_slice(&s_ts.to_le_bytes());
             buf[8..12].copy_from_slice(&bits.to_le_bytes());
@@ -245,10 +247,50 @@ fn fill_ctrl(
     n as i32
 }
 
+/// `SCE_CTRL_LTRIGGER`/`RTRIGGER` and `SCE_CTRL_L1`/`R1` (psp2common/ctrl.h).
+const LTRIGGER: u32 = 0x0000_0100;
+const RTRIGGER: u32 = 0x0000_0200;
+const L1: u32 = 0x0000_0400;
+const R1: u32 = 0x0000_0800;
+
+/// The "2" spellings of the sample calls (`sceCtrlPeekBufferPositive2` and kin) report the
+/// built-in pad's shoulder buttons as L1/R1 rather than LTRIGGER/RTRIGGER - the layout of the
+/// external controllers that API also serves (psp2/ctrl.h: "will bind L/R trigger value to
+/// L1/R1 instead of LTRIGGER/RTRIGGER"). A title on that API tests the L1/R1 bits, so handing
+/// it the trigger bits is a shoulder press it never sees.
+fn shoulders_as_l1_r1(buttons: u32) -> u32 {
+    let mut b = buttons & !(LTRIGGER | RTRIGGER);
+    if buttons & LTRIGGER != 0 {
+        b |= L1;
+    }
+    if buttons & RTRIGGER != 0 {
+        b |= R1;
+    }
+    b
+}
+
 /// int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad_data, int count)
+///
+/// Also `sceCtrlPeekBufferPositiveExt`: the Ext spelling differs only in returning presses a
+/// common dialog or the IME intercepted, and nothing here intercepts any.
 #[hostcall]
 pub(super) fn peek_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: Ptr, count: i32) -> i32 {
-    fill_ctrl(ctx, st, port, data.addr(), false, count)
+    fill_ctrl(ctx, st, port, data.addr(), false, count, false)
+}
+
+/// `sceCtrlPeekBufferPositive2` / `PositiveExt2` / `Negative2`: [`peek_buffer_positive`] with
+/// the shoulders as L1/R1 (see [`shoulders_as_l1_r1`]).
+pub(super) fn peek_buffer_v2(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) {
+    let (port, data, count) = (ctx.arg(0), ctx.arg(1), ctx.arg(2) as i32);
+    let n = fill_ctrl(ctx, st, port, data, negative, count, true);
+    ctx.ret(n as u32);
+}
+
+/// `sceCtrlReadBufferPositive2` / `PositiveExt2` / `Negative2`: the blocking read with the
+/// shoulders as L1/R1. `sceCtrlReadBufferPositiveExt` is the plain read (see
+/// [`peek_buffer_positive`] on Ext).
+pub(super) fn read_buffer(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool, v2: bool) -> SvcOutcome {
+    read_blocking(ctx, st, negative, v2)
 }
 
 /// int sceCtrlReadBufferPositive(int port, SceCtrlData *pad_data, int count)
@@ -288,12 +330,12 @@ pub(super) fn peek_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState, port:
 /// The run-to-completion host has no scheduler to park against and keeps the old
 /// behaviour; there the display flip really is the only yield there is.
 pub(super) fn read_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
-    read_blocking(ctx, st, false)
+    read_blocking(ctx, st, false, false)
 }
 
 /// The blocking half of `sceCtrlRead*`, shared by the Positive and Negative spellings.
 /// See [`read_buffer_positive`] for why it parks.
-fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) -> SvcOutcome {
+fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool, v2: bool) -> SvcOutcome {
     let (port, data, count) = (ctx.arg(0), ctx.arg(1), ctx.arg(2) as i32);
     // >>> A READ RETURNS THE SAMPLES SINCE THE LAST READ, NOT `count` OF HISTORY.
     //
@@ -327,7 +369,7 @@ fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) -> SvcO
         };
         new.clamp(1, u64::from(buffer_count(count))) as i32
     };
-    let n = fill_ctrl(ctx, st, port, data, negative, count);
+    let n = fill_ctrl(ctx, st, port, data, negative, count, v2);
     tracing::trace!(target: "vitaslop::input", port, asked = ctx.arg(2), returned = n, vblank, frame = st.cur_frame(), lr = format_args!("{:#010x}", ctx.regs[14]), "ctrl read");
     ctx.ret(n as u32);
     if !st.is_preemptive() {
@@ -346,13 +388,27 @@ fn read_all() -> bool {
 /// int sceCtrlPeekBufferNegative(int port, SceCtrlData *pad_data, int count)
 #[hostcall]
 pub(super) fn peek_buffer_negative(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: Ptr, count: i32) -> i32 {
-    fill_ctrl(ctx, st, port, data.addr(), true, count)
+    fill_ctrl(ctx, st, port, data.addr(), true, count, false)
 }
 
 /// int sceCtrlReadBufferNegative(int port, SceCtrlData *pad_data, int count)
 /// Blocks on the sampling grid exactly as [`read_buffer_positive`] does.
 pub(super) fn read_buffer_negative(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
-    read_blocking(ctx, st, true)
+    read_blocking(ctx, st, true, false)
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+
+    #[test]
+    fn the_v2_api_moves_only_the_shoulders_to_l1_r1() {
+        assert_eq!(shoulders_as_l1_r1(LTRIGGER), L1);
+        assert_eq!(shoulders_as_l1_r1(RTRIGGER), R1);
+        // Cross + start + both shoulders: the face/start bits are untouched.
+        assert_eq!(shoulders_as_l1_r1(0x4008 | LTRIGGER | RTRIGGER), 0x4008 | L1 | R1);
+        assert_eq!(shoulders_as_l1_r1(0x4008), 0x4008);
+    }
 }
 
 #[cfg(test)]

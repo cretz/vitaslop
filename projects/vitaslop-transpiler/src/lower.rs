@@ -117,10 +117,20 @@ pub struct Discovered {
 /// the r7 tracking a noreturn `svc` needs.
 type RegConsts = [Option<u32>; 16];
 
-/// Upper bound on the instructions in one discovered function. Real ARM functions
-/// are far smaller (the largest seen in a shipping title is a few thousand); exceeding this
-/// means discovery is walking data as code, so the "function" is rejected.
-const MAX_FUNC_INSNS: usize = 16384;
+/// Upper bound on the instructions in one discovered function: as many 16-bit Thumb
+/// instructions as fit in [`MAX_FUNC_SPAN`], the bound the block-span guard already allows.
+/// Exceeding it means discovery is walking data as code, so the "function" is rejected.
+///
+/// It was 16384, on the belief that no shipping function comes near it. MEASURED: a 2D title's
+/// boot calls one REAL function of 101 KB of Thumb (0x8116b210..0x81183d5c: one prologue with a
+/// 21 KB stack frame, one epilogue) - the cap stubbed it, every call trapped, and the title died
+/// in its static initialisers. Two guards with different ideas of "too large" let the tighter one
+/// reject what the span guard was raised to accept.
+const MAX_FUNC_INSNS: usize = (MAX_FUNC_SPAN / 2) as usize;
+
+/// Widest span of block addresses one discovered function may cover - see the runaway guard at
+/// the end of `discover`.
+const MAX_FUNC_SPAN: u32 = 0x2_0000;
 
 /// Decode one instruction at guest `addr`, returning it and its byte length.
 fn decode_at(
@@ -2140,7 +2150,6 @@ fn discover_with(
     // It was 64 KiB, and a sports title's match code has one REAL function spanning 77 KiB of
     // Thumb (an 18 KB stack frame, one prologue, one epilogue): rejected, every call to it
     // lowered to a trap and the title died a few seconds into its first match.
-    const MAX_FUNC_SPAN: u32 = 0x2_0000;
     if let (Some(first), Some(last)) = (blocks.first(), blocks.last())
         && last.addr.wrapping_sub(first.addr) > MAX_FUNC_SPAN {
             return Err(Error::Runaway { first: first.addr, last: last.addr });

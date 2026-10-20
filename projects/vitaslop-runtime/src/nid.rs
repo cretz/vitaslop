@@ -242,6 +242,8 @@ pub mod gxm {
     /// same extra argument `sceGxmDrawInstanced` takes.
     pub const PRECOMPUTED_DRAW_SET_PARAMS_INSTANCED: u32 = 0x3A7B_1633;
     pub const PROGRAM_FIND_PARAMETER_BY_SEMANTIC: u32 = 0x7FFF_DD7A;
+    /// `sceGxmProgramFindParameterBySemantic`: the public export of the same lookup.
+    pub const PROGRAM_FIND_PARAMETER_BY_SEMANTIC_PUBLIC: u32 = 0x633C_AA54;
     pub const RENDER_TARGET_GET_DRIVER_MEM_BLOCK: u32 = 0x4955_3737;
     pub const NOTIFICATION_WAIT: u32 = 0x9F44_8E79;
     // Vertex-stage texture bind, cube-arbitrary init, paletted textures.
@@ -337,6 +339,15 @@ pub mod ctrl {
     pub const PEEK_BUFFER_NEGATIVE: u32 = 0x104E_D1A7;
     pub const READ_BUFFER_NEGATIVE: u32 = 0x15F9_6FB0;
     pub const SET_SAMPLING_MODE: u32 = 0xA497_B150;
+    /// The rest of the sample calls: `Ext` (presses a dialog intercepted - none here) and the
+    /// `2` spellings (shoulders as L1/R1). See `vita::ctrl::shoulders_as_l1_r1`.
+    pub const PEEK_BUFFER_POSITIVE_EXT: u32 = 0xA594_54D3;
+    pub const PEEK_BUFFER_POSITIVE_EXT2: u32 = 0x860B_F292;
+    pub const PEEK_BUFFER_NEGATIVE2: u32 = 0x81A8_9660;
+    pub const READ_BUFFER_POSITIVE2: u32 = 0xC422_6A3E;
+    pub const READ_BUFFER_POSITIVE_EXT: u32 = 0xE2D9_9296;
+    pub const READ_BUFFER_POSITIVE_EXT2: u32 = 0xA717_8860;
+    pub const READ_BUFFER_NEGATIVE2: u32 = 0x27A0_C5FB;
 }
 
 /// SceSysmem (kernel memory) function NIDs.
@@ -384,6 +395,8 @@ pub mod libkernel {
     pub const CLIB_MSPACE_MEMALIGN: u32 = 0x3C84_7D57;
     // Thread-local storage: a per-thread pointer slot indexed by key.
     pub const GET_TLS_ADDR: u32 = 0xB295_EB61;
+    /// `sceKernelGetEventFlagInfo`: an event flag's attributes and current pattern.
+    pub const GET_EVENT_FLAG_INFO: u32 = 0x8BA4_C0C1;
     // Message pipes: a byte FIFO between threads.
     pub const CREATE_MSG_PIPE: u32 = 0x0A10_C1C8;
     pub const SEND_MSG_PIPE: u32 = 0x0CA7_1EA2;
@@ -762,6 +775,17 @@ pub mod services {
     /// `sceRtcGetDayOfWeek` and the RFC 3339 formatter (local time - which is UTC here).
     pub const RTC_GET_DAY_OF_WEEK: u32 = 0x2F35_31EB;
     pub const RTC_FORMAT_RFC3339_LOCAL_TIME: u32 = 0x7422_50A9;
+    /// The rest of the SceRtcUser calendar arithmetic: each a pure function of its
+    /// arguments over the same proleptic-Gregorian construction as the members above.
+    pub const RTC_FORMAT_RFC3339: u32 = 0xCCEA_2B54;
+    pub const RTC_GET_DAYS_IN_MONTH: u32 = 0x49EB_4556;
+    pub const RTC_IS_LEAP_YEAR: u32 = 0xF17F_D8B5;
+    pub const RTC_CHECK_VALID: u32 = 0xD762_2935;
+    pub const RTC_COMPARE_TICK: u32 = 0xC738_5158;
+    pub const RTC_SET_TIME_T: u32 = 0x3A33_2F81;
+    pub const RTC_SET_WIN32_FILE_TIME: u32 = 0xA79A_8846;
+    pub const RTC_GET_DOS_TIME: u32 = 0x92AB_EBAF;
+    pub const RTC_SET_DOS_TIME: u32 = 0xF8B2_2B07;
     /// `sceAppMgrAcquireBgmPort`: claim the shared background-music port.
     pub const APPMGR_ACQUIRE_BGM_PORT: u32 = 0xAFCE_AB96;
     /// `sceAppMgrReleaseBgmPort`: give it back. The pair has to exist together - a title
@@ -878,6 +902,19 @@ pub mod services {
     pub const NP_SNS_FACEBOOK_DIALOG_INIT: u32 = 0x6821_F09B;
     pub const NP_SNS_FACEBOOK_DIALOG_GET_STATUS: u32 = 0x1476_50E8;
     pub const NP_SNS_FACEBOOK_DIALOG_GET_RESULT_LONG_TOKEN: u32 = 0xA868_2304;
+    /// The rest of the common-dialog lifecycle: progress-bar updates on an open message or
+    /// save-data dialog (nothing is drawn, so they succeed), and the aborts/terms that close
+    /// a family the way its own Term does.
+    pub const MSG_DIALOG_PROGRESS_BAR_INC: u32 = 0x7BE0_E08B;
+    pub const MSG_DIALOG_PROGRESS_BAR_SET_MSG: u32 = 0x0150_A451;
+    pub const MSG_DIALOG_PROGRESS_BAR_SET_VALUE: u32 = 0x9CDA_5E0D;
+    pub const SAVEDATA_DIALOG_PROGRESS_BAR_INC: u32 = 0xBDE0_0A83;
+    pub const SAVEDATA_DIALOG_PROGRESS_BAR_SET_VALUE: u32 = 0x5C32_2D1E;
+    pub const NET_CHECK_DIALOG_ABORT: u32 = 0x2D8E_DF09;
+    pub const NP_FRIEND_LIST_DIALOG_ABORT: u32 = 0x58FA_2062;
+    pub const NP_SNS_FACEBOOK_DIALOG_ABORT: u32 = 0x7E22_AD33;
+    pub const NP_SNS_FACEBOOK_DIALOG_TERM: u32 = 0xDE1F_3928;
+    pub const NP_TROPHY_SETUP_DIALOG_ABORT: u32 = 0xDC34_6979;
     // SceTouch.
     pub const TOUCH_SET_SAMPLING_STATE: u32 = 0x1B9C_5D14;
     pub const TOUCH_GET_SAMPLING_STATE: u32 = 0x2653_1526;
@@ -1037,10 +1074,14 @@ pub mod services {
     // `NP_SCORE_CREATE_TITLE_CTX` already reports signed out.
     pub const NP_SCORE_CREATE_REQUEST: u32 = 0xD30D_1993;
     pub const NP_SCORE_DELETE_REQUEST: u32 = 0xFFF2_4BB1;
+    /// `sceNpScoreAbortRequest(reqId)`: cancel a request's outstanding operation.
+    pub const NP_SCORE_ABORT_REQUEST: u32 = 0xA7E9_3CE1;
     pub const NP_SCORE_RECORD_SCORE: u32 = 0x320C_0277;
     pub const NP_SCORE_RECORD_SCORE_ASYNC: u32 = 0x24B0_9634;
     pub const NP_SCORE_GET_RANKING_BY_RANGE: u32 = 0x427D_3412;
     pub const NP_SCORE_GET_RANKING_BY_RANGE_ASYNC: u32 = 0xC45E_3FCD;
+    pub const NP_SCORE_GET_RANKING_BY_NP_ID: u32 = 0xBAE5_5B34;
+    pub const NP_SCORE_GET_RANKING_BY_NP_ID_ASYNC: u32 = 0x45CD_1D00;
     pub const NP_SCORE_POLL_ASYNC: u32 = 0x9F2A_7AC9;
     pub const HTTP_TERM: u32 = 0xC907_6666;
     pub const SSL_TERM: u32 = 0x03CE_6E3A;
@@ -1267,6 +1308,62 @@ pub mod lwsync {
     pub const GET_LW_MUTEX_INFO: u32 = 0xF7D8_F1FC;
 }
 
+/// SceLibKernel's `sceKernelAtomic<Op><8|16|32>` family (psp2/kernel/cpu.h), all served by
+/// `vita::libkernel::atomic`. The 64-bit members and `DecIfPositive` are not here - see there.
+pub mod atomic {
+    pub const ADD_AND_GET_16: u32 = 0x495C_52EC;
+    pub const ADD_AND_GET_32: u32 = 0x2E84_A93B;
+    pub const ADD_AND_GET_8: u32 = 0x8F7B_D940;
+    pub const ADD_UNLESS_16: u32 = 0x1CF4_AA4B;
+    pub const ADD_UNLESS_32: u32 = 0x4B33_FD3C;
+    pub const ADD_UNLESS_8: u32 = 0x7FD9_4393;
+    pub const AND_AND_GET_16: u32 = 0xF989_0F7E;
+    pub const AND_AND_GET_32: u32 = 0x6709_D30C;
+    pub const AND_AND_GET_8: u32 = 0x86B9_170F;
+    pub const CLEAR_AND_GET_16: u32 = 0xCC36_B775;
+    pub const CLEAR_AND_GET_32: u32 = 0x9DAA_0DE8;
+    pub const CLEAR_AND_GET_8: u32 = 0x17B4_0010;
+    pub const CLEAR_MASK_16: u32 = 0x5FE7_DFF8;
+    pub const CLEAR_MASK_32: u32 = 0xE3DF_0CB3;
+    pub const CLEAR_MASK_8: u32 = 0xD7D4_9E36;
+    pub const COMPARE_AND_SET_16: u32 = 0xE8C0_1236;
+    pub const COMPARE_AND_SET_32: u32 = 0x1124_A1D4;
+    pub const COMPARE_AND_SET_8: u32 = 0x327D_B4C0;
+    pub const GET_AND_ADD_16: u32 = 0x5674_DB0C;
+    pub const GET_AND_ADD_32: u32 = 0x2611_CB0B;
+    pub const GET_AND_ADD_8: u32 = 0x27A2_AAFA;
+    pub const GET_AND_AND_16: u32 = 0x7A0C_B056;
+    pub const GET_AND_AND_32: u32 = 0x0826_6595;
+    pub const GET_AND_AND_8: u32 = 0x53DC_A02B;
+    pub const GET_AND_CLEAR_16: u32 = 0x57CD_7E7D;
+    pub const GET_AND_CLEAR_32: u32 = 0x0226_A017;
+    pub const GET_AND_CLEAR_8: u32 = 0xA108_73A4;
+    pub const GET_AND_OR_16: u32 = 0x31E4_9E73;
+    pub const GET_AND_OR_32: u32 = 0x984A_D276;
+    pub const GET_AND_OR_8: u32 = 0x107A_68DF;
+    pub const GET_AND_SET_16: u32 = 0xF7B9_ADFC;
+    pub const GET_AND_SET_32: u32 = 0x9B43_E667;
+    pub const GET_AND_SET_8: u32 = 0x2672_EA0B;
+    pub const GET_AND_SUB_16: u32 = 0xAC51_979C;
+    pub const GET_AND_SUB_32: u32 = 0x115C_516F;
+    pub const GET_AND_SUB_8: u32 = 0xCDF5_DF67;
+    pub const GET_AND_XOR_16: u32 = 0x6E2D_0B9E;
+    pub const GET_AND_XOR_32: u32 = 0x3873_9E2F;
+    pub const GET_AND_XOR_8: u32 = 0x7350_B2DF;
+    pub const OR_AND_GET_16: u32 = 0x8E24_8EBD;
+    pub const OR_AND_GET_32: u32 = 0xC3B2_F7F8;
+    pub const OR_AND_GET_8: u32 = 0x5169_3931;
+    pub const SET_16: u32 = 0x450B_FECF;
+    pub const SET_32: u32 = 0xB69D_A09B;
+    pub const SET_8: u32 = 0xE960_FDA2;
+    pub const SUB_AND_GET_16: u32 = 0xC26B_BBB1;
+    pub const SUB_AND_GET_32: u32 = 0x01C9_CD92;
+    pub const SUB_AND_GET_8: u32 = 0x99E1_796E;
+    pub const XOR_AND_GET_16: u32 = 0x6F52_4195;
+    pub const XOR_AND_GET_32: u32 = 0x4694_0704;
+    pub const XOR_AND_GET_8: u32 = 0x634A_F062;
+}
+
 /// SceThreadmgr function NIDs: thread-manager primitives not wrapped in
 /// SceLibKernel.
 pub mod threadmgr {
@@ -1277,6 +1374,13 @@ pub mod threadmgr {
     pub const EXIT_THREAD: u32 = 0x0C8A_38E1;
     pub const GET_PROCESS_ID: u32 = 0x9DCB_4B7A;
     pub const GET_THREAD_CURRENT_PRIORITY: u32 = 0x0141_4F0B;
+    /// The same call as SceLibKernel exports it - a title imports whichever its SDK linked.
+    pub const GET_THREAD_CURRENT_PRIORITY_LIBKERNEL: u32 = 0xC53A_9848;
+    /// `sceKernelRegisterThreadEventHandler` (exported by SceLibKernel) and its inverse
+    /// (by SceThreadmgr): a function the kernel calls on the thread a START or EXIT event
+    /// is about. A C library registers one to free each ending thread's TLS.
+    pub const REGISTER_THREAD_EVENT_HANDLER: u32 = 0x6D8C_0F13;
+    pub const UNREGISTER_THREAD_EVENT_HANDLER: u32 = 0x2C8E_D6F0;
     /// CPU affinity: RECORDED, not obeyed - this scheduler interleaves on one baton, so
     /// there is no placement to honour. Kept so the getter agrees with the setter and with
     /// `sceKernelGetThreadInfo`. See `vita::threadmgr`.
@@ -1285,6 +1389,9 @@ pub mod threadmgr {
     /// `sceKernelCloseSema`: releases a semaphore id (same effect as DeleteSema in
     /// this model - the id becomes invalid). Routed to the shared delete handler.
     pub const CLOSE_SEMA: u32 = 0xA2D8_1F9E;
+    /// `sceKernelCloseEventFlag`: releases an event-flag id, routed to the shared delete
+    /// handler like `CLOSE_SEMA`.
+    pub const CLOSE_EVENT_FLAG: u32 = 0x9A68_F547;
     /// `sceKernelChangeThreadVfpException`: sets which VFP/NEON floating-point
     /// exceptions trap for the calling thread. We compute IEEE arithmetic without
     /// trapping, so this only records intent; it never changes numeric results.
@@ -1641,7 +1748,7 @@ pub const UNKNOWN_NAME: &str = "<unknown>";
 /// the unimplemented-call report. Falls back to the raw NIDs.
 pub fn name(func_nid: u32) -> &'static str {
     use {
-        audio as au, audiodec as ad, audioin, avplayer as avp, ctrl as c, display as d, fiber as fb, gxm as g, http,
+        atomic as at, audio as au, audiodec as ad, audioin, avplayer as avp, ctrl as c, display as d, fiber as fb, gxm as g, http,
         iofilemgr as io, livearea, pgf, xml,
         libkernel as lk, lwsync as lw, net as nt, ngs as ng, processmgr as pm, pvf as pv, services as sv,
         sync as sy, sysmem as s, threadmgr as tm, videodec as vd, voice as vo,
@@ -1871,6 +1978,13 @@ pub fn name(func_nid: u32) -> &'static str {
         c::PEEK_BUFFER_NEGATIVE => "sceCtrlPeekBufferNegative",
         c::READ_BUFFER_NEGATIVE => "sceCtrlReadBufferNegative",
         c::SET_SAMPLING_MODE => "sceCtrlSetSamplingMode",
+        c::PEEK_BUFFER_POSITIVE_EXT => "sceCtrlPeekBufferPositiveExt",
+        c::PEEK_BUFFER_POSITIVE_EXT2 => "sceCtrlPeekBufferPositiveExt2",
+        c::PEEK_BUFFER_NEGATIVE2 => "sceCtrlPeekBufferNegative2",
+        c::READ_BUFFER_POSITIVE2 => "sceCtrlReadBufferPositive2",
+        c::READ_BUFFER_POSITIVE_EXT => "sceCtrlReadBufferPositiveExt",
+        c::READ_BUFFER_POSITIVE_EXT2 => "sceCtrlReadBufferPositiveExt2",
+        c::READ_BUFFER_NEGATIVE2 => "sceCtrlReadBufferNegative2",
         s::ALLOC_MEM_BLOCK => "sceKernelAllocMemBlock",
         s::GET_MEM_BLOCK_BASE => "sceKernelGetMemBlockBase",
         lk::CLIB_PRINTF => "sceClibPrintf",
@@ -1895,6 +2009,7 @@ pub fn name(func_nid: u32) -> &'static str {
         lk::CLIB_MSPACE_FREE => "sceClibMspaceFree",
         lk::CLIB_MSPACE_MEMALIGN => "sceClibMspaceMemalign",
         lk::GET_TLS_ADDR => "sceKernelGetTLSAddr",
+        lk::GET_EVENT_FLAG_INFO => "sceKernelGetEventFlagInfo",
         lk::CREATE_MSG_PIPE => "sceKernelCreateMsgPipe",
         lk::SEND_MSG_PIPE => "sceKernelSendMsgPipe",
         lk::RECEIVE_MSG_PIPE => "sceKernelReceiveMsgPipe",
@@ -2021,6 +2136,15 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::MOTION_ROTATE_YAW => "sceMotionRotateYaw",
         sv::RTC_GET_DAY_OF_WEEK => "sceRtcGetDayOfWeek",
         sv::RTC_FORMAT_RFC3339_LOCAL_TIME => "sceRtcFormatRFC3339LocalTime",
+        sv::RTC_FORMAT_RFC3339 => "sceRtcFormatRFC3339",
+        sv::RTC_GET_DAYS_IN_MONTH => "sceRtcGetDaysInMonth",
+        sv::RTC_IS_LEAP_YEAR => "sceRtcIsLeapYear",
+        sv::RTC_CHECK_VALID => "sceRtcCheckValid",
+        sv::RTC_COMPARE_TICK => "sceRtcCompareTick",
+        sv::RTC_SET_TIME_T => "sceRtcSetTime_t",
+        sv::RTC_SET_WIN32_FILE_TIME => "sceRtcSetWin32FileTime",
+        sv::RTC_GET_DOS_TIME => "sceRtcGetDosTime",
+        sv::RTC_SET_DOS_TIME => "sceRtcSetDosTime",
         sv::APPMGR_ACQUIRE_BGM_PORT => "sceAppMgrAcquireBgmPort",
         sv::APPMGR_RELEASE_BGM_PORT => "sceAppMgrReleaseBgmPort",
         sv::RAZOR_CPU_WRITE_FIBER_ULT_PKT => "_sceRazorCpuWriteFiberUltPkt",
@@ -2356,6 +2480,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::PROGRAM_GET_SIZE => "sceGxmProgramGetSize",
         g::PRECOMPUTED_DRAW_SET_PARAMS_INSTANCED => "sceGxmPrecomputedDrawSetParamsInstanced",
         g::PROGRAM_FIND_PARAMETER_BY_SEMANTIC => "_sceGxmProgramFindParameterBySemantic",
+        g::PROGRAM_FIND_PARAMETER_BY_SEMANTIC_PUBLIC => "sceGxmProgramFindParameterBySemantic",
         g::RENDER_TARGET_GET_DRIVER_MEM_BLOCK => "sceGxmRenderTargetGetDriverMemBlock",
         g::NOTIFICATION_WAIT => "sceGxmNotificationWait",
         g::SET_VERTEX_TEXTURE => "_sceGxmSetVertexTexture",
@@ -2408,10 +2533,66 @@ pub fn name(func_nid: u32) -> &'static str {
         pv::PIXEL_TO_POINT_H => "scePvfPixelToPointH",
         pv::PIXEL_TO_POINT_V => "scePvfPixelToPointV",
         // Threadmgr, sysmem, display additions.
-        tm::GET_THREAD_CURRENT_PRIORITY => "sceKernelGetThreadCurrentPriority",
+        tm::GET_THREAD_CURRENT_PRIORITY | tm::GET_THREAD_CURRENT_PRIORITY_LIBKERNEL => {
+            "sceKernelGetThreadCurrentPriority"
+        }
+        tm::REGISTER_THREAD_EVENT_HANDLER => "sceKernelRegisterThreadEventHandler",
+        at::ADD_AND_GET_16 => "sceKernelAtomicAddAndGet16",
+        at::ADD_AND_GET_32 => "sceKernelAtomicAddAndGet32",
+        at::ADD_AND_GET_8 => "sceKernelAtomicAddAndGet8",
+        at::ADD_UNLESS_16 => "sceKernelAtomicAddUnless16",
+        at::ADD_UNLESS_32 => "sceKernelAtomicAddUnless32",
+        at::ADD_UNLESS_8 => "sceKernelAtomicAddUnless8",
+        at::AND_AND_GET_16 => "sceKernelAtomicAndAndGet16",
+        at::AND_AND_GET_32 => "sceKernelAtomicAndAndGet32",
+        at::AND_AND_GET_8 => "sceKernelAtomicAndAndGet8",
+        at::CLEAR_AND_GET_16 => "sceKernelAtomicClearAndGet16",
+        at::CLEAR_AND_GET_32 => "sceKernelAtomicClearAndGet32",
+        at::CLEAR_AND_GET_8 => "sceKernelAtomicClearAndGet8",
+        at::CLEAR_MASK_16 => "sceKernelAtomicClearMask16",
+        at::CLEAR_MASK_32 => "sceKernelAtomicClearMask32",
+        at::CLEAR_MASK_8 => "sceKernelAtomicClearMask8",
+        at::COMPARE_AND_SET_16 => "sceKernelAtomicCompareAndSet16",
+        at::COMPARE_AND_SET_32 => "sceKernelAtomicCompareAndSet32",
+        at::COMPARE_AND_SET_8 => "sceKernelAtomicCompareAndSet8",
+        at::GET_AND_ADD_16 => "sceKernelAtomicGetAndAdd16",
+        at::GET_AND_ADD_32 => "sceKernelAtomicGetAndAdd32",
+        at::GET_AND_ADD_8 => "sceKernelAtomicGetAndAdd8",
+        at::GET_AND_AND_16 => "sceKernelAtomicGetAndAnd16",
+        at::GET_AND_AND_32 => "sceKernelAtomicGetAndAnd32",
+        at::GET_AND_AND_8 => "sceKernelAtomicGetAndAnd8",
+        at::GET_AND_CLEAR_16 => "sceKernelAtomicGetAndClear16",
+        at::GET_AND_CLEAR_32 => "sceKernelAtomicGetAndClear32",
+        at::GET_AND_CLEAR_8 => "sceKernelAtomicGetAndClear8",
+        at::GET_AND_OR_16 => "sceKernelAtomicGetAndOr16",
+        at::GET_AND_OR_32 => "sceKernelAtomicGetAndOr32",
+        at::GET_AND_OR_8 => "sceKernelAtomicGetAndOr8",
+        at::GET_AND_SET_16 => "sceKernelAtomicGetAndSet16",
+        at::GET_AND_SET_32 => "sceKernelAtomicGetAndSet32",
+        at::GET_AND_SET_8 => "sceKernelAtomicGetAndSet8",
+        at::GET_AND_SUB_16 => "sceKernelAtomicGetAndSub16",
+        at::GET_AND_SUB_32 => "sceKernelAtomicGetAndSub32",
+        at::GET_AND_SUB_8 => "sceKernelAtomicGetAndSub8",
+        at::GET_AND_XOR_16 => "sceKernelAtomicGetAndXor16",
+        at::GET_AND_XOR_32 => "sceKernelAtomicGetAndXor32",
+        at::GET_AND_XOR_8 => "sceKernelAtomicGetAndXor8",
+        at::OR_AND_GET_16 => "sceKernelAtomicOrAndGet16",
+        at::OR_AND_GET_32 => "sceKernelAtomicOrAndGet32",
+        at::OR_AND_GET_8 => "sceKernelAtomicOrAndGet8",
+        at::SET_16 => "sceKernelAtomicSet16",
+        at::SET_32 => "sceKernelAtomicSet32",
+        at::SET_8 => "sceKernelAtomicSet8",
+        at::SUB_AND_GET_16 => "sceKernelAtomicSubAndGet16",
+        at::SUB_AND_GET_32 => "sceKernelAtomicSubAndGet32",
+        at::SUB_AND_GET_8 => "sceKernelAtomicSubAndGet8",
+        at::XOR_AND_GET_16 => "sceKernelAtomicXorAndGet16",
+        at::XOR_AND_GET_32 => "sceKernelAtomicXorAndGet32",
+        at::XOR_AND_GET_8 => "sceKernelAtomicXorAndGet8",
+        tm::UNREGISTER_THREAD_EVENT_HANDLER => "sceKernelUnregisterThreadEventHandler",
         tm::CHANGE_THREAD_CPU_AFFINITY_MASK => "sceKernelChangeThreadCpuAffinityMask",
         tm::GET_THREAD_CPU_AFFINITY_MASK => "sceKernelGetThreadCpuAffinityMask",
         tm::CLOSE_SEMA => "sceKernelCloseSema",
+        tm::CLOSE_EVENT_FLAG => "sceKernelCloseEventFlag",
         tm::CHANGE_THREAD_VFP_EXCEPTION => "sceKernelChangeThreadVfpException",
         s::FREE_MEM_BLOCK => "sceKernelFreeMemBlock",
         d::WAIT_VBLANK_START_MULTI => "sceDisplayWaitVblankStartMulti",
@@ -2495,10 +2676,13 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_MATCHING2_SEND_ROOM_MESSAGE => "sceNpMatching2SendRoomMessage",
         sv::NP_SCORE_CREATE_REQUEST => "sceNpScoreCreateRequest",
         sv::NP_SCORE_DELETE_REQUEST => "sceNpScoreDeleteRequest",
+        sv::NP_SCORE_ABORT_REQUEST => "sceNpScoreAbortRequest",
         sv::NP_SCORE_RECORD_SCORE => "sceNpScoreRecordScore",
         sv::NP_SCORE_RECORD_SCORE_ASYNC => "sceNpScoreRecordScoreAsync",
         sv::NP_SCORE_GET_RANKING_BY_RANGE => "sceNpScoreGetRankingByRange",
         sv::NP_SCORE_GET_RANKING_BY_RANGE_ASYNC => "sceNpScoreGetRankingByRangeAsync",
+        sv::NP_SCORE_GET_RANKING_BY_NP_ID => "sceNpScoreGetRankingByNpId",
+        sv::NP_SCORE_GET_RANKING_BY_NP_ID_ASYNC => "sceNpScoreGetRankingByNpIdAsync",
         sv::NP_SCORE_POLL_ASYNC => "sceNpScorePollAsync",
         sv::HTTP_TERM => "sceHttpTerm",
         sv::SSL_TERM => "sceSslTerm",
@@ -2566,6 +2750,16 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NET_CHECK_DIALOG_GET_STATUS => "sceNetCheckDialogGetStatus",
         sv::NET_CHECK_DIALOG_GET_RESULT => "sceNetCheckDialogGetResult",
         sv::NET_CHECK_DIALOG_TERM => "sceNetCheckDialogTerm",
+        sv::MSG_DIALOG_PROGRESS_BAR_INC => "sceMsgDialogProgressBarInc",
+        sv::MSG_DIALOG_PROGRESS_BAR_SET_MSG => "sceMsgDialogProgressBarSetMsg",
+        sv::MSG_DIALOG_PROGRESS_BAR_SET_VALUE => "sceMsgDialogProgressBarSetValue",
+        sv::SAVEDATA_DIALOG_PROGRESS_BAR_INC => "sceSaveDataDialogProgressBarInc",
+        sv::SAVEDATA_DIALOG_PROGRESS_BAR_SET_VALUE => "sceSaveDataDialogProgressBarSetValue",
+        sv::NET_CHECK_DIALOG_ABORT => "sceNetCheckDialogAbort",
+        sv::NP_FRIEND_LIST_DIALOG_ABORT => "sceNpFriendListDialogAbort",
+        sv::NP_SNS_FACEBOOK_DIALOG_ABORT => "sceNpSnsFacebookDialogAbort",
+        sv::NP_SNS_FACEBOOK_DIALOG_TERM => "sceNpSnsFacebookDialogTerm",
+        sv::NP_TROPHY_SETUP_DIALOG_ABORT => "sceNpTrophySetupDialogAbort",
         sv::SAVEDATA_DIALOG_INIT => "sceSaveDataDialogInit",
         sv::SAVEDATA_DIALOG_GET_STATUS => "sceSaveDataDialogGetStatus",
         sv::SAVEDATA_DIALOG_GET_SUB_STATUS => "sceSaveDataDialogGetSubStatus",

@@ -143,6 +143,11 @@ pub struct LinkedProgram {
     /// pointer/value in the image, so a consumer (probe, front-end) must surface this
     /// list - a non-empty one means some data table the guest reads is unbound.
     pub unresolved_var_imports: Vec<(u32, u32)>,
+    /// Function imports wired to the host that the dispatch table has no arm for, as sorted,
+    /// deduplicated `(library_nid, func_nid)`. Nothing is wrong until one is CALLED - a title
+    /// imports far more than it uses - but when one is, the run stops on it, so this is the
+    /// whole list of calls the title could stop on, known before it runs.
+    pub unhandled_imports: Vec<(u32, u32)>,
     /// Every module in the finished image, in load order, with the placed addresses
     /// its segments ended up at. The kernel's module queries (`GetModuleInfoByAddr`,
     /// `GetModuleIdByAddr`) answer from this: a guest address maps to whichever
@@ -571,21 +576,20 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
     // call. The imports are all known HERE, at link time, so the whole list can be reported
     // at once and implemented in one pass.
     //
-    // `nid::name` is the test because a NID gets its name in the same change that gives it
-    // a handler, so an unnamed import is an unimplemented one. It is a HINT, not a
-    // guarantee: a named NID with no dispatch arm still hard-fails at the call, which is
-    // why the call-time failure stays exactly as loud as it was.
-    let unnamed: Vec<(u32, u32)> = {
+    // The test is the dispatch table itself (`dispatch_handles`, generated from its arms by
+    // build.rs), so this list is exactly the set of imports that reach the `_` arm - not a
+    // guess from which NIDs have names.
+    let unhandled_imports: Vec<(u32, u32)> = {
         let mut v: Vec<(u32, u32)> = imports
             .iter()
             .copied()
-            .filter(|(_, func)| crate::nid::name(*func) == crate::nid::UNKNOWN_NAME)
+            .filter(|(_, func)| !crate::vita::dispatch_handles(*func))
             .collect();
         v.sort_unstable();
         v.dedup();
         v
     };
-    if !unnamed.is_empty() {
+    if !unhandled_imports.is_empty() {
         // >>> STATUS, NOT A WARNING, AND THE DISTINCTION IS WHETHER ANYTHING IS OWED.
         //
         // A title IMPORTS far more than it calls. This list is an inventory taken at link
@@ -600,9 +604,9 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
             "link: {} imported function NID(s) have no handler. A call to one is a hard failure \
              that names it; an import that is never called costs nothing. To implement them, \
              look each up in the vitasdk NID db (db/360/*.yml):",
-            unnamed.len()
+            unhandled_imports.len()
         );
-        for (lib, func) in &unnamed {
+        for (lib, func) in &unhandled_imports {
             tracing::info!(
                 target: "vitaslop::status",
                 "  unhandled import: library_nid={lib:#010x} func_nid={func:#010x}"
@@ -791,6 +795,7 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         process_param,
         tls_template,
         unresolved_var_imports,
+        unhandled_imports,
         loaded_modules,
     })
 }

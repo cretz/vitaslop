@@ -3651,8 +3651,7 @@ fn snorm16_to_u8(raw: u16) -> u8 {
 /// `0RRR` - so the mirrored pair below is pinned by the modes that ARE used and left consistent
 /// for the ones that are not.
 ///
-/// `SWIZZLE2` carries the same ambiguity and is NOT changed here: it has no measurement behind
-/// it yet, and flipping a convention on a hunch is how the first reading got in.
+/// `SWIZZLE2` carries the same ambiguity and is read the same way, high to low - see [`swizzle2`].
 fn swizzle1(r: u8, swizzle: u32) -> [u8; 4] {
     match swizzle {
         // A one-letter name says only which channel is defined, so it reads the same way round:
@@ -3671,17 +3670,25 @@ fn swizzle1(r: u8, swizzle: u32) -> [u8; 4] {
 /// Route a two-channel texel to straight RGBA per its GXM `SWIZZLE2` selector, with `r`
 /// the low (first) lane and `g` the high (second) lane.
 ///
-/// The selector names the output channels left to right, the same reading `swizzle1` uses,
-/// and a channel the name does not mention is 0 - except alpha, which is opaque so a
-/// two-channel texture does not render invisible.
+/// The name reads HIGH TO LOW, the way the four-channel names (`ABGR`: alpha in the top byte)
+/// and [`swizzle1`] read: a four-letter name lists alpha, blue, green, red, and its `R` / `G`
+/// are the texel's low and high lanes. A two-letter name lists only green and red, with blue 0
+/// and alpha opaque.
+///
+/// # This was read the other way round, and a whole title vanished
+/// It read left to right (`GRRR` as red = high lane, alpha = low lane). MEASURED on a 2D title
+/// whose every sprite is a `U8U8 GRRR` atlas - black silhouettes with their coverage in the high
+/// lane: alpha came from the LUMINANCE, so every black shape was fully transparent and the scene
+/// target held nothing but a few grey edges. Read high to low, `GRRR` is the luminance/alpha pair
+/// that atlas is (grey from the low lane, coverage from the high one), and the scene draws.
 fn swizzle2(r: u8, g: u8, swizzle: u32) -> [u8; 4] {
     match swizzle {
-        1 => [0, 0, g, r],       // 00GR
-        2 => [g, r, r, r],       // GRRR
-        3 => [r, g, g, g],       // RGGG
-        4 => [g, r, g, r],       // GRGR
-        5 => [0, 0, r, g],       // 00RG
-        _ => [g, r, 0, 255],     // GR
+        1 => [r, g, 0, 0],       // 00GR
+        2 => [r, r, r, g],       // GRRR - luminance, coverage
+        3 => [g, g, g, r],       // RGGG
+        4 => [r, g, r, g],       // GRGR
+        5 => [g, r, 0, 0],       // 00RG
+        _ => [r, g, 0, 255],     // GR
     }
 }
 
@@ -7312,7 +7319,19 @@ impl RenderSceneBuilder {
         // every frame.
     }
 
-    /// The recompiler's `GxpTex` list for a captured binding set, derived once per frame per
+    /// A bound texture's own LOD bias in mip levels: control word 0's 6-bit `lod_bias`, an
+/// unsigned value offset by 31 with three fractional bits - `(raw - 31) / 8`, so raw 31 is no
+/// bias and the range is -3.875..=+4.0. A `LINEAR_STRIDED` texture has no bias: those bits are
+/// part of its stride.
+pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
+    const TYPE_LINEAR_STRIDED: u32 = 6;
+    if t.tex_type == TYPE_LINEAR_STRIDED {
+        return 0.0;
+    }
+    (t.lod_bias as f32 - 31.0) / 8.0
+}
+
+/// The recompiler's `GxpTex` list for a captured binding set, derived once per frame per
     /// set. See [`RenderSceneBuilder::gxp_tex_sets`] for why once per frame is exactly what the
     /// per-draw derivation did.
     fn gxp_textures(
@@ -7363,7 +7382,11 @@ impl RenderSceneBuilder {
             .iter()
             .map(|t| {
                 keys.push(tex_key(t));
-                vitaslop_platform::gpu::GxpTex { unit: t.unit as u8, tex: self.texture(t, work) }
+                vitaslop_platform::gpu::GxpTex {
+                    unit: t.unit as u8,
+                    tex: self.texture(t, work),
+                    lod_bias: Self::texture_lod_bias_levels(t),
+                }
             })
             .collect();
         if self.gxp_tex_sets.len() >= GXP_SET_CACHE_CAP {
@@ -9603,6 +9626,21 @@ mod texture_tests {
     //! swizzled RGBA - no game data, no fixture. These pin the format/swizzle
     //! decode that the render output depends on.
     use super::*;
+
+    /// SWIZZLE2 names read high to low like every other GXM swizzle: `GRRR` is grey from the
+    /// low lane with coverage from the high one, so a black, opaque silhouette (low 0, high 255)
+    /// stays black AND opaque instead of turning transparent.
+    #[test]
+    fn swizzle2_reads_high_to_low() {
+        let (lo, hi) = (0x10, 0xf0);
+        assert_eq!(swizzle2(0, 255, 2), [0, 0, 0, 255], "GRRR: a black, opaque texel");
+        assert_eq!(swizzle2(lo, hi, 2), [lo, lo, lo, hi], "GRRR");
+        assert_eq!(swizzle2(lo, hi, 3), [hi, hi, hi, lo], "RGGG");
+        assert_eq!(swizzle2(lo, hi, 4), [lo, hi, lo, hi], "GRGR");
+        assert_eq!(swizzle2(lo, hi, 1), [lo, hi, 0, 0], "00GR");
+        assert_eq!(swizzle2(lo, hi, 5), [hi, lo, 0, 0], "00RG");
+        assert_eq!(swizzle2(lo, hi, 0), [lo, hi, 0, 255], "GR: red is the low lane, as in ABGR");
+    }
 
     /// `transcoded_source`, driven to COMPLETION the way a run drives it.
     ///

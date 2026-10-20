@@ -1673,6 +1673,28 @@ pub struct GuestCall {
     pub args: Vec<u32>,
 }
 
+/// One `sceKernelRegisterThreadEventHandler` registration.
+#[derive(Clone, Debug)]
+pub struct ThreadEventHandler {
+    pub uid: i32,
+    /// The thread it watches, or [`THREAD_EVENT_ALL_IN_PROCESS`].
+    pub target: i32,
+    /// `SceKernelThreadEventType` bits it asked for.
+    pub mask: u32,
+    pub handler: u32,
+    pub common: u32,
+}
+
+/// `SceKernelThreadEventType`: a thread starting / ending (psp2common/kernel/threadmgr.h).
+pub const THREAD_EVENT_START: u32 = 0x4;
+pub const THREAD_EVENT_EXIT: u32 = 0x8;
+/// The target id meaning "every thread in this process" (`SCE_KERNEL_THREAD_ID_PROCESS_ALL_ID`).
+pub const THREAD_EVENT_ALL_IN_PROCESS: i32 = 0x10027;
+
+/// The highest key `sceKernelGetTLSAddr` has a slot for: keys `0..=0x100` index one
+/// per-thread array of pointer slots.
+pub const TLS_KEY_MAX: u32 = 0x100;
+
 /// Bytes kept below the caller's stack pointer before a guest call's own frame starts.
 ///
 /// The call is made from inside a library function the title called, and a real library
@@ -9080,6 +9102,9 @@ pub struct VitaState {
     /// [`create_event_flag`](Self::create_event_flag)). Kept beside `event_flags` rather
     /// than in it so no waiter/set path pays for a string it never reads.
     event_flag_names: std::collections::BTreeMap<i32, String>,
+    /// Each event flag's creation `(attr, initPattern)`, for `sceKernelGetEventFlagInfo`. Kept
+    /// beside `event_flags` for the same reason as the names.
+    event_flag_params: std::collections::BTreeMap<i32, (u32, u32)>,
     /// One bit per open SceCommonDialog family (see `vita::services::DialogFamily`):
     /// set by `*DialogInit`, read by `*DialogGetStatus` (RUNNING for a short while, then
     /// FINISHED - see `vita::services::dialog_get_status`), cleared by `*DialogTerm`.
@@ -9176,6 +9201,12 @@ pub struct VitaState {
     /// `(callback thread, callback uid)` for every callback currently being delivered, so
     /// its return value can be applied when the delivery thread ends.
     kcb_threads: Vec<(i32, i32)>,
+    /// `sceKernelRegisterThreadEventHandler` registrations, in registration order.
+    thread_event_handlers: Vec<ThreadEventHandler>,
+    /// Threads whose EXIT handlers have been handed out ([`Self::thread_exit_event_calls`]):
+    /// each thread ends once, so a handler that itself calls `sceKernelExitThread`, or an
+    /// exit followed by the engine's own end-of-thread, does not run them again.
+    thread_exit_events_done: std::collections::HashSet<i32>,
     pending_spawns: Vec<Reentry>,
     /// Fiber threads and the REAL thread that first ran them: `(fiber thid, runner)`. A fiber
     /// is not a thread on the hardware - it runs on its caller's core at its caller's priority -
@@ -9281,11 +9312,16 @@ pub struct VitaState {
     /// The modules in the linked image (from [`crate::link::LinkedProgram`]), which
     /// is what the kernel's module queries answer from. Set once before the run.
     modules: Vec<crate::link::LoadedModule>,
-    /// Per-`(thread, key)` thread-local storage slots handed out by
-    /// `sceKernelGetTLSAddr`. Each is a distinct zero-initialized guest block whose
-    /// address is stable across calls, so a thread stores and reads back its own
-    /// TLS pointer faithfully.
-    tls_slots: Vec<((i32, u32), u32)>,
+    /// The title's function imports with no dispatch arm (from
+    /// [`crate::link::LinkedProgram::unhandled_imports`]), so the report of the one that
+    /// stopped the run can name every other one the title could stop on.
+    unhandled_imports: Vec<(u32, u32)>,
+    /// Per-thread key-slot arrays behind `sceKernelGetTLSAddr`: `(thread, base)`, where key
+    /// `k` is the pointer slot at `base + 4*k`. ONE zero-initialized array per thread, not a
+    /// block per key: a caller may treat consecutive keys as one struct (a bundled libc keeps
+    /// a `{array, count, generation}` triple in three adjacent keys), so key `k+1` must be the
+    /// word after key `k`.
+    tls_slots: Vec<(i32, u32)>,
     /// The main executable's TLS template `(init image address, initialized byte
     /// count, full block size)`, from [`crate::link::LinkedProgram::tls_template`].
     /// Each thread gets a private block of `memsz` bytes; the compiler reaches
@@ -9372,6 +9408,11 @@ pub struct VitaState {
     /// words - see [`TextureExtra`]. Everything the sampler getters used to read from here now
     /// lives in the guest's `SceGxmTexture`, where the hardware keeps it.
     texture_extra: std::collections::HashMap<u32, TextureExtra>,
+    /// The byte stride of every `LINEAR_STRIDED` texture initialised, keyed by its control
+    /// words 1 and 2 (type, format and size; data address) rather than by the struct's address,
+    /// so a BY-VALUE COPY of the struct - which keeps those words - still finds it. See
+    /// [`Self::linear_strided_stride`].
+    strided_by_words: std::collections::HashMap<(u32, u32), u32>,
     /// Per-color-surface gamma-correction mode set by `sceGxmColorSurfaceSetGammaMode`, as
     /// `(SceGxmColorSurface*, data address, mode)`. Absent = SCE_GXM_COLOR_SURFACE_GAMMA_NONE.
     ///
@@ -9774,6 +9815,7 @@ impl VitaState {
             timers: Vec::new(),
             event_flags: Vec::new(),
             event_flag_names: std::collections::BTreeMap::new(),
+            event_flag_params: std::collections::BTreeMap::new(),
             open_dialogs: 0,
             dialog_opened_flip: [0; 16],
             fios_overlays: Vec::new(),
@@ -9809,6 +9851,8 @@ impl VitaState {
             join_waiters: Vec::new(),
             kcallbacks: Vec::new(),
             kcb_threads: Vec::new(),
+            thread_event_handlers: Vec::new(),
+            thread_exit_events_done: std::collections::HashSet::new(),
             pending_spawns: Vec::new(),
             spawn_near: Vec::new(),
             pending_wakes: Vec::new(),
@@ -9841,6 +9885,7 @@ impl VitaState {
             main_priority: DEFAULT_THREAD_PRIORITY,
             main_affinity: 0,
             modules: Vec::new(),
+            unhandled_imports: Vec::new(),
             tls_slots: Vec::new(),
             tls_template: (0, 0, 0),
             tls_bases: Vec::new(),
@@ -9858,6 +9903,7 @@ impl VitaState {
             nearby_texture_cache: FxHashMap::default(),
             texture_unit_scratch: Vec::new(),
             texture_extra: std::collections::HashMap::new(),
+            strided_by_words: std::collections::HashMap::new(),
             color_surface_gamma: FxHashMap::default(),
             color_surface_gamma_by_data: FxHashMap::default(),
             snaps_frames_pending: std::sync::atomic::AtomicU32::new(0),
@@ -10013,6 +10059,16 @@ impl VitaState {
         self.modules = modules;
     }
 
+    /// Record the linked image's unhandled function imports, for the unimplemented-NID report.
+    pub fn set_unhandled_imports(&mut self, imports: Vec<(u32, u32)>) {
+        self.unhandled_imports = imports;
+    }
+
+    /// The linked image's unhandled function imports - see [`Self::set_unhandled_imports`].
+    pub fn unhandled_imports(&self) -> &[(u32, u32)] {
+        &self.unhandled_imports
+    }
+
     /// The module whose segments contain `addr`, and its SceUID, or `None` if the
     /// address is in no loaded module (guest heap, a stack, a memory block).
     ///
@@ -10066,30 +10122,37 @@ impl VitaState {
         (self.tls_template.0, self.tls_template.1)
     }
 
-    /// The stable guest address of TLS slot `key` for the currently running thread,
-    /// allocating a fresh zero-initialized 4-byte pointer slot on first use. Guest
-    /// memory starts zeroed, so a never-written slot reads back as NULL.
-    pub fn tls_addr(&mut self, key: u32) -> u32 {
+    /// The stable guest address of TLS slot `key` for the currently running thread (see
+    /// [`tls_addr_of`](Self::tls_addr_of)).
+    pub fn tls_addr(&mut self, key: u32) -> Option<u32> {
         let current = self.current;
         self.tls_addr_of(current, key)
     }
 
-    /// The TLS slot of ANOTHER thread (`sceKernelGetThreadTLSAddr`); `thid` 0 is the
-    /// caller. Same table as [`tls_addr`](Self::tls_addr), so a slot a thread reads
-    /// through either call is the one slot.
-    pub fn tls_addr_of(&mut self, thid: i32, key: u32) -> u32 {
+    /// The TLS slot `key` of thread `thid` (`sceKernelGetThreadTLSAddr`; `thid` 0 is the
+    /// caller): word `key` of that thread's slot array, allocated zeroed on the thread's first
+    /// query, so a never-written slot reads back as NULL. `None` for a key past
+    /// [`TLS_KEY_MAX`], which has no slot.
+    pub fn tls_addr_of(&mut self, thid: i32, key: u32) -> Option<u32> {
+        if key > TLS_KEY_MAX {
+            return None;
+        }
         let thid = if thid == 0 { self.current } else { thid };
         // A fiber shares its runner's thread-local storage: on hardware it runs ON that
         // thread, so a slot it reads must be the same slot the runner writes.
         let thread = self.logical_thread(thid);
-        if let Some(&(_, addr)) = self.tls_slots.iter().find(|&&(k, _)| k == (thread, key)) {
-            return addr;
-        }
-        // A pointer-sized slot per key is what the low-level TLS API hands out; the
-        // caller stores its own per-thread pointer there.
-        let addr = self.galloc(4, 4);
-        self.tls_slots.push(((thread, key), addr));
-        addr
+        let base = match self.tls_slots.iter().find(|&&(t, _)| t == thread) {
+            Some(&(_, base)) => base,
+            None => {
+                let base = self.galloc((TLS_KEY_MAX + 1) * 4, 4);
+                if base == 0 {
+                    return None; // out of guest memory; galloc has already said so
+                }
+                self.tls_slots.push((thread, base));
+                base
+            }
+        };
+        Some(base + key * 4)
     }
 
     /// Delete a file from the virtual filesystem, reporting whether it was there.
@@ -11638,6 +11701,65 @@ impl VitaState {
         };
         top.results.push((call, GuestCallResult { r0, r1, bytes }));
         top.resume = true;
+    }
+
+    /// Record a `sceKernelRegisterThreadEventHandler` registration and return its id.
+    pub fn register_thread_event_handler(&mut self, target: i32, mask: u32, handler: u32, common: u32) -> i32 {
+        let uid = self.new_uid();
+        self.thread_event_handlers.push(ThreadEventHandler { uid, target, mask, handler, common });
+        uid
+    }
+
+    /// Whether `thid` is a thread the title created (`sceKernelCreateThread`).
+    pub fn thread_exists(&self, thid: i32) -> bool {
+        self.threads.iter().any(|t| t.uid == thid)
+    }
+
+    /// Drop a registration; false when `uid` names none.
+    pub fn unregister_thread_event_handler(&mut self, uid: i32) -> bool {
+        let before = self.thread_event_handlers.len();
+        self.thread_event_handlers.retain(|h| h.uid != uid);
+        self.thread_event_handlers.len() != before
+    }
+
+    /// Whether this dispatch is a REPLAY of a host call that already asked for a guest call
+    /// (see [`Self::call_guest`]) - read before the handler makes any guest call of its own.
+    pub fn guest_call_replaying(&self) -> bool {
+        self.guest_call_active.is_some()
+    }
+
+    /// Claim thread `thid`'s END for its EXIT handlers: true the first time, false after.
+    ///
+    /// The handlers run once per thread whichever way it ends - `sceKernelExitThread`, or
+    /// returning from its entry - and a handler that itself calls `sceKernelExitThread`
+    /// must end the thread rather than run the handlers again.
+    pub fn claim_thread_exit_events(&mut self, thid: i32) -> bool {
+        self.thread_exit_events_done.insert(thid)
+    }
+
+    /// The EXIT handler calls owed thread `thid` ending with `code`, in registration order:
+    /// `handler(SCE_KERNEL_THREAD_EVENT_TYPE_EXIT, thid, code, common)`, to be run ON that
+    /// thread (a C library's handler frees the ending thread's own TLS).
+    ///
+    /// Only threads the title created get them: the host's own delivery threads (a kernel
+    /// callback's, a display-queue callback's) are not threads the title knows about. Pure,
+    /// so a host call can rebuild the list on each replay.
+    ///
+    /// The handler's id rides as a fifth (stack) argument the handler never reads, so two
+    /// registrations of the same function with the same `common` are still two distinct
+    /// calls - [`Self::call_guest`] matches a replayed call by its arguments.
+    pub fn thread_exit_event_calls(&self, thid: i32, code: u32) -> Vec<GuestCall> {
+        if !self.thread_exists(thid) || self.kcb_threads.iter().any(|(t, _)| *t == thid) {
+            return Vec::new();
+        }
+        self.thread_event_handlers
+            .iter()
+            .filter(|h| h.mask & THREAD_EVENT_EXIT != 0 && (h.target == THREAD_EVENT_ALL_IN_PROCESS || h.target == thid))
+            .map(|h| GuestCall {
+                entry: h.handler,
+                args: vec![THREAD_EVENT_EXIT, thid as u32, code, h.common, h.uid as u32],
+            })
+            .collect()
     }
 
     /// Record a finished thread's return value (set by the engine host after the
@@ -14373,6 +14495,20 @@ impl VitaState {
         }
     }
 
+    /// Record an event flag's creation attributes, read back by [`Self::event_flag_info`].
+    pub fn record_event_flag_params(&mut self, uid: i32, attr: u32, init: u32) {
+        self.event_flag_params.insert(uid, (attr, init));
+    }
+
+    /// `(attr, initPattern, currentPattern, waiting threads)` of an event flag, or `None` for
+    /// a uid that names none.
+    pub fn event_flag_info(&self, uid: i32) -> Option<(u32, u32, u32, u32)> {
+        let &(_, current) = self.event_flags.iter().find(|(u, _)| *u == uid)?;
+        let (attr, init) = self.event_flag_params.get(&uid).copied().unwrap_or((0, 0));
+        let waiters = self.evf_waiters.iter().filter(|w| w.uid == uid).count() as u32;
+        Some((attr, init, current, waiters))
+    }
+
     /// The guest's name for an event flag, or `""`.
     pub fn event_flag_name(&self, uid: i32) -> &str {
         self.event_flag_names.get(&uid).map(String::as_str).unwrap_or("")
@@ -15657,7 +15793,7 @@ impl VitaState {
             let format = self.texture_format(b.addr);
             // The explicit row pitch `sceGxmTextureInitLinearStrided` was given - see
             // `build_texture_template`.
-            let byte_stride = self.texture_extra(b.addr).byte_stride;
+            let byte_stride = self.linear_strided_stride_of(b.addr, b.words);
             // Only for a handle with no format of its own: is there an initialised texture
             // NEARBY? A struct the guest inits at one address and binds at another (off by a
             // fixed member offset, or copied by value) is a completely different bug from one
@@ -15950,6 +16086,49 @@ impl VitaState {
         self.texture_extra_mut(texture_addr).byte_stride = byte_stride;
     }
 
+    /// Remember a just-initialised `LINEAR_STRIDED` texture's stride under its own control words
+    /// 1 and 2, which a by-value copy carries with it. Called after the words are written.
+    pub fn record_strided_words(&mut self, ctx: &GuestCtx, texture_addr: u32, byte_stride: u32) {
+        let key = (ctx.read_u32(texture_addr.wrapping_add(4)), ctx.read_u32(texture_addr.wrapping_add(8)) & !3);
+        self.strided_by_words.insert(key, byte_stride);
+    }
+
+    /// The explicit byte stride of the `LINEAR_STRIDED` texture at `texture_addr`, or 0 for one
+    /// that is not strided (derive the pitch from width x bytes-per-pixel).
+    ///
+    /// The stride cannot be read back out of the guest's words (see [`TextureExtra`]), so it is
+    /// found by the struct's address first and then by the words a copy keeps: a title that
+    /// inits a strided texture and binds a by-value copy of it - a material holding its own
+    /// `SceGxmTexture` - otherwise samples a render target at width x 4 instead of its real
+    /// pitch, every row shifting by the difference, and the frame turns to slanted stripes.
+    pub fn linear_strided_stride(&self, ctx: &GuestCtx, texture_addr: u32) -> u32 {
+        let words = [0, 4, 8, 12].map(|o| ctx.read_u32(texture_addr.wrapping_add(o)));
+        self.linear_strided_stride_of(texture_addr, words)
+    }
+
+    /// [`Self::linear_strided_stride`] for a binding whose control words were already read (at
+    /// bind time - the struct may since have been reused, so its memory is not re-read).
+    fn linear_strided_stride_of(&self, texture_addr: u32, words: [u32; 4]) -> u32 {
+        let own = self.texture_extra(texture_addr).byte_stride;
+        if own != 0 {
+            return own;
+        }
+        if (words[1] >> 29) & 0x7 != crate::vita::gxm::TYPE_LINEAR_STRIDED {
+            return 0;
+        }
+        let key = (words[1], words[2] & !3);
+        let found = self.strided_by_words.get(&key).copied();
+        if found.is_none() && tracing::enabled!(target: "vitaslop::texinit", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "vitaslop::texinit",
+                texture = format_args!("{texture_addr:#x}"), w1 = format_args!("{:#010x}", key.0),
+                w2 = format_args!("{:#010x}", key.1),
+                "a LINEAR_STRIDED texture with no recorded stride"
+            );
+        }
+        found.unwrap_or(0)
+    }
+
     /// Report the first `sceGxmTextureSetGammaMode` of a run.
     ///
     /// The mode itself is stored in the guest's control word 0 by the handler; this only says so
@@ -15975,9 +16154,9 @@ impl VitaState {
     /// alignment), compressed rows are block-packed - the same formula the capture
     /// decoder uses (`decode_texture`).
     pub fn texture_stride(&self, ctx: &GuestCtx, texture_addr: u32) -> u32 {
-        let e = self.texture_extra(texture_addr);
-        if e.byte_stride != 0 {
-            return e.byte_stride;
+        let strided = self.linear_strided_stride(ctx, texture_addr);
+        if strided != 0 {
+            return strided;
         }
         let w0 = ctx.read_u32(texture_addr);
         let w1 = ctx.read_u32(texture_addr.wrapping_add(4));
@@ -22773,6 +22952,14 @@ pub trait ImportDispatch {
         None
     }
 
+    /// Thread `thid` RETURNED from its entry with `code`: the guest calls to run on it,
+    /// in order, before it counts as ended (its EXIT event handlers - see
+    /// [`VitaState::thread_exit_event_calls`]). Claims the thread's end, so a second ask
+    /// returns nothing. A host with no handlers (default) has none.
+    fn thread_return_calls(&mut self, _thid: i32, _code: u32) -> Vec<GuestCall> {
+        Vec::new()
+    }
+
     /// Record the r0/r1 a guest call left, before the engine re-dispatches the host call
     /// that asked for it.
     fn guest_call_returned(&mut self, _thid: i32, _r0: u32, _r1: u32, _mem: &dyn GuestMemory, _base: u32) {}
@@ -23144,6 +23331,14 @@ impl ImportDispatch for VitaEnv {
 
     fn take_guest_call(&mut self, thid: i32) -> Option<GuestCall> {
         self.state.take_guest_call(thid)
+    }
+
+    fn thread_return_calls(&mut self, thid: i32, code: u32) -> Vec<GuestCall> {
+        if self.state.claim_thread_exit_events(thid) {
+            self.state.thread_exit_event_calls(thid, code)
+        } else {
+            Vec::new()
+        }
     }
 
     fn guest_call_returned(&mut self, thid: i32, r0: u32, r1: u32, mem: &dyn GuestMemory, base: u32) {
@@ -23557,6 +23752,10 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
 
     fn take_guest_call(&mut self, thid: i32) -> Option<GuestCall> {
         self.borrow_mut().take_guest_call(thid)
+    }
+
+    fn thread_return_calls(&mut self, thid: i32, code: u32) -> Vec<GuestCall> {
+        self.borrow_mut().thread_return_calls(thid, code)
     }
 
     fn guest_call_returned(&mut self, thid: i32, r0: u32, r1: u32, mem: &dyn GuestMemory, base: u32) {
@@ -26269,6 +26468,39 @@ mod strided_texture_tests {
         assert_eq!(lin.stride, 128 * 4);
     }
 
+    /// **A BY-VALUE COPY OF A STRIDED TEXTURE KEEPS ITS STRIDE.** The stride is held beside the
+    /// struct rather than in its words; a title that copies the 16 bytes into its own material and
+    /// binds the copy sampled a 992-pixel-pitch render target at 960 x 4, and every row slid 32
+    /// pixels into slanted stripes. The copy is found again by the words it carries.
+    #[test]
+    fn a_copied_strided_texture_keeps_its_stride() {
+        use crate::world::DeterministicWorld;
+        use crate::{SliceMemory, VFP_ARG_COUNT};
+        use vitaslop_transpiler::abi::REG_COUNT;
+        const ORIG: u32 = 0x100;
+        const COPY: u32 = 0x200;
+        let mut st = VitaState::new(0, 0x1000, Box::new(DeterministicWorld::default()));
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 0x1000];
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        // sceGxmTextureInitLinearStrided(tex, data, U8U8U8U8, 960, 544, stride 3968)
+        (ctx.regs[0], ctx.regs[1], ctx.regs[2], ctx.regs[3]) = (ORIG, 0x8000_0000, 0x0c00_0000, 960);
+        ctx.regs[13] = 0x800;
+        ctx.write_u32(0x800, 544);
+        ctx.write_u32(0x804, 3968);
+        crate::vita::dispatch(crate::nid::lib::SCE_GXM, crate::nid::gxm::TEXTURE_INIT_LINEAR_STRIDED, &mut ctx, &mut st);
+        assert_eq!(st.linear_strided_stride(&ctx, ORIG), 3968, "the struct it was given");
+        let words = ctx.read_bytes(ORIG, 16);
+        ctx.write_bytes(COPY, &words);
+        assert_eq!(st.linear_strided_stride(&ctx, COPY), 3968, "a by-value copy");
+        assert_eq!(st.texture_stride(&ctx, COPY), 3968, "and sceGxmTextureGetStride on it");
+        // A linear texture over the same data takes no stride from the strided one.
+        ctx.write_u32(COPY + 4, (ctx.read_u32(COPY + 4) & !(0x7 << 29)) | (3 << 29));
+        assert_eq!(st.linear_strided_stride(&ctx, COPY), 0);
+    }
+
     /// **A STRIDED TEXTURE MINIFIES WITH ITS MAG FILTER**: its bits 10..11 are stride bits. The
     /// type selector for LINEAR_STRIDED is 6 - it was compared against 1, no type at all.
     #[test]
@@ -26334,4 +26566,38 @@ pub fn timed_out_waits() -> (Vec<String>, u64) {
         TIMED_OUT.lock().map(|v| v.clone()).unwrap_or_default(),
         TIMED_OUT_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+#[cfg(test)]
+mod tls_slot_tests {
+    //! The key-slot layout behind `sceKernelGetTLSAddr`: callers index it like an array.
+    use super::*;
+    use crate::world::DeterministicWorld;
+
+    fn state() -> VitaState {
+        VitaState::new(0x1000, 0x10000, Box::new(DeterministicWorld::default()))
+    }
+
+    /// Consecutive keys are consecutive words of ONE per-thread array: a caller that keeps a
+    /// struct in adjacent keys reads its own fields, not whatever was allocated next.
+    #[test]
+    fn consecutive_keys_are_consecutive_words_of_one_array_per_thread() {
+        let mut st = state();
+        let a = st.tls_addr_of(0x40, 0x8c).unwrap();
+        assert_eq!(st.tls_addr_of(0x40, 0x8d), Some(a + 4));
+        assert_eq!(st.tls_addr_of(0x40, 0x8e), Some(a + 8));
+        assert_eq!(st.tls_addr_of(0x40, 0), Some(a - 0x8c * 4), "key 0 is the array base");
+        assert_eq!(st.tls_addr_of(0x40, 0x8c), Some(a), "stable across calls");
+        let b = st.tls_addr_of(0x41, 0x8c).unwrap();
+        assert_ne!(a, b, "each thread has its own array");
+        assert!(b.abs_diff(a) >= (TLS_KEY_MAX + 1) * 4, "the arrays do not overlap");
+    }
+
+    /// The last key has a slot; the one past it is refused rather than handed memory nobody owns.
+    #[test]
+    fn a_key_past_the_last_slot_is_refused() {
+        let mut st = state();
+        assert!(st.tls_addr_of(0x40, TLS_KEY_MAX).is_some());
+        assert_eq!(st.tls_addr_of(0x40, TLS_KEY_MAX + 1), None);
+    }
 }

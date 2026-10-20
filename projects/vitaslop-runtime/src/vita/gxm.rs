@@ -2454,7 +2454,7 @@ pub(super) const TYPE_CUBE: u32 = 2; // 0x4000_0000 >> 29
 pub(super) const TYPE_LINEAR: u32 = 3; // 0x6000_0000 >> 29
 pub(super) const TYPE_TILED: u32 = 4; // 0x8000_0000 >> 29
 pub(super) const TYPE_SWIZZLED_ARBITRARY: u32 = 5; // 0xA000_0000 >> 29
-pub(super) const TYPE_LINEAR_STRIDED: u32 = 6; // 0xC000_0000 >> 29
+pub(crate) const TYPE_LINEAR_STRIDED: u32 = 6; // 0xC000_0000 >> 29
 pub(super) const TYPE_CUBE_ARBITRARY: u32 = 7; // 0xE000_0000 >> 29
 
 /// void sceGxmSetFragmentTexture(context, unsigned int textureIndex, const
@@ -2516,6 +2516,15 @@ pub(super) fn texture_init(ctx: &mut GuestCtx, st: &mut VitaState, type_field: u
         data,
         (!strided).then_some(mip_or_stride),
     );
+    if strided {
+        st.record_strided_words(ctx, texture, mip_or_stride);
+        tracing::debug!(
+            target: "vitaslop::texinit",
+            texture = format_args!("{texture:#x}"), data = format_args!("{data:#x}"),
+            width, height, byte_stride = mip_or_stride,
+            "sceGxmTextureInitLinearStrided"
+        );
+    }
     st.set_texture_format(texture, tex_format);
     ctx.ret(0);
 }
@@ -3972,14 +3981,16 @@ pub(super) fn program_get_size(ctx: &mut GuestCtx, _st: &mut VitaState, program:
     ctx.read_u32(program.wrapping_add(0x08))
 }
 
-/// const SceGxmProgramParameter *_sceGxmProgramFindParameterBySemantic(
+/// const SceGxmProgramParameter *sceGxmProgramFindParameterBySemantic(
 ///     const SceGxmProgram *program, SceGxmParameterSemantic semantic, unsigned int index)
 ///
-/// The counterpart of `sceGxmProgramFindParameterByName` for a title that builds its
-/// vertex-attribute array from semantics rather than names. Walks the same parameter
-/// table and returns the first entry whose packed semantic word matches - the semantic
-/// in the LOW byte, its index in the high one (see [`param_get_semantic`]). Null when
-/// nothing matches, which is what the API returns and what a caller tests for.
+/// (and its `_`-prefixed export, the same function.) The counterpart of
+/// `sceGxmProgramFindParameterByName` for a title that builds its vertex-attribute array
+/// from semantics rather than names. Walks the same parameter table and returns the first
+/// entry whose packed semantic word matches - the semantic in the LOW byte, its index in the
+/// high one (see [`param_get_semantic`]). Null when nothing matches, which is what the API
+/// returns and what a caller tests for - and for `SCE_GXM_PARAMETER_SEMANTIC_NONE`, which
+/// names no parameter (every non-attribute carries a zero semantic word).
 #[hostcall]
 pub(super) fn find_parameter_by_semantic(
     ctx: &mut GuestCtx,
@@ -3988,12 +3999,12 @@ pub(super) fn find_parameter_by_semantic(
     semantic: u32,
     index: u32,
 ) -> u32 {
-    let count = ctx.read_u32(program.wrapping_add(0x24));
+    let count = if semantic == 0 { 0 } else { ctx.read_u32(program.wrapping_add(0x24)) };
     let base = program.wrapping_add(0x28).wrapping_add(ctx.read_u32(program.wrapping_add(0x28)));
-    let want = (semantic & 0xff) | ((index & 0xff) << 8);
+    let want = (semantic & GXM_SEMANTIC_MASK) | ((index & 0xff) << GXM_SEMANTIC_INDEX_SHIFT);
     (0..count)
         .map(|i| base.wrapping_add(i.wrapping_mul(16)))
-        .find(|&p| (ctx.read_u32(p.wrapping_add(4)) >> 16) & 0xffff == want)
+        .find(|&p| param_semantic_word(ctx, p) == want)
         .unwrap_or(0)
 }
 
@@ -5793,6 +5804,50 @@ mod semantic_tests {
         let semantic = handler_result_over(g::PROGRAM_PARAMETER_GET_SEMANTIC, record(word));
         let index = handler_result_over(g::PROGRAM_PARAMETER_GET_SEMANTIC_INDEX, record(word));
         assert_eq!(semantic | (index << 8), word as u32, "the two fields reassemble the word");
+    }
+
+    /// `FindParameterBySemantic(program, semantic, index)` over a program whose parameter
+    /// table holds `words` (one record each), through `func_nid`.
+    fn find_over(func_nid: u32, words: &[u16], semantic: u32, index: u32) -> u32 {
+        use crate::host::VitaState;
+        use crate::world::DeterministicWorld;
+        use crate::{SliceMemory, VFP_ARG_COUNT};
+        use vitaslop_transpiler::abi::REG_COUNT;
+        const PROGRAM: u32 = 0x100;
+        let table = PROGRAM + 0x40;
+        let mut bytes = vec![0u8; 4096];
+        let mut put = |at: u32, w: u32| bytes[at as usize..at as usize + 4].copy_from_slice(&w.to_le_bytes());
+        put(PROGRAM + 0x24, words.len() as u32);
+        put(PROGRAM + 0x28, table - (PROGRAM + 0x28)); // self-relative, like every program offset
+        for (i, &w) in words.iter().enumerate() {
+            for (j, v) in record(w).into_iter().enumerate() {
+                put(table + i as u32 * 16 + j as u32 * 4, v);
+            }
+        }
+        let mut regs = [0u32; REG_COUNT];
+        (regs[0], regs[1], regs[2]) = (PROGRAM, semantic, index);
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        super::super::dispatch(crate::nid::lib::SCE_GXM, func_nid, &mut ctx, &mut st);
+        regs[0]
+    }
+
+    /// Both exports find the record whose semantic AND index match, null when none does, and
+    /// null for SEMANTIC_NONE even though a non-attribute record carries a zero word.
+    #[test]
+    fn find_by_semantic_matches_semantic_and_index_through_either_export() {
+        let table = 0x140;
+        let words = [0x000b, 0x000e, 0x010e, 0x0000];
+        for nid in [g::PROGRAM_FIND_PARAMETER_BY_SEMANTIC, g::PROGRAM_FIND_PARAMETER_BY_SEMANTIC_PUBLIC] {
+            assert_eq!(find_over(nid, &words, POSITION, 0), table);
+            assert_eq!(find_over(nid, &words, TEXCOORD, 0), table + 16);
+            assert_eq!(find_over(nid, &words, TEXCOORD, 1), table + 32);
+            assert_eq!(find_over(nid, &words, TEXCOORD, 2), 0, "no such index");
+            assert_eq!(find_over(nid, &words, NORMAL, 0), 0, "no such semantic");
+            assert_eq!(find_over(nid, &words, 0, 0), 0, "SEMANTIC_NONE names no parameter");
+        }
     }
 }
 

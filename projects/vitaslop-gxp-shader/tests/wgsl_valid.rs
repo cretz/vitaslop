@@ -133,7 +133,7 @@ fn texture_sample_produces_valid_wgsl() {
         instrs: vec![instr(Op::Tex { unit: 3, coords: 2, coord_half: false, lod: TexLod::Implicit }, Operand::plain(Bank::Output, 0, 1), vec![coord], [true; 4])],
     };
     let body = emit_fragment(&sh).unwrap();
-    assert!(body.contains("textureSample(t3, s3,"), "tex emit:\n{body}");
+    assert!(body.contains("textureSampleBias(t3, s3,"), "tex emit:\n{body}");
     assert_eq!(tex_units(&sh, |_| false), vec![TexBinding { unit: 3, coords: 2, cube: false, raw: false }]);
     validate_with(&body, &tex_units(&sh, |_| false));
 
