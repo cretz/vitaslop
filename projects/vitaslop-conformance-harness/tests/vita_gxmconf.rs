@@ -47,7 +47,7 @@ const HALF_W: u32 = W / 2;
 
 /// The scenes the app emits, in order, with what each exists to check. Kept beside the
 /// assertions because a scene index on its own says nothing about what failed.
-const SCENES: [&str; 18] = [
+const SCENES: [&str; 19] = [
     "baseline: one quad over the whole viewport",
     "region clip: the same quad clipped to the left half",
     "above the viewport: a quad entirely past y = +1",
@@ -66,6 +66,7 @@ const SCENES: [&str; 18] = [
     "SetFormat then COPY: a U2F10F10F10 cube re-formatted A8B8G8R8, sampled through a copy of its struct",
     "quadrants: red / green / blue / yellow into a 64x64 target",
     "sub-rectangle: a 32x32 strided texture naming the bottom-right quadrant, sampled at uv 0.25: yellow",
+    "default uniform buffers set under ANOTHER program: left green (vertex stage), right blue (fragment stage)",
 ];
 
 /// Is this pixel something other than the clear colour?

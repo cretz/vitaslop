@@ -5503,6 +5503,7 @@ fn rtt_substitute(image: &Framebuffer, proto: &BoundTexture) -> BoundTexture {
         u_addr_mode: proto.u_addr_mode,
         v_addr_mode: proto.v_addr_mode,
         lod_bias: proto.lod_bias,
+        lod_min: proto.lod_min,
         min_filter: proto.min_filter,
         mag_filter: proto.mag_filter,
         mip_filter: proto.mip_filter,
@@ -6153,6 +6154,7 @@ fn tex_key(t: &BoundTexture) -> u64 {
     // of the same image the FIRST binding's filter and wrap modes.
     mix((t.mag_filter as u64) << 32 | t.min_filter as u64);
     mix((t.u_addr_mode as u64) << 32 | t.v_addr_mode as u64);
+    mix(t.lod_min as u64);
     // GAMMA belongs here for the same reason: it does not change the decoded bytes, but it
     // changes the FORMAT they are uploaded through (sRGB decodes on fetch), so two bindings of
     // one image differing only in gamma must not share a cache entry.
@@ -7722,6 +7724,7 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
             filter_linear,
             addr_mode_u: t.u_addr_mode,
             addr_mode_v: t.v_addr_mode,
+            lod_min: t.lod_min,
             gamma: t.gamma != 0,
             compressed,
             // The guest's own bytes for a texture whose decode is a permutation, so the
@@ -9175,6 +9178,7 @@ mod geometry_tests {
             u_addr_mode: 0,
             v_addr_mode: 0,
             lod_bias: 0,
+            lod_min: 0,
             min_filter: 0,
             mag_filter: 0,
             mip_filter: 0,
@@ -9522,7 +9526,7 @@ mod supersample_tests {
             unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 1, height: 1, stride: 4,
             faces: 1, face_bytes: 4, levels: 1,
             pixels: vec![200, 100, 50, 255].into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0,
-            lod_bias: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0,
+            lod_bias: 0, lod_min: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0,
         };
         let draw = Draw {
             fragment_program_header: 0,
@@ -9573,7 +9577,7 @@ mod supersample_tests {
             pixels_id: crate::capture::next_pixels_id(),
             unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: tw, height: th, stride: tw * 4,
             faces: 1, face_bytes: tw * th * 4, levels: 1,
-            pixels: pixels.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0,
+            pixels: pixels.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, lod_min: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0,
         };
         // A full-frame Pixel-space quad over a 32px frame, uv 0..1 across the 64px checker, so
         // it is minified 2x - the aliasing regime one sample per pixel cannot resolve.
@@ -9755,6 +9759,7 @@ mod texture_tests {
             u_addr_mode: 0,
             v_addr_mode: 0,
             lod_bias: 0,
+            lod_min: 0,
             min_filter: 0,
             mag_filter: 0,
             mip_filter: 0,
@@ -10450,7 +10455,7 @@ mod texture_tests {
     // SWIZZLED = 0), so the block-compressed / swizzled paths can be exercised.
     fn tex_typed(base_format: u32, tex_type: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
         let face_bytes = pixels.len() as u32;
-        BoundTexture { pixels_id: crate::capture::next_pixels_id(), unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, faces: 1, face_bytes, levels: 1, data_addr: 0, pixels: pixels.into(), u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0 }
+        BoundTexture { pixels_id: crate::capture::next_pixels_id(), unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, faces: 1, face_bytes, levels: 1, data_addr: 0, pixels: pixels.into(), u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, lod_min: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0 }
     }
 
     #[test]

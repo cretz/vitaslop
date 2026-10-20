@@ -1068,15 +1068,27 @@ fn write_color_surface(ctx: &mut GuestCtx, addr: u32, s: &ColorSurface) {
 ///
 /// The layout is [`texture_init`]'s, so a title that binds this texture and one that binds a
 /// texture it built by hand over the same memory go down exactly the same path. A surface whose
-/// stride differs from its width is LINEAR_STRIDED (that is what the layout means); otherwise
-/// plain LINEAR.
+/// pitch is not the one a LINEAR texture of its width has (the width rounded up to 8 texels) is
+/// LINEAR_STRIDED, with the surface's own pitch in bytes packed into the words; otherwise plain
+/// LINEAR.
 fn write_background_tex(ctx: &mut GuestCtx, addr: u32, s: &ColorSurface) {
     report_background_tex_had_data(ctx, addr);
     let tex_format = color_format_to_texture_format(s.format);
     let base_format = (tex_format >> 24) & 0xff;
     let swizzle = (tex_format >> 12) & 0x7;
-    let type_field =
-        if s.stride_pixels != 0 && s.stride_pixels != s.width { TYPE_LINEAR_STRIDED } else { TYPE_LINEAR };
+    let texel_bytes = match crate::render::block_layout(base_format) {
+        Some((1, 1, bytes)) => bytes,
+        _ => 4,
+    };
+    let byte_stride = s.stride_pixels * texel_bytes;
+    let type_field = if s.stride_pixels != 0
+        && s.stride_pixels != s.width.next_multiple_of(8)
+        && byte_stride <= MAX_PACKED_STRIDE
+    {
+        TYPE_LINEAR_STRIDED
+    } else {
+        TYPE_LINEAR
+    };
     write_texture_control_words(
         ctx,
         addr,
@@ -1087,8 +1099,8 @@ fn write_background_tex(ctx: &mut GuestCtx, addr: u32, s: &ColorSurface) {
         s.height,
         s.data_addr,
         // A colour surface's background texture is a single image - a render target has no mip
-        // chain - so one level, and `None` for the strided case where those bits are the stride.
-        (type_field != TYPE_LINEAR_STRIDED).then_some(1),
+        // chain - so one level, or the pitch for the strided case, whose word 0 carries that.
+        if type_field == TYPE_LINEAR_STRIDED { Level0::Stride(byte_stride) } else { Level0::Mips(1) },
     );
 }
 
@@ -1129,6 +1141,13 @@ fn report_background_tex_had_data(ctx: &mut GuestCtx, addr: u32) {
 /// words alone (which is what happens once a title COPIES the struct) silently becomes a
 /// different format, and every compressed format plus `U2F10F10F10` is above 0x7f.
 #[allow(clippy::too_many_arguments)]
+/// What a texture's sixth init argument was: a mip count, or a `LINEAR_STRIDED` byte stride.
+#[derive(Clone, Copy)]
+enum Level0 {
+    Mips(u32),
+    Stride(u32),
+}
+
 fn write_texture_control_words(
     ctx: &mut GuestCtx,
     addr: u32,
@@ -1138,19 +1157,24 @@ fn write_texture_control_words(
     width: u32,
     height: u32,
     data: u32,
-    // `mipCount` as the guest passed it to `sceGxmTextureInit*`, or `None` for a
-    // `LINEAR_STRIDED` texture, where the same argument is a byte stride and these bits belong
-    // to the stride field instead (see [`texword0`]).
-    mip_count: Option<u32>,
+    // `mipCount` as the guest passed it to `sceGxmTextureInit*`, or the byte stride of a
+    // `LINEAR_STRIDED` texture, whose word 0 carries that instead (see [`pack_linear_stride`]).
+    level0: Level0,
 ) {
-    // Word 0's sampler fields are all left ZERO here, which is not a shortcut: GXM's defaults
-    // for every one of them IS zero - REPEAT addressing, POINT filtering, mip filter disabled,
-    // lod bias 0, gamma off - so a freshly initialised texture reads back the documented
-    // defaults from its own control word with nothing else written.
-    let mip = mip_count.map_or(0, |n| {
-        let (shift, mask) = texword0::MIP_COUNT;
-        (n & mask) << shift
-    });
+    // Word 0's sampler fields are left ZERO here, which is not a shortcut: GXM's default for
+    // each of them IS zero - REPEAT addressing, POINT filtering, mip filter disabled, gamma off.
+    // The ONE exception is the LOD bias: its field is excess-31 (`(raw - 31) / 8` levels), so
+    // "no bias" is raw 31 and that is what init writes. Left zero, every texture a title never
+    // calls `sceGxmTextureSetLodBias` on would sample 3.875 mip levels too sharp. A
+    // `LINEAR_STRIDED` texture has no bias field - those bits are its stride.
+    let mip = match level0 {
+        Level0::Mips(n) => {
+            let (mip_shift, mip_mask) = texword0::MIP_COUNT;
+            let (bias_shift, _) = texword0::LOD_BIAS;
+            ((n & mip_mask) << mip_shift) | (LOD_BIAS_NONE << bias_shift)
+        }
+        Level0::Stride(byte_stride) => pack_linear_stride(byte_stride),
+    };
     let w0 = (((base_format >> 7) & 1) << 31) | mip;
     let w1 = (height.saturating_sub(1) & 0xfff)
         | ((width.saturating_sub(1) & 0xfff) << 12)
@@ -1748,6 +1772,8 @@ fn report_unknown_program_handle(call: &str, handle: u32, program: u32) {
 /// `SCE_GXM_ERROR_INVALID_VALUE` (`psp2/gxm.h`): an argument that is not a thing this
 /// context knows about.
 const SCE_GXM_ERROR_INVALID_VALUE: i32 = 0x805B_0003u32 as i32;
+/// `SCE_GXM_ERROR_INVALID_ALIGNMENT` (`psp2/gxm.h`).
+const SCE_GXM_ERROR_INVALID_ALIGNMENT: i32 = 0x805B_0005u32 as i32;
 
 /// int sceGxmShaderPatcherGetVertexProgramRefCount(patcher, vertexProgram, uint *count)
 /// int sceGxmShaderPatcherGetFragmentProgramRefCount(patcher, fragmentProgram, uint *count)
@@ -2490,19 +2516,23 @@ pub(super) fn texture_init(ctx: &mut GuestCtx, st: &mut VitaState, type_field: u
     let width = ctx.arg(3);
     let height = ctx.arg(4);
 
-    // The 6th argument is `mipCount` for every layout except LINEAR_STRIDED, where it
-    // is the explicit byte stride. Record it so GetMipmapCountUnsafe / GetStride read
-    // back the exact value the guest passed.
-    // The BYTE STRIDE stays in the host shadow. It is the one field of word 0 that cannot move
-    // into the guest's words: a `LINEAR_STRIDED` texture spreads its stride over `stride_ext`,
-    // `stride_low` and `stride`, and how those three COMPOSE is not published - the header names
-    // them "stride extension" and "internal stride lower bits" and stops there. Packing it would
-    // mean inventing the composition, so `sceGxmTextureGetStride` still reads what the guest
-    // passed. `mipCount` DOES move, for every layout that has the field.
+    // The 6th argument is `mipCount` for every layout except LINEAR_STRIDED, where it is the
+    // explicit byte stride - packed into word 0 (see [`pack_linear_stride`]), so it travels with
+    // the struct and `sceGxmTextureGetStride` reads it back out of the words.
     let mip_or_stride = ctx.arg(5);
     let strided = type_field == TYPE_LINEAR_STRIDED;
-    if strided {
-        st.set_texture_stride(texture, mip_or_stride);
+    if strided && (!mip_or_stride.is_multiple_of(4) || !(4..=MAX_PACKED_STRIDE).contains(&mip_or_stride)) {
+        // Word 0 holds 13 bits of `stride / 4 - 1`; where a larger stride's top bits go is not
+        // known. Refused loudly rather than truncated into a texture that samples the wrong rows
+        // - a title that reaches this is the evidence for where those bits live.
+        tracing::error!(
+            target: "vitaslop::warning",
+            texture = format_args!("{texture:#x}"), byte_stride = mip_or_stride,
+            "sceGxmTextureInitLinearStrided: a byte stride that is not a multiple of 4 in 4..={MAX_PACKED_STRIDE} \
+             cannot be packed into the control words - refused"
+        );
+        ctx.ret((if !mip_or_stride.is_multiple_of(4) { SCE_GXM_ERROR_INVALID_ALIGNMENT } else { SCE_GXM_ERROR_INVALID_VALUE }) as u32);
+        return;
     }
 
     write_texture_control_words(
@@ -2514,10 +2544,9 @@ pub(super) fn texture_init(ctx: &mut GuestCtx, st: &mut VitaState, type_field: u
         width,
         height,
         data,
-        (!strided).then_some(mip_or_stride),
+        if strided { Level0::Stride(mip_or_stride) } else { Level0::Mips(mip_or_stride) },
     );
     if strided {
-        st.record_strided_words(ctx, texture, mip_or_stride);
         tracing::debug!(
             target: "vitaslop::texinit",
             texture = format_args!("{texture:#x}"), data = format_args!("{data:#x}"),
@@ -3078,10 +3107,10 @@ pub(super) fn param_get_semantic_index(ctx: &mut GuestCtx, _st: &mut VitaState, 
 ///   unobservable through the API: every path that can see it goes through our own writer and
 ///   reader, and both choices satisfy `Set(n)` then `Get() == n` and survive a struct copy.
 ///   Stored raw, and this comment is the record of the ambiguity.
-/// - `byte_stride` for a `LINEAR_STRIDED` texture is spread over `stride_ext`, `stride_low` and
-///   `stride`, and how those three COMPOSE is not published ("stride extension", "internal
-///   stride lower bits"). That one stays in the host shadow, because packing it would mean
-///   inventing the composition - see [`VitaState::texture_stride`].
+/// - `byte_stride` for a `LINEAR_STRIDED` texture is packed into the mip filter, min filter,
+///   mip count and LOD bias fields, which such a texture does not have - see
+///   [`pack_linear_stride`]. Only 13 bits of it fit; where a stride above
+///   [`MAX_PACKED_STRIDE`] keeps its top bits is not known, so init refuses one.
 /// Control word 3, from vitasdk `gxm.h struct SceGxmTexture` (an approved permissive
 /// reference), declared LSB-first:
 ///
@@ -3120,6 +3149,36 @@ mod texword0 {
     pub const MIP_COUNT: (u32, u32) = (17, 0xf);
     pub const LOD_BIAS: (u32, u32) = (21, 0x3f);
     pub const GAMMA_MODE: (u32, u32) = (27, 0x3);
+}
+
+/// The raw `lod_bias` that means NO bias (the field is excess-31) - what texture init writes.
+const LOD_BIAS_NONE: u32 = 31;
+
+/// The largest byte stride word 0 can carry: 13 bits of `stride / 4 - 1`.
+pub(crate) const MAX_PACKED_STRIDE: u32 = 1 << 15;
+
+/// A `LINEAR_STRIDED` texture's byte stride as word-0 bits. There is no stride field: the
+/// stride in words minus one, `E`, is spread over four SAMPLER fields that such a texture does
+/// not have - E bit 0 in the mip filter, bits 1-2 in the min filter, bits 3-6 in the mip count
+/// and bits 7-12 in the LOD bias. So the stride travels inside the 16 bytes, and a by-value copy
+/// of the struct samples at the same pitch as the original.
+pub(crate) fn pack_linear_stride(byte_stride: u32) -> u32 {
+    let e = (byte_stride >> 2).wrapping_sub(1) & 0x1fff;
+    ((e & 1) << texword0::MIP_FILTER.0)
+        | (((e >> 1) & 3) << texword0::MIN_FILTER.0)
+        | (((e >> 3) & 0xf) << texword0::MIP_COUNT.0)
+        | (((e >> 7) & 0x3f) << texword0::LOD_BIAS.0)
+}
+
+/// The inverse of [`pack_linear_stride`]: the byte stride a strided texture's word 0 carries.
+/// Meaningless for any other type, whose same bits are real sampler state.
+pub(crate) fn linear_stride_from_word0(w0: u32) -> u32 {
+    let field = |(shift, mask): (u32, u32)| (w0 >> shift) & mask;
+    let e = field(texword0::MIP_FILTER)
+        | (field(texword0::MIN_FILTER) << 1)
+        | (field(texword0::MIP_COUNT) << 3)
+        | (field(texword0::LOD_BIAS) << 7);
+    (e + 1) * 4
 }
 
 /// Read one field of a texture's control word 0.
@@ -5449,6 +5508,43 @@ mod texture_inline_tests {
             0xDEAD_0004,
             0xDEAD_0008,
         ]
+    }
+
+    /// Control words a `sceGxmTextureInit*` writes for a 64x32 RGBA8 texture with `arg5` as its
+    /// sixth argument (`mipCount`, or the byte stride for `LINEAR_STRIDED`).
+    fn init_words(init_nid: u32, arg5: u32) -> [u32; 4] {
+        const SP: u32 = 0x800;
+        let mut regs = [0u32; REG_COUNT];
+        regs[..4].copy_from_slice(&[PARAM, 0x1000, 0x0C00_1000, 64]);
+        regs[vitaslop_transpiler::abi::SP] = SP;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 4096];
+        bytes[SP as usize..SP as usize + 4].copy_from_slice(&32u32.to_le_bytes());
+        bytes[SP as usize + 4..SP as usize + 8].copy_from_slice(&arg5.to_le_bytes());
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        let mut mem = SliceMemory(&mut bytes);
+        {
+            let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            super::super::dispatch(crate::nid::lib::SCE_GXM, init_nid, &mut ctx, &mut st);
+        }
+        [0, 4, 8, 12].map(|o| u32::from_le_bytes(bytes[PARAM as usize + o..PARAM as usize + o + 4].try_into().unwrap()))
+    }
+
+    /// A freshly initialised texture carries NO LOD bias: the field is excess-31, so init writes
+    /// raw 31, which the renderer's `(raw - 31) / 8` reads as 0.0 levels. Raw 0 would be
+    /// -3.875 levels on every texture whose title never calls `sceGxmTextureSetLodBias`.
+    #[test]
+    fn a_new_texture_has_no_lod_bias() {
+        let (shift, mask) = texword0::LOD_BIAS;
+        for nid in [g::TEXTURE_INIT_LINEAR, g::TEXTURE_INIT_SWIZZLED, g::TEXTURE_INIT_TILED] {
+            let w = init_words(nid, 1);
+            let raw = (w[0] >> shift) & mask;
+            assert_eq!(raw, LOD_BIAS_NONE, "init {nid:#x} wrote lod_bias {raw}");
+            assert_eq!(inline_op(g::TEXTURE_GET_LOD_BIAS).expect("inline getter").eval(w[0]), 31);
+        }
+        // A strided texture's bits there are its stride, so init leaves the bias field alone.
+        let w = init_words(g::TEXTURE_INIT_LINEAR_STRIDED, 256);
+        assert_eq!((w[0] >> shift) & mask, 0, "a strided init must not write a bias");
     }
 
     /// The word an inline form reads out of [`texture_record`], at its own offset.

@@ -48,8 +48,9 @@ use std::sync::Arc;
 /// - and a capsule is a scratch artifact recaptured in seconds, so the version is bumped
 /// rather than the reader taught two layouts. Version 3 added the FRAGMENT stage's
 /// guest-memory windows beside the vertex stage's. Version 4 added the vertex program the
-/// fragment was PATCHED against (`Draw::fprog_patched_vprog`).
-const MAGIC: &[u8; 8] = b"VSCAPS\x00\x04";
+/// fragment was PATCHED against (`Draw::fprog_patched_vprog`). Version 5 added each texture's
+/// LOD min (`BoundTexture::lod_min`).
+const MAGIC: &[u8; 8] = b"VSCAPS\x00\x05";
 
 /// What a capsule cannot answer. Printed by the replay tool every time - a limitation nobody
 /// reads is a limitation nobody applies.
@@ -112,6 +113,9 @@ struct Slim {
     next: u32,
     /// Reading: blob id -> its bytes, shared by every field that references it.
     read: Vec<Arc<[u8]>>,
+    /// Reading: one minted `pixels_id` per shared pixel buffer (by its address, which is stable
+    /// while `read` holds it), so every draw of one texture is ONE texture to the renderer.
+    pixel_ids: std::collections::HashMap<usize, u64>,
 }
 thread_local! {
     static SLIM: std::cell::RefCell<Option<Slim>> = const { std::cell::RefCell::new(None) };
@@ -233,7 +237,7 @@ fn w_tex(o: &mut impl Write, t: &BoundTexture) -> io::Result<()> {
         w_u32(o, v)?;
     }
     w_bytes(o, &t.pixels)?;
-    for v in [t.u_addr_mode, t.v_addr_mode, t.lod_bias, t.min_filter, t.mag_filter, t.mip_filter, t.gamma] {
+    for v in [t.u_addr_mode, t.v_addr_mode, t.lod_bias, t.lod_min, t.min_filter, t.mag_filter, t.mip_filter, t.gamma] {
         w_u32(o, v)?;
     }
     Ok(())
@@ -246,8 +250,13 @@ fn r_tex(i: &mut impl Read) -> io::Result<BoundTexture> {
     Ok(BoundTexture {
         unit,
         // Replayed from a capsule: a buffer this process just built, so it is minted like any
-        // other. A capsule replays ONE draw, so nothing downstream is comparing it to another.
-        pixels_id: crate::capture::next_pixels_id(),
+        // other - ONCE per shared buffer in a slim frame. Minted per draw, every draw of one
+        // texture was a new texture to the renderer's caches: a 2D title's frame of ~150 draws
+        // over a handful of 1024x1024 layers replayed as 264 decodes and a 1.3 GB working set.
+        pixels_id: SLIM.with(|c| match c.borrow_mut().as_mut() {
+            Some(s) => *s.pixel_ids.entry(pixels.as_ptr() as usize).or_insert_with(crate::capture::next_pixels_id),
+            None => crate::capture::next_pixels_id(),
+        }),
         base_format,
         swizzle,
         tex_type,
@@ -262,6 +271,7 @@ fn r_tex(i: &mut impl Read) -> io::Result<BoundTexture> {
         u_addr_mode: r_u32(i)?,
         v_addr_mode: r_u32(i)?,
         lod_bias: r_u32(i)?,
+        lod_min: r_u32(i)?,
         min_filter: r_u32(i)?,
         mag_filter: r_u32(i)?,
         mip_filter: r_u32(i)?,
@@ -582,10 +592,10 @@ impl Capsule {
 // frame: targets an EARLIER frame left behind are not in it, which the replay tool says.
 
 /// Frame-capsule magic + version. Bump on any field-order change.
-/// Version 2: the draw record grew with `VSCAPS` version 4.
-const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x02";
+/// Version 2: the draw record grew with `VSCAPS` version 4; 4 (slim 5) with version 5.
+const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x04";
 /// The same frame body with every large byte field deduplicated - see [`SLIM_MIN`].
-const FRAME_MAGIC_SLIM: &[u8; 8] = b"VSFRAM\x00\x03";
+const FRAME_MAGIC_SLIM: &[u8; 8] = b"VSFRAM\x00\x05";
 
 /// Clears the slim context when a slim write or read ends, however it ends.
 struct SlimReset;
@@ -759,7 +769,10 @@ pub fn maybe_write_frame(scenes: &[crate::capture::Scene], width: u32, height: u
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(format!("f{frame:06}.frame"));
     let mut bytes = Vec::new();
-    let result = write_frame(&mut bytes, scenes, width, height, clear, frame).and_then(|()| std::fs::write(&path, &bytes));
+    // SLIM: the same frame with each repeated texture once. A full frame writes every draw's
+    // textures in full, and a replay read back one buffer per draw - one texture identity per
+    // draw, so its caches never hit (see `r_tex`).
+    let result = write_frame_slim(&mut bytes, scenes, width, height, clear, frame).and_then(|()| std::fs::write(&path, &bytes));
     match result {
         Ok(()) => tracing::info!(
             target: "vitaslop::gxm",
@@ -833,6 +846,7 @@ mod tests {
             u_addr_mode: 1,
             v_addr_mode: 2,
             lod_bias: 3,
+            lod_min: 2,
             min_filter: 1,
             mag_filter: 0,
             mip_filter: 1,

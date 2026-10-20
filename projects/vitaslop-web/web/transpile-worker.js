@@ -168,6 +168,6 @@ self.onmessage = async (e) => {
     try {
       if (reader) reader.close();
     } catch {}
-    self.postMessage({ type: "error", message: String((err && err.stack) || err) });
+    self.postMessage({ type: "error", message: String((err && err.stack) || err), linkError: err instanceof WebAssembly.LinkError });
   }
 };

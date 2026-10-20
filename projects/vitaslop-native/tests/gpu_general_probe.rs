@@ -104,6 +104,7 @@ fn solid_texture(size: u32, rgba: [u8; 4]) -> BoundTexture {
         u_addr_mode: 0,
         v_addr_mode: 0,
         lod_bias: 0,
+        lod_min: 0,
         min_filter: 0,
         mag_filter: 0,
         mip_filter: 0,
@@ -463,6 +464,7 @@ color: None,
             u_addr_mode: 0,
             v_addr_mode: 0,
             lod_bias: 0,
+            lod_min: 0,
             min_filter: 1,
             mag_filter: 1, // SCE_GXM_TEXTURE_FILTER_LINEAR
             mip_filter: 0,
@@ -659,7 +661,7 @@ fn general_renderer_supersample_matches_software() {
         pixels_id: vitaslop_runtime::capture::next_pixels_id(),
         unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 2, height: 2, stride: 8,
         faces: 1, face_bytes: 16, levels: 1,
-        pixels: checker.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0,
+        pixels: checker.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, lod_min: 0,
         min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0,
     };
     let mut sprite_v = Vec::new();

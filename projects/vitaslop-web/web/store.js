@@ -24,12 +24,10 @@ export function wasm() {
   if (!ready) {
     ready = init().then(
       (m) => {
-        try {
-          sessionStorage.removeItem(MIXED_BUILD_KEY);
-        } catch {}
+        bundleLoaded("pkg");
         return m;
       },
-      (err) => recoverFromMixedBuild(err)
+      (err) => recoverFromMixedBuild(err, "pkg")
     );
   }
   return ready;
@@ -40,21 +38,44 @@ export function wasm() {
 // deploy can pair the new glue with the old wasm (or the reverse), and instantiating fails with
 // a LinkError ("function import requires a callable"). Seen on a phone right after a merge.
 // That error is fixed by fetching both bundles again past the cache and reloading, so the page
-// does exactly that - once per tab session, so a genuinely broken deploy shows its error instead
-// of reloading forever.
-const MIXED_BUILD_KEY = "vitaslop.mixed-build-reload";
+// does exactly that - once per tab session PER BUNDLE, so a genuinely broken deploy shows its
+// error instead of reloading forever. The page's own `pkg` initialises here; `pkg-threads` only
+// in the run and transpile workers, whose LinkError reaches the player (player.js `start`),
+// which recovers through the same function.
+// The guard is per bundle and cleared only when THAT bundle instantiates: one shared marker
+// would be cleared by `pkg` loading fine after the reload, and a still-mixed `pkg-threads`
+// would then reload on every play.
+const MIXED_BUILD_KEY = (bundle) => `vitaslop.mixed-build-reload.${bundle}`;
 const BUNDLE_FILES = ["pkg/vitaslop_web.js", "pkg/vitaslop_web_bg.wasm", "pkg-threads/vitaslop_web.js", "pkg-threads/vitaslop_web_bg.wasm"];
 
-async function recoverFromMixedBuild(err) {
-  const linkError = err instanceof WebAssembly.LinkError || /LinkError/.test(String(err));
+/// `bundle` ("pkg" or "pkg-threads") instantiated: a later mixed load of it may recover again.
+export function bundleLoaded(bundle) {
+  try {
+    sessionStorage.removeItem(MIXED_BUILD_KEY(bundle));
+  } catch {}
+}
+
+/// Refetch the bundles and reload once if `err` is a LinkError from `bundle`; otherwise (or on a
+/// second try in this tab session) rethrow it. A worker's error arrives as a plain `Error`
+/// carrying `linkError: true` (a worker message cannot carry the error's class).
+export async function recoverFromMixedBuild(err, bundle) {
+  const linkError = err instanceof WebAssembly.LinkError || !!(err && err.linkError) || /LinkError/.test(String(err));
   let tried = true;
   try {
-    tried = sessionStorage.getItem(MIXED_BUILD_KEY) === "1";
-    if (linkError && !tried) sessionStorage.setItem(MIXED_BUILD_KEY, "1");
+    tried = sessionStorage.getItem(MIXED_BUILD_KEY(bundle)) === "1";
+    if (linkError && !tried) sessionStorage.setItem(MIXED_BUILD_KEY(bundle), "1");
   } catch {}
   if (!linkError || tried) throw err;
-  // `cache: "reload"` fetches from the server AND stores the answer, so the reload finds fresh copies.
-  await Promise.all(BUNDLE_FILES.map((f) => fetch(new URL(f, import.meta.url), { cache: "reload" }).catch(() => {})));
+  // `cache: "reload"` fetches from the server AND stores the answer, so the reload finds fresh
+  // copies. The bodies are read to the end first: `fetch` resolves on the headers, and a reload
+  // with a download still running cancels it before it reaches the cache.
+  await Promise.all(
+    BUNDLE_FILES.map((f) =>
+      fetch(new URL(f, import.meta.url), { cache: "reload" })
+        .then((r) => r.arrayBuffer())
+        .catch(() => {})
+    )
+  );
   location.reload();
   return new Promise(() => {});
 }

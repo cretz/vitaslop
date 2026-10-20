@@ -1645,3 +1645,98 @@ mod spin_history_tests {
         assert!(long.should_spin(), "16 of the last 32 short is exactly half - spin");
     }
 }
+
+/// For an engine that runs a thread's EXIT event handlers as further entries of that thread
+/// (the browser's): the handlers owed once its final entry returned
+/// ([`ImportDispatch::thread_return_calls`]), run one after another ON it.
+///
+/// It belongs to the THREAD, not to the instance running it: an engine that lends a finished
+/// thread's instance to the next must [`reset`](Self::reset) it, or that thread starts out
+/// "running EXIT handlers" - it then skips its own and ends with the previous thread's code.
+#[derive(Default, Debug)]
+pub struct ExitHandlerRun {
+    /// The code the thread's entry returned, while its handlers run: the code it ends with,
+    /// whatever they return.
+    code: Option<u32>,
+    /// The handlers still to run after the current one, in order.
+    calls: std::collections::VecDeque<crate::host::GuestCall>,
+    /// The handler the next entry start runs: seeded from its arguments, not the launch
+    /// registers.
+    seed: Option<crate::host::GuestCall>,
+}
+
+impl ExitHandlerRun {
+    /// The thread returned with `code` and owes `calls`. False, beginning nothing, when it
+    /// owes none.
+    pub fn begin(&mut self, code: u32, calls: Vec<crate::host::GuestCall>) -> bool {
+        if calls.is_empty() {
+            return false;
+        }
+        self.code = Some(code);
+        self.calls = calls.into();
+        true
+    }
+
+    /// The code the thread ends with when its handlers are running, else `None`.
+    pub fn code(&self) -> Option<u32> {
+        self.code
+    }
+
+    /// Make the next handler the one the next entry start runs; its address, or `None` when
+    /// none is left.
+    pub fn advance(&mut self) -> Option<u32> {
+        let call = self.calls.pop_front()?;
+        let entry = call.entry;
+        self.seed = Some(call);
+        Some(entry)
+    }
+
+    /// The handler an entry start is to seed, if it is one.
+    pub fn take_seed(&mut self) -> Option<crate::host::GuestCall> {
+        self.seed.take()
+    }
+
+    /// Forget the thread: back to owing nothing.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod exit_handler_run_tests {
+    use super::ExitHandlerRun;
+    use crate::host::GuestCall;
+
+    fn call(entry: u32) -> GuestCall {
+        GuestCall { entry, args: vec![8, 0x101, 5, 0] }
+    }
+
+    #[test]
+    fn one_instance_reused_for_two_threads_starts_the_second_clean() {
+        let mut run = ExitHandlerRun::default();
+        // Thread one returns 5 owing two handlers; the first calls `sceKernelExitThread`,
+        // ending the thread with the second still queued and nothing taken.
+        assert!(run.begin(5, vec![call(0x100), call(0x200)]));
+        assert_eq!(run.advance(), Some(0x100));
+        assert_eq!(run.take_seed().map(|c| c.entry), Some(0x100));
+        assert_eq!(run.code(), Some(5));
+        // Its instance is released and lent to thread two.
+        run.reset();
+        // Thread two's own return is not mistaken for a handler's: nothing is running...
+        assert_eq!(run.code(), None);
+        assert!(run.take_seed().is_none());
+        assert_eq!(run.advance(), None, "thread one's leftover handler must not run on thread two");
+        // ...and it gets its own handlers with its own code.
+        assert!(run.begin(9, vec![call(0x300)]));
+        assert_eq!(run.code(), Some(9));
+        assert_eq!(run.advance(), Some(0x300));
+        assert_eq!(run.advance(), None);
+    }
+
+    #[test]
+    fn owing_no_handlers_begins_nothing() {
+        let mut run = ExitHandlerRun::default();
+        assert!(!run.begin(7, Vec::new()));
+        assert_eq!(run.code(), None);
+    }
+}

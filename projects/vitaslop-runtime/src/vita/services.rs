@@ -1771,17 +1771,31 @@ const SAVEDATA_FILE_MODE_OFF: u32 = 24;
 /// own data instead of a phantom. A directory-mode entry creates no file. Faithful
 /// enough for bring-up: writes land in the guest FS; a future disk/OPFS backend can
 /// persist them across sessions. `requiredSizeKiB` (an out estimate) is reported as 0.
+///
+/// >>> THE SLOT IS PART OF THE SAVE. `slot` is `{u32 id; SceAppUtilSaveDataSlotParam
+/// *slotParam; u8 reserved[32]}`, and a save that carries a param creates or updates that slot
+/// in the same call. Ignored, a title that saves this way and on its next boot checks the slot
+/// before reading its file finds the file with no slot - which it reports as a save it cannot
+/// read, offers a retry, and fails again forever.
 #[hostcall]
 pub(super) fn apputil_savedata_data_save(
     ctx: &mut GuestCtx,
     st: &mut VitaState,
-    _slot: Ptr,
+    slot: Ptr,
     files: Ptr,
     file_num: u32,
     mount: Ptr,
     required_kib: Ptr,
 ) -> i32 {
     let mount_name = read_mount_name(ctx, mount);
+    if !slot.is_null() {
+        let (slot_id, param) = (ctx.read_u32(slot.addr()), ctx.read_u32(slot.addr() + 4));
+        if param != 0 {
+            let bytes = ctx.read_bytes(param, SAVEDATA_SLOT_PARAM_SIZE);
+            st.savedata_slot_put(&mount_name, slot_id, bytes);
+            tracing::debug!(target: "vitaslop::cb", slot = slot_id, "sceAppUtilSaveDataDataSave -> slot written");
+        }
+    }
     for i in 0..file_num {
         let entry = files.addr() + i * SAVEDATA_FILE_STRIDE;
         let path_ptr = ctx.read_u32(entry + SAVEDATA_FILE_PATH_OFF);
@@ -3101,6 +3115,58 @@ mod calendar_tests {
         // The Unix epoch is day zero, which pins the offset rather than just the deltas.
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+}
+
+#[cfg(test)]
+mod savedata_slot_tests {
+    use super::*;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    const SLOT: u32 = 0x100; // SceAppUtilSaveDataFileSlot
+    const PARAM: u32 = 0x200; // its SceAppUtilSaveDataSlotParam
+    const FILES: u32 = 0x600; // one SceAppUtilSaveDataFile
+    const PATH: u32 = 0x700;
+    const BUF: u32 = 0x800;
+    const OUT: u32 = 0xA00;
+
+    fn call(bytes: &mut [u8], st: &mut VitaState, args: &[u32], f: fn(&mut GuestCtx, &mut VitaState)) -> i32 {
+        let mut regs = [0u32; REG_COUNT];
+        regs[..args.len()].copy_from_slice(args);
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut mem = SliceMemory(bytes);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        f(&mut ctx, st);
+        ctx.regs[0] as i32
+    }
+
+    /// A DataSave that carries a slot param creates that slot, so the title's next boot finds
+    /// the slot beside the file it wrote. One without a param leaves the slots alone.
+    #[test]
+    fn a_data_save_with_a_slot_param_creates_the_slot() {
+        let mut bytes = vec![0u8; 0x1000];
+        let mut st = VitaState::new(0, 4096, Box::new(crate::world::DeterministicWorld::default()));
+        let param: Vec<u8> = (0..SAVEDATA_SLOT_PARAM_SIZE).map(|i| (i * 7) as u8).collect();
+        bytes[PARAM as usize..PARAM as usize + param.len()].copy_from_slice(&param);
+        bytes[PATH as usize..PATH as usize + 9].copy_from_slice(b"SAVE.TXT\0");
+        bytes[BUF as usize..BUF as usize + 3].copy_from_slice(b"abc");
+        for (off, v) in [(0, PATH), (4, BUF), (8, 3)] {
+            bytes[(FILES + off) as usize..(FILES + off) as usize + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        // No param first: the file lands, the slot does not.
+        bytes[SLOT as usize..SLOT as usize + 4].copy_from_slice(&245u32.to_le_bytes());
+        assert_eq!(call(&mut bytes, &mut st, &[SLOT, FILES, 1, 0], apputil_savedata_data_save), 0);
+        assert_eq!(st.read_file("savedata0:/SAVE.TXT").as_deref(), Some(&b"abc"[..]));
+        assert_eq!(
+            call(&mut bytes, &mut st, &[245, OUT, 0], apputil_savedata_slot_get_param),
+            SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND
+        );
+        // With a param: the slot exists and reads back the title's own bytes.
+        bytes[SLOT as usize + 4..SLOT as usize + 8].copy_from_slice(&PARAM.to_le_bytes());
+        assert_eq!(call(&mut bytes, &mut st, &[SLOT, FILES, 1, 0], apputil_savedata_data_save), 0);
+        assert_eq!(call(&mut bytes, &mut st, &[245, OUT, 0], apputil_savedata_slot_get_param), 0);
+        assert_eq!(&bytes[OUT as usize..OUT as usize + param.len()], &param[..]);
     }
 }
 

@@ -140,6 +140,7 @@ fn texture_naming_target() -> BoundTexture {
         u_addr_mode: 0,
         v_addr_mode: 0,
         lod_bias: 0,
+        lod_min: 0,
         min_filter: 0,
         mag_filter: 0,
         mip_filter: 0,

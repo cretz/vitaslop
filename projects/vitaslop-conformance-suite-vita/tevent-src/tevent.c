@@ -10,9 +10,11 @@
  *     handler is running on the very thread it was told about;
  *   - it runs before the thread counts as ended (main joins each worker, so the
  *     handler's output lands before the next worker's);
+ *   - a thread that ended and is STARTED AGAIN under the same id runs it again at its second
+ *     end ("ax5s" twice from one thread);
  *   - after sceKernelUnregisterThreadEventHandler it no longer runs ("c" alone);
  *   - `common` is passed through (the handler counts calls in it).
- * Expected output: "ax5sbx7scM2".
+ * Expected output: "ax5sbx7sax5sax5scM4".
  *
  * Authored clean-room from the MIT vita-headers API, built -nostdlib.
  */
@@ -60,6 +62,16 @@ static void run(SceKernelThreadEntry entry) {
 	sceKernelWaitThreadEnd(t, NULL, NULL);
 }
 
+/* One thread, started, ended, then started again under the same id. */
+static void restart(SceKernelThreadEntry entry) {
+	SceUID t = sceKernelCreateThread("r", entry, 0x10000100, 0x10000, 0, 0, NULL);
+	expected = t;
+	for (int i = 0; i < 2; i++) {
+		sceKernelStartThread(t, 0, NULL);
+		sceKernelWaitThreadEnd(t, NULL, NULL);
+	}
+}
+
 int main(void) {
 	static int calls;
 	SceUID h = sceKernelRegisterThreadEventHandler("h", ALL_THREADS_IN_PROCESS, EVENT_EXIT, on_event, &calls);
@@ -68,6 +80,7 @@ int main(void) {
 
 	run(returns);
 	run(exits);
+	restart(returns);
 	sceKernelUnregisterThreadEventHandler(h);
 	run(after);
 

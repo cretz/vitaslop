@@ -16,7 +16,7 @@ import { isComplete } from "./opfs.js";
 import * as gamedata from "./gamedata.js";
 import { mountTouchPad } from "./touchpad.js";
 import { installGamepad } from "./gamepad.js";
-import { runKnobs, vocabulary, touchTitle } from "./store.js";
+import { runKnobs, vocabulary, touchTitle, bundleLoaded, recoverFromMixedBuild } from "./store.js";
 import { renderVita } from "./vita.js";
 import * as navpad from "./navpad.js";
 
@@ -534,6 +534,8 @@ export function createPlayer({ onExit, onRestart }) {
     onRuntimeSetting = onSetting || (() => {});
     running = true;
     fatalText = "";
+    // Only a run that printed something reports it, so a silent run must not show the last one's.
+    delete reports["guest-console"];
     $("fatal").hidden = true;
     $("fatal-text").textContent = "";
     root.hidden = false;
@@ -589,8 +591,10 @@ export function createPlayer({ onExit, onRestart }) {
       const hostOff = await new Promise((resolve, reject) => {
         worker.onmessage = (e) => {
           const d = e.data;
-          if (d.type === "reserved") resolve(d.hostOff);
-          else if (d.type === "error") reject(new Error(d.message));
+          if (d.type === "reserved") {
+            bundleLoaded(runsThreads ? "pkg-threads" : "pkg");
+            resolve(d.hostOff);
+          } else if (d.type === "error") reject(Object.assign(new Error(d.message), { linkError: !!d.linkError }));
           else if (d.type === "panic") reject(new Error("RUST PANIC WHILE RESERVING\n" + d.message));
         };
         worker.onerror = (e) => reject(new Error(e.message || "the run worker failed to start"));
@@ -605,7 +609,7 @@ export function createPlayer({ onExit, onRestart }) {
             return;
           }
           tw.terminate();
-          e.data.type === "built" ? resolve(e.data.built) : reject(new Error(e.data.message));
+          e.data.type === "built" ? resolve(e.data.built) : reject(Object.assign(new Error(e.data.message), { linkError: !!e.data.linkError }));
         };
         tw.onerror = (e) => {
           tw.terminate();
@@ -712,6 +716,9 @@ export function createPlayer({ onExit, onRestart }) {
       applyPause();
       postOutputSize();
     } catch (err) {
+      // A worker's bundle that does not link is a mixed build: refetch and reload once, as the
+      // page does for its own (store.js). Otherwise, or on a second try, it is shown below.
+      if (err && err.linkError) await recoverFromMixedBuild(err, runsThreads ? "pkg-threads" : "pkg").catch(() => {});
       fatal("COULD NOT START\n" + ((err && (err.stack || err.message)) || err));
     }
   }

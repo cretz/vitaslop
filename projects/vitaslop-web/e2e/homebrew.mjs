@@ -20,7 +20,7 @@ import { startServer, webDir, here } from "./harness.mjs";
 
 const suite = join(here, "..", "..", "vitaslop-conformance-suite-vita");
 const velf = process.env.VELF || join(suite, "tevent-src", "tevent.velf");
-const expect = process.env.EXPECT ?? "ax5sbx7scM2";
+const expect = process.env.EXPECT ?? "ax5sbx7sax5sax5scM4";
 const waitMs = Number(process.env.WAIT_MS || 60000);
 const shotDir = process.env.SHOT_DIR || join(here, "screenshots", "homebrew");
 

@@ -100,6 +100,17 @@ async function walk(root, dir = root, out = []) {
   return out;
 }
 
+// The product page's base knobs, read from `base_knobs()` in the frontend crate the page is
+// built from - one list, so a knob added there reaches the harness without a second edit. An
+// empty parse is fatal: it means the function moved, and a run without them is not the product.
+async function productKnobs() {
+  const src = await readFile(join(here, "..", "..", "vitaslop-frontend", "src", "settings.rs"), "utf8");
+  const body = src.match(/pub fn base_knobs\(\)[\s\S]*?\n\}/)?.[0] || "";
+  const knobs = Object.fromEntries([...body.matchAll(/\("(VITASLOP_\w+)",\s*"([^"]*)"\)/g)].map((m) => [m[1], m[2]]));
+  if (!Object.keys(knobs).length) throw new Error("no base_knobs() found in vitaslop-frontend/src/settings.rs");
+  return knobs;
+}
+
 // Memory is sampled per PROCESS by `procmon.mjs` (see the note at the top of that file
 // for why a sum over Chrome processes and a 15-second cadence cannot answer the question
 // that decides the diagnosis).
@@ -572,7 +583,15 @@ async function main() {
     // the live loop runs on the event loop.
     // KNOBS='{"VITASLOP_FRAME_TOPUP":"0"}' - the browser has no environment, so a knob a
     // title needs has to be handed to the page explicitly.
-    const knobs = JSON.parse(process.env.KNOBS || "{}");
+    // The PRODUCT page starts every run from `base_knobs()` (GXP_LIVE, FRAME_TOPUP, SMP) and
+    // layers the person's knobs over it; a harness that starts from nothing runs every draw
+    // fixed-function and its shots are junk while the playbook still reports DONE. So this
+    // reads the same list out of the source the page is built from, and KNOBS goes on top
+    // (`"VITASLOP_SMP":"0"` for a deterministic run). `PRODUCT_KNOBS=0` starts from nothing.
+    const knobs = {
+      ...(process.env.PRODUCT_KNOBS === "0" ? {} : await productKnobs()),
+      ...JSON.parse(process.env.KNOBS || "{}"),
+    };
     // The product page's console is silent on a clean run: setup notes, the adapter and
     // surface lines, the status channel and the `[live]` heartbeat all go to the panel
     // only. This harness READS the heartbeat (liveness, progress, the frames.csv join), so
@@ -590,8 +609,11 @@ async function main() {
     if (playbook) console.log(`[game] playbook: ${playbook.name}`);
     // `SAVE_PROFILE=<name>`: run under that save profile (worker mode). A name not used before
     // has no saves, so the title boots as it does the first time - which is what a playbook
-    // written against a clean desktop run expects.
-    const saveProfile = process.env.SAVE_PROFILE || "";
+    // written against a clean desktop run expects. So a PLAYBOOK run with none named gets a
+    // fresh one, as a desktop playbook run (no `--save-dir`) does: under the shared default a
+    // title that saved last run boots to its continue menu, and the playbook's first cue never
+    // comes. `SAVE_PROFILE=default` runs one against the saves a person would have.
+    const saveProfile = process.env.SAVE_PROFILE || (playbook ? `playbook-${Date.now()}` : "");
     if (saveProfile) console.log(`[game] save profile: ${saveProfile}`);
     const msg = await page.evaluate(
       ([recipe, f, r, k, id, pb, sp]) => window.__boot(recipe, f, r, k, id, pb, sp),

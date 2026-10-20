@@ -48,6 +48,12 @@ Vita toolchain via `$VITASDK`).
   suite cannot: the state machine around the shader, which is where a region clip
   belonging to the wrong target and geometry placed off the top of the screen each
   cost a title-level debugging session.
+- **`savedata-src/`** (`vita_savedata`): AppUtil save slots - a
+  `sceAppUtilSaveDataDataSave` that carries a slot param creates or updates that slot, one
+  without writes only its files, and the file reads back through the savedata mount.
+- **`gxmtex-src/`** (`vita_gxmtex`): GXM texture state in the 16-byte struct - a new
+  texture has no LOD bias, a `LINEAR_STRIDED` stride survives a by-value copy, two strided
+  views of one surface keep their own pitches, an unaligned stride is refused.
 - **`pvf-src/`** (`vita_pvf`): the ScePvf vector-font engine end to end - create a
   library, open a real font file through the host filesystem (the first case to
   read a data file the way a title does), configure size/resolution, and query

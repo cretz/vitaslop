@@ -1667,6 +1667,11 @@ pub struct GxmTexture {
     /// showed the world tiled diagonally across the display rather than clipped.
     pub addr_mode_u: u32,
     pub addr_mode_v: u32,
+    /// The finest mip level the guest lets this texture be sampled at (`sceGxmTextureSetLodMin`):
+    /// a whole-level lower clamp on the LOD, after the bias - the sampler's `lod_min_clamp`. A
+    /// depth-of-field layer sampled with it pinned to a blurry level reads as rows of sharp
+    /// copies when it is dropped.
+    pub lod_min: u32,
     /// The guest set `sceGxmTextureSetGammaMode` on this texture, so the hardware sampler
     /// sRGB-DECODES every texel it fetches. Uploading through an sRGB texture format does the
     /// same decode in the same place, before filtering.
@@ -12603,8 +12608,12 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
     /// blends between mip levels. See [`MIP_NEAREST_SAMPLER_FLAG`].
     fn sampler_mode(t: &GxmTexture) -> (bool, u32, u32) {
         let mip = if t.mip_filter == 0 { MIP_NEAREST_SAMPLER_FLAG } else { 0 };
-        (t.filter_linear, t.addr_mode_u | mip, t.addr_mode_v)
+        (t.filter_linear, t.addr_mode_u | mip, t.addr_mode_v | (t.lod_min.min(15) << LOD_MIN_SAMPLER_SHIFT))
     }
+
+    /// Where a sampler-mode key's `v` carries the texture's LOD min (4 bits) above its address
+    /// mode. See [`GxmTexture::lod_min`].
+    const LOD_MIN_SAMPLER_SHIFT: u32 = 8;
 
     fn make_gxp_sampler(device: &wgpu::Device, linear: bool, u: u32, v: u32) -> wgpu::Sampler {
         let raw = u & RAW_SAMPLER_FLAG != 0;
@@ -12613,8 +12622,9 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
         device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some(if raw { "gxp-sampler-raw" } else { "gxp-sampler" }),
             address_mode_u: gxm_addr_mode(u & !(RAW_SAMPLER_FLAG | MIP_NEAREST_SAMPLER_FLAG)),
-            address_mode_v: gxm_addr_mode(v),
+            address_mode_v: gxm_addr_mode(v & ((1 << LOD_MIN_SAMPLER_SHIFT) - 1)),
             address_mode_w: wgpu::AddressMode::Repeat,
+            lod_min_clamp: ((v >> LOD_MIN_SAMPLER_SHIFT) & 0xf) as f32,
             mag_filter: f,
             min_filter: f,
             // A minified surface reads a level sized for it (see `build_mip_chain`), and blends
@@ -15521,6 +15531,7 @@ fn gxp_nudge2(c: vec2<f32>) -> vec2<f32> {{ return c + vec2<f32>({eps:e}); }}
                 filter_linear: false,
                 addr_mode_u: 0,
                 addr_mode_v: 0,
+                lod_min: 0,
                 gamma: false,
                 compressed: None,
                 planar_yuv: None,

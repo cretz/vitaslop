@@ -90,7 +90,7 @@ fn main() {
             format!("{:#x} {}x{} pitch {} fmt {:#x}", c.data_addr, c.width, c.height, c.stride_pixels, c.format)
         });
         let depth = s.depth.map_or(String::new(), |d| {
-            format!(", depth {:#x} (stencil {:#x}, zls {:#x})", d.depth_addr, d.stencil_addr, d.zls_control)
+            format!(", depth {:#x} (stencil {:#x}, zls {:#x}, clears to {} / stencil {:#x})", d.depth_addr, d.stencil_addr, d.zls_control, f32::from_bits(d.background_depth), d.background_control & 0xff)
         });
         eprintln!("  scene {i}: {} draw(s) into {target}{depth} msaa {}", s.draws.len(), s.multisample);
         // `--list`: every draw's bound textures, as the capture decoded them.
@@ -105,9 +105,10 @@ fn main() {
                 );
                 for t in d.textures.iter() {
                     eprintln!(
-                        "    draw {di} unit {} tex {:#x} {}x{} type {} fmt {:#x} stride {} faces {} min {} mag {} mip {} mips {} addr {}/{}",
+                        "    draw {di} unit {} tex {:#x} {}x{} type {} fmt {:#x} stride {} faces {} min {} mag {} mip {} mips {} addr {}/{} bias {} lodmin {}",
                         t.unit, t.data_addr, t.width, t.height, t.tex_type, t.base_format, t.stride, t.faces,
-                        t.min_filter, t.mag_filter, t.mip_filter, t.levels, t.u_addr_mode, t.v_addr_mode
+                        t.min_filter, t.mag_filter, t.mip_filter, t.levels, t.u_addr_mode, t.v_addr_mode,
+                        t.lod_bias, t.lod_min
                     );
                 }
             }

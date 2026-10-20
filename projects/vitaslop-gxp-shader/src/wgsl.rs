@@ -2221,14 +2221,26 @@ fn substitute_constant_samples(body: &str, kind: ProgramKind) -> (String, Vec<u8
                 // all - see `case_texture_value_at`. It is everything after the coordinate: one
                 // scalar for a bias or a level, two `vec2` derivatives for a gradient, which a
                 // `vec4` constructor takes as they stand.
+                // Empty for an implicit sample, which has nothing after the coordinate.
+                let (_, end, _) = coord_arg_span(args)?;
+                let rest = args[end..].trim();
+                let extra = rest.strip_prefix(',').map_or("", |r| r.trim().strip_suffix(");").unwrap_or(r).trim());
+                // >>> THE TEXTURE'S OWN LOD BIAS IS NOT PART OF A CASE. A case binds a stand-in
+                // with no texture state, so the per-draw `gxp_depth` block it is read from does
+                // not exist here: a sample the emitter biased ONLY by it is the program's implicit
+                // sample, and one it added to the program's own bias keeps the program's term.
+                let tex_bias = texture_bias(unit);
+                let (func, extra) = if extra == tex_bias {
+                    ("textureSample", "")
+                } else {
+                    (func, extra.strip_suffix(&format!(" + {tex_bias}")).unwrap_or(extra))
+                };
                 let mode = match func {
                     "textureSampleBias" => TexLod::Bias,
                     "textureSampleLevel" => TexLod::Level,
                     "textureSampleGrad" => TexLod::Gradient,
                     _ => return Some(format!("{}= gxp_case_tex({unit}u, {coord});", &line[..eq])),
                 };
-                let (_, end, _) = coord_arg_span(args)?;
-                let extra = args[end..].trim().strip_prefix(',')?.trim().strip_suffix(");")?.trim();
                 let lod = if mode == TexLod::Gradient {
                     format!("vec4<f32>({extra})")
                 } else {
@@ -5283,6 +5295,27 @@ mod tests {
     use super::*;
     use crate::container::ProgramKind;
     use crate::ir::{Bank, Instr, Predicate};
+
+    /// A conformance case binds a stand-in with no texture state, so the rewrite drops the
+    /// texture's own LOD bias and keeps the INSTRUCTION's mode: an implicit sample the emitter
+    /// biased only by the texture stays tag 0 (not Bias), and a program bias keeps its own term.
+    /// Left in, the case module reads `gxp_depth`, which its wrapper does not declare.
+    #[test]
+    fn a_case_drops_the_texture_bias_and_keeps_the_lod_mode() {
+        let b = texture_bias(1);
+        let body = format!(
+            "  let _tex0 = textureSampleBias(t1, s1, vec2<f32>(r0.x, r0.y), {b});\n  \
+             let _tex1 = textureSampleBias(t1, s1, vec2<f32>(r0.x, r0.y), r2.x + {b});\n  \
+             let _tex2 = textureSampleLevel(t1, s1, vec2<f32>(r0.x, r0.y), r2.y);\n"
+        );
+        let (out, units) = substitute_constant_samples(&body, ProgramKind::Fragment);
+        assert_eq!(units, vec![1]);
+        assert!(!out.contains("gxp_depth"), "the draw-state bias survived:\n{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("= gxp_case_tex(1u, ") && !lines[0].contains("texl"), "{}", lines[0]);
+        assert!(lines[1].ends_with("), 1u, vec4<f32>(r2.x, 0.0, 0.0, 0.0));"), "{}", lines[1]);
+        assert!(lines[2].ends_with("), 2u, vec4<f32>(r2.y, 0.0, 0.0, 0.0));"), "{}", lines[2]);
+    }
 
     /// >>> THE EMITTER'S CONSTANT AND THE REFERENCE'S CONSTANT ARE ONE FACT, AND THEY DRIFTED.
     ///

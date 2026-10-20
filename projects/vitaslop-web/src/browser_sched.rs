@@ -2273,15 +2273,9 @@ struct ThreadEngine {
     /// Whether the current entry has been started (its `promising` call made). Cleared
     /// when advancing to the next entry.
     entry_started: bool,
-    /// Set once the thread's LAST entry has returned and it owes EXIT event handlers
-    /// (`ImportDispatch::thread_return_calls`): the code it returned with, which is the one
-    /// it ends with whatever the handlers return.
-    exit_code: Option<u32>,
-    /// The EXIT handlers still to run after the current one, in order.
-    exit_calls: std::collections::VecDeque<vitaslop_runtime::host::GuestCall>,
-    /// The handler the next entry start runs: it is seeded from this call's arguments
-    /// instead of the launch registers.
-    entry_seed: Option<vitaslop_runtime::host::GuestCall>,
+    /// The EXIT event handlers the thread owes once its LAST entry has returned, run as
+    /// further entries. Per thread: [`BrowserThread::release`] resets it before pooling.
+    exit: vitaslop_runtime::sched::ExitHandlerRun,
     sp: u32,
     r0: u32,
     r1: u32,
@@ -2633,6 +2627,8 @@ impl ThreadHandle for BrowserThread {
         engine.entries.clear();
         engine.entry_idx = 0;
         engine.entry_started = false;
+        // Or the next thread would start out running this one's EXIT handlers.
+        engine.exit.reset();
         // ZERO, because that is what the instance's `reset` export leaves in the counter -
         // the same rule `fuel_used` follows after a clear.
         engine.fuel_last = 0;
@@ -3380,9 +3376,7 @@ impl BrowserEngine {
             entries: Vec::new(),
             entry_idx: 0,
             entry_started: false,
-            exit_code: None,
-            exit_calls: std::collections::VecDeque::new(),
-            entry_seed: None,
+            exit: Default::default(),
             sp: 0,
             r0: 0,
             r1: 0,
@@ -3714,7 +3708,7 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
 
         if !t.entry_started {
             t.entry_started = true;
-            if let Some(call) = t.entry_seed.take() {
+            if let Some(call) = t.exit.take_seed() {
                 // An EXIT event handler: its arguments, on the thread's own fresh stack.
                 let mut seeded = [0u32; abi::REG_COUNT];
                 seeded[abi::SP] = t.sp;
@@ -3726,6 +3720,8 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
                     t.rt.set_reg(r, seeded[r]);
                 }
             } else {
+                // Only the final entry's end is the thread's (it owes the EXIT handlers).
+                host.lock().unwrap().thread_entry_starting(thid, t.entry_idx + 1 >= t.entries.len());
                 // Each entry starts on a fresh stack; only the first carries args.
                 t.rt.set_reg(abi::SP, t.sp);
                 t.rt.set_reg(0, if t.entry_idx == 0 { t.r0 } else { 0 });
@@ -3883,7 +3879,7 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
         // The thread's own entries are done and it is running its EXIT handlers: one that
         // returns moves to the next, and the thread ends with the code its entry returned. A
         // handler that exits the thread itself ends it with that code too.
-        if let Some(code) = t.exit_code {
+        if let Some(code) = t.exit.code() {
             match ev {
                 Ev::Suspend(stop) => return ThreadStep::Suspended(stop),
                 Ev::Halt(c) => return ThreadStep::Finished(FiberEnd::ProcessHalt(c)),
@@ -3903,12 +3899,9 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
                 // The thread returned from its entry: its EXIT handlers run on it before it
                 // ends. (An `sceKernelExitThread` runs them inside that host call instead.)
                 let calls = host.lock().unwrap().thread_return_calls(thid, c);
-                if calls.is_empty() {
+                if !t.exit.begin(c, calls) || !start_exit_call(t) {
                     return ThreadStep::Finished(FiberEnd::Returned(c));
                 }
-                t.exit_code = Some(c);
-                t.exit_calls = calls.into();
-                start_exit_call(t);
             }
             Ev::ThreadExit(c) if last => return ThreadStep::Finished(FiberEnd::ThreadExit(c)),
             // A non-final entry ended (returned or called ExitThread): advance to the
@@ -3921,20 +3914,19 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
     }
 }
 
-/// Queue the next EXIT event handler (see [`ThreadEngine::exit_calls`]) as this thread's next
+/// Queue the next EXIT event handler (see [`ThreadEngine::exit`]) as this thread's next
 /// entry: the module's dispatcher bound to its address, started on a fresh stack seeded from its
 /// arguments. False when none is left.
 fn start_exit_call(t: &mut ThreadEngine) -> bool {
-    let Some(call) = t.exit_calls.pop_front() else { return false };
     let Some(dispatch_p) = t.dispatch_p.clone() else { return false };
+    let Some(entry) = t.exit.advance() else { return false };
     t.entries.push(
         dispatch_p
-            .bind2(&JsValue::UNDEFINED, &JsValue::from(call.entry & !1), &JsValue::from(0u32))
+            .bind2(&JsValue::UNDEFINED, &JsValue::from(entry & !1), &JsValue::from(0u32))
             .unchecked_into::<Function>(),
     );
     t.entry_idx = t.entries.len() - 1;
     t.entry_started = false;
-    t.entry_seed = Some(call);
     true
 }
 

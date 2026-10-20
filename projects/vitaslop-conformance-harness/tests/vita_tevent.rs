@@ -12,8 +12,8 @@ use vitaslop_native::{DeterministicWorld, RunReport, ThreadedScheduler, VitaEnv}
 const TEVENT: &[u8] = include_bytes!("../../vitaslop-conformance-suite-vita/tevent-src/tevent.velf");
 
 /// See tevent.c: `a`/`b`/`c` from the three workers, `x<code>s` from the handler on the
-/// worker it was called for, `M2` = main saw the handler called exactly twice.
-const EXPECTED: &str = "ax5sbx7scM2";
+/// worker it was called for (the restarted one twice), `M4` = main saw the handler called four times.
+const EXPECTED: &str = "ax5sbx7sax5sax5scM4";
 
 #[test]
 fn exit_handlers_run_on_the_ending_thread() {

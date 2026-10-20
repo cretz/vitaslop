@@ -1702,6 +1702,8 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                 set_reg_store(&mut store, &instance, 1, if carries_args { r1 } else { 0 });
                 set_reg_store(&mut store, &instance, 2, if carries_args { r2 } else { 0 });
                 set_reg_store(&mut store, &instance, 3, if carries_args { r3 } else { 0 });
+                // Only the final entry's end is the thread's (it owes the EXIT handlers).
+                store.data().host.lock().unwrap().thread_entry_starting(thid, i == last);
                 let func = match instance
                     .get_typed_func::<(), ()>(&mut store, &abi::func_export(entry))
                 {
@@ -1761,8 +1763,10 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                     if let Some(msg) = d.fatal.take() {
                         return FiberEnd::Error(msg);
                     }
+                    // A handler that exits the PROCESS ends it with the code it exits with
+                    // (its r0 now), not the code the entry returned.
                     if d.process_halt {
-                        return FiberEnd::ProcessHalt(last_r0);
+                        return FiberEnd::ProcessHalt(get_reg_store(&mut store, &instance, 0));
                     }
                     // A handler that exits the thread itself ends it with the code it had.
                     if d.thread_exit {

@@ -310,6 +310,10 @@ pub struct BoundTexture {
     pub u_addr_mode: u32,
     pub v_addr_mode: u32,
     pub lod_bias: u32,
+    /// The finest mip level the sampler may use (`sceGxmTextureSetLodMin`): a whole level index,
+    /// a lower clamp on the LOD after the bias. Control word 2 bits 0-1 hold its HIGH two bits and
+    /// word 3 bits 26-27 its low two. 0 = no clamp; a strided texture has none.
+    pub lod_min: u32,
     /// Minification/magnification filters (`SceGxmTextureFilter`, 0 = POINT/nearest,
     /// 1 = LINEAR) set via `sceGxmTextureSetMinFilter`/`SetMagFilter`. The renderer
     /// bilinear-samples a LINEAR magnified texture and point-samples a POINT one, so

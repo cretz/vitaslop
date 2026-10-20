@@ -1332,6 +1332,21 @@ fn dispatch_inner(
             "call"
         );
     }
+    // Diagnostic (`RUST_LOG=vitaslop::gxmcall=trace`, with `VITASLOP_NO_INLINE_IMPORTS=1` so the
+    // inlined setters reach here too): every GXM call in order with its first four args - the
+    // ORDER a title sets programs, reserves uniform buffers and draws in, which is state no
+    // single call can show.
+    if library_nid == nid::lib::SCE_GXM {
+        tracing::trace!(
+            target: "vitaslop::gxmcall",
+            name = nid::name(func_nid),
+            a0 = format_args!("{:#010x}", ctx.arg(0)),
+            a1 = format_args!("{:#010x}", ctx.arg(1)),
+            a2 = format_args!("{:#010x}", ctx.arg(2)),
+            a3 = format_args!("{:#010x}", ctx.arg(3)),
+            "call"
+        );
+    }
     crate::host::VitaState::watch_guest_range_changes(
         ctx,
         st.cur_frame(),

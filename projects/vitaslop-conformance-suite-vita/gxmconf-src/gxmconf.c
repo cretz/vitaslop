@@ -60,6 +60,12 @@
  *                              target's pitch), sampled at uv (0.25, 0.25):
  *                              yellow. Binding the whole target reads red.
  *                              Rendered in ONE frame with scene 16.
+ *   scene 18 DEFAULT UNIFORMS  each stage's default uniform buffer set while
+ *                              ANOTHER program is bound, then the program that
+ *                              reads it set, then a draw: left half green from
+ *                              the vertex buffer, right half blue from the
+ *                              fragment one. The value sits past the end of the
+ *                              block the earlier program declares.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS APP EXISTS, GIVEN THE SHADER CONFORMANCE SUITE ALREADY DOES
@@ -223,7 +229,7 @@ static void *fragment_usse_alloc(unsigned int size, SceUID *uid, unsigned int *u
  * not reuse a buffer inside a frame" is the real rule is a separate question, and a
  * conformance app is the wrong place to be asking it - so there is nothing to alias: eleven
  * draws, fifty-two vertices (thirteen quads), all written before the first BeginScene. */
-#define QUADS        33
+#define QUADS        35
 #define MAX_VERTICES (QUADS * 4)
 /* First vertex of quad `q`, for `sceGxmSetVertexStream`. */
 #define QUAD_AT(q) ((q) * 4)
@@ -562,6 +568,37 @@ int main(void) {
 		SCE_GXM_MULTISAMPLE_NONE, NULL, real_vert,
 		&tex2d_fragment_program);
 
+	/* Scene 18's pair: each takes its colour from its stage's DEFAULT UNIFORM at
+	 * register 16, and declares 32 registers of it where the programs above
+	 * declare 16. The vertex one reads no colour attribute. */
+	const SceGxmProgram *uniform_vert = (const SceGxmProgram *)conf_uniform_vert_gxp;
+	const SceGxmProgram *uniform_frag = (const SceGxmProgram *)conf_uniform_frag_gxp;
+	sceGxmProgramCheck(uniform_vert);
+	sceGxmProgramCheck(uniform_frag);
+	SceGxmShaderPatcherId uniform_vert_id, uniform_frag_id;
+	sceGxmShaderPatcherRegisterProgram(patcher, uniform_vert, &uniform_vert_id);
+	sceGxmShaderPatcherRegisterProgram(patcher, uniform_frag, &uniform_frag_id);
+	SceGxmVertexProgram *uniform_vertex_program = NULL;
+	sceGxmShaderPatcherCreateVertexProgram(patcher, uniform_vert_id,
+		real_attributes, 1, streams, 1, &uniform_vertex_program);
+	SceGxmFragmentProgram *uniform_fragment_program = NULL;
+	sceGxmShaderPatcherCreateFragmentProgram(patcher, uniform_frag_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+		SCE_GXM_MULTISAMPLE_NONE, NULL, real_vert,
+		&uniform_fragment_program);
+
+	/* The title's OWN default uniform buffers, one per stage (32 registers each),
+	 * zero but for the colour at register 16: green for the vertex stage, blue
+	 * for the fragment. */
+	SceUID uniform_uid;
+	float *uniforms = gpu_alloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
+		2 * 32 * sizeof(float), SCE_GXM_MEMORY_ATTRIB_READ, &uniform_uid);
+	rt_memset(uniforms, 0, 2 * 32 * sizeof(float));
+	float *vertex_uniforms = uniforms;
+	float *fragment_uniforms = uniforms + 32;
+	vertex_uniforms[17] = 1.0f;   vertex_uniforms[19] = 1.0f;
+	fragment_uniforms[18] = 1.0f; fragment_uniforms[19] = 1.0f;
+
 	/* --- 8. geometry buffers --- */
 	SceUID vbo_uid, ibo_uid;
 	ConfVertex *vertices = gpu_alloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
@@ -618,6 +655,9 @@ int main(void) {
 	fill_quad(&vertices[QUAD_AT(31)],  0.0f, -1.0f, 1.0f, 0.0f, 0.5f, 0xff00ffffu); /* 31: bottom-right, yellow */
 	/* 32: full quad whose colour IS the uv: 0x40/255 = 0.25 in both. */
 	fill_quad(&vertices[QUAD_AT(32)], -1.0f, -1.0f, 1.0f, 1.0f, 0.5f, 0xff004040u);
+	/* 33..34: scene 18's halves, RED in the attribute - which neither program reads. */
+	fill_quad(&vertices[QUAD_AT(33)], -1.0f, -1.0f, 0.0f, 1.0f, 0.5f, RED);   /* 33: vertex uniform, left    */
+	fill_quad(&vertices[QUAD_AT(34)],  0.0f, -1.0f, 1.0f, 1.0f, 0.5f, RED);   /* 34: fragment uniform, right */
 
 	/* ================================================================== *
 	 *  scene 0 - BASELINE: one quad over the whole viewport.
@@ -1038,9 +1078,44 @@ int main(void) {
 		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
 	sceGxmEndScene(context, NULL, NULL);
 
+	/* ================================================================== *
+	 *  scene 18 - A DEFAULT UNIFORM BUFFER IS CONTEXT STATE: each stage's
+	 *  buffer is set while ANOTHER program is bound, then the program that
+	 *  reads it is set, then the draw. Left half green (the vertex stage's
+	 *  buffer), right half blue (the fragment stage's).
+	 *
+	 *  The binding stays in effect across the program change, and is read
+	 *  at the size the DRAWING program declares: register 16 is past the
+	 *  end of the 16-register block the program bound at the set declares.
+	 *  A renderer that owned the binding to that program judged it stale
+	 *  for the next and read an empty bank - a 2D title's clear took its
+	 *  depth from one and wrote 0, and every later draw failed the test.
+	 *  Here that is black (all-zero colour) in place of either half.
+	 * ================================================================== */
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &color_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, real_vertex_program);
+	sceGxmSetFragmentProgram(context, real_fragment_program);
+	sceGxmSetVertexDefaultUniformBuffer(context, vertex_uniforms);
+	sceGxmSetVertexProgram(context, uniform_vertex_program);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(33)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmSetVertexProgram(context, real_vertex_program);
+	sceGxmSetFragmentDefaultUniformBuffer(context, fragment_uniforms);
+	sceGxmSetFragmentProgram(context, uniform_fragment_program);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(34)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmEndScene(context, NULL, NULL);
+
 	sceGxmFinish(context);
 
 	/* --- teardown --- */
+	sceGxmShaderPatcherReleaseFragmentProgram(patcher, uniform_fragment_program);
+	sceGxmShaderPatcherReleaseVertexProgram(patcher, uniform_vertex_program);
+	sceGxmShaderPatcherUnregisterProgram(patcher, uniform_frag_id);
+	sceGxmShaderPatcherUnregisterProgram(patcher, uniform_vert_id);
 	sceGxmShaderPatcherReleaseFragmentProgram(patcher, tex2d_fragment_program);
 	sceGxmShaderPatcherUnregisterProgram(patcher, tex2d_frag_id);
 	sceGxmDestroyRenderTarget(quad_target);

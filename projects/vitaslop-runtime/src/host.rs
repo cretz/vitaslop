@@ -1098,6 +1098,12 @@ const FIOS_OVERLAY_ID_BASE: i32 = 0x0200_0000;
 /// base keeps those ids clear of the small ones threads and sync objects mint.
 const MODULE_UID_BASE: i32 = 0x0100_0000;
 
+/// The program-header slot of a default uniform buffer binding the TITLE named with
+/// `sceGxmSet{Vertex,Fragment}DefaultUniformBuffer`: context state that belongs to no one
+/// program, read at the size of whichever program draws. Never a program header address.
+/// See [`VitaState::set_default_uniform_buffer`].
+pub(crate) const USER_UNIFORM_BUFFER: u32 = u32::MAX;
+
 /// What `sceKernelGetThreadInfo` reports about one thread. A borrowed view rather
 /// than a copy: the caller writes it straight into the guest's struct.
 pub struct ThreadInfo<'a> {
@@ -3177,8 +3183,8 @@ impl RowLayout {
 /// every one of them decoded as a null data pointer, and the light, bloom and composite passes
 /// all rendered pure black. The frame still looked like a frame, only far too dark.
 ///
-/// The ADDRESS is kept beside the words because the two remaining side tables
-/// (`texture_formats`, `texture_extra`) are keyed by it - see
+/// The ADDRESS is kept beside the words because the remaining side table
+/// (`texture_formats`) is keyed by it - see
 /// `vitaslop-host-call-reference-semantics` for why identity and value both have to survive.
 /// The sampler wrap modes, filters, LOD bias, gamma and mip count used to be a third such
 /// table and are now read out of `words` itself, which is what lets them survive the by-value
@@ -3252,29 +3258,6 @@ impl TextureBinding {
     }
 }
 
-
-/// The ONE piece of per-texture state that cannot live in the guest's own control words.
-///
-/// Everything else this used to hold - the wrap modes, the three filters, the LOD bias, the
-/// gamma mode and the mip count - is now written into and read out of the guest's 16-byte
-/// `SceGxmTexture`, where the hardware keeps it (see `vita::gxm::texword0`). This shadow was
-/// address-keyed, and a `SceGxmTexture` is a POD the guest copies freely, so a copied texture
-/// silently lost all of it - the identical defect the doc on [`PrecomputedDraw`] below describes
-/// for precomputed draws, which this codebase had already fixed there.
-///
-/// The byte stride stays, and the reason is the refuse-to-guess rule rather than convenience: a
-/// `LINEAR_STRIDED` texture spreads its stride across word 0's `stride_ext`, `stride_low` and
-/// `stride` fields, and the vitasdk header documents their WIDTHS but not how they COMPOSE
-/// ("stride extension", "internal stride lower bits"). Packing it would mean inventing that, and
-/// a wrong packing would corrupt the neighbouring fields that ARE understood. So this holds what
-/// the guest passed to `sceGxmTextureInitLinearStrided`, and a by-value copy of a strided texture
-/// still loses its stride - which is a known, bounded gap, not a solved one.
-#[derive(Clone, Copy, Default)]
-struct TextureExtra {
-    /// Explicit byte stride for a `LINEAR_STRIDED` texture (0 = derive from width x
-    /// bytes-per-pixel, as the driver does for every other layout).
-    byte_stride: u32,
-}
 
 /// A precomputed draw: the vertex program, stream-0 vertex buffer, and draw
 /// parameters the guest bundled with `sceGxmPrecomputedDraw{Init,SetVertexStream,
@@ -3797,6 +3780,7 @@ struct TextureTemplate {
     u_addr_mode: u32,
     v_addr_mode: u32,
     lod_bias: u32,
+    lod_min: u32,
     min_filter: u32,
     mag_filter: u32,
     gamma: u32,
@@ -9205,8 +9189,13 @@ pub struct VitaState {
     thread_event_handlers: Vec<ThreadEventHandler>,
     /// Threads whose EXIT handlers have been handed out ([`Self::thread_exit_event_calls`]):
     /// each thread ends once, so a handler that itself calls `sceKernelExitThread`, or an
-    /// exit followed by the engine's own end-of-thread, does not run them again.
+    /// exit followed by the engine's own end-of-thread, does not run them again. A restart
+    /// ([`Self::start_thread`]) is a new run that ends again, so it clears the thread's entry.
     thread_exit_events_done: std::collections::HashSet<i32>,
+    /// The initial thread is still running a module's `module_start` before the last one
+    /// ([`Self::note_thread_entry`]): an `sceKernelExitThread` there ends that initializer,
+    /// not the thread, so it owes no EXIT handlers.
+    main_initializing: bool,
     pending_spawns: Vec<Reentry>,
     /// Fiber threads and the REAL thread that first ran them: `(fiber thid, runner)`. A fiber
     /// is not a thread on the hardware - it runs on its caller's core at its caller's priority -
@@ -9404,15 +9393,6 @@ pub struct VitaState {
     /// race that is ~644 draws a frame, and in the browser an allocation is a good deal dearer
     /// than it is here.
     texture_unit_scratch: Vec<(TextureBinding, Option<u32>, Option<(i64, u32)>, u32)>,
-    /// The one piece of per-texture state that cannot be packed into the guest's own control
-    /// words - see [`TextureExtra`]. Everything the sampler getters used to read from here now
-    /// lives in the guest's `SceGxmTexture`, where the hardware keeps it.
-    texture_extra: std::collections::HashMap<u32, TextureExtra>,
-    /// The byte stride of every `LINEAR_STRIDED` texture initialised, keyed by its control
-    /// words 1 and 2 (type, format and size; data address) rather than by the struct's address,
-    /// so a BY-VALUE COPY of the struct - which keeps those words - still finds it. See
-    /// [`Self::linear_strided_stride`].
-    strided_by_words: std::collections::HashMap<(u32, u32), u32>,
     /// Per-color-surface gamma-correction mode set by `sceGxmColorSurfaceSetGammaMode`, as
     /// `(SceGxmColorSurface*, data address, mode)`. Absent = SCE_GXM_COLOR_SURFACE_GAMMA_NONE.
     ///
@@ -9853,6 +9833,7 @@ impl VitaState {
             kcb_threads: Vec::new(),
             thread_event_handlers: Vec::new(),
             thread_exit_events_done: std::collections::HashSet::new(),
+            main_initializing: false,
             pending_spawns: Vec::new(),
             spawn_near: Vec::new(),
             pending_wakes: Vec::new(),
@@ -9902,8 +9883,6 @@ impl VitaState {
             texture_formats: Default::default(),
             nearby_texture_cache: FxHashMap::default(),
             texture_unit_scratch: Vec::new(),
-            texture_extra: std::collections::HashMap::new(),
-            strided_by_words: std::collections::HashMap::new(),
             color_surface_gamma: FxHashMap::default(),
             color_surface_gamma_by_data: FxHashMap::default(),
             snaps_frames_pending: std::sync::atomic::AtomicU32::new(0),
@@ -11539,6 +11518,8 @@ impl VitaState {
             thid,
             priority: new_priority,
         };
+        // A new run of the thread, so its next end owes the EXIT handlers again.
+        self.thread_exit_events_done.remove(&thid);
         if self.preemptive {
             self.pending_spawns.push(req);
             Ok(new_priority < self.current_priority())
@@ -11710,9 +11691,20 @@ impl VitaState {
         uid
     }
 
-    /// Whether `thid` is a thread the title created (`sceKernelCreateThread`).
+    /// Whether `thid` is a thread of the title's: one it created (`sceKernelCreateThread`),
+    /// or the initial thread ([`MAIN_THID`], which has no create record). The host's own
+    /// delivery threads (a kernel callback's, a display-queue callback's) have neither.
     pub fn thread_exists(&self, thid: i32) -> bool {
-        self.threads.iter().any(|t| t.uid == thid)
+        thid == MAIN_THID || self.threads.iter().any(|t| t.uid == thid)
+    }
+
+    /// Thread `thid` is starting one of its entries; `last` when it is its final one. Only
+    /// the initial thread has more than one (each module's `module_start`, the executable's
+    /// last), and only its final entry's end is the thread's end.
+    pub fn note_thread_entry(&mut self, thid: i32, last: bool) {
+        if thid == MAIN_THID {
+            self.main_initializing = !last;
+        }
     }
 
     /// Drop a registration; false when `uid` names none.
@@ -11732,8 +11724,12 @@ impl VitaState {
     ///
     /// The handlers run once per thread whichever way it ends - `sceKernelExitThread`, or
     /// returning from its entry - and a handler that itself calls `sceKernelExitThread`
-    /// must end the thread rather than run the handlers again.
+    /// must end the thread rather than run the handlers again. False, claiming nothing, while
+    /// the initial thread is in an early `module_start` (see [`Self::note_thread_entry`]).
     pub fn claim_thread_exit_events(&mut self, thid: i32) -> bool {
+        if thid == MAIN_THID && self.main_initializing {
+            return false;
+        }
         self.thread_exit_events_done.insert(thid)
     }
 
@@ -11741,8 +11737,8 @@ impl VitaState {
     /// `handler(SCE_KERNEL_THREAD_EVENT_TYPE_EXIT, thid, code, common)`, to be run ON that
     /// thread (a C library's handler frees the ending thread's own TLS).
     ///
-    /// Only threads the title created get them: the host's own delivery threads (a kernel
-    /// callback's, a display-queue callback's) are not threads the title knows about. Pure,
+    /// Only the title's threads ([`Self::thread_exists`]) get them: the host's own delivery
+    /// threads (a kernel callback's, a display-queue callback's) are not threads it knows about. Pure,
     /// so a host call can rebuild the list on each replay.
     ///
     /// The handler's id rides as a fifth (stack) argument the handler never reads, so two
@@ -15793,7 +15789,7 @@ impl VitaState {
             let format = self.texture_format(b.addr);
             // The explicit row pitch `sceGxmTextureInitLinearStrided` was given - see
             // `build_texture_template`.
-            let byte_stride = self.linear_strided_stride_of(b.addr, b.words);
+            let byte_stride = Self::linear_strided_stride_of(b.words);
             // Only for a handle with no format of its own: is there an initialised texture
             // NEARBY? A struct the guest inits at one address and binds at another (off by a
             // fixed member offset, or copied by value) is a completely different bug from one
@@ -16070,63 +16066,25 @@ impl VitaState {
         self.color_surfaces.get(&addr).copied()
     }
 
-    /// The sticky extra state for a `SceGxmTexture*`, or GXM defaults if never set.
-    fn texture_extra(&self, texture_addr: u32) -> TextureExtra {
-        self.texture_extra.get(&texture_addr).copied().unwrap_or_default()
-    }
-
-    /// Mutable slot for a texture's extra state, inserting GXM defaults on first touch.
-    fn texture_extra_mut(&mut self, texture_addr: u32) -> &mut TextureExtra {
-        self.texture_extra.entry(texture_addr).or_default()
-    }
-
-    /// Record the explicit byte stride a `sceGxmTextureInitLinearStrided` established - the one
-    /// field of word 0 that cannot be packed into the guest's words. See [`TextureExtra`].
-    pub fn set_texture_stride(&mut self, texture_addr: u32, byte_stride: u32) {
-        self.texture_extra_mut(texture_addr).byte_stride = byte_stride;
-    }
-
-    /// Remember a just-initialised `LINEAR_STRIDED` texture's stride under its own control words
-    /// 1 and 2, which a by-value copy carries with it. Called after the words are written.
-    pub fn record_strided_words(&mut self, ctx: &GuestCtx, texture_addr: u32, byte_stride: u32) {
-        let key = (ctx.read_u32(texture_addr.wrapping_add(4)), ctx.read_u32(texture_addr.wrapping_add(8)) & !3);
-        self.strided_by_words.insert(key, byte_stride);
-    }
-
     /// The explicit byte stride of the `LINEAR_STRIDED` texture at `texture_addr`, or 0 for one
     /// that is not strided (derive the pitch from width x bytes-per-pixel).
     ///
-    /// The stride cannot be read back out of the guest's words (see [`TextureExtra`]), so it is
-    /// found by the struct's address first and then by the words a copy keeps: a title that
-    /// inits a strided texture and binds a by-value copy of it - a material holding its own
-    /// `SceGxmTexture` - otherwise samples a render target at width x 4 instead of its real
-    /// pitch, every row shifting by the difference, and the frame turns to slanted stripes.
+    /// Read out of the struct's own word 0, where init packed it (`vita::gxm::pack_linear_stride`),
+    /// so a by-value copy - a material holding its own `SceGxmTexture` - samples at the same
+    /// pitch. Held beside the struct instead, a copy sampled a render target at width x 4 instead
+    /// of its real pitch, every row shifting by the difference into slanted stripes.
     pub fn linear_strided_stride(&self, ctx: &GuestCtx, texture_addr: u32) -> u32 {
         let words = [0, 4, 8, 12].map(|o| ctx.read_u32(texture_addr.wrapping_add(o)));
-        self.linear_strided_stride_of(texture_addr, words)
+        Self::linear_strided_stride_of(words)
     }
 
     /// [`Self::linear_strided_stride`] for a binding whose control words were already read (at
     /// bind time - the struct may since have been reused, so its memory is not re-read).
-    fn linear_strided_stride_of(&self, texture_addr: u32, words: [u32; 4]) -> u32 {
-        let own = self.texture_extra(texture_addr).byte_stride;
-        if own != 0 {
-            return own;
-        }
+    fn linear_strided_stride_of(words: [u32; 4]) -> u32 {
         if (words[1] >> 29) & 0x7 != crate::vita::gxm::TYPE_LINEAR_STRIDED {
             return 0;
         }
-        let key = (words[1], words[2] & !3);
-        let found = self.strided_by_words.get(&key).copied();
-        if found.is_none() && tracing::enabled!(target: "vitaslop::texinit", tracing::Level::DEBUG) {
-            tracing::debug!(
-                target: "vitaslop::texinit",
-                texture = format_args!("{texture_addr:#x}"), w1 = format_args!("{:#010x}", key.0),
-                w2 = format_args!("{:#010x}", key.1),
-                "a LINEAR_STRIDED texture with no recorded stride"
-            );
-        }
-        found.unwrap_or(0)
+        crate::vita::gxm::linear_stride_from_word0(words[0])
     }
 
     /// Report the first `sceGxmTextureSetGammaMode` of a run.
@@ -17387,13 +17345,26 @@ impl VitaState {
     /// bound exactly as [`Self::reserve_vertex_uniform_buffer`] binds its own, sized by the
     /// program bound at the call (the reserve's rule). First called by a 2011 fighting title,
     /// which never reserves.
+    /// `sceGxmSet{Vertex,Fragment}DefaultUniformBuffer`: the title names its OWN buffer as the
+    /// stage's default uniform buffer.
+    ///
+    /// >>> CONTEXT STATE, NOT A RESERVATION FOR ONE PROGRAM. A reserve is sized for the program
+    /// bound when it is made, and a draw by another program reading it is reading another
+    /// object's uniforms ([`Self::stale_uniforms`]). This binding is the title's own pointer and
+    /// stays in effect until it is set again, across program changes - a title sets the buffer
+    /// and THEN the program, and draws. Recorded with the program bound at set time, every such
+    /// draw was judged stale and read the empty `sceGxmSetUniformDataF` bank instead: MEASURED on
+    /// a 2D title, its full-screen clear took `clearDepth` from that empty bank, wrote depth 0
+    /// over its half-resolution layer target, and every layer drawn after it failed the depth
+    /// test - the blurred background never rendered and only the sharp multi-tap copies of the
+    /// foreground were left, as stacked bands. So it is marked [`USER_UNIFORM_BUFFER`], and a
+    /// draw reads as many bytes as the program DRAWING declares.
     pub(crate) fn set_default_uniform_buffer(&mut self, ctx: &mut GuestCtx, stage: ProgramStage, buf: u32) {
-        let (handle, off) = match stage {
-            ProgramStage::Vertex => (self.bound_vertex_program(ctx), crate::vita::gxmctx::off::VERTEX_UNIFORM),
-            ProgramStage::Fragment => (self.bound_fragment_program(ctx), crate::vita::gxmctx::off::FRAGMENT_UNIFORM),
+        let off = match stage {
+            ProgramStage::Vertex => crate::vita::gxmctx::off::VERTEX_UNIFORM,
+            ProgramStage::Fragment => crate::vita::gxmctx::off::FRAGMENT_UNIFORM,
         };
-        let (size, header) = self.memoised_uniform_size(ctx, handle, stage);
-        self.bind_uniform_buffer(ctx, off, buf, size, header);
+        self.bind_uniform_buffer(ctx, off, buf, 0, USER_UNIFORM_BUFFER);
     }
 
     pub fn reserve_fragment_uniform_buffer(&mut self, ctx: &mut GuestCtx) -> u32 {
@@ -17930,13 +17901,15 @@ impl VitaState {
         ctx: &GuestCtx,
         blk: &crate::vita::gxmctx::Block<'_>,
     ) -> Option<(u32, usize)> {
-        let bound = blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM);
+        let mut bound = blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM);
         if bound.buf != 0 {
             let drawing =
                 self.vertex_program_header(blk.word(crate::vita::gxmctx::off::VERTEX_PROGRAM));
             let refl = self.reflect_program(ctx, drawing);
             let needs = refl.uniform_size_bytes.max(refl.default_uniform_bytes);
-            if self.stale_uniforms("vertex", bound.header, drawing, needs) {
+            if bound.header == USER_UNIFORM_BUFFER {
+                bound.size = needs;
+            } else if self.stale_uniforms("vertex", bound.header, drawing, needs) {
                 return None;
             }
         }
@@ -17956,7 +17929,7 @@ impl VitaState {
         // cannot change a pixel and can only report a drop that did not happen. It did:
         // 10,000 `bound_for=0x0` warnings in one retail run, which reads as a rendering
         // defect when the direct uniform path was serving those draws correctly.
-        let bound = blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM);
+        let mut bound = blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM);
         if bound.buf != 0 {
             let drawing =
                 self.vertex_program_header(blk.word(crate::vita::gxmctx::off::VERTEX_PROGRAM));
@@ -17966,7 +17939,9 @@ impl VitaState {
             // than a map lookup AND a guest word read on every draw.
             let refl = self.reflect_program(ctx, drawing);
             let needs = refl.uniform_size_bytes.max(refl.default_uniform_bytes);
-            if self.stale_uniforms("vertex", bound.header, drawing, needs) {
+            if bound.header == USER_UNIFORM_BUFFER {
+                bound.size = needs;
+            } else if self.stale_uniforms("vertex", bound.header, drawing, needs) {
                 return self.sa_bank_floats(ctx);
             }
         }
@@ -18044,7 +18019,9 @@ impl VitaState {
             // than a map lookup AND a guest word read on every draw.
             let refl = self.reflect_program(ctx, drawing);
             let needs = refl.uniform_size_bytes.max(refl.default_uniform_bytes);
-            if self.stale_uniforms("fragment", frag_uniform.header, drawing, needs) {
+            if frag_uniform.header == USER_UNIFORM_BUFFER {
+                frag_uniform.size = needs;
+            } else if self.stale_uniforms("fragment", frag_uniform.header, drawing, needs) {
                 frag_uniform.buf = 0;
                 frag_uniform.size = 0;
             }
@@ -20784,14 +20761,20 @@ impl VitaState {
         // origin, which is what "it is drawn at the wrong place" actually means.
         let vbound = self.vertex_uniform(ctx);
         let vbuf = vbound.buf;
-        let usable = vbuf != 0 && vbound.size >= 4 && vbound.header == vh;
-        let source = match (vbuf != 0, vbound.header == vh) {
+        let owned = vbound.header == vh || vbound.header == USER_UNIFORM_BUFFER;
+        let vsize = if vbound.header == USER_UNIFORM_BUFFER {
+            vref.uniform_size_bytes.max(vref.default_uniform_bytes)
+        } else {
+            vbound.size
+        };
+        let usable = vbuf != 0 && vsize >= 4 && owned;
+        let source = match (vbuf != 0, owned) {
             (true, true) => "ubuf",
             (true, false) => "STALE-ubuf",
             (false, _) => "setUniformDataF",
         };
         let raw: Vec<f32> = if usable {
-            (0..(vbound.size / 4) as usize)
+            (0..(vsize / 4) as usize)
                 .map(|i| ctx.read_f32(vbuf.wrapping_add(i as u32 * 4)))
                 .collect()
         } else {
@@ -22000,7 +21983,9 @@ fn word0_sampler_state(w0: u32, tex_type: u32) -> (u32, u32, u32, u32, u32, u32,
         min,
         mag,
         w0 & 0x1800_0000, // gamma_mode, in the enum's own already-shifted encoding
-        (w0 >> 9) & 0x1,  // mip_filter (`vita::gxm::texword0::MIP_FILTER`)
+        // mip_filter (`vita::gxm::texword0::MIP_FILTER`) - a stride bit on a strided texture,
+        // which has one level and nothing to filter between.
+        if tex_type == TYPE_LINEAR_STRIDED { 0 } else { (w0 >> 9) & 0x1 },
     )
 }
 
@@ -22063,6 +22048,7 @@ fn decode_texture(
             u_addr_mode: 0,
             v_addr_mode: 0,
             lod_bias: 0,
+            lod_min: 0,
             min_filter: 0,
             mag_filter: 0,
             mip_filter: 0,
@@ -22323,6 +22309,7 @@ fn decode_texture_pixels(
         u_addr_mode: t.u_addr_mode,
         v_addr_mode: t.v_addr_mode,
         lod_bias: t.lod_bias,
+        lod_min: t.lod_min,
         min_filter: t.min_filter,
         mag_filter: t.mag_filter,
         gamma: t.gamma,
@@ -22536,9 +22523,8 @@ fn build_texture_template(
     };
     // >>> A LINEAR_STRIDED TEXTURE'S ROWS ARE `byte_stride` APART, NOT A ROW'S WIDTH.
     //
-    // The pitch is the explicit stride `sceGxmTextureInitLinearStrided` was given (the control
-    // words spread it over three fields whose composition is not published, so it rides in the
-    // host shadow - see `vita::gxm::texture_init`). MEASURED on a fighting title: its
+    // The pitch is the explicit stride `sceGxmTextureInitLinearStrided` was given, packed into
+    // word 0 (see `vita::gxm::pack_linear_stride`). MEASURED on a fighting title: its
     // bloom samples each mip level as a 128- or 256-wide strided window onto ONE 512-wide
     // surface. Read at the width's pitch, every row after the first came from the wrong place
     // (four texture rows to one surface row), and a renderer resolving the window against the
@@ -22631,6 +22617,9 @@ fn build_texture_template(
         u_addr_mode: sampler.0,
         v_addr_mode: sampler.1,
         lod_bias: sampler.2,
+        // Word 2 bits 0-1 are its HIGH bits, word 3 bits 26-27 the low ones - see `vita::gxm`'s
+        // `texture_set_lod_min`. A strided texture has no LOD min (nor any level to clamp to).
+        lod_min: if tex_type == crate::vita::gxm::TYPE_LINEAR_STRIDED { 0 } else { ((w2 & 0x3) << 2) | ((w3 >> 26) & 0x3) },
         min_filter: sampler.3,
         mag_filter: sampler.4,
         gamma: sampler.5,
@@ -22959,6 +22948,10 @@ pub trait ImportDispatch {
     fn thread_return_calls(&mut self, _thid: i32, _code: u32) -> Vec<GuestCall> {
         Vec::new()
     }
+
+    /// Thread `thid` is starting one of its entries, `last` when it is its final one (see
+    /// [`VitaState::note_thread_entry`]). Default no-op.
+    fn thread_entry_starting(&mut self, _thid: i32, _last: bool) {}
 
     /// Record the r0/r1 a guest call left, before the engine re-dispatches the host call
     /// that asked for it.
@@ -23339,6 +23332,10 @@ impl ImportDispatch for VitaEnv {
         } else {
             Vec::new()
         }
+    }
+
+    fn thread_entry_starting(&mut self, thid: i32, last: bool) {
+        self.state.note_thread_entry(thid, last);
     }
 
     fn guest_call_returned(&mut self, thid: i32, r0: u32, r1: u32, mem: &dyn GuestMemory, base: u32) {
@@ -23756,6 +23753,10 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
 
     fn thread_return_calls(&mut self, thid: i32, code: u32) -> Vec<GuestCall> {
         self.borrow_mut().thread_return_calls(thid, code)
+    }
+
+    fn thread_entry_starting(&mut self, thid: i32, last: bool) {
+        self.borrow_mut().thread_entry_starting(thid, last);
     }
 
     fn guest_call_returned(&mut self, thid: i32, r0: u32, r1: u32, mem: &dyn GuestMemory, base: u32) {
@@ -26468,10 +26469,10 @@ mod strided_texture_tests {
         assert_eq!(lin.stride, 128 * 4);
     }
 
-    /// **A BY-VALUE COPY OF A STRIDED TEXTURE KEEPS ITS STRIDE.** The stride is held beside the
-    /// struct rather than in its words; a title that copies the 16 bytes into its own material and
-    /// binds the copy sampled a 992-pixel-pitch render target at 960 x 4, and every row slid 32
-    /// pixels into slanted stripes. The copy is found again by the words it carries.
+    /// **A BY-VALUE COPY OF A STRIDED TEXTURE KEEPS ITS STRIDE.** A title that copies the 16 bytes
+    /// into its own material and binds the copy sampled a 992-pixel-pitch render target at 960 x 4
+    /// while the stride was held beside the struct, and every row slid 32 pixels into slanted
+    /// stripes. It is packed into word 0 now, so the copy carries it.
     #[test]
     fn a_copied_strided_texture_keeps_its_stride() {
         use crate::world::DeterministicWorld;
@@ -26499,6 +26500,27 @@ mod strided_texture_tests {
         // A linear texture over the same data takes no stride from the strided one.
         ctx.write_u32(COPY + 4, (ctx.read_u32(COPY + 4) & !(0x7 << 29)) | (3 << 29));
         assert_eq!(st.linear_strided_stride(&ctx, COPY), 0);
+        // Two views of ONE surface - same format, size and data - at different pitches keep
+        // their own: the stride is in each struct, not in a table keyed by what they share.
+        const OTHER: u32 = 0x300;
+        ctx.regs[0] = OTHER;
+        (ctx.regs[1], ctx.regs[2], ctx.regs[3]) = (0x8000_0000, 0x0c00_0000, 960);
+        ctx.write_u32(0x804, 3840);
+        crate::vita::dispatch(crate::nid::lib::SCE_GXM, crate::nid::gxm::TEXTURE_INIT_LINEAR_STRIDED, &mut ctx, &mut st);
+        let words = ctx.read_bytes(ORIG, 16);
+        ctx.write_bytes(COPY, &words);
+        assert_eq!(st.linear_strided_stride(&ctx, COPY), 3968, "the first view's copy");
+        assert_eq!(st.linear_strided_stride(&ctx, OTHER), 3840, "the second view");
+        // Every stride the words can carry round-trips through them.
+        for s in [4, 3840, 3968, 4096, crate::vita::gxm::MAX_PACKED_STRIDE] {
+            assert_eq!(crate::vita::gxm::linear_stride_from_word0(crate::vita::gxm::pack_linear_stride(s)), s);
+        }
+        // One that cannot be packed is refused, not truncated.
+        ctx.regs[0] = OTHER;
+        (ctx.regs[1], ctx.regs[2], ctx.regs[3]) = (0x8000_0000, 0x0c00_0000, 960);
+        ctx.write_u32(0x804, crate::vita::gxm::MAX_PACKED_STRIDE + 4);
+        crate::vita::dispatch(crate::nid::lib::SCE_GXM, crate::nid::gxm::TEXTURE_INIT_LINEAR_STRIDED, &mut ctx, &mut st);
+        assert!((ctx.regs[0] as i32) < 0, "an unpackable stride must fail");
     }
 
     /// **A STRIDED TEXTURE MINIFIES WITH ITS MAG FILTER**: its bits 10..11 are stride bits. The

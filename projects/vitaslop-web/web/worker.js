@@ -369,7 +369,8 @@ self.onmessage = async (e) => {
       const split = `import ${Math.round(lt.imported - lt.t0)} ms, init (fetch+compile+instantiate) ${Math.round(lt.inited - lt.imported)} ms [${fetchNote}], reserve ${Math.round(performance.now() - tr)} ms`;
       self.postMessage({ type: "reserved", hostOff, split });
     } catch (err) {
-      self.postMessage({ type: "error", message: `guest region: ${String((err && err.message) || err)}` });
+      // `linkError`: a mixed build (store.js `recoverFromMixedBuild`); the class does not survive the message.
+      self.postMessage({ type: "error", message: `guest region: ${String((err && err.message) || err)}`, linkError: err instanceof WebAssembly.LinkError });
     }
     return;
   }
