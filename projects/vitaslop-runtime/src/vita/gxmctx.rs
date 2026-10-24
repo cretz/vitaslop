@@ -261,7 +261,11 @@ pub fn init(ctx: &mut GuestCtx, context: u32) {
     // The default-uniform ring starts EMPTY - a base of 0 is what both the handler and the
     // inline form read as "no ring here yet", and the ring is attached separately (see
     // `VitaState::attach_uniform_ring`) because only the host can allocate one.
-    for offset in [off::UNIFORM_RING_BASE, off::UNIFORM_RING_END, off::UNIFORM_RING_CURSOR] {
+    for offset in [
+        off::UNIFORM_RING_BASE,
+        off::UNIFORM_RING_END,
+        off::UNIFORM_RING_CURSOR,
+    ] {
         ctx.write_u32(context.wrapping_add(offset), 0);
     }
     for record in [off::VERTEX_UNIFORM, off::FRAGMENT_UNIFORM] {
@@ -271,7 +275,10 @@ pub fn init(ctx: &mut GuestCtx, context: u32) {
     }
     for i in 0..MAX_UNIFORM_BUFFERS as u32 {
         ctx.write_u32(context.wrapping_add(off::VERTEX_UNIFORM_BUFFERS + i * 4), 0);
-        ctx.write_u32(context.wrapping_add(off::FRAGMENT_UNIFORM_BUFFERS + i * 4), 0);
+        ctx.write_u32(
+            context.wrapping_add(off::FRAGMENT_UNIFORM_BUFFERS + i * 4),
+            0,
+        );
     }
     // Stamped LAST, so a partially written block is never mistaken for a complete one.
     ctx.write_u32(context.wrapping_add(off::MAGIC), MAGIC);
@@ -377,7 +384,12 @@ pub fn set_fragment_uniform_buffer(ctx: &mut GuestCtx, context: u32, index: u32,
         );
         return;
     }
-    set(ctx, context, off::FRAGMENT_UNIFORM_BUFFERS + index * 4, addr);
+    set(
+        ctx,
+        context,
+        off::FRAGMENT_UNIFORM_BUFFERS + index * 4,
+        addr,
+    );
 }
 
 /// One fragment sampler binding, as the block holds it.
@@ -422,7 +434,12 @@ pub fn set_texture_binding(ctx: &mut GuestCtx, context: u32, unit: u32, b: TexBi
     for (k, w) in b.words.iter().enumerate() {
         set(ctx, context, at + 4 + k as u32 * 4, *w);
     }
-    set(ctx, context, at + 4 + TEXTURE_CONTROL_WORDS * 4, b.from_precomputed as u32);
+    set(
+        ctx,
+        context,
+        at + 4 + TEXTURE_CONTROL_WORDS * 4,
+        b.from_precomputed as u32,
+    );
 }
 
 /// Read sampler `unit`'s binding.
@@ -484,7 +501,8 @@ pub fn texture_bindings(ctx: &GuestCtx, context: u32, out: &mut Vec<(u32, TexBin
             &scratch
         }
     };
-    let word = |at: usize| u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
+    let word =
+        |at: usize| u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
     for unit in 0..MAX_TEXTURE_UNITS {
         let at = unit * TEXTURE_STRIDE as usize;
         let addr = word(at);
@@ -584,27 +602,54 @@ pub fn store(ctx: &mut GuestCtx, context: u32, rs: &crate::capture::RenderState)
     w(off::CULL_MODE, rs.cull_mode);
     w(off::TWO_SIDED, rs.two_sided);
     w(off::FRONT_DEPTH_FUNC, rs.front_depth_func);
-    w(off::FRONT_DEPTH_BIAS_FACTOR, rs.front_depth_bias_factor as u32);
-    w(off::FRONT_DEPTH_BIAS_UNITS, rs.front_depth_bias_units as u32);
+    w(
+        off::FRONT_DEPTH_BIAS_FACTOR,
+        rs.front_depth_bias_factor as u32,
+    );
+    w(
+        off::FRONT_DEPTH_BIAS_UNITS,
+        rs.front_depth_bias_units as u32,
+    );
     w(off::BACK_DEPTH_FUNC, rs.back_depth_func);
     w(off::FRONT_DEPTH_WRITE, rs.front_depth_write);
     w(off::BACK_DEPTH_WRITE, rs.back_depth_write);
-    w(off::FRONT_FRAGMENT_PROGRAM_ENABLE, rs.front_fragment_program_enable);
-    w(off::BACK_FRAGMENT_PROGRAM_ENABLE, rs.back_fragment_program_enable);
+    w(
+        off::FRONT_FRAGMENT_PROGRAM_ENABLE,
+        rs.front_fragment_program_enable,
+    );
+    w(
+        off::BACK_FRAGMENT_PROGRAM_ENABLE,
+        rs.back_fragment_program_enable,
+    );
     w(off::FRONT_POLYGON_MODE, rs.front_polygon_mode);
     w(off::BACK_POLYGON_MODE, rs.back_polygon_mode);
     w(off::FRONT_POINT_LINE_WIDTH, rs.front_point_line_width);
     w(off::FRONT_STENCIL_REF, rs.front_stencil_ref);
     w(off::FRONT_STENCIL_FUNC, rs.front_stencil_func);
     w(off::FRONT_STENCIL_OP_FAIL, rs.front_stencil_op_fail);
-    w(off::FRONT_STENCIL_OP_DEPTH_FAIL, rs.front_stencil_op_depth_fail);
-    w(off::FRONT_STENCIL_OP_DEPTH_PASS, rs.front_stencil_op_depth_pass);
-    w(off::FRONT_STENCIL_COMPARE_MASK, rs.front_stencil_compare_mask);
+    w(
+        off::FRONT_STENCIL_OP_DEPTH_FAIL,
+        rs.front_stencil_op_depth_fail,
+    );
+    w(
+        off::FRONT_STENCIL_OP_DEPTH_PASS,
+        rs.front_stencil_op_depth_pass,
+    );
+    w(
+        off::FRONT_STENCIL_COMPARE_MASK,
+        rs.front_stencil_compare_mask,
+    );
     w(off::FRONT_STENCIL_WRITE_MASK, rs.front_stencil_write_mask);
     w(off::BACK_STENCIL_FUNC, rs.back_stencil_func);
     w(off::BACK_STENCIL_OP_FAIL, rs.back_stencil_op_fail);
-    w(off::BACK_STENCIL_OP_DEPTH_FAIL, rs.back_stencil_op_depth_fail);
-    w(off::BACK_STENCIL_OP_DEPTH_PASS, rs.back_stencil_op_depth_pass);
+    w(
+        off::BACK_STENCIL_OP_DEPTH_FAIL,
+        rs.back_stencil_op_depth_fail,
+    );
+    w(
+        off::BACK_STENCIL_OP_DEPTH_PASS,
+        rs.back_stencil_op_depth_pass,
+    );
     w(off::BACK_STENCIL_COMPARE_MASK, rs.back_stencil_compare_mask);
     w(off::BACK_STENCIL_WRITE_MASK, rs.back_stencil_write_mask);
     w(off::BACK_STENCIL_REF, rs.back_stencil_ref);
@@ -616,8 +661,14 @@ pub fn store(ctx: &mut GuestCtx, context: u32, rs: &crate::capture::RenderState)
     for (i, v) in rs.region_clip.iter().enumerate() {
         w(off::REGION_CLIP + i as u32 * 4, *v);
     }
-    w(off::FRONT_VISIBILITY_TEST_ENABLE, rs.front_visibility_test_enable);
-    w(off::FRONT_VISIBILITY_TEST_INDEX, rs.front_visibility_test_index);
+    w(
+        off::FRONT_VISIBILITY_TEST_ENABLE,
+        rs.front_visibility_test_enable,
+    );
+    w(
+        off::FRONT_VISIBILITY_TEST_INDEX,
+        rs.front_visibility_test_index,
+    );
     w(off::FRONT_VISIBILITY_TEST_OP, rs.front_visibility_test_op);
 }
 
@@ -795,55 +846,55 @@ impl<'a> Block<'a> {
 
     /// The whole render state, parsed out of the snapshot. The body [`load`] used to be.
     pub fn render_state(&self) -> crate::capture::RenderState {
-    let r = |offset: u32| -> u32 { self.word(offset) };
-    let mut viewport = [0f32; 6];
-    for (i, v) in viewport.iter_mut().enumerate() {
-        *v = f32::from_bits(r(off::VIEWPORT + i as u32 * 4));
-    }
-    let mut region_clip = [0u32; 4];
-    for (i, v) in region_clip.iter_mut().enumerate() {
-        *v = r(off::REGION_CLIP + i as u32 * 4);
-    }
-    crate::capture::RenderState {
-        cull_mode: r(off::CULL_MODE),
-        two_sided: r(off::TWO_SIDED),
-        front_depth_func: r(off::FRONT_DEPTH_FUNC),
-        front_depth_bias_factor: r(off::FRONT_DEPTH_BIAS_FACTOR) as i32,
-        front_depth_bias_units: r(off::FRONT_DEPTH_BIAS_UNITS) as i32,
-        back_depth_func: r(off::BACK_DEPTH_FUNC),
-        front_depth_write: r(off::FRONT_DEPTH_WRITE),
-        back_depth_write: r(off::BACK_DEPTH_WRITE),
-        front_fragment_program_enable: r(off::FRONT_FRAGMENT_PROGRAM_ENABLE),
-        back_fragment_program_enable: r(off::BACK_FRAGMENT_PROGRAM_ENABLE),
-        front_polygon_mode: r(off::FRONT_POLYGON_MODE),
-        back_polygon_mode: r(off::BACK_POLYGON_MODE),
-        front_point_line_width: r(off::FRONT_POINT_LINE_WIDTH),
-        front_stencil_ref: r(off::FRONT_STENCIL_REF),
-        front_stencil_func: r(off::FRONT_STENCIL_FUNC),
-        front_stencil_op_fail: r(off::FRONT_STENCIL_OP_FAIL),
-        front_stencil_op_depth_fail: r(off::FRONT_STENCIL_OP_DEPTH_FAIL),
-        front_stencil_op_depth_pass: r(off::FRONT_STENCIL_OP_DEPTH_PASS),
-        // The stencil masks are `unsigned char` in the GXM prototype. The setters store
-        // their argument words AS PASSED - that is what lets them lower to a plain argument
-        // run (`InlineOp::StoreArgRun`) that writes exactly what the handler writes - so the
-        // byte narrowing lives HERE, on the one path every consumer reads through.
-        front_stencil_compare_mask: r(off::FRONT_STENCIL_COMPARE_MASK) & 0xff,
-        front_stencil_write_mask: r(off::FRONT_STENCIL_WRITE_MASK) & 0xff,
-        back_stencil_func: r(off::BACK_STENCIL_FUNC),
-        back_stencil_op_fail: r(off::BACK_STENCIL_OP_FAIL),
-        back_stencil_op_depth_fail: r(off::BACK_STENCIL_OP_DEPTH_FAIL),
-        back_stencil_op_depth_pass: r(off::BACK_STENCIL_OP_DEPTH_PASS),
-        back_stencil_compare_mask: r(off::BACK_STENCIL_COMPARE_MASK) & 0xff,
-        back_stencil_write_mask: r(off::BACK_STENCIL_WRITE_MASK) & 0xff,
-        back_stencil_ref: r(off::BACK_STENCIL_REF),
-        viewport_enable: r(off::VIEWPORT_ENABLE),
-        viewport,
-        region_clip_mode: r(off::REGION_CLIP_MODE),
-        region_clip,
-        front_visibility_test_enable: r(off::FRONT_VISIBILITY_TEST_ENABLE),
-        front_visibility_test_index: r(off::FRONT_VISIBILITY_TEST_INDEX),
-        front_visibility_test_op: r(off::FRONT_VISIBILITY_TEST_OP),
-    }
+        let r = |offset: u32| -> u32 { self.word(offset) };
+        let mut viewport = [0f32; 6];
+        for (i, v) in viewport.iter_mut().enumerate() {
+            *v = f32::from_bits(r(off::VIEWPORT + i as u32 * 4));
+        }
+        let mut region_clip = [0u32; 4];
+        for (i, v) in region_clip.iter_mut().enumerate() {
+            *v = r(off::REGION_CLIP + i as u32 * 4);
+        }
+        crate::capture::RenderState {
+            cull_mode: r(off::CULL_MODE),
+            two_sided: r(off::TWO_SIDED),
+            front_depth_func: r(off::FRONT_DEPTH_FUNC),
+            front_depth_bias_factor: r(off::FRONT_DEPTH_BIAS_FACTOR) as i32,
+            front_depth_bias_units: r(off::FRONT_DEPTH_BIAS_UNITS) as i32,
+            back_depth_func: r(off::BACK_DEPTH_FUNC),
+            front_depth_write: r(off::FRONT_DEPTH_WRITE),
+            back_depth_write: r(off::BACK_DEPTH_WRITE),
+            front_fragment_program_enable: r(off::FRONT_FRAGMENT_PROGRAM_ENABLE),
+            back_fragment_program_enable: r(off::BACK_FRAGMENT_PROGRAM_ENABLE),
+            front_polygon_mode: r(off::FRONT_POLYGON_MODE),
+            back_polygon_mode: r(off::BACK_POLYGON_MODE),
+            front_point_line_width: r(off::FRONT_POINT_LINE_WIDTH),
+            front_stencil_ref: r(off::FRONT_STENCIL_REF),
+            front_stencil_func: r(off::FRONT_STENCIL_FUNC),
+            front_stencil_op_fail: r(off::FRONT_STENCIL_OP_FAIL),
+            front_stencil_op_depth_fail: r(off::FRONT_STENCIL_OP_DEPTH_FAIL),
+            front_stencil_op_depth_pass: r(off::FRONT_STENCIL_OP_DEPTH_PASS),
+            // The stencil masks are `unsigned char` in the GXM prototype. The setters store
+            // their argument words AS PASSED - that is what lets them lower to a plain argument
+            // run (`InlineOp::StoreArgRun`) that writes exactly what the handler writes - so the
+            // byte narrowing lives HERE, on the one path every consumer reads through.
+            front_stencil_compare_mask: r(off::FRONT_STENCIL_COMPARE_MASK) & 0xff,
+            front_stencil_write_mask: r(off::FRONT_STENCIL_WRITE_MASK) & 0xff,
+            back_stencil_func: r(off::BACK_STENCIL_FUNC),
+            back_stencil_op_fail: r(off::BACK_STENCIL_OP_FAIL),
+            back_stencil_op_depth_fail: r(off::BACK_STENCIL_OP_DEPTH_FAIL),
+            back_stencil_op_depth_pass: r(off::BACK_STENCIL_OP_DEPTH_PASS),
+            back_stencil_compare_mask: r(off::BACK_STENCIL_COMPARE_MASK) & 0xff,
+            back_stencil_write_mask: r(off::BACK_STENCIL_WRITE_MASK) & 0xff,
+            back_stencil_ref: r(off::BACK_STENCIL_REF),
+            viewport_enable: r(off::VIEWPORT_ENABLE),
+            viewport,
+            region_clip_mode: r(off::REGION_CLIP_MODE),
+            region_clip,
+            front_visibility_test_enable: r(off::FRONT_VISIBILITY_TEST_ENABLE),
+            front_visibility_test_index: r(off::FRONT_VISIBILITY_TEST_INDEX),
+            front_visibility_test_op: r(off::FRONT_VISIBILITY_TEST_OP),
+        }
     }
 }
 
@@ -860,29 +911,56 @@ pub(crate) const SCALARS: &[(u32, &str)] = &[
     (off::BACK_DEPTH_FUNC, "back_depth_func"),
     (off::FRONT_DEPTH_WRITE, "front_depth_write"),
     (off::BACK_DEPTH_WRITE, "back_depth_write"),
-    (off::FRONT_FRAGMENT_PROGRAM_ENABLE, "front_fragment_program_enable"),
-    (off::BACK_FRAGMENT_PROGRAM_ENABLE, "back_fragment_program_enable"),
+    (
+        off::FRONT_FRAGMENT_PROGRAM_ENABLE,
+        "front_fragment_program_enable",
+    ),
+    (
+        off::BACK_FRAGMENT_PROGRAM_ENABLE,
+        "back_fragment_program_enable",
+    ),
     (off::FRONT_POLYGON_MODE, "front_polygon_mode"),
     (off::BACK_POLYGON_MODE, "back_polygon_mode"),
     (off::FRONT_POINT_LINE_WIDTH, "front_point_line_width"),
     (off::FRONT_STENCIL_REF, "front_stencil_ref"),
     (off::FRONT_STENCIL_FUNC, "front_stencil_func"),
     (off::FRONT_STENCIL_OP_FAIL, "front_stencil_op_fail"),
-    (off::FRONT_STENCIL_OP_DEPTH_FAIL, "front_stencil_op_depth_fail"),
-    (off::FRONT_STENCIL_OP_DEPTH_PASS, "front_stencil_op_depth_pass"),
-    (off::FRONT_STENCIL_COMPARE_MASK, "front_stencil_compare_mask"),
+    (
+        off::FRONT_STENCIL_OP_DEPTH_FAIL,
+        "front_stencil_op_depth_fail",
+    ),
+    (
+        off::FRONT_STENCIL_OP_DEPTH_PASS,
+        "front_stencil_op_depth_pass",
+    ),
+    (
+        off::FRONT_STENCIL_COMPARE_MASK,
+        "front_stencil_compare_mask",
+    ),
     (off::FRONT_STENCIL_WRITE_MASK, "front_stencil_write_mask"),
     (off::BACK_STENCIL_FUNC, "back_stencil_func"),
     (off::BACK_STENCIL_OP_FAIL, "back_stencil_op_fail"),
-    (off::BACK_STENCIL_OP_DEPTH_FAIL, "back_stencil_op_depth_fail"),
-    (off::BACK_STENCIL_OP_DEPTH_PASS, "back_stencil_op_depth_pass"),
+    (
+        off::BACK_STENCIL_OP_DEPTH_FAIL,
+        "back_stencil_op_depth_fail",
+    ),
+    (
+        off::BACK_STENCIL_OP_DEPTH_PASS,
+        "back_stencil_op_depth_pass",
+    ),
     (off::BACK_STENCIL_COMPARE_MASK, "back_stencil_compare_mask"),
     (off::BACK_STENCIL_WRITE_MASK, "back_stencil_write_mask"),
     (off::BACK_STENCIL_REF, "back_stencil_ref"),
     (off::VIEWPORT_ENABLE, "viewport_enable"),
     (off::REGION_CLIP_MODE, "region_clip_mode"),
-    (off::FRONT_VISIBILITY_TEST_ENABLE, "front_visibility_test_enable"),
-    (off::FRONT_VISIBILITY_TEST_INDEX, "front_visibility_test_index"),
+    (
+        off::FRONT_VISIBILITY_TEST_ENABLE,
+        "front_visibility_test_enable",
+    ),
+    (
+        off::FRONT_VISIBILITY_TEST_INDEX,
+        "front_visibility_test_index",
+    ),
     (off::FRONT_VISIBILITY_TEST_OP, "front_visibility_test_op"),
     (off::VERTEX_PROGRAM, "vertex_program"),
     (off::FRAGMENT_PROGRAM, "fragment_program"),
@@ -932,8 +1010,14 @@ mod tests {
             }
         }
         for i in 0..MAX_UNIFORM_BUFFERS as u32 {
-            claimed.push((off::VERTEX_UNIFORM_BUFFERS + i * 4, "vertex_uniform_buffers"));
-            claimed.push((off::FRAGMENT_UNIFORM_BUFFERS + i * 4, "fragment_uniform_buffers"));
+            claimed.push((
+                off::VERTEX_UNIFORM_BUFFERS + i * 4,
+                "vertex_uniform_buffers",
+            ));
+            claimed.push((
+                off::FRAGMENT_UNIFORM_BUFFERS + i * 4,
+                "fragment_uniform_buffers",
+            ));
         }
         claimed.sort();
         for w in claimed.windows(2) {
@@ -966,14 +1050,32 @@ mod tests {
     fn the_texture_binding_layout_is_closed() {
         let op = crate::vita::gxm::inline_op(crate::nid::gxm::SET_FRAGMENT_TEXTURE)
             .expect("sceGxmSetFragmentTexture has an inline form");
-        let vitaslop_transpiler::InlineOp::CopyArgIndexed { offset, stride, count, words } = op
+        let vitaslop_transpiler::InlineOp::CopyArgIndexed {
+            offset,
+            stride,
+            count,
+            words,
+        } = op
         else {
             panic!("sceGxmSetFragmentTexture must lower to a copy form, got {op:?}");
         };
-        assert_eq!(offset, off::TEXTURES, "the emitted copy writes the texture array");
-        assert_eq!(stride, TEXTURE_STRIDE, "one slot per sampler unit, same size both sides");
-        assert_eq!(count, MAX_TEXTURE_UNITS as u32, "the same unit bound both sides");
-        assert_eq!(words, TEXTURE_CONTROL_WORDS, "the same control words copied both sides");
+        assert_eq!(
+            offset,
+            off::TEXTURES,
+            "the emitted copy writes the texture array"
+        );
+        assert_eq!(
+            stride, TEXTURE_STRIDE,
+            "one slot per sampler unit, same size both sides"
+        );
+        assert_eq!(
+            count, MAX_TEXTURE_UNITS as u32,
+            "the same unit bound both sides"
+        );
+        assert_eq!(
+            words, TEXTURE_CONTROL_WORDS,
+            "the same control words copied both sides"
+        );
         // ...and the slot the emitted code writes must be exactly the slot the reader reads:
         // addr, then `words` control words, then the provenance flag, with nothing left over.
         assert_eq!(
@@ -999,11 +1101,22 @@ mod tests {
     #[test]
     fn the_uniform_reserve_layout_is_closed() {
         use crate::vita::gxmprog;
-        assert_eq!(uniform_record::BUF, 0, "the emitter writes the buffer at record + 0");
+        assert_eq!(
+            uniform_record::BUF,
+            0,
+            "the emitter writes the buffer at record + 0"
+        );
         assert_eq!(uniform_record::SIZE, 4, "...the size at record + 4");
         assert_eq!(uniform_record::HEADER, 8, "...and the header at record + 8");
-        assert_eq!(uniform_record::BYTES, 12, "a record is exactly those three words");
-        assert!(UNIFORM_ALIGN.is_power_of_two(), "the emitted mask is `!(align - 1)`");
+        assert_eq!(
+            uniform_record::BYTES,
+            12,
+            "a record is exactly those three words"
+        );
+        assert!(
+            UNIFORM_ALIGN.is_power_of_two(),
+            "the emitted mask is `!(align - 1)`"
+        );
         assert_eq!(
             UNIFORM_MIN_ALLOC % UNIFORM_ALIGN,
             0,
@@ -1030,7 +1143,10 @@ mod tests {
             assert_eq!(l.record, record, "each stage records into its OWN slot");
             assert_eq!(l.ctx_program, program, "...and reads its OWN bound program");
             assert_eq!((l.ctx_magic_at, l.ctx_magic), (off::MAGIC, MAGIC));
-            assert_eq!((l.prog_magic_at, l.prog_magic), (gxmprog::off::MAGIC, gxmprog::MAGIC));
+            assert_eq!(
+                (l.prog_magic_at, l.prog_magic),
+                (gxmprog::off::MAGIC, gxmprog::MAGIC)
+            );
             assert_eq!(l.ctx_ring_base, off::UNIFORM_RING_BASE);
             assert_eq!(l.ctx_ring_end, off::UNIFORM_RING_END);
             assert_eq!(l.ctx_ring_cursor, off::UNIFORM_RING_CURSOR);
@@ -1040,7 +1156,10 @@ mod tests {
             assert_eq!(l.align, UNIFORM_ALIGN);
             // Every word the emitted code reaches must be inside the block it is bounded
             // against, or the guard admits a pointer whose last access lands outside it.
-            assert!(l.ctx_top() + 4 <= BYTES, "the form stays inside the context block");
+            assert!(
+                l.ctx_top() + 4 <= BYTES,
+                "the form stays inside the context block"
+            );
             assert!(
                 l.prog_top() + 4 <= gxmprog::BYTES,
                 "...and inside the program handle block"
@@ -1136,7 +1255,10 @@ mod tests {
             let mut bytes = image.clone();
             let mut mem = SliceMemory(&mut bytes);
             let ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
-            assert!(ctx.borrow_bytes(CONTEXT, 4).is_some(), "the lending arm must lend");
+            assert!(
+                ctx.borrow_bytes(CONTEXT, 4).is_some(),
+                "the lending arm must lend"
+            );
             let mut out = Vec::new();
             texture_bindings(&ctx, CONTEXT, &mut out);
             out
@@ -1146,7 +1268,10 @@ mod tests {
             let mut inner = SliceMemory(&mut bytes);
             let mut mem = NoBorrow(inner_of(&mut inner), std::cell::Cell::new(0));
             let ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
-            assert!(ctx.borrow_bytes(CONTEXT, 4).is_none(), "the copying arm must not lend");
+            assert!(
+                ctx.borrow_bytes(CONTEXT, 4).is_none(),
+                "the copying arm must not lend"
+            );
             let mut out = Vec::new();
             texture_bindings(&ctx, CONTEXT, &mut out);
             let n = match &mem {
@@ -1160,7 +1285,10 @@ mod tests {
             expect_units,
             "the bound units themselves"
         );
-        assert_eq!(borrowed, copied, "the borrowing and copying readers disagree");
+        assert_eq!(
+            borrowed, copied,
+            "the borrowing and copying readers disagree"
+        );
         // >>> AND THE COPY IS ONE READ, WHICH IS THE PROPERTY THAT ACTUALLY REGRESSED.
         //
         // The equality above would have passed the whole time this was slow: the per-unit
@@ -1220,7 +1348,10 @@ mod tests {
             let mut bytes = image.clone();
             let mut mem = SliceMemory(&mut bytes);
             let ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
-            assert!(ctx.borrow_bytes(CONTEXT, 4).is_some(), "the lending arm must lend");
+            assert!(
+                ctx.borrow_bytes(CONTEXT, 4).is_some(),
+                "the lending arm must lend"
+            );
             (load(&ctx, CONTEXT), streams(&ctx, CONTEXT))
         };
         let (rs_copy, st_copy, reads) = {
@@ -1228,7 +1359,10 @@ mod tests {
             let mut inner = SliceMemory(&mut bytes);
             let mut mem = NoBorrow(inner_of(&mut inner), std::cell::Cell::new(0));
             let ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
-            assert!(ctx.borrow_bytes(CONTEXT, 4).is_none(), "the copying arm must not lend");
+            assert!(
+                ctx.borrow_bytes(CONTEXT, 4).is_none(),
+                "the copying arm must not lend"
+            );
             let rs = load(&ctx, CONTEXT);
             let st = streams(&ctx, CONTEXT);
             let n = match &mem {
@@ -1237,8 +1371,14 @@ mod tests {
             (rs, st, n)
         };
 
-        assert_eq!(rs_borrow, rs_copy, "load disagrees across the borrow/copy split");
-        assert_eq!(st_borrow, st_copy, "streams disagrees across the borrow/copy split");
+        assert_eq!(
+            rs_borrow, rs_copy,
+            "load disagrees across the borrow/copy split"
+        );
+        assert_eq!(
+            st_borrow, st_copy,
+            "streams disagrees across the borrow/copy split"
+        );
         // One read for `load`, one for `streams` - the cost property, which an
         // equality-only test cannot see (the per-word path was correct, just 57x the calls).
         assert!(
@@ -1298,7 +1438,10 @@ mod tests {
     #[test]
     fn init_seeds_the_defaults_and_stamps_the_block() {
         with_ctx(|ctx| {
-            assert!(!is_context(ctx, CONTEXT), "untouched memory is not a context");
+            assert!(
+                !is_context(ctx, CONTEXT),
+                "untouched memory is not a context"
+            );
             init(ctx, CONTEXT);
             assert!(is_context(ctx, CONTEXT));
             assert_eq!(load(ctx, CONTEXT), crate::capture::RenderState::default());
@@ -1317,7 +1460,11 @@ mod tests {
             let past = CONTEXT + off::STREAMS + MAX_VERTEX_STREAMS as u32 * 4;
             ctx.write_u32(past, 0xDEAD_BEEF);
             set_stream(ctx, CONTEXT, MAX_VERTEX_STREAMS as u32, 0x1234);
-            assert_eq!(ctx.read_u32(past), 0xDEAD_BEEF, "the word past the array is untouched");
+            assert_eq!(
+                ctx.read_u32(past),
+                0xDEAD_BEEF,
+                "the word past the array is untouched"
+            );
             assert_eq!(streams(ctx, CONTEXT), [0; MAX_VERTEX_STREAMS]);
             assert_eq!(stream(ctx, CONTEXT, MAX_VERTEX_STREAMS as u32), 0);
         });
@@ -1363,16 +1510,27 @@ mod span_tests {
         let before = guest;
         let streams = [0x1111_0000, 0x2222_0000, 0x3333_0000, 0x4444_0000];
         for lent in [true, false] {
-            let blk = if lent { Block::Lent(&guest) } else { Block::Copied(guest) };
-            let blk = blk.overlaid(off::VERTEX_PROGRAM, &[0xabcd_ef01]).overlaid(off::STREAMS, &streams);
+            let blk = if lent {
+                Block::Lent(&guest)
+            } else {
+                Block::Copied(guest)
+            };
+            let blk = blk
+                .overlaid(off::VERTEX_PROGRAM, &[0xabcd_ef01])
+                .overlaid(off::STREAMS, &streams);
             assert_eq!(blk.word(off::VERTEX_PROGRAM), 0xabcd_ef01, "lent={lent}");
             assert_eq!(blk.streams()[..4], streams, "lent={lent}");
             let mut expect = before;
-            expect[off::VERTEX_PROGRAM as usize..][..4].copy_from_slice(&0xabcd_ef01u32.to_le_bytes());
+            expect[off::VERTEX_PROGRAM as usize..][..4]
+                .copy_from_slice(&0xabcd_ef01u32.to_le_bytes());
             for (i, s) in streams.iter().enumerate() {
                 expect[off::STREAMS as usize + i * 4..][..4].copy_from_slice(&s.to_le_bytes());
             }
-            assert_eq!(blk.span(0, BYTES as usize), &expect[..], "every other byte is the block's (lent={lent})");
+            assert_eq!(
+                blk.span(0, BYTES as usize),
+                &expect[..],
+                "every other byte is the block's (lent={lent})"
+            );
         }
         assert_eq!(guest, before, "the guest's block is never written");
     }
@@ -1396,12 +1554,18 @@ mod span_tests {
         let blk = Block::Copied(bytes);
         let (mut a, mut b) = (Vec::new(), Vec::new());
         blk.texture_bindings(&mut a);
-        texture_bindings_in_span(blk.span(off::TEXTURES, MAX_TEXTURE_UNITS * TEXTURE_STRIDE as usize), &mut b);
+        texture_bindings_in_span(
+            blk.span(off::TEXTURES, MAX_TEXTURE_UNITS * TEXTURE_STRIDE as usize),
+            &mut b,
+        );
         assert!(!a.is_empty());
         assert_eq!(a.len(), b.len());
         for ((ua, ba), (ub, bb)) in a.iter().zip(b.iter()) {
             assert_eq!(ua, ub);
-            assert_eq!((ba.addr, ba.words, ba.from_precomputed), (bb.addr, bb.words, bb.from_precomputed));
+            assert_eq!(
+                (ba.addr, ba.words, ba.from_precomputed),
+                (bb.addr, bb.words, bb.from_precomputed)
+            );
         }
     }
 }

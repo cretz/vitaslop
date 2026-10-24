@@ -19,13 +19,13 @@
 //! (partial) sector uses the CTS tail rule. Per-sector integrity is
 //! `HMAC-SHA1(HMAC-SHA1(secret, LE32(sector_index)), encrypted_sector)`.
 
+use super::Error;
 use super::keys;
 use super::pfs::{FileCtx, PfsCrypto};
-use super::Error;
+use aes::Aes128;
 use aes::cipher::block_padding::NoPadding;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockDecryptMut, BlockEncrypt, KeyInit, KeyIvInit};
-use aes::Aes128;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
@@ -67,7 +67,11 @@ fn cbc_cts_decrypt(key: &[u8; 16], iv: &[u8; 16], ct: &[u8]) -> Vec<u8> {
     if tail != 0 {
         // The chaining value the tail is masked with: the last full ciphertext block,
         // or the IV when the sector is shorter than one block.
-        let prev: &[u8] = if full != 0 { &ct[full - 16..full] } else { &iv[..] };
+        let prev: &[u8] = if full != 0 {
+            &ct[full - 16..full]
+        } else {
+            &iv[..]
+        };
         let cipher = Aes128::new(GenericArray::from_slice(key));
         let mut ks = GenericArray::clone_from_slice(prev);
         cipher.encrypt_block(&mut ks);
@@ -128,7 +132,10 @@ pub(crate) fn integrity_secret_pub(drv_key: &[u8; 16], files_salt: u32, icv_salt
 
 /// The 20-byte integrity secret (per-sector HMAC key).
 fn integrity_secret(drv_key: &[u8; 16], files_salt: u32, icv_salt: u32) -> [u8; 20] {
-    let combo = hmac_sha1(&keys::PFS_INTEGRITY_BASE, &secret_salt(files_salt, icv_salt));
+    let combo = hmac_sha1(
+        &keys::PFS_INTEGRITY_BASE,
+        &secret_salt(files_salt, icv_salt),
+    );
     let wrapped = cbc_cts_encrypt(drv_key, &keys::PFS_FIXED_CBC_IV, &combo);
     let mut out = [0u8; 20];
     out.copy_from_slice(&wrapped);
@@ -229,13 +236,14 @@ impl GameData {
         chunk: &[u8],
     ) -> Result<Vec<u8>, Error> {
         if self.verify
-            && let Some(expect) = ctx.signatures.get(idx) {
-                let subkey = hmac_sha1(&keys.secret, &(idx as u32).to_le_bytes());
-                let got = hmac_sha1(&subkey, chunk);
-                if &got != expect {
-                    return Err(Error::IntegrityCheck("pfs sector hmac mismatch"));
-                }
+            && let Some(expect) = ctx.signatures.get(idx)
+        {
+            let subkey = hmac_sha1(&keys.secret, &(idx as u32).to_le_bytes());
+            let got = hmac_sha1(&subkey, chunk);
+            if &got != expect {
+                return Err(Error::IntegrityCheck("pfs sector hmac mismatch"));
             }
+        }
         let page_size = ctx.page_size.max(1) as usize;
         let offset = (page_size as u64).wrapping_mul(idx as u64);
         let mut iv = [0u8; 16];
@@ -423,11 +431,20 @@ mod tests {
             let t = by_page
                 .get(&n.id)
                 .unwrap_or_else(|| panic!("no table at page_no == node id {}", n.id));
-            assert_eq!(t.n_sectors, expected(n.size), "sector count for node {}", n.id);
+            assert_eq!(
+                t.n_sectors,
+                expected(n.size),
+                "sector count for node {}",
+                n.id
+            );
         }
         let distinct: std::collections::HashSet<u32> =
             img.unicv.tables.iter().map(|t| t.page_no).collect();
-        assert_eq!(distinct.len(), img.unicv.tables.len(), "page_no not a bijection");
+        assert_eq!(
+            distinct.len(),
+            img.unicv.tables.len(),
+            "page_no not a bijection"
+        );
     }
 
     /// End-to-end acid test, fully offline: `drv_key` is computed from the raw

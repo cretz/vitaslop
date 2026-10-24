@@ -7,7 +7,9 @@
 //! unimplemented-NID at a time.
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: list_imports <module> [name filter]");
+    let path = args
+        .next()
+        .expect("usage: list_imports <module> [name filter]");
     let filter = args.next().unwrap_or_default().to_lowercase();
     let bytes = std::fs::read(&path).expect("read the module");
     let module = vitaslop_loader::load(&bytes).expect("parse the module");
@@ -15,7 +17,13 @@ fn main() {
     let mut rows: Vec<(u32, u32, &'static str)> = module
         .imports
         .iter()
-        .map(|i| (i.library_nid, i.func_nid, vitaslop_runtime::nid::name(i.func_nid)))
+        .map(|i| {
+            (
+                i.library_nid,
+                i.func_nid,
+                vitaslop_runtime::nid::name(i.func_nid),
+            )
+        })
         .collect();
     rows.sort_by_key(|(lib, nid, _)| (*lib, *nid));
     rows.dedup();

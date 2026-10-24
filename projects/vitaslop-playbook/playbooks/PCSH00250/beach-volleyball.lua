@@ -1,10 +1,10 @@
 -- Dead or Alive Xtreme 3 Venus (PCSH00250, Asia): boot through the intro and Day 1's
 -- tutorial, pick NIKI BEACH on the activity menu, choose PLAY BEACH VOLLEYBALL, and play.
 --
--- Converted from the recipe `beach-volleyball`, which tapped CIRCLE every 150 frames from f800
+-- Converted from the old frame-keyed script `beach-volleyball`, which tapped CIRCLE every 150 frames from f800
 -- to f4750 and then alternated CIRCLE/CROSS on a fixed grid. This waits on the game instead.
 --
--- HOW THE CUES WERE FOUND: `--discover` on the recipe's run (deterministic, 9100 frames) next
+-- HOW THE CUES WERE FOUND: `--discover` on the old script's run (deterministic, 9100 frames) next
 -- to a shot every 100 frames. Every file the title reads is a `sceIoOpen` with the path in r0,
 -- and each screen loads its own UI layout the moment it opens (frames from that run):
 --
@@ -50,7 +50,7 @@ phase("boot", { timeout = 240 }, function()
   title:trace("title screen opened")
   -- MEASURED: waiting the intro movie out with no presses STALLS (a run sat 60 s after it
   -- started and never reached character select) - so the taps go on through it, as the
-  -- recipe's did, and the two screens are only marked as they pass.
+  -- old script's did, and the two screens are only marked as they pass.
   local saw_movie, saw_chara = false, false
   repeat
     tap("circle", 6, 24)
@@ -103,7 +103,7 @@ phase("volleyball", { timeout = 200 }, function()
   idle(180)
   shot("match-start")
   -- Alternate CIRCLE (receive / toss) and CROSS (spike / block / serve) on a 12-frame
-  -- rhythm, as the recipe did - enough to keep rallies going and points scoring. Two
+  -- rhythm, as the old script did - enough to keep rallies going and points scoring. Two
   -- minutes of guest time is several points.
   local _, _, start = now()
   local n = 0

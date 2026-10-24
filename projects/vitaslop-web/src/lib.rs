@@ -29,9 +29,11 @@
 /// never falls, so by the time it is large the allocation that made it large is gone. This
 /// counts LIVE bytes, which fall when a cache is evicted, and the high-water mark, which is what
 /// the wasm heap actually took pages for and can never give back.
+///
+/// Under it, the threads bundle's 16 MB-step heap (`heap::PrivateHeap`; a pass-through elsewhere).
 #[global_allocator]
-static ALLOC: vitaslop_platform::heap::Counting<std::alloc::System> =
-    vitaslop_platform::heap::Counting(std::alloc::System);
+static ALLOC: vitaslop_platform::heap::Counting<vitaslop_platform::heap::PrivateHeap<std::alloc::System>> =
+    vitaslop_platform::heap::Counting(vitaslop_platform::heap::PrivateHeap(std::alloc::System));
 
 mod audio;
 mod browser_sched;
@@ -58,7 +60,7 @@ use vitaslop_platform::gpu::{CubeRenderer, GxmRenderer};
 use vitaslop_platform::present_scale;
 use vitaslop_runtime::capture::Scene;
 use vitaslop_runtime::render::RenderSceneBuilder;
-use vitaslop_runtime::{CtrlFrame, RecipeWorld, RunReport, VitaEnv, World};
+use vitaslop_runtime::{CtrlFrame, RunReport, VitaEnv, World};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;
@@ -635,7 +637,7 @@ struct RttWriteback {
     /// the panel prints and the reader divides.
     ///
     /// This exists because a washed-out picture could not be told apart from a STARVED
-    /// writeback. MEASURED on this machine, one build, one recipe, one frame: turning the
+    /// writeback. MEASURED on this machine, one build, one input script, one frame: turning the
     /// writeback off entirely takes a baseball title's at-bat from a frame mean of 135,132,124 to
     /// 203,180,144 - the device's exact look - because the guest's auto-exposure reads its
     /// light probe out of guest memory and raises the exposure until it clamps when that probe
@@ -1048,6 +1050,11 @@ struct LivePlayback {
     /// that type's own accounting; the render split needs four reads of its own.
     perf: Option<web_sys::Performance>,
     split: RenderSplit,
+    /// Where the presents since the last guest frame spent their wall time - `[build, pipeline
+    /// wait, acquire, encode, submit]` ms - for the lost-time list, which otherwise says only
+    /// `present 40` and cannot tell a compile wait from an encode from a blocked submit.
+    /// Taken (and zeroed) by [`Self::take_present_span`].
+    present_span: [f64; 5],
     /// Reads back WHAT WE PRESENTED, when `VITASLOP_PRESENT_PROBE` asks for it.
     probe: Option<PresentProbe>,
     /// A playbook's pixel cues' view of the surface - see [`PixelTap`].
@@ -1702,7 +1709,7 @@ impl TargetProbe {
 }
 
 /// What a playbook's pixel cues read: the presented surface, copied on the frame's own encoder
-/// while `vitaslop_playbook::engine::wants_pixels` holds, mapped after the submit and handed to
+/// while `playbook::wants_pixels` holds, mapped after the submit and handed to
 /// the engine (`on_frame_pixels`) on the present that finds the map done.
 ///
 /// ONE copy in flight at a time, so a reading is the newest the GPU has finished, a frame or two
@@ -1796,7 +1803,7 @@ impl PixelTap {
                 }
             }
             drop(view);
-            vitaslop_playbook::engine::on_frame_pixels(w, h, &rgba);
+            playbook::on_frame_pixels(w, h, &rgba);
         }
         buffer.unmap();
         self.in_flight = false;
@@ -3131,6 +3138,7 @@ impl LivePlayback {
             fps,
             perf: split_clock,
             split: RenderSplit::default(),
+            present_span: [0.0; 5],
             targets: probe.is_some().then(TargetProbe::new),
             pixel_tap: PixelTap::new(),
             scratch: None,
@@ -3529,13 +3537,17 @@ impl LivePlayback {
         // cache cannot tell a texture it is about to need again from one it is finished with.
         self.builder.begin_frame();
         let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
+        let t_built = clock(&self.perf);
         // A frame whose new pipelines are still compiling is declined, not waited for - see
         // `warm_pipelines`. After the build, like the acquire arms below: its scenes are carried.
-        let Some(pipe_wait) = self.warm_pipelines(&built, "present", !self.fps.paused).await else {
+        let warmed = self.warm_pipelines(&built, "present", !self.fps.paused).await;
+        let t1 = clock(&self.perf);
+        self.present_span[0] += t_built - t0;
+        self.present_span[1] += t1 - t_built;
+        let Some(pipe_wait) = warmed else {
             return PresentOutcome::Skipped;
         };
         let draws: usize = built.iter().map(|b| b.draws.len()).sum();
-        let t1 = clock(&self.perf);
         // >>> EVERY VARIANT IS ANSWERED, AND THREE OF THEM ARE NOT "SKIP THE FRAME".
         //
         // `Outdated` and `Lost` do not clear themselves: a surface in either state answers the
@@ -3574,7 +3586,7 @@ impl LivePlayback {
         // A playbook that watches the screen (`cue.pixels`) reads the surface back, which needs
         // `COPY_SRC` - asked for only once one does (see `surface_usage` at construction). A copy
         // from a surface without it invalidates the frame's WHOLE command buffer: nothing renders.
-        if vitaslop_playbook::engine::wants_pixels() && !self.surface_config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+        if playbook::wants_pixels() && !self.surface_config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
             self.surface_config.usage |= wgpu::TextureUsages::COPY_SRC;
             self.surface.configure(&self.device, &self.surface_config);
         }
@@ -3639,6 +3651,8 @@ impl LivePlayback {
                 ));
             }
         };
+        let t_acq = clock(&self.perf);
+        self.present_span[2] += t_acq - t1;
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.render_format),
             ..Default::default()
@@ -3743,7 +3757,7 @@ impl LivePlayback {
             probe.shots.push_front(0);
         }
         let sampling = self.probe.as_ref().is_some_and(|p| p.wants(self.presents_total, guest_frame));
-        if vitaslop_playbook::engine::wants_pixels() && target_tex.usage().contains(wgpu::TextureUsages::COPY_SRC) {
+        if playbook::wants_pixels() && target_tex.usage().contains(wgpu::TextureUsages::COPY_SRC) {
             self.pixel_tap.capture(&self.device, &mut encoder, target_tex);
         }
         if sampling {
@@ -3911,6 +3925,8 @@ impl LivePlayback {
         let ts_map = clock(&self.perf);
         self.queue.present(frame);
         let t3 = clock(&self.perf);
+        self.present_span[3] += t2 - t_acq;
+        self.present_span[4] += t3 - t2;
         self.split.sub_capture_ms += ts_cap - t2;
         self.split.sub_finish_ms += ts_fin - ts_cap;
         self.split.sub_submit_ms += ts_sub - ts_fin;
@@ -4517,12 +4533,16 @@ async fn next_tick() {
 /// rather than hanging the tab forever.
 const PER_FRAME_ROUNDS: u64 = 60_000_000;
 
+/// How much of the title's debug console the end-of-run report carries - enough for the last
+/// screenful of a log, small enough not to bury the rest of the diagnostics.
+const GUEST_CONSOLE_TAIL: usize = 2048;
+
 /// The heavy one-time setup shared by the main-thread and worker live paths: build the
 /// guest filesystem from the fetched container bytes, decrypt + link + transpile the
 /// title, and stand up the preemptive scheduler over a [`BrowserWorld`]. Returns the
 /// ready scheduler plus the numbers for the setup status line. `live` is the shared
-/// input cell the world reads (fed by DOM listeners on the main thread; unused but
-/// harmless in the worker recipe path).
+/// input cell the world reads (fed by DOM listeners on the main thread, or by the page's
+/// forwarded events in the worker).
 struct GameSetup {
     sched: browser_sched::BrowserSched,
     nfiles: usize,
@@ -4530,25 +4550,22 @@ struct GameSetup {
     image_kib: usize,
     decrypt_ms: f64,
     transpile_ms: f64,
-    scripted: bool,
-    /// The parsed recipe, kept so the live loop can EVALUATE it - not just replay its
-    /// input. Before this the browser shared the recipe's input timeline and none of its
-    /// checks (they lived in `vitaslop-native`, which a wasm32 build cannot reach), so a
-    /// browser run replayed the same buttons as a passing native run and verified nothing.
-    recipe: Option<vitaslop_runtime::recipe::Recipe>,
+    /// How many of the title's function imports have no handler - each one stops the run if
+    /// called. A count in the setup line; the list itself is in the report of the one that does.
+    unhandled_imports: usize,
 }
 
 impl GameSetup {
     /// The one-line setup status, tagged with where the run lives (main thread / worker).
     fn status(&self, home: &str) -> String {
         format!(
-            "retail title live in browser ({home}): {} files, {} modules, image {} KiB | decrypt/link {:.0} ms + transpile {:.0} ms (one-time){} | rendering live via WebGPU",
+            "retail title live in browser ({home}): {} files, {} modules, image {} KiB | decrypt/link {:.0} ms + transpile {:.0} ms (one-time) | {} imported function(s) unhandled | rendering live via WebGPU",
             self.nfiles,
             self.n_modules,
             self.image_kib,
             self.decrypt_ms,
             self.transpile_ms,
-            if self.scripted { " | scripted recipe" } else { "" },
+            self.unhandled_imports,
         )
     }
 }
@@ -5143,7 +5160,6 @@ async fn mount_and_link(source: JsValue) -> Result<Mounted, JsValue> {
 
 async fn setup_game(
     source: JsValue,
-    recipe: &str,
     live: Arc<Mutex<InputState>>,
     prebuilt: Option<Prebuilt>,
     audio_ring: &JsValue,
@@ -5151,25 +5167,6 @@ async fn setup_game(
     let perf = global_performance().ok_or_else(|| JsValue::from_str("no performance clock"))?;
     let Mounted { linked, backing, resident, addons, nfiles, decrypt_ms } = mount_and_link(source).await?;
 
-    // The input world: a scripted recipe (if given) overlaid with live pointer/keyboard
-    // input, both feeding the same touch/pad seam the native probe drives.
-    let scripted = !recipe.trim().is_empty();
-    // Parsed ONCE, into both halves: the input timeline the world replays and the
-    // observations the live loop evaluates. Same text, same parser, same verdict as
-    // native - which is the whole point of moving the evaluator into the runtime.
-    let parsed_recipe = if scripted {
-        Some(
-            vitaslop_runtime::recipe::Recipe::parse(recipe)
-                .map_err(|e| JsValue::from_str(&format!("recipe: {e}")))?,
-        )
-    } else {
-        None
-    };
-    let recipe_world = if scripted {
-        Some(RecipeWorld::parse(recipe).map_err(|e| JsValue::from_str(&format!("recipe: {e}")))?)
-    } else {
-        None
-    };
     // The host's location provider. Created and registered HERE rather than passed in by
     // each engine, because both engines want exactly the same cell and the exported
     // `worker_location_*` entry points find it through the thread-local registry - so an
@@ -5177,12 +5174,13 @@ async fn setup_game(
     let location: crate::location::SharedLocation =
         Arc::new(Mutex::new(crate::location::LiveLocation::default()));
     crate::location::set_shared_location(location.clone());
-    let world = Box::new(BrowserWorld::new(recipe_world, live, location));
+    let world = Box::new(BrowserWorld::new(live, location));
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
     env.state.set_main_thread_request(linked.main_thread_request());
     env.state.set_modules(linked.loaded_modules.clone());
+    env.state.set_unhandled_imports(linked.unhandled_imports.clone());
     env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);
     // Audio output. The page owns the AudioContext (a main-thread API) and hands us the
@@ -5296,8 +5294,7 @@ async fn setup_game(
         image_kib: linked.image.len() / 1024,
         decrypt_ms,
         transpile_ms,
-        scripted,
-        recipe: parsed_recipe,
+        unhandled_imports: linked.unhandled_imports.len(),
     })
 }
 
@@ -5334,6 +5331,10 @@ pub fn opfs_verify(reader: JsValue, prefix: &str) -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub fn set_knob(name: &str, value: &str) {
     vitaslop_runtime::knobs::set_override(name, value);
+    // Not latched by a reader: the allocator cannot read a knob, so the switch is thrown here.
+    if name == "VITASLOP_HEAP_BIG_GROW" {
+        vitaslop_platform::heap::route_all_allocations(value.trim() != "0");
+    }
 }
 
 /// Read a knob from JavaScript - a guest worker's script shares the override table (it is in
@@ -5473,8 +5474,7 @@ pub fn game_data_describe(zip: &[u8]) -> Result<String, JsValue> {
 /// Boot the REAL retail title LIVE on the MAIN THREAD: decrypt + link + transpile, then
 /// run the guest frame-by-frame through the JSPI preemptive scheduler, rendering each
 /// freshly-executed frame to the WebGPU `canvas` through the general GXM renderer and
-/// feeding real input (pointer/keyboard on the canvas, plus an optional scripted
-/// `recipe`) through the browser [`BrowserWorld`]. Returns after setup once the live
+/// feeding real input (pointer/keyboard on the canvas) through the browser [`BrowserWorld`]. Returns after setup once the live
 /// loop is spawned; the loop then runs on the event loop, updating the on-page FPS
 /// meter and status. `max_frames` bounds the run (display flips); `max_rounds` is unused
 /// (kept for API compatibility - the live loop caps rounds per frame).
@@ -5486,7 +5486,6 @@ pub fn game_data_describe(zip: &[u8]) -> Result<String, JsValue> {
 pub async fn run_game(
     canvas: JsValue,
     files: JsValue,
-    recipe: String,
     max_frames: u32,
     max_rounds: f64,
 ) -> Result<String, JsValue> {
@@ -5497,7 +5496,7 @@ pub async fn run_game(
     let live: Arc<Mutex<InputState>> = Arc::new(Mutex::new(InputState::default()));
     // The main thread has no throwaway-worker option (it cannot spawn one and wait
     // synchronously mid-run), so it always transpiles in place.
-    let setup = setup_game(files, &recipe, live.clone(), None, &JsValue::UNDEFINED).await?;
+    let setup = setup_game(files, live.clone(), None, &JsValue::UNDEFINED).await?;
 
     // Acquire WebGPU on the canvas and wire live input, then hand both to the live loop.
     let canvas: HtmlCanvasElement = canvas.dyn_into()?;
@@ -5520,7 +5519,6 @@ pub async fn run_game(
         playback,
         report,
         max_frames as u64,
-        setup.recipe,
         None,
     ));
     Ok(status)
@@ -5532,13 +5530,12 @@ pub async fn run_game(
 /// status elements, since a worker has no DOM). This is the production home: a worker
 /// allows synchronous instantiation of the title's large transpiled module at any size,
 /// so it needs no `WebAssemblyUnlimitedSyncCompilation` flag (the one main-thread
-/// caveat), and it is where the later multi-worker SMP step lands. Input here is the
-/// scripted `recipe`; forwarding live pointer/keyboard from the page is a follow-up.
+/// caveat), and it is where the later multi-worker SMP step lands. Input is the page's
+/// forwarded pointer/keyboard/pad, or a playbook.
 #[wasm_bindgen]
 pub async fn run_game_worker(
     offscreen: JsValue,
     files: JsValue,
-    recipe: String,
     max_frames: u32,
     report_fn: js_sys::Function,
     prebuilt: JsValue,
@@ -5572,7 +5569,7 @@ pub async fn run_game_worker(
     // one keeps the transpile's ~463 MB peak out of THIS worker's heap, which it could
     // never give back - see the note in `setup_game`.
     let setup =
-        setup_game(files, &recipe, live, Prebuilt::from_js(&prebuilt)?, &audio_ring).await?;
+        setup_game(files, live, Prebuilt::from_js(&prebuilt)?, &audio_ring).await?;
 
     // >>> THE SAVE GOES BACK IN BEFORE THE GUEST RUNS, AND THERE IS NO SECOND CHANCE.
     //
@@ -5626,32 +5623,16 @@ pub async fn run_game_worker(
     let status = setup.status("web worker");
     logging::note(&status);
     // The playbook engine starts before the live loop runs a guest instruction, so it sees the
-    // first pad read. A recipe and a playbook both driving input is refused.
-    if !playbook.is_undefined() && !playbook.is_null() && setup.recipe.is_some() {
-        return Err(JsValue::from_str("a recipe and a playbook both drive input - pass one"));
-    }
+    // first pad read.
     playbook::start(&playbook)?;
     wasm_bindgen_futures::spawn_local(live_loop(
         setup.sched,
         playback,
         report,
         max_frames as u64,
-        setup.recipe,
         Some(persist),
     ));
     Ok(status)
-}
-
-/// Reads guest memory for the shared recipe evaluator, through the scheduler core.
-///
-/// The browser's half of the `GuestRead` seam - a `SharedArrayBuffer` view where native
-/// has a wasmtime store. Everything else about evaluating a recipe is shared.
-struct CoreRead<'a>(&'a browser_sched::BrowserSched);
-
-impl vitaslop_runtime::recipe_eval::GuestRead for CoreRead<'_> {
-    fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
-        self.0.read_guest(addr, out)
-    }
 }
 
 // The live run: step the guest one display frame, render it through the general GXM
@@ -5659,10 +5640,6 @@ impl vitaslop_runtime::recipe_eval::GuestRead for CoreRead<'_> {
 // ends. This is what makes the browser build *live* (the guest computes each frame on
 // demand and reacts to input) rather than replaying a canned capture. The presented
 // FPS the meter shows is the true combined guest-CPU + render cadence.
-//
-// `recipe`, when given, is EVALUATED as well as replayed: its `@watch`/`@assert`/`@sig`
-// go through the same `vitaslop-runtime` evaluator the native runner uses, so a browser
-// run of a recipe reaches the same verdict instead of merely pressing the same buttons.
 // The `(sound seconds, clock seconds)` the last diagnostics panel read, so the next one
 // can report the RATE between them rather than only the run's cumulative total. See the
 // `CLOCK vs PICTURE vs SOUND` line for why the cumulative figure cannot answer "is the
@@ -5677,42 +5654,27 @@ async fn live_loop(
     mut playback: LivePlayback,
     report: Report,
     max_frames: u64,
-    recipe: Option<vitaslop_runtime::recipe::Recipe>,
     persist: Option<Persist>,
 ) {
     // A small render target a title reads on the CPU is completed at its own
     // `sceGxmEndScene` - asynchronously here, the thread parked meanwhile. See
     // `VitaState::complete_scene_async` and `browser_sched::EarlyCompleter`.
     sched.host.lock().unwrap().state.complete_scene_async = true;
-    let mut eval = recipe.as_ref().map(|r| vitaslop_runtime::recipe_eval::RecipeEval::new(r, None));
-    // >>> ONLY FOLD THE DETERMINISM SIGNATURE WHEN SOMETHING WILL READ IT.
-    //
-    // This function is the ONLY place in the browser that asks for it, and only when it is
-    // evaluating a recipe (see the `eval.finish(frames, sig)` at the end of the run). A live
-    // player session has no recipe - the user's own device captures read `recipe: (none)` - and
-    // folding hashes every retired scene's vertices, indices and uniforms: about 3 MB a frame on
-    // this title's race, MEASURED at 7.9% of the whole frame, for a number nobody asks for.
-    //
-    // `Capture::signature` refuses rather than returning a partial hash when this was off, so
-    // the failure mode of getting this wrong is a loud one.
-    //
-    // >>> AND A RECIPE IS NOT ITSELF A READER. The only consumer of the number is
-    // `RecipeEval::finish`, which uses it if and only if the recipe DECLARES `@sig`; every
-    // other recipe run folded 3 MB a frame to print a hash nothing compared. The user drives
-    // this page with a recipe selected from the menu - that is what the recipe dropdown IS -
-    // so "has a recipe" was true for every session anyone has ever measured, including every
-    // browser number in the notes. Gated on the declaration instead, with a knob to ask for it
-    // when the point of the run is to LEARN the signature and bless it into a recipe.
-    let want_sig = eval.is_some()
-        && (recipe.as_ref().and_then(|r| r.meta.sig).is_some()
-            || vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE"));
-    sched.host.lock().unwrap().state.capture.set_signature_wanted(want_sig);
     // `VITASLOP_SIGNATURE_EVERY=<n>`: how often the running signature is printed, mirroring the
     // desktop knob of the same name. 0 (the default) prints none.
     let sig_every: u64 = vitaslop_runtime::knobs::var("VITASLOP_SIGNATURE_EVERY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
+    // >>> ONLY FOLD THE DETERMINISM SIGNATURE WHEN SOMETHING WILL READ IT.
+    //
+    // Folding hashes every retired scene's vertices, indices and uniforms: about 3 MB a frame on
+    // one title's race, MEASURED at 7.9% of the whole frame. A live player session never reads
+    // the number, so it is folded only when asked for - `VITASLOP_SIGNATURE=1`, or a running
+    // trace interval - the same rule as the desktop. `Capture::signature` refuses rather than
+    // returning a partial hash when this was off, so getting it wrong is loud.
+    let want_sig = vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE") || sig_every != 0;
+    sched.host.lock().unwrap().state.capture.set_signature_wanted(want_sig);
     // The one frame whose per-SCENE digests are printed, if any. See the print site.
     // `<frame>` or `<frame>:<draw>` - split BEFORE parsing, or the two-part form silently
     // disables the whole diagnostic.
@@ -5904,6 +5866,10 @@ async fn live_loop(
     let mut gap_last_shown = 0.0f64;
     let mut gap_declined = 0u32;
     let mut gap_mark = StallMark::now();
+    // The GAME's own time and flips at the last shown present: a gap whose game time matches its
+    // wall time is the title not flipping (a real Vita shows that hitch too); a gap with little
+    // game time in it is ours.
+    let mut gap_game0 = (0u64, 0u64);
     let mut gap_defer0 = 0u64;
     let mut gap_budget0 = 0u64;
     let mut gap_busy0: Vec<u64> = Vec::new();
@@ -6490,7 +6456,7 @@ async fn live_loop(
                 // EMPTY-fold hash as though it were a real one. See `Capture::take_frame_scenes`.
                 // `VITASLOP_FRAME_DIGEST=<frame>`: at ONE frame, a digest per scene, printed
                 // BEFORE the drain - after it there are no scenes left to describe. The
-                // desktop prints the same line from `recipe_runner`, so the two logs diff.
+                // desktop headless runner prints the same line, so the two logs diff.
                 if frame_digest_at == Some(sched.frames()) {
                     // `VITASLOP_FRAME_DIGEST=<frame>:<draw>` also dumps that draw's vertex
                     // FLOATS - the end of the bisect, where the question stops being "which
@@ -6581,26 +6547,10 @@ async fn live_loop(
                 let guest_us = sched.host.lock().unwrap().state.guest_mono_us();
                 playbook::on_present(frames, guest_us);
             }
-            // Evaluate the recipe's observations for this frame. Shots are NAMED here and
-            // logged rather than written: a worker has no filesystem, so the picture is
-            // the harness's job (`SHOT_EVERY_MS` / the end-of-run capture) while WHICH
-            // frames wanted one is the recipe's.
             let t_eval = now();
-            if let Some(eval) = eval.as_mut() {
-                let shots = {
-                    let host = sched.host.lock().unwrap();
-                    // Read guest memory through the core, not through the locked host -
-                    // they are different objects and taking both at once would deadlock.
-                    let cap = &host.state.capture;
-                    eval.on_frame(frames, &CoreRead(&sched), cap)
-                };
-                for name in shots {
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                        "[shot] {name} at frame {frames}"
-                    )));
-                }
+            {
                 // >>> THE RUNNING SIGNATURE, the browser half of the desktop's
-                // `VITASLOP_SIGNATURE_EVERY` (`recipe_runner::signature_trace_interval`).
+                // `VITASLOP_SIGNATURE_EVERY`.
                 //
                 // Two engines that disagree at the END disagree from some FIRST frame onward,
                 // and the end-of-run number cannot say which. The desktop has printed this for
@@ -6700,7 +6650,20 @@ async fn live_loop(
                     // The contents are only formatted for a frame that makes the list.
                     let busy_now: Vec<u64> = sched.smp().map(|s| s.worker_busy_us()).unwrap_or_default();
                     let makes_list = deficit_worst.len() < SLOWEST_KEPT || deficit > deficit_worst[0].1;
-                    let contents = if makes_list { frame_contents(&frame_mark, &busy_prev, &busy_now) } else { String::new() };
+                    let span = playback.take_present_span();
+                    let contents = if makes_list {
+                        format!(
+                            "{}| present build {:.0} pipes {:.0} acquire {:.0} encode {:.0} submit {:.0}",
+                            frame_contents(&frame_mark, &busy_prev, &busy_now),
+                            span[0],
+                            span[1],
+                            span[2],
+                            span[3],
+                            span[4]
+                        )
+                    } else {
+                        String::new()
+                    };
                     busy_prev = busy_now;
                     let e = (frames, deficit, wall, c1 - c0, last_present_ms, last_present_shown, last_serve_ms, contents);
                     if deficit_worst.len() < SLOWEST_KEPT {
@@ -6716,6 +6679,9 @@ async fn live_loop(
                 frame_mark = StallMark::now();
                 if frames <= WARMUP_FRAMES || fast {
                     busy_prev = sched.smp().map(|s| s.worker_busy_us()).unwrap_or_default();
+                }
+                if frames <= WARMUP_FRAMES || fast {
+                    playback.take_present_span();
                 }
                 last_present_ms = 0.0;
                 last_present_shown = true;
@@ -6858,6 +6824,25 @@ async fn live_loop(
                         "status",
                         &format!("frame {frames} ENDED (live via WebGPU) | {report_step:?}"),
                     );
+                    // What the title printed to its debug console (`sceClibPrintf`), the
+                    // tail of it: a title's own log line is often the one that names what it
+                    // was doing when it stopped, and a homebrew test's whole verdict is there.
+                    {
+                        let host = sched.host.lock().unwrap();
+                        let out = &host.state.capture.stdout;
+                        if !out.is_empty() {
+                            let tail = &out[out.len().saturating_sub(GUEST_CONSOLE_TAIL)..];
+                            report.emit_final(
+                                "guest-console",
+                                &format!(
+                                    "guest console ({} bytes printed{}):\n{}",
+                                    out.len(),
+                                    if tail.len() < out.len() { ", the last part" } else { "" },
+                                    String::from_utf8_lossy(tail)
+                                ),
+                            );
+                        }
+                    }
                     // >>> A GUEST TRAP IS A FATAL OUTCOME AND BELONGS IN THE FATAL BOX.
                     // It is not a Rust panic, so the panic hook never sees it, and the
                     // status line it lands on is rebuilt away by the next panel refresh.
@@ -6889,40 +6874,11 @@ async fn live_loop(
                     if let Some(path) = sched.host.lock().unwrap().state.exec_request.take() {
                         web_sys::console::log_1(&JsValue::from_str(&format!("[exec] {path}")));
                     }
-                    // The recipe's VERDICT, on the console, at the end of the run.
-                    //
-                    // Without it a browser run that replayed a recipe reported only where
-                    // it stopped, which says nothing about whether the title did what the
-                    // recipe says it should - and assertions past the frame reached count
-                    // as failures, so a run that stalled short cannot read as a pass.
-                    if let Some(eval) = eval.as_mut() {
-                        let sig = if want_sig {
-                            sched.host.lock().unwrap().state.capture.signature()
-                        } else {
-                            u64::MAX
-                        };
-                        eval.finish(frames, sig);
-                        // Say WHICH of the two things happened rather than printing an
-                        // all-ones hash that reads like a real one. A run that was meant to
-                        // learn the signature and did not fold has to be told so here, at the
-                        // only place it would ever have looked.
-                        let sig_text = if want_sig {
-                            format!("sig {sig:#018x}")
-                        } else {
-                            "sig NOT FOLDED (this recipe declares no @sig; set \
-                             VITASLOP_SIGNATURE=1 to compute one)"
-                                .to_string()
-                        };
-                        web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "[recipe] {} | {sig_text}",
-                            eval.summary()
-                        )));
-                        for a in eval.asserts.iter().filter(|a| !a.passed) {
-                            web_sys::console::log_1(&JsValue::from_str(&format!(
-                                "[recipe] FAIL f{} {} - {}",
-                                a.frame, a.desc, a.detail
-                            )));
-                        }
+                    // The run's determinism signature, when one was folded - the number two runs
+                    // of the same input must agree on.
+                    if want_sig {
+                        let sig = sched.host.lock().unwrap().state.capture.signature();
+                        web_sys::console::log_1(&JsValue::from_str(&format!("[signature] f{frames} {sig:#018x}")));
                     }
                     if let Some(scene) = &latest {
                         let display = sched.host.lock().unwrap().state.display_size();
@@ -7043,7 +6999,11 @@ async fn live_loop(
                 last_serve_ms += now() - g0;
             }
             let r0 = now();
-            let display = sched.host.lock().unwrap().state.display_size();
+            let (display, ime_open) = {
+                let st = &sched.host.lock().unwrap().state;
+                (st.display_size(), st.ime.is_open())
+            };
+            ime_panel_changed(ime_open);
             // >>> A RENDERER THAT CANNOT DRAW ENDS THE RUN HERE.
             //
             // The alternative is what this used to do: keep executing the guest, keep
@@ -7092,6 +7052,7 @@ async fn live_loop(
                 let defer = playback.pipeline_defer_report().0;
                 let budget = playback.gpu_budget_report().1;
                 let busy: Vec<u64> = sched.smp().map(|s| s.worker_busy_us()).unwrap_or_default();
+                let game = (sched.host.lock().unwrap().state.now_us(), sched.frames());
                 let gap = t - gap_last_shown;
                 if gap_last_shown > 0.0 && sched.frames() > WARMUP_FRAMES && sched.frames() >= ff_to {
                     if gap > 50.0 {
@@ -7105,7 +7066,12 @@ async fn live_loop(
                             gap_declined,
                             defer.saturating_sub(gap_defer0),
                             budget.saturating_sub(gap_budget0),
-                            frame_contents(&gap_mark, &gap_busy0, &busy),
+                            format!(
+                                "game {:.0} ms over {} frame(s) | {}",
+                                game.0.saturating_sub(gap_game0.0) as f64 / 1000.0,
+                                game.1.saturating_sub(gap_game0.1),
+                                frame_contents(&gap_mark, &gap_busy0, &busy)
+                            ),
                         );
                         if gap_worst.len() < GAPS_KEPT {
                             gap_worst.push(e);
@@ -7116,6 +7082,7 @@ async fn live_loop(
                     }
                 }
                 gap_last_shown = t;
+                gap_game0 = game;
                 gap_declined = 0;
                 gap_mark = StallMark::now();
                 gap_defer0 = defer;
@@ -7578,12 +7545,15 @@ async fn live_loop(
                     line(
                         &mut diag,
                         "PIPELINE DEFER",
-                        &format!(
+                        &(format!(
                             "{} - declined {skips} present(s) this run while their new pipelines compiled (createRenderPipelineAsync), so the guest ran on instead of waiting; waited {waits} time(s) (the early batch, or a frame's compile pending over {:.0} ms); {in_flight} compiling now. `VITASLOP_PIPELINE_DEFER=0` is the arm back (every present waits). From each compile's start: {}",
                             if pipeline_defer_on() { "ON" } else { "OFF (VITASLOP_PIPELINE_DEFER=0)" },
                             pipe_defer_max_ms(),
                             settle_times_line(),
-                        ),
+                        ) + &format!(
+                            " | 16 MB-step heap {:.1} MB of pages",
+                            vitaslop_platform::heap::private_heap_bytes() as f64 / (1024.0 * 1024.0)
+                        )),
                     );
                 }
                 // >>> THE GPU'S OWN CLOCK, which the latency above cannot separate from the
@@ -9038,6 +9008,10 @@ impl LivePlayback {
         Some(ms)
     }
 
+    fn take_present_span(&mut self) -> [f64; 5] {
+        std::mem::take(&mut self.present_span)
+    }
+
     fn pipeline_defer_report(&self) -> (u64, u64, usize) {
         (self.pipe_defer_skips_total, self.pipe_defer_waits, self.pipes_in_flight.len())
     }
@@ -9245,6 +9219,23 @@ fn pipe_defer_max_ms() -> f64 {
 
 /// `VITASLOP_PIPELINE_DEFER=0`: the arm back - a present waits for every pipeline still compiling
 /// instead of being declined. See `LivePlayback::warm_pipelines`.
+/// Tell the page when the game opens or closes its on-screen keyboard (SceIme), so it can raise
+/// the device's own keyboard for the person to type on - a phone has no other. Posts only on a
+/// change: `{type: "ime", open}`.
+fn ime_panel_changed(open: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    if SHOWN.swap(open, Ordering::Relaxed) == open {
+        return;
+    }
+    if let Ok(scope) = js_sys::global().dyn_into::<web_sys::DedicatedWorkerGlobalScope>() {
+        let msg = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&msg, &"type".into(), &"ime".into());
+        let _ = js_sys::Reflect::set(&msg, &"open".into(), &open.into());
+        let _ = scope.post_message(&msg);
+    }
+}
+
 fn pipeline_defer_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| vitaslop_runtime::knobs::var("VITASLOP_PIPELINE_DEFER").as_deref().map(str::trim) != Ok("0"))

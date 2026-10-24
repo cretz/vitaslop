@@ -1,10 +1,10 @@
 // Validate the USER-FACING browser play path end to end: load debug/play.html (which auto-
 // boots the emulator in a Web Worker with NO Chrome flags and live input), then drive
-// it to the Tutorial level with REAL POINTER TAPS (not the scripted Rust recipe) - the
+// it to the Tutorial level with REAL POINTER TAPS (not a scripted playbook) - the
 // exact thing a human does. Proves the whole chain: worker run + OffscreenCanvas render
 // + page->worker input forwarding + touch reaching the guest. Screenshots the result.
 //
-// This is the interactive twin of game-boot.mjs (which uses the in-Rust recipe). It
+// This is the interactive twin of game-boot.mjs (which drives input with a playbook). It
 // deliberately launches Chrome WITHOUT WebAssemblyUnlimitedSyncCompilation.
 import { chromium } from "playwright";
 import { createServer } from "node:http";
@@ -19,7 +19,7 @@ const webDir = join(here, "..", "web");
 const gameDir = process.env.GAME_DIR || process.env.VITASLOP_GAME_DIR || "";
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".json": "application/json", ".css": "text/css" };
 
-// The Tutorial tap sequence in SCREEN coords (960x544) = the recipe's panel coords / 2,
+// The Tutorial tap sequence in SCREEN coords (960x544) = the panel coords / 2,
 // each paired with the display frame to fire it at (the page reports "frame N" in
 // #status, so taps sync to frames, not wall time).
 const taps = [

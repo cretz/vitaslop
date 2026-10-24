@@ -93,12 +93,14 @@ pub struct Settings {
     pub gamepad: BTreeMap<String, String>,
     /// Stick dead zone, 0..1 of full deflection.
     pub stick_deadzone: f32,
+    /// Live input for the REAR touch panel, which few titles use: off, the rear panel is never
+    /// touched and every pointer goes to the front exactly as before. Browser: the right mouse
+    /// button, or a REAR toggle on the on-screen controls. Desktop: the right mouse button.
+    pub rear_touch: bool,
     /// Which game-data profile a run saves into. `"default"` is the unnamed one.
     pub profile: String,
     /// Advanced: `VITASLOP_*` knobs merged over the base set, verbatim.
     pub knobs: BTreeMap<String, String>,
-    /// Advanced: a scripted-input recipe's text, replayed from the first frame.
-    pub recipe: String,
     /// Advanced: run unpaced and unpresented to this display frame first.
     pub fast_forward: u32,
     /// Advanced: time every host call (roughly doubles the frame cost).
@@ -120,9 +122,9 @@ impl Default for Settings {
             keyboard: crate::input::default_keyboard(),
             gamepad: crate::input::default_gamepad(),
             stick_deadzone: 0.14,
+            rear_touch: false,
             profile: "default".to_string(),
             knobs: BTreeMap::new(),
-            recipe: String::new(),
             fast_forward: 0,
             debug_capture: false,
             console_notes: false,
@@ -148,7 +150,7 @@ pub fn base_knobs() -> BTreeMap<String, String> {
     // `VITASLOP_PREPARE_SPLIT=1` and `VITASLOP_AMBIENT_PROBE=all` were both put in this list to
     // make the next device dump answer two open questions. Neither writes anything, neither
     // touches a pipeline, and both are documented as changing no rendering. On the desktop
-    // BROWSER, same bundle, same recipe, same frame, they change the PICTURE: without them the
+    // BROWSER, same bundle, same input, same frame, they change the PICTURE: without them the
     // frame mean is 121,101,97 and with them it is 215,199,161 - the washed-out frame the user
     // is reporting from the device.
     //
@@ -170,7 +172,7 @@ pub fn base_knobs() -> BTreeMap<String, String> {
         // fourth). Not instrumentation: it changes where work runs, not what is drawn, and it
         // is what the phone needs - its frame is the title's serial main -> render chain, and
         // the proxy measured that chain at -23% with the resolver off it. Deterministic runs
-        // (recipes, capsules, bisections) set `VITASLOP_SMP=0`.
+        // (scripted A/Bs, capsules, bisections) set `VITASLOP_SMP=0`.
         ("VITASLOP_SMP", "1"),
     ]
         .into_iter()
@@ -285,6 +287,14 @@ mod tests {
     fn an_unknown_field_in_a_stored_record_does_not_reset_everything() {
         let v = json!({ "showFps": true, "somethingFromTheFuture": 3 });
         assert!(Settings::from_value(&v).show_fps);
+    }
+
+    #[test]
+    fn rear_touch_is_off_unless_asked_for() {
+        // A record stored before the setting existed keeps every pointer on the front panel.
+        assert!(!Settings::from_value(&json!({ "showFps": true })).rear_touch);
+        assert!(!Settings::default().rear_touch);
+        assert!(Settings::from_value(&json!({ "rearTouch": true })).rear_touch);
     }
 
     #[test]

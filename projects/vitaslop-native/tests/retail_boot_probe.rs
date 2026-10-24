@@ -68,8 +68,8 @@ const IMAGE_SCAN_LEN: usize = 0x1000_0000;
 const MAX_ROUNDS: u64 = 200_000;
 
 /// A minimal host world: a monotonic clock advancing one 60Hz tick per poll, no
-/// input, deterministic zero randomness. Enough to boot; input scripting comes
-/// with the recipe-driven validation harness later.
+/// input, deterministic zero randomness. Enough to boot; scripted input is the playbook
+/// runner's job, not the probe's.
 #[derive(Default)]
 struct BootWorld {
     polls: u64,
@@ -385,28 +385,15 @@ fn retail_boot_probe() {
     //    PREEMPTIVE mode so blocking primitives really park a thread (a real title
     //    boots its render loop on threads that a synchronous run-to-completion model
     //    cannot interleave). The heap is moved above the whole linked image.
-    // Input: a scripted TAS recipe when VITASLOP_INPUT_RECIPE points at a recipe
-    // file (frame-keyed button/analog directives; see `vitaslop_runtime::recipe`),
-    // else the deterministic input-free BootWorld. The recipe drives menus/dialogs
-    // reproducibly (e.g. dismiss the "not signed in" dialog, then move the cursor).
-    let world: Box<dyn World + Send> = match std::env::var("VITASLOP_INPUT_RECIPE") {
-        Ok(path) => {
-            let text = std::fs::read_to_string(&path).expect("read input recipe");
-            match vitaslop_runtime::RecipeWorld::parse(&text) {
-                Ok(w) => {
-                    eprintln!("input: scripted recipe from {path}");
-                    Box::new(w)
-                }
-                Err(e) => panic!("input recipe parse error: {e}"),
-            }
-        }
-        Err(_) => Box::new(BootWorld::default()),
-    };
+    // Input: none - the deterministic input-free BootWorld. The probe proves a boot; driving a
+    // title past its menus is what a playbook does.
+    let world: Box<dyn World + Send> = Box::new(BootWorld::default());
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
     env.state.set_main_thread_request(linked.main_thread_request());
     env.state.set_modules(linked.loaded_modules.clone());
+    env.state.set_unhandled_imports(linked.unhandled_imports.clone());
     env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);
     let mut preloaded = 0usize;
@@ -1013,8 +1000,8 @@ fn retail_boot_probe() {
         st.capture.scenes.len(),
         st.capture.retired_scenes,
     );
-    // The game->OS egress ledger: the human-readable milestones a conformance recipe
-    // asserts on (savedata writes, trophies, score submits), each frame-tagged. This
+    // The game->OS egress ledger: the human-readable milestones a conformance check
+    // reads (savedata writes, trophies, score submits), each frame-tagged. This
     // is the content-free "the game reached a real state" signal - no pixels needed.
     eprintln!("egress ledger ({} events):", st.capture.egress.len());
     for ev in &st.capture.egress {
@@ -1022,9 +1009,9 @@ fn retail_boot_probe() {
     }
     // Determinism signature: a cheap FNV-1a hash over the captured render stream
     // (per scene: color target + every draw's vertex/index/uniform bytes) and the
-    // egress ledger. Two runs of the same recipe must print the SAME signature - that
-    // is what makes a recipe a reproducible test rather than a one-off. Run the probe
-    // twice with a recipe and diff this line to prove the run is deterministic.
+    // egress ledger. Two runs of the probe must print the SAME signature - that is what
+    // makes a run a reproducible test rather than a one-off. Run the probe twice and diff this
+    // line to prove the run is deterministic.
     // Use `Capture::signature()` - the ONE authority - rather than folding
     // `capture.scenes` here. The probe used to hand-roll its own FNV over the retained
     // scenes, which was a second implementation of the same idea and, worse, was not

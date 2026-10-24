@@ -309,6 +309,12 @@ impl Module {
                 reloc::code::THM_MOVT_ABS => {
                     patch_thumb_mov(&mut data.data, off, (target >> 16) as u16)?;
                 }
+                reloc::code::MOVW_ABS_NC => {
+                    patch_arm_mov(&mut data.data, off, (target & 0xFFFF) as u16)?;
+                }
+                reloc::code::MOVT_ABS => {
+                    patch_arm_mov(&mut data.data, off, (target >> 16) as u16)?;
+                }
                 other => return Err(Error::UnsupportedReloc(other)),
             }
         }
@@ -371,6 +377,19 @@ pub fn patch_thumb_mov(data: &mut [u8], off: usize, imm16: u16) -> Result<(), Er
     hw2 = (hw2 & 0x8F00) | (imm3 << 12) | imm8;
     site[0..2].copy_from_slice(&hw1.to_le_bytes());
     site[2..4].copy_from_slice(&hw2.to_le_bytes());
+    Ok(())
+}
+
+/// Patch the 16-bit immediate of an ARM (A1) `MOVW`/`MOVT` at `off`: one little-endian
+/// word, `imm16` split as imm4 (bits 19:16) and imm12 (bits 11:0).
+pub fn patch_arm_mov(data: &mut [u8], off: usize, imm16: u16) -> Result<(), Error> {
+    let site = data
+        .get_mut(off..off + 4)
+        .ok_or(Error::OutOfBounds("reloc arm-mov site"))?;
+    let word = u32::from_le_bytes([site[0], site[1], site[2], site[3]]);
+    let imm16 = imm16 as u32;
+    let word = (word & 0xFFF0_F000) | ((imm16 >> 12) << 16) | (imm16 & 0xFFF);
+    site.copy_from_slice(&word.to_le_bytes());
     Ok(())
 }
 
@@ -939,6 +958,21 @@ mod tests {
     const CUBE_EBOOT_C: &[u8] = include_bytes!(
         "../../vitaslop-conformance-suite-vita/cube-src/cube.eboot_c.bin"
     );
+
+    /// ARM-mode MOVW/MOVT relocations (codes 43/44) write imm4:imm12 and keep cond, op and Rd.
+    #[test]
+    fn arm_mov_relocation_writes_the_split_immediate() {
+        // movw r0, #0 ; movt r1, #0 (cond AL)
+        let mut code = [0xE300_0000u32.to_le_bytes(), 0xE340_1000u32.to_le_bytes()].concat();
+        patch_arm_mov(&mut code, 0, 0x1234).unwrap();
+        patch_arm_mov(&mut code, 4, 0xABCD).unwrap();
+        let w = |c: &[u8], o: usize| u32::from_le_bytes(c[o..o + 4].try_into().unwrap());
+        assert_eq!(w(&code, 0), 0xE301_0234); // movw r0, #0x1234
+        assert_eq!(w(&code, 4), 0xE34A_1BCD); // movt r1, #0xabcd
+        // Re-patching replaces the old immediate rather than OR-ing into it.
+        patch_arm_mov(&mut code, 0, 0x0001).unwrap();
+        assert_eq!(w(&code, 0), 0xE300_0001);
+    }
 
     #[test]
     fn loads_cube_header() {

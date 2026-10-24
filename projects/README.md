@@ -8,15 +8,15 @@ A real commercial title's NAME, its content id, and any other reference that say
 measurement came from appear nowhere in this workspace. The engine is game-agnostic by design,
 and the northstar is a public, MIT, clean-room engine plus a conformance suite - a title baked
 into shipped code would tie it to a specific commercial product. Titles are BYO: the dumps live
-outside the repo, and everything title-specific lives in `vitaslop-gamerun-recipes` and in
-`vitaslop-playbook`'s `playbooks/`, which hold no game data and key their scripts by id there
-and only there.
+outside the repo, and everything title-specific lives in `vitaslop-playbook` - its `playbooks/`,
+its README's Titles table and `TOOLS.md` - which holds no game data and is the ONLY crate that
+names a specific game.
 
 Comments here are full of measurements taken on real titles, and they keep the DETAIL - draw
 counts, frame times, program layouts, what broke and how it looked - while saying only "a
 retail title" or "one title". Which title it was is not load-bearing for any of them: the
 finding is about the hardware's behaviour or ours, and a reader who needs to reproduce it does
-so from a recipe. A shader-program hash (`vert_82bfdfb0`, `frag_8669f600`) names a blob in the
+so from a playbook. A shader-program hash (`vert_82bfdfb0`, `frag_8669f600`) names a blob in the
 captured corpus, not a title, and it is the evidence a linkage claim rests on - so those stay.
 
 - [vitaslop-aac](vitaslop-aac/) - Platform-native AAC decoding behind one API (Media Foundation, WebCodecs), for the sound track of a movie the guest decodes in `SceAudiodec`. Submit-and-poll, like the video path, because a browser's decoded audio arrives on a callback.
@@ -26,14 +26,13 @@ captured corpus, not a title, and it is the evidence a linkage claim rests on - 
 - [vitaslop-conformance-suite-vita](vitaslop-conformance-suite-vita/) - Generic Vita conformance corpus. Placeholder (shape, generator, and oracle TBD).
 - [vitaslop-desktop](vitaslop-desktop/) - Native binary running the same wasm and wgpu stack on the desktop.
 - [vitaslop-frontend](vitaslop-frontend/) - What the browser and desktop front ends share: the settings record and its merge, the Vita's buttons with the default keyboard and gamepad maps, and the per-title library metadata. All `serde` JSON.
-- [vitaslop-gamerun-recipes](vitaslop-gamerun-recipes/) - Dev-only harness for driving a title to a target frame and asserting on what it renders. The `play`/`sweep` binaries run recipe scripts (scripted input plus `@assert`/`@watch`/`@shot` directives) to reach and validate a scene. Holds no game data; recipes reference titles by id/behaviour.
 - [vitaslop-gxp-shader](vitaslop-gxp-shader/) - Clean-room GXP (`SceGxmProgram`) to WGSL shader recompiler. Parses the container, decodes the PowerVR SGX543 "USSE" bytecode to an IR, and emits WGSL for shaders it can translate faithfully - hard-failing (never approximating) on anything not yet established. wasm-safe; ships only the decoder and emitter, never any game data.
 - [vitaslop-h264](vitaslop-h264/) - H.264 video decoding through each platform's own decoder (Media Foundation, Video Toolbox, VA-API, WebCodecs) behind one API, plus the bitstream work all four leave to the caller: parameter sets, access unit boundaries, picture order counts, presentation ordering, and - on VA-API, whose entry point is stateless - the decoded picture buffer. Depends on no other crate here and knows nothing about the Vita; it could be lifted out into a standalone repo unchanged.
 - [vitaslop-hostcall](vitaslop-hostcall/) - The `#[hostcall]` proc-macro: write a Vita host handler as a normal typed Rust function and let it generate the AAPCS-VFP argument marshalling and return write, leaving the behavior hand-written.
 - [vitaslop-loader](vitaslop-loader/) - Parses SELF/ELF, relocations, and NID tables, and does provenance-based entry-point enumeration to feed the transpiler.
 - [vitaslop-native](vitaslop-native/) - OS-level mechanisms shared by every non-browser host (desktop and, someday, mobile): the wasmtime-backed engine that runs the transpiler's WASM, the cooperative and preemptive fiber schedulers that drive the guest threads, and later the mmap image source. Never built for wasm32.
 - [vitaslop-platform](vitaslop-platform/) - Web/native abstraction seam: random-access asset storage (OPFS vs mmap), window, renderer, input, audio.
-- [vitaslop-playbook](vitaslop-playbook/) - Lua playbooks that play a title by reacting to it (calls it makes, values in its memory) rather than at frame numbers, the tapes their runs record (exact input per input frame, replayable byte for byte), and the engine behind a two-function Lua seam (mlua natively, wasmoon in the browser). Replaces the recipes as they are converted.
+- [vitaslop-playbook](vitaslop-playbook/) - Lua playbooks that play a title by reacting to it (calls it makes, values in its memory) rather than at frame numbers, the tapes their runs record (exact input per input frame, replayable byte for byte), and the engine behind a two-function Lua seam (mlua natively, wasmoon in the browser). Also the native tools a playbook is written with (`session`/`ctl`, `explore`, `bench`, `memdiff`, `sheet` - see its `TOOLS.md`), and the only crate that names a specific game.
 - [vitaslop-runtime](vitaslop-runtime/) - Engine-agnostic core (compiles to wasm32): guest memory, the dispatch map, the Vita host-call handlers, the preemptive concurrency model (thread park/wake state and `SvcOutcome`), software rasterizer, audio/NGS, the transpiler-to-runtime ABI logic, and the ROM-to-wasm-blob transform (PFS/SELF decrypt plus link). Holds no wasm engine and no fiber scheduler; the host supplies those (vitaslop-native or the browser).
 - [vitaslop-transpiler](vitaslop-transpiler/) - Vita-agnostic ARMv7 plus Thumb-2 plus NEON plus VFP to WASM engine. Decodes via our yaxpeax-arm consolidation fork, lifts to an IR, emits WASM.
 - [vitaslop-web](vitaslop-web/) - Browser app: a Rust `cdylib` (wasm-bindgen) plus a vite/TypeScript static page.

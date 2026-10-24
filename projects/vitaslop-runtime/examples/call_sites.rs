@@ -15,7 +15,9 @@ use std::collections::HashMap;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: call_sites <module> [library_nid_hex | --callers addr]");
+    let path = args
+        .next()
+        .expect("usage: call_sites <module> [library_nid_hex | --callers addr]");
     let second = args.next();
     let callers_of = if second.as_deref() == Some("--callers") {
         Some(
@@ -28,9 +30,10 @@ fn main() {
     } else {
         None
     };
-    let library = second.as_ref().filter(|v| *v != "--callers").map(|v| {
-        u32::from_str_radix(v.trim_start_matches("0x"), 16).expect("library nid in hex")
-    });
+    let library = second
+        .as_ref()
+        .filter(|v| *v != "--callers")
+        .map(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).expect("library nid in hex"));
 
     let bytes = std::fs::read(&path).expect("read the module");
     let module = vitaslop_loader::load(&bytes).expect("parse the module");
@@ -140,25 +143,37 @@ fn main() {
         if previous != 0 && site.saturating_sub(previous) > 0x100 {
             println!();
         }
-        println!("{site:#010x}  {}  ({nid:#010x})", vitaslop_runtime::nid::name(*nid));
+        println!(
+            "{site:#010x}  {}  ({nid:#010x})",
+            vitaslop_runtime::nid::name(*nid)
+        );
         previous = *site;
     }
 
-    println!("
-{} calls through wrappers (the real usage):", callers.len());
+    println!(
+        "
+{} calls through wrappers (the real usage):",
+        callers.len()
+    );
     let mut previous = 0u32;
     for (site, nid) in &callers {
         if previous != 0 && site.saturating_sub(previous) > 0x80 {
             println!();
         }
-        println!("{site:#010x}  {}  ({nid:#010x})", vitaslop_runtime::nid::name(*nid));
+        println!(
+            "{site:#010x}  {}  ({nid:#010x})",
+            vitaslop_runtime::nid::name(*nid)
+        );
         previous = *site;
     }
 }
 
 /// Walk back from a call site to the `push {..., lr}` that starts its function.
 fn function_start(module: &vitaslop_loader::Module, site: u32) -> Option<u32> {
-    let segment = module.segments.iter().find(|s| site >= s.vaddr && site < s.vaddr + s.data.len() as u32)?;
+    let segment = module
+        .segments
+        .iter()
+        .find(|s| site >= s.vaddr && site < s.vaddr + s.data.len() as u32)?;
     let offset = (site - segment.vaddr) as usize;
     let lowest = offset.saturating_sub(0x80);
     let mut at = offset;

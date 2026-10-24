@@ -15,8 +15,9 @@ import { startAudio } from "./audio.js";
 import { isComplete } from "./opfs.js";
 import * as gamedata from "./gamedata.js";
 import { mountTouchPad } from "./touchpad.js";
+import { mountImeInput } from "./ime-input.js";
 import { installGamepad } from "./gamepad.js";
-import { runKnobs, vocabulary, touchTitle } from "./store.js";
+import { runKnobs, vocabulary, touchTitle, bundleLoaded, recoverFromMixedBuild } from "./store.js";
 import { renderVita } from "./vita.js";
 import * as navpad from "./navpad.js";
 
@@ -33,7 +34,16 @@ export function createPlayer({ onExit, onRestart }) {
   const stage = $("stage");
   let worker = null;
   let touch = null;
+  // The text field over the game while it has its on-screen keyboard open - see ime-input.js.
+  let imeInput = null;
   let pads = null;
+  // The page's pointer + key listeners for this run (`forwardInput`), re-installed when the
+  // menu turns the rear panel on or off.
+  let inputOff = null;
+  const installInput = () => {
+    if (inputOff) inputOff();
+    inputOff = forwardInput(worker, canvas, { rearTouch: settings.rearTouch, rearLatched: () => !!(touch && touch.rearLatched()) });
+  };
   // Undo functions for listeners installed per run on targets that outlive it.
   const unlisten = [];
   let audioPause = () => {};
@@ -358,6 +368,7 @@ export function createPlayer({ onExit, onRestart }) {
       $("m-pad-mode").value = settings.pad.mode;
       $("m-pad-opacity").value = settings.pad.opacity;
       $("m-pause-blur").checked = !!settings.pauseOnBlur;
+      $("m-rear").checked = !!settings.rearTouch;
       $("m-fullscreen").textContent = isFull() ? "Exit fullscreen" : "Fullscreen";
       $("m-diag").textContent = diagText();
       $("m-settings").href = `#/settings/${meta.titleId}`;
@@ -401,6 +412,12 @@ export function createPlayer({ onExit, onRestart }) {
     settings.pauseOnBlur = e.target.checked;
     applyPause();
     onRuntimeSetting({ pauseOnBlur: settings.pauseOnBlur });
+  });
+  $("m-rear").addEventListener("change", (e) => {
+    settings.rearTouch = e.target.checked;
+    if (worker) installInput();
+    if (touch) touch.setRearTouch(settings.rearTouch);
+    onRuntimeSetting({ rearTouch: settings.rearTouch });
   });
   $("m-copy").addEventListener("click", () => copyText(diagText(), $("m-copy")));
   $("m-download").addEventListener("click", () => download(`vitaslop-${meta.titleId}-diag.txt`, diagText(), "text/plain"));
@@ -478,6 +495,7 @@ export function createPlayer({ onExit, onRestart }) {
       `status: ${reports.status}`,
       audioLine(),
       fatalText ? `\nFATAL\n${fatalText}` : ``,
+      reports["guest-console"] ? `\n${reports["guest-console"]}` : ``,
       ``,
       reports.diag,
       ``,
@@ -533,6 +551,8 @@ export function createPlayer({ onExit, onRestart }) {
     onRuntimeSetting = onSetting || (() => {});
     running = true;
     fatalText = "";
+    // Only a run that printed something reports it, so a silent run must not show the last one's.
+    delete reports["guest-console"];
     $("fatal").hidden = true;
     $("fatal-text").textContent = "";
     root.hidden = false;
@@ -588,8 +608,10 @@ export function createPlayer({ onExit, onRestart }) {
       const hostOff = await new Promise((resolve, reject) => {
         worker.onmessage = (e) => {
           const d = e.data;
-          if (d.type === "reserved") resolve(d.hostOff);
-          else if (d.type === "error") reject(new Error(d.message));
+          if (d.type === "reserved") {
+            bundleLoaded(runsThreads ? "pkg-threads" : "pkg");
+            resolve(d.hostOff);
+          } else if (d.type === "error") reject(Object.assign(new Error(d.message), { linkError: !!d.linkError }));
           else if (d.type === "panic") reject(new Error("RUST PANIC WHILE RESERVING\n" + d.message));
         };
         worker.onerror = (e) => reject(new Error(e.message || "the run worker failed to start"));
@@ -604,7 +626,7 @@ export function createPlayer({ onExit, onRestart }) {
             return;
           }
           tw.terminate();
-          e.data.type === "built" ? resolve(e.data.built) : reject(new Error(e.data.message));
+          e.data.type === "built" ? resolve(e.data.built) : reject(Object.assign(new Error(e.data.message), { linkError: !!e.data.linkError }));
         };
         tw.onerror = (e) => {
           tw.terminate();
@@ -631,6 +653,8 @@ export function createPlayer({ onExit, onRestart }) {
             // The first present is the moment the loading screen has nothing to say.
             if (/present|frame|fps/i.test(d.text)) $("loading").hidden = true;
           }
+        } else if (d.type === "ime") {
+          if (imeInput) imeInput.setOpen(d.open);
         } else if (d.type === "note") {
           note(d.text);
           // The title exec'd one of its own executables (`sceAppMgrLoadExec`): the process is
@@ -662,10 +686,15 @@ export function createPlayer({ onExit, onRestart }) {
       });
 
       worker.postMessage({ type: "keymap", json: JSON.stringify(settings.keyboard) });
-      unlisten.push(forwardInput(worker, canvas));
+      installInput();
+      unlisten.push(() => {
+        if (inputOff) inputOff();
+        inputOff = null;
+      });
       vocab = await vocabulary();
-      touch = mountTouchPad($("pad"), worker, settings.keyboard, { vibrate: settings.pad.vibrate });
+      touch = mountTouchPad($("pad"), worker, settings.keyboard, { vibrate: settings.pad.vibrate, rearTouch: settings.rearTouch });
       touch.setOpacity(settings.pad.opacity);
+      imeInput = mountImeInput(worker, stage);
       touch.setScale(settings.pad.scale);
       pads = installGamepad(
         worker,
@@ -704,13 +733,16 @@ export function createPlayer({ onExit, onRestart }) {
       const offscreen = canvas.transferControlToOffscreen();
       fresh = false;
       worker.postMessage(
-        { offscreen, titleId: m.titleId, recipe: settings.recipe || "", maxFrames: MAX_FRAMES, knobs, prebuilt, audioRing, profile: settings.profile },
+        { offscreen, titleId: m.titleId, maxFrames: MAX_FRAMES, knobs, prebuilt, audioRing, profile: settings.profile },
         [offscreen]
       );
       touchTitle(m.titleId, { lastPlayedAt: Date.now() });
       applyPause();
       postOutputSize();
     } catch (err) {
+      // A worker's bundle that does not link is a mixed build: refetch and reload once, as the
+      // page does for its own (store.js). Otherwise, or on a second try, it is shown below.
+      if (err && err.linkError) await recoverFromMixedBuild(err, runsThreads ? "pkg-threads" : "pkg").catch(() => {});
       fatal("COULD NOT START\n" + ((err && (err.stack || err.message)) || err));
     }
   }
@@ -768,6 +800,8 @@ export function createPlayer({ onExit, onRestart }) {
     // outlive a run, so anything left here is still live for the next game.
     for (const undo of unlisten.splice(0)) undo();
     if (touch) touch.destroy();
+    if (imeInput) imeInput.destroy();
+    imeInput = null;
     if (pads) pads.stop();
     audio = null;
     touch = pads = null;

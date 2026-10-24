@@ -516,6 +516,8 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_GXP_WGSL_OVERRIDE_TEXT",
     "VITASLOP_GXP_YFLIP",
     "VITASLOP_GXP_ZFIX",
+    // `0`: allocate from std's heap again instead of the 16 MB-step one (threads bundle) - `heap::route_all_allocations`.
+    "VITASLOP_HEAP_BIG_GROW",
     // Rig: spin the browser run worker `<ms>` once after frame `<frame>` (`<frame>:<ms>`).
     "VITASLOP_HITCH_AT",
     // Report every write a HOST CALL makes to these guest addresses / values (host.rs).
@@ -582,6 +584,8 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_MP4_READ_AHEAD_MS",
     // One params state per voice: a params block and a lock/unlock write the same thing.
     "VITASLOP_NGS_BLOCK_STATE",
+    // `0`: the NGS callbacks a grain raised run on the serial callback thread, not on the audio thread.
+    "VITASLOP_NGS_CB_SYNC",
     "VITASLOP_NGS_VOICE_HANDLE_MEMO",
     "VITASLOP_NGS_ZERO_LEVEL",
     // The falsifier for the voice-handle LOOKUP: with it off, every query for a rack's
@@ -770,11 +774,9 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_SCHED_TRACE",
     // Guest frames to photograph (comma list): full-size presentshot lines; the runner's params.shots.
     "VITASLOP_SHOT_FRAMES",
-    // Fold the determinism signature on a browser recipe run that does NOT declare `@sig`.
-    // The fold hashes every retired scene's vertices, indices and uniforms - about 3 MB a
-    // frame on a race, MEASURED at 7.7% of the guest window - and the only consumer is an
-    // `@sig` assertion, so a recipe without one pays for a number nothing compares. Set this
-    // when the point of the run is to LEARN the signature and bless it into a recipe.
+    // Fold the determinism signature (printed at the end of a browser run). The fold hashes
+    // every retired scene's vertices, indices and uniforms - about 3 MB a frame on a race,
+    // MEASURED at 7.7% of the guest window - so it is off unless asked for.
     "VITASLOP_SIGNATURE",
     // How often the RUNNING signature is printed (`sigtrace f<frame> <hash>`), so a
     // browser-only divergence can be bisected against the desktop's identical line instead of
@@ -786,7 +788,7 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_SLOW_FRAME_US",
     // `=1`: run the guest's threads IN PARALLEL on several browser workers (the Vita's three
     // cores) instead of one at a time on the run worker. OFF by default, and off is the
-    // DETERMINISTIC engine every recipe, capsule and bisection assumes: a parallel run's
+    // DETERMINISTIC engine every scripted A/B, capsule and bisection assumes: a parallel run's
     // interleaving depends on host timing and does not replay. See `vitaslop_web::smp`.
     "VITASLOP_SMP",
     // `1` moves the flip's geometry resolve from the guest render thread to the run worker.
@@ -843,6 +845,8 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_SNAPSHOT_BUDGET_MB",
     // `0`: surplus free staging-belt chunks are never destroyed (the old unbounded free list).
     "VITASLOP_STAGING_TRIM",
+    // `1`: re-read every snapshot the dirty stamps call clean and warn when its bytes changed.
+    "VITASLOP_STAMP_VERIFY",
     // `0`: the transpiler keeps every function on the `br_table` dispatch loop instead of
     // emitting structured control flow (`emit::structured`).
     "VITASLOP_STRUCTURED_CF",
@@ -946,6 +950,9 @@ pub const OVERRIDABLE: &[&str] = &[
     // `1`: a desktop guest movie decodes on the HARDWARE decoder (default software - video.rs
     // `movie_hardware`; the browser keeps WebCodecs' own choice).
     "VITASLOP_VIDEO_HARDWARE",
+    // A/B arm for resetting the viewport to the whole target at `sceGxmBeginScene` (`0` keeps
+    // the last scene's). Browser-reachable for the same reason as `VITASLOP_REGION_CLIP_SCENE`.
+    "VITASLOP_VIEWPORT_SCENE",
     // The format-keyed pipeline warm fallback (gpu.rs `warm_by_format`); `=0` is the arm back.
     "VITASLOP_WARM_BY_FORMAT",
     "VITASLOP_WASM_NAMES",

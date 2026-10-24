@@ -5,7 +5,7 @@
 // compiler the product uses: Tint refuses things naga accepts, and the one that matters here is
 // `dpdx`/`dpdy` outside uniform control flow - which compiles on the desktop and kills the
 // browser's run worker with an invalid pipeline. Until now the only Tint in reach was a full
-// browser replay of the title that binds the pair, which cannot check a shader no recipe reaches.
+// browser replay of the title that binds the pair, which cannot check a shader no playbook reaches.
 // `corpus.rs::write_every_linked_pair_wgsl` writes every module a corpus can produce; this
 // compiles all of them in the real browser in one go.
 //

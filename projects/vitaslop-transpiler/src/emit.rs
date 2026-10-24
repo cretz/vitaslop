@@ -743,7 +743,7 @@ fn and_armed(f: &mut Body) {
 // not an argument any more - it is a MEASUREMENT: 2026-08-20a ran a retail race to
 // frame 10,000 with the map on and off and the two arms are identical at frame 9,600 to
 // the digit (`guest clock 162.179s`, `11 scenes / 829 draws`, the same per-target draw
-// breakdown). The guest timeline does not move, so no recipe re-times.
+// breakdown). The guest timeline does not move, so no scripted run re-times.
 //
 // What the map is worth on native, same pair of runs, over a 400-frame shot window:
 // **median rendered frame 37.54 -> 23.83 ms (-36.5%)**, and index expansion **4,220.7
@@ -1280,7 +1280,7 @@ static ANY_EMIT_KNOB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 /// Set one emit-time diagnostic knob for this thread, as if the environment carried it.
 /// The value is the same string the environment would hold, so a browser run and a desktop
-/// run spell every knob identically and a recipe copied between them cannot mean two things.
+/// run spell every knob identically and a knob set copied between them cannot mean two things.
 pub fn set_emit_knob(name: &str, value: &str) {
     ANY_EMIT_KNOB.store(true, std::sync::atomic::Ordering::Relaxed);
     EMIT_KNOBS.with(|m| m.borrow_mut().insert(name.to_string(), value.to_string()));
@@ -1804,7 +1804,7 @@ pub fn fuel_interval() -> u32 {
 /// differs. `untolled` means "not OUR fuel", not "free".
 ///
 /// RESULT, 2026-08-15f: both poison arms rendered SHA-256 `50164a52...` at frame 7450 of the
-/// committed race recipe, bit-identical, on identical fuel. No elided flag was read.
+/// committed scripted race, bit-identical, on identical fuel. No elided flag was read.
 fn flag_poison() -> Option<i32> {
     use std::sync::OnceLock;
     static CELL: OnceLock<Option<i32>> = OnceLock::new();
@@ -1898,7 +1898,7 @@ fn poison_flag(f: &mut Body, flag: abi::Flag) {
 /// than two scales that have to be fitted to each other.
 ///
 /// Four cheaper models were measured against native's clock curve on the same title and
-/// recipe, and every one of them is wrong in a way no constant can absorb:
+/// input, and every one of them is wrong in a way no constant can absorb:
 ///
 /// | model                            | ~f10,300 | ~f29,300 | ~f40,800 |
 /// |----------------------------------|----------|----------|----------|
@@ -4824,7 +4824,7 @@ fn count_neon_regs(s: &crate::ir::NeonStmt, q: &mut [u32; 8], d: &mut [u32; 8]) 
             reg(a);
             dn(*src, d);
         }
-        RecipEstimate { dst, src, .. }
+        ReciprocalEstimate { dst, src, .. }
         | Widen { dst, a: src, .. }
         | PairLong { dst, a: src, .. }
         | Unary { dst, a: src, .. }
@@ -7198,7 +7198,7 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             }
             neon_set(f, *dst);
         }
-        RecipEstimate { sqrt, dst, src } => {
+        ReciprocalEstimate { sqrt, dst, src } => {
             // Full-precision reciprocal: 1 / (sqrt?)(src). f32x4 only.
             f.instruction(&f32x4_splat_const(1.0));
             neon_get(f, *src);
@@ -8133,6 +8133,10 @@ enum InlineLowering {
     /// (the clamped case, which only the handler defines - see
     /// [`crate::InlineOp::LoadScaled`]).
     GuestScaled { offset: u32, max: u32, shl: u32, limit: u32 },
+    /// Read the field word through the pointer in r0, falling back to the host call when the
+    /// pointer is out of range OR the guard word matches (see
+    /// [`crate::InlineOp::LoadShiftMaskUnless`]). `limit` admits BOTH words.
+    GuestUnless { offset: u32, shift: u32, mask: u32, guard_offset: u32, guard_mask: u32, guard_value: u32, limit: u32 },
     /// Read the host-mirror word at this fixed linear-memory offset. No guard: the
     /// address is a constant inside the module's own reserved page, so there is no
     /// out-of-range case to fall back for.
@@ -8174,6 +8178,10 @@ enum InlineLowering {
     /// like [`InlineLowering::ArgStore`] - the word is READ as well as written, so a
     /// rejected pointer would otherwise load garbage and store it back.
     ArgStoreField { offset: u32, shift: u32, mask: u32, limit: u32 },
+    /// [`InlineLowering::ArgStoreField`] behind two more guards: the guard word at
+    /// `guard_offset` must not match and r1 must fit the field - see
+    /// [`crate::InlineOp::StoreArgFieldChecked`]. `limit` admits BOTH words.
+    ArgStoreFieldChecked { offset: u32, shift: u32, mask: u32, guard_offset: u32, guard_mask: u32, guard_value: u32, limit: u32 },
     /// Store r2 at `r0 + offset + r1 * 4` and set r0 = 0, when `r1 < count`. Guarded on
     /// BOTH the pointer and the index: an index past the end is the handler's case, and
     /// `limit` is computed against the LAST element so an in-bounds index can never reach
@@ -8297,6 +8305,10 @@ impl InlineImports {
                 let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset)?;
                 Some(InlineLowering::GuestScaled { offset, max, shl, limit })
             }
+            crate::InlineOp::LoadShiftMaskUnless { offset, shift, mask, guard_offset, guard_mask, guard_value } => {
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset.max(guard_offset))?;
+                Some(InlineLowering::GuestUnless { offset, shift, mask, guard_offset, guard_mask, guard_value, limit })
+            }
             crate::InlineOp::RetConst { value } => Some(InlineLowering::RetConst { value }),
             crate::InlineOp::Nop => Some(InlineLowering::Nop),
             crate::InlineOp::Fast => Some(InlineLowering::Fast),
@@ -8364,6 +8376,18 @@ impl InlineImports {
                 // plain store.
                 let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset)?;
                 Some(InlineLowering::ArgStoreField { offset, shift, mask, limit })
+            }
+            crate::InlineOp::StoreArgFieldChecked { offset, shift, mask, guard_offset, guard_mask, guard_value } => {
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset.max(guard_offset))?;
+                Some(InlineLowering::ArgStoreFieldChecked {
+                    offset,
+                    shift,
+                    mask,
+                    guard_offset,
+                    guard_mask,
+                    guard_value,
+                    limit,
+                })
             }
             crate::InlineOp::StoreArgFieldInPlace { offset, mask } => {
                 // The SAME lowering with no shift: `(w & !mask) | (r1 & mask)` is what
@@ -9046,29 +9070,39 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
         }
         Some(InlineLowering::ArgStoreField { offset, shift, mask, limit }) => {
             emit_pointer_guard(f, base, limit, index);
-            // *(u32 *)(r0 + offset) = (old & !(mask << shift)) | ((r1 & mask) << shift).
-            // The address is pushed once for the store and once for the load inside it,
-            // rather than parked in a local, because `L_T0` already holds it and a second
-            // `local.get` is what the reading forms cost too.
-            emit_watch_store_inline(f, base, L_T0, offset, 4, index);
+            emit_field_store(f, base, offset, shift, mask, index);
+            f.instruction(&W::End);
+            return;
+        }
+        Some(InlineLowering::ArgStoreFieldChecked {
+            offset,
+            shift,
+            mask,
+            guard_offset,
+            guard_mask,
+            guard_value,
+            limit,
+        }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // In range. A matching guard word OR a value wider than the field is a refusal
+            // the handler defines (see `InlineOp::StoreArgFieldChecked`).
             f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::I32Load(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
-            f.instruction(&W::I32Const(!(mask << shift) as i32));
+            f.instruction(&W::I32Load(MemArg { offset: guard_offset as u64, align: 0, memory_index: 0 }));
+            f.instruction(&W::I32Const(guard_mask as i32));
             f.instruction(&W::I32And);
+            f.instruction(&W::I32Const(guard_value as i32));
+            f.instruction(&W::I32Eq);
             f.instruction(&W::GlobalGet(abi::reg_global(1)));
             f.instruction(&W::I32Const(mask as i32));
-            f.instruction(&W::I32And);
-            if shift != 0 {
-                f.instruction(&W::I32Const(shift as i32));
-                f.instruction(&W::I32Shl);
-            }
+            f.instruction(&W::I32GtU);
             f.instruction(&W::I32Or);
-            f.instruction(&W::I32Store(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
-            // The handler returns 0, and the guarded path is the one it would have taken.
-            f.instruction(&W::I32Const(0));
-            f.instruction(&W::GlobalSet(abi::reg_global(0)));
-            f.instruction(&W::End);
+            f.instruction(&W::If(BlockType::Empty));
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.instruction(&W::Else);
+            emit_field_store(f, base, offset, shift, mask, index);
+            f.instruction(&W::End); // the refusal test
+            f.instruction(&W::End); // the pointer guard's `if`
             return;
         }
         Some(InlineLowering::ArgStoreIndexed { offset, count, limit }) => {
@@ -10023,6 +10057,35 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::End); // the pointer guard's `if`
             return;
         }
+        Some(InlineLowering::GuestUnless { offset, shift, mask, guard_offset, guard_mask, guard_value, limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // In range. The guard word first: where it matches, the field's bits mean
+            // something else and only the handler defines the answer.
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Load(MemArg { offset: guard_offset as u64, align: 0, memory_index: 0 }));
+            f.instruction(&W::I32Const(guard_mask as i32));
+            f.instruction(&W::I32And);
+            f.instruction(&W::I32Const(guard_value as i32));
+            f.instruction(&W::I32Eq);
+            f.instruction(&W::If(BlockType::Empty));
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.instruction(&W::Else);
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Load(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
+            if shift != 0 {
+                f.instruction(&W::I32Const(shift as i32));
+                f.instruction(&W::I32ShrU);
+            }
+            if mask != u32::MAX {
+                f.instruction(&W::I32Const(mask as i32));
+                f.instruction(&W::I32And);
+            }
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::End);
+            f.instruction(&W::End); // the pointer guard's `if`
+            return;
+        }
         Some(InlineLowering::Guest { offset, shift, mask, plus, limit }) => {
             (offset, shift, mask, plus, limit)
         }
@@ -10046,6 +10109,33 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
     }
     f.instruction(&W::GlobalSet(abi::reg_global(0)));
     f.instruction(&W::End);
+}
+
+/// The body of a field setter, inside its guards: `*(u32 *)(r0 + offset) =
+/// (old & !(mask << shift)) | ((r1 & mask) << shift); r0 = 0`, with the rebased pointer in
+/// `L_T0`.
+fn emit_field_store(f: &mut Body, base: u32, offset: u32, shift: u32, mask: u32, index: u32) {
+    // The address is pushed once for the store and once for the load inside it, rather than
+    // parked in a local, because `L_T0` already holds it and a second `local.get` is what
+    // the reading forms cost too.
+    emit_watch_store_inline(f, base, L_T0, offset, 4, index);
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Load(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
+    f.instruction(&W::I32Const(!(mask << shift) as i32));
+    f.instruction(&W::I32And);
+    f.instruction(&W::GlobalGet(abi::reg_global(1)));
+    f.instruction(&W::I32Const(mask as i32));
+    f.instruction(&W::I32And);
+    if shift != 0 {
+        f.instruction(&W::I32Const(shift as i32));
+        f.instruction(&W::I32Shl);
+    }
+    f.instruction(&W::I32Or);
+    f.instruction(&W::I32Store(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
+    // The handler returns 0, and the guarded path is the one it would have taken.
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::GlobalSet(abi::reg_global(0)));
 }
 
 fn load_op(size: MemSize, signed: bool) -> W<'static> {

@@ -21,7 +21,7 @@
 use std::sync::Mutex;
 
 use vitaslop_runtime::observer::{self, HostCallObserver, ObservedCall};
-use vitaslop_runtime::recipe_eval::GuestRead;
+use vitaslop_runtime::guest_read::GuestRead;
 use vitaslop_runtime::{CtrlFrame, TouchFrame};
 
 use crate::calls;
@@ -197,7 +197,9 @@ impl CueState for Cues {
 
     fn value(&self, id: CueId) -> Option<f64> {
         match &self.defs[id] {
-            CueDef::Call { .. } | CueDef::Mem { .. } | CueDef::Pixels { .. } | CueDef::Locate { .. } => self.vals[id],
+            CueDef::Call { .. } | CueDef::Mem { .. } | CueDef::Pixels { .. } | CueDef::Locate { .. } | CueDef::Color { .. } => {
+                self.vals[id]
+            }
             CueDef::Cmp { src, op, value } => self.value(*src).map(|v| op.eval(v, *value) as u8 as f64),
             CueDef::Changed(src) => Some(self.changed_now[*src] as u8 as f64),
             CueDef::Stable(src, n) => {
@@ -227,6 +229,8 @@ struct Engine {
     traces: Vec<(CueId, String, Option<f64>)>,
     ctrl: CtrlFrame,
     touch: Option<(u16, u16)>,
+    /// The rear panel's finger, `back_touch` in a playbook.
+    back: Option<(u16, u16)>,
     block: Block,
     /// A reply the playbook is owed: when set, the next pump resumes it.
     pending: Option<String>,
@@ -307,6 +311,7 @@ fn new_engine(name: String, source: Source, header: Vec<(String, String)>, wall:
         traces: vec![],
         ctrl: CtrlFrame::default(),
         touch: None,
+        back: None,
         block: Block::None,
         pending: Some(proto::ok()),
         phases: vec![],
@@ -353,13 +358,14 @@ pub fn active() -> bool {
     ENGINE.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
-/// The input every pad read returns this display frame. Port 0 only: the playbook drives the
-/// built-in pad and the front panel.
+/// The input every pad read returns this display frame. The playbook drives the built-in pad,
+/// the front panel (port 0) and the rear panel (port 1's touch).
 pub fn input(port: u32) -> Option<(CtrlFrame, TouchFrame)> {
     let g = ENGINE.lock().ok()?;
     let e = g.as_ref().filter(|e| e.drives)?;
     if port != 0 {
-        return Some((CtrlFrame::default(), TouchFrame::default()));
+        let back = if port == 1 { e.back.map(|(x, y)| TouchFrame::single(x, y)) } else { None };
+        return Some((CtrlFrame::default(), back.unwrap_or_default()));
     }
     Some((e.ctrl, e.touch.map(|(x, y)| TouchFrame::single(x, y)).unwrap_or_default()))
 }
@@ -383,7 +389,7 @@ pub fn wants_pixels() -> bool {
     ENGINE.lock().ok().is_some_and(|g| {
         g.as_ref().is_some_and(|e| {
             matches!(e.source, Source::Script { .. })
-                && e.cues.defs.iter().any(|d| matches!(d, CueDef::Pixels { .. } | CueDef::Locate { .. }))
+                && e.cues.defs.iter().any(|d| matches!(d, CueDef::Pixels { .. } | CueDef::Locate { .. } | CueDef::Color { .. }))
         })
     })
 }
@@ -407,6 +413,9 @@ pub fn on_frame_pixels(w: u32, h: u32, rgba: &[u8]) {
                 CueDef::Locate { x, y, w: rw, h: rh, rgb, tol } => {
                     let at = scan_pixels(w, h, rgba, (x, y, rw, rh), rgb, tol, true);
                     c.pixels[i] = (at != u32::MAX).then_some(at as f64);
+                }
+                CueDef::Color { x, y, w: rw, h: rh } => {
+                    c.pixels[i] = Some(average_rgb(w, h, rgba, (x, y, rw, rh)) as f64);
                 }
                 _ => {}
             }
@@ -434,6 +443,26 @@ fn scan_pixels(w: u32, h: u32, rgba: &[u8], r: (u32, u32, u32, u32), rgb: [u8; 3
         }
     }
     if first { u32::MAX } else { n }
+}
+
+/// The average colour of the panel rectangle `r` in a `w` x `h` frame, packed `0xRRGGBB`.
+fn average_rgb(w: u32, h: u32, rgba: &[u8], r: (u32, u32, u32, u32)) -> u32 {
+    let (rx, ry, rw, rh) = r;
+    let mut sum = [0u64; 3];
+    let mut n = 0u64;
+    for py in ry..ry + rh {
+        let sy = (py as u64 * h as u64 / 544) as u32;
+        for px in rx..rx + rw {
+            let sx = (px as u64 * w as u64 / 960) as u32;
+            let o = ((sy.min(h - 1) * w + sx.min(w - 1)) * 4) as usize;
+            for (k, s) in sum.iter_mut().enumerate() {
+                *s += u64::from(rgba[o + k]);
+            }
+            n += 1;
+        }
+    }
+    let n = n.max(1);
+    ((sum[0] / n) as u32) << 16 | ((sum[1] / n) as u32) << 8 | (sum[2] / n) as u32
 }
 
 /// Drive a VM the engine does not hold (the browser's): resume it until it blocks.
@@ -511,6 +540,7 @@ impl Engine {
         self.pending = None;
         self.ctrl = CtrlFrame::default();
         self.touch = None;
+        self.back = None;
     }
 
     fn running(&self) -> bool {
@@ -552,6 +582,7 @@ impl Engine {
             self.status = Status::Done;
             self.ctrl = CtrlFrame::default();
             self.touch = None;
+            self.back = None;
             return;
         }
         if let Some(c) = t.change_at(input)
@@ -566,6 +597,8 @@ impl Engine {
         let (ctrl, touch) = t.input_at(input);
         self.ctrl = ctrl;
         self.touch = (touch.count > 0).then(|| (touch.points[0].x, touch.points[0].y));
+        let back = t.back_at(input);
+        self.back = (back.count > 0).then(|| (back.points[0].x, back.points[0].y));
         // The recorded run's shots, on the input frames it asked for them.
         let at = t.notes.partition_point(|n| n.input < input);
         for n in t.notes[at..].iter().take_while(|n| n.input == input) {
@@ -583,7 +616,7 @@ impl Engine {
             let v = match &c.defs[i] {
                 CueDef::Call { .. } => c.slot[i].map(|s| calls::count(s) as f64),
                 CueDef::Mem { ty, base, offs } => read_mem(mem, *ty, *base, offs),
-                CueDef::Pixels { .. } | CueDef::Locate { .. } => c.pixels[i],
+                CueDef::Pixels { .. } | CueDef::Locate { .. } | CueDef::Color { .. } => c.pixels[i],
                 _ => continue,
             };
             // A cue's FIRST sample is its starting value, not a change: a memory cue declared
@@ -726,7 +759,10 @@ impl Engine {
             }
         }
         let is_state = |c: CueId| {
-            matches!(self.cues.defs[c], CueDef::Call { .. } | CueDef::Mem { .. } | CueDef::Pixels { .. } | CueDef::Locate { .. })
+            matches!(
+                self.cues.defs[c],
+                CueDef::Call { .. } | CueDef::Mem { .. } | CueDef::Pixels { .. } | CueDef::Locate { .. } | CueDef::Color { .. }
+            )
         };
         match &def {
             CueDef::Cmp { src, .. } | CueDef::Changed(src) | CueDef::Stable(src, _) if !is_state(*src) => {
@@ -859,8 +895,12 @@ impl Engine {
                 }
                 proto::ok()
             }
-            Request::Touch(t) => {
-                self.touch = t;
+            Request::Touch { back, at } => {
+                if back {
+                    self.back = at;
+                } else {
+                    self.touch = at;
+                }
                 proto::ok()
             }
             Request::Shot(name) => {
@@ -902,8 +942,13 @@ impl Engine {
     }
 
     fn record(&mut self) {
-        let change = Change { input: self.input_frame(), display: self.display, ctrl: self.ctrl, touch: self.touch };
-        let same = self.tape.changes.last().is_some_and(|c| c.ctrl == change.ctrl && c.touch == change.touch);
+        let change =
+            Change { input: self.input_frame(), display: self.display, ctrl: self.ctrl, touch: self.touch, back: self.back };
+        let same = self
+            .tape
+            .changes
+            .last()
+            .is_some_and(|c| c.ctrl == change.ctrl && c.touch == change.touch && c.back == change.back);
         if !same {
             self.tape.changes.push(change);
         }
@@ -931,6 +976,16 @@ fn read_mem(mem: &dyn GuestRead, ty: crate::cue::MemTy, base: u32, offs: &[u32])
 mod tests {
     use super::*;
     use crate::lua_mlua::MluaVm;
+
+    /// `cue.color`'s value is the rectangle's average, packed `0xRRGGBB`, at panel coordinates
+    /// whatever the frame's own size.
+    #[test]
+    fn a_colour_cue_averages_its_rectangle() {
+        // A 2x1 frame: left pixel (10, 20, 30), right pixel (30, 40, 50).
+        let rgba = [10, 20, 30, 255, 30, 40, 50, 255];
+        assert_eq!(average_rgb(2, 1, &rgba, (0, 0, 960, 544)), 0x0014_1e28);
+        assert_eq!(average_rgb(2, 1, &rgba, (480, 0, 480, 544)), 0x001e_2832);
+    }
 
     /// The engine is process-wide; its tests take turns.
     static SERIAL: Mutex<()> = Mutex::new(());

@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 
 use vitaslop_native::{RunReport, ThreadSpawn, ThreadedScheduler};
-use vitaslop_runtime::{GuestMemory, ImportDispatch, SvcOutcome, VFP_ARG_COUNT};
+use vitaslop_runtime::{GuestCall, GuestMemory, ImportDispatch, SvcOutcome, VFP_ARG_COUNT};
 use vitaslop_transpiler::abi::REG_COUNT;
 use vitaslop_transpiler::Extern;
 
@@ -263,4 +263,72 @@ fn preemptive_block_wake_spawn_ordering() {
     // signalled) and M last (main was blocked joining until both workers ended).
     let log = String::from_utf8(sched.host().log.clone()).unwrap();
     assert_eq!(log, "BAM", "observed interleaving proves real blocking and wakeups");
+}
+
+/// A mock host whose one thread owes one EXIT handler when it returns from its entry, and
+/// whose only import exits the process.
+#[derive(Default)]
+struct ExitHandlerKernel {
+    handed_out: bool,
+    handler_ran: bool,
+}
+
+const HANDLER: u32 = 0x1_0100;
+
+impl ImportDispatch for ExitHandlerKernel {
+    fn dispatch(
+        &mut self,
+        index: u32,
+        _regs: &mut [u32; REG_COUNT],
+        _vfp: &mut [u32; VFP_ARG_COUNT],
+        _mem: &mut dyn GuestMemory,
+        _base: u32,
+    ) -> SvcOutcome {
+        match index {
+            imp::EXIT => {
+                self.handler_ran = true;
+                SvcOutcome::Halt
+            }
+            other => panic!("unexpected import index {other}"),
+        }
+    }
+
+    fn thread_return_calls(&mut self, _thid: i32, code: u32) -> Vec<GuestCall> {
+        if std::mem::replace(&mut self.handed_out, true) {
+            return Vec::new();
+        }
+        vec![GuestCall { entry: HANDLER, args: vec![vitaslop_runtime::host::THREAD_EVENT_EXIT, 0, code, 0] }]
+    }
+}
+
+/// An EXIT handler that exits the process ends it with the code IT exits with, not the code
+/// the thread's entry returned: the entry returns 5, its handler exits the process with 0.
+#[test]
+fn exit_handler_process_exit_reports_its_own_code() {
+    const MOV_R0_5: u32 = 0xE3A0_0005;
+    const MOV_R0_0: u32 = 0xE3A0_0000;
+    let mut code = vec![0u8; 0x110];
+    let mut put = |off: u32, word: u32| code[off as usize..off as usize + 4].copy_from_slice(&word.to_le_bytes());
+    // main: return 5.
+    put(MAIN - BASE, MOV_R0_5);
+    put(MAIN - BASE + 4, BX_LR);
+    // The handler: exit the process with 0.
+    put(HANDLER - BASE, MOV_R0_0);
+    put(HANDLER - BASE + 4, bl(HANDLER + 4, stub(imp::EXIT)));
+    put(HANDLER - BASE + 8, BX_LR);
+
+    let mut sched = ThreadedScheduler::new(
+        &code,
+        BASE,
+        false, // ARM
+        &[MAIN, HANDLER],
+        &build_externs(),
+        MEM_BYTES,
+        ExitHandlerKernel::default(),
+    )
+    .expect("build scheduler");
+
+    let report = sched.run();
+    assert!(sched.host().handler_ran, "the EXIT handler should have run");
+    assert_eq!(report, RunReport::Finished(0), "the handler's process exit code, not the entry's 5");
 }

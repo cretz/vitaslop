@@ -1038,6 +1038,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlmalloc"
+version = "0.2.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f5b01c17f85ee988d832c40e549a64bd89ab2c9f8d8a613bdf5122ae507e294"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4209,15 +4220,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vitaslop-gamerun-recipes"
-version = "0.1.0"
-dependencies = [
- "tracing-subscriber",
- "vitaslop-native",
- "vitaslop-runtime",
-]
-
-[[package]]
 name = "vitaslop-gxp-shader"
 version = "0.1.0"
 dependencies = [
@@ -4274,6 +4276,7 @@ dependencies = [
 name = "vitaslop-platform"
 version = "0.1.0"
 dependencies = [
+ "dlmalloc",
  "js-sys",
  "tracing",
  "vitaslop-aac",
@@ -4288,6 +4291,8 @@ version = "0.1.0"
 dependencies = [
  "mlua",
  "serde_json",
+ "tracing-subscriber",
+ "vitaslop-native",
  "vitaslop-runtime",
 ]
 
@@ -5505,7 +5510,7 @@ dependencies = [
 [[package]]
 name = "yaxpeax-arm"
 version = "0.4.0"
-source = "git+https://github.com/cretz/yaxpeax-arm?rev=20d87c571f4c127a8341489baa4f39dfa517f94d#20d87c571f4c127a8341489baa4f39dfa517f94d"
+source = "git+https://github.com/cretz/yaxpeax-arm?rev=1f09ab41aba2c1991d4c6024c23d80160d71eb8e#1f09ab41aba2c1991d4c6024c23d80160d71eb8e"
 dependencies = [
  "bitvec",
  "yaxpeax-arch",

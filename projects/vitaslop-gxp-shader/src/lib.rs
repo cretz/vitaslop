@@ -674,10 +674,10 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
             found = Some(blend);
             continue;
         }
-        // A PRIMARY-ATTRIBUTE destination moved to `o[0]` by the program's one final identity
-        // copy is the same epilogue one register away (`usse::sop2_pa_epilogue_tail_ok`).
+        // A PRIMARY-ATTRIBUTE or TEMPORARY destination moved to `o[0]` by the program's one final
+        // identity copy is the same epilogue one register away (`usse::sop2_pa_epilogue_tail_ok`).
         let dest_reaches_output = dest_is_output
-            || (bit(33, 32) == 2 && bit(51, 51) == 0 && usse::sop2_pa_epilogue_tail_ok(&shader.instrs, at));
+            || (matches!(bit(33, 32), 0 | 2) && bit(51, 51) == 0 && usse::sop2_pa_epilogue_tail_ok(&shader.instrs, at));
         if !dest_reaches_output || !src2_is_output {
             continue;
         }

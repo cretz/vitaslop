@@ -3,7 +3,7 @@
 //!
 //! OFF by default, and off is not a degraded mode - it is the DETERMINISTIC engine: one guest
 //! thread at a time, switched only at host calls, so the same inputs replay the same run. Every
-//! recipe, capsule and bisection depends on that, and a parallel run cannot give it (which
+//! scripted run, capsule and bisection depends on that, and a parallel run cannot give it (which
 //! thread reaches a lock first depends on the host's timing). So this is a run-time choice, and
 //! the single-worker path does not change when it exists.
 //!
@@ -74,7 +74,7 @@ pub fn enabled() -> bool {
 /// MEASURED (`pf25b`, desktop Chrome, CPU ms of run-worker wall per frame): a football title one worker
 /// 13.9-16.1, SMP stop-the-world 11.6-13.0, overlapped ~0 (the run worker slept 27 of a 32.7 ms
 /// period); a baseball title one worker 8.5-9.0, SMP stop-the-world 9.7-10.7 (SLOWER), overlapped 0.0-0.2
-/// (slept 12.5 of 17.1). Sweep `sw25o`: all 8 gameplay recipes reach their end frame with
+/// (slept 12.5 of 17.1). Sweep `sw25o`: all 8 scripted gameplay runs reach their end frame with
 /// correct pictures and the fighting title's @assert passes. It is safe because the present reads no live
 /// guest memory: geometry is snapshotted at the guest's GPU wait or flip, textures per scene.
 pub fn overlap() -> bool {
@@ -167,7 +167,7 @@ fn early_pause_all() -> bool {
 /// SMP; `VITASLOP_CLOCK_WALL_FLOOR=0` is the arm back.
 ///
 /// Not below `VITASLOP_BROWSER_FASTFORWARD`: a fast-forward is not real time by definition, and
-/// a frame-numbered recipe written against the unfloored clock must land where it was written
+/// a frame-numbered input script written against the unfloored clock must land where it was written
 /// on a device slower than real time too (the phone's baseball-title menu walk ended in another scene).
 fn wall_floor(frame: u64) -> bool {
     static ON: OnceLock<(bool, u64)> = OnceLock::new();
@@ -2324,7 +2324,7 @@ pub struct SmpRun {
     engine: BrowserEngine,
     /// Frames the run worker has taken for presenting. Under [`overlap`] the guest may already
     /// be a frame past this; everything the live loop keys on a frame number (its next target,
-    /// its shots, its recipe cues) means the frame being PRESENTED, which is this.
+    /// its shots, its playbook cues) means the frame being PRESENTED, which is this.
     consumed: u64,
     _workers: Vec<web_sys::Worker>,
     _listeners: Vec<Closure<dyn FnMut(web_sys::MessageEvent)>>,

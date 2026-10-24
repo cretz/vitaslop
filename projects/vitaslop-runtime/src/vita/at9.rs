@@ -14,8 +14,8 @@ use std::collections::VecDeque;
 
 use vitaslop_atrac9::Atrac9Decoder;
 
-use crate::host::GuestCtx;
 use super::hevag;
+use crate::host::GuestCtx;
 
 /// The `SceNgsPlayerParams` layout a title writes for the AT9 player module,
 /// recovered from the live params buffer:
@@ -73,7 +73,11 @@ struct BufDesc {
 impl BufDesc {
     fn read(ctx: &GuestCtx, at: u32, with_discards: bool) -> BufDesc {
         let loop_next = ctx.read_u32(at + DESC_OFF_LOOP);
-        let discards = if with_discards { ctx.read_u32(at + DESC_OFF_DISCARD_START) } else { 0 };
+        let discards = if with_discards {
+            ctx.read_u32(at + DESC_OFF_DISCARD_START)
+        } else {
+            0
+        };
         debug_assert_eq!(DESC_OFF_NEXT, DESC_OFF_LOOP + 2);
         debug_assert_eq!(DESC_OFF_DISCARD_END, DESC_OFF_DISCARD_START + 2);
         BufDesc {
@@ -305,25 +309,6 @@ pub(crate) struct At9Voice {
     rate: u32,
     /// PCM only: how the source bytes are encoded.
     format: PcmFormat,
-    /// Routing gain from this voice's patch (`sceNgsVoicePatchSetVolume*`). Unity until
-    /// the title says otherwise, which is the only safe default: too quiet is a sound
-    /// nobody hears, too loud is distortion across the whole mix.
-    gain: f32,
-    /// The patch's 2x2 volume matrix, `patch[source channel][destination channel]`, as
-    /// `sceNgsVoicePatchSetVolume` (one cell) and `sceNgsVoicePatchSetVolumesMatrix` (all
-    /// four) set it. `gain` above is its loudest cell, kept for the diagnostics. IDENTITY
-    /// until the title writes a cell: the hardware's fresh patch is silent, but titles that
-    /// never set one still sound on a device, so unity is the only default that agrees with
-    /// what is heard. A stereo source's L and R reach each output channel through their own
-    /// cells, which is how a title pans, and how a title that writes `(L->R) = 0` LAST no
-    /// longer silences the voice (the scalar took the last write as the whole gain).
-    patch: [[f32; 2]; 2],
-    /// Whether the title has written any cell of `patch`. Until it has, a MONO source
-    /// fans out through row 0's first cell to BOTH port channels: the identity default
-    /// would put it on the left channel only, which is not what a device does with a voice
-    /// whose patch was never set (MEASURED by the mix test: mono 100 + 500 on L, nothing on
-    /// R). A title that sets a cell owns the whole matrix from then on.
-    patch_set: bool,
     /// The voice's own level, from its player params - see [`OFF_PCM_LEVEL`]. Multiplied
     /// with `gain`: they are independent controls (a voice's own level, and the level of
     /// the routing that carries it), and the device applies both.
@@ -446,9 +431,6 @@ impl At9Voice {
             start_bytes: 0,
             rate: 0,
             format: PcmFormat::S16,
-            gain: 1.0,
-            patch: [[1.0, 0.0], [0.0, 1.0]],
-            patch_set: false,
             level: 1.0,
             level_set: false,
             adpcm_hist: [[0; 4]; 2],
@@ -503,7 +485,11 @@ impl At9Voice {
         // slot holds some. The chain is read here rather than after the checks so the gate and
         // the checks ask about the same buffers.
         let at9_bufs: [BufDesc; PLAYER_BUFFERS] = std::array::from_fn(|i| {
-            BufDesc::read(ctx, params_addr + OFF_BUFFER_PTR + i as u32 * AT9_BUFFER_STRIDE, true)
+            BufDesc::read(
+                ctx,
+                params_addr + OFF_BUFFER_PTR + i as u32 * AT9_BUFFER_STRIDE,
+                true,
+            )
         });
         let head_buf = at9_bufs.iter().find(|b| !b.is_empty()).copied();
         let data_ptr = head_buf.map_or(0, |b| b.ptr);
@@ -539,11 +525,19 @@ impl At9Voice {
             let chain: Vec<String> = at9_bufs
                 .iter()
                 .enumerate()
-                .map(|(i, b)| format!("[{i}] ptr {:#010x} bytes {} loop {} next {} discard {}/{}", b.ptr, b.bytes, b.loop_count, b.next, b.discard_start, b.discard_end))
+                .map(|(i, b)| {
+                    format!(
+                        "[{i}] ptr {:#010x} bytes {} loop {} next {} discard {}/{}",
+                        b.ptr, b.bytes, b.loop_count, b.next, b.discard_start, b.discard_end
+                    )
+                })
                 .collect();
             // The words between the buffer table and the channel count, unparsed: a
             // start buffer / start byte would live here.
-            let tail: Vec<String> = (0x48..OFF_CHANNELS).step_by(4).map(|o| format!("+{o:#x}={:#x}", ctx.read_u32(params_addr + o))).collect();
+            let tail: Vec<String> = (0x48..OFF_CHANNELS)
+                .step_by(4)
+                .map(|o| format!("+{o:#x}={:#x}", ctx.read_u32(params_addr + o)))
+                .collect();
             tracing::trace!(
                 target: "vitaslop::at9",
                 params = format_args!("{params_addr:#010x}"),
@@ -556,7 +550,10 @@ impl At9Voice {
             );
         }
         self.set_chain(at9_bufs);
-        debug_assert_eq!(self.loop_count, ctx.read_u32(params_addr + OFF_LOOP_COUNT) as i16);
+        debug_assert_eq!(
+            self.loop_count,
+            ctx.read_u32(params_addr + OFF_LOOP_COUNT) as i16
+        );
         true
     }
 
@@ -637,7 +634,9 @@ impl At9Voice {
             return true;
         }
         let next = b.next;
-        let next_desc = usize::try_from(next).ok().and_then(|n| self.bufs.get(n).copied());
+        let next_desc = usize::try_from(next)
+            .ok()
+            .and_then(|n| self.bufs.get(n).copied());
         match next_desc {
             Some(nb) if !nb.is_empty() => {
                 self.events.push(PlayerEvent::Swapped { finished: index });
@@ -747,14 +746,22 @@ impl At9Voice {
         // chain. Requiring bytes in slot 0 refused such a source outright, and a refused
         // source is digital silence with a warning that names the symptom and not the cause.
         let bufs: [BufDesc; PLAYER_BUFFERS] = std::array::from_fn(|i| {
-            BufDesc::read(ctx, params_addr + OFF_BUFFER_PTR + i as u32 * PCM_BUFFER_STRIDE, false)
+            BufDesc::read(
+                ctx,
+                params_addr + OFF_BUFFER_PTR + i as u32 * PCM_BUFFER_STRIDE,
+                false,
+            )
         });
         let rate = f32::from_bits(ctx.read_u32(params_addr + OFF_PCM_RATE)) as i64;
         let channels = u32::from(ctx.read_bytes(params_addr + OFF_PCM_CHANNELS, 1)[0]);
         // Where a key-on starts. An out-of-range slot is not a start this reading can
         // explain, so slot 0 stands - the old behaviour - rather than a guess.
         let start_buffer = usize::from(ctx.read_bytes(params_addr + OFF_PCM_START_BUFFER, 1)[0]);
-        self.start_buffer = if start_buffer < PLAYER_BUFFERS { start_buffer } else { 0 };
+        self.start_buffer = if start_buffer < PLAYER_BUFFERS {
+            start_buffer
+        } else {
+            0
+        };
         self.start_bytes = ctx.read_u32(params_addr + OFF_PCM_START_BYTES);
         // The first slot with bytes: what the format checks below are asked of, and what the
         // head dump reads. Slot 0's own values still drive `select(0)`, because that is where
@@ -777,7 +784,11 @@ impl At9Voice {
             let chain: Vec<String> = (0..PLAYER_BUFFERS)
                 .map(|i| {
                     let at = params_addr + OFF_BUFFER_PTR + i as u32 * PCM_BUFFER_STRIDE;
-                    format!("[{i}] ptr {:#010x} bytes {}", ctx.read_u32(at), ctx.read_u32(at + 4))
+                    format!(
+                        "[{i}] ptr {:#010x} bytes {}",
+                        ctx.read_u32(at),
+                        ctx.read_u32(at + 4)
+                    )
                 })
                 .collect();
             let head = ctx.read_bytes(params_addr, PCM_PARAMS_SIZE as usize);
@@ -817,7 +828,10 @@ impl At9Voice {
         // Asked of EVERY slot that has bytes, not just the first: each is read by the same
         // code with the same format, so one that does not divide is the same evidence of a
         // misread layout wherever it sits in the chain.
-        if let Some(b) = bufs.iter().find(|b| !b.is_empty() && !b.bytes.is_multiple_of(unit)) {
+        if let Some(b) = bufs
+            .iter()
+            .find(|b| !b.is_empty() && !b.bytes.is_multiple_of(unit))
+        {
             let bad = b.bytes;
             self.refuse(format_args!(
                 "{format:?} source of {bad} bytes is not a whole number of {unit}-byte \
@@ -881,7 +895,10 @@ impl At9Voice {
             let ch = u32::from(self.channels.max(1) as u16);
             (self.consumed, self.resample_pos) = match self.format {
                 PcmFormat::S16 => (0, f64::from(start / (ch * 2))),
-                PcmFormat::Adpcm => (start / (ADPCM_BLOCK_BYTES * ch) * (ADPCM_BLOCK_BYTES * ch), 0.0),
+                PcmFormat::Adpcm => (
+                    start / (ADPCM_BLOCK_BYTES * ch) * (ADPCM_BLOCK_BYTES * ch),
+                    0.0,
+                ),
             };
             self.adpcm_hist = [[0; 4]; 2];
             self.src_pending.clear();
@@ -952,7 +969,8 @@ impl At9Voice {
             self.fill_at9(ctx, needed, scratch);
         }
         // What this call produced, in FRAMES: the player state a streaming title polls.
-        let frames = (self.pending.len().saturating_sub(before) / self.channels.max(1) as usize) as u32;
+        let frames =
+            (self.pending.len().saturating_sub(before) / self.channels.max(1) as usize) as u32;
         self.generated_keyon = self.generated_keyon.wrapping_add(frames);
         self.generated_total = self.generated_total.wrapping_add(frames);
     }
@@ -966,7 +984,13 @@ impl At9Voice {
     /// thousands of small allocations per voice per grain, on a path that runs inside a
     /// host call at grain rate and in a browser.
     #[cfg_attr(feature = "profile-symbols", inline(never))]
-    fn fill_pcm(&mut self, ctx: &GuestCtx, needed: usize, port_rate: u32, scratch: &mut MixScratch) {
+    fn fill_pcm(
+        &mut self,
+        ctx: &GuestCtx,
+        needed: usize,
+        port_rate: u32,
+        scratch: &mut MixScratch,
+    ) {
         if self.format == PcmFormat::Adpcm {
             self.fill_adpcm(ctx, needed, port_rate, scratch);
             return;
@@ -1013,10 +1037,16 @@ impl At9Voice {
                 let want_bytes = take * frame_bytes as usize;
                 scratch.src.clear();
                 scratch.src.resize(want_bytes, 0);
-                ctx.read_into(self.data_ptr + start_frame as u32 * frame_bytes, &mut scratch.src);
+                ctx.read_into(
+                    self.data_ptr + start_frame as u32 * frame_bytes,
+                    &mut scratch.src,
+                );
                 self.pending.reserve(take * ch);
                 self.pending.extend(
-                    scratch.src.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])),
+                    scratch
+                        .src
+                        .chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]])),
                 );
                 self.resample_pos += take as f64;
             }
@@ -1036,7 +1066,11 @@ impl At9Voice {
             // partner of the last sample.
             let usable = (total_frames - 1).saturating_sub(start_frame) as f64;
             let frac = self.resample_pos - start_frame as f64;
-            let can = if ratio > 0.0 { ((usable - frac) / ratio).floor() } else { 0.0 };
+            let can = if ratio > 0.0 {
+                ((usable - frac) / ratio).floor()
+            } else {
+                0.0
+            };
             let take = want_frames.min(can.max(0.0) as usize);
             if take == 0 {
                 self.wrap_or_stop();
@@ -1108,7 +1142,11 @@ impl At9Voice {
             }
             // Only produce what the buffered source can actually support.
             let usable = (have - 1) as f64;
-            let can = if ratio > 0.0 { ((usable - self.resample_pos) / ratio).floor() } else { 0.0 };
+            let can = if ratio > 0.0 {
+                ((usable - self.resample_pos) / ratio).floor()
+            } else {
+                0.0
+            };
             let take = out_frames.min(can.max(0.0) as usize);
             if take == 0 {
                 // The source is finished and cannot feed another frame.
@@ -1145,7 +1183,10 @@ impl At9Voice {
                     let b = if f == 0.0 {
                         a
                     } else {
-                        self.src_pending.get((i + 1) * ch + c).copied().map_or(a, f64::from)
+                        self.src_pending
+                            .get((i + 1) * ch + c)
+                            .copied()
+                            .map_or(a, f64::from)
                     };
                     self.pending.push_back((a + (b - a) * f) as i16);
                 }
@@ -1154,7 +1195,8 @@ impl At9Voice {
             // Retire whole source frames the cursor has passed, keeping the fraction.
             let done = self.resample_pos.floor() as usize;
             if done > 0 {
-                self.src_pending.drain(..(done * ch).min(self.src_pending.len()));
+                self.src_pending
+                    .drain(..(done * ch).min(self.src_pending.len()));
                 self.resample_pos -= done as f64;
             }
         }
@@ -1236,7 +1278,11 @@ impl At9Voice {
             scratch.pcm.resize(ADPCM_BLOCK_SAMPLES * ch, 0);
             let decoded = &mut scratch.pcm;
             for g in scratch.src.chunks_exact(ADPCM_BLOCK_BYTES as usize * ch) {
-                for (c, block) in g.chunks_exact(ADPCM_BLOCK_BYTES as usize).enumerate().take(ch) {
+                for (c, block) in g
+                    .chunks_exact(ADPCM_BLOCK_BYTES as usize)
+                    .enumerate()
+                    .take(ch)
+                {
                     // HE-VAG: the predictor index is EIGHT bits and it is split across both
                     // header bytes - see `vita::hevag`. Reading only `block[0] >> 4` gave the
                     // low four and decoded a title's music with the wrong filter.
@@ -1354,8 +1400,8 @@ impl At9Voice {
             let mut spanning = 0usize;
             if tail < sf_bytes {
                 let b = self.bufs[self.cur];
-                let will_loop = !b.is_empty()
-                    && (b.loop_count == -1 || self.laps < i32::from(b.loop_count));
+                let will_loop =
+                    !b.is_empty() && (b.loop_count == -1 || self.laps < i32::from(b.loop_count));
                 let next_has_bytes = usize::try_from(b.next)
                     .ok()
                     .and_then(|n| self.bufs.get(n))
@@ -1414,10 +1460,14 @@ impl At9Voice {
                             .iter()
                             .enumerate()
                             .map(|(i, b)| {
-                                format!("[{i}] {:#010x}+{} loop {} next {}", b.ptr, b.bytes, b.loop_count, b.next)
+                                format!(
+                                    "[{i}] {:#010x}+{} loop {} next {}",
+                                    b.ptr, b.bytes, b.loop_count, b.next
+                                )
                             })
                             .collect();
-                        let head: Vec<String> = sf.iter().take(16).map(|b| format!("{b:02x}")).collect();
+                        let head: Vec<String> =
+                            sf.iter().take(16).map(|b| format!("{b:02x}")).collect();
                         let (cur, data_bytes, config) = (self.cur, self.data_bytes, self.config);
                         // >>> A SUPERFRAME THAT IS ONE BYTE REPEATED IS THE TITLE'S DATA RUNNING
                         // >>> OUT, NOT A DECODER FAULT. MEASURED on a football title: its
@@ -1499,20 +1549,19 @@ static MIX_LOOPING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// never attenuates.
 ///
 /// So the attenuation that is missing is inside the NGS graph. The one candidate the code
-/// already warns about is a voice with no ROUTE: `buss_gain` walks `routes` and returns 1.0
-/// when there is no entry, so a source we failed to see routed goes straight to the output
+/// already warns about is a voice with no ROUTE: a voice with no output patch is mixed at
+/// identity, so a source we failed to see routed goes straight to the output
 /// at its own level, louder than the title asked by the product of every buss it should have
 /// passed through. These two counters discriminate that from "the levels themselves are
-/// simply large": UNROUTED counts playing voices with no route entry, and the gain sum gives
+/// simply large": UNROUTED counts playing voices with no output patch, and the gain sum gives
 /// the mean gain actually applied per voice.
 static MIX_UNROUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Applied per-voice gain (`v.gain * v.level * buss_gain`) in permille, summed over every
+/// Applied per-voice gain (the loudest cell of `At9Bank::source_matrix`) in permille, summed over every
 /// voice of every grain.
 static MIX_GAIN_SUM_PERMILLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Buss hops walked per grain whose level was never set by the title, summed over voices.
 /// See `At9Voice::level_set`.
-static MIX_DEFAULTED_BUSSES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static MIX_DEFAULTED_BUSSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Voices started by `sceNgsVoicePlay`, stopped by the title (key-off / kill / pause), and
 /// ended on their own because a source ran out and did not loop. Starts against the other
 /// two is the whole question: if voices only ever start, they accumulate for the run.
@@ -1556,13 +1605,19 @@ fn zero_level_is_unity() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
     *CELL.get_or_init(|| {
-        crate::knobs::var("VITASLOP_NGS_ZERO_LEVEL").map(|v| v.trim() != "silent").unwrap_or(true)
+        crate::knobs::var("VITASLOP_NGS_ZERO_LEVEL")
+            .map(|v| v.trim() != "silent")
+            .unwrap_or(true)
     })
 }
 
 /// The loudest cell of a patch matrix - the scalar the diagnostics and the silence gate use.
 fn loudest_cell(m: &[[f32; 2]; 2]) -> f32 {
-    m.iter().flatten().copied().filter(|v| v.is_finite()).fold(0.0f32, f32::max)
+    m.iter()
+        .flatten()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(0.0f32, f32::max)
 }
 
 /// `a * b` for row-vector transforms: `out = in * a * b`.
@@ -1659,8 +1714,7 @@ pub fn note_mix_headroom(peak: i32, clipped: u64, gain: f32) {
 
 /// `sceNgsVoiceInit` calls, and how many carried a non-null preset. See `ngs::voice_init`.
 static VOICE_INITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static VOICE_INITS_WITH_PRESET: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static VOICE_INITS_WITH_PRESET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Playing voices whose OWN level was never set by the title (`At9Voice::level_set`), summed
 /// over the grains.
@@ -1675,8 +1729,7 @@ static MIX_DEFAULTED_LEVELS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// The product of the PATCH volumes on the busses above each playing voice, in permille,
 /// summed over voices. 1.000 means every buss-to-buss routing in the graph is at unity and
 /// applying them attenuates nothing.
-static MIX_BUSS_PATCH_PERMILLE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static MIX_BUSS_PATCH_PERMILLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The census of NGS param modules this engine does not interpret, keyed by
 /// `(params id, module index, the voice is a buss)` and carrying `(writes, first bytes seen)`.
@@ -1717,21 +1770,32 @@ struct UnknownModule {
 /// params block.
 pub(crate) fn note_unknown_module(id: u32, module: u32, is_buss: bool, bytes: &[u8]) {
     let mut g = UNKNOWN_MODULES.lock().unwrap();
-    let e = g.entry((id, module, is_buss)).or_insert_with(|| UnknownModule {
-        writes: 0,
-        first: bytes.to_vec(),
-        word_bits: Vec::new(),
-        word_f32: Vec::new(),
-    });
+    let e = g
+        .entry((id, module, is_buss))
+        .or_insert_with(|| UnknownModule {
+            writes: 0,
+            first: bytes.to_vec(),
+            word_bits: Vec::new(),
+            word_f32: Vec::new(),
+        });
     e.writes += 1;
     for i in 0..UNKNOWN_MODULE_WORDS.min(bytes.len() / 4) {
-        let w = u32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
+        let w = u32::from_le_bytes([
+            bytes[i * 4],
+            bytes[i * 4 + 1],
+            bytes[i * 4 + 2],
+            bytes[i * 4 + 3],
+        ]);
         let f = f32::from_bits(w);
         if e.word_bits.len() <= i {
             e.word_bits.push((w, w));
             // A non-finite word is not a float; seed the float range from the first FINITE
             // one so one garbage word does not make the whole column unreadable.
-            e.word_f32.push(if f.is_finite() { (f, f) } else { (f32::NAN, f32::NAN) });
+            e.word_f32.push(if f.is_finite() {
+                (f, f)
+            } else {
+                (f32::NAN, f32::NAN)
+            });
         } else {
             e.word_bits[i].0 = e.word_bits[i].0.min(w);
             e.word_bits[i].1 = e.word_bits[i].1.max(w);
@@ -1836,7 +1900,11 @@ fn capture_voice(handle: u32, channels: usize, gain: f32, src: &[i16]) {
     static BASE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     #[allow(clippy::type_complexity)]
     static FILES: std::sync::Mutex<Vec<(u32, std::fs::File)>> = std::sync::Mutex::new(Vec::new());
-    let Some(base) = BASE.get_or_init(|| std::env::var("VITASLOP_NGS_VOICE_RAW").ok().filter(|v| !v.is_empty())) else {
+    let Some(base) = BASE.get_or_init(|| {
+        std::env::var("VITASLOP_NGS_VOICE_RAW")
+            .ok()
+            .filter(|v| !v.is_empty())
+    }) else {
         return;
     };
     use std::io::Write;
@@ -1844,7 +1912,10 @@ fn capture_voice(handle: u32, channels: usize, gain: f32, src: &[i16]) {
     let at = match files.iter().position(|(h, _)| *h == handle) {
         Some(i) => i,
         None => {
-            let Ok(f) = std::fs::File::create(format!("{base}.{handle:08x}.{channels}ch.raw")) else { return };
+            let Ok(f) = std::fs::File::create(format!("{base}.{handle:08x}.{channels}ch.raw"))
+            else {
+                return;
+            };
             files.push((handle, f));
             files.len() - 1
         }
@@ -1852,12 +1923,19 @@ fn capture_voice(handle: u32, channels: usize, gain: f32, src: &[i16]) {
     let bytes: Vec<u8> = src.iter().flat_map(|s| s.to_le_bytes()).collect();
     let _ = files[at].1.write_all(&bytes);
     // The timeline, under the same lock; voice 0 names the CSV's own slot.
-    let rms = (src.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>() / src.len().max(1) as f64).sqrt();
+    let rms = (src
+        .iter()
+        .map(|&s| f64::from(s) * f64::from(s))
+        .sum::<f64>()
+        / src.len().max(1) as f64)
+        .sqrt();
     let grain = MIX_GRAINS.load(std::sync::atomic::Ordering::Relaxed);
     let at = match files.iter().position(|(h, _)| *h == 0) {
         Some(i) => i,
         None => {
-            let Ok(f) = std::fs::File::create(format!("{base}.csv")) else { return };
+            let Ok(f) = std::fs::File::create(format!("{base}.csv")) else {
+                return;
+            };
             files.push((0, f));
             files.len() - 1
         }
@@ -1919,7 +1997,11 @@ pub fn mix_report() -> Vec<String> {
         VOICES_STOPPED.load(Relaxed),
         VOICES_ENDED.load(Relaxed),
         unrouted as f64 / grains as f64,
-        if voices > 0 { gain_sum / voices as f64 } else { 0.0 },
+        if voices > 0 {
+            gain_sum / voices as f64
+        } else {
+            0.0
+        },
         if voices > 0 {
             MIX_DEFAULTED_BUSSES.load(Relaxed) as f64 / voices as f64
         } else {
@@ -2012,9 +2094,14 @@ pub fn mix_report() -> Vec<String> {
     }
     // >>> AND, WHEN ASKED, THE LOUDEST SOURCES - see `voice_peaks_enabled`.
     {
-        let mut g = VOICE_PEAKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut g = VOICE_PEAKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if !g.is_empty() {
-            g.sort_by(|a, b| (b.1 .1 / b.1 .2.max(1) as f64).total_cmp(&(a.1 .1 / a.1 .2.max(1) as f64)));
+            g.sort_by(|a, b| {
+                (b.1.1 / b.1.2.max(1) as f64).total_cmp(&(a.1.1 / a.1.2.max(1) as f64))
+            });
             let rows: Vec<String> = g
                 .iter()
                 .take(16)
@@ -2023,7 +2110,11 @@ pub fn mix_report() -> Vec<String> {
                     format!("{h:#x} {k} {bytes}B peak {peak} rms {rms:.0} over {n}")
                 })
                 .collect();
-            out.push(format!("ngs voice peaks ({} source sets, loudest RMS first): {}", g.len(), rows.join("; ")));
+            out.push(format!(
+                "ngs voice peaks ({} source sets, loudest RMS first): {}",
+                g.len(),
+                rows.join("; ")
+            ));
         }
     }
     // >>> AND THE VOICES THE TITLE IS HOLDING MUTED. See `At9Voice::take_level`.
@@ -2070,6 +2161,47 @@ pub(crate) struct MixScratch {
     flat: Vec<i16>,
 }
 
+/// One output patch of a voice: `sceNgsPatchCreateRouting`'s routing to `dest`, and the 2x2
+/// volume matrix `sceNgsVoicePatchSetVolume` (one cell) and `sceNgsVoicePatchSetVolumesMatrix`
+/// (all four) set on it, `m[source channel][destination channel]`.
+///
+/// IDENTITY until the title writes a cell: the hardware's fresh patch is silent, but titles that
+/// never set one still sound on a device, so unity is the only default that agrees with what is
+/// heard. A stereo source's L and R reach each output channel through their own cells, which is
+/// how a title pans, and how a title that writes `(L->R) = 0` LAST does not silence the voice
+/// (a scalar took the last write as the whole gain).
+#[derive(Clone, Copy, Debug)]
+struct PatchOut {
+    patch: u32,
+    dest: u32,
+    m: [[f32; 2]; 2],
+    /// Whether the title has written any cell of `m`. Until it has, a MONO source fans out
+    /// through row 0's first cell to BOTH port channels: the identity default would put it on
+    /// the left channel only, which is not what a device does with a voice whose patch was
+    /// never set (MEASURED by the mix test: mono 100 + 500 on L, nothing on R). A title that
+    /// sets a cell owns the whole matrix from then on.
+    set: bool,
+}
+
+const IDENTITY: [[f32; 2]; 2] = [[1.0, 0.0], [0.0, 1.0]];
+
+fn mat_add(a: &[[f32; 2]; 2], b: &[[f32; 2]; 2]) -> [[f32; 2]; 2] {
+    [
+        [a[0][0] + b[0][0], a[0][1] + b[0][1]],
+        [a[1][0] + b[1][0], a[1][1] + b[1][1]],
+    ]
+}
+
+/// The matrix a SOURCE of `channels` uses for a patch whose cells it never wrote - see
+/// [`PatchOut::set`].
+fn unset_patch(channels: usize) -> [[f32; 2]; 2] {
+    if channels == 1 {
+        [[1.0, 1.0], [0.0, 1.0]]
+    } else {
+        IDENTITY
+    }
+}
+
 /// The bank of source voices, keyed by the NGS voice handle, plus the routing graph
 /// that says where each one's output goes.
 #[derive(Default)]
@@ -2078,7 +2210,8 @@ pub(crate) struct At9Bank {
     /// back, which is what lets one buffer be shared by voices held in the same map.
     scratch: MixScratch,
     voices: std::collections::BTreeMap<u32, At9Voice>,
-    /// `source voice -> destination voice`, from `sceNgsPatchCreateRouting`.
+    /// Each voice's OUTPUT PATCHES, from `sceNgsPatchCreateRouting`: where its output goes, and
+    /// at what volume - see [`PatchOut`].
     ///
     /// A title does not route everything straight to the output: one measured front end
     /// feeds ~136 sources into each of two sub-busses, both of those into a third, and
@@ -2086,7 +2219,14 @@ pub(crate) struct At9Bank {
     /// applies all of them - so a source mixed straight to the output at its own level
     /// alone is louder than the title asked for, by the product of every buss it should
     /// have passed through.
-    routes: std::collections::BTreeMap<u32, u32>,
+    ///
+    /// >>> A LIST PER VOICE, NOT ONE ROUTE. A voice can feed SEVERAL destinations, each through
+    /// its own patch with its own volume: one title routes every source both straight to its
+    /// master buss (the dry level, 0.5 / 0.7 / 1.0 ...) and to a send buss that feeds the same
+    /// master (held at 0.0). Kept as ONE route and ONE volume per voice, the send - created and
+    /// written second - replaced the dry path, and that title's whole NGS mix played at gain
+    /// 0.000: silent, with every voice decoding real audio.
+    outputs: std::collections::BTreeMap<u32, Vec<PatchOut>>,
     /// Voices played with no source, still unexplained - see `VOICES_NO_SOURCE`.
     ///
     /// Held rather than only counted because the explanation can arrive LATER: `play` decides
@@ -2124,7 +2264,7 @@ impl At9Bank {
         // a voice of a buss rack (`buss_rack`), or one that other voices route INTO, is
         // reported quietly. Only a voice nobody routes into is genuinely a sound that will
         // not be heard.
-        let is_buss = buss_rack || self.routes.values().any(|dst| *dst == voice);
+        let is_buss = buss_rack || self.is_buss(voice);
         match self.voices.get_mut(&voice) {
             Some(v) if v.data_ptr != 0 => {
                 // Counted HERE and not in `start`, which a loop calls again every lap: the
@@ -2179,7 +2319,7 @@ impl At9Bank {
     /// a source voice affects one sound, a stage on a buss affects everything routed through
     /// it, and the missing attenuation in this mixer is at a buss by elimination.
     pub(crate) fn is_buss(&self, voice: u32) -> bool {
-        self.routes.values().any(|dst| *dst == voice)
+        self.outputs.values().flatten().any(|o| o.dest == voice)
     }
 
     /// Whether a play on `voice` was counted as a sound with no source.
@@ -2213,10 +2353,17 @@ impl At9Bank {
         true
     }
 
-    /// Record that `source`'s output feeds `destination`.
-    pub(crate) fn set_route(&mut self, source: u32, destination: u32) {
+    /// Record a routing: `patch` carries `source`'s output into `destination`.
+    pub(crate) fn add_patch(&mut self, patch: u32, source: u32, destination: u32) {
         if source != 0 && destination != 0 && source != destination {
-            self.routes.insert(source, destination);
+            let outs = self.outputs.entry(source).or_default();
+            outs.retain(|o| o.patch != patch);
+            outs.push(PatchOut {
+                patch,
+                dest: destination,
+                m: IDENTITY,
+                set: false,
+            });
             // A voice we already complained had no source, which something now routes INTO,
             // is a BUSS whose routing simply arrived after its play. See `At9Bank::no_source`.
             if self.no_source.remove(&destination) {
@@ -2225,112 +2372,170 @@ impl At9Bank {
         }
     }
 
-    /// The product of every buss level `voice` passes through on its way to the output,
-    /// NOT including the voice's own level.
-    ///
-    /// Bounded walk: a routing graph that contained a cycle would otherwise hang the
-    /// audio thread, and a malformed graph is not worth a deadlock. Eight hops is far
-    /// past any real mix tree (the deepest measured is three).
-    /// How many busses on `voice`'s way to the output never had a level set - see
-    /// `At9Voice::level_set`. Same bounded walk as [`At9Bank::buss_gain`].
-    fn defaulted_busses_above(&self, voice: u32) -> usize {
-        let mut n = 0;
-        let mut at = voice;
-        for _ in 0..8 {
-            let Some(&next) = self.routes.get(&at) else { break };
-            let Some(v) = self.voices.get(&next) else { break };
-            if !v.level_set {
-                n += 1;
-            }
-            at = next;
-        }
-        n
+    /// `sceNgsPatchRemoveRouting`: `patch` no longer carries anything. Answers whether it was
+    /// a patch this bank knew.
+    pub(crate) fn remove_patch(&mut self, patch: u32) -> bool {
+        let mut found = false;
+        self.outputs.retain(|_, outs| {
+            let before = outs.len();
+            outs.retain(|o| o.patch != patch);
+            found |= outs.len() != before;
+            !outs.is_empty()
+        });
+        found
     }
 
-    /// Only the PATCH volumes on the busses above `voice` - the half of [`Self::buss_gain`]
+    /// Every patch out of `voice` and every patch into it - the voice's rack was released.
+    pub(crate) fn forget_voice(&mut self, voice: u32) {
+        self.outputs.remove(&voice);
+        self.outputs.retain(|_, outs| {
+            outs.retain(|o| o.dest != voice);
+            !outs.is_empty()
+        });
+    }
+
+    /// Drop every patch out of `voice` (its routing was reset) and answer their handles.
+    pub(crate) fn forget_outputs(&mut self, voice: u32) -> Vec<u32> {
+        self.outputs
+            .remove(&voice)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|o| o.patch)
+            .collect()
+    }
+
+    fn patch_mut(&mut self, patch: u32) -> Option<&mut PatchOut> {
+        self.outputs
+            .values_mut()
+            .flatten()
+            .find(|o| o.patch == patch)
+    }
+
+    /// `sceNgsVoicePatchSetVolume`: ONE cell of `patch`'s matrix, source channel `src` to
+    /// destination channel `dst`. See [`PatchOut`].
+    pub(crate) fn set_patch_cell(&mut self, patch: u32, src: usize, dst: usize, volume: f32) {
+        if let Some(o) = self.patch_mut(patch) {
+            o.m[src & 1][dst & 1] = volume;
+            o.set = true;
+        }
+    }
+
+    /// `sceNgsVoicePatchSetVolumesMatrix`: all four cells of `patch`, `m[source][destination]`.
+    pub(crate) fn set_patch_matrix(&mut self, patch: u32, m: [[f32; 2]; 2]) {
+        if let Some(o) = self.patch_mut(patch) {
+            o.m = m;
+            o.set = true;
+        }
+    }
+
+    /// The 2x2 transform `voice`'s output passes through on its way to the output port, NOT
+    /// including its own level: the sum, over each patch out of it, of that patch's matrix times
+    /// the destination's level times the destination's own way out - every PATH to the port, as
+    /// a product of row-vector transforms (`out = in * M1 * M2 ...`). A voice with no patches IS
+    /// the way out (identity), and so is a destination this bank never saw created.
+    ///
+    /// `levels` false leaves out every buss level, for the report on what the patch volumes
+    /// alone contribute. Bounded: a routing graph that contained a cycle would otherwise hang
+    /// the audio thread, and a malformed graph is not worth a deadlock. Eight hops is far past
+    /// any real mix tree (the deepest measured is three).
+    fn downstream(&self, voice: u32, levels: bool, depth: u32) -> [[f32; 2]; 2] {
+        let mut total = [[0.0f32; 2]; 2];
+        for o in self.outputs.get(&voice).into_iter().flatten() {
+            let m = if o.set { o.m } else { IDENTITY };
+            total = mat_add(&total, &mat_mul(&m, &self.through(o.dest, levels, depth)));
+        }
+        total
+    }
+
+    /// What reaching `dest` does to a signal from there on: its level, then its own way out.
+    fn through(&self, dest: u32, levels: bool, depth: u32) -> [[f32; 2]; 2] {
+        let Some(v) = self.voices.get(&dest) else {
+            return IDENTITY;
+        };
+        let on = if depth == 0 || self.outputs.get(&dest).is_none_or(|o| o.is_empty()) {
+            IDENTITY
+        } else {
+            self.downstream(dest, levels, depth - 1)
+        };
+        if levels { mat_scale(&on, v.level) } else { on }
+    }
+
+    /// The whole transform a SOURCE's samples pass through: its own level, each of its own
+    /// patches, and every buss beyond them. A source with no patches reaches the port at its
+    /// own level - see [`unset_patch`] for the mono case.
+    fn source_matrix(&self, voice: u32) -> [[f32; 2]; 2] {
+        let Some(v) = self.voices.get(&voice) else {
+            return IDENTITY;
+        };
+        let vc = v.channels.max(1) as usize;
+        let m = match self.outputs.get(&voice).filter(|o| !o.is_empty()) {
+            None => unset_patch(vc),
+            Some(outs) => outs.iter().fold([[0.0f32; 2]; 2], |acc, o| {
+                let own = if o.set { o.m } else { unset_patch(vc) };
+                mat_add(&acc, &mat_mul(&own, &self.through(o.dest, true, 8)))
+            }),
+        };
+        mat_scale(&m, v.level)
+    }
+
+    /// The buss levels and patches beyond `voice`'s own patches, summed over its patches -
+    /// `levels` as in [`Self::downstream`]. Identity for a voice with no patches.
+    fn beyond(&self, voice: u32, levels: bool) -> [[f32; 2]; 2] {
+        match self.outputs.get(&voice).filter(|o| !o.is_empty()) {
+            None => IDENTITY,
+            Some(outs) => outs.iter().fold([[0.0f32; 2]; 2], |acc, o| {
+                mat_add(&acc, &self.through(o.dest, levels, 8))
+            }),
+        }
+    }
+
+    /// The loudest cell of [`Self::beyond`] - the scalar the diagnostics report as a voice's
+    /// buss gain, NOT including its own level or patches.
+    fn buss_gain(&self, voice: u32) -> f32 {
+        loudest_cell(&self.beyond(voice, true))
+    }
+
+    /// Only the PATCH volumes on the busses beyond `voice` - the half of [`Self::buss_gain`]
     /// that used to be dropped, on its own, so a report can say whether applying it matters.
     fn buss_patch_gain(&self, voice: u32) -> f32 {
-        let mut gain = 1.0f32;
-        let mut at = voice;
+        loudest_cell(&self.beyond(voice, false))
+    }
+
+    /// How many busses beyond `voice` never had a level set - see `At9Voice::level_set`. Each
+    /// counted once however many paths reach it, and bounded like [`Self::downstream`].
+    fn defaulted_busses_above(&self, voice: u32) -> usize {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut frontier = vec![voice];
         for _ in 0..8 {
-            let Some(&next) = self.routes.get(&at) else { break };
-            let Some(v) = self.voices.get(&next) else { break };
-            gain *= v.gain;
-            at = next;
+            let mut next = Vec::new();
+            for at in frontier {
+                for o in self.outputs.get(&at).into_iter().flatten() {
+                    if self.voices.contains_key(&o.dest) && seen.insert(o.dest) {
+                        next.push(o.dest);
+                    }
+                }
+            }
+            frontier = next;
         }
-        gain
+        seen.iter()
+            .filter(|d| self.voices.get(d).is_some_and(|v| !v.level_set))
+            .count()
     }
 
-    fn buss_gain(&self, voice: u32) -> f32 {
-        let mut gain = 1.0f32;
-        let mut at = voice;
-        for _ in 0..8 {
-            let Some(&next) = self.routes.get(&at) else { break };
-            let Some(v) = self.voices.get(&next) else { break };
-            // >>> BOTH OF A BUSS'S CONTROLS, not just one.
-            //
-            // A buss is a voice like any other and has the same two independent gains: its
-            // own `level`, from its params module, and the `gain` of the PATCH that carries
-            // its output onward, from `sceNgsVoicePatchSetVolume`. Only `level` was applied
-            // here, so every routing volume set on a buss-to-buss or buss-to-master patch was
-            // recorded and then ignored - and on a title whose graph is nine mixer busses
-            // feeding a master, that is where most of the balancing lives. The source voice's
-            // own pair is applied by the caller; this walk owes the same treatment to every
-            // hop above it.
-            gain *= v.gain * v.level;
-            at = next;
+    /// The loudest cell over `voice`'s own written patches - its routing volume, for the
+    /// diagnostics. 1.0 for a voice with none written.
+    fn own_gain(&self, voice: u32) -> f32 {
+        let mut written = self
+            .outputs
+            .get(&voice)
+            .into_iter()
+            .flatten()
+            .filter(|o| o.set)
+            .peekable();
+        if written.peek().is_none() {
+            return 1.0;
         }
-        gain
-    }
-
-    /// Set the routing gain for `voice`, from its patch's volume.
-    ///
-    /// Recorded even for a voice that has no source yet: a title routes and balances its
-    /// mix graph up front and only later hands a voice something to play, so dropping
-    /// the gain here would silently restore full scale for exactly the voices whose
-    /// levels were set earliest.
-    /// Unwired today: no dispatch reaches it, because the routing call that would is not
-    /// implemented. Kept because the RULE above is the finding, and it would have to be
-    /// rediscovered from a title's wrong mix if this were deleted.
-    #[allow(dead_code)]
-    pub(crate) fn set_gain(&mut self, voice: u32, gain: f32) {
-        let v = self.voices.entry(voice).or_insert_with(At9Voice::empty);
-        v.gain = gain;
-        v.patch = [[gain, 0.0], [0.0, gain]];
-    }
-
-    /// `sceNgsVoicePatchSetVolume`: ONE cell of the patch matrix, source channel `src` to
-    /// destination channel `dst`. See [`At9Voice::patch`].
-    pub(crate) fn set_patch_cell(&mut self, voice: u32, src: usize, dst: usize, volume: f32) {
-        let v = self.voices.entry(voice).or_insert_with(At9Voice::empty);
-        v.patch[src & 1][dst & 1] = volume;
-        v.patch_set = true;
-        v.gain = loudest_cell(&v.patch);
-    }
-
-    /// `sceNgsVoicePatchSetVolumesMatrix`: all four cells, `m[source][destination]`.
-    pub(crate) fn set_patch_matrix(&mut self, voice: u32, m: [[f32; 2]; 2]) {
-        let v = self.voices.entry(voice).or_insert_with(At9Voice::empty);
-        v.patch = m;
-        v.patch_set = true;
-        v.gain = loudest_cell(&m);
-    }
-
-    /// The 2x2 gain a source's stereo output passes through on its way to the master:
-    /// every buss above it contributes its own level (a scalar) and its patch matrix, in
-    /// route order, as a product of row-vector transforms (`out = in * M1 * M2 ...`). The
-    /// source voice's own patch and level are applied by the caller. Same bounded walk as
-    /// [`At9Bank::buss_gain`].
-    fn buss_matrix(&self, voice: u32) -> [[f32; 2]; 2] {
-        let mut m = [[1.0f32, 0.0], [0.0, 1.0]];
-        let mut at = voice;
-        for _ in 0..8 {
-            let Some(&next) = self.routes.get(&at) else { break };
-            let Some(v) = self.voices.get(&next) else { break };
-            m = mat_mul(&m, &mat_scale(&v.patch, v.level));
-            at = next;
-        }
-        m
+        written.map(|o| loudest_cell(&o.m)).fold(0.0, f32::max)
     }
 
     /// Stop `voice` (key-off / kill / pause).
@@ -2431,31 +2636,41 @@ impl At9Bank {
         // entries of the same map, which cannot happen while one of them is borrowed
         // mutably. It is a handful of map lookups per playing voice per grain, against
         // the hundreds of thousands of sample operations below.
-        let routed: Vec<(u32, f32, [[f32; 2]; 2])> = self
+        let routed: Vec<(u32, f32, f32, [[f32; 2]; 2])> = self
             .voices
             .iter()
             .filter(|(_, v)| v.playing && !v.paused)
-            .map(|(&handle, _)| (handle, self.buss_gain(handle), self.buss_matrix(handle)))
+            .map(|(&handle, _)| {
+                (
+                    handle,
+                    self.own_gain(handle),
+                    self.buss_gain(handle),
+                    self.source_matrix(handle),
+                )
+            })
             .collect();
         // Playing voices with nothing to route them anywhere - see `MIX_UNROUTED`.
-        let unrouted = routed.iter().filter(|(h, _, _)| !self.routes.contains_key(h)).count();
+        let unrouted = routed
+            .iter()
+            .filter(|(h, ..)| self.outputs.get(h).is_none_or(|o| o.is_empty()))
+            .count();
         // ...and the busses on their way out whose level is the DEFAULT rather than something
         // the title set. See `At9Voice::level_set`: each of those is a stage of attenuation
         // this mixer may simply not be applying, and the mix is ~5x too hot.
         let defaulted_busses = routed
             .iter()
-            .map(|(h, _, _)| self.defaulted_busses_above(*h))
+            .map(|(h, ..)| self.defaulted_busses_above(*h))
             .sum::<usize>();
         // ...and the same question one stage lower: playing voices whose own level is still
         // the 1.0 this struct starts at. See `MIX_DEFAULTED_LEVELS`.
         let defaulted_levels = routed
             .iter()
-            .filter(|(h, _, _)| self.voices.get(h).is_some_and(|v| !v.level_set))
+            .filter(|(h, ..)| self.voices.get(h).is_some_and(|v| !v.level_set))
             .count();
         // How much the buss PATCH volumes above each voice contribute - the half of
         // `buss_gain` that was being dropped. 1.0 a voice means applying them changes nothing,
         // which is a real answer and the one that sends the search elsewhere.
-        let buss_patch_sum: f32 = routed.iter().map(|(h, _, _)| self.buss_patch_gain(*h)).sum();
+        let buss_patch_sum: f32 = routed.iter().map(|(h, ..)| self.buss_patch_gain(*h)).sum();
         // >>> WHAT THE MIX IS ACTUALLY CARRYING, because the cost of this path is per VOICE
         // and nothing reported how many there were. MEASURED with a V8 worker profile of one
         // title's browser race: ATRAC9 decode was **32% of the whole thread** and
@@ -2464,8 +2679,15 @@ impl At9Bank {
         // and it is one counter.
         let routed_len = routed.len();
         let bank = self.voices.len();
-        let looping = self.voices.values().filter(|v| v.playing && v.loops()).count();
-        let audible = routed.iter().filter(|(_, g, _)| *g > 0.0).count();
+        let looping = self
+            .voices
+            .values()
+            .filter(|v| v.playing && v.loops())
+            .count();
+        let audible = routed
+            .iter()
+            .filter(|(.., g)| loudest_cell(g) > 0.0)
+            .count();
         // Counted as the grain is mixed, below.
         let mut silent = 0usize;
         // The gain each voice is actually mixed at, summed - see `MIX_GAIN_SUM_PERMILLE`.
@@ -2476,8 +2698,10 @@ impl At9Bank {
         // The whole grain, so a device run's phase table says what audio costs without
         // anyone having to attach a profiler to it - see [`crate::perf::Phase::AudioMix`].
         let _t = crate::perf::scope(crate::perf::Phase::AudioMix);
-        for (handle, buss_gain, buss_matrix) in routed {
-            let Some(v) = self.voices.get_mut(&handle) else { continue };
+        for (handle, voice_gain, buss_gain, g) in routed {
+            let Some(v) = self.voices.get_mut(&handle) else {
+                continue;
+            };
             let vc = v.channels.max(1) as usize;
             {
                 let _t = crate::perf::scope(crate::perf::Phase::AudioDecode);
@@ -2490,18 +2714,20 @@ impl At9Bank {
             // costs nothing: its samples are still CONSUMED below (the source has to
             // advance, or it would resume from a stale position the moment it is turned
             // back up), but the mixing loop is skipped entirely.
-            let gain = v.gain * v.level * buss_gain;
-            // The stereo transform this voice's samples actually pass through: its own patch
-            // (scaled by its level) then every buss above it - see `At9Voice::patch`. `gain`
-            // stays the loudest-cell scalar for the silence gate and the diagnostics.
-            let mut own = v.patch;
-            if !v.patch_set && vc == 1 {
-                own[0][1] = own[0][0];
-            }
-            let g = mat_mul(&mat_scale(&own, v.level), &buss_matrix);
+            // `g` is the stereo transform this voice's samples actually pass through: its own
+            // level, its own patches, and every buss beyond them, summed over every path to the
+            // port - see `At9Bank::source_matrix`. `gain` is its loudest cell, for the silence
+            // gate, the ports that are not stereo, and the diagnostics.
+            let gain = loudest_cell(&g);
             let gq: [[i32; 2]; 2] = [
-                [(g[0][0].clamp(0.0, 4.0) * 65536.0) as i32, (g[0][1].clamp(0.0, 4.0) * 65536.0) as i32],
-                [(g[1][0].clamp(0.0, 4.0) * 65536.0) as i32, (g[1][1].clamp(0.0, 4.0) * 65536.0) as i32],
+                [
+                    (g[0][0].clamp(0.0, 4.0) * 65536.0) as i32,
+                    (g[0][1].clamp(0.0, 4.0) * 65536.0) as i32,
+                ],
+                [
+                    (g[1][0].clamp(0.0, 4.0) * 65536.0) as i32,
+                    (g[1][1].clamp(0.0, 4.0) * 65536.0) as i32,
+                ],
             ];
             gain_sum += gain;
             // >>> THE FIRST GRAIN OF EACH VOICE, WITH BOTH HALVES OF "SILENT" ON ONE LINE.
@@ -2512,7 +2738,12 @@ impl At9Bank {
             // decides where to look next, and nothing else in this engine says.
             if !v.heard {
                 v.heard = true;
-                let peak = v.pending.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+                let peak = v
+                    .pending
+                    .iter()
+                    .map(|s| s.unsigned_abs())
+                    .max()
+                    .unwrap_or(0);
                 tracing::debug!(
                     target: "vitaslop::at9",
                     voice = format_args!("{handle:#x}"),
@@ -2521,7 +2752,7 @@ impl At9Bank {
                     slot = v.cur,
                     rate = v.rate,
                     kind = format_args!("{:?}", v.kind),
-                    voice_gain = v.gain,
+                    voice_gain,
                     level = v.level,
                     buss_gain,
                     gain,
@@ -2576,7 +2807,9 @@ impl At9Bank {
                     let need = want - head.len();
                     scratch.flat.clear();
                     scratch.flat.extend_from_slice(head);
-                    scratch.flat.extend_from_slice(&tail[..need.min(tail.len())]);
+                    scratch
+                        .flat
+                        .extend_from_slice(&tail[..need.min(tail.len())]);
                     &scratch.flat[..]
                 }
             };
@@ -2593,14 +2826,22 @@ impl At9Bank {
             } else {
                 if voice_peaks_enabled() {
                     if v.life_src != v.data_ptr {
-                        (v.life_src, v.life_peak, v.life_sumsq, v.life_samples) = (v.data_ptr, 0, 0.0, 0);
+                        (v.life_src, v.life_peak, v.life_sumsq, v.life_samples) =
+                            (v.data_ptr, 0, 0.0, 0);
                     }
                     for &s in src {
                         v.life_peak = v.life_peak.max(s.unsigned_abs());
                         v.life_sumsq += f64::from(s) * f64::from(s);
                     }
                     v.life_samples += src.len() as u64;
-                    note_voice_peak(v.life_src, v.kind_name(), v.data_bytes, v.life_peak, v.life_sumsq, v.life_samples);
+                    note_voice_peak(
+                        v.life_src,
+                        v.kind_name(),
+                        v.data_bytes,
+                        v.life_peak,
+                        v.life_sumsq,
+                        v.life_samples,
+                    );
                 }
                 match (vc, port_channels) {
                     // >>> THE STEREO PORT TAKES THE PATCH MATRIX: a mono source reaches L and R
@@ -2610,7 +2851,9 @@ impl At9Bank {
                     // arithmetic stays 16.16 integer per cell.
                     (1, 2) => {
                         for (f, &s) in src.iter().enumerate() {
-                            let Some(frame) = mix.get_mut(f * 2..f * 2 + 2) else { break };
+                            let Some(frame) = mix.get_mut(f * 2..f * 2 + 2) else {
+                                break;
+                            };
                             frame[0] += (s as i32 * gq[0][0]) >> 16;
                             frame[1] += (s as i32 * gq[0][1]) >> 16;
                         }
@@ -2618,7 +2861,9 @@ impl At9Bank {
                     (2, 2) => {
                         for (f, pair) in src.chunks_exact(2).enumerate() {
                             let (l, r) = (pair[0] as i32, pair[1] as i32);
-                            let Some(frame) = mix.get_mut(f * 2..f * 2 + 2) else { break };
+                            let Some(frame) = mix.get_mut(f * 2..f * 2 + 2) else {
+                                break;
+                            };
                             frame[0] += ((l * gq[0][0]) >> 16) + ((r * gq[1][0]) >> 16);
                             frame[1] += ((l * gq[0][1]) >> 16) + ((r * gq[1][1]) >> 16);
                         }
@@ -2632,7 +2877,9 @@ impl At9Bank {
                     (1, pc) => {
                         for (f, &s) in src.iter().enumerate() {
                             let scaled = (s as i32 * gain_q16) >> 16;
-                            let Some(frame) = mix.get_mut(f * pc..f * pc + pc) else { break };
+                            let Some(frame) = mix.get_mut(f * pc..f * pc + pc) else {
+                                break;
+                            };
                             for m in frame {
                                 *m += scaled;
                             }
@@ -2651,7 +2898,9 @@ impl At9Bank {
                         for f in 0..grain {
                             for c in 0..port_channels {
                                 let src_c = c.min(vc - 1);
-                                let Some(&s) = src.get(f * vc + src_c) else { continue };
+                                let Some(&s) = src.get(f * vc + src_c) else {
+                                    continue;
+                                };
                                 mix[f * port_channels + c] += (s as i32 * gain_q16) >> 16;
                             }
                         }
@@ -2702,9 +2951,7 @@ mod buss_tests {
         let mut v = At9Voice::empty();
         v.playing = true;
         v.channels = channels;
-        v.gain = gain;
-        v.patch = [[gain, 0.0], [0.0, gain]];
-        v.level = 1.0;
+        v.level = gain;
         v.pending = samples.iter().copied().collect();
         v
     }
@@ -2729,7 +2976,8 @@ mod buss_tests {
         // Mono at unity: every port channel gets it.
         bank.voices.insert(1, ready(&[100, 200, 300, 400], 1, 1.0));
         // Stereo at unity: channel for channel.
-        bank.voices.insert(2, ready(&[10, -10, 20, -20, 30, -30, 40, -40], 2, 1.0));
+        bank.voices
+            .insert(2, ready(&[10, -10, 20, -20, 30, -30, 40, -40], 2, 1.0));
         // Mono at half gain, and it runs out after two frames.
         bank.voices.insert(3, ready(&[1000, 2000], 1, 0.5));
 
@@ -2737,16 +2985,27 @@ mod buss_tests {
         bank.mix_grain(&ctx, &mut mix, 4, 2, 48_000);
 
         // Frame 0: 100 (mono) + 10/-10 (stereo) + 500 (half of 1000).
-        assert_eq!(mix, vec![
-            100 + 10 + 500, 100 - 10 + 500,
-            200 + 20 + 1000, 200 - 20 + 1000,
-            300 + 30, 300 - 30,
-            400 + 40, 400 - 40,
-        ]);
+        assert_eq!(
+            mix,
+            vec![
+                100 + 10 + 500,
+                100 - 10 + 500,
+                200 + 20 + 1000,
+                200 - 20 + 1000,
+                300 + 30,
+                300 - 30,
+                400 + 40,
+                400 - 40,
+            ]
+        );
         // Every voice consumed its own grain, whatever it contributed.
         assert_eq!(bank.voices[&1].pending.len(), 0);
         assert_eq!(bank.voices[&2].pending.len(), 0);
-        assert_eq!(bank.voices[&3].pending.len(), 0, "a drained voice still drains");
+        assert_eq!(
+            bank.voices[&3].pending.len(),
+            0,
+            "a drained voice still drains"
+        );
     }
 
     #[test]
@@ -2755,12 +3014,16 @@ mod buss_tests {
         bank.voices.insert(1, buss(1.0)); // the source
         bank.voices.insert(2, buss(0.5)); // a sub-buss
         bank.voices.insert(3, buss(0.25)); // the master
-        bank.set_route(1, 2);
-        bank.set_route(2, 3);
+        bank.add_patch(100, 1, 2);
+        bank.add_patch(101, 2, 3);
         // The source's OWN level is not included - the mixer applies that separately.
         assert_eq!(bank.buss_gain(1), 0.125);
         assert_eq!(bank.buss_gain(2), 0.25);
-        assert_eq!(bank.buss_gain(3), 1.0, "an unrouted voice passes through unchanged");
+        assert_eq!(
+            bank.buss_gain(3),
+            1.0,
+            "an unrouted voice passes through unchanged"
+        );
     }
 
     #[test]
@@ -2776,8 +3039,8 @@ mod buss_tests {
         let mut bank = At9Bank::default();
         bank.voices.insert(1, buss(0.5));
         bank.voices.insert(2, buss(0.5));
-        bank.set_route(1, 2);
-        bank.set_route(2, 1);
+        bank.add_patch(100, 1, 2);
+        bank.add_patch(101, 2, 1);
         // Bounded walk: it stops rather than spinning, and the value is whatever the
         // bound yields - the point of the test is that it RETURNS.
         let _ = bank.buss_gain(1);
@@ -2788,7 +3051,70 @@ mod buss_tests {
     fn a_route_to_an_unknown_voice_is_ignored() {
         let mut bank = At9Bank::default();
         bank.voices.insert(1, buss(1.0));
-        bank.set_route(1, 99);
+        bank.add_patch(100, 1, 99);
         assert_eq!(bank.buss_gain(1), 1.0);
+    }
+
+    /// >>> ONE SOURCE, TWO PATCHES. A title routes every source both straight to its master
+    /// (the dry level) and to a send buss that feeds the same master, holding the send at 0.0 -
+    /// and writes the send SECOND. Each patch keeps its own volume, and the source reaches the
+    /// port by BOTH paths: the dry 0.5 here, not the send's 0.0 (which, kept as one volume per
+    /// voice, silenced a whole title's NGS mix).
+    #[test]
+    fn a_source_with_two_patches_is_heard_through_both() {
+        let mut bank = At9Bank::default();
+        bank.voices.insert(1, ready(&[], 2, 1.0)); // the source
+        bank.voices.insert(2, buss(1.0)); // the send buss
+        bank.voices.insert(3, buss(1.0)); // the master
+        bank.add_patch(100, 1, 3); // dry
+        bank.add_patch(101, 1, 2); // send
+        bank.add_patch(102, 2, 3);
+        bank.set_patch_matrix(100, [[0.5, 0.0], [0.0, 0.5]]);
+        bank.set_patch_matrix(101, [[0.0, 0.0], [0.0, 0.0]]);
+        assert_eq!(bank.source_matrix(1), [[0.5, 0.0], [0.0, 0.5]]);
+        // A send that is turned up adds its path: 0.5 dry + 0.25 through the send at level 0.5.
+        bank.voices.get_mut(&2).unwrap().level = 0.5;
+        bank.set_patch_matrix(101, [[0.5, 0.0], [0.0, 0.5]]);
+        assert_eq!(bank.source_matrix(1), [[0.75, 0.0], [0.0, 0.75]]);
+        assert!(bank.is_buss(2) && bank.is_buss(3) && !bank.is_buss(1));
+    }
+
+    /// A voice whose routing is reset (`sceNgsVoiceInit` flag bit 0) keeps nothing of it: a
+    /// title that re-creates the routing each time it re-uses a voice is heard once, not once
+    /// per re-use.
+    #[test]
+    fn a_reset_voice_is_heard_once_through_its_new_patch() {
+        let mut bank = At9Bank::default();
+        bank.voices.insert(1, ready(&[], 2, 1.0));
+        bank.voices.insert(3, buss(1.0));
+        bank.add_patch(100, 1, 3);
+        assert_eq!(bank.forget_outputs(1), vec![100]);
+        bank.add_patch(101, 1, 3);
+        bank.set_patch_matrix(101, [[0.25, 0.0], [0.0, 0.25]]);
+        assert_eq!(bank.source_matrix(1), [[0.25, 0.0], [0.0, 0.25]]);
+    }
+
+    /// `sceNgsPatchRemoveRouting` takes the path away, and a title that rebuilds its graph does
+    /// not leave the old patches summing beside the new ones.
+    #[test]
+    fn a_removed_patch_carries_nothing() {
+        let mut bank = At9Bank::default();
+        bank.voices.insert(1, ready(&[], 2, 1.0));
+        bank.voices.insert(3, buss(1.0));
+        bank.add_patch(100, 1, 3);
+        bank.set_patch_matrix(100, [[0.5, 0.0], [0.0, 0.5]]);
+        bank.add_patch(200, 1, 3);
+        bank.set_patch_matrix(200, [[0.5, 0.0], [0.0, 0.5]]);
+        assert_eq!(
+            bank.source_matrix(1),
+            [[1.0, 0.0], [0.0, 1.0]],
+            "two live patches sum"
+        );
+        assert!(bank.remove_patch(100));
+        assert_eq!(bank.source_matrix(1), [[0.5, 0.0], [0.0, 0.5]]);
+        assert!(!bank.remove_patch(100), "a patch is removed once");
+        // With its last patch gone the source is unrouted: its own level, straight out.
+        assert!(bank.remove_patch(200));
+        assert_eq!(bank.source_matrix(1), IDENTITY);
     }
 }

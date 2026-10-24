@@ -27,7 +27,7 @@ in a window instead of a canvas.
 
 ## Headless
 
-- Renders without a window, driven by a recipe, for scripted runs and shots. This
+- Renders without a window, driven by a playbook or tape, for scripted runs and shots. This
   is the judging path for titles the software renderer cannot draw - a screenshot
   from a different pass than the game shows is worse than no screenshot.
 - Runtime `tracing` diagnostics surface through `RUST_LOG` (e.g.

@@ -220,7 +220,7 @@ pub trait VideoDecode: Send {
     /// `poll` drains whatever a decoder thread has finished at that instant, and the count of
     /// pictures it yields becomes the guest's `numOfOutput` - a value titles BRANCH ON. So the
     /// guest's control flow was a function of host thread progress. MEASURED: two identical
-    /// headless replays of one recipe, same binary, disagreed on the delivery digest on the
+    /// headless replays of one input script, same binary, disagreed on the delivery digest on the
     /// FIRST pair and executed **4.2% different guest work** (fuel 96.5 G against 92.5 G).
     /// That is the whole of the "replay is not deterministic in gameplay" story - it read as
     /// rare only because an end-of-run signature comparison notices a divergence solely when it

@@ -193,7 +193,7 @@ fn header_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// Decode a JPEG to interleaved RGB, three bytes per pixel, row-major.
-fn decode_rgb(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+pub(super) fn decode_rgb(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let opts = zune_core::options::DecoderOptions::default()
         .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
     let mut d =
@@ -204,12 +204,16 @@ fn decode_rgb(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 /// BT.601 full-range RGB -> YCbCr, the conversion JFIF itself specifies. Integer and rounded.
-fn rgb_to_ycbcr(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+pub(super) fn rgb_to_ycbcr(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     let (r, g, b) = (i32::from(r), i32::from(g), i32::from(b));
     let y = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
     let cb = 128 + ((-11056 * r - 21712 * g + 32768 * b + 32768) >> 16);
     let cr = 128 + ((32768 * r - 27440 * g - 5328 * b + 32768) >> 16);
-    (y.clamp(0, 255) as u8, cb.clamp(0, 255) as u8, cr.clamp(0, 255) as u8)
+    (
+        y.clamp(0, 255) as u8,
+        cb.clamp(0, 255) as u8,
+        cr.clamp(0, 255) as u8,
+    )
 }
 
 /// BT.601 full-range YCbCr -> RGB (JFIF), the inverse of `rgb_to_ycbcr`.
@@ -220,7 +224,11 @@ fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> (u8, u8, u8) {
     let r = y + ((91881 * cr + 32768) >> 16);
     let g = y - ((22554 * cb + 46802 * cr + 32768) >> 16);
     let b = y + ((116130 * cb + 32768) >> 16);
-    (r.clamp(0, 255) as u8, g.clamp(0, 255) as u8, b.clamp(0, 255) as u8)
+    (
+        r.clamp(0, 255) as u8,
+        g.clamp(0, 255) as u8,
+        b.clamp(0, 255) as u8,
+    )
 }
 
 /// The two calls the browser-side bench drives, so the number it reports is THIS decoder on
@@ -336,7 +344,16 @@ pub(super) fn decode_mjpeg_ycbcr(
     work: Ptr,
     work_size: u32,
 ) -> i32 {
-    do_decode_mjpeg_ycbcr(ctx, st, jpeg_data, jpeg_size, output, output_size, work, work_size)
+    do_decode_mjpeg_ycbcr(
+        ctx,
+        st,
+        jpeg_data,
+        jpeg_size,
+        output,
+        output_size,
+        work,
+        work_size,
+    )
 }
 
 /// The body, as a plain function - see [`do_get_output_info`] for why.
@@ -550,7 +567,9 @@ mod tests {
 #[test]
 #[ignore = "needs an image; set VITASLOP_JPEG_BENCH=<path to a .jpg>"]
 fn how_long_one_decode_takes() {
-    let Ok(path) = std::env::var("VITASLOP_JPEG_BENCH") else { return };
+    let Ok(path) = std::env::var("VITASLOP_JPEG_BENCH") else {
+        return;
+    };
     let bytes = std::fs::read(&path).expect("the bench image");
     let (w, h, _) = decode_rgb(&bytes).expect("it decodes");
     // Warm, then time a run of decodes: one decode is short enough that the clock's own

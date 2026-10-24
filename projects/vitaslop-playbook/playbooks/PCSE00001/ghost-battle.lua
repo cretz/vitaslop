@@ -2,7 +2,7 @@
 -- ID card, location, region, controls), the main menu, WORLD RACE -> GHOST BATTLE against the
 -- built-in Default Ghost on Highland Cliffs, and a live race driven along a recorded line.
 --
--- Converted from the recipes `title-screen` (boot, PLAY) and `ghost-battle-race` (the wizard,
+-- Converted from the old frame-keyed scripts `title-screen` (boot, PLAY) and `ghost-battle-race` (the wizard,
 -- then a live race); `time-attack.lua` covers `play` and `time-attack-lap` (the TIME card).
 -- GHOST BATTLE races POSITION 2/2 against a real opponent, with a lap timer.
 --
@@ -18,7 +18,7 @@
 --   then   sceNgsVoiceKeyOff x2               the intro ends; the countdown begins
 --
 -- THE WIZARD MAKES NO CALLS and no screen-id cell was found (a value search over two dumps of
--- each of its ten screens found none constant per screen), so its touches replay the recipe's,
+-- each of its ten screens found none constant per screen), so its touches replay the old script's,
 -- in game frames from PLAY. Every coordinate was taken from a shot of the screen it acts on; the
 -- wizard is TOUCH ONLY (its buttons are not pad-selectable), panel coordinates are screen x2:
 --   * PLANETARY LEAGUE -> SIGN ON (not a PSN sign-in); TEAMS: touch the ticket to sign;
@@ -88,7 +88,7 @@ end
 
 -- THE MENUS HAVE NO CUE EITHER: a value search over two dumps of each menu screen found only a
 -- byte that steps every ~160 frames on its own (it matched the dumps by coincidence) and a
--- pointer that moves on unrelated events. So the menu taps keep the recipe's spacing too.
+-- pointer that moves on unrelated events. So the menu taps keep the old script's spacing too.
 
 phase("title", { timeout = 120 }, function()
   -- Legal notice, BANDAI NAMCO, namco, CELLIUS, a save-data spinner, then the RIDGE RACER title
@@ -108,7 +108,7 @@ phase("wizard", { timeout = 240 }, function()
   idle(100)
   shot("news")
   -- The team trophy + RCTV ticker; the right-edge arrow dismisses it to the MAIN MENU - ONCE.
-  -- MEASURED: the recipe tapped it at +419 and +719 frames from the trophy. Deterministic, the
+  -- MEASURED: the old script tapped it at +419 and +719 frames from the trophy. Deterministic, the
   -- first tap came before the BREAKING NEWS panel was ready and the second took it; at real
   -- speed the first took it and the second landed on the main menu, where that spot is the
   -- SPOT RACE card. The panel is ready by ~+420 in both, so: one tap at +500.
@@ -124,7 +124,7 @@ phase("ghost-battle", { timeout = 120 }, function()
   -- BISARGENTO / Default Ghost, READY at screen (838,275) - which streams the course in.
   -- The main menu is a horizontal scroller that slides in; a tap before it settles lands on
   -- another card (MEASURED at real speed: GARAGE). Settled, WORLD RACE is centred at screen
-  -- (727,270). Then the recipe's spacing.
+  -- (727,270). Then the old script's spacing.
   idle(200)
   shot("main-menu")
   play_touches({
@@ -243,7 +243,7 @@ local LINE = {
 
 phase("race", { timeout = 120 }, function()
   -- MEASURED: the intro and the countdown run ~1000 frames after the scene is built (the
-  -- recipe's "live by f8800" had gone stale). Throttle may be held through the countdown.
+  -- old script's "live by f8800" had gone stale). Throttle may be held through the countdown.
   wait(countdown:atleast(2), { timeout = 60 })
   split("countdown")
   press("cross")

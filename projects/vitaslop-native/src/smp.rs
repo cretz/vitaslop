@@ -19,7 +19,7 @@
 //!
 //! # Determinism
 //! OFF unless asked for. A parallel run is not reproducible - which thread reaches a lock first
-//! depends on the host's timing - and every recipe, capsule and bisection depends on the
+//! depends on the host's timing - and every scripted run, capsule and bisection depends on the
 //! one-at-a-time engine being exactly that. The desktop window turns it on through the same
 //! `VITASLOP_SMP` knob the browser's settings set; headless runs leave it off.
 //!

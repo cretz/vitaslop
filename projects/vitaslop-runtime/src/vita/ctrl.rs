@@ -1,6 +1,6 @@
 //! SceCtrl: controller input. The one place a title reads a non-deterministic
 //! external input, so it goes through the World seam (`poll_ctrl`), which a record
-//! or replay wrapper - or a scripted TAS recipe - drives.
+//! or replay wrapper - or a playbook - drives.
 //!
 //! Titles reach the pad through several entry points with the same `SceCtrlData`
 //! payload: `Peek` returns the latest sample immediately, `Read` classically blocks
@@ -10,9 +10,9 @@
 //! The `Positive`/`Positive2` variants differ only in button remapping we do not
 //! model, so they share one filler.
 
+use crate::SvcOutcome;
 use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
-use crate::SvcOutcome;
 
 /// Bytes of SceCtrlData we populate: timeStamp (8) + buttons (4) + the four analog
 /// bytes lx/ly/rx/ry (4). The real struct is larger but the guest reads these
@@ -54,7 +54,7 @@ fn buffer_count(count: i32) -> u32 {
 ///
 /// The older samples used to carry the CURRENT buttons, on the reasoning that this engine's
 /// world holds one input frame at a time and inventing a differing past would be inventing
-/// input the recipe never gave. The premise is right and the conclusion was not: the past
+/// input the script never gave. The premise is right and the conclusion was not: the past
 /// this ring should hold is not invented, it is the input the world ALREADY GAVE, one
 /// sample per display frame, and the engine simply was not keeping it.
 ///
@@ -107,7 +107,8 @@ impl CtrlHistory {
             Some(k) => &mut self.ports[k].1,
             None => {
                 let cap = CTRL_MAX_BUFFERS as usize;
-                self.ports.push((port, std::collections::VecDeque::with_capacity(cap)));
+                self.ports
+                    .push((port, std::collections::VecDeque::with_capacity(cap)));
                 &mut self.ports.last_mut().expect("just pushed").1
             }
         };
@@ -136,16 +137,24 @@ impl CtrlHistory {
                 // The same vblank read again after the pad moved: a vblank has one sample, and
                 // it is the state as of now.
                 if last.pad != pad
-                    && let Some(b) = ring.back_mut() {
-                        b.pad = pad;
-                    }
+                    && let Some(b) = ring.back_mut()
+                {
+                    b.pad = pad;
+                }
             }
             Some(last) if vblank > last.vblank => {
                 let gap = (vblank - last.vblank - 1).min(cap as u64);
                 for k in 1..=gap {
                     let v = vblank - gap - 1 + k;
                     let t = last.ts + (v - last.vblank) * super::display::VBLANK_US;
-                    push(ring, Sample { vblank: v, ts: t.min(ts.saturating_sub(1)), pad: last.pad });
+                    push(
+                        ring,
+                        Sample {
+                            vblank: v,
+                            ts: t.min(ts.saturating_sub(1)),
+                            pad: last.pad,
+                        },
+                    );
                 }
                 push(ring, Sample { vblank, ts, pad });
             }
@@ -161,12 +170,18 @@ impl CtrlHistory {
     /// when the ring does not go back that far.
     fn sample(&self, port: u32, age: usize) -> Option<Sample> {
         let (_, ring) = self.ports.iter().find(|(p, _)| *p == port)?;
-        ring.len().checked_sub(1 + age).and_then(|i| ring.get(i)).copied()
+        ring.len()
+            .checked_sub(1 + age)
+            .and_then(|i| ring.get(i))
+            .copied()
     }
 
     /// How many samples the ring holds for `port`.
     fn depth(&self, port: u32) -> usize {
-        self.ports.iter().find(|(p, _)| *p == port).map_or(0, |(_, r)| r.len())
+        self.ports
+            .iter()
+            .find(|(p, _)| *p == port)
+            .map_or(0, |(_, r)| r.len())
     }
 }
 
@@ -181,6 +196,7 @@ fn fill_ctrl(
     data: u32,
     negative: bool,
     count: i32,
+    v2: bool,
 ) -> i32 {
     let frame = st.world.poll_ctrl(port);
     let ts = st.guest_mono_us();
@@ -207,10 +223,15 @@ fn fill_ctrl(
     // sampled at. Pushed here rather than on a timer because the world is polled here: asking
     // it for a sample the guest never requested would put a poll on the record/replay seam
     // that no title made.
-    st.ctrl_history.push(port, u64::from(super::display::vcount(st)), ts, frame);
+    st.ctrl_history
+        .push(port, u64::from(super::display::vcount(st)), ts, frame);
     let depth = st.ctrl_history.depth(port);
 
     let n = buffer_count(count);
+    let analog = st
+        .ctrl_sampling_mode
+        .iter()
+        .any(|&m| m != SCE_CTRL_MODE_DIGITAL);
     if data != 0 {
         // The oldest sample the ring holds, for the slots below it: a title asking for more
         // history than the run has produced gets that sample extended backwards on the vblank
@@ -226,29 +247,132 @@ fn fill_ctrl(
             let (s_ts, pad) = match st.ctrl_history.sample(port, age) {
                 Some(s) => (s.ts, s.pad),
                 None => {
-                    let base = oldest.map_or((ts, crate::world::CtrlFrame::default()), |s| (s.ts, s.pad));
+                    let base =
+                        oldest.map_or((ts, crate::world::CtrlFrame::default()), |s| (s.ts, s.pad));
                     let short = (age + 1 - depth) as u64;
-                    (base.0.saturating_sub(short * super::display::VBLANK_US), base.1)
+                    (
+                        base.0.saturating_sub(short * super::display::VBLANK_US),
+                        base.1,
+                    )
                 }
             };
-            let bits = if negative { !pad.buttons } else { pad.buttons };
+            let buttons = if v2 {
+                shoulders_as_l1_r1(pad.buttons)
+            } else {
+                pad.buttons
+            };
+            let bits = if negative { !buttons } else { buttons };
             let mut buf = [0u8; CTRL_DATA_PREFIX];
             buf[0..8].copy_from_slice(&s_ts.to_le_bytes());
             buf[8..12].copy_from_slice(&bits.to_le_bytes());
-            buf[12] = pad.lx;
-            buf[13] = pad.ly;
-            buf[14] = pad.rx;
-            buf[15] = pad.ry;
+            // In DIGITAL mode the sticks are not sampled: they read centred.
+            let (lx, ly, rx, ry) = if analog {
+                (pad.lx, pad.ly, pad.rx, pad.ry)
+            } else {
+                (STICK_CENTRE, STICK_CENTRE, STICK_CENTRE, STICK_CENTRE)
+            };
+            buf[12] = lx;
+            buf[13] = ly;
+            buf[14] = rx;
+            buf[15] = ry;
             ctx.write_bytes(data + i * CTRL_DATA_SIZE, &buf);
         }
     }
     n as i32
 }
 
+/// `SceCtrlPadInputMode` (psp2common/ctrl.h): buttons only, or buttons and sticks (WIDE is a
+/// larger stick range). DIGITAL is the mode a process starts in.
+const SCE_CTRL_MODE_DIGITAL: u32 = 0;
+const SCE_CTRL_MODE_ANALOG_WIDE: u32 = 2;
+/// A stick at rest.
+const STICK_CENTRE: u8 = 0x80;
+/// `SCE_CTRL_ERROR_INVALID_ARG`.
+const SCE_CTRL_ERROR_INVALID_ARG: i32 = 0x8034_0001u32 as i32;
+
+/// int sceCtrlSetSamplingMode(SceCtrlPadInputMode mode) and its `...Ext` twin: switch the stick
+/// sampling on or off, answering the PREVIOUS mode (psp2/ctrl.h). The two keep their own mode;
+/// which of the sample calls the Ext one governs is not established, so the sticks are sampled
+/// when EITHER mode asks for them.
+pub(super) fn set_sampling_mode(ctx: &mut GuestCtx, st: &mut VitaState, which: usize) {
+    let mode = ctx.arg(0);
+    let r = if mode > SCE_CTRL_MODE_ANALOG_WIDE {
+        SCE_CTRL_ERROR_INVALID_ARG
+    } else {
+        std::mem::replace(&mut st.ctrl_sampling_mode[which], mode) as i32
+    };
+    ctx.ret(r as u32);
+}
+
+/// int sceCtrlGetSamplingMode(SceCtrlPadInputMode *pMode) / `...Ext`: the mode, written and
+/// answered.
+pub(super) fn get_sampling_mode(ctx: &mut GuestCtx, st: &mut VitaState, which: usize) {
+    let out = ctx.arg(0);
+    let mode = st.ctrl_sampling_mode[which];
+    let r = if out == 0 {
+        SCE_CTRL_ERROR_INVALID_ARG
+    } else {
+        ctx.write_u32(out, mode);
+        mode as i32
+    };
+    ctx.ret(r as u32);
+}
+
+/// `SCE_CTRL_LTRIGGER`/`RTRIGGER` and `SCE_CTRL_L1`/`R1` (psp2common/ctrl.h).
+const LTRIGGER: u32 = 0x0000_0100;
+const RTRIGGER: u32 = 0x0000_0200;
+const L1: u32 = 0x0000_0400;
+const R1: u32 = 0x0000_0800;
+
+/// The "2" spellings of the sample calls (`sceCtrlPeekBufferPositive2` and kin) report the
+/// built-in pad's shoulder buttons as L1/R1 rather than LTRIGGER/RTRIGGER - the layout of the
+/// external controllers that API also serves (psp2/ctrl.h: "will bind L/R trigger value to
+/// L1/R1 instead of LTRIGGER/RTRIGGER"). A title on that API tests the L1/R1 bits, so handing
+/// it the trigger bits is a shoulder press it never sees.
+fn shoulders_as_l1_r1(buttons: u32) -> u32 {
+    let mut b = buttons & !(LTRIGGER | RTRIGGER);
+    if buttons & LTRIGGER != 0 {
+        b |= L1;
+    }
+    if buttons & RTRIGGER != 0 {
+        b |= R1;
+    }
+    b
+}
+
 /// int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad_data, int count)
+///
+/// Also `sceCtrlPeekBufferPositiveExt`: the Ext spelling differs only in returning presses a
+/// common dialog or the IME intercepted, and nothing here intercepts any.
 #[hostcall]
-pub(super) fn peek_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: Ptr, count: i32) -> i32 {
-    fill_ctrl(ctx, st, port, data.addr(), false, count)
+pub(super) fn peek_buffer_positive(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    port: u32,
+    data: Ptr,
+    count: i32,
+) -> i32 {
+    fill_ctrl(ctx, st, port, data.addr(), false, count, false)
+}
+
+/// `sceCtrlPeekBufferPositive2` / `PositiveExt2` / `Negative2`: [`peek_buffer_positive`] with
+/// the shoulders as L1/R1 (see [`shoulders_as_l1_r1`]).
+pub(super) fn peek_buffer_v2(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) {
+    let (port, data, count) = (ctx.arg(0), ctx.arg(1), ctx.arg(2) as i32);
+    let n = fill_ctrl(ctx, st, port, data, negative, count, true);
+    ctx.ret(n as u32);
+}
+
+/// `sceCtrlReadBufferPositive2` / `PositiveExt2` / `Negative2`: the blocking read with the
+/// shoulders as L1/R1. `sceCtrlReadBufferPositiveExt` is the plain read (see
+/// [`peek_buffer_positive`] on Ext).
+pub(super) fn read_buffer(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    negative: bool,
+    v2: bool,
+) -> SvcOutcome {
+    read_blocking(ctx, st, negative, v2)
 }
 
 /// int sceCtrlReadBufferPositive(int port, SceCtrlData *pad_data, int count)
@@ -288,12 +412,12 @@ pub(super) fn peek_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState, port:
 /// The run-to-completion host has no scheduler to park against and keeps the old
 /// behaviour; there the display flip really is the only yield there is.
 pub(super) fn read_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
-    read_blocking(ctx, st, false)
+    read_blocking(ctx, st, false, false)
 }
 
 /// The blocking half of `sceCtrlRead*`, shared by the Positive and Negative spellings.
 /// See [`read_buffer_positive`] for why it parks.
-fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) -> SvcOutcome {
+fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool, v2: bool) -> SvcOutcome {
     let (port, data, count) = (ctx.arg(0), ctx.arg(1), ctx.arg(2) as i32);
     // >>> A READ RETURNS THE SAMPLES SINCE THE LAST READ, NOT `count` OF HISTORY.
     //
@@ -307,7 +431,7 @@ fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) -> SvcO
     // last), so a title reading `buf[ret - 1]` gets the current sample exactly as before.
     // >>> OPT-IN (`VITASLOP_CTRL_READ_NEW=1`), NOT THE DEFAULT: it did NOT change that title's
     // held-d-pad rate (ctl26fn vs ctl26fo, team wheel, identical cadence) and it DOES change
-    // a skating title's pushing recipe (2 of 2 shots differ; READ_ALL restores them byte-identical),
+    // a skating title's scripted pushing run (2 of 2 shots differ; READ_ALL restores them byte-identical),
     // with no ground truth for which reading is the hardware's. Default = `count` samples.
     let vblank = u64::from(super::display::vcount(st));
     let count = if read_all() {
@@ -327,7 +451,7 @@ fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool) -> SvcO
         };
         new.clamp(1, u64::from(buffer_count(count))) as i32
     };
-    let n = fill_ctrl(ctx, st, port, data, negative, count);
+    let n = fill_ctrl(ctx, st, port, data, negative, count, v2);
     tracing::trace!(target: "vitaslop::input", port, asked = ctx.arg(2), returned = n, vblank, frame = st.cur_frame(), lr = format_args!("{:#010x}", ctx.regs[14]), "ctrl read");
     ctx.ret(n as u32);
     if !st.is_preemptive() {
@@ -345,14 +469,37 @@ fn read_all() -> bool {
 
 /// int sceCtrlPeekBufferNegative(int port, SceCtrlData *pad_data, int count)
 #[hostcall]
-pub(super) fn peek_buffer_negative(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: Ptr, count: i32) -> i32 {
-    fill_ctrl(ctx, st, port, data.addr(), true, count)
+pub(super) fn peek_buffer_negative(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    port: u32,
+    data: Ptr,
+    count: i32,
+) -> i32 {
+    fill_ctrl(ctx, st, port, data.addr(), true, count, false)
 }
 
 /// int sceCtrlReadBufferNegative(int port, SceCtrlData *pad_data, int count)
 /// Blocks on the sampling grid exactly as [`read_buffer_positive`] does.
 pub(super) fn read_buffer_negative(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
-    read_blocking(ctx, st, true)
+    read_blocking(ctx, st, true, false)
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+
+    #[test]
+    fn the_v2_api_moves_only_the_shoulders_to_l1_r1() {
+        assert_eq!(shoulders_as_l1_r1(LTRIGGER), L1);
+        assert_eq!(shoulders_as_l1_r1(RTRIGGER), R1);
+        // Cross + start + both shoulders: the face/start bits are untouched.
+        assert_eq!(
+            shoulders_as_l1_r1(0x4008 | LTRIGGER | RTRIGGER),
+            0x4008 | L1 | R1
+        );
+        assert_eq!(shoulders_as_l1_r1(0x4008), 0x4008);
+    }
 }
 
 #[cfg(test)]
@@ -363,11 +510,18 @@ mod history_tests {
     const UP: u32 = 0x0010;
 
     fn pad(buttons: u32) -> CtrlFrame {
-        CtrlFrame { buttons, ..CtrlFrame::default() }
+        CtrlFrame {
+            buttons,
+            ..CtrlFrame::default()
+        }
     }
 
     fn buttons(h: &CtrlHistory, n: usize) -> Vec<u32> {
-        (0..n).rev().filter_map(|age| h.sample(0, age)).map(|s| s.pad.buttons).collect()
+        (0..n)
+            .rev()
+            .filter_map(|age| h.sample(0, age))
+            .map(|s| s.pad.buttons)
+            .collect()
     }
 
     #[test]
@@ -379,14 +533,21 @@ mod history_tests {
         h.push(0, 4, 4 * v, pad(0));
         h.push(0, 6, 6 * v, pad(UP));
         assert_eq!(h.depth(0), 5, "vblanks 2..=6, one sample each");
-        assert_eq!(buttons(&h, 5), vec![0, 0, 0, 0, UP], "vblank 5 holds the state before the read");
+        assert_eq!(
+            buttons(&h, 5),
+            vec![0, 0, 0, 0, UP],
+            "vblank 5 holds the state before the read"
+        );
         // The next read (vblank 8, still held): the two NEW samples are both UP - "the last
         // two samples" contain no rising edge, which is what stops a second cursor step.
         h.push(0, 8, 8 * v, pad(UP));
         let last_two = buttons(&h, 2);
         assert_eq!(last_two, vec![UP, UP]);
         // Negative control - the old per-READ ring's last two here were [0, UP] again.
-        let edges: usize = buttons(&h, h.depth(0)).windows(2).filter(|w| w[0] & UP == 0 && w[1] & UP != 0).count();
+        let edges: usize = buttons(&h, h.depth(0))
+            .windows(2)
+            .filter(|w| w[0] & UP == 0 && w[1] & UP != 0)
+            .count();
         assert_eq!(edges, 1, "one press is one rising edge in the history");
     }
 
@@ -396,11 +557,22 @@ mod history_tests {
         let v = super::super::display::VBLANK_US;
         h.push(0, 10, 10 * v, pad(0));
         h.push(0, 10, 10 * v + 5, pad(UP));
-        assert_eq!(h.depth(0), 1, "a second read in one vblank replaces, never appends");
+        assert_eq!(
+            h.depth(0),
+            1,
+            "a second read in one vblank replaces, never appends"
+        );
         assert_eq!(buttons(&h, 1), vec![UP]);
         h.push(0, 13, 13 * v, pad(0));
-        let ts: Vec<u64> = (0..h.depth(0)).rev().filter_map(|a| h.sample(0, a)).map(|s| s.ts).collect();
-        assert!(ts.windows(2).all(|w| w[0] < w[1]), "stamps are what titles dedupe on: {ts:?}");
+        let ts: Vec<u64> = (0..h.depth(0))
+            .rev()
+            .filter_map(|a| h.sample(0, a))
+            .map(|s| s.ts)
+            .collect();
+        assert!(
+            ts.windows(2).all(|w| w[0] < w[1]),
+            "stamps are what titles dedupe on: {ts:?}"
+        );
         // A very long gap fills at most a ring's worth.
         h.push(0, 10_000, 10_000 * v, pad(0));
         assert_eq!(h.depth(0), CTRL_MAX_BUFFERS as usize);

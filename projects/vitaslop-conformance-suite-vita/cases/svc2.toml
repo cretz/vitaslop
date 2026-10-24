@@ -1,0 +1,12 @@
+category = "vita"
+description = "Service odds and ends: controller sampling mode, console model, AppUtil safe memory - RUNNABLE"
+
+# Source: ../svc2-src/svc2.c (clean-room, -nostdlib). sceCtrlSetSamplingMode answers the
+# previous mode (a process starts DIGITAL) and refuses one above ANALOG_WIDE; the console is the
+# handheld; safe memory is 64 KiB - byte counts answered, zeroes where never written,
+# neighbours untouched by a save, out-of-range or NULL refused. Executable form:
+# tests/vita_svc2.rs.
+[out]
+output = """ctrl 0 0 0 2 80340001 1
+model 10000 0
+safe 16 4 16 0000a0a1a2a311111111a8a9aaabacad 80100600 80100600 16"""

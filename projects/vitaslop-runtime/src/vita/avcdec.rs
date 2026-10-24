@@ -26,9 +26,9 @@
 
 use std::sync::Arc;
 
-use crate::hostcall;
-use crate::host::{GuestCtx, Ptr, VitaState};
 use crate::SvcOutcome;
+use crate::host::{GuestCtx, Ptr, VitaState};
+use crate::hostcall;
 use vitaslop_platform::video::{DecodedPicture, PictureFormat, VideoDecode};
 
 /// `SCE_VIDEODEC_TYPE_HW_AVCDEC`, the only codec type this API defines.
@@ -273,11 +273,7 @@ fn do_codec_engine_free_memory_from_unmap_mem_block(
 }
 
 /// SceInt32 sceCodecEngineCloseUnmapMemBlock(SceUID uid)
-fn do_codec_engine_close_unmap_mem_block(
-    _ctx: &mut GuestCtx,
-    st: &mut VitaState,
-    uid: i32,
-) -> i32 {
+fn do_codec_engine_close_unmap_mem_block(_ctx: &mut GuestCtx, st: &mut VitaState, uid: i32) -> i32 {
     let before = st.avcdec.blocks.len();
     st.avcdec.blocks.retain(|b| b.uid != uid);
     if st.avcdec.blocks.len() == before {
@@ -381,6 +377,24 @@ fn do_videodec_init_library_with_unmap_mem(
         mem = format_args!("{:#010x}", mem.addr()), mem_size,
         "sceVideodecInitLibraryWithUnmapMem"
     );
+    0
+}
+
+/// int sceVideodecInitLibrary(SceVideodecType codec, const SceVideodecQueryInitInfoHwAvcdec *initInfo)
+///
+/// The library keeps its working memory in the system's own pool: the `WithUnmapMem`
+/// variant minus the caller's block, which this engine never touches either way.
+fn do_videodec_init_library(ctx: &mut GuestCtx, st: &mut VitaState, codec: u32, init_info: Ptr) -> i32 {
+    if codec != SCE_VIDEODEC_TYPE_HW_AVCDEC {
+        return SCE_VIDEODEC_ERROR_INVALID_TYPE;
+    }
+    if init_info.is_null() {
+        return SCE_AVCDEC_ERROR_INVALID_PARAM;
+    }
+    let width = ctx.read_u32(init_info.addr() + 4);
+    let height = ctx.read_u32(init_info.addr() + 8);
+    st.avcdec.library = Some((width, height));
+    tracing::debug!(target: "vitaslop::movie", width, height, "sceVideodecInitLibrary");
     0
 }
 
@@ -580,7 +594,12 @@ fn do_avcdec_decode(
         | ctx.read_u32(au_ptr.addr() + au::PTS_LOWER) as u64;
     // The submit-only pass submitted this very unit already (see `presubmitted`).
     let already = !st.avcdec.submit_only
-        && match st.avcdec.presubmitted.iter().position(|p| *p == (handle, es_ptr, pts)) {
+        && match st
+            .avcdec
+            .presubmitted
+            .iter()
+            .position(|p| *p == (handle, es_ptr, pts))
+        {
             Some(at) => {
                 st.avcdec.presubmitted.remove(at);
                 true
@@ -632,12 +651,7 @@ pub fn set_submit_only(st: &mut VitaState, on: bool) {
 ///
 /// End of stream: no more input is coming, so whatever the decoder is holding back for
 /// reordering comes out now.
-fn do_avcdec_decode_stop(
-    ctx: &mut GuestCtx,
-    st: &mut VitaState,
-    decoder: Ptr,
-    array: Ptr,
-) -> i32 {
+fn do_avcdec_decode_stop(ctx: &mut GuestCtx, st: &mut VitaState, decoder: Ptr, array: Ptr) -> i32 {
     if decoder.is_null() || array.is_null() {
         return SCE_AVCDEC_ERROR_INVALID_PARAM;
     }
@@ -658,13 +672,16 @@ fn do_avcdec_decode_stop(
 /// next call rather than being dropped, because a dropped picture is a frame of the movie
 /// that never appears and nothing downstream would say so.
 fn deliver_pictures(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, array: u32) -> i32 {
-    let session = st.avcdec.session_mut(handle).expect("caller checked the handle");
+    let session = st
+        .avcdec
+        .session_mut(handle)
+        .expect("caller checked the handle");
     // >>> WAIT FOR THE DECODER TO ANSWER WHAT IT WAS GIVEN, BEFORE READING WHAT IT HAS.
     //
     // Without this the loop below drains whatever a HOST DECODER THREAD happened to have
     // finished at that instant, so `numOfOutput` - which titles branch on - was a function of
     // wall-clock progress rather than of the input. MEASURED: two identical headless replays of
-    // one recipe, same binary, disagreed on the delivery digest on the FIRST pair and ran 4.2%
+    // one input script, same binary, disagreed on the delivery digest on the FIRST pair and ran 4.2%
     // different guest work. See `VideoDecode::drain_owed`; the wait ends on RETIREMENT, never
     // on a clock, and the decoder's own pipeline still decides which pictures come out when.
     session.decoder.drain_owed();
@@ -710,7 +727,10 @@ fn deliver_pictures(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, array: 
     SLOTS_OFFERED.fetch_add(capacity as u64, std::sync::atomic::Ordering::Relaxed);
     let mut written = 0u32;
     while written < capacity {
-        let session = st.avcdec.session_mut(handle).expect("caller checked the handle");
+        let session = st
+            .avcdec
+            .session_mut(handle)
+            .expect("caller checked the handle");
         let Some(pic) = session.ready.pop_front() else {
             break;
         };
@@ -756,7 +776,10 @@ fn deliver_pictures(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, array: 
         }
         repeat_last_picture(ctx, st, handle, list, capacity);
     }
-    let session = st.avcdec.session_mut(handle).expect("caller checked the handle");
+    let session = st
+        .avcdec
+        .session_mut(handle)
+        .expect("caller checked the handle");
     if session.delivered <= 4 || session.submitted.is_multiple_of(200) {
         tracing::debug!(
             target: "vitaslop::movie",
@@ -824,7 +847,7 @@ static PICTURES_OWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// The totals above are rates; this is an IDENTITY. `numOfOutput` is the one value the movie
 /// path returns that the guest branches on, and it is produced by draining whatever a HOST
 /// DECODER THREAD happened to have finished at that instant ([`deliver_pictures`]) - so if two
-/// runs of the same recipe ever hand out a different SEQUENCE of counts, the guest has been
+/// runs of the same input ever hand out a different SEQUENCE of counts, the guest has been
 /// told two different stories and everything downstream of it is a different run.
 ///
 /// Comparing end-of-run determinism signatures cannot find that: the sequences can differ on
@@ -902,7 +925,10 @@ fn note_destination(addr: u32) {
 pub fn decoder_behind(st: &mut VitaState) -> bool {
     // NOT `any`: `behind_stream` also collects each decoder's finished pictures, so a
     // short-circuit would leave every session after the first lagging one uncollected.
-    st.avcdec.sessions.iter_mut().fold(false, |behind, s| s.decoder.behind_stream() | behind)
+    st.avcdec
+        .sessions
+        .iter_mut()
+        .fold(false, |behind, s| s.decoder.behind_stream() | behind)
 }
 
 /// A decode call that waited for [`decoder_behind`] to clear: how long, and whether it gave up.
@@ -966,7 +992,7 @@ pub fn pictures_owed() -> u64 {
     PICTURES_OWED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The delivery digest ([`DELIVERY_DIGEST`]): two runs of one recipe must agree on it.
+/// The delivery digest ([`DELIVERY_DIGEST`]): two runs of one input must agree on it.
 pub fn delivery_digest() -> u64 {
     DELIVERY_DIGEST.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -994,15 +1020,27 @@ pub fn movie_report(frames: u64) -> Vec<String> {
     if sub == 0 {
         return Vec::new();
     }
-    let per_frame = if frames > 0 { del as f64 / frames as f64 } else { 0.0 };
+    let per_frame = if frames > 0 {
+        del as f64 / frames as f64
+    } else {
+        0.0
+    };
     let (calls, empty, slots) = (
         DECODE_CALLS.load(Relaxed),
         EMPTY_CALLS.load(Relaxed),
         SLOTS_OFFERED.load(Relaxed),
     );
     let buffers = DEST_BUFFER_COUNT.load(Relaxed);
-    let empty_pct = if calls > 0 { empty as f64 * 100.0 / calls as f64 } else { 0.0 };
-    let slots_per_call = if calls > 0 { slots as f64 / calls as f64 } else { 0.0 };
+    let empty_pct = if calls > 0 {
+        empty as f64 * 100.0 / calls as f64
+    } else {
+        0.0
+    };
+    let slots_per_call = if calls > 0 {
+        slots as f64 / calls as f64
+    } else {
+        0.0
+    };
     vec![
         format!(
             "movie: {sub} access units submitted, {del} pictures delivered \
@@ -1018,11 +1056,18 @@ pub fn movie_report(frames: u64) -> Vec<String> {
              rotates {} destination buffer(s). One buffer and an empty call HOLDS the last \
              picture; more than one and an empty call shows a buffer this engine may never \
              have written, which is the black half of a flicker",
-            if buffers >= 5 { "4+".to_string() } else { buffers.to_string() },
+            if buffers >= 5 {
+                "4+".to_string()
+            } else {
+                buffers.to_string()
+            },
         ),
         format!(
             "movie decoder at the last EMPTY call: {}",
-            LAST_EMPTY_DECODER.lock().map(|g| g.clone()).unwrap_or_default()
+            LAST_EMPTY_DECODER
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default()
         ),
         {
             let n = CATCH_UP_CALLS.load(Relaxed);
@@ -1051,7 +1096,11 @@ pub fn movie_report(frames: u64) -> Vec<String> {
 /// this question and the API has nowhere to put one.
 fn picture_frame_timing(st: &VitaState) -> Option<(u32, u32)> {
     let movie = st.movie.as_ref()?;
-    let track = movie.mp4.tracks.iter().find(|t| t.kind == crate::mp4::TrackKind::Video)?;
+    let track = movie
+        .mp4
+        .tracks
+        .iter()
+        .find(|t| t.kind == crate::mp4::TrackKind::Video)?;
     let units = track.samples.iter().map(|s| s.duration).find(|&d| d != 0)?;
     let scale = track.timescale.checked_mul(2)?;
     Some((units, scale))
@@ -1087,12 +1136,20 @@ fn picture_frame_timing(st: &VitaState) -> Option<(u32, u32)> {
 ///
 /// It copies only when the offered buffer is NOT the one that already holds the picture - the
 /// one-buffer case the report calls out needs nothing done and must not pay a copy per call.
-fn repeat_last_picture(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, list: u32, capacity: u32) {
+fn repeat_last_picture(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    handle: u32,
+    list: u32,
+    capacity: u32,
+) {
     if list == 0 || capacity == 0 {
         return;
     }
-    let Some((last_dest, bytes)) =
-        st.avcdec.session_mut(handle).and_then(|s| s.last_written.clone())
+    let Some((last_dest, bytes)) = st
+        .avcdec
+        .session_mut(handle)
+        .and_then(|s| s.last_written.clone())
     else {
         // Nothing has ever decoded on this session, so there is no picture to repeat and the
         // buffer keeps whatever it held. This is the FIRST call of a movie, where the title has
@@ -1256,7 +1313,7 @@ fn write_picture(
 ///
 /// # Why a screenshot cannot answer this question
 /// A movie frame is delivered by a decoder running on the HOST's clock, and the guest takes
-/// whatever picture is ready when it looks. MEASURED here: three runs of the same recipe -
+/// whatever picture is ready when it looks. MEASURED here: three runs of the same input -
 /// two of them the same binary - produced three different `f001400.png`, while every
 /// non-movie shot in the same runs was byte-identical. So "the picture did not change" cannot
 /// be established by comparing a shot inside the movie, and a claim that it was is a claim
@@ -1286,7 +1343,10 @@ fn report_picture_hash(st: &mut VitaState, bytes: &[u8], pitch: u32, height: u32
     // The MEAN LUMA beside the hash, because a hash cannot tell a black picture from a
     // bright one and "the movie is black" is the question this diagnostic gets asked.
     let luma_at = pitch as usize * height as usize;
-    let mean = bytes[..luma_at.min(bytes.len())].iter().map(|&b| b as u64).sum::<u64>()
+    let mean = bytes[..luma_at.min(bytes.len())]
+        .iter()
+        .map(|&b| b as u64)
+        .sum::<u64>()
         / (luma_at.min(bytes.len()).max(1) as u64);
     tracing::info!(
         target: "vitaslop::movie",
@@ -1313,7 +1373,10 @@ fn dump_picture(n: u64, bytes: &[u8], pitch: u32, height: u32) {
     static SPEC: std::sync::OnceLock<Option<(String, u64)>> = std::sync::OnceLock::new();
     let Some((dir, every)) = SPEC.get_or_init(|| {
         let dir = crate::knobs::var("VITASLOP_MOVIE_DUMP_DIR").ok()?;
-        let every = crate::knobs::var("VITASLOP_MOVIE_DUMP_EVERY").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(30);
+        let every = crate::knobs::var("VITASLOP_MOVIE_DUMP_EVERY")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(30);
         Some((dir, every))
     }) else {
         return;
@@ -1478,7 +1541,10 @@ fn write_nv12(
     let chroma_base = dest + chroma_at as u32;
     for y in 0..chroma_rows {
         let at = chroma_at + y * pitch;
-        ctx.write_bytes(chroma_base + (y * pitch) as u32, &buf[at..at + cw.min(pitch / 2) * 2]);
+        ctx.write_bytes(
+            chroma_base + (y * pitch) as u32,
+            &buf[at..at + cw.min(pitch / 2) * 2],
+        );
     }
     None
 }
@@ -1554,7 +1620,11 @@ fn lay_rgba_as_nv12(
 fn rgba_at(pic: &DecodedPicture, x: usize, y: usize) -> (i32, i32, i32) {
     let w = pic.width as usize;
     let at = (y * w + x.min(w - 1)) * 4;
-    (pic.data[at] as i32, pic.data[at + 1] as i32, pic.data[at + 2] as i32)
+    (
+        pic.data[at] as i32,
+        pic.data[at + 1] as i32,
+        pic.data[at + 2] as i32,
+    )
 }
 
 /// BT.601 studio-swing luma, in 16.16 - the inverse of the conversion the display path
@@ -1607,7 +1677,10 @@ fn write_i420(
     let (cb, cr) = (src.chroma_offset(), src.cr_offset());
     let plane = (pitch / 2 * ch) as u32;
     for y in 0..ch {
-        ctx.write_bytes(chroma + (y * pitch / 2) as u32, &src.data[cb + y * cw..cb + y * cw + cw]);
+        ctx.write_bytes(
+            chroma + (y * pitch / 2) as u32,
+            &src.data[cb + y * cw..cb + y * cw + cw],
+        );
         ctx.write_bytes(
             chroma + plane + (y * pitch / 2) as u32,
             &src.data[cr + y * cw..cr + y * cw + cw],
@@ -1716,6 +1789,11 @@ pub(super) fn videodec_query_mem_size(
 }
 
 #[hostcall]
+pub(super) fn videodec_init_library(ctx: &mut GuestCtx, st: &mut VitaState, codec: u32, init_info: Ptr) -> i32 {
+    do_videodec_init_library(ctx, st, codec, init_info)
+}
+
+#[hostcall]
 pub(super) fn videodec_init_library_with_unmap_mem(
     ctx: &mut GuestCtx,
     st: &mut VitaState,
@@ -1820,11 +1898,7 @@ pub(super) fn avcdec_decode_stop(
 }
 
 #[hostcall]
-pub(super) fn videodec_term_library(
-    _ctx: &mut GuestCtx,
-    st: &mut VitaState,
-    codec: u32,
-) -> i32 {
+pub(super) fn videodec_term_library(_ctx: &mut GuestCtx, st: &mut VitaState, codec: u32) -> i32 {
     do_videodec_term_library(_ctx, st, codec)
 }
 
@@ -1835,25 +1909,25 @@ pub(super) fn videodec_term_library(
 /// it otherwise. Answered with the size of the frame buffer the title gave the decoder
 /// (`SceAvcdecCtrl.frameBuf.size`, the one "size" this call can see), never an error.
 #[hostcall]
-pub(super) fn avcdec_decode_available_size(ctx: &mut GuestCtx, _st: &mut VitaState, decoder: Ptr) -> i32 {
-    if decoder.is_null() { 0 } else { ctx.read_u32(decoder.addr() + 8) as i32 }
+pub(super) fn avcdec_decode_available_size(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    decoder: Ptr,
+) -> i32 {
+    if decoder.is_null() {
+        0
+    } else {
+        ctx.read_u32(decoder.addr() + 8) as i32
+    }
 }
 
 #[hostcall]
-pub(super) fn avcdec_delete_decoder(
-    ctx: &mut GuestCtx,
-    st: &mut VitaState,
-    decoder: Ptr,
-) -> i32 {
+pub(super) fn avcdec_delete_decoder(ctx: &mut GuestCtx, st: &mut VitaState, decoder: Ptr) -> i32 {
     do_avcdec_delete_decoder(ctx, st, decoder)
 }
 
 #[hostcall]
-pub(super) fn avcdec_decode_flush(
-    ctx: &mut GuestCtx,
-    st: &mut VitaState,
-    decoder: Ptr,
-) -> i32 {
+pub(super) fn avcdec_decode_flush(ctx: &mut GuestCtx, st: &mut VitaState, decoder: Ptr) -> i32 {
     do_avcdec_decode_flush(ctx, st, decoder)
 }
 
@@ -1911,11 +1985,25 @@ mod tests {
         };
         // Deterministic, and not a gradient in one direction only: a plane written at the
         // wrong offset has to change the bytes, so neighbouring rows must differ.
-        let data = (0..len).map(|i| ((i * 37 + i / 7 * 11) % 251) as u8).collect();
-        DecodedPicture { width: w, height: h, pts: 0, format, data }
+        let data = (0..len)
+            .map(|i| ((i * 37 + i / 7 * 11) % 251) as u8)
+            .collect();
+        DecodedPicture {
+            width: w,
+            height: h,
+            pts: 0,
+            format,
+            data,
+        }
     }
 
-    fn run(format: PictureFormat, w: u32, h: u32, pitch: u32, height: u32) -> (Vec<u8>, Option<Arc<[u8]>>) {
+    fn run(
+        format: PictureFormat,
+        w: u32,
+        h: u32,
+        pitch: u32,
+        height: u32,
+    ) -> (Vec<u8>, Option<Arc<[u8]>>) {
         let pic = picture(format, w, h);
         let bytes = (pitch as usize * height as usize * 3 / 2) + pitch as usize;
         let mut mem = vec![0xa5u8; bytes];
@@ -1929,16 +2017,44 @@ mod tests {
         (mem, authored)
     }
 
+    /// `sceVideodecInitLibrary` (no caller memory) opens the library at the size the init
+    /// info names, refuses a codec this API does not define, and `TermLibrary` closes it.
+    #[test]
+    fn init_library_without_caller_memory_opens_the_library() {
+        let mut mem = vec![0u8; 64];
+        mem[20..24].copy_from_slice(&960u32.to_le_bytes());
+        mem[24..28].copy_from_slice(&544u32.to_le_bytes());
+        let mut regs = [0u32; vitaslop_transpiler::abi::REG_COUNT];
+        let mut vfp = [0u32; crate::host::VFP_ARG_COUNT];
+        let mut slice = SliceMemory(&mut mem);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut slice, 0);
+        let mut st = VitaState::new(0, 64, Box::new(crate::world::DeterministicWorld::default()));
+        assert_eq!(do_videodec_init_library(&mut ctx, &mut st, 0x2, Ptr(16)), SCE_VIDEODEC_ERROR_INVALID_TYPE);
+        assert_eq!(do_videodec_init_library(&mut ctx, &mut st, SCE_VIDEODEC_TYPE_HW_AVCDEC, Ptr(16)), 0);
+        assert_eq!(st.avcdec.library, Some((960, 544)));
+        assert_eq!(do_videodec_term_library(&mut ctx, &mut st, SCE_VIDEODEC_TYPE_HW_AVCDEC), 0);
+        assert_eq!(st.avcdec.library, None);
+    }
+
     /// Every source layout, at the guest's own pitch, is laid out where the obvious writer
     /// would have put it - and the composed buffer IS the surface, so it can be handed to the
     /// texture cache.
     #[test]
     fn composed_surface_matches_the_row_by_row_reference() {
-        for format in [PictureFormat::Nv12, PictureFormat::I420, PictureFormat::Rgba] {
+        for format in [
+            PictureFormat::Nv12,
+            PictureFormat::I420,
+            PictureFormat::Rgba,
+        ] {
             let (w, h, pitch, height) = (64u32, 32u32, 64u32, 32u32);
             let (mem, authored) = run(format, w, h, pitch, height);
             let mut want = vec![0xa5u8; mem.len()];
-            reference_nv12(&picture(format, w, h), pitch as usize, height as usize, &mut want);
+            reference_nv12(
+                &picture(format, w, h),
+                pitch as usize,
+                height as usize,
+                &mut want,
+            );
             assert_eq!(mem, want, "{format:?} surface");
             let authored = authored.expect("a full surface is authored");
             assert_eq!(
@@ -1955,9 +2071,17 @@ mod tests {
     fn padded_surface_keeps_its_padding_and_is_not_authored() {
         let (w, h, pitch, height) = (60u32, 32u32, 64u32, 32u32);
         let (mem, authored) = run(PictureFormat::Nv12, w, h, pitch, height);
-        assert!(authored.is_none(), "a padded surface is not the buffer we composed");
+        assert!(
+            authored.is_none(),
+            "a padded surface is not the buffer we composed"
+        );
         let mut want = vec![0xa5u8; mem.len()];
-        reference_nv12(&picture(PictureFormat::Nv12, w, h), pitch as usize, height as usize, &mut want);
+        reference_nv12(
+            &picture(PictureFormat::Nv12, w, h),
+            pitch as usize,
+            height as usize,
+            &mut want,
+        );
         assert_eq!(mem, want);
         assert_eq!(mem[60], 0xa5, "the padding column is the guest's, not ours");
     }
@@ -1987,14 +2111,20 @@ mod tests {
         println!("RGBA -> NV12, 960x544: {each:.2} ms per picture on this machine");
         // A phone's wasm is several times slower than this and has to do it 30 times a
         // second, so a number here that looks small is not evidence that it is.
-        assert!(each < 100.0, "a picture conversion should not take {each} ms");
+        assert!(
+            each < 100.0,
+            "a picture conversion should not take {each} ms"
+        );
     }
 
     /// A picture shorter than the surface fills what it reaches and no more.
     #[test]
     fn short_picture_does_not_write_past_itself() {
         let (mem, authored) = run(PictureFormat::Nv12, 64, 16, 64, 32);
-        assert!(authored.is_none(), "a picture that does not fill the surface is not authored");
+        assert!(
+            authored.is_none(),
+            "a picture that does not fill the surface is not authored"
+        );
         assert_eq!(mem[64 * 16], 0xa5, "the row after the picture is untouched");
     }
 }

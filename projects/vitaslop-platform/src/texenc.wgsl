@@ -1182,22 +1182,34 @@ fn encode_etc2_chain(@builtin(global_invocation_id) gid: vec3<u32>) {
 //   out_row_words words per output row (= width)
 //   flags         FLAG_SWAP_CHROMA when the format's swizzle says YVU rather than YUV
 //
-// The matrix is BT.601 studio swing, which is GXM's default YUV profile - the same conversion
-// the CPU path applies, and the two are held together by a test on the CPU side.
+// The matrix is the `SceGxmYuvProfile` in flags bits 5..6 (0 BT.601 studio swing, the default;
+// 1 BT.709 studio; 2 BT.601 full range; 3 BT.709 full range) - the same numbers the CPU path
+// uses (`render::YUV_PROFILES`), held together by a test on the CPU side.
 
 const FLAG_SWAP_CHROMA: u32 = 16u;
+const YUV_PROFILE_SHIFT: u32 = 5u;
 
 fn src_byte_at(i: u32) -> u32 {
     return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu;
 }
 
 fn yuv_to_rgb(y: i32, cb: i32, cr: i32) -> vec4<u32> {
-    let yt = (y - 16) * 76309;
+    // (luma offset, luma scale) and (Cr->R, Cb->G, Cr->G, Cb->B), in 16.16.
+    var off = 16;
+    var scale = 76309;
+    var m = vec4<i32>(104597, -25675, -53279, 132201);
+    switch ((P.flags >> YUV_PROFILE_SHIFT) & 3u) {
+        case 1u: { m = vec4<i32>(117489, -13975, -34925, 138438); }
+        case 2u: { off = 0; scale = 65536; m = vec4<i32>(91881, -22554, -46802, 116130); }
+        case 3u: { off = 0; scale = 65536; m = vec4<i32>(103206, -12276, -30679, 121609); }
+        default: {}
+    }
+    let yt = (y - off) * scale;
     let u = cb - 128;
     let v = cr - 128;
-    let r = (yt + 104597 * v + 32768) >> 16u;
-    let g = (yt - 25675 * u - 53279 * v + 32768) >> 16u;
-    let b = (yt + 132201 * u + 32768) >> 16u;
+    let r = (yt + m.x * v + 32768) >> 16u;
+    let g = (yt + m.y * u + m.z * v + 32768) >> 16u;
+    let b = (yt + m.w * u + 32768) >> 16u;
     return vec4<u32>(
         u32(clamp(r, 0, 255)),
         u32(clamp(g, 0, 255)),

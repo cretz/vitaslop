@@ -94,7 +94,12 @@ pub(super) fn read(_ctx: &mut GuestCtx, _st: &mut VitaState, _devnum: u32, _read
 /// so a caller that ignores the return code does not read a fabricated setting as if the
 /// hardware had reported it.
 #[hostcall]
-pub(super) fn get_reverse(_ctx: &mut GuestCtx, _st: &mut VitaState, _devnum: u32, _out: Ptr) -> i32 {
+pub(super) fn get_reverse(
+    _ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _devnum: u32,
+    _out: Ptr,
+) -> i32 {
     SCE_CAMERA_ERROR_NOT_OPEN
 }
 
@@ -106,8 +111,41 @@ pub(super) fn set_reverse(_ctx: &mut GuestCtx, _st: &mut VitaState, _devnum: u32
 
 /// int sceCameraSetBacklight(int devnum, int backlight)
 #[hostcall]
-pub(super) fn set_backlight(_ctx: &mut GuestCtx, _st: &mut VitaState, _devnum: u32, _v: u32) -> i32 {
+pub(super) fn set_backlight(
+    _ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _devnum: u32,
+    _v: u32,
+) -> i32 {
     SCE_CAMERA_ERROR_NOT_OPEN
+}
+
+/// Every other `int sceCameraGet<Setting>(int devnum, int *out)` - anti-flicker, auto-control
+/// hold, backlight, brightness, contrast, device location, EV, effect, exposure ceiling, gain,
+/// ISO, image quality, night mode, noise reduction, saturation, sharpness (and its off
+/// switch), white balance, zoom. The device was never opened, so each reports that and leaves
+/// `out` alone - see [`get_reverse`].
+#[hostcall]
+pub(super) fn get_setting(
+    _ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _devnum: u32,
+    _out: Ptr,
+) -> i32 {
+    SCE_CAMERA_ERROR_NOT_OPEN
+}
+
+/// Every other `int sceCameraSet<Setting>(int devnum, int value)`, the setters of the
+/// settings [`get_setting`] lists: refused on a device that was never opened.
+#[hostcall]
+pub(super) fn set_setting(_ctx: &mut GuestCtx, _st: &mut VitaState, _devnum: u32, _v: u32) -> i32 {
+    SCE_CAMERA_ERROR_NOT_OPEN
+}
+
+/// SceBool sceCameraIsActive(int devnum): whether the camera is started. None ever is.
+#[hostcall]
+pub(super) fn is_active(_ctx: &mut GuestCtx, _st: &mut VitaState, _devnum: u32) -> u32 {
+    0
 }
 
 /// int sceCameraSetWhiteBalance(int devnum, int wb)

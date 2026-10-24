@@ -36,7 +36,12 @@ fn fx(v: f32) -> i32 {
 /// (custom allocators / external glyph cache) is not needed - the engine owns its own
 /// allocation and cache.
 #[hostcall]
-pub(super) fn new_lib(ctx: &mut GuestCtx, st: &mut VitaState, _init_param: Ptr, error_code: Ptr) -> u32 {
+pub(super) fn new_lib(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    _init_param: Ptr,
+    error_code: Ptr,
+) -> u32 {
     let lib = st.fonts.new_lib();
     if !error_code.is_null() {
         ctx.write_u32(error_code.addr(), 0);
@@ -68,7 +73,12 @@ pub(super) fn set_em(st: &mut VitaState, lib: u32, em_value: f32) -> i32 {
 /// ScePvfError scePvfSetResolution(ScePvfLibId libID, ScePvfFloat32 hResolution,
 ///     ScePvfFloat32 vResolution)
 #[hostcall]
-pub(super) fn set_resolution(st: &mut VitaState, lib: u32, h_resolution: f32, v_resolution: f32) -> i32 {
+pub(super) fn set_resolution(
+    st: &mut VitaState,
+    lib: u32,
+    h_resolution: f32,
+    v_resolution: f32,
+) -> i32 {
     if st.fonts.set_resolution(lib, h_resolution, v_resolution) {
         0
     } else {
@@ -83,10 +93,18 @@ pub(super) fn set_resolution(st: &mut VitaState, lib: u32, h_resolution: f32, v_
 /// rather than hand back a font id with no backing face. Titles that render their own
 /// text ship a font and use `scePvfOpenUserFile` instead.
 #[hostcall]
-pub(super) fn open(ctx: &mut GuestCtx, st: &mut VitaState, lib: u32, font_index: i32, _mode: u32, error_code: Ptr) -> u32 {
+pub(super) fn open(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    lib: u32,
+    font_index: i32,
+    _mode: u32,
+    error_code: Ptr,
+) -> u32 {
     let font = crate::font::system::bytes()
         .and_then(|bytes| {
-            st.fonts.open_system_substitute(lib, &bytes, crate::font::system::SUBSTITUTE_PX)
+            st.fonts
+                .open_system_substitute(lib, &bytes, crate::font::system::SUBSTITUTE_PX)
         })
         .inspect(|_| super::pgf::report_substitute_font(font_index));
     match font {
@@ -127,7 +145,14 @@ fn report_no_system_font(index: i32) {
 /// Open a font from a file the title ships. The bytes are read from the guest
 /// filesystem and parsed by the backend; a non-null font handle is returned on success.
 #[hostcall]
-pub(super) fn open_user_file(ctx: &mut GuestCtx, st: &mut VitaState, lib: u32, filename: Ptr, _mode: u32, error_code: Ptr) -> u32 {
+pub(super) fn open_user_file(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    lib: u32,
+    filename: Ptr,
+    _mode: u32,
+    error_code: Ptr,
+) -> u32 {
     let path = super::iofilemgr::read_cstr(ctx, filename.addr());
     let (font, err) = match st.read_file(&path) {
         Some(bytes) => match st.fonts.open_user_file(lib, &bytes) {
@@ -243,8 +268,18 @@ pub(super) fn is_element(st: &mut VitaState, font: u32, char_code: u32) -> u32 {
 /// ScePvfFloat32 scePvfPixelToPointH(ScePvfLibId libID, ScePvfFloat32 pixel,
 ///     ScePvfError *errorCode)
 #[hostcall]
-pub(super) fn pixel_to_point_h(ctx: &mut GuestCtx, st: &mut VitaState, lib: u32, pixel: f32, error_code: Ptr) -> f32 {
-    let err = if st.fonts.lib_exists(lib) { 0 } else { SCE_PVF_ERROR_LIBID };
+pub(super) fn pixel_to_point_h(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    lib: u32,
+    pixel: f32,
+    error_code: Ptr,
+) -> f32 {
+    let err = if st.fonts.lib_exists(lib) {
+        0
+    } else {
+        SCE_PVF_ERROR_LIBID
+    };
     if !error_code.is_null() {
         ctx.write_u32(error_code.addr(), err as u32);
     }
@@ -254,8 +289,18 @@ pub(super) fn pixel_to_point_h(ctx: &mut GuestCtx, st: &mut VitaState, lib: u32,
 /// ScePvfFloat32 scePvfPixelToPointV(ScePvfLibId libID, ScePvfFloat32 pixel,
 ///     ScePvfError *errorCode)
 #[hostcall]
-pub(super) fn pixel_to_point_v(ctx: &mut GuestCtx, st: &mut VitaState, lib: u32, pixel: f32, error_code: Ptr) -> f32 {
-    let err = if st.fonts.lib_exists(lib) { 0 } else { SCE_PVF_ERROR_LIBID };
+pub(super) fn pixel_to_point_v(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    lib: u32,
+    pixel: f32,
+    error_code: Ptr,
+) -> f32 {
+    let err = if st.fonts.lib_exists(lib) {
+        0
+    } else {
+        SCE_PVF_ERROR_LIBID
+    };
     if !error_code.is_null() {
         ctx.write_u32(error_code.addr(), err as u32);
     }
@@ -266,9 +311,16 @@ pub(super) fn pixel_to_point_v(ctx: &mut GuestCtx, st: &mut VitaState, lib: u32,
 /// buffer, from fractional-pixel values in the field order the struct declares.
 fn write_iglyph_metrics(buf: &mut [u8], off: usize, m: &crate::font::GlyphMetrics) {
     let fields = [
-        m.width, m.height, m.ascender, m.descender,
-        m.h_bearing_x, m.h_bearing_y, m.v_bearing_x, m.v_bearing_y,
-        m.h_advance, m.v_advance,
+        m.width,
+        m.height,
+        m.ascender,
+        m.descender,
+        m.h_bearing_x,
+        m.h_bearing_y,
+        m.v_bearing_x,
+        m.v_bearing_y,
+        m.h_advance,
+        m.v_advance,
     ];
     for (i, v) in fields.iter().enumerate() {
         buf[off + i * 4..off + i * 4 + 4].copy_from_slice(&fx(*v).to_le_bytes());
@@ -279,7 +331,13 @@ fn write_iglyph_metrics(buf: &mut [u8], off: usize, m: &crate::font::GlyphMetric
 ///     ScePvfCharInfo *charInfo)
 /// Fill the per-glyph info: bitmap dimensions/placement plus the 26.6 glyph metrics.
 #[hostcall]
-pub(super) fn get_char_info(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32, char_info: Ptr) -> i32 {
+pub(super) fn get_char_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    font: u32,
+    char_code: u32,
+    char_info: Ptr,
+) -> i32 {
     let exists = st.fonts.font_exists(font);
     match st.fonts.glyph(font, char_code & 0xFFFF) {
         Some((bmp, metrics)) => {
@@ -307,7 +365,13 @@ pub(super) fn get_char_info(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, c
 /// The glyph's bitmap dimensions (u16 width, u16 height) - what a title needs to size
 /// the destination buffer before `scePvfGetCharGlyphImage`.
 #[hostcall]
-pub(super) fn get_char_image_rect(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32, rect: Ptr) -> i32 {
+pub(super) fn get_char_image_rect(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    font: u32,
+    char_code: u32,
+    rect: Ptr,
+) -> i32 {
     let exists = st.fonts.font_exists(font);
     match st.fonts.glyph(font, char_code & 0xFFFF) {
         Some((bmp, _)) => {
@@ -331,7 +395,12 @@ pub(super) fn get_char_image_rect(ctx: &mut GuestCtx, st: &mut VitaState, font: 
 /// left zeroed - it describes a system font selected from the font list, not a user
 /// file, and a title that opened its own file does not read it back.
 #[hostcall]
-pub(super) fn get_font_info(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, font_info: Ptr) -> i32 {
+pub(super) fn get_font_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    font: u32,
+    font_info: Ptr,
+) -> i32 {
     match st.fonts.face_metrics(font) {
         None => SCE_PVF_ERROR_ARG,
         Some(fm) => {
@@ -357,9 +426,16 @@ pub(super) fn get_font_info(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, f
             let mut buf = [0u8; 0x130];
             write_iglyph_metrics(&mut buf, 0, &max);
             let f_fields = [
-                max.width, max.height, max.ascender, max.descender,
-                max.h_bearing_x, max.h_bearing_y, max.v_bearing_x, max.v_bearing_y,
-                max.h_advance, max.v_advance,
+                max.width,
+                max.height,
+                max.ascender,
+                max.descender,
+                max.h_bearing_x,
+                max.h_bearing_y,
+                max.v_bearing_x,
+                max.v_bearing_y,
+                max.h_advance,
+                max.v_advance,
             ];
             for (i, v) in f_fields.iter().enumerate() {
                 buf[0x28 + i * 4..0x28 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
@@ -378,14 +454,26 @@ pub(super) fn get_font_info(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, f
 /// Rasterize the glyph and blit its 8-bit coverage into the caller's destination buffer
 /// at the pen position, respecting the buffer's pixel format, stride, and rect clip.
 #[hostcall]
-pub(super) fn get_char_glyph_image(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32, image_buffer: Ptr) -> i32 {
+pub(super) fn get_char_glyph_image(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    font: u32,
+    char_code: u32,
+    image_buffer: Ptr,
+) -> i32 {
     glyph_image_impl(ctx, st, font, char_code & 0xFFFF, image_buffer.addr())
 }
 
 /// The glyph-blit logic, as a plain function so it can use early returns (the
 /// `#[hostcall]` wrapper's body cannot). `image_buffer` is the guest address of the
 /// `ScePvfUserImageBufferRec`; a zero address is a null pointer.
-fn glyph_image_impl(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, ch: u32, image_buffer: u32) -> i32 {
+fn glyph_image_impl(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    font: u32,
+    ch: u32,
+    image_buffer: u32,
+) -> i32 {
     if image_buffer == 0 {
         return SCE_PVF_ERROR_ARG;
     }
@@ -407,7 +495,13 @@ fn glyph_image_impl(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, ch: u32, 
     // Copy the cached glyph out so the fonts borrow ends before we touch guest memory.
     let exists = st.fonts.font_exists(font);
     let glyph = st.fonts.glyph(font, ch).map(|(bmp, m)| {
-        (bmp.coverage.clone(), bmp.width as i32, bmp.height as i32, m.bitmap_left, m.bitmap_top)
+        (
+            bmp.coverage.clone(),
+            bmp.width as i32,
+            bmp.height as i32,
+            m.bitmap_left,
+            m.bitmap_top,
+        )
     });
     let (coverage, gw, gh, left, top) = match glyph {
         Some(g) => g,

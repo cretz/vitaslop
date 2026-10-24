@@ -13,6 +13,10 @@ use crate::audio_out::AudioOut;
 use crate::input::Input;
 use crate::retail::{DesktopInput, RetailGuest, SharedInput, GAME_H, GAME_W, PANEL_SCALE};
 
+/// The rear panel's inclusive maximum Y (`vitaslop_runtime::vita::touch`): the same 0..1919 X
+/// as the front, but it stops at 889.
+const BACK_PANEL_MAX_Y: f64 = 889.0;
+
 /// One display period, in ms.
 const FRAME_MS: f64 = 1000.0 / 60.0;
 /// The most wall time either direction may bank - the browser's `MAX_CATCHUP_MS`.
@@ -32,6 +36,10 @@ pub(crate) struct Session {
     pub game_rect: Option<(f64, f64, f64, f64)>,
     cursor: (f64, f64),
     mouse_down: bool,
+    /// The opt-in rear-touch setting: the RIGHT button touches the rear panel. Off, the right
+    /// button does nothing, as before.
+    pub rear_touch: bool,
+    right_down: bool,
     /// Wall time owed to the guest, in ms - NEGATIVE when the last frame advanced more game
     /// time than the wall has since (a 30 fps title's two-period frame). See `tick`.
     acc_ms: f64,
@@ -124,6 +132,8 @@ impl Session {
             game_rect: None,
             cursor: (0.0, 0.0),
             mouse_down: false,
+            rear_touch: false,
+            right_down: false,
             acc_ms: 0.0,
             pace_debt_ms: 0.0,
             floor_seen_us: 0,
@@ -148,6 +158,26 @@ impl Session {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     self.input.set_key(code, event.state == ElementState::Pressed);
                 }
+                if event.state == ElementState::Pressed {
+                    use vitaslop_runtime::world::TextKey;
+                    use winit::keyboard::{Key, NamedKey};
+                    let key = match &event.logical_key {
+                        Key::Named(NamedKey::Backspace) => Some(TextKey::Backspace),
+                        Key::Named(NamedKey::Enter) => Some(TextKey::Enter),
+                        Key::Named(NamedKey::Escape) => Some(TextKey::Escape),
+                        Key::Named(NamedKey::ArrowLeft) => Some(TextKey::Left),
+                        Key::Named(NamedKey::ArrowRight) => Some(TextKey::Right),
+                        _ => None,
+                    };
+                    match key {
+                        Some(k) => crate::retail::push_text(k),
+                        None => {
+                            for c in event.text.as_deref().unwrap_or("").chars().filter(|c| !c.is_control()) {
+                                crate::retail::push_text(TextKey::Char(c));
+                            }
+                        }
+                    }
+                }
             }
             WindowEvent::Focused(focused) => {
                 if self.pause_on_blur {
@@ -156,6 +186,7 @@ impl Session {
                 if !focused {
                     self.input.release_all();
                     self.mouse_down = false;
+                    self.right_down = false;
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x, position.y),
@@ -163,14 +194,16 @@ impl Session {
                 if *button == MouseButton::Left => {
                     self.mouse_down = *state == ElementState::Pressed;
                 }
+            WindowEvent::MouseInput { state, button, .. }
+                if *button == MouseButton::Right && self.rear_touch => {
+                    self.right_down = *state == ElementState::Pressed;
+                }
             _ => {}
         }
     }
 
-    fn mouse_touch(&self, window_size: Option<(f64, f64)>) -> Option<TouchFrame> {
-        if !self.mouse_down {
-            return None;
-        }
+    /// The cursor in 960x544 screen space, or `None` when there is no picture to touch.
+    fn mouse_screen(&self, window_size: Option<(f64, f64)>) -> Option<(f64, f64)> {
         let (x0, y0, w, h) = match self.game_rect {
             Some(r) => r,
             None => {
@@ -183,7 +216,28 @@ impl Session {
         }
         let sx = ((self.cursor.0 - x0) / w * GAME_W as f64).clamp(0.0, GAME_W as f64);
         let sy = ((self.cursor.1 - y0) / h * GAME_H as f64).clamp(0.0, GAME_H as f64);
+        Some((sx, sy))
+    }
+
+    fn mouse_touch(&self, window_size: Option<(f64, f64)>) -> Option<TouchFrame> {
+        if !self.mouse_down {
+            return None;
+        }
+        let (sx, sy) = self.mouse_screen(window_size)?;
         Some(TouchFrame::single((sx as f32 * PANEL_SCALE) as u16, (sy as f32 * PANEL_SCALE) as u16))
+    }
+
+    /// The right button on the rear panel (the opt-in rear-touch setting): X doubled as on the
+    /// front, Y scaled to the panel's 0..889 - the point a title projects back onto the screen.
+    fn mouse_back_touch(&self, window_size: Option<(f64, f64)>) -> Option<TouchFrame> {
+        if !self.right_down {
+            return None;
+        }
+        let (sx, sy) = self.mouse_screen(window_size)?;
+        Some(TouchFrame::single(
+            ((sx as f32 * PANEL_SCALE) as u16).min(1919),
+            (sy / GAME_H as f64 * BACK_PANEL_MAX_Y) as u16,
+        ))
     }
 
     /// Feed the input, advance the guest by however many 1/60 s ticks have elapsed.
@@ -193,7 +247,8 @@ impl Session {
         self.last_ctrl = ctrl;
         // A press on the on-screen controls is theirs, not a touch on the screen under them.
         let touch = if self.overlay_pointer { None } else { self.mouse_touch(window_size) };
-        *self.input_shared.lock().unwrap() = DesktopInput { ctrl, touch };
+        let back_touch = if self.overlay_pointer { None } else { self.mouse_back_touch(window_size) };
+        *self.input_shared.lock().unwrap() = DesktopInput { ctrl, touch, back_touch };
 
         let now = Instant::now();
         self.acc_ms += now.duration_since(self.last_tick).as_secs_f64() * 1000.0;

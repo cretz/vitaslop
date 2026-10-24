@@ -31,6 +31,7 @@
 //! disconnected - the two must agree, or a title that checks the link state first and
 //! then gets a different story from a socket call is being told two different things.
 
+use crate::SvcOutcome;
 use crate::host::{GuestCtx, Ptr, VitaState};
 use crate::hostcall;
 
@@ -41,11 +42,15 @@ pub(super) const SCE_NET_ENETDOWN: i32 = 116;
 pub(super) const SCE_NET_EBADF: i32 = 9;
 pub(super) const SCE_NET_EINVAL: i32 = 22;
 pub(super) const SCE_NET_EAGAIN: i32 = 11;
+pub(super) const SCE_NET_EINTR: i32 = 4;
+pub(super) const SCE_NET_ENOTBLK: i32 = 15;
+/// `SCE_NET_EPOLL_ABORT_FLAG_PRESERVATION`: keep an abort that found no waiter for the next wait.
+const EPOLL_ABORT_FLAG_PRESERVATION: i32 = 0x1;
 /// `SCE_NET_RESOLVER_ERROR_NO_RECORD` - the resolver found no record for the name.
 const SCE_NET_RESOLVER_ENODNS: i32 = 0x804_1140Au32 as i32;
 
 /// What every failing socket call returns; the reason goes in the thread's errno.
-const NET_FAIL: i32 = -1;
+pub(crate) const NET_FAIL: i32 = -1;
 
 /// Fail `code`: record it in the calling thread's errno slot and return -1.
 fn fail(st: &mut VitaState, code: i32) -> i32 {
@@ -59,8 +64,19 @@ fn fail(st: &mut VitaState, code: i32) -> i32 {
 /// down - it is only the operations that need the network that fail - so refusing here
 /// would be wrong, and would also hide which call a title actually cannot complete.
 #[hostcall]
-pub(super) fn socket(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, domain: i32, ty: i32, protocol: i32) -> i32 {
-    let name = if name.is_null() { String::new() } else { ctx.read_cstr(name.addr(), 64) };
+pub(super) fn socket(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    name: Ptr,
+    domain: i32,
+    ty: i32,
+    protocol: i32,
+) -> i32 {
+    let name = if name.is_null() {
+        String::new()
+    } else {
+        ctx.read_cstr(name.addr(), 64)
+    };
     st.net_socket(&name, domain, ty, protocol)
 }
 
@@ -85,7 +101,13 @@ const SOCKADDR_ADDR: u32 = 4;
 /// Binding names a LOCAL endpoint, which needs no network, so this really records the
 /// address and `sceNetGetsockname` reads it back.
 #[hostcall]
-pub(super) fn bind(ctx: &mut GuestCtx, st: &mut VitaState, s: i32, addr: Ptr, _addrlen: u32) -> i32 {
+pub(super) fn bind(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    s: i32,
+    addr: Ptr,
+    _addrlen: u32,
+) -> i32 {
     if addr.is_null() {
         fail(st, SCE_NET_EINVAL)
     } else {
@@ -178,7 +200,13 @@ pub(super) fn socket_abort(st: &mut VitaState, s: i32, _flags: i32) -> i32 {
 /// Reads back what `sceNetBind` recorded. An unbound socket reports the wildcard
 /// address and port zero, which is what the kernel reports for one.
 #[hostcall]
-pub(super) fn getsockname(ctx: &mut GuestCtx, st: &mut VitaState, s: i32, name: Ptr, namelen: Ptr) -> i32 {
+pub(super) fn getsockname(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    s: i32,
+    name: Ptr,
+    namelen: Ptr,
+) -> i32 {
     match st.net_local_addr(s) {
         None => fail(st, SCE_NET_EBADF),
         Some((ip, port)) => {
@@ -304,7 +332,13 @@ pub(super) fn swap16(n: u32) -> u32 {
 /// malformed string - the BSD convention, which is NOT the -1/errno convention the rest
 /// of this surface uses, and a title tests it as a boolean.
 #[hostcall]
-pub(super) fn inet_pton(ctx: &mut GuestCtx, st: &mut VitaState, af: i32, src: Ptr, dst: Ptr) -> i32 {
+pub(super) fn inet_pton(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    af: i32,
+    src: Ptr,
+    dst: Ptr,
+) -> i32 {
     if af != 2 || src.is_null() || dst.is_null() {
         fail(st, SCE_NET_EINVAL)
     } else {
@@ -324,7 +358,14 @@ pub(super) fn inet_pton(ctx: &mut GuestCtx, st: &mut VitaState, af: i32, src: Pt
 /// Format a network-order address as a dotted quad into the caller's buffer, returning
 /// that buffer (or null on failure), which is what the caller then prints.
 #[hostcall]
-pub(super) fn inet_ntop(ctx: &mut GuestCtx, st: &mut VitaState, af: i32, src: Ptr, dst: Ptr, size: u32) -> u32 {
+pub(super) fn inet_ntop(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    af: i32,
+    src: Ptr,
+    dst: Ptr,
+    size: u32,
+) -> u32 {
     if af != 2 || src.is_null() || dst.is_null() || size < 8 {
         st.net_set_errno(SCE_NET_EINVAL);
         0
@@ -373,7 +414,11 @@ pub(super) fn resolver_create(st: &mut VitaState, _name: Ptr, _param: Ptr, _flag
 /// still `EBADF`, which is the distinction a title's teardown path cares about.
 #[hostcall]
 pub(super) fn resolver_abort(st: &mut VitaState, rid: i32, _flags: i32) -> i32 {
-    if st.net_resolver_error(rid).is_some() { 0 } else { fail(st, SCE_NET_EBADF) }
+    if st.net_resolver_error(rid).is_some() {
+        0
+    } else {
+        fail(st, SCE_NET_EBADF)
+    }
 }
 
 /// int sceNetGetMacAddress(SceNetEtherAddr *addr, int flags)
@@ -389,7 +434,12 @@ pub(super) fn resolver_abort(st: &mut VitaState, rid: i32, _flags: i32) -> i32 {
 /// player's machine identity into a save file, and a random one would make a title that
 /// remembers it think it moved to a different console on every launch.
 #[hostcall]
-pub(super) fn get_mac_address(ctx: &mut GuestCtx, st: &mut VitaState, addr: Ptr, _flags: i32) -> i32 {
+pub(super) fn get_mac_address(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    addr: Ptr,
+    _flags: i32,
+) -> i32 {
     if addr.is_null() {
         fail(st, SCE_NET_EINVAL)
     } else {
@@ -462,7 +512,12 @@ pub(super) fn resolver_start(st: &mut VitaState, rid: i32) -> i32 {
 
 /// int sceNetResolverGetError(int rid, int *result)
 #[hostcall]
-pub(super) fn resolver_get_error(ctx: &mut GuestCtx, st: &mut VitaState, rid: i32, result: Ptr) -> i32 {
+pub(super) fn resolver_get_error(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    rid: i32,
+    result: Ptr,
+) -> i32 {
     match st.net_resolver_error(rid) {
         None => fail(st, SCE_NET_EBADF),
         Some(e) => {
@@ -507,15 +562,59 @@ pub(super) fn epoll_control(st: &mut VitaState, eid: i32, op: i32, id: i32, _eve
 
 /// int sceNetEpollWait(int eid, SceNetEpollEvent *events, int maxevents, int timeout)
 ///
-/// No socket can ever become readable or writable (nothing connects), so the wait
-/// always expires with ZERO events ready. Returning 0 is the timeout answer, not an
-/// error, and it is what keeps a poll loop looping instead of aborting.
+/// A REAL BLOCKING WAIT. No socket can ever become readable or writable (nothing connects), so
+/// the wait parks the caller for `timeout` MICROSECONDS of guest time and returns ZERO events -
+/// the timeout answer, not an error. A negative timeout waits until [`epoll_abort`] or
+/// `sceNetEpollDestroy` interrupts it (EINTR); 0 is a poll. A preserved abort interrupts the
+/// next wait at once.
+///
+/// MEASURED: answering at once made a title's network host thread spin ~160 waits a frame - 17 s
+/// of a 293 s run busy in a loop that was asking to sleep.
+pub(super) fn epoll_wait(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let (eid, events, maxevents, timeout) = (
+        ctx.arg(0) as i32,
+        ctx.arg(1),
+        ctx.arg(2) as i32,
+        ctx.arg(3) as i32,
+    );
+    let r = if !st.net_epoll_exists(eid) {
+        fail(st, SCE_NET_EBADF)
+    } else if events == 0 || maxevents <= 0 {
+        fail(st, SCE_NET_EINVAL)
+    } else if st.net_epoll_take_abort(eid) {
+        fail(st, SCE_NET_EINTR)
+    } else {
+        0
+    };
+    ctx.ret(r as u32);
+    if r != 0 || timeout == 0 || !st.is_preemptive() {
+        return SvcOutcome::Continue;
+    }
+    st.net_epoll_park(eid, (timeout > 0).then_some(timeout as u64));
+    SvcOutcome::Block
+}
+
+/// int sceNetEpollAbort(int eid, int flags)
+///
+/// Interrupts every thread waiting on `eid`: their waits return EINTR. With no waiter, a
+/// PRESERVATION abort is kept for the next wait, which it interrupts; without the flag there is
+/// nothing to interrupt, which the library answers with ENOTBLK. The registrations are untouched
+/// either way.
 #[hostcall]
-pub(super) fn epoll_wait(st: &mut VitaState, eid: i32, _events: Ptr, _maxevents: i32, _timeout: i32) -> i32 {
-    if st.net_epoll_exists(eid) {
+pub(super) fn epoll_abort(st: &mut VitaState, eid: i32, flags: i32) -> i32 {
+    if !st.net_epoll_exists(eid) {
+        fail(st, SCE_NET_EBADF)
+    } else if flags & !EPOLL_ABORT_FLAG_PRESERVATION != 0 {
+        fail(st, SCE_NET_EINVAL)
+    } else if st.net_epoll_wake(eid, NET_FAIL as u32) > 0 {
+        // The woken waits fail with EINTR.
+        st.net_set_errno(SCE_NET_EINTR);
+        0
+    } else if flags & EPOLL_ABORT_FLAG_PRESERVATION != 0 {
+        st.net_epoll_latch_abort(eid);
         0
     } else {
-        fail(st, SCE_NET_EBADF)
+        fail(st, SCE_NET_ENOTBLK)
     }
 }
 
@@ -650,7 +749,13 @@ pub(super) fn adhoc_matching_term(st: &mut VitaState) -> i32 {
 /// Reporting success would be a claim that bytes went out to somebody - the one answer that
 /// cannot be true here, and one a title acts on by waiting for a reply that cannot come.
 #[hostcall]
-pub(super) fn adhoc_matching_send_data(st: &mut VitaState, id: i32, _addr: Ptr, _data_len: i32, _data: Ptr) -> i32 {
+pub(super) fn adhoc_matching_send_data(
+    st: &mut VitaState,
+    id: i32,
+    _addr: Ptr,
+    _data_len: i32,
+    _data: Ptr,
+) -> i32 {
     if st.adhoc_matching_live(id) {
         SCE_NET_ADHOC_MATCHING_ERROR_UNKNOWN_TARGET
     } else {
@@ -706,7 +811,12 @@ pub(super) fn adhoc_matching_get_members(
 /// is accepted and goes nowhere - which is what happens on a console in an empty room too:
 /// the hello really is broadcast, and nothing answers.
 #[hostcall]
-pub(super) fn adhoc_matching_set_hello_opt(st: &mut VitaState, id: i32, _opt_len: i32, _opt: Ptr) -> i32 {
+pub(super) fn adhoc_matching_set_hello_opt(
+    st: &mut VitaState,
+    id: i32,
+    _opt_len: i32,
+    _opt: Ptr,
+) -> i32 {
     if st.adhoc_matching_live(id) {
         0
     } else {
@@ -722,7 +832,13 @@ pub(super) fn adhoc_matching_set_hello_opt(st: &mut VitaState, id: i32, _opt_len
 /// UNKNOWN_TARGET, which is exactly what the console says about an address that is not in
 /// its member list. Reporting success would promise a pairing that can never complete.
 #[hostcall]
-pub(super) fn adhoc_matching_select_target(st: &mut VitaState, id: i32, _target: Ptr, _opt_len: i32, _opt: Ptr) -> i32 {
+pub(super) fn adhoc_matching_select_target(
+    st: &mut VitaState,
+    id: i32,
+    _target: Ptr,
+    _opt_len: i32,
+    _opt: Ptr,
+) -> i32 {
     if st.adhoc_matching_live(id) {
         SCE_NET_ADHOC_MATCHING_ERROR_UNKNOWN_TARGET
     } else {
@@ -738,4 +854,122 @@ pub(super) fn adhoc_matching_select_target(st: &mut VitaState, id: i32, _target:
 #[hostcall]
 pub(super) fn errno_loc(st: &mut VitaState) -> u32 {
     st.net_errno_addr()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::{SliceMemory, VFP_ARG_COUNT};
+    use crate::world::DeterministicWorld;
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    type Entry = fn(&mut GuestCtx, &mut VitaState);
+
+    /// [`epoll_wait`] as an [`Entry`] (it answers a scheduler outcome the harness ignores).
+    fn wait(ctx: &mut GuestCtx, st: &mut VitaState) {
+        let _ = epoll_wait(ctx, st);
+    }
+
+    struct Run {
+        regs: [u32; REG_COUNT],
+        vfp: [u32; VFP_ARG_COUNT],
+        bytes: Vec<u8>,
+        st: VitaState,
+    }
+
+    impl Run {
+        fn new() -> Self {
+            Run {
+                regs: [0; REG_COUNT],
+                vfp: [0; VFP_ARG_COUNT],
+                bytes: vec![0u8; 0x400],
+                st: VitaState::new(0, 0x400, Box::new(DeterministicWorld::default())),
+            }
+        }
+
+        fn call(&mut self, f: Entry, args: &[u32]) -> i32 {
+            self.regs = [0; REG_COUNT];
+            self.regs[..args.len()].copy_from_slice(args);
+            {
+                let mut mem = SliceMemory(&mut self.bytes);
+                let mut ctx = GuestCtx::new(&mut self.regs, &mut self.vfp, &mut mem, 0);
+                f(&mut ctx, &mut self.st);
+            }
+            self.regs[0] as i32
+        }
+    }
+
+    /// A preserved abort interrupts the next wait once and only once; an abort with nothing to
+    /// interrupt and no PRESERVATION is refused; a bad id or an unknown flag is refused.
+    #[test]
+    fn a_preserved_abort_interrupts_the_next_wait_once() {
+        let mut r = Run::new();
+        let eid = r.call(epoll_create, &[0, 0]) as u32;
+        assert_eq!(r.call(wait, &[eid, 0x100, 1, 0]), 0);
+        assert_eq!(r.call(epoll_abort, &[eid, 1]), 0);
+        assert_eq!(r.call(wait, &[eid, 0x100, 1, 0]), NET_FAIL);
+        assert_eq!(r.call(wait, &[eid, 0x100, 1, 0]), 0);
+        assert_eq!(r.call(epoll_abort, &[eid, 0]), NET_FAIL);
+        assert_eq!(r.call(wait, &[eid, 0x100, 1, 0]), 0);
+        assert_eq!(r.call(epoll_abort, &[eid, 2]), NET_FAIL);
+        assert_eq!(r.call(epoll_abort, &[0x9999, 1]), NET_FAIL);
+    }
+
+    /// A parked wait is interrupted by an abort with EINTR (no latch is left behind); one whose
+    /// timeout runs out is no longer a waiter, so a later abort finds nobody to interrupt.
+    #[test]
+    fn an_abort_interrupts_a_parked_wait_and_a_timed_out_wait_is_gone() {
+        let mut r = Run::new();
+        let eid = r.call(epoll_create, &[0, 0]);
+        let me = r.st.current_thread();
+        r.st.net_epoll_park(eid, None);
+        assert_eq!(
+            r.call(epoll_abort, &[eid as u32, 0]),
+            0,
+            "a waiter was interrupted"
+        );
+        assert_eq!(r.st.take_resume_code(me), Some(NET_FAIL as u32));
+        assert_eq!(
+            r.call(wait, &[eid as u32, 0x100, 1, 0]),
+            0,
+            "no latch was left"
+        );
+        r.st.net_epoll_park(eid, Some(1_000));
+        r.st.advance_time_to(5_000);
+        assert_eq!(
+            r.st.take_resume_code(me),
+            None,
+            "a wait that ran out returns its 0 events"
+        );
+        assert_eq!(
+            r.call(epoll_abort, &[eid as u32, 0]),
+            NET_FAIL,
+            "nobody is waiting any more"
+        );
+        r.st.net_epoll_park(eid, Some(1_000_000));
+        assert_eq!(r.call(epoll_destroy, &[eid as u32]), 0);
+        assert_eq!(
+            r.st.take_resume_code(me),
+            Some(NET_FAIL as u32),
+            "a destroy interrupts its waiters"
+        );
+        // A null event buffer or a non-positive capacity is refused.
+        let eid = r.call(epoll_create, &[0, 0]) as u32;
+        assert_eq!(r.call(wait, &[eid, 0, 1, 0]), NET_FAIL);
+        assert_eq!(r.call(wait, &[eid, 0x100, 0, 0]), NET_FAIL);
+    }
+
+    /// Destroying an epoll forgets its latch, and a later epoll never reuses a live id.
+    #[test]
+    fn epoll_ids_are_never_reused() {
+        let mut r = Run::new();
+        let a = r.call(epoll_create, &[0, 0]);
+        let b = r.call(epoll_create, &[0, 0]);
+        assert_eq!(r.call(epoll_abort, &[a as u32, 1]), 0);
+        assert_eq!(r.call(epoll_destroy, &[a as u32]), 0);
+        let c = r.call(epoll_create, &[0, 0]);
+        assert!(c != a && c != b);
+        assert_eq!(r.call(wait, &[c as u32, 0x100, 1, 0]), 0);
+        assert_eq!(r.call(wait, &[a as u32, 0x100, 1, 0]), NET_FAIL);
+    }
 }

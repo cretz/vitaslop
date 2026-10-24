@@ -8,6 +8,8 @@
 //         node build.mjs --debug            # dev profile, faster to iterate
 //         node build.mjs --single-only      # only web/pkg (the default engine)
 //         node build.mjs --threads-only     # only web/pkg-threads (VITASLOP_SMP)
+//         node build.mjs --playbook         # the same bundle(s) WITH playbooks, into web-playbook/
+//                                           # (the harnesses' build - see playbook-build.mjs)
 //
 // The wasm-bindgen CLI version must equal the crate's wasm-bindgen version (pinned in
 // Cargo.toml). If it does not, run:
@@ -34,9 +36,13 @@ function run(cmd, args, env) {
 // out of line so a V8 worker profile can attribute them separately. See the
 // `profile-symbols` feature in vitaslop-runtime/Cargo.toml. Never use it for a timing A/B -
 // it is slower by construction; it is for finding out WHERE the time goes, not how much.
-const features = process.env.PROFILE_SYMBOLS
-  ? ["--features", "vitaslop-runtime/profile-symbols"]
-  : [];
+// `--playbook` builds the harnesses' variant (the `playbook` feature; see playbook-build.mjs).
+const playbook = process.argv.includes("--playbook");
+const featureList = [
+  ...(process.env.PROFILE_SYMBOLS ? ["vitaslop-runtime/profile-symbols"] : []),
+  ...(playbook ? ["vitaslop-web/playbook"] : []),
+];
+const features = featureList.length ? ["--features", featureList.join(",")] : [];
 
 // >>> TWO BUNDLES, AND THE DEFAULT ENGINE RUNS ON THE ONE IT ALWAYS DID.
 //
@@ -94,7 +100,8 @@ for (const threads of kinds) {
   // and sharing one would rebuild the world every time the kind changes.
   const targetDir = join(projects, threads ? "target-web-threads" : "target");
   const outName = threads ? "pkg-threads" : "pkg";
-  console.log(`Building vitaslop-web (${profile}) for wasm32 -> web/${outName} ` +
+  const webRoot = playbook ? "web-playbook" : "web";
+  console.log(`Building vitaslop-web (${profile}${playbook ? ", playbook" : ""}) for wasm32 -> ${webRoot}/${outName} ` +
     `(${threads ? "wasm THREADS, shared memory" : "single-threaded"})...`);
   run(
     "cargo",
@@ -117,7 +124,7 @@ for (const threads of kinds) {
   );
 
   const wasm = join(targetDir, "wasm32-unknown-unknown", profileDir, "vitaslop_web.wasm");
-  const out = join(crateDir, "web", outName);
+  const out = join(crateDir, webRoot, outName);
   console.log(`Running wasm-bindgen -> ${out}`);
   run("wasm-bindgen", ["--target", "web", "--out-dir", out, "--out-name", "vitaslop_web", wasm]);
 
@@ -136,7 +143,7 @@ for (const threads of kinds) {
   const dirty = git(["status", "--porcelain"]).split("\n").filter((l) => l.trim()).length;
   const wasmBytes = statSync(join(out, "vitaslop_web_bg.wasm")).size;
   const stamp =
-    `${new Date().toISOString()} ${profile}${threads ? "+threads" : ""} ${rev}` +
+    `${new Date().toISOString()} ${profile}${threads ? "+threads" : ""}${playbook ? "+playbook" : ""} ${rev}` +
     `${dirty ? `+${dirty}dirty` : ""} ${wasmBytes} bytes`;
   writeFileSync(join(out, "build-stamp.txt"), stamp + "\n");
   console.log(`build stamp: ${stamp}`);

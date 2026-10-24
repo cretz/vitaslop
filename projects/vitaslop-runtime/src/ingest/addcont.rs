@@ -20,14 +20,17 @@ pub fn is_addcont_category(category: &str) -> bool {
 /// for, and a wrong one is an add-on that silently never appears.
 pub fn dir_name(content_id: &str) -> Option<&str> {
     let label = content_id.rsplit_once('-')?.1;
-    (label.len() == 16 && label.bytes().all(|b| b.is_ascii_alphanumeric()) && title_id(content_id).is_some())
-        .then_some(label)
+    (label.len() == 16
+        && label.bytes().all(|b| b.is_ascii_alphanumeric())
+        && title_id(content_id).is_some())
+    .then_some(label)
 }
 
 /// The title id a content id belongs to (`ABCD12345` in `XX0000-ABCD12345_00-...`).
 pub fn title_id(content_id: &str) -> Option<&str> {
     let id = content_id.get(7..16)?;
-    (content_id.as_bytes().get(6) == Some(&b'-') && id.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(id)
+    (content_id.as_bytes().get(6) == Some(&b'-') && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then_some(id)
 }
 
 #[cfg(test)]
@@ -39,7 +42,11 @@ mod tests {
         let cid = "XX0000-ABCD12345_00-LABEL01234567890";
         assert_eq!(title_id(cid), Some("ABCD12345"));
         assert_eq!(dir_name(cid), Some("LABEL01234567890"));
-        assert_eq!(dir_name("XX0000-ABCD12345_00-LABEL012345678901"), None, "a 17-character label");
+        assert_eq!(
+            dir_name("XX0000-ABCD12345_00-LABEL012345678901"),
+            None,
+            "a 17-character label"
+        );
         assert_eq!(dir_name("XX0000-ABCD12345_00-SHORT"), None);
         assert_eq!(dir_name("garbage"), None);
         assert_eq!(title_id("garbage"), None);

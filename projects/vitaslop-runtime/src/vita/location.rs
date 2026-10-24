@@ -234,7 +234,11 @@ fn do_open(
     }
     st.location.next_id += 1;
     let id = st.location.next_id;
-    st.location.handles.push(Handle { id, locate_method, heading_method });
+    st.location.handles.push(Handle {
+        id,
+        locate_method,
+        heading_method,
+    });
     ctx.write_u32(handle_addr, id);
     0
 }
@@ -490,8 +494,9 @@ fn do_get_location(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, addr: u3
         }
         // Permitted, or not yet asked: either way the question below is the same one -
         // is there a fix? A provider that has not been asked simply never has one.
-        LocationPermission::Granted | LocationPermission::NotAsked | LocationPermission::Pending => {
-        }
+        LocationPermission::Granted
+        | LocationPermission::NotAsked
+        | LocationPermission::Pending => {}
     }
     let Some(fix) = st.world.poll_location() else {
         write_undetermined_location(ctx, addr);
@@ -709,9 +714,9 @@ mod tests {
 
     use super::*;
     use crate::host::{SliceMemory, VFP_ARG_COUNT};
-    use vitaslop_transpiler::abi::REG_COUNT;
     use crate::world::{CtrlFrame, LocationFix, World};
     use std::sync::{Arc, Mutex};
+    use vitaslop_transpiler::abi::REG_COUNT;
 
     /// What the test world was ASKED to do, observable while `VitaState` owns it.
     #[derive(Default)]
@@ -793,7 +798,11 @@ mod tests {
     impl Run {
         fn new(permission: LocationPermission, fix: Option<LocationFix>) -> Self {
             let calls = Arc::new(Mutex::new(Calls::default()));
-            let w = TestWorld { permission, fix, calls: calls.clone() };
+            let w = TestWorld {
+                permission,
+                fix,
+                calls: calls.clone(),
+            };
             Run {
                 regs: [0; REG_COUNT],
                 vfp: [0; VFP_ARG_COUNT],
@@ -825,16 +834,32 @@ mod tests {
         }
 
         fn word(&self, addr: u32) -> u32 {
-            u32::from_le_bytes(self.bytes[addr as usize..addr as usize + 4].try_into().unwrap())
+            u32::from_le_bytes(
+                self.bytes[addr as usize..addr as usize + 4]
+                    .try_into()
+                    .unwrap(),
+            )
         }
         fn f64_at(&self, addr: u32) -> f64 {
-            f64::from_le_bytes(self.bytes[addr as usize..addr as usize + 8].try_into().unwrap())
+            f64::from_le_bytes(
+                self.bytes[addr as usize..addr as usize + 8]
+                    .try_into()
+                    .unwrap(),
+            )
         }
         fn f32_at(&self, addr: u32) -> f32 {
-            f32::from_le_bytes(self.bytes[addr as usize..addr as usize + 4].try_into().unwrap())
+            f32::from_le_bytes(
+                self.bytes[addr as usize..addr as usize + 4]
+                    .try_into()
+                    .unwrap(),
+            )
         }
         fn u64_at(&self, addr: u32) -> u64 {
-            u64::from_le_bytes(self.bytes[addr as usize..addr as usize + 8].try_into().unwrap())
+            u64::from_le_bytes(
+                self.bytes[addr as usize..addr as usize + 8]
+                    .try_into()
+                    .unwrap(),
+            )
         }
 
         /// Open one handle and return it, asserting the open succeeded. The arguments are
@@ -856,8 +881,15 @@ mod tests {
     fn open_without_a_provider_reports_unavailable_and_writes_no_handle() {
         let mut r = Run::new(LocationPermission::Unavailable, None);
         r.bytes[0x100..0x104].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        assert_eq!(r.call(open, &[0x100, 1, 0]), SCE_LOCATION_ERROR_PROVIDER_UNAVAILABLE);
-        assert_eq!(r.word(0x100), 0xFFFF_FFFF, "the caller's variable must be untouched");
+        assert_eq!(
+            r.call(open, &[0x100, 1, 0]),
+            SCE_LOCATION_ERROR_PROVIDER_UNAVAILABLE
+        );
+        assert_eq!(
+            r.word(0x100),
+            0xFFFF_FFFF,
+            "the caller's variable must be untouched"
+        );
     }
 
     #[test]
@@ -894,7 +926,10 @@ mod tests {
         for _ in 0..MAX_HANDLES {
             assert_eq!(r.call(open, &[0x100, 1, 0]), 0);
         }
-        assert_eq!(r.call(open, &[0x100, 1, 0]), SCE_LOCATION_ERROR_TOO_MANY_HANDLES);
+        assert_eq!(
+            r.call(open, &[0x100, 1, 0]),
+            SCE_LOCATION_ERROR_TOO_MANY_HANDLES
+        );
     }
 
     /// Two opens that returned the same value would let a close of one silently close
@@ -913,9 +948,16 @@ mod tests {
     fn close_rejects_a_handle_it_never_issued() {
         let mut r = Run::new(LocationPermission::NotAsked, None);
         let h = r.open_handle();
-        assert_eq!(r.call(close, &[h.wrapping_add(1000)]), SCE_LOCATION_ERROR_INVALID_HANDLE);
+        assert_eq!(
+            r.call(close, &[h.wrapping_add(1000)]),
+            SCE_LOCATION_ERROR_INVALID_HANDLE
+        );
         assert_eq!(r.call(close, &[h]), 0);
-        assert_eq!(r.call(close, &[h]), SCE_LOCATION_ERROR_INVALID_HANDLE, "already closed");
+        assert_eq!(
+            r.call(close, &[h]),
+            SCE_LOCATION_ERROR_INVALID_HANDLE,
+            "already closed"
+        );
     }
 
     /// The provider is released when the LAST handle closes, not the first - two handles
@@ -952,7 +994,10 @@ mod tests {
         let h = r.open_handle();
         assert_eq!(r.call(confirm_get_status, &[h, 0x200]), 0);
         assert_eq!(r.word(0x200), DIALOG_STATUS_IDLE);
-        assert_eq!(r.call(confirm_get_result, &[h, 0x204]), SCE_LOCATION_ERROR_DIALOG_RESULT_NONE);
+        assert_eq!(
+            r.call(confirm_get_result, &[h, 0x204]),
+            SCE_LOCATION_ERROR_DIALOG_RESULT_NONE
+        );
         assert_eq!(r.word(0x204), DIALOG_RESULT_NONE);
     }
 
@@ -962,7 +1007,11 @@ mod tests {
     fn confirm_asks_the_host_to_start_acquiring() {
         let mut r = Run::new(LocationPermission::NotAsked, None);
         let h = r.open_handle();
-        assert_eq!(r.requests(), 0, "opening must not raise a prompt on its own");
+        assert_eq!(
+            r.requests(),
+            0,
+            "opening must not raise a prompt on its own"
+        );
         assert_eq!(r.call(confirm, &[h]), 0);
         assert_eq!(r.requests(), 1);
     }
@@ -976,7 +1025,10 @@ mod tests {
         assert_eq!(r.call(confirm, &[h]), 0);
         assert_eq!(r.call(confirm_get_status, &[h, 0x200]), 0);
         assert_eq!(r.word(0x200), DIALOG_STATUS_RUNNING);
-        assert_eq!(r.call(confirm_get_result, &[h, 0x204]), SCE_LOCATION_ERROR_DIALOG_RESULT_NONE);
+        assert_eq!(
+            r.call(confirm_get_result, &[h, 0x204]),
+            SCE_LOCATION_ERROR_DIALOG_RESULT_NONE
+        );
     }
 
     /// A grant finishes the dialog with ENABLE; a refusal finishes it with DISABLE.
@@ -1015,7 +1067,11 @@ mod tests {
         let mut g = Run::new(LocationPermission::Granted, Some(full_fix()));
         let h = g.open_handle();
         assert_eq!(g.call(confirm, &[h]), 0);
-        assert_eq!(g.call(confirm, &[h]), 0, "the dialog is finished, not multiple");
+        assert_eq!(
+            g.call(confirm, &[h]),
+            0,
+            "the dialog is finished, not multiple"
+        );
     }
 
     /// Aborting returns the dialog to IDLE without inventing an answer.
@@ -1075,7 +1131,10 @@ mod tests {
         for b in &mut r.bytes[0x200..0x230] {
             *b = 0xAB;
         }
-        assert_eq!(r.call(get_location, &[h, 0x200]), SCE_LOCATION_INFO_UNDETERMINED_LOCATION);
+        assert_eq!(
+            r.call(get_location, &[h, 0x200]),
+            SCE_LOCATION_INFO_UNDETERMINED_LOCATION
+        );
         assert_eq!(r.f64_at(0x200), SCE_LOCATION_DATA_INVALID);
         assert_eq!(r.f64_at(0x208), SCE_LOCATION_DATA_INVALID);
         assert_eq!(r.f64_at(0x210), SCE_LOCATION_DATA_INVALID);
@@ -1086,7 +1145,10 @@ mod tests {
     fn a_refusal_reports_denied_by_user_and_leaks_no_position() {
         let mut r = Run::new(LocationPermission::Denied, Some(full_fix()));
         let h = r.open_handle();
-        assert_eq!(r.call(get_location, &[h, 0x200]), SCE_LOCATION_INFO_DENIED_BY_USER);
+        assert_eq!(
+            r.call(get_location, &[h, 0x200]),
+            SCE_LOCATION_INFO_DENIED_BY_USER
+        );
         assert_eq!(r.f64_at(0x200), SCE_LOCATION_DATA_INVALID);
     }
 
@@ -1130,7 +1192,10 @@ mod tests {
         assert_eq!(r.call(get_method, &[h, 0x200, 0x204]), 0);
         assert_eq!(r.word(0x200), 5);
         assert_eq!(r.word(0x204), 3);
-        assert_eq!(r.call(reopen, &[h, 99, 0]), SCE_LOCATION_ERROR_INVALID_LOCATION_METHOD);
+        assert_eq!(
+            r.call(reopen, &[h, 99, 0]),
+            SCE_LOCATION_ERROR_INVALID_LOCATION_METHOD
+        );
     }
 
     /// A heading is a compass reading and this emulator has no compass, so the answer is
@@ -1140,7 +1205,10 @@ mod tests {
     fn get_heading_reports_undetermined_with_no_compass() {
         let mut r = Run::new(LocationPermission::Granted, Some(full_fix()));
         let h = r.open_handle();
-        assert_eq!(r.call(get_heading, &[h, 0x200]), SCE_LOCATION_INFO_UNDETERMINED_LOCATION);
+        assert_eq!(
+            r.call(get_heading, &[h, 0x200]),
+            SCE_LOCATION_INFO_UNDETERMINED_LOCATION
+        );
         for off in [0x200u32, 0x204, 0x208, 0x20C, 0x210, 0x214] {
             assert_eq!(r.f32_at(off), SCE_LOCATION_DATA_INVALID as f32);
         }

@@ -239,7 +239,11 @@ pub(crate) fn do_create_decoder_external(
         handle,
         codec: TYPE_AAC,
         channels: channels.max(1),
-        sample_rate: if sample_rate == 0 { 48_000 } else { sample_rate },
+        sample_rate: if sample_rate == 0 {
+            48_000
+        } else {
+            sample_rate
+        },
         context: va_context,
         delivered: 0,
         refused: 0,
@@ -299,8 +303,10 @@ pub(super) fn audiodec_init_library(
     } else if st.audiodec.initialised.contains(&codec_type) {
         ERROR_ALREADY_INITIALIZED
     } else {
-        let (size, total) =
-            (ctx.read_u32(p_init_param.addr()), ctx.read_u32(p_init_param.addr() + 4));
+        let (size, total) = (
+            ctx.read_u32(p_init_param.addr()),
+            ctx.read_u32(p_init_param.addr() + 4),
+        );
         st.audiodec.initialised.push(codec_type);
         tracing::info!(
             target: "vitaslop::audio",
@@ -394,8 +400,14 @@ fn create_at9_decoder(ctx: &mut GuestCtx, st: &mut VitaState, ctrl_addr: u32) ->
     ctx.write_u32(info + info_at9::CH, geom.channels as u32);
     ctx.write_u32(info + info_at9::BIT_RATE, bit_rate);
     ctx.write_u32(info + info_at9::SAMPLING_RATE, geom.sample_rate as u32);
-    ctx.write_u32(info + info_at9::SUPER_FRAME_SIZE, geom.superframe_size as u32);
-    ctx.write_u32(info + info_at9::FRAMES_IN_SUPER_FRAME, geom.frames_in_superframe as u32);
+    ctx.write_u32(
+        info + info_at9::SUPER_FRAME_SIZE,
+        geom.superframe_size as u32,
+    );
+    ctx.write_u32(
+        info + info_at9::FRAMES_IN_SUPER_FRAME,
+        geom.frames_in_superframe as u32,
+    );
 
     let channels = geom.channels.max(1) as u32;
     st.audiodec.next_handle += 1;
@@ -414,7 +426,10 @@ fn create_at9_decoder(ctx: &mut GuestCtx, st: &mut VitaState, ctrl_addr: u32) ->
     ctx.write_u32(ctrl_addr + ctrl::HANDLE, handle);
     ctx.write_u32(ctrl_addr + ctrl::WORD_LENGTH, 16);
     ctx.write_u32(ctrl_addr + ctrl::MAX_ES_SIZE, AT9_MAX_ES_SIZE);
-    ctx.write_u32(ctrl_addr + ctrl::MAX_PCM_SIZE, AT9_MAX_SAMPLES * 2 * channels);
+    ctx.write_u32(
+        ctrl_addr + ctrl::MAX_PCM_SIZE,
+        AT9_MAX_SAMPLES * 2 * channels,
+    );
     tracing::info!(
         target: "vitaslop::audio",
         handle,
@@ -501,7 +516,11 @@ pub(super) fn audiodec_get_internal_error(
 ) -> i32 {
     if p_ctrl.addr() == 0 {
         ERROR_INVALID_PTR
-    } else if st.audiodec.session(ctx.read_u32(p_ctrl.addr() + ctrl::HANDLE)).is_none() {
+    } else if st
+        .audiodec
+        .session(ctx.read_u32(p_ctrl.addr() + ctrl::HANDLE))
+        .is_none()
+    {
         ERROR_INVALID_HANDLE
     } else {
         if p_internal_error.addr() != 0 {
@@ -525,9 +544,13 @@ fn decode_at9(ctx: &mut GuestCtx, st: &mut VitaState, ctrl_addr: u32, handle: u3
     // `decode_frame` reports how many bytes it actually consumed, which is what the
     // title advances its own read cursor by.
     let input = ctx.read_bytes(es, max_es as usize);
-    let Some(session) = st.audiodec.session(handle) else { return ERROR_INVALID_HANDLE };
+    let Some(session) = st.audiodec.session(handle) else {
+        return ERROR_INVALID_HANDLE;
+    };
     let (channels, sample_rate) = (session.channels, session.sample_rate);
-    let Some(decoder) = session.at9.as_mut() else { return ERROR_INVALID_HANDLE };
+    let Some(decoder) = session.at9.as_mut() else {
+        return ERROR_INVALID_HANDLE;
+    };
     let mut pcm = vec![0i16; decoder.frame_samples() * decoder.channels()];
     let used = match decoder.decode_frame(&input, &mut pcm) {
         Ok(used) => used,
@@ -541,9 +564,11 @@ fn decode_at9(ctx: &mut GuestCtx, st: &mut VitaState, ctrl_addr: u32, handle: u3
             // reset?), the window the caller declared and the first bytes of it are what
             // separate "our decoder is wrong" from "our caller is feeding it wrong". Without
             // them the line says only that something failed, which cost a re-run.
-            let ordinal = st.audiodec.session(handle).map_or(0, |s| s.delivered + s.refused);
-            let head: Vec<String> =
-                input.iter().take(8).map(|b| format!("{b:02x}")).collect();
+            let ordinal = st
+                .audiodec
+                .session(handle)
+                .map_or(0, |s| s.delivered + s.refused);
+            let head: Vec<String> = input.iter().take(8).map(|b| format!("{b:02x}")).collect();
             tracing::error!(
                 target: "vitaslop::audio",
                 handle, error = %e, ordinal, max_es, es = format_args!("{es:#x}"),
@@ -617,26 +642,26 @@ pub(super) fn audiodec_decode_n_frames(
     if ctrl_addr == 0 {
         ERROR_INVALID_PTR
     } else {
-    let es0 = ctx.read_u32(ctrl_addr + ctrl::P_ES);
-    let pcm0 = ctx.read_u32(ctrl_addr + ctrl::P_PCM);
-    let (mut es_total, mut pcm_total, mut result) = (0u32, 0u32, 0i32);
-    for _ in 0..n_frames {
-        ctx.write_u32(ctrl_addr + ctrl::P_ES, es0.wrapping_add(es_total));
-        ctx.write_u32(ctrl_addr + ctrl::P_PCM, pcm0.wrapping_add(pcm_total));
-        let r = do_decode(ctx, st, p_ctrl);
-        if r < 0 {
-            result = r;
-            break;
+        let es0 = ctx.read_u32(ctrl_addr + ctrl::P_ES);
+        let pcm0 = ctx.read_u32(ctrl_addr + ctrl::P_PCM);
+        let (mut es_total, mut pcm_total, mut result) = (0u32, 0u32, 0i32);
+        for _ in 0..n_frames {
+            ctx.write_u32(ctrl_addr + ctrl::P_ES, es0.wrapping_add(es_total));
+            ctx.write_u32(ctrl_addr + ctrl::P_PCM, pcm0.wrapping_add(pcm_total));
+            let r = do_decode(ctx, st, p_ctrl);
+            if r < 0 {
+                result = r;
+                break;
+            }
+            es_total = es_total.wrapping_add(ctx.read_u32(ctrl_addr + ctrl::INPUT_ES_SIZE));
+            pcm_total = pcm_total.wrapping_add(ctx.read_u32(ctrl_addr + ctrl::OUTPUT_PCM_SIZE));
         }
-        es_total = es_total.wrapping_add(ctx.read_u32(ctrl_addr + ctrl::INPUT_ES_SIZE));
-        pcm_total = pcm_total.wrapping_add(ctx.read_u32(ctrl_addr + ctrl::OUTPUT_PCM_SIZE));
-    }
-    // The guest`s own pointers back, and the totals over every pass that ran.
-    ctx.write_u32(ctrl_addr + ctrl::P_ES, es0);
-    ctx.write_u32(ctrl_addr + ctrl::P_PCM, pcm0);
-    ctx.write_u32(ctrl_addr + ctrl::INPUT_ES_SIZE, es_total);
-    ctx.write_u32(ctrl_addr + ctrl::OUTPUT_PCM_SIZE, pcm_total);
-    result
+        // The guest`s own pointers back, and the totals over every pass that ran.
+        ctx.write_u32(ctrl_addr + ctrl::P_ES, es0);
+        ctx.write_u32(ctrl_addr + ctrl::P_PCM, pcm0);
+        ctx.write_u32(ctrl_addr + ctrl::INPUT_ES_SIZE, es_total);
+        ctx.write_u32(ctrl_addr + ctrl::OUTPUT_PCM_SIZE, pcm_total);
+        result
     }
 }
 
@@ -649,15 +674,27 @@ pub(super) fn audiodec_decode_n_frames(
 /// Asked with the host lock HELD and the call dispatched under the same hold, so the session
 /// it saw is the session the call finds. Handles are never reused and a session's codec never
 /// changes, so an unknown or AAC handle answers false and the call is forwarded as before.
-pub fn decode_is_self_contained(st: &VitaState, mem: &dyn crate::host::GuestMemory, base: u32, p_ctrl: u32) -> bool {
-    let Some(off) = p_ctrl.wrapping_add(ctrl::HANDLE).checked_sub(base).map(|o| o as usize) else {
+pub fn decode_is_self_contained(
+    st: &VitaState,
+    mem: &dyn crate::host::GuestMemory,
+    base: u32,
+    p_ctrl: u32,
+) -> bool {
+    let Some(off) = p_ctrl
+        .wrapping_add(ctrl::HANDLE)
+        .checked_sub(base)
+        .map(|o| o as usize)
+    else {
         return false;
     };
     if p_ctrl == 0 || off + 4 > mem.len() {
         return false;
     }
     let handle = mem.read_u32(off);
-    st.audiodec.sessions.iter().any(|s| s.handle == handle && s.codec == TYPE_AT9)
+    st.audiodec
+        .sessions
+        .iter()
+        .any(|s| s.handle == handle && s.codec == TYPE_AT9)
 }
 
 /// SceInt32 sceAudiodecDecode(SceAudiodecCtrl *pCtrl)
@@ -676,8 +713,10 @@ pub(crate) fn do_decode(ctx: &mut GuestCtx, st: &mut VitaState, p_ctrl: Ptr) -> 
         return ERROR_INVALID_PTR;
     }
     let handle = ctx.read_u32(ctrl_addr + ctrl::HANDLE);
-    let Some((codec, channels, sample_rate)) =
-        st.audiodec.session(handle).map(|s| (s.codec, s.channels, s.sample_rate))
+    let Some((codec, channels, sample_rate)) = st
+        .audiodec
+        .session(handle)
+        .map(|s| (s.codec, s.channels, s.sample_rate))
     else {
         return ERROR_INVALID_HANDLE;
     };
@@ -744,7 +783,11 @@ pub(crate) fn do_decode(ctx: &mut GuestCtx, st: &mut VitaState, p_ctrl: Ptr) -> 
         // offers exactly the unit and that is what a decoder that decoded it would report.
         // The buffer's capacity (`maxEsSize`) is the fallback for a title that offers
         // nothing, and would over-advance a title that keeps several units in one buffer.
-        let consumed = if es_offered != 0 { es_offered } else { ctx.read_u32(ctrl_addr + ctrl::MAX_ES_SIZE) };
+        let consumed = if es_offered != 0 {
+            es_offered
+        } else {
+            ctx.read_u32(ctrl_addr + ctrl::MAX_ES_SIZE)
+        };
         ctx.write_u32(ctrl_addr + ctrl::INPUT_ES_SIZE, consumed);
         return 0;
     };
@@ -880,7 +923,6 @@ fn report_resynced(st: &mut VitaState, dropped: u64) {
     );
 }
 
-
 #[cfg(test)]
 mod smp_route_tests {
     use super::*;
@@ -912,16 +954,32 @@ mod smp_route_tests {
 
     #[test]
     fn only_an_at9_decode_runs_off_the_run_worker() {
-        let mut st = VitaState::new(BASE, 0x1000, Box::new(crate::world::DeterministicWorld::default()));
+        let mut st = VitaState::new(
+            BASE,
+            0x1000,
+            Box::new(crate::world::DeterministicWorld::default()),
+        );
         st.audiodec.sessions.push(session(1, TYPE_AT9));
         st.audiodec.sessions.push(session(2, TYPE_AAC));
-        assert!(judged(&st, 1, CTRL_AT), "an AT9 handle is decoded in Rust, wherever it is called");
+        assert!(
+            judged(&st, 1, CTRL_AT),
+            "an AT9 handle is decoded in Rust, wherever it is called"
+        );
         // Negative controls: every other answer forwards the call, which is always safe.
-        assert!(!judged(&st, 2, CTRL_AT), "an AAC handle reaches the run worker's WebCodecs");
+        assert!(
+            !judged(&st, 2, CTRL_AT),
+            "an AAC handle reaches the run worker's WebCodecs"
+        );
         assert!(!judged(&st, 3, CTRL_AT), "an unknown handle is forwarded");
         assert!(!judged(&st, 1, 0), "a null control block is forwarded");
-        assert!(!judged(&st, 1, BASE - 0x1000), "a control block below the guest is forwarded");
-        assert!(!judged(&st, 1, BASE + 0xffe), "a control block past the guest is forwarded");
+        assert!(
+            !judged(&st, 1, BASE - 0x1000),
+            "a control block below the guest is forwarded"
+        );
+        assert!(
+            !judged(&st, 1, BASE + 0xffe),
+            "a control block past the guest is forwarded"
+        );
     }
 
     #[test]
@@ -929,7 +987,9 @@ mod smp_route_tests {
         use crate::nid::audiodec as ad;
         assert!(crate::vita::smp_forward_per_call(ad::DECODE));
         assert!(crate::vita::smp_forward_per_call(ad::DECODE_N_FRAMES));
-        assert!(!crate::vita::smp_forward_per_call(ad::CREATE_DECODER_EXTERNAL));
+        assert!(!crate::vita::smp_forward_per_call(
+            ad::CREATE_DECODER_EXTERNAL
+        ));
         // Still in the forwarded family: the per-call route only ever NARROWS it.
         assert!(crate::vita::smp_owner_only(ad::DECODE));
     }

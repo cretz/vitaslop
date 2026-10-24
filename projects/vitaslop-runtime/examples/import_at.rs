@@ -8,9 +8,13 @@
 //! (library, NID) pair - which the loader already knows and nothing printed.
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: import_at <module> <stub_addr> [span]");
+    let path = args
+        .next()
+        .expect("usage: import_at <module> <stub_addr> [span]");
     let addr = u32::from_str_radix(
-        args.next().expect("a stub address").trim_start_matches("0x"),
+        args.next()
+            .expect("a stub address")
+            .trim_start_matches("0x"),
         16,
     )
     .expect("hex address");
@@ -37,7 +41,10 @@ fn main() {
         let mut near: Vec<u32> = module.imports.iter().map(|i| i.stub_addr).collect();
         near.sort_unstable();
         if let (Some(lo), Some(hi)) = (near.first(), near.last()) {
-            println!("stub table spans {lo:#010x}..={hi:#010x} ({} imports)", near.len());
+            println!(
+                "stub table spans {lo:#010x}..={hi:#010x} ({} imports)",
+                near.len()
+            );
         }
     }
 }

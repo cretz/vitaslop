@@ -159,7 +159,13 @@ jobs:
       - name: Regenerate the ARM conformance goldens and fail on any diff
         if: runner.os == 'Linux' && runner.arch == 'X64'
         working-directory: projects
+        # The harness links at arm-none-eabi-ld's default 0x8000, below the kernel's
+        # vm.mmap_min_addr (65536). qemu 8 relocated the guest past it; the qemu 10 on the
+        # current runner image maps the ELF where it is linked and is refused ("Error mapping
+        # file: Operation not permitted"). Lowering the floor on this throwaway runner runs the
+        # harness exactly as every committed golden was produced.
         run: |
+          sudo sysctl -w vm.mmap_min_addr=0
           cargo run --locked -p vitaslop-conformance-suite-arm --bin regen
           git diff --exit-code
 
@@ -178,7 +184,7 @@ jobs:
   #                        no GPU, and the harness refuses a software rasteriser unless told
   #
   # Chrome via Playwright's `chrome` channel, because that is the browser the page ships to
-  # and the one with the codecs. The game-boot runs (a real title, a recipe) are NOT here:
+  # and the one with the codecs. The game-boot runs (a real title, a playbook) are NOT here:
   # they need a game dump, which cannot live in a public runner.
   web:
     name: web (browser)
@@ -234,6 +240,14 @@ jobs:
           -p vitaslop-web -p vitaslop-aac -p vitaslop-h264 -p vitaslop-platform -p vitaslop-runtime
           -p vitaslop-gxp-shader -p vitaslop-transpiler -p vitaslop-frontend -p vitaslop-hostcall
           -p vitaslop-loader -p vitaslop-atrac9 -p vitaslop-playbook -- -D warnings
+
+      # The harnesses' bundle (`node build.mjs --playbook`): the same crate with its playbook
+      # engine compiled in, which the shipped build above leaves out.
+      - name: Clippy (wasm, playbook build)
+        working-directory: projects
+        run: >-
+          cargo clippy --locked --release --target wasm32-unknown-unknown
+          -p vitaslop-web --features playbook -- -D warnings
 
       - name: Build the wasm bundle
         working-directory: projects/vitaslop-web
@@ -322,6 +336,16 @@ jobs:
         # (no X display), restarted seven times, stopped presenting, and destroyed the WebGPU
         # device seven seconds in. The short cube test above finishes before that matters.
         run: xvfb-run -a node smp-cube.mjs
+
+      # A person's mouse and finger on the player reach the guest's touch panels: the front as
+      # always, and the rear only through the opt-in setting (an authored program reports what
+      # it was touched with).
+      - name: Live touch input, front and rear panels
+        working-directory: projects/vitaslop-web/e2e
+        env:
+          ALLOW_SOFTWARE: "1"
+          HEADLESS: "1"
+        run: xvfb-run -a node touch-live.mjs
 
       - name: Keep the screenshots
         if: always()

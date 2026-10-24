@@ -3,7 +3,7 @@
 -- (Kasumi vs Ayane), a fresh stage, and THREE whole matches with FIGHT AGAIN between them -
 -- each match's result saved.
 --
--- Converted from the recipes `boot` (the intro movie and autosave), `versus-fight` (one match,
+-- Converted from the old frame-keyed scripts `boot` (the intro movie and autosave), `versus-fight` (one match,
 -- asserting the result save) and `full-fight` (three matches, FIGHT AGAIN between them).
 --
 -- HOW THE CUES WERE FOUND: `--discover` on `versus-fight`'s run (deterministic, 8000 frames) next
@@ -17,7 +17,7 @@
 --   f6692  sceAppUtilSaveDataDataSave             the match result ("You got a new title!")
 --   later  sceGxmPrecomputedFragmentStateInit     FIGHT AGAIN: the next stage's draw state
 --
--- MEASURED in the recipes, kept here: the autosave notice now opens only AFTER START on the
+-- MEASURED in the old scripts, kept here: the autosave notice now opens only AFTER START on the
 -- title; the play-style prompt's "set to casual" OK can open late (a phone), so the hold for the
 -- main menu PULSES CROSS; a direction in the fight loop moved the post-match cursor off FIGHT
 -- AGAIN into the options pages for good, so the loop is FACE BUTTONS ONLY - and its CROSS
@@ -33,7 +33,7 @@ local notice    = cue.call("sceMsgDialogInit"):happened()
 local function stage_load() return cue.call("sceIoOpen", { arg = 0, has = "/DATA/I1IF_" }):happened() end
 local function a_save() return cue.call("sceAppUtilSaveDataDataSave"):happened() end
 
--- One 120-frame cycle of the recipe's fight loop: punches, kicks, a punch+kick, a throw, a hold.
+-- One 120-frame cycle of the old script's fight loop: punches, kicks, a punch+kick, a throw, a hold.
 local function cycle()
   tap("triangle", 4, 8); tap("triangle", 4, 8); tap("circle", 4, 12)
   tap("triangle+circle", 4, 12); tap("circle", 4, 12); tap("triangle", 4, 8)
@@ -43,7 +43,7 @@ end
 phase("boot", { timeout = 120 }, function()
   -- The Tecmo Koei logo and the intro movie need nothing. Then the autosave notice (CROSS),
   -- "PRESS START" (START) and the play-style prompt (CROSS, and its OK) - in an order that has
-  -- differed between engines and devices (the recipes saw the notice both before and after
+  -- differed between engines and devices (the old scripts saw the notice both before and after
   -- START), so START and CROSS are both pulsed until the main menu opens.
   wait(movie_over)
   split("intro movie over")
@@ -82,7 +82,7 @@ end)
 phase("matches", { timeout = 600 }, function()
   for match = 1, 3 do
     -- The intros; then the fight. The loop runs until this match's result is SAVED (the
-    -- recipe's egress assert, as a call: a save after this match began).
+    -- old script's save check, as a call: a save after this match began).
     -- (Three matches, so three pairs of cues - declared per match on purpose.)
     idle(240)
     local result = a_save()

@@ -570,7 +570,7 @@ fn remap_branch_targets(instrs: &mut [crate::ir::Instr], starts: &[usize]) {
 pub(crate) fn sop2_pa_epilogue_tail_ok(instrs: &[crate::ir::Instr], at: usize) -> bool {
     use crate::ir::{Bank, BitwiseKind, Op, Predicate};
     let Some(dest) = instrs.get(at).and_then(|i| i.dest.as_ref()) else { return false };
-    if dest.bank != Bank::PrimaryAttr {
+    if !matches!(dest.bank, Bank::PrimaryAttr | Bank::Temp) {
         return false;
     }
     let mut copies = 0;
@@ -582,7 +582,7 @@ pub(crate) fn sop2_pa_epilogue_tail_ok(instrs: &[crate::ir::Instr], at: usize) -
                     && matches!(ins.pred, Predicate::Always)
                     && ins.dest.as_ref().is_some_and(|d| d.bank == Bank::Output && d.index == 0)
                     && ins.srcs.len() == 1
-                    && ins.srcs[0].bank == Bank::PrimaryAttr
+                    && ins.srcs[0].bank == dest.bank
                     && ins.srcs[0].index == dest.index =>
             {
                 copies += 1;
@@ -877,6 +877,22 @@ mod tests {
         let mut alone = vec![decode::decode(0x808088da90000000)];
         validate_sop2_pa_epilogues(&mut alone);
         assert!(alone[0].blocked.is_some());
+    }
+
+    /// The same epilogue through a TEMPORARY register, as a title's world materials end it:
+    /// `sop2 r0 <- pa0, o0` (`0x808082dc90000000`), then `or o0, r0, #0`. A copy from the wrong
+    /// bank (a PA register of the same number) is not the tail.
+    #[test]
+    fn a_temp_destination_blend_is_admitted_only_when_moved_to_the_output() {
+        let mut ok: Vec<Instr> = [0x808082dc90000000u64, 0x50a1000920000000].iter().map(|&w| decode::decode(w)).collect();
+        assert_eq!(ok[0].dest.as_ref().map(|d| d.bank), Some(crate::ir::Bank::Temp));
+        assert_eq!(ok[0].blocked, Some(decode::SOP2_PA_DEST_PENDING), "one word cannot see the tail");
+        validate_sop2_pa_epilogues(&mut ok);
+        assert!(ok[0].blocked.is_none(), "{:?}", ok[0].blocked);
+        let mut wrong_bank: Vec<Instr> =
+            [0x808082dc90000000u64, 0x50a10009a0000000].iter().map(|&w| decode::decode(w)).collect();
+        validate_sop2_pa_epilogues(&mut wrong_bank);
+        assert!(wrong_bank[0].blocked.is_some(), "an o0 <- pa0 copy does not carry r0");
     }
 
     /// The secondary program's bank rule keeps an inline immediate an immediate: the referee's

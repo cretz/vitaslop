@@ -5,7 +5,7 @@
 //! mode, that reproduces the run byte for byte. The format is in the crate README.
 use std::fmt::Write as _;
 
-use vitaslop_runtime::recipe::BUTTON_NAMES;
+use vitaslop_runtime::timeline::{InputSegment, BUTTON_NAMES};
 use vitaslop_runtime::{CtrlFrame, TouchFrame};
 
 /// The first line of every tape, and its version.
@@ -19,6 +19,9 @@ pub struct Change {
     pub display: u64,
     pub ctrl: CtrlFrame,
     pub touch: Option<(u16, u16)>,
+    /// The rear panel. Rendered as a NINTH field only when set, so a tape that never
+    /// touches it is byte-identical to one written before the field existed.
+    pub back: Option<(u16, u16)>,
 }
 
 /// A timeline line: a split, a phase boundary, a log line - informative, not replayed.
@@ -80,6 +83,25 @@ impl Tape {
         }
     }
 
+    /// The REAR panel's touch at input frame `input` - the [`Self::input_at`] of port 1.
+    pub fn back_at(&self, input: u64) -> TouchFrame {
+        let i = self.changes.partition_point(|c| c.input <= input);
+        i.checked_sub(1).and_then(|i| self.changes[i].back).map(|(x, y)| TouchFrame::single(x, y)).unwrap_or_default()
+    }
+
+    /// The tape's changes as a display-frame [`InputSegment`] timeline, each at the DISPLAY frame
+    /// it was recorded on - the starting prefix a native tool (`session`, `explore`, `bench`)
+    /// replays to reach a screen. Display-keyed, so it reproduces the run only where display
+    /// frames repeat (the deterministic engine, one build); the engine's own `--tape` replay is
+    /// input-keyed and the one to trust beyond that.
+    pub fn segments(&self) -> Vec<InputSegment> {
+        let point = |p: Option<(u16, u16)>| p.map(|(x, y)| TouchFrame::single(x, y)).unwrap_or_default();
+        self.changes
+            .iter()
+            .map(|c| InputSegment { frame: c.display, input: c.ctrl, touch: point(c.touch), back: point(c.back) })
+            .collect()
+    }
+
     /// The change recorded exactly at `input`, if any.
     pub fn change_at(&self, input: u64) -> Option<&Change> {
         let i = self.changes.partition_point(|c| c.input < input);
@@ -93,7 +115,7 @@ impl Tape {
         for (k, v) in &self.header {
             let _ = writeln!(s, "{k} {v}");
         }
-        s.push_str("# <input frame> <display frame> <buttons> <lx> <ly> <rx> <ry> <touch>  - a line per CHANGE\n");
+        s.push_str("# <input frame> <display frame> <buttons> <lx> <ly> <rx> <ry> <touch> [<back>]  - a line per CHANGE\n");
         // Changes and notes interleave in input-frame order, a note after the change it sits on.
         let mut notes = self.notes.iter().peekable();
         for c in &self.changes {
@@ -105,9 +127,13 @@ impl Tape {
                 Some((x, y)) => format!("{x},{y}"),
                 None => "-".into(),
             };
+            let back = match c.back {
+                Some((x, y)) => format!(" {x},{y}"),
+                None => String::new(),
+            };
             let _ = writeln!(
                 s,
-                "{} f{} {} {} {} {} {} {touch}",
+                "{} f{} {} {} {} {} {} {touch}{back}",
                 c.input,
                 c.display,
                 buttons_text(c.ctrl.buttons),
@@ -178,23 +204,27 @@ impl Tape {
                 continue;
             }
             in_body = true;
-            if f.len() != 8 {
-                return Err(at(format!("a change has 8 fields, this has {}", f.len())));
+            if f.len() != 8 && f.len() != 9 {
+                return Err(at(format!("a change has 8 fields (9 with the rear panel), this has {}", f.len())));
             }
             let num = |s: &str| s.parse::<u8>().map_err(|_| at(format!("bad axis {s:?}")));
             let input = f[0].parse().map_err(|_| at(format!("bad input frame {:?}", f[0])))?;
             let display = f[1].strip_prefix('f').and_then(|v| v.parse().ok()).ok_or_else(|| at(format!("bad display frame {:?}", f[1])))?;
-            let touch = if f[7] == "-" {
-                None
-            } else {
-                let (x, y) = f[7].split_once(',').ok_or_else(|| at(format!("bad touch {:?}", f[7])))?;
-                Some((x.parse().map_err(|_| at("bad touch x".into()))?, y.parse().map_err(|_| at("bad touch y".into()))?))
+            let point = |v: &str| -> Result<Option<(u16, u16)>, String> {
+                if v == "-" {
+                    return Ok(None);
+                }
+                let (x, y) = v.split_once(',').ok_or_else(|| at(format!("bad touch {v:?}")))?;
+                Ok(Some((x.parse().map_err(|_| at("bad touch x".into()))?, y.parse().map_err(|_| at("bad touch y".into()))?)))
             };
+            let touch = point(f[7])?;
+            let back = f.get(8).map(|v| point(v)).transpose()?.flatten();
             t.changes.push(Change {
                 input,
                 display,
                 ctrl: CtrlFrame { buttons: parse_buttons(f[2]).map_err(at)?, lx: num(f[3])?, ly: num(f[4])?, rx: num(f[5])?, ry: num(f[6])? },
                 touch,
+                back,
             });
         }
         if t.changes.windows(2).any(|w| w[1].input <= w[0].input) {
@@ -265,8 +295,9 @@ mod tests {
         let t = Tape {
             header: vec![("title".into(), "ABCD00001".into()), ("mode".into(), "deterministic".into())],
             changes: vec![
-                Change { input: 0, display: 100, ctrl: CtrlFrame::default(), touch: None },
-                Change { input: 4, display: 104, ctrl: CtrlFrame { buttons: 0x4008, lx: 0, ..CtrlFrame::default() }, touch: Some((10, 20)) },
+                Change { input: 0, display: 100, ctrl: CtrlFrame::default(), touch: None, back: None },
+                Change { input: 4, display: 104, ctrl: CtrlFrame { buttons: 0x4008, lx: 0, ..CtrlFrame::default() }, touch: Some((10, 20)), back: None },
+                Change { input: 8, display: 108, ctrl: CtrlFrame::default(), touch: None, back: Some((960, 445)) },
             ],
             notes: vec![
                 Note { input: 2, display: 102, seconds: 1.5, text: "split title".into() },
@@ -279,6 +310,8 @@ mod tests {
         assert_eq!(Tape::parse(&text).unwrap(), t, "{text}");
         assert_eq!(t.input_at(3).0, CtrlFrame::default());
         assert_eq!(t.input_at(7).0.buttons, 0x4008);
+        assert_eq!(t.back_at(7).count, 0, "the rear panel is its own field");
+        assert_eq!((t.back_at(8).points[0].x, t.back_at(8).points[0].y), (960, 445));
     }
 
     #[test]

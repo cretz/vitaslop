@@ -216,6 +216,203 @@ fn gave(n: usize) {
     LIVE.fetch_sub(n, Ordering::Relaxed);
 }
 
+/// >>> THE THREADS BUNDLE'S HEAP: dlmalloc, GROWING THE WASM MEMORY 16 MB AT A TIME.
+///
+/// std's wasm32 allocator is dlmalloc too, but it grows the memory one 64 KB `memory.grow` at a
+/// time, and in the threads bundle a grow of the SHARED memory is expensive. MEASURED (desktop
+/// browser, V8 sampling profiles of every worker over a baseball title's load into the game):
+/// dlmalloc's page provider was 1.2-1.3 s of self time on each of the render and resolver
+/// workers per 35 s, and 81% of a shader translation's samples - the same pairs translated in
+/// 213-248 ms with the guest workers running and 17-24 ms without. With this heap: that title's
+/// in-frame translation 2194 -> 529 ms, the load 88% -> 92% speed, worst freeze 3.8 -> 1.9 s; a
+/// football title's translation 376 -> 126 ms, worst freeze 812 -> 278 ms.
+///
+/// New blocks come from this heap from the first allocation ([`route_all_allocations`];
+/// `VITASLOP_HEAP_BIG_GROW=0` is the arm back to std's). Its pages are marked in a page bitmap,
+/// and a free or realloc is routed by WHICH heap owns the pointer's page - so blocks std's heap
+/// made before a switch are still freed there. Outside the threads bundle (and natively) this
+/// forwards unchanged.
+pub struct PrivateHeap<A>(pub A);
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+mod private {
+    use std::cell::UnsafeCell;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+    /// One bit per 64 KB wasm page (4 GiB of them): set when the second heap took that page.
+    static OWNED: [AtomicU32; 2048] = [const { AtomicU32::new(0) }; 2048];
+    /// Bytes of pages the second heap has taken, for a report line.
+    pub static PAGES_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub struct Pages;
+
+    /// The smallest `memory.grow` the second heap makes, in bytes.
+    const GROW_STEP: usize = 16 << 20;
+
+    // SAFETY: hands out whole fresh pages from `memory.grow` and never returns any, exactly like
+    // dlmalloc's own wasm `System`; marking them is the only addition.
+    unsafe impl dlmalloc::Allocator for Pages {
+        fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+            // At least GROW_STEP at a time: dlmalloc asks for 64 KB segments, and a
+            // `memory.grow` of a SHARED memory is expensive in the browser - MEASURED, 81% of a
+            // shader translation's samples sat in this call when it grew 64 KB at a time.
+            // Near wasm32's 4 GiB ceiling the step can fail where the request itself fits: then
+            // take exactly what was asked, so this heap runs out no sooner than std's would.
+            let mut pages = size.max(GROW_STEP).div_ceil(65536);
+            let mut prev = core::arch::wasm32::memory_grow(0, pages);
+            if prev == usize::MAX && size < GROW_STEP {
+                pages = size.div_ceil(65536);
+                prev = core::arch::wasm32::memory_grow(0, pages);
+            }
+            if prev == usize::MAX {
+                return (std::ptr::null_mut(), 0, 0);
+            }
+            for p in prev..prev + pages {
+                OWNED[p / 32].fetch_or(1 << (p % 32), Ordering::Release);
+            }
+            PAGES_BYTES.fetch_add((pages * 65536) as u64, Ordering::Relaxed);
+            ((prev * 65536) as *mut u8, pages * 65536, 0)
+        }
+        fn remap(&self, _: *mut u8, _: usize, _: usize, _: bool) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+        fn free_part(&self, _: *mut u8, _: usize, _: usize) -> bool {
+            false
+        }
+        fn free(&self, _: *mut u8, _: usize) -> bool {
+            false
+        }
+        fn can_release_part(&self, _: u32) -> bool {
+            false
+        }
+        fn allocates_zeros(&self) -> bool {
+            true
+        }
+        fn page_size(&self) -> usize {
+            65536
+        }
+    }
+
+    struct Locked {
+        busy: AtomicBool,
+        heap: UnsafeCell<dlmalloc::Dlmalloc<Pages>>,
+    }
+    // SAFETY: `heap` is only touched while `busy` is held (see `with`).
+    unsafe impl Sync for Locked {}
+
+    static HEAP: Locked =
+        Locked { busy: AtomicBool::new(false), heap: UnsafeCell::new(dlmalloc::Dlmalloc::new_with_allocator(Pages)) };
+
+    pub fn with<R>(f: impl FnOnce(&mut dlmalloc::Dlmalloc<Pages>) -> R) -> R {
+        while HEAP.busy.swap(true, Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        // SAFETY: the lock above is held until the store below.
+        let r = f(unsafe { &mut *HEAP.heap.get() });
+        HEAP.busy.store(false, Ordering::Release);
+        r
+    }
+
+    pub fn owns(p: *mut u8) -> bool {
+        let page = p as usize >> 16;
+        OWNED[page / 32].load(Ordering::Acquire) & (1 << (page % 32)) != 0
+    }
+
+    /// Whether new blocks come from this heap - `route_all_allocations`. ON from the first
+    /// allocation; `VITASLOP_HEAP_BIG_GROW=0` turns it off before the run starts.
+    pub static ALL: AtomicBool = AtomicBool::new(true);
+
+    #[inline]
+    pub fn here() -> bool {
+        ALL.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether new blocks come from the 16 MB-step heap ([`PrivateHeap`]) - ON from the start;
+/// `VITASLOP_HEAP_BIG_GROW=0` (thrown in `set_knob`, before the run starts) goes back to std's.
+/// Blocks made before a switch stay in the heap that made them and are freed there - routing is
+/// by page. A no-op outside the threads bundle.
+pub fn route_all_allocations(on: bool) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    private::ALL.store(on, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+    let _ = on;
+}
+
+/// Bytes of pages the second heap has taken from the wasm memory (0 where there is none).
+pub fn private_heap_bytes() -> u64 {
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    {
+        private::PAGES_BYTES.load(Ordering::Relaxed)
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+    {
+        0
+    }
+}
+
+// SAFETY: a block is freed or resized by the heap that owns its page (`private::owns`), which is
+// the heap that allocated it; everything outside a scope forwards to the inner allocator.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+unsafe impl<A: GlobalAlloc> GlobalAlloc for PrivateHeap<A> {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        if private::here() {
+            private::with(|h| unsafe { h.malloc(l.size(), l.align()) })
+        } else {
+            unsafe { self.0.alloc(l) }
+        }
+    }
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        if private::here() {
+            private::with(|h| unsafe { h.calloc(l.size(), l.align()) })
+        } else {
+            unsafe { self.0.alloc_zeroed(l) }
+        }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        if private::owns(p) {
+            private::with(|h| unsafe { h.free(p, l.size(), l.align()) })
+        } else {
+            unsafe { self.0.dealloc(p, l) }
+        }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+        let inside = private::here();
+        match (private::owns(p), inside) {
+            (true, true) => private::with(|h| unsafe { h.realloc(p, l.size(), l.align(), n) }),
+            (false, false) => unsafe { self.0.realloc(p, l, n) },
+            // Crossing heaps: allocate where this thread allocates now, copy, free where it was.
+            _ => {
+                // SAFETY: `GlobalAlloc::realloc`'s contract makes `n` with `l.align()` a valid layout.
+                let nl = unsafe { Layout::from_size_align_unchecked(n, l.align()) };
+                let q = unsafe { self.alloc(nl) };
+                if !q.is_null() {
+                    unsafe { std::ptr::copy_nonoverlapping(p, q, l.size().min(n)) };
+                    unsafe { self.dealloc(p, l) };
+                }
+                q
+            }
+        }
+    }
+}
+
+// SAFETY: forwards every call unchanged.
+#[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+unsafe impl<A: GlobalAlloc> GlobalAlloc for PrivateHeap<A> {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        unsafe { self.0.alloc(l) }
+    }
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        unsafe { self.0.alloc_zeroed(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { self.0.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+        unsafe { self.0.realloc(p, l, n) }
+    }
+}
+
 /// A [`GlobalAlloc`] that counts. Wrap the allocator a front end would have used anyway:
 ///
 /// ```ignore
@@ -275,6 +472,12 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
 mod tests {
     use super::*;
 
+    /// The live and peak counters are process-wide, and the tests that drive them run on
+    /// parallel threads: one test's allocation landing between another's free and its check
+    /// made that check fail (MEASURED on a CI runner - `live_bytes_rise_and_fall` failed once
+    /// and passed everywhere else). Every test that reads a delta of them holds this.
+    static COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A live count that goes UP on an allocation and back DOWN on its free - which is the
     /// property that separates this from `memory_size`, and the reason the module exists.
     ///
@@ -285,6 +488,7 @@ mod tests {
     /// this module contributes, and `System` is not ours to test.
     #[test]
     fn live_bytes_rise_and_fall() {
+        let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = Counting(std::alloc::System);
         let layout = Layout::from_size_align(8 * 1024 * 1024, 8).unwrap();
         // Not asserted against an absolute figure: other threads in the test binary may be
@@ -310,6 +514,7 @@ mod tests {
     /// difference for the life of the process.
     #[test]
     fn a_realloc_counts_only_the_delta() {
+        let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = Counting(std::alloc::System);
         let small = Layout::from_size_align(1024 * 1024, 8).unwrap();
         let before = live_bytes();

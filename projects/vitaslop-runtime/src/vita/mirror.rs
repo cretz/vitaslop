@@ -249,8 +249,8 @@ mod tests {
     use crate::nid::display as d;
     use crate::world::DeterministicWorld;
     use crate::{SliceMemory, VFP_ARG_COUNT};
-    use vitaslop_transpiler::abi::REG_COUNT;
     use vitaslop_transpiler::InlineOp;
+    use vitaslop_transpiler::abi::REG_COUNT;
 
     /// A state whose clock is at `us`.
     fn state_at(us: u64) -> VitaState {
@@ -277,7 +277,16 @@ mod tests {
     /// so an off-by-one in the division cannot pass.
     #[test]
     fn mirror_matches_its_handlers() {
-        for us in [0, 1, 16_665, 16_666, 16_667, 33_333, 1_000_000, 4_000_000_000] {
+        for us in [
+            0,
+            1,
+            16_665,
+            16_666,
+            16_667,
+            33_333,
+            1_000_000,
+            4_000_000_000,
+        ] {
             let mut st = state_at(us);
             let words = snapshot(&st);
             let op = super::super::display::inline_op(d::GET_VCOUNT)
@@ -331,7 +340,11 @@ mod tests {
     /// word that never changes, which for a clock is a spin that can never be satisfied.
     #[test]
     fn every_declared_slot_is_within_the_block() {
-        assert_eq!(snapshot(&state_at(0)).len(), SLOT_COUNT, "snapshot fills every slot");
+        assert_eq!(
+            snapshot(&state_at(0)).len(),
+            SLOT_COUNT,
+            "snapshot fills every slot"
+        );
         for slot in [
             SLOT_VCOUNT,
             SLOT_CLOCK_LO,
@@ -342,7 +355,10 @@ mod tests {
             SLOT_YIELD_FREE,
             SLOT_ELIDE_RUN,
         ] {
-            assert!((slot as usize) < SLOT_COUNT, "slot {slot} is outside the block");
+            assert!(
+                (slot as usize) < SLOT_COUNT,
+                "slot {slot} is outside the block"
+            );
         }
     }
 
@@ -352,7 +368,11 @@ mod tests {
     /// whatever else landed next door.
     #[test]
     fn the_clock_slots_are_adjacent_and_ordered() {
-        assert_eq!(SLOT_CLOCK_HI, SLOT_CLOCK_LO + 1, "the high word follows the low word");
+        assert_eq!(
+            SLOT_CLOCK_HI,
+            SLOT_CLOCK_LO + 1,
+            "the high word follows the low word"
+        );
     }
 
     /// The whole `sceKernelGetProcessTime` family must read the same clock its handlers
@@ -365,7 +385,14 @@ mod tests {
         use vitaslop_transpiler::InlineOp;
         // Values that span the 32-bit boundary in both directions, so a high word that is
         // simply never written (or written from the low half) cannot pass.
-        for us in [0u64, 1, 0xFFFF_FFFF, 0x1_0000_0000, 0x1_2345_6789, 4_000_000_000] {
+        for us in [
+            0u64,
+            1,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0x1_2345_6789,
+            4_000_000_000,
+        ] {
             let st = state_at(us);
             let words = snapshot(&st);
             let lo = words[SLOT_CLOCK_LO as usize];
@@ -378,7 +405,11 @@ mod tests {
 
             // ...and each spelling must name the clock's LOW slot as its base, since both
             // pair forms take the high word from the slot above it.
-            for nid in [lk::GET_PROCESS_TIME, lk::GET_PROCESS_TIME_WIDE, lk::GET_PROCESS_TIME_LOW] {
+            for nid in [
+                lk::GET_PROCESS_TIME,
+                lk::GET_PROCESS_TIME_WIDE,
+                lk::GET_PROCESS_TIME_LOW,
+            ] {
                 let op = super::super::libkernel::inline_op(nid).expect("has an inline form");
                 assert_eq!(
                     op.mirror_slot(),
@@ -389,7 +420,11 @@ mod tests {
             }
             // The truncated spelling is the low word and nothing else.
             let low = super::super::libkernel::inline_op(lk::GET_PROCESS_TIME_LOW).unwrap();
-            assert_eq!(low.eval(lo), st.now_us() as u32, "the Low spelling truncates");
+            assert_eq!(
+                low.eval(lo),
+                st.now_us() as u32,
+                "the Low spelling truncates"
+            );
             assert!(
                 matches!(low, InlineOp::LoadMirror { .. }),
                 "the Low spelling reads ONE word, not a pair"
@@ -451,9 +486,9 @@ mod tests {
             // falls through to this handler for every call that sleeps or has someone to
             // yield to - the libkernel table still has no entry for it.
             crate::vita::tm_nid::DELAY_THREAD,
-            lk::CREATE_THREAD,                 // spawns
-            lk::EXIT_PROCESS,                  // halts the run
-            lk::GET_TLS_ADDR,                  // per-thread host state
+            lk::CREATE_THREAD, // spawns
+            lk::EXIT_PROCESS,  // halts the run
+            lk::GET_TLS_ADDR,  // per-thread host state
         ] {
             assert!(
                 super::super::libkernel::inline_op(nid).is_none(),
@@ -467,7 +502,11 @@ mod tests {
     /// behaviour, and an inlined call never reaches the host at all.
     #[test]
     fn only_the_counter_is_mirrored() {
-        for nid in [d::WAIT_VBLANK_START, d::WAIT_VBLANK_START_MULTI, d::SET_FRAME_BUF] {
+        for nid in [
+            d::WAIT_VBLANK_START,
+            d::WAIT_VBLANK_START_MULTI,
+            d::SET_FRAME_BUF,
+        ] {
             assert!(
                 super::super::display::inline_op(nid).is_none(),
                 "{} has behaviour and must not be inlined",

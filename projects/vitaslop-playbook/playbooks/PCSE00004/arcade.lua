@@ -1,13 +1,13 @@
 -- Ultimate Marvel vs. Capcom 3 (PCSE00004, NTSC): boot, decline PSN, OFFLINE MODE -> ARCADE,
 -- take the default team and stage, and fight the first match.
 --
--- Converted from the recipes `into-a-fight` and `arcade-deep`. Those pressed CROSS every 150
+-- Converted from the old frame-keyed scripts `into-a-fight` and `arcade-deep`. Those pressed CROSS every 150
 -- frames from boot and hoped each press landed on a screen; this waits on what the game DOES.
 --
--- HOW THE CUES WERE FOUND: `--discover` on the old recipe's run (deterministic, 7000 frames)
+-- HOW THE CUES WERE FOUND: `--discover` on the old script's run (deterministic, 7000 frames)
 -- next to a shot every 100 frames. The title loads every file through one Fios call whose
 -- third argument (r2) is the path, so "the game started loading X" is the screen signal.
--- Frames are from that run (the recipe waited out the intro movie; this skips it):
+-- Frames are from that run (the old script waited out the intro movie; this skips it):
 --
 --   f30    sceMp4OpenFile                       the intro movie starts
 --   f3148  the title screen reads the pad
@@ -109,7 +109,7 @@ end)
 -- One attack cycle facing `fwd` ("right" or "left"): walk in, an L-M-H chain, a Hadoken
 -- (down, down-forward, forward + L), a Shinku Hadoken hyper (the same motion + L+M), both
 -- assist calls, a jump-in and H, then S (CROSS). Default Vita layout: square L, triangle M,
--- circle H, cross S, L/R assists. Timings are the recipe's, in input frames.
+-- circle H, cross S, L/R assists. Timings are the old script's, in input frames.
 local function cycle(fwd)
   hold(fwd, 30)
   tap("square", 4, 4); tap("triangle", 4, 4); tap("circle", 4, 18)

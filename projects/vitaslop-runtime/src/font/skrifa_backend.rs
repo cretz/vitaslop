@@ -84,8 +84,12 @@ impl FontBackend for SkrifaBackend {
     }
 
     fn has_glyph(&self, face: FaceId, ch: u32) -> bool {
-        let Some(bytes) = self.bytes(face) else { return false };
-        let Ok(font) = FontRef::new(&bytes) else { return false };
+        let Some(bytes) = self.bytes(face) else {
+            return false;
+        };
+        let Ok(font) = FontRef::new(&bytes) else {
+            return false;
+        };
         font.charmap().map(ch).is_some()
     }
 
@@ -103,7 +107,12 @@ impl FontBackend for SkrifaBackend {
         })
     }
 
-    fn rasterize(&mut self, face: FaceId, size: PixelSize, ch: u32) -> Option<(GlyphBitmap, GlyphMetrics)> {
+    fn rasterize(
+        &mut self,
+        face: FaceId,
+        size: PixelSize,
+        ch: u32,
+    ) -> Option<(GlyphBitmap, GlyphMetrics)> {
         let bytes = self.bytes(face)?;
         let font = FontRef::new(&bytes).ok()?;
         let gid: GlyphId = font.charmap().map(ch)?;
@@ -122,21 +131,40 @@ impl FontBackend for SkrifaBackend {
         // One hinter per (face, size); reused across glyphs.
         let key = (face, (size.v.to_bits(), size.h.to_bits()));
         if let std::collections::hash_map::Entry::Vacant(e) = self.hinters.entry(key) {
-            let hinter = HintingInstance::new(&outlines, px, LocationRef::default(), HintingOptions::default()).ok()?;
+            let hinter = HintingInstance::new(
+                &outlines,
+                px,
+                LocationRef::default(),
+                HintingOptions::default(),
+            )
+            .ok()?;
             e.insert(hinter);
         }
         let hinter = self.hinters.get(&key)?;
 
-        let mut pen = ZenoPen { cmds: Vec::new(), x_scale };
-        let adjusted = outline.draw(DrawSettings::hinted(hinter, false), &mut pen).ok()?;
+        let mut pen = ZenoPen {
+            cmds: Vec::new(),
+            x_scale,
+        };
+        let adjusted = outline
+            .draw(DrawSettings::hinted(hinter, false), &mut pen)
+            .ok()?;
 
         let (coverage, placement) = Mask::new(&pen.cmds[..]).format(Format::Alpha).render();
 
         // Hinted advance/LSB (FreeType-equivalent) where the scaler produced them.
         let h_advance = adjusted.advance_width.unwrap_or(linear_advance) * x_scale;
-        let h_bearing_x = adjusted.lsb.unwrap_or_else(|| bounds.map(|b| b.x_min).unwrap_or(0.0)) * x_scale;
+        let h_bearing_x = adjusted
+            .lsb
+            .unwrap_or_else(|| bounds.map(|b| b.x_min).unwrap_or(0.0))
+            * x_scale;
         let (bb_w, bb_h, asc, desc) = match bounds {
-            Some(b) => ((b.x_max - b.x_min) * x_scale, b.y_max - b.y_min, b.y_max, b.y_min),
+            Some(b) => (
+                (b.x_max - b.x_min) * x_scale,
+                b.y_max - b.y_min,
+                b.y_max,
+                b.y_min,
+            ),
             None => (0.0, 0.0, 0.0, 0.0),
         };
 

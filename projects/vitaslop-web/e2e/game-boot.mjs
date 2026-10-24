@@ -6,7 +6,7 @@
 // This runs the real installed Chrome on the real GPU. **USE HEADLESS=1** - it is the
 // polite mode (it never steals the foreground) and it is NOT a software run.
 //
-// MEASURED 2026-08-07, one retail title, same recipe, one variable changed: headed and
+// MEASURED 2026-08-07, one retail title, same input, one variable changed: headed and
 // HEADLESS=1 both report `adapter: vendor=nvidia arch=blackwell | GPU`, both reach the
 // same frame, both at the same rate. Modern headless Chrome takes the GPU when asked, and
 // `--enable-gpu` below asks; the older claim that headless here has no GPU and falls back
@@ -22,12 +22,12 @@
 //       MAX_FRAMES   display flips to run to
 //       MAX_ROUNDS   scheduler round cap (default 50_000_000)
 //       TARGET_FRAME the flip to screenshot at
-//       RECIPE       scripted-input recipe path
 //       PLAYBOOK     a playbook (.lua) to drive input instead; worker mode (WORKER=1) only
 //       SAVE_PROFILE run under this save profile (worker mode); a new name = no saves
 //       KNOBS        {"VITASLOP_GXP_LIVE":"1",...} - the browser has no environment
 //       WAIT_MS      how long to wait for TARGET_FRAME
 //       SHOT_DIR     where the screenshot and summary land
+//       CLICKS       "x,y;x,y" screen points to click with the real mouse once the run ends
 //       HEADLESS=1   run without a window - the DEFAULT CHOICE; still the real GPU (above)
 //       ALLOW_SOFTWARE=1  accept a software adapter instead of failing
 //       HIDE_SHOW_MS background the tab every N ms (HIDE_FOR_MS, HIDE_FROM_FRAME) and shoot
@@ -41,6 +41,7 @@ import { pipeline } from "node:stream/promises";
 import { join, extname, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startProcMon } from "./procmon.mjs";
+import { playbookFile, requirePlaybookBundle } from "../playbook-build.mjs";
 
 const here = join(fileURLToPath(import.meta.url), "..");
 // The bundle to SERVE. Normally this crate's own `web/`, but an A/B against another build
@@ -48,28 +49,16 @@ const here = join(fileURLToPath(import.meta.url), "..");
 // makes the harness itself a variable, and the harness is what publishes the number.
 const webDir = process.env.WEB_DIR || join(here, "..", "web");
 const gameDir = process.env.GAME_DIR || process.env.VITASLOP_GAME_DIR || "";
-// Live run: render frame-by-frame through the real GXM->WebGPU renderer, driven by a
-// scripted recipe that navigates the touch front-end to the Tutorial level. Run past
-// the frame the level appears (~175) so the screenshot lands on live gameplay.
+// Live run: render frame-by-frame through the real GXM->WebGPU renderer, driven by a playbook
+// (PLAYBOOK) or by nothing (a live-input session).
 const maxFrames = Number(process.env.MAX_FRAMES || 260);
 const maxRounds = Number(process.env.MAX_ROUNDS || 50_000_000);
-// The display flip by which the tutorial level is on screen; the harness waits for the
-// live loop to pass it before screenshotting.
+// The display flip the harness waits for the live loop to pass before screenshotting.
 const targetFrame = Number(process.env.TARGET_FRAME || 178);
-// The scripted-input recipe (frame-keyed touch taps). Override with RECIPE=<path>, or
-// RECIPE="" for a live-input session. No default: pass a recipe from the
-// vitaslop-gamerun-recipes crate for the title under test.
-const recipePath = process.env.RECIPE ?? "";
-// A RECIPE that cannot be read is fatal, never "live input": a run that silently dropped its
-// recipe presses nothing, and every screen it reaches reads as the title ignoring the input.
-// A relative path resolves against THIS process's cwd, which a wrapper script may have changed.
-const recipe = recipePath
-  ? await readFile(recipePath, "utf8").catch((e) => {
-      console.error(`[game] RECIPE ${recipePath} cannot be read (cwd ${process.cwd()}): ${e.message}`);
-      process.exit(2);
-    })
-  : "";
-// `PLAYBOOK=<file.lua>`: drive the run with a playbook (vitaslop-playbook) instead of a recipe.
+// `PLAYBOOK=<file.lua>`: drive the run with a playbook (vitaslop-playbook). A PLAYBOOK that cannot
+// be read is fatal, never "live input": a run that silently dropped its input presses nothing,
+// and every screen it reaches reads as the title ignoring it. A relative path resolves against
+// THIS process's cwd, which a wrapper script may have changed.
 // Its shots, report and tape land in SHOT_DIR (`<name>.png`, `playbook.txt`, `playbook.tape`),
 // and the run ends when the playbook does. Named `<title dir>/<file>` as the desktop names it.
 const playbookPath = process.env.PLAYBOOK ?? "";
@@ -82,10 +71,9 @@ const playbook = playbookPath
       }),
     }
   : undefined;
-if (playbook && recipe) {
-  console.error("[game] RECIPE and PLAYBOOK both drive input - pass one");
-  process.exit(2);
-}
+// A PLAYBOOK run is served the playbook build (`node build.mjs --playbook`): the shipped bundles
+// have no playbook engine. Everything else is `webDir` as usual. See playbook-build.mjs.
+if (playbook) requirePlaybookBundle();
 
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".wasm": "application/wasm", ".json": "application/json" };
 
@@ -98,6 +86,17 @@ async function walk(root, dir = root, out = []) {
     else out.push(relative(root, full).split(sep).join("/"));
   }
   return out;
+}
+
+// The product page's base knobs, read from `base_knobs()` in the frontend crate the page is
+// built from - one list, so a knob added there reaches the harness without a second edit. An
+// empty parse is fatal: it means the function moved, and a run without them is not the product.
+async function productKnobs() {
+  const src = await readFile(join(here, "..", "..", "vitaslop-frontend", "src", "settings.rs"), "utf8");
+  const body = src.match(/pub fn base_knobs\(\)[\s\S]*?\n\}/)?.[0] || "";
+  const knobs = Object.fromEntries([...body.matchAll(/\("(VITASLOP_\w+)",\s*"([^"]*)"\)/g)].map((m) => [m[1], m[2]]));
+  if (!Object.keys(knobs).length) throw new Error("no base_knobs() found in vitaslop-frontend/src/settings.rs");
+  return knobs;
 }
 
 // Memory is sampled per PROCESS by `procmon.mjs` (see the note at the top of that file
@@ -139,7 +138,7 @@ async function main() {
       }
       const file = url.startsWith("/game/")
         ? join(gameDir, url.slice("/game/".length))
-        : join(webDir, url === "/" ? "/debug/game.html" : url);
+        : (playbook && playbookFile(url)) || join(webDir, url === "/" ? "/debug/game.html" : url);
       // STREAMED, and with a content-length the page holds the transfer to.
       //
       // >>> `readFile` CANNOT READ A RETAIL CONTAINER. Node refuses a file over 2 GiB
@@ -507,8 +506,13 @@ async function main() {
     // because the run under study may kill its renderer, and a renderer's buffer dies with it.
     // `disabled-by-default-v8.gc_stats` puts live V8 objects BY INSTANCE TYPE in it at every
     // full GC, for worker isolates too - which object is piling up, not just that one is.
-    if (process.env.TRACE_CATS) {
+    // `TRACE_DELAY_MS=<ms>` starts it that long after the page loads instead, so a trace can
+    // cover one stretch deep into a run (a load, a scene) without recording everything before it.
+    // Detached, so a delay does not hold up the auto-attach below.
+    if (process.env.TRACE_CATS) (async () => {
       const traceMs = Number(process.env.TRACE_MS || 30000);
+      const delayMs = Number(process.env.TRACE_DELAY_MS || 0);
+      if (delayMs > 0) await new Promise((ok) => setTimeout(ok, delayMs).unref?.());
       await rootCdp.send("Tracing.start", {
         categories: process.env.TRACE_CATS,
         transferMode: "ReturnAsStream",
@@ -528,7 +532,7 @@ async function main() {
         await rootCdp.send("IO.close", { handle: stream }).catch(() => {});
         console.log(`[game] trace written`);
       }, traceMs).unref?.();
-    }
+    })().catch((e) => console.log(`[game] tracing: ${e.message}`));
     await rootCdp
       .send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true })
       .catch(() => {});
@@ -567,12 +571,20 @@ async function main() {
   try {
     await page.goto(url + (useWorker ? "debug/game-worker.html" : ""), { waitUntil: "load", timeout: 30000 });
     console.log(`[game] mode: ${useWorker ? "web worker (no sync-compile flag)" : "main thread"}`);
-    console.log(`[game] recipe: ${recipe ? `${recipe.split("\n").length} lines` : "(none - live input)"}`);
+    console.log(`[game] input: ${playbook ? "a playbook" : "(none - live input)"}`);
     // __boot resolves after the one-time decrypt/link/transpile + WebGPU setup, then
     // the live loop runs on the event loop.
     // KNOBS='{"VITASLOP_FRAME_TOPUP":"0"}' - the browser has no environment, so a knob a
     // title needs has to be handed to the page explicitly.
-    const knobs = JSON.parse(process.env.KNOBS || "{}");
+    // The PRODUCT page starts every run from `base_knobs()` (GXP_LIVE, FRAME_TOPUP, SMP) and
+    // layers the person's knobs over it; a harness that starts from nothing runs every draw
+    // fixed-function and its shots are junk while the playbook still reports DONE. So this
+    // reads the same list out of the source the page is built from, and KNOBS goes on top
+    // (`"VITASLOP_SMP":"0"` for a deterministic run). `PRODUCT_KNOBS=0` starts from nothing.
+    const knobs = {
+      ...(process.env.PRODUCT_KNOBS === "0" ? {} : await productKnobs()),
+      ...JSON.parse(process.env.KNOBS || "{}"),
+    };
     // The product page's console is silent on a clean run: setup notes, the adapter and
     // surface lines, the status channel and the `[live]` heartbeat all go to the panel
     // only. This harness READS the heartbeat (liveness, progress, the frames.csv join), so
@@ -590,12 +602,15 @@ async function main() {
     if (playbook) console.log(`[game] playbook: ${playbook.name}`);
     // `SAVE_PROFILE=<name>`: run under that save profile (worker mode). A name not used before
     // has no saves, so the title boots as it does the first time - which is what a playbook
-    // written against a clean desktop run expects.
-    const saveProfile = process.env.SAVE_PROFILE || "";
+    // written against a clean desktop run expects. So a PLAYBOOK run with none named gets a
+    // fresh one, as a desktop playbook run (no `--save-dir`) does: under the shared default a
+    // title that saved last run boots to its continue menu, and the playbook's first cue never
+    // comes. `SAVE_PROFILE=default` runs one against the saves a person would have.
+    const saveProfile = process.env.SAVE_PROFILE || (playbook ? `playbook-${Date.now()}` : "");
     if (saveProfile) console.log(`[game] save profile: ${saveProfile}`);
     const msg = await page.evaluate(
-      ([recipe, f, r, k, id, pb, sp]) => window.__boot(recipe, f, r, k, id, pb, sp),
-      [recipe, maxFrames, maxRounds, knobs, titleId, playbook, saveProfile]
+      ([f, r, k, id, pb, sp]) => window.__boot(f, r, k, id, pb, sp),
+      [maxFrames, maxRounds, knobs, titleId, playbook, saveProfile]
     );
     console.log("[game] SETUP:", msg);
     // The adapter the page ACTUALLY got. The wasm refuses to render on a software one
@@ -830,6 +845,27 @@ async function main() {
       }
       await new Promise((r) => setTimeout(r, 500));
     }
+    // `CLICKS="x,y;x,y;..."` (960x544 screen points): once the run has ended, click each point on
+    // the game canvas with the REAL mouse - the page's own pointer listeners carry it to the
+    // touch panel exactly as a person's click does - and shoot `click<N>.png` after each. Asks
+    // "does a person's tap on this screen do what the game says it will", which a playbook's
+    // scripted touch cannot answer for the page's input path.
+    const clicks = (process.env.CLICKS || "").split(";").map((s) => s.trim()).filter(Boolean);
+    if (clicks.length) {
+      const box = await page.locator("canvas").first().boundingBox();
+      for (const [n, c] of clicks.entries()) {
+        const [x, y] = c.split(",").map(Number);
+        const px = box.x + (x / 960) * box.width;
+        const py = box.y + (y / 544) * box.height;
+        await page.mouse.move(px, py);
+        await page.mouse.down();
+        await page.waitForTimeout(150);
+        await page.mouse.up();
+        await page.waitForTimeout(4000);
+        await page.screenshot({ path: join(shotDir, `click${n + 1}.png`) });
+        console.log(`[game] clicked screen (${x},${y}) = page (${px | 0},${py | 0}); shot click${n + 1}.png`);
+      }
+    }
     clearInterval(ticker);
     if (shotTimer) clearInterval(shotTimer);
     if (frameShotTimer) clearInterval(frameShotTimer);
@@ -947,7 +983,7 @@ async function main() {
     await fs.writeFile(
       join(shotDir, "browser-run.json"),
       JSON.stringify(
-        { adapter, fps, perf, status, headless, allowSoftware, targetFrame, maxFrames, recipe: recipePath, knobs, screenshot: shot },
+        { adapter, fps, perf, status, headless, allowSoftware, targetFrame, maxFrames, playbook: playbookPath || null, knobs, screenshot: shot },
         null,
         2
       ) + "\n"

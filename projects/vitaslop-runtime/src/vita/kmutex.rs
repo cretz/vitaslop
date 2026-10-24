@@ -72,7 +72,12 @@ pub const SLOTS: u32 = ENTRIES * (ENTRY_BYTES / 4);
 
 /// The offsets, packaged for the transpiler. One definition, two readers.
 pub fn layout() -> LwMutexLayout {
-    LwMutexLayout { id: off::ID, owner: off::OWNER, count: off::COUNT, waiters: off::WAITERS }
+    LwMutexLayout {
+        id: off::ID,
+        owner: off::OWNER,
+        count: off::COUNT,
+        waiters: off::WAITERS,
+    }
 }
 
 /// Which entry `uid` maps to. The emitted form computes exactly this.
@@ -161,10 +166,7 @@ pub fn set_waiters(w: &mut dyn GuestWords, table: u32, uid: i32, n: usize) {
 ///
 /// Takes the entry ADDRESS rather than the table base, so a test can place one anywhere.
 pub fn fast_lock(w: &mut dyn GuestWords, entry: u32, uid: i32, thid: i32, lock_count: u32) -> bool {
-    if lock_count != 1
-        || get(w, entry, off::ID) != uid as u32
-        || get(w, entry, off::WAITERS) != 0
-    {
+    if lock_count != 1 || get(w, entry, off::ID) != uid as u32 || get(w, entry, off::WAITERS) != 0 {
         return false;
     }
     let held = get(w, entry, off::COUNT);
@@ -191,9 +193,7 @@ pub fn fast_unlock(
     thid: i32,
     unlock_count: u32,
 ) -> bool {
-    if unlock_count != 1
-        || get(w, entry, off::ID) != uid as u32
-        || get(w, entry, off::WAITERS) != 0
+    if unlock_count != 1 || get(w, entry, off::ID) != uid as u32 || get(w, entry, off::WAITERS) != 0
     {
         return false;
     }

@@ -69,13 +69,21 @@ fn resolve() -> &'static Option<Resolved> {
     static CELL: OnceLock<Option<Resolved>> = OnceLock::new();
     CELL.get_or_init(|| {
         if let Some(bytes) = INJECTED.read().ok().and_then(|s| s.clone()) {
-            return Some(Resolved { bytes, source: "supplied by the host embedder".to_string() });
+            return Some(Resolved {
+                bytes,
+                source: "supplied by the host embedder".to_string(),
+            });
         }
         // An explicit path wins over any probe: someone who names a font means that font.
-        if let Some(path) = crate::knobs::var("VITASLOP_SYSTEM_FONT").ok().filter(|p| !p.is_empty())
+        if let Some(path) = crate::knobs::var("VITASLOP_SYSTEM_FONT")
+            .ok()
+            .filter(|p| !p.is_empty())
         {
             return match read_file(&path) {
-                Some(bytes) => Some(Resolved { bytes: Arc::new(bytes), source: path }),
+                Some(bytes) => Some(Resolved {
+                    bytes: Arc::new(bytes),
+                    source: path,
+                }),
                 None => {
                     // A named path that does not load is a MISTAKE, not a fallback: silently
                     // probing past it would hide the typo and leave the run looking as though
@@ -131,7 +139,10 @@ fn probe_host_fonts() -> Option<Resolved> {
     ];
     for path in CANDIDATES {
         if let Some(bytes) = read_file(path) {
-            return Some(Resolved { bytes: Arc::new(bytes), source: (*path).to_string() });
+            return Some(Resolved {
+                bytes: Arc::new(bytes),
+                source: (*path).to_string(),
+            });
         }
     }
     None

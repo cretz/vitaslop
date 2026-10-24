@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 vitaslop-transpiler = { path = "../vitaslop-transpiler" }
 vitaslop-runtime = { path = "../vitaslop-runtime" }
-# SELF/ELF loader. Used by the recipe runner's boot path (boot_retail) and the
+# SELF/ELF loader. Used by the shared boot path (boot_retail) and the
 # retail integration tests.
 vitaslop-loader = { path = "../vitaslop-loader" }
 # The shader container parser, so the capsule replay tool can NAME the registers it
