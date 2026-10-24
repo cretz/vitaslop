@@ -159,7 +159,13 @@ jobs:
       - name: Regenerate the ARM conformance goldens and fail on any diff
         if: runner.os == 'Linux' && runner.arch == 'X64'
         working-directory: projects
+        # The harness links at arm-none-eabi-ld's default 0x8000, below the kernel's
+        # vm.mmap_min_addr (65536). qemu 8 relocated the guest past it; the qemu 10 on the
+        # current runner image maps the ELF where it is linked and is refused ("Error mapping
+        # file: Operation not permitted"). Lowering the floor on this throwaway runner runs the
+        # harness exactly as every committed golden was produced.
         run: |
+          sudo sysctl -w vm.mmap_min_addr=0
           cargo run --locked -p vitaslop-conformance-suite-arm --bin regen
           git diff --exit-code
 

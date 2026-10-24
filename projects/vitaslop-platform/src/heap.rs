@@ -472,6 +472,12 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
 mod tests {
     use super::*;
 
+    /// The live and peak counters are process-wide, and the tests that drive them run on
+    /// parallel threads: one test's allocation landing between another's free and its check
+    /// made that check fail (MEASURED on a CI runner - `live_bytes_rise_and_fall` failed once
+    /// and passed everywhere else). Every test that reads a delta of them holds this.
+    static COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A live count that goes UP on an allocation and back DOWN on its free - which is the
     /// property that separates this from `memory_size`, and the reason the module exists.
     ///
@@ -482,6 +488,7 @@ mod tests {
     /// this module contributes, and `System` is not ours to test.
     #[test]
     fn live_bytes_rise_and_fall() {
+        let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = Counting(std::alloc::System);
         let layout = Layout::from_size_align(8 * 1024 * 1024, 8).unwrap();
         // Not asserted against an absolute figure: other threads in the test binary may be
@@ -507,6 +514,7 @@ mod tests {
     /// difference for the life of the process.
     #[test]
     fn a_realloc_counts_only_the_delta() {
+        let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = Counting(std::alloc::System);
         let small = Layout::from_size_align(1024 * 1024, 8).unwrap();
         let before = live_bytes();
