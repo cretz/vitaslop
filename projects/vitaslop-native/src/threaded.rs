@@ -1753,7 +1753,8 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                         return FiberEnd::ThreadExit(last_r0);
                     }
                     let regs = reg_dump(&mut store, &instance);
-                    return FiberEnd::Error(format!("{}\n{}", trap_detail(&e), regs));
+                    let pointees = reg_pointees(&mut store, &instance);
+                    return FiberEnd::Error(format!("{}\n{}{}", trap_detail(&e), regs, pointees));
                 }
             }
             // The thread RETURNED from its entry. Its EXIT event handlers run on it now,
@@ -3187,6 +3188,44 @@ fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
              is not the faulting address. Re-run with VITASLOP_TRACK_PC=1 to have each basic \
              block record its own guest start address, which names the faulting block exactly.",
         );
+    }
+    s
+}
+
+/// What each register that holds a guest address POINTS AT, at a trap: its first words, and,
+/// when the first word is itself a guest address (a C++ object's vtable), that table's first
+/// words too.
+///
+/// A null-target dispatch through `ldr r0,[rX]; ldr ip,[r0,#off]; blx ip` leaves only `rX` in
+/// the register dump, and the question it raises - is the OBJECT unbuilt (no vtable), or is
+/// the register itself wrong - needs the memory the moment it trapped. A heap object's address
+/// moves between runs under SMP and a trap there is intermittent, so a watch armed by address
+/// in a later run cannot answer it; this does, in the run that fails.
+fn reg_pointees<H: ImportDispatch + Send + 'static>(store: &mut Store<ThreadData<H>>, instance: &Instance) -> String {
+    let regs: Vec<u32> = (0..13).map(|i| get_reg_store(store, instance, i)).collect();
+    let base = store.data().base;
+    let data = store.data().shared_mem.data();
+    // SAFETY: as in `watch_words` - `UnsafeCell<u8>` is repr(transparent) over `u8`, and the
+    // faulting fiber is not running while its trap is reported.
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
+    let word = |addr: u32| -> Option<u32> {
+        let off = addr.checked_sub(base)? as usize;
+        bytes.get(off..off + 4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+    };
+    let words = |addr: u32, n: u32| -> String {
+        (0..n).map(|k| word(addr.wrapping_add(4 * k)).map_or("--------".into(), |v| format!("{v:08x}"))).collect::<Vec<_>>().join(" ")
+    };
+    let mut s = String::from("\nmemory at trap (registers holding a guest address):");
+    let mut seen = Vec::new();
+    for (i, &r) in regs.iter().enumerate() {
+        if word(r).is_none() || seen.contains(&r) {
+            continue;
+        }
+        seen.push(r);
+        s.push_str(&format!("\n  r{i}={r:#010x}: {}", words(r, 8)));
+        if let Some(first) = word(r).filter(|&v| word(v).is_some()) {
+            s.push_str(&format!("\n      *[{first:#010x}]: {}", words(first, 16)));
+        }
     }
     s
 }

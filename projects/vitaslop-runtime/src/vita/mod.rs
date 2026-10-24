@@ -4003,6 +4003,80 @@ mod smp_policy_tests {
 pub use gxm::report_completed_early;
 
 #[cfg(test)]
+mod precomputed_state_tests {
+    use super::*;
+    use crate::host::VitaState;
+    use crate::world::DeterministicWorld;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    const MEM: usize = 2 << 20;
+    const STATE: u32 = 0x1000;
+    const COPY: u32 = 0x1100;
+    const FOREIGN: u32 = 0x2000;
+
+    fn word(bytes: &[u8], at: u32) -> u32 {
+        let a = at as usize;
+        u32::from_le_bytes(bytes[a..a + 4].try_into().unwrap())
+    }
+
+    fn put(bytes: &mut [u8], at: u32, v: u32) {
+        let a = at as usize;
+        bytes[a..a + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn init(st: &mut VitaState, bytes: &mut [u8], state: u32) {
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = state;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut mem = SliceMemory(bytes);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        assert!(matches!(
+            dispatch(0, gxm_nid::PRECOMPUTED_FRAGMENT_STATE_INIT, &mut ctx, st),
+            SvcOutcome::Continue
+        ));
+    }
+
+    /// A RECYCLED struct - our magic left in its first word, something else's pointer where the
+    /// block pointer was - is a struct this engine never stamped: `Init` gives it a fresh block
+    /// and writes nothing through the stale pointer. A tennis title's court load zeroed a
+    /// read-only vtable this way, and the run died in a virtual call through it.
+    #[test]
+    fn init_never_writes_through_a_block_pointer_it_did_not_allocate() {
+        let mut bytes = vec![0u8; MEM];
+        bytes[FOREIGN as usize..FOREIGN as usize + 512].fill(0xa5);
+        put(&mut bytes, STATE, crate::vita::gxmstate::MAGIC_FRAGMENT);
+        put(&mut bytes, STATE + 4, FOREIGN);
+        let mut st = VitaState::new(0, MEM as u32, Box::new(DeterministicWorld::default()));
+        init(&mut st, &mut bytes, STATE);
+        assert!(bytes[FOREIGN as usize..FOREIGN as usize + 512].iter().all(|&b| b == 0xa5));
+        let block = word(&bytes, STATE + 4);
+        assert!(block != 0 && block != FOREIGN, "block {block:#x}");
+        assert_eq!(word(&bytes, STATE), crate::vita::gxmstate::MAGIC_FRAGMENT);
+    }
+
+    /// Re-initialising a state in place keeps its block (no allocation per `Init`), while a
+    /// by-value COPY that is initialised gets its own - `Init` is a new state, and zeroing the
+    /// shared block would wipe the original's textures.
+    #[test]
+    fn reinit_keeps_its_block_and_an_initialised_copy_gets_its_own() {
+        let mut bytes = vec![0u8; MEM];
+        let mut st = VitaState::new(0, MEM as u32, Box::new(DeterministicWorld::default()));
+        init(&mut st, &mut bytes, STATE);
+        let block = word(&bytes, STATE + 4);
+        init(&mut st, &mut bytes, STATE);
+        assert_eq!(word(&bytes, STATE + 4), block, "re-init moved the block");
+        let len = crate::vita::gxmstate::off::BYTES as usize;
+        bytes.copy_within(STATE as usize..STATE as usize + len, COPY as usize);
+        put(&mut bytes, block, 0x1234_5678);
+        init(&mut st, &mut bytes, COPY);
+        let copy_block = word(&bytes, COPY + 4);
+        assert_ne!(copy_block, block, "the copy's Init reused the original's block");
+        assert_eq!(word(&bytes, block), 0x1234_5678, "the copy's Init zeroed the original's block");
+    }
+}
+
+#[cfg(test)]
 mod np_identity_tests {
     use super::*;
     use crate::host::VitaState;

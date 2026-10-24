@@ -10225,6 +10225,10 @@ pub struct VitaState {
     /// (`CSC0`/`CSC1`, which a YUV texture's swizzle selects). Both start at 0,
     /// `SCE_GXM_YUV_PROFILE_BT601_STANDARD`, the conversion used before any call.
     pub(crate) yuv_profiles: [u32; 2],
+    /// Every precomputed-state ARRAYS block this engine has allocated, with the state struct
+    /// address it was allocated FOR - see [`Self::ensure_state_block`] for why a block pointer
+    /// read out of guest memory is trusted only when it is in here.
+    precomputed_state_blocks: std::collections::HashMap<u32, u32>,
     /// Frame boundaries owed to [`Self::texture_snapshots`] because it was held when the flip
     /// came - applied by the next `snaps!`.
     ///
@@ -10548,6 +10552,7 @@ impl VitaState {
             ))),
             guest_stacks,
             yuv_profiles: [0, 0],
+            precomputed_state_blocks: std::collections::HashMap::new(),
             complete_scene_now: None,
             complete_scene_async: false,
             pending_early: None,
@@ -18278,21 +18283,41 @@ impl VitaState {
     /// the old table served through `entry().or_default()`) gets a fresh zeroed block from
     /// the guest heap. The title's own `memBlock` is deliberately NOT used: its size is the
     /// real driver's, which this engine does not define.
+    ///
+    /// >>> A BLOCK POINTER READ OUT OF GUEST MEMORY IS TRUSTED ONLY IF THIS ENGINE MADE IT.
+    ///
+    /// The struct is the title's memory, and titles recycle it: a state freed back to the
+    /// title's allocator keeps our magic in its first word while the rest is reused for
+    /// something else. MEASURED on a tennis title's court load (~7,000 state inits in 500
+    /// frames, on recycled memory): such a struct carried the magic and, in the BLOCK slot, a
+    /// C++ vtable pointer into the READ-ONLY text segment - and `Init` zeroed 440 bytes there,
+    /// so a later virtual call through that vtable dispatched to address 0 and the run died
+    /// (intermittently: it needs that exact reuse, ~1 run in 3 in the browser). So the block
+    /// is reused only when it is in [`Self::precomputed_state_blocks`]; anything else is a
+    /// struct this engine never stamped, and gets a fresh block.
+    ///
+    /// `for_init` asks for more: the block must have been allocated for THIS struct. An `Init`
+    /// is a new state - on hardware it gets the `memBlock` the title just handed it - so a
+    /// struct that is a by-value COPY of another (which shares its block, as a copied state
+    /// shares driver memory) is given its own block rather than zeroing the original's.
     fn ensure_state_block(
         &mut self,
         ctx: &mut GuestCtx,
         state: u32,
         magic: u32,
         block_bytes: u32,
+        for_init: bool,
     ) -> u32 {
         use crate::vita::gxmstate::off;
         if ctx.read_u32(state.wrapping_add(off::MAGIC)) == magic {
             let block = ctx.read_u32(state.wrapping_add(off::BLOCK));
-            if block != 0 {
+            let ours = self.precomputed_state_blocks.get(&block);
+            if block != 0 && ours.is_some_and(|&owner| !for_init || owner == state) {
                 return block;
             }
         }
         let block = self.galloc(block_bytes, 16);
+        self.precomputed_state_blocks.insert(block, state);
         // ONE range write each, not a word loop: every guest write from the host is a
         // boundary crossing in the browser, and the fragment block is 100+ words. MEASURED on a
         // football title's live frame: `sceGxmPrecomputedFragmentStateInit` at 52 us a call,
@@ -18322,6 +18347,7 @@ impl VitaState {
             state,
             gxmstate::MAGIC_VERTEX,
             gxmstate::VERTEX_BLOCK_BYTES,
+            true,
         );
         // Re-init REPLACES: the arrays block and the mutable fields go back to zero. One range
         // write, not a word loop - see `ensure_state_block`.
@@ -18356,6 +18382,7 @@ impl VitaState {
             state,
             gxmstate::MAGIC_FRAGMENT,
             gxmstate::FRAGMENT_BLOCK_BYTES,
+            true,
         );
         // One range write, not a word loop - see `ensure_state_block`.
         ctx.write_bytes(block, &[0u8; gxmstate::FRAGMENT_BLOCK_BYTES as usize]);
@@ -18476,6 +18503,7 @@ impl VitaState {
             state,
             gxmstate::MAGIC_VERTEX,
             gxmstate::VERTEX_BLOCK_BYTES,
+            false,
         );
         ctx.write_u32(state.wrapping_add(off::BUF), buffer);
     }
@@ -18491,6 +18519,7 @@ impl VitaState {
             state,
             gxmstate::MAGIC_FRAGMENT,
             gxmstate::FRAGMENT_BLOCK_BYTES,
+            false,
         );
         ctx.write_u32(state.wrapping_add(off::BUF), buffer);
     }
@@ -18520,7 +18549,7 @@ impl VitaState {
                 gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS,
             )
         };
-        let block = self.ensure_state_block(ctx, state, magic, bytes);
+        let block = self.ensure_state_block(ctx, state, magic, bytes, false);
         ctx.write_u32(block.wrapping_add(table + index * 4), buffer);
     }
 
@@ -18559,7 +18588,7 @@ impl VitaState {
                 gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS,
             )
         };
-        let block = self.ensure_state_block(ctx, state, magic, bytes);
+        let block = self.ensure_state_block(ctx, state, magic, bytes, false);
         // Out-of-range tail reads as zeros, exactly as the per-word `read_u32` answered for
         // it - so a short array binds nothing where it used to bind nothing.
         let mut ptrs = [0u8; TABLE_BYTES];
@@ -18608,6 +18637,7 @@ impl VitaState {
             state,
             gxmstate::MAGIC_VERTEX,
             gxmstate::VERTEX_BLOCK_BYTES,
+            false,
         );
         gxmstate::write_texture_slot(
             ctx,
@@ -18636,6 +18666,7 @@ impl VitaState {
             state,
             gxmstate::MAGIC_FRAGMENT,
             gxmstate::FRAGMENT_BLOCK_BYTES,
+            false,
         );
         gxmstate::write_texture_slot(ctx, block, index, b.addr, b.words);
     }
