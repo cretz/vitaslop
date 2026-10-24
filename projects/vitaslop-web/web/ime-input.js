@@ -49,6 +49,10 @@ export function mountImeInput(worker, host) {
   const editing = { Enter: 1, Escape: 1, ArrowLeft: 1, ArrowRight: 1 };
   field.addEventListener("keydown", (e) => {
     e.stopPropagation();
+    // A key inside a COMPOSITION belongs to the device's own IME: Enter there picks a candidate,
+    // and forwarding it would close the game's keyboard before the word lands. The committed
+    // text still arrives, as an edit of the field.
+    if (composing || e.isComposing || e.keyCode === 229) return;
     if (editing[e.key]) {
       e.preventDefault();
       send(e.key);

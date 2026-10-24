@@ -54,23 +54,36 @@ export function forwardInput(worker, canvas, opts = {}) {
     on(canvas, "pointerup", pointer(false, false));
     on(canvas, "pointerleave", pointer(false, false));
   } else {
-    // Which panel each press went to, so its move and release go to the same one.
-    let back = false;
+    // Which panel each press went to, BY POINTER, so its move and release go to the same one -
+    // a second contact made while the Rear toggle changed must not move the first one's panel.
+    const panelOf = new Map();
     const toBack = (e) =>
       e.pointerType === "mouse" ? e.button === 2 || (e.buttons & 2) !== 0 : !!(opts.rearLatched && opts.rearLatched());
-    const post = (e, down) => {
+    const post = (e, back, down) => {
       const { x, y } = toScreen(e);
       worker.postMessage({ type: back ? "back-pointer" : "pointer", x, y, down });
     };
+    const release = (e) => {
+      if (!panelOf.has(e.pointerId)) return;
+      post(e, panelOf.get(e.pointerId), false);
+      panelOf.delete(e.pointerId);
+    };
     on(canvas, "pointerdown", (e) => {
-      back = toBack(e);
-      post(e, true);
+      const back = toBack(e);
+      panelOf.set(e.pointerId, back);
+      post(e, back, true);
     });
     on(canvas, "pointermove", (e) => {
-      if ((e.buttons & (back ? 2 : 1)) !== 0) post(e, true);
+      if (!panelOf.has(e.pointerId)) return;
+      const back = panelOf.get(e.pointerId);
+      // Only a MOUSE reaches the rear panel through its right button; a touch or pen contact is
+      // pressed on bit 0 whichever panel the toggle sent it to.
+      const held = e.pointerType === "mouse" && back ? 2 : 1;
+      if ((e.buttons & held) !== 0) post(e, back, true);
     });
-    on(canvas, "pointerup", (e) => post(e, false));
-    on(canvas, "pointerleave", (e) => post(e, false));
+    on(canvas, "pointerup", release);
+    on(canvas, "pointerleave", release);
+    on(canvas, "pointercancel", release);
     // The right button is the rear panel here, not the browser's menu.
     on(canvas, "contextmenu", (e) => e.preventDefault());
   }
