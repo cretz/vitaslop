@@ -12,7 +12,9 @@ use yaxpeax_arm::armv7::InstDecoder;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: disasm <module> <addr> [count] [--arm]");
+    let path = args
+        .next()
+        .expect("usage: disasm <module> <addr> [count] [--arm]");
     let rest: Vec<String> = args.collect();
     let thumb = !rest.iter().any(|a| a == "--arm");
     let mut numbers = rest.iter().filter(|a| !a.starts_with("--"));
@@ -43,12 +45,18 @@ fn main() {
                 // of 2- and 4-byte encodings and stepping by a fixed stride desynchronises.
                 let length = if thumb {
                     let half = u16::from_le_bytes([segment.data[at], segment.data[at + 1]]);
-                    if (0b11101..=0b11111).contains(&(half >> 11)) { 4 } else { 2 }
+                    if (0b11101..=0b11111).contains(&(half >> 11)) {
+                        4
+                    } else {
+                        2
+                    }
                 } else {
                     4
                 };
-                let raw: Vec<String> =
-                    segment.data[at..at + length].iter().map(|b| format!("{b:02x}")).collect();
+                let raw: Vec<String> = segment.data[at..at + length]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
                 println!("{pc:#010x}  {:<12}  {inst}", raw.join(""));
                 at += length;
             }

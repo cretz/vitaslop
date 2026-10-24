@@ -81,7 +81,11 @@ fn resolve_char(st: &mut VitaState, font: u32, ch: u32) -> Option<u32> {
 /// a system-font list this host does not have (see [`open`]).
 #[hostcall]
 pub(super) fn new_lib(ctx: &mut GuestCtx, st: &mut VitaState, params: Ptr, error_code: Ptr) -> u32 {
-    let num_fonts = if params.is_null() { 0 } else { ctx.read_u32(params.addr() + 4) };
+    let num_fonts = if params.is_null() {
+        0
+    } else {
+        ctx.read_u32(params.addr() + 4)
+    };
     let lib = st.fonts.new_lib();
     tracing::debug!(target: "vitaslop::cb", lib, num_fonts, "sceFontNewLib");
     if !error_code.is_null() {
@@ -108,10 +112,18 @@ pub(super) fn done_lib(_ctx: &mut GuestCtx, st: &mut VitaState, lib: u32) -> i32
 /// the honest answer. A title that renders its own text ships its own font and reaches
 /// [`open_user_memory`] instead, which works.
 #[hostcall]
-pub(super) fn open(ctx: &mut GuestCtx, st: &mut VitaState, lib: u32, index: i32, _mode: i32, error_code: Ptr) -> u32 {
+pub(super) fn open(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    lib: u32,
+    index: i32,
+    _mode: i32,
+    error_code: Ptr,
+) -> u32 {
     let font = crate::font::system::bytes()
         .and_then(|bytes| {
-            st.fonts.open_system_substitute(lib, &bytes, crate::font::system::SUBSTITUTE_PX)
+            st.fonts
+                .open_system_substitute(lib, &bytes, crate::font::system::SUBSTITUTE_PX)
         })
         .inspect(|_| report_substitute_font(index));
     match font {
@@ -253,12 +265,24 @@ pub(super) fn close(_ctx: &mut GuestCtx, st: &mut VitaState, font: u32) -> i32 {
 /// second glyph the PGF format can carry and nothing here synthesizes one, so claiming an
 /// id for it would point the title at a glyph that does not exist.
 #[hostcall]
-pub(super) fn get_char_info(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32, char_info: Ptr) -> i32 {
+pub(super) fn get_char_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    font: u32,
+    char_code: u32,
+    char_info: Ptr,
+) -> i32 {
     char_info_impl(ctx, st, font, char_code & 0xFFFF, char_info.addr())
 }
 
 /// The body of [`get_char_info`], as a plain function so it can use early returns.
-fn char_info_impl(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32, char_info: u32) -> i32 {
+fn char_info_impl(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    font: u32,
+    char_code: u32,
+    char_info: u32,
+) -> i32 {
     let Some(ch) = resolve_char(st, font, char_code) else {
         return SCE_FONT_ERROR_INVALID_PARAMETER;
     };
@@ -301,7 +325,12 @@ fn char_info_impl(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: 
 /// choose from that list - there is nothing true to put there. `BPP` is 8, which is what
 /// this engine's coverage bitmaps are and what [`glyph_image`] blits.
 #[hostcall]
-pub(super) fn get_font_info(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, font_info: Ptr) -> i32 {
+pub(super) fn get_font_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    font: u32,
+    font_info: Ptr,
+) -> i32 {
     font_info_impl(ctx, st, font, font_info.addr())
 }
 
@@ -346,13 +375,25 @@ fn font_info_impl(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, font_info: 
 /// Rasterize the glyph and blit its 8-bit coverage into the caller's buffer at the pen
 /// position, in the buffer's own pixel format and stride.
 #[hostcall]
-pub(super) fn get_char_glyph_image(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32, image: Ptr) -> i32 {
+pub(super) fn get_char_glyph_image(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    font: u32,
+    char_code: u32,
+    image: Ptr,
+) -> i32 {
     glyph_image(ctx, st, font, char_code & 0xFFFF, image.addr())
 }
 
 /// The blit, as a plain function so it can use early returns (a `#[hostcall]` body is
 /// inlined into a wrapper that returns `()`, so `return` in one is a type error).
-fn glyph_image(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32, image: u32) -> i32 {
+fn glyph_image(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    font: u32,
+    char_code: u32,
+    image: u32,
+) -> i32 {
     if image == 0 {
         return SCE_FONT_ERROR_INVALID_PARAMETER;
     }
@@ -368,8 +409,10 @@ fn glyph_image(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32
 
     // 24- and 32-bit destinations are colour formats; this engine rasterizes COVERAGE and
     // has no colour to put in them, so they are refused rather than filled with a guess.
-    if !matches!(pixel_format, SCE_FONT_PIXELFORMAT_4 | SCE_FONT_PIXELFORMAT_4_REV | SCE_FONT_PIXELFORMAT_8)
-    {
+    if !matches!(
+        pixel_format,
+        SCE_FONT_PIXELFORMAT_4 | SCE_FONT_PIXELFORMAT_4_REV | SCE_FONT_PIXELFORMAT_8
+    ) {
         return SCE_FONT_ERROR_INVALID_PARAMETER;
     }
     let Some(ch) = resolve_char(st, font, char_code) else {
@@ -377,7 +420,13 @@ fn glyph_image(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32
     };
     // Copy the glyph out so the `fonts` borrow ends before guest memory is touched.
     let Some((coverage, gw, gh, left, top)) = st.fonts.glyph(font, ch).map(|(b, m)| {
-        (b.coverage.clone(), b.width as i32, b.height as i32, m.bitmap_left, m.bitmap_top)
+        (
+            b.coverage.clone(),
+            b.width as i32,
+            b.height as i32,
+            m.bitmap_left,
+            m.bitmap_top,
+        )
     }) else {
         return SCE_FONT_ERROR_INVALID_PARAMETER;
     };
@@ -441,7 +490,10 @@ fn glyph_image(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32
         }
         let row = &coverage[(gy * gw + gx0) as usize..(gy * gw + gx1) as usize];
         if pixel_format == SCE_FONT_PIXELFORMAT_8 {
-            ctx.write_bytes(buffer + dy as u32 * bytes_per_line + (dst_x0 + gx0) as u32, row);
+            ctx.write_bytes(
+                buffer + dy as u32 * bytes_per_line + (dst_x0 + gx0) as u32,
+                row,
+            );
             continue;
         }
         // The two 4-bit formats pack two pixels per byte and differ ONLY in which nibble
@@ -457,7 +509,11 @@ fn glyph_image(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, char_code: u32
             let old = ((existing >> shift) & 0xFF) as u8;
             let nib = cov >> 4;
             let high = (dx & 1 == 0) == even_high;
-            let merged = if high { (old & 0x0F) | (nib << 4) } else { (old & 0xF0) | nib };
+            let merged = if high {
+                (old & 0x0F) | (nib << 4)
+            } else {
+                (old & 0xF0) | nib
+            };
             ctx.write_bytes(byte_off, &[merged]);
         }
     }

@@ -146,6 +146,9 @@ pub struct BindingPlan {
     /// hardware would store - instead of a converted `vec4<f32>`. Set by the link from
     /// [`crate::link::LinkOptions::raw64_output`].
     pub raw64_output: bool,
+    /// The pass is multisampled: a destination read loads its own sample of a multisampled
+    /// copy. Set by the link from [`crate::link::LinkOptions::dest_multisampled`].
+    pub dest_multisampled: bool,
     /// Splat the colour's alpha into every channel and read the destination's red as its
     /// alpha. Set by the link from [`crate::link::LinkOptions::alpha_to_red`].
     pub alpha_to_red: bool,
@@ -584,6 +587,7 @@ pub fn plan_bindings(shader: &Shader, uniform_regs: u32, is_cube: impl Fn(u8) ->
         dual_source: false,
         dual_split: None,
         raw64_output: false,
+        dest_multisampled: false,
         alpha_to_red: false,
         // A plan built from the SHADER alone cannot resolve a window - that needs the
         // program's containers and parameter table - so it carries none, and
@@ -1683,7 +1687,7 @@ pub fn reads_output_bank(shader: &Shader) -> bool {
 /// the same correspondence [`color_return_expr`] uses in the other direction. Reading an F16
 /// destination as four F32 registers is the denormal-black failure
 /// [[vitaslop-f16-colour-output]] records, run backwards.
-pub(crate) fn dest_color_init(precision: ColorPrecision, dual_source: bool, alpha_to_red: bool) -> String {
+pub(crate) fn dest_color_init(precision: ColorPrecision, dual_source: bool, alpha_to_red: bool, multisampled: bool) -> String {
     let mut s = String::new();
     if dual_source {
         // The dual-source body takes the destination as a PARAMETER - it is evaluated once with
@@ -1706,12 +1710,18 @@ pub(crate) fn dest_color_init(precision: ColorPrecision, dual_source: bool, alph
                 "  let gxp_dstc = vec4<f32>({:?}, {:?}, {:?}, {:?}); // POISONED",
                 c[0], c[1], c[2], c[3]
             );
-            let _ = writeln!(s, "  _ = textureLoad(gxp_dst, vec2<i32>(0, 0), 0);");
+            let _ = writeln!(
+                s,
+                "  _ = textureLoad(gxp_dst, vec2<i32>(0, 0), {});",
+                if multisampled { "i32(in.gxp_sample)" } else { "0" }
+            );
         }
         None => {
             let _ = writeln!(
                 s,
-                "  let gxp_dstc = textureLoad(gxp_dst, vec2<i32>(in.frag_coord.xy), 0){};",
+                "  let gxp_dstc = textureLoad(gxp_dst, vec2<i32>(in.frag_coord.xy), {}){};",
+                // A multisampled copy is read at the sample being shaded; a plain one at mip 0.
+                if multisampled { "i32(in.gxp_sample)" } else { "0" },
                 // A single-channel ALPHA target keeps its one value in RED - see
                 // `link::LinkOptions::alpha_to_red`.
                 if alpha_to_red { ".rrrr" } else { "" }
@@ -1770,6 +1780,11 @@ fn dest_poison() -> Option<[f32; 4]> {
 /// block, so it is the one group whose bind group is rebuilt often enough to also carry a view
 /// that changes within a pass.
 pub(crate) const GXP_DEST_DECL: &str = "@group(3) @binding(1) var gxp_dst: texture_2d<f32>;
+";
+
+/// [`GXP_DEST_DECL`] on a multisampled pass: the copy keeps every sample - see
+/// `link::LinkOptions::dest_multisampled`.
+pub(crate) const GXP_DEST_DECL_MS: &str = "@group(3) @binding(1) var gxp_dst: texture_multisampled_2d<f32>;
 ";
 
 /// Assemble a complete, bindable WGSL fragment module from an emitted body + its binding
@@ -1845,7 +1860,7 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
     // ...and the O bank starts at the DESTINATION colour for a program that blends itself,
     // because that is what the hardware seeds those registers with.
     if plan.reads_dest_color {
-        m.push_str(&dest_color_init(plan.color_precision, false, false));
+        m.push_str(&dest_color_init(plan.color_precision, false, false, plan.dest_multisampled));
     }
     // Predicate registers p0..p3 (written by test ops, read by predicated instructions).
     let _ = writeln!(m, "  var p: array<bool, 4>;");

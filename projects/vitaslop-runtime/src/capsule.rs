@@ -37,7 +37,9 @@
 //! capsule is REFUSED rather than misread, because a capsule silently decoded through the wrong
 //! field order would produce a wrong picture that looks like a shader bug.
 
-use crate::capture::{BlendState, BoundTexture, Draw, FragmentMaterial, RenderState, VertexAttribute};
+use crate::capture::{
+    BlendState, BoundTexture, Draw, FragmentMaterial, RenderState, VertexAttribute,
+};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
@@ -48,8 +50,10 @@ use std::sync::Arc;
 /// - and a capsule is a scratch artifact recaptured in seconds, so the version is bumped
 /// rather than the reader taught two layouts. Version 3 added the FRAGMENT stage's
 /// guest-memory windows beside the vertex stage's. Version 4 added the vertex program the
-/// fragment was PATCHED against (`Draw::fprog_patched_vprog`).
-const MAGIC: &[u8; 8] = b"VSCAPS\x00\x04";
+/// fragment was PATCHED against (`Draw::fprog_patched_vprog`). Version 5 added each texture's
+/// LOD min (`BoundTexture::lod_min`).
+/// Version 6 added each texture's YUV profile (`BoundTexture::yuv_profile`).
+const MAGIC: &[u8; 8] = b"VSCAPS\x00\x06";
 
 /// What a capsule cannot answer. Printed by the replay tool every time - a limitation nobody
 /// reads is a limitation nobody applies.
@@ -112,6 +116,9 @@ struct Slim {
     next: u32,
     /// Reading: blob id -> its bytes, shared by every field that references it.
     read: Vec<Arc<[u8]>>,
+    /// Reading: one minted `pixels_id` per shared pixel buffer (by its address, which is stable
+    /// while `read` holds it), so every draw of one texture is ONE texture to the renderer.
+    pixel_ids: std::collections::HashMap<usize, u64>,
 }
 thread_local! {
     static SLIM: std::cell::RefCell<Option<Slim>> = const { std::cell::RefCell::new(None) };
@@ -185,9 +192,15 @@ fn r_bytes_shared(i: &mut impl Read) -> io::Result<Arc<[u8]>> {
     if n == SLIM_REF && slim_on {
         let id = r_u32(i)? as usize;
         return SLIM.with(|c| {
-            c.borrow().as_ref().and_then(|s| s.read.get(id).cloned()).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("slim frame: reference to blob {id}, which was never written"))
-            })
+            c.borrow()
+                .as_ref()
+                .and_then(|s| s.read.get(id).cloned())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("slim frame: reference to blob {id}, which was never written"),
+                    )
+                })
         });
     }
     let mut v = vec![0u8; n as usize];
@@ -227,13 +240,32 @@ fn r_attr(i: &mut impl Read) -> io::Result<VertexAttribute> {
 
 fn w_tex(o: &mut impl Write, t: &BoundTexture) -> io::Result<()> {
     for v in [
-        t.unit, t.base_format, t.swizzle, t.tex_type, t.width, t.height, t.stride, t.faces,
-        t.face_bytes, t.levels, t.data_addr,
+        t.unit,
+        t.base_format,
+        t.swizzle,
+        t.tex_type,
+        t.width,
+        t.height,
+        t.stride,
+        t.faces,
+        t.face_bytes,
+        t.levels,
+        t.data_addr,
     ] {
         w_u32(o, v)?;
     }
     w_bytes(o, &t.pixels)?;
-    for v in [t.u_addr_mode, t.v_addr_mode, t.lod_bias, t.min_filter, t.mag_filter, t.mip_filter, t.gamma] {
+    for v in [
+        t.u_addr_mode,
+        t.v_addr_mode,
+        t.lod_bias,
+        t.lod_min,
+        t.min_filter,
+        t.mag_filter,
+        t.mip_filter,
+        t.gamma,
+        t.yuv_profile,
+    ] {
         w_u32(o, v)?;
     }
     Ok(())
@@ -246,8 +278,16 @@ fn r_tex(i: &mut impl Read) -> io::Result<BoundTexture> {
     Ok(BoundTexture {
         unit,
         // Replayed from a capsule: a buffer this process just built, so it is minted like any
-        // other. A capsule replays ONE draw, so nothing downstream is comparing it to another.
-        pixels_id: crate::capture::next_pixels_id(),
+        // other - ONCE per shared buffer in a slim frame. Minted per draw, every draw of one
+        // texture was a new texture to the renderer's caches: a 2D title's frame of ~150 draws
+        // over a handful of 1024x1024 layers replayed as 264 decodes and a 1.3 GB working set.
+        pixels_id: SLIM.with(|c| match c.borrow_mut().as_mut() {
+            Some(s) => *s
+                .pixel_ids
+                .entry(pixels.as_ptr() as usize)
+                .or_insert_with(crate::capture::next_pixels_id),
+            None => crate::capture::next_pixels_id(),
+        }),
         base_format,
         swizzle,
         tex_type,
@@ -262,10 +302,12 @@ fn r_tex(i: &mut impl Read) -> io::Result<BoundTexture> {
         u_addr_mode: r_u32(i)?,
         v_addr_mode: r_u32(i)?,
         lod_bias: r_u32(i)?,
+        lod_min: r_u32(i)?,
         min_filter: r_u32(i)?,
         mag_filter: r_u32(i)?,
         mip_filter: r_u32(i)?,
         gamma: r_u32(i)?,
+        yuv_profile: r_u32(i)?,
     })
 }
 
@@ -307,7 +349,11 @@ fn w_state(o: &mut impl Write, s: &RenderState) -> io::Result<()> {
     for v in s.region_clip {
         w_u32(o, v)?;
     }
-    for v in [s.front_visibility_test_enable, s.front_visibility_test_index, s.front_visibility_test_op] {
+    for v in [
+        s.front_visibility_test_enable,
+        s.front_visibility_test_index,
+        s.front_visibility_test_op,
+    ] {
         w_u32(o, v)?;
     }
     Ok(())
@@ -582,10 +628,11 @@ impl Capsule {
 // frame: targets an EARLIER frame left behind are not in it, which the replay tool says.
 
 /// Frame-capsule magic + version. Bump on any field-order change.
-/// Version 2: the draw record grew with `VSCAPS` version 4.
-const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x02";
+/// Version 2: the draw record grew with `VSCAPS` version 4; 4 (slim 5) with version 5.
+/// 6 (slim 7) with version 6.
+const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x06";
 /// The same frame body with every large byte field deduplicated - see [`SLIM_MIN`].
-const FRAME_MAGIC_SLIM: &[u8; 8] = b"VSFRAM\x00\x03";
+const FRAME_MAGIC_SLIM: &[u8; 8] = b"VSFRAM\x00\x07";
 
 /// Clears the slim context when a slim write or read ends, however it ends.
 struct SlimReset;
@@ -632,7 +679,16 @@ pub fn write_frame(
         match &s.color {
             Some(c) => {
                 w_u8(o, 1)?;
-                for v in [c.format, c.surface_type, c.width, c.height, c.stride_pixels, c.data_addr, c.scale_mode, c.gamma] {
+                for v in [
+                    c.format,
+                    c.surface_type,
+                    c.width,
+                    c.height,
+                    c.stride_pixels,
+                    c.data_addr,
+                    c.scale_mode,
+                    c.gamma,
+                ] {
                     w_u32(o, v)?;
                 }
             }
@@ -641,7 +697,13 @@ pub fn write_frame(
         match &s.depth {
             Some(d) => {
                 w_u8(o, 1)?;
-                for v in [d.zls_control, d.depth_addr, d.stencil_addr, d.background_depth, d.background_control] {
+                for v in [
+                    d.zls_control,
+                    d.depth_addr,
+                    d.stencil_addr,
+                    d.background_depth,
+                    d.background_control,
+                ] {
                     w_u32(o, v)?;
                 }
             }
@@ -692,7 +754,9 @@ pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
     if &magic != FRAME_MAGIC && !slim {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("not a frame capsule of this version (magic {magic:?}, expected {FRAME_MAGIC:?} or {FRAME_MAGIC_SLIM:?})"),
+            format!(
+                "not a frame capsule of this version (magic {magic:?}, expected {FRAME_MAGIC:?} or {FRAME_MAGIC_SLIM:?})"
+            ),
         ));
     }
     let _reset = slim.then(|| {
@@ -747,19 +811,37 @@ pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
         }
         scenes.push(s);
     }
-    Ok(FrameCapsule { scenes, width, height, clear, frame })
+    Ok(FrameCapsule {
+        scenes,
+        width,
+        height,
+        clear,
+        frame,
+    })
 }
 
 /// `VITASLOP_FRAME_CAPSULE=<dir>`: write every frame a headless run renders for a SHOT to
 /// `<dir>/f<frame>.frame`. The frame is whatever the shot rendered, so `--shot-every` and the
 /// frame count choose which frames are kept. Reported once if a write fails.
-pub fn maybe_write_frame(scenes: &[crate::capture::Scene], width: u32, height: u32, clear: [u8; 4], frame: u64) {
-    let Some(dir) = vitaslop_platform::knobs::var_os("VITASLOP_FRAME_CAPSULE") else { return };
+pub fn maybe_write_frame(
+    scenes: &[crate::capture::Scene],
+    width: u32,
+    height: u32,
+    clear: [u8; 4],
+    frame: u64,
+) {
+    let Some(dir) = vitaslop_platform::knobs::var_os("VITASLOP_FRAME_CAPSULE") else {
+        return;
+    };
     let dir = std::path::PathBuf::from(dir);
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(format!("f{frame:06}.frame"));
     let mut bytes = Vec::new();
-    let result = write_frame(&mut bytes, scenes, width, height, clear, frame).and_then(|()| std::fs::write(&path, &bytes));
+    // SLIM: the same frame with each repeated texture once. A full frame writes every draw's
+    // textures in full, and a replay read back one buffer per draw - one texture identity per
+    // draw, so its caches never hit (see `r_tex`).
+    let result = write_frame_slim(&mut bytes, scenes, width, height, clear, frame)
+        .and_then(|()| std::fs::write(&path, &bytes));
     match result {
         Ok(()) => tracing::info!(
             target: "vitaslop::gxm",
@@ -768,7 +850,9 @@ pub fn maybe_write_frame(scenes: &[crate::capture::Scene], width: u32, height: u
             bytes.len(),
             path.display()
         ),
-        Err(e) => tracing::warn!(target: "vitaslop::gxm", "frame capsule: could NOT write {}: {e}", path.display()),
+        Err(e) => {
+            tracing::warn!(target: "vitaslop::gxm", "frame capsule: could NOT write {}: {e}", path.display())
+        }
     }
 }
 
@@ -792,7 +876,11 @@ mod tests {
         SLIM.with(|c| *c.borrow_mut() = None);
         // big + small + a 8-byte reference + small again.
         assert_eq!(out.len(), (4 + 4096) + (4 + 3) + 8 + (4 + 3));
-        assert_eq!(&out[..4 + 4096], &plain[..], "the first occurrence is the old format exactly");
+        assert_eq!(
+            &out[..4 + 4096],
+            &plain[..],
+            "the first occurrence is the old format exactly"
+        );
         SLIM.with(|c| *c.borrow_mut() = Some(Slim::default()));
         let mut r = &out[..];
         let a = r_bytes_shared(&mut r).unwrap();
@@ -801,7 +889,10 @@ mod tests {
         let s2 = r_bytes_shared(&mut r).unwrap();
         SLIM.with(|c| *c.borrow_mut() = None);
         assert_eq!(&a[..], &big[..]);
-        assert!(Arc::ptr_eq(&a, &b), "a reference reads back as the same buffer");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "a reference reads back as the same buffer"
+        );
         assert_eq!((&s1[..], &s2[..]), (&small[..], &small[..]));
         assert!(r.is_empty());
     }
@@ -811,8 +902,20 @@ mod tests {
     #[test]
     fn capsule_round_trips_every_field() {
         let attrs = vec![
-            VertexAttribute { stream_index: 0, offset: 0, format: 9, component_count: 4, reg_index: 0 },
-            VertexAttribute { stream_index: 0, offset: 52, format: 4, component_count: 4, reg_index: 8 },
+            VertexAttribute {
+                stream_index: 0,
+                offset: 0,
+                format: 9,
+                component_count: 4,
+                reg_index: 0,
+            },
+            VertexAttribute {
+                stream_index: 0,
+                offset: 52,
+                format: 4,
+                component_count: 4,
+                reg_index: 8,
+            },
         ];
         let tex = BoundTexture {
             // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
@@ -833,10 +936,12 @@ mod tests {
             u_addr_mode: 1,
             v_addr_mode: 2,
             lod_bias: 3,
+            lod_min: 2,
             min_filter: 1,
             mag_filter: 0,
             mip_filter: 1,
             gamma: 1,
+            yuv_profile: 2,
         };
         let mut state = RenderState::default();
         state.cull_mode = 2;
@@ -884,7 +989,10 @@ mod tests {
             vert_sa: Arc::from(vec![0xCCu8; 7]),
             frag_sa: Arc::from(vec![0xDDu8; 8]),
             frag_sa_addr: 0x882c_aa80,
-            mem_windows: vec![(0x882c_9780, Arc::from(&[1u8, 2, 3, 4][..])), (0x8e1d_2fb0, Arc::from(&[5u8, 6][..]))],
+            mem_windows: vec![
+                (0x882c_9780, Arc::from(&[1u8, 2, 3, 4][..])),
+                (0x8e1d_2fb0, Arc::from(&[5u8, 6][..])),
+            ],
             frag_mem_windows: vec![(0x8b40_0000, Arc::from(&[9u8, 8, 7, 6][..]))],
             shader_expanded: true,
         };
@@ -912,16 +1020,17 @@ mod tests {
         // this one's sequence, where they can collide with freshly minted ones - which is the
         // exact defect the field exists to remove. The reader mints instead, and a capsule
         // replays ONE draw, so nothing is comparing two of them.
-        let same_ids = |read: &Arc<[BoundTexture]>, want: &Arc<[BoundTexture]>| -> Arc<[BoundTexture]> {
-            read.iter()
-                .zip(want.iter())
-                .map(|(a, b)| {
-                    let mut a = a.clone();
-                    a.pixels_id = b.pixels_id;
-                    a
-                })
-                .collect()
-        };
+        let same_ids =
+            |read: &Arc<[BoundTexture]>, want: &Arc<[BoundTexture]>| -> Arc<[BoundTexture]> {
+                read.iter()
+                    .zip(want.iter())
+                    .map(|(a, b)| {
+                        let mut a = a.clone();
+                        a.pixels_id = b.pixels_id;
+                        a
+                    })
+                    .collect()
+            };
         back.draw.textures = same_ids(&back.draw.textures, &c.draw.textures);
         back.draw.vertex_textures = same_ids(&back.draw.vertex_textures, &c.draw.vertex_textures);
 
@@ -1031,7 +1140,11 @@ pub fn maybe_capture(d: &Draw) {
             return None;
         }
         let _ = std::fs::create_dir_all(dir);
-        Some(Spec { hashes, dir: std::path::PathBuf::from(dir), limit })
+        Some(Spec {
+            hashes,
+            dir: std::path::PathBuf::from(dir),
+            limit,
+        })
     });
     let Some(spec) = spec else { return };
 
@@ -1063,7 +1176,6 @@ pub fn maybe_capture(d: &Draw) {
             );
         }
     }
-
 
     if d.index_count < min_indices() {
         return;
@@ -1108,7 +1220,11 @@ pub fn maybe_capture(d: &Draw) {
         draw_index: n as u32,
         note: format!(
             "vprog {vhash:016x} submission {n}; extent {w}x{h_}{}",
-            if guessed { " (GUESSED - this draw carried no viewport)" } else { " (from the viewport)" }
+            if guessed {
+                " (GUESSED - this draw carried no viewport)"
+            } else {
+                " (from the viewport)"
+            }
         ),
     };
     match c.save(&path) {

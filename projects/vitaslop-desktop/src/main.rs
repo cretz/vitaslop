@@ -158,7 +158,7 @@ fn main() {
             println!("vitaslop import <pkg|zip|folder> add a title to the library ({})", library::library_dir().display());
             println!("vitaslop list                    list the library");
             println!("vitaslop serve [--port N]        host the web front end from this binary");
-            println!("vitaslop --game <dir> [--recipe <file>] [--headless <shot-dir>] [--save-dir <dir>] [--addons <dir>] [--repatch <dir>]");
+            println!("vitaslop --game <dir> [--headless <shot-dir>] [--save-dir <dir>] [--addons <dir>] [--repatch <dir>]");
             println!("vitaslop --game <dir> --headless <out> (--playbook <file.lua> | --tape <file>) [--discover]");
             println!("vitaslop --cube                  the built-in demo");
             return;
@@ -170,28 +170,6 @@ fn main() {
             eprintln!("usage: vitaslop --game <extracted-app-dir> [--headless <shot-dir>] [--save-dir <dir>]");
             std::process::exit(2);
         };
-        // `--recipe <file>` replays a scripted TAS recipe. In the live window it drives input
-        // so a recorded playthrough can be watched (live keyboard/mouse still nudge it); under
-        // `--headless` it is what makes the run reach the screen the recipe is about.
-        //
-        // >>> IT USED TO BE DROPPED ON THE FLOOR UNDER `--headless`, and that is worth a
-        // comment because of HOW it failed. The flag was parsed and the file was READ and
-        // validated - so a bad path still exited 2, which is exactly the check that makes a
-        // flag look wired up - and then `headless_check` was called without it, silently
-        // running the built-in tap script instead. The run then ends on whatever screen the
-        // built-in taps reach, which is a perfectly ordinary-looking frame. Every conclusion
-        // drawn from it is about the wrong screen, and nothing anywhere says so.
-        let recipe_path = args
-            .iter()
-            .position(|a| a == "--recipe" || a == "-r")
-            .and_then(|i| args.get(i + 1))
-            .cloned();
-        let recipe = recipe_path.as_ref().map(|p| {
-            std::fs::read_to_string(p).unwrap_or_else(|e| {
-                eprintln!("cannot read recipe {p}: {e}");
-                std::process::exit(2);
-            })
-        });
         // `--headless <dir>` validates the retail path without opening a window (drive
         // the tutorial + render one frame to a PNG); useful on a display-less box.
         // `--save-dir <root>` keeps the guest's OWN saved state across runs, under
@@ -244,13 +222,13 @@ fn main() {
         }
         let result = match args.iter().position(|a| a == "--headless") {
             Some(h) => match args.get(h + 1) {
-                Some(shot) => retail::headless_check(dir.into(), shot.into(), recipe, save_dir, addons, repatch, play, discover),
+                Some(shot) => retail::headless_check(dir.into(), shot.into(), save_dir, addons, repatch, play, discover),
                 None => {
                     eprintln!("--headless requires a shot directory");
                     std::process::exit(2);
                 }
             },
-            None => retail::run(dir.into(), recipe, save_dir, addons, repatch),
+            None => retail::run(dir.into(), save_dir, addons, repatch),
         };
         if let Err(e) = result {
             eprintln!("error: {e}");

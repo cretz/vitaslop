@@ -342,7 +342,7 @@ impl Backend for WebCodecsBackend {
         // submitted 9 units and got 2 pictures back, hardware holding the rest. The title's
         // own pool then filled with unrecycled buffers (`sceClibMspaceMemalign: 8 REFUSED` on
         // a phone), it stopped pulling units, and the movie froze - and the divergent flow
-        // failed the recipe's determinism signature downstream. Chrome's software decoder
+        // failed the run's determinism signature downstream. Chrome's software decoder
         // honours `optimizeForLatency` with a pipeline depth of ~1, and a console-sized
         // picture (<= 960x544) is a few milliseconds in software on any target this runs on.
         let preference = if self.low_latency || !self.hardware {

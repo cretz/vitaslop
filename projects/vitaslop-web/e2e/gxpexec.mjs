@@ -11,7 +11,7 @@
 // renderer ships plus the register file the crate's own USSE interpreter computes for the same
 // inputs. This runs the GPU half and diffs. The emitter and the interpreter share the decoder
 // and nothing else, so a disagreement is a defect in one of them - visible with no title, no
-// recipe and no frame.
+// playbook and no frame.
 //
 // >>> IT IS BUILT FOR CI, WHICH MEANS IT IS BUILT AROUND ONE COST. The expensive part is Tint
 // compiling each module; everything else must not add to it. So:

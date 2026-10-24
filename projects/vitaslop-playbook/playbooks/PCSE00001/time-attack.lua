@@ -2,10 +2,10 @@
 -- menu, TIME -> LAP TIME ATTACK on Highland Cliffs with no ghost, and a live lap (LAP 1/30)
 -- driven off the line.
 --
--- Converted from the recipes `play` (the wizard, then TIME ATTACK SELECTION) and
+-- Converted from the old frame-keyed scripts `play` (the wizard, then TIME ATTACK SELECTION) and
 -- `time-attack-lap` (on to a live Lap Time Attack). Everything up to the main menu, and the race
 -- start, are `ghost-battle.lua`'s - read its notes; this file repeats them because a playbook is
--- one file. MEASURED 10-16: LAP TIME ATTACK no longer faults (the recipe's note of a fault at
+-- one file. MEASURED 10-16: LAP TIME ATTACK no longer faults (the old script's note of a fault at
 -- f9459 in the resource-group collector is stale); its driving line was already stale.
 --
 -- HOW THE CUES WERE FOUND: `--discover` on `ghost-battle-race`'s run (deterministic, 9400
@@ -20,7 +20,7 @@
 --   then   sceNgsVoiceKeyOff x2               the intro ends; the countdown begins
 --
 -- THE WIZARD MAKES NO CALLS and no screen-id cell was found (a value search over two dumps of
--- each of its ten screens found none constant per screen), so its touches replay the recipe's,
+-- each of its ten screens found none constant per screen), so its touches replay the old script's,
 -- in game frames from PLAY. Every coordinate was taken from a shot of the screen it acts on; the
 -- wizard is TOUCH ONLY (its buttons are not pad-selectable), panel coordinates are screen x2:
 --   * PLANETARY LEAGUE -> SIGN ON (not a PSN sign-in); TEAMS: touch the ticket to sign;
@@ -89,7 +89,7 @@ end
 
 -- THE MENUS HAVE NO CUE EITHER: a value search over two dumps of each menu screen found only a
 -- byte that steps every ~160 frames on its own (it matched the dumps by coincidence) and a
--- pointer that moves on unrelated events. So the menu taps keep the recipe's spacing too.
+-- pointer that moves on unrelated events. So the menu taps keep the old script's spacing too.
 
 phase("title", { timeout = 120 }, function()
   -- Legal notice, BANDAI NAMCO, namco, CELLIUS, a save-data spinner, then the RIDGE RACER title
@@ -109,7 +109,7 @@ phase("wizard", { timeout = 240 }, function()
   idle(100)
   shot("news")
   -- The team trophy + RCTV ticker; the right-edge arrow dismisses it to the MAIN MENU - ONCE.
-  -- MEASURED: the recipe tapped it at +419 and +719 frames from the trophy. Deterministic, the
+  -- MEASURED: the old script tapped it at +419 and +719 frames from the trophy. Deterministic, the
   -- first tap came before the BREAKING NEWS panel was ready and the second took it; at real
   -- speed the first took it and the second landed on the main menu, where that spot is the
   -- SPOT RACE card. The panel is ready by ~+420 in both, so: one tap at +500.
@@ -122,7 +122,7 @@ phase("time-attack", { timeout = 120 }, function()
   -- MAIN MENU: the TIME card (screen 930,415); TIME ATTACK SELECTION: LAP TIME ATTACK (the "30"
   -- card, screen 238,275 - fastest lap out of up to 30); COURSE: Highland Cliffs, the centred
   -- card; GHOST: "Do not display Ghosts", centred; MACHINE: BISARGENTO on the right-edge arrow;
-  -- CONFIRM: READY (screen 925,275), which streams the course in. MEASURED: the recipe sat on
+  -- CONFIRM: READY (screen 925,275), which streams the course in. MEASURED: the old script sat on
   -- TIME ATTACK SELECTION for ~1500 frames tapping empty space before the card it wanted; the
   -- spacing here is ~300 frames a screen.
   -- The main menu slides in after the news tap; let it settle (see ghost-battle.lua).
@@ -245,7 +245,7 @@ local LINE = {
 
 phase("race", { timeout = 120 }, function()
   -- MEASURED: the intro and the countdown run ~1000 frames after the scene is built (the
-  -- recipe's "live by f8800" had gone stale). Throttle may be held through the countdown.
+  -- old script's "live by f8800" had gone stale). Throttle may be held through the countdown.
   wait(countdown:atleast(2), { timeout = 60 })
   split("countdown")
   press("cross")

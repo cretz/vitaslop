@@ -23,7 +23,9 @@
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: refs <module> <addr> [span] [--arm]");
+    let path = args
+        .next()
+        .expect("usage: refs <module> <addr> [span] [--arm]");
     let rest: Vec<String> = args.collect();
     let arm = rest.iter().any(|a| a == "--arm");
     let mut numbers = rest.iter().filter(|a| !a.starts_with("--"));
@@ -66,12 +68,13 @@ fn main() {
                 if op == 0x30 {
                     pending[rd] = Some((pc, imm16));
                 } else if op == 0x34
-                    && let Some((lo_pc, lo)) = pending[rd] {
-                        let addr = (imm16 << 16) | lo;
-                        if hit(addr) {
-                            println!("{pc:#010x}  movt r{rd} (movw at {lo_pc:#010x})  -> {addr:#010x}");
-                        }
+                    && let Some((lo_pc, lo)) = pending[rd]
+                {
+                    let addr = (imm16 << 16) | lo;
+                    if hit(addr) {
+                        println!("{pc:#010x}  movt r{rd} (movw at {lo_pc:#010x})  -> {addr:#010x}");
                     }
+                }
                 at += 4;
                 continue;
             }
@@ -98,7 +101,11 @@ fn main() {
             }
             // Not a wide instruction we care about: step one halfword, since Thumb is a mix of
             // 2- and 4-byte encodings and a fixed stride desynchronises (see `disasm`).
-            at += if (0b11101..=0b11111).contains(&(hw0 >> 11)) { 4 } else { 2 };
+            at += if (0b11101..=0b11111).contains(&(hw0 >> 11)) {
+                4
+            } else {
+                2
+            };
         }
 
         // Literal words.

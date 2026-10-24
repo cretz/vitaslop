@@ -2,15 +2,14 @@
 //! current frame to a PNG, and reduce the whole observable output to one
 //! determinism signature.
 //!
-//! These three are the entire observation surface of a game run, and both drivers
-//! share them - the batch [`recipe_runner`](crate::recipe_runner) and the resident
-//! [`session`](crate::session). Keeping them here (rather than one copy per driver)
-//! is what makes a signature printed by `play` and one printed by `session`
-//! comparable, which is the property the whole equivalence-oracle idea rests on.
+//! These three are the entire observation surface of a game run, and every native tool
+//! shares them - the resident session, `explore`, `bench`. Keeping them here (rather than one
+//! copy per tool) is what makes a signature printed by one comparable with another's, which is
+//! the property the whole equivalence-oracle idea rests on.
 
 use std::path::{Path, PathBuf};
 
-use vitaslop_runtime::recipe::WatchDecl;
+use vitaslop_runtime::guest_read::WatchDecl;
 use vitaslop_runtime::{render, VitaEnv};
 
 use crate::ThreadedScheduler;
@@ -20,10 +19,10 @@ pub const WIDTH: u32 = 960;
 pub const HEIGHT: u32 = 544;
 pub const CLEAR: [u8; 4] = [0, 0, 0, 255];
 
-/// Reads guest memory through a scheduler, for the shared recipe evaluator.
+/// Reads guest memory through a scheduler, for the shared watch sampler.
 struct SchedRead<'a>(&'a ThreadedScheduler<VitaEnv>);
 
-impl vitaslop_runtime::recipe_eval::GuestRead for SchedRead<'_> {
+impl vitaslop_runtime::guest_read::GuestRead for SchedRead<'_> {
     fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
         self.0.read_guest_into(addr, out)
     }
@@ -32,11 +31,11 @@ impl vitaslop_runtime::recipe_eval::GuestRead for SchedRead<'_> {
 /// Sample one watched value from current guest memory, widened to `f64`. `None`
 /// when the address is outside guest memory.
 ///
-/// Delegates to the SHARED sampler, so a `@watch` means the same thing in a resident
-/// session, in a native recipe run and in the browser. A second copy of four lines of
+/// Delegates to the SHARED sampler, so a watch means the same thing in a resident session,
+/// in a native tool and in the browser. A second copy of four lines of
 /// decode looks harmless right up to the point where one of them is fixed.
 pub fn sample_watch(sched: &ThreadedScheduler<VitaEnv>, w: &WatchDecl) -> Option<f64> {
-    vitaslop_runtime::recipe_eval::sample_watch(&SchedRead(sched), w)
+    vitaslop_runtime::guest_read::sample_watch(&SchedRead(sched), w)
 }
 
 /// Render the current frame to `<dir>/<name>.png`. Returns the written path, or `None`
@@ -89,7 +88,7 @@ pub fn signature(cap: &vitaslop_runtime::capture::Capture) -> u64 {
 }
 
 /// Format an `f64` compactly: integers without a trailing `.0`. The shared formatter, so
-/// a value reads identically in a session, a recipe report and the browser.
+/// a value reads identically in a session, a tool's report and the browser.
 pub fn format_f64(x: f64) -> String {
-    vitaslop_runtime::recipe_eval::format_f64(x)
+    vitaslop_runtime::guest_read::format_f64(x)
 }

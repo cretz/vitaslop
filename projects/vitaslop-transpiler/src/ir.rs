@@ -187,7 +187,7 @@ pub enum NeonStmt {
     /// NEON's ~8-bit table seed: the Newton-Raphson steps that accompany it converge to this same
     /// value, and code consuming the estimate directly only gains accuracy. Deterministic across
     /// our backends (the conformance requirement); not bit-identical to Cortex-A9 hardware.
-    RecipEstimate { sqrt: bool, dst: NeonReg, src: NeonReg },
+    ReciprocalEstimate { sqrt: bool, dst: NeonReg, src: NeonReg },
     /// Newton-Raphson refinement step, f32 (`vrecps`/`vrsqrts`): `2 - a*b` (`sqrt = false`) or
     /// `(3 - a*b) / 2` (`sqrt = true`). Non-fused, matching the two-rounding NEON definition.
     RecipStep { sqrt: bool, dst: NeonReg, a: NeonReg, b: NeonReg },

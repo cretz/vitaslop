@@ -90,7 +90,7 @@ fn main() {
             format!("{:#x} {}x{} pitch {} fmt {:#x}", c.data_addr, c.width, c.height, c.stride_pixels, c.format)
         });
         let depth = s.depth.map_or(String::new(), |d| {
-            format!(", depth {:#x} (stencil {:#x}, zls {:#x})", d.depth_addr, d.stencil_addr, d.zls_control)
+            format!(", depth {:#x} (stencil {:#x}, zls {:#x}, clears to {} / stencil {:#x})", d.depth_addr, d.stencil_addr, d.zls_control, f32::from_bits(d.background_depth), d.background_control & 0xff)
         });
         eprintln!("  scene {i}: {} draw(s) into {target}{depth} msaa {}", s.draws.len(), s.multisample);
         // `--list`: every draw's bound textures, as the capture decoded them.
@@ -99,15 +99,16 @@ fn main() {
                 let h = |b: &[u8]| vitaslop_gxp_shader::Program::parse(b).map(|p| p.hash).unwrap_or(0);
                 let rs = &d.render_state;
                 eprintln!(
-                    "    draw {di} vprog {:016x} fprog {:016x} depth func {} write {} cull {} viewport {} {:?}",
+                    "    draw {di} vprog {:016x} fprog {:016x} depth func {} write {} cull {} viewport {} {:?} clip {:#x} {:?}",
                     h(&d.vprog), h(&d.fprog), rs.front_depth_func, rs.front_depth_write, rs.cull_mode,
-                    if rs.viewport_enable == 0 { "on" } else { "OFF" }, rs.viewport
+                    if rs.viewport_enable == 0 { "on" } else { "OFF" }, rs.viewport, rs.region_clip_mode, rs.region_clip
                 );
                 for t in d.textures.iter() {
                     eprintln!(
-                        "    draw {di} unit {} tex {:#x} {}x{} type {} fmt {:#x} stride {} faces {} min {} mag {} mip {} mips {} addr {}/{}",
+                        "    draw {di} unit {} tex {:#x} {}x{} type {} fmt {:#x} stride {} faces {} min {} mag {} mip {} mips {} addr {}/{} bias {} lodmin {}",
                         t.unit, t.data_addr, t.width, t.height, t.tex_type, t.base_format, t.stride, t.faces,
-                        t.min_filter, t.mag_filter, t.mip_filter, t.levels, t.u_addr_mode, t.v_addr_mode
+                        t.min_filter, t.mag_filter, t.mip_filter, t.levels, t.u_addr_mode, t.v_addr_mode,
+                        t.lod_bias, t.lod_min
                     );
                 }
             }
@@ -507,7 +508,7 @@ fn main() {
     // SAME renderer, so the targets they draw persist into the main frame exactly as they do
     // live - a light probe or lookup map a title renders once at load and samples for the rest
     // of the level is otherwise read from guest bytes the GPU never wrote. Capsules from two
-    // runs of one recipe line up: the emulator is deterministic.
+    // runs of one input script line up: the emulator is deterministic.
     for (i, a) in args.iter().enumerate() {
         if a != "--before" {
             continue;

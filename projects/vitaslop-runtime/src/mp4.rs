@@ -57,7 +57,11 @@ impl fmt::Display for Mp4Error {
         match self {
             Mp4Error::Truncated(what) => write!(f, "truncated MP4: {what}"),
             Mp4Error::BadBoxSize { kind, size } => {
-                write!(f, "box '{}' declares an impossible size {size}", fourcc(*kind))
+                write!(
+                    f,
+                    "box '{}' declares an impossible size {size}",
+                    fourcc(*kind)
+                )
             }
             Mp4Error::NoTracks => write!(f, "MP4 has no tracks"),
             Mp4Error::MissingBox(b) => write!(f, "MP4 track has no {b} box"),
@@ -134,7 +138,9 @@ impl Track {
         let mut at = 4usize;
         let d = &self.codec_config;
         // ES_Descriptor
-        let Some((body, next)) = descriptor(d, at, 0x03) else { return Vec::new() };
+        let Some((body, next)) = descriptor(d, at, 0x03) else {
+            return Vec::new();
+        };
         let _ = next;
         // ES_ID (2) + a flags byte, whose bits say which optional fields follow.
         let mut inner = body.0 + 3;
@@ -155,8 +161,12 @@ impl Track {
         at = inner;
         // DecoderConfigDescriptor: objectTypeIndication, streamType, bufferSize (3),
         // maxBitrate (4), avgBitrate (4) - 13 bytes - then the specific info.
-        let Some((cfg, _)) = descriptor(d, at, 0x04) else { return Vec::new() };
-        let Some((asc, _)) = descriptor(d, cfg.0 + 13, 0x05) else { return Vec::new() };
+        let Some((cfg, _)) = descriptor(d, at, 0x04) else {
+            return Vec::new();
+        };
+        let Some((asc, _)) = descriptor(d, cfg.0 + 13, 0x05) else {
+            return Vec::new();
+        };
         d.get(asc.0..asc.1).map(|b| b.to_vec()).unwrap_or_default()
     }
 
@@ -218,7 +228,11 @@ impl Mp4 {
         if tracks.is_empty() {
             return Err(Mp4Error::NoTracks);
         }
-        Ok(Mp4 { timescale, duration, tracks })
+        Ok(Mp4 {
+            timescale,
+            duration,
+            tracks,
+        })
     }
 
     /// The first track of a kind, which is what a player wants ("the video track").
@@ -303,7 +317,9 @@ pub fn find_moov(
         if kind == *b"moov" {
             return Ok((off + header_len, size.saturating_sub(header_len)));
         }
-        off = off.checked_add(size).ok_or(Mp4Error::Truncated("box chain"))?;
+        off = off
+            .checked_add(size)
+            .ok_or(Mp4Error::Truncated("box chain"))?;
     }
     Err(Mp4Error::NoTracks)
 }
@@ -321,7 +337,9 @@ fn find_path<'a>(mut data: &'a [u8], path: &[[u8; 4]]) -> Result<Option<&'a [u8]
 
 /// `(type, payload, offset of the next box)` for the box starting at `off`.
 fn read_box(data: &[u8], off: usize) -> Result<([u8; 4], &[u8], usize), Mp4Error> {
-    let head = data.get(off..off + 8).ok_or(Mp4Error::Truncated("box header"))?;
+    let head = data
+        .get(off..off + 8)
+        .ok_or(Mp4Error::Truncated("box header"))?;
     let mut kind = [0u8; 4];
     kind.copy_from_slice(&head[4..8]);
     let size32 = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as u64;
@@ -329,7 +347,9 @@ fn read_box(data: &[u8], off: usize) -> Result<([u8; 4], &[u8], usize), Mp4Error
         // 0 means "to the end of the enclosing box".
         0 => ((data.len() - off) as u64, 8usize),
         1 => {
-            let ext = data.get(off + 8..off + 16).ok_or(Mp4Error::Truncated("64-bit box size"))?;
+            let ext = data
+                .get(off + 8..off + 16)
+                .ok_or(Mp4Error::Truncated("64-bit box size"))?;
             let mut b = [0u8; 8];
             b.copy_from_slice(ext);
             (u64::from_be_bytes(b), 16usize)
@@ -365,7 +385,9 @@ fn be_u64(d: &[u8], at: usize) -> Result<u64, Mp4Error> {
 
 /// A full box's `version` byte (the payload starts `version:u8, flags:u24`).
 fn version(d: &[u8]) -> Result<u8, Mp4Error> {
-    d.first().copied().ok_or(Mp4Error::Truncated("full box version"))
+    d.first()
+        .copied()
+        .ok_or(Mp4Error::Truncated("full box version"))
 }
 
 // ---------------------------------------------------------------------------
@@ -450,7 +472,9 @@ fn parse_stsd(d: &[u8], kind: TrackKind) -> Result<([u8; 4], Vec<u8>), Mp4Error>
         // Walk the children rather than reading one. A malformed size would otherwise
         // spin, so the loop advances by the box size and stops the moment it cannot.
         while off + 8 <= rest.len() {
-            let Ok((kind4, payload, next)) = read_box(rest, off) else { break };
+            let Ok((kind4, payload, next)) = read_box(rest, off) else {
+                break;
+            };
             if wanted.iter().any(|w| **w == kind4) {
                 config = payload.to_vec();
                 break;
@@ -463,7 +487,6 @@ fn parse_stsd(d: &[u8], kind: TrackKind) -> Result<([u8; 4], Vec<u8>), Mp4Error>
     }
     Ok((codec, config))
 }
-
 
 /// One MPEG-4 descriptor at `at`, if it carries `tag`: its payload range and the offset
 /// just past it. The length is 1 to 4 bytes, each carrying 7 bits with the top bit meaning
@@ -499,12 +522,24 @@ fn parse_trak(trak: &[u8]) -> Result<Track, Mp4Error> {
     let mdia = find_box(trak, *b"mdia")?.ok_or(Mp4Error::MissingBox("mdia"))?;
     let mdhd = find_box(mdia, *b"mdhd")?.ok_or(Mp4Error::MissingBox("mdhd"))?;
     let (timescale, duration) = parse_mdhd(mdhd)?;
-    let kind = find_box(mdia, *b"hdlr")?.map(parse_hdlr).unwrap_or(TrackKind::Other);
+    let kind = find_box(mdia, *b"hdlr")?
+        .map(parse_hdlr)
+        .unwrap_or(TrackKind::Other);
     let stbl = find_path(mdia, &[*b"minf", *b"stbl"])?.ok_or(Mp4Error::MissingBox("stbl"))?;
     let stsd = find_box(stbl, *b"stsd")?.ok_or(Mp4Error::MissingBox("stsd"))?;
     let (codec, codec_config) = parse_stsd(stsd, kind)?;
     let samples = build_samples(stbl)?;
-    Ok(Track { id, kind, codec, timescale, duration, width, height, codec_config, samples })
+    Ok(Track {
+        id,
+        kind,
+        codec,
+        timescale,
+        duration,
+        width,
+        height,
+        codec_config,
+        samples,
+    })
 }
 
 /// Flatten `stts`/`ctts`/`stsc`/`stsz`/`stco`/`stss` into one sample list.
@@ -561,7 +596,9 @@ fn build_samples(stbl: &[u8]) -> Result<Vec<Sample>, Mp4Error> {
         }
     }
     if sample_index != n {
-        return Err(Mp4Error::InconsistentTables("chunks do not cover every sample"));
+        return Err(Mp4Error::InconsistentTables(
+            "chunks do not cover every sample",
+        ));
     }
     if let Some(sync) = sync {
         for s in samples.iter_mut() {
@@ -569,7 +606,9 @@ fn build_samples(stbl: &[u8]) -> Result<Vec<Sample>, Mp4Error> {
         }
         for one_based in sync {
             let Some(s) = samples.get_mut(one_based.saturating_sub(1) as usize) else {
-                return Err(Mp4Error::InconsistentTables("stss names a sample that does not exist"));
+                return Err(Mp4Error::InconsistentTables(
+                    "stss names a sample that does not exist",
+                ));
             };
             s.sync = true;
         }
@@ -596,7 +635,11 @@ fn parse_stco(d: &[u8], wide: bool) -> Result<Vec<u64>, Mp4Error> {
     let count = be_u32(d, 4)? as usize;
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        out.push(if wide { be_u64(d, 8 + 8 * i)? } else { be_u32(d, 8 + 4 * i)? as u64 });
+        out.push(if wide {
+            be_u64(d, 8 + 8 * i)?
+        } else {
+            be_u32(d, 8 + 4 * i)? as u64
+        });
     }
     Ok(out)
 }
@@ -645,7 +688,9 @@ fn parse_stts(d: &[u8]) -> Result<Vec<u32>, Mp4Error> {
         // A corrupt count could otherwise ask for gigabytes; the cap is far above any
         // real movie's sample count.
         if out.len().saturating_add(n as usize) > 16_000_000 {
-            return Err(Mp4Error::InconsistentTables("stts run count is implausible"));
+            return Err(Mp4Error::InconsistentTables(
+                "stts run count is implausible",
+            ));
         }
         out.extend(std::iter::repeat_n(delta, n as usize));
     }
@@ -665,9 +710,15 @@ fn parse_ctts(d: &[u8]) -> Result<Vec<i32>, Mp4Error> {
         // right reinterpretation for version 1; for version 0 it would turn a value above
         // i32::MAX into a negative offset, so that case saturates instead. (Both arms used to
         // read `raw as i32`, which is what made `signed` a flag nothing acted on.)
-        let offset = if signed { raw as i32 } else { raw.min(i32::MAX as u32) as i32 };
+        let offset = if signed {
+            raw as i32
+        } else {
+            raw.min(i32::MAX as u32) as i32
+        };
         if out.len().saturating_add(n as usize) > 16_000_000 {
-            return Err(Mp4Error::InconsistentTables("ctts run count is implausible"));
+            return Err(Mp4Error::InconsistentTables(
+                "ctts run count is implausible",
+            ));
         }
         out.extend(std::iter::repeat_n(offset, n as usize));
     }
@@ -710,13 +761,18 @@ impl AvcC {
         if d.len() < 7 {
             return Err(Mp4Error::Truncated("avcC record"));
         }
-        let mut out = AvcC { length_size: (d[4] & 0x03) as usize + 1, ..AvcC::default() };
+        let mut out = AvcC {
+            length_size: (d[4] & 0x03) as usize + 1,
+            ..AvcC::default()
+        };
         let mut off = 5usize;
         let read_set = |off: &mut usize, into: &mut Vec<Vec<u8>>, count: usize| {
             for _ in 0..count {
                 let len = be_u16(d, *off)? as usize;
                 *off += 2;
-                let end = off.checked_add(len).ok_or(Mp4Error::Truncated("avcC parameter set"))?;
+                let end = off
+                    .checked_add(len)
+                    .ok_or(Mp4Error::Truncated("avcC parameter set"))?;
                 if end > d.len() {
                     return Err(Mp4Error::Truncated("avcC parameter set"));
                 }
@@ -768,7 +824,9 @@ impl AvcC {
                 len = (len << 8) | sample[off + i] as usize;
             }
             off += n;
-            let end = off.checked_add(len).ok_or(Mp4Error::Truncated("NAL payload"))?;
+            let end = off
+                .checked_add(len)
+                .ok_or(Mp4Error::Truncated("NAL payload"))?;
             if end > sample.len() {
                 return Err(Mp4Error::Truncated("NAL payload"));
             }
@@ -846,7 +904,11 @@ mod tests {
         mvhd[16..20].copy_from_slice(&2400u32.to_be_bytes());
 
         let moov = cat(&[bx(b"mvhd", &mvhd), bx(b"trak", &trak)]);
-        cat(&[bx(b"ftyp", b"mp42\0\0\0\0mp42mp41"), bx(b"moov", &moov), bx(b"mdat", &[0u8; 16])])
+        cat(&[
+            bx(b"ftyp", b"mp42\0\0\0\0mp42mp41"),
+            bx(b"moov", &moov),
+            bx(b"mdat", &[0u8; 16]),
+        ])
     }
 
     #[test]
@@ -859,7 +921,11 @@ mod tests {
         assert_eq!(t.id, 1);
         assert_eq!((t.width, t.height), (640, 360));
         assert_eq!(&t.codec, b"avc1");
-        assert_eq!(t.codec_config, vec![1, 2, 3, 4], "avcC setup bytes not recovered");
+        assert_eq!(
+            t.codec_config,
+            vec![1, 2, 3, 4],
+            "avcC setup bytes not recovered"
+        );
         assert_eq!(t.duration_us(), 4_000_000);
     }
 
@@ -872,14 +938,17 @@ mod tests {
         // spec's run-length form says chunk 2 holds 1, which would leave a sample
         // uncovered, so this movie declares 2/2 via the second run's value.
         assert_eq!(t.samples.len(), 4, "not every sample was placed in a chunk");
-        assert_eq!(t.samples[0], Sample {
-            offset: 1000,
-            size: 10,
-            dts: 0,
-            pts: 0,
-            duration: 600,
-            sync: true
-        });
+        assert_eq!(
+            t.samples[0],
+            Sample {
+                offset: 1000,
+                size: 10,
+                dts: 0,
+                pts: 0,
+                duration: 600,
+                sync: true
+            }
+        );
         // Samples run consecutively inside a chunk.
         assert_eq!(t.samples[1].offset, 1010);
         assert_eq!(t.samples[1].dts, 600);
@@ -924,22 +993,34 @@ mod tests {
         }
         let t = Mp4::parse(&trimmed).unwrap();
         let t = t.track(TrackKind::Video).unwrap();
-        assert!(t.samples.iter().all(|s| s.sync), "absent stss must mean all-sync");
+        assert!(
+            t.samples.iter().all(|s| s.sync),
+            "absent stss must mean all-sync"
+        );
     }
 
     #[test]
     fn a_malformed_file_is_an_error_not_a_panic() {
         assert_eq!(Mp4::parse(&[]).unwrap_err(), Mp4Error::NoTracks);
         // Arbitrary bytes read as a box header claim a size the buffer does not have.
-        assert!(matches!(Mp4::parse(b"not an mp4 at all").unwrap_err(), Mp4Error::Truncated(_)));
+        assert!(matches!(
+            Mp4::parse(b"not an mp4 at all").unwrap_err(),
+            Mp4Error::Truncated(_)
+        ));
         // A box claiming a size smaller than its own header.
         let mut bad = 4u32.to_be_bytes().to_vec();
         bad.extend_from_slice(b"moov");
-        assert!(matches!(Mp4::parse(&bad).unwrap_err(), Mp4Error::BadBoxSize { .. }));
+        assert!(matches!(
+            Mp4::parse(&bad).unwrap_err(),
+            Mp4Error::BadBoxSize { .. }
+        ));
         // A box claiming more bytes than the file holds.
         let mut over = 9999u32.to_be_bytes().to_vec();
         over.extend_from_slice(b"moov");
-        assert!(matches!(Mp4::parse(&over).unwrap_err(), Mp4Error::Truncated(_)));
+        assert!(matches!(
+            Mp4::parse(&over).unwrap_err(),
+            Mp4Error::Truncated(_)
+        ));
         // Truncating the real movie anywhere must never panic.
         let movie = sample_movie();
         for cut in 0..movie.len() {
@@ -952,14 +1033,19 @@ mod tests {
     /// layout itself being wrong. Content-free assertions; skips without the fixture.
     #[test]
     fn reads_a_real_retail_movie() {
-        let Some(dir) = crate::ingest::testfix::game_dir() else { return };
+        let Some(dir) = crate::ingest::testfix::game_dir() else {
+            return;
+        };
         // The fixture may be an app root or a dump root; look for movies under both.
         let mut found = None;
         for sub in ["files/Data/Movie", "Data/Movie", "movie", "Movie"] {
             let p = dir.join(sub);
             if let Ok(entries) = std::fs::read_dir(&p) {
                 for e in entries.flatten() {
-                    if e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("mp4")) {
+                    if e.path()
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("mp4"))
+                    {
                         found = Some(e.path());
                         break;
                     }
@@ -976,10 +1062,16 @@ mod tests {
         assert!(m.duration_us() > 0, "movie has no duration");
         let v = m.track(TrackKind::Video).expect("no video track");
         assert_eq!(&v.codec, b"avc1", "expected H.264 video");
-        assert!(v.width > 0 && v.height > 0, "video track has no display size");
+        assert!(
+            v.width > 0 && v.height > 0,
+            "video track has no display size"
+        );
         assert!(!v.codec_config.is_empty(), "no avcC setup bytes");
         assert!(!v.samples.is_empty(), "video track has no samples");
-        assert!(v.samples.iter().any(|s| s.sync), "no keyframe to start decoding from");
+        assert!(
+            v.samples.iter().any(|s| s.sync),
+            "no keyframe to start decoding from"
+        );
         // Every sample must lie inside the file, and timestamps must not go backwards.
         let mut last_dts = 0;
         for s in &v.samples {

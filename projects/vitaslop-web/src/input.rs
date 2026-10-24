@@ -1,7 +1,6 @@
 //! The browser input world: the [`World`] the live run polls, fed by real pointer
-//! and keyboard events (a human playing) and/or a scripted TAS recipe (a deterministic
-//! headless run, e.g. the e2e that drives to the tutorial for a screenshot). Both feed
-//! the same seam the native probe uses ([`World::poll_ctrl`]/[`World::poll_touch`]), so
+//! and keyboard events (a human playing), or by a playbook (a deterministic headless run).
+//! Both feed the same seam the native probe uses ([`World::poll_ctrl`]/[`World::poll_touch`]), so
 //! the browser reaches the exact live gameplay the native probe does.
 //!
 //! # One shared input cell
@@ -14,7 +13,8 @@ use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use crate::location::SharedLocation;
-use vitaslop_runtime::{CtrlFrame, LocationFix, LocationPermission, RecipeWorld, TouchFrame, World};
+use vitaslop_runtime::{CtrlFrame, LocationFix, LocationPermission, TouchFrame, World};
+use vitaslop_runtime::world::TextKey;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;
@@ -34,14 +34,15 @@ pub struct InputState {
     pub buttons: u32,
     /// The live front-panel touch, if a pointer is pressed.
     pub touch: Option<TouchFrame>,
+    /// The live REAR-panel touch: only the opt-in rear-touch setting ever sets it
+    /// ([`worker_input_back_pointer`]).
+    pub back_touch: Option<TouchFrame>,
     /// The live ANALOG sticks as `(x, y)` in the guest's 0..255 encoding, or `None` when
     /// nothing is driving them.
     ///
     /// # Why `Option` and not a centred default
-    /// A centred stick is not "no stick": 128 is a VALUE, and writing it every frame would
-    /// overwrite a scripted recipe's steering with neutral on every poll, which is the same
-    /// mistake as an over-report. `None` means "this run has no live stick, use whatever the
-    /// recipe says" - the identical rule `touch` already follows. It matters because one
+    /// A centred stick is not "no stick": 128 is a VALUE, and `None` means "this run has no
+    /// live stick" - the identical rule `touch` already follows. It matters because one
     /// retail racer's whole steering is `lx` (memory `vitaslop-absolute-heading-control`), so a
     /// browser that can only send buttons cannot drive it at all.
     pub left_stick: Option<(u8, u8)>,
@@ -79,15 +80,13 @@ pub fn worker_set_keymap(json: &str) -> Result<(), JsValue> {
     Ok(())
 }
 
-/// Microseconds per virtual 60Hz frame (matches the runtime's `RecipeWorld`), so a
+/// Microseconds per virtual 60Hz frame (matches the runtime's `TimelineWorld`), so a
 /// title reading elapsed time still sees monotonic progress.
 const FRAME_US: u64 = 16_666;
 
-/// The world the live browser run polls: a virtual 60Hz clock, a seeded PRNG, and
-/// input drawn from a scripted recipe (optional) merged with live pointer/keyboard.
-/// Live input takes precedence when present, so a human can take over a scripted run.
+/// The world the live browser run polls: a virtual 60Hz clock, a seeded PRNG, and live
+/// pointer/keyboard/pad input - unless a playbook run owns the pad.
 pub struct BrowserWorld {
-    recipe: Option<RecipeWorld>,
     live: SharedInput,
     /// The host's location provider (see [`crate::location`]). Read on every guest
     /// query rather than cached, so a fix cannot go stale behind the title's back.
@@ -102,11 +101,9 @@ pub struct BrowserWorld {
 }
 
 impl BrowserWorld {
-    /// A world driven by `live` input, optionally overlaid on a scripted `recipe`
-    /// (frame-keyed touch/button directives). Pass `None` for a purely live session.
-    pub fn new(recipe: Option<RecipeWorld>, live: SharedInput, location: SharedLocation) -> Self {
+    /// A world driven by `live` input.
+    pub fn new(live: SharedInput, location: SharedLocation) -> Self {
         BrowserWorld {
-            recipe,
             live,
             location,
             location_requested: false,
@@ -126,15 +123,13 @@ impl World for BrowserWorld {
     }
     fn poll_ctrl(&mut self, port: u32) -> CtrlFrame {
         // A playbook run owns the pad outright.
-        if let Some((ctrl, _)) = vitaslop_playbook::engine::input(port) {
+        if let Some((ctrl, _)) = crate::playbook::input(port) {
             return ctrl;
         }
-        let mut f = self.recipe.as_mut().map(|r| r.poll_ctrl(port)).unwrap_or_default();
-        // Merge live keyboard buttons on top of any scripted state.
+        let mut f = CtrlFrame::default();
         let live = self.live.lock().unwrap();
         f.buttons |= live.buttons;
-        // A live stick OVERRIDES the scripted one, exactly as a live touch does - and only
-        // while something is actually driving it. See `InputState::left_stick`.
+        // A stick only while something is actually driving it. See `InputState::left_stick`.
         if let Some((x, y)) = live.left_stick {
             f.lx = x;
             f.ly = y;
@@ -146,16 +141,17 @@ impl World for BrowserWorld {
         f
     }
     fn poll_touch(&mut self, port: u32) -> TouchFrame {
-        if let Some((_, touch)) = vitaslop_playbook::engine::input(port) {
+        if let Some((_, touch)) = crate::playbook::input(port) {
             return touch;
         }
-        // A live pointer press overrides the scripted touch; otherwise the recipe (if
-        // any) drives, and failing that there is no finger down.
-        if port == 0
-            && let Some(t) = self.live.lock().unwrap().touch {
-                return t;
-            }
-        self.recipe.as_mut().map(|r| r.poll_touch(port)).unwrap_or_default()
+        // A live pointer press is the front panel; the rear panel is the opt-in rear-touch input.
+        let live = self.live.lock().unwrap();
+        let t = match port {
+            0 => live.touch,
+            1 => live.back_touch,
+            _ => None,
+        };
+        t.unwrap_or_default()
     }
     fn location_permission(&mut self) -> LocationPermission {
         self.location.lock().unwrap().permission
@@ -191,12 +187,41 @@ impl World for BrowserWorld {
         }
     }
     fn set_frame(&mut self, frame: u64) {
-        if let Some(r) = self.recipe.as_mut() {
-            r.set_frame(frame);
-        }
         self.monotonic_us = frame.wrapping_mul(FRAME_US);
         self.wall_us = 1_500_000_000_000_000u64.wrapping_add(self.monotonic_us);
     }
+    fn poll_text(&mut self) -> Vec<TextKey> {
+        std::mem::take(&mut *TEXT.lock().unwrap())
+    }
+}
+
+/// Keys typed for the game's on-screen keyboard, waiting for its next `sceImeUpdate`. A static
+/// rather than part of [`InputState`] because the page's key events arrive on the render
+/// worker while `poll_text` runs on whichever guest worker pumps the keyboard.
+static TEXT: Mutex<Vec<TextKey>> = Mutex::new(Vec::new());
+
+/// The most keys held for a keyboard nobody is reading; the oldest are dropped past it.
+const TEXT_QUEUE_MAX: usize = 256;
+
+/// Worker input entry point: one key typed, as `KeyboardEvent.key` - a single character, or
+/// `Backspace` / `Enter` / `Escape` / `ArrowLeft` / `ArrowRight`. Anything else is ignored.
+#[wasm_bindgen]
+pub fn worker_input_text(key: &str) {
+    let mut chars = key.chars();
+    let k = match (chars.next(), chars.next(), key) {
+        (Some(c), None, _) => TextKey::Char(c),
+        (_, _, "Backspace") => TextKey::Backspace,
+        (_, _, "Enter") => TextKey::Enter,
+        (_, _, "Escape") => TextKey::Escape,
+        (_, _, "ArrowLeft") => TextKey::Left,
+        (_, _, "ArrowRight") => TextKey::Right,
+        _ => return,
+    };
+    let mut q = TEXT.lock().unwrap();
+    if q.len() >= TEXT_QUEUE_MAX {
+        q.remove(0);
+    }
+    q.push(k);
 }
 
 /// Attach pointer and keyboard listeners that write into `state`, so a human can play
@@ -347,8 +372,7 @@ pub fn worker_input_key(code: &str, pressed: bool) {
 /// `stick` is 0 for the left stick and 1 for the right. `(x, y)` are the guest's own 0..255
 /// encoding with 128 centred, so the page owns the deadzone and the curve (an on-screen thumb
 /// stick and a real gamepad axis need different ones) and this layer stays a plain conduit.
-/// `active` false releases the stick back to whatever a scripted recipe says, which is not the
-/// same as centring it - see [`InputState::left_stick`].
+/// `active` false releases the stick (no live stick), which is not the same as centring it - see [`InputState::left_stick`].
 ///
 /// An unknown `stick` index is IGNORED rather than silently treated as the left one: a caller
 /// that means a stick this build does not have is a bug in the caller, and steering the wrong
@@ -375,6 +399,26 @@ pub fn worker_input_pointer(sx: f64, sy: f64, down: bool) {
         st.touch = if down {
             let x = (sx.clamp(0.0, SCREEN_W) * PANEL_SCALE) as u16;
             let y = (sy.clamp(0.0, SCREEN_H) * PANEL_SCALE) as u16;
+            Some(TouchFrame::single(x, y))
+        } else {
+            None
+        };
+    });
+}
+
+/// The rear panel's inclusive maximum Y (`vitaslop_runtime::vita::touch`): it spans the same
+/// 0..1919 X as the front but stops at 889, and a title maps it onto the 1088-row display.
+const BACK_PANEL_MAX_Y: f64 = 889.0;
+
+/// [`worker_input_pointer`] for the REAR panel (the opt-in rear-touch setting): a screen point
+/// `(sx, sy)` in 960x544 becomes the back-panel point that a title projects back onto it - X
+/// doubled as on the front, Y scaled to the panel's 0..889.
+#[wasm_bindgen]
+pub fn worker_input_back_pointer(sx: f64, sy: f64, down: bool) {
+    with_worker_input(|st| {
+        st.back_touch = if down {
+            let x = (sx.clamp(0.0, SCREEN_W) * PANEL_SCALE).min(1919.0) as u16;
+            let y = (sy.clamp(0.0, SCREEN_H) / SCREEN_H * BACK_PANEL_MAX_Y) as u16;
             Some(TouchFrame::single(x, y))
         } else {
             None

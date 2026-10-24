@@ -19,7 +19,13 @@ is where it is either true or not.
   the installed CLI must match exactly (the CLI reads a schema the macro embeds),
   so bump both together.
 - Implements the platform seam for the browser: OPFS-backed storage, and
-  pointer/keyboard events on the canvas mapped to the touch panel and SceCtrl.
+  pointer/keyboard events on the canvas mapped to the touch panels and SceCtrl (the rear
+  panel only through the opt-in "Rear touch panel" setting).
+- Two builds. `node build.mjs` is what ships (`web/pkg`, `web/pkg-threads`), WITHOUT the
+  playbook engine. `node build.mjs --playbook` builds the same bundles with it into
+  `web-playbook/`, beside the Lua VM; the harnesses that run playbooks (`e2e/game-boot.mjs`
+  with `PLAYBOOK`, `serve.mjs` and its device runner) serve those over `web/` - see
+  `playbook-build.mjs`. `serve.mjs --production-build` serves the shipped pair instead.
 
 ## The front end
 

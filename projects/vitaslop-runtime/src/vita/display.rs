@@ -2,9 +2,9 @@
 //! queue callback (deferred), but a direct call is also supported: it records the
 //! presented framebuffer address.
 
+use crate::SvcOutcome;
 use crate::host::{GuestCtx, Ptr, VitaState};
 use crate::hostcall;
-use crate::SvcOutcome;
 
 /// The virtual duration of one display vblank interval at 60 Hz, in microseconds.
 pub(crate) const VBLANK_US: u64 = 1_000_000 / 60;
@@ -151,7 +151,11 @@ pub(super) fn wait_set_frame_buf_multi(ctx: &mut GuestCtx, st: &mut VitaState) -
     }
     // With no buffer named: the latch itself has already happened when a present is
     // outstanding, so only the remainder is a wait.
-    let after_latch = if st.take_present_since_wait() { vcount as u64 - 1 } else { vcount as u64 };
+    let after_latch = if st.take_present_since_wait() {
+        vcount as u64 - 1
+    } else {
+        vcount as u64
+    };
     if after_latch == 0 {
         return SvcOutcome::Reschedule;
     }
@@ -230,7 +234,9 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
                 budget: crate::vita::mirror::SLOT_SPIN_BUDGET,
             }
         } else {
-            LoadMirror { slot: crate::vita::mirror::SLOT_VCOUNT }
+            LoadMirror {
+                slot: crate::vita::mirror::SLOT_VCOUNT,
+            }
         }),
         _ => None,
     }
@@ -242,7 +248,10 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
 /// VALUE-sensitive, and read through the knob seam rather than the environment because the
 /// browser is where the spin costs the most and the browser has no environment.
 fn vblank_park_spin() -> bool {
-    !matches!(crate::knobs::var("VITASLOP_VBLANK_PARK").as_deref(), Ok("0"))
+    !matches!(
+        crate::knobs::var("VITASLOP_VBLANK_PARK").as_deref(),
+        Ok("0")
+    )
 }
 
 /// Report a distinct display-buffer shape once. Unconditional: an approximation the screen

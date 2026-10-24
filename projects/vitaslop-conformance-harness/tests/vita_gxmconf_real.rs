@@ -69,7 +69,7 @@ fn render_frame_on_gpu(range: std::ops::Range<usize>) -> Option<Framebuffer> {
     let env = env.borrow();
     let cap = &env.state.capture;
     assert!(cap.unimplemented.is_empty(), "unimplemented NIDs: {:?}", cap.unimplemented);
-    assert_eq!(cap.scenes.len(), 18, "gxmconf emits 18 scenes");
+    assert_eq!(cap.scenes.len(), 21, "gxmconf emits 21 scenes");
     let scenes = &cap.scenes[range.clone()];
     assert!(
         scenes.iter().flat_map(|s| s.draws.iter()).all(|d| !d.vprog.is_empty() && !d.fprog.is_empty()),
@@ -236,4 +236,37 @@ fn a_texture_naming_a_sub_rectangle_of_a_target_samples_that_rectangle() {
     };
     let p = fb.pixel(W / 2, H / 2);
     assert!(p[0] > 200 && p[1] > 200 && p[2] < 60, "expected the bottom-right quadrant's yellow, got {p:?}");
+}
+
+/// **SCENE 18 - A DEFAULT UNIFORM BUFFER IS CONTEXT STATE, READ AT THE DRAWING PROGRAM'S SIZE.**
+///
+/// Each stage's buffer is set with `sceGxmSet{Vertex,Fragment}DefaultUniformBuffer` while
+/// ANOTHER program is bound (one declaring 16 default-uniform registers), then the program that
+/// reads it (32 registers, the colour at register 16) is set, then the draw. Left half must be
+/// the vertex buffer's green and right half the fragment buffer's blue, every pixel. A binding
+/// owned by the program bound at the set is judged stale for the drawing one and reads the empty
+/// bank: both halves come out all-zero black. A 2D title's clear took its depth from such a bank,
+/// wrote 0, and every later draw failed the depth test.
+#[test]
+fn a_default_uniform_buffer_outlives_a_program_change() {
+    let Some(fb) = render_on_gpu(18) else {
+        eprintln!("no GPU adapter; scene 18 not checked");
+        return;
+    };
+    let mut failures = Vec::new();
+    for (name, x0, x1, want) in [
+        ("left (vertex stage)", 0, HALF_W, [0u8, 255, 0, 255]),
+        ("right (fragment stage)", HALF_W, W, [0, 0, 255, 255]),
+    ] {
+        let wrong = (0..H).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| fb.pixel(x, y) != want).count();
+        if wrong != 0 {
+            failures.push(format!(
+                "{name}: {wrong} of {} pixels are not {want:?} - mid pixel {:?} (all-zero means the \
+                 binding was read as another program's and dropped)",
+                (x1 - x0) * H,
+                fb.pixel((x0 + x1) / 2, H / 2)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

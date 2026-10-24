@@ -8,7 +8,12 @@ publish.workspace = true
 
 # Playbooks: Lua scripts that play a title by reacting to it (calls it makes, values in its
 # memory) instead of pressing at frame numbers, the tapes their runs record, and the engine
-# that runs both. The per-title playbooks live here too (playbooks/<TITLE_ID>/*.lua).
+# that runs both. The per-title playbooks live here too (playbooks/<TITLE_ID>/*.lua) - this is
+# the ONLY crate that names specific games.
+#
+# The native tools that author and measure playbooks live here as binaries too (`session`/`ctl`,
+# `explore`, `bench`, `memdiff`, `sheet`); they need the native engine, so they and their
+# dependencies sit behind the `native` feature the browser build turns off.
 #
 # The engine reaches the running game only through the runtime's host-call observer, so this
 # crate depends on the runtime and never the reverse - the desktop headless runner and the
@@ -21,7 +26,7 @@ workspace = true
 # The native Lua backend (PUC-Rio Lua 5.4 compiled from source by mlua). The browser build
 # turns it off and brings its own backend (wasmoon, in vitaslop-web).
 default = ["native"]
-native = ["dep:mlua"]
+native = ["dep:mlua", "dep:vitaslop-native", "dep:tracing-subscriber"]
 
 [dependencies]
 vitaslop-runtime = { path = "../vitaslop-runtime" }
@@ -33,8 +38,48 @@ serde_json = "1"
 # reads the pad, so it lives behind a lock and must be Send.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mlua = { version = "0.11", features = ["lua54", "vendored", "send"], optional = true }
+vitaslop-native = { path = "../vitaslop-native", optional = true }
+# Installs the fmt/EnvFilter subscriber in the tools, so the engine's `tracing` diagnostics
+# (RUST_LOG=vitaslop::input=trace, ...) reach whoever is authoring. Without a subscriber
+# RUST_LOG is silently ignored and every diagnostic looks like "the guest never did that".
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [[bin]]
 name = "playbook"
 path = "src/bin/playbook.rs"
+required-features = ["native"]
+
+# The resident session a game is poked through while writing a playbook, and its client.
+[[bin]]
+name = "session"
+path = "src/bin/session.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "ctl"
+path = "src/bin/ctl.rs"
+required-features = ["native"]
+
+# Parallel variant search: pay the boot prefix once in wall-clock across N workers.
+[[bin]]
+name = "explore"
+path = "src/bin/explore.rs"
+required-features = ["native"]
+
+# What does a frame COST on this screen, and where did the time go?
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+required-features = ["native"]
+
+# Diff two runs' guest memory: what did this input actually touch?
+[[bin]]
+name = "memdiff"
+path = "src/bin/memdiff.rs"
+required-features = ["native"]
+
+# Montage a run's screenshots into one labelled grid, so a whole run is judged in a single look.
+[[bin]]
+name = "sheet"
+path = "src/bin/sheet.rs"
 required-features = ["native"]

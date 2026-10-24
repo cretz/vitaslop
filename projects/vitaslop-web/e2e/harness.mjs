@@ -82,3 +82,36 @@ export function launchChrome() {
     ],
   });
 }
+
+/// A minimal `param.sfo` carrying TITLE_ID and TITLE (the layout `ingest/sfo.rs` reads).
+export function sfo(fields) {
+  const keys = Object.keys(fields);
+  let keyTable = Buffer.alloc(0);
+  let dataTable = Buffer.alloc(0);
+  const entries = [];
+  for (const k of keys) {
+    const value = Buffer.from(fields[k] + "\0", "utf8");
+    const max = (value.length + 3) & ~3;
+    entries.push({ keyOff: keyTable.length, len: value.length, max, dataOff: dataTable.length });
+    keyTable = Buffer.concat([keyTable, Buffer.from(k + "\0", "ascii")]);
+    dataTable = Buffer.concat([dataTable, value, Buffer.alloc(max - value.length)]);
+  }
+  while (keyTable.length % 4) keyTable = Buffer.concat([keyTable, Buffer.alloc(1)]);
+  const keyTableOff = 20 + entries.length * 16;
+  const dataTableOff = keyTableOff + keyTable.length;
+  const head = Buffer.alloc(20);
+  head.write("\0PSF", 0, "binary");
+  head.writeUInt32LE(0x0101, 4);
+  head.writeUInt32LE(keyTableOff, 8);
+  head.writeUInt32LE(dataTableOff, 12);
+  head.writeUInt32LE(entries.length, 16);
+  const index = Buffer.alloc(entries.length * 16);
+  entries.forEach((e, i) => {
+    index.writeUInt16LE(e.keyOff, i * 16);
+    index.writeUInt16LE(0x0204, i * 16 + 2);
+    index.writeUInt32LE(e.len, i * 16 + 4);
+    index.writeUInt32LE(e.max, i * 16 + 8);
+    index.writeUInt32LE(e.dataOff, i * 16 + 12);
+  });
+  return Buffer.concat([head, index, keyTable, dataTable]);
+}

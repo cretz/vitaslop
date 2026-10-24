@@ -201,10 +201,10 @@ pub trait GuestEngine {
     /// Fill `out` from shared guest memory at guest address `addr`. False if the range is
     /// not mapped.
     ///
-    /// The symmetric partner of [`write_mem`](Self::write_mem), and what lets a recipe's
-    /// `@watch` be sampled by the SHARED evaluator on either engine. It returns a bool
+    /// The symmetric partner of [`write_mem`](Self::write_mem), and what lets a session
+    /// watch be sampled by the SHARED reader on either engine. It returns a bool
     /// rather than zero-filling because "this address is not mapped" and "this address
-    /// holds zero" are different findings and only one of them means the recipe is wrong.
+    /// holds zero" are different findings and only one of them means the watch is wrong.
     fn read_mem(&self, addr: u32, out: &mut [u8]) -> bool;
 
     /// Called once per display frame boundary, with the new frame count. The default
@@ -287,7 +287,16 @@ struct Slot<T> {
 
 impl<T> Slot<T> {
     fn new(thread: T, state: ThreadState) -> Slot<T> {
-        Slot { thread, state, cooled: false, picks: 0, quanta: 0, fuel_seen: 0, arm_seen: 0, retired_total: 0 }
+        Slot {
+            thread,
+            state,
+            cooled: false,
+            picks: 0,
+            quanta: 0,
+            fuel_seen: 0,
+            arm_seen: 0,
+            retired_total: 0,
+        }
     }
 }
 
@@ -365,7 +374,7 @@ pub struct SchedCore<E: GuestEngine, H: ImportDispatch> {
     /// Kept ASCENDING so the round-robin rotation over it visits the same slots in the same
     /// order the old `(cursor + k) % n` walk did: a finished slot is never runnable, so
     /// skipping it changes nothing about WHICH thread is picked. That equality is the whole
-    /// safety argument - a scheduler that picks differently re-times every recipe in the tree.
+    /// safety argument - a scheduler that picks differently re-times every scripted run in the tree.
     live: Vec<usize>,
     /// Round-robin cursor: the index after the last thread resumed.
     cursor: usize,
@@ -472,18 +481,22 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         let mut seen = [false; CAP_SLOTS];
         let mut top = 0usize;
         let mut overflow: Vec<(u32, u32)> = Vec::new();
-        let written = self.host.lock().unwrap().refresh_mirror(&mut |slot, value| {
-            let s = slot as usize;
-            if s < CAP_SLOTS {
-                buf[s * 4..s * 4 + 4].copy_from_slice(&value.to_le_bytes());
-                seen[s] = true;
-                top = top.max(s + 1);
-            } else {
-                // A block this big means the "only values that cannot change while guest
-                // code runs" rule was abandoned; carry it correctly and let the size show.
-                overflow.push((slot, value));
-            }
-        });
+        let written = self
+            .host
+            .lock()
+            .unwrap()
+            .refresh_mirror(&mut |slot, value| {
+                let s = slot as usize;
+                if s < CAP_SLOTS {
+                    buf[s * 4..s * 4 + 4].copy_from_slice(&value.to_le_bytes());
+                    seen[s] = true;
+                    top = top.max(s + 1);
+                } else {
+                    // A block this big means the "only values that cannot change while guest
+                    // code runs" rule was abandoned; carry it correctly and let the size show.
+                    overflow.push((slot, value));
+                }
+            });
         if seen[..top].iter().all(|&s| s) {
             self.engine.write_mem(base, &buf[..top * 4]);
         } else {
@@ -494,7 +507,8 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             }
         }
         for (slot, value) in overflow {
-            self.engine.write_mem(base.wrapping_add(slot * 4), &value.to_le_bytes());
+            self.engine
+                .write_mem(base.wrapping_add(slot * 4), &value.to_le_bytes());
         }
         written
     }
@@ -526,7 +540,16 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         let mut rows: Vec<(i32, i32, u64, u64, u64, ThreadState)> = self
             .threads
             .iter()
-            .map(|t| (t.thread.thid(), t.thread.priority(), t.picks, t.quanta, t.retired_total, t.state))
+            .map(|t| {
+                (
+                    t.thread.thid(),
+                    t.thread.priority(),
+                    t.picks,
+                    t.quanta,
+                    t.retired_total,
+                    t.state,
+                )
+            })
             .collect();
         // By WORK, not by resumes - see `Slot::retired_total`.
         rows.sort_by_key(|r| std::cmp::Reverse(r.4));
@@ -535,8 +558,16 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             rows.len()
         );
         for (thid, prio, picks, quanta, work, state) in rows {
-            let pct = if total == 0 { 0.0 } else { picks as f64 * 100.0 / total as f64 };
-            let wpct = if retired == 0 { 0.0 } else { work as f64 * 100.0 / retired as f64 };
+            let pct = if total == 0 {
+                0.0
+            } else {
+                picks as f64 * 100.0 / total as f64
+            };
+            let wpct = if retired == 0 {
+                0.0
+            } else {
+                work as f64 * 100.0 / retired as f64
+            };
             let _ = writeln!(
                 s,
                 "  thid={thid:#x} prio={prio:#x} work {wpct:6.2}%  resumes {pct:6.2}%  picks={picks} whole-quanta={quanta} {state:?}"
@@ -560,8 +591,12 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         if total == 0 {
             return "--- runnable at a quantum: no quanta observed ---\n".to_string();
         }
-        let weighted: u64 =
-            self.runnable_hist.iter().enumerate().map(|(n, c)| n as u64 * c).sum();
+        let weighted: u64 = self
+            .runnable_hist
+            .iter()
+            .enumerate()
+            .map(|(n, c)| n as u64 * c)
+            .sum();
         let capped: u64 = self
             .runnable_hist
             .iter()
@@ -599,7 +634,10 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// harness. Locking [`host`](Self::host) alone is not enough for those: the state they
     /// touch lives in the guest, and a host that writes it nowhere leaves a woken thread
     /// believing it holds a mutex the work area says is free.
-    pub fn with_host_words<R>(&mut self, f: impl FnOnce(&mut H, &mut dyn crate::host::GuestWords) -> R) -> R {
+    pub fn with_host_words<R>(
+        &mut self,
+        f: impl FnOnce(&mut H, &mut dyn crate::host::GuestWords) -> R,
+    ) -> R {
         let mut words = EngineWords(&mut self.engine);
         let mut host = self.host.lock().unwrap();
         f(&mut host, &mut words)
@@ -623,7 +661,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     }
 
     /// Read shared guest memory at guest address `addr`; false if it is not mapped.
-    /// The seam a recipe's `@watch` is sampled through on either engine.
+    /// The seam a watch or a playbook cue is sampled through on either engine.
     pub fn read_guest(&self, addr: u32, out: &mut [u8]) -> bool {
         self.engine.read_mem(addr, out)
     }
@@ -697,7 +735,9 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
 
     /// Emit one [`sched_trace_window`] line, if the run is inside the window.
     fn sched_trace(&self, what: &str) {
-        let Some((from, to)) = *Self::sched_trace_window() else { return };
+        let Some((from, to)) = *Self::sched_trace_window() else {
+            return;
+        };
         if self.frames < from || self.frames > to {
             return;
         }
@@ -902,8 +942,8 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // sleep waiter fires on the next scheduler pass and this costs one
                 // reschedule - which is also what hardware does at a frame boundary.
                 self.block_or_consume_token(idx);
-                // Count the frame and advance any frame-keyed input (a scripted TAS
-                // recipe) in lockstep with the render loop.
+                // Count the frame and advance any frame-keyed input (a scripted input
+                // timeline) in lockstep with the render loop.
                 self.frames += 1;
                 // `VITASLOP_CPU_SHARE_FROM=<frame>`: start the CPU-share counters (`picks`,
                 // `quanta`, `retired_total`) afresh at that frame, so `cpu_share_report`
@@ -922,7 +962,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // diagnostic that lives outside this crate can put a frame number on its
                 // lines. Native's block tracer has always been able to; the browser's could
                 // not, and a control-flow trace with no frame number cannot be lined up with
-                // a crash frame, a recipe cue, or another instrument's output - which is most
+                // a crash frame, a playbook cue, or another instrument's output - which is most
                 // of what such a trace is for.
                 CURRENT_FRAME.store(self.frames, std::sync::atomic::Ordering::Relaxed);
                 // Diagnostic (`RUST_LOG=vitaslop::display=trace`): the frame boundary itself,
@@ -1001,8 +1041,11 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         }
         // Over the LIVE slots: this runs on every suspension, and a finished thread is not
         // runnable, so scanning the whole table was thousands of loads per resume.
-        let runnable =
-            self.live.iter().filter(|&&i| self.threads[i].state == ThreadState::Runnable).count();
+        let runnable = self
+            .live
+            .iter()
+            .filter(|&&i| self.threads[i].state == ThreadState::Runnable)
+            .count();
         if self.runnable_hist.len() <= runnable {
             self.runnable_hist.resize(runnable + 1, 0);
         }
@@ -1016,7 +1059,10 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         self.fuel_samples += 1;
         self.fuel_max = self.fuel_max.max(burned);
         self.arm_total = self.arm_total.saturating_add(retired.unwrap_or(0));
-        self.host.lock().unwrap().on_guest_work(runnable, burned, retired);
+        self.host
+            .lock()
+            .unwrap()
+            .on_guest_work(runnable, burned, retired);
     }
 
     /// `(total fuel burned, samples, largest single burn)`.
@@ -1125,7 +1171,11 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // The thread is parked on nothing, no timer names it, and the run ends one frame
         // into a title that was about to render its title screen.
         self.drain();
-        if self.live.iter().any(|&i| self.threads[i].state == ThreadState::Runnable) {
+        if self
+            .live
+            .iter()
+            .any(|&i| self.threads[i].state == ThreadState::Runnable)
+        {
             return IdleStep::Continue;
         }
         let blocked: Vec<i32> = self
@@ -1139,7 +1189,11 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         }
         let (deadline, io_remaining, now) = {
             let h = self.host.lock().unwrap();
-            (h.earliest_deadline(), h.earliest_io_remaining_us(), h.clock_us())
+            (
+                h.earliest_deadline(),
+                h.earliest_io_remaining_us(),
+                h.clock_us(),
+            )
         };
         // >>> AN OUTSTANDING TRANSFER AND A PENDING TIMED WAIT ARE HONOURED IN TIME ORDER.
         //
@@ -1225,8 +1279,11 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // deadlock has sent several sessions looking at the guest's locking.
                 let (dump, orphans) = {
                     let h = self.host.lock().unwrap();
-                    let orphans: Vec<i32> =
-                        blocked.iter().copied().filter(|&t| !h.thread_has_wait_record(t)).collect();
+                    let orphans: Vec<i32> = blocked
+                        .iter()
+                        .copied()
+                        .filter(|&t| !h.thread_has_wait_record(t))
+                        .collect();
                     (h.sync_dump(), orphans)
                 };
                 if orphans.is_empty() {
@@ -1259,7 +1316,11 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         self.with_host_words(|host, words| host.resolve_deferred(words));
         let (spawns, wakes, stat_writes) = {
             let mut host = self.host.lock().unwrap();
-            (host.take_spawns(), host.take_wakes(), host.take_stat_writes())
+            (
+                host.take_spawns(),
+                host.take_wakes(),
+                host.take_stat_writes(),
+            )
         };
         // Deliver any exit codes owed to a blocked `sceKernelWaitThreadEnd` joiner's
         // `stat` out-parameter. Done here (no thread runs during a drain) before the
@@ -1268,9 +1329,8 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             self.engine.write_mem(addr, &value.to_le_bytes());
         }
         for sp in spawns {
-            let spawned = crate::perf::time(crate::perf::Phase::ThreadSpawn, || {
-                self.engine.spawn(&sp)
-            });
+            let spawned =
+                crate::perf::time(crate::perf::Phase::ThreadSpawn, || self.engine.spawn(&sp));
             match spawned {
                 Ok(thread) => {
                     self.sched_trace(&format!(
@@ -1309,7 +1369,11 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // that follows will consume it instead of parking. See `wake_tokens`.
                 None => {
                     // `live` IS "not finished", so this is the same test over 13 entries.
-                    if self.live.iter().any(|&i| self.threads[i].thread.thid() == thid) {
+                    if self
+                        .live
+                        .iter()
+                        .any(|&i| self.threads[i].thread.thid() == thid)
+                    {
                         self.wake_tokens.insert(thid);
                     }
                 }
@@ -1328,7 +1392,9 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         if self.wake_tokens.remove(&thid) {
             self.threads[idx].state = ThreadState::Runnable;
             self.threads[idx].cooled = false;
-            self.sched_trace(&format!("BLOCK t{thid:#x} SKIPPED (wake token already owed)"));
+            self.sched_trace(&format!(
+                "BLOCK t{thid:#x} SKIPPED (wake token already owed)"
+            ));
             return;
         }
         self.threads[idx].state = ThreadState::Blocked;
@@ -1389,7 +1455,10 @@ where
 {
     /// A scheduler seeded with its `main` thread, ready to run.
     pub fn new(engine: E, host: Arc<Mutex<H>>, main: E::Thread) -> Self {
-        Scheduler { core: SchedCore::new(engine, host, main), rounds_total: 0 }
+        Scheduler {
+            core: SchedCore::new(engine, host, main),
+            rounds_total: 0,
+        }
     }
 
     /// The scheduling core, for the few things that need both the host and the engine at
@@ -1545,8 +1614,16 @@ mod idle_order_tests {
         // vblank goes first again; after two, what is left fits inside a frame and the
         // transfer completes. That is 2 MB costing three display frames, which is the
         // whole point of modelling it.
-        assert!(!storage_completes_first(Some(38_286 - FRAME_US), Some(FRAME_US), 0));
-        assert!(storage_completes_first(Some(38_286 - 2 * FRAME_US), Some(FRAME_US), 0));
+        assert!(!storage_completes_first(
+            Some(38_286 - FRAME_US),
+            Some(FRAME_US),
+            0
+        ));
+        assert!(storage_completes_first(
+            Some(38_286 - 2 * FRAME_US),
+            Some(FRAME_US),
+            0
+        ));
     }
 
     #[test]
@@ -1571,7 +1648,11 @@ mod idle_order_tests {
     fn the_comparison_is_against_the_clock_now_not_the_raw_deadline() {
         // 5 ms of transfer left against a deadline 1 ms away: the deadline is at
         // 101_000 on a clock reading 100_000, so the transfer must NOT win.
-        assert!(!storage_completes_first(Some(5_000), Some(101_000), 100_000));
+        assert!(!storage_completes_first(
+            Some(5_000),
+            Some(101_000),
+            100_000
+        ));
     }
 }
 
@@ -1579,7 +1660,11 @@ mod idle_order_tests {
 pub fn cpu_share_from() -> Option<u64> {
     use std::sync::OnceLock;
     static AT: OnceLock<Option<u64>> = OnceLock::new();
-    *AT.get_or_init(|| crate::knobs::var("VITASLOP_CPU_SHARE_FROM").ok().and_then(|v| v.trim().parse().ok()))
+    *AT.get_or_init(|| {
+        crate::knobs::var("VITASLOP_CPU_SHARE_FROM")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
 }
 
 /// For the parallel browser scheduler (`vitaslop-web`'s `smp`): the last [`SpinHistory::N`]
@@ -1605,7 +1690,11 @@ impl SpinHistory {
 
     /// Spin only on evidence: 8 waits recorded, at least half of them short.
     pub fn should_spin(&self) -> bool {
-        let mask = if self.seen >= 32 { u32::MAX } else { (1u32 << self.seen) - 1 };
+        let mask = if self.seen >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << self.seen) - 1
+        };
         self.seen >= 8 && (self.bits & mask).count_ones() * 2 >= self.seen
     }
 }
@@ -1633,15 +1722,126 @@ mod spin_history_tests {
         for _ in 0..17 {
             h.record(false);
         }
-        assert!(!h.should_spin(), "17 long of the last 25 is a worker that mostly sleeps");
+        assert!(
+            !h.should_spin(),
+            "17 long of the last 25 is a worker that mostly sleeps"
+        );
         let mut long = SpinHistory::new();
         for _ in 0..100 {
             long.record(false);
         }
-        assert!(!long.should_spin(), "a storage worker idle for whole frames never spins");
+        assert!(
+            !long.should_spin(),
+            "a storage worker idle for whole frames never spins"
+        );
         for _ in 0..16 {
             long.record(true);
         }
-        assert!(long.should_spin(), "16 of the last 32 short is exactly half - spin");
+        assert!(
+            long.should_spin(),
+            "16 of the last 32 short is exactly half - spin"
+        );
+    }
+}
+
+/// For an engine that runs a thread's EXIT event handlers as further entries of that thread
+/// (the browser's): the handlers owed once its final entry returned
+/// ([`ImportDispatch::thread_return_calls`]), run one after another ON it.
+///
+/// It belongs to the THREAD, not to the instance running it: an engine that lends a finished
+/// thread's instance to the next must [`reset`](Self::reset) it, or that thread starts out
+/// "running EXIT handlers" - it then skips its own and ends with the previous thread's code.
+#[derive(Default, Debug)]
+pub struct ExitHandlerRun {
+    /// The code the thread's entry returned, while its handlers run: the code it ends with,
+    /// whatever they return.
+    code: Option<u32>,
+    /// The handlers still to run after the current one, in order.
+    calls: std::collections::VecDeque<crate::host::GuestCall>,
+    /// The handler the next entry start runs: seeded from its arguments, not the launch
+    /// registers.
+    seed: Option<crate::host::GuestCall>,
+}
+
+impl ExitHandlerRun {
+    /// The thread returned with `code` and owes `calls`. False, beginning nothing, when it
+    /// owes none.
+    pub fn begin(&mut self, code: u32, calls: Vec<crate::host::GuestCall>) -> bool {
+        if calls.is_empty() {
+            return false;
+        }
+        self.code = Some(code);
+        self.calls = calls.into();
+        true
+    }
+
+    /// The code the thread ends with when its handlers are running, else `None`.
+    pub fn code(&self) -> Option<u32> {
+        self.code
+    }
+
+    /// Make the next handler the one the next entry start runs; its address, or `None` when
+    /// none is left.
+    pub fn advance(&mut self) -> Option<u32> {
+        let call = self.calls.pop_front()?;
+        let entry = call.entry;
+        self.seed = Some(call);
+        Some(entry)
+    }
+
+    /// The handler an entry start is to seed, if it is one.
+    pub fn take_seed(&mut self) -> Option<crate::host::GuestCall> {
+        self.seed.take()
+    }
+
+    /// Forget the thread: back to owing nothing.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod exit_handler_run_tests {
+    use super::ExitHandlerRun;
+    use crate::host::GuestCall;
+
+    fn call(entry: u32) -> GuestCall {
+        GuestCall {
+            entry,
+            args: vec![8, 0x101, 5, 0],
+        }
+    }
+
+    #[test]
+    fn one_instance_reused_for_two_threads_starts_the_second_clean() {
+        let mut run = ExitHandlerRun::default();
+        // Thread one returns 5 owing two handlers; the first calls `sceKernelExitThread`,
+        // ending the thread with the second still queued and nothing taken.
+        assert!(run.begin(5, vec![call(0x100), call(0x200)]));
+        assert_eq!(run.advance(), Some(0x100));
+        assert_eq!(run.take_seed().map(|c| c.entry), Some(0x100));
+        assert_eq!(run.code(), Some(5));
+        // Its instance is released and lent to thread two.
+        run.reset();
+        // Thread two's own return is not mistaken for a handler's: nothing is running...
+        assert_eq!(run.code(), None);
+        assert!(run.take_seed().is_none());
+        assert_eq!(
+            run.advance(),
+            None,
+            "thread one's leftover handler must not run on thread two"
+        );
+        // ...and it gets its own handlers with its own code.
+        assert!(run.begin(9, vec![call(0x300)]));
+        assert_eq!(run.code(), Some(9));
+        assert_eq!(run.advance(), Some(0x300));
+        assert_eq!(run.advance(), None);
+    }
+
+    #[test]
+    fn owing_no_handlers_begins_nothing() {
+        let mut run = ExitHandlerRun::default();
+        assert!(!run.begin(7, Vec::new()));
+        assert_eq!(run.code(), None);
     }
 }

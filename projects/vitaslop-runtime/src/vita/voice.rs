@@ -63,7 +63,11 @@ impl VoiceState {
     fn create_port(&mut self) -> u32 {
         // Port ids start away from zero so a title that treats 0 as "no port" (several
         // do) is not handed one that looks like the absence of one.
-        self.next_port = if self.next_port == 0 { 0x100 } else { self.next_port + 1 };
+        self.next_port = if self.next_port == 0 {
+            0x100
+        } else {
+            self.next_port + 1
+        };
         self.ports.push(self.next_port);
         self.next_port
     }
@@ -138,7 +142,11 @@ pub(super) fn create_port(ctx: &mut GuestCtx, st: &mut VitaState, out: Ptr, _par
 /// int sceVoiceDeletePort(SceUInt32 portId)
 #[hostcall]
 pub(super) fn delete_port(_ctx: &mut GuestCtx, st: &mut VitaState, id: u32) -> i32 {
-    if st.voice.delete(id) { 0 } else { SCE_VOICE_ERROR_ARG_INVALID }
+    if st.voice.delete(id) {
+        0
+    } else {
+        SCE_VOICE_ERROR_ARG_INVALID
+    }
 }
 
 /// int sceVoiceConnectIPortToOPort(SceUInt32 ips, SceUInt32 ops)
@@ -147,13 +155,21 @@ pub(super) fn delete_port(_ctx: &mut GuestCtx, st: &mut VitaState, id: u32) -> i
 /// ever written into an input port that an output port could deliver.
 #[hostcall]
 pub(super) fn connect(_ctx: &mut GuestCtx, st: &mut VitaState, ips: u32, ops: u32) -> i32 {
-    if st.voice.has(ips) && st.voice.has(ops) { 0 } else { SCE_VOICE_ERROR_ARG_INVALID }
+    if st.voice.has(ips) && st.voice.has(ops) {
+        0
+    } else {
+        SCE_VOICE_ERROR_ARG_INVALID
+    }
 }
 
 /// int sceVoiceDisconnectIPortFromOPort(SceUInt32 ips, SceUInt32 ops)
 #[hostcall]
 pub(super) fn disconnect(_ctx: &mut GuestCtx, st: &mut VitaState, ips: u32, ops: u32) -> i32 {
-    if st.voice.has(ips) && st.voice.has(ops) { 0 } else { SCE_VOICE_ERROR_ARG_INVALID }
+    if st.voice.has(ips) && st.voice.has(ops) {
+        0
+    } else {
+        SCE_VOICE_ERROR_ARG_INVALID
+    }
 }
 
 /// int sceVoiceWriteToIPort(SceUInt32 portId, const void *data, SceUInt32 *size)
@@ -169,7 +185,11 @@ pub(super) fn write_to_iport(
     _data: Ptr,
     _size: Ptr,
 ) -> i32 {
-    if st.voice.has(id) { 0 } else { SCE_VOICE_ERROR_ARG_INVALID }
+    if st.voice.has(id) {
+        0
+    } else {
+        SCE_VOICE_ERROR_ARG_INVALID
+    }
 }
 
 /// int sceVoiceReadFromOPort(SceUInt32 portId, void *data, SceUInt32 *size)

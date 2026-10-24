@@ -21,7 +21,13 @@ pub struct CtrlFrame {
 impl Default for CtrlFrame {
     /// No buttons held, sticks centered.
     fn default() -> Self {
-        CtrlFrame { buttons: 0, lx: 128, ly: 128, rx: 128, ry: 128 }
+        CtrlFrame {
+            buttons: 0,
+            lx: 128,
+            ly: 128,
+            rx: 128,
+            ry: 128,
+        }
     }
 }
 
@@ -56,7 +62,12 @@ impl TouchFrame {
     /// the panel's typical full-press value and the id is 0 (a lone finger).
     pub fn single(x: u16, y: u16) -> Self {
         let mut f = TouchFrame::default();
-        f.points[0] = TouchPoint { id: 0, force: 128, x, y };
+        f.points[0] = TouchPoint {
+            id: 0,
+            force: 128,
+            x,
+            y,
+        };
         f.count = 1;
         f
     }
@@ -153,7 +164,10 @@ impl Default for HostLocation {
     /// would report missing hardware on a device that has a GPS. `Unavailable` is set
     /// only when the platform really has no positioning API.
     fn default() -> Self {
-        HostLocation { permission: LocationPermission::NotAsked, fix: None }
+        HostLocation {
+            permission: LocationPermission::NotAsked,
+            fix: None,
+        }
     }
 }
 
@@ -229,6 +243,18 @@ impl HostLocation {
     }
 }
 
+/// One key from the host's keyboard as text editing sees it: a character to insert, or an
+/// editing key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextKey {
+    Char(char),
+    Backspace,
+    Enter,
+    Escape,
+    Left,
+    Right,
+}
+
 /// The external world a guest observes. The only source of non-determinism the
 /// emulator admits. Implementations decide whether time is real, virtual, or
 /// replayed, and whether the clocks move together.
@@ -277,11 +303,18 @@ pub trait World {
         None
     }
 
+    /// The keys typed on the host's keyboard since the last poll, for an on-screen keyboard
+    /// the guest has open (`sceImeUpdate` asks). The default is none: a world without a
+    /// keyboard types nothing.
+    fn poll_text(&mut self) -> Vec<TextKey> {
+        Vec::new()
+    }
+
     /// Fill `buf` with entropy.
     fn fill_random(&mut self, buf: &mut [u8]);
 
     /// Notify the world that display frame `frame` (a flip just completed) is now
-    /// current, so a frame-keyed input source (a scripted TAS recipe) can advance.
+    /// current, so a frame-keyed input source (a scripted input timeline) can advance.
     /// The default ignores it - time-free and input-free worlds do not need it.
     fn set_frame(&mut self, _frame: u64) {}
 }
@@ -298,7 +331,11 @@ pub struct DeterministicWorld {
 impl DeterministicWorld {
     /// A world starting at monotonic 0, the given wall epoch, and a PRNG seed.
     pub fn new(wall_epoch_us: u64, seed: u64) -> Self {
-        DeterministicWorld { monotonic_us: 0, wall_us: wall_epoch_us, rng: seed | 1 }
+        DeterministicWorld {
+            monotonic_us: 0,
+            wall_us: wall_epoch_us,
+            rng: seed | 1,
+        }
     }
 
     /// Advance the virtual monotonic clock (e.g. one frame's worth). The host
@@ -353,14 +390,22 @@ impl World for DeterministicWorld {
 pub enum WorldEvent {
     Monotonic(u64),
     Wall(u64),
-    Ctrl { port: u32, frame: CtrlFrame },
-    Touch { port: u32, frame: TouchFrame },
+    Ctrl {
+        port: u32,
+        frame: CtrlFrame,
+    },
+    Touch {
+        port: u32,
+        frame: TouchFrame,
+    },
     Random(Vec<u8>),
     /// The permission answer, recorded because a user's grant or refusal is exactly the
     /// kind of external decision a replay must reproduce rather than re-ask.
     LocationPermission(LocationPermission),
     /// A position fix (or its absence), which is the most external input there is.
     Location(Option<LocationFix>),
+    /// The keys one `poll_text` returned.
+    Text(Vec<TextKey>),
 }
 
 /// Wraps any inner world and logs every answer it gives, in order. This is the
@@ -374,7 +419,10 @@ pub struct Record<W: World> {
 
 impl<W: World> Record<W> {
     pub fn new(inner: W) -> Self {
-        Record { inner, events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) }
+        Record {
+            inner,
+            events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
     }
 
     /// A shared handle to the recorded log. Clone it before boxing the recorder as
@@ -400,17 +448,26 @@ impl<W: World> World for Record<W> {
     }
     fn poll_ctrl(&mut self, port: u32) -> CtrlFrame {
         let frame = self.inner.poll_ctrl(port);
-        self.events.lock().unwrap().push(WorldEvent::Ctrl { port, frame });
+        self.events
+            .lock()
+            .unwrap()
+            .push(WorldEvent::Ctrl { port, frame });
         frame
     }
     fn poll_touch(&mut self, port: u32) -> TouchFrame {
         let frame = self.inner.poll_touch(port);
-        self.events.lock().unwrap().push(WorldEvent::Touch { port, frame });
+        self.events
+            .lock()
+            .unwrap()
+            .push(WorldEvent::Touch { port, frame });
         frame
     }
     fn location_permission(&mut self) -> LocationPermission {
         let v = self.inner.location_permission();
-        self.events.lock().unwrap().push(WorldEvent::LocationPermission(v));
+        self.events
+            .lock()
+            .unwrap()
+            .push(WorldEvent::LocationPermission(v));
         v
     }
     fn request_location(&mut self) {
@@ -427,9 +484,20 @@ impl<W: World> World for Record<W> {
         self.events.lock().unwrap().push(WorldEvent::Location(v));
         v
     }
+    fn poll_text(&mut self) -> Vec<TextKey> {
+        let v = self.inner.poll_text();
+        self.events
+            .lock()
+            .unwrap()
+            .push(WorldEvent::Text(v.clone()));
+        v
+    }
     fn fill_random(&mut self, buf: &mut [u8]) {
         self.inner.fill_random(buf);
-        self.events.lock().unwrap().push(WorldEvent::Random(buf.to_vec()));
+        self.events
+            .lock()
+            .unwrap()
+            .push(WorldEvent::Random(buf.to_vec()));
     }
     fn set_frame(&mut self, frame: u64) {
         // A frame tick is not a recorded answer (it is driven by the scheduler, which
@@ -447,7 +515,9 @@ pub struct Replay {
 
 impl Replay {
     pub fn new(events: Vec<WorldEvent>) -> Self {
-        Replay { events: events.into() }
+        Replay {
+            events: events.into(),
+        }
     }
     fn next(&mut self) -> WorldEvent {
         self.events.pop_front().expect("replay log exhausted")
@@ -491,6 +561,12 @@ impl World for Replay {
             e => panic!("replay expected Location, got {e:?}"),
         }
     }
+    fn poll_text(&mut self) -> Vec<TextKey> {
+        match self.next() {
+            WorldEvent::Text(v) => v,
+            e => panic!("replay expected Text, got {e:?}"),
+        }
+    }
     fn fill_random(&mut self, buf: &mut [u8]) {
         match self.next() {
             WorldEvent::Random(bytes) => {
@@ -523,7 +599,15 @@ mod host_location_tests {
     #[test]
     fn a_fix_grants_permission_and_converts_every_component() {
         let mut l = HostLocation::default();
-        l.apply_w3c_fix(35.5, 139.5, Some(41.5), Some(12.25), Some(97.5), Some(3.75), 1_700_000.0);
+        l.apply_w3c_fix(
+            35.5,
+            139.5,
+            Some(41.5),
+            Some(12.25),
+            Some(97.5),
+            Some(3.75),
+            1_700_000.0,
+        );
         assert_eq!(l.permission, LocationPermission::Granted);
         let f = l.fix.unwrap();
         assert_eq!(f.latitude_deg, 35.5);
@@ -532,7 +616,10 @@ mod host_location_tests {
         assert_eq!(f.accuracy_m, Some(12.25));
         assert_eq!(f.direction_deg, Some(97.5));
         assert_eq!(f.speed_mps, Some(3.75));
-        assert_eq!(f.timestamp_us, 1_700_000_000, "milliseconds become microseconds");
+        assert_eq!(
+            f.timestamp_us, 1_700_000_000,
+            "milliseconds become microseconds"
+        );
     }
 
     /// A stationary device reports NaN heading and speed. That is UNKNOWN, not zero -
@@ -540,12 +627,24 @@ mod host_location_tests {
     #[test]
     fn a_nan_or_absent_component_stays_unknown_rather_than_zero() {
         let mut l = HostLocation::default();
-        l.apply_w3c_fix(1.0, 2.0, None, Some(5.0), Some(f64::NAN), Some(f64::NAN), 0.0);
+        l.apply_w3c_fix(
+            1.0,
+            2.0,
+            None,
+            Some(5.0),
+            Some(f64::NAN),
+            Some(f64::NAN),
+            0.0,
+        );
         let f = l.fix.unwrap();
         assert_eq!(f.direction_deg, None);
         assert_eq!(f.speed_mps, None);
         assert_eq!(f.altitude_m, None);
-        assert_eq!(f.accuracy_m, Some(5.0), "a component that IS finite still lands");
+        assert_eq!(
+            f.accuracy_m,
+            Some(5.0),
+            "a component that IS finite still lands"
+        );
     }
 
     /// Only PERMISSION_DENIED is a refusal. POSITION_UNAVAILABLE and TIMEOUT mean
@@ -561,7 +660,11 @@ mod host_location_tests {
             let mut l = HostLocation::default();
             l.set_pending();
             l.apply_w3c_error(code);
-            assert_eq!(l.permission, LocationPermission::Granted, "code {code} is not a refusal");
+            assert_eq!(
+                l.permission,
+                LocationPermission::Granted,
+                "code {code} is not a refusal"
+            );
             assert!(l.fix.is_none());
         }
     }

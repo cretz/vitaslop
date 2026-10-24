@@ -2221,14 +2221,26 @@ fn substitute_constant_samples(body: &str, kind: ProgramKind) -> (String, Vec<u8
                 // all - see `case_texture_value_at`. It is everything after the coordinate: one
                 // scalar for a bias or a level, two `vec2` derivatives for a gradient, which a
                 // `vec4` constructor takes as they stand.
+                // Empty for an implicit sample, which has nothing after the coordinate.
+                let (_, end, _) = coord_arg_span(args)?;
+                let rest = args[end..].trim();
+                let extra = rest.strip_prefix(',').map_or("", |r| r.trim().strip_suffix(");").unwrap_or(r).trim());
+                // >>> THE TEXTURE'S OWN LOD BIAS IS NOT PART OF A CASE. A case binds a stand-in
+                // with no texture state, so the per-draw `gxp_depth` block it is read from does
+                // not exist here: a sample the emitter biased ONLY by it is the program's implicit
+                // sample, and one it added to the program's own bias keeps the program's term.
+                let tex_bias = texture_bias(unit);
+                let (func, extra) = if extra == tex_bias {
+                    ("textureSample", "")
+                } else {
+                    (func, extra.strip_suffix(&format!(" + {tex_bias}")).unwrap_or(extra))
+                };
                 let mode = match func {
                     "textureSampleBias" => TexLod::Bias,
                     "textureSampleLevel" => TexLod::Level,
                     "textureSampleGrad" => TexLod::Gradient,
                     _ => return Some(format!("{}= gxp_case_tex({unit}u, {coord});", &line[..eq])),
                 };
-                let (_, end, _) = coord_arg_span(args)?;
-                let extra = args[end..].trim().strip_prefix(',')?.trim().strip_suffix(");")?.trim();
                 let lod = if mode == TexLod::Gradient {
                     format!("vec4<f32>({extra})")
                 } else {
@@ -3645,8 +3657,8 @@ fn emit_instr(
         Op::PackToInt { bits, signed, norm, .. } => {
             emit_pack_to_int(s, instr, dest, mask, bits, signed, norm).ok_or_else(unmapped)
         }
-        Op::PackFromInt { bits, signed } => {
-            emit_pack_from_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
+        Op::PackFromInt { bits, signed, norm } => {
+            emit_pack_from_int(s, instr, dest, mask, bits, signed, norm).ok_or_else(unmapped)
         }
         Op::PackIntCopy { bits, dest_bits, signed } => {
             emit_pack_int_copy(s, instr, dest, mask, bits, dest_bits, signed).ok_or_else(unmapped)
@@ -4054,10 +4066,13 @@ fn emit_pack_from_int(
     mask: [bool; 4],
     bits: u8,
     signed: bool,
+    norm: bool,
 ) -> Option<()> {
     debug_assert!(bits == 16 || bits == 8, "only the 16- and 8-bit widths decode to this op");
     let s1 = instr.srcs.first()?;
     let dp = Prec::of(instr);
+    // The normalized form's divisor: the integer's full positive range (see `Op::PackFromInt`).
+    let range = if signed { (1u32 << (bits - 1)) - 1 } else { (1u32 << bits) - 1 };
     for c in 0..4 {
         if !mask[c] {
             continue;
@@ -4068,6 +4083,11 @@ fn emit_pack_from_int(
         let lo = (sel % elems_per_reg) * bits as u32;
         let half = raw_elem_expr(&reg, lo, bits as u32, signed);
         let e = format!("f32({half})");
+        let e = match (norm, signed) {
+            (true, true) => format!("max({e} / {range}.0, -1.0)"),
+            (true, false) => format!("({e} / {range}.0)"),
+            (false, _) => e,
+        };
         let e = if s1.neg { format!("(-{e})") } else { e };
         let e = if s1.abs { format!("abs({e})") } else { e };
         body.store(dest, c, &e, dp)?;
@@ -4814,6 +4834,16 @@ fn emit_tex(
     Some(())
 }
 
+/// The WGSL expression for fragment sampler unit `unit`'s TEXTURE LOD bias, in mip levels: the
+/// per-draw lane the renderer fills from the bound texture's control word (`lod_bias`, raw 0..63,
+/// `(raw - 31) / 8` levels). Texture state, not program state - one program draws the same layer
+/// sharp and blurred by binding it with different biases, which is how a depth-of-field title
+/// blurs its background: left out, every tap of its blur reads the sharp base level and the
+/// out-of-focus layers become rows of hard-edged copies.
+pub(crate) fn texture_bias(unit: u8) -> String {
+    format!("gxp_depth.tex_bias[{}][{}]", unit / 4, unit % 4)
+}
+
 /// The sample call [`emit_tex`] makes, as WGSL text - `FUNC(tex, samp, vecK<f32>(...)EXTRA)`.
 fn tex_call(instr: &Instr, unit: u8, coords: u8, coord_half: bool, lod: TexLod, kind: ProgramKind) -> Option<String> {
     let (tex, samp) = sampler_names(kind, unit);
@@ -4827,15 +4857,25 @@ fn tex_call(instr: &Instr, unit: u8, coords: u8, coord_half: bool, lod: TexLod, 
     // (1D pads Y to 0). The bound-texture type (2d/3d/cube) is chosen at pipeline-build.
     // The mip level, when the encoding supplies one. It is a scalar read at F32 (see the
     // decoder's note) and selects the WGSL sample variant.
-    let (func, extra) = match lod {
-        TexLod::Implicit => ("textureSample", String::new()),
-        TexLod::Bias => ("textureSampleBias", format!(", {}", src_channel(instr.srcs.get(1)?, 0, Prec::F32)?)),
-        TexLod::Level => ("textureSampleLevel", format!(", {}", src_channel(instr.srcs.get(1)?, 0, Prec::F32)?)),
+    // A FRAGMENT sample whose LOD the hardware computes also takes the TEXTURE's own LOD bias
+    // (see [`texture_bias`]); a vertex sample has no implicit LOD to bias.
+    let tex_bias = matches!(kind, ProgramKind::Fragment).then(|| texture_bias(unit));
+    let (func, extra) = match (lod, &tex_bias) {
+        (TexLod::Implicit, None) => ("textureSample", String::new()),
+        (TexLod::Implicit, Some(b)) => ("textureSampleBias", format!(", {b}")),
+        (TexLod::Bias, b) => (
+            "textureSampleBias",
+            match b {
+                Some(b) => format!(", {} + {b}", src_channel(instr.srcs.get(1)?, 0, Prec::F32)?),
+                None => format!(", {}", src_channel(instr.srcs.get(1)?, 0, Prec::F32)?),
+            },
+        ),
+        (TexLod::Level, _) => ("textureSampleLevel", format!(", {}", src_channel(instr.srcs.get(1)?, 0, Prec::F32)?)),
         // The gradient form supplies BOTH derivatives from src2, packed one after the other:
         // for a 2D sample components 0,1 are ddx and 2,3 are ddy (spec E0.4). They are
         // vectors of the same arity as the coordinate, so a 3D sample would take 3 and 3 -
         // the decoder blocks that case rather than guess where the second vector starts.
-        TexLod::Gradient => {
+        (TexLod::Gradient, _) => {
             let g = instr.srcs.get(1)?;
             let (ddx0, ddx1) = (src_channel(g, 0, Prec::F32)?, src_channel(g, 1, Prec::F32)?);
             let (ddy0, ddy1) = (src_channel(g, 2, Prec::F32)?, src_channel(g, 3, Prec::F32)?);
@@ -5264,6 +5304,27 @@ mod tests {
     use crate::container::ProgramKind;
     use crate::ir::{Bank, Instr, Predicate};
 
+    /// A conformance case binds a stand-in with no texture state, so the rewrite drops the
+    /// texture's own LOD bias and keeps the INSTRUCTION's mode: an implicit sample the emitter
+    /// biased only by the texture stays tag 0 (not Bias), and a program bias keeps its own term.
+    /// Left in, the case module reads `gxp_depth`, which its wrapper does not declare.
+    #[test]
+    fn a_case_drops_the_texture_bias_and_keeps_the_lod_mode() {
+        let b = texture_bias(1);
+        let body = format!(
+            "  let _tex0 = textureSampleBias(t1, s1, vec2<f32>(r0.x, r0.y), {b});\n  \
+             let _tex1 = textureSampleBias(t1, s1, vec2<f32>(r0.x, r0.y), r2.x + {b});\n  \
+             let _tex2 = textureSampleLevel(t1, s1, vec2<f32>(r0.x, r0.y), r2.y);\n"
+        );
+        let (out, units) = substitute_constant_samples(&body, ProgramKind::Fragment);
+        assert_eq!(units, vec![1]);
+        assert!(!out.contains("gxp_depth"), "the draw-state bias survived:\n{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("= gxp_case_tex(1u, ") && !lines[0].contains("texl"), "{}", lines[0]);
+        assert!(lines[1].ends_with("), 1u, vec4<f32>(r2.x, 0.0, 0.0, 0.0));"), "{}", lines[1]);
+        assert!(lines[2].ends_with("), 2u, vec4<f32>(r2.y, 0.0, 0.0, 0.0));"), "{}", lines[2]);
+    }
+
     /// >>> THE EMITTER'S CONSTANT AND THE REFERENCE'S CONSTANT ARE ONE FACT, AND THEY DRIFTED.
     ///
     /// [`src_channel`] builds a WGSL literal for a constant operand channel;
@@ -5376,7 +5437,7 @@ mod tests {
         };
         let dest = Operand::plain(Bank::SecondaryAttr, 60, 2);
         for (sel, lo) in [(0u8, 0u32), (1, 8), (2, 16), (3, 24)] {
-            let mut i = instr(Op::PackFromInt { bits: 8, signed: false }, Some(dest), vec![src(sel)]);
+            let mut i = instr(Op::PackFromInt { bits: 8, signed: false, norm: false }, Some(dest), vec![src(sel)]);
             i.write_mask = [true, false, false, false];
             let wgsl = emit_fragment(&shader(vec![i])).unwrap();
             // ONE register - the operand's own - and the byte at the selector's position.
@@ -5705,11 +5766,11 @@ mod tests {
         let mut ins = instr(Op::Tex { unit: 1, coords: 2, coord_half: false, lod: TexLod::Implicit }, d, vec![uv]);
         ins.pred = Predicate::IfNotP(0);
         let wgsl = emit_fragment(&shader(vec![ins])).unwrap();
-        let sample = wgsl.find("let gxp_texh0 = textureSample(t1, s1,").unwrap_or_else(|| panic!("not hoisted:\n{wgsl}"));
+        let sample = wgsl.find("let gxp_texh0 = textureSampleBias(t1, s1,").unwrap_or_else(|| panic!("not hoisted:\n{wgsl}"));
         let cond = wgsl.find("if (!p[0]) {").unwrap_or_else(|| panic!("no predicate:\n{wgsl}"));
         assert!(sample < cond, "the sample must precede the predicate's if:\n{wgsl}");
         assert!(wgsl[cond..].contains("gxp_texh0.x"), "the store reads the hoisted sample:\n{wgsl}");
-        assert!(!wgsl[cond..].contains("textureSample("), "no sample left inside the if:\n{wgsl}");
+        assert!(!wgsl[cond..].contains("textureSample"), "no sample left inside the if:\n{wgsl}");
         // An unpredicated sample is emitted where it stands, as before.
         let plain = emit_fragment(&shader(vec![instr(
             Op::Tex { unit: 1, coords: 2, coord_half: false, lod: TexLod::Implicit },
@@ -5717,7 +5778,7 @@ mod tests {
             vec![uv],
         )]))
         .unwrap();
-        assert!(plain.contains("let _tex0 = textureSample(t1, s1,") && !plain.contains("gxp_texh"), "got:\n{plain}");
+        assert!(plain.contains("let _tex0 = textureSampleBias(t1, s1,") && !plain.contains("gxp_texh"), "got:\n{plain}");
     }
 
     #[test]

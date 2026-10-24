@@ -1,0 +1,15 @@
+category = "vita"
+description = "Kernel odds and ends: priority spellings, PollSema, affinity, libc time - RUNNABLE"
+
+# Source: ../kernel2-src/kernel2.c (clean-room, -nostdlib). sceKernelChangeThreadPriority
+# answers 0 and its "2" spelling the previous priority (0 = the caller's own, relative forms
+# resolved, outside 64..191 refused) - on the INITIAL thread too; sceKernelPollSema takes
+# without waiting; a default-mask thread reports the user set; the libc time helpers use a
+# full-year struct tm and Mktime normalises it. Executable form: tests/vita_kernel2.rs.
+[out]
+output = """prio 160 0 100 100 165 165 80028023 80028023 165
+sema 0 80028102 0 0 8002000f 80028101
+affinity 70000
+gm 2012-1-29 13:45:30 w3 y59 d0
+local 2012-1-29 13:45:30 w3 y59 d0
+mk 0 1328140801 1328140801 2012-1-2 0:0:1 w4 y32 d0"""

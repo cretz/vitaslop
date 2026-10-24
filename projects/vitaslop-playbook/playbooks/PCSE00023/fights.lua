@@ -2,7 +2,7 @@
 -- screen and BOTH pre-fight intros played out, the first fight fought with combos, specials and
 -- X-ray attempts, then on through several more rounds.
 --
--- Converted from the recipes `boot` (skip the logos), `fight-with-intros` (the intros played
+-- Converted from the old frame-keyed scripts `boot` (skip the logos), `fight-with-intros` (the intros played
 -- out, then attacks), `fight-hard` (the same attacks) and `walk-several-fights` (CROSS every 150
 -- frames through fights - the render rig). `attract-idle.lua` is the no-input control.
 --
@@ -69,7 +69,7 @@ phase("first-fight", { timeout = 180 }, function()
 end)
 
 phase("several-fights", { timeout = 600 }, function()
-  -- The walk: the recipe pressed CROSS every 150 frames through fights and result screens alike;
+  -- The walk: the old script pressed CROSS every 150 frames through fights and result screens alike;
   -- that leaves rounds to run their whole 90-second clock (~5,700 frames each, MEASURED). The
   -- attack string ends them sooner, and its CROSSes still answer the result screens. MEASURED:
   -- a lost fight's continue is a REMATCH on the same stage (no new stage loads) - so the walk is

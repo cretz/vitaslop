@@ -52,10 +52,10 @@ await page.goto(url, { waitUntil: "load", timeout: 60000 });
 console.log("--- loaded, title:", await page.title());
 
 // Click through to the title the device would pick, if the page offers a picker.
-// The page lists titles as cards, each with its own recipe <select> and PLAY button, keyed
-// by TITLE_ID. Drive it the way a person does: choose the recipe, then press PLAY.
+// The page lists titles as cards, each with its own PLAY button, keyed by TITLE_ID. Drive it
+// the way a person does: press PLAY.
 // No default: a title id names a specific commercial title, and this repo keeps those out
-// of tracked source (they live in the BYO game directories and in the recipe tree). Fail
+// of tracked source (they live in the BYO game directories and in the playbooks). Fail
 // loudly rather than fall back to one - a silent default is how a probe ends up driving a
 // title the caller did not ask for.
 const titleId = process.env.TITLE_ID;
@@ -63,19 +63,7 @@ if (!titleId) {
   console.error("probe-live: TITLE_ID is required (the id of the dump under --games)");
   process.exit(2);
 }
-const recipe = process.env.RECIPE_NAME || "";
 await page.waitForSelector(`#p-${titleId}`, { timeout: 30000 });
-if (recipe) {
-  const opts = await page.locator(`#r-${titleId} option`).allTextContents();
-  console.log(`--- recipes offered: ${JSON.stringify(opts)}`);
-  const match = opts.find((o) => o.toLowerCase().includes(recipe.toLowerCase()));
-  if (match) {
-    await page.selectOption(`#r-${titleId}`, { label: match });
-    console.log(`--- selected recipe: ${match}`);
-  } else {
-    console.log(`--- NO recipe matching ${recipe}; leaving the default`);
-  }
-}
 // Extra knobs, appended to the card's own textarea exactly as a person would type them -
 // `KNOBS="VITASLOP_LOG=info\nVITASLOP_DIRTY_PAGES=1"`. Driving the real control rather than
 // reaching past it into the worker keeps this probe a test of the page that ships.

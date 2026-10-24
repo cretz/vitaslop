@@ -1480,6 +1480,66 @@ fn store_arg_field_falls_back_on_a_null_pointer() {
     assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "the handler's answer must survive");
 }
 
+/// The texture-type guard both checked forms use: word 1's top three bits = `LINEAR_STRIDED`.
+const STRIDED_GUARD: (u32, u32, u32) = (4, 0x7 << 29, 6 << 29);
+
+/// A guarded getter answers inline for every other type and hands the guarded one back.
+#[test]
+fn load_shift_mask_unless_splits_on_its_guard_word() {
+    let (guard_offset, guard_mask, guard_value) = STRIDED_GUARD;
+    let op = InlineOp::LoadShiftMaskUnless { offset: 0, shift: 21, mask: 0x3f, guard_offset, guard_mask, guard_value };
+    let word0 = 0x0AB0_0000u32;
+    for (word1, expect_crossing) in [(5u32 << 29, false), (6u32 << 29, true), ((6u32 << 29) | 0x00ff_ffff, true), (7u32 << 29, false)] {
+        let mut vm = vm_with(op);
+        vm.write_mem(PTR, &word0.to_le_bytes()).expect("seed word 0");
+        vm.write_mem(PTR + 4, &word1.to_le_bytes()).expect("seed word 1");
+        vm.set_reg(0, PTR);
+        let crossed = run(&mut vm);
+        assert_eq!(crossed, expect_crossing, "word1 {word1:#x}");
+        assert_eq!(op.falls_back_on_guard(word1), expect_crossing, "the predicate agrees at {word1:#x}");
+        let want = if expect_crossing { HANDLER_SENTINEL } else { op.eval(word0) };
+        assert_eq!(vm.get_reg(0), want, "word1 {word1:#x}");
+    }
+}
+
+/// A checked field store writes in the common case and leaves the word alone - handing the
+/// call to the host - on a matching guard word OR a value wider than its field.
+#[test]
+fn store_arg_field_checked_refuses_on_its_guard_and_a_wide_value() {
+    let (guard_offset, guard_mask, guard_value) = STRIDED_GUARD;
+    let op = InlineOp::StoreArgFieldChecked { offset: 0, shift: 21, mask: 0x3f, guard_offset, guard_mask, guard_value };
+    const BEFORE: u32 = 0xFFFF_FFFF;
+    for (word1, value, expect_crossing) in [
+        (5u32 << 29, 0u32, false),
+        (5 << 29, 63, false),
+        (5 << 29, 64, true),
+        (5 << 29, 0xFFFF_FFFF, true),
+        (6 << 29, 1, true),
+    ] {
+        let mut vm = vm_with(op);
+        vm.write_mem(OUT_PTR, &BEFORE.to_le_bytes()).expect("seed word 0");
+        vm.write_mem(OUT_PTR + 4, &word1.to_le_bytes()).expect("seed word 1");
+        vm.set_reg(0, OUT_PTR);
+        vm.set_reg(1, value);
+        let crossed = run(&mut vm);
+        assert_eq!(crossed, expect_crossing, "word1 {word1:#x} value {value:#x}");
+        assert_eq!(
+            op.falls_back_on_guard(word1) || op.falls_back_on_value(value),
+            expect_crossing,
+            "the predicates agree"
+        );
+        let got = vm.read_mem(OUT_PTR, 4).expect("read back");
+        let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
+        if expect_crossing {
+            assert_eq!(got, BEFORE, "a refused store must not touch the word");
+            assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+        } else {
+            assert_eq!(got, (BEFORE & !(0x3f << 21)) | (value << 21));
+            assert_eq!(vm.get_reg(0), 0);
+        }
+    }
+}
+
 // --- the bulk forms -------------------------------------------------------------------
 //
 // These are the only forms whose reach is chosen by the GUEST, so they are the only ones

@@ -2,16 +2,20 @@
 //! user-facing create/start/wait wrappers live in `libkernel`; what remains here
 //! are the direct primitives a program can also call.
 
+use crate::SvcOutcome;
 use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
-use crate::SvcOutcome;
 
 /// SceUID sceKernelGetProcessId(void)
 /// A single process, so a fixed nonzero id is faithful and stable.
 #[hostcall]
 pub(super) fn get_process_id(_st: &mut VitaState) -> i32 {
-    0x1000
+    PROCESS_ID
 }
+
+/// The one process this kernel runs - what `sceKernelGetProcessId` and
+/// `sceKernelGetCurrentProcess` both answer.
+pub(super) const PROCESS_ID: i32 = 0x1000;
 
 /// int sceKernelGetThreadCurrentPriority(void)
 /// The scheduler priority of the calling thread (lower value = higher priority).
@@ -113,7 +117,11 @@ const ERR_UNKNOWN_CALLBACK_ID: i32 = 0x8002_8190_u32 as i32;
 ///     SceKernelCallbackFunction func, void *userData)
 pub(super) fn create_callback(ctx: &mut GuestCtx, st: &mut VitaState) {
     let (name_ptr, func, common) = (ctx.arg(0), ctx.arg(2), ctx.arg(3));
-    let name = if name_ptr != 0 { ctx.read_cstr(name_ptr, 31) } else { String::new() };
+    let name = if name_ptr != 0 {
+        ctx.read_cstr(name_ptr, 31)
+    } else {
+        String::new()
+    };
     let uid = st.kcb_create(name, func, common);
     ctx.ret(uid as u32);
 }
@@ -121,43 +129,152 @@ pub(super) fn create_callback(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// int sceKernelDeleteCallback(SceUID cb)
 #[hostcall]
 pub(super) fn delete_callback(st: &mut VitaState, uid: i32) -> i32 {
-    if st.kcb_delete(uid) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+    if st.kcb_delete(uid) {
+        0
+    } else {
+        ERR_UNKNOWN_CALLBACK_ID
+    }
+}
+
+/// `SCE_KERNEL_ERROR_UNKNOWN_THREAD_EVENT_ID` (psp2/kernel/error.h).
+const ERR_UNKNOWN_THREAD_EVENT_ID: i32 = 0x8002_8061_u32 as i32;
+
+/// SceUID sceKernelRegisterThreadEventHandler(const char *name, SceUID thid,
+///     SceInt32 eventMask, SceKernelThreadEventHandler handler, void *common)
+///
+/// Records the handler; EXIT events are delivered on the ending thread (see
+/// `VitaState::thread_exit_event_calls`). Anything this cannot deliver faithfully stops the
+/// run naming it rather than registering a handler that would never be called: a START
+/// event (not delivered yet), a mask with bits outside START|EXIT, a NULL handler, or a
+/// target that is neither "every thread in the process" nor a thread this process has.
+pub(super) fn register_thread_event_handler(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    use crate::host::{THREAD_EVENT_ALL_IN_PROCESS, THREAD_EVENT_EXIT, THREAD_EVENT_START};
+    let (name_ptr, target, mask, handler, common) = (
+        ctx.arg(0),
+        ctx.arg(1) as i32,
+        ctx.arg(2),
+        ctx.arg(3),
+        ctx.arg(4),
+    );
+    let name = if name_ptr != 0 {
+        ctx.read_cstr(name_ptr, 31)
+    } else {
+        String::new()
+    };
+    // `SCE_KERNEL_THREAD_ID_SELF`: the calling thread.
+    let target = if target == 0 {
+        st.current_thread()
+    } else {
+        target
+    };
+    let refuse = if handler == 0 {
+        Some("a NULL handler")
+    } else if mask & THREAD_EVENT_START != 0 {
+        Some("a START event (only EXIT events are delivered so far)")
+    } else if mask & !(THREAD_EVENT_START | THREAD_EVENT_EXIT) != 0 || mask == 0 {
+        Some("an event mask outside START|EXIT")
+    } else if target != THREAD_EVENT_ALL_IN_PROCESS && !st.thread_exists(target) {
+        Some("a target that is not a thread of this process")
+    } else {
+        None
+    };
+    if let Some(why) = refuse {
+        return SvcOutcome::Fatal(format!(
+            "sceKernelRegisterThreadEventHandler(\"{name}\", thid={target:#x}, mask={mask:#x}, handler={handler:#x}): \
+             {why} - the kernel's answer to this is not implemented (no silent stub)"
+        ));
+    }
+    ctx.ret(st.register_thread_event_handler(target, mask, handler, common) as u32);
+    SvcOutcome::Continue
+}
+
+/// SceUID sceKernelUnregisterThreadEventHandler(SceUID id)
+#[hostcall]
+pub(super) fn unregister_thread_event_handler(st: &mut VitaState, uid: i32) -> i32 {
+    if st.unregister_thread_event_handler(uid) {
+        0
+    } else {
+        ERR_UNKNOWN_THREAD_EVENT_ID
+    }
+}
+
+/// The ending of the calling thread (`sceKernelExitThread` / `sceKernelExitDeleteThread`)
+/// under the preemptive scheduler: its EXIT handlers run on it first, then it ends.
+///
+/// Built for [`VitaState::call_guest`]'s replay: the claim (the one state change) happens
+/// only on the first pass, and the handler list is rebuilt purely on each. A handler that
+/// itself exits finds the thread already claimed and just ends it.
+pub(super) fn exit_thread(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let thid = st.current_thread();
+    let code = ctx.arg(0);
+    if !st.guest_call_replaying() && !st.claim_thread_exit_events(thid) {
+        return SvcOutcome::ThreadExit;
+    }
+    for call in st.thread_exit_event_calls(thid, code) {
+        if st.call_guest(call, None).is_none() {
+            // The wrapper turns this into `CallGuest` and restores the registers.
+            return SvcOutcome::Continue;
+        }
+    }
+    SvcOutcome::ThreadExit
 }
 
 /// int sceKernelNotifyCallback(SceUID cb, int arg2)
 #[hostcall]
 pub(super) fn notify_callback(st: &mut VitaState, uid: i32, arg: i32) -> i32 {
-    if st.kcb_notify(uid, arg as u32) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+    if st.kcb_notify(uid, arg as u32) {
+        0
+    } else {
+        ERR_UNKNOWN_CALLBACK_ID
+    }
 }
 
 /// int sceKernelCancelCallback(SceUID cb)
 #[hostcall]
 pub(super) fn cancel_callback(st: &mut VitaState, uid: i32) -> i32 {
-    if st.kcb_cancel(uid) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+    if st.kcb_cancel(uid) {
+        0
+    } else {
+        ERR_UNKNOWN_CALLBACK_ID
+    }
 }
 
 /// int sceKernelGetCallbackCount(SceUID cb)
 #[hostcall]
 pub(super) fn get_callback_count(st: &mut VitaState, uid: i32) -> i32 {
-    st.kcb_count(uid).map_or(ERR_UNKNOWN_CALLBACK_ID, |n| n as i32)
+    st.kcb_count(uid)
+        .map_or(ERR_UNKNOWN_CALLBACK_ID, |n| n as i32)
 }
 
 /// int sceDisplayRegisterVblankStartCallback(SceUID uid) / ...Unregister...: every vblank
 /// edge from here on is one notification of `uid`.
 pub(super) fn vblank_start_callback_raw(st: &mut VitaState, uid: i32, on: bool) -> i32 {
-    if st.kcb_vblank(uid, on) { 0 } else { ERR_UNKNOWN_CALLBACK_ID }
+    if st.kcb_vblank(uid, on) {
+        0
+    } else {
+        ERR_UNKNOWN_CALLBACK_ID
+    }
 }
 
 /// int sceKernelChangeThreadPriority(SceUID thid, int priority)
 ///
-/// Retarget a thread's scheduler priority; `thid` 0 is the calling thread. Returns
-/// the PREVIOUS priority, which is what a title saves so it can restore after a
-/// temporary boost. This genuinely moves the thread in the run order - the scheduler
-/// picks the highest-priority runnable thread - so a title raising a loader above the
-/// main thread gets the ordering it asked for rather than a value it can read back
-/// and no change in behaviour.
+/// Retarget a thread's scheduler priority; `thid` 0 is the calling thread. Returns 0
+/// (`psp2/kernel/threadmgr/thread.h`: "0 if successful"); the `...2` spelling below is
+/// the one that answers with the previous priority. This genuinely moves the thread in
+/// the run order - the scheduler picks the highest-priority runnable thread - so a title
+/// raising a loader above the main thread gets the ordering it asked for.
 #[hostcall]
 pub(super) fn change_thread_priority(st: &mut VitaState, thid: i32, priority: i32) -> i32 {
+    match st.change_thread_priority(thid, priority) {
+        Ok(_) => 0,
+        Err(e) => e as i32,
+    }
+}
+
+/// int sceKernelChangeThreadPriority2(SceUID thid, int priority): the same change, answered
+/// with the PREVIOUS priority - what a title saves so it can restore after a temporary boost.
+#[hostcall]
+pub(super) fn change_thread_priority2(st: &mut VitaState, thid: i32, priority: i32) -> i32 {
     match st.change_thread_priority(thid, priority) {
         Ok(previous) => previous,
         Err(e) => e as i32,
@@ -254,7 +371,9 @@ fn delay_census(delay_us: u32, lr: u32) {
         return;
     }
     let mut g = DELAY_HIST.lock().unwrap_or_else(|e| e.into_inner());
-    *g.get_or_insert_with(Default::default).entry((lr, delay_us)).or_insert(0) += 1;
+    *g.get_or_insert_with(Default::default)
+        .entry((lr, delay_us))
+        .or_insert(0) += 1;
 }
 
 /// Print what [`delay_census`] gathered, most-called first. A no-op unless the knob is set.
@@ -266,5 +385,90 @@ pub fn dump_delay_census(top: usize) {
     eprintln!("--- sceKernelDelayThread by (call site, requested us): count ---");
     for (lr, us, n) in rows.into_iter().take(top) {
         eprintln!("  {n:>10}  {us:>8} us @ lr={lr:#010x}");
+    }
+}
+
+#[cfg(test)]
+mod thread_event_tests {
+    use crate::host::{MAIN_THID, THREAD_EVENT_ALL_IN_PROCESS, THREAD_EVENT_EXIT, VitaState};
+    use crate::world::DeterministicWorld;
+    use crate::{SliceMemory, SvcOutcome, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::{REG_COUNT, SP};
+
+    fn state() -> VitaState {
+        VitaState::new(0, 0x100, Box::new(DeterministicWorld::default()))
+    }
+
+    /// `sceKernelRegisterThreadEventHandler(NULL, target, EXIT, handler, common=0)` on the
+    /// calling thread; the uid, or `None` when the call stopped the run.
+    fn register(st: &mut VitaState, target: i32, handler: u32) -> Option<i32> {
+        let mut regs = [0u32; REG_COUNT];
+        (regs[0], regs[1], regs[2], regs[3]) = (0, target as u32, THREAD_EVENT_EXIT, handler);
+        // `common`, the fifth argument, is the zero word at sp.
+        regs[SP] = 0x40;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 0x100];
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        match super::register_thread_event_handler(&mut ctx, st) {
+            SvcOutcome::Continue => Some(regs[0] as i32),
+            _ => None,
+        }
+    }
+
+    /// The initial thread has no create record, yet it is a thread of the process: it can
+    /// register a handler for itself (`SCE_KERNEL_THREAD_ID_SELF` = 0), and its end - only
+    /// the end of its LAST entry, not an earlier `module_start` - owes its handlers and the
+    /// process-wide ones. The host's own delivery threads owe none.
+    #[test]
+    fn the_initial_thread_gets_exit_handlers_at_its_final_end_only() {
+        let mut st = state();
+        let own =
+            register(&mut st, 0, 0x100).expect("SELF from the initial thread is a valid target");
+        let all = register(&mut st, THREAD_EVENT_ALL_IN_PROCESS, 0x200).expect("process-wide");
+        assert!(own > 0 && all > 0);
+
+        // An earlier module's initializer exits: that ends the initializer, not the thread.
+        st.note_thread_entry(MAIN_THID, false);
+        assert!(
+            !st.claim_thread_exit_events(MAIN_THID),
+            "no EXIT handlers between initializers"
+        );
+        // The final entry ends: both handlers, once.
+        st.note_thread_entry(MAIN_THID, true);
+        assert!(st.claim_thread_exit_events(MAIN_THID));
+        let calls: Vec<u32> = st
+            .thread_exit_event_calls(MAIN_THID, 3)
+            .iter()
+            .map(|c| c.entry)
+            .collect();
+        assert_eq!(calls, vec![0x100, 0x200]);
+        assert!(
+            !st.claim_thread_exit_events(MAIN_THID),
+            "a thread ends once"
+        );
+
+        // A thread id the title never created (a delivery thread's) gets nothing.
+        assert!(st.thread_exit_event_calls(0x7fff_0000, 3).is_empty());
+    }
+
+    /// A thread started, ended, and started again ends twice: each end runs its EXIT
+    /// handlers, whether it returns or exits.
+    #[test]
+    fn a_restarted_thread_runs_its_exit_handlers_again() {
+        let mut st = state();
+        st.set_preemptive(true);
+        let worker = st.create_thread(0x2000, 0x1000, crate::host::DEFAULT_THREAD_PRIORITY, 0, 0);
+        register(&mut st, THREAD_EVENT_ALL_IN_PROCESS, 0x200).expect("process-wide");
+        for code in [5, 7] {
+            st.start_thread(worker, 0, 0).unwrap();
+            assert!(
+                st.claim_thread_exit_events(worker),
+                "run ending with {code} owes its handlers"
+            );
+            assert_eq!(st.thread_exit_event_calls(worker, code).len(), 1);
+            assert!(!st.claim_thread_exit_events(worker), "and only once");
+            st.set_thread_exit(worker, code);
+        }
     }
 }

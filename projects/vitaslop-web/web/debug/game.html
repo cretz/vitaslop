@@ -25,15 +25,14 @@
 
       // Driven by the Playwright harness (game-boot.mjs): fetch the container files
       // this page's own origin serves, then boot the retail title LIVE through the JSPI
-      // scheduler with the general GXM->WebGPU renderer. `recipe` is an optional
-      // scripted-input string that drives the touch front-end (e.g. to the tutorial).
-      // run_game returns after setup and spawns the live loop, which then updates
+      // scheduler with the general GXM->WebGPU renderer. Input is live (pointer/keyboard on
+      // the canvas). run_game returns after setup and spawns the live loop, which then updates
       // #status ("frame N ...") and #fps as it runs. Exposed on window so the harness
       // can await setup and watch the live frame count.
       // `knobs` is an optional {NAME: value} map. The browser has no environment, so this
       // is the ONLY way to reach a VITASLOP_* knob here - and one retail racer will not
       // finish loading without VITASLOP_FRAME_TOPUP=0.
-      window.__boot = async (recipe, maxFrames, maxRounds, knobs) => {
+      window.__boot = async (maxFrames, maxRounds, knobs) => {
         await init();
         for (const [k, v] of Object.entries(knobs || {})) set_knob(k, String(v));
         status.textContent = "fetching manifest...";
@@ -64,7 +63,7 @@
         // main thread cannot do that synchronously, so it hands the fetched bytes over as
         // `memory`. Passing the bare map made this page fail with `game source kind ""` - which
         // is exactly the error the tag exists to produce rather than guess.
-        const msg = await run_game(canvas, { kind: "memory", payload: files }, recipe || "", maxFrames, maxRounds);
+        const msg = await run_game(canvas, { kind: "memory", payload: files }, maxFrames, maxRounds);
         return msg;
       };
     </script>

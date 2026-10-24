@@ -2,10 +2,10 @@
 -- the opening cinematic, the Journal tutorial gate, the dark prologue (which waits for the
 -- stick), the Jumping and Climbing tutorial panel, and FIRST PLAYER CONTROL in the jungle ruins.
 --
--- Converted from the recipe `new-game`, which waited fixed frames at every gate (the load into
+-- Converted from the old frame-keyed script `new-game`, which waited fixed frames at every gate (the load into
 -- the prologue "ends anywhere in f7700..8500 between runs") and so spent ~4,000 frames idle.
 --
--- HOW THE CUES WERE FOUND: `--discover` on the recipe's run (deterministic, 9400 frames) next
+-- HOW THE CUES WERE FOUND: `--discover` on the old script's run (deterministic, 9400 frames) next
 -- to a shot every 100 frames (frames from that run):
 --
 --   f508   sceMp4OpenFile bend_logo3.mp4             the studio logo movie

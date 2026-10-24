@@ -239,6 +239,18 @@ pub enum InlineOp {
     /// one idea; the bias is one `i32.add` the emitter drops entirely when it is zero, so an
     /// unbiased form stays byte-identical to what it was before this existed.
     LoadShiftMask { offset: u32, shift: u32, mask: u32, plus: u32 },
+    /// [`InlineOp::LoadShiftMask`] with no bias, but ONLY when
+    /// `u32_at(r0 + guard_offset) & guard_mask != guard_value`; otherwise the real host call
+    /// runs.
+    ///
+    /// For a field whose bits mean something else in one variant of the structure. A GXM
+    /// texture's LOD bias, min filter and mip filter share their word-0 bits with the byte
+    /// stride of a `LINEAR_STRIDED` texture, and the driver's getters HIDE those bits there
+    /// rather than return them. The type lives in word 1, so the answer is not a function of
+    /// one word: the inline form handles every other type and hands the strided one back to
+    /// the handler, which stays the definition - the same principle as
+    /// [`InlineOp::LoadScaled`]'s value guard.
+    LoadShiftMaskUnless { offset: u32, shift: u32, mask: u32, guard_offset: u32, guard_mask: u32, guard_value: u32 },
     /// `r0 = u32_at(mirror_base + slot * 4)` - read slot `slot` of the HOST MIRROR
     /// block, a small run of words the host keeps up to date in linear memory (see
     /// [`Artifact::mirror_off`]). Takes no guest argument and reads nothing the guest
@@ -430,6 +442,16 @@ pub enum InlineOp {
     /// two threads racing on one texture's control word is a data race the guest wrote, and
     /// the host handler was no more atomic.
     StoreArgField { offset: u32, shift: u32, mask: u32 },
+    /// [`InlineOp::StoreArgField`], but the real host call runs instead when
+    /// `u32_at(r0 + guard_offset) & guard_mask == guard_value` OR `r1 > mask`.
+    ///
+    /// For a setter whose handler REFUSES rather than truncates: `sceGxmTextureSetLodBias`
+    /// returns INVALID_VALUE for a bias wider than its field and UNSUPPORTED on a
+    /// `LINEAR_STRIDED` texture, whose word-0 bits there are its byte stride. Both refusals
+    /// are the handler's to define, and the common case - an in-range value on any other
+    /// texture - stays one read-modify-write. See [`InlineOp::LoadShiftMaskUnless`] for the
+    /// getter twin of the guard.
+    StoreArgFieldChecked { offset: u32, shift: u32, mask: u32, guard_offset: u32, guard_mask: u32, guard_value: u32 },
     /// `w = u32_at(r0 + offset); u32_at(r0 + offset) = (w & !mask) | (r1 & mask); r0 = 0` -
     /// [`InlineOp::StoreArgField`] for a setter whose argument is ALREADY in field position.
     ///
@@ -1215,6 +1237,9 @@ impl InlineOp {
             InlineOp::LoadShiftMask { shift, mask, plus, .. } => {
                 ((word >> shift) & mask).wrapping_add(plus)
             }
+            // Over the FIELD word; the guarded case has no inline answer (see
+            // [`InlineOp::falls_back_on_guard`]).
+            InlineOp::LoadShiftMaskUnless { shift, mask, .. } => (word >> shift) & mask,
             // The mirror word IS the answer; the host computed it.
             InlineOp::LoadMirror { .. } | InlineOp::LoadMirrorParking { .. } => word,
             // An elided yield returns the success code, whatever the mirror said.
@@ -1228,6 +1253,7 @@ impl InlineOp {
             InlineOp::StoreArg { .. }
             | InlineOp::StoreArgIndexed { .. }
             | InlineOp::StoreArgField { .. }
+            | InlineOp::StoreArgFieldChecked { .. }
             | InlineOp::StoreArgFieldInPlace { .. } => 0,
             // Void run setters: the guest gets the success code. What they WRITE is a run of
             // argument words, which a one-word `eval` cannot express - the execution test in
@@ -1299,6 +1325,29 @@ impl InlineOp {
         }
     }
 
+    /// Whether the GUARD word (`u32_at(r0 + guard_offset)`) sends this op to the host call.
+    /// Only [`InlineOp::LoadShiftMaskUnless`] has a guard word; a separate predicate from
+    /// [`InlineOp::falls_back`] because it is a different word from the one `eval` reads.
+    pub fn falls_back_on_guard(self, guard_word: u32) -> bool {
+        match self {
+            InlineOp::LoadShiftMaskUnless { guard_mask, guard_value, .. }
+            | InlineOp::StoreArgFieldChecked { guard_mask, guard_value, .. } => {
+                guard_word & guard_mask == guard_value
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether VALUE argument `value` (r1) sends this op to the host call. Only
+    /// [`InlineOp::StoreArgFieldChecked`] refuses a value; it does so for one wider than its
+    /// field, which its handler rejects rather than truncates.
+    pub fn falls_back_on_value(self, value: u32) -> bool {
+        match self {
+            InlineOp::StoreArgFieldChecked { mask, .. } => value > mask,
+            _ => false,
+        }
+    }
+
     /// Whether index argument `index` sends this op to the host call. Only
     /// [`InlineOp::StoreArgIndexed`] has an index at all; every other form answers false
     /// for every index, which is trivially true of a form that has none.
@@ -1317,6 +1366,8 @@ impl InlineOp {
     pub fn offset(self) -> Option<u32> {
         match self {
             InlineOp::LoadShiftMask { offset, .. } => Some(offset),
+            // The FIELD word's offset; the guard word is `falls_back_on_guard`'s.
+            InlineOp::LoadShiftMaskUnless { offset, .. } => Some(offset),
             InlineOp::LoadScaled { offset, .. } => Some(offset),
             // Writes through r0 rather than reading through it, so it has no read offset
             // even though it is a pointer form. `emit_import` guards it on its own terms.
@@ -1324,7 +1375,9 @@ impl InlineOp {
             InlineOp::StoreArg { .. } | InlineOp::StoreArgIndexed { .. } => None,
             // Reads the word it is about to rewrite, so its offset is a `store_offset` -
             // reporting it here would make a getter test read the field mid-update.
-            InlineOp::StoreArgField { .. } | InlineOp::StoreArgFieldInPlace { .. } => None,
+            InlineOp::StoreArgField { .. }
+            | InlineOp::StoreArgFieldChecked { .. }
+            | InlineOp::StoreArgFieldInPlace { .. } => None,
             // Reads through r2 and writes through r0, so neither pointer's offset is "the"
             // offset.
             InlineOp::CopyArgIndexed { .. } => None,
@@ -1377,6 +1430,7 @@ impl InlineOp {
             InlineOp::StoreArgIndexed { offset, .. } => Some(offset),
             InlineOp::CopyArgIndexed { offset, .. } => Some(offset),
             InlineOp::StoreArgField { offset, .. } => Some(offset),
+            InlineOp::StoreArgFieldChecked { offset, .. } => Some(offset),
             InlineOp::StoreArgFieldInPlace { offset, .. } => Some(offset),
             _ => None,
         }
@@ -1387,9 +1441,13 @@ impl InlineOp {
     /// [`InlineOp::top_mirror_slot`] reports.
     pub fn mirror_slot(self) -> Option<u32> {
         match self {
-            InlineOp::LoadShiftMask { .. } | InlineOp::LoadScaled { .. } => None,
+            InlineOp::LoadShiftMask { .. }
+            | InlineOp::LoadShiftMaskUnless { .. }
+            | InlineOp::LoadScaled { .. } => None,
             InlineOp::StoreArg { .. } | InlineOp::StoreArgIndexed { .. } => None,
-            InlineOp::StoreArgField { .. } | InlineOp::StoreArgFieldInPlace { .. } => None,
+            InlineOp::StoreArgField { .. }
+            | InlineOp::StoreArgFieldChecked { .. }
+            | InlineOp::StoreArgFieldInPlace { .. } => None,
             InlineOp::StoreVfpRun { .. } | InlineOp::StoreArgRun { .. } => None,
             InlineOp::CopyArgIndexed { .. } => None,
             InlineOp::LoadMirror { slot } => Some(slot),
@@ -2428,7 +2486,7 @@ mod tests {
     /// This is the whole point of the mechanism. The charge drives the browser's virtual
     /// game clock, and that clock is only comparable with native's because native's
     /// quantum is wasmtime fuel over the very same module - so any divergence in the rule
-    /// is a divergence in game time, which a frame-keyed recipe then reads as the browser
+    /// is a divergence in game time, which a frame-keyed input script then reads as the browser
     /// being on a different screen from native.
     ///
     /// Both halves of wasmtime's rule are load-bearing and each was got wrong in turn:

@@ -67,7 +67,8 @@ pub enum Request {
     Hold { buttons: Vec<String>, frames: u64 },
     Idle(u64),
     Stick { right: bool, x: u8, y: u8 },
-    Touch(Option<(u16, u16)>),
+    /// A finger down at `at` (or lifted, `None`) on the front panel, or the rear one.
+    Touch { back: bool, at: Option<(u16, u16)> },
     Shot(String),
     Log(String),
     Split(String),
@@ -172,6 +173,21 @@ fn parse_cue(o: &Map<String, Value>) -> Result<CueDef, String> {
             };
             CueDef::Mem { ty, base: base as u32, offs }
         }
+        "color" => {
+            let dim = |k: &str, max: f64| -> Result<u32, String> {
+                let n = num_of(o, k)?;
+                if !(0.0..=max).contains(&n) || n.fract() != 0.0 {
+                    return Err(format!("cue.color `{k}` must be a whole number 0..{max}, got {n}"));
+                }
+                Ok(n as u32)
+            };
+            let (x, y) = (dim("x", 959.0)?, dim("y", 543.0)?);
+            let (w, h) = (dim("w", 960.0)?.max(1), dim("h", 544.0)?.max(1));
+            if x + w > 960 || y + h > 544 {
+                return Err(format!("cue.color {w}x{h} at {x},{y} runs off the 960x544 frame"));
+            }
+            CueDef::Color { x, y, w, h }
+        }
         "pixels" | "locate" => {
             let dim = |k: &str, max: f64| -> Result<u32, String> {
                 let n = num_of(o, k)?;
@@ -251,10 +267,18 @@ pub fn parse(text: &str) -> Result<Request, String> {
             };
             Request::Stick { right, x: axis(o, "x")?, y: axis(o, "y")? }
         }
-        "touch" => match (opt_num(o, "x")?, opt_num(o, "y")?) {
-            (Some(x), Some(y)) => Request::Touch(Some((x as u16, y as u16))),
-            _ => Request::Touch(None),
-        },
+        "touch" => {
+            let back = match o.get("panel").and_then(|v| v.as_str()) {
+                None | Some("front") => false,
+                Some("back") => true,
+                Some(p) => return Err(format!("touch panel must be \"front\" or \"back\", got {p:?}")),
+            };
+            let at = match (opt_num(o, "x")?, opt_num(o, "y")?) {
+                (Some(x), Some(y)) => Some((x as u16, y as u16)),
+                _ => None,
+            };
+            Request::Touch { back, at }
+        }
         "shot" => Request::Shot(str_of(o, "name")?),
         "log" => Request::Log(str_of(o, "text")?),
         "split" => Request::Split(str_of(o, "name")?),
@@ -305,6 +329,13 @@ mod tests {
         assert_eq!(at, Ok(Request::Cue(CueDef::Locate { x: 0, y: 0, w: 960, h: 544, rgb: [1, 2, 3], tol: 0 })));
         assert!(parse(r#"{"op":"cue","def":{"kind":"pixels","x":950,"y":0,"w":20,"h":1,"rgb":[0,0,0],"tol":0}}"#).is_err());
         assert!(parse(r#"{"op":"cue","def":{"kind":"pixels","x":0,"y":0,"w":1,"h":1,"tol":0}}"#).is_err(), "no rgb");
+    }
+
+    #[test]
+    fn a_colour_box_must_lie_on_the_frame() {
+        let ok = parse(r#"{"op":"cue","def":{"kind":"color","x":580,"y":410,"w":80,"h":40}}"#);
+        assert_eq!(ok, Ok(Request::Cue(CueDef::Color { x: 580, y: 410, w: 80, h: 40 })));
+        assert!(parse(r#"{"op":"cue","def":{"kind":"color","x":950,"y":0,"w":20,"h":1}}"#).is_err());
     }
 
     #[test]

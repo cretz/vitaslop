@@ -1,4 +1,4 @@
-﻿//! The host-call boundary: how a guest NID import trap becomes a typed Rust
+//! The host-call boundary: how a guest NID import trap becomes a typed Rust
 //! handler. `GuestCtx` marshals AAPCS arguments (r0..r3 then stack) and guest
 //! memory in and out; `VitaEnv` owns the per-run state (allocator, handles,
 //! capture, world) and routes a dense import index to a per-module handler.
@@ -12,9 +12,9 @@ use std::sync::Arc;
 use vitaslop_transpiler::abi::{REG_COUNT, SP};
 
 use crate::capture::Capture;
-use crate::world::{DeterministicWorld, World};
 use crate::vita::lwwork;
-use crate::{vita, SvcOutcome};
+use crate::world::{DeterministicWorld, World};
+use crate::{SvcOutcome, vita};
 
 /// The number of VFP single-precision registers (s0..s15) that carry floating-
 /// point arguments and the float return under AAPCS-VFP (the Vita is hardfloat).
@@ -82,16 +82,17 @@ pub trait GuestWords {
     }
 }
 
-/// A [`GuestMemory`] at its `base`, read by guest address with a bounds check - what a recipe
-/// `@wait watch` samples through (see `recipe::wait_call::poll_watch`).
+/// A [`GuestMemory`] at its `base`, read by guest address with a bounds check.
 struct MemRead<'a> {
     mem: &'a dyn GuestMemory,
     base: u32,
 }
 
-impl crate::recipe_eval::GuestRead for MemRead<'_> {
+impl crate::guest_read::GuestRead for MemRead<'_> {
     fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
-        let Some(off) = addr.checked_sub(self.base).map(|o| o as usize) else { return false };
+        let Some(off) = addr.checked_sub(self.base).map(|o| o as usize) else {
+            return false;
+        };
         if off + out.len() > self.mem.len() {
             return false;
         }
@@ -446,7 +447,12 @@ pub struct PrefetchedMemory<'m> {
 impl<'m> PrefetchedMemory<'m> {
     /// Fetch `ranges` (any order, overlaps allowed) in one crossing and copy the dirty map.
     pub fn new(base: &'m dyn GuestMemory, ranges: &[(usize, usize)]) -> Self {
-        let mut me = PrefetchedMemory { base, table: Vec::new(), data: Vec::new(), stamps: base.dirty_stamps() };
+        let mut me = PrefetchedMemory {
+            base,
+            table: Vec::new(),
+            data: Vec::new(),
+            stamps: base.dirty_stamps(),
+        };
         me.extend(ranges);
         me
     }
@@ -455,7 +461,12 @@ impl<'m> PrefetchedMemory<'m> {
     /// reads bytes (one draw's uniform banks), where copying the whole map per call would cost
     /// far more than the crossings it saves. `dirty_since` then asks the base, as before.
     pub fn reads_only(base: &'m dyn GuestMemory, ranges: &[(usize, usize)]) -> Self {
-        let mut me = PrefetchedMemory { base, table: Vec::new(), data: Vec::new(), stamps: None };
+        let mut me = PrefetchedMemory {
+            base,
+            table: Vec::new(),
+            data: Vec::new(),
+            stamps: None,
+        };
         me.extend(ranges);
         me
     }
@@ -479,7 +490,8 @@ impl<'m> PrefetchedMemory<'m> {
             self.table.push((off, len, start));
             start += len;
         }
-        self.table.sort_unstable_by_key(|&(off, len, _)| (off, usize::MAX - len));
+        self.table
+            .sort_unstable_by_key(|&(off, len, _)| (off, usize::MAX - len));
     }
 
     /// The prefetched bytes covering `[off, off + len)` entirely, if any range does.
@@ -519,13 +531,17 @@ impl GuestMemory for PrefetchedMemory<'_> {
         }
     }
     fn write(&mut self, _off: usize, _bytes: &[u8]) {
-        panic!("PrefetchedMemory is read-only: a host path that writes guest memory must not run under the prefetch overlay");
+        panic!(
+            "PrefetchedMemory is read-only: a host path that writes guest memory must not run under the prefetch overlay"
+        );
     }
     fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
         self.find(off, len).or_else(|| self.base.borrow(off, len))
     }
     fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
-        let Some((stamps, shift)) = &self.stamps else { return self.base.dirty_since(off, len, stamp) };
+        let Some((stamps, shift)) = &self.stamps else {
+            return self.base.dirty_since(off, len, stamp);
+        };
         if len == 0 {
             return Some(false);
         }
@@ -536,7 +552,13 @@ impl GuestMemory for PrefetchedMemory<'_> {
         let last = ((off + len - 1) >> shift).min(stamps.len().saturating_sub(1));
         Some(stamps[first.min(last)..=last].iter().any(|&s| s >= stamp))
     }
-    fn dirty_runs_since(&self, off: usize, len: usize, stamp: u8, out: &mut Vec<(usize, usize)>) -> Option<()> {
+    fn dirty_runs_since(
+        &self,
+        off: usize,
+        len: usize,
+        stamp: u8,
+        out: &mut Vec<(usize, usize)>,
+    ) -> Option<()> {
         self.base.dirty_runs_since(off, len, stamp, out)
     }
     fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
@@ -597,7 +619,11 @@ mod prefetch_tests {
     /// the dirty map, which per draw would cost more than the crossings saved.
     #[test]
     fn a_reads_only_prefetch_serves_its_ranges_from_one_crossing() {
-        let mem = Remote { bytes: (0..=255u8).cycle().take(4096).collect(), crossings: Cell::new(0), stamp_copies: Cell::new(0) };
+        let mem = Remote {
+            bytes: (0..=255u8).cycle().take(4096).collect(),
+            crossings: Cell::new(0),
+            stamp_copies: Cell::new(0),
+        };
         let pm = PrefetchedMemory::reads_only(&mem, &[(100, 64), (1000, 32)]);
         assert_eq!((mem.crossings.get(), mem.stamp_copies.get()), (1, 0));
         let mut a = [0u8; 64];
@@ -607,10 +633,18 @@ mod prefetch_tests {
         pm.read(1010, &mut b);
         assert_eq!(b[..], mem.bytes[1010..1018]);
         assert_eq!(pm.borrow(1000, 32), Some(&mem.bytes[1000..1032]));
-        assert_eq!(mem.crossings.get(), 1, "every fetched byte came out of the one crossing");
+        assert_eq!(
+            mem.crossings.get(),
+            1,
+            "every fetched byte came out of the one crossing"
+        );
         pm.read(2000, &mut b);
         assert_eq!(b[..], mem.bytes[2000..2008]);
-        assert_eq!(mem.crossings.get(), 2, "a range not fetched is read from the memory");
+        assert_eq!(
+            mem.crossings.get(),
+            2,
+            "a range not fetched is read from the memory"
+        );
     }
 }
 
@@ -636,7 +670,14 @@ impl<'a> GuestCtx<'a> {
         mem: &'a mut dyn GuestMemory,
         base: u32,
     ) -> Self {
-        GuestCtx { regs, vfp, mem, base, next_core: 0, next_vfp: 0 }
+        GuestCtx {
+            regs,
+            vfp,
+            mem,
+            base,
+            next_core: 0,
+            next_vfp: 0,
+        }
     }
 
     /// Read positional integer/pointer argument `n` (AAPCS: r0..r3 then stack).
@@ -724,9 +765,10 @@ impl<'a> GuestCtx<'a> {
     pub fn write_u32(&mut self, addr: u32, v: u32) {
         report_host_write(self, addr, 4, &v.to_le_bytes());
         if let Some(o) = self.offset(addr)
-            && o + 4 <= self.mem.len() {
-                self.mem.write_u32(o, v);
-            }
+            && o + 4 <= self.mem.len()
+        {
+            self.mem.write_u32(o, v);
+        }
     }
 
     /// Read `len` bytes at guest address `addr` (short read clamped to range).
@@ -763,7 +805,9 @@ impl<'a> GuestCtx<'a> {
     /// extra pass is real. This reads once into the `Arc`'s own allocation.
     pub fn read_bytes_arc(&self, addr: u32, len: usize) -> Arc<[u8]> {
         crate::perf::note_bulk_read();
-        let Some(o) = self.offset(addr) else { return Arc::from(&[][..]) };
+        let Some(o) = self.offset(addr) else {
+            return Arc::from(&[][..]);
+        };
         let n = (o + len).min(self.mem.len()) - o;
         if let Some(s) = self.mem.borrow(o, n) {
             // One copy: straight from the lent slice into the Arc's allocation.
@@ -813,15 +857,18 @@ impl<'a> GuestCtx<'a> {
         // result is written once. A default uniform buffer is hundreds of floats and
         // is read on every draw.
         if let Some(o) = self.offset(addr)
-            && let Some(s) = self.mem.borrow(o, count * 4) {
-                return s
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-            }
+            && let Some(s) = self.mem.borrow(o, count * 4)
+        {
+            return s
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+        }
         let mut raw = vec![0u8; count * 4];
         self.read_into(addr, &mut raw);
-        raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        raw.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 
     /// Borrow `len` bytes of guest memory at `addr` in place, without copying.
@@ -848,7 +895,8 @@ impl<'a> GuestCtx<'a> {
         stamp: u8,
         out: &mut Vec<(usize, usize)>,
     ) -> Option<()> {
-        self.mem.dirty_runs_since(self.offset(addr)?, len, stamp, out)
+        self.mem
+            .dirty_runs_since(self.offset(addr)?, len, stamp, out)
     }
 
     /// Advance the guest-store epoch - see [`GuestMemory::bump_dirty_epoch`].
@@ -951,7 +999,10 @@ fn report_host_write(ctx: &GuestCtx, addr: u32, len: u32, bytes: &[u8]) {
     static WATCH: OnceLock<(Vec<u32>, Vec<u32>)> = OnceLock::new();
     let (addrs, vals) = WATCH.get_or_init(|| {
         let (mut a, mut v) = (Vec::new(), Vec::new());
-        for t in crate::knobs::var("VITASLOP_HOST_WRITE_WATCH").unwrap_or_default().split(',') {
+        for t in crate::knobs::var("VITASLOP_HOST_WRITE_WATCH")
+            .unwrap_or_default()
+            .split(',')
+        {
             let t = t.trim();
             let (list, hex) = match t.strip_prefix("v:") {
                 Some(rest) => (&mut v, rest),
@@ -988,16 +1039,20 @@ fn report_host_write(ctx: &GuestCtx, addr: u32, len: u32, bytes: &[u8]) {
         });
     }
     let end = addr.wrapping_add(len.max(1)).wrapping_sub(1);
-    let hit = addrs.iter().copied().find(|&a| a >= addr && a <= end).or_else(|| {
-        (!vals.is_empty())
-            .then(|| {
-                bytes.chunks_exact(4).position(|c| {
-                    vals.contains(&u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    let hit = addrs
+        .iter()
+        .copied()
+        .find(|&a| a >= addr && a <= end)
+        .or_else(|| {
+            (!vals.is_empty())
+                .then(|| {
+                    bytes
+                        .chunks_exact(4)
+                        .position(|c| vals.contains(&u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
                 })
-            })
-            .flatten()
-            .map(|i| addr + i as u32 * 4)
-    });
+                .flatten()
+                .map(|i| addr + i as u32 * 4)
+        });
     let Some(hit) = hit else { return };
     // The bytes AT the watched word, not the whole (possibly megabyte) write: what the question
     // is about is the value that ends up there.
@@ -1097,6 +1152,12 @@ const FIOS_OVERLAY_ID_BASE: i32 = 0x0200_0000;
 /// time and never unloaded, so a module's load-order index is a stable identity; the
 /// base keeps those ids clear of the small ones threads and sync objects mint.
 const MODULE_UID_BASE: i32 = 0x0100_0000;
+
+/// The program-header slot of a default uniform buffer binding the TITLE named with
+/// `sceGxmSet{Vertex,Fragment}DefaultUniformBuffer`: context state that belongs to no one
+/// program, read at the size of whichever program draws. Never a program header address.
+/// See [`VitaState::set_default_uniform_buffer`].
+pub(crate) const USER_UNIFORM_BUFFER: u32 = u32::MAX;
 
 /// What `sceKernelGetThreadInfo` reports about one thread. A borrowed view rather
 /// than a copy: the caller writes it straight into the guest's struct.
@@ -1258,7 +1319,9 @@ struct HttpObject {
     headers: Vec<(String, String)>,
     /// Connect/send/receive timeouts in microseconds, as the guest set them. The
     /// library's own defaults until it does.
-    timeouts: [u32; 3],
+    /// Connect, send and receive timeouts, then the resolver's timeout and retry count -
+    /// each recorded against the object it was set on.
+    timeouts: [u32; 5],
     /// Whether the guest turned the cookie jar on for this object
     /// (`sceHttpSetCookieEnabled`), read back by `sceHttpGetCookieEnabled`. Off until it
     /// says otherwise, which is the library's own default.
@@ -1381,7 +1444,6 @@ pub const SCE_KERNEL_DEFAULT_PRIORITY: i32 = 0x1000_0100;
 /// middle default the initial (main) thread and a defaulted worker resolve to.
 pub const DEFAULT_THREAD_PRIORITY: i32 = 0xA0;
 
-
 /// The SceUID of the initial ("main") thread. It is the one thread with no
 /// [`ThreadRec`]: `create_thread` records what the GUEST creates, and the loader
 /// starts this one before any guest code runs. Anything that has to name it uses
@@ -1422,6 +1484,10 @@ pub const SCE_KERNEL_ERROR_WAIT_DELETE: u32 = 0x8002_8006;
 pub const SCE_KERNEL_ERROR_NOT_DORMANT: u32 = 0x8002_8028;
 /// `SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID` - no thread has that SceUID (same header).
 pub const SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID: u32 = 0x8002_8021;
+/// Bytes of SceAppUtil safe memory each title has.
+pub const SAFE_MEMORY_SIZE: usize = 64 * 1024;
+/// `SCE_KERNEL_ERROR_ILLEGAL_PRIORITY` (psp2/kernel/error.h).
+pub const SCE_KERNEL_ERROR_ILLEGAL_PRIORITY: u32 = 0x8002_8023;
 /// `sceKernelSendSignal` to a thread whose last signal is still unconsumed (a latch of one).
 pub const SCE_KERNEL_ERROR_ALREADY_SENT: u32 = 0x8002_8121;
 
@@ -1434,7 +1500,12 @@ pub const SCE_KERNEL_ERROR_ALREADY_SENT: u32 = 0x8002_8121;
 /// player's first buffering check. Faithful on paper, wrong on this CPU until the A/B says how.
 fn fiber_runner_priority() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| crate::knobs::var("VITASLOP_FIBER_RUNNER_PRIORITY").as_deref().map(str::trim) == Ok("1"))
+    *V.get_or_init(|| {
+        crate::knobs::var("VITASLOP_FIBER_RUNNER_PRIORITY")
+            .as_deref()
+            .map(str::trim)
+            == Ok("1")
+    })
 }
 
 /// Resolve a `sceKernelCreateThread` priority argument to a concrete scheduler
@@ -1661,6 +1732,43 @@ pub struct Reentry {
     pub priority: i32,
 }
 
+/// One `sceGxmCreateDeferredContext` context. Its sticky state is in its own block in guest
+/// memory; this is what the host keeps beside it.
+#[derive(Default)]
+pub struct DeferredContext {
+    /// The draws of the command list being recorded, between `sceGxmBeginCommandList` and
+    /// `sceGxmEndCommandList`; `None` while not recording.
+    pub recording: Option<Vec<RecordedDraw>>,
+    /// The VDM, vertex and fragment buffers the title last gave (`params` at create, then
+    /// `sceGxmSetDeferredContext*Buffer`), answered by the matching getters.
+    pub buffers: [(u32, u32); 3],
+}
+
+/// The draw call a command list replays.
+#[derive(Clone, Copy, Debug)]
+pub enum DeferredDraw {
+    /// `sceGxmDraw` (`index_wrap` 0) or `sceGxmDrawInstanced`.
+    Indexed {
+        primitive: u32,
+        index_format: u32,
+        index_data: u32,
+        index_count: u32,
+        index_wrap: u32,
+    },
+    /// `sceGxmDrawPrecomputed`.
+    Precomputed { precomputed: u32 },
+}
+
+/// One draw of a command list: the call, the deferred context it was made on, and a copy of
+/// that context's block as the draw saw it.
+#[derive(Clone)]
+pub struct RecordedDraw {
+    pub context: u32,
+    pub draw: DeferredDraw,
+    pub block: Vec<u8>,
+    pdraw: Option<(u32, [u32; pdraw::STREAM_SLOTS])>,
+}
+
 /// A guest function a host call runs on its CALLER's thread before it returns - see
 /// [`SvcOutcome::CallGuest`] and [`VitaState::call_guest`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1672,6 +1780,28 @@ pub struct GuestCall {
     /// it (an even register pair, or an 8-byte-aligned stack slot).
     pub args: Vec<u32>,
 }
+
+/// One `sceKernelRegisterThreadEventHandler` registration.
+#[derive(Clone, Debug)]
+pub struct ThreadEventHandler {
+    pub uid: i32,
+    /// The thread it watches, or [`THREAD_EVENT_ALL_IN_PROCESS`].
+    pub target: i32,
+    /// `SceKernelThreadEventType` bits it asked for.
+    pub mask: u32,
+    pub handler: u32,
+    pub common: u32,
+}
+
+/// `SceKernelThreadEventType`: a thread starting / ending (psp2common/kernel/threadmgr.h).
+pub const THREAD_EVENT_START: u32 = 0x4;
+pub const THREAD_EVENT_EXIT: u32 = 0x8;
+/// The target id meaning "every thread in this process" (`SCE_KERNEL_THREAD_ID_PROCESS_ALL_ID`).
+pub const THREAD_EVENT_ALL_IN_PROCESS: i32 = 0x10027;
+
+/// The highest key `sceKernelGetTLSAddr` has a slot for: keys `0..=0x100` index one
+/// per-thread array of pointer slots.
+pub const TLS_KEY_MAX: u32 = 0x100;
 
 /// Bytes kept below the caller's stack pointer before a guest call's own frame starts.
 ///
@@ -1779,7 +1909,12 @@ pub mod io_journal {
     pub fn result(r: &Option<Vec<u8>>) -> String {
         match r {
             None => "EBADF".into(),
-            Some(d) if full_hash() => format!("{} h{:08x} full{:08x}", d.len(), head_tail_hash(d), all_hash(d)),
+            Some(d) if full_hash() => format!(
+                "{} h{:08x} full{:08x}",
+                d.len(),
+                head_tail_hash(d),
+                all_hash(d)
+            ),
             Some(d) => format!("{} h{:08x}", d.len(), head_tail_hash(d)),
         }
     }
@@ -1834,7 +1969,10 @@ pub mod io_journal {
             assert_ne!(super::head_tail_hash(&a), super::head_tail_hash(&b));
             assert_ne!(super::head_tail_hash(&a), super::head_tail_hash(&c));
             assert_ne!(super::head_tail_hash(&a), super::head_tail_hash(&a[..999]));
-            assert_eq!(super::head_tail_hash(&[1, 2, 3]), super::head_tail_hash(&[1, 2, 3]));
+            assert_eq!(
+                super::head_tail_hash(&[1, 2, 3]),
+                super::head_tail_hash(&[1, 2, 3])
+            );
         }
     }
 }
@@ -1906,7 +2044,11 @@ impl MountedBacking {
     pub fn new(prefix: &str, inner: Box<dyn FileBacking>) -> MountedBacking {
         let prefix = prefix.trim_end_matches('/').to_string();
         let key_prefix = format!("{}/", vfs_key(&prefix));
-        MountedBacking { prefix, key_prefix, inner }
+        MountedBacking {
+            prefix,
+            key_prefix,
+            inner,
+        }
     }
 
     fn inner_key<'a>(&self, key: &'a str) -> Option<&'a str> {
@@ -1919,10 +2061,15 @@ impl FileBacking for MountedBacking {
         self.inner.len(self.inner_key(key)?)
     }
     fn read_at(&self, key: &str, off: usize, buf: &mut [u8]) -> usize {
-        self.inner_key(key).map_or(0, |k| self.inner.read_at(k, off, buf))
+        self.inner_key(key)
+            .map_or(0, |k| self.inner.read_at(k, off, buf))
     }
     fn keys(&self) -> Vec<String> {
-        self.inner.keys().into_iter().map(|k| format!("{}/{}", self.prefix, k.trim_start_matches('/'))).collect()
+        self.inner
+            .keys()
+            .into_iter()
+            .map(|k| format!("{}/{}", self.prefix, k.trim_start_matches('/')))
+            .collect()
     }
 }
 
@@ -2023,8 +2170,11 @@ impl SaveDataStore {
 
     /// Every slot, ordered by (mount, id) so an export is a function of the state alone.
     pub fn all(&self) -> Vec<(String, u32, Vec<u8>)> {
-        let mut out: Vec<(String, u32, Vec<u8>)> =
-            self.slots.iter().map(|((m, i), p)| (m.clone(), *i, p.clone())).collect();
+        let mut out: Vec<(String, u32, Vec<u8>)> = self
+            .slots
+            .iter()
+            .map(|((m, i), p)| (m.clone(), *i, p.clone()))
+            .collect();
         out.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
         out
     }
@@ -2039,7 +2189,9 @@ impl SaveDataStore {
 
     /// The stored param blob for a slot, or `None` if it was never created.
     pub fn get(&self, mount: &str, slot_id: u32) -> Option<&[u8]> {
-        self.slots.get(&Self::key(mount, slot_id)).map(Vec::as_slice)
+        self.slots
+            .get(&Self::key(mount, slot_id))
+            .map(Vec::as_slice)
     }
     /// Remove a slot; returns whether it existed.
     pub fn remove(&mut self, mount: &str, slot_id: u32) -> bool {
@@ -2204,7 +2356,10 @@ pub fn is_persisted_mount(key: &str) -> bool {
 
 impl FileTable {
     fn new() -> Self {
-        FileTable { next_fd: FIRST_FD, ..Default::default() }
+        FileTable {
+            next_fd: FIRST_FD,
+            ..Default::default()
+        }
     }
 
     /// Install a lazy backing and register every key it serves. Called at setup, before the
@@ -2238,8 +2393,10 @@ impl FileTable {
             }
             // Keep the as-supplied spelling too: a directory listing hands names back to
             // the title's own glob matching, and a lowercased name would not match.
-            self.originals
-                .insert(key.clone(), strip_app0(&path).trim_start_matches('/').to_string());
+            self.originals.insert(
+                key.clone(),
+                strip_app0(&path).trim_start_matches('/').to_string(),
+            );
             self.backed.insert(key.clone(), n);
             if src > 0 {
                 self.backed_src.insert(key.clone(), src);
@@ -2334,7 +2491,9 @@ impl FileTable {
                     shadowed += 1;
                     continue;
                 }
-                self.originals.entry(ekey.clone()).or_insert_with(|| entry.name.clone());
+                self.originals
+                    .entry(ekey.clone())
+                    .or_insert_with(|| entry.name.clone());
                 self.archived.insert(ekey, (idx, i));
                 mounted += 1;
             }
@@ -2360,7 +2519,9 @@ impl FileTable {
             return Some(data[start..end].to_vec());
         }
         if let Some(&size) = self.backed.get(key) {
-            let backing = self.backings.get(self.backed_src.get(key).copied().unwrap_or(0))?;
+            let backing = self
+                .backings
+                .get(self.backed_src.get(key).copied().unwrap_or(0))?;
             let start = start.min(size);
             let end = (start + len).min(size);
             let mut out = vec![0u8; end - start];
@@ -2388,7 +2549,11 @@ impl FileTable {
     /// is about to MOVE, which the backing cannot follow.
     fn backed_under(&self, key: &str) -> Vec<String> {
         let prefix = format!("{key}/");
-        self.backed.keys().filter(|k| *k == key || k.starts_with(&prefix)).cloned().collect()
+        self.backed
+            .keys()
+            .filter(|k| *k == key || k.starts_with(&prefix))
+            .cloned()
+            .collect()
     }
 
     /// Make `key` resident so it can be written, reading it out of the backing first if
@@ -2438,11 +2603,23 @@ impl FileTable {
         }
 
         // Append seeks to end; every other open starts at the beginning.
-        let cursor = if flags & SCE_O_APPEND != 0 { self.byte_len(&path).unwrap_or(0) } else { 0 };
+        let cursor = if flags & SCE_O_APPEND != 0 {
+            self.byte_len(&path).unwrap_or(0)
+        } else {
+            0
+        };
 
         let fd = self.next_fd;
         self.next_fd += 1;
-        self.open.insert(fd, OpenFile { path, cursor, readable, writable });
+        self.open.insert(
+            fd,
+            OpenFile {
+                path,
+                cursor,
+                readable,
+                writable,
+            },
+        );
         fd
     }
 
@@ -2563,7 +2740,11 @@ impl FileTable {
     fn dopen(&mut self, path: &str) -> i32 {
         let key = vfs_key(path);
         let key = key.trim_end_matches('/');
-        let prefix = if key.is_empty() { String::new() } else { format!("{key}/") };
+        let prefix = if key.is_empty() {
+            String::new()
+        } else {
+            format!("{key}/")
+        };
         // Child components sit at this index when a full key is split on '/'.
         let comp_index = prefix.matches('/').count();
         let mut children: std::collections::BTreeMap<String, DirEntry> =
@@ -2576,7 +2757,10 @@ impl FileTable {
             .iter()
             .map(|(k, d)| (k, d.len()))
             .chain(
-                self.backed.iter().filter(|(k, _)| !self.files.contains_key(*k)).map(|(k, n)| (k, *n)),
+                self.backed
+                    .iter()
+                    .filter(|(k, _)| !self.files.contains_key(*k))
+                    .map(|(k, n)| (k, *n)),
             )
             // A file inside a mounted archive lists like any other: a title that
             // enumerates a directory to find its assets must see the same names the
@@ -2587,7 +2771,9 @@ impl FileTable {
             }))
             .collect();
         for (k, len) in entries {
-            let Some(rest) = k.strip_prefix(&prefix) else { continue };
+            let Some(rest) = k.strip_prefix(&prefix) else {
+                continue;
+            };
             if rest.is_empty() {
                 continue;
             }
@@ -2605,7 +2791,11 @@ impl FileTable {
                     .and_then(|orig| orig.split('/').nth(comp_index))
                     .unwrap_or(comp)
                     .to_string();
-                DirEntry { name, is_dir, size: 0 }
+                DirEntry {
+                    name,
+                    is_dir,
+                    size: 0,
+                }
             });
             if !is_dir {
                 entry.size = len as u64;
@@ -2614,7 +2804,9 @@ impl FileTable {
         // Explicitly-created directories are not implied by any file key, so they have
         // to be folded in separately or a title cannot see the directory it just made.
         for d in &self.dirs {
-            let Some(rest) = d.strip_prefix(&prefix) else { continue };
+            let Some(rest) = d.strip_prefix(&prefix) else {
+                continue;
+            };
             if rest.is_empty() {
                 continue;
             }
@@ -2626,7 +2818,11 @@ impl FileTable {
                     .and_then(|orig| orig.split('/').nth(comp_index))
                     .unwrap_or(comp)
                     .to_string();
-                DirEntry { name, is_dir: true, size: 0 }
+                DirEntry {
+                    name,
+                    is_dir: true,
+                    size: 0,
+                }
             });
         }
         // An empty listing is only ENOENT when the directory itself does not exist; a
@@ -2638,7 +2834,11 @@ impl FileTable {
         self.next_fd += 1;
         self.open_dirs.insert(
             fd,
-            OpenDir { entries: children.into_values().collect(), cursor: 0, path: key.to_string() },
+            OpenDir {
+                entries: children.into_values().collect(),
+                cursor: 0,
+                path: key.to_string(),
+            },
         );
         fd
     }
@@ -2684,7 +2884,8 @@ impl FileTable {
         if self.has(&key) || self.is_dir(&key) {
             return SCE_ERROR_ERRNO_EEXIST;
         }
-        self.originals.insert(key.clone(), path.trim_end_matches('/').to_string());
+        self.originals
+            .insert(key.clone(), path.trim_end_matches('/').to_string());
         self.touch(&key);
         self.dirs.insert(key);
         0
@@ -2719,7 +2920,11 @@ impl FileTable {
     fn remove(&mut self, path: &str) -> i32 {
         let key = vfs_key(path);
         if !self.has(&key) {
-            return if self.is_dir(&key) { SCE_ERROR_ERRNO_EISDIR } else { SCE_ERROR_ERRNO_ENOENT };
+            return if self.is_dir(&key) {
+                SCE_ERROR_ERRNO_EISDIR
+            } else {
+                SCE_ERROR_ERRNO_ENOENT
+            };
         }
         self.files.remove(&key);
         // A backed file is deleted by forgetting the key: the bytes stay in storage but
@@ -2741,7 +2946,10 @@ impl FileTable {
     /// as the kernel does.
     fn rename(&mut self, old: &str, new: &str) -> i32 {
         let (from, to) = (vfs_key(old), vfs_key(new));
-        let (from, to) = (from.trim_end_matches('/').to_string(), to.trim_end_matches('/').to_string());
+        let (from, to) = (
+            from.trim_end_matches('/').to_string(),
+            to.trim_end_matches('/').to_string(),
+        );
         if from == to {
             return 0;
         }
@@ -2778,16 +2986,24 @@ impl FileTable {
         // A directory: re-key the directory itself and everything beneath it.
         let old_prefix = format!("{from}/");
         let rekey = |k: &str| format!("{to}{}", &k[from.len()..]);
-        let moved: Vec<String> =
-            self.files.keys().filter(|k| k.starts_with(&old_prefix)).cloned().collect();
+        let moved: Vec<String> = self
+            .files
+            .keys()
+            .filter(|k| k.starts_with(&old_prefix))
+            .cloned()
+            .collect();
         for k in moved {
             let data = self.files.remove(&k).unwrap_or_default();
             let nk = rekey(&k);
             // The original spelling's tail is preserved; only the renamed prefix changes.
-            let orig_tail = self.originals.remove(&k).map(|o| o[from.len().min(o.len())..].to_string());
+            let orig_tail = self
+                .originals
+                .remove(&k)
+                .map(|o| o[from.len().min(o.len())..].to_string());
             self.files.insert(nk.clone(), data);
             if let Some(tail) = orig_tail {
-                self.originals.insert(nk.clone(), format!("{new_orig}{tail}"));
+                self.originals
+                    .insert(nk.clone(), format!("{new_orig}{tail}"));
             }
             if let Some(s) = self.stats.remove(&k) {
                 self.stats.insert(nk, s);
@@ -2871,7 +3087,9 @@ impl FileTable {
 
     /// `chstat` on an open descriptor: the same change, addressed by fd.
     fn chstat_fd(&mut self, fd: i32, over: FileStatOverride) -> i32 {
-        let Some(of) = self.open.get(&fd) else { return SCE_ERROR_ERRNO_EBADF };
+        let Some(of) = self.open.get(&fd) else {
+            return SCE_ERROR_ERRNO_EBADF;
+        };
         let path = of.path.clone();
         self.chstat(&path, over)
     }
@@ -2892,7 +3110,12 @@ impl FileTable {
             }
         }
         out.files.sort_by(|a, b| a.0.cmp(&b.0));
-        out.dirs = self.dirs.iter().filter(|k| is_persisted_mount(k)).cloned().collect();
+        out.dirs = self
+            .dirs
+            .iter()
+            .filter(|k| is_persisted_mount(k))
+            .cloned()
+            .collect();
         out.dirs.sort();
         out.originals = self
             .originals
@@ -3111,9 +3334,7 @@ impl RowLayout {
         for p in pieces.drain(..) {
             match out.last_mut() {
                 Some(q)
-                    if q.stream == p.stream
-                        && q.src + q.len == p.src
-                        && q.dst + q.len == p.dst =>
+                    if q.stream == p.stream && q.src + q.len == p.src && q.dst + q.len == p.dst =>
                 {
                     q.len += p.len;
                 }
@@ -3131,7 +3352,10 @@ impl RowLayout {
                 key = key.wrapping_mul(0x0000_0100_0000_01b3);
             }
         }
-        Self { pieces: pieces.into(), key }
+        Self {
+            pieces: pieces.into(),
+            key,
+        }
     }
     fn pieces(&self) -> &[ScatterPiece] {
         &self.pieces
@@ -3155,8 +3379,8 @@ impl RowLayout {
 /// every one of them decoded as a null data pointer, and the light, bloom and composite passes
 /// all rendered pure black. The frame still looked like a frame, only far too dark.
 ///
-/// The ADDRESS is kept beside the words because the two remaining side tables
-/// (`texture_formats`, `texture_extra`) are keyed by it - see
+/// The ADDRESS is kept beside the words because the remaining side table
+/// (`texture_formats`) is keyed by it - see
 /// `vitaslop-host-call-reference-semantics` for why identity and value both have to survive.
 /// The sampler wrap modes, filters, LOD bias, gamma and mip count used to be a third such
 /// table and are now read out of `words` itself, which is what lets them survive the by-value
@@ -3219,39 +3443,25 @@ impl TextureBinding {
         let words = if addr == 0 {
             [0; 4]
         } else {
-            [ctx.read_u32(addr), ctx.read_u32(addr + 4), ctx.read_u32(addr + 8), ctx.read_u32(addr + 12)]
+            [
+                ctx.read_u32(addr),
+                ctx.read_u32(addr + 4),
+                ctx.read_u32(addr + 8),
+                ctx.read_u32(addr + 12),
+            ]
         };
-        TextureBinding { unit, addr, words, from_precomputed }
+        TextureBinding {
+            unit,
+            addr,
+            words,
+            from_precomputed,
+        }
     }
 
     /// True when the captured control words are all zero - a handle that was never a texture.
     fn is_null(&self) -> bool {
         self.words.iter().all(|&w| w == 0)
     }
-}
-
-
-/// The ONE piece of per-texture state that cannot live in the guest's own control words.
-///
-/// Everything else this used to hold - the wrap modes, the three filters, the LOD bias, the
-/// gamma mode and the mip count - is now written into and read out of the guest's 16-byte
-/// `SceGxmTexture`, where the hardware keeps it (see `vita::gxm::texword0`). This shadow was
-/// address-keyed, and a `SceGxmTexture` is a POD the guest copies freely, so a copied texture
-/// silently lost all of it - the identical defect the doc on [`PrecomputedDraw`] below describes
-/// for precomputed draws, which this codebase had already fixed there.
-///
-/// The byte stride stays, and the reason is the refuse-to-guess rule rather than convenience: a
-/// `LINEAR_STRIDED` texture spreads its stride across word 0's `stride_ext`, `stride_low` and
-/// `stride` fields, and the vitasdk header documents their WIDTHS but not how they COMPOSE
-/// ("stride extension", "internal stride lower bits"). Packing it would mean inventing that, and
-/// a wrong packing would corrupt the neighbouring fields that ARE understood. So this holds what
-/// the guest passed to `sceGxmTextureInitLinearStrided`, and a by-value copy of a strided texture
-/// still loses its stride - which is a known, bounded gap, not a solved one.
-#[derive(Clone, Copy, Default)]
-struct TextureExtra {
-    /// Explicit byte stride for a `LINEAR_STRIDED` texture (0 = derive from width x
-    /// bytes-per-pixel, as the driver does for every other layout).
-    byte_stride: u32,
 }
 
 /// A precomputed draw: the vertex program, stream-0 vertex buffer, and draw
@@ -3296,7 +3506,10 @@ macro_rules! snaps {
                 } else {
                     (0, None)
                 };
-                let g = $s.texture_snapshots.lock().unwrap_or_else(|e| e.into_inner());
+                let g = $s
+                    .texture_snapshots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let (Some(t0), Some(t1)) = (t0, crate::perf::now_ms()) {
                     crate::perf::snaps_waited(holder, ((t1 - t0).max(0.0) * 1.0e6) as u64);
                 }
@@ -3306,7 +3519,10 @@ macro_rules! snaps {
         crate::perf::snaps_taken(line!());
         // Frame boundaries that arrived while another holder had the cache (see
         // `snaps_frames_pending`), applied before anyone reads it.
-        for _ in 0..$s.snaps_frames_pending.swap(0, std::sync::atomic::Ordering::AcqRel) {
+        for _ in 0..$s
+            .snaps_frames_pending
+            .swap(0, std::sync::atomic::Ordering::AcqRel)
+        {
             g.begin_frame();
         }
         g
@@ -3775,6 +3991,7 @@ struct TextureTemplate {
     u_addr_mode: u32,
     v_addr_mode: u32,
     lod_bias: u32,
+    lod_min: u32,
     min_filter: u32,
     mag_filter: u32,
     gamma: u32,
@@ -3942,7 +4159,12 @@ fn compact_sparse_draws() -> bool {
 fn vertex_intern_use_stamps() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::var("VITASLOP_VERTEX_INTERN_USE").ok().as_deref() != Some("0"))
+    *ON.get_or_init(|| {
+        crate::knobs::var("VITASLOP_VERTEX_INTERN_USE")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
 }
 
 fn vertex_intern_enabled() -> bool {
@@ -4052,7 +4274,10 @@ fn window_wait() -> bool {
 fn wall_step_ms() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        crate::knobs::var("VITASLOP_CLOCK_WALL_STEP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12.0)
+        crate::knobs::var("VITASLOP_CLOCK_WALL_STEP_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(12.0)
     })
 }
 
@@ -4066,7 +4291,12 @@ fn io_wall_floor() -> bool {
 fn defer_window_bytes() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::var("VITASLOP_DEFER_WINDOW_BYTES").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| {
+        crate::knobs::var("VITASLOP_DEFER_WINDOW_BYTES")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }
 
 /// Which windows the guest's GPU wait re-reads - see [`window_wants_reread`].
@@ -4098,11 +4328,13 @@ enum WindowReread {
 fn window_reread_rule() -> WindowReread {
     use std::sync::OnceLock;
     static R: OnceLock<WindowReread> = OnceLock::new();
-    *R.get_or_init(|| match crate::knobs::var("VITASLOP_WINDOW_REREAD").ok().as_deref() {
-        Some("slot") => WindowReread::Slot,
-        Some("all") => WindowReread::All,
-        _ => WindowReread::Blank,
-    })
+    *R.get_or_init(
+        || match crate::knobs::var("VITASLOP_WINDOW_REREAD").ok().as_deref() {
+            Some("slot") => WindowReread::Slot,
+            Some("all") => WindowReread::All,
+            _ => WindowReread::Blank,
+        },
+    )
 }
 
 /// Whether this window's draw-time bytes should be replaced by a fresh read at the guest's own
@@ -4285,7 +4517,10 @@ mod bytes_eq_tests {
             if len > 0 {
                 // At len 0 the "shorter" slice is the same empty slice, so there is nothing to
                 // differ - the case only exists from one byte up.
-                assert!(!bytes_eq(&base, &base[..len - 1]), "len {len}: length differs");
+                assert!(
+                    !bytes_eq(&base, &base[..len - 1]),
+                    "len {len}: length differs"
+                );
             }
             for at in 0..len {
                 let mut other = base.clone();
@@ -4401,7 +4636,7 @@ enum TextureCheck {
     /// the engine has them.
     ///
     /// Exact, and slower than `scene` on every engine, so it is not a performance
-    /// option: it exists to falsify the stamps. Two runs of one recipe that differ
+    /// option: it exists to falsify the stamps. Two runs of one input script that differ
     /// only in this must be BIT-IDENTICAL, and if they are not, the dirty map missed a
     /// store - which is a silent stale-texture bug and the only failure mode the
     /// mechanism has.
@@ -4616,8 +4851,11 @@ fn count_victims<K: Copy + Eq + std::hash::Hash, V>(
     if map.len() <= keep {
         return Vec::new();
     }
-    let mut old: Vec<(K, u64)> =
-        map.iter().map(|(k, v)| (*k, stamp(v))).filter(|(_, s)| *s != current).collect();
+    let mut old: Vec<(K, u64)> = map
+        .iter()
+        .map(|(k, v)| (*k, stamp(v)))
+        .filter(|(_, s)| *s != current)
+        .collect();
     old.sort_by_key(|(_, s)| *s);
     old.truncate(map.len() - keep);
     old.into_iter().map(|(k, _)| k).collect()
@@ -4692,6 +4930,33 @@ fn texture_snapshot_budget() -> usize {
     crate::knobs::scale_budget(base)
 }
 
+/// `VITASLOP_STAMP_VERIFY=1` - see the check in `TextureSnapshots::get_or_read`.
+fn stamp_verify() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(crate::knobs::var("VITASLOP_STAMP_VERIFY").as_deref(), Ok("1")))
+}
+
+/// Once per range: the dirty stamps said these bytes were untouched and they had changed.
+fn report_unstamped_change(ctx: &GuestCtx, addr: u32, len: usize, old: &[u8]) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, usize)>>> = Mutex::new(None);
+    if !SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert((addr, len)) {
+        return;
+    }
+    let Some(live) = ctx.borrow_bytes(addr, len) else { return };
+    let first = live.iter().zip(old).position(|(a, b)| a != b).unwrap_or(0);
+    let last = live.iter().zip(old).rposition(|(a, b)| a != b).unwrap_or(0);
+    let changed = live.iter().zip(old).filter(|(a, b)| a != b).count();
+    tracing::warn!(
+        target: "vitaslop::warning",
+        "STAMP VERIFY: {addr:#010x}+{len:#x} CHANGED with no stamp - {changed} byte(s) differ,          first at {:#010x}, last at {:#010x}",
+        addr as usize + first,
+        addr as usize + last
+    );
+}
+
 /// What [`TextureSnapshots::palette_expanded`] may hold, in bytes.
 ///
 /// Half the snapshot budget: an expansion is four times the indices it came from, and the
@@ -4720,18 +4985,15 @@ fn palette_memo_budget() -> usize {
 ///
 /// It is a diagnostic and it is expensive - one map probe per 4 KB page - so it is off unless
 /// asked for, and it reports on a ladder rather than per texture.
-fn dirty_page_census(
-    ctx: &GuestCtx,
-    addr: u32,
-    len: usize,
-    stamps: &FxHashMap<(u32, usize), u8>,
-) {
+fn dirty_page_census(ctx: &GuestCtx, addr: u32, len: usize, stamps: &FxHashMap<(u32, usize), u8>) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| crate::knobs::flag("VITASLOP_TEX_DIRTY_CENSUS")) {
         return;
     }
-    let Some(&stamp) = stamps.get(&(addr, len)) else { return };
+    let Some(&stamp) = stamps.get(&(addr, len)) else {
+        return;
+    };
     const PAGE: usize = 4096;
     let pages = len.div_ceil(PAGE);
     let mut dirty = 0usize;
@@ -4789,7 +5051,10 @@ impl TextureSnapshots {
 
     /// A cache that stamps `stacks` - the engine's own list, shared with [`VitaState`].
     fn with_stacks(stacks: GuestStacks) -> Self {
-        TextureSnapshots { stacks, ..Self::default() }
+        TextureSnapshots {
+            stacks,
+            ..Self::default()
+        }
     }
 
     /// Stamp every known stack with the epoch just handed out, so a stack page reads as
@@ -4869,6 +5134,16 @@ impl TextureSnapshots {
                     None => false,
                 }
             };
+            // `VITASLOP_STAMP_VERIFY=1`: the stamps' FALSIFIER, naming what they missed. When the
+            // stamps say "untouched", compare anyway and report - once per range - every range
+            // whose bytes changed regardless: a guest store that carried no mark.
+            if untouched
+                && stamp_verify()
+                && let Some(p) = retained.as_ref()
+                && ctx.borrow_bytes(addr, len).is_some_and(|live| live != &p[..])
+            {
+                report_unstamped_change(ctx, addr, len, p);
+            }
             if untouched {
                 // >>> RE-STAMP, EVEN THOUGH NOTHING WAS READ. The stamps have just PROVED
                 // these bytes current as of this scene, so recording that costs a hash write
@@ -4973,10 +5248,11 @@ impl TextureSnapshots {
         // byte-identical pixels would re-decode and re-upload an unchanged texture every
         // scene. Same answer, same bytes, one buffer.
         if let Some(p) = retained
-            && bytes_eq(&raw, &p) {
-                self.restamp(addr, len);
-                return p;
-            }
+            && bytes_eq(&raw, &p)
+        {
+            self.restamp(addr, len);
+            return p;
+        }
         let bytes: Arc<[u8]> = raw;
         crate::perf::note_bytes(crate::perf::Phase::DrawTextures, bytes.len());
         self.insert(addr, len, bytes.clone());
@@ -5043,7 +5319,10 @@ impl TextureSnapshots {
         // not a default anyone is expected to change; it is the falsifier.
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| {
-            !matches!(crate::knobs::var("VITASLOP_TEX_PAGE_READ").as_deref(), Ok("0"))
+            !matches!(
+                crate::knobs::var("VITASLOP_TEX_PAGE_READ").as_deref(),
+                Ok("0")
+            )
         }) {
             return None;
         }
@@ -5092,7 +5371,11 @@ impl TextureSnapshots {
             }
         }
         self.run_scratch = runs;
-        Some(if changed { Reread::Changed(fresh.into()) } else { Reread::Unchanged(retained.clone()) })
+        Some(if changed {
+            Reread::Changed(fresh.into())
+        } else {
+            Reread::Unchanged(retained.clone())
+        })
     }
 
     fn restamp(&mut self, addr: u32, len: usize) {
@@ -5204,14 +5487,16 @@ impl TextureSnapshots {
         }
         let fp = vertex_fingerprint(bytes);
         if let Some(p) = self.vertex_by_content.get(&(bytes.len(), fp))
-            && bytes_eq(bytes, p) {
-                // A HIT pays a comparison; a MISS pays a copy. See `Phase::DrawVertexInternHit`.
-                crate::perf::note_hit(crate::perf::Phase::DrawVertexInternHit);
-                let p = p.clone();
-                // A hit is a use - it is what keeps this entry out of the eviction below.
-                self.vertex_content_used.insert((bytes.len(), fp), self.frame_seq);
-                return (p, true);
-            }
+            && bytes_eq(bytes, p)
+        {
+            // A HIT pays a comparison; a MISS pays a copy. See `Phase::DrawVertexInternHit`.
+            crate::perf::note_hit(crate::perf::Phase::DrawVertexInternHit);
+            let p = p.clone();
+            // A hit is a use - it is what keeps this entry out of the eviction below.
+            self.vertex_content_used
+                .insert((bytes.len(), fp), self.frame_seq);
+            return (p, true);
+        }
         // A MISS on a key the index already holds is a fingerprint collision, not new
         // geometry, and it costs both meshes their identity every frame. See
         // `Phase::DrawVertexInternCollide`.
@@ -5226,8 +5511,12 @@ impl TextureSnapshots {
         {
             self.evict_interned_vertices(made.len());
         }
-        self.vertex_content_used.insert((made.len(), fp), self.frame_seq);
-        if let Some(old) = self.vertex_by_content.insert((made.len(), fp), made.clone()) {
+        self.vertex_content_used
+            .insert((made.len(), fp), self.frame_seq);
+        if let Some(old) = self
+            .vertex_by_content
+            .insert((made.len(), fp), made.clone())
+        {
             self.vertex_content_bytes = self.vertex_content_bytes.saturating_sub(old.len());
         }
         self.vertex_content_bytes += made.len();
@@ -5254,23 +5543,23 @@ impl TextureSnapshots {
         out.clear();
         out.extend(
             streams
-            .iter()
-            .enumerate()
-            .filter(|(_, st)| st.column != 0)
-            .map(|(si, st)| {
-                let buf = bound_streams.get(si).copied().unwrap_or(0);
-                let dst = base.get(si).copied().unwrap_or(0);
-                if st.per_instance || st.stride == 0 {
-                    (buf, st.column as usize, dst, st.column)
-                } else {
-                    (
-                        buf.wrapping_add(first.wrapping_mul(st.stride)),
-                        (last - first) as usize * st.stride as usize + st.column as usize,
-                        dst,
-                        st.column,
-                    )
-                }
-            }),
+                .iter()
+                .enumerate()
+                .filter(|(_, st)| st.column != 0)
+                .map(|(si, st)| {
+                    let buf = bound_streams.get(si).copied().unwrap_or(0);
+                    let dst = base.get(si).copied().unwrap_or(0);
+                    if st.per_instance || st.stride == 0 {
+                        (buf, st.column as usize, dst, st.column)
+                    } else {
+                        (
+                            buf.wrapping_add(first.wrapping_mul(st.stride)),
+                            (last - first) as usize * st.stride as usize + st.column as usize,
+                            dst,
+                            st.column,
+                        )
+                    }
+                }),
         );
     }
 
@@ -5333,7 +5622,9 @@ impl TextureSnapshots {
     /// Whether `bytes` IS the shared placeholder [`deferred_window_placeholder`] handed out for
     /// its length - by pointer, so a placeholder is recognised as blank WITHOUT scanning it.
     fn is_window_placeholder(&self, bytes: &Arc<[u8]>) -> bool {
-        self.window_placeholders.get(&bytes.len()).is_some_and(|p| Arc::ptr_eq(p, bytes))
+        self.window_placeholders
+            .get(&bytes.len())
+            .is_some_and(|p| Arc::ptr_eq(p, bytes))
     }
 
     fn deferred_window_placeholder(&mut self, len: usize) -> Arc<[u8]> {
@@ -5395,8 +5686,20 @@ impl TextureSnapshots {
             }
         }
         let stamp = self.scene_stamp;
-        let stamps = key.spans.iter().map(|&(a, l, _, _)| (a, l, stamp)).collect();
-        if let Some(old) = self.gather_memo.insert(key, GatherMemo { result: result.clone(), stamps, used: self.frame_seq, gather }) {
+        let stamps = key
+            .spans
+            .iter()
+            .map(|&(a, l, _, _)| (a, l, stamp))
+            .collect();
+        if let Some(old) = self.gather_memo.insert(
+            key,
+            GatherMemo {
+                result: result.clone(),
+                stamps,
+                used: self.frame_seq,
+                gather,
+            },
+        ) {
             self.gather_memo_bytes = self.gather_memo_bytes.saturating_sub(old.result.len());
         }
         self.gather_memo_bytes += result.len();
@@ -5518,11 +5821,13 @@ impl TextureSnapshots {
                 crate::perf::note_bytes(crate::perf::Phase::DrawVertices, hit.len());
                 return hit;
             }
-            let vertices = self.gather_rows_into_scratch(ctx, streams, bound_streams, layout, stride, gather);
+            let vertices =
+                self.gather_rows_into_scratch(ctx, streams, bound_streams, layout, stride, gather);
             crate::perf::note_bytes(crate::perf::Phase::DrawVertices, vertices.len());
-            let (interned, seen_before) = crate::perf::time(crate::perf::Phase::DrawVertexGatherIntern, || {
-                self.intern_vertices_noting_hit(&vertices)
-            });
+            let (interned, seen_before) =
+                crate::perf::time(crate::perf::Phase::DrawVertexGatherIntern, || {
+                    self.intern_vertices_noting_hit(&vertices)
+                });
             self.interleave_scratch = vertices;
             if seen_before {
                 self.gather_memo_file(key.clone(), Some(gather.clone()), interned.clone());
@@ -5575,9 +5880,10 @@ impl TextureSnapshots {
         // TIMED SEPARATELY from the gather that produced the bytes: this is a content
         // fingerprint plus a full comparison, and the gather is guest reads plus a scatter.
         // See `Phase::DrawVertexGatherRead`.
-        let (interned, seen_before) = crate::perf::time(crate::perf::Phase::DrawVertexGatherIntern, || {
-            self.intern_vertices_noting_hit(&vertices)
-        });
+        let (interned, seen_before) =
+            crate::perf::time(crate::perf::Phase::DrawVertexGatherIntern, || {
+                self.intern_vertices_noting_hit(&vertices)
+            });
         self.interleave_scratch = vertices;
         if seen_before {
             self.gather_memo_file(key.clone(), None, interned.clone());
@@ -5651,9 +5957,15 @@ impl TextureSnapshots {
         key.stride = stride;
         key.layout = layout.key;
         key.streams.clear();
-        key.streams.extend(streams.iter().enumerate().map(|(si, st)| {
-            (bound_streams.get(si).copied().unwrap_or(0), st.stride, st.column, st.per_instance)
-        }));
+        key.streams
+            .extend(streams.iter().enumerate().map(|(si, st)| {
+                (
+                    bound_streams.get(si).copied().unwrap_or(0),
+                    st.stride,
+                    st.column,
+                    st.per_instance,
+                )
+            }));
         if memo_on && self.instanced_memo.contains_key(&key) {
             let clean = self.instanced_memo[&key]
                 .stamps
@@ -5685,7 +5997,9 @@ impl TextureSnapshots {
         // as the reads happen so the memo can never claim a range it did not actually read.
         let stamp = self.scene_stamp;
         let mut stamps: Vec<(u32, usize, u8)> = vec![(index_addr, wrap * index_elem, stamp)];
-        let raw = crate::perf::time(crate::perf::Phase::DrawIndices, || ctx.read_bytes(index_addr, wrap * index_elem));
+        let raw = crate::perf::time(crate::perf::Phase::DrawIndices, || {
+            ctx.read_bytes(index_addr, wrap * index_elem)
+        });
         crate::perf::note_bytes(crate::perf::Phase::DrawIndices, raw.len());
         let index_of = |c: &[u8]| match index_elem {
             2 => u16::from_le_bytes([c[0], c[1]]) as u32,
@@ -5778,7 +6092,12 @@ impl TextureSnapshots {
             }
         }
         let indices: Arc<[u8]> = Arc::from(indices);
-        let idx = DrawIndices { bytes: indices.clone(), first_vertex: 0, vertex_count: rows as u32, gather: None };
+        let idx = DrawIndices {
+            bytes: indices.clone(),
+            first_vertex: 0,
+            vertex_count: rows as u32,
+            gather: None,
+        };
         // The identity share the plain path gets, so a static crowd section is one upload.
         let (interned, seen_before) = self.intern_vertices_noting_hit(&vertices);
         // >>> FILED ONLY ON THE SECOND SIGHTING, which is the gate the gather memo rests its
@@ -5885,7 +6204,9 @@ impl TextureSnapshots {
                 .unwrap_or(0)
                 .max(st.column as usize);
             debug_assert!(
-                mine_pieces.iter().all(|p| p.dst as usize + p.len as usize <= stride_us),
+                mine_pieces
+                    .iter()
+                    .all(|p| p.dst as usize + p.len as usize <= stride_us),
                 "stream {si} has a piece outside the packed row of {stride_us}"
             );
             let buf = bound_streams.get(si).copied().unwrap_or(0);
@@ -5957,7 +6278,10 @@ impl TextureSnapshots {
         let start = pieces.iter().position(|p| p.stream as usize == si);
         match start {
             Some(a) => {
-                let n = pieces[a..].iter().take_while(|p| p.stream as usize == si).count();
+                let n = pieces[a..]
+                    .iter()
+                    .take_while(|p| p.stream as usize == si)
+                    .count();
                 &pieces[a..a + n]
             }
             None => &[],
@@ -6105,7 +6429,9 @@ impl TextureSnapshots {
                 .unwrap_or(0)
                 .max(st.column as usize);
             debug_assert!(
-                mine_pieces.iter().all(|p| p.dst as usize + p.len as usize <= stride_us),
+                mine_pieces
+                    .iter()
+                    .all(|p| p.dst as usize + p.len as usize <= stride_us),
                 "stream {si} has a piece outside the packed row of {stride_us}"
             );
             let buf = bound_streams.get(si).copied().unwrap_or(0);
@@ -6225,11 +6551,12 @@ impl TextureSnapshots {
         // is common), and a fresh `Arc` there would miss every downstream cache keyed on
         // identity while being byte-for-byte the thing they already hold.
         if let Some(p) = self.vertex_entries.get(&(addr, len))
-            && bytes_eq(&raw, p) {
-                let same = p.clone();
-                self.stamp_vertices(addr, len);
-                return same;
-            }
+            && bytes_eq(&raw, p)
+        {
+            let same = p.clone();
+            self.stamp_vertices(addr, len);
+            return same;
+        }
         // ...and the same bytes held under a DIFFERENT address, which is what a title that
         // rebuilds its geometry into a rotating arena produces every frame. See
         // `vertex_by_content`. Proven by comparison, never by the fingerprint.
@@ -6242,46 +6569,47 @@ impl TextureSnapshots {
         // says nothing about that, so it is off with the rest of the feature.
         let fp = vertex_fingerprint(&raw);
         if vertex_intern_enabled()
-        && let Some(p) = self.vertex_by_content.get(&(len, fp))
-            && bytes_eq(&raw, p) {
-                let same = p.clone();
-                // >>> A HIT IS A USE, AND THIS ONE WAS NOT RECORDED AS ONE.
-                //
-                // `vertex_content_used` is what `lru_victims` reads to decide which entries are
-                // COLD, and only `intern_vertices_noting_hit` was stamping it. Every mesh
-                // recognised through THIS path - the single-stream snapshot path, which is most
-                // draws of most frames - was served from the index and then looked untouched to
-                // the very next eviction. So the index evicted exactly the entries it was
-                // answering from: MEASURED on one baseball-title run, **96,281 entries and 2,770 MB shed**,
-                // ending at 485 entries against an 8,192 cap and 3 MB against a 64 MB budget,
-                // while ~95 draws a frame arrived in a fresh allocation whose bytes the
-                // renderer's packed cache still held. `VITASLOP_VERTEX_INTERN_USE=0` is the OFF
-                // arm. [[vitaslop-an-intern-eviction-had-no-counter]]
-                if vertex_intern_use_stamps() {
-                    self.vertex_content_used.insert((len, fp), self.frame_seq);
-                }
-                // NOT also recorded in `vertex_entries`: that map's byte accounting is per
-                // ENTRY, and a rotating arena would file one shared buffer under a new address
-                // every frame - counting the same megabytes N times and clearing the budget
-                // early. The address entry buys nothing here anyway, because the next frame's
-                // address is different again.
-                //
-                // >>> AND AN ENTRY THIS ADDRESS ALREADY HAD IS NOW WRONG, so it goes - it is not
-                // re-stamped. This branch is reached only when that entry did NOT match the bytes
-                // just read (the comparisons above), so it holds what the address held BEFORE.
-                // Stamping the address here used to certify those old bytes as current, and the
-                // next read of the address with no store in between - the end-of-scene re-read of
-                // the same draw, or the next draw through it - handed them back. MEASURED on a
-                // beach title's title screen: its marquee quads are rewritten into one of three
-                // rotating buffers after the draw, the draw-time bytes matched a buffer held
-                // elsewhere, and on every third frame the marquee was drawn from that buffer's
-                // previous quad - mirrored and stretched across the top of the screen.
-                if let Some(old) = self.vertex_entries.remove(&(addr, len)) {
-                    self.vertex_bytes -= old.len();
-                }
-                self.vertex_stamps.remove(&(addr, len));
-                return same;
+            && let Some(p) = self.vertex_by_content.get(&(len, fp))
+            && bytes_eq(&raw, p)
+        {
+            let same = p.clone();
+            // >>> A HIT IS A USE, AND THIS ONE WAS NOT RECORDED AS ONE.
+            //
+            // `vertex_content_used` is what `lru_victims` reads to decide which entries are
+            // COLD, and only `intern_vertices_noting_hit` was stamping it. Every mesh
+            // recognised through THIS path - the single-stream snapshot path, which is most
+            // draws of most frames - was served from the index and then looked untouched to
+            // the very next eviction. So the index evicted exactly the entries it was
+            // answering from: MEASURED on one baseball-title run, **96,281 entries and 2,770 MB shed**,
+            // ending at 485 entries against an 8,192 cap and 3 MB against a 64 MB budget,
+            // while ~95 draws a frame arrived in a fresh allocation whose bytes the
+            // renderer's packed cache still held. `VITASLOP_VERTEX_INTERN_USE=0` is the OFF
+            // arm. [[vitaslop-an-intern-eviction-had-no-counter]]
+            if vertex_intern_use_stamps() {
+                self.vertex_content_used.insert((len, fp), self.frame_seq);
             }
+            // NOT also recorded in `vertex_entries`: that map's byte accounting is per
+            // ENTRY, and a rotating arena would file one shared buffer under a new address
+            // every frame - counting the same megabytes N times and clearing the budget
+            // early. The address entry buys nothing here anyway, because the next frame's
+            // address is different again.
+            //
+            // >>> AND AN ENTRY THIS ADDRESS ALREADY HAD IS NOW WRONG, so it goes - it is not
+            // re-stamped. This branch is reached only when that entry did NOT match the bytes
+            // just read (the comparisons above), so it holds what the address held BEFORE.
+            // Stamping the address here used to certify those old bytes as current, and the
+            // next read of the address with no store in between - the end-of-scene re-read of
+            // the same draw, or the next draw through it - handed them back. MEASURED on a
+            // beach title's title screen: its marquee quads are rewritten into one of three
+            // rotating buffers after the draw, the draw-time bytes matched a buffer held
+            // elsewhere, and on every third frame the marquee was drawn from that buffer's
+            // previous quad - mirrored and stretched across the top of the screen.
+            if let Some(old) = self.vertex_entries.remove(&(addr, len)) {
+                self.vertex_bytes -= old.len();
+            }
+            self.vertex_stamps.remove(&(addr, len));
+            return same;
+        }
         let bytes: Arc<[u8]> = raw;
         // A budget, and past it the COLDEST meshes are shed rather than all of them. The keys
         // are (address, length) rather than content, so an eviction costs a re-read and never
@@ -6349,7 +6677,12 @@ impl TextureSnapshots {
         elem: usize,
     ) -> DrawIndices {
         if len == 0 {
-            return DrawIndices { bytes: Arc::from(&[][..]), first_vertex: 0, vertex_count: 0, gather: None };
+            return DrawIndices {
+                bytes: Arc::from(&[][..]),
+                first_vertex: 0,
+                vertex_count: 0,
+                gather: None,
+            };
         }
         self.arm_scene_stamp(ctx);
         let key = (addr, len, elem);
@@ -6407,7 +6740,9 @@ impl TextureSnapshots {
                     uniq.sort_unstable();
                     uniq.dedup();
                     for c in raw.chunks_mut(elem) {
-                        let pos = uniq.binary_search(&index_of(c)).expect("every index is in its own unique set");
+                        let pos = uniq
+                            .binary_search(&index_of(c))
+                            .expect("every index is in its own unique set");
                         write(c, pos as u32);
                     }
                     let count = uniq.len() as u32;
@@ -6421,7 +6756,12 @@ impl TextureSnapshots {
                 }
                 (first_vertex, vertex_count, None)
             });
-        let value = DrawIndices { bytes: Arc::<[u8]>::from(raw), first_vertex, vertex_count, gather };
+        let value = DrawIndices {
+            bytes: Arc::<[u8]>::from(raw),
+            first_vertex,
+            vertex_count,
+            gather,
+        };
         // The same budget the vertex snapshots use, and shed the same way - coldest first. The
         // keys are (address, length, element size) rather than content, so an eviction costs a
         // re-read and can never cost correctness.
@@ -6464,7 +6804,9 @@ impl TextureSnapshots {
     /// failed probe performs and without touching the use stamp - a probe, not a use.
     fn gather_memo_cached(&self, ctx: &GuestCtx, key: &GatherKey) -> bool {
         self.gather_memo.get(key).is_some_and(|e| {
-            e.stamps.iter().all(|&(addr, len, stamp)| ctx.dirty_since(addr, len, stamp) == Some(false))
+            e.stamps
+                .iter()
+                .all(|&(addr, len, stamp)| ctx.dirty_since(addr, len, stamp) == Some(false))
         })
     }
 
@@ -6488,7 +6830,9 @@ impl TextureSnapshots {
         // Reclaim the epoch range before spending the last of it, rather than letting the
         // wrap disown every snapshot this cache holds. See `Self::rebase_epoch_if_exhausted`.
         self.rebase_epoch_if_exhausted(ctx);
-        let Some((stamp, wrapped)) = ctx.bump_dirty_epoch() else { return };
+        let Some((stamp, wrapped)) = ctx.bump_dirty_epoch() else {
+            return;
+        };
         self.stamp_stacks(ctx);
         // A wrapped epoch zeroed the map, so every stamp taken before it describes a page whose
         // record is gone. They are dropped, and each entry pays one compare to earn a new one.
@@ -6539,7 +6883,9 @@ impl TextureSnapshots {
         /// working set, which is what a wrap costs. Everything below the floor is what the
         /// renumbering hands back.
         const RETAIN: u8 = 128;
-        let Some(epoch) = ctx.dirty_epoch() else { return };
+        let Some(epoch) = ctx.dirty_epoch() else {
+            return;
+        };
         if epoch < NEAR_CEILING {
             return;
         }
@@ -6561,15 +6907,22 @@ impl TextureSnapshots {
         // proven at an epoch below the floor has no proof left and goes; the rest shift. A
         // memo left un-rebased here answered from stale proofs after every rebase (a golf
         // title's picture moved on 7 of 12 shots), exactly the failure a stamp is for.
-        self.gather_memo.retain(|_, e| e.stamps.iter().all(|&(_, _, st)| st >= floor));
+        self.gather_memo
+            .retain(|_, e| e.stamps.iter().all(|&(_, _, st)| st >= floor));
         self.gather_memo_bytes = self.gather_memo.values().map(|e| e.result.len()).sum();
         // ...and the INSTANCED expansion memo, on the same terms and for the same reason.
-        self.instanced_memo.retain(|_, e| e.stamps.iter().all(|&(_, _, st)| st >= floor));
-        self.instanced_memo_bytes =
-            self.instanced_memo.values().map(|e| e.vertices.len() + e.indices.len()).sum();
+        self.instanced_memo
+            .retain(|_, e| e.stamps.iter().all(|&(_, _, st)| st >= floor));
+        self.instanced_memo_bytes = self
+            .instanced_memo
+            .values()
+            .map(|e| e.vertices.len() + e.indices.len())
+            .sum();
         self.window_entries.retain(|_, (_, st)| *st >= floor);
         self.window_bytes = self.window_entries.values().map(|(b, _)| b.len()).sum();
-        let Some(_new_epoch) = ctx.rebase_dirty_epoch(floor) else { return };
+        let Some(_new_epoch) = ctx.rebase_dirty_epoch(floor) else {
+            return;
+        };
         // Every stamp owes the same subtraction the map just took. `floor` is the minimum, so
         // none of these can underflow.
         let shift = floor - 1;
@@ -6793,7 +7146,8 @@ impl TextureSnapshots {
         // have CHANGED (or were read for the first time); the unchanged paths return the
         // retained `Arc` without coming here, so an unchanged texture keeps its id and every
         // cache keyed on it keeps hitting.
-        self.pixel_ids.insert((addr, len), crate::capture::next_pixels_id());
+        self.pixel_ids
+            .insert((addr, len), crate::capture::next_pixels_id());
         self.bytes += bytes.len();
     }
 
@@ -6816,8 +7170,16 @@ impl TextureSnapshots {
     /// the palette's own bytes (`pal`, hashed; it is at most 1 KB and it can change under a
     /// texture that did not). Same inputs, same buffer, same id, and every cache keyed on that
     /// id keeps hitting.
-    fn expanded_palette(&self, addr: u32, len: usize, src: u64, pal: u64) -> Option<&PaletteExpansion> {
-        self.palette_expanded.get(&(addr, len)).filter(|e| e.src == src && e.pal == pal)
+    fn expanded_palette(
+        &self,
+        addr: u32,
+        len: usize,
+        src: u64,
+        pal: u64,
+    ) -> Option<&PaletteExpansion> {
+        self.palette_expanded
+            .get(&(addr, len))
+            .filter(|e| e.src == src && e.pal == pal)
     }
 
     /// Record an expansion against its inputs - see [`Self::expanded_palette`]. One entry per
@@ -6944,7 +7306,11 @@ impl TextureSnapshots {
             Some(e) if e.valid_scene == self.scene_seq => return Some(e.res.clone()),
             Some(e) => (e.snap, e.degraded),
         };
-        let pixels = self.decoded.get(&key).and_then(|e| e.res.as_ref().ok()).map(|t| t.pixels.clone());
+        let pixels = self
+            .decoded
+            .get(&key)
+            .and_then(|e| e.res.as_ref().ok())
+            .map(|t| t.pixels.clone());
         // A dropped or degraded decode is re-attempted each new scene, exactly as it was
         // when this memo died with its scene: a texture that becomes readable is picked up
         // at the next scene, not never.
@@ -7046,7 +7412,12 @@ impl TextureSnapshots {
     /// The set re-proof compares pixel buffers by pointer and wants nothing else, so it does
     /// not need [`Self::decoded_validated`]'s full [`crate::capture::BoundTexture`] clone -
     /// which copies a dozen fields and a second `Arc` per dependency, ~1,150 times a frame.
-    fn decoded_pixels_are(&mut self, ctx: &GuestCtx, key: (u32, [u32; 4]), held: &Arc<[u8]>) -> bool {
+    fn decoded_pixels_are(
+        &mut self,
+        ctx: &GuestCtx,
+        key: (u32, [u32; 4]),
+        held: &Arc<[u8]>,
+    ) -> bool {
         // >>> THE ANSWER IS A POINTER COMPARE, SO THE BUFFER IS NEVER CLONED OUT.
         //
         // The only caller is the set re-proof, which took the `Arc` out, compared it by
@@ -7138,7 +7509,11 @@ impl TextureSnapshots {
         key: u64,
         list: Arc<[crate::capture::BoundTexture]>,
     ) {
-        self.last_vertex_set = Some(LastVertexSet { generation, key, list });
+        self.last_vertex_set = Some(LastVertexSet {
+            generation,
+            key,
+            list,
+        });
     }
 
     /// Remember a finished list under its fold, with the exact key material and the
@@ -7171,10 +7546,13 @@ impl TextureSnapshots {
             // so nothing can have rebuilt it in between. A unit whose decode dropped or
             // degraded (or whose entry the snapshot budget just evicted) makes the whole
             // set per-scene.
-            let pixels = self.decoded.get(&dep_key).and_then(|e| match (&e.res, e.degraded) {
-                (Ok(t), false) => Some(t.pixels.clone()),
-                _ => None,
-            });
+            let pixels = self
+                .decoded
+                .get(&dep_key)
+                .and_then(|e| match (&e.res, e.degraded) {
+                    (Ok(t), false) => Some(t.pixels.clone()),
+                    _ => None,
+                });
             match (deps.as_mut(), pixels) {
                 (Some(d), Some(p)) => d.push((dep_key, p)),
                 _ => deps = None,
@@ -7206,8 +7584,10 @@ impl TextureSnapshots {
         );
         // A GAUGE, not a tally: published here because this is the only place the map grows.
         // See `snapcounts::SET_LIVE`.
-        snapcounts::SET_LIVE
-            .store(self.snapshot_sets.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        snapcounts::SET_LIVE.store(
+            self.snapshot_sets.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// The mean colour of `t`'s pixels, computed once per distinct byte buffer.
@@ -7265,9 +7645,8 @@ impl TextureSnapshots {
         // Keep the cadence bookkeeping in step with the entries it describes. A stale key
         // here is harmless (the `entries` lookup misses first and the texture is re-read),
         // but leaving it means the sets grow with every address the run ever touched.
-        let overlapping = |&(a, l): &(u32, usize)| {
-            (a as u64) < end && (addr as u64) < (a as u64 + l as u64)
-        };
+        let overlapping =
+            |&(a, l): &(u32, usize)| (a as u64) < end && (addr as u64) < (a as u64 + l as u64);
         self.mutable.retain(|k| !overlapping(k));
         self.checked_this_scene.retain(|k| !overlapping(k));
         self.checked_this_frame.retain(|k| !overlapping(k));
@@ -7483,23 +7862,51 @@ mod texture_snapshot_stamp_tests {
         for (k, i) in sparse.iter().enumerate() {
             mem.bytes[10 * PAGE + k * 2..][..2].copy_from_slice(&i.to_le_bytes());
         }
-        let streams = [VertexStreamInfo { stride: 4, column: 4, per_instance: false }];
+        let streams = [VertexStreamInfo {
+            stride: 4,
+            column: 4,
+            per_instance: false,
+        }];
         let base = [0u32];
         let (idx, rows) = {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
             let idx = snaps.get_or_read_indices(&ctx, i0, sparse.len() * 2, 2);
-            let rows = snaps.read_draw_vertices(&ctx, &idx, true, &streams, &[v0], &base, &RowLayout::columns(&streams, &base), 4);
+            let rows = snaps.read_draw_vertices(
+                &ctx,
+                &idx,
+                true,
+                &streams,
+                &[v0],
+                &base,
+                &RowLayout::columns(&streams, &base),
+                4,
+            );
             (idx, rows)
         };
-        assert_eq!(idx.gather.as_deref(), Some(&[5u32, 3000, 3001, 4000][..]), "sorted unique rows");
+        assert_eq!(
+            idx.gather.as_deref(),
+            Some(&[5u32, 3000, 3001, 4000][..]),
+            "sorted unique rows"
+        );
         assert_eq!((idx.first_vertex, idx.vertex_count), (0, 4));
-        let rewritten: Vec<u16> =
-            idx.bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        assert_eq!(rewritten, [0, 1, 0, 3, 2], "each index names its row's compact position");
+        let rewritten: Vec<u16> = idx
+            .bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(
+            rewritten,
+            [0, 1, 0, 3, 2],
+            "each index names its row's compact position"
+        );
         assert_eq!(rows.len(), 16, "four rows of four bytes");
         for (k, i) in rewritten.iter().enumerate() {
             let row = u32::from_le_bytes(rows[*i as usize * 4..][..4].try_into().unwrap());
-            assert_eq!(row, sparse[k] as u32, "index {k} still lands on guest row {}", sparse[k]);
+            assert_eq!(
+                row, sparse[k] as u32,
+                "index {k} still lands on guest row {}",
+                sparse[k]
+            );
         }
         // The same five rows named densely (0..5) is a window, not a compaction.
         let dense = [0u16, 1, 2, 3, 4];
@@ -7537,36 +7944,100 @@ mod texture_snapshot_stamp_tests {
         }
         // Indices at page 10: the quad, then stale entries that would index far past it.
         let i0 = 10 * PAGE as u32;
-        let raw = [0u16, 1, 2, 2, 3, 0, 0, 500, 9, 124, 0, 587, 3, 3, 700, 0, 12, 99];
+        let raw = [
+            0u16, 1, 2, 2, 3, 0, 0, 500, 9, 124, 0, 587, 3, 3, 700, 0, 12, 99,
+        ];
         for (k, i) in raw.iter().enumerate() {
             mem.bytes[10 * PAGE + k * 2..][..2].copy_from_slice(&i.to_le_bytes());
         }
         let streams = [
-            VertexStreamInfo { stride: 4, column: 4, per_instance: false },
-            VertexStreamInfo { stride: 2, column: 2, per_instance: true },
+            VertexStreamInfo {
+                stride: 4,
+                column: 4,
+                per_instance: false,
+            },
+            VertexStreamInfo {
+                stride: 2,
+                column: 2,
+                per_instance: true,
+            },
         ];
         let base = [0u32, 4];
         let (idx, rows) = {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
             snaps
-                .read_instanced_draw(&ctx, i0, raw.len() * 2, 2, 6, &streams, &[v0, p0], &RowLayout::columns(&streams, &base), 6)
+                .read_instanced_draw(
+                    &ctx,
+                    i0,
+                    raw.len() * 2,
+                    2,
+                    6,
+                    &streams,
+                    &[v0, p0],
+                    &RowLayout::columns(&streams, &base),
+                    6,
+                )
                 .expect("twelve indices at a wrap of six is an instanced draw")
         };
         assert_eq!(idx.vertex_count, 12, "3 instances x 4 quad rows");
         assert_eq!(rows.len(), 12 * 6);
-        let rewritten: Vec<u16> = idx.bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        assert_eq!(rewritten, [0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4, 8, 9, 10, 10, 11, 8], "the wrapped quad, offset by four rows per instance");
+        let rewritten: Vec<u16> = idx
+            .bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(
+            rewritten,
+            [0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4, 8, 9, 10, 10, 11, 8],
+            "the wrapped quad, offset by four rows per instance"
+        );
         for k in 0..3usize {
             for v in 0..4usize {
                 let r = &rows[(k * 4 + v) * 6..][..6];
-                assert_eq!(u32::from_le_bytes(r[..4].try_into().unwrap()), 100 + v as u32, "instance {k} vertex {v} quad row");
-                assert_eq!(u16::from_le_bytes([r[4], r[5]]), 7000 + k as u16, "instance {k} vertex {v} per-instance row");
+                assert_eq!(
+                    u32::from_le_bytes(r[..4].try_into().unwrap()),
+                    100 + v as u32,
+                    "instance {k} vertex {v} quad row"
+                );
+                assert_eq!(
+                    u16::from_le_bytes([r[4], r[5]]),
+                    7000 + k as u16,
+                    "instance {k} vertex {v} per-instance row"
+                );
             }
         }
         // A wrap of 0, or no more indices than one wrap, is not an instanced draw.
         let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
-        assert!(snaps.read_instanced_draw(&ctx, i0, raw.len() * 2, 2, 0, &streams, &[v0, p0], &RowLayout::columns(&streams, &base), 6).is_none());
-        assert!(snaps.read_instanced_draw(&ctx, i0, 6 * 2, 2, 6, &streams, &[v0, p0], &RowLayout::columns(&streams, &base), 6).is_none());
+        assert!(
+            snaps
+                .read_instanced_draw(
+                    &ctx,
+                    i0,
+                    raw.len() * 2,
+                    2,
+                    0,
+                    &streams,
+                    &[v0, p0],
+                    &RowLayout::columns(&streams, &base),
+                    6
+                )
+                .is_none()
+        );
+        assert!(
+            snaps
+                .read_instanced_draw(
+                    &ctx,
+                    i0,
+                    6 * 2,
+                    2,
+                    6,
+                    &streams,
+                    &[v0, p0],
+                    &RowLayout::columns(&streams, &base),
+                    6
+                )
+                .is_none()
+        );
     }
 
     /// >>> A VERTEX BUFFER ON A GUEST STACK IS RE-READ AFTER A STORE THAT CARRIED NO MARK.
@@ -7602,7 +8073,11 @@ mod texture_snapshot_stamp_tests {
         // An unmarked store (no `guest_store`): bytes only.
         mem.bytes[on_stack as usize] = 9;
         mem.bytes[off_stack as usize] = 9;
-        assert_eq!(read(&mut snaps, &mut mem, on_stack), 9, "a stack page reads as stored-into every scene");
+        assert_eq!(
+            read(&mut snaps, &mut mem, on_stack),
+            9,
+            "a stack page reads as stored-into every scene"
+        );
         assert_eq!(
             read(&mut snaps, &mut mem, off_stack),
             8,
@@ -7647,35 +8122,73 @@ mod texture_snapshot_stamp_tests {
             }
         }
         let streams = [
-            VertexStreamInfo { stride: 4, column: 4, per_instance: false },
-            VertexStreamInfo { stride: 2, column: 2, per_instance: false },
+            VertexStreamInfo {
+                stride: 4,
+                column: 4,
+                per_instance: false,
+            },
+            VertexStreamInfo {
+                stride: 2,
+                column: 2,
+                per_instance: false,
+            },
         ];
         let base = [0u32, 4];
-        let idx = DrawIndices { bytes: Arc::from(&[][..]), first_vertex: 0, vertex_count: 64, gather: None };
+        let idx = DrawIndices {
+            bytes: Arc::from(&[][..]),
+            first_vertex: 0,
+            vertex_count: 64,
+            gather: None,
+        };
         let mut read = |snaps: &mut TextureSnapshots, mem: &mut StampedMemory| {
             snaps.begin_scene();
             let ctx = ctx_over(&mut regs, &mut vfp, mem);
-            let v = snaps.read_draw_vertices(&ctx, &idx, false, &streams, &[a0, a1], &base, &RowLayout::columns(&streams, &base), 6);
+            let v = snaps.read_draw_vertices(
+                &ctx,
+                &idx,
+                false,
+                &streams,
+                &[a0, a1],
+                &base,
+                &RowLayout::columns(&streams, &base),
+                6,
+            );
             snaps.end_scene_for_test();
             v
         };
         let first = read(&mut snaps, &mut mem);
         assert_eq!(first.len(), 64 * 6);
-        assert!(snaps.gather_memo.is_empty(), "a first sighting files nothing");
+        assert!(
+            snaps.gather_memo.is_empty(),
+            "a first sighting files nothing"
+        );
         let second = read(&mut snaps, &mut mem);
-        assert!(Arc::ptr_eq(&first, &second), "the intern hands back the held buffer");
-        assert_eq!(snaps.gather_memo.len(), 1, "the second sighting files the memo");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the intern hands back the held buffer"
+        );
+        assert_eq!(
+            snaps.gather_memo.len(),
+            1,
+            "the second sighting files the memo"
+        );
         // A byte changed BEHIND the dirty map (no store recorded): a gather would see it, the
         // memo trusts the map and must not - which is how the third read proves it never
         // gathered. (A real guest cannot write without the map seeing it; this is the probe.)
         mem.bytes[13 * PAGE + 10] = 0xEE;
         let third = read(&mut snaps, &mut mem);
-        assert!(Arc::ptr_eq(&first, &third), "the third sighting is the memo's buffer, ungathered");
+        assert!(
+            Arc::ptr_eq(&first, &third),
+            "the third sighting is the memo's buffer, ungathered"
+        );
         assert_ne!(third[5 * 6 + 4], 0xEE, "which the unrecorded byte proves");
         // Now the same store, RECORDED.
         mem.guest_store(13 * PAGE + 10, 0xEE);
         let fourth = read(&mut snaps, &mut mem);
-        assert!(!Arc::ptr_eq(&first, &fourth), "a written stream is a fresh gather");
+        assert!(
+            !Arc::ptr_eq(&first, &fourth),
+            "a written stream is a fresh gather"
+        );
         assert_eq!(fourth[5 * 6 + 4], 0xEE, "carrying the stored byte");
         assert_eq!(&fourth[..4], &first[..4], "and every untouched row");
     }
@@ -7699,13 +8212,25 @@ mod texture_snapshot_stamp_tests {
             mem.bytes[11 * PAGE + i * 2..][..2].copy_from_slice(&w.to_le_bytes());
         }
         for v in 0..16usize {
-            mem.bytes[12 * PAGE + v * 4..][..4]
-                .copy_from_slice(&[(0x10 + v) as u8, 0x11, 0x12, 0x13]);
+            mem.bytes[12 * PAGE + v * 4..][..4].copy_from_slice(&[
+                (0x10 + v) as u8,
+                0x11,
+                0x12,
+                0x13,
+            ]);
             mem.bytes[13 * PAGE + v * 2..][..2].copy_from_slice(&[(0xa0 + v) as u8, 0xa1]);
         }
         let streams = [
-            VertexStreamInfo { stride: 4, column: 4, per_instance: false },
-            VertexStreamInfo { stride: 2, column: 2, per_instance: true },
+            VertexStreamInfo {
+                stride: 4,
+                column: 4,
+                per_instance: false,
+            },
+            VertexStreamInfo {
+                stride: 2,
+                column: 2,
+                per_instance: true,
+            },
         ];
         let base = [0u32, 4];
         // Six indices a wrap, 18 in all, so three instances of a four-vertex quad.
@@ -7713,36 +8238,73 @@ mod texture_snapshot_stamp_tests {
             snaps.begin_scene();
             let ctx = ctx_over(&mut regs, &mut vfp, mem);
             let out = snaps
-                .read_instanced_draw(&ctx, ia, 36, 2, 6, &streams, &[a0, a1], &RowLayout::columns(&streams, &base), 6)
+                .read_instanced_draw(
+                    &ctx,
+                    ia,
+                    36,
+                    2,
+                    6,
+                    &streams,
+                    &[a0, a1],
+                    &RowLayout::columns(&streams, &base),
+                    6,
+                )
                 .expect("three instances of a four-vertex quad expand");
             snaps.end_scene_for_test();
             out
         };
         let (i1, v1) = read(&mut snaps, &mut mem);
-        assert_eq!(v1.len(), 3 * 4 * 6, "three instances of four rows at stride 6");
+        assert_eq!(
+            v1.len(),
+            3 * 4 * 6,
+            "three instances of four rows at stride 6"
+        );
         assert_eq!(i1.vertex_count, 12);
-        assert!(snaps.instanced_memo.is_empty(), "a first sighting files nothing");
+        assert!(
+            snaps.instanced_memo.is_empty(),
+            "a first sighting files nothing"
+        );
         let (_, v2) = read(&mut snaps, &mut mem);
-        assert!(Arc::ptr_eq(&v1, &v2), "the intern hands back the held buffer");
-        assert_eq!(snaps.instanced_memo.len(), 1, "the second sighting files the memo");
+        assert!(
+            Arc::ptr_eq(&v1, &v2),
+            "the intern hands back the held buffer"
+        );
+        assert_eq!(
+            snaps.instanced_memo.len(),
+            1,
+            "the second sighting files the memo"
+        );
         // A byte changed BEHIND the dirty map: an expansion would see it, the memo trusts the
         // map and must not - which is how the third read proves it never read anything.
         mem.bytes[13 * PAGE + 2] = 0xEE;
         let (_, v3) = read(&mut snaps, &mut mem);
-        assert!(Arc::ptr_eq(&v1, &v3), "the third sighting is the memo's buffer, unexpanded");
+        assert!(
+            Arc::ptr_eq(&v1, &v3),
+            "the third sighting is the memo's buffer, unexpanded"
+        );
         assert_ne!(v3[4 * 6 + 4], 0xEE, "which the unrecorded byte proves");
         // Now the same store, RECORDED.
         mem.guest_store(13 * PAGE + 2, 0xEE);
         let (_, v4) = read(&mut snaps, &mut mem);
-        assert!(!Arc::ptr_eq(&v1, &v4), "a written stream is a fresh expansion");
-        assert_eq!(v4[4 * 6 + 4], 0xEE, "carrying the stored byte into instance 1");
+        assert!(
+            !Arc::ptr_eq(&v1, &v4),
+            "a written stream is a fresh expansion"
+        );
+        assert_eq!(
+            v4[4 * 6 + 4],
+            0xEE,
+            "carrying the stored byte into instance 1"
+        );
         assert_eq!(&v4[..4], &v1[..4], "and every untouched row");
         // ...and the INDEX words are in the proof too.
         let (_, v5) = read(&mut snaps, &mut mem);
         assert!(Arc::ptr_eq(&v4, &v5), "and it re-files");
         mem.guest_store(11 * PAGE + 2, 0x03);
         let (i6, _) = read(&mut snaps, &mut mem);
-        assert_eq!(i6.vertex_count, 12, "the wrap still names four rows an instance");
+        assert_eq!(
+            i6.vertex_count, 12,
+            "the wrap still names four rows an instance"
+        );
         assert!(
             snaps.instanced_memo.len() <= 1,
             "a stored index word unfiles the entry rather than leaving two"
@@ -7775,14 +8337,37 @@ mod texture_snapshot_stamp_tests {
             mem.bytes[13 * PAGE + v * 2 + 1] = 0xc9;
         }
         let streams = [
-            VertexStreamInfo { stride: 8, column: 7, per_instance: false },
-            VertexStreamInfo { stride: 2, column: 2, per_instance: false },
+            VertexStreamInfo {
+                stride: 8,
+                column: 7,
+                per_instance: false,
+            },
+            VertexStreamInfo {
+                stride: 2,
+                column: 2,
+                per_instance: false,
+            },
         ];
         // The row `set_vertex_program` builds for that: U8x3 at 0, the pair at 4, stream 1 at 8.
         let layout = RowLayout::new(vec![
-            ScatterPiece { stream: 0, src: 0, dst: 0, len: 3 },
-            ScatterPiece { stream: 0, src: 3, dst: 4, len: 4 },
-            ScatterPiece { stream: 1, src: 0, dst: 8, len: 2 },
+            ScatterPiece {
+                stream: 0,
+                src: 0,
+                dst: 0,
+                len: 3,
+            },
+            ScatterPiece {
+                stream: 0,
+                src: 3,
+                dst: 4,
+                len: 4,
+            },
+            ScatterPiece {
+                stream: 1,
+                src: 0,
+                dst: 8,
+                len: 2,
+            },
         ]);
         let _base = [0u32, 8];
         let stride = 12u32;
@@ -7796,10 +8381,25 @@ mod texture_snapshot_stamp_tests {
         for v in 0..4usize {
             let r = &rows[v * 12..v * 12 + 12];
             let g = |b: usize| (0x10 * (v + 1) + b) as u8;
-            assert_eq!(&r[0..3], &[g(0), g(1), g(2)], "the U8x3 at its own slot, row {v}");
-            assert_eq!(r[3], 0, "the byte a widened uint8x4 fetch reads past it is DEFINED");
-            assert_eq!(&r[4..8], &[g(3), g(4), g(5), g(6)], "the pair moved off offset 3, row {v}");
-            assert_eq!(&r[8..10], &[(0xc0 + v) as u8, 0xc9], "the second stream, row {v}");
+            assert_eq!(
+                &r[0..3],
+                &[g(0), g(1), g(2)],
+                "the U8x3 at its own slot, row {v}"
+            );
+            assert_eq!(
+                r[3], 0,
+                "the byte a widened uint8x4 fetch reads past it is DEFINED"
+            );
+            assert_eq!(
+                &r[4..8],
+                &[g(3), g(4), g(5), g(6)],
+                "the pair moved off offset 3, row {v}"
+            );
+            assert_eq!(
+                &r[8..10],
+                &[(0xc0 + v) as u8, 0xc9],
+                "the second stream, row {v}"
+            );
             assert_eq!(&r[10..12], &[0, 0], "and the tail pad is DEFINED too");
         }
     }
@@ -7830,12 +8430,30 @@ mod texture_snapshot_stamp_tests {
         }
         mem.bytes[13 * PAGE + 64..][..4].copy_from_slice(&[0x5d, 0x81, 0x4f, 0xff]);
         let streams = [
-            VertexStreamInfo { stride: 16, column: 16, per_instance: false },
-            VertexStreamInfo { stride: 68, column: 68, per_instance: true },
+            VertexStreamInfo {
+                stride: 16,
+                column: 16,
+                per_instance: false,
+            },
+            VertexStreamInfo {
+                stride: 68,
+                column: 68,
+                per_instance: true,
+            },
         ];
         let layout = RowLayout::new(vec![
-            ScatterPiece { stream: 0, src: 0, dst: 0, len: 16 },
-            ScatterPiece { stream: 1, src: 64, dst: 16, len: 4 },
+            ScatterPiece {
+                stream: 0,
+                src: 0,
+                dst: 0,
+                len: 16,
+            },
+            ScatterPiece {
+                stream: 1,
+                src: 64,
+                dst: 16,
+                len: 4,
+            },
         ]);
         let _base = [0u32, 16];
         let stride = 20u32;
@@ -7873,21 +8491,51 @@ mod texture_snapshot_stamp_tests {
         }
         mem.bytes[13 * PAGE..][..2].copy_from_slice(&[0xab, 0xcd]);
         let streams = [
-            VertexStreamInfo { stride: 4, column: 4, per_instance: false },
-            VertexStreamInfo { stride: 2, column: 2, per_instance: true },
+            VertexStreamInfo {
+                stride: 4,
+                column: 4,
+                per_instance: false,
+            },
+            VertexStreamInfo {
+                stride: 2,
+                column: 2,
+                per_instance: true,
+            },
         ];
         let base = [0u32, 4];
         // Rows 7 and 9 are one run (8 bytes apart); 5000 is a second read.
         let gather = [7u32, 9, 5000];
-        let idx = DrawIndices { bytes: Arc::from(&[][..]), first_vertex: 0, vertex_count: 3, gather: Some(Arc::from(&gather[..])) };
+        let idx = DrawIndices {
+            bytes: Arc::from(&[][..]),
+            first_vertex: 0,
+            vertex_count: 3,
+            gather: Some(Arc::from(&gather[..])),
+        };
         let rows = {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
-            snaps.read_draw_vertices(&ctx, &idx, false, &streams, &[a0, a1], &base, &RowLayout::columns(&streams, &base), 6)
+            snaps.read_draw_vertices(
+                &ctx,
+                &idx,
+                false,
+                &streams,
+                &[a0, a1],
+                &base,
+                &RowLayout::columns(&streams, &base),
+                6,
+            )
         };
         assert_eq!(rows.len(), 18);
         for (k, g) in gather.iter().enumerate() {
-            assert_eq!(u32::from_le_bytes(rows[k * 6..][..4].try_into().unwrap()), *g, "row {k}");
-            assert_eq!(&rows[k * 6 + 4..k * 6 + 6], &[0xab, 0xcd], "instance row repeats into row {k}");
+            assert_eq!(
+                u32::from_le_bytes(rows[k * 6..][..4].try_into().unwrap()),
+                *g,
+                "row {k}"
+            );
+            assert_eq!(
+                &rows[k * 6 + 4..k * 6 + 6],
+                &[0xab, 0xcd],
+                "instance row repeats into row {k}"
+            );
         }
     }
 
@@ -7947,9 +8595,16 @@ mod texture_snapshot_stamp_tests {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
             snaps.get_or_read(&ctx, 0, len)
         };
-        assert!(!Arc::ptr_eq(&first, &third), "changed bytes are a new buffer");
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "changed bytes are a new buffer"
+        );
         assert_eq!(third[PAGE + 7], 0xAB, "the changed byte is the guest's");
-        assert_eq!(&third[..PAGE], &mem.bytes[..PAGE], "the untouched page is carried over");
+        assert_eq!(
+            &third[..PAGE],
+            &mem.bytes[..PAGE],
+            "the untouched page is carried over"
+        );
         assert_eq!(
             &third[2 * PAGE..len],
             &mem.bytes[2 * PAGE..len],
@@ -7965,7 +8620,10 @@ mod texture_snapshot_stamp_tests {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
             snaps.get_or_read(&ctx, 0, len)
         };
-        assert!(Arc::ptr_eq(&third, &fourth), "an untouched texture is the same buffer");
+        assert!(
+            Arc::ptr_eq(&third, &fourth),
+            "an untouched texture is the same buffer"
+        );
     }
 
     /// >>> THE REGRESSION THIS EXISTS FOR: one epoch per SCENE, not one per snapshot.
@@ -7992,7 +8650,11 @@ mod texture_snapshot_stamp_tests {
             }
         }
         assert_eq!(c.bumps.get(), 4, "one epoch per scene, four scenes");
-        assert_eq!(c.wraps.get(), 0, "254 values must comfortably outlast four scenes");
+        assert_eq!(
+            c.wraps.get(),
+            0,
+            "254 values must comfortably outlast four scenes"
+        );
     }
 
     /// An unchanged texture must be proved unchanged WITHOUT its bytes being compared, and the
@@ -8017,7 +8679,10 @@ mod texture_snapshot_stamp_tests {
         for _ in 0..3 {
             snaps.begin_scene();
             let again = snaps.get_or_read(&ctx, 8 * PAGE as u32, 2048);
-            assert!(Arc::ptr_eq(&first, &again), "an unchanged texture must be the SAME buffer");
+            assert!(
+                Arc::ptr_eq(&first, &again),
+                "an unchanged texture must be the SAME buffer"
+            );
         }
         assert_eq!(
             c.borrows.get(),
@@ -8052,7 +8717,10 @@ mod texture_snapshot_stamp_tests {
         let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
         snaps.begin_scene();
         let again = snaps.get_or_read(&ctx, addr, 2048);
-        assert!(!Arc::ptr_eq(&first, &again), "a written texture must be re-read");
+        assert!(
+            !Arc::ptr_eq(&first, &again),
+            "a written texture must be re-read"
+        );
         assert_eq!(again[7], 0xAB, "and it must carry the new byte");
 
         // Having been re-read, it must go back to being provably clean rather than paying the
@@ -8063,7 +8731,11 @@ mod texture_snapshot_stamp_tests {
             let stable = snaps.get_or_read(&ctx, addr, 2048);
             assert!(Arc::ptr_eq(&again, &stable));
         }
-        assert_eq!(c.borrows.get(), settled, "it must re-stamp clean after the re-read");
+        assert_eq!(
+            c.borrows.get(),
+            settled,
+            "it must re-stamp clean after the re-read"
+        );
     }
 
     /// Static geometry must be read ONCE and then proved unchanged, handing back the same buffer.
@@ -8085,7 +8757,10 @@ mod texture_snapshot_stamp_tests {
             snaps.begin_scene();
             for _ in 0..10 {
                 let again = snaps.get_or_read_vertices(&ctx, addr, 4096);
-                assert!(Arc::ptr_eq(&first, &again), "static geometry must be the SAME buffer");
+                assert!(
+                    Arc::ptr_eq(&first, &again),
+                    "static geometry must be the SAME buffer"
+                );
             }
         }
     }
@@ -8129,34 +8804,78 @@ mod texture_snapshot_stamp_tests {
             }
         }
         let streams = [
-            VertexStreamInfo { stride: 4, column: 4, per_instance: false },
-            VertexStreamInfo { stride: 2, column: 2, per_instance: false },
+            VertexStreamInfo {
+                stride: 4,
+                column: 4,
+                per_instance: false,
+            },
+            VertexStreamInfo {
+                stride: 2,
+                column: 2,
+                per_instance: false,
+            },
         ];
         let base = [0u32, 4];
         // A LONG draw first, so the scratch is left holding its bytes for the short one below.
         let long = {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
-            snaps.gather_into_scratch(&ctx, &streams, &[a0, a1], &RowLayout::columns(&streams, &base), 6, 0, 8)
+            snaps.gather_into_scratch(
+                &ctx,
+                &streams,
+                &[a0, a1],
+                &RowLayout::columns(&streams, &base),
+                6,
+                0,
+                8,
+            )
         };
         assert_eq!(long.len(), 48);
         let expected = long.clone();
         for v in 0..8usize {
-            assert_eq!(&long[v * 6..v * 6 + 4], &mem.bytes[12 * PAGE + v * 4..][..4], "row {v} stream 0");
-            assert_eq!(&long[v * 6 + 4..v * 6 + 6], &mem.bytes[13 * PAGE + v * 2..][..2], "row {v} stream 1");
+            assert_eq!(
+                &long[v * 6..v * 6 + 4],
+                &mem.bytes[12 * PAGE + v * 4..][..4],
+                "row {v} stream 0"
+            );
+            assert_eq!(
+                &long[v * 6 + 4..v * 6 + 6],
+                &mem.bytes[13 * PAGE + v * 2..][..2],
+                "row {v} stream 1"
+            );
         }
         snaps.interleave_scratch = long;
 
         // PER-INSTANCE: stream 1 now steps by instance, so every vertex reads its row 0.
         let per_instance = [
-            VertexStreamInfo { stride: 4, column: 4, per_instance: false },
-            VertexStreamInfo { stride: 2, column: 2, per_instance: true },
+            VertexStreamInfo {
+                stride: 4,
+                column: 4,
+                per_instance: false,
+            },
+            VertexStreamInfo {
+                stride: 2,
+                column: 2,
+                per_instance: true,
+            },
         ];
         let inst = {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
-            snaps.gather_into_scratch(&ctx, &per_instance, &[a0, a1], &RowLayout::columns(&per_instance, &base), 6, 0, 4)
+            snaps.gather_into_scratch(
+                &ctx,
+                &per_instance,
+                &[a0, a1],
+                &RowLayout::columns(&per_instance, &base),
+                6,
+                0,
+                4,
+            )
         };
         for v in 0..4usize {
-            assert_eq!(&inst[v * 6 + 4..v * 6 + 6], &mem.bytes[13 * PAGE..][..2], "row {v} is instance 0");
+            assert_eq!(
+                &inst[v * 6 + 4..v * 6 + 6],
+                &mem.bytes[13 * PAGE..][..2],
+                "row {v} is instance 0"
+            );
         }
         snaps.interleave_scratch = inst;
 
@@ -8165,10 +8884,22 @@ mod texture_snapshot_stamp_tests {
         let past_end = mem.bytes.len() as u32;
         let short = {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
-            snaps.gather_into_scratch(&ctx, &streams, &[a0, past_end], &RowLayout::columns(&streams, &base), 6, 0, 4)
+            snaps.gather_into_scratch(
+                &ctx,
+                &streams,
+                &[a0, past_end],
+                &RowLayout::columns(&streams, &base),
+                6,
+                0,
+                4,
+            )
         };
         for v in 0..4usize {
-            assert_eq!(&short[v * 6..v * 6 + 4], &mem.bytes[12 * PAGE + v * 4..][..4], "row {v} stream 0");
+            assert_eq!(
+                &short[v * 6..v * 6 + 4],
+                &mem.bytes[12 * PAGE + v * 4..][..4],
+                "row {v} stream 0"
+            );
             assert_eq!(
                 &short[v * 6 + 4..v * 6 + 6],
                 &[0, 0],
@@ -8207,9 +8938,20 @@ mod texture_snapshot_stamp_tests {
         );
         let merged = {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
-            snaps.gather_into_scratch(&ctx, &streams, &[adj0, adj1], &RowLayout::columns(&streams, &base), 6, 0, 8)
+            snaps.gather_into_scratch(
+                &ctx,
+                &streams,
+                &[adj0, adj1],
+                &RowLayout::columns(&streams, &base),
+                6,
+                0,
+                8,
+            )
         };
-        assert_eq!(merged, expected, "one read of the union must interleave exactly as two reads do");
+        assert_eq!(
+            merged, expected,
+            "one read of the union must interleave exactly as two reads do"
+        );
     }
 
     #[test]
@@ -8231,7 +8973,10 @@ mod texture_snapshot_stamp_tests {
             mem.guest_store(12 * PAGE + 5, round);
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
             let v = snaps.get_or_read_vertices(&ctx, addr, 1024);
-            assert_eq!(v[5], round, "a mid-scene rewrite must be visible to the next draw");
+            assert_eq!(
+                v[5], round,
+                "a mid-scene rewrite must be visible to the next draw"
+            );
         }
     }
 
@@ -8258,7 +9003,10 @@ mod texture_snapshot_stamp_tests {
         let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
         snaps.begin_scene();
         let again = snaps.get_or_read_vertices(&ctx, addr, 1024);
-        assert!(Arc::ptr_eq(&first, &again), "identical bytes must keep the same buffer");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "identical bytes must keep the same buffer"
+        );
     }
 
     /// >>> AN UNCHANGED PALETTED TEXTURE MUST KEEP ONE EXPANSION AND ONE IDENTITY.
@@ -8293,13 +9041,18 @@ mod texture_snapshot_stamp_tests {
         // field vitasdk declares. The exact format is handed in, which is what the runtime does
         // whenever the guest's own `sceGxmTextureInitP8` call was seen.
         let words = [0u32, (3 << 29) | (3 << 12) | 3, tex, pal >> 6];
-        let binding = TextureBinding { unit: 0, addr: 0x1000, words, from_precomputed: false };
+        let binding = TextureBinding {
+            unit: 0,
+            addr: 0x1000,
+            words,
+            from_precomputed: false,
+        };
         let fmt = Some(crate::render::P8 << 24);
 
         let decode = |snaps: &mut TextureSnapshots,
-                          mem: &mut StampedMemory,
-                          regs: &mut [u32; REG_COUNT],
-                          vfp: &mut [u32; VFP_ARG_COUNT]| {
+                      mem: &mut StampedMemory,
+                      regs: &mut [u32; REG_COUNT],
+                      vfp: &mut [u32; VFP_ARG_COUNT]| {
             let ctx = ctx_over(regs, vfp, mem);
             snaps.begin_scene();
             decode_texture(&ctx, snaps, &binding, fmt, None, 0).expect("a P8 texture decodes")
@@ -8307,20 +9060,37 @@ mod texture_snapshot_stamp_tests {
 
         let first = decode(&mut snaps, &mut mem, &mut regs, &mut vfp);
         let again = decode(&mut snaps, &mut mem, &mut regs, &mut vfp);
-        assert_eq!(first.base_format, crate::render::U8U8U8U8, "expanded to RGBA8");
-        assert_eq!(first.pixels_id, again.pixels_id, "an unchanged expansion keeps its identity");
+        assert_eq!(
+            first.base_format,
+            crate::render::U8U8U8U8,
+            "expanded to RGBA8"
+        );
+        assert_eq!(
+            first.pixels_id, again.pixels_id,
+            "an unchanged expansion keeps its identity"
+        );
         assert!(Arc::ptr_eq(&first.pixels, &again.pixels), "and its buffer");
 
         // The PALETTE moves under a texture whose own bytes never do.
         mem.guest_store(pal as usize + 1, 99);
         let repalette = decode(&mut snaps, &mut mem, &mut regs, &mut vfp);
-        assert_ne!(first.pixels_id, repalette.pixels_id, "new colours are a new buffer");
-        assert_ne!(&first.pixels[..], &repalette.pixels[..], "and they are actually different");
+        assert_ne!(
+            first.pixels_id, repalette.pixels_id,
+            "new colours are a new buffer"
+        );
+        assert_ne!(
+            &first.pixels[..],
+            &repalette.pixels[..],
+            "and they are actually different"
+        );
 
         // And the INDICES move.
         mem.guest_store(tex as usize + 5, 3);
         let reindex = decode(&mut snaps, &mut mem, &mut regs, &mut vfp);
-        assert_ne!(repalette.pixels_id, reindex.pixels_id, "new indices are a new buffer");
+        assert_ne!(
+            repalette.pixels_id, reindex.pixels_id,
+            "new indices are a new buffer"
+        );
     }
 
     /// Freed guest memory must not keep serving its old geometry.
@@ -8340,7 +9110,10 @@ mod texture_snapshot_stamp_tests {
         snaps.invalidate_range(addr, 1024);
         let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
         let again = snaps.get_or_read_vertices(&ctx, addr, 1024);
-        assert!(!Arc::ptr_eq(&first, &again), "a freed range must be re-read");
+        assert!(
+            !Arc::ptr_eq(&first, &again),
+            "a freed range must be re-read"
+        );
     }
 
     /// An address whose new bytes are recognised through the CONTENT index (they equal a buffer
@@ -8359,7 +9132,12 @@ mod texture_snapshot_stamp_tests {
         {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
             snaps.begin_scene();
-            assert!(snaps.get_or_read_vertices(&ctx, a as u32, 64).iter().all(|&v| v == 0));
+            assert!(
+                snaps
+                    .get_or_read_vertices(&ctx, a as u32, 64)
+                    .iter()
+                    .all(|&v| v == 0)
+            );
             snaps.get_or_read_vertices(&ctx, b as u32, 64);
         }
         for i in 0..64 {
@@ -8368,12 +9146,19 @@ mod texture_snapshot_stamp_tests {
         {
             let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
             snaps.begin_scene();
-            assert_eq!(snaps.get_or_read_vertices(&ctx, a as u32, 64)[5], 6, "the new bytes, via the content index");
+            assert_eq!(
+                snaps.get_or_read_vertices(&ctx, a as u32, 64)[5],
+                6,
+                "the new bytes, via the content index"
+            );
         }
         let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
         snaps.begin_scene();
         let again = snaps.get_or_read_vertices(&ctx, a as u32, 64);
-        assert_eq!(again[5], 6, "a later read with no store between must not hand back the address's OLD snapshot");
+        assert_eq!(
+            again[5], 6,
+            "a later read with no store between must not hand back the address's OLD snapshot"
+        );
     }
 
     /// A texture whose page is written EVERY scene must be re-read every scene - the mechanism
@@ -8556,7 +9341,8 @@ impl SaUniformLayout {
     fn none() -> std::sync::Arc<Self> {
         use std::sync::{Arc, OnceLock};
         static NONE: OnceLock<Arc<SaUniformLayout>> = OnceLock::new();
-        NONE.get_or_init(|| Arc::new(SaUniformLayout::default())).clone()
+        NONE.get_or_init(|| Arc::new(SaUniformLayout::default()))
+            .clone()
     }
 }
 
@@ -8607,7 +9393,9 @@ fn yield_elide_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            vitaslop_platform::knobs::var("VITASLOP_YIELD_ELIDE").as_deref().map(str::trim),
+            vitaslop_platform::knobs::var("VITASLOP_YIELD_ELIDE")
+                .as_deref()
+                .map(str::trim),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
     })
@@ -8757,7 +9545,8 @@ pub struct VitaState {
     /// here before `sceGxmEndScene` returns. Only scenes whose colour target fits the
     /// write-back cap take this path; the frame render then skips them
     /// (`Scene::completed_early`). `None` on a frontend without a renderer.
-    pub complete_scene_now: Option<Box<dyn FnMut(&[crate::capture::Scene]) -> Vec<(u32, u32, u32, Vec<u8>)> + Send>>,
+    pub complete_scene_now:
+        Option<Box<dyn FnMut(&[crate::capture::Scene]) -> Vec<(u32, u32, u32, Vec<u8>)> + Send>>,
     /// The ASYNC form of the same completion, for a frontend whose readback cannot block (the
     /// browser: a GPU map resolves on a later event-loop turn). When set, a small target's
     /// `sceGxmEndScene` records the batch in `pending_early` and BLOCKS the calling thread;
@@ -8964,6 +9753,10 @@ pub struct VitaState {
     ///
     /// Zero until a context exists. A draw before then is reported, not guessed at.
     gxm_context: u32,
+    /// `sceGxmCreateDeferredContext` contexts, by address (see [`Self::is_deferred_context`]).
+    pub(crate) deferred_contexts: FxHashMap<u32, DeferredContext>,
+    /// Ended command lists, by the id their `SceGxmCommandList` carries.
+    pub(crate) command_lists: Vec<Vec<RecordedDraw>>,
     /// Whether a draw with no context has already been reported, so the report is once.
     reported_no_gxm_context: bool,
     /// Whether a draw whose fragment program DECLARES samplers but whose binding list came
@@ -9080,6 +9873,9 @@ pub struct VitaState {
     /// [`create_event_flag`](Self::create_event_flag)). Kept beside `event_flags` rather
     /// than in it so no waiter/set path pays for a string it never reads.
     event_flag_names: std::collections::BTreeMap<i32, String>,
+    /// Each event flag's creation `(attr, initPattern)`, for `sceKernelGetEventFlagInfo`. Kept
+    /// beside `event_flags` for the same reason as the names.
+    event_flag_params: std::collections::BTreeMap<i32, (u32, u32)>,
     /// One bit per open SceCommonDialog family (see `vita::services::DialogFamily`):
     /// set by `*DialogInit`, read by `*DialogGetStatus` (RUNNING for a short while, then
     /// FINISHED - see `vita::services::dialog_get_status`), cleared by `*DialogTerm`.
@@ -9157,6 +9953,12 @@ pub struct VitaState {
     ngs_cb_next_slot: u32,
     ngs_cb_queue: std::collections::VecDeque<(u32, u32)>,
     ngs_cb_running: Option<i32>,
+    /// Per thread: the NGS callbacks its `sceAudioOutOutput` is running on it, as
+    /// `(entry, info slot)` - see [`VitaState::ngs_sync_stash`].
+    ngs_sync: std::collections::HashMap<i32, Vec<(u32, u32)>>,
+    /// The info ring those callbacks read their `SceNgsCallbackInfo` from, and its cursor.
+    ngs_sync_slots: u32,
+    ngs_sync_next: u32,
     // Registered service-state callbacks (preemptive mode). A title registers
     // these at boot and pumps them every frame (`sce*CheckCallback`), waiting for
     // the one-time state notification (offline: signed-out / disconnected) before
@@ -9176,6 +9978,17 @@ pub struct VitaState {
     /// `(callback thread, callback uid)` for every callback currently being delivered, so
     /// its return value can be applied when the delivery thread ends.
     kcb_threads: Vec<(i32, i32)>,
+    /// `sceKernelRegisterThreadEventHandler` registrations, in registration order.
+    thread_event_handlers: Vec<ThreadEventHandler>,
+    /// Threads whose EXIT handlers have been handed out ([`Self::thread_exit_event_calls`]):
+    /// each thread ends once, so a handler that itself calls `sceKernelExitThread`, or an
+    /// exit followed by the engine's own end-of-thread, does not run them again. A restart
+    /// ([`Self::start_thread`]) is a new run that ends again, so it clears the thread's entry.
+    thread_exit_events_done: std::collections::HashSet<i32>,
+    /// The initial thread is still running a module's `module_start` before the last one
+    /// ([`Self::note_thread_entry`]): an `sceKernelExitThread` there ends that initializer,
+    /// not the thread, so it owes no EXIT handlers.
+    main_initializing: bool,
     pending_spawns: Vec<Reentry>,
     /// Fiber threads and the REAL thread that first ran them: `(fiber thid, runner)`. A fiber
     /// is not a thread on the hardware - it runs on its caller's core at its caller's priority -
@@ -9209,6 +10022,10 @@ pub struct VitaState {
     addcont: Vec<String>,
     // In-memory savedata slot metadata (SceAppUtil), so a created slot round-trips on get.
     savedata: SaveDataStore,
+    /// SceAppUtil safe memory: [`SAFE_MEMORY_SIZE`] bytes once the title has written any
+    /// (empty until then, which reads as zeroes), and whether it changed since the last flush.
+    safe_memory: Vec<u8>,
+    safe_memory_dirty: bool,
     /// SceNpTrophy: the sets read out of the title's own TRP plus this run's unlock
     /// ledger. Public to the NID handlers in `vita/services.rs`.
     pub(crate) trophies: crate::trophy::TrophyStore,
@@ -9281,11 +10098,16 @@ pub struct VitaState {
     /// The modules in the linked image (from [`crate::link::LinkedProgram`]), which
     /// is what the kernel's module queries answer from. Set once before the run.
     modules: Vec<crate::link::LoadedModule>,
-    /// Per-`(thread, key)` thread-local storage slots handed out by
-    /// `sceKernelGetTLSAddr`. Each is a distinct zero-initialized guest block whose
-    /// address is stable across calls, so a thread stores and reads back its own
-    /// TLS pointer faithfully.
-    tls_slots: Vec<((i32, u32), u32)>,
+    /// The title's function imports with no dispatch arm (from
+    /// [`crate::link::LinkedProgram::unhandled_imports`]), so the report of the one that
+    /// stopped the run can name every other one the title could stop on.
+    unhandled_imports: Vec<(u32, u32)>,
+    /// Per-thread key-slot arrays behind `sceKernelGetTLSAddr`: `(thread, base)`, where key
+    /// `k` is the pointer slot at `base + 4*k`. ONE zero-initialized array per thread, not a
+    /// block per key: a caller may treat consecutive keys as one struct (a bundled libc keeps
+    /// a `{array, count, generation}` triple in three adjacent keys), so key `k+1` must be the
+    /// word after key `k`.
+    tls_slots: Vec<(i32, u32)>,
     /// The main executable's TLS template `(init image address, initialized byte
     /// count, full block size)`, from [`crate::link::LinkedProgram::tls_template`].
     /// Each thread gets a private block of `memsz` bytes; the compiler reaches
@@ -9335,7 +10157,11 @@ pub struct VitaState {
     /// the `Draw` it lands in, and a run of draws inside one pass carries the identical state.
     /// Two `memcmp`s (132 + 24 bytes, the two contiguous regions the state occupies) answer
     /// "the same as last time?", and a hit is an `Arc` clone instead of a parse and a copy.
-    render_state_memo: Option<(Box<[u8]>, Box<[u8]>, std::sync::Arc<crate::capture::RenderState>)>,
+    render_state_memo: Option<(
+        Box<[u8]>,
+        Box<[u8]>,
+        std::sync::Arc<crate::capture::RenderState>,
+    )>,
     /// Scratch for decoding a draw's vertex uniform bank into floats.
     ///
     /// The bank is read as BYTES (that is what the recompiled shader wants) and the reflection
@@ -9368,10 +10194,6 @@ pub struct VitaState {
     /// race that is ~644 draws a frame, and in the browser an allocation is a good deal dearer
     /// than it is here.
     texture_unit_scratch: Vec<(TextureBinding, Option<u32>, Option<(i64, u32)>, u32)>,
-    /// The one piece of per-texture state that cannot be packed into the guest's own control
-    /// words - see [`TextureExtra`]. Everything the sampler getters used to read from here now
-    /// lives in the guest's `SceGxmTexture`, where the hardware keeps it.
-    texture_extra: std::collections::HashMap<u32, TextureExtra>,
     /// Per-color-surface gamma-correction mode set by `sceGxmColorSurfaceSetGammaMode`, as
     /// `(SceGxmColorSurface*, data address, mode)`. Absent = SCE_GXM_COLOR_SURFACE_GAMMA_NONE.
     ///
@@ -9399,6 +10221,14 @@ pub struct VitaState {
     texture_snapshots: Arc<std::sync::Mutex<TextureSnapshots>>,
     /// Every guest stack handed out - see [`GuestStacks`]. Shared with `texture_snapshots`.
     guest_stacks: GuestStacks,
+    /// `sceGxmSetYuvProfile`: the `SceGxmYuvProfile` of each of the two YUV conversion slots
+    /// (`CSC0`/`CSC1`, which a YUV texture's swizzle selects). Both start at 0,
+    /// `SCE_GXM_YUV_PROFILE_BT601_STANDARD`, the conversion used before any call.
+    pub(crate) yuv_profiles: [u32; 2],
+    /// Every precomputed-state ARRAYS block this engine has allocated, with the state struct
+    /// address it was allocated FOR - see [`Self::ensure_state_block`] for why a block pointer
+    /// read out of guest memory is trusted only when it is in here.
+    precomputed_state_blocks: std::collections::HashMap<u32, u32>,
     /// Frame boundaries owed to [`Self::texture_snapshots`] because it was held when the flip
     /// came - applied by the next `snaps!`.
     ///
@@ -9504,6 +10334,24 @@ pub struct VitaState {
     adhoc_matchings: Vec<(i32, bool)>,
     net_resolvers: Vec<(i32, i32)>,
     net_epolls: Vec<(i32, Vec<i32>)>,
+    /// Epolls carrying a preserved `sceNetEpollAbort`, which the next wait on them consumes.
+    net_epoll_aborted: Vec<i32>,
+    /// Threads parked in `sceNetEpollWait`, as `(thid, eid)`. A timed wait is ALSO in
+    /// `sleep_waiters` (its deadline wakes it with 0 events); an untimed one waits only here.
+    /// `sceNetEpollAbort` / `Destroy` wake every waiter on the epoll with EINTR.
+    net_epoll_waiters: Vec<(i32, i32)>,
+    /// The touch panels' contact ids, per port: `(world id, panel id)` of each finger down at the
+    /// last sample, and the next id a NEW contact gets - see `vita::touch::panel_ids`.
+    pub(crate) touch_contacts: [Vec<(u8, u8)>; 2],
+    pub(crate) touch_next_id: u8,
+    /// Ports whose FORCE output the title switched on (`sceTouchEnableTouchForce`); a report
+    /// on any other port carries force 0.
+    pub(crate) touch_force: [bool; 2],
+    /// The last sample each panel handed the guest, `(timestamp us, the SceTouchData bytes)`,
+    /// so a read can report the samples taken SINCE it - see `vita::touch::fill_touch`.
+    pub(crate) touch_last: [Option<(u64, Vec<u8>)>; 2],
+    /// Epolls created so far, destroyed ones included, so an id is never handed out twice.
+    net_epoll_minted: i32,
     net_errno: Vec<(i32, u32)>,
     /// The offline SceHttp object graph: templates, connections and requests. See
     /// `vita::http` for what is real in it and what reports the link being down.
@@ -9515,6 +10363,8 @@ pub struct VitaState {
     /// set them; the device's defaults until it does. Held so a getter answers with
     /// what the setter was given.
     pub power_clocks: [u32; 4],
+    /// `scePowerSetUsingWireless`, read back by `scePowerGetUsingWireless`.
+    pub power_using_wireless: bool,
     /// `sceMotionSetDeadband` / `sceMotionSetTiltCorrection`: the two tuning bits, held
     /// for the same reason the magnetometer bit is - each has a getter, and a title told
     /// its setting did not take has been told two different things. Both change nothing
@@ -9542,6 +10392,10 @@ pub struct VitaState {
     /// The `sce::Xml` DOM: the node arena every parsed document lives in, plus the
     /// interned guest copies of the strings handed back. See `vita::sce_xml`.
     pub xml: crate::vita::sce_xml::XmlState,
+    /// NpCommon/NpBasic/NpCommerce2/Lookup/WordFilter/Near state - see `vita::np`.
+    pub np: crate::vita::np::NpState,
+    /// The on-screen keyboard a game has open - see `vita::ime`.
+    pub ime: crate::vita::ime::ImeState,
     /// Every `SceFiber` the guest has initialised (see [`FiberRec`]).
     fibers: Vec<FiberRec>,
     /// Per THREAD that called `sceFiberRun`, the `argOnRun` out-pointer to fill when
@@ -9616,7 +10470,7 @@ pub struct VitaState {
     /// `(wait kind, thread id)`. See [`VitaState::idle_attribution`].
     idle_by_owner: Vec<(IdleOwner, u64, u64)>,
     /// The current display-frame index, updated each flip by the scheduler
-    /// (`on_frame_boundary`). Frame-tags egress-ledger events so a recipe can assert
+    /// (`on_frame_boundary`). Frame-tags egress-ledger events so a check can establish
     /// roughly when a milestone occurred, not only that it did.
     cur_frame: u64,
     /// Said once when the display-callback backlog reached its data ring's depth - see
@@ -9627,6 +10481,8 @@ pub struct VitaState {
     /// its own past out of this ring, and a ring that repeats the present has no edges in
     /// it.
     pub(crate) ctrl_history: crate::vita::ctrl::CtrlHistory,
+    /// `sceCtrlSetSamplingMode` / `...Ext`: each starts DIGITAL (sticks not sampled).
+    pub(crate) ctrl_sampling_mode: [u32; 2],
 }
 
 /// The ceiling on a default uniform buffer, in 4-byte registers. A program header or parameter
@@ -9691,8 +10547,12 @@ impl VitaState {
         let top = base.wrapping_add(mem_bytes);
         guest_stacks.note(top.wrapping_sub(Self::MAIN_STACK_RESERVE_BYTES), top);
         VitaState {
-            texture_snapshots: Arc::new(std::sync::Mutex::new(TextureSnapshots::with_stacks(guest_stacks.clone()))),
+            texture_snapshots: Arc::new(std::sync::Mutex::new(TextureSnapshots::with_stacks(
+                guest_stacks.clone(),
+            ))),
             guest_stacks,
+            yuv_profiles: [0, 0],
+            precomputed_state_blocks: std::collections::HashMap::new(),
             complete_scene_now: None,
             complete_scene_async: false,
             pending_early: None,
@@ -9744,6 +10604,8 @@ impl VitaState {
             display_queue_cb_data_size: 0,
             scene: None,
             gxm_context: 0,
+            deferred_contexts: FxHashMap::default(),
+            command_lists: Vec::new(),
             reported_no_gxm_context: false,
             reported_draw_without_textures: false,
             texture_writes: TextureSlotWrites::default(),
@@ -9774,6 +10636,7 @@ impl VitaState {
             timers: Vec::new(),
             event_flags: Vec::new(),
             event_flag_names: std::collections::BTreeMap::new(),
+            event_flag_params: std::collections::BTreeMap::new(),
             open_dialogs: 0,
             dialog_opened_flip: [0; 16],
             fios_overlays: Vec::new(),
@@ -9802,6 +10665,9 @@ impl VitaState {
             ngs_cb_next_slot: 0,
             ngs_cb_queue: std::collections::VecDeque::new(),
             ngs_cb_running: None,
+            ngs_sync: std::collections::HashMap::new(),
+            ngs_sync_slots: 0,
+            ngs_sync_next: 0,
             np_service_cb: None,
             np_cb_delivered: false,
             net_inet_cb: None,
@@ -9809,6 +10675,9 @@ impl VitaState {
             join_waiters: Vec::new(),
             kcallbacks: Vec::new(),
             kcb_threads: Vec::new(),
+            thread_event_handlers: Vec::new(),
+            thread_exit_events_done: std::collections::HashSet::new(),
+            main_initializing: false,
             pending_spawns: Vec::new(),
             spawn_near: Vec::new(),
             pending_wakes: Vec::new(),
@@ -9820,6 +10689,8 @@ impl VitaState {
             fs: FileTable::new(),
             addcont: Vec::new(),
             savedata: SaveDataStore::default(),
+            safe_memory: Vec::new(),
+            safe_memory_dirty: false,
             trophies: crate::trophy::TrophyStore::default(),
             mspaces: crate::mspace::MspaceStore::default(),
             fonts: crate::font::FontLibrary::default(),
@@ -9841,6 +10712,7 @@ impl VitaState {
             main_priority: DEFAULT_THREAD_PRIORITY,
             main_affinity: 0,
             modules: Vec::new(),
+            unhandled_imports: Vec::new(),
             tls_slots: Vec::new(),
             tls_template: (0, 0, 0),
             tls_bases: Vec::new(),
@@ -9857,7 +10729,6 @@ impl VitaState {
             texture_formats: Default::default(),
             nearby_texture_cache: FxHashMap::default(),
             texture_unit_scratch: Vec::new(),
-            texture_extra: std::collections::HashMap::new(),
             color_surface_gamma: FxHashMap::default(),
             color_surface_gamma_by_data: FxHashMap::default(),
             snaps_frames_pending: std::sync::atomic::AtomicU32::new(0),
@@ -9887,6 +10758,7 @@ impl VitaState {
             http_objects: Vec::new(),
             motion_magnetometer: false,
             power_clocks: [333, 166, 111, 166],
+            power_using_wireless: false,
             motion_deadband: true,
             motion_angle_threshold: 0,
             msg_pipes: std::collections::BTreeMap::new(),
@@ -9897,7 +10769,16 @@ impl VitaState {
             shared_fb: None,
             motion_tilt_correction: true,
             xml: Default::default(),
+            np: Default::default(),
+            ime: Default::default(),
             net_epolls: Vec::new(),
+            net_epoll_aborted: Vec::new(),
+            net_epoll_waiters: Vec::new(),
+            touch_contacts: [Vec::new(), Vec::new()],
+            touch_next_id: 0,
+            touch_force: [false; 2],
+            touch_last: [None, None],
+            net_epoll_minted: 0,
             net_errno: Vec::new(),
             fibers: Vec::new(),
             fiber_run_out: std::collections::HashMap::new(),
@@ -9920,6 +10801,7 @@ impl VitaState {
             cur_frame: 0,
             reported_display_cb_overrun: false,
             ctrl_history: crate::vita::ctrl::CtrlHistory::default(),
+            ctrl_sampling_mode: [0; 2],
         }
     }
 
@@ -9959,7 +10841,11 @@ impl VitaState {
 
     /// Store the shader patcher's user-data word, replacing any previous one.
     pub fn set_shader_patcher_user_data(&mut self, patcher: u32, user_data: u32) {
-        match self.shader_patcher_user_data.iter_mut().find(|(h, _)| *h == patcher) {
+        match self
+            .shader_patcher_user_data
+            .iter_mut()
+            .find(|(h, _)| *h == patcher)
+        {
             Some(slot) => slot.1 = user_data,
             None => self.shader_patcher_user_data.push((patcher, user_data)),
         }
@@ -10011,6 +10897,16 @@ impl VitaState {
     /// from them. Set once before the run, alongside [`Self::set_process_param`].
     pub fn set_modules(&mut self, modules: Vec<crate::link::LoadedModule>) {
         self.modules = modules;
+    }
+
+    /// Record the linked image's unhandled function imports, for the unimplemented-NID report.
+    pub fn set_unhandled_imports(&mut self, imports: Vec<(u32, u32)>) {
+        self.unhandled_imports = imports;
+    }
+
+    /// The linked image's unhandled function imports - see [`Self::set_unhandled_imports`].
+    pub fn unhandled_imports(&self) -> &[(u32, u32)] {
+        &self.unhandled_imports
     }
 
     /// The module whose segments contain `addr`, and its SceUID, or `None` if the
@@ -10066,30 +10962,37 @@ impl VitaState {
         (self.tls_template.0, self.tls_template.1)
     }
 
-    /// The stable guest address of TLS slot `key` for the currently running thread,
-    /// allocating a fresh zero-initialized 4-byte pointer slot on first use. Guest
-    /// memory starts zeroed, so a never-written slot reads back as NULL.
-    pub fn tls_addr(&mut self, key: u32) -> u32 {
+    /// The stable guest address of TLS slot `key` for the currently running thread (see
+    /// [`tls_addr_of`](Self::tls_addr_of)).
+    pub fn tls_addr(&mut self, key: u32) -> Option<u32> {
         let current = self.current;
         self.tls_addr_of(current, key)
     }
 
-    /// The TLS slot of ANOTHER thread (`sceKernelGetThreadTLSAddr`); `thid` 0 is the
-    /// caller. Same table as [`tls_addr`](Self::tls_addr), so a slot a thread reads
-    /// through either call is the one slot.
-    pub fn tls_addr_of(&mut self, thid: i32, key: u32) -> u32 {
+    /// The TLS slot `key` of thread `thid` (`sceKernelGetThreadTLSAddr`; `thid` 0 is the
+    /// caller): word `key` of that thread's slot array, allocated zeroed on the thread's first
+    /// query, so a never-written slot reads back as NULL. `None` for a key past
+    /// [`TLS_KEY_MAX`], which has no slot.
+    pub fn tls_addr_of(&mut self, thid: i32, key: u32) -> Option<u32> {
+        if key > TLS_KEY_MAX {
+            return None;
+        }
         let thid = if thid == 0 { self.current } else { thid };
         // A fiber shares its runner's thread-local storage: on hardware it runs ON that
         // thread, so a slot it reads must be the same slot the runner writes.
         let thread = self.logical_thread(thid);
-        if let Some(&(_, addr)) = self.tls_slots.iter().find(|&&(k, _)| k == (thread, key)) {
-            return addr;
-        }
-        // A pointer-sized slot per key is what the low-level TLS API hands out; the
-        // caller stores its own per-thread pointer there.
-        let addr = self.galloc(4, 4);
-        self.tls_slots.push(((thread, key), addr));
-        addr
+        let base = match self.tls_slots.iter().find(|&&(t, _)| t == thread) {
+            Some(&(_, base)) => base,
+            None => {
+                let base = self.galloc((TLS_KEY_MAX + 1) * 4, 4);
+                if base == 0 {
+                    return None; // out of guest memory; galloc has already said so
+                }
+                self.tls_slots.push((thread, base));
+                base
+            }
+        };
+        Some(base + key * 4)
     }
 
     /// Delete a file from the virtual filesystem, reporting whether it was there.
@@ -10267,7 +11170,10 @@ impl VitaState {
     /// the whole time, and nothing asked for it to be saved.
     pub fn add_file(&mut self, path: &str, bytes: Vec<u8>) {
         let key = vfs_key(path);
-        self.fs.originals.insert(key.clone(), strip_app0(path).trim_start_matches('/').to_string());
+        self.fs.originals.insert(
+            key.clone(),
+            strip_app0(path).trim_start_matches('/').to_string(),
+        );
         self.fs.files.insert(key.clone(), bytes);
         self.fs.touch(&key);
         // An archive arrives as an ordinary file, so this is where a resident one is
@@ -10301,7 +11207,10 @@ impl VitaState {
     /// before the guest runs, after the title's own backing.
     pub fn add_addcont(&mut self, dir: &str, backing: Box<dyn FileBacking>) {
         self.note_addcont(dir);
-        self.fs.set_backing(Box::new(MountedBacking::new(&format!("addcont0:/{dir}"), backing)));
+        self.fs.set_backing(Box::new(MountedBacking::new(
+            &format!("addcont0:/{dir}"),
+            backing,
+        )));
     }
 
     /// Record the add-on `dir` as installed when its files are already served under
@@ -10332,7 +11241,12 @@ impl VitaState {
     pub fn io_open(&mut self, path: &str, flags: u32) -> i32 {
         let fd = self.fs.open(path, flags);
         tracing::trace!(target: "vitaslop::io", path, flags = format_args!("{flags:#x}"), fd, "open");
-        io_journal::push(|| format!("f{} t{:#x} open {path:?} {flags:#x} -> {fd}", self.cur_frame, self.current));
+        io_journal::push(|| {
+            format!(
+                "f{} t{:#x} open {path:?} {flags:#x} -> {fd}",
+                self.cur_frame, self.current
+            )
+        });
         fd
     }
 
@@ -10344,14 +11258,23 @@ impl VitaState {
 
     /// The path behind `fd` for a journal line, or `?`.
     fn journal_path(&self, fd: i32) -> String {
-        self.fs.open.get(&fd).map(|o| o.path.clone()).unwrap_or_else(|| "?".into())
+        self.fs
+            .open
+            .get(&fd)
+            .map(|o| o.path.clone())
+            .unwrap_or_else(|| "?".into())
     }
 
     /// sceIoRead: read up to `len` bytes; None on a bad/unreadable fd.
     pub fn io_read(&mut self, fd: i32, len: usize) -> Option<Vec<u8>> {
         let at = self.fs.open.get(&fd).map(|o| o.cursor as u64);
         let r = self.fs.read(fd, len);
-        let path = self.fs.open.get(&fd).map(|o| o.path.clone()).unwrap_or_default();
+        let path = self
+            .fs
+            .open
+            .get(&fd)
+            .map(|o| o.path.clone())
+            .unwrap_or_default();
         tracing::trace!(target: "vitaslop::io", fd, len, path, got = r.as_ref().map(|d| d.len()).unwrap_or(0), "read");
         io_journal::push(|| {
             format!(
@@ -10383,7 +11306,12 @@ impl VitaState {
         // the BYTES, and nothing else in the engine could show that: the arguments match, the
         // call count matches, and the divergence appears several thousand calls later.
         if tracing::enabled!(target: "vitaslop::io", tracing::Level::TRACE) {
-            let path = self.fs.open.get(&fd).map(|o| o.path.clone()).unwrap_or_default();
+            let path = self
+                .fs
+                .open
+                .get(&fd)
+                .map(|o| o.path.clone())
+                .unwrap_or_default();
             let head: Vec<String> = r
                 .as_ref()
                 .map(|d| d.iter().take(16).map(|b| format!("{b:02x}")).collect())
@@ -10439,27 +11367,34 @@ impl VitaState {
     /// Egress ledger: if the descriptor being closed was a writable file under a
     /// persisted mount (`savedata0:`/`ux0:`), record a [`SaveWrite`](crate::capture::EgressKind::SaveWrite)
     /// with the path, final size, and an ASCII preview - the title-agnostic,
-    /// human-readable "the game persisted state" signal a conformance recipe asserts
-    /// on. Close is the natural commit point (the whole file is present by then).
+    /// human-readable "the game persisted state" signal a conformance check reads.
+    /// Close is the natural commit point (the whole file is present by then).
     pub fn io_close(&mut self, fd: i32) -> i32 {
         if let Some(of) = self.fs.open.get(&fd)
-            && of.writable && is_persisted_mount(&of.path) {
-                let path = of.path.clone();
-                if let Some(data) = self.fs.files.get(&path) {
-                    let ev = crate::capture::EgressEvent {
-                        frame: self.cur_frame,
-                        kind: crate::capture::EgressKind::SaveWrite {
-                            path,
-                            bytes: data.len(),
-                            ascii: crate::capture::ascii_preview(data, 96),
-                        },
-                    };
-                    self.capture.egress.push(ev);
-                }
+            && of.writable
+            && is_persisted_mount(&of.path)
+        {
+            let path = of.path.clone();
+            if let Some(data) = self.fs.files.get(&path) {
+                let ev = crate::capture::EgressEvent {
+                    frame: self.cur_frame,
+                    kind: crate::capture::EgressKind::SaveWrite {
+                        path,
+                        bytes: data.len(),
+                        ascii: crate::capture::ascii_preview(data, 96),
+                    },
+                };
+                self.capture.egress.push(ev);
             }
+        }
         let path = self.journal_path(fd);
         let r = self.fs.close(fd);
-        io_journal::push(|| format!("f{} t{:#x} close fd{fd} {path:?} -> {r}", self.cur_frame, self.current));
+        io_journal::push(|| {
+            format!(
+                "f{} t{:#x} close fd{fd} {path:?} -> {r}",
+                self.cur_frame, self.current
+            )
+        });
         r
     }
 
@@ -10469,8 +11404,8 @@ impl VitaState {
     /// `io_close` is the commit point for the descriptor path and cannot see this one:
     /// `sceAppUtilSaveDataDataSave` hands over a buffer per file and never opens anything,
     /// so a title whose autosave uses it wrote its progress with the ledger recording
-    /// nothing - and the ledger is what `@assert egress SaveWrite` reads, so a conformance
-    /// recipe for such a title could not assert that it saved at all.
+    /// nothing - and the ledger is what a save check reads, so a conformance
+    /// run for such a title could not show that it saved at all.
     ///
     /// Gated on the mount, like every other exportable-state site: a title rewriting one of
     /// its own shipped assets is not a save.
@@ -10479,7 +11414,9 @@ impl VitaState {
         if !is_persisted_mount(&key) {
             return;
         }
-        let Some(data) = self.fs.files.get(&key) else { return };
+        let Some(data) = self.fs.files.get(&key) else {
+            return;
+        };
         let ev = crate::capture::EgressEvent {
             frame: self.cur_frame,
             kind: crate::capture::EgressKind::SaveWrite {
@@ -10497,7 +11434,26 @@ impl VitaState {
     /// flag was last cleared. One bool over three stores, so a persistence layer can ask
     /// every frame and pay nothing on the frames where the answer is no.
     pub fn game_data_dirty(&self) -> bool {
-        self.fs.dirty() || self.savedata.dirty() || self.trophies.dirty()
+        self.fs.dirty() || self.savedata.dirty() || self.trophies.dirty() || self.safe_memory_dirty
+    }
+
+    /// Copy `len` bytes of safe memory from `offset` (zeroes where the title never wrote).
+    /// The caller has range-checked against [`SAFE_MEMORY_SIZE`].
+    pub fn safe_memory_read(&self, offset: usize, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        if let Some(src) = self.safe_memory.get(offset..offset + len) {
+            out.copy_from_slice(src);
+        }
+        out
+    }
+
+    /// Write `bytes` into safe memory at `offset`, leaving the rest of it alone.
+    pub fn safe_memory_write(&mut self, offset: usize, bytes: &[u8]) {
+        if self.safe_memory.is_empty() {
+            self.safe_memory = vec![0u8; SAFE_MEMORY_SIZE];
+        }
+        self.safe_memory[offset..offset + bytes.len()].copy_from_slice(bytes);
+        self.safe_memory_dirty = true;
     }
 
     /// Clear the flag - call after the container has actually been written out, never
@@ -10506,6 +11462,7 @@ impl VitaState {
         self.fs.clear_dirty();
         self.savedata.clear_dirty();
         self.trophies.clear_dirty();
+        self.safe_memory_dirty = false;
     }
 
     /// Everything this run has saved, as a portable container's worth of state.
@@ -10516,6 +11473,7 @@ impl VitaState {
         let mut data = self.fs.collect_game_data();
         data.slots = self.savedata.all();
         data.trophies = self.trophies.all_unlocked();
+        data.safe_memory = self.safe_memory.clone();
         data
     }
 
@@ -10531,6 +11489,11 @@ impl VitaState {
             self.savedata.put(mount, *id, param.clone());
         }
         let trophies = self.trophies.restore_unlocked(&data.trophies);
+        // A container from somewhere else may carry a different size; keep what fits.
+        if !data.safe_memory.is_empty() {
+            let n = data.safe_memory.len().min(SAFE_MEMORY_SIZE);
+            self.safe_memory_write(0, &data.safe_memory[..n]);
+        }
         // A restore is not a change TO be saved - what was just read in is already in the
         // container it came from - so the dirty flags the puts above set are cleared here.
         // Leaving them set would make the first tick of every run rewrite storage.
@@ -10583,7 +11546,9 @@ impl VitaState {
     /// Replace a registered overlay's configuration, keeping its id. Returns whether
     /// the id resolved. The list is re-sorted because `order` may have changed.
     pub fn fios_overlay_modify(&mut self, id: i32, mut new_value: FiosOverlay) -> bool {
-        let Some(i) = self.fios_overlays.iter().position(|o| o.id == id) else { return false };
+        let Some(i) = self.fios_overlays.iter().position(|o| o.id == id) else {
+            return false;
+        };
         new_value.id = id;
         self.fios_overlays[i] = new_value;
         self.fios_overlays.sort_by_key(|o| o.order);
@@ -10650,18 +11615,20 @@ impl VitaState {
             return path.to_string();
         }
         let mut cur = path.to_string();
-        for o in self.fios_overlays.iter().filter(|o| o.order >= min_order && o.order <= max_order) {
-            let Some(rest) = strip_path_prefix(&cur, &o.dst) else { continue };
+        for o in self
+            .fios_overlays
+            .iter()
+            .filter(|o| o.order >= min_order && o.order <= max_order)
+        {
+            let Some(rest) = strip_path_prefix(&cur, &o.dst) else {
+                continue;
+            };
             let candidate = format!("{}{rest}", o.src);
             let exists = |p: &str| self.io_size(p).is_some() || self.io_is_dir(p);
             cur = match o.kind {
                 SCE_FIOS_OVERLAY_TYPE_OPAQUE => candidate,
                 SCE_FIOS_OVERLAY_TYPE_TRANSLUCENT | SCE_FIOS_OVERLAY_TYPE_WRITABLE => {
-                    if exists(&candidate) {
-                        candidate
-                    } else {
-                        cur
-                    }
+                    if exists(&candidate) { candidate } else { cur }
                 }
                 SCE_FIOS_OVERLAY_TYPE_NEWER => {
                     if exists(&cur) {
@@ -10741,7 +11708,12 @@ impl VitaState {
     pub fn io_dopen(&mut self, path: &str) -> i32 {
         let fd = self.fs.dopen(path);
         tracing::trace!(target: "vitaslop::io", path, fd, "dopen");
-        io_journal::push(|| format!("f{} t{:#x} dopen {path:?} -> {fd}", self.cur_frame, self.current));
+        io_journal::push(|| {
+            format!(
+                "f{} t{:#x} dopen {path:?} -> {fd}",
+                self.cur_frame, self.current
+            )
+        });
         fd
     }
 
@@ -10749,7 +11721,11 @@ impl VitaState {
     /// `Some(None)` = end of listing.
     pub fn io_dread(&mut self, fd: i32) -> Option<Option<DirEntry>> {
         let r = self.fs.dread(fd);
-        let name = match &r { Some(Some(e)) => e.name.clone(), Some(None) => "<end>".into(), None => "<badfd>".into() };
+        let name = match &r {
+            Some(Some(e)) => e.name.clone(),
+            Some(None) => "<end>".into(),
+            None => "<badfd>".into(),
+        };
         tracing::trace!(target: "vitaslop::io", fd, name, "dread");
         r
     }
@@ -10763,7 +11739,12 @@ impl VitaState {
     pub fn io_size(&self, path: &str) -> Option<u64> {
         let r = self.fs.size_of(path);
         tracing::trace!(target: "vitaslop::io", path, size = r.unwrap_or(u64::MAX), found = r.is_some(), "getstat");
-        io_journal::push(|| format!("f{} t{:#x} getstat {path:?} -> {r:?}", self.cur_frame, self.current));
+        io_journal::push(|| {
+            format!(
+                "f{} t{:#x} getstat {path:?} -> {r:?}",
+                self.cur_frame, self.current
+            )
+        });
         r
     }
 
@@ -10771,7 +11752,12 @@ impl VitaState {
     pub fn io_size_fd(&self, fd: i32) -> Option<u64> {
         let r = self.fs.size_of_fd(fd);
         io_journal::push(|| {
-            format!("f{} t{:#x} getstat fd{fd} {:?} -> {r:?}", self.cur_frame, self.current, self.journal_path(fd))
+            format!(
+                "f{} t{:#x} getstat fd{fd} {:?} -> {r:?}",
+                self.cur_frame,
+                self.current,
+                self.journal_path(fd)
+            )
         });
         r
     }
@@ -10954,7 +11940,10 @@ impl VitaState {
             if self.current == MAIN_THID {
                 self.main_affinity
             } else {
-                self.threads.iter().find(|t| t.uid == self.current).map_or(0, |t| t.cpu_affinity)
+                self.threads
+                    .iter()
+                    .find(|t| t.uid == self.current)
+                    .map_or(0, |t| t.cpu_affinity)
             }
         } else {
             cpu_affinity
@@ -10998,19 +11987,25 @@ impl VitaState {
     pub const FIBER_ERROR_STATE: i32 = 0x8059_0006u32 as i32;
 
     fn fiber_index(&self, addr: u32) -> Option<usize> {
-        self.fibers.iter().position(|f| f.addr == addr && !f.finalized)
+        self.fibers
+            .iter()
+            .position(|f| f.addr == addr && !f.finalized)
     }
 
     /// The fiber the CURRENT thread is executing, if it is executing one.
     fn current_fiber_index(&self) -> Option<usize> {
         let cur = self.current;
-        self.fibers.iter().position(|f| f.thid == cur && f.started && !f.finalized)
+        self.fibers
+            .iter()
+            .position(|f| f.thid == cur && f.started && !f.finalized)
     }
 
     /// The guest `SceFiber*` the current thread is running, or 0 for a plain thread.
     /// This is `sceFiberGetSelf`.
     pub fn current_fiber(&self) -> u32 {
-        self.current_fiber_index().map(|i| self.fibers[i].addr).unwrap_or(0)
+        self.current_fiber_index()
+            .map(|i| self.fibers[i].addr)
+            .unwrap_or(0)
     }
 
     /// The thread a title's own code would call itself: for a fiber's backing thread,
@@ -11022,11 +12017,19 @@ impl VitaState {
     /// The thread a newly spawned `thid` should be placed BESIDE, if any: a fiber's first real
     /// runner (see `fiber_dispatch`). `None` for an ordinary thread.
     pub fn spawn_near(&self, thid: i32) -> Option<i32> {
-        self.spawn_near.iter().rev().find(|(t, _)| *t == thid).map(|(_, r)| *r)
+        self.spawn_near
+            .iter()
+            .rev()
+            .find(|(t, _)| *t == thid)
+            .map(|(_, r)| *r)
     }
 
     pub fn logical_thread(&self, thid: i32) -> i32 {
-        match self.fibers.iter().find(|f| f.thid == thid && f.started && !f.finalized) {
+        match self
+            .fibers
+            .iter()
+            .find(|f| f.thid == thid && f.started && !f.finalized)
+        {
             Some(f) if f.runner != 0 => self.logical_thread(f.runner),
             _ => thid,
         }
@@ -11065,7 +12068,8 @@ impl VitaState {
         // Its stack is a guest buffer, and SP-relative stores into it are unmarked - see
         // `GuestStacks`.
         if context_addr != 0 {
-            self.guest_stacks.note(context_addr, context_addr.wrapping_add(context_size));
+            self.guest_stacks
+                .note(context_addr, context_addr.wrapping_add(context_size));
         }
         // The fiber runs on the GUEST's context buffer, so this thread record owns no
         // stack of its own - `stack: (0, 0)` marks that there is nothing to reclaim
@@ -11114,7 +12118,12 @@ impl VitaState {
         self.fibers[i].started = true;
         let (thid, entry, arg0, stack_top) = {
             let f = &self.fibers[i];
-            (f.thid, f.entry, f.arg_on_initialize, fiber_stack_top(f.context.0, f.context.1))
+            (
+                f.thid,
+                f.entry,
+                f.arg_on_initialize,
+                fiber_stack_top(f.context.0, f.context.1),
+            )
         };
         // A fiber shares its runner's thread-local storage, because on hardware it IS
         // that thread. Bind the block before the scheduler instantiates the fiber (it
@@ -11135,7 +12144,14 @@ impl VitaState {
             self.threads
                 .iter()
                 .find(|t| t.uid == logical_runner)
-                .map_or(if logical_runner == MAIN_THID { self.main_priority } else { DEFAULT_THREAD_PRIORITY }, |t| t.priority)
+                .map_or(
+                    if logical_runner == MAIN_THID {
+                        self.main_priority
+                    } else {
+                        DEFAULT_THREAD_PRIORITY
+                    },
+                    |t| t.priority,
+                )
         } else {
             DEFAULT_THREAD_PRIORITY
         };
@@ -11166,13 +12182,20 @@ impl VitaState {
     /// `sceFiberRun(fiber, argOnRunTo, argOnRun)` called by a plain THREAD: hand the
     /// fiber the baton and park the caller until the chain returns to it. Returns
     /// `Ok(())` when the caller must park, or the errno to return instead.
-    pub fn fiber_run(&mut self, addr: u32, arg_on_run_to: u32, arg_on_run_out: u32) -> Result<(), i32> {
+    pub fn fiber_run(
+        &mut self,
+        addr: u32,
+        arg_on_run_to: u32,
+        arg_on_run_out: u32,
+    ) -> Result<(), i32> {
         if self.current_fiber_index().is_some() {
             // A fiber must Switch, not Run: running nests a second chain on one thread,
             // which the baton model (and the hardware) does not have.
             return Err(Self::FIBER_ERROR_PERMISSION);
         }
-        let Some(i) = self.fiber_index(addr) else { return Err(Self::FIBER_ERROR_INVALID) };
+        let Some(i) = self.fiber_index(addr) else {
+            return Err(Self::FIBER_ERROR_INVALID);
+        };
         if self.fibers[i].runner != 0 {
             return Err(Self::FIBER_ERROR_STATE);
         }
@@ -11196,8 +12219,12 @@ impl VitaState {
         arg_on_run_out: u32,
         context: Option<(u32, u32)>,
     ) -> Result<(), i32> {
-        let Some(from) = self.current_fiber_index() else { return Err(Self::FIBER_ERROR_PERMISSION) };
-        let Some(to) = self.fiber_index(addr) else { return Err(Self::FIBER_ERROR_INVALID) };
+        let Some(from) = self.current_fiber_index() else {
+            return Err(Self::FIBER_ERROR_PERMISSION);
+        };
+        let Some(to) = self.fiber_index(addr) else {
+            return Err(Self::FIBER_ERROR_INVALID);
+        };
         if to == from || self.fibers[to].runner != 0 {
             return Err(Self::FIBER_ERROR_STATE);
         }
@@ -11221,8 +12248,14 @@ impl VitaState {
 
     /// `sceFiberReturnToThread(argOnReturn, argOnRun)`: give the baton back to the
     /// thread that ran this chain and park the fiber where it stands.
-    pub fn fiber_return_to_thread(&mut self, arg_on_return: u32, arg_on_run_out: u32) -> Result<(), i32> {
-        let Some(i) = self.current_fiber_index() else { return Err(Self::FIBER_ERROR_PERMISSION) };
+    pub fn fiber_return_to_thread(
+        &mut self,
+        arg_on_return: u32,
+        arg_on_run_out: u32,
+    ) -> Result<(), i32> {
+        let Some(i) = self.current_fiber_index() else {
+            return Err(Self::FIBER_ERROR_PERMISSION);
+        };
         let runner = self.fibers[i].runner;
         if runner == 0 {
             return Err(Self::FIBER_ERROR_STATE);
@@ -11230,9 +12263,10 @@ impl VitaState {
         self.fibers[i].runner = 0;
         self.fibers[i].resume_out = arg_on_run_out;
         if let Some(&out) = self.fiber_run_out.get(&runner)
-            && out != 0 {
-                self.pending_stat_writes.push((out, arg_on_return));
-            }
+            && out != 0
+        {
+            self.pending_stat_writes.push((out, arg_on_return));
+        }
         self.fiber_run_out.remove(&runner);
         push_wake!(self, runner);
         Ok(())
@@ -11240,7 +12274,9 @@ impl VitaState {
 
     /// `sceFiberFinalize(fiber)`: retire a fiber that is not running.
     pub fn fiber_finalize(&mut self, addr: u32) -> i32 {
-        let Some(i) = self.fiber_index(addr) else { return Self::FIBER_ERROR_INVALID };
+        let Some(i) = self.fiber_index(addr) else {
+            return Self::FIBER_ERROR_INVALID;
+        };
         if self.fibers[i].runner != 0 {
             return Self::FIBER_ERROR_STATE;
         }
@@ -11265,7 +12301,13 @@ impl VitaState {
     pub fn fiber_info(&self, addr: u32) -> Option<(u32, u32, u32, u32, &str)> {
         let i = self.fiber_index(addr)?;
         let f = &self.fibers[i];
-        Some((f.entry, f.arg_on_initialize, f.context.0, f.context.1, f.name.as_str()))
+        Some((
+            f.entry,
+            f.arg_on_initialize,
+            f.context.0,
+            f.context.1,
+            f.name.as_str(),
+        ))
     }
 
     /// int sceKernelChangeThreadPriority(SceUID thid, int priority): retarget a
@@ -11276,15 +12318,27 @@ impl VitaState {
     /// This genuinely moves the thread in the run order - the scheduler picks the
     /// highest-priority runnable thread - so a title raising a loader above the main
     /// thread gets the ordering it asked for.
+    ///
+    /// `priority` 0 is the CALLER's current priority; one in `0x100000E0..=0x1000011F` is
+    /// relative to the default; anything else must be an absolute user priority in `64..=191`
+    /// or the change is refused with ILLEGAL_PRIORITY. Returns the previous priority.
     pub fn change_thread_priority(&mut self, thid: i32, priority: i32) -> Result<i32, u32> {
         let thid = if thid == 0 { self.current } else { thid };
-        let priority = resolve_priority(priority);
+        let priority = match priority {
+            0 => self.current_priority(),
+            0x1000_00E0..=0x1000_011F => resolve_priority(priority),
+            64..=191 => priority,
+            _ => return Err(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY),
+        };
         match self.threads.iter_mut().find(|t| t.uid == thid) {
             Some(t) => {
                 let previous = t.priority;
                 t.priority = priority;
                 Ok(previous)
             }
+            // The INITIAL thread has no create record; its priority lives beside the table
+            // (`current_priority` reads it from there too).
+            None if thid == MAIN_THID => Ok(std::mem::replace(&mut self.main_priority, priority)),
             None => Err(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID),
         }
     }
@@ -11346,7 +12400,10 @@ impl VitaState {
         let slot: Option<&mut u32> = if thid == MAIN_THID {
             Some(&mut self.main_signals)
         } else {
-            self.threads.iter_mut().find(|t| t.uid == thid).map(|t| &mut t.signals)
+            self.threads
+                .iter_mut()
+                .find(|t| t.uid == thid)
+                .map(|t| &mut t.signals)
         };
         match slot {
             Some(n) if *n > 0 => {
@@ -11414,7 +12471,11 @@ impl VitaState {
     pub fn thread_cpu_affinity(&self, thid: i32) -> i32 {
         let target = if thid == 0 { self.current } else { thid };
         if target == MAIN_THID && !self.threads.iter().any(|t| t.uid == MAIN_THID) {
-            return if self.main_affinity == 0 { crate::vita::threadmgr::CPU_MASK_USER_ALL } else { self.main_affinity };
+            return if self.main_affinity == 0 {
+                crate::vita::threadmgr::CPU_MASK_USER_ALL
+            } else {
+                self.main_affinity
+            };
         }
         match self.threads.iter().find(|t| t.uid == target) {
             // A thread created with 0 ("inherit") has never named a set, and the kernel
@@ -11427,10 +12488,14 @@ impl VitaState {
 
     /// The priority the current thread is running at (lower = higher priority).
     pub fn current_priority(&self) -> i32 {
-        self.threads
-            .iter()
-            .find(|t| t.uid == self.current)
-            .map_or(if self.current == MAIN_THID { self.main_priority } else { DEFAULT_THREAD_PRIORITY }, |t| t.priority)
+        self.threads.iter().find(|t| t.uid == self.current).map_or(
+            if self.current == MAIN_THID {
+                self.main_priority
+            } else {
+                DEFAULT_THREAD_PRIORITY
+            },
+            |t| t.priority,
+        )
     }
 
     /// Start a thread. In the single-thread model this raises a *synchronous*
@@ -11476,6 +12541,8 @@ impl VitaState {
             thid,
             priority: new_priority,
         };
+        // A new run of the thread, so its next end owes the EXIT handlers again.
+        self.thread_exit_events_done.remove(&thid);
         if self.preemptive {
             self.pending_spawns.push(req);
             Ok(new_priority < self.current_priority())
@@ -11487,18 +12554,25 @@ impl VitaState {
 
     /// The exit code of a finished thread, if it has run.
     pub fn thread_exit_code(&self, thid: i32) -> Option<u32> {
-        self.threads.iter().find(|t| t.uid == thid).and_then(|t| t.exit_code)
+        self.threads
+            .iter()
+            .find(|t| t.uid == thid)
+            .and_then(|t| t.exit_code)
     }
 
     /// Whether `thid` is STARTED and has not ended - the state `sceKernelStartThread` and
     /// `sceKernelDeleteThread` refuse with `NOT_DORMANT`.
     pub fn thread_running(&self, thid: i32) -> bool {
-        self.threads.iter().any(|t| t.uid == thid && t.started && t.exit_code.is_none())
+        self.threads
+            .iter()
+            .any(|t| t.uid == thid && t.started && t.exit_code.is_none())
     }
 
     /// Whether the thread with id `thid` has finished.
     pub fn thread_finished(&self, thid: i32) -> bool {
-        self.threads.iter().any(|t| t.uid == thid && t.exit_code.is_some())
+        self.threads
+            .iter()
+            .any(|t| t.uid == thid && t.exit_code.is_some())
     }
 
     /// Take the pending thread-run request, if any (drained by the engine host).
@@ -11529,7 +12603,11 @@ impl VitaState {
     /// suspended mid-body holding it. Re-running it is the one shape that needs no second
     /// copy of the state and no unsafe aliasing, and every engine can drive it: native nests a
     /// wasm call, the browser nests a JSPI stack.
-    pub fn call_guest(&mut self, call: GuestCall, capture: Option<(u32, u32)>) -> Option<GuestCallResult> {
+    pub fn call_guest(
+        &mut self,
+        call: GuestCall,
+        capture: Option<(u32, u32)>,
+    ) -> Option<GuestCallResult> {
         let thid = self.current;
         let frames = self.guest_call_frames.entry(thid).or_default();
         let idx = match self.guest_call_active {
@@ -11576,7 +12654,9 @@ impl VitaState {
     /// helper deep in a handler returns a neutral value, and the handler checks this before
     /// reading that value as a failure.
     pub fn guest_call_pending(&self) -> bool {
-        let Some(i) = self.guest_call_active else { return false };
+        let Some(i) = self.guest_call_active else {
+            return false;
+        };
         self.guest_call_frames
             .get(&self.current)
             .and_then(|f| f.get(i))
@@ -11604,9 +12684,13 @@ impl VitaState {
     /// After a dispatch: whether it is waiting on a guest call ([`SvcOutcome::CallGuest`]).
     /// A dispatch that finished drops its record.
     pub(crate) fn guest_call_end(&mut self) -> bool {
-        let Some(idx) = self.guest_call_active.take() else { return false };
+        let Some(idx) = self.guest_call_active.take() else {
+            return false;
+        };
         let thid = self.current;
-        let Some(frames) = self.guest_call_frames.get_mut(&thid) else { return false };
+        let Some(frames) = self.guest_call_frames.get_mut(&thid) else {
+            return false;
+        };
         if frames.get(idx).is_some_and(|f| f.pending.is_some()) {
             return true;
         }
@@ -11625,9 +12709,24 @@ impl VitaState {
 
     /// The guest call thread `thid` was waiting on has returned: record its result (and the
     /// capture it asked for) so the replay that follows finds it.
-    pub fn guest_call_returned(&mut self, thid: i32, r0: u32, r1: u32, mem: &dyn GuestMemory, base: u32) {
-        let Some(top) = self.guest_call_frames.get_mut(&thid).and_then(|f| f.last_mut()) else { return };
-        let Some((call, capture)) = top.pending.take() else { return };
+    pub fn guest_call_returned(
+        &mut self,
+        thid: i32,
+        r0: u32,
+        r1: u32,
+        mem: &dyn GuestMemory,
+        base: u32,
+    ) {
+        let Some(top) = self
+            .guest_call_frames
+            .get_mut(&thid)
+            .and_then(|f| f.last_mut())
+        else {
+            return;
+        };
+        let Some((call, capture)) = top.pending.take() else {
+            return;
+        };
         let bytes = match capture {
             Some((addr, len)) if len > 0 => {
                 let mut b = vec![0u8; len as usize];
@@ -11638,6 +12737,95 @@ impl VitaState {
         };
         top.results.push((call, GuestCallResult { r0, r1, bytes }));
         top.resume = true;
+    }
+
+    /// Record a `sceKernelRegisterThreadEventHandler` registration and return its id.
+    pub fn register_thread_event_handler(
+        &mut self,
+        target: i32,
+        mask: u32,
+        handler: u32,
+        common: u32,
+    ) -> i32 {
+        let uid = self.new_uid();
+        self.thread_event_handlers.push(ThreadEventHandler {
+            uid,
+            target,
+            mask,
+            handler,
+            common,
+        });
+        uid
+    }
+
+    /// Whether `thid` is a thread of the title's: one it created (`sceKernelCreateThread`),
+    /// or the initial thread ([`MAIN_THID`], which has no create record). The host's own
+    /// delivery threads (a kernel callback's, a display-queue callback's) have neither.
+    pub fn thread_exists(&self, thid: i32) -> bool {
+        thid == MAIN_THID || self.threads.iter().any(|t| t.uid == thid)
+    }
+
+    /// Thread `thid` is starting one of its entries; `last` when it is its final one. Only
+    /// the initial thread has more than one (each module's `module_start`, the executable's
+    /// last), and only its final entry's end is the thread's end.
+    pub fn note_thread_entry(&mut self, thid: i32, last: bool) {
+        if thid == MAIN_THID {
+            self.main_initializing = !last;
+        }
+    }
+
+    /// Drop a registration; false when `uid` names none.
+    pub fn unregister_thread_event_handler(&mut self, uid: i32) -> bool {
+        let before = self.thread_event_handlers.len();
+        self.thread_event_handlers.retain(|h| h.uid != uid);
+        self.thread_event_handlers.len() != before
+    }
+
+    /// Whether this dispatch is a REPLAY of a host call that already asked for a guest call
+    /// (see [`Self::call_guest`]) - read before the handler makes any guest call of its own.
+    pub fn guest_call_replaying(&self) -> bool {
+        self.guest_call_active.is_some()
+    }
+
+    /// Claim thread `thid`'s END for its EXIT handlers: true the first time, false after.
+    ///
+    /// The handlers run once per thread whichever way it ends - `sceKernelExitThread`, or
+    /// returning from its entry - and a handler that itself calls `sceKernelExitThread`
+    /// must end the thread rather than run the handlers again. False, claiming nothing, while
+    /// the initial thread is in an early `module_start` (see [`Self::note_thread_entry`]).
+    pub fn claim_thread_exit_events(&mut self, thid: i32) -> bool {
+        if thid == MAIN_THID && self.main_initializing {
+            return false;
+        }
+        self.thread_exit_events_done.insert(thid)
+    }
+
+    /// The EXIT handler calls owed thread `thid` ending with `code`, in registration order:
+    /// `handler(SCE_KERNEL_THREAD_EVENT_TYPE_EXIT, thid, code, common)`, to be run ON that
+    /// thread (a C library's handler frees the ending thread's own TLS).
+    ///
+    /// Only the title's threads ([`Self::thread_exists`]) get them: the host's own delivery
+    /// threads (a kernel callback's, a display-queue callback's) are not threads it knows about. Pure,
+    /// so a host call can rebuild the list on each replay.
+    ///
+    /// The handler's id rides as a fifth (stack) argument the handler never reads, so two
+    /// registrations of the same function with the same `common` are still two distinct
+    /// calls - [`Self::call_guest`] matches a replayed call by its arguments.
+    pub fn thread_exit_event_calls(&self, thid: i32, code: u32) -> Vec<GuestCall> {
+        if !self.thread_exists(thid) || self.kcb_threads.iter().any(|(t, _)| *t == thid) {
+            return Vec::new();
+        }
+        self.thread_event_handlers
+            .iter()
+            .filter(|h| {
+                h.mask & THREAD_EVENT_EXIT != 0
+                    && (h.target == THREAD_EVENT_ALL_IN_PROCESS || h.target == thid)
+            })
+            .map(|h| GuestCall {
+                entry: h.handler,
+                args: vec![THREAD_EVENT_EXIT, thid as u32, code, h.common, h.uid as u32],
+            })
+            .collect()
     }
 
     /// Record a finished thread's return value (set by the engine host after the
@@ -11793,7 +12981,10 @@ impl VitaState {
     /// a new one, so this is the lookup behind it. First match wins, which matches a
     /// kernel that refuses a duplicate openable name.
     pub fn sema_by_name(&self, name: &str) -> Option<i32> {
-        self.semaphores.iter().find(|s| s.name == name).map(|s| s.uid)
+        self.semaphores
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.uid)
     }
 
     /// Everything `sceKernelGetSemaInfo` reports: `(name, attr, init, current, max,
@@ -11826,10 +13017,11 @@ impl VitaState {
     /// the count was available (and consumed), false otherwise.
     pub fn sema_try_acquire(&mut self, uid: i32, need: i32) -> bool {
         if let Some(s) = self.semaphores.iter_mut().find(|s| s.uid == uid)
-            && s.count >= need {
-                s.count -= need;
-                return true;
-            }
+            && s.count >= need
+        {
+            s.count -= need;
+            return true;
+        }
         false
     }
 
@@ -11839,8 +13031,19 @@ impl VitaState {
     /// `SCE_KERNEL_ERROR_WAIT_TIMEOUT` even if no signal arrives.
     pub fn sema_block(&mut self, uid: i32, need: i32, timeout_us: u32) {
         let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
-        let began = (self.virtual_us, self.clock_from_quanta_us, self.clock_from_wall_us, self.clock_from_idle_us);
-        self.sema_waiters.push(SemaWaiter { uid, thid: self.current, need, deadline, began });
+        let began = (
+            self.virtual_us,
+            self.clock_from_quanta_us,
+            self.clock_from_wall_us,
+            self.clock_from_idle_us,
+        );
+        self.sema_waiters.push(SemaWaiter {
+            uid,
+            thid: self.current,
+            need,
+            deadline,
+            began,
+        });
     }
 
     /// Signal semaphore `uid` by `n`, then release every parked waiter the new
@@ -11882,7 +13085,10 @@ impl VitaState {
         if self.mutex_in_table(w, uid) {
             return crate::vita::kmutex::owner(w, self.mutex_table, uid);
         }
-        self.mutexes.iter().find(|m| m.uid == uid).and_then(|m| m.owner)
+        self.mutexes
+            .iter()
+            .find(|m| m.uid == uid)
+            .and_then(|m| m.owner)
     }
 
     /// Take `uid` for `thid`: name the owner and bump the recursion depth.
@@ -11906,7 +13112,11 @@ impl VitaState {
         if !self.mutex_in_table(w, uid) {
             return;
         }
-        let n = self.mutexes.iter().find(|m| m.uid == uid).map_or(0, |m| m.waiters.len());
+        let n = self
+            .mutexes
+            .iter()
+            .find(|m| m.uid == uid)
+            .map_or(0, |m| m.waiters.len());
         crate::vita::kmutex::set_waiters(w, self.mutex_table, uid, n);
     }
 
@@ -11918,7 +13128,13 @@ impl VitaState {
     /// its whole life, which is exactly what every kernel mutex was before the table existed.
     /// Refused rather than shared, because two mutexes in one entry would each read the
     /// other's owner.
-    pub fn create_mutex(&mut self, w: &mut dyn GuestWords, name: &str, attr: u32, init: i32) -> i32 {
+    pub fn create_mutex(
+        &mut self,
+        w: &mut dyn GuestWords,
+        name: &str,
+        attr: u32,
+        init: i32,
+    ) -> i32 {
         let uid = self.new_uid();
         crate::vita::kmutex::claim(w, self.mutex_table, uid);
         self.mutexes.push(MutexRec {
@@ -11936,7 +13152,11 @@ impl VitaState {
     /// What `sceKernelGetMutexInfo` reports for `uid`: `(name, attr, init count, current
     /// count, owner thread or 0, waiting threads)`, from whichever home the mutex's ownership
     /// lives in - see [`Self::mutex_owner`]. `None` for an unknown id.
-    pub fn mutex_info(&self, w: &dyn GuestWords, uid: i32) -> Option<(String, u32, i32, i32, i32, i32)> {
+    pub fn mutex_info(
+        &self,
+        w: &dyn GuestWords,
+        uid: i32,
+    ) -> Option<(String, u32, i32, i32, i32, i32)> {
         let m = self.mutexes.iter().find(|m| m.uid == uid)?;
         let count = if self.mutex_in_table(w, uid) {
             crate::vita::kmutex::count(w, self.mutex_table, uid)
@@ -11944,7 +13164,14 @@ impl VitaState {
             m.count
         };
         let owner = self.mutex_owner(w, uid).unwrap_or(0);
-        Some((m.name.clone(), m.attr, m.init, count, owner, m.waiters.len() as i32))
+        Some((
+            m.name.clone(),
+            m.attr,
+            m.init,
+            count,
+            owner,
+            m.waiters.len() as i32,
+        ))
     }
 
     /// Lock mutex `uid` for the current thread. Returns true if acquired (free, or
@@ -11998,7 +13225,11 @@ impl VitaState {
                 kmutex::set_count(w, self.mutex_table, uid, n);
                 n
             } else {
-                let m = self.mutexes.iter_mut().find(|m| m.uid == uid).expect("just checked");
+                let m = self
+                    .mutexes
+                    .iter_mut()
+                    .find(|m| m.uid == uid)
+                    .expect("just checked");
                 if m.count > 0 {
                     m.count -= 1;
                 }
@@ -12014,10 +13245,10 @@ impl VitaState {
                     // A table entry needs no "free" write: `count == 0` IS free, which is why
                     // the owner word is meaningful only beside a non-zero count.
                     None => {
-                        if !in_table
-                            && let Some(m) = self.mutexes.iter_mut().find(|m| m.uid == uid) {
-                                m.owner = None;
-                            }
+                        if !in_table && let Some(m) = self.mutexes.iter_mut().find(|m| m.uid == uid)
+                        {
+                            m.owner = None;
+                        }
                     }
                     Some(next) => {
                         self.mutex_take(w, uid, next);
@@ -12061,11 +13292,14 @@ impl VitaState {
     /// `SCE_KERNEL_ERROR_WAIT_DELETE` - the object they waited on is gone and nothing else
     /// would ever release them. `false` for an unknown uid.
     pub fn delete_rwlock(&mut self, uid: i32) -> bool {
-        let Some(idx) = self.rwlocks.iter().position(|l| l.uid == uid) else { return false };
+        let Some(idx) = self.rwlocks.iter().position(|l| l.uid == uid) else {
+            return false;
+        };
         let l = self.rwlocks.remove(idx);
         for w in l.waiters {
             push_wake!(self, w.thid);
-            self.pending_resume_codes.push((w.thid, SCE_KERNEL_ERROR_WAIT_DELETE));
+            self.pending_resume_codes
+                .push((w.thid, SCE_KERNEL_ERROR_WAIT_DELETE));
         }
         true
     }
@@ -12080,7 +13314,9 @@ impl VitaState {
     /// deadlock the thread on itself. A writer gets in while nobody else holds it at all.
     pub fn rwlock_try(&mut self, uid: i32, write: bool) -> RwLockResult {
         let cur = self.current;
-        let Some(l) = self.rwlocks.iter_mut().find(|l| l.uid == uid) else { return RwLockResult::Unknown };
+        let Some(l) = self.rwlocks.iter_mut().find(|l| l.uid == uid) else {
+            return RwLockResult::Unknown;
+        };
         let recursive = l.attr & Self::RWLOCK_ATTR_RECURSIVE != 0;
         let holds_write = l.writer == Some(cur);
         let holds_read = l.readers.iter().any(|&(t, _)| t == cur);
@@ -12089,7 +13325,9 @@ impl VitaState {
         }
         if write {
             let others_read = l.readers.iter().any(|&(t, _)| t != cur);
-            if holds_write || (l.writer.is_none() && !others_read && (holds_read || l.waiters.is_empty())) {
+            if holds_write
+                || (l.writer.is_none() && !others_read && (holds_read || l.waiters.is_empty()))
+            {
                 l.writer = Some(cur);
                 l.write_count += 1;
                 return RwLockResult::Done;
@@ -12112,7 +13350,11 @@ impl VitaState {
         let deadline = timeout_us.map(|t| self.virtual_us + u64::from(t));
         let thid = self.current;
         if let Some(l) = self.rwlocks.iter_mut().find(|l| l.uid == uid) {
-            l.waiters.push(RwWaiter { thid, write, deadline });
+            l.waiters.push(RwWaiter {
+                thid,
+                write,
+                deadline,
+            });
         }
     }
 
@@ -12120,7 +13362,9 @@ impl VitaState {
     /// whoever the release unblocks.
     pub fn rwlock_unlock(&mut self, uid: i32, write: bool) -> RwLockResult {
         let cur = self.current;
-        let Some(l) = self.rwlocks.iter_mut().find(|l| l.uid == uid) else { return RwLockResult::Unknown };
+        let Some(l) = self.rwlocks.iter_mut().find(|l| l.uid == uid) else {
+            return RwLockResult::Unknown;
+        };
         if write {
             if l.writer != Some(cur) {
                 return RwLockResult::NotOwned;
@@ -12130,7 +13374,9 @@ impl VitaState {
                 l.writer = None;
             }
         } else {
-            let Some(i) = l.readers.iter().position(|&(t, _)| t == cur) else { return RwLockResult::NotOwned };
+            let Some(i) = l.readers.iter().position(|&(t, _)| t == cur) else {
+                return RwLockResult::NotOwned;
+            };
             l.readers[i].1 -= 1;
             if l.readers[i].1 == 0 {
                 l.readers.remove(i);
@@ -12218,9 +13464,16 @@ impl VitaState {
     /// without a distinct create call.
     fn lwmutex_rec(&mut self, work: u32) -> &mut LwMutexRec {
         if !self.lwmutexes.iter().any(|m| m.work == work) {
-            self.lwmutexes.push(LwMutexRec { work, waiters: Vec::new(), meta: Default::default() });
+            self.lwmutexes.push(LwMutexRec {
+                work,
+                waiters: Vec::new(),
+                meta: Default::default(),
+            });
         }
-        self.lwmutexes.iter_mut().find(|m| m.work == work).expect("just inserted")
+        self.lwmutexes
+            .iter_mut()
+            .find(|m| m.work == work)
+            .expect("just inserted")
     }
 
     /// Register the lightweight mutex at `work` and lay its state out there
@@ -12284,7 +13537,10 @@ impl VitaState {
         }
         let deadline = timeout_us.map(|us| self.virtual_us + us as u64);
         let m = self.lwmutex_rec(work);
-        m.waiters.push(LwMutexWaiter { thid: cur, deadline });
+        m.waiters.push(LwMutexWaiter {
+            thid: cur,
+            deadline,
+        });
         let parked = m.waiters.len();
         lwwork::set_waiters(w, work, parked);
         false
@@ -12303,7 +13559,10 @@ impl VitaState {
     ///
     /// Taking a free mutex past parked threads (`queued`) is the host's barge, as before.
     fn lwmutex_take_for(&mut self, w: &mut dyn GuestWords, work: u32, thid: i32) -> bool {
-        let queued = self.lwmutexes.iter().any(|m| m.work == work && !m.waiters.is_empty());
+        let queued = self
+            .lwmutexes
+            .iter()
+            .any(|m| m.work == work && !m.waiters.is_empty());
         loop {
             let raw = lwwork::count_word(w, work);
             let held = raw & !lwwork::CONTENDED;
@@ -12341,7 +13600,10 @@ impl VitaState {
         if lwwork::fast_lock(w, work, cur, 1) {
             return true;
         }
-        let queued = self.lwmutexes.iter().any(|m| m.work == work && !m.waiters.is_empty());
+        let queued = self
+            .lwmutexes
+            .iter()
+            .any(|m| m.work == work && !m.waiters.is_empty());
         loop {
             let raw = lwwork::count_word(w, work);
             let held = raw & !lwwork::CONTENDED;
@@ -12377,7 +13639,10 @@ impl VitaState {
         }
         let remaining = held - 1;
         if remaining != 0 {
-            let queued = self.lwmutexes.iter().any(|m| m.work == work && !m.waiters.is_empty());
+            let queued = self
+                .lwmutexes
+                .iter()
+                .any(|m| m.work == work && !m.waiters.is_empty());
             lwwork::set_held(w, work, remaining, queued);
             return;
         }
@@ -12420,7 +13685,10 @@ impl VitaState {
         let m = self.lwmutex_rec(work);
         // A cond waiter handed back to its mutex waits for the OWNER, not for a clock: its
         // own timeout already expired (that is why it is here), so it carries none.
-        m.waiters.push(LwMutexWaiter { thid, deadline: None });
+        m.waiters.push(LwMutexWaiter {
+            thid,
+            deadline: None,
+        });
         let parked = m.waiters.len();
         lwwork::set_waiters(w, work, parked);
         // Woken later, when the owner unlocks.
@@ -12455,7 +13723,11 @@ impl VitaState {
     /// Create a condition variable bound to mutex `mutex_uid`.
     pub fn create_cond(&mut self, mutex_uid: i32) -> i32 {
         let uid = self.new_uid();
-        self.conds.push(CondRec { uid, mutex: mutex_uid, waiters: Vec::new() });
+        self.conds.push(CondRec {
+            uid,
+            mutex: mutex_uid,
+            waiters: Vec::new(),
+        });
         uid
     }
 
@@ -12482,7 +13754,10 @@ impl VitaState {
         let cur = self.current;
         let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
         if let Some(c) = self.conds.iter_mut().find(|c| c.uid == uid) {
-            c.waiters.push(CondWaiter { thid: cur, deadline });
+            c.waiters.push(CondWaiter {
+                thid: cur,
+                deadline,
+            });
         }
     }
 
@@ -12495,7 +13770,10 @@ impl VitaState {
                 return;
             };
             let woken: Vec<i32> = if all {
-                std::mem::take(&mut c.waiters).into_iter().map(|w| w.thid).collect()
+                std::mem::take(&mut c.waiters)
+                    .into_iter()
+                    .map(|w| w.thid)
+                    .collect()
             } else if c.waiters.is_empty() {
                 Vec::new()
             } else {
@@ -12597,7 +13875,10 @@ impl VitaState {
     /// The lightweight mutex work address bound to lightweight cond `cond_work`, if
     /// its `CreateLwCond` was seen.
     fn lwcond_mutex_of(&self, cond_work: u32) -> Option<u32> {
-        self.lwcond_mutex.iter().find(|&&(c, _)| c == cond_work).map(|&(_, m)| m)
+        self.lwcond_mutex
+            .iter()
+            .find(|&&(c, _)| c == cond_work)
+            .map(|&(_, m)| m)
     }
 
     /// Whether `cond_work` is a lightweight cond we recorded at `sceKernelCreateLwCond`
@@ -12628,7 +13909,6 @@ impl VitaState {
         self.lwcond_waiters.push((self.current, work, deadline));
         true
     }
-
 
     /// `sceKernelSignalLwCond`/`SignalLwCondAll`: wake one (or all) threads parked on
     /// cond `work`. Each woken thread must re-acquire the cond's bound lightweight mutex
@@ -12832,7 +14112,8 @@ impl VitaState {
         // `WALL_FLOOR_LAG_US` below the clock, so an idle jump is paid back by wall time first
         // and a long idle stretch is not banked.
         const WALL_FLOOR_LAG_US: u64 = 67_000;
-        let floor = (floor + (step * 1000.0) as u64).max(self.virtual_us.saturating_sub(WALL_FLOOR_LAG_US));
+        let floor =
+            (floor + (step * 1000.0) as u64).max(self.virtual_us.saturating_sub(WALL_FLOOR_LAG_US));
         self.wall_floor = Some((wall_ms, floor));
         if floor > self.virtual_us {
             // >>> THE STORAGE CLOCK GETS THE SAME FLOOR. A Vita's card streams in real time; the
@@ -12860,7 +14141,11 @@ impl VitaState {
     }
 
     pub fn clock_sources(&self) -> (u64, u64, u64) {
-        (self.clock_from_quanta_us, self.clock_from_topup_us, self.clock_from_idle_us)
+        (
+            self.clock_from_quanta_us,
+            self.clock_from_topup_us,
+            self.clock_from_idle_us,
+        )
     }
 
     /// One display flip happened: bring the game clock up to one full frame of progress,
@@ -12906,7 +14191,7 @@ impl VitaState {
     /// Scheduler quanta and display flips seen so far. `QUANTUM_CPU_US` is calibrated
     /// from their ratio on a title that is rendering steadily: one quantum is worth one
     /// frame divided by the quanta a frame actually takes.
-    /// Display flips completed so far - the frame number a recipe and a `@shot` count
+    /// Display flips completed so far - the frame number scripted input and a shot count
     /// in. Diagnostics stamp it so an event can be placed on the timeline.
     pub fn flip_count(&self) -> u64 {
         self.flip_count
@@ -12925,7 +14210,10 @@ impl VitaState {
     /// which is how a modelled read came to cost no display frames at all whatever its
     /// size. See [`crate::sched`]'s idle path.
     pub fn earliest_io_remaining_us(&self) -> Option<u64> {
-        self.io_waiters.iter().map(|&(_, d)| d.saturating_sub(self.io_us)).min()
+        self.io_waiters
+            .iter()
+            .map(|&(_, d)| d.saturating_sub(self.io_us))
+            .min()
     }
 
     /// Nothing is runnable and the game clock is being jumped to `us` ahead: the device
@@ -12967,7 +14255,8 @@ impl VitaState {
     }
 
     pub fn sleep_park(&mut self, us: u64) {
-        self.sleep_waiters.push((self.current, self.virtual_us.wrapping_add(us)));
+        self.sleep_waiters
+            .push((self.current, self.virtual_us.wrapping_add(us)));
     }
 
     /// >>> PARK THE CURRENT THREAD UNTIL A HOST WALL-CLOCK TIME, not a guest-clock one.
@@ -13036,7 +14325,7 @@ impl VitaState {
     /// suspend whatever the runnable set says. At 2,674 of these a frame the bound still
     /// removes better than 99% of them, and nothing can be deferred by more than one run.
     ///
-    /// NOT measured as necessary - both engines ran a football title's whole recipe with the
+    /// NOT measured as necessary - both engines ran a football title's whole scripted run with the
     /// unbounded form. It is here because the hazard is nameable, not because it was seen.
     ///
     /// >>> RAISED 256 -> 4096 (2026-09-17) because a SUSPEND IS THE EXPENSIVE UNIT. MEASURED in
@@ -13081,7 +14370,9 @@ impl VitaState {
     /// one the cap means to suspend. Resets the host's own count with it: the resume that
     /// follows republishes zero and the inline form starts a fresh run.
     pub fn inline_elide_run_at_cap(&mut self, ctx: &GuestCtx) -> bool {
-        let Some(base) = self.mirror_base else { return false };
+        let Some(base) = self.mirror_base else {
+            return false;
+        };
         let run = ctx.read_u32(base.wrapping_add(vita::mirror::SLOT_ELIDE_RUN * 4));
         if run < Self::ELIDE_RUN_CAP {
             return false;
@@ -13194,7 +14485,7 @@ impl VitaState {
     /// "however fast the guest can draw". Measured on this title's front end: **4.64 ms
     /// of game clock per flip, 216 fps**, against a 60 Hz panel. Every wall-clock wait in
     /// the title then cost 3.6x the flips hardware needs, and since a frame number is
-    /// what a recipe, a screenshot and `--max-frames` are keyed to, the whole timeline
+    /// what scripted input, a screenshot and `--max-frames` are keyed to, the whole timeline
     /// stretched by that factor. The race was unaffected (33.5 ms/flip, a true 30 fps),
     /// which is what makes this a pacing bug and not a speed one.
     ///
@@ -13219,7 +14510,11 @@ impl VitaState {
     /// Returns the microseconds parked, for the caller's diagnostics.
     pub fn pace_flip(&mut self, frame_us: u64) -> u64 {
         // Retire the entries the scanout has already shown.
-        while self.display_latches.front().is_some_and(|&t| t <= self.virtual_us) {
+        while self
+            .display_latches
+            .front()
+            .is_some_and(|&t| t <= self.virtual_us)
+        {
             self.display_latches.pop_front();
         }
         // >>> THE QUEUE HAS THE DEPTH THE GUEST ASKED FOR, AND THAT IS NOT A THROUGHPUT
@@ -13327,7 +14622,10 @@ impl VitaState {
         let latch = if immediate {
             self.virtual_us
         } else {
-            Self::at_or_after_vblank(self.virtual_us.saturating_add(1), crate::vita::display::VBLANK_US)
+            Self::at_or_after_vblank(
+                self.virtual_us.saturating_add(1),
+                crate::vita::display::VBLANK_US,
+            )
         };
         self.frame_buf_latch_us = Some(latch);
     }
@@ -13509,14 +14807,18 @@ impl VitaState {
         if self.display_cb_slots == 0 {
             self.display_cb_slots = self.galloc(size * Self::DISPLAY_CB_SLOT_COUNT, 8);
             self.display_cb_stack = self.galloc(Self::DISPLAY_CB_STACK_BYTES, 16);
-            self.guest_stacks.note(self.display_cb_stack, self.display_cb_stack.wrapping_add(Self::DISPLAY_CB_STACK_BYTES));
+            self.guest_stacks.note(
+                self.display_cb_stack,
+                self.display_cb_stack
+                    .wrapping_add(Self::DISPLAY_CB_STACK_BYTES),
+            );
             if self.display_cb_slots == 0 || self.display_cb_stack == 0 {
                 self.display_queue_cb = 0; // OOM: disable rather than corrupt
                 return;
             }
         }
-        let slot =
-            self.display_cb_slots + (self.display_cb_next_slot % Self::DISPLAY_CB_SLOT_COUNT) * size;
+        let slot = self.display_cb_slots
+            + (self.display_cb_next_slot % Self::DISPLAY_CB_SLOT_COUNT) * size;
         self.display_cb_next_slot = self.display_cb_next_slot.wrapping_add(1);
         if callback_data != 0 {
             let bytes = ctx.read_bytes(callback_data, size as usize);
@@ -13591,7 +14893,9 @@ impl VitaState {
         if self.display_cb_running.is_some() {
             return;
         }
-        let Some(data) = self.display_cb_queue.pop_front() else { return };
+        let Some(data) = self.display_cb_queue.pop_front() else {
+            return;
+        };
         let thid = self.new_uid();
         self.pending_spawns.push(Reentry {
             entry: self.display_queue_cb & !1,
@@ -13647,7 +14951,10 @@ impl VitaState {
         if self.ngs_cb_slots == 0 {
             self.ngs_cb_slots = self.galloc(Self::NGS_CB_INFO_BYTES * Self::NGS_CB_SLOT_COUNT, 8);
             self.ngs_cb_stack = self.galloc(Self::NGS_CB_STACK_BYTES, 16);
-            self.guest_stacks.note(self.ngs_cb_stack, self.ngs_cb_stack.wrapping_add(Self::NGS_CB_STACK_BYTES));
+            self.guest_stacks.note(
+                self.ngs_cb_stack,
+                self.ngs_cb_stack.wrapping_add(Self::NGS_CB_STACK_BYTES),
+            );
             if self.ngs_cb_slots == 0 || self.ngs_cb_stack == 0 {
                 tracing::warn!(
                     target: "vitaslop::ngs",
@@ -13673,13 +14980,87 @@ impl VitaState {
         self.pump_ngs_callback();
     }
 
+    /// Whether an NGS callback is queued or running.
+    pub fn ngs_callbacks_pending(&self) -> bool {
+        self.ngs_cb_running.is_some() || !self.ngs_cb_queue.is_empty()
+    }
+
+    /// Info slots in [`Self::ngs_sync_slots`]: more than any one grain raises (a few per
+    /// streaming voice); a batch past it goes to the serial thread instead.
+    const NGS_SYNC_SLOTS: u32 = 64;
+
+    /// Stash the callbacks one `sceAudioOutOutput` grain raised, to run on the CALLING thread
+    /// before it returns - see `vita::audio::out_output`. Each gets its own info slot, so no
+    /// two calls of one batch are the same [`GuestCall`] (the replay matches results by call).
+    /// False - nothing stashed, the caller delivers them the old way - outside the preemptive
+    /// engine, for a batch past the ring, or when the heap cannot spare the ring.
+    pub fn ngs_sync_stash(&mut self, ctx: &mut GuestCtx, calls: &[(u32, [u8; 0x1c])]) -> bool {
+        if !self.preemptive || calls.len() as u32 > Self::NGS_SYNC_SLOTS {
+            return false;
+        }
+        if calls.is_empty() {
+            return true;
+        }
+        if self.ngs_sync_slots == 0 {
+            self.ngs_sync_slots = self.galloc(Self::NGS_CB_INFO_BYTES * Self::NGS_SYNC_SLOTS, 8);
+            if self.ngs_sync_slots == 0 {
+                self.ngs_sync_slots = u32::MAX;
+            }
+        }
+        if self.ngs_sync_slots == u32::MAX {
+            return false;
+        }
+        let mut batch = Vec::with_capacity(calls.len());
+        for (entry, info) in calls {
+            let slot = self.ngs_sync_slots
+                + (self.ngs_sync_next % Self::NGS_SYNC_SLOTS) * Self::NGS_CB_INFO_BYTES;
+            self.ngs_sync_next = self.ngs_sync_next.wrapping_add(1);
+            ctx.write_bytes(slot, info);
+            batch.push((*entry, slot));
+        }
+        self.ngs_sync.insert(self.current, batch);
+        true
+    }
+
+    /// Whether this dispatch is a REPLAY of a `sceAudioOutOutput` still running its callbacks.
+    pub fn ngs_sync_replaying(&self) -> bool {
+        self.ngs_sync.contains_key(&self.current)
+    }
+
+    /// Run the current thread's stashed callbacks as guest calls, in order. True when every one
+    /// has returned (the stash is gone); false when one is being run - the handler returns
+    /// [`crate::SvcOutcome::CallGuest`] and is dispatched again when it comes back.
+    pub fn ngs_sync_run(&mut self) -> bool {
+        let Some(batch) = self.ngs_sync.get(&self.current).cloned() else {
+            return true;
+        };
+        for (entry, slot) in batch {
+            if self
+                .call_guest(
+                    GuestCall {
+                        entry,
+                        args: vec![slot],
+                    },
+                    None,
+                )
+                .is_none()
+            {
+                return false;
+            }
+        }
+        self.ngs_sync.remove(&self.current);
+        true
+    }
+
     /// Start the next queued NGS callback if none is in flight. Chained from
     /// [`Self::set_thread_exit`] when the in-flight one ends.
     fn pump_ngs_callback(&mut self) {
         if self.ngs_cb_running.is_some() {
             return;
         }
-        let Some((entry, info)) = self.ngs_cb_queue.pop_front() else { return };
+        let Some((entry, info)) = self.ngs_cb_queue.pop_front() else {
+            return;
+        };
         let thid = self.new_uid();
         self.pending_spawns.push(Reentry {
             entry: entry & !1,
@@ -13728,7 +15109,8 @@ impl VitaState {
         if stack == 0 {
             return false;
         }
-        self.guest_stacks.note(stack, stack + Self::SERVICE_CB_STACK_BYTES);
+        self.guest_stacks
+            .note(stack, stack + Self::SERVICE_CB_STACK_BYTES);
         let thid = self.new_uid();
         self.pending_spawns.push(Reentry {
             entry: entry & !1,
@@ -13769,7 +15151,16 @@ impl VitaState {
         let uid = self.new_uid();
         let owner = self.current;
         tracing::debug!(target: "vitaslop::cb", uid = format_args!("{uid:#x}"), owner = format_args!("{owner:#x}"), %name, func = format_args!("{func:#x}"), "sceKernelCreateCallback");
-        self.kcallbacks.push(KCallback { uid, owner, name, func, common, count: 0, notify_arg: 0, vblank_since: None });
+        self.kcallbacks.push(KCallback {
+            uid,
+            owner,
+            name,
+            func,
+            common,
+            count: 0,
+            notify_arg: 0,
+            vblank_since: None,
+        });
         uid
     }
 
@@ -13807,7 +15198,10 @@ impl VitaState {
     /// `sceKernelGetCallbackCount`, vblank notifications included.
     pub fn kcb_count(&mut self, uid: i32) -> Option<u32> {
         self.kcb_account_vblanks();
-        self.kcallbacks.iter().find(|c| c.uid == uid).map(|c| c.count)
+        self.kcallbacks
+            .iter()
+            .find(|c| c.uid == uid)
+            .map(|c| c.count)
     }
 
     /// `sceDisplayRegisterVblankStartCallback` (`on`) / `...Unregister...` (`!on`).
@@ -13849,7 +15243,11 @@ impl VitaState {
         }
         self.kcb_account_vblanks();
         let owner = self.current;
-        let Some(c) = self.kcallbacks.iter_mut().find(|c| c.owner == owner && c.count > 0) else {
+        let Some(c) = self
+            .kcallbacks
+            .iter_mut()
+            .find(|c| c.owner == owner && c.count > 0)
+        else {
             return false;
         };
         let (uid, func, count, arg, common) = (c.uid, c.func, c.count, c.notify_arg, c.common);
@@ -13860,7 +15258,8 @@ impl VitaState {
         if stack == 0 || func == 0 {
             return false;
         }
-        self.guest_stacks.note(stack, stack + Self::SERVICE_CB_STACK_BYTES);
+        self.guest_stacks
+            .note(stack, stack + Self::SERVICE_CB_STACK_BYTES);
         let thid = self.new_uid();
         let priority = self.current_priority();
         self.pending_spawns.push(Reentry {
@@ -13886,9 +15285,10 @@ impl VitaState {
             return;
         }
         if let Some((entry, userdata)) = self.net_inet_cb
-            && self.spawn_oneshot_callback(entry, event, userdata, 0) {
-                self.net_cb_delivered = true;
-            }
+            && self.spawn_oneshot_callback(entry, event, userdata, 0)
+        {
+            self.net_cb_delivered = true;
+        }
     }
 
     /// The earliest pending timed-wake deadline across every timed blocking wait -
@@ -13912,22 +15312,30 @@ impl VitaState {
             .lwcond_waiters
             .iter()
             .filter_map(|&(t, _, d)| d.map(|d| (d, own(IdleKind::LwCond, t))));
-        let sl = self.sleep_waiters.iter().map(|&(t, d)| (d, own(IdleKind::Sleep, t)));
-        let ev = self.evf_waiters.iter().filter_map(|w| {
-            w.deadline.map(|d| (d, own(IdleKind::EventFlag, w.thid)))
-        });
+        let sl = self
+            .sleep_waiters
+            .iter()
+            .map(|&(t, d)| (d, own(IdleKind::Sleep, t)));
+        let ev = self
+            .evf_waiters
+            .iter()
+            .filter_map(|w| w.deadline.map(|d| (d, own(IdleKind::EventFlag, w.thid))));
         let sem = self
             .sema_waiters
             .iter()
             .filter_map(|w| w.deadline.map(|d| (d, own(IdleKind::Sema, w.thid))));
         let cnd = self.conds.iter().flat_map(|c| {
-            c.waiters.iter().filter_map(|w| w.deadline.map(|d| (d, own(IdleKind::Cond, w.thid))))
+            c.waiters
+                .iter()
+                .filter_map(|w| w.deadline.map(|d| (d, own(IdleKind::Cond, w.thid))))
         });
         // A timed lightweight-mutex lock is a real deadline like any other: omitted here, the
         // scheduler would refuse to jump the clock for it and a run where every other thread
         // is parked would report a DEADLOCK instead of letting the lock time out.
         let lwm = self.lwmutexes.iter().flat_map(|m| {
-            m.waiters.iter().filter_map(|x| x.deadline.map(|d| (d, own(IdleKind::LwMutex, x.thid))))
+            m.waiters
+                .iter()
+                .filter_map(|x| x.deadline.map(|d| (d, own(IdleKind::LwMutex, x.thid))))
         });
         // `min_by_key` on the deadline alone: two waits can share a deadline and either is a
         // correct answer for the JUMP, but only one may be credited for the time or the
@@ -13937,9 +15345,18 @@ impl VitaState {
             .iter()
             .filter_map(|w| w.deadline.map(|d| (d, own(IdleKind::MsgPipe, w.thid))));
         let rw = self.rwlocks.iter().flat_map(|l| {
-            l.waiters.iter().filter_map(|x| x.deadline.map(|d| (d, own(IdleKind::RwLock, x.thid))))
+            l.waiters
+                .iter()
+                .filter_map(|x| x.deadline.map(|d| (d, own(IdleKind::RwLock, x.thid))))
         });
-        lw.chain(sl).chain(ev).chain(sem).chain(cnd).chain(lwm).chain(mpp).chain(rw).min_by_key(|&(d, _)| d)
+        lw.chain(sl)
+            .chain(ev)
+            .chain(sem)
+            .chain(cnd)
+            .chain(lwm)
+            .chain(mpp)
+            .chain(rw)
+            .min_by_key(|&(d, _)| d)
     }
 
     /// Where the idle-path clock time went, as `(owner, microseconds, jumps)`, largest first.
@@ -13967,7 +15384,10 @@ impl VitaState {
     /// wait that expired), if any. Drained once, by the engine, at the point the thread
     /// resumes; `None` (a signal wake) leaves the thread's pre-park return value intact.
     pub fn take_resume_code(&mut self, thid: i32) -> Option<u32> {
-        let idx = self.pending_resume_codes.iter().position(|&(t, _)| t == thid)?;
+        let idx = self
+            .pending_resume_codes
+            .iter()
+            .position(|&(t, _)| t == thid)?;
         Some(self.pending_resume_codes.remove(idx).1)
     }
 
@@ -14020,16 +15440,18 @@ impl VitaState {
         // WaitLwCond re-acquires its bound mutex before resuming, so collect the
         // expirees, then hand each to its mutex (or wake directly if none is bound).
         let mut expired_lw: Vec<(i32, u32)> = Vec::new(); // (thid, cond work address)
-        self.lwcond_waiters.retain(|&(thid, work, deadline)| match deadline {
-            Some(d) if d <= now => {
-                expired_lw.push((thid, work));
-                false
-            }
-            _ => true,
-        });
+        self.lwcond_waiters
+            .retain(|&(thid, work, deadline)| match deadline {
+                Some(d) if d <= now => {
+                    expired_lw.push((thid, work));
+                    false
+                }
+                _ => true,
+            });
         for (thid, work) in expired_lw {
             self.timeout_wakes.push(thid);
-            self.pending_resume_codes.push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+            self.pending_resume_codes
+                .push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
             match self.lwcond_mutex_of(work) {
                 // No guest memory is reachable here (see `resolve_deferred_lwmutex`), and
                 // deciding this needs to READ the work area, so queue the intent and let
@@ -14048,7 +15470,8 @@ impl VitaState {
             m.waiters.retain(|x| match x.deadline {
                 Some(d) if d <= now => {
                     push_wake!(self, x.thid);
-                    self.pending_resume_codes.push((x.thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+                    self.pending_resume_codes
+                        .push((x.thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
                     false
                 }
                 _ => true,
@@ -14064,7 +15487,8 @@ impl VitaState {
             l.waiters.retain(|x| match x.deadline {
                 Some(d) if d <= now => {
                     push_wake!(self, x.thid);
-                    self.pending_resume_codes.push((x.thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+                    self.pending_resume_codes
+                        .push((x.thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
                     false
                 }
                 _ => true,
@@ -14079,17 +15503,27 @@ impl VitaState {
         // A pure sleep (sceKernelDelayThread / audio grain pacing) that elapses is a
         // successful completion, not a timed-out wait: wake it with its return value
         // (0) unchanged - no resume code.
+        let mut slept: Vec<i32> = Vec::new();
         self.sleep_waiters.retain(|&(thid, deadline)| {
             if deadline <= now {
                 push_wake!(self, thid);
+                slept.push(thid);
                 false
             } else {
                 true
             }
         });
+        // A timed `sceNetEpollWait` that ran out is no longer a waiter an abort can interrupt.
+        if !slept.is_empty() && !self.net_epoll_waiters.is_empty() {
+            self.net_epoll_waiters.retain(|(t, _)| !slept.contains(t));
+        }
         // Timed semaphore waits whose deadline passed: wake with WAIT_TIMEOUT. The
         // count is untouched (nothing was available to consume).
-        let (q, wl, idl) = (self.clock_from_quanta_us, self.clock_from_wall_us, self.clock_from_idle_us);
+        let (q, wl, idl) = (
+            self.clock_from_quanta_us,
+            self.clock_from_wall_us,
+            self.clock_from_idle_us,
+        );
         let frame = self.cur_frame();
         self.sema_waiters.retain(|w| match w.deadline {
             Some(d) if d <= now => {
@@ -14127,7 +15561,8 @@ impl VitaState {
             });
         }
         for (thid, mutex) in expired_cond {
-            self.pending_resume_codes.push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+            self.pending_resume_codes
+                .push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
             // No guest memory is reachable here and re-acquiring now needs to READ the mutex
             // table, so the intent is queued and the scheduler settles it before anything
             // resumes - the same deferral `pending_lwmutex_acquires` already makes, and for
@@ -14152,17 +15587,23 @@ impl VitaState {
                 self.pending_stat_writes.push((result, 0));
             }
             push_wake!(self, thid);
-            self.pending_resume_codes.push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+            self.pending_resume_codes
+                .push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
         }
         let patterns: Vec<(i32, u32)> = self.event_flags.clone();
         self.evf_waiters.retain(|w| match w.deadline {
             Some(d) if d <= now => {
                 if w.out_addr != 0 {
-                    let p = patterns.iter().find(|(u, _)| *u == w.uid).map(|(_, p)| *p).unwrap_or(0);
+                    let p = patterns
+                        .iter()
+                        .find(|(u, _)| *u == w.uid)
+                        .map(|(_, p)| *p)
+                        .unwrap_or(0);
                     self.pending_stat_writes.push((w.out_addr, p));
                 }
                 push_wake!(self, w.thid);
-                self.pending_resume_codes.push((w.thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+                self.pending_resume_codes
+                    .push((w.thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
                 false
             }
             _ => true,
@@ -14185,7 +15626,14 @@ impl VitaState {
     /// `sceKernelGetSemaInfo` reports all three.
     pub fn create_sema(&mut self, name: &str, attr: u32, init: i32, max: i32) -> i32 {
         let uid = self.new_uid();
-        self.semaphores.push(SemaRec { uid, name: name.to_string(), attr, init, max, count: init });
+        self.semaphores.push(SemaRec {
+            uid,
+            name: name.to_string(),
+            attr,
+            init,
+            max,
+            count: init,
+        });
         uid
     }
 
@@ -14227,7 +15675,14 @@ impl VitaState {
     /// separate call and a title that reads the time without starting must see nothing.
     pub fn create_timer(&mut self, name: &str, attr: u32) -> i32 {
         let uid = self.new_uid();
-        self.timers.push(TimerRec { uid, name: name.to_string(), attr, running: false, accrued_us: 0, started_us: 0 });
+        self.timers.push(TimerRec {
+            uid,
+            name: name.to_string(),
+            attr,
+            running: false,
+            accrued_us: 0,
+            started_us: 0,
+        });
         uid
     }
 
@@ -14266,14 +15721,22 @@ impl VitaState {
     /// stopped, plus the time since it was last started if it is running.
     pub fn timer_time_us(&self, uid: i32) -> Option<u64> {
         let t = self.timers.iter().find(|t| t.uid == uid)?;
-        Some(if t.running { t.accrued_us + self.virtual_us.saturating_sub(t.started_us) } else { t.accrued_us })
+        Some(if t.running {
+            t.accrued_us + self.virtual_us.saturating_sub(t.started_us)
+        } else {
+            t.accrued_us
+        })
     }
 
     /// Set a timer's count, keeping it running if it was.
     pub fn timer_set_time_us(&mut self, uid: i32, us: u64) -> Option<u64> {
         let now = self.virtual_us;
         let t = self.timers.iter_mut().find(|t| t.uid == uid)?;
-        let before = if t.running { t.accrued_us + now.saturating_sub(t.started_us) } else { t.accrued_us };
+        let before = if t.running {
+            t.accrued_us + now.saturating_sub(t.started_us)
+        } else {
+            t.accrued_us
+        };
         t.accrued_us = us;
         t.started_us = now;
         Some(before)
@@ -14288,12 +15751,20 @@ impl VitaState {
 
     /// The guest's name for a timer, for reports.
     pub fn timer_name(&self, uid: i32) -> &str {
-        self.timers.iter().find(|t| t.uid == uid).map(|t| t.name.as_str()).unwrap_or("")
+        self.timers
+            .iter()
+            .find(|t| t.uid == uid)
+            .map(|t| t.name.as_str())
+            .unwrap_or("")
     }
 
     /// A timer's attribute word, as it was created with.
     pub fn timer_attr(&self, uid: i32) -> u32 {
-        self.timers.iter().find(|t| t.uid == uid).map(|t| t.attr).unwrap_or(0)
+        self.timers
+            .iter()
+            .find(|t| t.uid == uid)
+            .map(|t| t.attr)
+            .unwrap_or(0)
     }
 
     /// Whether a timer is currently counting.
@@ -14373,9 +15844,26 @@ impl VitaState {
         }
     }
 
+    /// Record an event flag's creation attributes, read back by [`Self::event_flag_info`].
+    pub fn record_event_flag_params(&mut self, uid: i32, attr: u32, init: u32) {
+        self.event_flag_params.insert(uid, (attr, init));
+    }
+
+    /// `(attr, initPattern, currentPattern, waiting threads)` of an event flag, or `None` for
+    /// a uid that names none.
+    pub fn event_flag_info(&self, uid: i32) -> Option<(u32, u32, u32, u32)> {
+        let &(_, current) = self.event_flags.iter().find(|(u, _)| *u == uid)?;
+        let (attr, init) = self.event_flag_params.get(&uid).copied().unwrap_or((0, 0));
+        let waiters = self.evf_waiters.iter().filter(|w| w.uid == uid).count() as u32;
+        Some((attr, init, current, waiters))
+    }
+
     /// The guest's name for an event flag, or `""`.
     pub fn event_flag_name(&self, uid: i32) -> &str {
-        self.event_flag_names.get(&uid).map(String::as_str).unwrap_or("")
+        self.event_flag_names
+            .get(&uid)
+            .map(String::as_str)
+            .unwrap_or("")
     }
 
     /// Set (OR in) bits on an event flag.
@@ -14425,9 +15913,25 @@ impl VitaState {
     }
 
     /// Park the current thread in a message-pipe receive. See [`MsgPipeWaiter`].
-    pub fn msgpipe_block(&mut self, uid: i32, buf: u32, size: u32, full: bool, result: u32, timeout_us: Option<u32>) {
+    pub fn msgpipe_block(
+        &mut self,
+        uid: i32,
+        buf: u32,
+        size: u32,
+        full: bool,
+        result: u32,
+        timeout_us: Option<u32>,
+    ) {
         let deadline = timeout_us.map(|t| self.virtual_us + t as u64);
-        self.msgpipe_waiters.push(MsgPipeWaiter { uid, thid: self.current, buf, size, full, result, deadline });
+        self.msgpipe_waiters.push(MsgPipeWaiter {
+            uid,
+            thid: self.current,
+            buf,
+            size,
+            full,
+            result,
+            deadline,
+        });
     }
 
     /// After bytes arrive on pipe `uid`: hand them to parked receivers in FIFO order, each
@@ -14436,15 +15940,26 @@ impl VitaState {
     pub fn msgpipe_service(&mut self, ctx: &mut GuestCtx, uid: i32) {
         loop {
             let held = self.msg_pipes.get(&uid).map_or(0, |p| p.len());
-            let Some(idx) = self.msgpipe_waiters.iter().position(|x| x.uid == uid) else { break };
+            let Some(idx) = self.msgpipe_waiters.iter().position(|x| x.uid == uid) else {
+                break;
+            };
             let x = &self.msgpipe_waiters[idx];
-            let ok = if x.full { held >= x.size as usize } else { held > 0 };
+            let ok = if x.full {
+                held >= x.size as usize
+            } else {
+                held > 0
+            };
             if !ok {
                 break;
             }
             let x = self.msgpipe_waiters.remove(idx);
             let n = (x.size as usize).min(held);
-            let bytes: Vec<u8> = self.msg_pipes.get_mut(&uid).expect("held > 0").drain(..n).collect();
+            let bytes: Vec<u8> = self
+                .msg_pipes
+                .get_mut(&uid)
+                .expect("held > 0")
+                .drain(..n)
+                .collect();
             ctx.write_bytes(x.buf, &bytes);
             if x.result != 0 {
                 ctx.write_u32(x.result, n as u32);
@@ -14458,7 +15973,15 @@ impl VitaState {
     /// `outBits` pointer the wake will write the match pattern through.
     pub fn evf_block(&mut self, uid: i32, bits: u32, mode: u32, out_addr: u32, timeout_us: u32) {
         let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
-        self.evf_waiters.push(EvfWaiter { uid, thid: self.current, bits, mode, out_addr, deadline, user_data_addr: 0 });
+        self.evf_waiters.push(EvfWaiter {
+            uid,
+            thid: self.current,
+            bits,
+            mode,
+            out_addr,
+            deadline,
+            user_data_addr: 0,
+        });
     }
 
     /// Set bits on an event flag, then release every parked waiter the new pattern
@@ -14484,7 +16007,8 @@ impl VitaState {
             if w.user_data_addr != 0 {
                 let d = self.simple_events.get(&uid).map_or(0, |e| e.1);
                 self.pending_stat_writes.push((w.user_data_addr, d as u32));
-                self.pending_stat_writes.push((w.user_data_addr + 4, (d >> 32) as u32));
+                self.pending_stat_writes
+                    .push((w.user_data_addr + 4, (d >> 32) as u32));
             }
             push_wake!(self, w.thid);
         }
@@ -14506,7 +16030,12 @@ impl VitaState {
     /// The event-flag wait mode a simple event's wait uses, or `None` if `uid` is not one.
     pub fn simple_event_mode(&self, uid: i32) -> Option<u32> {
         self.simple_events.get(&uid).map(|(attr, _)| {
-            Self::EVF_WAITOR | if attr & Self::SIMPLE_EVENT_AUTO_RESET != 0 { Self::EVF_WAITCLEAR } else { 0 }
+            Self::EVF_WAITOR
+                | if attr & Self::SIMPLE_EVENT_AUTO_RESET != 0 {
+                    Self::EVF_WAITCLEAR
+                } else {
+                    0
+                }
         })
     }
 
@@ -14532,9 +16061,25 @@ impl VitaState {
 
     /// Park the current thread on a simple event - [`Self::evf_block`] plus the user-data
     /// out pointer.
-    pub fn simple_event_block(&mut self, uid: i32, bits: u32, mode: u32, out_addr: u32, user_data_addr: u32, timeout_us: u32) {
+    pub fn simple_event_block(
+        &mut self,
+        uid: i32,
+        bits: u32,
+        mode: u32,
+        out_addr: u32,
+        user_data_addr: u32,
+        timeout_us: u32,
+    ) {
         let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
-        self.evf_waiters.push(EvfWaiter { uid, thid: self.current, bits, mode, out_addr, deadline, user_data_addr });
+        self.evf_waiters.push(EvfWaiter {
+            uid,
+            thid: self.current,
+            bits,
+            mode,
+            out_addr,
+            deadline,
+            user_data_addr,
+        });
     }
 
     /// Clear an event flag's bits: keep only the bits also set in `bits` (the
@@ -14547,7 +16092,11 @@ impl VitaState {
 
     /// The current bit pattern of an event flag.
     pub fn event_pattern(&self, uid: i32) -> u32 {
-        self.event_flags.iter().find(|(u, _)| *u == uid).map(|(_, p)| *p).unwrap_or(0)
+        self.event_flags
+            .iter()
+            .find(|(u, _)| *u == uid)
+            .map(|(_, p)| *p)
+            .unwrap_or(0)
     }
 
     /// Guest-region bytes reserved at the top for the MAIN THREAD'S STACK, which the
@@ -14582,10 +16131,14 @@ impl VitaState {
         // both at once).
         static SKEW: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let skew = *SKEW.get_or_init(|| {
-            crate::knobs::var("VITASLOP_GALLOC_SKEW").ok().and_then(|v| {
-                let v = v.trim();
-                v.strip_prefix("0x").map_or_else(|| v.parse().ok(), |h| u32::from_str_radix(h, 16).ok())
-            }).unwrap_or(0)
+            crate::knobs::var("VITASLOP_GALLOC_SKEW")
+                .ok()
+                .and_then(|v| {
+                    let v = v.trim();
+                    v.strip_prefix("0x")
+                        .map_or_else(|| v.parse().ok(), |h| u32::from_str_radix(h, 16).ok())
+                })
+                .unwrap_or(0)
         });
         if skew != 0 && !self.galloc_skewed {
             self.galloc_skewed = true;
@@ -14689,7 +16242,7 @@ impl VitaState {
     //
     // Real descriptors and real local state, no host sockets. See `vita::net` for what
     // is modelled and why. Everything here is a pure function of the guest's own call
-    // sequence, so two runs of the same recipe produce identical socket ids.
+    // sequence, so two runs of the same input produce identical socket ids.
 
     /// `sceNetSocket`: allocate a descriptor. Ids start above the file-descriptor range
     /// so a socket id mistakenly passed to `sceIoClose` cannot close a file.
@@ -14710,7 +16263,9 @@ impl VitaState {
     }
 
     fn net_socket_mut(&mut self, id: i32) -> Option<&mut NetSocket> {
-        self.net_sockets.iter_mut().find(|s| s.id == id && !s.closed)
+        self.net_sockets
+            .iter_mut()
+            .find(|s| s.id == id && !s.closed)
     }
 
     pub fn net_socket_exists(&self, id: i32) -> bool {
@@ -14748,7 +16303,10 @@ impl VitaState {
     }
 
     pub fn net_local_addr(&self, id: i32) -> Option<(u32, u16)> {
-        self.net_sockets.iter().find(|s| s.id == id && !s.closed).map(|s| s.local)
+        self.net_sockets
+            .iter()
+            .find(|s| s.id == id && !s.closed)
+            .map(|s| s.local)
     }
 
     pub fn net_set_opt(&mut self, id: i32, level: i32, name: i32, value: u32) -> bool {
@@ -14767,7 +16325,13 @@ impl VitaState {
     /// answer from "the option is zero" and must not be conflated.
     pub fn net_get_opt(&self, id: i32, level: i32, name: i32) -> Option<u32> {
         let s = self.net_sockets.iter().find(|s| s.id == id && !s.closed)?;
-        Some(s.options.iter().find(|&&(l, n, _)| (l, n) == (level, name)).map(|&(_, _, v)| v).unwrap_or(0))
+        Some(
+            s.options
+                .iter()
+                .find(|&&(l, n, _)| (l, n) == (level, name))
+                .map(|&(_, _, v)| v)
+                .unwrap_or(0),
+        )
     }
 
     /// `sceNetShowNetstat`'s output: the live socket table, one line each.
@@ -14780,7 +16344,16 @@ impl VitaState {
             let _ = writeln!(
                 s,
                 "  fd={} name={:?} domain={} type={} proto={} local={}.{}.{}.{}:{}{}",
-                k.id, k.name, k.domain, k.ty, k.protocol, b[0], b[1], b[2], b[3], port,
+                k.id,
+                k.name,
+                k.domain,
+                k.ty,
+                k.protocol,
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                port,
                 if k.listening { " LISTEN" } else { "" }
             );
         }
@@ -14832,7 +16405,7 @@ impl VitaState {
             label: label.to_string(),
             method,
             headers: Vec::new(),
-            timeouts: [0; 3],
+            timeouts: [0; 5],
             cookies_enabled: false,
             deleted: false,
         });
@@ -14860,7 +16433,9 @@ impl VitaState {
     }
 
     fn http_object_mut(&mut self, id: i32) -> Option<&mut HttpObject> {
-        self.http_objects.iter_mut().find(|o| o.id == id && !o.deleted)
+        self.http_objects
+            .iter_mut()
+            .find(|o| o.id == id && !o.deleted)
     }
 
     /// Is `id` a live object at all, of any kind?
@@ -14870,7 +16445,9 @@ impl VitaState {
 
     /// Is `id` a live object of exactly `kind`?
     pub fn http_is(&self, id: i32, kind: HttpKind) -> bool {
-        self.http_objects.iter().any(|o| o.id == id && o.kind == kind && !o.deleted)
+        self.http_objects
+            .iter()
+            .any(|o| o.id == id && o.kind == kind && !o.deleted)
     }
 
     /// Free `id`. Deleting a template or connection also frees everything under it,
@@ -14878,12 +16455,18 @@ impl VitaState {
     /// owns their settings, and leaving them live would let a request survive its
     /// connection and report a different error than hardware gives.
     pub fn http_delete(&mut self, id: i32) -> bool {
-        let Some(o) = self.http_object_mut(id) else { return false };
+        let Some(o) = self.http_object_mut(id) else {
+            return false;
+        };
         o.deleted = true;
         let mut doomed = vec![id];
         while let Some(parent) = doomed.pop() {
-            let kids: Vec<i32> =
-                self.http_objects.iter().filter(|o| o.parent == parent && !o.deleted).map(|o| o.id).collect();
+            let kids: Vec<i32> = self
+                .http_objects
+                .iter()
+                .filter(|o| o.parent == parent && !o.deleted)
+                .map(|o| o.id)
+                .collect();
             for k in kids {
                 if let Some(o) = self.http_object_mut(k) {
                     o.deleted = true;
@@ -14897,7 +16480,7 @@ impl VitaState {
     /// Record a connect/send/receive timeout (`which` is 0/1/2) against a live object.
     pub fn http_set_timeout(&mut self, id: i32, which: usize, usec: u32) -> bool {
         match self.http_object_mut(id) {
-            Some(o) if which < 3 => {
+            Some(o) if which < o.timeouts.len() => {
                 o.timeouts[which] = usec;
                 true
             }
@@ -14956,13 +16539,35 @@ impl VitaState {
     }
 
     pub fn net_resolver_error(&self, rid: i32) -> Option<i32> {
-        self.net_resolvers.iter().find(|(id, _)| *id == rid).map(|&(_, e)| e)
+        self.net_resolvers
+            .iter()
+            .find(|(id, _)| *id == rid)
+            .map(|&(_, e)| e)
     }
 
     pub fn net_epoll_create(&mut self) -> i32 {
-        let id = NET_EPOLL_BASE + self.net_epolls.len() as i32;
+        let id = NET_EPOLL_BASE + self.net_epoll_minted;
+        self.net_epoll_minted += 1;
         self.net_epolls.push((id, Vec::new()));
         id
+    }
+
+    /// Latch an abort on `eid` for its next wait. `false` if `eid` names no epoll.
+    pub fn net_epoll_latch_abort(&mut self, eid: i32) -> bool {
+        if !self.net_epoll_exists(eid) {
+            return false;
+        }
+        if !self.net_epoll_aborted.contains(&eid) {
+            self.net_epoll_aborted.push(eid);
+        }
+        true
+    }
+
+    /// Consume a latched abort on `eid`, if there is one.
+    pub fn net_epoll_take_abort(&mut self, eid: i32) -> bool {
+        let before = self.net_epoll_aborted.len();
+        self.net_epoll_aborted.retain(|&e| e != eid);
+        self.net_epoll_aborted.len() != before
     }
 
     pub fn net_epoll_exists(&self, eid: i32) -> bool {
@@ -14972,7 +16577,36 @@ impl VitaState {
     pub fn net_epoll_destroy(&mut self, eid: i32) -> bool {
         let before = self.net_epolls.len();
         self.net_epolls.retain(|(id, _)| *id != eid);
+        self.net_epoll_aborted.retain(|&e| e != eid);
+        self.net_epoll_wake(eid, crate::vita::net::NET_FAIL as u32);
         self.net_epolls.len() != before
+    }
+
+    /// Park the current thread in `sceNetEpollWait` on `eid`: for `timeout_us` of guest time
+    /// (it then returns the 0 events already in its `r0`), or with `None` until an abort or a
+    /// destroy wakes it.
+    pub fn net_epoll_park(&mut self, eid: i32, timeout_us: Option<u64>) {
+        self.net_epoll_waiters.push((self.current, eid));
+        if let Some(us) = timeout_us {
+            self.sleep_park(us);
+        }
+    }
+
+    /// Wake every thread waiting on `eid`, each returning `code`. Returns how many woke.
+    pub fn net_epoll_wake(&mut self, eid: i32, code: u32) -> usize {
+        let woken: Vec<i32> = self
+            .net_epoll_waiters
+            .iter()
+            .filter(|&&(_, e)| e == eid)
+            .map(|&(t, _)| t)
+            .collect();
+        self.net_epoll_waiters.retain(|&(_, e)| e != eid);
+        for &thid in &woken {
+            self.sleep_waiters.retain(|&(t, _)| t != thid);
+            self.pending_resume_codes.push((thid, code));
+            push_wake!(self, thid);
+        }
+        woken.len()
     }
 
     /// `SCE_NET_EPOLL_CTL_ADD` (1) / `MOD` (2) / `DEL` (3) over the registered set.
@@ -15042,7 +16676,9 @@ impl VitaState {
         // than the console has must fail HERE, whatever the arena has room for. A title
         // sizes its pools by allocating until refused, so an unbounded partition is not a
         // spare resource - it is a wrong answer the title then builds on.
-        use crate::vita::sysmem::{partition_of, Partition, CDRAM_BUDGET_BYTES, PHYCONT_BUDGET_BYTES};
+        use crate::vita::sysmem::{
+            CDRAM_BUDGET_BYTES, PHYCONT_BUDGET_BYTES, Partition, partition_of,
+        };
         let part = partition_of(ty);
         let (used, budget) = match part {
             Partition::Cdram => (self.cdram_used, CDRAM_BUDGET_BYTES),
@@ -15052,9 +16688,10 @@ impl VitaState {
         if used.saturating_add(want) > budget {
             return 0;
         }
-        let reused = self.freed_memblocks.iter().position(|&(base, sz)| {
-            sz >= want && base & (a - 1) == 0
-        });
+        let reused = self
+            .freed_memblocks
+            .iter()
+            .position(|&(base, sz)| sz >= want && base & (a - 1) == 0);
         let base = match reused {
             Some(i) => {
                 let (base, sz) = self.freed_memblocks.remove(i);
@@ -15082,7 +16719,12 @@ impl VitaState {
         }
         let uid = self.next_uid;
         self.next_uid += 1;
-        self.memblocks.push(MemBlock { uid, base, size, ty });
+        self.memblocks.push(MemBlock {
+            uid,
+            base,
+            size,
+            ty,
+        });
         uid
     }
 
@@ -15122,7 +16764,11 @@ impl VitaState {
         // it. [`dump_stream_bytes`] prints the raw window if it needs re-checking.
         let streams: Vec<VertexStreamInfo> = streams
             .into_iter()
-            .map(|(stride, per_instance)| VertexStreamInfo { stride, column: stride, per_instance })
+            .map(|(stride, per_instance)| VertexStreamInfo {
+                stride,
+                column: stride,
+                per_instance,
+            })
             .collect();
         // The packed layout every draw of this program will capture into - see
         // `VertexProgramInfo::packed_attributes` for why it belongs here and not in the draw.
@@ -15132,8 +16778,9 @@ impl VitaState {
             .max()
             .map(|m| m + 1)
             .unwrap_or(0);
-        let used_streams: std::sync::Arc<[VertexStreamInfo]> =
-            (0..used).map(|i| streams.get(i).copied().unwrap_or_default()).collect();
+        let used_streams: std::sync::Arc<[VertexStreamInfo]> = (0..used)
+            .map(|i| streams.get(i).copied().unwrap_or_default())
+            .collect();
         // The extent each stream's own attributes need, so a stride-0 stream still gets a
         // column - see `VertexStreamInfo::column`.
         let extent_of = |si: usize| -> u32 {
@@ -15154,7 +16801,10 @@ impl VitaState {
         let used_streams: std::sync::Arc<[VertexStreamInfo]> = used_streams
             .iter()
             .enumerate()
-            .map(|(i, s)| VertexStreamInfo { column: s.stride.max(extent_of(i)), ..*s })
+            .map(|(i, s)| VertexStreamInfo {
+                column: s.stride.max(extent_of(i)),
+                ..*s
+            })
             .collect();
         // >>> EVERY STREAM'S COLUMN STARTS ON A FOUR-BYTE BOUNDARY, AND THE ROW ENDS ON ONE.
         //
@@ -15221,7 +16871,9 @@ impl VitaState {
                     continue;
                 }
                 mine.clear();
-                mine.extend((0..attributes.len()).filter(|&k| attributes[k].stream_index as usize == si));
+                mine.extend(
+                    (0..attributes.len()).filter(|&k| attributes[k].stream_index as usize == si),
+                );
                 // A stream nothing names still has a column (its stride), and it is copied
                 // whole exactly as it always was: nothing fetches those bytes, but every cache
                 // downstream HASHES the row, so dropping them would be a change of content for
@@ -15259,7 +16911,9 @@ impl VitaState {
                     // the row already being read), and is exactly the byte a widened `uint8x4`
                     // fetch would have read - a lane a 3-component attribute never uses, since
                     // the linker bakes the surplus lane as a constant.
-                    let copy = slot.min(st.column.saturating_sub(u32::from(a.offset))).max(len);
+                    let copy = slot
+                        .min(st.column.saturating_sub(u32::from(a.offset)))
+                        .max(len);
                     pieces.push(ScatterPiece {
                         stream: si as u16,
                         src: a.offset,
@@ -15339,7 +16993,13 @@ impl VitaState {
                 // under the column form it is the guest's own plus its stream's base.
                 a.offset = match moved.get(k) {
                     Some(&at) => at as u16,
-                    None => a.offset + stream_base.get(a.stream_index as usize).copied().unwrap_or(0) as u16,
+                    None => {
+                        a.offset
+                            + stream_base
+                                .get(a.stream_index as usize)
+                                .copied()
+                                .unwrap_or(0) as u16
+                    }
                 };
                 a.stream_index = 0;
                 a
@@ -15388,7 +17048,10 @@ impl VitaState {
 
     /// The `SceGxmProgram*` a vertex program handle was created from, if recorded.
     pub(crate) fn vertex_program_header(&self, handle: u32) -> u32 {
-        self.vertex_programs.get(&handle).map(|i| i.program_header).unwrap_or(0)
+        self.vertex_programs
+            .get(&handle)
+            .map(|i| i.program_header)
+            .unwrap_or(0)
     }
 
     /// Record `sceGxmShaderPatcherCreateFragmentProgram`'s handle -> (`SceGxmProgram*`, the
@@ -15400,23 +17063,33 @@ impl VitaState {
         blend: crate::capture::BlendState,
         patched_vertex_header: u32,
     ) {
-        self.fragment_programs.insert(handle, (program_header, blend, patched_vertex_header));
+        self.fragment_programs
+            .insert(handle, (program_header, blend, patched_vertex_header));
     }
 
     pub(crate) fn fragment_program_header(&self, handle: u32) -> u32 {
-        self.fragment_programs.get(&handle).map(|(h, ..)| *h).unwrap_or(0)
+        self.fragment_programs
+            .get(&handle)
+            .map(|(h, ..)| *h)
+            .unwrap_or(0)
     }
 
     /// The vertex `SceGxmProgram*` a fragment program handle was PATCHED against at create
     /// (0 when the title passed NULL or the handle is unknown).
     fn fragment_program_patched_vertex(&self, handle: u32) -> u32 {
-        self.fragment_programs.get(&handle).map(|(_, _, v)| *v).unwrap_or(0)
+        self.fragment_programs
+            .get(&handle)
+            .map(|(_, _, v)| *v)
+            .unwrap_or(0)
     }
 
     /// The blend equation a fragment program handle was created with. An unknown handle
     /// yields the GXM default (no blending), which is what a NULL `blendInfo` means.
     fn fragment_program_blend(&self, handle: u32) -> crate::capture::BlendState {
-        self.fragment_programs.get(&handle).map(|(_, b, _)| *b).unwrap_or_default()
+        self.fragment_programs
+            .get(&handle)
+            .map(|(_, b, _)| *b)
+            .unwrap_or_default()
     }
 
     /// Record a color surface, keyed by its guest struct address.
@@ -15445,16 +17118,25 @@ impl VitaState {
         let bytes = |s: &crate::capture::ColorSurface| -> u64 {
             u64::from(s.stride_pixels.max(s.width)) * u64::from(s.height)
         };
-        let (lo, hi) = (u64::from(new.data_addr), u64::from(new.data_addr) + bytes(new));
+        let (lo, hi) = (
+            u64::from(new.data_addr),
+            u64::from(new.data_addr) + bytes(new),
+        );
         if new.data_addr == 0 || hi == lo {
             return;
         }
         for old in self.color_surfaces.values() {
-            let (olo, ohi) = (u64::from(old.data_addr), u64::from(old.data_addr) + bytes(old));
+            let (olo, ohi) = (
+                u64::from(old.data_addr),
+                u64::from(old.data_addr) + bytes(old),
+            );
             if old.data_addr == 0 || old.data_addr == new.data_addr || ohi <= lo || hi <= olo {
                 continue;
             }
-            let key = (old.data_addr.min(new.data_addr), old.data_addr.max(new.data_addr));
+            let key = (
+                old.data_addr.min(new.data_addr),
+                old.data_addr.max(new.data_addr),
+            );
             if self.reported_surface_overlaps.insert(key) {
                 tracing::warn!(
                     target: "vitaslop::gxm",
@@ -15500,8 +17182,17 @@ impl VitaState {
         if self.gxm_context != 0 {
             crate::vita::gxmctx::rewind_uniform_ring(ctx, self.gxm_context);
         }
-        self.scene =
-            Some(crate::capture::Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, color, depth, multisample, target_extent, draws: Vec::new(), precompile: Default::default() });
+        self.scene = Some(crate::capture::Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
+            color,
+            depth,
+            multisample,
+            target_extent,
+            draws: Vec::new(),
+            precompile: Default::default(),
+        });
         self.clear_sa_bank(ctx);
     }
 
@@ -15511,6 +17202,113 @@ impl VitaState {
     // why. These are the read side: every one resolves through `self.gxm_context`, so
     // there is exactly one home for each fact and no host copy to fall out of step with
     // an inlined setter that never reaches the host at all.
+
+    // --- Deferred contexts and command lists -----------------------------------
+    //
+    // A deferred context records draws into a command list that an immediate context later
+    // splices into its own scene. Its sticky state lives in its own block, exactly like the
+    // immediate one's (`gxmctx::init` lays it down in the title's hostMem), so every setter -
+    // host or inlined - already lands in the right place. What does not is the handful of
+    // host paths that act on "the" context (`self.gxm_context`): those are pointed at the
+    // deferred block for the duration of any GXM call that names it (`vita::dispatch`).
+    //
+    // A recorded draw is its arguments plus a COPY of the deferred block at that moment, because
+    // the list must replay the state each draw saw, not the state the context ended up in.
+    // Replay ([`Self::replay_command_list`]) puts each copy back in the block and runs the
+    // ordinary draw path against it, inside the immediate context's open scene.
+
+    /// Whether `context` is a deferred context this run created.
+    pub fn is_deferred_context(&self, context: u32) -> bool {
+        !self.deferred_contexts.is_empty() && self.deferred_contexts.contains_key(&context)
+    }
+
+    /// Make `context` "the" GXM context, answering the one it replaces.
+    pub fn swap_gxm_context(&mut self, context: u32) -> u32 {
+        std::mem::replace(&mut self.gxm_context, context)
+    }
+
+    /// Whether a scene is open on the immediate context.
+    pub fn scene_open(&self) -> bool {
+        self.scene.is_some()
+    }
+
+    /// Record a draw made on deferred `context`: the call, its arguments, and the context's
+    /// block as it stands. `false` when the context is not recording.
+    pub fn record_deferred_draw(
+        &mut self,
+        ctx: &GuestCtx,
+        context: u32,
+        draw: DeferredDraw,
+    ) -> bool {
+        let block = ctx.read_bytes(context, crate::vita::gxmctx::BYTES as usize);
+        let pdraw = self.pdraw_binding;
+        match self
+            .deferred_contexts
+            .get_mut(&context)
+            .and_then(|d| d.recording.as_mut())
+        {
+            Some(list) => {
+                list.push(RecordedDraw {
+                    context,
+                    draw,
+                    block,
+                    pdraw,
+                });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Replay a recorded command list into the open scene: for each draw, put the block it was
+    /// recorded against back (with the SCENE's viewport and region clip - a list does not carry
+    /// them), point the draw path at it, draw, and put everything back as it was.
+    pub fn replay_command_list(&mut self, ctx: &mut GuestCtx, id: u32) -> bool {
+        use crate::vita::gxmctx::off;
+        let Some(draws) = self.command_lists.get(id as usize).cloned() else {
+            return false;
+        };
+        let immediate = self.gxm_context;
+        // The scene's viewport and region clip, from VIEWPORT_ENABLE up to the visibility state.
+        let scene_view = (immediate != 0).then(|| {
+            ctx.read_bytes(
+                immediate + off::VIEWPORT_ENABLE,
+                (off::FRONT_VISIBILITY_TEST_ENABLE - off::VIEWPORT_ENABLE) as usize,
+            )
+        });
+        for d in &draws {
+            let live = ctx.read_bytes(d.context, d.block.len());
+            ctx.write_bytes(d.context, &d.block);
+            if let Some(v) = &scene_view {
+                ctx.write_bytes(d.context + off::VIEWPORT_ENABLE, v);
+            }
+            let prev = self.swap_gxm_context(d.context);
+            let pdraw = std::mem::replace(&mut self.pdraw_binding, d.pdraw);
+            match d.draw {
+                DeferredDraw::Indexed {
+                    primitive,
+                    index_format,
+                    index_data,
+                    index_count,
+                    index_wrap,
+                } => self.record_draw(
+                    ctx,
+                    primitive,
+                    index_format,
+                    index_data,
+                    index_count,
+                    index_wrap,
+                ),
+                DeferredDraw::Precomputed { precomputed } => {
+                    self.draw_precomputed(ctx, precomputed)
+                }
+            }
+            self.pdraw_binding = pdraw;
+            self.swap_gxm_context(prev);
+            ctx.write_bytes(d.context, &live);
+        }
+        true
+    }
 
     /// Adopt the context `sceGxmCreateContext` just built.
     ///
@@ -15657,7 +17455,7 @@ impl VitaState {
             let format = self.texture_format(b.addr);
             // The explicit row pitch `sceGxmTextureInitLinearStrided` was given - see
             // `build_texture_template`.
-            let byte_stride = self.texture_extra(b.addr).byte_stride;
+            let byte_stride = Self::linear_strided_stride_of(b.words);
             // Only for a handle with no format of its own: is there an initialised texture
             // NEARBY? A struct the guest inits at one address and binds at another (off by a
             // fixed member offset, or copied by value) is a completely different bug from one
@@ -15667,12 +17465,22 @@ impl VitaState {
             let nearby = self.nearby_texture_cache.get(&b.addr).copied().flatten();
             (b, format, nearby, byte_stride)
         }));
+        let yuv_profiles = self.yuv_profiles;
         let mut snapshots_guard = snaps!(self);
         let snapshots = &mut *snapshots_guard;
         let out = unit_state
             .iter()
             .filter_map(|(binding, format, nearby, byte_stride)| {
                 decode_texture(ctx, snapshots, binding, *format, *nearby, *byte_stride)
+            })
+            .map(|mut t| {
+                // The YUV conversion slot the texture names (swizzle bit 13 for the two-plane
+                // formats: `YUV_CSC1`/`YVU_CSC1`) takes the profile the context has for it NOW.
+                // Per draw, outside the memoised decode, because it is context state.
+                if t.base_format == crate::render::YUV420P2 {
+                    t.yuv_profile = yuv_profiles[((t.swizzle >> 13) & 1) as usize];
+                }
+                t
             })
             .collect();
         self.texture_unit_scratch = unit_state;
@@ -15689,7 +17497,10 @@ impl VitaState {
         // Bumped only on a REAL change, so a title that rebinds the same texture keeps the
         // draw-side shortcut. See [`Self::vertex_texture_gen`].
         let mut changed = true;
-        match self.bound_vertex_textures.binary_search_by_key(&unit, |b| b.unit) {
+        match self
+            .bound_vertex_textures
+            .binary_search_by_key(&unit, |b| b.unit)
+        {
             Ok(i) => {
                 if texture_addr == 0 {
                     self.bound_vertex_textures.remove(i);
@@ -15739,7 +17550,11 @@ impl VitaState {
             ctx,
             context,
             unit,
-            crate::vita::gxmctx::TexBinding { addr: texture_addr, words, from_precomputed: false },
+            crate::vita::gxmctx::TexBinding {
+                addr: texture_addr,
+                words,
+                from_precomputed: false,
+            },
         );
     }
 
@@ -15797,8 +17612,13 @@ impl VitaState {
     ///
     /// Fires once for the run: the failing pair repeats every frame, and a per-draw line would
     /// bury the rest of the log [[vitaslop-a-diagnostic-can-bury-the-findings]].
-    fn report_draw_without_bound_textures(&mut self, blk: &crate::vita::gxmctx::Block, fheader: u32, want: u32) {
-        use crate::vita::gxmctx::{self, off, MAX_TEXTURE_UNITS, TEXTURE_STRIDE};
+    fn report_draw_without_bound_textures(
+        &mut self,
+        blk: &crate::vita::gxmctx::Block,
+        fheader: u32,
+        want: u32,
+    ) {
+        use crate::vita::gxmctx::{self, MAX_TEXTURE_UNITS, TEXTURE_STRIDE, off};
         if self.reported_draw_without_textures {
             return;
         }
@@ -15843,9 +17663,17 @@ impl VitaState {
              always complete - those setters are never inlined). \
              {}",
             self.cur_frame,
-            if self.last_draw_was_precomputed { "sceGxmDrawPrecomputed" } else { "sceGxmDraw" },
+            if self.last_draw_was_precomputed {
+                "sceGxmDrawPrecomputed"
+            } else {
+                "sceGxmDraw"
+            },
             MAX_TEXTURE_UNITS,
-            if sampler_narrow_enabled() { "ON" } else { "OFF (VITASLOP_SAMPLER_NARROW=0)" },
+            if sampler_narrow_enabled() {
+                "ON"
+            } else {
+                "OFF (VITASLOP_SAMPLER_NARROW=0)"
+            },
             self.gxm_context,
             self.texture_writes.binds,
             self.texture_writes.unbinds,
@@ -15867,17 +17695,21 @@ impl VitaState {
             },
             self.texture_writes.state_texture_sets,
             match crate::vita::texture_slot_writers_are_host_routed() {
-                (true, true) => "Both writers are host-routed in this run, so both counts are \
+                (true, true) =>
+                    "Both writers are host-routed in this run, so both counts are \
                                  COMPLETE.",
-                (true, false) => "The direct-bind count is COMPLETE, but an INLINED \
+                (true, false) =>
+                    "The direct-bind count is COMPLETE, but an INLINED \
                                   sceGxmSetPrecomputedFragmentState replaces all sixteen slots \
                                   without reaching the host - so a precomputed-state count of 0 \
                                   here means UNCOUNTED, not none. Re-run with \
                                   VITASLOP_NO_INLINE_IMPORTS=1 for both.",
-                (false, true) => "The precomputed-state count is COMPLETE; the direct-bind count \
+                (false, true) =>
+                    "The precomputed-state count is COMPLETE; the direct-bind count \
                                   is a lower bound (the inlined copy form does not reach the \
                                   host).",
-                (false, false) => "BOTH counts are lower bounds: the inlined copy form and the \
+                (false, false) =>
+                    "BOTH counts are lower bounds: the inlined copy form and the \
                                    inlined state bind each write the slots without reaching the \
                                    host. Re-run with VITASLOP_NO_INLINE_IMPORTS=1.",
             },
@@ -15905,11 +17737,9 @@ impl VitaState {
         }
     }
 
-
     pub fn texture_format(&self, texture_addr: u32) -> Option<u32> {
         self.texture_formats.get(&texture_addr).copied()
     }
-
 
     /// The initialised texture nearest `addr` within `+-window` bytes, as `(signed byte delta,
     /// its format)`. Diagnostic only.
@@ -15934,20 +17764,25 @@ impl VitaState {
         self.color_surfaces.get(&addr).copied()
     }
 
-    /// The sticky extra state for a `SceGxmTexture*`, or GXM defaults if never set.
-    fn texture_extra(&self, texture_addr: u32) -> TextureExtra {
-        self.texture_extra.get(&texture_addr).copied().unwrap_or_default()
+    /// The explicit byte stride of the `LINEAR_STRIDED` texture at `texture_addr`, or 0 for one
+    /// that is not strided (derive the pitch from width x bytes-per-pixel).
+    ///
+    /// Read out of the struct's own word 0, where init packed it (`vita::gxm::pack_linear_stride`),
+    /// so a by-value copy - a material holding its own `SceGxmTexture` - samples at the same
+    /// pitch. Held beside the struct instead, a copy sampled a render target at width x 4 instead
+    /// of its real pitch, every row shifting by the difference into slanted stripes.
+    pub fn linear_strided_stride(&self, ctx: &GuestCtx, texture_addr: u32) -> u32 {
+        let words = [0, 4, 8, 12].map(|o| ctx.read_u32(texture_addr.wrapping_add(o)));
+        Self::linear_strided_stride_of(words)
     }
 
-    /// Mutable slot for a texture's extra state, inserting GXM defaults on first touch.
-    fn texture_extra_mut(&mut self, texture_addr: u32) -> &mut TextureExtra {
-        self.texture_extra.entry(texture_addr).or_default()
-    }
-
-    /// Record the explicit byte stride a `sceGxmTextureInitLinearStrided` established - the one
-    /// field of word 0 that cannot be packed into the guest's words. See [`TextureExtra`].
-    pub fn set_texture_stride(&mut self, texture_addr: u32, byte_stride: u32) {
-        self.texture_extra_mut(texture_addr).byte_stride = byte_stride;
+    /// [`Self::linear_strided_stride`] for a binding whose control words were already read (at
+    /// bind time - the struct may since have been reused, so its memory is not re-read).
+    fn linear_strided_stride_of(words: [u32; 4]) -> u32 {
+        if (words[1] >> 29) & 0x7 != crate::vita::gxm::TYPE_LINEAR_STRIDED {
+            return 0;
+        }
+        crate::vita::gxm::linear_stride_from_word0(words[0])
     }
 
     /// Report the first `sceGxmTextureSetGammaMode` of a run.
@@ -15969,38 +17804,6 @@ impl VitaState {
         }
     }
 
-    /// `sceGxmTextureGetStride`: the row pitch in bytes. Returns the explicit byte
-    /// stride for a `LINEAR_STRIDED` texture, otherwise the driver-derived linear
-    /// stride: uncompressed rows are padded to a multiple of 8 texels (the GXM linear
-    /// alignment), compressed rows are block-packed - the same formula the capture
-    /// decoder uses (`decode_texture`).
-    pub fn texture_stride(&self, ctx: &GuestCtx, texture_addr: u32) -> u32 {
-        let e = self.texture_extra(texture_addr);
-        if e.byte_stride != 0 {
-            return e.byte_stride;
-        }
-        let w0 = ctx.read_u32(texture_addr);
-        let w1 = ctx.read_u32(texture_addr.wrapping_add(4));
-        let width = ((w1 >> 12) & 0xfff) + 1;
-        // Reconstruct the full base-format high byte exactly as decode_texture does:
-        // prefer the exact 32-bit format the guest set, else the 5-bit control-word
-        // field plus the format0 extension bit (word 0 bit 31).
-        let base_format = match self.texture_format(texture_addr) {
-            Some(f) => (f >> 24) & 0xff,
-            None => ((w1 >> 24) & 0x1f) | (((w0 >> 31) & 1) << 7),
-        };
-        match crate::render::block_layout(base_format) {
-            Some((block_w, _block_h, block_bytes)) => {
-                if block_w == 1 {
-                    align_up(width, 8) * block_bytes
-                } else {
-                    width.div_ceil(block_w) * block_bytes
-                }
-            }
-            None => width * 4,
-        }
-    }
-
     /// Record a color surface's gamma-correction mode (`sceGxmColorSurfaceSetGammaMode`).
     ///
     /// On hardware a non-`NONE` mode makes the ROP sRGB-ENCODE on write, so a shader writing
@@ -16011,7 +17814,11 @@ impl VitaState {
     pub fn set_color_surface_gamma(&mut self, surface_addr: u32, data_addr: u32, gamma: u32) {
         // Once per (surface, mode) for the whole run: a title sets this every frame, and
         // 20,000 copies of one fact bury every other line in the log.
-        if gamma != 0 && crate::rtt_writeback::report_once(0x6a00_0000_0000_0000 ^ ((surface_addr as u64) << 16) ^ gamma as u64) {
+        if gamma != 0
+            && crate::rtt_writeback::report_once(
+                0x6a00_0000_0000_0000 ^ ((surface_addr as u64) << 16) ^ gamma as u64,
+            )
+        {
             {
                 tracing::info!(
                     target: "vitaslop::status",
@@ -16021,7 +17828,8 @@ impl VitaState {
                 );
             }
         }
-        self.color_surface_gamma.insert(surface_addr, (data_addr, gamma));
+        self.color_surface_gamma
+            .insert(surface_addr, (data_addr, gamma));
         if data_addr != 0 {
             self.color_surface_gamma_by_data.insert(data_addr, gamma);
         }
@@ -16041,7 +17849,10 @@ impl VitaState {
         if data_addr == 0 {
             return 0;
         }
-        self.color_surface_gamma_by_data.get(&data_addr).copied().unwrap_or(0)
+        self.color_surface_gamma_by_data
+            .get(&data_addr)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The GPU notification region, allocating it on first use. Returns a guest
@@ -16158,7 +17969,11 @@ impl VitaState {
         // warning below): a draw counts into the FRONT test's slot when that test is on, else into
         // the BACK test's slot when only that one is - the same approximation, now with the slot
         // a back-only query asked for rather than nothing.
-        let back = self.back_visibility.get(&self.gxm_context).copied().unwrap_or([0; 3]);
+        let back = self
+            .back_visibility
+            .get(&self.gxm_context)
+            .copied()
+            .unwrap_or([0; 3]);
         let front_on = blk.word(off::FRONT_VISIBILITY_TEST_ENABLE) != 0;
         if (!front_on && back[0] == 0) || self.visibility_buffer == 0 {
             return;
@@ -16187,7 +18002,11 @@ impl VitaState {
                  control flow depend on which adapter is present. See `accumulate_visibility`."
             );
         }
-        let slot = if front_on { blk.word(off::FRONT_VISIBILITY_TEST_INDEX) } else { back[1] };
+        let slot = if front_on {
+            blk.word(off::FRONT_VISIBILITY_TEST_INDEX)
+        } else {
+            back[1]
+        };
         *self.visibility_counts.entry(slot).or_insert(0) += index_count;
     }
 
@@ -16208,20 +18027,25 @@ impl VitaState {
     /// Remember the `driverMemBlock` UID from a render target's params so
     /// `sceGxmRenderTargetGetDriverMemBlock` returns exactly what the guest supplied.
     pub fn set_render_target_mem_block(&mut self, render_target: u32, mem_block: u32) {
-        self.render_target_mem_blocks.insert(render_target, mem_block);
+        self.render_target_mem_blocks
+            .insert(render_target, mem_block);
     }
 
     /// The `driverMemBlock` of `render_target`, or `SCE_UID_INVALID_UID` (-1) when the
     /// target was created asking sceGxm to allocate its own - which is exactly what the
     /// guest passed in that case.
     pub fn render_target_mem_block(&self, render_target: u32) -> u32 {
-        self.render_target_mem_blocks.get(&render_target).copied().unwrap_or(0xffff_ffff)
+        self.render_target_mem_blocks
+            .get(&render_target)
+            .copied()
+            .unwrap_or(0xffff_ffff)
     }
 
     /// Remember the extent a render target was created with
     /// (`SceGxmRenderTargetParams::width`/`height`).
     pub fn set_render_target_extent(&mut self, render_target: u32, width: u32, height: u32) {
-        self.render_target_extents.insert(render_target, (width, height));
+        self.render_target_extents
+            .insert(render_target, (width, height));
     }
 
     /// The `(width, height)` of `render_target`, or `None` if it was never created
@@ -16249,7 +18073,12 @@ impl VitaState {
     /// Record `sceGxmPrecomputedDrawInit(precomputedDraw, vertexProgram, memBlock)`:
     /// start a precomputed-draw record keyed by the guest block address, bound to the
     /// given vertex program (its handle). Any prior record at that address is replaced.
-    pub fn precomputed_draw_init(&mut self, ctx: &mut GuestCtx, precomputed: u32, vertex_program: u32) {
+    pub fn precomputed_draw_init(
+        &mut self,
+        ctx: &mut GuestCtx,
+        precomputed: u32,
+        vertex_program: u32,
+    ) {
         for w in 0..pdraw::WORDS {
             ctx.write_u32(precomputed + w * 4, 0);
         }
@@ -16274,8 +18103,15 @@ impl VitaState {
     ///
     /// `words` is the block as [`Self::precomputed_draw_read`] just read it, so the check costs
     /// no guest read of its own on the path every precomputed draw takes.
-    fn note_pdraw_guest_edits(&mut self, ctx: &GuestCtx, precomputed: u32, words: &[u32; pdraw::WORDS as usize]) {
-        let Some(shadow) = self.pdraw_shadow.get_mut(&precomputed) else { return };
+    fn note_pdraw_guest_edits(
+        &mut self,
+        ctx: &GuestCtx,
+        precomputed: u32,
+        words: &[u32; pdraw::WORDS as usize],
+    ) {
+        let Some(shadow) = self.pdraw_shadow.get_mut(&precomputed) else {
+            return;
+        };
         for (i, old) in shadow.iter_mut().enumerate() {
             let now = words[i];
             if now != *old {
@@ -16346,24 +18182,31 @@ impl VitaState {
     /// `sceGxmDrawPrecomputed`, which a measured race grid issues **411 times a frame** - so the word
     /// form was ~4,100 crossings a frame to move 1.8 kB that sit CONSECUTIVELY in guest memory.
     /// The whole block is [`pdraw::WORDS`] words with no gaps worth skipping.
-    fn precomputed_draw_read(ctx: &GuestCtx, precomputed: u32) -> ([u32; pdraw::WORDS as usize], Option<PrecomputedDraw>) {
+    fn precomputed_draw_read(
+        ctx: &GuestCtx,
+        precomputed: u32,
+    ) -> ([u32; pdraw::WORDS as usize], Option<PrecomputedDraw>) {
         let mut buf = [0u8; pdraw::WORDS as usize * 4];
         ctx.read_into(precomputed, &mut buf);
-        let words: [u32; pdraw::WORDS as usize] =
-            std::array::from_fn(|i| u32::from_le_bytes([buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]]));
+        let words: [u32; pdraw::WORDS as usize] = std::array::from_fn(|i| {
+            u32::from_le_bytes([buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]])
+        });
         let word = |off: u32| words[off as usize / 4];
         if word(pdraw::OFF_MAGIC) != pdraw::MAGIC {
             return (words, None);
         }
-        (words, Some(PrecomputedDraw {
-            vertex_program: word(pdraw::OFF_VERTEX_PROGRAM),
-            streams: std::array::from_fn(|i| word(pdraw::OFF_STREAM[i])),
-            primitive: word(pdraw::OFF_PRIMITIVE),
-            index_format: word(pdraw::OFF_INDEX_FORMAT),
-            index_addr: word(pdraw::OFF_INDEX_ADDR),
-            index_count: word(pdraw::OFF_INDEX_COUNT),
-            index_wrap: word(pdraw::OFF_INDEX_WRAP),
-        }))
+        (
+            words,
+            Some(PrecomputedDraw {
+                vertex_program: word(pdraw::OFF_VERTEX_PROGRAM),
+                streams: std::array::from_fn(|i| word(pdraw::OFF_STREAM[i])),
+                primitive: word(pdraw::OFF_PRIMITIVE),
+                index_format: word(pdraw::OFF_INDEX_FORMAT),
+                index_addr: word(pdraw::OFF_INDEX_ADDR),
+                index_count: word(pdraw::OFF_INDEX_COUNT),
+                index_wrap: word(pdraw::OFF_INDEX_WRAP),
+            }),
+        )
     }
 
     /// Replay `sceGxmDrawPrecomputed(context, precomputedDraw)`: bind the precomputed
@@ -16411,7 +18254,14 @@ impl VitaState {
         // cannot tell them apart from the state alone.
         self.last_draw_was_precomputed = true;
         self.last_precomputed_block = precomputed;
-        self.record_draw(ctx, d.primitive, d.index_format, d.index_addr, d.index_count, d.index_wrap);
+        self.record_draw(
+            ctx,
+            d.primitive,
+            d.index_format,
+            d.index_addr,
+            d.index_count,
+            d.index_wrap,
+        );
         self.last_draw_was_precomputed = false;
         self.last_precomputed_block = 0;
         self.pdraw_binding = None;
@@ -16433,21 +18283,41 @@ impl VitaState {
     /// the old table served through `entry().or_default()`) gets a fresh zeroed block from
     /// the guest heap. The title's own `memBlock` is deliberately NOT used: its size is the
     /// real driver's, which this engine does not define.
+    ///
+    /// >>> A BLOCK POINTER READ OUT OF GUEST MEMORY IS TRUSTED ONLY IF THIS ENGINE MADE IT.
+    ///
+    /// The struct is the title's memory, and titles recycle it: a state freed back to the
+    /// title's allocator keeps our magic in its first word while the rest is reused for
+    /// something else. MEASURED on a tennis title's court load (~7,000 state inits in 500
+    /// frames, on recycled memory): such a struct carried the magic and, in the BLOCK slot, a
+    /// C++ vtable pointer into the READ-ONLY text segment - and `Init` zeroed 440 bytes there,
+    /// so a later virtual call through that vtable dispatched to address 0 and the run died
+    /// (intermittently: it needs that exact reuse, ~1 run in 3 in the browser). So the block
+    /// is reused only when it is in [`Self::precomputed_state_blocks`]; anything else is a
+    /// struct this engine never stamped, and gets a fresh block.
+    ///
+    /// `for_init` asks for more: the block must have been allocated for THIS struct. An `Init`
+    /// is a new state - on hardware it gets the `memBlock` the title just handed it - so a
+    /// struct that is a by-value COPY of another (which shares its block, as a copied state
+    /// shares driver memory) is given its own block rather than zeroing the original's.
     fn ensure_state_block(
         &mut self,
         ctx: &mut GuestCtx,
         state: u32,
         magic: u32,
         block_bytes: u32,
+        for_init: bool,
     ) -> u32 {
         use crate::vita::gxmstate::off;
         if ctx.read_u32(state.wrapping_add(off::MAGIC)) == magic {
             let block = ctx.read_u32(state.wrapping_add(off::BLOCK));
-            if block != 0 {
+            let ours = self.precomputed_state_blocks.get(&block);
+            if block != 0 && ours.is_some_and(|&owner| !for_init || owner == state) {
                 return block;
             }
         }
         let block = self.galloc(block_bytes, 16);
+        self.precomputed_state_blocks.insert(block, state);
         // ONE range write each, not a word loop: every guest write from the host is a
         // boundary crossing in the browser, and the fragment block is 100+ words. MEASURED on a
         // football title's live frame: `sceGxmPrecomputedFragmentStateInit` at 52 us a call,
@@ -16464,11 +18334,21 @@ impl VitaState {
     /// struct, attach its arrays block, and memoise the program facts the bind needs -
     /// including the stage's uniform SIZE, which is fixed the moment the program exists
     /// (the same move the inlined reserve rests on). Replaces any prior state there.
-    pub fn precomputed_vertex_state_init(&mut self, ctx: &mut GuestCtx, state: u32, vertex_program: u32) {
+    pub fn precomputed_vertex_state_init(
+        &mut self,
+        ctx: &mut GuestCtx,
+        state: u32,
+        vertex_program: u32,
+    ) {
         use crate::vita::gxmstate::{self, off};
         let program_header = self.vertex_program_header(vertex_program);
-        let block =
-            self.ensure_state_block(ctx, state, gxmstate::MAGIC_VERTEX, gxmstate::VERTEX_BLOCK_BYTES);
+        let block = self.ensure_state_block(
+            ctx,
+            state,
+            gxmstate::MAGIC_VERTEX,
+            gxmstate::VERTEX_BLOCK_BYTES,
+            true,
+        );
         // Re-init REPLACES: the arrays block and the mutable fields go back to zero. One range
         // write, not a word loop - see `ensure_state_block`.
         ctx.write_bytes(block, &[0u8; gxmstate::VERTEX_BLOCK_BYTES as usize]);
@@ -16489,7 +18369,12 @@ impl VitaState {
     }
 
     /// `sceGxmPrecomputedFragmentStateInit(state, fragmentProgram, memBlock)`.
-    pub fn precomputed_fragment_state_init(&mut self, ctx: &mut GuestCtx, state: u32, fragment_program: u32) {
+    pub fn precomputed_fragment_state_init(
+        &mut self,
+        ctx: &mut GuestCtx,
+        state: u32,
+        fragment_program: u32,
+    ) {
         use crate::vita::gxmstate::{self, off};
         let program_header = self.fragment_program_header(fragment_program);
         let block = self.ensure_state_block(
@@ -16497,6 +18382,7 @@ impl VitaState {
             state,
             gxmstate::MAGIC_FRAGMENT,
             gxmstate::FRAGMENT_BLOCK_BYTES,
+            true,
         );
         // One range write, not a word loop - see `ensure_state_block`.
         ctx.write_bytes(block, &[0u8; gxmstate::FRAGMENT_BLOCK_BYTES as usize]);
@@ -16533,9 +18419,15 @@ impl VitaState {
             return;
         }
         let (own, other) = if vertex {
-            (&mut self.precomputed_state_vertex_headers, &self.precomputed_state_fragment_headers)
+            (
+                &mut self.precomputed_state_vertex_headers,
+                &self.precomputed_state_fragment_headers,
+            )
         } else {
-            (&mut self.precomputed_state_fragment_headers, &self.precomputed_state_vertex_headers)
+            (
+                &mut self.precomputed_state_fragment_headers,
+                &self.precomputed_state_vertex_headers,
+            )
         };
         if own.contains(&header) {
             return;
@@ -16577,7 +18469,10 @@ impl VitaState {
         // browser a status line is a console crossing. A NEW program is what this line is
         // for; a re-init of a known one only moves the power-of-two ladder.
         let n = self.precomputed_state_count;
-        let distinct = (self.precomputed_state_vertex_headers.len(), self.precomputed_state_fragment_headers.len());
+        let distinct = (
+            self.precomputed_state_vertex_headers.len(),
+            self.precomputed_state_fragment_headers.len(),
+        );
         if n > 4 && !n.is_power_of_two() && distinct == self.precomputed_state_reported {
             return;
         }
@@ -16596,14 +18491,36 @@ impl VitaState {
     /// `sceGxmPrecomputed{Vertex,Fragment}StateSetDefaultUniformBuffer(state, buffer)`:
     /// store the guest pointer the game will write this stage's uniforms into. The record
     /// is created lazily so a setter before `Init` (unexpected) still lands.
-    pub fn precomputed_vertex_state_set_uniform_buffer(&mut self, ctx: &mut GuestCtx, state: u32, buffer: u32) {
+    pub fn precomputed_vertex_state_set_uniform_buffer(
+        &mut self,
+        ctx: &mut GuestCtx,
+        state: u32,
+        buffer: u32,
+    ) {
         use crate::vita::gxmstate::{self, off};
-        self.ensure_state_block(ctx, state, gxmstate::MAGIC_VERTEX, gxmstate::VERTEX_BLOCK_BYTES);
+        self.ensure_state_block(
+            ctx,
+            state,
+            gxmstate::MAGIC_VERTEX,
+            gxmstate::VERTEX_BLOCK_BYTES,
+            false,
+        );
         ctx.write_u32(state.wrapping_add(off::BUF), buffer);
     }
-    pub fn precomputed_fragment_state_set_uniform_buffer(&mut self, ctx: &mut GuestCtx, state: u32, buffer: u32) {
+    pub fn precomputed_fragment_state_set_uniform_buffer(
+        &mut self,
+        ctx: &mut GuestCtx,
+        state: u32,
+        buffer: u32,
+    ) {
         use crate::vita::gxmstate::{self, off};
-        self.ensure_state_block(ctx, state, gxmstate::MAGIC_FRAGMENT, gxmstate::FRAGMENT_BLOCK_BYTES);
+        self.ensure_state_block(
+            ctx,
+            state,
+            gxmstate::MAGIC_FRAGMENT,
+            gxmstate::FRAGMENT_BLOCK_BYTES,
+            false,
+        );
         ctx.write_u32(state.wrapping_add(off::BUF), buffer);
     }
 
@@ -16632,7 +18549,7 @@ impl VitaState {
                 gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS,
             )
         };
-        let block = self.ensure_state_block(ctx, state, magic, bytes);
+        let block = self.ensure_state_block(ctx, state, magic, bytes, false);
         ctx.write_u32(block.wrapping_add(table + index * 4), buffer);
     }
 
@@ -16671,7 +18588,7 @@ impl VitaState {
                 gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS,
             )
         };
-        let block = self.ensure_state_block(ctx, state, magic, bytes);
+        let block = self.ensure_state_block(ctx, state, magic, bytes, false);
         // Out-of-range tail reads as zeros, exactly as the per-word `read_u32` answered for
         // it - so a short array binds nothing where it used to bind nothing.
         let mut ptrs = [0u8; TABLE_BYTES];
@@ -16702,15 +18619,26 @@ impl VitaState {
     /// `SceGxmTexture*` to this stage's sampler `index` (0 unbinds), replacing any prior
     /// binding at that index - written into the state's guest texture array, in the
     /// context block's own slot layout, so the fragment bind is one wholesale copy.
-    pub fn precomputed_vertex_state_set_texture(&mut self, ctx: &mut GuestCtx, state: u32, index: u32, texture: u32) {
+    pub fn precomputed_vertex_state_set_texture(
+        &mut self,
+        ctx: &mut GuestCtx,
+        state: u32,
+        index: u32,
+        texture: u32,
+    ) {
         use crate::vita::gxmstate::{self};
         if index as usize >= crate::vita::gxmctx::MAX_TEXTURE_UNITS {
             self.report_precomputed_texture_unit(index, texture);
             return;
         }
         let b = TextureBinding::read(ctx, index, texture, true);
-        let block =
-            self.ensure_state_block(ctx, state, gxmstate::MAGIC_VERTEX, gxmstate::VERTEX_BLOCK_BYTES);
+        let block = self.ensure_state_block(
+            ctx,
+            state,
+            gxmstate::MAGIC_VERTEX,
+            gxmstate::VERTEX_BLOCK_BYTES,
+            false,
+        );
         gxmstate::write_texture_slot(
             ctx,
             block.wrapping_add(gxmstate::VERTEX_BLOCK_TEXTURES),
@@ -16719,7 +18647,13 @@ impl VitaState {
             b.words,
         );
     }
-    pub fn precomputed_fragment_state_set_texture(&mut self, ctx: &mut GuestCtx, state: u32, index: u32, texture: u32) {
+    pub fn precomputed_fragment_state_set_texture(
+        &mut self,
+        ctx: &mut GuestCtx,
+        state: u32,
+        index: u32,
+        texture: u32,
+    ) {
         use crate::vita::gxmstate::{self};
         if index as usize >= crate::vita::gxmctx::MAX_TEXTURE_UNITS {
             self.report_precomputed_texture_unit(index, texture);
@@ -16732,6 +18666,7 @@ impl VitaState {
             state,
             gxmstate::MAGIC_FRAGMENT,
             gxmstate::FRAGMENT_BLOCK_BYTES,
+            false,
         );
         gxmstate::write_texture_slot(ctx, block, index, b.addr, b.words);
     }
@@ -16753,7 +18688,12 @@ impl VitaState {
     /// was created with, in stream order. The count comes from the program (a caller
     /// passes no length), so a draw whose vertex program we never saw sets nothing -
     /// and says so, because silently binding no streams renders empty geometry.
-    pub fn precomputed_draw_set_all_streams(&mut self, ctx: &mut GuestCtx, precomputed: u32, array: u32) {
+    pub fn precomputed_draw_set_all_streams(
+        &mut self,
+        ctx: &mut GuestCtx,
+        precomputed: u32,
+        array: u32,
+    ) {
         let handle = ctx.read_u32(precomputed + pdraw::OFF_VERTEX_PROGRAM);
         let count = match self.vertex_programs.get(&handle) {
             Some(info) => info.streams.len(),
@@ -16790,7 +18730,12 @@ impl VitaState {
     /// Note the array is of `SceGxmTexture` STRUCTS, not pointers: element `i` lives at
     /// `textureArray + i*16`, and that address is exactly what the per-index setter takes.
     /// The length is the program's texture-unit count, since the caller passes none.
-    pub fn precomputed_vertex_state_set_all_textures(&mut self, ctx: &mut GuestCtx, state: u32, array: u32) {
+    pub fn precomputed_vertex_state_set_all_textures(
+        &mut self,
+        ctx: &mut GuestCtx,
+        state: u32,
+        array: u32,
+    ) {
         use crate::vita::gxmstate::{self, off};
         let header = if ctx.read_u32(state.wrapping_add(off::MAGIC)) == gxmstate::MAGIC_VERTEX {
             ctx.read_u32(state.wrapping_add(off::HEADER))
@@ -16803,7 +18748,12 @@ impl VitaState {
         }
     }
 
-    pub fn precomputed_fragment_state_set_all_textures(&mut self, ctx: &mut GuestCtx, state: u32, array: u32) {
+    pub fn precomputed_fragment_state_set_all_textures(
+        &mut self,
+        ctx: &mut GuestCtx,
+        state: u32,
+        array: u32,
+    ) {
         use crate::vita::gxmstate::{self, off};
         let header = if ctx.read_u32(state.wrapping_add(off::MAGIC)) == gxmstate::MAGIC_FRAGMENT {
             ctx.read_u32(state.wrapping_add(off::HEADER))
@@ -16971,9 +18921,15 @@ impl VitaState {
         const TABLE_BYTES: usize = gxmctx::MAX_UNIFORM_BUFFERS * 4;
         let mut table = [0u8; TABLE_BYTES];
         if block != 0 {
-            ctx.read_into(block.wrapping_add(gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS), &mut table);
+            ctx.read_into(
+                block.wrapping_add(gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS),
+                &mut table,
+            );
         }
-        ctx.write_bytes(context.wrapping_add(gxmctx::off::FRAGMENT_UNIFORM_BUFFERS), &table);
+        ctx.write_bytes(
+            context.wrapping_add(gxmctx::off::FRAGMENT_UNIFORM_BUFFERS),
+            &table,
+        );
         // Binding a precomputed fragment state leaves the context bound to its program, so it
         // goes where `sceGxmSetFragmentProgram` puts it. The blend equation follows from the
         // handle and needs no separate record.
@@ -17096,7 +19052,13 @@ impl VitaState {
         let (size, header) = self.memoised_uniform_size(ctx, handle, ProgramStage::Vertex);
         let buf = self.alloc_default_uniform_buffer(ctx, size);
         poison_uniform_buffer(ctx, buf, size);
-        self.bind_uniform_buffer(ctx, crate::vita::gxmctx::off::VERTEX_UNIFORM, buf, size, header);
+        self.bind_uniform_buffer(
+            ctx,
+            crate::vita::gxmctx::off::VERTEX_UNIFORM,
+            buf,
+            size,
+            header,
+        );
         tracing::trace!(
             target: "vitaslop::gxm",
             program = format_args!("{handle:#x}"),
@@ -17208,20 +19170,44 @@ impl VitaState {
     /// bound exactly as [`Self::reserve_vertex_uniform_buffer`] binds its own, sized by the
     /// program bound at the call (the reserve's rule). First called by a 2011 fighting title,
     /// which never reserves.
-    pub(crate) fn set_default_uniform_buffer(&mut self, ctx: &mut GuestCtx, stage: ProgramStage, buf: u32) {
-        let (handle, off) = match stage {
-            ProgramStage::Vertex => (self.bound_vertex_program(ctx), crate::vita::gxmctx::off::VERTEX_UNIFORM),
-            ProgramStage::Fragment => (self.bound_fragment_program(ctx), crate::vita::gxmctx::off::FRAGMENT_UNIFORM),
+    /// `sceGxmSet{Vertex,Fragment}DefaultUniformBuffer`: the title names its OWN buffer as the
+    /// stage's default uniform buffer.
+    ///
+    /// >>> CONTEXT STATE, NOT A RESERVATION FOR ONE PROGRAM. A reserve is sized for the program
+    /// bound when it is made, and a draw by another program reading it is reading another
+    /// object's uniforms ([`Self::stale_uniforms`]). This binding is the title's own pointer and
+    /// stays in effect until it is set again, across program changes - a title sets the buffer
+    /// and THEN the program, and draws. Recorded with the program bound at set time, every such
+    /// draw was judged stale and read the empty `sceGxmSetUniformDataF` bank instead: MEASURED on
+    /// a 2D title, its full-screen clear took `clearDepth` from that empty bank, wrote depth 0
+    /// over its half-resolution layer target, and every layer drawn after it failed the depth
+    /// test - the blurred background never rendered and only the sharp multi-tap copies of the
+    /// foreground were left, as stacked bands. So it is marked [`USER_UNIFORM_BUFFER`], and a
+    /// draw reads as many bytes as the program DRAWING declares.
+    pub(crate) fn set_default_uniform_buffer(
+        &mut self,
+        ctx: &mut GuestCtx,
+        stage: ProgramStage,
+        buf: u32,
+    ) {
+        let off = match stage {
+            ProgramStage::Vertex => crate::vita::gxmctx::off::VERTEX_UNIFORM,
+            ProgramStage::Fragment => crate::vita::gxmctx::off::FRAGMENT_UNIFORM,
         };
-        let (size, header) = self.memoised_uniform_size(ctx, handle, stage);
-        self.bind_uniform_buffer(ctx, off, buf, size, header);
+        self.bind_uniform_buffer(ctx, off, buf, 0, USER_UNIFORM_BUFFER);
     }
 
     pub fn reserve_fragment_uniform_buffer(&mut self, ctx: &mut GuestCtx) -> u32 {
         let handle = self.bound_fragment_program(ctx);
         let (size, header) = self.memoised_uniform_size(ctx, handle, ProgramStage::Fragment);
         let buf = self.alloc_default_uniform_buffer(ctx, size);
-        self.bind_uniform_buffer(ctx, crate::vita::gxmctx::off::FRAGMENT_UNIFORM, buf, size, header);
+        self.bind_uniform_buffer(
+            ctx,
+            crate::vita::gxmctx::off::FRAGMENT_UNIFORM,
+            buf,
+            size,
+            header,
+        );
         buf
     }
 
@@ -17231,10 +19217,12 @@ impl VitaState {
     /// later `sceKernelGetMemBlockBase(uid)` no longer resolves it, matching the guest-
     /// visible contract that the id is now invalid.
     pub fn free_memblock(&mut self, uid: i32) -> bool {
-        let Some(i) = self.memblocks.iter().position(|b| b.uid == uid) else { return false };
+        let Some(i) = self.memblocks.iter().position(|b| b.uid == uid) else {
+            return false;
+        };
         let b = self.memblocks.remove(i);
         {
-            use crate::vita::sysmem::{partition_of, Partition};
+            use crate::vita::sysmem::{Partition, partition_of};
             let want = b.size.max(4);
             match partition_of(b.ty) {
                 Partition::Cdram => self.cdram_used = self.cdram_used.saturating_sub(want),
@@ -17299,7 +19287,10 @@ impl VitaState {
             return;
         }
         for (i, v) in values.iter().enumerate() {
-            ctx.write_u32(bank + SA_BANK_DATA + (at as usize + i) as u32 * 4, v.to_bits());
+            ctx.write_u32(
+                bank + SA_BANK_DATA + (at as usize + i) as u32 * 4,
+                v.to_bits(),
+            );
         }
         // The gap between the old high-water mark and `at` is already zero - `clear_sa_bank`
         // left it that way for this scene - which is what the `Vec`'s `resize(end, 0.0)` used
@@ -17376,7 +19367,11 @@ impl VitaState {
             if let Some(w) = l.waiters.iter().find(|w| w.thid == thid) {
                 return format!(
                     "blocked on rwlock uid={:#x} {:?} for {} (writer={:?} readers={:x?})",
-                    l.uid, l.name, if w.write { "WRITE" } else { "READ" }, l.writer, l.readers
+                    l.uid,
+                    l.name,
+                    if w.write { "WRITE" } else { "READ" },
+                    l.writer,
+                    l.readers
                 );
             }
         }
@@ -17385,7 +19380,9 @@ impl VitaState {
             // covers its need is a LOST WAKE-UP, and the line alone could not say so.
             let state = self
                 .sema_info(w.uid)
-                .map(|(name, _, _, count, max, waiting)| format!(" ({name:?} count={count} max={max} waiting={waiting})"))
+                .map(|(name, _, _, count, max, waiting)| {
+                    format!(" ({name:?} count={count} max={max} waiting={waiting})")
+                })
                 .unwrap_or_else(|| " (NO SUCH SEMAPHORE)".into());
             return format!("blocked on sema uid={:#x} need={}{state}", w.uid, w.need);
         }
@@ -17399,7 +19396,12 @@ impl VitaState {
             );
         }
         if let Some(w) = self.evf_waiters.iter().find(|w| w.thid == thid) {
-            let pattern = self.event_flags.iter().find(|(u, _)| *u == w.uid).map(|(_, p)| *p).unwrap_or(0);
+            let pattern = self
+                .event_flags
+                .iter()
+                .find(|(u, _)| *u == w.uid)
+                .map(|(_, p)| *p)
+                .unwrap_or(0);
             return format!(
                 "blocked on eventflag uid={:#x}{} want={:#x} mode={:#x} have={:#x}{}",
                 w.uid,
@@ -17418,7 +19420,10 @@ impl VitaState {
         }
         for c in &self.conds {
             if c.waiters.iter().any(|w| w.thid == thid) {
-                return format!("blocked on cond uid={:#x} (mutex uid={:#x})", c.uid, c.mutex);
+                return format!(
+                    "blocked on cond uid={:#x} (mutex uid={:#x})",
+                    c.uid, c.mutex
+                );
             }
         }
         if let Some((_, work, deadline)) = self.lwcond_waiters.iter().find(|(t, _, _)| *t == thid) {
@@ -17468,12 +19473,20 @@ impl VitaState {
                 out.push((thid, name, state));
             }
         };
-        push(MAIN_THID, "main".to_string(), self.thread_wait_state(MAIN_THID));
+        push(
+            MAIN_THID,
+            "main".to_string(),
+            self.thread_wait_state(MAIN_THID),
+        );
         for t in &self.threads {
             if t.exit_code.is_some() {
                 continue;
             }
-            let name = if t.name.is_empty() { "-".to_string() } else { t.name.clone() };
+            let name = if t.name.is_empty() {
+                "-".to_string()
+            } else {
+                t.name.clone()
+            };
             // A thread the guest created but never started is not blocked on anything; saying
             // so is the difference between "waiting for a signal" and "never launched".
             let state = if t.started {
@@ -17500,7 +19513,11 @@ impl VitaState {
     pub fn debug_sync_dump_with(&self, read_word: Option<&dyn Fn(u32) -> u32>) -> String {
         use std::fmt::Write;
         let mut s = String::new();
-        let _ = writeln!(s, "current thread = {:#x}, virtual_us = {}", self.current, self.virtual_us);
+        let _ = writeln!(
+            s,
+            "current thread = {:#x}, virtual_us = {}",
+            self.current, self.virtual_us
+        );
         // The threads themselves come first: the primitive lists below say who is
         // waiting on each object, but only this says, for every live thread, whether
         // it is parked at all - and a thread absent from every waiter list is the
@@ -17510,7 +19527,11 @@ impl VitaState {
         let _ = writeln!(
             s,
             "threads ({} live):",
-            1 + self.threads.iter().filter(|t| t.exit_code.is_none()).count()
+            1 + self
+                .threads
+                .iter()
+                .filter(|t| t.exit_code.is_none())
+                .count()
         );
         // The MAIN thread is listed first and by hand, because it is the one thread
         // that has no `ThreadRec`: `create_thread` records the threads the GUEST
@@ -17528,7 +19549,11 @@ impl VitaState {
             if t.exit_code.is_some() {
                 continue;
             }
-            let name = if t.name.is_empty() { "-".to_string() } else { format!("{:?}", t.name) };
+            let name = if t.name.is_empty() {
+                "-".to_string()
+            } else {
+                format!("{:?}", t.name)
+            };
             let _ = writeln!(
                 s,
                 "  thid={:#x} {name} entry={:#010x} prio={:#x} {}{}",
@@ -17570,7 +19595,8 @@ impl VitaState {
         let _ = writeln!(s, "mutexes ({}):", self.mutexes.len());
         for m in &self.mutexes {
             let _ = writeln!(
-                s, "  uid={:#x} owner={:?} count={} waiters={:x?}",
+                s,
+                "  uid={:#x} owner={:?} count={} waiters={:x?}",
                 m.uid, m.owner, m.count, m.waiters
             );
         }
@@ -17578,14 +19604,19 @@ impl VitaState {
         for l in &self.rwlocks {
             let waiters: Vec<(i32, bool)> = l.waiters.iter().map(|w| (w.thid, w.write)).collect();
             let _ = writeln!(
-                s, "  uid={:#x} name={:?} writer={:?}x{} readers={:x?} waiters(thid,write)={waiters:x?}",
+                s,
+                "  uid={:#x} name={:?} writer={:?}x{} readers={:x?} waiters(thid,write)={waiters:x?}",
                 l.uid, l.name, l.writer, l.write_count, l.readers
             );
         }
         let _ = writeln!(s, "semaphores ({}):", self.semaphores.len());
         for sem in &self.semaphores {
-            let waiters: Vec<(i32, i32)> =
-                self.sema_waiters.iter().filter(|w| w.uid == sem.uid).map(|w| (w.thid, w.need)).collect();
+            let waiters: Vec<(i32, i32)> = self
+                .sema_waiters
+                .iter()
+                .filter(|w| w.uid == sem.uid)
+                .map(|w| (w.thid, w.need))
+                .collect();
             let _ = writeln!(
                 s,
                 "  uid={:#x} name={:?} count={} waiters(thid,need)={waiters:x?}",
@@ -17597,22 +19628,45 @@ impl VitaState {
         // list empty while several threads were blocked.
         let _ = writeln!(s, "event flags ({}):", self.event_flags.len());
         for (uid, pattern) in &self.event_flags {
-            let waiters: Vec<(i32, u32)> =
-                self.evf_waiters.iter().filter(|w| w.uid == *uid).map(|w| (w.thid, w.bits)).collect();
+            let waiters: Vec<(i32, u32)> = self
+                .evf_waiters
+                .iter()
+                .filter(|w| w.uid == *uid)
+                .map(|w| (w.thid, w.bits))
+                .collect();
             if !waiters.is_empty() {
-                let _ = writeln!(s, "  uid={uid:#x} pattern={pattern:#x} waiters(thid,want)={waiters:x?}");
+                let _ = writeln!(
+                    s,
+                    "  uid={uid:#x} pattern={pattern:#x} waiters(thid,want)={waiters:x?}"
+                );
             }
         }
         let _ = writeln!(s, "cond waiters:");
         for c in &self.conds {
             let w: Vec<i32> = c.waiters.iter().map(|x| x.thid).collect();
             if !w.is_empty() {
-                let _ = writeln!(s, "  cond uid={:#x} mutex={:#x} waiters={:x?}", c.uid, c.mutex, w);
+                let _ = writeln!(
+                    s,
+                    "  cond uid={:#x} mutex={:#x} waiters={:x?}",
+                    c.uid, c.mutex, w
+                );
             }
         }
-        let _ = writeln!(s, "lwcond waiters (thid, cond_work, deadline): {:x?}", self.lwcond_waiters);
-        let _ = writeln!(s, "lwcond->mutex bindings (cond_work, mutex_work): {:x?}", self.lwcond_mutex);
-        let _ = writeln!(s, "sleep waiters (thid, deadline_us): {:x?}", self.sleep_waiters);
+        let _ = writeln!(
+            s,
+            "lwcond waiters (thid, cond_work, deadline): {:x?}",
+            self.lwcond_waiters
+        );
+        let _ = writeln!(
+            s,
+            "lwcond->mutex bindings (cond_work, mutex_work): {:x?}",
+            self.lwcond_mutex
+        );
+        let _ = writeln!(
+            s,
+            "sleep waiters (thid, deadline_us): {:x?}",
+            self.sleep_waiters
+        );
         s
     }
 
@@ -17682,9 +19736,9 @@ impl VitaState {
         // program, which on a baseball at-bat is most of them - a knob lookup there was a mutex,
         // a string hash and an environment probe per draw (0.25% of the render worker, measured).
         static USE_STALE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *USE_STALE
-            .get_or_init(|| crate::knobs::var("VITASLOP_GXM_STALE_UNIFORMS").as_deref() == Ok("use"))
-        {
+        if *USE_STALE.get_or_init(|| {
+            crate::knobs::var("VITASLOP_GXM_STALE_UNIFORMS").as_deref() == Ok("use")
+        }) {
             return false;
         }
         // >>> EVERY ONE OF THEM, for the DEVICE BUDGET - not just the ones the cadence below
@@ -17695,7 +19749,10 @@ impl VitaState {
         // Keyed on the program DRAWING, not the pair: what was bound for it varies with the
         // draw order and multiplied the lines - 1,108 of one browser window's status lines,
         // on a title where the affected draws are culled geometry anyway.
-        let n = self.reported_stale_uniforms.entry((stage, 0, drawing)).or_insert(0);
+        let n = self
+            .reported_stale_uniforms
+            .entry((stage, 0, drawing))
+            .or_insert(0);
         *n += 1;
         // At the first sighting and then on powers of a thousand, so the log carries the
         // SCALE without carrying a line per draw. Four dropped draws in a run is a curiosity;
@@ -17751,13 +19808,15 @@ impl VitaState {
         ctx: &GuestCtx,
         blk: &crate::vita::gxmctx::Block<'_>,
     ) -> Option<(u32, usize)> {
-        let bound = blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM);
+        let mut bound = blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM);
         if bound.buf != 0 {
             let drawing =
                 self.vertex_program_header(blk.word(crate::vita::gxmctx::off::VERTEX_PROGRAM));
             let refl = self.reflect_program(ctx, drawing);
             let needs = refl.uniform_size_bytes.max(refl.default_uniform_bytes);
-            if self.stale_uniforms("vertex", bound.header, drawing, needs) {
+            if bound.header == USER_UNIFORM_BUFFER {
+                bound.size = needs;
+            } else if self.stale_uniforms("vertex", bound.header, drawing, needs) {
                 return None;
             }
         }
@@ -17777,7 +19836,7 @@ impl VitaState {
         // cannot change a pixel and can only report a drop that did not happen. It did:
         // 10,000 `bound_for=0x0` warnings in one retail run, which reads as a rendering
         // defect when the direct uniform path was serving those draws correctly.
-        let bound = blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM);
+        let mut bound = blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM);
         if bound.buf != 0 {
             let drawing =
                 self.vertex_program_header(blk.word(crate::vita::gxmctx::off::VERTEX_PROGRAM));
@@ -17787,7 +19846,9 @@ impl VitaState {
             // than a map lookup AND a guest word read on every draw.
             let refl = self.reflect_program(ctx, drawing);
             let needs = refl.uniform_size_bytes.max(refl.default_uniform_bytes);
-            if self.stale_uniforms("vertex", bound.header, drawing, needs) {
+            if bound.header == USER_UNIFORM_BUFFER {
+                bound.size = needs;
+            } else if self.stale_uniforms("vertex", bound.header, drawing, needs) {
                 return self.sa_bank_floats(ctx);
             }
         }
@@ -17838,14 +19899,17 @@ impl VitaState {
             match self.pdraw_binding {
                 Some((program, streams)) if self.gxm_context != 0 => {
                     use crate::vita::gxmctx::off;
-                    blk.overlaid(off::VERTEX_PROGRAM, &[program]).overlaid(off::STREAMS, &streams)
+                    blk.overlaid(off::VERTEX_PROGRAM, &[program])
+                        .overlaid(off::STREAMS, &streams)
                 }
                 _ => blk,
             }
         };
         // Occlusion query: this draw contributes to whatever slot the front-face
         // visibility test currently names (no-op when no query is live).
-        crate::perf::time(crate::perf::Phase::DrawPrelude, || self.accumulate_visibility(&blk, index_count));
+        crate::perf::time(crate::perf::Phase::DrawPrelude, || {
+            self.accumulate_visibility(&blk, index_count)
+        });
         // Drop a default uniform buffer still bound for a DIFFERENT program before anything
         // below reads it (see [`Self::stale_uniforms`]). The vertex stage is handled inside
         // `current_vertex_uniforms`; the fragment stage has several independent readers
@@ -17853,7 +19917,8 @@ impl VitaState {
         // here and they all see the same truth.
         let reflect_phase = crate::perf::scope(crate::perf::Phase::DrawReflect);
         let mut frag_uniform = blk.uniform_binding(crate::vita::gxmctx::off::FRAGMENT_UNIFORM);
-        let fheader = self.fragment_program_header(blk.word(crate::vita::gxmctx::off::FRAGMENT_PROGRAM));
+        let fheader =
+            self.fragment_program_header(blk.word(crate::vita::gxmctx::off::FRAGMENT_PROGRAM));
         if frag_uniform.buf != 0 {
             let drawing = fheader;
             // How much SA bank the program ABOUT TO DRAW actually declares. Zero means it
@@ -17865,7 +19930,9 @@ impl VitaState {
             // than a map lookup AND a guest word read on every draw.
             let refl = self.reflect_program(ctx, drawing);
             let needs = refl.uniform_size_bytes.max(refl.default_uniform_bytes);
-            if self.stale_uniforms("fragment", frag_uniform.header, drawing, needs) {
+            if frag_uniform.header == USER_UNIFORM_BUFFER {
+                frag_uniform.size = needs;
+            } else if self.stale_uniforms("fragment", frag_uniform.header, drawing, needs) {
                 frag_uniform.buf = 0;
                 frag_uniform.size = 0;
             }
@@ -17884,24 +19951,25 @@ impl VitaState {
         // `VertexProgramInfo::packed_attributes`: the packed stride, the per-stream bases, the
         // single-stream test and the rebased attribute list are constants of the PROGRAM, and
         // building them per draw was four allocations and two loops on the hottest path here.
-        let (attributes, streams, base, layout, stride, single_stream) = match self.vertex_programs.get(&vhandle) {
-            Some(info) => (
-                info.packed_attributes.clone(),
-                info.used_streams.clone(),
-                info.stream_base.clone(),
-                info.layout.clone(),
-                info.packed_stride,
-                info.single_stream,
-            ),
-            None => (
-                crate::capture::no_attributes(),
-                std::sync::Arc::from(&[][..]),
-                std::sync::Arc::from(&[][..]),
-                RowLayout::default(),
-                0,
-                false,
-            ),
-        };
+        let (attributes, streams, base, layout, stride, single_stream) =
+            match self.vertex_programs.get(&vhandle) {
+                Some(info) => (
+                    info.packed_attributes.clone(),
+                    info.used_streams.clone(),
+                    info.stream_base.clone(),
+                    info.layout.clone(),
+                    info.packed_stride,
+                    info.single_stream,
+                ),
+                None => (
+                    crate::capture::no_attributes(),
+                    std::sync::Arc::from(&[][..]),
+                    std::sync::Arc::from(&[][..]),
+                    RowLayout::default(),
+                    0,
+                    false,
+                ),
+            };
         drop(reflect_phase);
         // >>> THE DRAW'S UNIFORM BANKS IN ONE CROSSING. Their addresses are known now (the block
         // is in hand and the programs reflected), and the readers below - the fragment bank, the
@@ -17912,7 +19980,11 @@ impl VitaState {
         // memory for anything not fetched. A DIRECT memory (native) fetches nothing: a read
         // there is already a load. The guest cannot run during a host call, so bytes fetched
         // here are the bytes those reads would have seen.
-        let vert_src = if gxp_live_capture() { self.current_vertex_uniform_src(ctx, &blk) } else { None };
+        let vert_src = if gxp_live_capture() {
+            self.current_vertex_uniform_src(ctx, &blk)
+        } else {
+            None
+        };
         let mut uniform_ranges: Vec<(usize, usize)> = Vec::new();
         if gxp_live_capture() && !ctx.mem.direct() {
             let mut addrs: Vec<(u32, usize)> = Vec::new();
@@ -17922,9 +19994,10 @@ impl VitaState {
             addrs.extend(vert_src);
             self.sa_uniform_ranges(ctx, &blk, vheader, UniformStage::Vertex, &mut addrs);
             self.sa_uniform_ranges(ctx, &blk, fheader, UniformStage::Fragment, &mut addrs);
-            uniform_ranges.extend(
-                addrs.into_iter().filter_map(|(a, l)| ctx.offset(a).map(|o| (o, l.min(ctx.mem.len().saturating_sub(o))))),
-            );
+            uniform_ranges.extend(addrs.into_iter().filter_map(|(a, l)| {
+                ctx.offset(a)
+                    .map(|o| (o, l.min(ctx.mem.len().saturating_sub(o))))
+            }));
         }
         let mut uniform_mem = PrefetchedMemory::reads_only(&*ctx.mem, &uniform_ranges);
         let (mut uregs, mut uvfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
@@ -17961,7 +20034,12 @@ impl VitaState {
             )
         };
         let draw_indices = if deferring {
-            DrawIndices { bytes: crate::capture::no_bytes(), first_vertex: 0, vertex_count: 0, gather: None }
+            DrawIndices {
+                bytes: crate::capture::no_bytes(),
+                first_vertex: 0,
+                vertex_count: 0,
+                gather: None,
+            }
         } else if let Some((idx, _)) = &instanced {
             idx.clone()
         } else {
@@ -17989,7 +20067,16 @@ impl VitaState {
         } else {
             let mut snapshots = snaps!(self);
             crate::perf::time(crate::perf::Phase::DrawVertices, || {
-                snapshots.read_draw_vertices(ctx, &draw_indices, single_stream, &streams, &bound_streams, &base, &layout, stride)
+                snapshots.read_draw_vertices(
+                    ctx,
+                    &draw_indices,
+                    single_stream,
+                    &streams,
+                    &bound_streams,
+                    &base,
+                    &layout,
+                    stride,
+                )
             })
         };
         drop(geometry_phase);
@@ -18120,8 +20207,9 @@ impl VitaState {
         // functions of the SAME pair of reflected matrices, and each used to read the pair for
         // itself - 32 lanes of the bank fetched twice per draw, ~626 draws a frame, for bytes
         // the first read already had.
-        const IDENTITY_4X4: [f32; 16] =
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        const IDENTITY_4X4: [f32; 16] = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
         let world_proj = Self::reflected_world_proj_by(&vref, lane);
         let world = world_proj.map(|(w, _)| w).unwrap_or(IDENTITY_4X4);
         // Recover the true clip-space transform from the vertex program's reflected
@@ -18155,9 +20243,10 @@ impl VitaState {
             uniforms[..bank_lanes.min(16)].to_vec()
         };
         if let Some(mvp) = composed
-            && draw_uniforms.len() >= 16 {
-                draw_uniforms[..16].copy_from_slice(&mvp);
-            }
+            && draw_uniforms.len() >= 16
+        {
+            draw_uniforms[..16].copy_from_slice(&mvp);
+        }
         // >>> READ AFTER THE STAMP, WHICH IS WHERE IT ALWAYS WAS.
         //
         // A shader whose reflected exposure lane sits inside 0..16 reads the composed MVP
@@ -18185,8 +20274,19 @@ impl VitaState {
         // (it prints the reflected transform and material rather than recomputing them).
         self.dump_gxp_blobs(ctx, fheader, vheader);
         self.dump_draw_gxp(
-            ctx, vhandle, &blk.streams(), &vref, &material, &textures, &attributes, primitive, index_count, stride,
-            frag_uniform.buf, index_addr, if index_format == 0 { 2 } else { 4 },
+            ctx,
+            vhandle,
+            &blk.streams(),
+            &vref,
+            &material,
+            &textures,
+            &attributes,
+            primitive,
+            index_count,
+            stride,
+            frag_uniform.buf,
+            index_addr,
+            if index_format == 0 { 2 } else { 4 },
         );
         // Snapshot the raw shader blobs + SA uniform bytes for the GXP->WGSL recompiler
         // path, but only when it is enabled (the reads are pure cost on the default
@@ -18200,8 +20300,9 @@ impl VitaState {
             let fprog = self.program_blob(ctx, fheader);
             // The vertex program the fragment was PATCHED against, when that is not the one
             // this draw binds - see `capture::Draw::fprog_patched_vprog`.
-            let patched = self
-                .fragment_program_patched_vertex(blk.word(crate::vita::gxmctx::off::FRAGMENT_PROGRAM));
+            let patched = self.fragment_program_patched_vertex(
+                blk.word(crate::vita::gxmctx::off::FRAGMENT_PROGRAM),
+            );
             let fprog_patched_vprog = if patched != 0 && patched != vheader {
                 let pv = self.program_blob(ctx, patched);
                 // Pointer identity first: `program_blob` hands every draw the same shared `Arc`
@@ -18252,7 +20353,11 @@ impl VitaState {
         };
         // ...and WHERE the fragment bank came from, which the bytes cannot say. See
         // `capture::Draw::frag_sa_addr`.
-        let frag_sa_addr = if gxp_live_capture() { frag_uniform.buf } else { 0 };
+        let frag_sa_addr = if gxp_live_capture() {
+            frag_uniform.buf
+        } else {
+            0
+        };
         // The guest-memory window the vertex program's 0xE8 loads read through, snapshotted
         // at draw time like every other guest input. One map lookup for a program without
         // loads, which is every program of every other captured title.
@@ -18335,7 +20440,8 @@ impl VitaState {
             uniforms: draw_uniforms,
             textures,
             render_state,
-            blend: self.fragment_program_blend(blk.word(crate::vita::gxmctx::off::FRAGMENT_PROGRAM)),
+            blend: self
+                .fragment_program_blend(blk.word(crate::vita::gxmctx::off::FRAGMENT_PROGRAM)),
             fragment_program_header: fheader,
             exposure,
             material,
@@ -18390,7 +20496,7 @@ impl VitaState {
         fheader: u32,
         fref: &ProgramReflection,
     ) -> Box<DeferredTextures> {
-        use crate::vita::gxmctx::{off, MAX_TEXTURE_UNITS, TEXTURE_STRIDE};
+        use crate::vita::gxmctx::{MAX_TEXTURE_UNITS, TEXTURE_STRIDE, off};
         let span = blk.span(off::TEXTURES, MAX_TEXTURE_UNITS * TEXTURE_STRIDE as usize);
         let want = fref.sampler_units;
         // The failure-only report `draw_textures_now` makes on an empty list, from the same
@@ -18436,7 +20542,13 @@ impl VitaState {
                 }
             }
         };
-        Box::new(DeferredTextures { span, fheader, want, albedo: Self::fragment_albedo_unit(fref), vert })
+        Box::new(DeferredTextures {
+            span,
+            fheader,
+            want,
+            albedo: Self::fragment_albedo_unit(fref),
+            vert,
+        })
     }
 
     /// The draw's texture lists, proven NOW - the fragment list (albedo first) and the vertex
@@ -18447,7 +20559,10 @@ impl VitaState {
         blk: &crate::vita::gxmctx::Block,
         fheader: u32,
         fref: &ProgramReflection,
-    ) -> (Arc<[crate::capture::BoundTexture]>, Arc<[crate::capture::BoundTexture]>) {
+    ) -> (
+        Arc<[crate::capture::BoundTexture]>,
+        Arc<[crate::capture::BoundTexture]>,
+    ) {
         // Snapshot every bound fragment texture (decoded from its control words),
         // sorted by unit so unit 0 is first. `bound_textures` is already kept sorted by
         // unit as it is bound, so this reads it in place rather than cloning and
@@ -18557,12 +20672,7 @@ impl VitaState {
                     h
                 };
                 let _p = crate::perf::scope(crate::perf::Phase::DrawTexBindProbe);
-                let cached = snaps!(self).set_validated(
-                    ctx,
-                    set_key,
-                    fheader as u64,
-                    &frag_binds,
-                );
+                let cached = snaps!(self).set_validated(ctx, set_key, fheader as u64, &frag_binds);
                 (set_key, cached)
             }
         };
@@ -18665,15 +20775,18 @@ impl VitaState {
             // either way the memo below is current and there is nothing to remember.
             Some(set) => set,
             None => {
-                if let Some(pos) =
-                    textures.iter().position(|t| t.height > 1 && t.faces <= 1).filter(|&p| p > 0)
+                if let Some(pos) = textures
+                    .iter()
+                    .position(|t| t.height > 1 && t.faces <= 1)
+                    .filter(|&p| p > 0)
                 {
                     textures[..=pos].rotate_right(1);
                 }
                 if let Some(unit) = Self::fragment_albedo_unit(fref)
-                    && let Some(pos) = textures.iter().position(|t| t.unit == unit) {
-                        textures[..=pos].rotate_right(1);
-                    }
+                    && let Some(pos) = textures.iter().position(|t| t.unit == unit)
+                {
+                    textures[..=pos].rotate_right(1);
+                }
                 let set: Arc<[crate::capture::BoundTexture]> = textures.into();
                 // Taken and put back: `set_insert` needs the bindings that produced the
                 // list, and they were returned to `self.bound_textures` above.
@@ -18686,12 +20799,7 @@ impl VitaState {
         // Remember it against the bytes it came from, so the NEXT draw of this batch can skip
         // the gate entirely. Not on a previous-draw hit: that entry is this one.
         if previous_set.is_none() {
-            snaps!(self).remember_last_set(
-                sampler_span,
-                fheader,
-                set_key,
-                textures.clone(),
-            );
+            snaps!(self).remember_last_set(sampler_span, fheader, set_key, textures.clone());
         }
         (textures, vertex_textures)
     }
@@ -18747,19 +20855,22 @@ impl VitaState {
             return spec.clone();
         }
         let blob = self.program_blob(ctx, header);
-        let spec: std::sync::Arc<[vitaslop_gxp_shader::MemWindow]> = std::sync::Arc::from(
-            match stage {
+        let spec: std::sync::Arc<[vitaslop_gxp_shader::MemWindow]> =
+            std::sync::Arc::from(match stage {
                 ProgramStage::Vertex => vitaslop_gxp_shader::mem_windows_for_vertex_blob(&blob),
                 ProgramStage::Fragment => vitaslop_gxp_shader::mem_windows_for_fragment_blob(&blob),
-            },
-        );
+            });
         self.mem_window_specs.insert(key, spec.clone());
         spec
     }
 
     /// The SA-register layout of one program's uniform BUFFERS - see [`SaUniformLayout`].
     /// Memoised per registered program beside [`Self::mem_window_spec`].
-    fn sa_uniform_layout(&mut self, ctx: &GuestCtx, header: u32) -> std::sync::Arc<SaUniformLayout> {
+    fn sa_uniform_layout(
+        &mut self,
+        ctx: &GuestCtx,
+        header: u32,
+    ) -> std::sync::Arc<SaUniformLayout> {
         if header == 0 {
             return SaUniformLayout::none();
         }
@@ -18779,7 +20890,11 @@ impl VitaState {
                     // exactly what a header declaring more than its own container holds has
                     // been describing. Reporting those as short is a false alarm, and a
                     // warning that is wrong for the ordinary case trains its reader to skip it.
-                    if !p.uniform_buffer_bindings.iter().any(|b| b.buffer_index == 14) {
+                    if !p
+                        .uniform_buffer_bindings
+                        .iter()
+                        .any(|b| b.buffer_index == 14)
+                    {
                         report_default_uniform_container_short(header, default_regs, short);
                     }
                 }
@@ -18861,7 +20976,9 @@ impl VitaState {
         // copies per stage, inside `sceGxmDraw`, on a title that draws 600 times a frame.
         let mut image: Arc<[u8]> = unsafe {
             // SAFETY: a zeroed byte is an initialised byte.
-            Arc::<[std::mem::MaybeUninit<u8>]>::assume_init(Arc::new_zeroed_slice(extent_regs as usize * 4))
+            Arc::<[std::mem::MaybeUninit<u8>]>::assume_init(Arc::new_zeroed_slice(
+                extent_regs as usize * 4,
+            ))
         };
         {
             let img = Arc::get_mut(&mut image).expect("freshly created, uniquely owned");
@@ -18881,13 +20998,16 @@ impl VitaState {
                 let n = (b.size_regs as usize * 4).min(img.len().saturating_sub(at));
                 ctx.read_into(addr, &mut img[at..at + n]);
                 if watch_uniform_rewrites() {
-                    UNIFORM_WATCH.lock().unwrap_or_else(|e| e.into_inner()).push((
-                        addr,
-                        n as u32,
-                        stream_watch_hash(&img[at..at + n]),
-                        header,
-                        b.buffer_index,
-                    ));
+                    UNIFORM_WATCH
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((
+                            addr,
+                            n as u32,
+                            stream_watch_hash(&img[at..at + n]),
+                            header,
+                            b.buffer_index,
+                        ));
                 }
             }
         }
@@ -19029,7 +21149,12 @@ impl VitaState {
         }
         for (w, h) in words.iter().zip(&hits) {
             let list: Vec<String> = h.iter().map(|a| format!("{a:#010x}")).collect();
-            eprintln!("MEM-SCAN frame {}: {w:#010x} found at {} place(s): {}", self.cur_frame, h.len(), list.join(" "));
+            eprintln!(
+                "MEM-SCAN frame {}: {w:#010x} found at {} place(s): {}",
+                self.cur_frame,
+                h.len(),
+                list.join(" ")
+            );
         }
     }
 
@@ -19044,16 +21169,25 @@ impl VitaState {
     ///
     /// Also checked at EVERY host call when armed (`at` = thread, return address, NID), which
     /// pins a change between two host calls of one thread - close enough to disassemble.
-    pub(crate) fn watch_guest_range_changes(ctx: &GuestCtx, frame: u64, at: Option<(u32, u32, u32)>) {
+    pub(crate) fn watch_guest_range_changes(
+        ctx: &GuestCtx,
+        frame: u64,
+        at: Option<(u32, u32, u32)>,
+    ) {
         use std::sync::{Mutex, OnceLock};
         static SPEC: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
         static LAST: Mutex<Vec<Option<Vec<u8>>>> = Mutex::new(Vec::new());
         let spec = SPEC.get_or_init(|| {
-            let Ok(v) = crate::knobs::var("VITASLOP_MEM_CHANGE_WATCH") else { return Vec::new() };
+            let Ok(v) = crate::knobs::var("VITASLOP_MEM_CHANGE_WATCH") else {
+                return Vec::new();
+            };
             v.split(',')
                 .filter_map(|one| {
                     let (a, n) = one.trim().split_once(':')?;
-                    Some((u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, n.parse().ok()?))
+                    Some((
+                        u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?,
+                        n.parse().ok()?,
+                    ))
                 })
                 .collect()
         });
@@ -19065,7 +21199,8 @@ impl VitaState {
         static PREV: Mutex<Option<(u32, u32, u32)>> = Mutex::new(None);
         // ...and the CURRENT thread's own previous host call: the write is in this thread's code
         // between that call and this one when no other thread's call came in between.
-        static PREV_OWN: Mutex<Option<std::collections::HashMap<u32, (u32, u32)>>> = Mutex::new(None);
+        static PREV_OWN: Mutex<Option<std::collections::HashMap<u32, (u32, u32)>>> =
+            Mutex::new(None);
         let prev = {
             let mut p = PREV.lock().unwrap_or_else(|e| e.into_inner());
             let was = *p;
@@ -19086,17 +21221,27 @@ impl VitaState {
                 let head: String = now.iter().take(32).map(|b| format!("{b:02x}")).collect();
                 let site = at.map_or_else(
                     || "scene end".to_string(),
-                    |(t, lr, nid)| format!("entering {} on t{t} lr={lr:#010x}", crate::nid::name(nid)),
+                    |(t, lr, nid)| {
+                        format!("entering {} on t{t} lr={lr:#010x}", crate::nid::name(nid))
+                    },
                 );
                 let site = match prev {
-                    Some((t, lr, nid)) => format!("{site}; previous host call {} on t{t} lr={lr:#010x}", crate::nid::name(nid)),
+                    Some((t, lr, nid)) => format!(
+                        "{site}; previous host call {} on t{t} lr={lr:#010x}",
+                        crate::nid::name(nid)
+                    ),
                     None => site,
                 };
                 let site = match prev_own {
-                    Some((lr, nid)) => format!("{site}; this thread's previous host call {} lr={lr:#010x}", crate::nid::name(nid)),
+                    Some((lr, nid)) => format!(
+                        "{site}; this thread's previous host call {} lr={lr:#010x}",
+                        crate::nid::name(nid)
+                    ),
                     None => site,
                 };
-                eprintln!("MEM-CHANGE frame {frame} ({site}): {len} bytes at {addr:#010x} now start {head}");
+                eprintln!(
+                    "MEM-CHANGE frame {frame} ({site}): {len} bytes at {addr:#010x} now start {head}"
+                );
                 last[i] = Some(now);
             }
         }
@@ -19109,7 +21254,9 @@ impl VitaState {
         static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let spec = SPEC.get_or_init(|| {
-            let Ok(v) = crate::knobs::var("VITASLOP_MEM_DUMP") else { return Vec::new() };
+            let Ok(v) = crate::knobs::var("VITASLOP_MEM_DUMP") else {
+                return Vec::new();
+            };
             v.split(',')
                 .filter_map(|one| {
                     let (a, n) = one.trim().split_once(':')?;
@@ -19123,17 +21270,24 @@ impl VitaState {
                             None => t.parse().ok(),
                         }
                     };
-                    Some((u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?, num(n)?))
+                    Some((
+                        u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?,
+                        num(n)?,
+                    ))
                 })
                 .collect()
         });
         // Called for every window-bearing draw: with the knob unset this is the whole cost - a
         // cached empty spec - and nothing below, not even the one-time "reached" line, runs.
         static KNOB_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if spec.is_empty() && !*KNOB_SET.get_or_init(|| crate::knobs::var("VITASLOP_MEM_DUMP").is_ok()) {
+        if spec.is_empty()
+            && !*KNOB_SET.get_or_init(|| crate::knobs::var("VITASLOP_MEM_DUMP").is_ok())
+        {
             return;
         }
-        if !ARMED.load(std::sync::atomic::Ordering::Relaxed) && !ARMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if !ARMED.load(std::sync::atomic::Ordering::Relaxed)
+            && !ARMED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             eprintln!(
                 "MEM-DUMP: reached at frame {frame}; VITASLOP_MEM_DUMP={:?}",
                 crate::knobs::var("VITASLOP_MEM_DUMP").ok()
@@ -19170,7 +21324,9 @@ impl VitaState {
                 let bytes: Vec<u8> = ctx.read_bytes(addr, len as usize);
                 let path = format!("mem-{addr:08x}-f{frame}.bin");
                 match std::fs::write(&path, &bytes) {
-                    Ok(()) => eprintln!("MEM-DUMP frame {frame}: {len} bytes of {addr:#010x} -> {path}"),
+                    Ok(()) => {
+                        eprintln!("MEM-DUMP frame {frame}: {len} bytes of {addr:#010x} -> {path}")
+                    }
                     Err(e) => eprintln!("MEM-DUMP {addr:#010x}: {e}"),
                 }
             }
@@ -19183,7 +21339,10 @@ impl VitaState {
             // cannot see is otherwise a dump that silently never happens, which is the failure
             // this instrument exists to avoid.
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            if !N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(65536) {
+            if !N
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(65536)
+            {
                 return;
             }
         } else {
@@ -19193,7 +21352,9 @@ impl VitaState {
             let bytes: Vec<u8> = ctx.read_bytes(addr, len as usize);
             let path = format!("mem-{addr:08x}.bin");
             match std::fs::write(&path, &bytes) {
-                Ok(()) => eprintln!("MEM-DUMP frame {frame}: {len} bytes of {addr:#010x} -> {path}"),
+                Ok(()) => {
+                    eprintln!("MEM-DUMP frame {frame}: {len} bytes of {addr:#010x} -> {path}")
+                }
                 Err(e) => eprintln!("MEM-DUMP {addr:#010x}: {e}"),
             }
         }
@@ -19222,7 +21383,11 @@ impl VitaState {
         };
         static SEEN: OnceLock<Mutex<std::collections::HashSet<(u32, u32)>>> = OnceLock::new();
         let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-        if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert((vheader, buffer_index)) {
+        if !seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((vheader, buffer_index))
+        {
             return;
         }
         let words = |a: u32| -> String {
@@ -19305,7 +21470,11 @@ impl VitaState {
         } else {
             "OTHER slots of this stage's table ARE bound, so the binding path works and this              INDEX is the one that does not arrive."
         };
-        let bound_slots = if bound.is_empty() { "none".to_string() } else { bound.join(" ") };
+        let bound_slots = if bound.is_empty() {
+            "none".to_string()
+        } else {
+            bound.join(" ")
+        };
         tracing::warn!(
             target: "vitaslop::gxm",
             program = format_args!("{vheader:#x}"),
@@ -19357,11 +21526,13 @@ impl VitaState {
             // bytes - a wrong picture with nothing to say so.
             let addr = match stage {
                 ProgramStage::Vertex if w.buffer_index == Self::DEFAULT_UNIFORM_BUFFER_INDEX => {
-                    blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM).buf
+                    blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM)
+                        .buf
                 }
                 ProgramStage::Vertex => blk.vertex_uniform_buffer(w.buffer_index),
                 ProgramStage::Fragment if w.buffer_index == Self::DEFAULT_UNIFORM_BUFFER_INDEX => {
-                    blk.uniform_binding(crate::vita::gxmctx::off::FRAGMENT_UNIFORM).buf
+                    blk.uniform_binding(crate::vita::gxmctx::off::FRAGMENT_UNIFORM)
+                        .buf
                 }
                 ProgramStage::Fragment => blk.fragment_uniform_buffer(w.buffer_index),
             };
@@ -19392,7 +21563,13 @@ impl VitaState {
                     })
                     .buf;
                 Self::report_unbound_mem_window(
-                    vheader, stage, w.buffer_index, addr, spec.len(), &table, default_buf,
+                    vheader,
+                    stage,
+                    w.buffer_index,
+                    addr,
+                    spec.len(),
+                    &table,
+                    default_buf,
                 );
                 return Vec::new();
             }
@@ -19440,7 +21617,10 @@ impl VitaState {
                 };
                 // Tested ONCE per (program, buffer) - see `report_mem_window`. A set on the state,
                 // not a global lock: this line runs for every window of every draw.
-                if self.mem_windows_zero_tested.insert((vheader, w.buffer_index)) {
+                if self
+                    .mem_windows_zero_tested
+                    .insert((vheader, w.buffer_index))
+                {
                     Self::report_mem_window(vheader, w.buffer_index, at, &bytes);
                 }
                 Self::peek_past_mem_window(ctx, vheader, w.buffer_index, at);
@@ -19516,7 +21696,12 @@ impl VitaState {
     /// Deduplicated by `(vertex header, fragment header)`: a title creates fragment programs in
     /// bursts and re-creates them after a patcher reset, and the renderer's own module cache
     /// would absorb that anyway - but the guest-memory reads and the queue would not.
-    pub fn queue_shader_precompile(&mut self, ctx: &GuestCtx, vertex_header: u32, fragment_header: u32) {
+    pub fn queue_shader_precompile(
+        &mut self,
+        ctx: &GuestCtx,
+        vertex_header: u32,
+        fragment_header: u32,
+    ) {
         Self::report_null_vertex_program(vertex_header, fragment_header);
         if fragment_header == 0 {
             return;
@@ -19647,7 +21832,10 @@ impl VitaState {
             }
             return;
         }
-        if !self.precompiled_pairs.insert((vertex_header, fragment_header)) {
+        if !self
+            .precompiled_pairs
+            .insert((vertex_header, fragment_header))
+        {
             return;
         }
         let vprog = self.program_blob(ctx, vertex_header);
@@ -19658,9 +21846,15 @@ impl VitaState {
         // gates it). This is what lets the ahead-of-draw translation carry the draw's options.
         let mut layouts: Vec<Vec<(u32, u8, u8)>> = Vec::new();
         if vitaslop_platform::knobs::gxp_guest_attrs_in_link() {
-            for info in self.vertex_programs.values().filter(|i| i.program_header == vertex_header) {
+            for info in self
+                .vertex_programs
+                .values()
+                .filter(|i| i.program_header == vertex_header)
+            {
                 let spec = vitaslop_gxp_shader::guest_attr_spec(
-                    info.packed_attributes.iter().map(|a| (u32::from(a.reg_index), a.format, a.component_count)),
+                    info.packed_attributes
+                        .iter()
+                        .map(|a| (u32::from(a.reg_index), a.format, a.component_count)),
                 );
                 if !layouts.contains(&spec) {
                     layouts.push(spec);
@@ -19672,7 +21866,11 @@ impl VitaState {
         }
         let list = std::sync::Arc::make_mut(&mut self.pending_precompile);
         for attrs in layouts {
-            list.push(vitaslop_gxp_shader::PatcherPair { vprog: vprog.clone(), fprog: fprog.clone(), attrs });
+            list.push(vitaslop_gxp_shader::PatcherPair {
+                vprog: vprog.clone(),
+                fprog: fprog.clone(),
+                attrs,
+            });
         }
     }
 
@@ -19685,9 +21883,7 @@ impl VitaState {
     /// the very end, so every pair was drained into a scene nobody looked at and the preparation
     /// silently never happened. The renderer skips a pair whose module it already has, at the
     /// cost of one hash lookup, so re-offering the whole list is cheap and cannot be missed.
-    pub fn shader_precompile(
-        &self,
-    ) -> std::sync::Arc<Vec<vitaslop_gxp_shader::PatcherPair>> {
+    pub fn shader_precompile(&self) -> std::sync::Arc<Vec<vitaslop_gxp_shader::PatcherPair>> {
         self.pending_precompile.clone()
     }
 
@@ -19791,11 +21987,13 @@ impl VitaState {
         r: &ProgramReflection,
         lane: impl Fn(usize) -> Option<f32>,
     ) -> [f32; 16] {
-        const IDENTITY: [f32; 16] =
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
-        Self::reflected_world_proj_by(r, lane).map(|(w, _)| w).unwrap_or(IDENTITY)
+        const IDENTITY: [f32; 16] = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        Self::reflected_world_proj_by(r, lane)
+            .map(|(w, _)| w)
+            .unwrap_or(IDENTITY)
     }
-
 
     /// Pull the vertex program's model->world and world->projection 4x4 matrices out of
     /// this draw's `uniforms`, at the offsets [`ProgramReflection`] located by name.
@@ -19843,7 +22041,9 @@ impl VitaState {
     }
 
     fn reflected_exposure_by(r: &ProgramReflection, lane: impl Fn(usize) -> Option<f32>) -> f32 {
-        let Some(off) = r.exposure_off else { return 1.0 };
+        let Some(off) = r.exposure_off else {
+            return 1.0;
+        };
         match lane(off as usize) {
             Some(e) if e.is_finite() && e > 0.0 => e,
             _ => 1.0,
@@ -19868,7 +22068,9 @@ impl VitaState {
             return;
         }
         let count = ctx.read_u32(ph.wrapping_add(0x24));
-        let base = ph.wrapping_add(0x28).wrapping_add(ctx.read_u32(ph.wrapping_add(0x28)));
+        let base = ph
+            .wrapping_add(0x28)
+            .wrapping_add(ctx.read_u32(ph.wrapping_add(0x28)));
         for i in 0..count.min(64) {
             let p = base.wrapping_add(i.wrapping_mul(16));
             let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
@@ -19893,7 +22095,11 @@ impl VitaState {
             let res = ctx.read_u32(p.wrapping_add(0xc)) as usize;
             let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
             let raw = ctx.read_bytes(name_addr, 48);
-            let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            let name: String = raw
+                .iter()
+                .take_while(|&&b| b != 0)
+                .map(|&b| b as char)
+                .collect();
             let n = (comp * array) as usize;
             // The bytes this parameter's OWN container holds. The default container is the
             // buffer the caller already read (`values`); any other is the address the guest
@@ -19905,7 +22111,11 @@ impl VitaState {
                 (
                     "default".into(),
                     (0..n.min(16))
-                        .map(|k| values.get(res + k).map_or("-".into(), |v| format!("{v:.4}")))
+                        .map(|k| {
+                            values
+                                .get(res + k)
+                                .map_or("-".into(), |v| format!("{v:.4}"))
+                        })
                         .collect(),
                 )
             } else {
@@ -19956,7 +22166,9 @@ impl VitaState {
             seen.push(ph);
         }
         let count = ctx.read_u32(ph.wrapping_add(0x24));
-        let base = ph.wrapping_add(0x28).wrapping_add(ctx.read_u32(ph.wrapping_add(0x28)));
+        let base = ph
+            .wrapping_add(0x28)
+            .wrapping_add(ctx.read_u32(ph.wrapping_add(0x28)));
         eprintln!("VPROG header={ph:#x} params={count}");
         for i in 0..count.min(64) {
             let p = base.wrapping_add(i.wrapping_mul(16));
@@ -19966,7 +22178,11 @@ impl VitaState {
             let res_index = ctx.read_u32(p.wrapping_add(0xc));
             let name_addr = (p as i64 + name_off as i64) as u32;
             let raw = ctx.read_bytes(name_addr, 48);
-            let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            let name: String = raw
+                .iter()
+                .take_while(|&&b| b != 0)
+                .map(|&b| b as char)
+                .collect();
             // The upper half of the +4 word is the `semantic` u16 that
             // `sceGxmProgramParameterGetSemantic`/`GetSemanticIndex` split. Printed RAW as
             // well as split, because a title that builds its `SceGxmVertexAttribute` array
@@ -19977,7 +22193,10 @@ impl VitaState {
             eprintln!(
                 "  param[{i}] name={name:?} cat={} type={} comp={} container={} array={array_size} \
                  res_index={res_index} semantic_word={semantic:#06x}",
-                word & 0xf, (word >> 4) & 0xf, (word >> 8) & 0xf, (word >> 12) & 0xf,
+                word & 0xf,
+                (word >> 4) & 0xf,
+                (word >> 8) & 0xf,
+                (word >> 12) & 0xf,
             );
         }
     }
@@ -20050,15 +22269,12 @@ impl VitaState {
                     (Some(s), true) => {
                         crate::render::half_to_f32(u16::from_le_bytes([s[i * 2], s[i * 2 + 1]]))
                     }
-                    (Some(s), false) => f32::from_le_bytes([
-                        s[i * 4],
-                        s[i * 4 + 1],
-                        s[i * 4 + 2],
-                        s[i * 4 + 3],
-                    ]),
-                    (None, true) => {
-                        crate::render::half_to_f32(ctx.read_u16(byte_off.wrapping_add(i as u32 * 2)))
+                    (Some(s), false) => {
+                        f32::from_le_bytes([s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3]])
                     }
+                    (None, true) => crate::render::half_to_f32(
+                        ctx.read_u16(byte_off.wrapping_add(i as u32 * 2)),
+                    ),
                     (None, false) => ctx.read_f32(byte_off.wrapping_add(i as u32 * 4)),
                 })
             };
@@ -20088,9 +22304,10 @@ impl VitaState {
         // flat ambient for a renderer that does not sample it per-normal. Leaves the default
         // grey ambient when no such map is present.
         if let Some(amb) = textures.iter().find(|t| t.unit == 15)
-            && let Some(mean) = snaps!(self).mean_rgb(amb) {
-                m.ambient = mean;
-            }
+            && let Some(mean) = snaps!(self).mean_rgb(amb)
+        {
+            m.ambient = mean;
+        }
         m
     }
 
@@ -20112,7 +22329,9 @@ impl VitaState {
             seen.push(header);
         }
         let count = ctx.read_u32(header.wrapping_add(0x24));
-        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+        let base = header
+            .wrapping_add(0x28)
+            .wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
         eprintln!("FPROG header={header:#x} params={count}");
         for i in 0..count.min(256) {
             let p = base.wrapping_add(i.wrapping_mul(16));
@@ -20123,8 +22342,15 @@ impl VitaState {
             let unit = ctx.read_u32(p.wrapping_add(0xc));
             let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
             let raw = ctx.read_bytes(name_addr, 64);
-            let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
-            eprintln!("  sampler name={name:?} unit={unit} score={}", albedo_name_score(&name.to_ascii_lowercase()));
+            let name: String = raw
+                .iter()
+                .take_while(|&&b| b != 0)
+                .map(|&b| b as char)
+                .collect();
+            eprintln!(
+                "  sampler name={name:?} unit={unit} score={}",
+                albedo_name_score(&name.to_ascii_lowercase())
+            );
         }
     }
 
@@ -20211,7 +22437,11 @@ impl VitaState {
             let _x = crate::perf::exclude_scope();
             let job = self.take_resolve_job(u64::MAX);
             if !job.scenes.is_empty() {
-                let mut slot = self.async_resolve.slot.lock().unwrap_or_else(|e| e.into_inner());
+                let mut slot = self
+                    .async_resolve
+                    .slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 slot.in_flight += 1;
                 slot.queue.push_back(job);
                 self.async_resolve.cv.notify_all();
@@ -20242,7 +22472,11 @@ impl VitaState {
     /// Only under the asynchronous frontend with a resolver worker; elsewhere (and under
     /// `VITASLOP_SYNC_RESOLVE_ASYNC=0`) the inline read is unchanged.
     pub fn queue_sync_resolve(&mut self) -> bool {
-        if !self.complete_scene_async || !resolver_attached() || !async_flip_resolve() || !sync_resolve_async() {
+        if !self.complete_scene_async
+            || !resolver_attached()
+            || !async_flip_resolve()
+            || !sync_resolve_async()
+        {
             return false;
         }
         self.flip_resolve_upto = None;
@@ -20250,7 +22484,11 @@ impl VitaState {
         if job.scenes.is_empty() {
             return false;
         }
-        let mut slot = self.async_resolve.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self
+            .async_resolve
+            .slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         slot.in_flight += 1;
         slot.queue.push_back(job);
         self.async_resolve.cv.notify_all();
@@ -20320,21 +22558,42 @@ impl VitaState {
     /// windows move into the job and come back with [`Self::apply_posted_resolve`]. `None` when
     /// no boundary is owed. The job is marked IN FLIGHT here, so a sync point on a guest thread
     /// ([`Self::resolve_deferred_geometry`]) waits for its bytes instead of reading around it.
-    fn take_flip_resolve_job(&mut self) -> Option<(ResolveJob, Arc<AsyncResolve>, Arc<std::sync::Mutex<TextureSnapshots>>)> {
+    fn take_flip_resolve_job(
+        &mut self,
+    ) -> Option<(
+        ResolveJob,
+        Arc<AsyncResolve>,
+        Arc<std::sync::Mutex<TextureSnapshots>>,
+    )> {
         let upto = self.flip_resolve_upto.take()?;
         let job = self.take_resolve_job(upto);
         if job.scenes.is_empty() {
             return None;
         }
-        self.async_resolve.slot.lock().unwrap_or_else(|e| e.into_inner()).in_flight += 1;
-        Some((job, self.async_resolve.clone(), self.texture_snapshots.clone()))
+        self.async_resolve
+            .slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_flight += 1;
+        Some((
+            job,
+            self.async_resolve.clone(),
+            self.texture_snapshots.clone(),
+        ))
     }
 
     /// Apply every job a presenting worker has finished reading (see
     /// [`Self::take_flip_resolve_job`]) to the scenes it came from. Under the host lock; cheap -
     /// it moves `Arc`s into draws.
     pub fn apply_posted_resolve(&mut self, ctx: &GuestCtx) {
-        let done = std::mem::take(&mut self.async_resolve.slot.lock().unwrap_or_else(|e| e.into_inner()).done);
+        let done = std::mem::take(
+            &mut self
+                .async_resolve
+                .slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .done,
+        );
         for job in done {
             self.apply_resolve_job(ctx, job);
         }
@@ -20344,9 +22603,17 @@ impl VitaState {
     /// lock, never the host lock this caller holds, so the wait cannot deadlock.
     fn settle_async_resolve(&mut self, ctx: &GuestCtx) {
         {
-            let mut slot = self.async_resolve.slot.lock().unwrap_or_else(|e| e.into_inner());
+            let mut slot = self
+                .async_resolve
+                .slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             while slot.in_flight > 0 {
-                slot = self.async_resolve.cv.wait(slot).unwrap_or_else(|e| e.into_inner());
+                slot = self
+                    .async_resolve
+                    .cv
+                    .wait(slot)
+                    .unwrap_or_else(|e| e.into_inner());
             }
         }
         self.apply_posted_resolve(ctx);
@@ -20358,7 +22625,10 @@ impl VitaState {
         &mut self,
         ctx: &GuestCtx,
         t: ResolvedTextures,
-    ) -> (Arc<[crate::capture::BoundTexture]>, Arc<[crate::capture::BoundTexture]>) {
+    ) -> (
+        Arc<[crate::capture::BoundTexture]>,
+        Arc<[crate::capture::BoundTexture]>,
+    ) {
         let frag = match t.frag {
             TexSet::Hit(list) => list,
             TexSet::Miss(key, binds) => {
@@ -20370,7 +22640,11 @@ impl VitaState {
                         let _m = crate::perf::scope(crate::perf::Phase::DrawTexFragMiss);
                         let mut textures = self.snapshot_bound_textures(ctx, &binds);
                         // The albedo reorder `draw_textures_now` applies before it stores a set.
-                        if let Some(pos) = textures.iter().position(|t| t.height > 1 && t.faces <= 1).filter(|&p| p > 0) {
+                        if let Some(pos) = textures
+                            .iter()
+                            .position(|t| t.height > 1 && t.faces <= 1)
+                            .filter(|&p| p > 0)
+                        {
                             textures[..=pos].rotate_right(1);
                         }
                         if let Some(unit) = t.albedo
@@ -20409,7 +22683,11 @@ impl VitaState {
     /// [`Self::apply_resolve_job`]). Scenes the capture no longer holds, or whose draws do not
     /// pair with their descriptions, are reported here and dropped from the job.
     fn take_resolve_job(&mut self, upto: u64) -> ResolveJob {
-        let cut = self.pending_geometry.iter().position(|(id, _)| *id > upto).unwrap_or(self.pending_geometry.len());
+        let cut = self
+            .pending_geometry
+            .iter()
+            .position(|(id, _)| *id > upto)
+            .unwrap_or(self.pending_geometry.len());
         let rest = self.pending_geometry.split_off(cut);
         let entries = std::mem::replace(&mut self.pending_geometry, rest);
         let mut scenes = Vec::with_capacity(entries.len());
@@ -20442,11 +22720,26 @@ impl VitaState {
             let windows = scene
                 .draws
                 .iter_mut()
-                .map(|d| (std::mem::take(&mut d.mem_windows), std::mem::take(&mut d.frag_mem_windows)))
+                .map(|d| {
+                    (
+                        std::mem::take(&mut d.mem_windows),
+                        std::mem::take(&mut d.frag_mem_windows),
+                    )
+                })
                 .collect();
-            scenes.push(ResolveScene { id, continues: false, geo, windows, out: Vec::new(), tex_out: Vec::new() });
+            scenes.push(ResolveScene {
+                id,
+                continues: false,
+                geo,
+                windows,
+                out: Vec::new(),
+                tex_out: Vec::new(),
+            });
         }
-        ResolveJob { frame: self.cur_frame, scenes }
+        ResolveJob {
+            frame: self.cur_frame,
+            scenes,
+        }
     }
 
     /// Put a computed job's bytes into the draws it was taken from.
@@ -20455,9 +22748,21 @@ impl VitaState {
             // Deferred textures: a set the resolver proved is moved in; one it could not answer
             // is built HERE, under the host lock, because building one reads the host's recorded
             // texture formats - exactly the miss path `draw_textures_now` takes.
-            let tex: Vec<Option<(Arc<[crate::capture::BoundTexture]>, Arc<[crate::capture::BoundTexture]>)>> =
-                std::mem::take(&mut rs.tex_out).into_iter().map(|t| t.map(|t| self.finish_textures(ctx, t))).collect();
-            let Some(scene) = self.capture.scenes.iter_mut().find(|s| s.deferred_id == rs.id) else {
+            let tex: Vec<
+                Option<(
+                    Arc<[crate::capture::BoundTexture]>,
+                    Arc<[crate::capture::BoundTexture]>,
+                )>,
+            > = std::mem::take(&mut rs.tex_out)
+                .into_iter()
+                .map(|t| t.map(|t| self.finish_textures(ctx, t)))
+                .collect();
+            let Some(scene) = self
+                .capture
+                .scenes
+                .iter_mut()
+                .find(|s| s.deferred_id == rs.id)
+            else {
                 tracing::warn!(
                     target: "vitaslop::gxm",
                     deferred_id = rs.id, draws = rs.geo.len(), scenes_held = self.capture.scenes.len(),
@@ -20466,7 +22771,11 @@ impl VitaState {
                 continue;
             };
             scene.deferred_id = 0;
-            for (d, ((indices, vertices), (mw, fw))) in scene.draws.iter_mut().zip(rs.out.into_iter().zip(rs.windows)) {
+            for (d, ((indices, vertices), (mw, fw))) in scene
+                .draws
+                .iter_mut()
+                .zip(rs.out.into_iter().zip(rs.windows))
+            {
                 d.indices = indices;
                 d.vertices = vertices;
                 d.mem_windows = mw;
@@ -20525,7 +22834,9 @@ impl VitaState {
     /// "N", or an inclusive range "LO-HI". Cached, because it runs per draw.
     fn dump_draw_frame_matches(disp: u64) -> bool {
         static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        let Some(want) = WANT.get_or_init(|| vitaslop_platform::knobs::var("VITASLOP_DUMP_DRAW_GXP").ok()) else {
+        let Some(want) =
+            WANT.get_or_init(|| vitaslop_platform::knobs::var("VITASLOP_DUMP_DRAW_GXP").ok())
+        else {
             return false;
         };
         want == "all"
@@ -20540,10 +22851,25 @@ impl VitaState {
 
     /// `vhandle` and `streams` are the DRAW's bindings - the snapshot's, which a precomputed
     /// draw overlays - not a fresh read of the context.
-    fn dump_draw_gxp(&self, ctx: &GuestCtx, vhandle: u32, streams: &[u32; MAX_VERTEX_STREAMS], vref: &ProgramReflection, material: &crate::capture::FragmentMaterial, textures: &[crate::capture::BoundTexture], attributes: &[crate::capture::VertexAttribute], primitive: u32, index_count: u32, stride: u32, frag_buf: u32, index_addr: u32, index_elem: usize) {
+    fn dump_draw_gxp(
+        &self,
+        ctx: &GuestCtx,
+        vhandle: u32,
+        streams: &[u32; MAX_VERTEX_STREAMS],
+        vref: &ProgramReflection,
+        material: &crate::capture::FragmentMaterial,
+        textures: &[crate::capture::BoundTexture],
+        attributes: &[crate::capture::VertexAttribute],
+        primitive: u32,
+        index_count: u32,
+        stride: u32,
+        frag_buf: u32,
+        index_addr: u32,
+        index_elem: usize,
+    ) {
         // The frame the dump keys on is the scheduler frame (`cur_frame`, the display-flip /
         // yield count set at each `on_frame_boundary`), which is exactly the `fNNNN` a shot is
-        // labelled with in the recipe runner. (`presents.len()` is NOT it: this title renders
+        // labelled with in the headless runner. (`presents.len()` is NOT it: this title renders
         // through the GXM display queue and calls the raw `present` path only a couple of times.)
         let disp = self.cur_frame;
         if !Self::dump_draw_frame_matches(disp) {
@@ -20576,12 +22902,24 @@ impl VitaState {
              depth_func={}/{} depth_write={}/{} frag_enable={}/{} stencil_func={}/{} stencil_ops={:#x},{:#x},{:#x} stencil_ref={} stencil_masks={:#x}/{:#x} two_sided={} cull={} viewport_en={} clip_mode={} \
              viewport={:?} vp_extent={}x{} clip_rect={:?}",
             self.last_precomputed_block,
-            rs.front_depth_func, rs.back_depth_func, rs.front_depth_write, rs.back_depth_write,
-            rs.front_fragment_program_enable, rs.back_fragment_program_enable,
-            rs.front_stencil_func, rs.back_stencil_func,
-            rs.front_stencil_op_fail, rs.front_stencil_op_depth_fail, rs.front_stencil_op_depth_pass,
-            rs.front_stencil_ref, rs.front_stencil_compare_mask, rs.front_stencil_write_mask, rs.two_sided,
-            rs.cull_mode, rs.viewport_enable, rs.region_clip_mode,
+            rs.front_depth_func,
+            rs.back_depth_func,
+            rs.front_depth_write,
+            rs.back_depth_write,
+            rs.front_fragment_program_enable,
+            rs.back_fragment_program_enable,
+            rs.front_stencil_func,
+            rs.back_stencil_func,
+            rs.front_stencil_op_fail,
+            rs.front_stencil_op_depth_fail,
+            rs.front_stencil_op_depth_pass,
+            rs.front_stencil_ref,
+            rs.front_stencil_compare_mask,
+            rs.front_stencil_write_mask,
+            rs.two_sided,
+            rs.cull_mode,
+            rs.viewport_enable,
+            rs.region_clip_mode,
             // >>> THE VIEWPORT ITSELF, and the TARGET SIZE IT IMPLIES.
             //
             // `viewport_en` alone says only whether the transform is in effect; it cannot say
@@ -20605,14 +22943,20 @@ impl VitaState {
         // origin, which is what "it is drawn at the wrong place" actually means.
         let vbound = self.vertex_uniform(ctx);
         let vbuf = vbound.buf;
-        let usable = vbuf != 0 && vbound.size >= 4 && vbound.header == vh;
-        let source = match (vbuf != 0, vbound.header == vh) {
+        let owned = vbound.header == vh || vbound.header == USER_UNIFORM_BUFFER;
+        let vsize = if vbound.header == USER_UNIFORM_BUFFER {
+            vref.uniform_size_bytes.max(vref.default_uniform_bytes)
+        } else {
+            vbound.size
+        };
+        let usable = vbuf != 0 && vsize >= 4 && owned;
+        let source = match (vbuf != 0, owned) {
             (true, true) => "ubuf",
             (true, false) => "STALE-ubuf",
             (false, _) => "setUniformDataF",
         };
         let raw: Vec<f32> = if usable {
-            (0..(vbound.size / 4) as usize)
+            (0..(vsize / 4) as usize)
                 .map(|i| ctx.read_f32(vbuf.wrapping_add(i as u32 * 4)))
                 .collect()
         } else {
@@ -20630,7 +22974,10 @@ impl VitaState {
             "  TRANSFORM source={source} ubuf={vbuf:#x} lanes={} composed={} origin_clip=[{:.3},{:.3},{:.3},{:.3}]",
             raw.len(),
             if composed.is_some() { "yes" } else { "no" },
-            eff[12], eff[13], eff[14], eff[15],
+            eff[12],
+            eff[13],
+            eff[14],
+            eff[15],
         );
         // >>> THE NON-DEFAULT UNIFORM BUFFER TABLE, because a transform that is not in the
         // >>> default buffer is not in anything this dump used to print.
@@ -20654,7 +23001,11 @@ impl VitaState {
                 .collect();
             eprintln!(
                 "  VUBUFS {}",
-                if bound.is_empty() { "none bound".to_string() } else { bound.join(" ") },
+                if bound.is_empty() {
+                    "none bound".to_string()
+                } else {
+                    bound.join(" ")
+                },
             );
             // >>> AND THE BYTES OF ONE OF THEM (`VITASLOP_DUMP_VUBUF=<index>`), as floats.
             //
@@ -20663,21 +23014,20 @@ impl VitaState {
             // never wrote. This prints the head of the buffer so the matrix can be LOOKED FOR
             // rather than assumed to start where `resource_index` says.
             if let Ok(want) = std::env::var("VITASLOP_DUMP_VUBUF")
-                && let Ok(idx) = want.trim().parse::<u32>() {
-                    let addr = if self.gxm_context != 0 {
-                        gxmctx::vertex_uniform_buffer(ctx, self.gxm_context, idx)
-                    } else {
-                        0
-                    };
-                    if addr != 0 {
-                        let f: Vec<String> = (0..64)
-                            .map(|k| {
-                                format!("{:.4}", ctx.read_f32(addr.wrapping_add(k * 4)))
-                            })
-                            .collect();
-                        eprintln!("  VUBUF{idx}@{addr:#x} f0..63 = [{}]", f.join(","));
-                    }
+                && let Ok(idx) = want.trim().parse::<u32>()
+            {
+                let addr = if self.gxm_context != 0 {
+                    gxmctx::vertex_uniform_buffer(ctx, self.gxm_context, idx)
+                } else {
+                    0
+                };
+                if addr != 0 {
+                    let f: Vec<String> = (0..64)
+                        .map(|k| format!("{:.4}", ctx.read_f32(addr.wrapping_add(k * 4))))
+                        .collect();
+                    eprintln!("  VUBUF{idx}@{addr:#x} f0..63 = [{}]", f.join(","));
                 }
+            }
         }
         // The whole transform, column by column. `origin_clip` above is only its last
         // column, which says WHERE the origin lands and nothing about the scale or the
@@ -20686,10 +23036,22 @@ impl VitaState {
         eprintln!(
             "  MVP c0=[{:.4},{:.4},{:.4},{:.4}] c1=[{:.4},{:.4},{:.4},{:.4}] \
              c2=[{:.4},{:.4},{:.4},{:.4}] c3=[{:.4},{:.4},{:.4},{:.4}]",
-            eff[0], eff[1], eff[2], eff[3],
-            eff[4], eff[5], eff[6], eff[7],
-            eff[8], eff[9], eff[10], eff[11],
-            eff[12], eff[13], eff[14], eff[15],
+            eff[0],
+            eff[1],
+            eff[2],
+            eff[3],
+            eff[4],
+            eff[5],
+            eff[6],
+            eff[7],
+            eff[8],
+            eff[9],
+            eff[10],
+            eff[11],
+            eff[12],
+            eff[13],
+            eff[14],
+            eff[15],
         );
         // Every uniform lane the program declares, by NAME, so a transform that is not
         // in the first sixteen floats can be found rather than guessed at. This is the
@@ -20697,15 +23059,27 @@ impl VitaState {
         self.dump_named_uniforms(ctx, vh, &raw);
         eprintln!(
             "  MATERIAL tint=[{:.3},{:.3},{:.3}] has_light={} light_dir=[{:.3},{:.3},{:.3}] light_col=[{:.3},{:.3},{:.3}] ambient=[{:.3},{:.3},{:.3}]",
-            mat.tint[0], mat.tint[1], mat.tint[2], mat.has_light,
-            mat.light_dir[0], mat.light_dir[1], mat.light_dir[2],
-            mat.light_col[0], mat.light_col[1], mat.light_col[2],
-            mat.ambient[0], mat.ambient[1], mat.ambient[2],
+            mat.tint[0],
+            mat.tint[1],
+            mat.tint[2],
+            mat.has_light,
+            mat.light_dir[0],
+            mat.light_dir[1],
+            mat.light_dir[2],
+            mat.light_col[0],
+            mat.light_col[1],
+            mat.light_col[2],
+            mat.ambient[0],
+            mat.ambient[1],
+            mat.ambient[2],
         );
         // Vertex stream attributes (bytes -> shader register): the count of distinct UV-ish
         // float2/float4 lanes is the number of texcoord sets the mesh actually carries.
         for a in attributes {
-            eprintln!("  attr stream={} off={} fmt={} comp={} reg={}", a.stream_index, a.offset, a.format, a.component_count, a.reg_index);
+            eprintln!(
+                "  attr stream={} off={} fmt={} comp={} reg={}",
+                a.stream_index, a.offset, a.format, a.component_count, a.reg_index
+            );
         }
         // >>> AND THE STREAMS THEMSELVES, because the line above prints the PACKED attributes.
         //
@@ -20718,17 +23092,35 @@ impl VitaState {
             eprintln!(
                 "  streams packed_stride={} columns={:?} strides={:?} per_instance={:?} raw_attrs={:?}",
                 info.packed_stride,
-                info.used_streams.iter().map(|s| s.column).collect::<Vec<_>>(),
-                info.used_streams.iter().map(|s| s.stride).collect::<Vec<_>>(),
-                info.used_streams.iter().map(|s| s.per_instance).collect::<Vec<_>>(),
+                info.used_streams
+                    .iter()
+                    .map(|s| s.column)
+                    .collect::<Vec<_>>(),
+                info.used_streams
+                    .iter()
+                    .map(|s| s.stride)
+                    .collect::<Vec<_>>(),
+                info.used_streams
+                    .iter()
+                    .map(|s| s.per_instance)
+                    .collect::<Vec<_>>(),
                 info.attributes
                     .iter()
-                    .map(|a| (a.stream_index, a.offset, a.format, a.component_count, a.reg_index))
+                    .map(|a| (
+                        a.stream_index,
+                        a.offset,
+                        a.format,
+                        a.component_count,
+                        a.reg_index
+                    ))
                     .collect::<Vec<_>>(),
             );
             eprintln!(
                 "  streams DECLARED={:?} bound_addrs={:x?}",
-                info.streams.iter().map(|s| (s.stride, s.per_instance)).collect::<Vec<_>>(),
+                info.streams
+                    .iter()
+                    .map(|s| (s.stride, s.per_instance))
+                    .collect::<Vec<_>>(),
                 &streams[..info.used_streams.len().min(4)],
             );
             // >>> AND THE GUEST'S OWN BYTES, straight from memory, per stream.
@@ -20748,13 +23140,15 @@ impl VitaState {
                 // the wrong turn this print existed to prevent.
                 let (first_vertex, vertex_count) = if index_addr != 0 && index_count > 0 {
                     let raw = ctx.read_bytes(index_addr, index_count as usize * index_elem);
-                    let (lo, hi) = raw.chunks(index_elem).fold((u32::MAX, 0u32), |(lo, hi), c| {
-                        let i = match index_elem {
-                            2 => u16::from_le_bytes([c[0], c[1]]) as u32,
-                            _ => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-                        };
-                        (lo.min(i), hi.max(i))
-                    });
+                    let (lo, hi) = raw
+                        .chunks(index_elem)
+                        .fold((u32::MAX, 0u32), |(lo, hi), c| {
+                            let i = match index_elem {
+                                2 => u16::from_le_bytes([c[0], c[1]]) as u32,
+                                _ => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                            };
+                            (lo.min(i), hi.max(i))
+                        });
                     if lo > hi { (0, 0) } else { (lo, hi - lo + 1) }
                 } else {
                     (0, 0)
@@ -20813,7 +23207,10 @@ impl VitaState {
                         st.stride,
                         st.column,
                         raw.len(),
-                        raw.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
+                        raw.iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join("")
                     );
                 }
             }
@@ -20836,8 +23233,18 @@ impl VitaState {
             // `VITASLOP_PEEK`, the `refs` tool and the scene-target list.
             eprintln!(
                 "  tex unit={} {}x{} base_fmt={:#x} swizzle={:#x} type={} addr={:#010x} stride={} levels={} mip_filter={} lod_bias={} nonzero={nonzero:.3} sampler={:?}",
-                t.unit, t.width, t.height, t.base_format, t.swizzle, t.tex_type, t.data_addr,
-                t.stride, t.levels, t.mip_filter, t.lod_bias, sampler_name(t.unit)
+                t.unit,
+                t.width,
+                t.height,
+                t.base_format,
+                t.swizzle,
+                t.tex_type,
+                t.data_addr,
+                t.stride,
+                t.levels,
+                t.mip_filter,
+                t.lod_bias,
+                sampler_name(t.unit)
             );
         }
         if std::env::var("VITASLOP_DUMP_DRAW_GXP_FULL").is_ok() {
@@ -20889,7 +23296,10 @@ impl VitaState {
                     // joined to the draw that sampled it, and a question of the form "what is
                     // in the albedo THIS draw bound" has to be answered by guessing from the
                     // extent.
-                    .join(format!("f{disp}_seq{seq}_{:08x}_u{}_{}.png", t.data_addr, t.unit, safe));
+                    .join(format!(
+                        "f{disp}_seq{seq}_{:08x}_u{}_{}.png",
+                        t.data_addr, t.unit, safe
+                    ));
                 let _ = std::fs::write(path, crate::render::rgba_to_png(w, h, &rgba));
             }
         }
@@ -20934,7 +23344,9 @@ impl VitaState {
                             "recompiled FRAGMENT program to a bindable WGSL module ({} chars)",
                             m.wgsl.len(),
                         ),
-                        Err(e) => panic!("VITASLOP_GXP_RECOMPILE: fragment program {header:#010x}: {e}"),
+                        Err(e) => {
+                            panic!("VITASLOP_GXP_RECOMPILE: fragment program {header:#010x}: {e}")
+                        }
                     },
                     _ => match vitaslop_gxp_shader::recompile_vertex_module(&bytes) {
                         Ok((r, m)) => tracing::info!(
@@ -20947,7 +23359,9 @@ impl VitaState {
                             "recompiled VERTEX program to a bindable WGSL module ({} chars)",
                             m.wgsl.len(),
                         ),
-                        Err(e) => panic!("VITASLOP_GXP_RECOMPILE: vertex program {header:#010x}: {e}"),
+                        Err(e) => {
+                            panic!("VITASLOP_GXP_RECOMPILE: vertex program {header:#010x}: {e}")
+                        }
                     },
                 }
             }
@@ -20960,7 +23374,9 @@ impl VitaState {
             return String::new();
         }
         let count = ctx.read_u32(header.wrapping_add(0x24));
-        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+        let base = header
+            .wrapping_add(0x28)
+            .wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
         for i in 0..count.min(256) {
             let p = base.wrapping_add(i.wrapping_mul(16));
             let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
@@ -20970,7 +23386,11 @@ impl VitaState {
             if ctx.read_u32(p.wrapping_add(0xc)) == unit {
                 let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
                 let raw = ctx.read_bytes(name_addr, 64);
-                return raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+                return raw
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as char)
+                    .collect();
             }
         }
         String::new()
@@ -20986,7 +23406,9 @@ impl VitaState {
             return;
         }
         let count = ctx.read_u32(header.wrapping_add(0x24));
-        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+        let base = header
+            .wrapping_add(0x28)
+            .wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
         for i in 0..count.min(128) {
             let p = base.wrapping_add(i.wrapping_mul(16));
             let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
@@ -20994,7 +23416,11 @@ impl VitaState {
             let res_index = ctx.read_u32(p.wrapping_add(0xc));
             let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
             let raw = ctx.read_bytes(name_addr, 64);
-            let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            let name: String = raw
+                .iter()
+                .take_while(|&&b| b != 0)
+                .map(|&b| b as char)
+                .collect();
             let cat = match word & 0xf {
                 0 => "attr",
                 1 => "unif",
@@ -21004,7 +23430,9 @@ impl VitaState {
             };
             eprintln!(
                 "    [{i}] {cat} type={} comp={} container={} array={array_size} res={res_index} name={name:?}",
-                (word >> 4) & 0xf, (word >> 8) & 0xf, (word >> 12) & 0xf,
+                (word >> 4) & 0xf,
+                (word >> 8) & 0xf,
+                (word >> 12) & 0xf,
             );
         }
     }
@@ -21017,7 +23445,10 @@ impl VitaState {
             if !self.deferred_geometry.is_empty() {
                 self.deferred_serial += 1;
                 scene.deferred_id = self.deferred_serial;
-                self.pending_geometry.push((self.deferred_serial, std::mem::take(&mut self.deferred_geometry)));
+                self.pending_geometry.push((
+                    self.deferred_serial,
+                    std::mem::take(&mut self.deferred_geometry),
+                ));
             }
             // Diagnostic (`RUST_LOG=vitaslop::display=trace`): which buffer this scene drew
             // into and how many draws it holds, in submission order, beside the flip trace.
@@ -21075,7 +23506,9 @@ fn reflect_program_uncached(ctx: &GuestCtx, header: u32) -> ProgramReflection {
     let mut r = ProgramReflection::default();
     r.default_uniform_bytes = default_uniform_buffer_bytes(ctx, header);
     let count = ctx.read_u32(header.wrapping_add(0x24));
-    let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+    let base = header
+        .wrapping_add(0x28)
+        .wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
     let mut max_regs = 0u32;
     let mut best_albedo: Option<(i32, u32)> = None;
     // One scratch buffer for every name in the table: names are short and this walk is
@@ -21128,7 +23561,11 @@ fn reflect_program_uncached(ctx: &GuestCtx, header: u32) -> ProgramReflection {
                     _ => comps,
                 };
                 max_regs = max_regs.max(res.wrapping_add(regs));
-                let pref = ParamRef { res, comp: comp.max(1) as u8, f16: is_f16 };
+                let pref = ParamRef {
+                    res,
+                    comp: comp.max(1) as u8,
+                    f16: is_f16,
+                };
                 // A 4x4 matrix is declared as component_count 4, array_size 4.
                 let is_matrix = comp == 4 && array == 4;
                 // A single COMBINED model->clip matrix, tested first: its name contains
@@ -21225,12 +23662,11 @@ fn read_lowercase_name(ctx: &GuestCtx, addr: u32, out: &mut String) {
     let mut raw = [0u8; MAX_PARAM_NAME];
     ctx.read_into(addr, &mut raw);
     out.clear();
-    out.extend(raw.iter().take_while(|&&b| b != 0).map(|&b| (b as char).to_ascii_lowercase()));
-}
-
-/// Round `v` up to the next multiple of `align` (a power of two).
-fn align_up(v: u32, align: u32) -> u32 {
-    (v + align - 1) & !(align - 1)
+    out.extend(
+        raw.iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| (b as char).to_ascii_lowercase()),
+    );
 }
 
 /// Score a fragment-sampler name (already lowercased) for how strongly it reads as the
@@ -21241,8 +23677,8 @@ fn albedo_name_score(name: &str) -> i32 {
     // A name that clearly identifies a non-colour map role is never the albedo, even if
     // it also contains a generic "map"/"tex" token.
     const NON_ALBEDO: [&str; 14] = [
-        "normal", "spec", "gloss", "rough", "env", "cube", "reflect", "light", "shadow",
-        "detail", "bump", "height", "mask", "emiss",
+        "normal", "spec", "gloss", "rough", "env", "cube", "reflect", "light", "shadow", "detail",
+        "bump", "height", "mask", "emiss",
     ];
     if NON_ALBEDO.iter().any(|k| name.contains(k)) {
         return 0;
@@ -21288,7 +23724,9 @@ fn albedo_name_score(name: &str) -> i32 {
 /// uses that size as the length of the block it writes into the buffer it reserved, so a
 /// wrong answer truncates its own uniform upload (see [`crate::vita::gxm`]).
 pub(crate) fn default_uniform_buffer_bytes(ctx: &GuestCtx, header: u32) -> u32 {
-    use crate::vita::gxm::{DEFAULT_UNIFORM_BUFFER_MAX_WORDS, GXP_DEFAULT_UNIFORM_BUFFER_COUNT_OFF};
+    use crate::vita::gxm::{
+        DEFAULT_UNIFORM_BUFFER_MAX_WORDS, GXP_DEFAULT_UNIFORM_BUFFER_COUNT_OFF,
+    };
     if header == 0 {
         return 0;
     }
@@ -21312,7 +23750,8 @@ fn poison_uniform_buffer(ctx: &mut GuestCtx, buf: u32, size: u32) {
     // from "this is the previous draw's uniforms still in the ring", and the value it has to
     // decide that about (`screenTintColour`, the white-out) only ever appears in the BROWSER -
     // which has no environment, so the knob could not be set on the only engine that shows it.
-    if buf == 0 || !*ON.get_or_init(|| crate::knobs::var_os("VITASLOP_GXM_UNIFORM_POISON").is_some())
+    if buf == 0
+        || !*ON.get_or_init(|| crate::knobs::var_os("VITASLOP_GXM_UNIFORM_POISON").is_some())
     {
         return;
     }
@@ -21404,8 +23843,9 @@ fn report_present_no_scene_rendered(buffer_addr: u32, cap: &crate::capture::Capt
     // LAST scene's colour surface, so a present that names an EARLIER one is a frame composed
     // from the wrong pass - the picture on screen is whatever that last pass drew, and the pass
     // the guest actually wanted shown is an offscreen target nothing reads.
-    if let Some(i) =
-        scenes.iter().position(|s| s.color.as_ref().is_some_and(|c| c.data_addr == buffer_addr))
+    if let Some(i) = scenes
+        .iter()
+        .position(|s| s.color.as_ref().is_some_and(|c| c.data_addr == buffer_addr))
     {
         // >>> THE TEST IS THE ADDRESS, NOT THE INDEX, and on the index it cried wolf four times
         // out of five. What the renderer composes from is the last scene's colour ADDRESS, so a
@@ -21419,7 +23859,10 @@ fn report_present_no_scene_rendered(buffer_addr: u32, cap: &crate::capture::Capt
         // the None when the final scene has no colour target at all. Anything cleverer here
         // would be a SECOND opinion about the display buffer, and the whole value of this
         // warning is that it reports the renderer's actual choice rather than a better one.
-        let composed = scenes.last().and_then(|s| s.color.as_ref()).map(|c| c.data_addr);
+        let composed = scenes
+            .last()
+            .and_then(|s| s.color.as_ref())
+            .map(|c| c.data_addr);
         if composed != Some(buffer_addr) {
             report_present_is_not_the_last_scene(buffer_addr, i, &scenes, frame);
         }
@@ -21445,10 +23888,9 @@ fn report_present_no_scene_rendered(buffer_addr: u32, cap: &crate::capture::Capt
     // the next boundary - so "nothing renders it" would be wrong and would send a reader
     // hunting a missing pass that is sitting in the queue. The list above is the scenes the
     // renderer is handed NOW; this line is the rest of the truth.
-    let deferred = cap
-        .scenes
-        .iter()
-        .any(|s| s.deferred_id != 0 && s.color.as_ref().is_some_and(|c| c.data_addr == buffer_addr));
+    let deferred = cap.scenes.iter().any(|s| {
+        s.deferred_id != 0 && s.color.as_ref().is_some_and(|c| c.data_addr == buffer_addr)
+    });
     if deferred {
         tracing::warn!(
             target: "vitaslop::display",
@@ -21492,13 +23934,22 @@ fn report_present_is_not_the_last_scene(
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<(usize, usize)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((index, scenes.len())) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((index, scenes.len()))
+    {
         return;
     }
     let targets: Vec<String> = scenes
         .iter()
         .map(|s| match s.color.as_ref() {
-            Some(c) => format!("{:#x}({}x{}, {} draws)", c.data_addr, c.width, c.height, s.draws.len()),
+            Some(c) => format!(
+                "{:#x}({}x{}, {} draws)",
+                c.data_addr,
+                c.width,
+                c.height,
+                s.draws.len()
+            ),
             None => format!("none({} draws)", s.draws.len()),
         })
         .collect();
@@ -21528,7 +23979,10 @@ fn report_texture_resolved_from_control_words(unit: u32, base_format: u32, swizz
     }
     static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((base_format, swizzle)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((base_format, swizzle))
+    {
         return;
     }
     tracing::info!(
@@ -21539,12 +23993,21 @@ fn report_texture_resolved_from_control_words(unit: u32, base_format: u32, swizz
     );
 }
 
-fn report_unsized_texture_format(unit: u32, base_format: u32, tex_type: u32, width: u32, height: u32) {
+fn report_unsized_texture_format(
+    unit: u32,
+    base_format: u32,
+    tex_type: u32,
+    width: u32,
+    height: u32,
+) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((unit, base_format)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((unit, base_format))
+    {
         return;
     }
     eprintln!(
@@ -21562,7 +24025,14 @@ fn report_unsized_texture_format(unit: u32, base_format: u32, tex_type: u32, wid
 /// somebody else's or nothing at all. It is NOT expected for an ordinary asset, and there the
 /// line is the difference between "the guest has no mips here" and "we computed the chain size
 /// wrong", which need opposite fixes.
-fn report_mip_chain_unreadable(unit: u32, base_format: u32, data_addr: u32, width: u32, height: u32, levels: u32) {
+fn report_mip_chain_unreadable(
+    unit: u32,
+    base_format: u32,
+    data_addr: u32,
+    width: u32,
+    height: u32,
+    levels: u32,
+) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
@@ -21585,7 +24055,8 @@ fn report_mip_chain_unreadable(unit: u32, base_format: u32, data_addr: u32, widt
 /// four units and a zero handle on three read identically in the log while costing wildly
 /// different numbers of draws. Counted here, printed by [`report_texture_drops`].
 /// Atomics, not a locked array: this is counted per dropped BINDING, millions on some titles.
-static TEXTURE_DROPS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+static TEXTURE_DROPS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Drop causes, in [`TEXTURE_DROPS`] order.
 const DROP_CAUSES: [&str; 6] = [
@@ -21656,11 +24127,16 @@ fn note_texture_drop(cause: usize) {
 /// Print how many sampler-unit bindings were dropped, by cause, over the run. Call once at
 /// the end of a run; silent when nothing was dropped.
 pub fn report_texture_drops() {
-    let counts: [u64; 6] = std::array::from_fn(|i| TEXTURE_DROPS[i].load(std::sync::atomic::Ordering::Relaxed));
+    let counts: [u64; 6] =
+        std::array::from_fn(|i| TEXTURE_DROPS[i].load(std::sync::atomic::Ordering::Relaxed));
     if counts.iter().all(|&c| c == 0) {
         return;
     }
-    let mut ranked: Vec<_> = DROP_CAUSES.iter().zip(counts).filter(|(_, c)| *c > 0).collect();
+    let mut ranked: Vec<_> = DROP_CAUSES
+        .iter()
+        .zip(counts)
+        .filter(|(_, c)| *c > 0)
+        .collect();
     ranked.sort_by_key(|r| std::cmp::Reverse(r.1));
     eprintln!("gxm texture: sampler-unit bindings DROPPED over this run, by cause:");
     for (cause, n) in ranked {
@@ -21671,17 +24147,18 @@ pub fn report_texture_drops() {
         TEXTURE_INITS.load(std::sync::atomic::Ordering::Relaxed)
     );
     if let Ok(g) = ZERO_TEXTURE_ADDRS.lock()
-        && let Some(addrs) = g.as_ref().filter(|a| !a.is_empty()) {
-            let mut list: Vec<u32> = addrs.iter().copied().collect();
-            list.sort_unstable();
-            let shown: Vec<String> = list.iter().take(12).map(|a| format!("{a:#x}")).collect();
-            eprintln!(
-                "gxm texture:   the zero control words come from {} DISTINCT handle(s): {}{}",
-                list.len(),
-                shown.join(" "),
-                if list.len() > shown.len() { " ..." } else { "" }
-            );
-        }
+        && let Some(addrs) = g.as_ref().filter(|a| !a.is_empty())
+    {
+        let mut list: Vec<u32> = addrs.iter().copied().collect();
+        list.sort_unstable();
+        let shown: Vec<String> = list.iter().take(12).map(|a| format!("{a:#x}")).collect();
+        eprintln!(
+            "gxm texture:   the zero control words come from {} DISTINCT handle(s): {}{}",
+            list.len(),
+            shown.join(" "),
+            if list.len() > shown.len() { " ..." } else { "" }
+        );
+    }
 }
 
 /// Report - once per unit - that a bound `SceGxmTexture` handle reads as all zeros at draw
@@ -21727,9 +24204,17 @@ fn report_zero_texture_handle(
     // that is zero for a long stretch means the struct was never written, while live data
     // either side of a zero window means the handle address is off by an offset.
     let window: Vec<String> = (0..32)
-        .map(|i| format!("{:08x}", ctx.read_u32(addr.wrapping_sub(48).wrapping_add(i * 4))))
+        .map(|i| {
+            format!(
+                "{:08x}",
+                ctx.read_u32(addr.wrapping_sub(48).wrapping_add(i * 4))
+            )
+        })
         .collect();
-    eprintln!("gxm texture: memory around handle {addr:#x} (from -48): {}", window.join(" "));
+    eprintln!(
+        "gxm texture: memory around handle {addr:#x} (from -48): {}",
+        window.join(" ")
+    );
     let via = if from_precomputed {
         "a PRECOMPUTED fragment state"
     } else {
@@ -21775,7 +24260,10 @@ fn report_unreadable_texture(unit: u32, base_format: u32, addr: u32, len: usize,
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((unit, base_format)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((unit, base_format))
+    {
         return;
     }
     eprintln!(
@@ -21797,7 +24285,8 @@ fn report_unreadable_texture(unit: u32, base_format: u32, addr: u32, len: usize,
 /// draw. The bytes are constant, so one buffer is as correct as a million.
 fn zero_texel() -> Arc<[u8]> {
     static ZERO: std::sync::OnceLock<Arc<[u8]>> = std::sync::OnceLock::new();
-    ZERO.get_or_init(|| Arc::from([0u8, 0, 0, 0].as_slice())).clone()
+    ZERO.get_or_init(|| Arc::from([0u8, 0, 0, 0].as_slice()))
+        .clone()
 }
 
 /// The sampler state a texture's CONTROL WORD 0 carries, as
@@ -21813,15 +24302,25 @@ fn word0_sampler_state(w0: u32, tex_type: u32) -> (u32, u32, u32, u32, u32, u32,
     // strided texture read two of its stride bits as its minification filter.
     const TYPE_LINEAR_STRIDED: u32 = 6;
     let mag = (w0 >> 12) & 0x3;
-    let min = if tex_type == TYPE_LINEAR_STRIDED { mag } else { (w0 >> 10) & 0x3 };
+    let min = if tex_type == TYPE_LINEAR_STRIDED {
+        mag
+    } else {
+        (w0 >> 10) & 0x3
+    };
     (
-        (w0 >> 6) & 0x7,  // uaddr_mode
-        (w0 >> 3) & 0x7,  // vaddr_mode
+        (w0 >> 6) & 0x7,   // uaddr_mode
+        (w0 >> 3) & 0x7,   // vaddr_mode
         (w0 >> 21) & 0x3f, // lod_bias
         min,
         mag,
         w0 & 0x1800_0000, // gamma_mode, in the enum's own already-shifted encoding
-        (w0 >> 9) & 0x1,  // mip_filter (`vita::gxm::texword0::MIP_FILTER`)
+        // mip_filter (`vita::gxm::texword0::MIP_FILTER`) - a stride bit on a strided texture,
+        // which has one level and nothing to filter between.
+        if tex_type == TYPE_LINEAR_STRIDED {
+            0
+        } else {
+            (w0 >> 9) & 0x1
+        },
     )
 }
 
@@ -21884,10 +24383,12 @@ fn decode_texture(
             u_addr_mode: 0,
             v_addr_mode: 0,
             lod_bias: 0,
+            lod_min: 0,
             min_filter: 0,
             mag_filter: 0,
             mip_filter: 0,
             gamma: 0,
+            yuv_profile: 0,
         });
     }
 
@@ -21998,7 +24499,12 @@ fn decode_texture_pixels(
         }
     };
     let scene = cache.scene_seq;
-    let entry = move |res, snap, degraded| DecodedEntry { res, snap, degraded, valid_scene: scene };
+    let entry = move |res, snap, degraded| DecodedEntry {
+        res,
+        snap,
+        degraded,
+        valid_scene: scene,
+    };
     let Some(t) = template else {
         return entry(Err(1), None, false);
     };
@@ -22031,7 +24537,14 @@ fn decode_texture_pixels(
         pixels_id = cache.pixels_id(t.data_addr, t.level0_read_len as usize);
     }
     if pixels.is_empty() {
-        report_unreadable_texture(unit, t.base_format, t.data_addr, t.read_len as usize, t.width, t.height);
+        report_unreadable_texture(
+            unit,
+            t.base_format,
+            t.data_addr,
+            t.read_len as usize,
+            t.width,
+            t.height,
+        );
         return entry(Err(2), None, false);
     }
     let snap = Some((t.data_addr, snap_len));
@@ -22055,7 +24568,13 @@ fn decode_texture_pixels(
                     ctx.read_bytes(t.palette_addr, pal_len)
                 };
                 if palette.len() < pal_len {
-                    report_missing_palette(unit, t.base_format, t.palette_addr, palette.len(), pal_len);
+                    report_missing_palette(
+                        unit,
+                        t.base_format,
+                        t.palette_addr,
+                        palette.len(),
+                        pal_len,
+                    );
                     return entry(Err(4), None, false);
                 }
                 // >>> THE EXPANSION IS REMEMBERED AGAINST ITS INPUTS, and the identity with
@@ -22096,59 +24615,75 @@ fn decode_texture_pixels(
                         pixels_id = id;
                         (crate::render::U8U8U8U8, stride, fb, levels, px)
                     }
-                    None => match expand_paletted_texture(&t, &pixels, &palette, levels, face_bytes) {
-                        Some((px, stride, fb)) => {
-                            // A DIFFERENT buffer than the one the snapshot layer holds - the
-                            // indices expanded through the palette - so it carries an identity
-                            // of its own. Minted here rather than inherited: the same indices
-                            // under a different palette are different texels, and inheriting
-                            // would give them one cache entry.
-                            let px: std::sync::Arc<[u8]> = std::sync::Arc::from(px);
-                            pixels_id = crate::capture::next_pixels_id();
-                            cache.remember_palette(
-                                t.data_addr,
-                                pixels.len(),
-                                PaletteExpansion {
-                                    src: src_id,
-                                    pal: pal_key,
-                                    pixels: px.clone(),
-                                    id: pixels_id,
-                                    stride,
-                                    face_bytes: fb,
-                                },
-                            );
-                            (crate::render::U8U8U8U8, stride, fb, levels, px)
+                    None => {
+                        match expand_paletted_texture(&t, &pixels, &palette, levels, face_bytes) {
+                            Some((px, stride, fb)) => {
+                                // A DIFFERENT buffer than the one the snapshot layer holds - the
+                                // indices expanded through the palette - so it carries an identity
+                                // of its own. Minted here rather than inherited: the same indices
+                                // under a different palette are different texels, and inheriting
+                                // would give them one cache entry.
+                                let px: std::sync::Arc<[u8]> = std::sync::Arc::from(px);
+                                pixels_id = crate::capture::next_pixels_id();
+                                cache.remember_palette(
+                                    t.data_addr,
+                                    pixels.len(),
+                                    PaletteExpansion {
+                                        src: src_id,
+                                        pal: pal_key,
+                                        pixels: px.clone(),
+                                        id: pixels_id,
+                                        stride,
+                                        face_bytes: fb,
+                                    },
+                                );
+                                (crate::render::U8U8U8U8, stride, fb, levels, px)
+                            }
+                            None => {
+                                report_unexpandable_palette(
+                                    unit,
+                                    t.base_format,
+                                    t.tex_type,
+                                    t.width,
+                                    t.height,
+                                );
+                                return entry(Err(5), None, false);
+                            }
                         }
-                        None => {
-                            report_unexpandable_palette(unit, t.base_format, t.tex_type, t.width, t.height);
-                            return entry(Err(5), None, false);
-                        }
-                    },
+                    }
                 }
             }
         };
-    entry(Ok(crate::capture::BoundTexture {
-        unit,
-        base_format,
-        swizzle: t.swizzle,
-        tex_type: t.tex_type,
-        width: t.width,
-        height: t.height,
-        stride,
-        faces: t.faces,
-        face_bytes,
-        levels,
-        data_addr: t.data_addr,
-        pixels,
-        pixels_id,
-        u_addr_mode: t.u_addr_mode,
-        v_addr_mode: t.v_addr_mode,
-        lod_bias: t.lod_bias,
-        min_filter: t.min_filter,
-        mag_filter: t.mag_filter,
-        gamma: t.gamma,
-        mip_filter: t.mip_filter,
-    }), snap, degraded)
+    entry(
+        Ok(crate::capture::BoundTexture {
+            unit,
+            base_format,
+            swizzle: t.swizzle,
+            tex_type: t.tex_type,
+            width: t.width,
+            height: t.height,
+            stride,
+            faces: t.faces,
+            face_bytes,
+            levels,
+            data_addr: t.data_addr,
+            pixels,
+            pixels_id,
+            u_addr_mode: t.u_addr_mode,
+            v_addr_mode: t.v_addr_mode,
+            lod_bias: t.lod_bias,
+            lod_min: t.lod_min,
+            min_filter: t.min_filter,
+            mag_filter: t.mag_filter,
+            gamma: t.gamma,
+            mip_filter: t.mip_filter,
+            // Set per draw by the caller from the context's profiles - see
+            // `VitaState::apply_yuv_profiles`; the memoised decode cannot know them.
+            yuv_profile: 0,
+        }),
+        snap,
+        degraded,
+    )
 }
 
 /// Turn a paletted texture's INDICES into the colours its table names, level by level and face
@@ -22170,7 +24705,7 @@ fn expand_paletted_texture(
     levels: u32,
     src_face_bytes: u32,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    use crate::render::{level_layout, P4, U8U8U8U8};
+    use crate::render::{P4, U8U8U8U8, level_layout};
     let bits = if t.base_format == P4 { 4u32 } else { 8 };
     let index_mask = if bits == 4 { 0x0fu32 } else { 0xff };
     let entries = crate::render::palette_entries(t.base_format)?;
@@ -22210,13 +24745,19 @@ fn expand_paletted_texture(
             // `morton_tables`, which is asserted to be the same function as `morton_index`.
             let swizzled = crate::render::swizzled_type(t.tex_type);
             let (sxs, sys) = if swizzled {
-                let (pw, ph) = (src_l.width.next_power_of_two(), src_l.height.next_power_of_two());
+                let (pw, ph) = (
+                    src_l.width.next_power_of_two(),
+                    src_l.height.next_power_of_two(),
+                );
                 crate::render::morton_tables(pw, ph, src_l.width, src_l.height)
             } else {
                 (Vec::new(), Vec::new())
             };
             let (dxs, dys) = if swizzled {
-                let (pw, ph) = (dst_l.width.next_power_of_two(), dst_l.height.next_power_of_two());
+                let (pw, ph) = (
+                    dst_l.width.next_power_of_two(),
+                    dst_l.height.next_power_of_two(),
+                );
                 crate::render::morton_tables(pw, ph, dst_l.width, dst_l.height)
             } else {
                 (Vec::new(), Vec::new())
@@ -22227,7 +24768,11 @@ fn expand_paletted_texture(
                 for x in 0..src_l.width {
                     let (soff, nib) = if swizzled {
                         let m = (sxs[x as usize] + sys[y as usize]) as usize;
-                        if bits == 4 { (m / 2, (m % 2) as u32) } else { (m, 0) }
+                        if bits == 4 {
+                            (m / 2, (m % 2) as u32)
+                        } else {
+                            (m, 0)
+                        }
                     } else if bits == 4 {
                         (srow + (x / 2) as usize, x % 2)
                     } else {
@@ -22261,7 +24806,10 @@ fn report_missing_palette(unit: u32, base_format: u32, addr: u32, got: usize, wa
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((unit, base_format)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((unit, base_format))
+    {
         return;
     }
     tracing::warn!(
@@ -22280,12 +24828,21 @@ fn report_missing_palette(unit: u32, base_format: u32, addr: u32, got: usize, wa
 
 /// Report - once per (unit, format) - that a paletted texture's LAYOUT could not be walked, so
 /// the binding is dropped.
-fn report_unexpandable_palette(unit: u32, base_format: u32, tex_type: u32, width: u32, height: u32) {
+fn report_unexpandable_palette(
+    unit: u32,
+    base_format: u32,
+    tex_type: u32,
+    width: u32,
+    height: u32,
+) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((unit, base_format)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((unit, base_format))
+    {
         return;
     }
     tracing::warn!(
@@ -22317,9 +24874,8 @@ fn build_texture_template(
     // The sampler state, out of the guest's own word 0 rather than a host-side map. See
     // [`word0_sampler_state`] and `vita::gxm::texword0`.
     let sampler = word0_sampler_state(w0, tex_type);
-    // generic2 layout (non-swizzled/non-cube): width/height are 12-bit size-1.
-    let width = ((w1 >> 12) & 0xfff) + 1;
-    let height = (w1 & 0xfff) + 1;
+    // Size-1 for most types, log2 for SWIZZLED and CUBE - see `vita::gxm::texture_dims`.
+    let (width, height) = crate::vita::gxm::texture_dims(w1);
     let data_addr = w2 & 0xffff_fffc;
     // Prefer the exact format the guest set (full high byte keeps 24-bit/paletted
     // formats and the channel swizzle intact); otherwise reconstruct the high byte
@@ -22357,30 +24913,31 @@ fn build_texture_template(
     };
     // >>> A LINEAR_STRIDED TEXTURE'S ROWS ARE `byte_stride` APART, NOT A ROW'S WIDTH.
     //
-    // The pitch is the explicit stride `sceGxmTextureInitLinearStrided` was given (the control
-    // words spread it over three fields whose composition is not published, so it rides in the
-    // host shadow - see `vita::gxm::texture_init`). MEASURED on a fighting title: its
+    // The pitch is the explicit stride `sceGxmTextureInitLinearStrided` was given, packed into
+    // word 0 (see `vita::gxm::pack_linear_stride`). MEASURED on a fighting title: its
     // bloom samples each mip level as a 128- or 256-wide strided window onto ONE 512-wide
     // surface. Read at the width's pitch, every row after the first came from the wrong place
     // (four texture rows to one surface row), and a renderer resolving the window against the
     // rendered surface saw a texture whose pitch did not match it.
     let strided = tex_type == 6 && byte_stride != 0;
     let stride = if strided { byte_stride } else { l0.stride };
-    let level0 = if strided { byte_stride * height } else { l0.bytes };
+    let level0 = if strided {
+        byte_stride * height
+    } else {
+        l0.bytes
+    };
     // A CUBE texture stores its six faces back to back, each laid out exactly like a standalone
     // texture of the same size - so one face is `level0` bytes and the snapshot is six of them.
-    let faces = if crate::render::cube_type(tex_type) { 6 } else { 1 };
+    let faces = if crate::render::cube_type(tex_type) {
+        6
+    } else {
+        1
+    };
     // >>> HOW MANY MIP LEVELS TO READ, and why the count is CLAMPED rather than trusted.
     //
-    // `mip_count` is control word 0 bits 17-20 (`vita::gxm::texword0::MIP_COUNT`), and whether
-    // the driver packs the count or the count minus one is NOT settled by any clean source -
-    // that ambiguity is recorded at `texword0`, and it is unobservable through the API because
-    // both our writer and our reader use the same shift. It is observable HERE, from the data,
-    // and `report_mip_chain_probe` is the instrument that measures it.
-    //
-    // Reading the field AS the count is the conservative choice: if the truth is count-minus-one
-    // we stop one (1x1) level short, which costs a level nothing minifies far enough to sample,
-    // whereas the other error reads past the guest's allocation.
+    // `mip_count` is control word 0 bits 17-20 (`vita::gxm::texword0::MIP_COUNT`), stored as
+    // the count MINUS ONE (`vita::gxm::mip_count_of_field`). It is clamped to the levels the
+    // size can have, because a title that builds its own words can put anything there.
     // >>> AND NOT READ AT ALL IF NOTHING CAN USE IT.
     //
     // The chain is ~33% more guest bytes per texture, and those bytes are re-COMPARED against
@@ -22390,7 +24947,7 @@ fn build_texture_template(
     // most expensive loop in the capture, bought for nothing. Level 0 is unchanged either way,
     // so this changes no picture on any engine.
     let mip_field = if vitaslop_platform::gpu::block_compression_available() {
-        (w0 >> 17) & 0xf
+        crate::vita::gxm::mip_count_of_field((w0 >> 17) & 0xf)
     } else {
         1
     };
@@ -22407,7 +24964,8 @@ fn build_texture_template(
     let chain = if strided {
         level0
     } else {
-        crate::render::level_offset(base_format, tex_type, width, height, want_levels).unwrap_or(level0)
+        crate::render::level_offset(base_format, tex_type, width, height, want_levels)
+            .unwrap_or(level0)
     };
     // >>> A CUBE'S FACES ARE A WHOLE MIP CHAIN APART, however many levels it declares. See
     // `render::cube_face_stride` for the measurement.
@@ -22418,7 +24976,11 @@ fn build_texture_template(
     };
     // A cube packed at its level-0 size has no room for a chain between its faces, whatever it
     // declares - so it is read, and sampled, as the level 0 it stores.
-    let (want_levels, chain) = if face_bytes < chain { (1, level0) } else { (want_levels, chain) };
+    let (want_levels, chain) = if face_bytes < chain {
+        (1, level0)
+    } else {
+        (want_levels, chain)
+    };
     Some(TextureTemplate {
         base_format,
         // >>> THE PALETTE POINTER IS IN THE CONTROL WORDS, and reading it there is what makes a
@@ -22452,6 +25014,13 @@ fn build_texture_template(
         u_addr_mode: sampler.0,
         v_addr_mode: sampler.1,
         lod_bias: sampler.2,
+        // Word 2 bits 0-1 are its HIGH bits, word 3 bits 26-27 the low ones - see `vita::gxm`'s
+        // `texture_set_lod_min`. A strided texture has no LOD min (nor any level to clamp to).
+        lod_min: if tex_type == crate::vita::gxm::TYPE_LINEAR_STRIDED {
+            0
+        } else {
+            ((w2 & 0x3) << 2) | ((w3 >> 26) & 0x3)
+        },
         min_filter: sampler.3,
         mag_filter: sampler.4,
         gamma: sampler.5,
@@ -22485,7 +25054,9 @@ impl VitaEnv {
     /// The caller computes it with [`compute_flip_resolve_job`] WITHOUT this host locked, then
     /// calls [`Self::apply_posted_resolve`].
     pub fn take_flip_resolve_job(&mut self) -> Option<FlipResolveJob> {
-        self.state.take_flip_resolve_job().map(|(job, post, snaps)| FlipResolveJob { job, post, snaps })
+        self.state
+            .take_flip_resolve_job()
+            .map(|(job, post, snaps)| FlipResolveJob { job, post, snaps })
     }
 
     /// See [`VitaState::apply_posted_resolve`]. `mem`/`base` are guest memory, which a
@@ -22505,7 +25076,10 @@ impl VitaEnv {
 
     /// Handles for a resolver worker's [`run_resolver`].
     pub fn resolver_handles(&self) -> ResolverHandles {
-        ResolverHandles { post: self.state.async_resolve.clone(), snaps: self.state.texture_snapshots.clone() }
+        ResolverHandles {
+            post: self.state.async_resolve.clone(),
+            snaps: self.state.texture_snapshots.clone(),
+        }
     }
 
     /// Build an environment for a module whose imports are `(library_nid,
@@ -22525,7 +25099,12 @@ impl VitaEnv {
 
     /// Convenience constructor with the default deterministic world.
     pub fn with_default_world(imports: Vec<(u32, u32)>, base: u32, mem_bytes: u32) -> Self {
-        VitaEnv::new(imports, base, mem_bytes, Box::new(DeterministicWorld::default()))
+        VitaEnv::new(
+            imports,
+            base,
+            mem_bytes,
+            Box::new(DeterministicWorld::default()),
+        )
     }
 
     /// The `(library_nid, func_nid)` pair a dense import index dispatches to, or
@@ -22584,7 +25163,6 @@ impl<T: SvcDispatch> SvcDispatch for std::rc::Rc<std::cell::RefCell<T>> {
     }
 }
 
-
 // --- the CROSS-ENGINE host-call digest -------------------------------------------
 //
 // >>> WHY: "the browser diverges from the desktop" is the hardest question this project asks,
@@ -22609,7 +25187,11 @@ static NID_DIGEST_SPEC: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::Onc
 /// `VITASLOP_THREAD_TRAILS_AT=<frame>` - see its use in the host-call dispatch.
 fn thread_trails_at() -> Option<u64> {
     static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *AT.get_or_init(|| crate::knobs::var("VITASLOP_THREAD_TRAILS_AT").ok().and_then(|v| v.trim().parse().ok()))
+    *AT.get_or_init(|| {
+        crate::knobs::var("VITASLOP_THREAD_TRAILS_AT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
 }
 
 /// `VITASLOP_THREAD_TRAILS_NID=<hex>` - see its use in the host-call dispatch.
@@ -22773,9 +25355,29 @@ pub trait ImportDispatch {
         None
     }
 
+    /// Thread `thid` RETURNED from its entry with `code`: the guest calls to run on it,
+    /// in order, before it counts as ended (its EXIT event handlers - see
+    /// [`VitaState::thread_exit_event_calls`]). Claims the thread's end, so a second ask
+    /// returns nothing. A host with no handlers (default) has none.
+    fn thread_return_calls(&mut self, _thid: i32, _code: u32) -> Vec<GuestCall> {
+        Vec::new()
+    }
+
+    /// Thread `thid` is starting one of its entries, `last` when it is its final one (see
+    /// [`VitaState::note_thread_entry`]). Default no-op.
+    fn thread_entry_starting(&mut self, _thid: i32, _last: bool) {}
+
     /// Record the r0/r1 a guest call left, before the engine re-dispatches the host call
     /// that asked for it.
-    fn guest_call_returned(&mut self, _thid: i32, _r0: u32, _r1: u32, _mem: &dyn GuestMemory, _base: u32) {}
+    fn guest_call_returned(
+        &mut self,
+        _thid: i32,
+        _r0: u32,
+        _r1: u32,
+        _mem: &dyn GuestMemory,
+        _base: u32,
+    ) {
+    }
 
     /// The thread the host takes to be running - for an engine that keeps no thread ids of
     /// its own (the run-to-completion `Vm`) and has to name one to the calls above.
@@ -22965,7 +25567,7 @@ pub trait ImportDispatch {
     }
 
     /// A display frame just flipped (`frame` flips so far). Lets a frame-keyed input
-    /// source - a scripted TAS recipe - advance in lockstep with the render loop.
+    /// source - a scripted input timeline - advance in lockstep with the render loop.
     /// The default ignores it.
     fn on_frame_boundary(&mut self, _frame: u64) {}
 
@@ -23036,19 +25638,8 @@ impl ImportDispatch for VitaEnv {
             self.state.vblank_park(1, vita::display::VBLANK_US);
             return SvcOutcome::Block;
         }
-        let (library_nid, func_nid) = self
-            .imports
-            .get(index as usize)
-            .copied()
-            .unwrap_or((0, 0));
+        let (library_nid, func_nid) = self.imports.get(index as usize).copied().unwrap_or((0, 0));
         self.state.capture.record_call(func_nid, self.state.current);
-        // A recipe `@wait call` holding its input for this call - see `recipe::WaitDecl`.
-        crate::recipe::wait_call::note(func_nid);
-        // A recipe `@wait watch` polls its value here: every engine passes this point with the
-        // guest's memory in hand, and a title waiting on a menu calls into the host each frame.
-        if crate::recipe::wait_call::watch_armed() {
-            crate::recipe::wait_call::poll_watch(&MemRead { mem: &*mem, base });
-        }
         // A playbook's cues and its pad-poll tick - see `crate::observer`.
         if crate::observer::enabled() {
             let frame = self.state.cur_frame();
@@ -23066,10 +25657,17 @@ impl ImportDispatch for VitaEnv {
         // one point both engines share and the arguments are still the guest's own.
         if nid_digest_spec().is_some() {
             let frame = self.state.cur_frame();
-            self.nid_digest.record(frame, func_nid, self.state.current, regs);
+            self.nid_digest
+                .record(frame, func_nid, self.state.current, regs);
         }
         if crate::call_table::spec().is_some() {
-            crate::call_table::record(self.state.cur_frame(), func_nid, self.state.current, regs[14], &regs[..13]);
+            crate::call_table::record(
+                self.state.cur_frame(),
+                func_nid,
+                self.state.current,
+                regs[14],
+                &regs[..13],
+            );
         }
         // Diagnostic (`RUST_LOG=vitaslop::display=trace`): EVERY host call the guest's
         // display-queue callback makes, in order. GXM runs that callback once per queued
@@ -23108,15 +25706,15 @@ impl ImportDispatch for VitaEnv {
                 self.state.current as u64
             };
             if thread_trail_first(key) {
-            tracing::warn!(
-                target: "vitaslop::warning",
-                thread = format_args!("{:#x}", self.state.current).to_string(),
-                frame = self.state.cur_frame(),
-                call = crate::nid::name(func_nid),
-                lr = format_args!("{:#010x}", ctx.regs[14]).to_string(),
-                pc_trail = %trail,
-                "THREAD TRAIL"
-            );
+                tracing::warn!(
+                    target: "vitaslop::warning",
+                    thread = format_args!("{:#x}", self.state.current).to_string(),
+                    frame = self.state.cur_frame(),
+                    call = crate::nid::name(func_nid),
+                    lr = format_args!("{:#010x}", ctx.regs[14]).to_string(),
+                    pc_trail = %trail,
+                    "THREAD TRAIL"
+                );
             }
         }
         self.state.guest_call_begin();
@@ -23133,7 +25731,13 @@ impl ImportDispatch for VitaEnv {
             return SvcOutcome::CallGuest;
         }
         if crate::call_table::spec().is_some() {
-            crate::call_table::record_ret(self.state.cur_frame(), func_nid, self.state.current, saved.0[14], regs[0]);
+            crate::call_table::record_ret(
+                self.state.cur_frame(),
+                func_nid,
+                self.state.current,
+                saved.0[14],
+                regs[0],
+            );
         }
         out
     }
@@ -23146,7 +25750,26 @@ impl ImportDispatch for VitaEnv {
         self.state.take_guest_call(thid)
     }
 
-    fn guest_call_returned(&mut self, thid: i32, r0: u32, r1: u32, mem: &dyn GuestMemory, base: u32) {
+    fn thread_return_calls(&mut self, thid: i32, code: u32) -> Vec<GuestCall> {
+        if self.state.claim_thread_exit_events(thid) {
+            self.state.thread_exit_event_calls(thid, code)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn thread_entry_starting(&mut self, thid: i32, last: bool) {
+        self.state.note_thread_entry(thid, last);
+    }
+
+    fn guest_call_returned(
+        &mut self,
+        thid: i32,
+        r0: u32,
+        r1: u32,
+        mem: &dyn GuestMemory,
+        base: u32,
+    ) {
         self.state.guest_call_returned(thid, r0, r1, mem, base);
     }
 
@@ -23292,7 +25915,8 @@ impl ImportDispatch for VitaEnv {
     }
 
     fn set_mirror_base(&mut self, addr: u32) {
-        self.state.set_mutex_table(addr.wrapping_add(vita::mirror::SLOT_MUTEX_TABLE * 4));
+        self.state
+            .set_mutex_table(addr.wrapping_add(vita::mirror::SLOT_MUTEX_TABLE * 4));
         self.state.set_mirror_block_base(addr);
     }
 
@@ -23301,7 +25925,8 @@ impl ImportDispatch for VitaEnv {
         for (slot, value) in words.iter().enumerate() {
             write(slot as u32, *value);
         }
-        self.state.note_yield_free_published(words[vita::mirror::SLOT_YIELD_FREE as usize] != 0);
+        self.state
+            .note_yield_free_published(words[vita::mirror::SLOT_YIELD_FREE as usize] != 0);
         words.len()
     }
 
@@ -23314,13 +25939,19 @@ impl ImportDispatch for VitaEnv {
         match self.state.texture_snapshots.try_lock() {
             Ok(mut g) => {
                 crate::perf::snaps_taken(line!());
-                for _ in 0..self.state.snaps_frames_pending.swap(0, std::sync::atomic::Ordering::AcqRel) {
+                for _ in 0..self
+                    .state
+                    .snaps_frames_pending
+                    .swap(0, std::sync::atomic::Ordering::AcqRel)
+                {
                     g.begin_frame();
                 }
                 g.begin_frame();
             }
             Err(_) => {
-                self.state.snaps_frames_pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                self.state
+                    .snaps_frames_pending
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             }
         }
         self.state.world.set_frame(frame);
@@ -23367,7 +25998,7 @@ impl ImportDispatch for VitaEnv {
 /// holds while both divide by the same number.
 ///
 /// **5,000,000 is what every real consumer preempts at** - the desktop's retail runner, the
-/// resident session, the recipe runner, and the browser's software-fuel interval (whose own
+/// resident session, the headless runner, and the browser's software-fuel interval (whose own
 /// knob is documented where it is read, not here: naming it in this comment makes the generated
 /// knob index attribute it to a constant rather than to the code that reads it). A 1,000,000
 /// default also exists on two constructors nothing production uses, and taking the calibration
@@ -23458,8 +26089,7 @@ const GUEST_IPC_MILLI: u64 = 1_000;
 ///
 /// Override for an experiment with `VITASLOP_QUANTUM_CPU_US`; 0 restores the old model
 /// (a game clock that moves only on a flip or a scheduler idle) for an A/B.
-const QUANTUM_CPU_US: u64 =
-    QUANTUM_ARM * 1_000 * 1_000_000 / (GUEST_CPU_HZ * GUEST_IPC_MILLI);
+const QUANTUM_CPU_US: u64 = QUANTUM_ARM * 1_000 * 1_000_000 / (GUEST_CPU_HZ * GUEST_IPC_MILLI);
 
 /// GUEST ARM INSTRUCTIONS in one quantum of guest work - the unit [`QUANTUM_CPU_US`] and
 /// [`QUANTUM_IO_US`] are priced against, on any engine that carries the emitted per-block
@@ -23559,8 +26189,24 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
         self.borrow_mut().take_guest_call(thid)
     }
 
-    fn guest_call_returned(&mut self, thid: i32, r0: u32, r1: u32, mem: &dyn GuestMemory, base: u32) {
-        self.borrow_mut().guest_call_returned(thid, r0, r1, mem, base);
+    fn thread_return_calls(&mut self, thid: i32, code: u32) -> Vec<GuestCall> {
+        self.borrow_mut().thread_return_calls(thid, code)
+    }
+
+    fn thread_entry_starting(&mut self, thid: i32, last: bool) {
+        self.borrow_mut().thread_entry_starting(thid, last);
+    }
+
+    fn guest_call_returned(
+        &mut self,
+        thid: i32,
+        r0: u32,
+        r1: u32,
+        mem: &dyn GuestMemory,
+        base: u32,
+    ) {
+        self.borrow_mut()
+            .guest_call_returned(thid, r0, r1, mem, base);
     }
 
     fn running_thread(&self) -> i32 {
@@ -23641,7 +26287,6 @@ mod hostcall_tests {
         VitaState::new(0, 64, Box::new(DeterministicWorld::default()))
     }
 
-
     // Mixed integer and float args with a float return: `a` and `b` come from the
     // core registers (r0, r1), `x` and `y` from the VFP file (s0 and d1), and the
     // f32 result goes to s0.
@@ -23719,7 +26364,10 @@ mod hostcall_tests {
             let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
             sum_out(&mut ctx, &mut st);
         }
-        assert_eq!(u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]), 42);
+        assert_eq!(
+            u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            42
+        );
     }
 }
 
@@ -23847,7 +26495,10 @@ mod savedata_tests {
         st.savedata_slot_put("savedata0:", 0, param.clone());
 
         assert!(st.savedata_slot_exists("savedata0:", 0));
-        assert_eq!(st.savedata_slot_get("savedata0:", 0).as_deref(), Some(param.as_slice()));
+        assert_eq!(
+            st.savedata_slot_get("savedata0:", 0).as_deref(),
+            Some(param.as_slice())
+        );
     }
 
     #[test]
@@ -23857,7 +26508,10 @@ mod savedata_tests {
         // A different slot id or mount is a distinct, still-empty slot.
         assert!(!st.savedata_slot_exists("savedata0:", 1));
         assert!(!st.savedata_slot_exists("savedata1:", 0));
-        assert_eq!(st.savedata_slot_get("savedata0:", 0).as_deref(), Some([1].as_slice()));
+        assert_eq!(
+            st.savedata_slot_get("savedata0:", 0).as_deref(),
+            Some([1].as_slice())
+        );
     }
 
     #[test]
@@ -23905,22 +26559,27 @@ mod register_window_tests {
             {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             for (i, line) in text.lines().enumerate() {
                 // `ctx.regs[N]` / `self.regs[N]` with a literal index. A non-literal index is
                 // either the AAPCS argument cursor (bounded to 0..4 where it is written) or a
                 // loop over a caller's OWN array, neither of which is a live-context read.
                 for m in line.match_indices(".regs[") {
                     let rest = &line[m.0 + ".regs[".len()..];
-                    let digits: String =
-                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                    let Ok(n) = digits.parse::<usize>() else { continue };
+                    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let Ok(n) = digits.parse::<usize>() else {
+                        continue;
+                    };
                     // A range (`regs[0..13]`) is spelt with a literal too; treat its start as
                     // the index and let the end be caught by the same rule on the next scan.
                     if !WINDOW.contains(&n) {
                         bad.push(format!("{rel}:{} reads r{n}", i + 1));
                     }
-                    if let Some(end) = rest.strip_prefix(&digits).and_then(|r| r.strip_prefix(".."))
+                    if let Some(end) = rest
+                        .strip_prefix(&digits)
+                        .and_then(|r| r.strip_prefix(".."))
                     {
                         let e: String = end.chars().take_while(|c| c.is_ascii_digit()).collect();
                         if let Ok(e) = e.parse::<usize>()
@@ -23960,17 +26619,70 @@ mod preemptive_tests {
         st
     }
 
+    /// A grain's NGS callbacks run as guest calls on the CALLING thread, one per replay of the
+    /// dispatch, each on its own info slot; the last one returning ends the replay.
+    #[test]
+    fn a_grains_ngs_callbacks_run_on_the_calling_thread_in_order() {
+        const AUDIO: i32 = 0x40;
+        let mut st = state();
+        st.set_current(AUDIO);
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 0x10000];
+        let mut mem = SliceMemory(&mut bytes);
+        let calls = [(0x8100_0001, [1u8; 0x1c]), (0x8100_0001, [2u8; 0x1c])];
+        {
+            let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0x1000);
+            assert!(st.ngs_sync_stash(&mut ctx, &calls));
+        }
+        assert!(st.ngs_sync_replaying());
+        let mut ran = Vec::new();
+        loop {
+            st.guest_call_begin();
+            let done = st.ngs_sync_run();
+            let pending = st.guest_call_end();
+            if done {
+                assert!(!pending);
+                break;
+            }
+            assert!(pending, "a run that is not done is waiting on a guest call");
+            let call = st.take_guest_call(AUDIO).expect("the call being run");
+            assert_eq!(call.entry, 0x8100_0001);
+            ran.push(call.args[0]);
+            st.guest_call_returned(AUDIO, 0, 0, &mem, 0x1000);
+        }
+        assert_eq!(ran.len(), 2, "both callbacks ran");
+        assert_ne!(ran[0], ran[1], "each on its own info slot");
+        assert!(!st.ngs_sync_replaying(), "the stash is gone");
+        assert!(st.ngs_sync_run(), "nothing left to run");
+    }
+
     /// The INITIAL thread has no create record and must still be signallable, and a signal is a
     /// latch of one: a second send before the wait consumes it is refused, not counted.
     #[test]
     fn the_initial_thread_takes_a_signal_and_a_signal_is_a_latch_of_one() {
         let mut st = state();
-        assert_eq!(st.send_signal(MAIN_THID), Ok(()), "the initial thread is a known thread");
-        assert_eq!(st.send_signal(MAIN_THID), Err(SCE_KERNEL_ERROR_ALREADY_SENT), "unconsumed: refused");
+        assert_eq!(
+            st.send_signal(MAIN_THID),
+            Ok(()),
+            "the initial thread is a known thread"
+        );
+        assert_eq!(
+            st.send_signal(MAIN_THID),
+            Err(SCE_KERNEL_ERROR_ALREADY_SENT),
+            "unconsumed: refused"
+        );
         assert!(st.take_signal(MAIN_THID));
         assert!(!st.take_signal(MAIN_THID), "one send, one take");
-        assert_eq!(st.send_signal(MAIN_THID), Ok(()), "consumed, so it can be sent again");
-        assert_eq!(st.send_signal(0x7777), Err(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID));
+        assert_eq!(
+            st.send_signal(MAIN_THID),
+            Ok(()),
+            "consumed, so it can be sent again"
+        );
+        assert_eq!(
+            st.send_signal(0x7777),
+            Err(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID)
+        );
     }
 
     /// Guest memory for the tests that touch guest-resident state, as a sparse word map -
@@ -24049,12 +26761,20 @@ mod preemptive_tests {
         // Three frames may be in flight, so the first three queue without waiting - and
         // each one still reserves its own vblank, so the LATCHES are a period apart.
         for i in 1..=3u64 {
-            assert_eq!(st.pace_flip(FRAME_US), 0, "frame {i} fits in a queue of three");
+            assert_eq!(
+                st.pace_flip(FRAME_US),
+                0,
+                "frame {i} fits in a queue of three"
+            );
             assert_eq!(*latches(&st).last().expect("a latch"), i * FRAME_US);
         }
         // The fourth is one too many: it waits for the OLDEST to reach the panel, which
         // is the first frame's latch, and no longer.
-        assert_eq!(st.pace_flip(FRAME_US), FRAME_US - 1_000, "the queue is full");
+        assert_eq!(
+            st.pace_flip(FRAME_US),
+            FRAME_US - 1_000,
+            "the queue is full"
+        );
         assert_eq!(parked_us(&st, 1), FRAME_US - 1_000);
         // A guest that never declares a depth gets one: ONE frame in flight, so the second
         // flip waits for the first to latch - and not, as this used to, for the vblank
@@ -24071,7 +26791,11 @@ mod preemptive_tests {
         const FRAME_US: u64 = 1_000_000 / 60;
         let mut st = state();
         st.set_current(1);
-        assert_eq!(st.display_sync(), VitaState::SETBUF_NEXTFRAME, "the safe default");
+        assert_eq!(
+            st.display_sync(),
+            VitaState::SETBUF_NEXTFRAME,
+            "the safe default"
+        );
         st.advance_time_to(5_000);
         st.pace_flip(FRAME_US);
         // IMMEDIATE decides whether the scanout's pointer changes MID-SCAN, which tears.
@@ -24098,7 +26822,10 @@ mod preemptive_tests {
         let mut st = state();
         assert!(!st.take_present_since_wait(), "nothing presented yet");
         st.present(0x1000);
-        assert!(st.take_present_since_wait(), "the wait after a present is satisfied");
+        assert!(
+            st.take_present_since_wait(),
+            "the wait after a present is satisfied"
+        );
         assert!(!st.take_present_since_wait(), "and only the FIRST one is");
     }
 
@@ -24155,7 +26882,10 @@ mod preemptive_tests {
         st.set_current(2);
         st.io_park(1);
         st.advance_io_frame(FRAME_US);
-        assert!(st.take_wakes().is_empty(), "the flip owed nothing, so nothing completed");
+        assert!(
+            st.take_wakes().is_empty(),
+            "the flip owed nothing, so nothing completed"
+        );
     }
 
     #[test]
@@ -24186,7 +26916,11 @@ mod preemptive_tests {
 
         // Created stopped: the clock may run, the timer does not.
         st.charge_cpu_quantum(1_000);
-        assert_eq!(st.timer_time_us(t), Some(0), "a timer counts nothing before it is started");
+        assert_eq!(
+            st.timer_time_us(t),
+            Some(0),
+            "a timer counts nothing before it is started"
+        );
 
         assert_eq!(st.timer_start(t), Some(false), "not already running");
         st.charge_cpu_quantum(3_000);
@@ -24194,21 +26928,37 @@ mod preemptive_tests {
 
         // A second start must NOT restart it: the caller is told, and the count stands.
         assert_eq!(st.timer_start(t), Some(true), "already running");
-        assert_eq!(st.timer_time_us(t), Some(3_000), "a double start must not lose the count");
+        assert_eq!(
+            st.timer_time_us(t),
+            Some(3_000),
+            "a double start must not lose the count"
+        );
 
         // Stopped: what it counted is banked, and further clock does not reach it.
         assert_eq!(st.timer_stop(t), Some(true));
         st.charge_cpu_quantum(5_000);
-        assert_eq!(st.timer_time_us(t), Some(3_000), "a stopped timer does not keep counting");
+        assert_eq!(
+            st.timer_time_us(t),
+            Some(3_000),
+            "a stopped timer does not keep counting"
+        );
         assert_eq!(st.timer_stop(t), Some(false), "already stopped");
 
         // Restarting resumes from the banked count rather than from zero.
         assert_eq!(st.timer_start(t), Some(false));
         st.charge_cpu_quantum(2_000);
-        assert_eq!(st.timer_time_us(t), Some(5_000), "a restart resumes, it does not reset");
+        assert_eq!(
+            st.timer_time_us(t),
+            Some(5_000),
+            "a restart resumes, it does not reset"
+        );
 
         // Set replaces the count and keeps it running from there.
-        assert_eq!(st.timer_set_time_us(t, 100), Some(5_000), "returns what it was");
+        assert_eq!(
+            st.timer_set_time_us(t, 100),
+            Some(5_000),
+            "returns what it was"
+        );
         st.charge_cpu_quantum(1_000);
         assert_eq!(st.timer_time_us(t), Some(1_100));
 
@@ -24228,7 +26978,11 @@ mod preemptive_tests {
         assert!(st.timer_delete(t));
         assert_eq!(st.timer_time_us(t), None, "a deleted uid is gone");
         assert!(!st.timer_delete(t), "deleting twice is not a delete");
-        assert_eq!(st.timer_time_us(other), Some(500), "an unrelated timer is untouched");
+        assert_eq!(
+            st.timer_time_us(other),
+            Some(500),
+            "an unrelated timer is untouched"
+        );
     }
 
     #[test]
@@ -24333,7 +27087,10 @@ mod preemptive_tests {
         assert!(st.take_wakes().is_empty());
         st.sema_signal_wake(sem, 1); // count 3: released, consuming all 3
         assert_eq!(st.take_wakes(), vec![1]);
-        assert!(!st.sema_try_acquire(sem, 1), "the wake consumed the whole count");
+        assert!(
+            !st.sema_try_acquire(sem, 1),
+            "the wake consumed the whole count"
+        );
     }
 
     #[test]
@@ -24393,12 +27150,18 @@ mod preemptive_tests {
         // has none. Asserted rather than skipped - a wake appearing here would mean the
         // handoff had been guessed at instead of read.
         st.advance_time_to(500);
-        assert!(st.take_wakes().is_empty(), "the handoff is deferred, so the wake is too");
+        assert!(
+            st.take_wakes().is_empty(),
+            "the handoff is deferred, so the wake is too"
+        );
         assert_eq!(st.resolve_deferred_lwmutex(kw), 1);
         assert_eq!(st.take_wakes(), vec![1]);
         assert_eq!(st.take_resume_code(1), Some(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
         st.set_current(2);
-        assert!(st.mutex_contended(kw, m), "the timed-out cond wait re-acquired its mutex");
+        assert!(
+            st.mutex_contended(kw, m),
+            "the timed-out cond wait re-acquired its mutex"
+        );
     }
 
     #[test]
@@ -24418,11 +27181,17 @@ mod preemptive_tests {
         // At the deadline the wait times out, but the mutex is held: thread 1 queues
         // behind thread 2 (not woken yet) while its WAIT_TIMEOUT code is already owed.
         st.advance_time_to(500);
-        assert!(st.take_wakes().is_empty(), "the timed-out waiter queues behind the owner");
+        assert!(
+            st.take_wakes().is_empty(),
+            "the timed-out waiter queues behind the owner"
+        );
         // ...and the queueing itself is deferred to where guest memory is reachable, so it
         // has to be settled before the unlock below can find a waiter to hand the mutex to.
         assert_eq!(st.resolve_deferred_lwmutex(kw), 1);
-        assert!(st.take_wakes().is_empty(), "still behind the owner after it is settled");
+        assert!(
+            st.take_wakes().is_empty(),
+            "still behind the owner after it is settled"
+        );
         // Thread 2 unlocks: thread 1 finally gets the mutex, is woken, and the owed
         // timeout code is delivered when it resumes.
         st.mutex_unlock(kw, m);
@@ -24446,7 +27215,10 @@ mod preemptive_tests {
         // memory to hand it over in - so nothing is woken until the scheduler settles it.
         // Asserted rather than skipped: a wake that appeared here would mean the handoff
         // had been guessed at instead of read.
-        assert!(st.take_wakes().is_empty(), "the handoff is deferred, so the wake is too");
+        assert!(
+            st.take_wakes().is_empty(),
+            "the handoff is deferred, so the wake is too"
+        );
         assert_eq!(st.resolve_deferred_lwmutex(w), 1);
         assert_eq!(st.take_wakes(), vec![1]);
         assert_eq!(st.take_resume_code(1), Some(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
@@ -24493,7 +27265,10 @@ mod preemptive_tests {
         assert!(st.lwmutex_lock(w, work, None));
         st.set_current(2);
         assert!(st.lwmutex_contended(w, work));
-        assert!(!st.lwmutex_lock(w, work, None), "contender must block, not silently succeed");
+        assert!(
+            !st.lwmutex_lock(w, work, None),
+            "contender must block, not silently succeed"
+        );
         assert!(st.take_wakes().is_empty());
         // ...and the work area SAYS a thread is parked, which is what keeps the inline
         // fast path off a mutex only the host can now release correctly.
@@ -24502,12 +27277,19 @@ mod preemptive_tests {
         st.set_current(1);
         st.lwmutex_unlock(w, work);
         assert_eq!(st.take_wakes(), vec![2]);
-        assert_eq!(w.word(work + lwwork::off::WAITERS), 0, "the queue drained with the handoff");
+        assert_eq!(
+            w.word(work + lwwork::off::WAITERS),
+            0,
+            "the queue drained with the handoff"
+        );
         assert_eq!(lwwork::owner(w, work), 2, "and thread 2 holds it now");
         // A different work address is an independent lock (thread 3 takes it freely).
         st.set_current(3);
         assert!(st.lwmutex_lock(w, 0x9000, None));
-        assert!(st.lwmutex_contended(w, work), "the first lock is still held by thread 2");
+        assert!(
+            st.lwmutex_contended(w, work),
+            "the first lock is still held by thread 2"
+        );
     }
 
     #[test]
@@ -24521,11 +27303,17 @@ mod preemptive_tests {
         assert!(st.lwmutex_lock(w, work, None)); // count 2 (recursive, same owner)
         st.lwmutex_unlock(w, work); // count 1, still owned
         st.set_current(2);
-        assert!(st.lwmutex_contended(w, work), "still held after one of two unlocks");
+        assert!(
+            st.lwmutex_contended(w, work),
+            "still held after one of two unlocks"
+        );
         st.set_current(1);
         st.lwmutex_unlock(w, work); // count 0, released
         st.set_current(2);
-        assert!(!st.lwmutex_contended(w, work), "free after the matching unlock");
+        assert!(
+            !st.lwmutex_contended(w, work),
+            "free after the matching unlock"
+        );
     }
 
     #[test]
@@ -24543,17 +27331,26 @@ mod preemptive_tests {
         assert!(st.lwcond_wait(w, cond_work, 0));
         assert!(st.take_wakes().is_empty(), "waiter is parked, not runnable");
         st.set_current(2);
-        assert!(!st.lwmutex_contended(w, mutex_work), "the lwmutex was released by the wait");
+        assert!(
+            !st.lwmutex_contended(w, mutex_work),
+            "the lwmutex was released by the wait"
+        );
         // Thread 2 takes the lwmutex, then signals: the waiter must re-acquire the
         // mutex first, so it queues behind thread 2 (not woken yet).
         assert!(st.lwmutex_lock(w, mutex_work, None));
         st.lwcond_signal(w, cond_work, false);
-        assert!(st.take_wakes().is_empty(), "waiter must re-acquire the lwmutex first");
+        assert!(
+            st.take_wakes().is_empty(),
+            "waiter must re-acquire the lwmutex first"
+        );
         // Thread 2 unlocks: ownership passes to the waiter, which is finally woken.
         st.lwmutex_unlock(w, mutex_work);
         assert_eq!(st.take_wakes(), vec![1]);
         st.set_current(3);
-        assert!(st.lwmutex_contended(w, mutex_work), "the woken waiter re-acquired the lwmutex");
+        assert!(
+            st.lwmutex_contended(w, mutex_work),
+            "the woken waiter re-acquired the lwmutex"
+        );
     }
 
     #[test]
@@ -24567,7 +27364,10 @@ mod preemptive_tests {
         assert!(st.mutex_lock(kw, m)); // count 2 (recursive, same owner)
         st.mutex_unlock(kw, m); // count 1, still owned
         st.set_current(2);
-        assert!(st.mutex_contended(kw, m), "still held after one of two unlocks");
+        assert!(
+            st.mutex_contended(kw, m),
+            "still held after one of two unlocks"
+        );
         st.set_current(1);
         st.mutex_unlock(kw, m); // count 0, released
         st.set_current(2);
@@ -24595,7 +27395,10 @@ mod preemptive_tests {
         // 2 still owns the mutex), so it is queued behind the owner, not woken.
         assert!(st.mutex_lock(kw, m));
         st.cond_signal(kw, cv, false);
-        assert!(st.take_wakes().is_empty(), "waiter must re-acquire the mutex first");
+        assert!(
+            st.take_wakes().is_empty(),
+            "waiter must re-acquire the mutex first"
+        );
 
         // Thread 2 unlocks: ownership passes to the waiter, which is finally woken.
         st.mutex_unlock(kw, m);
@@ -24620,7 +27423,10 @@ mod preemptive_tests {
         st.cond_signal(kw, cv, false);
         assert_eq!(st.take_wakes(), vec![1]);
         st.set_current(3);
-        assert!(st.mutex_contended(kw, m), "waiter re-acquired the free mutex");
+        assert!(
+            st.mutex_contended(kw, m),
+            "waiter re-acquired the free mutex"
+        );
     }
 
     #[test]
@@ -24657,14 +27463,30 @@ mod preemptive_tests {
         st.set_main_thread_request((Some(0x56), Some(0x10000)));
         assert_eq!(st.main_thread_priority(), 0x56);
         st.set_current(MAIN_THID);
-        assert_eq!(st.thread_cpu_affinity(0), 0x10000, "main reports its requested mask");
+        assert_eq!(
+            st.thread_cpu_affinity(0),
+            0x10000,
+            "main reports its requested mask"
+        );
         let child = st.create_thread(0x2000, 0x1000, 0x8e, 0, 0);
-        assert_eq!(st.thread_cpu_affinity(child), 0x10000, "mask 0 inherits main's pin");
+        assert_eq!(
+            st.thread_cpu_affinity(child),
+            0x10000,
+            "mask 0 inherits main's pin"
+        );
         let named = st.create_thread(0x2000, 0x1000, 0x8e, 0, 0x40000);
-        assert_eq!(st.thread_cpu_affinity(named), 0x40000, "a named mask is kept");
+        assert_eq!(
+            st.thread_cpu_affinity(named),
+            0x40000,
+            "a named mask is kept"
+        );
         st.set_current(named);
         let grandchild = st.create_thread(0x2000, 0x1000, 0x8e, 0, 0);
-        assert_eq!(st.thread_cpu_affinity(grandchild), 0x40000, "inherits its own creator's");
+        assert_eq!(
+            st.thread_cpu_affinity(grandchild),
+            0x40000,
+            "inherits its own creator's"
+        );
         let mut plain = state();
         plain.set_current(MAIN_THID);
         let t = plain.create_thread(0x2000, 0x1000, 0x8e, 0, 0);
@@ -24688,7 +27510,10 @@ mod preemptive_tests {
         st.set_current(MAIN_THID);
         assert!(!st.join_block(worker, 0x5000));
         assert!(st.take_wakes().is_empty());
-        assert!(st.take_stat_writes().is_empty(), "no exit code to deliver yet");
+        assert!(
+            st.take_stat_writes().is_empty(),
+            "no exit code to deliver yet"
+        );
         // The worker ends: the joiner is woken, the exit code is recorded, AND queued
         // for delivery to the joiner's `stat` pointer (the wait handler cannot write
         // it at wake time).
@@ -24708,7 +27533,10 @@ mod preemptive_tests {
         let mut st = state();
         let worker = st.create_thread(0x2000, 0x1000, DEFAULT_THREAD_PRIORITY, 0, 0);
         st.start_thread(worker, 0, 0).unwrap();
-        assert_eq!(st.start_thread(worker, 0, 0), Err(SCE_KERNEL_ERROR_NOT_DORMANT));
+        assert_eq!(
+            st.start_thread(worker, 0, 0),
+            Err(SCE_KERNEL_ERROR_NOT_DORMANT)
+        );
         st.set_thread_exit(worker, 7);
         let _ = st.take_spawns();
         // Restart: the old exit code is gone and a join waits for this run.
@@ -24716,7 +27544,10 @@ mod preemptive_tests {
         assert_eq!(st.thread_exit_code(worker), None);
         assert!(st.thread_running(worker));
         st.set_current(MAIN_THID);
-        assert!(!st.join_block(worker, 0), "a join on the restarted thread parks");
+        assert!(
+            !st.join_block(worker, 0),
+            "a join on the restarted thread parks"
+        );
         st.set_thread_exit(worker, 9);
         assert_eq!(st.take_wakes(), vec![MAIN_THID]);
         assert!(!st.thread_running(worker));
@@ -24732,8 +27563,20 @@ mod preemptive_tests {
         let mem = SliceMemory(&mut []);
         // The "handler": two guest calls, then the sum of their results.
         let handler = |st: &mut VitaState| -> Option<u32> {
-            let a = st.call_guest(GuestCall { entry: 0x100, args: vec![1] }, None)?;
-            let b = st.call_guest(GuestCall { entry: 0x200, args: vec![a.r0] }, None)?;
+            let a = st.call_guest(
+                GuestCall {
+                    entry: 0x100,
+                    args: vec![1],
+                },
+                None,
+            )?;
+            let b = st.call_guest(
+                GuestCall {
+                    entry: 0x200,
+                    args: vec![a.r0],
+                },
+                None,
+            )?;
             Some(a.r0 + b.r0)
         };
         let dispatch = |st: &mut VitaState| {
@@ -24748,11 +27591,23 @@ mod preemptive_tests {
         assert!(!st.guest_call_end());
         st.guest_call_returned(MAIN_THID, 5, 0, &mem, 0);
         assert_eq!(dispatch(&mut st), (None, true));
-        assert_eq!(st.take_guest_call(MAIN_THID), Some(GuestCall { entry: 0x200, args: vec![5] }));
+        assert_eq!(
+            st.take_guest_call(MAIN_THID),
+            Some(GuestCall {
+                entry: 0x200,
+                args: vec![5]
+            })
+        );
         // A nested host call that ITSELF calls back gets its own record and finishes in it.
         let nested = |st: &mut VitaState| {
             st.guest_call_begin();
-            let r = st.call_guest(GuestCall { entry: 0x300, args: vec![] }, None);
+            let r = st.call_guest(
+                GuestCall {
+                    entry: 0x300,
+                    args: vec![],
+                },
+                None,
+            );
             (r.map(|r| r.r0), st.guest_call_end())
         };
         assert_eq!(nested(&mut st), (None, true));
@@ -24762,7 +27617,10 @@ mod preemptive_tests {
         // Back to the outer call's second guest call.
         st.guest_call_returned(MAIN_THID, 7, 0, &mem, 0);
         assert_eq!(dispatch(&mut st), (Some(12), false));
-        assert!(st.guest_call_frames.is_empty(), "a finished call leaves no record");
+        assert!(
+            st.guest_call_frames.is_empty(),
+            "a finished call leaves no record"
+        );
     }
 
     /// Arguments past the fourth go on a fresh, 8-byte-aligned frame below the caller's sp.
@@ -24771,13 +27629,19 @@ mod preemptive_tests {
         let mut bytes = vec![0u8; 0x1000];
         let mut regs = [0u32; REG_COUNT];
         regs[SP] = 0x0ffc;
-        let call = GuestCall { entry: 0x8100_0001, args: vec![10, 11, 12, 13, 14] };
+        let call = GuestCall {
+            entry: 0x8100_0001,
+            args: vec![10, 11, 12, 13, 14],
+        };
         call.seed(&mut regs, &mut SliceMemory(&mut bytes), 0);
         assert_eq!(&regs[..4], &[10, 11, 12, 13]);
         assert_eq!(regs[SP] % 8, 0);
         assert!(regs[SP] + 4 <= 0x0ffc - GUEST_CALL_GAP);
         let at = regs[SP] as usize;
-        assert_eq!(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()), 14);
+        assert_eq!(
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+            14
+        );
     }
 
     #[test]
@@ -24785,7 +27649,10 @@ mod preemptive_tests {
         let mut st = state();
         let worker = st.create_thread(0x2000, 0x1000, DEFAULT_THREAD_PRIORITY, 0, 0);
         st.start_thread(worker, 4, 0x1234).unwrap();
-        assert!(st.take_reentry().is_none(), "preemptive start does not re-enter synchronously");
+        assert!(
+            st.take_reentry().is_none(),
+            "preemptive start does not re-enter synchronously"
+        );
         let spawns = st.take_spawns();
         assert_eq!(spawns.len(), 1);
         assert_eq!(spawns[0].thid, worker);
@@ -24821,10 +27688,15 @@ mod filesystem_tests {
 
     impl MapBacking {
         fn new(files: &[(&str, Vec<u8>)]) -> Self {
-            let stored: Vec<(String, Vec<u8>)> =
-                files.iter().map(|(p, b)| (p.to_string(), b.clone())).collect();
-            let by_key =
-                stored.iter().enumerate().map(|(i, (p, _))| (vfs_key(p), i)).collect();
+            let stored: Vec<(String, Vec<u8>)> = files
+                .iter()
+                .map(|(p, b)| (p.to_string(), b.clone()))
+                .collect();
+            let by_key = stored
+                .iter()
+                .enumerate()
+                .map(|(i, (p, _))| (vfs_key(p), i))
+                .collect();
             MapBacking { stored, by_key }
         }
         fn get(&self, key: &str) -> Option<&[u8]> {
@@ -24899,7 +27771,10 @@ mod filesystem_tests {
         assert_eq!(st.io_lseek(fd, 0, SCE_SEEK_SET), 0);
         assert_eq!(st.io_read(fd, 8), Some(vec![9, 9, 9, 9, 1, 2, 3, 9]));
         // Faulted in, so the inspection seam can now see it.
-        assert_eq!(st.file_bytes("ux0:/data/asset.bin").map(|b| b.len()), Some(16));
+        assert_eq!(
+            st.file_bytes("ux0:/data/asset.bin").map(|b| b.len()),
+            Some(16)
+        );
     }
 
     /// A backed file whose stored name has CAPITALS must be reachable by the guest, which
@@ -24915,15 +27790,26 @@ mod filesystem_tests {
     fn a_backed_file_is_reachable_through_a_mount_and_a_different_case() {
         let data: Vec<u8> = (0..64u8).collect();
         let mut st = state();
-        st.set_file_backing(Box::new(MapBacking::new(&[("PSP2/Data/Blob.BIN", data.clone())])));
+        st.set_file_backing(Box::new(MapBacking::new(&[(
+            "PSP2/Data/Blob.BIN",
+            data.clone(),
+        )])));
 
         // The spelling the title actually uses: an app0: mount, and whatever case it feels
         // like. Every one of these is the same file.
-        for path in ["app0:/PSP2/Data/Blob.BIN", "app0:/psp2/data/blob.bin", "PSP2/Data/Blob.BIN"] {
+        for path in [
+            "app0:/PSP2/Data/Blob.BIN",
+            "app0:/psp2/data/blob.bin",
+            "PSP2/Data/Blob.BIN",
+        ] {
             assert_eq!(st.io_size(path), Some(64), "size of {path}");
             let fd = st.io_open(path, SCE_O_RDONLY);
             assert!(fd >= 0, "{path} must open (got {fd})");
-            assert_eq!(st.io_read(fd, 8), Some(vec![0, 1, 2, 3, 4, 5, 6, 7]), "read of {path}");
+            assert_eq!(
+                st.io_read(fd, 8),
+                Some(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+                "read of {path}"
+            );
         }
     }
 
@@ -24971,7 +27857,8 @@ mod filesystem_tests {
         );
         // `.` and `..` segments resolve too, and open() shares the same key.
         assert_eq!(
-            st.read_file("app0:/usrdir/./ui/bogus/../fonts/x.ttf").as_deref(),
+            st.read_file("app0:/usrdir/./ui/bogus/../fonts/x.ttf")
+                .as_deref(),
             Some(&b"FONTDATA"[..])
         );
         assert!(st.io_open("app0:/usrdir//ui/fonts//x.ttf", SCE_O_RDONLY) >= 3);
@@ -25033,10 +27920,17 @@ mod filesystem_tests {
     fn an_addon_is_listed_and_read_under_its_mount() {
         let mut st = state();
         st.set_file_backing(Box::new(MapBacking::new(&[("data/base.bin", vec![1; 4])])));
-        assert_eq!(st.io_dopen("addcont0:"), SCE_ERROR_ERRNO_ENOENT, "no add-on, no mount");
+        assert_eq!(
+            st.io_dopen("addcont0:"),
+            SCE_ERROR_ERRNO_ENOENT,
+            "no add-on, no mount"
+        );
         st.add_addcont(
             "PACK000000000001",
-            Box::new(MapBacking::new(&[("Costume.bcm", vec![7, 8, 9]), ("sce_sys/param.sfo", vec![0; 2])])),
+            Box::new(MapBacking::new(&[
+                ("Costume.bcm", vec![7, 8, 9]),
+                ("sce_sys/param.sfo", vec![0; 2]),
+            ])),
         );
         assert!(st.has_addcont("pack000000000001") && !st.has_addcont("PACK000000000002"));
         let fd = st.io_dopen("addcont0:");
@@ -25044,10 +27938,24 @@ mod filesystem_tests {
         assert_eq!((e.name.as_str(), e.is_dir), ("PACK000000000001", true));
         assert_eq!(st.io_dread(fd), Some(None));
         // Both separators, any case - and the title's own files are untouched.
-        assert_eq!(st.read_file("addcont0:PACK000000000001/costume.bcm").as_deref(), Some(&[7u8, 8, 9][..]));
-        assert_eq!(st.read_file("addcont0:/pack000000000001/Costume.bcm").as_deref(), Some(&[7u8, 8, 9][..]));
-        assert_eq!(st.read_file("app0:data/base.bin").as_deref(), Some(&[1u8; 4][..]));
-        assert!(st.read_file("costume.bcm").is_none(), "an add-on's files are not the title's");
+        assert_eq!(
+            st.read_file("addcont0:PACK000000000001/costume.bcm")
+                .as_deref(),
+            Some(&[7u8, 8, 9][..])
+        );
+        assert_eq!(
+            st.read_file("addcont0:/pack000000000001/Costume.bcm")
+                .as_deref(),
+            Some(&[7u8, 8, 9][..])
+        );
+        assert_eq!(
+            st.read_file("app0:data/base.bin").as_deref(),
+            Some(&[1u8; 4][..])
+        );
+        assert!(
+            st.read_file("costume.bcm").is_none(),
+            "an add-on's files are not the title's"
+        );
     }
 
     #[test]
@@ -25063,11 +27971,20 @@ mod filesystem_tests {
         // Ordered by lowercased name; subdirectories deduplicated; names keep the
         // original mixed case a title's glob (e.g. `Course_*`) expects.
         let e1 = st.io_dread(fd).unwrap().unwrap();
-        assert_eq!((e1.name.as_str(), e1.is_dir, e1.size), ("Course_601", true, 0));
+        assert_eq!(
+            (e1.name.as_str(), e1.is_dir, e1.size),
+            ("Course_601", true, 0)
+        );
         let e2 = st.io_dread(fd).unwrap().unwrap();
-        assert_eq!((e2.name.as_str(), e2.is_dir, e2.size), ("Course_700", true, 0));
+        assert_eq!(
+            (e2.name.as_str(), e2.is_dir, e2.size),
+            ("Course_700", true, 0)
+        );
         let e3 = st.io_dread(fd).unwrap().unwrap();
-        assert_eq!((e3.name.as_str(), e3.is_dir, e3.size), ("Readme.txt", false, 7));
+        assert_eq!(
+            (e3.name.as_str(), e3.is_dir, e3.size),
+            ("Readme.txt", false, 7)
+        );
         // Exhausted: end-of-listing, repeatably.
         assert_eq!(st.io_dread(fd), Some(None));
         assert_eq!(st.io_dread(fd), Some(None));
@@ -25131,7 +28048,10 @@ mod filesystem_tests {
         let fd = st.io_open("ux0:/save.bin", SCE_O_RDWR);
         // Positioned write past the current end zero-fills the gap.
         assert_eq!(st.io_pwrite(fd, 6, b"AB"), Some(2));
-        assert_eq!(st.file_bytes("ux0:/save.bin"), Some(&[0, 0, 0, 0, 0, 0, b'A', b'B'][..]));
+        assert_eq!(
+            st.file_bytes("ux0:/save.bin"),
+            Some(&[0, 0, 0, 0, 0, 0, b'A', b'B'][..])
+        );
         // The cursor is untouched, so a sequential read still starts at 0.
         assert_eq!(st.io_read(fd, 2).as_deref(), Some(&[0, 0][..]));
     }
@@ -25189,8 +28109,14 @@ mod game_data_tests {
         assert!(refused.is_empty(), "{refused:?}");
         second.restore_game_data(&data);
 
-        assert_eq!(guest_read(&mut second, "savedata0:/DATA.BIN").as_deref(), Some(&b"holes in one: 3"[..]));
-        assert_eq!(second.savedata_slot_get("savedata0:", 1), Some(vec![0xAB; 16]));
+        assert_eq!(
+            guest_read(&mut second, "savedata0:/DATA.BIN").as_deref(),
+            Some(&b"holes in one: 3"[..])
+        );
+        assert_eq!(
+            second.savedata_slot_get("savedata0:", 1),
+            Some(vec![0xAB; 16])
+        );
         assert!(second.trophies.is_unlocked("NPWR00001_00", 7));
         assert_eq!(second.trophies.unlocked_at("NPWR00001_00", 7), Some(0x1234));
     }
@@ -25204,7 +28130,10 @@ mod game_data_tests {
         // (`savedata0:data0_US.bin`) - two spellings, one file on the device, two keys
         // here. The read got ENOENT on a file the same run had just written.
         assert_eq!(vfs_key("savedata0:data0_US.bin"), "savedata0:/data0_us.bin");
-        assert_eq!(vfs_key("savedata0:/data0_US.bin"), "savedata0:/data0_us.bin");
+        assert_eq!(
+            vfs_key("savedata0:/data0_US.bin"),
+            "savedata0:/data0_us.bin"
+        );
         assert_eq!(vfs_key("SAVEDATA0:/x"), vfs_key("savedata0:x"));
         assert_eq!(vfs_key("ux0:data/a//b"), "ux0:/data/a/b");
         // The mount alone stays the mount, with no separator invented for it - it is the
@@ -25245,7 +28174,10 @@ mod game_data_tests {
         let mut st = state();
         assert!(!st.game_data_dirty());
         guest_write(&mut st, "app0:/data/level.gxt", b"an asset, not a save");
-        assert!(!st.game_data_dirty(), "writing a game asset is not saved state");
+        assert!(
+            !st.game_data_dirty(),
+            "writing a game asset is not saved state"
+        );
         assert!(guest_read(&mut st, "app0:/data/level.gxt").is_some());
         assert!(!st.game_data_dirty(), "reading is not saving");
     }
@@ -25265,8 +28197,14 @@ mod game_data_tests {
         // "can this reach `fs.files`, `fs.dirs`, `fs.stats`, the savedata slots or the
         // trophy ledger" - and every path that can, ends at `FileTable::touch`.
         let each: Vec<(&str, Box<dyn Fn(&mut VitaState)>)> = vec![
-            ("write", Box::new(|st: &mut VitaState| guest_write(st, "savedata0:/a", b"x"))),
-            ("mkdir", Box::new(|st: &mut VitaState| assert_eq!(st.io_mkdir("savedata0:/d"), 0))),
+            (
+                "write",
+                Box::new(|st: &mut VitaState| guest_write(st, "savedata0:/a", b"x")),
+            ),
+            (
+                "mkdir",
+                Box::new(|st: &mut VitaState| assert_eq!(st.io_mkdir("savedata0:/d"), 0)),
+            ),
             (
                 "pwrite",
                 Box::new(|st: &mut VitaState| {
@@ -25296,7 +28234,10 @@ mod game_data_tests {
                 Box::new(|st: &mut VitaState| {
                     guest_write(st, "savedata0:/s", b"x");
                     st.clear_game_data_dirty();
-                    let over = FileStatOverride { mode: Some(0x21b6), ..Default::default() };
+                    let over = FileStatOverride {
+                        mode: Some(0x21b6),
+                        ..Default::default()
+                    };
                     assert_eq!(st.io_chstat("savedata0:/s", over), 0);
                 }),
             ),
@@ -25337,7 +28278,10 @@ mod game_data_tests {
             let mut st = state();
             st.clear_game_data_dirty();
             act(&mut st);
-            assert!(st.game_data_dirty(), "{name} left the save looking unchanged");
+            assert!(
+                st.game_data_dirty(),
+                "{name} left the save looking unchanged"
+            );
         }
     }
 
@@ -25349,19 +28293,31 @@ mod game_data_tests {
     fn a_whole_file_save_survives_the_container_and_a_preload_does_not() {
         let mut first = state();
         first.add_file("app0:/usrdir/course.dat", vec![7; 16]);
-        assert!(!first.game_data_dirty(), "preloading a shipped asset is not a save");
+        assert!(
+            !first.game_data_dirty(),
+            "preloading a shipped asset is not a save"
+        );
         first.add_file("savedata0:/-AUTO-/DATA.BIN", b"progress".to_vec());
-        assert!(first.game_data_dirty(), "a whole-file save left the save looking unchanged");
+        assert!(
+            first.game_data_dirty(),
+            "a whole-file save left the save looking unchanged"
+        );
 
         let (data, _) = GameData::from_zip(&first.game_data().to_zip("X")).expect("read");
         assert_eq!(
             data.files,
-            vec![("savedata0:/-auto-/data.bin".to_string(), b"progress".to_vec())],
+            vec![(
+                "savedata0:/-auto-/data.bin".to_string(),
+                b"progress".to_vec()
+            )],
             "the container carries the save and nothing the title shipped",
         );
         let mut second = state();
         second.restore_game_data(&data);
-        assert_eq!(second.read_file("savedata0:/-AUTO-/DATA.BIN").as_deref(), Some(&b"progress"[..]));
+        assert_eq!(
+            second.read_file("savedata0:/-AUTO-/DATA.BIN").as_deref(),
+            Some(&b"progress"[..])
+        );
     }
 
     #[test]
@@ -25374,7 +28330,10 @@ mod game_data_tests {
         assert!(!second.game_data_dirty());
         // And what it restored is what a second export produces, byte for byte - so a
         // reload cycle is a fixed point rather than something that drifts each run.
-        assert_eq!(second.game_data().to_zip("X"), first.game_data().to_zip("X"));
+        assert_eq!(
+            second.game_data().to_zip("X"),
+            first.game_data().to_zip("X")
+        );
     }
 
     #[test]
@@ -25408,13 +28367,19 @@ static STREAM_WATCH: std::sync::Mutex<Vec<(u32, u32, u64)>> = std::sync::Mutex::
 /// of every SA-resident uniform buffer a draw read, re-read at `sceGxmEndScene` by
 /// [`VitaState::report_stream_rewrites`]. The uniform twin of [`STREAM_WATCH`]: the GPU loads a
 /// bound uniform buffer when the scene EXECUTES, and this engine copies it at the draw call.
-static UNIFORM_WATCH: std::sync::Mutex<Vec<(u32, u32, u64, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+static UNIFORM_WATCH: std::sync::Mutex<Vec<(u32, u32, u64, u32, u32)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// `VITASLOP_WATCH_UNIFORM_REWRITES=1`: watch every SA uniform buffer a draw read for a guest
 /// write between `sceGxmDraw` and `sceGxmEndScene` - see [`UNIFORM_WATCH`].
 fn watch_uniform_rewrites() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::var("VITASLOP_WATCH_UNIFORM_REWRITES").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| {
+        crate::knobs::var("VITASLOP_WATCH_UNIFORM_REWRITES")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }
 
 /// `VITASLOP_DUMP_STREAM_BYTES[=<n>]`: with the per-draw dump on, print each vertex stream's
@@ -25435,7 +28400,9 @@ fn dump_stream_bytes() -> Option<Option<usize>> {
 
 /// FNV-1a over a byte window, the checksum [`STREAM_WATCH`] compares with.
 fn stream_watch_hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(1469598103934665603u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(1099511628211))
+    bytes.iter().fold(1469598103934665603u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(1099511628211)
+    })
 }
 
 /// One scene's share of a [`ResolveJob`]: its draw descriptions, each draw's uniform windows
@@ -25514,7 +28481,12 @@ pub fn set_resolver_attached(on: bool) {
 /// the host lock. See [`VitaState::queue_sync_resolve`].
 fn sync_resolve_async() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::var("VITASLOP_SYNC_RESOLVE_ASYNC").as_deref().map(str::trim) != Ok("0"))
+    *ON.get_or_init(|| {
+        crate::knobs::var("VITASLOP_SYNC_RESOLVE_ASYNC")
+            .as_deref()
+            .map(str::trim)
+            != Ok("0")
+    })
 }
 
 fn resolver_attached() -> bool {
@@ -25609,7 +28581,12 @@ fn compute_posted_resolve_job(
 /// (a baseball title's pitches, the lock's waits-by-holder line) 1.07 ms/f at 64, 0.70 at 16 (039).
 fn resolve_chunk() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| crate::knobs::var("VITASLOP_RESOLVE_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16))
+    *N.get_or_init(|| {
+        crate::knobs::var("VITASLOP_RESOLVE_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(16)
+    })
 }
 
 /// >>> [`compute_resolve_job`] in CHUNKS of draws, releasing the snapshot lock between them.
@@ -25659,7 +28636,14 @@ fn compute_resolve_job_chunked(
             let has_tex = g.iter().any(|d| d.tex.is_some());
             let mut part = ResolveJob {
                 frame: job.frame,
-                scenes: vec![ResolveScene { id: rs.id, continues: has_tex && began, geo: g, windows: w, out: Vec::new(), tex_out: Vec::new() }],
+                scenes: vec![ResolveScene {
+                    id: rs.id,
+                    continues: has_tex && began,
+                    geo: g,
+                    windows: w,
+                    out: Vec::new(),
+                    tex_out: Vec::new(),
+                }],
             };
             began |= has_tex;
             first = false;
@@ -25683,7 +28667,11 @@ fn compute_resolve_job_chunked(
         rs.geo = geo_back;
         rs.windows = win_back;
         rs.out = out;
-        rs.tex_out = if tex_out.iter().all(Option::is_none) { Vec::new() } else { tex_out };
+        rs.tex_out = if tex_out.iter().all(Option::is_none) {
+            Vec::new()
+        } else {
+            tex_out
+        };
     }
 }
 
@@ -25729,14 +28717,18 @@ fn compute_resolve_job(snaps: &mut TextureSnapshots, ctx: &GuestCtx, job: &mut R
             let frag = match &t.span {
                 // The same bytes as the previous draw of this scene: the same list, exactly as
                 // `set_from_previous_draw` answers at the draw.
-                None => prev.clone().unwrap_or_else(|| TexSet::Hit(crate::capture::no_textures())),
+                None => prev
+                    .clone()
+                    .unwrap_or_else(|| TexSet::Hit(crate::capture::no_textures())),
                 Some(span) => {
                     crate::vita::gxmctx::texture_bindings_in_span(span, &mut raw);
                     // >>> ONLY THE UNITS THIS PROGRAM SAMPLES - `draw_textures_now`'s narrowing.
                     let narrow = t.want != 0 && sampler_narrow_enabled();
                     let binds: Vec<TextureBinding> = raw
                         .iter()
-                        .filter(|(unit, _)| !(narrow && (*unit >= 32 || t.want & (1u32 << *unit) == 0)))
+                        .filter(|(unit, _)| {
+                            !(narrow && (*unit >= 32 || t.want & (1u32 << *unit) == 0))
+                        })
                         .map(|(unit, b)| TextureBinding {
                             unit: *unit,
                             addr: b.addr,
@@ -25764,7 +28756,12 @@ fn compute_resolve_job(snaps: &mut TextureSnapshots, ctx: &GuestCtx, job: &mut R
                     set
                 }
             });
-            tex_out.push(Some(ResolvedTextures { frag, vert, fheader: t.fheader, albedo: t.albedo }));
+            tex_out.push(Some(ResolvedTextures {
+                frag,
+                vert,
+                fheader: t.fheader,
+                albedo: t.albedo,
+            }));
         }
         rs.tex_out = tex_out;
     }
@@ -25848,7 +28845,8 @@ fn compute_resolve_job(snaps: &mut TextureSnapshots, ctx: &GuestCtx, job: &mut R
                     continue;
                 }
                 if g.single_stream {
-                    let addr = g.bound_streams[0].wrapping_add(idx.first_vertex.wrapping_mul(g.stride));
+                    let addr =
+                        g.bound_streams[0].wrapping_add(idx.first_vertex.wrapping_mul(g.stride));
                     let len = idx.vertex_count as usize * g.stride as usize;
                     if snaps.vertices_cached(&pctx, addr, len) {
                         skipped += 1;
@@ -25863,16 +28861,27 @@ fn compute_resolve_job(snaps: &mut TextureSnapshots, ctx: &GuestCtx, job: &mut R
                     Some(gather) => (gather[0], gather[gather.len() - 1]),
                     None => (idx.first_vertex, idx.first_vertex + idx.vertex_count - 1),
                 };
-                TextureSnapshots::gather_spans_into(&mut key.spans, &g.streams, &g.bound_streams, &g.base, (first_row, last_row));
+                TextureSnapshots::gather_spans_into(
+                    &mut key.spans,
+                    &g.streams,
+                    &g.bound_streams,
+                    &g.base,
+                    (first_row, last_row),
+                );
                 key.stride = g.stride;
                 key.layout = g.layout.key;
-                key.gather = idx.gather.as_ref().map_or((0, 0), |ga| (ga.as_ptr() as usize, ga.len()));
+                key.gather = idx
+                    .gather
+                    .as_ref()
+                    .map_or((0, 0), |ga| (ga.as_ptr() as usize, ga.len()));
                 if snaps.gather_memo_cached(&pctx, &key) {
                     skipped += 1;
                     continue;
                 }
                 for (si, st) in g.streams.iter().enumerate() {
-                    let Some(&b) = g.bound_streams.get(si) else { continue };
+                    let Some(&b) = g.bound_streams.get(si) else {
+                        continue;
+                    };
                     if b == 0 || st.stride == 0 || st.per_instance {
                         continue;
                     }
@@ -25885,17 +28894,27 @@ fn compute_resolve_job(snaps: &mut TextureSnapshots, ctx: &GuestCtx, job: &mut R
                             let mut k = 0usize;
                             while k < gather.len() {
                                 let mut end = k;
-                                while end + 1 < gather.len() && (gather[end + 1] - gather[end]) as usize * step <= GATHER_RUN_GAP_BYTES {
+                                while end + 1 < gather.len()
+                                    && (gather[end + 1] - gather[end]) as usize * step
+                                        <= GATHER_RUN_GAP_BYTES
+                                {
                                     end += 1;
                                 }
-                                if let Some(o) = pctx.offset(b.wrapping_add(gather[k].wrapping_mul(st.stride))) {
-                                    rows.push((o, (gather[end] - gather[k]) as usize * step + step));
+                                if let Some(o) =
+                                    pctx.offset(b.wrapping_add(gather[k].wrapping_mul(st.stride)))
+                                {
+                                    rows.push((
+                                        o,
+                                        (gather[end] - gather[k]) as usize * step + step,
+                                    ));
                                 }
                                 k = end + 1;
                             }
                         }
                         None => {
-                            if let Some(o) = pctx.offset(b.wrapping_add(idx.first_vertex.wrapping_mul(st.stride))) {
+                            if let Some(o) = pctx
+                                .offset(b.wrapping_add(idx.first_vertex.wrapping_mul(st.stride)))
+                            {
                                 rows.push((o, idx.vertex_count as usize * st.stride as usize));
                             }
                         }
@@ -25921,7 +28940,17 @@ fn compute_resolve_job(snaps: &mut TextureSnapshots, ctx: &GuestCtx, job: &mut R
         for (i, ((mw, fw), g)) in rs.windows.iter_mut().zip(rs.geo.iter()).enumerate() {
             // An instanced draw is expanded here, one row per (instance, vertex), and then
             // needs nothing below but its uniform windows. See `read_instanced_draw`.
-            if let Some((idx, vertices)) = snaps.read_instanced_draw(ctx, g.index_addr, g.index_len, g.index_elem, g.index_wrap, &g.streams, &g.bound_streams, &g.layout, g.stride) {
+            if let Some((idx, vertices)) = snaps.read_instanced_draw(
+                ctx,
+                g.index_addr,
+                g.index_len,
+                g.index_elem,
+                g.index_wrap,
+                &g.streams,
+                &g.bound_streams,
+                &g.layout,
+                g.stride,
+            ) {
                 out.push((idx.bytes, vertices));
                 for (addr, bytes) in mw.iter_mut().chain(fw.iter_mut()) {
                     // ONLY WHERE THE DRAW-TIME BYTES SAY NOTHING WAS WRITTEN YET - the same
@@ -25936,12 +28965,32 @@ fn compute_resolve_job(snaps: &mut TextureSnapshots, ctx: &GuestCtx, job: &mut R
             if dump_volume {
                 let bytes = idx.vertex_count as usize * g.stride as usize;
                 if bytes >= 64 * 1024 {
-                    let streams: Vec<String> = g.streams.iter().enumerate().map(|(k, st)| format!("{:#x}/{}", g.bound_streams.get(k).copied().unwrap_or(0), st.stride)).collect();
+                    let streams: Vec<String> = g
+                        .streams
+                        .iter()
+                        .enumerate()
+                        .map(|(k, st)| {
+                            format!(
+                                "{:#x}/{}",
+                                g.bound_streams.get(k).copied().unwrap_or(0),
+                                st.stride
+                            )
+                        })
+                        .collect();
                     tracing::info!(target: "vitaslop::status", "GEOM frame={frame} seq={i} verts={} first={} compacted={} stride={} bytes={bytes} idx={:#x}/{} single={} streams=[{}]", idx.vertex_count, idx.first_vertex, idx.gather.is_some(), g.stride, g.index_addr, g.index_len, g.single_stream, streams.join(" "));
                 }
             }
             let vertices = crate::perf::time(crate::perf::Phase::DrawVertices, || {
-                snaps.read_draw_vertices(ctx, &idx, g.single_stream, &g.streams, &g.bound_streams, &g.base, &g.layout, g.stride)
+                snaps.read_draw_vertices(
+                    ctx,
+                    &idx,
+                    g.single_stream,
+                    &g.streams,
+                    &g.bound_streams,
+                    &g.base,
+                    &g.layout,
+                    g.stride,
+                )
             });
             out.push((idx.bytes.clone(), vertices));
             // >>> A UNIFORM BUFFER IS FILLED AFTER THE DRAW TOO, by the same contract that
@@ -26086,8 +29135,12 @@ fn fold_set_key(first: u64, binds: &[TextureBinding]) -> u64 {
 /// thread 17.6 -> 16.0 ms/f (px27c -> px27k), picture correct.
 fn defer_textures() -> bool {
     static KNOB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *KNOB.get_or_init(|| crate::knobs::var("VITASLOP_SMP_DEFER_TEXTURES").as_deref().map(str::trim) != Ok("0"))
-        && resolver_attached()
+    *KNOB.get_or_init(|| {
+        crate::knobs::var("VITASLOP_SMP_DEFER_TEXTURES")
+            .as_deref()
+            .map(str::trim)
+            != Ok("0")
+    }) && resolver_attached()
         && gxp_live_capture()
         && !fixed_function_wanted()
 }
@@ -26120,7 +29173,8 @@ fn inplace_compare() -> bool {
     *ON.get_or_init(|| crate::knobs::var("VITASLOP_INPLACE_COMPARE").as_deref() != Ok("0"))
 }
 
-static ASYNC_FLIP_RESOLVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ASYNC_FLIP_RESOLVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Leave a flip's geometry resolve to the presenting worker - see
 /// [`VitaState::resolve_at_flip`]. Set only by an engine whose presenter is NOT the flipping
@@ -26155,7 +29209,11 @@ fn defer_geometry() -> bool {
     // Through `crate::knobs`, not `std::env`: this is a DEFAULT-BEARING arm, and the browser
     // has no environment [[vitaslop-browser-has-no-env]] - a default that cannot be turned off
     // on the engine that ships is a default nobody can A/B.
-    *ON.get_or_init(|| crate::knobs::var("VITASLOP_DEFER_GEOMETRY").map(|v| v.trim() != "0").unwrap_or(true))
+    *ON.get_or_init(|| {
+        crate::knobs::var("VITASLOP_DEFER_GEOMETRY")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
 }
 
 #[cfg(test)]
@@ -26190,7 +29248,11 @@ mod dirty_runs_tests {
         let mut map = [0u8; 8];
         map[3] = 9; // a write recorded against page 3 may reach into page 4
         let got = runs(&map, 0, 8 * PAGE, 5);
-        assert_eq!(got, vec![(3 * PAGE, 5 * PAGE)], "pages 3 AND 4, not page 3 alone");
+        assert_eq!(
+            got,
+            vec![(3 * PAGE, 5 * PAGE)],
+            "pages 3 AND 4, not page 3 alone"
+        );
     }
 
     /// The original overhang still holds: a stamp on the page BELOW the range makes the
@@ -26200,7 +29262,11 @@ mod dirty_runs_tests {
         let mut map = [0u8; 8];
         map[2] = 9;
         let got = runs(&map, 3 * PAGE, PAGE, 5);
-        assert_eq!(got, vec![(0, PAGE)], "the range's own page is dirty by inheritance");
+        assert_eq!(
+            got,
+            vec![(0, PAGE)],
+            "the range's own page is dirty by inheritance"
+        );
     }
 
     /// Page 0 has no predecessor, and asking for one must not panic or wrap.
@@ -26217,7 +29283,11 @@ mod dirty_runs_tests {
         let mut map = [0u8; 8];
         map[1] = 9;
         let got = runs(&map, PAGE + 100, 200, 5);
-        assert_eq!(got, vec![(0, 200)], "relative to `off`, and no wider than `len`");
+        assert_eq!(
+            got,
+            vec![(0, 200)],
+            "relative to `off`, and no wider than `len`"
+        );
     }
 
     /// A stamp OLDER than the one asked about is not a change since it.
@@ -26226,7 +29296,11 @@ mod dirty_runs_tests {
         let mut map = [0u8; 8];
         map[3] = 4;
         assert_eq!(runs(&map, 0, 8 * PAGE, 5), Vec::new());
-        assert_eq!(runs(&map, 0, 8 * PAGE, 4), vec![(3 * PAGE, 5 * PAGE)], "equal counts as at-or-after");
+        assert_eq!(
+            runs(&map, 0, 8 * PAGE, 4),
+            vec![(3 * PAGE, 5 * PAGE)],
+            "equal counts as at-or-after"
+        );
     }
 
     /// Two separated writes are two runs, not one spanning the clean pages between them.
@@ -26260,13 +29334,108 @@ mod strided_texture_tests {
         let fmt = Some(0x0c00_0000);
         let t = build_texture_template(0, words(6, 1, 0), fmt, 2048).expect("template");
         assert_eq!(t.stride, 2048, "the recorded pitch");
-        assert!(t.read_len >= 2048 * 63 + 128 * 4, "reads the last row at its pitch (read_len {})", t.read_len);
+        assert!(
+            t.read_len >= 2048 * 63 + 128 * 4,
+            "reads the last row at its pitch (read_len {})",
+            t.read_len
+        );
         // With no recorded stride it falls back to the width-derived pitch, as before.
         let t0 = build_texture_template(0, words(6, 1, 0), fmt, 0).expect("template");
         assert_eq!(t0.stride, 128 * 4);
         // A NON-strided texture ignores a stray recorded stride.
         let lin = build_texture_template(0, words(3, 1, 0), fmt, 2048).expect("template");
         assert_eq!(lin.stride, 128 * 4);
+    }
+
+    /// **A BY-VALUE COPY OF A STRIDED TEXTURE KEEPS ITS STRIDE.** A title that copies the 16 bytes
+    /// into its own material and binds the copy sampled a 992-pixel-pitch render target at 960 x 4
+    /// while the stride was held beside the struct, and every row slid 32 pixels into slanted
+    /// stripes. It is packed into word 0 now, so the copy carries it.
+    #[test]
+    fn a_copied_strided_texture_keeps_its_stride() {
+        use crate::world::DeterministicWorld;
+        use crate::{SliceMemory, VFP_ARG_COUNT};
+        use vitaslop_transpiler::abi::REG_COUNT;
+        const ORIG: u32 = 0x100;
+        const COPY: u32 = 0x200;
+        let mut st = VitaState::new(0, 0x1000, Box::new(DeterministicWorld::default()));
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 0x1000];
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        // sceGxmTextureInitLinearStrided(tex, data, U8U8U8U8, 960, 544, stride 3968)
+        (ctx.regs[0], ctx.regs[1], ctx.regs[2], ctx.regs[3]) =
+            (ORIG, 0x8000_0000, 0x0c00_0000, 960);
+        ctx.regs[13] = 0x800;
+        ctx.write_u32(0x800, 544);
+        ctx.write_u32(0x804, 3968);
+        crate::vita::dispatch(
+            crate::nid::lib::SCE_GXM,
+            crate::nid::gxm::TEXTURE_INIT_LINEAR_STRIDED,
+            &mut ctx,
+            &mut st,
+        );
+        assert_eq!(
+            st.linear_strided_stride(&ctx, ORIG),
+            3968,
+            "the struct it was given"
+        );
+        let words = ctx.read_bytes(ORIG, 16);
+        ctx.write_bytes(COPY, &words);
+        assert_eq!(
+            st.linear_strided_stride(&ctx, COPY),
+            3968,
+            "a by-value copy"
+        );
+        // A linear texture over the same data takes no stride from the strided one.
+        ctx.write_u32(
+            COPY + 4,
+            (ctx.read_u32(COPY + 4) & !(0x7 << 29)) | (3 << 29),
+        );
+        assert_eq!(st.linear_strided_stride(&ctx, COPY), 0);
+        // Two views of ONE surface - same format, size and data - at different pitches keep
+        // their own: the stride is in each struct, not in a table keyed by what they share.
+        const OTHER: u32 = 0x300;
+        ctx.regs[0] = OTHER;
+        (ctx.regs[1], ctx.regs[2], ctx.regs[3]) = (0x8000_0000, 0x0c00_0000, 960);
+        ctx.write_u32(0x804, 3840);
+        crate::vita::dispatch(
+            crate::nid::lib::SCE_GXM,
+            crate::nid::gxm::TEXTURE_INIT_LINEAR_STRIDED,
+            &mut ctx,
+            &mut st,
+        );
+        let words = ctx.read_bytes(ORIG, 16);
+        ctx.write_bytes(COPY, &words);
+        assert_eq!(
+            st.linear_strided_stride(&ctx, COPY),
+            3968,
+            "the first view's copy"
+        );
+        assert_eq!(
+            st.linear_strided_stride(&ctx, OTHER),
+            3840,
+            "the second view"
+        );
+        // Every stride the words can carry round-trips through them.
+        for s in [4, 3840, 3968, 4096, crate::vita::gxm::MAX_PACKED_STRIDE] {
+            assert_eq!(
+                crate::vita::gxm::linear_stride_from_word0(crate::vita::gxm::pack_linear_stride(s)),
+                s
+            );
+        }
+        // One that cannot be packed is refused, not truncated.
+        ctx.regs[0] = OTHER;
+        (ctx.regs[1], ctx.regs[2], ctx.regs[3]) = (0x8000_0000, 0x0c00_0000, 960);
+        ctx.write_u32(0x804, crate::vita::gxm::MAX_PACKED_STRIDE + 4);
+        crate::vita::dispatch(
+            crate::nid::lib::SCE_GXM,
+            crate::nid::gxm::TEXTURE_INIT_LINEAR_STRIDED,
+            &mut ctx,
+            &mut st,
+        );
+        assert!((ctx.regs[0] as i32) < 0, "an unpackable stride must fail");
     }
 
     /// **A STRIDED TEXTURE MINIFIES WITH ITS MAG FILTER**: its bits 10..11 are stride bits. The
@@ -26296,7 +29465,10 @@ fn report_patched_against_other_vertex(fheader: u32, vheader: u32, patched: u32)
     }
     static SEEN: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((fheader, vheader, patched)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((fheader, vheader, patched))
+    {
         return;
     }
     tracing::info!(
@@ -26334,4 +29506,45 @@ pub fn timed_out_waits() -> (Vec<String>, u64) {
         TIMED_OUT.lock().map(|v| v.clone()).unwrap_or_default(),
         TIMED_OUT_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+#[cfg(test)]
+mod tls_slot_tests {
+    //! The key-slot layout behind `sceKernelGetTLSAddr`: callers index it like an array.
+    use super::*;
+    use crate::world::DeterministicWorld;
+
+    fn state() -> VitaState {
+        VitaState::new(0x1000, 0x10000, Box::new(DeterministicWorld::default()))
+    }
+
+    /// Consecutive keys are consecutive words of ONE per-thread array: a caller that keeps a
+    /// struct in adjacent keys reads its own fields, not whatever was allocated next.
+    #[test]
+    fn consecutive_keys_are_consecutive_words_of_one_array_per_thread() {
+        let mut st = state();
+        let a = st.tls_addr_of(0x40, 0x8c).unwrap();
+        assert_eq!(st.tls_addr_of(0x40, 0x8d), Some(a + 4));
+        assert_eq!(st.tls_addr_of(0x40, 0x8e), Some(a + 8));
+        assert_eq!(
+            st.tls_addr_of(0x40, 0),
+            Some(a - 0x8c * 4),
+            "key 0 is the array base"
+        );
+        assert_eq!(st.tls_addr_of(0x40, 0x8c), Some(a), "stable across calls");
+        let b = st.tls_addr_of(0x41, 0x8c).unwrap();
+        assert_ne!(a, b, "each thread has its own array");
+        assert!(
+            b.abs_diff(a) >= (TLS_KEY_MAX + 1) * 4,
+            "the arrays do not overlap"
+        );
+    }
+
+    /// The last key has a slot; the one past it is refused rather than handed memory nobody owns.
+    #[test]
+    fn a_key_past_the_last_slot_is_refused() {
+        let mut st = state();
+        assert!(st.tls_addr_of(0x40, TLS_KEY_MAX).is_some());
+        assert_eq!(st.tls_addr_of(0x40, TLS_KEY_MAX + 1), None);
+    }
 }

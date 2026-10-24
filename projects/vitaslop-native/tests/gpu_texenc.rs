@@ -335,6 +335,7 @@ fn bc_texture(
         unit: 0,
         base_format,
         swizzle: 0,
+        yuv_profile: 0,
         tex_type,
         width: w,
         height: h,
@@ -347,6 +348,7 @@ fn bc_texture(
         u_addr_mode: 0,
         v_addr_mode: 0,
         lod_bias: 0,
+        lod_min: 0,
         mag_filter: 0,
         min_filter: 0,
         mip_filter: 0,
@@ -922,6 +924,7 @@ fn gpu_yuv_conversion_matches_the_cpu() {
             chroma_stride,
             chroma_offset,
             swap_chroma,
+            profile: 0,
             data: &data,
         };
         let tex = enc
@@ -1065,6 +1068,7 @@ fn gpu_raw_expand_matches_the_cpu_decoder() {
                     base_format,
                     // The channel order lives in bits 12..14 of the format word.
                     swizzle: sel << 12,
+                    yuv_profile: 0,
                     tex_type,
                     width: w,
                     height: h,
@@ -1078,6 +1082,7 @@ fn gpu_raw_expand_matches_the_cpu_decoder() {
                     u_addr_mode: 0,
                     v_addr_mode: 0,
                     lod_bias: 0,
+                    lod_min: 0,
                     min_filter: 0,
                     mag_filter: 0,
                     mip_filter: 0,

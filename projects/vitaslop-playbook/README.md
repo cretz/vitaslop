@@ -12,14 +12,51 @@ Lua scripts that play a title by reacting to it, and the tapes their runs record
   replays byte for byte on the same build.
 - A real-speed (SMP) run adapts to whatever timing and randomness it gets.
 - Holds the engine, the Lua seam, the tape format, the tools, and the playbooks
-  (`playbooks/<TITLE_ID>/*.lua`). Replaces the recipes in
-  [`vitaslop-gamerun-recipes`](../vitaslop-gamerun-recipes/).
-- **Playbooks (and recipes) are the only place a title is named.** The Rust stays
-  game-agnostic: no title names or ids in source, comments or tests.
+  (`playbooks/[best-effort/]<TITLE_ID>/*.lua`, see Tiers and Titles).
+- **This crate is the ONLY place a specific game is named** - its playbooks, this README's
+  Titles table and `TOOLS.md`. Every other crate stays game-agnostic: no title names or ids in
+  source, comments or tests.
+
+## Tiers
+
+- `playbooks/<TITLE_ID>/` - kept working: a build that breaks one is a regression to fix.
+- `playbooks/best-effort/<TITLE_ID>/` - proved a title played through ONCE, on the build named
+  in its `-- last verified: <date> <build>` line (required; the compile test checks it). Nobody
+  keeps these green: a later build may leave one behind, and a stale one is a lead, not a
+  failure. A fix a best-effort run found is proved by a title-independent test instead.
+- Both tiers must COMPILE (`every_playbook_compiles`).
+
+## Titles
+
+The title id each playbook directory is named by, and the game it is. The test
+`titles_table_matches_the_playbook_dirs` fails if a directory has no row or a row names none.
+
+| directory | game |
+|---|---|
+| `PCSA00002` | MLB 12 The Show |
+| `PCSA00009` | Hot Shots Golf World Invitational |
+| `PCSA00015` | WipEout 2048 |
+| `PCSA00027` | MotorStorm RC |
+| `PCSA00029` | Uncharted Golden Abyss |
+| `PCSE00001` | Ridge Racer |
+| `PCSE00004` | Ultimate Marvel vs. Capcom 3 |
+| `PCSE00023` | Mortal Kombat |
+| `PCSE00084` | Madden NFL 13 |
+| `PCSE00093` | FIFA Soccer 13 |
+| `PCSE00120` | Persona 4 Golden |
+| `PCSE00235` | Dead or Alive 5 Plus |
+| `PCSE00341` | OlliOlli |
+| `PCSH00250` | Dead or Alive Xtreme 3 Venus |
+| `best-effort/PCSA00007` | Hustle Kings |
+| `best-effort/PCSA00017` | LittleBigPlanet |
+| `best-effort/PCSE00034` | Mutant Blobs Attack |
+| `best-effort/PCSE00003` | Virtua Tennis 4 |
+| `best-effort/PCSE00050` | Zen Pinball 2 |
+| `best-effort/PCSE00268` | Limbo |
 
 ## Why
 
-- Frame-numbered recipes need frame N to be the same every run: one-baton on the
+- A frame-numbered input script needs frame N to be the same every run: one-baton on the
   guest clock only, never real speed.
 - They break across builds whenever a CPU-side change shifts guest timing.
 - A playbook that waits on the game works in both modes and survives timing shifts.
@@ -43,9 +80,11 @@ vitaslop --game <extracted dir> --headless <out> --tape <out>/playbook.tape
 - Exit code is non-zero on failure (timeout, failed `check`, Lua error).
 
 Browser, through the worker-mode harness (`vitaslop-web/e2e`); writes the same files
-into `SHOT_DIR` and ends when the playbook does:
+into `SHOT_DIR` and ends when the playbook does. It serves the PLAYBOOK BUILD - the shipped
+bundles leave this engine out (`vitaslop-web/playbook-build.mjs`) - so build it first:
 
 ```
+node build.mjs --playbook
 WORKER=1 HEADLESS=1 PLAYBOOK=<path>/<TITLE_ID>/<name>.lua GAME_DIR=<extracted dir> \
   MAX_FRAMES=<cap> TARGET_FRAME=<cap> KNOBS='{"VITASLOP_SMP":"1"}' node e2e/game-boot.mjs
 ```
@@ -64,7 +103,7 @@ WORKER=1 HEADLESS=1 PLAYBOOK=<path>/<TITLE_ID>/<name>.lua GAME_DIR=<extracted di
 ## Finding cues: `--discover`
 
 ```
-vitaslop --game <dir> --headless <out> --discover [--playbook <p.lua> | --recipe <r>]
+vitaslop --game <dir> --headless <out> --discover [--playbook <p.lua>]
 ```
 
 - Appends to the report every host call the game made, ordered by the display frame
@@ -86,6 +125,9 @@ vitaslop --game <dir> --headless <out> --discover [--playbook <p.lua> | --recipe
   later. `grep -l cue.pixels playbooks/` finds one driving a shot gauge.
 
 ## The tools
+
+Authoring a playbook - the resident `session` + `ctl`, `explore`, `memdiff`, `bench`, `sheet` -
+is in [`TOOLS.md`](TOOLS.md). The offline ones:
 
 ```
 cargo run -p vitaslop-playbook --bin playbook -- check            # compile every playbook
@@ -134,6 +176,7 @@ end)
 | `cue.u32(ptr(base, off, ...))` | the value | (pointer chain: read a pointer at `base`, add `off`, repeat) |
 | `cue.pixels{x=, y=, w=, h=, rgb={r,g,b}, tol=24}` | matching pixels in the box | when the count differs from its value at the wait |
 | `cue.locate{x=, y=, w=, h=, rgb={r,g,b}, tol=24}` | first match, `y*1024+x` (`c:xy()` splits it) | when it moves |
+| `cue.color{x=, y=, w=, h=}` | the rectangle's average colour, `0xRRGGBB` (`c:rgb()` splits it) | when it changes |
 | `c:is(v)` `:isnt` `:above` `:below` `:atleast` `:atmost` | 1/0 | while it holds (at once if it already does) |
 | `c:happened()` | 1/0 | once call cue `c` has fired at all since `c` was declared (`:atleast(1)`) |
 | `c:changed()` | 1/0 | on a frame the value changed |
@@ -164,7 +207,7 @@ end)
 |---|---|
 | phases | `phase(name, {timeout = s}, fn)` - nestable; the timeout bounds the phase and every wait in it |
 | waits | `wait(c, {timeout = s, soft = true})` returns the cue's value; `try_wait(c, s)` returns nil on timeout |
-| input | `press(b...)` `release(b...)` (none = all) `hold(b, n)` `tap(b, down=6, up=6)` `idle(n)` `stick("left", x, y)` `touch(x, y)` `untouch()` |
+| input | `press(b...)` `release(b...)` (none = all) `hold(b, n)` `tap(b, down=6, up=6)` `idle(n)` `stick("left", x, y)` `touch(x, y)` `untouch()` (front PANEL coordinates 0..1919 x 0..1087 = screen x2, not screen pixels) `back_touch(x, y)` `back_untouch()` (rear panel, 0..1919 x 0..889) |
 | observe | `shot(name)` `log(...)` (= `print`) `split(name)` `c:trace(label)` `c:value()` `now()` |
 | assert | `check(cond_cue, msg)` `fail(msg)` |
 

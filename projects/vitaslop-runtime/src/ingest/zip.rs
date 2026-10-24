@@ -94,9 +94,10 @@ pub(crate) fn find_eocd(bytes: &[u8]) -> Option<usize> {
     // The comment is at most 0xFFFF bytes, so bound the scan.
     let max_back = (bytes.len()).min(EOCD_MIN + 0xFFFF);
     let start = bytes.len() - max_back;
-    (start..=bytes.len() - EOCD_MIN).rev().find(|&i| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) == EOCD_SIG)
+    (start..=bytes.len() - EOCD_MIN).rev().find(|&i| {
+        u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) == EOCD_SIG
+    })
 }
-
 
 // ---------------------------------------------------------------------------
 // Writing
@@ -154,7 +155,14 @@ pub fn write_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(payload);
 
-        central.push((local_off, name, crc, payload.len() as u32, data.len() as u32, method));
+        central.push((
+            local_off,
+            name,
+            crc,
+            payload.len() as u32,
+            data.len() as u32,
+            method,
+        ));
     }
 
     let cd_start = out.len() as u32;
@@ -213,8 +221,8 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::vfs::Vfs;
+    use super::*;
     use crate::ingest::testfix;
 
     #[test]
@@ -223,7 +231,9 @@ mod tests {
         // arm; the DEFLATE arm of the reader is what an ordinary archiver produces when a
         // user re-zips an export by hand, and it is exercised below.
         let squishy = vec![b'a'; 10_000];
-        let random: Vec<u8> = (0..2000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let random: Vec<u8> = (0..2000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
         let entries = vec![
             ("empty".to_string(), Vec::new()),
             ("squishy".to_string(), squishy.clone()),
@@ -287,7 +297,10 @@ mod tests {
         z.extend_from_slice(&cd_len.to_le_bytes());
         z.extend_from_slice(&cd_start.to_le_bytes());
         z.extend_from_slice(&0u16.to_le_bytes());
-        assert!(comp.len() < data.len(), "the fixture must really be deflated");
+        assert!(
+            comp.len() < data.len(),
+            "the fixture must really be deflated"
+        );
         let vfs = read_zip(&z).expect("read a hand-deflated archive");
         assert_eq!(vfs.read("hand-rezipped.bin").unwrap(), data);
     }

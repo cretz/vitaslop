@@ -1,0 +1,10 @@
+category = "vita"
+description = "AppUtil save slots written by sceAppUtilSaveDataDataSave - RUNNABLE"
+
+# Source: ../savedata-src/savedata.c (clean-room, -nostdlib). A data save carries a
+# slot {id, slotParam*} beside its file list: with a param it creates or updates that
+# slot in the same call, with a NULL param it writes only the files. A title that saves
+# this way checks the slot on its next boot before reading its files, and a file with
+# no slot reads as a broken save. Executable form: tests/vita_savedata.rs.
+[out]
+output = "i0 n s0 n s0 p42 s0 p43 r3"

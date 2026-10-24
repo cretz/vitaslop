@@ -311,7 +311,7 @@ pub fn lane_fill(
     // walk correctly finds `w` reaching a multiply-ADD (it multiplies the transform's fourth
     // matrix column) and answered ZERO, which is the projection's translation term deleted. The
     // whole front end went BLACK, every frame from f000800 on, against a control run of the same
-    // recipe. The rule the walk implements is about lanes that carry DATA; `w` carries the
+    // input. The rule the walk implements is about lanes that carry DATA; `w` carries the
     // homogeneous coordinate, and its identity is 1 for exactly the reason a position is not
     // data.
     //

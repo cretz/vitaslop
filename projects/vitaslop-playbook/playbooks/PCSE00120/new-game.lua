@@ -3,7 +3,7 @@
 -- arrival in Inaba (Dojima at the station, the car, the gas station) and FIRST PLAYER CONTROL:
 -- walking the protagonist down the street in FIELD MODE.
 --
--- Converted from the recipes `title-screen` (boot to the title) and `new-game` (everything),
+-- Converted from the old frame-keyed scripts `title-screen` (boot to the title) and `new-game` (everything),
 -- which pressed CROSS at fixed frames all the way - ~170 presses spaced 44 to 156 frames apart.
 --
 -- HOW THE CUES WERE FOUND: `--discover` on `new-game`'s run (deterministic, 24000 frames) next
@@ -102,7 +102,7 @@ phase("arrival", { timeout = 300 }, function()
   repeat tap("cross", 4, 18) until try_wait(field, 0.01)
   split("field")
   -- FIELD MODE opens under a HELP panel ("Examine the blue butterfly to save your progress");
-  -- CROSS clears it (the recipe's CROSSes ran on past the field and did).
+  -- CROSS clears it (the old script's CROSSes ran on past the field and did).
   idle(60)
   shot("field-help")
   for _ = 1, 3 do tap("cross", 4, 26) end

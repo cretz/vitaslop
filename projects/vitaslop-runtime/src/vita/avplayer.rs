@@ -196,19 +196,26 @@ impl Player {
     }
 
     fn duration_ms(&self) -> u64 {
-        self.source.as_ref().map_or(0, |s| s.mp4.duration_us() / 1000)
+        self.source
+            .as_ref()
+            .map_or(0, |s| s.mp4.duration_us() / 1000)
     }
 
     /// The end of a non-looping movie: every sample submitted and every picture and audio
     /// frame handed out.
     fn finished(&self) -> bool {
-        let Some(src) = &self.source else { return false };
+        let Some(src) = &self.source else {
+            return false;
+        };
         let video_done = src.video.as_ref().is_none_or(|v| {
-            v.next >= src.mp4.tracks[v.track].samples.len() && v.ready.is_empty() && !v.decoder.owes_frames()
+            v.next >= src.mp4.tracks[v.track].samples.len()
+                && v.ready.is_empty()
+                && !v.decoder.owes_frames()
         });
-        let audio_done = src.audio.as_ref().is_none_or(|a| {
-            a.next >= src.mp4.tracks[a.track].samples.len() && a.pcm.is_empty()
-        });
+        let audio_done = src
+            .audio
+            .as_ref()
+            .is_none_or(|a| a.next >= src.mp4.tracks[a.track].samples.len() && a.pcm.is_empty());
         video_done && audio_done
     }
 }
@@ -219,7 +226,10 @@ fn deliver(st: &mut VitaState, cb: &Callbacks, id: u32) -> Option<()> {
     if cb.event == 0 {
         return Some(());
     }
-    let call = GuestCall { entry: cb.event, args: vec![cb.event_object, id, 0, 0] };
+    let call = GuestCall {
+        entry: cb.event,
+        args: vec![cb.event_object, id, 0, 0],
+    };
     st.call_guest(call, None).map(|_| ())
 }
 
@@ -259,7 +269,11 @@ pub(super) fn init(ctx: &mut GuestCtx, st: &mut VitaState, data: Ptr) -> i32 {
         st.avplayers.list.push(Player {
             handle,
             cb,
-            video_buffers: if buffers > 0 { buffers as u32 } else { DEFAULT_VIDEO_BUFFERS },
+            video_buffers: if buffers > 0 {
+                buffers as u32
+            } else {
+                DEFAULT_VIDEO_BUFFERS
+            },
             auto_start,
             state: State::Idle,
             source: None,
@@ -285,7 +299,10 @@ pub(super) fn init(ctx: &mut GuestCtx, st: &mut VitaState, data: Ptr) -> i32 {
 /// Open and parse a movie on the engine's own file system.
 fn open_source(st: &mut VitaState, path: &str) -> Result<Source, String> {
     const SCE_O_RDONLY: u32 = 0x0001;
-    let size = st.io_size(path).filter(|&s| s > 0).ok_or_else(|| format!("{path} does not exist or is empty"))?;
+    let size = st
+        .io_size(path)
+        .filter(|&s| s > 0)
+        .ok_or_else(|| format!("{path} does not exist or is empty"))?;
     let fd = st.io_open(path, SCE_O_RDONLY);
     if fd < 0 {
         return Err(format!("{path} cannot be opened ({fd:#x})"));
@@ -317,17 +334,37 @@ fn open_source(st: &mut VitaState, path: &str) -> Result<Source, String> {
         .iter()
         .enumerate()
         .filter_map(|(i, t)| match t.kind {
-            crate::mp4::TrackKind::Video => Some(Stream { track: i, kind: stream_type::VIDEO, enabled: false }),
-            crate::mp4::TrackKind::Audio => Some(Stream { track: i, kind: stream_type::AUDIO, enabled: false }),
+            crate::mp4::TrackKind::Video => Some(Stream {
+                track: i,
+                kind: stream_type::VIDEO,
+                enabled: false,
+            }),
+            crate::mp4::TrackKind::Audio => Some(Stream {
+                track: i,
+                kind: stream_type::AUDIO,
+                enabled: false,
+            }),
             _ => None,
         })
         .collect();
-    Ok(Source { path: path.to_string(), fd, mp4, streams, video: None, audio: None })
+    Ok(Source {
+        path: path.to_string(),
+        fd,
+        mp4,
+        streams,
+        video: None,
+        audio: None,
+    })
 }
 
 /// int sceAvPlayerAddSource(SceAvPlayerHandle handle, const char *filename)
 #[hostcall]
-pub(super) fn add_source(ctx: &mut GuestCtx, st: &mut VitaState, handle: i32, filename: Ptr) -> i32 {
+pub(super) fn add_source(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    handle: i32,
+    filename: Ptr,
+) -> i32 {
     if filename.is_null() {
         ERROR_INVALID_PARAM
     } else {
@@ -337,7 +374,9 @@ pub(super) fn add_source(ctx: &mut GuestCtx, st: &mut VitaState, handle: i32, fi
 }
 
 fn do_add_source(st: &mut VitaState, handle: i32, path: &str) -> i32 {
-    let Some(p) = st.avplayers.get(handle) else { return ERROR_INVALID_PARAM };
+    let Some(p) = st.avplayers.get(handle) else {
+        return ERROR_INVALID_PARAM;
+    };
     // Idempotent across the replays the READY delivery causes: the source is opened once.
     if p.source.is_none() {
         if p.cb.file_open != 0 {
@@ -365,10 +404,20 @@ fn do_add_source(st: &mut VitaState, handle: i32, path: &str) -> i32 {
             .mp4
             .tracks
             .iter()
-            .map(|t| format!("{} {}x{} {}ms", String::from_utf8_lossy(&t.codec), t.width, t.height, t.duration_us() / 1000))
+            .map(|t| {
+                format!(
+                    "{} {}x{} {}ms",
+                    String::from_utf8_lossy(&t.codec),
+                    t.width,
+                    t.height,
+                    t.duration_us() / 1000
+                )
+            })
             .collect();
         tracing::info!(target: "vitaslop::status", handle, %path, ?tracks, "SceAvPlayer: source added");
-        let Some(p) = st.avplayers.get(handle) else { return ERROR_INVALID_PARAM };
+        let Some(p) = st.avplayers.get(handle) else {
+            return ERROR_INVALID_PARAM;
+        };
         p.source = Some(source);
         p.state = State::Ready;
         p.ready_sent = false;
@@ -408,7 +457,9 @@ fn do_add_source(st: &mut VitaState, handle: i32, path: &str) -> i32 {
 /// is consumed, and a title may wait for that event rather than poll `IsActive`. Returns
 /// whether the player has ended (and so the call should answer "no data").
 fn end_if_finished(st: &mut VitaState, handle: i32) -> bool {
-    let Some(p) = st.avplayers.get(handle) else { return true };
+    let Some(p) = st.avplayers.get(handle) else {
+        return true;
+    };
     if p.state != State::Playing || p.looping {
         return false;
     }
@@ -443,12 +494,22 @@ pub(super) fn stream_count(st: &mut VitaState, handle: i32) -> i32 {
 
 /// int sceAvPlayerGetStreamInfo(SceAvPlayerHandle handle, uint32_t id, SceAvPlayerStreamInfo *info)
 #[hostcall]
-pub(super) fn get_stream_info(ctx: &mut GuestCtx, st: &mut VitaState, handle: i32, id: u32, info: Ptr) -> i32 {
+pub(super) fn get_stream_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    handle: i32,
+    id: u32,
+    info: Ptr,
+) -> i32 {
     let found = st
         .avplayers
         .get(handle)
         .and_then(|p| p.source.as_ref())
-        .and_then(|s| s.streams.get(id as usize).map(|stream| (stream.kind, &s.mp4.tracks[stream.track])));
+        .and_then(|s| {
+            s.streams
+                .get(id as usize)
+                .map(|stream| (stream.kind, &s.mp4.tracks[stream.track]))
+        });
     match found {
         Some((kind, track)) if !info.is_null() => {
             let mut b = [0u8; 0x28];
@@ -456,7 +517,11 @@ pub(super) fn get_stream_info(ctx: &mut GuestCtx, st: &mut VitaState, handle: i3
             if kind == stream_type::VIDEO {
                 b[0x08..0x0c].copy_from_slice(&track.width.to_le_bytes());
                 b[0x0c..0x10].copy_from_slice(&track.height.to_le_bytes());
-                let aspect = if track.height == 0 { 0.0 } else { track.width as f32 / track.height as f32 };
+                let aspect = if track.height == 0 {
+                    0.0
+                } else {
+                    track.width as f32 / track.height as f32
+                };
                 b[0x10..0x14].copy_from_slice(&aspect.to_bits().to_le_bytes());
             } else {
                 let (channels, rate) = audio_shape(track);
@@ -475,7 +540,9 @@ pub(super) fn get_stream_info(ctx: &mut GuestCtx, st: &mut VitaState, handle: i3
 /// fields, the track timescale as the fallback for the rate.
 fn audio_shape(track: &crate::mp4::Track) -> (u32, u32) {
     let asc = track.audio_specific_config();
-    const RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+    const RATES: [u32; 13] = [
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+    ];
     if asc.len() >= 2 {
         let freq_index = (((asc[0] & 0x07) << 1) | (asc[1] >> 7)) as usize;
         let channels = ((asc[1] >> 3) & 0x0f) as u32;
@@ -498,7 +565,12 @@ pub(super) fn disable_stream(st: &mut VitaState, handle: i32, id: u32) -> i32 {
 }
 
 fn set_stream(st: &mut VitaState, handle: i32, id: u32, on: bool) -> i32 {
-    match st.avplayers.get(handle).and_then(|p| p.source.as_mut()).and_then(|s| s.streams.get_mut(id as usize)) {
+    match st
+        .avplayers
+        .get(handle)
+        .and_then(|p| p.source.as_mut())
+        .and_then(|s| s.streams.get_mut(id as usize))
+    {
         Some(s) => {
             s.enabled = on;
             0
@@ -514,24 +586,45 @@ pub(super) fn start(st: &mut VitaState, handle: i32) -> i32 {
 }
 
 fn do_start(st: &mut VitaState, handle: i32) -> i32 {
-    let Some(p) = st.avplayers.get(handle) else { return ERROR_INVALID_PARAM };
+    let Some(p) = st.avplayers.get(handle) else {
+        return ERROR_INVALID_PARAM;
+    };
     if p.source.is_none() {
         return ERROR_OPERATION_FAILED;
     }
     let cb = p.cb;
     let src = p.source.as_ref().expect("checked");
-    let video_track = src.streams.iter().find(|s| s.enabled && s.kind == stream_type::VIDEO).map(|s| s.track);
-    let audio_track = src.streams.iter().find(|s| s.enabled && s.kind == stream_type::AUDIO).map(|s| s.track);
-    let (width, height) = video_track.map_or((0, 0), |t| (src.mp4.tracks[t].width, src.mp4.tracks[t].height));
+    let video_track = src
+        .streams
+        .iter()
+        .find(|s| s.enabled && s.kind == stream_type::VIDEO)
+        .map(|s| s.track);
+    let audio_track = src
+        .streams
+        .iter()
+        .find(|s| s.enabled && s.kind == stream_type::AUDIO)
+        .map(|s| s.track);
+    let (width, height) = video_track.map_or((0, 0), |t| {
+        (src.mp4.tracks[t].width, src.mp4.tracks[t].height)
+    });
     let frame_bytes = width * height * 3 / 2;
     let audio_channels = audio_track.map_or(0, |t| audio_shape(&src.mp4.tracks[t]).0);
-    let want_frames = if video_track.is_some() && p.frame_bufs.is_empty() { p.video_buffers } else { 0 };
+    let want_frames = if video_track.is_some() && p.frame_bufs.is_empty() {
+        p.video_buffers
+    } else {
+        0
+    };
     let want_pcm = audio_track.is_some() && p.pcm_bufs.is_empty();
     // The title's allocators, all before anything changes (see the module docs).
     let mut frames = Vec::new();
     for _ in 0..want_frames {
-        let call = GuestCall { entry: cb.allocate_texture, args: vec![cb.mem_object, 256, frame_bytes] };
-        let Some(r) = st.call_guest(call, None) else { return 0 };
+        let call = GuestCall {
+            entry: cb.allocate_texture,
+            args: vec![cb.mem_object, 256, frame_bytes],
+        };
+        let Some(r) = st.call_guest(call, None) else {
+            return 0;
+        };
         frames.push(r.r0);
     }
     let mut pcm = Vec::new();
@@ -541,7 +634,9 @@ fn do_start(st: &mut VitaState, handle: i32) -> i32 {
                 entry: cb.allocate,
                 args: vec![cb.mem_object, 64, (AUDIO_FRAME as u32) * audio_channels * 2],
             };
-            let Some(r) = st.call_guest(call, None) else { return 0 };
+            let Some(r) = st.call_guest(call, None) else {
+                return 0;
+            };
             pcm.push(r.r0);
         }
     }
@@ -551,14 +646,22 @@ fn do_start(st: &mut VitaState, handle: i32) -> i32 {
     }
     // Open the decoders once.
     let needs_open = st.avplayers.get(handle).is_some_and(|p| {
-        p.source.as_ref().is_some_and(|s| (video_track.is_some() && s.video.is_none()) || (audio_track.is_some() && s.audio.is_none()))
+        p.source.as_ref().is_some_and(|s| {
+            (video_track.is_some() && s.video.is_none())
+                || (audio_track.is_some() && s.audio.is_none())
+        })
     });
     if needs_open {
         let (video, audio) = {
             let p = st.avplayers.get(handle).expect("checked");
             let src = p.source.as_ref().expect("checked");
             let avcc = video_track.map(|t| src.mp4.tracks[t].codec_config.clone());
-            let asc = audio_track.map(|t| (src.mp4.tracks[t].audio_specific_config(), audio_shape(&src.mp4.tracks[t])));
+            let asc = audio_track.map(|t| {
+                (
+                    src.mp4.tracks[t].audio_specific_config(),
+                    audio_shape(&src.mp4.tracks[t]),
+                )
+            });
             (avcc, asc)
         };
         let video_dec = match video {
@@ -579,7 +682,11 @@ fn do_start(st: &mut VitaState, handle: i32) -> i32 {
         };
         let audio_dec = match audio {
             Some((asc, (channels, rate))) => {
-                let stream = vitaslop_platform::audio_dec::AudioStream { asc, channels, sample_rate: rate };
+                let stream = vitaslop_platform::audio_dec::AudioStream {
+                    asc,
+                    channels,
+                    sample_rate: rate,
+                };
                 match st.audio_dec.open_aac(&stream) {
                     Ok(d) => Some((d, channels, rate)),
                     Err(e) => {
@@ -593,10 +700,25 @@ fn do_start(st: &mut VitaState, handle: i32) -> i32 {
         let p = st.avplayers.get(handle).expect("checked");
         let src = p.source.as_mut().expect("checked");
         if let (Some(t), Some(decoder)) = (video_track, video_dec) {
-            src.video = Some(VideoPath { track: t, decoder, next: 0, ready: VecDeque::new(), width, height });
+            src.video = Some(VideoPath {
+                track: t,
+                decoder,
+                next: 0,
+                ready: VecDeque::new(),
+                width,
+                height,
+            });
         }
         if let (Some(t), Some((decoder, channels, rate))) = (audio_track, audio_dec) {
-            src.audio = Some(AudioPath { track: t, decoder, next: 0, channels, rate, pcm: VecDeque::new(), frames_out: 0 });
+            src.audio = Some(AudioPath {
+                track: t,
+                decoder,
+                next: 0,
+                channels,
+                rate,
+                pcm: VecDeque::new(),
+                frames_out: 0,
+            });
         }
     }
     // PLAY is the last call into the title, so everything below happens exactly once.
@@ -633,7 +755,9 @@ pub(super) fn pause(st: &mut VitaState, handle: i32) -> i32 {
 
 fn do_pause(st: &mut VitaState, handle: i32) -> i32 {
     let now = st.guest_mono_us();
-    let Some(p) = st.avplayers.get(handle) else { return ERROR_INVALID_PARAM };
+    let Some(p) = st.avplayers.get(handle) else {
+        return ERROR_INVALID_PARAM;
+    };
     let cb = p.cb;
     if p.state != State::Playing {
         return ERROR_OPERATION_FAILED;
@@ -655,7 +779,9 @@ pub(super) fn resume(st: &mut VitaState, handle: i32) -> i32 {
 
 fn do_resume(st: &mut VitaState, handle: i32) -> i32 {
     let now = st.guest_mono_us();
-    let Some(p) = st.avplayers.get(handle) else { return ERROR_INVALID_PARAM };
+    let Some(p) = st.avplayers.get(handle) else {
+        return ERROR_INVALID_PARAM;
+    };
     let cb = p.cb;
     if p.state != State::Paused {
         return ERROR_OPERATION_FAILED;
@@ -678,7 +804,9 @@ pub(super) fn stop(st: &mut VitaState, handle: i32) -> i32 {
 }
 
 fn do_stop(st: &mut VitaState, handle: i32) -> i32 {
-    let Some(p) = st.avplayers.get(handle) else { return ERROR_INVALID_PARAM };
+    let Some(p) = st.avplayers.get(handle) else {
+        return ERROR_INVALID_PARAM;
+    };
     if p.source.is_none() {
         return ERROR_OPERATION_FAILED;
     }
@@ -692,7 +820,9 @@ fn do_stop(st: &mut VitaState, handle: i32) -> i32 {
 
 /// Deliver STOP once per playback. Returns whether it has been delivered.
 fn deliver_stop(st: &mut VitaState, handle: i32) -> bool {
-    let Some(p) = st.avplayers.get(handle) else { return true };
+    let Some(p) = st.avplayers.get(handle) else {
+        return true;
+    };
     if p.stop_sent {
         return true;
     }
@@ -714,18 +844,26 @@ pub(super) fn close(st: &mut VitaState, handle: i32) -> i32 {
 }
 
 fn do_close(st: &mut VitaState, handle: i32) -> i32 {
-    let Some(p) = st.avplayers.get(handle) else { return ERROR_INVALID_PARAM };
+    let Some(p) = st.avplayers.get(handle) else {
+        return ERROR_INVALID_PARAM;
+    };
     let cb = p.cb;
     let frames = p.frame_bufs.clone();
     let pcm = p.pcm_bufs.clone();
     for f in frames {
-        let call = GuestCall { entry: cb.deallocate_texture, args: vec![cb.mem_object, f] };
+        let call = GuestCall {
+            entry: cb.deallocate_texture,
+            args: vec![cb.mem_object, f],
+        };
         if st.call_guest(call, None).is_none() {
             return 0;
         }
     }
     for b in pcm {
-        let call = GuestCall { entry: cb.deallocate, args: vec![cb.mem_object, b] };
+        let call = GuestCall {
+            entry: cb.deallocate,
+            args: vec![cb.mem_object, b],
+        };
         if st.call_guest(call, None).is_none() {
             return 0;
         }
@@ -746,7 +884,9 @@ pub(super) fn is_active(st: &mut VitaState, handle: i32) -> i32 {
 }
 
 fn do_is_active(st: &mut VitaState, handle: i32) -> i32 {
-    let Some(p) = st.avplayers.get(handle) else { return 0 };
+    let Some(p) = st.avplayers.get(handle) else {
+        return 0;
+    };
     match p.state {
         State::Idle | State::Stopped => 0,
         State::Ready | State::Paused => 1,
@@ -831,7 +971,9 @@ fn read_sample(st: &mut VitaState, fd: i32, sample: &crate::mp4::Sample) -> Vec<
 /// Keep the video decoder fed [`VIDEO_AHEAD`] pictures ahead and collect what it produced.
 fn pump_video(st: &mut VitaState, handle: i32) {
     loop {
-        let Some(p) = st.avplayers.get(handle) else { return };
+        let Some(p) = st.avplayers.get(handle) else {
+            return;
+        };
         let looping = p.looping;
         let Some(src) = &mut p.source else { return };
         let fd = src.fd;
@@ -873,7 +1015,11 @@ fn pump_video(st: &mut VitaState, handle: i32) {
         v.next += 1;
         let bytes = read_sample(st, fd, &sample);
         let p = st.avplayers.get(handle).expect("present");
-        let v = p.source.as_mut().and_then(|s| s.video.as_mut()).expect("present");
+        let v = p
+            .source
+            .as_mut()
+            .and_then(|s| s.video.as_mut())
+            .expect("present");
         let pts_us = (sample.pts * 1_000_000 / ts) as i64;
         if let Err(e) = v.decoder.submit(&bytes, pts_us) {
             tracing::warn!(target: "vitaslop::movie", handle, error = ?e, "SceAvPlayer: a video access unit did not decode");
@@ -886,7 +1032,11 @@ fn pump_video(st: &mut VitaState, handle: i32) {
 
 /// Write a decoded picture as two-plane 4:2:0 at pitch `width`, chroma pairs Cr first (see
 /// the module docs).
-fn to_two_plane(pic: &vitaslop_platform::video::DecodedPicture, width: u32, height: u32) -> Vec<u8> {
+fn to_two_plane(
+    pic: &vitaslop_platform::video::DecodedPicture,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
     use vitaslop_platform::video::PictureFormat;
     let (w, h) = (width as usize, height as usize);
     let (pw, ph) = (pic.width as usize, pic.height as usize);
@@ -897,7 +1047,8 @@ fn to_two_plane(pic: &vitaslop_platform::video::DecodedPicture, width: u32, heig
     match pic.format {
         PictureFormat::Nv12 => {
             for y in 0..ph.min(h) {
-                out[y * w..y * w + pw.min(w)].copy_from_slice(&pic.data[y * pw..y * pw + pw.min(w)]);
+                out[y * w..y * w + pw.min(w)]
+                    .copy_from_slice(&pic.data[y * pw..y * pw + pw.min(w)]);
             }
             // The decoder's pairs are Cb first; swap each into Cr first.
             let src_c = pw * ph;
@@ -911,7 +1062,8 @@ fn to_two_plane(pic: &vitaslop_platform::video::DecodedPicture, width: u32, heig
         }
         PictureFormat::I420 => {
             for y in 0..ph.min(h) {
-                out[y * w..y * w + pw.min(w)].copy_from_slice(&pic.data[y * pw..y * pw + pw.min(w)]);
+                out[y * w..y * w + pw.min(w)]
+                    .copy_from_slice(&pic.data[y * pw..y * pw + pw.min(w)]);
             }
             let (cb, cr) = (pic.chroma_offset(), pic.cr_offset());
             for y in 0..ch.min(h / 2) {
@@ -926,12 +1078,18 @@ fn to_two_plane(pic: &vitaslop_platform::video::DecodedPicture, width: u32, heig
             // so a picture the browser's decoder handed over as RGBA round-trips to itself.
             let px = |x: usize, y: usize| {
                 let i = (y * pw + x) * 4;
-                (pic.data[i] as f32, pic.data[i + 1] as f32, pic.data[i + 2] as f32)
+                (
+                    pic.data[i] as f32,
+                    pic.data[i + 1] as f32,
+                    pic.data[i + 2] as f32,
+                )
             };
             for y in 0..ph.min(h) {
                 for x in 0..pw.min(w) {
                     let (r, g, b) = px(x, y);
-                    out[y * w + x] = (16.0 + 0.2568 * r + 0.5041 * g + 0.0979 * b).round().clamp(0.0, 255.0) as u8;
+                    out[y * w + x] = (16.0 + 0.2568 * r + 0.5041 * g + 0.0979 * b)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
                 }
             }
             for y in 0..ch.min(h / 2) {
@@ -958,7 +1116,12 @@ const PICTURE_REPORT_EVERY: u64 = 64;
 /// memory - and only the decoder's `describe` names which kind of decoder this device chose.
 fn report_picture_costs(handle: i32, p: &mut Player) {
     let n = PICTURE_REPORT_EVERY as f64;
-    let decoder = p.source.as_ref().and_then(|s| s.video.as_ref()).map(|v| v.decoder.describe()).unwrap_or_default();
+    let decoder = p
+        .source
+        .as_ref()
+        .and_then(|s| s.video.as_ref())
+        .map(|v| v.decoder.describe())
+        .unwrap_or_default();
     tracing::info!(
         target: "vitaslop::status",
         handle,
@@ -974,7 +1137,12 @@ fn report_picture_costs(handle: i32, p: &mut Player) {
 
 /// SceBool sceAvPlayerGetVideoData(SceAvPlayerHandle handle, SceAvPlayerFrameInfo *info)
 #[hostcall]
-pub(super) fn get_video_data(ctx: &mut GuestCtx, st: &mut VitaState, handle: i32, info: Ptr) -> i32 {
+pub(super) fn get_video_data(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    handle: i32,
+    info: Ptr,
+) -> i32 {
     if info.is_null() {
         0
     } else {
@@ -999,10 +1167,16 @@ fn do_get_video_data(ctx: &mut GuestCtx, st: &mut VitaState, handle: i32, info: 
     let now = st.guest_mono_us();
     let p = st.avplayers.get(handle).expect("checked");
     let clock = p.clock_ms(now);
-    let Some(v) = p.source.as_mut().and_then(|s| s.video.as_mut()) else { return false };
+    let Some(v) = p.source.as_mut().and_then(|s| s.video.as_mut()) else {
+        return false;
+    };
     // The newest picture already due; older due ones are dropped.
     let mut pick = None;
-    while v.ready.front().is_some_and(|pic| (pic.pts.max(0) as u64) / 1000 <= clock) {
+    while v
+        .ready
+        .front()
+        .is_some_and(|pic| (pic.pts.max(0) as u64) / 1000 <= clock)
+    {
         if pick.is_some() {
             p.dropped += 1;
         }
@@ -1022,7 +1196,11 @@ fn do_get_video_data(ctx: &mut GuestCtx, st: &mut VitaState, handle: i32, info: 
     b[0x08..0x10].copy_from_slice(&((pic.pts.max(0) as u64) / 1000).to_le_bytes());
     b[0x10..0x14].copy_from_slice(&width.to_le_bytes());
     b[0x14..0x18].copy_from_slice(&height.to_le_bytes());
-    let aspect = if height == 0 { 0.0 } else { width as f32 / height as f32 };
+    let aspect = if height == 0 {
+        0.0
+    } else {
+        width as f32 / height as f32
+    };
     b[0x18..0x1c].copy_from_slice(&aspect.to_bits().to_le_bytes());
     ctx.write_bytes(info, &b);
     if let (Some(a), Some(b)) = (t_deliver, crate::perf::now_ms()) {
@@ -1040,7 +1218,9 @@ fn do_get_video_data(ctx: &mut GuestCtx, st: &mut VitaState, handle: i32, info: 
 /// Keep the audio decoder fed and its PCM queued.
 fn pump_audio(st: &mut VitaState, handle: i32) {
     loop {
-        let Some(p) = st.avplayers.get(handle) else { return };
+        let Some(p) = st.avplayers.get(handle) else {
+            return;
+        };
         let Some(src) = &mut p.source else { return };
         let fd = src.fd;
         let Some(a) = &mut src.audio else { return };
@@ -1056,7 +1236,11 @@ fn pump_audio(st: &mut VitaState, handle: i32) {
         a.next += 1;
         let bytes = read_sample(st, fd, &sample);
         let p = st.avplayers.get(handle).expect("present");
-        let a = p.source.as_mut().and_then(|s| s.audio.as_mut()).expect("present");
+        let a = p
+            .source
+            .as_mut()
+            .and_then(|s| s.audio.as_mut())
+            .expect("present");
         if let Err(e) = a.decoder.submit(&bytes, sample.pts as i64) {
             tracing::warn!(target: "vitaslop::movie", handle, error = ?e, "SceAvPlayer: an audio access unit did not decode");
         }
@@ -1065,7 +1249,12 @@ fn pump_audio(st: &mut VitaState, handle: i32) {
 
 /// SceBool sceAvPlayerGetAudioData(SceAvPlayerHandle handle, SceAvPlayerFrameInfo *info)
 #[hostcall]
-pub(super) fn get_audio_data(ctx: &mut GuestCtx, st: &mut VitaState, handle: i32, info: Ptr) -> i32 {
+pub(super) fn get_audio_data(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    handle: i32,
+    info: Ptr,
+) -> i32 {
     if info.is_null() {
         0
     } else {
@@ -1084,8 +1273,12 @@ fn do_get_audio_data(ctx: &mut GuestCtx, st: &mut VitaState, handle: i32, info: 
     }
     let p = st.avplayers.get(handle).expect("checked");
     let buf = p.pcm_bufs[p.pcm_next % p.pcm_bufs.len()];
-    let Some(src) = &mut p.source else { return false };
-    let Some(a) = &mut src.audio else { return false };
+    let Some(src) = &mut p.source else {
+        return false;
+    };
+    let Some(a) = &mut src.audio else {
+        return false;
+    };
     let ch = a.channels.max(1) as usize;
     let whole = AUDIO_FRAME * ch;
     let ended = a.next >= src.mp4.tracks[a.track].samples.len();

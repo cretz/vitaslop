@@ -14,9 +14,9 @@
 //! The COND keeps its waiter list host-side (a list of parked thread ids is not something
 //! guest memory holds usefully), identified by the id stamped in its own work area.
 
-use crate::host::{GuestCtx, VitaState, SCE_KERNEL_ERROR_WAIT_TIMEOUT};
-use crate::vita::lwwork;
 use crate::SvcOutcome;
+use crate::host::{GuestCtx, SCE_KERNEL_ERROR_WAIT_TIMEOUT, VitaState};
+use crate::vita::lwwork;
 
 /// `SCE_KERNEL_ERROR_LW_MUTEX_FAILED_TO_OWN`: `sceKernelTryLockLwMutex` on a
 /// lightweight mutex another thread holds returns this rather than blocking.
@@ -113,7 +113,9 @@ pub(super) fn signal_lw_cond(ctx: &mut GuestCtx, st: &mut VitaState, all: bool) 
 /// producer/consumer wait from a timed delay loop. Capped, then free.
 pub(super) fn sample_wait(st: &mut VitaState, work: u32, timeout_ptr: u32, timeout: u32) {
     if st.capture.lwcond_wait_samples.len() < 8 {
-        st.capture.lwcond_wait_samples.push((work, timeout_ptr, timeout));
+        st.capture
+            .lwcond_wait_samples
+            .push((work, timeout_ptr, timeout));
     }
 }
 
@@ -135,7 +137,11 @@ pub(super) fn sample_wait(st: &mut VitaState, work: u32, timeout_ptr: u32, timeo
 pub(super) fn create_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) {
     let work = ctx.arg(0);
     let (name_ptr, attr, init) = (ctx.arg(1), ctx.arg(2), ctx.arg(3) as i32);
-    let name = if name_ptr != 0 { ctx.read_cstr(name_ptr, 31) } else { String::new() };
+    let name = if name_ptr != 0 {
+        ctx.read_cstr(name_ptr, 31)
+    } else {
+        String::new()
+    };
     ctx.write_bytes(work, &[0u8; lwwork::WORK_SIZE as usize]);
     st.lwmutex_register(ctx, work);
     st.lwmutex_set_meta(work, name, attr, init);
@@ -165,7 +171,11 @@ pub(super) fn get_lw_mutex_info(ctx: &mut GuestCtx, st: &mut VitaState) {
         return;
     }
     let count = lwwork::count(ctx, canonical);
-    let owner = if count != 0 { lwwork::owner(ctx, canonical) } else { 0 };
+    let owner = if count != 0 {
+        lwwork::owner(ctx, canonical)
+    } else {
+        0
+    };
     let mut name_buf = [0u8; 32];
     let n = name.len().min(31);
     name_buf[..n].copy_from_slice(&name.as_bytes()[..n]);
@@ -278,12 +288,14 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // callbacks; we model no callback delivery for either, so inlining one and not the
         // other would make two spellings of one call behave differently - which is a worse
         // answer than the one they already share.
-        lw::LOCK_LW_MUTEX | lw::LOCK_LW_MUTEX_CB | lw::LOCK_LW_MUTEX_0 => {
-            LwMutexLock { layout, thread_slot: SLOT_CURRENT_THREAD }
-        }
-        lw::UNLOCK_LW_MUTEX | lw::UNLOCK_LW_MUTEX2 | lw::UNLOCK_LW_MUTEX_0 => {
-            LwMutexUnlock { layout, thread_slot: SLOT_CURRENT_THREAD }
-        }
+        lw::LOCK_LW_MUTEX | lw::LOCK_LW_MUTEX_CB | lw::LOCK_LW_MUTEX_0 => LwMutexLock {
+            layout,
+            thread_slot: SLOT_CURRENT_THREAD,
+        },
+        lw::UNLOCK_LW_MUTEX | lw::UNLOCK_LW_MUTEX2 | lw::UNLOCK_LW_MUTEX_0 => LwMutexUnlock {
+            layout,
+            thread_slot: SLOT_CURRENT_THREAD,
+        },
         _ => return None,
     })
 }
@@ -298,11 +310,26 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
 /// simply stops happening, silently.
 #[cfg(test)]
 const NOT_INLINABLE: &[(u32, &str)] = &[
-    (crate::nid::lwsync::TRY_LOCK_LW_MUTEX, "returns an error code the work area cannot spell"),
-    (crate::nid::lwsync::CREATE_LW_MUTEX, "stamps an identity and registers a record"),
-    (crate::nid::lwsync::DELETE_LW_MUTEX, "drops the parked queue"),
-    (crate::nid::lwsync::WAIT_LW_COND, "parks the caller - that IS the behaviour"),
-    (crate::nid::lwsync::SIGNAL_LW_COND, "wakes a parked thread, which only the host can do"),
+    (
+        crate::nid::lwsync::TRY_LOCK_LW_MUTEX,
+        "returns an error code the work area cannot spell",
+    ),
+    (
+        crate::nid::lwsync::CREATE_LW_MUTEX,
+        "stamps an identity and registers a record",
+    ),
+    (
+        crate::nid::lwsync::DELETE_LW_MUTEX,
+        "drops the parked queue",
+    ),
+    (
+        crate::nid::lwsync::WAIT_LW_COND,
+        "parks the caller - that IS the behaviour",
+    ),
+    (
+        crate::nid::lwsync::SIGNAL_LW_COND,
+        "wakes a parked thread, which only the host can do",
+    ),
 ];
 
 /// int sceKernelTryLockLwMutex(SceKernelLwMutexWork *pWork, int lockCount)
@@ -325,7 +352,11 @@ pub(super) fn try_lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) {
     // inline take on another worker can land between the two, and the take would then QUEUE
     // a caller that was promised no wait.
     let acquired = st.lwmutex_try_lock(ctx, work);
-    ctx.ret(if acquired { 0 } else { ERR_LW_MUTEX_FAILED_TO_OWN });
+    ctx.ret(if acquired {
+        0
+    } else {
+        ERR_LW_MUTEX_FAILED_TO_OWN
+    });
 }
 
 /// int sceKernelLockLwMutex(SceKernelLwMutexWork *pWork, int lockCount,
@@ -366,7 +397,11 @@ pub(super) fn lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcom
     // [`try_lock_lw_mutex`], which returns nothing because it cannot park.
     if timeout_us == Some(0) {
         let acquired = st.lwmutex_try_lock(ctx, work);
-        ctx.ret(if acquired { 0 } else { ERR_LW_MUTEX_FAILED_TO_OWN });
+        ctx.ret(if acquired {
+            0
+        } else {
+            ERR_LW_MUTEX_FAILED_TO_OWN
+        });
         return SvcOutcome::Continue;
     }
     // Success returns 0 whether acquired now or after a wake by the releasing thread. A
@@ -433,8 +468,8 @@ mod tests {
     use crate::nid::lwsync as lw;
     use crate::world::DeterministicWorld;
     use crate::{SliceMemory, VFP_ARG_COUNT};
-    use vitaslop_transpiler::abi::REG_COUNT;
     use vitaslop_transpiler::InlineOp;
+    use vitaslop_transpiler::abi::REG_COUNT;
 
     /// A state and a guest image, with the registers a call would arrive with.
     fn with<R>(f: impl FnOnce(&mut GuestCtx, &mut VitaState) -> R) -> R {
@@ -463,19 +498,32 @@ mod tests {
                 create(ctx, st, WORK);
                 // A free mutex: the inline form would take it, and so must the handler,
                 // leaving the same words behind.
-                assert!(lwwork::fast_lock(ctx, WORK, 3, 1), "the definition takes it");
+                assert!(
+                    lwwork::fast_lock(ctx, WORK, 3, 1),
+                    "the definition takes it"
+                );
                 // Put it back and let the handler do it instead.
                 lwwork::init(ctx, WORK);
                 ctx.regs[0] = WORK;
                 ctx.regs[1] = 1;
-                assert!(matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue), "uncontended");
+                assert!(
+                    matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue),
+                    "uncontended"
+                );
                 assert_eq!(ctx.regs[0], 0, "success");
                 assert_eq!(lwwork::count(ctx, WORK), 1);
                 assert_eq!(lwwork::owner(ctx, WORK), 3);
             });
         }
-        for nid in [lw::UNLOCK_LW_MUTEX, lw::UNLOCK_LW_MUTEX2, lw::UNLOCK_LW_MUTEX_0] {
-            assert!(matches!(inline_op(nid), Some(InlineOp::LwMutexUnlock { .. })));
+        for nid in [
+            lw::UNLOCK_LW_MUTEX,
+            lw::UNLOCK_LW_MUTEX2,
+            lw::UNLOCK_LW_MUTEX_0,
+        ] {
+            assert!(matches!(
+                inline_op(nid),
+                Some(InlineOp::LwMutexUnlock { .. })
+            ));
         }
     }
 
@@ -486,7 +534,10 @@ mod tests {
     fn a_created_mutex_is_takeable_inline() {
         with(|ctx, st| {
             create(ctx, st, WORK);
-            assert!(lwwork::is_mutex(ctx, WORK), "create must stamp the identity");
+            assert!(
+                lwwork::is_mutex(ctx, WORK),
+                "create must stamp the identity"
+            );
             assert!(lwwork::fast_lock(ctx, WORK, 1, 1), "and leave it free");
         });
     }
@@ -498,11 +549,20 @@ mod tests {
     fn a_never_created_work_area_is_adopted_on_first_use() {
         with(|ctx, st| {
             st.set_current(1);
-            assert!(!lwwork::is_mutex(ctx, WORK), "zeroed memory is not yet a mutex");
-            assert!(!lwwork::fast_lock(ctx, WORK, 1, 1), "so the fast path refuses it");
+            assert!(
+                !lwwork::is_mutex(ctx, WORK),
+                "zeroed memory is not yet a mutex"
+            );
+            assert!(
+                !lwwork::fast_lock(ctx, WORK, 1, 1),
+                "so the fast path refuses it"
+            );
             ctx.regs[0] = WORK;
             ctx.regs[1] = 1;
-            assert!(matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue), "uncontended");
+            assert!(
+                matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue),
+                "uncontended"
+            );
             assert!(lwwork::is_mutex(ctx, WORK), "the handler adopted it");
             assert_eq!(lwwork::count(ctx, WORK), 1, "and took it");
             // Released, the next take is inline.
@@ -526,11 +586,21 @@ mod tests {
                 let v = ctx.read_u32(WORK + i * 4);
                 ctx.write_u32(copy + i * 4, v);
             }
-            assert!(!lwwork::fast_lock(ctx, copy, 1, 1), "the fast path will not serve a copy");
+            assert!(
+                !lwwork::fast_lock(ctx, copy, 1, 1),
+                "the fast path will not serve a copy"
+            );
             ctx.regs[0] = copy;
             ctx.regs[1] = 1;
-            assert!(matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue), "uncontended");
-            assert_eq!(lwwork::count(ctx, WORK), 1, "the ORIGINAL is the one that got locked");
+            assert!(
+                matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue),
+                "uncontended"
+            );
+            assert_eq!(
+                lwwork::count(ctx, WORK),
+                1,
+                "the ORIGINAL is the one that got locked"
+            );
             assert_eq!(lwwork::count(ctx, copy), 0, "and the copy is untouched");
         });
     }
@@ -587,7 +657,11 @@ mod tests {
             let out = wait_lw_cond(ctx, st);
             assert!(matches!(out, SvcOutcome::Continue), "a poll must NOT park");
             assert_eq!(ctx.regs[0], SCE_KERNEL_ERROR_WAIT_TIMEOUT);
-            assert_eq!(lwwork::owner(ctx, WORK), 3, "and must not have unlocked the mutex");
+            assert_eq!(
+                lwwork::owner(ctx, WORK),
+                3,
+                "and must not have unlocked the mutex"
+            );
             assert_eq!(lwwork::count(ctx, WORK), 1);
         });
     }
@@ -608,7 +682,10 @@ mod tests {
             assert!(matches!(lock_lw_mutex(ctx, st), SvcOutcome::Continue));
             ctx.regs[0] = COND;
             ctx.regs[1] = 0; // NULL - wait forever
-            assert!(matches!(wait_lw_cond(ctx, st), SvcOutcome::Block), "null still parks");
+            assert!(
+                matches!(wait_lw_cond(ctx, st), SvcOutcome::Block),
+                "null still parks"
+            );
         });
     }
 

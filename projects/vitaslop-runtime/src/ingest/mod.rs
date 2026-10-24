@@ -98,17 +98,21 @@ pub fn detect(vfs: &dyn Vfs) -> Result<Container, Error> {
     for p in vfs.list() {
         if p.ends_with(".pkg")
             && let Ok(head) = vfs.read(&p)
-                && head.len() >= 4 && &head[0..4] == b"\x7fPKG" {
-                    return Ok(Container::Pkg { path: p });
-                }
+            && head.len() >= 4
+            && &head[0..4] == b"\x7fPKG"
+        {
+            return Ok(Container::Pkg { path: p });
+        }
     }
     // Bare velf/SELF.
     for p in vfs.list() {
         if (p == "eboot.bin" || p.ends_with("/eboot.bin"))
             && let Ok(head) = vfs.read(&p)
-                && head.len() >= 4 && (&head[0..4] == b"SCE\0" || &head[0..4] == b"\x7fELF") {
-                    return Ok(Container::Velf { path: p });
-                }
+            && head.len() >= 4
+            && (&head[0..4] == b"SCE\0" || &head[0..4] == b"\x7fELF")
+        {
+            return Ok(Container::Velf { path: p });
+        }
     }
     Err(Error::UnknownContainer)
 }
@@ -206,17 +210,26 @@ impl<'a> Reader<'a> {
     }
 
     pub fn u16(&self, at: usize) -> Result<u16, Error> {
-        let b = self.bytes.get(at..at + 2).ok_or(Error::OutOfBounds("u16"))?;
+        let b = self
+            .bytes
+            .get(at..at + 2)
+            .ok_or(Error::OutOfBounds("u16"))?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
     }
 
     pub fn u32(&self, at: usize) -> Result<u32, Error> {
-        let b = self.bytes.get(at..at + 4).ok_or(Error::OutOfBounds("u32"))?;
+        let b = self
+            .bytes
+            .get(at..at + 4)
+            .ok_or(Error::OutOfBounds("u32"))?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     pub fn u64(&self, at: usize) -> Result<u64, Error> {
-        let b = self.bytes.get(at..at + 8).ok_or(Error::OutOfBounds("u64"))?;
+        let b = self
+            .bytes
+            .get(at..at + 8)
+            .ok_or(Error::OutOfBounds("u64"))?;
         Ok(u64::from_le_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
@@ -224,7 +237,10 @@ impl<'a> Reader<'a> {
 
     /// A fixed-size byte array at `at`.
     pub fn bytes<const N: usize>(&self, at: usize) -> Result<[u8; N], Error> {
-        let b = self.bytes.get(at..at + N).ok_or(Error::OutOfBounds("bytes"))?;
+        let b = self
+            .bytes
+            .get(at..at + N)
+            .ok_or(Error::OutOfBounds("bytes"))?;
         let mut out = [0u8; N];
         out.copy_from_slice(b);
         Ok(out)

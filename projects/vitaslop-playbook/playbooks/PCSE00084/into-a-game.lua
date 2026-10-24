@@ -1,10 +1,10 @@
 -- Madden NFL 13 (PCSE00084): boot, PLAY NOW with the defaults, the coin toss, KICK OFF with the
 -- right stick, let the return play out, then call a play, snap it and run upfield.
 --
--- Converted from the recipe `into-a-game`, which swept every button at fixed frames, pressed
+-- Converted from the old frame-keyed script `into-a-game`, which swept every button at fixed frames, pressed
 -- CROSS every 120 frames through the front end and timed the tip, the kick and the snap.
 --
--- HOW THE CUES WERE FOUND: `--discover` on the recipe's run (deterministic, 4500 frames) next
+-- HOW THE CUES WERE FOUND: `--discover` on the old script's run (deterministic, 4500 frames) next
 -- to a shot every 100 frames. This title reads everything through one archive, so its file
 -- names are not visible; these calls are (frames from that run):
 --
@@ -13,7 +13,7 @@
 --   f1471  sceGxmPrecomputedDrawInit (first)      the field is drawn - the coin toss is next
 --   f2621  sceMotionReset                         the Motion Sensor Kicking tip was cleared
 --
--- FOUR GATES, each non-obvious (from the recipe's own measurements):
+-- FOUR GATES, each non-obvious (from the old script's own measurements):
 --   1. The intro honours a button only after its own 5 s timer, and tests a bitset of its own
 --      that is not the SceCtrl order - so START and CROSS are both pressed until the title
 --      screen has taken one.
@@ -30,6 +30,10 @@ local slots_probed = cue.call("sceAppUtilSaveDataSlotGetParam"):happened()
 local match_loads  = cue.call("sceIoOpen", { arg = 0, has = "_uni_minicamp_big.ast" }):happened()
 local field_drawn  = cue.call("sceGxmPrecomputedDrawInit"):happened()
 local kick_armed   = cue.call("sceMotionReset"):happened()
+-- The coin toss WINNER's menu (Defend R. / Kick / Receive / Defend L.) with Receive highlighted:
+-- the orange bar on its third row. MEASURED: ~1000 matching pixels on that menu, ~180 on the
+-- in-game play-call menus, 0 on every other shot.
+local won_toss     = cue.pixels{ x = 790, y = 418, w = 100, h = 20, rgb = { 254, 217, 72 }, tol = 40 }:above(600)
 
 phase("boot", { timeout = 120 }, function()
   -- Gate 1: START (and CROSS, for the intro's own bitset) until the title screen takes START
@@ -57,8 +61,23 @@ phase("kickoff", { timeout = 180 }, function()
   -- The coin toss takes CROSS (the default choices); then the kicking team lines up and the
   -- tip comes up over the kickoff. Gate 3: TRIANGLE clears the tip; CROSS on it does not, and
   -- neither button kicks, so alternating them answers whichever screen is up.
+  --
+  -- The toss is a real coin. When the CPU wins it receives and we kick; when WE win, the winner's
+  -- menu comes up on Receive, and CROSS taking that hands the CPU the kickoff, with no tip and no
+  -- kick (MEASURED: 4 runs on 10-22 did). KICK is the row above it, and this list's d-pad runs
+  -- the other way: UP moved the highlight to Defend L., the row BELOW (MEASURED), and the stick
+  -- does not move it at all - so DOWN.
+  local function answer(button)
+    tap(button, 6, 6)
+    if try_wait(won_toss, 1) then
+      log("won the toss: taking KICK")
+      idle(10)
+      tap("down", 6, 20)
+      tap("cross", 6, 60)
+    end
+  end
   repeat
-    tap("cross", 6, 60); tap("triangle", 6, 60)
+    answer("cross"); answer("triangle")
   until try_wait(kick_armed, 0.01)
   split("kickoff")
   idle(60)
@@ -74,10 +93,10 @@ end)
 
 phase("first-snap", { timeout = 120 }, function()
   -- MEASURED: this title reads the pad on every other display flip, so an input frame is two
-  -- display frames and the recipe's display-frame gaps are halved here.
-  -- The return plays itself out and the down turns over to 1ST & 10 (the recipe's f3760, about
+  -- display frames and the old script's display-frame gaps are halved here.
+  -- The return plays itself out and the down turns over to 1ST & 10 (the old script's f3760, about
   -- 860 display frames after the kick). We kicked off, so this is the CPU's offence: its
-  -- huddle, its snap. The recipe's three CROSSes 60 display frames apart are kept (a "Hike the
+  -- huddle, its snap. The old script's three CROSSes 60 display frames apart are kept (a "Hike the
   -- Ball"-style tip takes CROSS as Dismiss; on defence CROSS switches the controlled player),
   -- then the left stick UP moves our player upfield while the play is run.
   idle(430)

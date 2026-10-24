@@ -22,7 +22,7 @@
 //!
 //! Every case in the first group is a defect this project actually shipped, found months after
 //! the fact because some title drew something visibly wrong. Each is now a five-millisecond
-//! question with no title, no recipe and no frame:
+//! question with no title, no playbook and no frame:
 //!
 //! | case | the defect it would have caught |
 //! |---|---|
@@ -3653,6 +3653,59 @@ fn gxmconf_tex2d_fragment() -> Vec<u8> {
     )
 }
 
+/// Scene 18's vertex program: NDC position straight through, and TEXCOORD0 taken from the
+/// DEFAULT UNIFORM at `sa[16..20]`. It declares 32 default-uniform registers where every other
+/// gxmconf program declares 16, so the value sits past the end of the block the program bound
+/// at set time declares: a binding sized by that program reads nothing of it.
+fn gxmconf_uniform_vertex() -> Vec<u8> {
+    let o = Bank::Output;
+    gxpwrite::write(
+        &ProgramSpec::vertex(vec![
+            asm::mov(false, Dest::new(o, 0), [true; 4], Src::reg(Bank::PrimaryAttr, 0)).unwrap(),
+            asm::mov(false, Dest::new(o, 4), [true; 4], Src::reg(Bank::SecondaryAttr, 16)).unwrap(),
+        ])
+        .with_parameters(vec![
+            gxpwrite::ParamSpec::attribute("IN.position", 0, 4),
+            gxpwrite::ParamSpec::uniform("u_colour", 16, 4),
+        ])
+        .with_default_uniform_regs(32)
+        .with_containers(vec![
+            gxpwrite::ContainerSpec { index: 14, base_sa: 0, size_regs: 32 },
+            gxpwrite::ContainerSpec { index: 16, base_sa: 32, size_regs: 4 },
+        ])
+        .with_registers(4, 36, 8)
+        .with_outputs(VertexOutputs { color0: false, texcoords: vec![(0, 4)] }),
+    )
+}
+
+/// Scene 18's fragment program: the DEFAULT UNIFORM at `sa[16..20]` packed to four unorm bytes
+/// in `o0`, the interpolant declared (it is patched against the app's vertex program) and
+/// unread. 32 default-uniform registers, for the reason [`gxmconf_uniform_vertex`] gives.
+fn gxmconf_uniform_fragment() -> Vec<u8> {
+    let pack = asm::pack(
+        Dest::new(Bank::Output, 0),
+        asm::PackFmt::U8,
+        Bank::SecondaryAttr,
+        16,
+        asm::PackFmt::F32,
+        [0, 1, 2, 3],
+        [true; 4],
+        true,
+    )
+    .unwrap();
+    gxpwrite::write(
+        &ProgramSpec::fragment(vec![pack])
+            .with_parameters(vec![gxpwrite::ParamSpec::uniform("u_colour", 16, 4)])
+            .with_interpolants(vec![gxpwrite::InterpolantSpec::texcoord(0, 4)])
+            .with_default_uniform_regs(32)
+            .with_containers(vec![
+                gxpwrite::ContainerSpec { index: 14, base_sa: 0, size_regs: 32 },
+                gxpwrite::ContainerSpec { index: 16, base_sa: 32, size_regs: 4 },
+            ])
+            .with_registers(4, 36, 8),
+    )
+}
+
 /// The C header `gxmconf.c` includes: every container as a 64-byte-aligned byte array.
 fn gxmconf_header() -> String {
     let mut s = String::from(
@@ -3667,6 +3720,8 @@ fn gxmconf_header() -> String {
         ("conf_real_frag_gxp", gxmconf_fragment()),
         ("conf_cube_frag_gxp", gxmconf_cube_fragment()),
         ("conf_tex2d_frag_gxp", gxmconf_tex2d_fragment()),
+        ("conf_uniform_vert_gxp", gxmconf_uniform_vertex()),
+        ("conf_uniform_frag_gxp", gxmconf_uniform_fragment()),
     ] {
         s.push_str(&format!("__attribute__((aligned(64)))\nstatic const unsigned char {name}[{}] = {{\n", bytes.len()));
         for row in bytes.chunks(16) {
@@ -3712,6 +3767,21 @@ fn gxmconf_tex2d_programs_link() {
     assert!(s.len() == 1 && s[0].unit == 0 && !s[0].cube, "{s:?}
 {}", l.wgsl);
     assert_eq!(l.fragment_bindings.color_precision, vitaslop_gxp_shader::module::ColorPrecision::Fx8);
+}
+
+/// Scene 18's two pairs link, each reading its colour from the default uniform at `sa[16]`.
+#[test]
+fn gxmconf_uniform_programs_link() {
+    // `sa[16..20]` is the bank's fifth vec4.
+    for (what, read, v, f) in [
+        ("vertex", "vs_sa.data[4]", gxmconf_uniform_vertex(), gxmconf_fragment()),
+        ("fragment", "fs_sa.data[4]", gxmconf_vertex(), gxmconf_uniform_fragment()),
+    ] {
+        let l = vitaslop_gxp_shader::link::link_programs(&v, &f)
+            .unwrap_or_else(|e| panic!("the gxmconf {what}-uniform pair links: {e:?}"));
+        assert!(l.wgsl.contains(read), "the {what} stage must read {read}:\n{}", l.wgsl);
+        assert_eq!(l.fragment_bindings.color_precision, vitaslop_gxp_shader::module::ColorPrecision::Fx8);
+    }
 }
 
 /// The checked-in `gxmconf_shaders.h` is exactly what these programs assemble to.

@@ -51,10 +51,22 @@ impl Variant {
     /// The GXM base format's variant, or `None` if it is not a PVRTC format.
     pub fn from_base_format(base_format: u32) -> Option<Variant> {
         Some(match base_format {
-            0x80 => Variant { two: false, four_bpp: false },
-            0x81 => Variant { two: false, four_bpp: true },
-            0x82 => Variant { two: true, four_bpp: false },
-            0x83 => Variant { two: true, four_bpp: true },
+            0x80 => Variant {
+                two: false,
+                four_bpp: false,
+            },
+            0x81 => Variant {
+                two: false,
+                four_bpp: true,
+            },
+            0x82 => Variant {
+                two: true,
+                four_bpp: false,
+            },
+            0x83 => Variant {
+                two: true,
+                four_bpp: true,
+            },
             _ => return None,
         })
     }
@@ -110,7 +122,12 @@ fn decode_block(bytes: &[u8], off: usize, variant: Variant) -> Block {
     // Colour B occupies the top 16 bits in both variants, with its opacity flag at bit 31.
     let op_b = c & 0x8000_0000 != 0;
     let b = if op_b {
-        [expand((c >> 26) & 0x1f, 5), expand((c >> 21) & 0x1f, 5), expand((c >> 16) & 0x1f, 5), 255]
+        [
+            expand((c >> 26) & 0x1f, 5),
+            expand((c >> 21) & 0x1f, 5),
+            expand((c >> 16) & 0x1f, 5),
+            255,
+        ]
     } else {
         // The 3-bit alpha is padded to 4 bits before expansion (a fully opaque translucent
         // encoding is 0b1110, not 0b1111 - the format cannot express 255 here).
@@ -124,10 +141,19 @@ fn decode_block(bytes: &[u8], off: usize, variant: Variant) -> Block {
 
     // Colour A is 15 bits in PVRTC1 (its own opacity flag at bit 15) and 14 bits in PVRTC2,
     // whose bit 15 is the hard-transition flag and whose opacity comes from colour B's flag.
-    let (op_a, h) = if variant.two { (op_b, c & 0x8000 != 0) } else { (c & 0x8000 != 0, false) };
+    let (op_a, h) = if variant.two {
+        (op_b, c & 0x8000 != 0)
+    } else {
+        (c & 0x8000 != 0, false)
+    };
     let a = if op_a {
         // Opaque A: 5 / 5 / 4 bits, the blue channel one bit shorter than colour B's.
-        [expand((c >> 10) & 0x1f, 5), expand((c >> 5) & 0x1f, 5), expand((c >> 1) & 0xf, 4), 255]
+        [
+            expand((c >> 10) & 0x1f, 5),
+            expand((c >> 5) & 0x1f, 5),
+            expand((c >> 1) & 0xf, 4),
+            255,
+        ]
     } else {
         [
             expand((c >> 8) & 0xf, 4),
@@ -136,7 +162,13 @@ fn decode_block(bytes: &[u8], off: usize, variant: Variant) -> Block {
             expand(((c >> 12) & 0x7) << 1, 4),
         ]
     };
-    Block { a, b, m, h, modulation }
+    Block {
+        a,
+        b,
+        m,
+        h,
+        modulation,
+    }
 }
 
 /// Byte offset of block `(bx, by)` in a GXM PVRTC image.
@@ -146,7 +178,12 @@ fn decode_block(bytes: &[u8], off: usize, variant: Variant) -> Block {
 /// same addressing applies here.
 fn block_offset(bx: u32, by: u32, blocks_x: u32, blocks_y: u32, swizzled: bool) -> usize {
     let index = if swizzled {
-        morton_index(bx, by, blocks_x.next_power_of_two(), blocks_y.next_power_of_two())
+        morton_index(
+            bx,
+            by,
+            blocks_x.next_power_of_two(),
+            blocks_y.next_power_of_two(),
+        )
     } else {
         by * blocks_x + bx
     };
@@ -171,13 +208,7 @@ fn shift_coord(v: u32, size: u32, shift: u32) -> u32 {
 /// Bilinearly upscale the four surrounding blocks' A and B colours at sub-block offset
 /// `(xr, yr)`. Shared by the per-texel decoder and the whole-image one so the two cannot
 /// drift apart; see [`decode_face`].
-fn upscale(
-    n: &[Block; 4],
-    xr: u32,
-    yr: u32,
-    bw: u32,
-    bh: u32,
-) -> ([u8; 4], [u8; 4]) {
+fn upscale(n: &[Block; 4], xr: u32, yr: u32, bw: u32, bh: u32) -> ([u8; 4], [u8; 4]) {
     let w00 = (bw - xr) * (bh - yr);
     let w10 = xr * (bh - yr);
     let w01 = (bw - xr) * yr;
@@ -290,9 +321,18 @@ pub fn texel(
         (own.a, own.b)
     } else {
         let fetch = |bx: u32, by: u32| {
-            decode_block(bytes, block_offset(bx, by, blocks_x, blocks_y, swizzled), variant)
+            decode_block(
+                bytes,
+                block_offset(bx, by, blocks_x, blocks_y, swizzled),
+                variant,
+            )
         };
-        let n = [fetch(bx0, by0), fetch(bx1, by0), fetch(bx0, by1), fetch(bx1, by1)];
+        let n = [
+            fetch(bx0, by0),
+            fetch(bx1, by0),
+            fetch(bx0, by1),
+            fetch(bx1, by1),
+        ];
         upscale(&n, xr, yr, bw, bh)
     };
 
@@ -384,10 +424,17 @@ pub fn decode_face(
                     let x = (sx + shift_x) % width;
                     let own = &blocks[(own_row + x / bw) as usize];
                     let hard = variant.two && own.h;
-                    let (a, b) =
-                        if hard { (own.a, own.b) } else { upscale(&n, xr, yr, bw, bh) };
+                    let (a, b) = if hard {
+                        (own.a, own.b)
+                    } else {
+                        upscale(&n, xr, yr, bw, bh)
+                    };
                     let (weight, punched) = modulation(own, variant, hard, x % bw, ty);
-                    let c = if punched { [0, 0, 0, 0] } else { blend(a, b, weight) };
+                    let c = if punched {
+                        [0, 0, 0, 0]
+                    } else {
+                        blend(a, b, weight)
+                    };
                     let o = row_out + (x * 4) as usize;
                     out[o..o + 4].copy_from_slice(&c);
                 }
@@ -420,7 +467,11 @@ pub fn face_is_opaque(bytes: &[u8], variant: Variant) -> bool {
     for chunk in bytes.chunks_exact(8) {
         let c = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
         let op_b = c & 0x8000_0000 != 0;
-        let (op_a, h) = if variant.two { (op_b, c & 0x8000 != 0) } else { (c & 0x8000 != 0, false) };
+        let (op_a, h) = if variant.two {
+            (op_b, c & 0x8000 != 0)
+        } else {
+            (c & 0x8000 != 0, false)
+        };
         if !op_a || !op_b {
             return false;
         }
@@ -487,7 +538,10 @@ mod tests {
     /// so it checks the addressing and the interpolation without assuming either.
     #[test]
     fn a_uniform_image_decodes_to_its_colour() {
-        let variant = Variant { two: false, four_bpp: true };
+        let variant = Variant {
+            two: false,
+            four_bpp: true,
+        };
         // Opaque A = B = white: colour word with both opacity flags and all channel bits set.
         let colour: u32 = 0xFFFF_FFFE; // every channel bit set, M = 0
         let mut bytes = Vec::new();
@@ -510,7 +564,10 @@ mod tests {
     /// colours are uniform across the image (so interpolation cannot move them).
     #[test]
     fn modulation_endpoints_select_a_and_b() {
-        let variant = Variant { two: false, four_bpp: true };
+        let variant = Variant {
+            two: false,
+            four_bpp: true,
+        };
         // A opaque black, B opaque white: A payload zero, B payload all ones.
         let colour: u32 = 0xFFFF_0000 | 0x8000;
         let mut bytes = Vec::new();
@@ -520,16 +577,31 @@ mod tests {
             bytes.extend_from_slice(&colour.to_le_bytes());
         }
         assert_eq!(texel(&bytes, 8, 8, 0, 0, variant, false), [0, 0, 0, 255]);
-        assert_eq!(texel(&bytes, 8, 8, 1, 0, variant, false), [255, 255, 255, 255]);
+        assert_eq!(
+            texel(&bytes, 8, 8, 1, 0, variant, false),
+            [255, 255, 255, 255]
+        );
     }
 
     /// A 2bpp block covers 8x4 texels and a 4bpp block 4x4 - the sizes the whole addressing
     /// rests on, and getting one wrong silently halves or doubles a texture.
     #[test]
     fn block_sizes_match_the_bit_rate() {
-        assert_eq!(Variant::from_base_format(0x81).unwrap().block_size(), (4, 4));
-        assert_eq!(Variant::from_base_format(0x80).unwrap().block_size(), (8, 4));
-        assert_eq!(Variant::from_base_format(0x83).unwrap(), Variant { two: true, four_bpp: true });
+        assert_eq!(
+            Variant::from_base_format(0x81).unwrap().block_size(),
+            (4, 4)
+        );
+        assert_eq!(
+            Variant::from_base_format(0x80).unwrap().block_size(),
+            (8, 4)
+        );
+        assert_eq!(
+            Variant::from_base_format(0x83).unwrap(),
+            Variant {
+                two: true,
+                four_bpp: true
+            }
+        );
         assert!(Variant::from_base_format(0x0c).is_none());
     }
 }

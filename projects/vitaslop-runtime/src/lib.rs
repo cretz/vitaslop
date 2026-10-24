@@ -18,49 +18,49 @@ extern crate self as vitaslop_runtime;
 
 pub mod audio;
 pub mod bcenc;
-pub mod etcenc;
 pub mod capsule;
 pub mod capture;
+pub mod etcenc;
 /// The shared fast hasher, re-exported so this crate's own modules can say `crate::fasthash`.
 /// It lives in `vitaslop-platform` because the renderer's per-draw maps want it just as much as
 /// the capture's do.
 pub use vitaslop_platform::fasthash;
+pub mod call_table;
 pub mod font;
 pub mod gamedata;
+pub mod guest_read;
 pub mod host;
 pub mod ingest;
-pub mod link;
-pub mod nid;
 pub mod knobs;
-pub mod observer;
-pub mod call_table;
+pub mod link;
 pub mod mp4;
 pub mod mspace;
+pub mod nid;
+pub mod observer;
 pub mod perf;
 pub mod psarc;
 pub mod pvrtc;
-pub mod recipe;
-pub mod recipe_eval;
-pub mod sched;
 pub mod render;
 pub mod rtt_writeback;
+pub mod sched;
+pub mod timeline;
 pub mod trophy;
 pub mod vita;
 pub mod world;
 
+pub use audio::{AudioFormat, AudioSink, NullSink};
 pub use host::{
     GuestCall, GuestCallResult, GuestCtx, GuestMemory, ImportDispatch, Ptr, Reentry, SliceMemory,
-    SvcDispatch, VitaEnv, VitaState, VFP_ARG_COUNT,
+    SvcDispatch, VFP_ARG_COUNT, VitaEnv, VitaState,
 };
-pub use audio::{AudioFormat, AudioSink, NullSink};
-pub use recipe::{InputSegment, Recipe, RecipeError, RecipeWorld, SharedTimeline, Timeline};
 pub use sched::{
     FiberEnd, GuestEngine, GuestThread, IdleStep, RunReport, SchedCore, Scheduler, Stop,
     ThreadHandle, ThreadStep,
 };
+pub use timeline::{InputSegment, SharedTimeline, Timeline, TimelineWorld};
 pub use world::{
-    CtrlFrame, DeterministicWorld, LocationFix, LocationPermission, Record, Replay, TouchFrame,
-    TouchPoint, World, WorldEvent, MAX_TOUCH_POINTS,
+    CtrlFrame, DeterministicWorld, LocationFix, LocationPermission, MAX_TOUCH_POINTS, Record,
+    Replay, TouchFrame, TouchPoint, World, WorldEvent,
 };
 
 /// Write a Vita host handler as a typed function; the macro generates the AAPCS-
@@ -95,7 +95,7 @@ pub enum SvcOutcome {
     /// `Continue`, so the outcome is a safe hint, never a requirement.
     ///
     /// This is the ONLY outcome that counts a frame, and the distinction is
-    /// load-bearing: the frame count paces frame-keyed input (a TAS recipe), bounds
+    /// load-bearing: the frame count paces frame-keyed input (a scripted timeline), bounds
     /// a run (`--max-frames`), names screenshots and is the x-axis of every timing
     /// figure. A plain "give someone else the CPU" yield - `sceKernelDelayThread(0)`,
     /// `sceDisplayWaitVblankStartMulti(0)` - is NOT a frame and must return

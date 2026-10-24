@@ -30,13 +30,14 @@
 //! stats.bin         sceIoChstat overrides
 //! slots.bin         SceAppUtil savedata slot params
 //! trophies.bin      unlocked trophy ids and the tick each was earned at
+//! safememory.bin    the title's SceAppUtil safe memory, raw
 //! ```
 //! The binary sidecars are length-prefixed records rather than JSON because this crate has
 //! no JSON, and inventing one to carry three integers would be more code than the records.
 //! Each is optional: an absent entry means that kind of state is empty, so an older
 //! container still imports into a newer build.
 
-use crate::host::{is_persisted_mount, vfs_key, FileStatOverride};
+use crate::host::{FileStatOverride, is_persisted_mount, vfs_key};
 use crate::ingest::vfs::Vfs;
 
 /// The container's format version, written into `README.txt` and checked on import.
@@ -65,6 +66,9 @@ pub struct GameData {
     pub slots: Vec<(String, u32, Vec<u8>)>,
     /// Unlocked trophies: (NP communication id, [(trophy id, SceRtcTick earned at)]).
     pub trophies: Vec<(String, Vec<(u32, u64)>)>,
+    /// The title's SceAppUtil safe memory (`sceAppUtilSaveSafeMemory`), all of it, or empty
+    /// if the title never wrote any.
+    pub safe_memory: Vec<u8>,
 }
 
 /// What an import actually did, so a refusal is reported rather than inferred from a save
@@ -110,6 +114,7 @@ impl GameData {
             && self.stats.is_empty()
             && self.slots.is_empty()
             && self.trophies.is_empty()
+            && self.safe_memory.is_empty()
     }
 
     /// Total bytes of guest file content (not of the container).
@@ -212,6 +217,9 @@ impl GameData {
             }
             entries.push(("trophies.bin".to_string(), out));
         }
+        if !self.safe_memory.is_empty() {
+            entries.push(("safememory.bin".to_string(), self.safe_memory.clone()));
+        }
         crate::ingest::zip::write_zip(&entries)
     }
 
@@ -231,7 +239,9 @@ impl GameData {
         names.sort();
 
         for name in &names {
-            let Some(rest) = name.strip_prefix("files/") else { continue };
+            let Some(rest) = name.strip_prefix("files/") else {
+                continue;
+            };
             let raw = unescape(rest);
             let key = vfs_key(&raw);
             // >>> THE GUARD. A key that is not on a writable mount names the installed
@@ -241,7 +251,9 @@ impl GameData {
                 refused.push(raw);
                 continue;
             }
-            let data = vfs.read(name).map_err(|e| format!("unreadable entry {name:?}: {e:?}"))?;
+            let data = vfs
+                .read(name)
+                .map_err(|e| format!("unreadable entry {name:?}: {e:?}"))?;
             out.files.push((key, data));
         }
 
@@ -261,7 +273,9 @@ impl GameData {
 
         if let Ok(text) = vfs.read("originals.txt") {
             for line in String::from_utf8_lossy(&text).lines() {
-                let Some((k, orig)) = line.split_once('\t') else { continue };
+                let Some((k, orig)) = line.split_once('\t') else {
+                    continue;
+                };
                 let key = vfs_key(k);
                 if !key.is_empty() && is_persisted_mount(&key) {
                     out.originals.push((key, orig.to_string()));
@@ -324,6 +338,10 @@ impl GameData {
             }
         }
 
+        if let Ok(bin) = vfs.read("safememory.bin") {
+            out.safe_memory = bin;
+        }
+
         Ok((out, refused))
     }
 }
@@ -365,9 +383,16 @@ impl<'a> Cursor<'a> {
         self.at >= self.b.len()
     }
     fn take(&mut self, n: usize, what: &str) -> Result<&'a [u8], String> {
-        let end = self.at.checked_add(n).ok_or_else(|| format!("{what}: length overflows"))?;
+        let end = self
+            .at
+            .checked_add(n)
+            .ok_or_else(|| format!("{what}: length overflows"))?;
         let out = self.b.get(self.at..end).ok_or_else(|| {
-            format!("{what}: wants {n} bytes at {} of {}, so this container is truncated", self.at, self.b.len())
+            format!(
+                "{what}: wants {n} bytes at {} of {}, so this container is truncated",
+                self.at,
+                self.b.len()
+            )
         })?;
         self.at = end;
         Ok(out)
@@ -422,7 +447,11 @@ mod tests {
                 },
             )],
             slots: vec![("savedata0:".into(), 3, vec![9, 8, 7])],
-            trophies: vec![("NPWR00001_00".into(), vec![(1, 0x1122_3344_5566_7788), (4, 5)])],
+            trophies: vec![(
+                "NPWR00001_00".into(),
+                vec![(1, 0x1122_3344_5566_7788), (4, 5)],
+            )],
+            safe_memory: (0..=255u8).cycle().take(64 * 1024).collect(),
         }
     }
 
@@ -431,7 +460,10 @@ mod tests {
         let data = sample();
         let zip = data.to_zip("PCSA00000");
         let (back, refused) = GameData::from_zip(&zip).expect("read back");
-        assert!(refused.is_empty(), "nothing legitimate should be refused: {refused:?}");
+        assert!(
+            refused.is_empty(),
+            "nothing legitimate should be refused: {refused:?}"
+        );
         assert_eq!(back, data);
     }
 
@@ -463,7 +495,10 @@ mod tests {
             ("dirs.txt".into(), b"eboot.bin\nsavedata0:/d".to_vec()),
         ]);
         let (data, refused) = GameData::from_zip(&hostile).expect("read");
-        assert_eq!(data.files, vec![("savedata0:/ok.bin".to_string(), b"fine".to_vec())]);
+        assert_eq!(
+            data.files,
+            vec![("savedata0:/ok.bin".to_string(), b"fine".to_vec())]
+        );
         assert_eq!(data.dirs, vec!["savedata0:/d".to_string()]);
         assert_eq!(refused.len(), 4, "refused: {refused:?}");
     }
@@ -485,8 +520,8 @@ mod tests {
     fn an_unknown_entry_is_ignored_so_an_older_build_can_read_a_newer_container() {
         let mut zip_entries = vec![("files/savedata0%3A/a".to_string(), b"a".to_vec())];
         zip_entries.push(("something-from-the-future.bin".into(), vec![1, 2, 3]));
-        let (data, refused) = GameData::from_zip(&crate::ingest::zip::write_zip(&zip_entries))
-            .expect("read");
+        let (data, refused) =
+            GameData::from_zip(&crate::ingest::zip::write_zip(&zip_entries)).expect("read");
         assert!(refused.is_empty());
         assert_eq!(data.files.len(), 1);
     }

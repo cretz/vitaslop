@@ -10,7 +10,7 @@
 //! where the hardware uses 1, a literal suppressed by a partial write. Each of those was found
 //! because some title drew something visibly wrong, months after the blob was first captured.
 //!
-//! This turns that into a corpus-wide question that needs no title, no recipe and no frame.
+//! This turns that into a corpus-wide question that needs no title, no playbook and no frame.
 //! Two independently-written implementations of the same USSE semantics already exist in this
 //! crate:
 //!

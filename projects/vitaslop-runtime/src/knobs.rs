@@ -31,16 +31,18 @@ pub const INDEX: &str = include_str!("../../KNOBS.md");
 // the renderer reads `VITASLOP_GXP_LIVE` from there, and it cannot reach a table owned
 // by the runtime. Re-exported here so the name `knobs::set_override` still resolves and
 // this module stays the single place to look for anything knob-shaped.
-pub use vitaslop_platform::knobs::{flag, log_filter, set_override, var, var_os, OVERRIDABLE};
+pub use vitaslop_platform::knobs::{OVERRIDABLE, flag, log_filter, set_override, var, var_os};
 
 /// One environment knob: its name, where it is read, and the first line of the doc
 /// comment attached to the code that reads it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Knob {
     pub name: String,
-    /// Workspace-relative path of the first file that reads it.
+    /// Workspace-relative path of the first file that reads it. The FILE and not a line: a
+    /// line number goes stale whenever anything above the read moves, which made the index
+    /// fail (and CI with it) on edits that changed no knob at all. The name is unique, so a
+    /// grep finds the read in one step anyway.
     pub file: String,
-    pub line: usize,
     /// A one-line summary lifted from the nearest preceding doc comment, or empty
     /// when the read site carries none.
     pub summary: String,
@@ -59,7 +61,9 @@ pub struct Knob {
 pub fn scan_sources(root: &std::path::Path) -> Vec<Knob> {
     let mut found: std::collections::BTreeMap<String, Knob> = std::collections::BTreeMap::new();
     for path in rust_sources(root) {
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         let rel = path
             .strip_prefix(root)
             .unwrap_or(&path)
@@ -89,8 +93,12 @@ pub fn scan_sources(root: &std::path::Path) -> Vec<Knob> {
                 } else {
                     1
                 };
-                let cand =
-                    Knob { name: name.clone(), file: rel.clone(), line: i + 1, summary, score };
+                let cand = Knob {
+                    name: name.clone(),
+                    file: rel.clone(),
+                    summary,
+                    score,
+                };
                 match found.get(&name) {
                     Some(prev) if prev.score >= score => {}
                     _ => {
@@ -112,7 +120,9 @@ fn knob_names(line: &str) -> Vec<String> {
         let start = i + at;
         let mut end = start;
         while end < bytes.len()
-            && (bytes[end].is_ascii_uppercase() || bytes[end].is_ascii_digit() || bytes[end] == b'_')
+            && (bytes[end].is_ascii_uppercase()
+                || bytes[end].is_ascii_digit()
+                || bytes[end] == b'_')
         {
             end += 1;
         }
@@ -145,7 +155,9 @@ fn doc_at(lines: &[&str], at: usize) -> (String, String) {
             break;
         }
     }
-    let Some(end) = doc_end else { return (String::new(), String::new()) };
+    let Some(end) = doc_end else {
+        return (String::new(), String::new());
+    };
     // Walk up to the start of that contiguous doc block, then take its first line.
     let mut start = end;
     while start > 0 && lines[start - 1].trim_start().starts_with("///") {
@@ -167,7 +179,9 @@ pub fn rust_sources(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
@@ -204,13 +218,16 @@ pub fn render_index(knobs: &[Knob]) -> String {
     s.push_str(&format!("{} knobs.\n\n", knobs.len()));
     s.push_str("| knob | read in | what it does |\n|---|---|---|\n");
     for k in knobs {
-        let summary = if k.summary.is_empty() { "-" } else { k.summary.as_str() };
+        let summary = if k.summary.is_empty() {
+            "-"
+        } else {
+            k.summary.as_str()
+        };
         // Pipes would break the table; the summaries are prose, so this is enough.
         s.push_str(&format!(
-            "| `{}` | {}:{} | {} |\n",
+            "| `{}` | {} | {} |\n",
             k.name,
             k.file,
-            k.line,
             summary.replace('|', "/")
         ));
     }
@@ -236,7 +253,11 @@ mod tests {
     fn index_is_current() {
         let root = workspace_root();
         let knobs = scan_sources(&root);
-        assert!(knobs.len() > 50, "the knob scan found only {} knobs - it is broken", knobs.len());
+        assert!(
+            knobs.len() > 50,
+            "the knob scan found only {} knobs - it is broken",
+            knobs.len()
+        );
         let rendered = render_index(&knobs);
         let path = root.join("KNOBS.md");
         if std::env::var("VITASLOP_BLESS_KNOBS").is_ok() {
@@ -293,7 +314,9 @@ mod tests {
             if rel.ends_with("vitaslop-platform/src/knobs.rs") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             for (i, line) in text.lines().enumerate() {
                 // The READ itself, not a mention: `knobs::var("NAME")` on one line. A doc
                 // comment that merely says the word "knobs" is not a read, which is why this
@@ -326,7 +349,10 @@ mod tests {
 
     #[test]
     fn knob_names_are_read_out_of_a_line() {
-        assert_eq!(knob_names("std::env::var(\"VITASLOP_GXP_LIVE\")"), vec!["VITASLOP_GXP_LIVE"]);
+        assert_eq!(
+            knob_names("std::env::var(\"VITASLOP_GXP_LIVE\")"),
+            vec!["VITASLOP_GXP_LIVE"]
+        );
         assert_eq!(
             knob_names("// VITASLOP_A2 and VITASLOP_B"),
             vec!["VITASLOP_A2".to_string(), "VITASLOP_B".to_string()]
@@ -353,7 +379,10 @@ mod tests {
         ];
         let (summary, block) = doc_at(&lines, 3);
         assert_eq!(summary, "Turn the thing on.");
-        assert!(block.contains("second line"), "the whole block is kept for matching");
+        assert!(
+            block.contains("second line"),
+            "the whole block is kept for matching"
+        );
     }
 }
 

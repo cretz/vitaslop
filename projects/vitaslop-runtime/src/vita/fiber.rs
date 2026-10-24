@@ -18,9 +18,9 @@
 //! Both are read from their documented siblings - see their doc comments - and both
 //! fail loudly rather than quietly if that reading is wrong.
 
+use crate::SvcOutcome;
 use crate::host::GuestCtx;
 use crate::hostcall;
-use crate::SvcOutcome;
 
 use super::iofilemgr::read_cstr;
 
@@ -50,7 +50,11 @@ pub(super) fn initialize(ctx: &mut GuestCtx, st: &mut crate::host::VitaState) {
     let arg_on_initialize = ctx.arg(3);
     let context_addr = ctx.arg(4);
     let context_size = ctx.arg(5);
-    let name = if name_ptr == 0 { String::new() } else { read_cstr(ctx, name_ptr) };
+    let name = if name_ptr == 0 {
+        String::new()
+    } else {
+        read_cstr(ctx, name_ptr)
+    };
     tracing::debug!(
         target: "vitaslop::thread",
         fiber = format_args!("{fiber:#x}"),
@@ -60,7 +64,14 @@ pub(super) fn initialize(ctx: &mut GuestCtx, st: &mut crate::host::VitaState) {
         size = context_size,
         "fiber initialize"
     );
-    let r = st.fiber_initialize(fiber, name, entry, arg_on_initialize, context_addr, context_size);
+    let r = st.fiber_initialize(
+        fiber,
+        name,
+        entry,
+        arg_on_initialize,
+        context_addr,
+        context_size,
+    );
     ctx.ret(r as u32);
 }
 
@@ -122,7 +133,10 @@ pub(super) fn switch(ctx: &mut GuestCtx, st: &mut crate::host::VitaState) -> Svc
 /// If that reading is wrong the fiber runs on a stack that is not its context, and the
 /// failure is a bounds trap on the first push rather than silent corruption, because a
 /// null or unaligned context is refused outright.
-pub(super) fn attach_context_and_switch(ctx: &mut GuestCtx, st: &mut crate::host::VitaState) -> SvcOutcome {
+pub(super) fn attach_context_and_switch(
+    ctx: &mut GuestCtx,
+    st: &mut crate::host::VitaState,
+) -> SvcOutcome {
     let context = (ctx.arg(1), ctx.arg(2));
     switch_inner(ctx, st, Some(context))
 }

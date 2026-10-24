@@ -13,8 +13,8 @@
 //! small allocated blocks for voices, definitions, and params buffers - so any
 //! incidental read lands on valid, zeroed memory.
 
-use crate::hostcall;
 use crate::host::{GuestCtx, VitaState};
+use crate::hostcall;
 
 /// Diagnostic (`RUST_LOG=vitaslop::ngs=trace`): dump an NGS param/output buffer to
 /// understand AT9 routing.
@@ -144,7 +144,16 @@ pub(super) fn report_failed_voices(st: &mut VitaState) {
             .get(&voice)
             .map(|v| {
                 v.iter()
-                    .map(|(nid, g)| format!("{}({:#x},{:#x},{:#x},{:#x})", crate::nid::name(*nid), g[0], g[1], g[2], g[3]))
+                    .map(|(nid, g)| {
+                        format!(
+                            "{}({:#x},{:#x},{:#x},{:#x})",
+                            crate::nid::name(*nid),
+                            g[0],
+                            g[1],
+                            g[2],
+                            g[3]
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -171,13 +180,26 @@ fn report_silent_play(st: &mut VitaState, voice: u32) {
         return;
     }
     a.ngs_silent_reported += 1;
-    let rack = a.ngs_voice_handles.iter().find(|(_, v)| *v == voice).map(|(k, _)| *k);
+    let rack = a
+        .ngs_voice_handles
+        .iter()
+        .find(|(_, v)| *v == voice)
+        .map(|(k, _)| *k);
     let calls: Vec<String> = a
         .ngs_voice_calls
         .get(&voice)
         .map(|v| {
             v.iter()
-                .map(|(nid, g)| format!("{}({:#x},{:#x},{:#x},{:#x})", crate::nid::name(*nid), g[0], g[1], g[2], g[3]))
+                .map(|(nid, g)| {
+                    format!(
+                        "{}({:#x},{:#x},{:#x},{:#x})",
+                        crate::nid::name(*nid),
+                        g[0],
+                        g[1],
+                        g[2],
+                        g[3]
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -207,6 +229,29 @@ pub(super) fn voice_init(ctx: &mut GuestCtx, st: &mut VitaState) {
     // the next session should not re-walk it.
     super::at9::note_voice_init(ctx.arg(1) != 0);
     st.audio_state.at9.stop(voice);
+    // >>> FLAG BIT 0 RESETS THE VOICE'S ROUTING: its output patches are gone. EVIDENCE, off a
+    // volleyball title: before each re-use of a voice it calls this with flags 1 and then
+    // `sceNgsPatchCreateRouting` again to the SAME destination, never removing the old patch -
+    // ~41 creates per source in one run. Kept, those patches summed: every voice heard dozens
+    // of times over, the mix at 3.1x full scale. Only the voice's OWN outputs go; patches other
+    // voices route into it are theirs.
+    let mut dropped = 0usize;
+    if ctx.arg(2) & 1 != 0 {
+        let a = &mut st.audio_state;
+        for patch in a.at9.forget_outputs(voice) {
+            a.ngs_patch_voice.retain(|(p, _)| *p != patch);
+            a.ngs_patch_dest.retain(|(p, _)| *p != patch);
+            dropped += 1;
+        }
+    }
+    tracing::debug!(
+        target: "vitaslop::at9",
+        voice = format_args!("{voice:#x}"),
+        flags = ctx.arg(2),
+        preset = ctx.arg(1) != 0,
+        dropped,
+        "voice init"
+    );
     ctx.ret(0);
 }
 
@@ -247,7 +292,11 @@ pub(super) fn voice_get_info(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32,
             NGS_VOICE_STATE_ACTIVE
         } else {
             NGS_VOICE_STATE_AVAILABLE
-        } | if bank.is_paused(voice) { NGS_VOICE_STATE_PAUSED } else { 0 };
+        } | if bank.is_paused(voice) {
+            NGS_VOICE_STATE_PAUSED
+        } else {
+            0
+        };
         ctx.write_u32(info.addr() + NGS_VOICE_INFO_STATE_OFF, state);
     }
     0
@@ -256,7 +305,7 @@ pub(super) fn voice_get_info(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32,
 /// SceInt32 sceNgsVoiceSetModuleCallback(SceNgsHVoice voice, SceUInt32 moduleId,
 ///                                       SceNgsModuleCallbackFunc callback, void *userData)
 /// Record the callback; the player module raises it at every buffer boundary - see
-/// [`deliver_player_events`]. A null `callback` clears the registration.
+/// [`player_event_calls`]. A null `callback` clears the registration.
 #[hostcall]
 pub(super) fn voice_set_module_callback(
     _ctx: &mut GuestCtx,
@@ -296,14 +345,17 @@ pub(super) fn voice_set_finished_callback(
 /// The player module's index in every voice definition that has one.
 const NGS_PLAYER_MODULE: u32 = 0;
 
-/// Hand every buffer boundary the mix just crossed to the guest, as the module callback
-/// (and, at the end of a voice's data, the finished callback) the title registered.
+/// Every module callback (and, at the end of a voice's data, the finished callback) the mix's
+/// buffer boundaries owe the title, in event order: each callback's entry and the
+/// `SceNgsCallbackInfo` it is handed. `audio::out_output` runs them on the thread whose grain
+/// raised them, as the device does, or hands them to the serial callback thread.
 ///
-/// The `SceNgsCallbackInfo` handed over is `{ voice, rack, module, reason, buffer index,
-/// callback pointer, user data }` - see `VitaState::NGS_CB_INFO_BYTES` for the evidence
-/// on the last three. The rack is the one the voice was fetched from with
-/// `sceNgsRackGetVoiceHandle`, or 0 for a voice this engine never saw fetched.
-pub(super) fn deliver_player_events(ctx: &mut GuestCtx, st: &mut VitaState) {
+/// The info is `{ voice, rack, module, reason, buffer index, callback pointer, user data }` -
+/// see `VitaState::NGS_CB_INFO_BYTES` for the evidence on the last three. The rack is the one
+/// the voice was fetched from with `sceNgsRackGetVoiceHandle`, or 0 for a voice this engine
+/// never saw fetched.
+pub(super) fn player_event_calls(st: &mut VitaState) -> Vec<(u32, [u8; 0x1c])> {
+    let mut calls = Vec::new();
     let events = st.audio_state.at9.take_events();
     for (voice, event) in events {
         let rack = st
@@ -320,7 +372,11 @@ pub(super) fn deliver_player_events(ctx: &mut GuestCtx, st: &mut VitaState) {
             .find(|(k, _)| *k == (voice, NGS_PLAYER_MODULE))
             .map(|(_, cb)| *cb);
         let finished_cb = if matches!(event, super::at9::PlayerEvent::EndOfData { .. }) {
-            st.audio_state.ngs_finished_cbs.iter().find(|(v, _)| *v == voice).map(|(_, cb)| *cb)
+            st.audio_state
+                .ngs_finished_cbs
+                .iter()
+                .find(|(v, _)| *v == voice)
+                .map(|(_, cb)| *cb)
         } else {
             None
         };
@@ -334,13 +390,22 @@ pub(super) fn deliver_player_events(ctx: &mut GuestCtx, st: &mut VitaState) {
         );
         for (entry, userdata) in module_cb.into_iter().chain(finished_cb) {
             let mut info = [0u8; 0x1c];
-            let words = [voice, rack, NGS_PLAYER_MODULE, event.reason(), event.buffer(), entry, userdata];
+            let words = [
+                voice,
+                rack,
+                NGS_PLAYER_MODULE,
+                event.reason(),
+                event.buffer(),
+                entry,
+                userdata,
+            ];
             for (i, w) in words.iter().enumerate() {
                 info[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
             }
-            st.enqueue_ngs_callback(ctx, entry, &info);
+            calls.push((entry, info));
         }
     }
+    calls
 }
 
 /// Voice key-off / kill / pause - stop producing audio from this voice.
@@ -411,7 +476,12 @@ const NGS_BLOCK_SIZE: u32 = 256;
 /// SceInt32 sceNgsSystemGetRequiredMemorySize(const SceNgsSystemInitParams *params,
 ///                                            SceUInt32 *size)
 #[hostcall]
-pub(super) fn system_get_required_memory_size(ctx: &mut GuestCtx, _st: &mut VitaState, _params: Ptr, size: Ptr) -> i32 {
+pub(super) fn system_get_required_memory_size(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _params: Ptr,
+    size: Ptr,
+) -> i32 {
     if size.addr() != 0 {
         ctx.write_u32(size.addr(), NGS_WORK_SIZE);
     }
@@ -423,8 +493,19 @@ pub(super) fn system_get_required_memory_size(ctx: &mut GuestCtx, _st: &mut Vita
 /// The system handle is the title's own working memory; hand that back (or a fresh
 /// block if it passed none) through `handle`.
 #[hostcall]
-pub(super) fn system_init(ctx: &mut GuestCtx, st: &mut VitaState, memory: Ptr, _mem_size: u32, _params: Ptr, handle: Ptr) -> i32 {
-    let sys = if memory.addr() != 0 { memory.addr() } else { st.galloc(NGS_WORK_SIZE, 16) };
+pub(super) fn system_init(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    memory: Ptr,
+    _mem_size: u32,
+    _params: Ptr,
+    handle: Ptr,
+) -> i32 {
+    let sys = if memory.addr() != 0 {
+        memory.addr()
+    } else {
+        st.galloc(NGS_WORK_SIZE, 16)
+    };
     if handle.addr() != 0 {
         ctx.write_u32(handle.addr(), sys);
     }
@@ -434,7 +515,13 @@ pub(super) fn system_init(ctx: &mut GuestCtx, st: &mut VitaState, memory: Ptr, _
 /// SceInt32 sceNgsRackGetRequiredMemorySize(SceNgsHSynSystem system,
 ///                                          const SceNgsRackDescription *desc, SceUInt32 *size)
 #[hostcall]
-pub(super) fn rack_get_required_memory_size(ctx: &mut GuestCtx, _st: &mut VitaState, _system: u32, _desc: Ptr, size: Ptr) -> i32 {
+pub(super) fn rack_get_required_memory_size(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _system: u32,
+    _desc: Ptr,
+    size: Ptr,
+) -> i32 {
     if size.addr() != 0 {
         ctx.write_u32(size.addr(), NGS_WORK_SIZE);
     }
@@ -446,9 +533,24 @@ pub(super) fn rack_get_required_memory_size(ctx: &mut GuestCtx, _st: &mut VitaSt
 /// `SceNgsBufferInfo` is `{ void *data; SceUInt32 size; }`; the rack handle is that
 /// data pointer (or a fresh block if the title supplied none).
 #[hostcall]
-pub(super) fn rack_init(ctx: &mut GuestCtx, st: &mut VitaState, _system: u32, rack_buffer: Ptr, desc: Ptr, handle: Ptr) -> i32 {
-    let data = if rack_buffer.addr() != 0 { ctx.read_u32(rack_buffer.addr()) } else { 0 };
-    let rack = if data != 0 { data } else { st.galloc(NGS_WORK_SIZE, 16) };
+pub(super) fn rack_init(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    _system: u32,
+    rack_buffer: Ptr,
+    desc: Ptr,
+    handle: Ptr,
+) -> i32 {
+    let data = if rack_buffer.addr() != 0 {
+        ctx.read_u32(rack_buffer.addr())
+    } else {
+        0
+    };
+    let rack = if data != 0 {
+        data
+    } else {
+        st.galloc(NGS_WORK_SIZE, 16)
+    };
     if handle.addr() != 0 {
         ctx.write_u32(handle.addr(), rack);
     }
@@ -474,7 +576,9 @@ pub(super) fn rack_init(ctx: &mut GuestCtx, st: &mut VitaState, _system: u32, ra
         let def_name = voice_def_name(st, defn);
         st.audio_state.ngs_rack_channels.retain(|(r, _)| *r != rack);
         st.audio_state.ngs_rack_channels.push((rack, channels));
-        if def_name.is_some_and(|n| n.ends_with("Buss")) && !st.audio_state.ngs_buss_racks.contains(&rack) {
+        if def_name.is_some_and(|n| n.ends_with("Buss"))
+            && !st.audio_state.ngs_buss_racks.contains(&rack)
+        {
             st.audio_state.ngs_buss_racks.push(rack);
         }
         let name = match def_name {
@@ -558,6 +662,8 @@ pub(super) fn rack_release(ctx: &mut GuestCtx, st: &mut VitaState) {
     for &((r, _), voice) in a.ngs_voice_handles.iter() {
         if r == rack {
             a.at9.stop(voice);
+            // Its patches go with it, both ways: a released buss carries nothing onward.
+            a.at9.forget_voice(voice);
         }
     }
     ctx.ret(0);
@@ -569,19 +675,35 @@ pub(super) fn system_release(ctx: &mut GuestCtx, st: &mut VitaState) {
     let a = &mut st.audio_state;
     for &(_, voice) in a.ngs_voice_handles.iter() {
         a.at9.stop(voice);
+        a.at9.forget_voice(voice);
     }
     ctx.ret(0);
 }
 
 #[hostcall]
-pub(super) fn rack_get_voice_handle(ctx: &mut GuestCtx, st: &mut VitaState, rack: u32, index: u32, handle: Ptr) -> i32 {
+pub(super) fn rack_get_voice_handle(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    rack: u32,
+    index: u32,
+    handle: Ptr,
+) -> i32 {
     // The A/B arm: `VITASLOP_NGS_VOICE_HANDLE_MEMO=0` restores the fresh-handle-per-call
     // behaviour, which is the one way to put a number on what it costs on any title.
     // Cached: asked per call.
     static MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let memo = *MEMO.get_or_init(|| !matches!(crate::knobs::var("VITASLOP_NGS_VOICE_HANDLE_MEMO").as_deref(), Ok("0")));
+    let memo = *MEMO.get_or_init(|| {
+        !matches!(
+            crate::knobs::var("VITASLOP_NGS_VOICE_HANDLE_MEMO").as_deref(),
+            Ok("0")
+        )
+    });
     let found = if memo {
-        st.audio_state.ngs_voice_handles.iter().find(|(k, _)| *k == (rack, index)).copied()
+        st.audio_state
+            .ngs_voice_handles
+            .iter()
+            .find(|(k, _)| *k == (rack, index))
+            .copied()
     } else {
         None
     };
@@ -634,7 +756,14 @@ pub(super) fn rack_get_voice_handle(ctx: &mut GuestCtx, st: &mut VitaState, rack
 /// plausible-looking number in a field this engine cannot check is worse than a zero: it
 /// cannot be told from a measurement later.
 #[hostcall]
-pub(super) fn voice_get_state_data(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, module: u32, data: Ptr, size: u32) -> i32 {
+pub(super) fn voice_get_state_data(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    voice: u32,
+    module: u32,
+    data: Ptr,
+    size: u32,
+) -> i32 {
     if data.addr() != 0 && size != 0 {
         ctx.write_bytes(data.addr(), &vec![0u8; size as usize]);
         // The whole state block, not just the byte position - see `At9::state_words` for
@@ -697,7 +826,14 @@ fn params_interface_size(param_id: u32) -> u32 {
 /// interface it is about to write params for; a buffer already handed out keeps its
 /// contents, because it IS the voice's persistent parameter state across the cycle.
 #[hostcall]
-pub(super) fn voice_lock_params(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, module: u32, param: u32, buffer: Ptr) -> i32 {
+pub(super) fn voice_lock_params(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    voice: u32,
+    module: u32,
+    param: u32,
+    buffer: Ptr,
+) -> i32 {
     let buf = voice_params_state(ctx, st, voice, module, param);
     if buffer.addr() != 0 {
         ctx.write_u32(buffer.addr(), buf); // SceNgsBufferInfo.data
@@ -713,7 +849,13 @@ pub(super) fn voice_lock_params(ctx: &mut GuestCtx, st: &mut VitaState, voice: u
 /// and a `sceNgsVoiceSetParamsBlock` entry update the SAME parameters on the device, which is
 /// why a title can set a voice up whole through a block and then change one field through a
 /// lock - see [`voice_set_params_block`].
-fn voice_params_state(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, module: u32, param: u32) -> u32 {
+fn voice_params_state(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    voice: u32,
+    module: u32,
+    param: u32,
+) -> u32 {
     let key = (voice, module, param);
     match st.audio_state.ngs_param_buf(key) {
         Some(a) => a,
@@ -772,7 +914,12 @@ fn voice_def_name(st: &VitaState, addr: u32) -> Option<&'static str> {
 /// mapping is recorded here rather than rediscovered later, because the patch handle is
 /// otherwise an opaque block with nothing linking it to anything.
 #[hostcall]
-pub(super) fn patch_create_routing(ctx: &mut GuestCtx, st: &mut VitaState, info: Ptr, handle: Ptr) -> i32 {
+pub(super) fn patch_create_routing(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    info: Ptr,
+    handle: Ptr,
+) -> i32 {
     let patch = st.galloc(NGS_BLOCK_SIZE, 16);
     if handle.addr() != 0 {
         ctx.write_u32(handle.addr(), patch);
@@ -792,31 +939,63 @@ pub(super) fn patch_create_routing(ctx: &mut GuestCtx, st: &mut VitaState, info:
             "patch routing created"
         );
         st.audio_state.ngs_patch_voice.push((patch, source_voice));
-        st.audio_state.ngs_patch_dest.push((patch, destination_voice));
-        st.audio_state.at9.set_route(source_voice, destination_voice);
+        st.audio_state
+            .ngs_patch_dest
+            .push((patch, destination_voice));
+        st.audio_state
+            .at9
+            .add_patch(patch, source_voice, destination_voice);
     }
     0
 }
 
-/// SceInt32 sceNgsVoiceGetOutputPatch(SceNgsHVoice voice, SceInt32 index, SceNgsHPatch *patch)
+/// SceInt32 sceNgsPatchRemoveRouting(SceNgsHPatch patch)
 ///
-/// The reverse of [`patch_create_routing`]: which patch carries this voice's `index`-th
-/// output. `ngs_patch_voice` already records `(patch, source voice)` for every routing the
-/// title created, in creation order, so the answer is the `index`-th entry whose source is
-/// this voice. No such output writes a NULL handle and returns 0 - which is what a title
-/// asking "is anything routed here yet" expects, and is not an error.
+/// >>> THE PATCH STOPS CARRYING ANYTHING. This was an inlined `ret 0` stub, which was harmless
+/// only while each voice kept one route that the next `sceNgsPatchCreateRouting` overwrote.
+/// With every patch kept (a voice can feed several busses), a title that tears its graph down
+/// and builds it again - one does, at each scene load - would leave the old patches summing
+/// beside the new ones, every voice heard twice. A handle this engine never created is not
+/// established as an error on the device, so it answers 0 as the stub did and says so at DEBUG.
+#[hostcall]
+pub(super) fn patch_remove_routing(_ctx: &mut GuestCtx, st: &mut VitaState, patch: u32) -> i32 {
+    let a = &mut st.audio_state;
+    a.ngs_patch_voice.retain(|(p, _)| *p != patch);
+    a.ngs_patch_dest.retain(|(p, _)| *p != patch);
+    let known = a.at9.remove_patch(patch);
+    tracing::debug!(target: "vitaslop::at9", patch = format_args!("{patch:#x}"), known, "patch routing removed");
+    0
+}
+
+/// SceInt32 sceNgsVoiceGetOutputPatch(SceNgsHVoice voice, SceInt32 outputIndex,
+///                                    SceInt32 patchIndex, SceNgsHPatch *patch)
 ///
-/// >>> IT IS HERE BECAUSE REFUSING A BOGUS EVENT-FLAG WAIT UNCOVERED IT. A football title's audio
-/// thread was parked forever on `sceKernelWaitEventFlag` on a uid that names nothing; once
-/// that wait returns `UNKNOWN_EVF_ID` the thread runs on and calls this, which had no
-/// implementation at all. A stall hides every gap downstream of it
-/// [[vitaslop-fast-fail-no-silent-success]].
+/// The reverse of [`patch_create_routing`]: which patch carries this voice's `patchIndex`-th
+/// routing (on output `outputIndex` - every voice modelled here has the one output, so it
+/// does not narrow the search). `ngs_patch_voice` records `(patch, source voice)` for every
+/// routing the title created, in creation order.
+///
+/// >>> FOUR ARGUMENTS, AND "NO PATCH" IS AN ERROR. EVIDENCE, off a football title's mixer
+/// set-up: it calls this as `(voice, 0, 0, sp)` and reads the handle back from `[sp]`, then
+/// `cmp r0, #0; beq` - on 0 it hands that handle to `sceNgsPatchGetInfo` and
+/// `sceNgsVoicePatchSetVolumesMatrix`, on anything else it builds a setup struct and creates
+/// the routing itself. Read as three arguments with the out-pointer in r2 (0 there) and 0
+/// returned for "nothing routed", the handle was never written, the title used the 1.0f its
+/// stack slot held as a patch, and never created a routing: every voice mixed at whatever
+/// gain that produced, and 10-21% of its grains clipped. The title's own create path is the
+/// proof that the device fails this call when no patch exists. WHICH error it returns is not
+/// established - the title tests only for non-zero - so this answers the generic
+/// `SCE_NGS_ERROR_INVALID_PARAM` and writes nothing.
+///
+/// It was first written for the same title's audio thread, after a refused event-flag wait let
+/// that thread run on into it [[vitaslop-fast-fail-no-silent-success]].
 #[hostcall]
 pub(super) fn voice_get_output_patch(
     ctx: &mut GuestCtx,
     st: &mut VitaState,
     voice: u32,
-    index: i32,
+    _output_index: i32,
+    patch_index: i32,
     patch: Ptr,
 ) -> i32 {
     let found = st
@@ -824,14 +1003,21 @@ pub(super) fn voice_get_output_patch(
         .ngs_patch_voice
         .iter()
         .filter(|(_, v)| *v == voice)
-        .nth(index.max(0) as usize)
-        .map(|(p, _)| *p)
-        .unwrap_or(0);
-    if !patch.is_null() {
-        ctx.write_u32(patch.addr(), found);
+        .nth(patch_index.max(0) as usize)
+        .map(|(p, _)| *p);
+    match found {
+        Some(p) => {
+            if !patch.is_null() {
+                ctx.write_u32(patch.addr(), p);
+            }
+            0
+        }
+        None => SCE_NGS_ERROR_INVALID_PARAM,
     }
-    0
 }
+
+/// `SCE_NGS_ERROR_INVALID_PARAM` (the dev wiki's error table).
+const SCE_NGS_ERROR_INVALID_PARAM: i32 = 0x804A_0002u32 as i32;
 
 /// SceInt32 sceNgsPatchGetInfo(SceNgsHPatch patch, SceNgsPatchInfo *info)
 ///
@@ -858,7 +1044,8 @@ pub(super) fn patch_get_info(ctx: &mut GuestCtx, st: &mut VitaState, patch: u32,
         }
         // Once: a title whose patches all come from a path not modelled here asks per call.
         None => {
-            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!(
                     target: "vitaslop::at9",
@@ -878,11 +1065,26 @@ pub(super) fn patch_get_info(ctx: &mut GuestCtx, st: &mut VitaState, patch: u32,
 fn patch_channels(st: &VitaState, patch: u32) -> Option<(u32, u32)> {
     let a = &st.audio_state;
     let channels_of = |voice: u32| -> Option<u32> {
-        let rack = a.ngs_voice_handles.iter().find(|(_, v)| *v == voice).map(|((r, _), _)| *r)?;
-        a.ngs_rack_channels.iter().find(|(r, _)| *r == rack).map(|(_, c)| *c)
+        let rack = a
+            .ngs_voice_handles
+            .iter()
+            .find(|(_, v)| *v == voice)
+            .map(|((r, _), _)| *r)?;
+        a.ngs_rack_channels
+            .iter()
+            .find(|(r, _)| *r == rack)
+            .map(|(_, c)| *c)
     };
-    let source = a.ngs_patch_voice.iter().find(|(p, _)| *p == patch).map(|(_, v)| *v)?;
-    let dest = a.ngs_patch_dest.iter().find(|(p, _)| *p == patch).map(|(_, v)| *v)?;
+    let source = a
+        .ngs_patch_voice
+        .iter()
+        .find(|(p, _)| *p == patch)
+        .map(|(_, v)| *v)?;
+    let dest = a
+        .ngs_patch_dest
+        .iter()
+        .find(|(p, _)| *p == patch)
+        .map(|(_, v)| *v)?;
     Some((channels_of(source)?, channels_of(dest)?))
 }
 
@@ -910,7 +1112,10 @@ pub(super) fn voice_patch_set_volume(
     // writing its cross-feed cell (L->R = 0) after its straight cells went silent.
     st.audio_state.set_patch_cells(
         patch,
-        Some((output_channel.clamp(0, 1) as usize, input_channel.clamp(0, 1) as usize)),
+        Some((
+            output_channel.clamp(0, 1) as usize,
+            input_channel.clamp(0, 1) as usize,
+        )),
         volume,
         [[0.0; 2]; 2],
     );
@@ -960,7 +1165,12 @@ pub(super) fn voice_patch_set_volumes_matrix(
             lr = format_args!("{:#x}", ctx.regs[14]),
             "patch volume matrix"
         );
-        let loudest = m.iter().flatten().copied().filter(|v| v.is_finite()).fold(0.0f32, f32::max);
+        let loudest = m
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(0.0f32, f32::max);
         if m.iter().flatten().all(|v| v.is_finite() && *v >= 0.0) {
             st.audio_state.set_patch_cells(patch, None, loudest, m);
         }
@@ -1030,8 +1240,12 @@ pub(super) fn voice_set_params_block(
             // dropped, so its sounds played at whatever rate their block named.
             // `VITASLOP_NGS_BLOCK_STATE=0` is the arm back: apply from the title's memory only.
             static BLOCK_STATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let block_state =
-                *BLOCK_STATE.get_or_init(|| !matches!(crate::knobs::var("VITASLOP_NGS_BLOCK_STATE").as_deref(), Ok("0")));
+            let block_state = *BLOCK_STATE.get_or_init(|| {
+                !matches!(
+                    crate::knobs::var("VITASLOP_NGS_BLOCK_STATE").as_deref(),
+                    Ok("0")
+                )
+            });
             let params = if block_state && entry_bytes != 0 && entry_bytes <= NGS_BLOCK_SIZE {
                 let id = ctx.read_u32(entry);
                 let state = voice_params_state(ctx, st, voice, module, id);
@@ -1153,7 +1367,12 @@ mod lock_params_tests {
 
         fn read_u32(&self, addr: u32) -> u32 {
             let a = addr as usize;
-            u32::from_le_bytes([self.mem[a], self.mem[a + 1], self.mem[a + 2], self.mem[a + 3]])
+            u32::from_le_bytes([
+                self.mem[a],
+                self.mem[a + 1],
+                self.mem[a + 2],
+                self.mem[a + 3],
+            ])
         }
 
         fn write_u32(&mut self, addr: u32, v: u32) {
@@ -1234,7 +1453,11 @@ mod lock_params_tests {
         let info = 0x3000u32;
         h.write_u32(info, 0xdead_beef);
         h.call(voice_get_info, [voice, info, 0, 0]);
-        assert_eq!(h.read_u32(info), 0, "a voice that was never played is AVAILABLE");
+        assert_eq!(
+            h.read_u32(info),
+            0,
+            "a voice that was never played is AVAILABLE"
+        );
         h.call(voice_play, [voice, 0, 0, 0]);
         h.call(voice_get_info, [voice, info, 0, 0]);
         assert_eq!(h.read_u32(info), 1, "a playing voice is ACTIVE");
@@ -1262,10 +1485,19 @@ mod lock_params_tests {
         let (va, vb) = (voice_of(&mut h, rack_a), voice_of(&mut h, rack_b));
         assert!(h.st.audio_state.at9.is_playing(va) && h.st.audio_state.at9.is_playing(vb));
         h.call(rack_release, [rack_a, 0, 0, 0]);
-        assert!(!h.st.audio_state.at9.is_playing(va), "the released rack's voice must stop");
-        assert!(h.st.audio_state.at9.is_playing(vb), "another rack's voice must keep playing");
+        assert!(
+            !h.st.audio_state.at9.is_playing(va),
+            "the released rack's voice must stop"
+        );
+        assert!(
+            h.st.audio_state.at9.is_playing(vb),
+            "another rack's voice must keep playing"
+        );
         h.call(system_release, [0, 0, 0, 0]);
-        assert!(!h.st.audio_state.at9.any_playing(), "releasing the system stops every voice");
+        assert!(
+            !h.st.audio_state.at9.any_playing(),
+            "releasing the system stops every voice"
+        );
     }
 
     /// `sceNgsPatchGetInfo` reports the source voice's channels as the patch's OUTPUT channels
@@ -1274,7 +1506,8 @@ mod lock_params_tests {
     #[test]
     fn patch_info_reports_each_end_s_rack_channels() {
         let mut h = Harness::new();
-        let (desc, handle, out, setup, info) = (0x3000u32, 0x3100u32, 0x3200u32, 0x3300u32, 0x3400u32);
+        let (desc, handle, out, setup, info) =
+            (0x3000u32, 0x3100u32, 0x3200u32, 0x3300u32, 0x3400u32);
         let voice_in_rack = |h: &mut Harness, def_nid: u32, channels: u32| {
             let def = voice_def_get_for(&mut h.st, def_nid);
             h.write_u32(desc, def);
@@ -1294,7 +1527,11 @@ mod lock_params_tests {
         h.write_u32(info, 0xdead_beef);
         h.write_u32(info + 4, 0xdead_beef);
         h.call(patch_get_info, [patch, info, 0, 0]);
-        assert_eq!((h.read_u32(info), h.read_u32(info + 4)), (1, 2), "mono source into a stereo buss");
+        assert_eq!(
+            (h.read_u32(info), h.read_u32(info + 4)),
+            (1, 2),
+            "mono source into a stereo buss"
+        );
     }
 
     /// A voice of a rack built from a BUSS definition is a buss from the start: playing it
@@ -1366,19 +1603,30 @@ mod lock_params_tests {
             mix
         };
         assert_eq!(grain(&mut h), vec![1, 2, 3, 4]);
-        assert!(h.st.audio_state.at9.take_events().is_empty(), "mid-buffer: no event");
+        assert!(
+            h.st.audio_state.at9.take_events().is_empty(),
+            "mid-buffer: no event"
+        );
         assert_eq!(grain(&mut h), vec![5, 6, 7, 8]);
         // The refill: slot 0 rewritten while slot 1 is about to play. Must not restart.
         h.write_u32(buf + 0x08, a + 8);
         h.write_u32(buf + 0x0c, 8);
         h.call(voice_unlock_params, [voice, 0, 0, 0]);
-        assert_eq!(grain(&mut h), vec![101, 102, 103, 104], "the chain moved to slot 1");
+        assert_eq!(
+            grain(&mut h),
+            vec![101, 102, 103, 104],
+            "the chain moved to slot 1"
+        );
         assert_eq!(
             h.st.audio_state.at9.take_events(),
             vec![(voice, PlayerEvent::Swapped { finished: 0 })]
         );
         assert_eq!(grain(&mut h), vec![105, 106, 107, 108]);
-        assert_eq!(grain(&mut h), vec![0, 0, 0, 0], "slot 1 names no successor: silence");
+        assert_eq!(
+            grain(&mut h),
+            vec![0, 0, 0, 0],
+            "slot 1 names no successor: silence"
+        );
         assert_eq!(
             h.st.audio_state.at9.take_events(),
             vec![(voice, PlayerEvent::EndOfData { last: 1 })]
@@ -1396,7 +1644,8 @@ mod lock_params_tests {
         let voice = 0x1234;
         let a = 0x0020_0000u32;
         for i in 0..64u32 {
-            h.mem[(a + i * 2) as usize..(a + i * 2 + 2) as usize].copy_from_slice(&(1 + i as i16).to_le_bytes());
+            h.mem[(a + i * 2) as usize..(a + i * 2 + 2) as usize]
+                .copy_from_slice(&(1 + i as i16).to_le_bytes());
         }
         // The block: module 0, all channels, then a whole PCM player struct.
         let block = 0x0030_0000u32;
@@ -1411,7 +1660,10 @@ mod lock_params_tests {
         h.write_u32(p + 0x38, 48000.0f32.to_bits());
         h.write_u32(p + 0x4c, 1); // one channel, raw s16
         let errs = 0x0031_0000u32;
-        h.call(voice_set_params_block, [voice, block, NGS_MODULE_PARAM_HEADER_BYTES + 84, errs]);
+        h.call(
+            voice_set_params_block,
+            [voice, block, NGS_MODULE_PARAM_HEADER_BYTES + 84, errs],
+        );
         h.call(voice_play, [voice, 0, 0, 0]);
         let grain = |h: &mut Harness| -> Vec<i32> {
             let mut mix = vec![0i32; 4];
@@ -1425,14 +1677,32 @@ mod lock_params_tests {
         let info = 0x2000u32;
         h.call(voice_lock_params, [voice, 0, PCM_PLAYER_ID, info]);
         let buf = h.read_u32(info);
-        assert_eq!(h.read_u32(buf + 0x08), a, "lock must return the source the block set");
-        assert_eq!(h.mem[(buf + 0x4c) as usize], 1, "lock must return the channel count the block set");
+        assert_eq!(
+            h.read_u32(buf + 0x08),
+            a,
+            "lock must return the source the block set"
+        );
+        assert_eq!(
+            h.mem[(buf + 0x4c) as usize],
+            1,
+            "lock must return the channel count the block set"
+        );
         h.write_u32(buf + 0x38, 24000.0f32.to_bits());
         h.call(voice_unlock_params, [voice, 0, 0, 0]);
-        assert!(h.st.audio_state.at9.is_playing(voice), "a rate change must not stop the voice");
+        assert!(
+            h.st.audio_state.at9.is_playing(voice),
+            "a rate change must not stop the voice"
+        );
         let next = grain(&mut h);
-        assert_eq!(next[0], 5, "a rate change continues from where the voice was");
-        assert_ne!(next, vec![5, 6, 7, 8], "the new rate must apply: half speed advances half as far");
+        assert_eq!(
+            next[0], 5,
+            "a rate change continues from where the voice was"
+        );
+        assert_ne!(
+            next,
+            vec![5, 6, 7, 8],
+            "the new rate must apply: half speed advances half as far"
+        );
     }
 
     /// The negative control, which is what the engine did before: with the descriptor id

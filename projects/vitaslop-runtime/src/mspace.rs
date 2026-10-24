@@ -156,7 +156,10 @@ impl Mspace {
             self.frees,
             self.failures,
             self.free_by_addr.len(),
-            self.free_by_size.iter().next_back().map_or(0, |&(len, _)| len),
+            self.free_by_size
+                .iter()
+                .next_back()
+                .map_or(0, |&(len, _)| len),
         )
     }
 
@@ -177,17 +180,19 @@ impl Mspace {
         let mut len = len;
         // Coalesce with the run ending here.
         if let Some((&prev_start, &prev_len)) = self.free_by_addr.range(..start).next_back()
-            && prev_start + prev_len == start {
-                self.remove_free(prev_start, prev_len);
-                start = prev_start;
-                len += prev_len;
-            }
+            && prev_start + prev_len == start
+        {
+            self.remove_free(prev_start, prev_len);
+            start = prev_start;
+            len += prev_len;
+        }
         // Coalesce with the run starting at our end.
         if let Some((&next_start, &next_len)) = self.free_by_addr.range(start + len..).next()
-            && next_start == start + len {
-                self.remove_free(next_start, next_len);
-                len += next_len;
-            }
+            && next_start == start + len
+        {
+            self.remove_free(next_start, next_len);
+            len += next_len;
+        }
         self.insert_free(start, len);
         true
     }
@@ -251,7 +256,11 @@ impl MspaceStore {
 
     /// Every live space's [`Mspace::report`], for the end of a run.
     pub fn report(&self) -> Vec<String> {
-        self.retired.iter().cloned().chain(self.spaces.values().map(Mspace::report)).collect()
+        self.retired
+            .iter()
+            .cloned()
+            .chain(self.spaces.values().map(Mspace::report))
+            .collect()
     }
 }
 
@@ -292,7 +301,11 @@ mod tests {
             assert!(m.free(*p));
         }
         // Everything came back, so the whole space is one run again.
-        assert_eq!(m.alloc(0x100, 0), Some(0), "free did not coalesce the space back");
+        assert_eq!(
+            m.alloc(0x100, 0),
+            Some(0),
+            "free did not coalesce the space back"
+        );
     }
 
     #[test]
@@ -354,7 +367,10 @@ mod tests {
                 continue;
             }
             if let Some(p) = m.alloc(size, 0) {
-                assert!(p >= 0x1_0000 && p + size <= 0x1_8000, "allocation left the space");
+                assert!(
+                    p >= 0x1_0000 && p + size <= 0x1_8000,
+                    "allocation left the space"
+                );
                 live.push(p);
             }
         }
@@ -362,6 +378,10 @@ mod tests {
             assert!(m.free(p));
         }
         assert_eq!(m.used_bytes(), 0);
-        assert_eq!(m.alloc(0x8000, 0), Some(0x1_0000), "the space did not come back whole");
+        assert_eq!(
+            m.alloc(0x8000, 0),
+            Some(0x1_0000),
+            "the space did not come back whole"
+        );
     }
 }

@@ -140,7 +140,7 @@ mod hostcalls {
     /// LOADER - and the comment here already warned that "a ratio measured on one
     /// workload does not transfer to another", which is exactly what then happened: on
     /// the front end the same setting ran the clock 5.1x slow and stranded a frame-keyed
-    /// recipe on a timed screen for 14,000 frames.
+    /// input script on a timed screen for 14,000 frames.
     ///
     /// The clock is now driven by [`super::fuel_interval`], which counts guest WORK the
     /// way native's engine fuel does. This stays as a liveness backstop for the one case
@@ -1056,7 +1056,7 @@ fn preempt_note() {
 /// magnitude between a menu and a race, so a clock driven by it is calibrated for
 /// whichever screen the calibration was taken on and wrong on every other. That model
 /// measured 17.37 s of game clock where native had 88.688 s - **5.1x slow** - and it
-/// stranded a frame-keyed recipe on a timed screen for 14,000 frames while native was two
+/// stranded a frame-keyed input script on a timed screen for 14,000 frames while native was two
 /// screens further on.
 ///
 /// # Why fitting a constant never worked
@@ -2273,6 +2273,9 @@ struct ThreadEngine {
     /// Whether the current entry has been started (its `promising` call made). Cleared
     /// when advancing to the next entry.
     entry_started: bool,
+    /// The EXIT event handlers the thread owes once its LAST entry has returned, run as
+    /// further entries. Per thread: [`BrowserThread::release`] resets it before pooling.
+    exit: vitaslop_runtime::sched::ExitHandlerRun,
     sp: u32,
     r0: u32,
     r1: u32,
@@ -2624,6 +2627,8 @@ impl ThreadHandle for BrowserThread {
         engine.entries.clear();
         engine.entry_idx = 0;
         engine.entry_started = false;
+        // Or the next thread would start out running this one's EXIT handlers.
+        engine.exit.reset();
         // ZERO, because that is what the instance's `reset` export leaves in the counter -
         // the same rule `fuel_used` follows after a clear.
         engine.fuel_last = 0;
@@ -3371,6 +3376,7 @@ impl BrowserEngine {
             entries: Vec::new(),
             entry_idx: 0,
             entry_started: false,
+            exit: Default::default(),
             sp: 0,
             r0: 0,
             r1: 0,
@@ -3702,12 +3708,27 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
 
         if !t.entry_started {
             t.entry_started = true;
-            // Each entry starts on a fresh stack; only the first carries args.
-            t.rt.set_reg(abi::SP, t.sp);
-            t.rt.set_reg(0, if t.entry_idx == 0 { t.r0 } else { 0 });
-            t.rt.set_reg(1, if t.entry_idx == 0 { t.r1 } else { 0 });
-            t.rt.set_reg(2, if t.entry_idx == 0 { t.r2 } else { 0 });
-            t.rt.set_reg(3, if t.entry_idx == 0 { t.r3 } else { 0 });
+            if let Some(call) = t.exit.take_seed() {
+                // An EXIT event handler: its arguments, on the thread's own fresh stack.
+                let mut seeded = [0u32; abi::REG_COUNT];
+                seeded[abi::SP] = t.sp;
+                {
+                    let mut mem: &GuestMem = &t.rt.view;
+                    call.seed(&mut seeded, &mut mem, t.rt.base);
+                }
+                for r in [0, 1, 2, 3, abi::SP] {
+                    t.rt.set_reg(r, seeded[r]);
+                }
+            } else {
+                // Only the final entry's end is the thread's (it owes the EXIT handlers).
+                host.lock().unwrap().thread_entry_starting(thid, t.entry_idx + 1 >= t.entries.len());
+                // Each entry starts on a fresh stack; only the first carries args.
+                t.rt.set_reg(abi::SP, t.sp);
+                t.rt.set_reg(0, if t.entry_idx == 0 { t.r0 } else { 0 });
+                t.rt.set_reg(1, if t.entry_idx == 0 { t.r1 } else { 0 });
+                t.rt.set_reg(2, if t.entry_idx == 0 { t.r2 } else { 0 });
+                t.rt.set_reg(3, if t.entry_idx == 0 { t.r3 } else { 0 });
+            }
             hostcalls::note_stack_start();
             // Which thread started a stack, and which of its entries. A count alone says
             // stacks are being created; it cannot say whether that is a handful of guest
@@ -3855,11 +3876,33 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
         };
 
         let last = t.entry_idx + 1 >= t.entries.len();
+        // The thread's own entries are done and it is running its EXIT handlers: one that
+        // returns moves to the next, and the thread ends with the code its entry returned. A
+        // handler that exits the thread itself ends it with that code too.
+        if let Some(code) = t.exit.code() {
+            match ev {
+                Ev::Suspend(stop) => return ThreadStep::Suspended(stop),
+                Ev::Halt(c) => return ThreadStep::Finished(FiberEnd::ProcessHalt(c)),
+                Ev::Error(m) => return ThreadStep::Finished(FiberEnd::Error(m)),
+                Ev::ThreadExit(_) => return ThreadStep::Finished(FiberEnd::ThreadExit(code)),
+                Ev::Returned(_) => match start_exit_call(t) {
+                    true => continue,
+                    false => return ThreadStep::Finished(FiberEnd::Returned(code)),
+                },
+            }
+        }
         match ev {
             Ev::Suspend(stop) => return ThreadStep::Suspended(stop),
             Ev::Halt(c) => return ThreadStep::Finished(FiberEnd::ProcessHalt(c)),
             Ev::Error(m) => return ThreadStep::Finished(FiberEnd::Error(m)),
-            Ev::Returned(c) if last => return ThreadStep::Finished(FiberEnd::Returned(c)),
+            Ev::Returned(c) if last => {
+                // The thread returned from its entry: its EXIT handlers run on it before it
+                // ends. (An `sceKernelExitThread` runs them inside that host call instead.)
+                let calls = host.lock().unwrap().thread_return_calls(thid, c);
+                if !t.exit.begin(c, calls) || !start_exit_call(t) {
+                    return ThreadStep::Finished(FiberEnd::Returned(c));
+                }
+            }
             Ev::ThreadExit(c) if last => return ThreadStep::Finished(FiberEnd::ThreadExit(c)),
             // A non-final entry ended (returned or called ExitThread): advance to the
             // next one on a fresh stack, without returning to the scheduler.
@@ -3869,6 +3912,22 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
             }
         }
     }
+}
+
+/// Queue the next EXIT event handler (see [`ThreadEngine::exit`]) as this thread's next
+/// entry: the module's dispatcher bound to its address, started on a fresh stack seeded from its
+/// arguments. False when none is left.
+fn start_exit_call(t: &mut ThreadEngine) -> bool {
+    let Some(dispatch_p) = t.dispatch_p.clone() else { return false };
+    let Some(entry) = t.exit.advance() else { return false };
+    t.entries.push(
+        dispatch_p
+            .bind2(&JsValue::UNDEFINED, &JsValue::from(entry & !1), &JsValue::from(0u32))
+            .unchecked_into::<Function>(),
+    );
+    t.entry_idx = t.entries.len() - 1;
+    t.entry_started = false;
+    true
 }
 
 /// How often [`run_frames`] reports its round count.
@@ -4844,7 +4903,7 @@ pub(crate) fn apply_early_batch(
                 tracing::info!(target: "vitaslop::status", "gxm rtt: early completion of {addr:#010x} ({w}x{h}): texel(24,1)={t:?}{detail}");
                 // `VITASLOP_RTT_GRID_FRAMES=a+b+..`: the same line STAMPED with the frame, for
                 // the first completion at or after each listed frame. The unstamped line cannot pair a device's target with the
-                // desktop's - both runs log it at unknown moments - and a same-recipe comparison
+                // desktop's - both runs log it at unknown moments - and a same-input comparison
                 // needs the same FRAME on both sides.
                 static GRID_FRAMES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
                 let at = GRID_FRAMES.get_or_init(|| {

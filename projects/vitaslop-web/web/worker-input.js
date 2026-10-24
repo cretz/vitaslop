@@ -4,7 +4,11 @@
 // canvas become front-panel touches (mapped into the Vita's 960x544 screen space, which
 // the worker doubles to panel coords); key events carry their KeyboardEvent.code, which
 // the worker maps to SceCtrl buttons.
-export function forwardInput(worker, canvas) {
+//
+// `opts.rearTouch` (the opt-in "Rear touch panel" setting) adds the BACK panel: a right-button
+// drag with a mouse, or any touch while `opts.rearLatched()` says the on-screen Rear toggle is
+// on. Off, nothing below differs from a run without the setting.
+export function forwardInput(worker, canvas, opts = {}) {
   const SCREEN_W = 960;
   const SCREEN_H = 544;
 
@@ -44,10 +48,32 @@ export function forwardInput(worker, canvas) {
     const { x, y } = toScreen(e);
     worker.postMessage({ type: "pointer", x, y, down });
   };
-  on(canvas, "pointerdown", pointer(true, false));
-  on(canvas, "pointermove", pointer(true, true));
-  on(canvas, "pointerup", pointer(false, false));
-  on(canvas, "pointerleave", pointer(false, false));
+  if (!opts.rearTouch) {
+    on(canvas, "pointerdown", pointer(true, false));
+    on(canvas, "pointermove", pointer(true, true));
+    on(canvas, "pointerup", pointer(false, false));
+    on(canvas, "pointerleave", pointer(false, false));
+  } else {
+    // Which panel each press went to, so its move and release go to the same one.
+    let back = false;
+    const toBack = (e) =>
+      e.pointerType === "mouse" ? e.button === 2 || (e.buttons & 2) !== 0 : !!(opts.rearLatched && opts.rearLatched());
+    const post = (e, down) => {
+      const { x, y } = toScreen(e);
+      worker.postMessage({ type: back ? "back-pointer" : "pointer", x, y, down });
+    };
+    on(canvas, "pointerdown", (e) => {
+      back = toBack(e);
+      post(e, true);
+    });
+    on(canvas, "pointermove", (e) => {
+      if ((e.buttons & (back ? 2 : 1)) !== 0) post(e, true);
+    });
+    on(canvas, "pointerup", (e) => post(e, false));
+    on(canvas, "pointerleave", (e) => post(e, false));
+    // The right button is the rear panel here, not the browser's menu.
+    on(canvas, "contextmenu", (e) => e.preventDefault());
+  }
 
   const scrollers = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "Enter"]);
   const key = (pressed) => (e) => {

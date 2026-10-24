@@ -1,4 +1,5 @@
 //! TOOL: Thumb-2 disassembly of a segment dumped by `vitaslop-native/tests/dump_segment.rs`.
+//! `VITASLOP_DISASM_ARM=1` decodes ARM (A32) instead, four bytes at a time.
 //!
 //! `VITASLOP_DISASM_FILE=<dump> VITASLOP_DISASM_RANGE=0x81385eae-0x81385fc0
 //! cargo test -p vitaslop-transpiler --test disasm_dump -- --ignored --nocapture`
@@ -17,20 +18,21 @@ fn disasm_dump() {
     let bytes = std::fs::read(file).expect("read dump");
     let base = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let code = &bytes[4..];
-    let decoder = InstDecoder::default_thumb();
-    let mut pc = lo;
+    let arm = std::env::var("VITASLOP_DISASM_ARM").is_ok_and(|v| v == "1");
+    let decoder = if arm { InstDecoder::default() } else { InstDecoder::default_thumb() };
+    let mut pc = if arm { lo & !3 } else { lo };
     while pc < hi {
         let off = (pc - base) as usize;
         let mut reader = U8Reader::new(&code[off..]);
         match decoder.decode(&mut reader) {
             Ok(inst) => {
-                let len = if (code[off + 1] & 0xf8) >= 0xe8 { 4 } else { 2 };
+                let len = if arm || (code[off + 1] & 0xf8) >= 0xe8 { 4 } else { 2 };
                 println!("{pc:08x}: {inst}");
                 pc += len;
             }
             Err(e) => {
                 println!("{pc:08x}: <{e:?}> {:02x}{:02x}", code[off + 1], code[off]);
-                pc += 2;
+                pc += if arm { 4 } else { 2 };
             }
         }
     }

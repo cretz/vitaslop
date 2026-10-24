@@ -94,7 +94,20 @@ pub fn record(frame: u64, func_nid: u32, thid: i32, lr: u32, regs: &[u32]) {
     for (d, s) in first.iter_mut().zip(regs) {
         *d = *s;
     }
-    t.rows.insert(key, Row { seq, first_frame: frame, last_frame: frame, count: 1, arg0, arg0_varies: false, regs: first, ret: None, ret_varies: false });
+    t.rows.insert(
+        key,
+        Row {
+            seq,
+            first_frame: frame,
+            last_frame: frame,
+            count: 1,
+            arg0,
+            arg0_varies: false,
+            regs: first,
+            ret: None,
+            ret_varies: false,
+        },
+    );
 }
 
 /// Record what a call returned (r0 once its handler finished), on the row [`record`] made for
@@ -106,7 +119,12 @@ pub fn record_ret(frame: u64, func_nid: u32, thid: i32, lr: u32, r0: u32) {
         return;
     }
     let Ok(mut g) = TABLE.lock() else { return };
-    let Some(r) = g.as_mut().and_then(|t| t.rows.get_mut(&(func_nid, thid, lr))) else { return };
+    let Some(r) = g
+        .as_mut()
+        .and_then(|t| t.rows.get_mut(&(func_nid, thid, lr)))
+    else {
+        return;
+    };
     if r.ret.is_some_and(|v| v != r0) {
         r.ret_varies = true;
     }
@@ -121,17 +139,20 @@ static TRACE_HITS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 pub fn note_trace_hit(line: &str) {
     if let Ok(mut v) = TRACE_HITS.lock()
-        && v.len() < TRACE_HITS_CAP {
-            // Runs of padding in the register dump carry nothing.
-            v.push(line.split_whitespace().collect::<Vec<_>>().join(" "));
-            return;
-        }
+        && v.len() < TRACE_HITS_CAP
+    {
+        // Runs of padding in the register dump carry nothing.
+        v.push(line.split_whitespace().collect::<Vec<_>>().join(" "));
+        return;
+    }
     TRACE_HITS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The kept trace hits as panel text, or empty when there are none.
 pub fn trace_hits_report() -> String {
-    let Ok(v) = TRACE_HITS.lock() else { return String::new() };
+    let Ok(v) = TRACE_HITS.lock() else {
+        return String::new();
+    };
     if v.is_empty() {
         return String::new();
     }
@@ -149,8 +170,12 @@ pub fn trace_hits_report() -> String {
 
 /// The table as panel text, first-seen order, or empty when nothing was recorded.
 pub fn report() -> String {
-    let Ok(g) = TABLE.lock() else { return String::new() };
-    let Some(t) = g.as_ref() else { return String::new() };
+    let Ok(g) = TABLE.lock() else {
+        return String::new();
+    };
+    let Some(t) = g.as_ref() else {
+        return String::new();
+    };
     let mut rows: Vec<_> = t.rows.iter().collect();
     rows.sort_by_key(|(_, r)| r.seq);
     let mut s = format!(
@@ -174,7 +199,10 @@ pub fn report() -> String {
             if r.arg0_varies { "*" } else { "" }
         ));
         if let Some(v) = r.ret {
-            s.push_str(&format!(" ret={v:#x}{}", if r.ret_varies { "*" } else { "" }));
+            s.push_str(&format!(
+                " ret={v:#x}{}",
+                if r.ret_varies { "*" } else { "" }
+            ));
         }
         if regs_on {
             s.push_str(" regs=");

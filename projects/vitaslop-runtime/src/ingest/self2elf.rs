@@ -248,11 +248,8 @@ mod tests {
         ) else {
             return;
         };
-        let img = PfsImage::new(
-            FilesDb::parse(&fdb).unwrap(),
-            UnicvDb::parse(&ucv).unwrap(),
-        )
-        .unwrap();
+        let img =
+            PfsImage::new(FilesDb::parse(&fdb).unwrap(), UnicvDb::parse(&ucv).unwrap()).unwrap();
         let rif = Rif::parse(&work).unwrap();
 
         // PFS layer -> SELF.
@@ -281,8 +278,8 @@ mod tests {
         ) else {
             return;
         };
-        let img = PfsImage::new(FilesDb::parse(&fdb).unwrap(), UnicvDb::parse(&ucv).unwrap())
-            .unwrap();
+        let img =
+            PfsImage::new(FilesDb::parse(&fdb).unwrap(), UnicvDb::parse(&ucv).unwrap()).unwrap();
         let rif = Rif::parse(&work).unwrap();
         let ctx = img.file_ctx("eboot.bin", &rif.key).unwrap();
         let self_bytes = GameData::from_klicensee(&rif.key)
@@ -294,7 +291,13 @@ mod tests {
             Ok(m) => {
                 eprintln!(
                     "loaded module '{}' nid={:#x} base={:#x} entry={:#x} segs={} imports={} init_ptrs={}",
-                    m.name, m.module_nid, m.base, m.entry, m.segments.len(), m.imports.len(), m.init_pointers.len()
+                    m.name,
+                    m.module_nid,
+                    m.base,
+                    m.entry,
+                    m.segments.len(),
+                    m.imports.len(),
+                    m.init_pointers.len()
                 );
                 use std::collections::BTreeMap;
                 let mut by_lib: BTreeMap<u32, usize> = BTreeMap::new();

@@ -117,10 +117,20 @@ pub struct Discovered {
 /// the r7 tracking a noreturn `svc` needs.
 type RegConsts = [Option<u32>; 16];
 
-/// Upper bound on the instructions in one discovered function. Real ARM functions
-/// are far smaller (the largest seen in a shipping title is a few thousand); exceeding this
-/// means discovery is walking data as code, so the "function" is rejected.
-const MAX_FUNC_INSNS: usize = 16384;
+/// Upper bound on the instructions in one discovered function: as many 16-bit Thumb
+/// instructions as fit in [`MAX_FUNC_SPAN`], the bound the block-span guard already allows.
+/// Exceeding it means discovery is walking data as code, so the "function" is rejected.
+///
+/// It was 16384, on the belief that no shipping function comes near it. MEASURED: a 2D title's
+/// boot calls one REAL function of 101 KB of Thumb (0x8116b210..0x81183d5c: one prologue with a
+/// 21 KB stack frame, one epilogue) - the cap stubbed it, every call trapped, and the title died
+/// in its static initialisers. Two guards with different ideas of "too large" let the tighter one
+/// reject what the span guard was raised to accept.
+const MAX_FUNC_INSNS: usize = (MAX_FUNC_SPAN / 2) as usize;
+
+/// Widest span of block addresses one discovered function may cover - see the runaway guard at
+/// the end of `discover`.
+const MAX_FUNC_SPAN: u32 = 0x2_0000;
 
 /// Decode one instruction at guest `addr`, returning it and its byte length.
 fn decode_at(
@@ -346,6 +356,7 @@ fn track_regs(
     in_code: &impl Fn(u32) -> bool,
     discover_pointers: bool,
     code_pointers: &mut BTreeSet<u32>,
+    arm_code_pointers: &mut BTreeSet<u32>,
 ) -> RegConsts {
     let dst = inst.operands.first().and_then(regnum);
     match inst.opcode {
@@ -419,6 +430,14 @@ fn track_regs(
                     let v = (lo & 0x0000_FFFF) | (hi << 16);
                     if discover_pointers && v & 1 == 1 && in_code(v & !1) {
                         code_pointers.insert(v & !1);
+                    }
+                    // An A32 pair that builds a word-aligned code address is an ARM-state
+                    // function pointer: ARM code has no Thumb bit to say so. MEASURED on a
+                    // title built for ARM state: every thread entry is one trampoline whose
+                    // only reference is such a pair, so it was never lifted and each thread
+                    // "returned" before running a single instruction.
+                    if discover_pointers && !inst.thumb && v & 3 == 0 && in_code(v) {
+                        arm_code_pointers.insert(v);
                     }
                     v
                 });
@@ -527,6 +546,97 @@ fn arm_add_pc_switch(inst: &Instruction, addr: u32, thumb: bool, code_len: u32, 
         return None;
     }
     Some(SwitchInfo { index: rm.number(), targets, default: None, bias: pc.wrapping_sub(start) as i32, shift: 2 })
+}
+
+/// `ldr pc, [pc, rM, lsl #2]` in ARM mode, unconditional: a jump table of ABSOLUTE
+/// addresses inline after it (`pc + 8`), one word per case, bounded by the compiler's range
+/// check (`cmp rM, #n ; bhi default`). armcc's switch for an ARM-state function - MEASURED:
+/// zlib's `inflate` in a title built for ARM state dispatches its 29 modes this way. Without
+/// it the load lowered to an indirect CALL of the case body plus a return, so every mode
+/// ran as a separate function and `inflate` returned after its first one.
+/// Whether `addr` opens like an ARM-state function, for a pointer a `movw`/`movt` pair built.
+///
+/// >>> WITHOUT THIS, EVERY CONSTANT INTO THE IMAGE WAS LIFTED AS CODE. The executable segment
+/// holds the read-only data too, and a title built for ARM state materialises those addresses
+/// with the same pair: MEASURED, its transpile went from 21 s to 360 s lifting strings and
+/// tables as functions until each hit the runaway guard. A function either saves `lr` (`push`
+/// / `stmdb sp!` with lr, `str lr, [sp, #-4]!`), sets up a frame (`mov ip, sp`, `sub sp`), or
+/// is a LEAF that returns (`bx lr`) within a few unconditional instructions.
+fn opens_like_arm_code(code: &[u8], base: u32, addr: u32) -> bool {
+    let word = |a: u32| -> Option<u32> {
+        let o = a.checked_sub(base)? as usize;
+        code.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let Some(first) = word(addr) else { return false };
+    let saves_lr = (first & 0xffff_4000) == 0xe92d_4000 || first == 0xe52d_e004;
+    let frame = first == 0xe1a0_c00d || (first & 0xffff_f000) == 0xe24d_d000;
+    if saves_lr || frame {
+        return true;
+    }
+    // A leaf: unconditional instructions up to a `bx lr`.
+    for i in 0..8 {
+        match word(addr + 4 * i) {
+            Some(0xe12f_ff1e) => return true,
+            Some(w) if w >> 28 == 0xe => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// How far from an `ldr pc` table its case bodies may lie: they belong to the same function.
+const ARM_TABLE_REACH: u32 = 0x10_0000;
+
+fn arm_ldr_pc_switch(
+    inst: &Instruction,
+    addr: u32,
+    thumb: bool,
+    code: &[u8],
+    base: u32,
+    decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
+) -> Option<SwitchInfo> {
+    if thumb || inst.opcode != Opcode::LDR || inst.condition != ConditionCode::AL {
+        return None;
+    }
+    if regnum(&inst.operands[0]) != Some(15) {
+        return None;
+    }
+    let Operand::RegDerefPreindexRegShift(rn, rs, true, false) = &inst.operands[1] else {
+        return None;
+    };
+    if rn.number() != 15 {
+        return None;
+    }
+    let RegShiftStyle::RegImm(sh) = rs.into_shift() else { return None };
+    if sh.stype() != ShiftStyle::LSL || sh.imm() != 2 || sh.shiftee().number() == 15 {
+        return None;
+    }
+    let index = sh.shiftee().number();
+    let table = addr.wrapping_add(8);
+    // An ARM case body: word-aligned, inside the image, and near the table (a case body is
+    // part of the same function).
+    let entry = |i: u32| -> Option<u32> {
+        let off = table.wrapping_add(i * 4).wrapping_sub(base) as usize;
+        let w = code.get(off..off + 4)?;
+        let t = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        let near = t.abs_diff(table) <= ARM_TABLE_REACH;
+        (t & 3 == 0 && t >= base && (t.wrapping_sub(base) as usize) < code.len() && near).then_some(t)
+    };
+    let (count, default) = recover_switch_bound(decoded, addr, index);
+    let count = match count.filter(|c| *c > 0 && *c <= MAX_SWITCH_ENTRIES) {
+        Some(c) => c,
+        // No trustworthy guard - the index is often spilled and reloaded between the compare
+        // and the load, which `recover_switch_bound` rightly refuses. The table's own EXTENT
+        // then bounds it: entries are absolute code addresses near the table, and the word
+        // after the last one is an instruction, which is not. MEASURED: `sub r0,#1 ; cmp r0,#7 ;
+        // bhi ; ldr r0,[sp,#..] ; sub r0,#1 ; ldr pc,[pc,r0,lsl #2]` - eight entries, then `b`.
+        None => (0..MAX_SWITCH_ENTRIES).take_while(|&i| entry(i).is_some()).count() as u32,
+    };
+    if count == 0 {
+        return None;
+    }
+    let targets = (0..count).map(entry).collect::<Option<Vec<u32>>>()?;
+    Some(SwitchInfo { index, targets, default, bias: 0, shift: 0 })
 }
 
 /// libgcc's integer-division ladder (`__aeabi_uidiv`/`__aeabi_idiv`, `lib1funcs.S`
@@ -1004,7 +1114,7 @@ fn recover_switch_bound(
     let mut snaps: Vec<(u32, &Instruction, u32, RegConsts)> = Vec::new();
     for (&a, (ins, len, _, _)) in decoded.range(tb_addr.wrapping_sub(WINDOW)..tb_addr) {
         snaps.push((a, ins, *len, regs));
-        regs = track_regs(ins, a, regs, &|_| false, false, &mut throwaway);
+        regs = track_regs(ins, a, regs, &|_| false, false, &mut throwaway, &mut BTreeSet::new());
     }
 
     // How the index register was produced from the switch variable: `idx = switch + k`.
@@ -1059,6 +1169,24 @@ fn recover_switch_bound(
             .rposition(|(_, ins, _, _)| ins.operands.first().and_then(regnum) == Some(reg))
         {
             let (_, ins, _, before) = &snaps[i];
+            // >>> A DEFINITION THAT CANNOT FALL THROUGH TO THE TABLE BRANCH IS NOT IN THE CHAIN.
+            // The walk is linear over addresses; an instruction in a block that jumps away
+            // never shaped the index. MEASURED in a title built for ARM state: `cmp r0,#8 ;
+            // bls table ; add r0, sp, #0x20 ; bl ; b away ; table: ldr pc, [pc, r0, lsl #2]`
+            // read the out-of-range path's `add` as a rebase onto sp, so the real guard on r0
+            // was never matched, the table was not recovered, and the load lowered to a call.
+            let falls_through = snaps[i + 1..].iter().all(|(_, ins, _, _)| {
+                !matches!(ins.opcode, Opcode::TBB | Opcode::TBH)
+                    && !(matches!(ins.opcode, Opcode::B | Opcode::BX)
+                        && ins.condition == ConditionCode::AL)
+            });
+            // Only a DEFINITION is skipped: a compare still ends the walk (see below), and
+            // walking past one picks up steps from above the guard.
+            if !falls_through && writes_first_operand(ins) {
+                // Skip it and keep walking: the chain's real steps sit above it.
+                from = i;
+                continue;
+            }
             let (next_reg, step) = adjustment_step(ins, reg, before);
             k = k.wrapping_add(step);
             // A definition that is not an adjustment reports itself as the same
@@ -1509,6 +1637,9 @@ fn discover_with(
     // helpers a Thumb function calls). Kept separate so the caller seeds them as
     // tentative ARM entries rather than Thumb.
     let mut arm_code_pointers: BTreeSet<u32> = BTreeSet::new();
+    // ARM-state pointers a `movw`/`movt` pair BUILT (not ones a `blx` called): kept apart because
+    // a constant into the image is as often rodata as code - see `opens_like_arm_code`.
+    let mut arm_built_pointers: BTreeSet<u32> = BTreeSet::new();
     // Register-indirect `blx`/`bx` sites whose tracked target constant is a known
     // host-import stub: the compiler routed a host import (e.g. `memset`) through a
     // function pointer. Keyed by the call-site address so pass 2 lowers it as the
@@ -1628,7 +1759,7 @@ fn discover_with(
             0
         };
         let next_regs =
-            track_regs(&inst, addr, regs, &in_bounds, discover_pointers, &mut code_pointers);
+            track_regs(&inst, addr, regs, &in_bounds, discover_pointers, &mut code_pointers, &mut arm_built_pointers);
         let next = addr.wrapping_add(len);
         if leaders.contains(&addr) {
             cond_lo.clear();
@@ -1696,6 +1827,7 @@ fn discover_with(
         // through - resolved or not. An unresolved table is reported per-function in
         // pass 2 rather than marching the decoder into table data.
         if let Some(info) = arm_add_pc_switch(&inst, addr, thumb, code.len() as u32, base)
+            .or_else(|| arm_ldr_pc_switch(&inst, addr, thumb, code, base, &decoded))
             .or_else(|| mov_pc_ladder_switch(&inst, addr, &decoded, code.len() as u32, base))
             .or_else(|| slot_sites.get(&addr).cloned())
             .or_else(|| {
@@ -1886,7 +2018,7 @@ fn discover_with(
             let (inst, len) = (&inst, &len);
             let regs = at[&addr];
             let next_regs =
-                track_regs(inst, addr, regs, &in_bounds, true, &mut code_pointers);
+                track_regs(inst, addr, regs, &in_bounds, true, &mut code_pointers, &mut arm_built_pointers);
             // A register-indirect call/branch through a tracked constant is an entry,
             // exactly as in pass 1 - but here the constant may have come from across a
             // branch.
@@ -2140,7 +2272,6 @@ fn discover_with(
     // It was 64 KiB, and a sports title's match code has one REAL function spanning 77 KiB of
     // Thumb (an 18 KB stack frame, one prologue, one epilogue): rejected, every call to it
     // lowered to a trap and the title died a few seconds into its first match.
-    const MAX_FUNC_SPAN: u32 = 0x2_0000;
     if let (Some(first), Some(last)) = (blocks.first(), blocks.last())
         && last.addr.wrapping_sub(first.addr) > MAX_FUNC_SPAN {
             return Err(Error::Runaway { first: first.addr, last: last.addr });
@@ -2155,6 +2286,7 @@ fn discover_with(
         finish_flags(&mut func);
     }
 
+    arm_code_pointers.extend(arm_built_pointers.into_iter().filter(|&a| opens_like_arm_code(code, base, a)));
     Ok(Discovered {
         func,
         trap_leaders: trap_leaders.union(&lower_gaps).copied().collect(),
@@ -2561,6 +2693,13 @@ fn lower_insn(
         // jump through memory: dispatch to the loaded target, then return to our
         // caller, exactly like `bx rN`.
         LDR if regnum(&ops[0]) == Some(15) => {
+            // A pc-relative table load (`ldr pc, [pc, rM, lsl #2]`) that pass 1 did not recover
+            // as a switch: its target is a CASE BODY of this function, not a function, so the
+            // indirect call below would run that body as a separate function and return out of
+            // this one. A named gap that traps where it is reached, never that.
+            if matches!(&ops[1], Operand::RegDerefPreindexRegShift(b, _, _, _) if b.number() == 15) {
+                return Err(err());
+            }
             let a = lower_addr(&ops[1], addr, thumb).ok_or_else(err)?;
             let pops_sp = matches!(
                 &ops[1],
@@ -2886,6 +3025,28 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 });
             }
             out.push(Stmt::SetReg(rd, bin(BinOp::Sub, op2, rn)));
+        }
+        // rsc rd, rn, op2 => rd = op2 - rn - NOT(C) = op2 + ~rn + C. A32 only: the high word
+        // of an ARM-state 64-bit negate (`rsbs lo, lo, #0 ; rsc hi, hi, #0`).
+        RSC => {
+            let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
+            let not_rn = Value::Not(Box::new(rn));
+            if sets_flags {
+                out.push(Stmt::FlagsAdd {
+                    a: op2,
+                    b: not_rn,
+                    cin: Value::Flag(crate::abi::Flag::C),
+                    live: ALL_FLAGS,
+                });
+                out.push(Stmt::SetReg(rd, Value::CarryAddResult));
+            } else {
+                let diff = bin(
+                    BinOp::Add,
+                    bin(BinOp::Add, op2, not_rn),
+                    Value::Flag(crate::abi::Flag::C),
+                );
+                out.push(Stmt::SetReg(rd, diff));
+            }
         }
         CMP => {
             let a = operand_value(&ops[0], pc_const).ok_or_else(err)?;
@@ -4635,8 +4796,8 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         VREV16 => NeonStmt::Rev { esize: ty.bits, container: 16, dst: r(0)?, src: r(1)? },
         VREV32 => NeonStmt::Rev { esize: ty.bits, container: 32, dst: r(0)?, src: r(1)? },
         VREV64 => NeonStmt::Rev { esize: ty.bits, container: 64, dst: r(0)?, src: r(1)? },
-        VRECPE => NeonStmt::RecipEstimate { sqrt: false, dst: r(0)?, src: r(1)? },
-        VRSQRTE => NeonStmt::RecipEstimate { sqrt: true, dst: r(0)?, src: r(1)? },
+        VRECPE => NeonStmt::ReciprocalEstimate { sqrt: false, dst: r(0)?, src: r(1)? },
+        VRSQRTE => NeonStmt::ReciprocalEstimate { sqrt: true, dst: r(0)?, src: r(1)? },
         VRECPS => NeonStmt::RecipStep { sqrt: false, dst: r(0)?, a: r(1)?, b: r(2)? },
         VRSQRTS => NeonStmt::RecipStep { sqrt: true, dst: r(0)?, a: r(1)?, b: r(2)? },
         // The permutes read and write both register operands (ops[0], ops[1]).
@@ -5128,6 +5289,119 @@ mod switch_bound_tests {
         assert_eq!(info.targets, vec![base + 0x20, base + 0x40, base + 0x60]);
         assert_eq!((info.index, info.shift, info.bias), (9, 5, 0u32.wrapping_sub(base + 0x20) as i32));
         assert_eq!(sites, vec![base + 0x28, base + 0x4c]);
+    }
+
+    /// An ARM-state `ldr pc, [pc, rM, lsl #2]` reads its cases off the absolute words at
+    /// `pc + 8`, as many as the `cmp`/`bhi` guard allows, and the guard's target is the default.
+    #[test]
+    fn an_arm_ldr_pc_table_is_a_switch() {
+        let base: u32 = 0x8100_0000;
+        let words: [u32; 11] = [
+            0xe354_0002, // cmp r4, #2
+            0x8a00_0004, // bhi base+0x1c
+            0xe79f_f104, // ldr pc, [pc, r4, lsl #2]
+            0xe1a0_0000, // (the word pc + 8 skips)
+            base + 0x20, base + 0x24, base + 0x28, // the table
+            0xe1a0_0000, // default
+            0xe12f_ff1e, 0xe12f_ff1e, 0xe12f_ff1e, // bx lr x3: the cases
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoder = InstDecoder::default();
+        let mut decoded = BTreeMap::new();
+        for a in (base..base + 0xc).step_by(4) {
+            let (inst, len) = decode_at(&decoder, &code, base, a, false).expect("decodes");
+            let c = inst.condition;
+            decoded.insert(a, (inst, len, c, false));
+        }
+        let ldr = decoded[&(base + 8)].0;
+        let info = arm_ldr_pc_switch(&ldr, base + 8, false, &code, base, &decoded).expect("recognised");
+        assert_eq!(info.targets, vec![base + 0x20, base + 0x24, base + 0x28]);
+        assert_eq!((info.index, info.bias, info.shift), (4, 0, 0));
+        assert_eq!(info.default, Some(base + 0x1c));
+        // A misaligned word is not an ARM case body: no switch rather than a wrong one.
+        let mut bad = code.clone();
+        bad[0x14..0x18].copy_from_slice(&(base + 0x26).to_le_bytes());
+        assert!(arm_ldr_pc_switch(&ldr, base + 8, false, &bad, base, &decoded).is_none());
+    }
+
+    /// The guard can sit ABOVE the block that holds the load, branching INTO it when in range:
+    /// `cmp r0, #8 ; (stores) ; bls table ; (out-of-range path) ; table: ldr pc, [pc, r0, lsl
+    /// #2]`. Real bytes from guest `0x81440d78` in a title built for ARM state - its UI thread
+    /// dies on the first run through when this lowers to a call.
+    #[test]
+    fn an_arm_ldr_pc_table_guarded_by_a_taken_branch_is_a_switch() {
+        let base: u32 = 0x8144_0d78;
+        let words: [u32; 25] = [
+            0xe350_0008, 0xe58d_201c, 0xe28d_3014, 0xe58d_102c, 0xe28d_2020, 0xe58d_3030,
+            0xe58d_2034, 0xe58d_a014, 0x9a00_0004, 0xe59d_11d8, 0xe28d_0020, 0xe58d_102c,
+            0xeb1b_e1c9, 0xea00_0328, 0xe79f_f100, 0xe1a0_0000, 0x8144_0ddc, 0x8144_137c,
+            0x8144_15c8, 0x8144_1334, 0x8144_0d9c, 0x8144_0d9c, 0x8144_0d9c, 0x8144_0d9c,
+            0x8144_1228,
+        ];
+        let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // Case bodies past the end of this excerpt must still be inside the image.
+        code.resize(0x900, 0);
+        let decoder = InstDecoder::default();
+        let mut decoded = BTreeMap::new();
+        for a in (base..base + 0x3c).step_by(4) {
+            let (inst, len) = decode_at(&decoder, &code, base, a, false).expect("decodes");
+            let c = inst.condition;
+            decoded.insert(a, (inst, len, c, false));
+        }
+        let at = base + 0x38;
+        let ldr = decoded[&at].0;
+        let info = arm_ldr_pc_switch(&ldr, at, false, &code, base, &decoded).expect("recognised");
+        assert_eq!(info.targets.len(), 9);
+        assert_eq!(info.targets[0], 0x8144_0ddc);
+        assert_eq!(info.targets[8], 0x8144_1228);
+    }
+
+    /// A SPILLED index: the guard tests one reload, the table indexes another, so the guard is
+    /// (rightly) not trusted - and the table's own extent bounds it instead: eight absolute
+    /// code addresses, then a `b`. Real bytes from guest `0x812d501c`.
+    #[test]
+    fn an_arm_ldr_pc_table_with_a_spilled_index_is_bounded_by_its_extent() {
+        let base: u32 = 0x812d_501c;
+        let words: [u32; 23] = [
+            0xe301_0c2c, 0xe79d_0000, 0xe590_0008, 0xe301_1d70, 0xe78d_0001, 0xe240_0001,
+            0xe350_0007, 0x8a00_000c, 0xe301_0d70, 0xe79d_0000, 0xe240_0001, 0xe79f_f100,
+            0xe1a0_0000, 0x812d_57b4, 0x812d_50c4, 0x812d_5074, 0x812d_509c, 0x812d_5088,
+            0x812d_55ac, 0x812d_57a4, 0x812d_5898, 0xea00_0242, 0xe3a0_0002,
+        ];
+        let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        code.resize(0x1000, 0);
+        let decoder = InstDecoder::default();
+        let mut decoded = BTreeMap::new();
+        for a in (base..base + 0x30).step_by(4) {
+            let (inst, len) = decode_at(&decoder, &code, base, a, false).expect("decodes");
+            let c = inst.condition;
+            decoded.insert(a, (inst, len, c, false));
+        }
+        let at = base + 0x2c;
+        let ldr = decoded[&at].0;
+        let info = arm_ldr_pc_switch(&ldr, at, false, &code, base, &decoded).expect("recognised");
+        assert_eq!(info.targets.len(), 8);
+        assert_eq!(info.targets[0], 0x812d_57b4);
+        assert_eq!(info.targets[7], 0x812d_5898);
+    }
+
+    /// A pointer a `movw`/`movt` pair built is lifted as ARM code only when it opens like a
+    /// function: the thread trampoline's `push {r4-r6, lr}` and a `bx lr` leaf are; a string is not.
+    #[test]
+    fn only_a_function_shaped_target_is_taken_as_arm_code() {
+        let base: u32 = 0x8100_0000;
+        let mut words: Vec<u32> = vec![
+            0xe92d_4070, // push {r4, r5, r6, lr}
+            0xe3a0_0001, 0xe12f_ff1e, // mov r0, #1 ; bx lr (a leaf, at +4)
+        ];
+        words.extend([0u32; 4]); // padding
+        let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let string_at = base + code.len() as u32;
+        code.extend_from_slice(b"app0:\\ui\\textures\0\0\0");
+        assert!(opens_like_arm_code(&code, base, base));
+        assert!(opens_like_arm_code(&code, base, base + 4));
+        assert!(!opens_like_arm_code(&code, base, string_at));
+        assert!(!opens_like_arm_code(&code, base, base + 0x1000), "outside the image");
     }
 
     /// A TABLE OVER 1024 ENTRIES IS STILL A TABLE. Real bytes from guest `0x8161a0a2` in a

@@ -223,6 +223,11 @@ details.card[open] > summary::before { content: "\25BE"; }
   -webkit-user-select: none;
   user-select: none;
 }
+/* The game's on-screen keyboard is open: the field the person types into, over the top of the
+   picture (ime-input.js). */
+.ime-bar { position: absolute; left: 50%; top: 8px; transform: translateX(-50%); width: min(480px, calc(100% - 32px)); z-index: 5; }
+.ime-bar input { width: 100%; box-sizing: border-box; font: inherit; font-size: 16px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line, #888); background: var(--panel, #111); color: var(--fg, #eee); }
+
 #stage {
   position: relative;
   flex: 1 1 auto;

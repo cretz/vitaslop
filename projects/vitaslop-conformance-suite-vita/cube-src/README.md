@@ -11,7 +11,7 @@ than any hand-written stub. See the project notes for the staged milestones.
 
 ## Artifacts (committed fixtures)
 - `cube.c`      - the source.
-- `build.sh`    - reproducible recipe (needs `$VITASDK`).
+- `build.sh`    - reproducible build (needs `$VITASDK`).
 - `cube.elf`    - linked ARM ELF (`-Wl,-q`, relocations kept).
 - `cube.velf`   - Vita executable: the ELF with NID import tables encoded by
                   `vita-elf-create`. This is the loader's input. No crypto - a

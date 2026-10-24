@@ -17,7 +17,7 @@
 #   GXMCONF_SRC=$D VITASDK=$HOME/vitasdk bash /tmp/b.sh
 #
 # The old note here said only the first half, and the copy then compiled nothing
-# and reported `gxmconf.c: No such file or directory` - a documented recipe that
+# and reported `gxmconf.c: No such file or directory` - a documented build that
 # does not work is worse than none, because it is tried first.
 set -euo pipefail
 

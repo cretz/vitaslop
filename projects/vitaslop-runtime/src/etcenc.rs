@@ -207,7 +207,13 @@ fn subblock_mean(block: &Block, flip: bool, sub: usize) -> [i32; 3] {
 ///
 /// The selector is a per-texel brightness, so this is a nearest-value search over four
 /// candidates per texel, in squared error over the three channels together.
-fn fit_subblock(block: &Block, flip: bool, sub: usize, base: [u8; 3], table: usize) -> (u32, [u8; 16]) {
+fn fit_subblock(
+    block: &Block,
+    flip: bool,
+    sub: usize,
+    base: [u8; 3],
+    table: usize,
+) -> (u32, [u8; 16]) {
     fit_subblock_within(block, flip, sub, base, table, u32::MAX)
 }
 
@@ -281,7 +287,11 @@ fn fit_subblock_within(
     // The four reachable colours, computed once per fit rather than once per texel.
     let mut palette = [[0i32; 3]; 4];
     for (s, &m) in mods.iter().enumerate() {
-        palette[s] = [clamp255(b0 + m) as i32, clamp255(b1 + m) as i32, clamp255(b2 + m) as i32];
+        palette[s] = [
+            clamp255(b0 + m) as i32,
+            clamp255(b1 + m) as i32,
+            clamp255(b2 + m) as i32,
+        ];
     }
     for &idx in idxs {
         let t = &block[idx];
@@ -351,11 +361,7 @@ fn quantise(v: i32, bits: u32) -> (u8, u8) {
 }
 
 fn expand_bits(q: u8, bits: u32) -> u8 {
-    if bits == 4 {
-        expand4(q)
-    } else {
-        expand5(q)
-    }
+    if bits == 4 { expand4(q) } else { expand5(q) }
 }
 
 /// The base-colour codes worth trying for one subblock: every combination of the two nearest
@@ -583,7 +589,14 @@ fn best_for(block: &Block, flip: bool, diff: bool) -> Option<Candidate> {
             }
         }
     }
-    Some(Candidate { err: total, flip, diff: false, stored, tables, sel })
+    Some(Candidate {
+        err: total,
+        flip,
+        diff: false,
+        stored,
+        tables,
+        sel,
+    })
 }
 
 /// DIFFERENTIAL mode: the second base is only expressible as a -4..3 offset from the first, so
@@ -641,13 +654,24 @@ fn best_differential(block: &Block, flip: bool) -> Option<Candidate> {
     // can never be an accidental T/H/planar block. Asserted rather than assumed, because that
     // failure would hand the hardware colour data in a completely different encoding.
     for c in 0..3 {
-        let d = if best1.1[c] >= 4 { best1.1[c] as i32 - 8 } else { best1.1[c] as i32 };
-        debug_assert!((0..32).contains(&(code0[c] as i32 + d)), "differential offset left 0..31");
+        let d = if best1.1[c] >= 4 {
+            best1.1[c] as i32 - 8
+        } else {
+            best1.1[c] as i32
+        };
+        debug_assert!(
+            (0..32).contains(&(code0[c] as i32 + d)),
+            "differential offset left 0..31"
+        );
     }
 
     let mut sel = [0u8; 16];
     for idx in 0..16 {
-        sel[idx] = if subblock_of(idx, flip) == 0 { sel0[idx] } else { best1.3[idx] };
+        sel[idx] = if subblock_of(idx, flip) == 0 {
+            sel0[idx]
+        } else {
+            best1.3[idx]
+        };
     }
     Some(Candidate {
         err: err0.saturating_add(best1.0),
@@ -658,7 +682,6 @@ fn best_differential(block: &Block, flip: bool) -> Option<Candidate> {
         sel,
     })
 }
-
 
 fn pack_rgb8(c: &Candidate) -> [u8; 8] {
     let mut b = [0u8; 8];
@@ -762,9 +785,10 @@ pub fn encode_etc2_rgb8_block(block: &Block) -> [u8; 8] {
     for flip in [false, true] {
         reachable_flip[usize::from(flip)] = differential_can_reach(block, flip);
         if let Some(c) = best_for(block, flip, true)
-            && best.as_ref().map(|b| c.err < b.err).unwrap_or(true) {
-                best = Some(c);
-            }
+            && best.as_ref().map(|b| c.err < b.err).unwrap_or(true)
+        {
+            best = Some(c);
+        }
     }
     // Exact already: nothing can improve on it, and both remaining modes would be searched to
     // arrive at the same block.
@@ -776,9 +800,10 @@ pub fn encode_etc2_rgb8_block(block: &Block) -> [u8; 8] {
             continue;
         }
         if let Some(c) = best_for(block, flip, false)
-            && best.as_ref().map(|b| c.err < b.err).unwrap_or(true) {
-                best = Some(c);
-            }
+            && best.as_ref().map(|b| c.err < b.err).unwrap_or(true)
+        {
+            best = Some(c);
+        }
     }
     // Individual mode with both bases equal is always expressible, so a candidate always exists;
     // the `expect` is a statement of that, not a hope.
@@ -918,7 +943,11 @@ fn eac_nearest(lv: &[i32; 8], a: i32) -> usize {
         }
         n -= half;
     }
-    if k > 0 && (a - lv[k - 1]) <= (lv[k] - a) { k - 1 } else { k }
+    if k > 0 && (a - lv[k - 1]) <= (lv[k] - a) {
+        k - 1
+    } else {
+        k
+    }
 }
 
 /// The squared error of a (table, multiplier, base) over a handful of representative alphas.
@@ -1037,7 +1066,11 @@ pub fn encode_eac_alpha_block(block: &Block) -> [u8; 8] {
     let mut best = (u32::MAX, 0i32, 1u8, EAC_ZERO_TABLE, [EAC_ZERO_SEL; 16]);
     for &(_, table) in ranked.iter().take(EAC_TABLES_REFINED) {
         let m0 = ideal_mult(table);
-        for mult in [m0, m0.saturating_sub(1).max(1), m0.saturating_add(1).min(15)] {
+        for mult in [
+            m0,
+            m0.saturating_sub(1).max(1),
+            m0.saturating_add(1).min(15),
+        ] {
             for base in bases(table, mult) {
                 let (e, sel) = fit_eac(&alphas, table, mult, base);
                 if e < best.0 {
@@ -1101,7 +1134,9 @@ pub fn encode_etc2_rgb8(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 /// frame's cost.
 pub fn encode_etc2_rgb8_blocks(w: u32, h: u32, rgba: &[u8], first: u32, count: u32) -> Vec<u8> {
     let bw = w.div_ceil(4);
-    let end = first.saturating_add(count).min(crate::bcenc::block_count(w, h));
+    let end = first
+        .saturating_add(count)
+        .min(crate::bcenc::block_count(w, h));
     let mut out = Vec::with_capacity((end.saturating_sub(first) * 8) as usize);
     for b in first..end {
         out.extend_from_slice(&encode_etc2_rgb8_block(&gather(w, h, rgba, b % bw, b / bw)));
@@ -1119,7 +1154,9 @@ pub fn encode_etc2_rgba8(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 /// [`encode_etc2_rgb8_blocks`].
 pub fn encode_etc2_rgba8_blocks(w: u32, h: u32, rgba: &[u8], first: u32, count: u32) -> Vec<u8> {
     let bw = w.div_ceil(4);
-    let end = first.saturating_add(count).min(crate::bcenc::block_count(w, h));
+    let end = first
+        .saturating_add(count)
+        .min(crate::bcenc::block_count(w, h));
     let mut out = Vec::with_capacity((end.saturating_sub(first) * 16) as usize);
     for b in first..end {
         let block = gather(w, h, rgba, b % bw, b / bw);
@@ -1190,7 +1227,11 @@ mod tests {
         let b: [u8; 8] = [0x88, 0x88, 0x88, 0b000_000_0_0, 0, 0, 0, 0];
         let d = decode_etc2_rgb8_block(&b).expect("individual mode always decodes");
         for texel in d.iter() {
-            assert_eq!(*texel, [138, 138, 138], "base 0x8 -> 0x88, table 0 selector 0 is +2");
+            assert_eq!(
+                *texel,
+                [138, 138, 138],
+                "base 0x8 -> 0x88, table 0 selector 0 is +2"
+            );
         }
 
         // Differential mode: base 5 bits = 0x10 (16), delta 0 -> both subblocks 16, which
@@ -1198,14 +1239,21 @@ mod tests {
         let b: [u8; 8] = [0x80, 0x80, 0x80, 0b000_000_1_0, 0xff, 0xff, 0xff, 0xff];
         let d = decode_etc2_rgb8_block(&b).expect("in-range differential decodes");
         for texel in d.iter() {
-            assert_eq!(*texel, [124, 124, 124], "5-bit 16 -> 132, table 0 selector 3 is -8");
+            assert_eq!(
+                *texel,
+                [124, 124, 124],
+                "5-bit 16 -> 132, table 0 selector 3 is -8"
+            );
         }
 
         // A differential block whose second base leaves 0..31 is NOT a differential block - it
         // is one of the ETC2 modes this module does not emit, and must be refused rather than
         // decoded into plausible garbage.
         let b: [u8; 8] = [0b00000_101, 0x80, 0x80, 0b000_000_1_0, 0, 0, 0, 0];
-        assert!(decode_etc2_rgb8_block(&b).is_none(), "base 0 + delta -3 is out of range");
+        assert!(
+            decode_etc2_rgb8_block(&b).is_none(),
+            "base 0 + delta -3 is out of range"
+        );
     }
 
     /// Texel ORDER is column-major in the index planes. A transposed reading decodes the right
@@ -1216,7 +1264,11 @@ mod tests {
         // The index planes are big-endian u16s, so bit 1 lives in the LOW byte of the pair.
         let b: [u8; 8] = [0x88, 0x88, 0x88, 0b000_000_0_0, 0x00, 0x00, 0x00, 0x02];
         let d = decode_etc2_rgb8_block(&b).unwrap();
-        assert_eq!(d[4], [144, 144, 144], "selector 1 is +8, and it must land on texel (0,1)");
+        assert_eq!(
+            d[4],
+            [144, 144, 144],
+            "selector 1 is +8, and it must land on texel (0,1)"
+        );
         for (i, texel) in d.iter().enumerate() {
             if i != 4 {
                 assert_eq!(*texel, [138, 138, 138], "texel {i} must be untouched");
@@ -1241,7 +1293,11 @@ mod tests {
     fn a_two_colour_block_keeps_both_colours() {
         let mut block = [[0u8; 4]; 16];
         for i in 0..16 {
-            block[i] = if i % 4 < 2 { [255, 32, 0, 255] } else { [0, 16, 255, 255] };
+            block[i] = if i % 4 < 2 {
+                [255, 32, 0, 255]
+            } else {
+                [0, 16, 255, 255]
+            };
         }
         let enc = encode_etc2_rgb8_block(&block);
         let dec = decode_etc2_rgb8_block(&enc).unwrap();
@@ -1252,8 +1308,14 @@ mod tests {
         // (This is exactly the block the planar/T/H modes exist for - see the module note.)
         let left = dec[0];
         let right = dec[2];
-        assert!(left[0] > left[2], "the left half must stay red-dominant, got {left:?}");
-        assert!(right[2] > right[0], "the right half must stay blue-dominant, got {right:?}");
+        assert!(
+            left[0] > left[2],
+            "the left half must stay red-dominant, got {left:?}"
+        );
+        assert!(
+            right[2] > right[0],
+            "the right half must stay blue-dominant, got {right:?}"
+        );
     }
 
     /// The flip bit earns its place on a HUE split, not a brightness one.
@@ -1267,14 +1329,32 @@ mod tests {
     fn a_top_bottom_hue_split_picks_the_flip() {
         let mut block = [[0u8; 4]; 16];
         for i in 0..16 {
-            block[i] = if i / 4 < 2 { [200, 40, 40, 255] } else { [40, 40, 200, 255] };
+            block[i] = if i / 4 < 2 {
+                [200, 40, 40, 255]
+            } else {
+                [40, 40, 200, 255]
+            };
         }
         let enc = encode_etc2_rgb8_block(&block);
-        assert!(enc[3] & 1 == 1, "a top/bottom hue split must pick the flip bit");
+        assert!(
+            enc[3] & 1 == 1,
+            "a top/bottom hue split must pick the flip bit"
+        );
         let dec = decode_etc2_rgb8_block(&enc).unwrap();
-        assert!(dec[0][0] > dec[0][2], "the top half must stay red-dominant, got {:?}", dec[0]);
-        assert!(dec[12][2] > dec[12][0], "the bottom half must stay blue-dominant, got {:?}", dec[12]);
-        assert!(mean_abs_err(&block, &dec) < 8.0, "a 4x2 hue split is what the flip bit is for");
+        assert!(
+            dec[0][0] > dec[0][2],
+            "the top half must stay red-dominant, got {:?}",
+            dec[0]
+        );
+        assert!(
+            dec[12][2] > dec[12][0],
+            "the bottom half must stay blue-dominant, got {:?}",
+            dec[12]
+        );
+        assert!(
+            mean_abs_err(&block, &dec) < 8.0,
+            "a 4x2 hue split is what the flip bit is for"
+        );
     }
 
     #[test]
@@ -1287,7 +1367,10 @@ mod tests {
         let enc = encode_etc2_rgb8_block(&block);
         let dec = decode_etc2_rgb8_block(&enc).unwrap();
         let err = mean_abs_err(&block, &dec);
-        assert!(err < 12.0, "a luminance ramp is ETC's best case, got mean abs error {err}");
+        assert!(
+            err < 12.0,
+            "a luminance ramp is ETC's best case, got mean abs error {err}"
+        );
     }
 
     /// Every block this encoder emits must be one the decoder accepts. A differential block
@@ -1318,15 +1401,26 @@ mod tests {
                 }
             }
         }
-        assert!(n > 100, "the sweep must actually cover something, covered {n}");
+        assert!(
+            n > 100,
+            "the sweep must actually cover something, covered {n}"
+        );
     }
 
     #[test]
     fn the_image_encoder_produces_the_right_size() {
         let (w, h) = (12u32, 8u32);
         let rgba = vec![128u8; (w * h * 4) as usize];
-        assert_eq!(encode_etc2_rgb8(w, h, &rgba).len(), (3 * 2 * 8) as usize, "4 bpp");
-        assert_eq!(encode_etc2_rgba8(w, h, &rgba).len(), (3 * 2 * 16) as usize, "8 bpp");
+        assert_eq!(
+            encode_etc2_rgb8(w, h, &rgba).len(),
+            (3 * 2 * 8) as usize,
+            "4 bpp"
+        );
+        assert_eq!(
+            encode_etc2_rgba8(w, h, &rgba).len(),
+            (3 * 2 * 16) as usize,
+            "8 bpp"
+        );
         // A non-multiple-of-4 image still produces whole blocks.
         assert_eq!(encode_etc2_rgb8(5, 5, &[0u8; 100]).len(), 2 * 2 * 8);
     }
@@ -1407,8 +1501,14 @@ mod conformance {
     fn the_intensity_tables_have_the_published_shape() {
         for (t, row) in MODIFIERS.iter().enumerate() {
             let (small, large, neg_small, neg_large) = (row[0], row[1], row[2], row[3]);
-            assert!(small > 0 && large > 0, "table {t}: entries 0 and 1 are the positive pair");
-            assert!(small < large, "table {t}: entry 0 is the SMALL step, entry 1 the large one");
+            assert!(
+                small > 0 && large > 0,
+                "table {t}: entries 0 and 1 are the positive pair"
+            );
+            assert!(
+                small < large,
+                "table {t}: entry 0 is the SMALL step, entry 1 the large one"
+            );
             assert_eq!(neg_small, -small, "table {t}: entry 2 mirrors entry 0");
             assert_eq!(neg_large, -large, "table {t}: entry 3 mirrors entry 1");
         }
@@ -1422,7 +1522,10 @@ mod conformance {
             );
         }
         assert_eq!(MODIFIERS[0][1], 8, "the weakest table's large step is 8");
-        assert_eq!(MODIFIERS[7][1], 183, "the strongest table's large step is 183");
+        assert_eq!(
+            MODIFIERS[7][1], 183,
+            "the strongest table's large step is 183"
+        );
     }
 
     /// EXHAUSTIVE over every table and selector: the decoded value must be the base plus the
@@ -1450,8 +1553,7 @@ mod conformance {
                     let dec = decode_etc2_rgb8_block(&b).expect("individual mode is always legal");
                     for (i, texel) in dec.iter().enumerate() {
                         assert_eq!(
-                            *texel,
-                            [want; 3],
+                            *texel, [want; 3],
                             "table {table} selector {sel} base {base4} texel {i}"
                         );
                     }
@@ -1467,7 +1569,10 @@ mod conformance {
         for base5 in 0..32i32 {
             for raw in 0..8u8 {
                 let delta = if raw >= 4 { raw as i32 - 8 } else { raw as i32 };
-                assert!((-4..=3).contains(&delta), "3-bit two's complement spans -4..3");
+                assert!(
+                    (-4..=3).contains(&delta),
+                    "3-bit two's complement spans -4..3"
+                );
                 let mut b = [0u8; 8];
                 for c in 0..3 {
                     b[c] = ((base5 as u8) << 3) | raw;
@@ -1512,7 +1617,10 @@ mod conformance {
             let miss = (expand4(8) as i32 + MODIFIERS[0][0]) as u8;
             for (i, texel) in dec.iter().enumerate() {
                 let want = if i == idx { hit } else { miss };
-                assert_eq!(*texel, [want; 3], "index bit {bit} must move texel {idx}, not {i}");
+                assert_eq!(
+                    *texel, [want; 3],
+                    "index bit {bit} must move texel {idx}, not {i}"
+                );
             }
         }
         // And the order is by COLUMN: bit 1 is (x=0, y=1), which is block index 4.
@@ -1575,16 +1683,27 @@ mod conformance {
         // Index 7 on texel (0,0) alone: its three bits are the TOP three of byte 2.
         let b = [100u8, (1 << 4) | 0, 0b111_00000, 0, 0, 0, 0, 0];
         let dec = decode_eac_alpha_block(&b);
-        assert_eq!(dec[0], (100 + EAC_TABLES[0][7]) as u8, "texel 0 uses the top 3 bits");
+        assert_eq!(
+            dec[0],
+            (100 + EAC_TABLES[0][7]) as u8,
+            "texel 0 uses the top 3 bits"
+        );
         for (i, v) in dec.iter().enumerate().skip(1) {
-            assert_eq!(*v, (100 + EAC_TABLES[0][0]) as u8, "texel {i} must be untouched");
+            assert_eq!(
+                *v,
+                (100 + EAC_TABLES[0][0]) as u8,
+                "texel {i} must be untouched"
+            );
         }
         // Every table must span negative and positive, low index to high.
         for (t, row) in EAC_TABLES.iter().enumerate() {
             assert!(row[0] < 0 && row[7] > 0, "EAC table {t} must straddle zero");
             for i in 1..8 {
                 if i != 4 {
-                    assert!(row[i] != row[i - 1], "EAC table {t} entry {i} duplicates its neighbour");
+                    assert!(
+                        row[i] != row[i - 1],
+                        "EAC table {t} entry {i} duplicates its neighbour"
+                    );
                 }
             }
         }
@@ -1605,7 +1724,11 @@ mod conformance {
                     let mut block = [[0u8; 4]; 16];
                     for (i, t) in block.iter_mut().enumerate() {
                         let first = if flip_rows { i / 4 < 2 } else { i % 4 < 2 };
-                        *t = if first { [a, b, a, 255] } else { [b, a, b, 255] };
+                        *t = if first {
+                            [a, b, a, 255]
+                        } else {
+                            [b, a, b, 255]
+                        };
                     }
                     let enc = encode_etc2_rgb8_block(&block);
                     assert!(
@@ -1616,7 +1739,10 @@ mod conformance {
                 }
             }
         }
-        assert!(checked >= 100, "the sweep must cover real ground, covered {checked}");
+        assert!(
+            checked >= 100,
+            "the sweep must cover real ground, covered {checked}"
+        );
     }
 
     /// Mean absolute per-channel error between a block and a decode of it.
@@ -1663,7 +1789,10 @@ mod conformance {
         assert_eq!(out.len(), (blocks * 8.0) as usize);
         // A 2048x2048 atlas is 256 times this area. Ten seconds for one would be unusable on a
         // phone, so this fails long before a user would notice, and prints the real figure.
-        assert!(ms < 400.0, "encoding 256x256 took {ms} ms, which scales to an unusable atlas");
+        assert!(
+            ms < 400.0,
+            "encoding 256x256 took {ms} ms, which scales to an unusable atlas"
+        );
     }
 
     /// The RGBA8 throughput, which is the one the device actually pays.
@@ -1754,9 +1883,33 @@ mod conformance {
                 },
                 4.0,
             ),
-            ("hue ramp", |x, y| [(x * 60) as u8, (y * 60) as u8, 128, 255], 33.0),
-            ("two colour", |x, _| if x < 2 { [200, 40, 40, 255] } else { [40, 60, 200, 255] }, 31.5),
-            ("edge", |x, y| if x + y < 3 { [250, 250, 240, 255] } else { [12, 10, 20, 255] }, 9.5),
+            (
+                "hue ramp",
+                |x, y| [(x * 60) as u8, (y * 60) as u8, 128, 255],
+                33.0,
+            ),
+            (
+                "two colour",
+                |x, _| {
+                    if x < 2 {
+                        [200, 40, 40, 255]
+                    } else {
+                        [40, 60, 200, 255]
+                    }
+                },
+                31.5,
+            ),
+            (
+                "edge",
+                |x, y| {
+                    if x + y < 3 {
+                        [250, 250, 240, 255]
+                    } else {
+                        [12, 10, 20, 255]
+                    }
+                },
+                9.5,
+            ),
             (
                 "noise",
                 |x, y| {
@@ -1784,7 +1937,10 @@ mod conformance {
             }
             let mean = total / n as f64;
             eprintln!("etc2 corpus {name:>11}: mean abs error {mean:.2} (ceiling {ceiling:.1})");
-            assert!(mean <= ceiling, "corpus shape {name} regressed to {mean:.2}");
+            assert!(
+                mean <= ceiling,
+                "corpus shape {name} regressed to {mean:.2}"
+            );
         }
     }
 
@@ -1799,7 +1955,10 @@ mod conformance {
         for table in 0..8 {
             let asc: Vec<i32> = MOD_ASC.iter().map(|&k| MODIFIERS[table][k]).collect();
             for k in 1..4 {
-                assert!(asc[k - 1] < asc[k], "table {table} is not ascending under MOD_ASC");
+                assert!(
+                    asc[k - 1] < asc[k],
+                    "table {table} is not ascending under MOD_ASC"
+                );
             }
             let mut sorted = MODIFIERS[table];
             sorted.sort_unstable();
@@ -1810,7 +1969,11 @@ mod conformance {
                 let idxs = SUB_IDX[f][s];
                 let mut seen = [false; 16];
                 for &i in &idxs {
-                    assert_eq!(subblock_of(i, f == 1), s, "SUB_IDX[{f}][{s}] holds a stray texel");
+                    assert_eq!(
+                        subblock_of(i, f == 1),
+                        s,
+                        "SUB_IDX[{f}][{s}] holds a stray texel"
+                    );
                     assert!(!seen[i], "SUB_IDX[{f}][{s}] repeats texel {i}");
                     seen[i] = true;
                 }
@@ -1869,13 +2032,20 @@ mod conformance {
                             table,
                         );
                         // Eight identical texels, so the per-texel error is an eighth of the fit.
-                        assert_eq!(got / 8, scan(base, t, table), "table {table} base {base_v} texel {t:?}");
+                        assert_eq!(
+                            got / 8,
+                            scan(base, t, table),
+                            "table {table} base {base_v} texel {t:?}"
+                        );
                         checked += 1;
                     }
                 }
             }
         }
-        assert!(checked > 10_000, "the sweep must actually cover something, got {checked}");
+        assert!(
+            checked > 10_000,
+            "the sweep must actually cover something, got {checked}"
+        );
     }
 
     /// The two derived EAC tables must agree with [`EAC_TABLES`], because everything the fast
@@ -1945,10 +2115,12 @@ mod conformance {
         }
         fn actual(block: &Block) -> u32 {
             let dec = decode_eac_alpha_block(&encode_eac_alpha_block(block));
-            (0..16).map(|i| {
-                let d = dec[i] as i32 - block[i][3] as i32;
-                (d * d) as u32
-            }).sum()
+            (0..16)
+                .map(|i| {
+                    let d = dec[i] as i32 - block[i][3] as i32;
+                    (d * d) as u32
+                })
+                .sum()
         }
         let mut worse = 0usize;
         let mut total_ratio = 0f64;
@@ -1961,7 +2133,13 @@ mod conformance {
                 // different demand on the (table, multiplier) pair.
                 let a = match seed % 4 {
                     0 => (i as u32 * 17) as u8,
-                    1 => if i % 3 == 0 { 0 } else { 255 },
+                    1 => {
+                        if i % 3 == 0 {
+                            0
+                        } else {
+                            255
+                        }
+                    }
                     2 => (h >> 24) as u8,
                     _ => (128 + (h >> 28)) as u8,
                 };
@@ -1982,7 +2160,11 @@ mod conformance {
                 "seed {seed}: fast search gave {got} against the exhaustive {want}"
             );
         }
-        let mean = if cases > 0 { total_ratio / cases as f64 } else { 1.0 };
+        let mean = if cases > 0 {
+            total_ratio / cases as f64
+        } else {
+            1.0
+        };
         eprintln!("eac fast search: worse on {worse}/256 blocks, mean ratio when worse {mean:.3}");
     }
 
@@ -2019,7 +2201,9 @@ mod conformance {
             // A deterministic spread - no RNG, so a failure is reproducible from its seed.
             let mut block = [[0u8; 4]; 16];
             for (i, t) in block.iter_mut().enumerate() {
-                let v = |k: u32| ((seed.wrapping_mul(2654435761).wrapping_add(i as u32 * k)) >> 3) as u8;
+                let v = |k: u32| {
+                    ((seed.wrapping_mul(2654435761).wrapping_add(i as u32 * k)) >> 3) as u8
+                };
                 *t = [v(97), v(193), v(389), 255];
             }
             let dec = decode_etc2_rgb8_block(&encode_etc2_rgb8_block(&block)).expect("legal mode");
@@ -2089,7 +2273,14 @@ mod conformance {
         for diagonal in [false, true] {
             let block = luminance(diagonal);
             let dec = decode_etc2_rgb8_block(&encode_etc2_rgb8_block(&block)).expect("legal mode");
-            measured.push((if diagonal { "diagonal-luma" } else { "aligned-luma" }, err_of(&block, &dec)));
+            measured.push((
+                if diagonal {
+                    "diagonal-luma"
+                } else {
+                    "aligned-luma"
+                },
+                err_of(&block, &dec),
+            ));
         }
 
         // The chroma ramp: recorded, bounded loosely, and labelled as the format's limit.
@@ -2122,7 +2313,11 @@ mod conformance {
             _ => 12.0,
         };
         for (name, e) in &measured {
-            assert!(*e < bound(name), "{name} encoded at {e}, bound {}", bound(name));
+            assert!(
+                *e < bound(name),
+                "{name} encoded at {e}, bound {}",
+                bound(name)
+            );
         }
     }
 }

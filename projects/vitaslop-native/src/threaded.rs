@@ -22,7 +22,7 @@
 //! instant; a thread yields control only at a host call (a blocking primitive, or a
 //! fuel-quantum preemption). No two guest threads touch memory truly concurrently, and
 //! scheduling is deterministic - the same inputs drive the same interleaving, which every
-//! recipe, capsule and test depends on.
+//! scripted run, capsule and test depends on.
 //!
 //! The PARALLEL engine (`crate::smp`, `VITASLOP_SMP`) runs these same instances on several
 //! OS threads at once, over the same shared memory, with a module built for it (atomics, the
@@ -486,7 +486,7 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
     fn on_frame(&mut self, frames: u64) {
         // Stamp the frame first, unconditionally: every host-side diagnostic that
         // prints a line reads it, and a trace line with no frame on it cannot be
-        // placed against a crash frame or a recipe cue at all.
+        // placed against a crash frame or a playbook cue at all.
         CURRENT_FRAME.store(frames, std::sync::atomic::Ordering::Relaxed);
         let (Some(off), Some(at)) = (self.arm_word_off, transpiler::arm_at_frame()) else {
             return;
@@ -514,7 +514,7 @@ static DIAG_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 /// The frame the run has reached, stamped by [`WasmtimeEngine::on_frame`]. Read by the
 /// host-side diagnostics so every line they print carries a frame number: a block trace
-/// that says only "this happened" cannot be lined up with a crash frame, a recipe cue or
+/// that says only "this happened" cannot be lined up with a crash frame, a playbook cue or
 /// another instrument's output, which is most of what such a trace is for.
 static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -547,7 +547,7 @@ struct MainBirth {
     priority: i32,
 }
 
-/// One guest thread at a time (deterministic - every recipe, capsule and test), or several at
+/// One guest thread at a time (deterministic - every scripted run, capsule and test), or several at
 /// once on OS threads (`crate::smp`, `VITASLOP_SMP`).
 enum Inner<H: ImportDispatch + Send + 'static> {
     Baton(Box<Scheduler<WasmtimeEngine<H>, H>>),
@@ -1534,7 +1534,15 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         true
     }
 
-    /// Diagnostic write into guest memory. No-op if out of bounds.
+    /// A host write into guest memory - the probe's POKE knob, and the render-target WRITEBACK
+    /// of rendered pixels. No-op if out of bounds.
+    ///
+    /// >>> IT STAMPS THE PAGES IT WRITES, like every other host write (`write_mem`). It did not
+    /// when it was only a diagnostic poke; once the writeback used it, a target the guest renders
+    /// and then SAMPLES as an ordinary texture was served from a snapshot the stamps called
+    /// current. MEASURED (`VITASLOP_STAMP_VERIFY=1`): a pool title's rendered cube map,
+    /// 0x90767d60+0x20c00, changed every frame with no stamp, and the balls reflecting it
+    /// rendered as blocky noise.
     pub(crate) fn write_guest(&self, addr: u32, bytes: &[u8]) {
         let off = addr.wrapping_sub(self.base) as usize;
         let data = self.shared_mem.data();
@@ -1547,6 +1555,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                 *data[off + i].get() = *b;
             }
         }
+        SharedView::new(&self.shared_mem, self.dirty_off).stamp_written(off, bytes.len());
     }
 
     /// Build one thread from a single entry (a spawned worker).
@@ -1702,12 +1711,23 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                 set_reg_store(&mut store, &instance, 1, if carries_args { r1 } else { 0 });
                 set_reg_store(&mut store, &instance, 2, if carries_args { r2 } else { 0 });
                 set_reg_store(&mut store, &instance, 3, if carries_args { r3 } else { 0 });
+                // Only the final entry's end is the thread's (it owes the EXIT handlers).
+                store.data().host.lock().unwrap().thread_entry_starting(thid, i == last);
                 let func = match instance
                     .get_typed_func::<(), ()>(&mut store, &abi::func_export(entry))
                 {
                     Ok(f) => f,
-                    // The entry was not a transpiled function; skip it.
-                    Err(_) => continue,
+                    // >>> AN ENTRY THAT WAS NEVER LIFTED IS A FAILURE, NOT A SKIP. Skipping it
+                    // ended the thread as if it had RETURNED code 0: MEASURED, a title's
+                    // UI/graphics/loader threads (an ARM-state entry discovery had missed) all
+                    // "finished" before running an instruction, and the run stalled on a
+                    // semaphore one of them owed, with nothing naming the cause.
+                    Err(_) => {
+                        return FiberEnd::Error(format!(
+                            "thread {thid:#x}: entry {entry:#010x} is not a transpiled function \
+                             (discovery never reached it) - the thread cannot run"
+                        ));
+                    }
                 };
                 let call_res = func.call_async(&mut store, ()).await;
                 last_r0 = get_reg_store(&mut store, &instance, 0);
@@ -1733,7 +1753,46 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                         return FiberEnd::ThreadExit(last_r0);
                     }
                     let regs = reg_dump(&mut store, &instance);
-                    return FiberEnd::Error(format!("{}\n{}", trap_detail(&e), regs));
+                    let pointees = reg_pointees(&mut store, &instance);
+                    return FiberEnd::Error(format!("{}\n{}{}", trap_detail(&e), regs, pointees));
+                }
+            }
+            // The thread RETURNED from its entry. Its EXIT event handlers run on it now,
+            // before it counts as ended - on this instance, stack and thread pointer, as a
+            // C library's TLS destructor needs. (An `sceKernelExitThread` ends the thread
+            // through the host call instead, which runs them itself.)
+            let calls = store.data().host.lock().unwrap().thread_return_calls(thid, last_r0);
+            for call in calls {
+                let mut regs = [0u32; abi::REG_COUNT];
+                regs[abi::SP] = sp;
+                {
+                    let data = store.data();
+                    let mut view = SharedView::new(&data.shared_mem, data.dirty_off);
+                    call.seed(&mut regs, &mut view, data.base);
+                }
+                for r in [0, 1, 2, 3, abi::SP] {
+                    set_reg_store(&mut store, &instance, r, regs[r]);
+                }
+                let dispatch = match instance.get_typed_func::<(i32, i32), ()>(&mut store, abi::DISPATCH_EXPORT) {
+                    Ok(f) => f,
+                    Err(e) => return FiberEnd::Error(format!("thread exit handler: module exports no dispatcher: {e}")),
+                };
+                if let Err(e) = dispatch.call_async(&mut store, ((call.entry & !1) as i32, 0)).await {
+                    let d = store.data_mut();
+                    if let Some(msg) = d.fatal.take() {
+                        return FiberEnd::Error(msg);
+                    }
+                    // A handler that exits the PROCESS ends it with the code it exits with
+                    // (its r0 now), not the code the entry returned.
+                    if d.process_halt {
+                        return FiberEnd::ProcessHalt(get_reg_store(&mut store, &instance, 0));
+                    }
+                    // A handler that exits the thread itself ends it with the code it had.
+                    if d.thread_exit {
+                        return FiberEnd::ThreadExit(last_r0);
+                    }
+                    let regs = reg_dump(&mut store, &instance);
+                    return FiberEnd::Error(format!("thread exit handler {:#x}: {}\n{}", call.entry, trap_detail(&e), regs));
                 }
             }
             FiberEnd::Returned(last_r0)
@@ -3129,6 +3188,44 @@ fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
              is not the faulting address. Re-run with VITASLOP_TRACK_PC=1 to have each basic \
              block record its own guest start address, which names the faulting block exactly.",
         );
+    }
+    s
+}
+
+/// What each register that holds a guest address POINTS AT, at a trap: its first words, and,
+/// when the first word is itself a guest address (a C++ object's vtable), that table's first
+/// words too.
+///
+/// A null-target dispatch through `ldr r0,[rX]; ldr ip,[r0,#off]; blx ip` leaves only `rX` in
+/// the register dump, and the question it raises - is the OBJECT unbuilt (no vtable), or is
+/// the register itself wrong - needs the memory the moment it trapped. A heap object's address
+/// moves between runs under SMP and a trap there is intermittent, so a watch armed by address
+/// in a later run cannot answer it; this does, in the run that fails.
+fn reg_pointees<H: ImportDispatch + Send + 'static>(store: &mut Store<ThreadData<H>>, instance: &Instance) -> String {
+    let regs: Vec<u32> = (0..13).map(|i| get_reg_store(store, instance, i)).collect();
+    let base = store.data().base;
+    let data = store.data().shared_mem.data();
+    // SAFETY: as in `watch_words` - `UnsafeCell<u8>` is repr(transparent) over `u8`, and the
+    // faulting fiber is not running while its trap is reported.
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
+    let word = |addr: u32| -> Option<u32> {
+        let off = addr.checked_sub(base)? as usize;
+        bytes.get(off..off + 4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+    };
+    let words = |addr: u32, n: u32| -> String {
+        (0..n).map(|k| word(addr.wrapping_add(4 * k)).map_or("--------".into(), |v| format!("{v:08x}"))).collect::<Vec<_>>().join(" ")
+    };
+    let mut s = String::from("\nmemory at trap (registers holding a guest address):");
+    let mut seen = Vec::new();
+    for (i, &r) in regs.iter().enumerate() {
+        if word(r).is_none() || seen.contains(&r) {
+            continue;
+        }
+        seen.push(r);
+        s.push_str(&format!("\n  r{i}={r:#010x}: {}", words(r, 8)));
+        if let Some(first) = word(r).filter(|&v| word(v).is_some()) {
+            s.push_str(&format!("\n      *[{first:#010x}]: {}", words(first, 16)));
+        }
     }
     s
 }

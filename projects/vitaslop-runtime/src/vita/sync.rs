@@ -9,9 +9,9 @@
 //! faithful. Cross-thread blocking semantics arrive with the preemptive
 //! multi-thread scheduler (see the runtime README concurrency model).
 
-use crate::host::{GuestCtx, VitaState, SCE_KERNEL_ERROR_WAIT_TIMEOUT};
-use crate::hostcall;
 use crate::SvcOutcome;
+use crate::host::{GuestCtx, SCE_KERNEL_ERROR_WAIT_TIMEOUT, VitaState};
+use crate::hostcall;
 
 /// A `sceKernelTryLockMutex` failure when another thread owns the mutex (the
 /// try-lock returns an error rather than blocking). Approximate value; the guest
@@ -49,7 +49,11 @@ pub(super) fn create_mutex(
     // `ctx` is here for the KERNEL MUTEX TABLE, not for an argument: the mutex claims its
     // entry in guest memory at create ([`crate::vita::kmutex`]).
     // The name, attributes and initial count are kept for `sceKernelGetMutexInfo`.
-    let name = if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    let name = if name.addr() == 0 {
+        String::new()
+    } else {
+        super::iofilemgr::read_cstr(ctx, name.addr())
+    };
     let id = st.create_mutex(ctx, &name, attr, init);
     // `attr` carries the waiter discipline (TH_FIFO 0x0000 vs TH_PRIO 0x2000) and the
     // recursion/ceiling bits. It is traced rather than dropped because "which discipline did
@@ -107,12 +111,7 @@ pub(super) fn lock_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool)
 
 /// int sceKernelUnlockMutex(SceUID mutexid, int unlockCount)
 #[hostcall]
-pub(super) fn unlock_mutex(
-    ctx: &mut GuestCtx,
-    st: &mut VitaState,
-    id: i32,
-    _count: i32,
-) -> i32 {
+pub(super) fn unlock_mutex(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, _count: i32) -> i32 {
     if st.is_preemptive() {
         tracing::trace!(target: "vitaslop::sema", id, thread = st.current_thread(), "mutex unlock");
         st.mutex_unlock(ctx, id);
@@ -131,18 +130,19 @@ pub(super) fn unlock_mutex(
 /// `sceKernelTryLockMutex` is deliberately NOT here: its refusal is a return value the handler
 /// defines, and the count argument it does not take makes it a different call, not the same one
 /// with a different name.
-pub(crate) fn inline_op(
-    func_nid: u32,
-    preemptive: bool,
-) -> Option<vitaslop_transpiler::InlineOp> {
+pub(crate) fn inline_op(func_nid: u32, preemptive: bool) -> Option<vitaslop_transpiler::InlineOp> {
     use crate::nid::sync as sy;
     use crate::vita::kmutex;
     use crate::vita::mirror::{SLOT_CURRENT_THREAD, SLOT_MUTEX_TABLE};
     if !preemptive {
         return None;
     }
-    let (layout, thread_slot, table_slot, entries) =
-        (kmutex::layout(), SLOT_CURRENT_THREAD, SLOT_MUTEX_TABLE, kmutex::ENTRIES);
+    let (layout, thread_slot, table_slot, entries) = (
+        kmutex::layout(),
+        SLOT_CURRENT_THREAD,
+        SLOT_MUTEX_TABLE,
+        kmutex::ENTRIES,
+    );
     match func_nid {
         sy::LOCK_MUTEX => Some(vitaslop_transpiler::InlineOp::KernelMutexLock {
             layout,
@@ -174,7 +174,11 @@ pub(super) fn create_sema(
     max: i32,
     _opt: Ptr,
 ) -> i32 {
-    let name = if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    let name = if name.addr() == 0 {
+        String::new()
+    } else {
+        super::iofilemgr::read_cstr(ctx, name.addr())
+    };
     let id = st.create_sema(&name, attr, init, max);
     tracing::trace!(target: "vitaslop::sema", id, init, max, name, thread = st.current_thread(), "create");
     id
@@ -188,7 +192,11 @@ pub(super) fn create_sema(
 /// look right and synchronize nothing. A name that names nothing is an error.
 #[hostcall]
 pub(super) fn open_sema(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr) -> i32 {
-    let name = if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    let name = if name.addr() == 0 {
+        String::new()
+    } else {
+        super::iofilemgr::read_cstr(ctx, name.addr())
+    };
     match st.sema_by_name(&name) {
         Some(uid) => uid,
         None => SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID as i32,
@@ -210,7 +218,12 @@ const SEMA_INFO_ATTR: u32 = 40;
 /// primitive, the waiter count from the park queue), so a title that reports or asserts
 /// on a semaphore sees what the semaphore is actually doing.
 #[hostcall]
-pub(super) fn get_sema_info(ctx: &mut GuestCtx, st: &mut VitaState, sema_id: i32, info: Ptr) -> i32 {
+pub(super) fn get_sema_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    sema_id: i32,
+    info: Ptr,
+) -> i32 {
     // Expression-bodied throughout: `#[hostcall]` inlines this into a `()` wrapper, so
     // an early `return` would leave the wrapper rather than this handler.
     match st.sema_info(sema_id) {
@@ -247,7 +260,12 @@ const MUTEX_INFO_ATTR: u32 = 40;
 /// ownership - current recursion count, owning thread (0 when free) and the number of threads
 /// parked on it. A sports title's engine reads this at boot.
 #[hostcall]
-pub(super) fn get_mutex_info(ctx: &mut GuestCtx, st: &mut VitaState, mutex_id: i32, info: Ptr) -> i32 {
+pub(super) fn get_mutex_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    mutex_id: i32,
+    info: Ptr,
+) -> i32 {
     // Expression-bodied, for the reason `get_sema_info` states.
     match st.mutex_info(ctx, mutex_id) {
         Some((name, attr, init, current, owner, waiting)) if info.addr() != 0 => {
@@ -279,6 +297,24 @@ pub(super) fn get_mutex_info(ctx: &mut GuestCtx, st: &mut VitaState, mutex_id: i
 /// `SCE_KERNEL_ERROR_WAIT_TIMEOUT`, delivered at wake through the resume-code channel
 /// (the return value is set to 0 before parking, since a woken thread resumes with
 /// the registers it parked with).
+/// int sceKernelPollSema(SceUID semaid, int signal): take `signal` from the count if it is
+/// there, never waiting - SEMA_ZERO when it is not, ILLEGAL_COUNT for a signal below 1, and
+/// UNKNOWN_SEMA_ID for an id that names no semaphore.
+#[hostcall]
+pub(super) fn poll_sema(st: &mut VitaState, id: i32, signal: i32) -> i32 {
+    const SCE_KERNEL_ERROR_ILLEGAL_COUNT: u32 = 0x8002_000F;
+    const SCE_KERNEL_ERROR_SEMA_ZERO: u32 = 0x8002_8102;
+    if !st.sema_exists(id) {
+        SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID as i32
+    } else if signal < 1 {
+        SCE_KERNEL_ERROR_ILLEGAL_COUNT as i32
+    } else if st.sema_try_acquire(id, signal) {
+        0
+    } else {
+        SCE_KERNEL_ERROR_SEMA_ZERO as i32
+    }
+}
+
 pub(super) fn wait_sema(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let id = ctx.arg(0) as i32;
     let signal = ctx.arg(1) as i32;
@@ -405,7 +441,9 @@ fn sema_trail_watched(id: i32) -> bool {
 /// would bury the finding it is there to make [[a-diagnostic-can-bury-the-findings]].
 fn sema_ovf_first_time(id: i32) -> bool {
     static SEEN: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
-    let Ok(mut seen) = SEEN.lock() else { return false };
+    let Ok(mut seen) = SEEN.lock() else {
+        return false;
+    };
     if seen.contains(&id) {
         return false;
     }
@@ -494,7 +532,13 @@ pub(super) fn signal_sema(st: &mut VitaState, id: i32, signal: i32) -> i32 {
 /// takes), then setting the count; a waiter that wakes this way returns 0 rather than the
 /// cancel error, which is the one deviation and is REPORTED when it happens.
 #[hostcall]
-pub(super) fn cancel_sema(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, set_count: i32, out: Ptr) -> i32 {
+pub(super) fn cancel_sema(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    id: i32,
+    set_count: i32,
+    out: Ptr,
+) -> i32 {
     match st.sema_cancel(id, set_count) {
         Some(waiters) => {
             if waiters > 0 {
@@ -518,7 +562,13 @@ pub(super) fn cancel_sema(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, set_c
 /// SceUID sceKernelCreateCond(const char *name, SceUInt attr, SceUID mutexId,
 ///     const SceKernelCondOptParam *option)
 #[hostcall]
-pub(super) fn create_cond(st: &mut VitaState, _name: Ptr, _attr: u32, mutex: i32, _opt: Ptr) -> i32 {
+pub(super) fn create_cond(
+    st: &mut VitaState,
+    _name: Ptr,
+    _attr: u32,
+    mutex: i32,
+    _opt: Ptr,
+) -> i32 {
     st.create_cond(mutex)
 }
 
@@ -606,14 +656,18 @@ pub(super) fn create_event_flag(
     ctx: &mut GuestCtx,
     st: &mut VitaState,
     name: Ptr,
-    _attr: u32,
+    attr: u32,
     init: u32,
     _opt: Ptr,
 ) -> i32 {
-    let name =
-        if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    let name = if name.addr() == 0 {
+        String::new()
+    } else {
+        super::iofilemgr::read_cstr(ctx, name.addr())
+    };
     let id = st.create_event_flag(init);
     st.name_event_flag(id, &name);
+    st.record_event_flag_params(id, attr, init);
     tracing::trace!(
         target: "vitaslop::sema",
         id, init, name, thread = st.current_thread(),
@@ -643,6 +697,41 @@ pub(super) fn set_event_flag(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, bi
         st.event_set(id, bits);
     }
     0
+}
+
+/// `SceKernelEventFlagInfo` (psp2common/kernel/threadmgr.h): size, evfId, name[32], attr,
+/// initPattern, currentPattern, numWaitThreads - 0x38 bytes.
+const EVENT_FLAG_INFO_BYTES: u32 = 0x38;
+
+/// int sceKernelGetEventFlagInfo(SceUID evid, SceKernelEventFlagInfo *info)
+///
+/// Fills the caller's struct from the flag's own record. `info->size` is the caller's and is
+/// left as it is; only that many bytes (at most the struct) are written, so a caller that
+/// declares a shorter struct is not overrun. An unknown uid is `UNKNOWN_EVF_ID`.
+pub(super) fn get_event_flag_info(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let (uid, info) = (ctx.arg(0) as i32, ctx.arg(1));
+    let Some((attr, init, current, waiters)) = st.event_flag_info(uid) else {
+        ctx.ret(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+        return SvcOutcome::Continue;
+    };
+    if info == 0 {
+        return SvcOutcome::Fatal(format!(
+            "sceKernelGetEventFlagInfo(evid={uid:#x}, info=NULL): the kernel's answer to a NULL info is not implemented (no silent stub)"
+        ));
+    }
+    let size = ctx.read_u32(info).min(EVENT_FLAG_INFO_BYTES);
+    let mut bytes = vec![0u8; EVENT_FLAG_INFO_BYTES as usize];
+    bytes[0..4].copy_from_slice(&ctx.read_u32(info).to_le_bytes());
+    bytes[4..8].copy_from_slice(&uid.to_le_bytes());
+    let name = st.event_flag_name(uid).as_bytes();
+    let n = name.len().min(31);
+    bytes[8..8 + n].copy_from_slice(&name[..n]);
+    for (at, v) in [(0x28, attr), (0x2c, init), (0x30, current), (0x34, waiters)] {
+        bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    ctx.write_bytes(info, &bytes[..size as usize]);
+    ctx.ret(0);
+    SvcOutcome::Continue
 }
 
 /// int sceKernelClearEventFlag(SceUID evid, unsigned int bitPattern)
@@ -747,7 +836,11 @@ pub(super) fn create_simple_event(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// int sceKernelDeleteSimpleEvent(SceUID uid)
 pub(super) fn delete_simple_event(ctx: &mut GuestCtx, st: &mut VitaState) {
     let uid = ctx.arg(0) as i32;
-    ctx.ret(if st.delete_simple_event(uid) { 0 } else { SCE_KERNEL_ERROR_UNKNOWN_EVF_ID });
+    ctx.ret(if st.delete_simple_event(uid) {
+        0
+    } else {
+        SCE_KERNEL_ERROR_UNKNOWN_EVF_ID
+    });
 }
 
 /// int sceKernelSetEvent(SceUID uid, SceUInt32 setPattern, SceUInt64 userData)
@@ -931,8 +1024,18 @@ fn rwlock_code(r: crate::host::RwLockResult) -> u32 {
 /// SceUID sceKernelCreateRWLock(const char *name, SceUInt32 attr,
 ///     const SceKernelRWLockOptParam *opt_param)
 #[hostcall]
-pub(super) fn create_rwlock(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, attr: u32, _opt: Ptr) -> i32 {
-    let name = if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+pub(super) fn create_rwlock(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    name: Ptr,
+    attr: u32,
+    _opt: Ptr,
+) -> i32 {
+    let name = if name.addr() == 0 {
+        String::new()
+    } else {
+        super::iofilemgr::read_cstr(ctx, name.addr())
+    };
     let id = st.create_rwlock(&name, attr);
     tracing::trace!(target: "vitaslop::sema", id, attr = format_args!("{attr:#x}"), name, "rwlock create");
     id
@@ -941,7 +1044,11 @@ pub(super) fn create_rwlock(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, a
 /// int sceKernelDeleteRWLock(SceUID rwlock_id)
 #[hostcall]
 pub(super) fn delete_rwlock(st: &mut VitaState, id: i32) -> i32 {
-    if st.delete_rwlock(id) { 0 } else { SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID as i32 }
+    if st.delete_rwlock(id) {
+        0
+    } else {
+        SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID as i32
+    }
 }
 
 /// int sceKernelLockReadRWLock(SceUID rwlock_id, unsigned int *timeout) and its Write
@@ -984,20 +1091,28 @@ pub(super) fn lock_rwlock(ctx: &mut GuestCtx, st: &mut VitaState, write: bool) -
 /// refused with `SCE_KERNEL_ERROR_RW_LOCK_FAILED_TO_LOCK` instead of parking.
 pub(super) fn try_lock_rwlock(ctx: &mut GuestCtx, st: &mut VitaState, write: bool) {
     let id = ctx.arg(0) as i32;
-    let code = if st.is_preemptive() { rwlock_code(st.rwlock_try(id, write)) } else { 0 };
+    let code = if st.is_preemptive() {
+        rwlock_code(st.rwlock_try(id, write))
+    } else {
+        0
+    };
     ctx.ret(code);
 }
 
 /// int sceKernelUnlockReadRWLock(SceUID) / sceKernelUnlockWriteRWLock(SceUID).
 pub(super) fn unlock_rwlock(ctx: &mut GuestCtx, st: &mut VitaState, write: bool) {
     let id = ctx.arg(0) as i32;
-    let code = if st.is_preemptive() { rwlock_code(st.rwlock_unlock(id, write)) } else { 0 };
+    let code = if st.is_preemptive() {
+        rwlock_code(st.rwlock_unlock(id, write))
+    } else {
+        0
+    };
     ctx.ret(code);
 }
 
 // --- delete (shared: no teardown needed for these lightweight handles) ---
 
-/// int sceKernelDelete{Mutex,Sema,EventFlag}(SceUID id), and sceKernelCloseMutex - all
+/// int sceKernelDelete{Mutex,Sema,EventFlag}(SceUID id), and sceKernelClose{Mutex,Sema,EventFlag} - all
 /// succeed. See `nid::sync::CLOSE_MUTEX` for why close and delete share this.
 #[hostcall]
 pub(super) fn delete_object(_st: &mut VitaState, _id: i32) -> i32 {
@@ -1038,8 +1153,11 @@ pub(super) fn create_timer(
     attr: u32,
     _opt: Ptr,
 ) -> i32 {
-    let name =
-        if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    let name = if name.addr() == 0 {
+        String::new()
+    } else {
+        super::iofilemgr::read_cstr(ctx, name.addr())
+    };
     let id = st.create_timer(&name, attr);
     tracing::trace!(
         target: "vitaslop::sema",
@@ -1056,8 +1174,11 @@ pub(super) fn create_timer(
 /// the not-found error rather than a fresh timer it would then read as zero forever.
 #[hostcall]
 pub(super) fn open_timer(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr) -> i32 {
-    let name =
-        if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    let name = if name.addr() == 0 {
+        String::new()
+    } else {
+        super::iofilemgr::read_cstr(ctx, name.addr())
+    };
     match st.timer_by_name(&name) {
         Some(id) => id,
         None => {
@@ -1174,7 +1295,11 @@ fn note_timer_step(st: &VitaState, id: i32, us: u64) {
 /// int sceKernelDeleteTimer(SceUID timerId)
 #[hostcall]
 pub(super) fn delete_timer(_ctx: &mut GuestCtx, st: &mut VitaState, id: i32) -> i32 {
-    if st.timer_delete(id) { 0 } else { uid_not_found(st, id, "sceKernelDeleteTimer") }
+    if st.timer_delete(id) {
+        0
+    } else {
+        uid_not_found(st, id, "sceKernelDeleteTimer")
+    }
 }
 
 /// The one report for a timer call naming a uid that does not exist. It is a WARNING:
@@ -1248,7 +1373,10 @@ mod zero_timeout_tests {
             ctx.regs[2] = TIMEOUT_PTR;
             let out = wait_sema(ctx, st);
             assert!(matches!(out, SvcOutcome::Continue), "a poll must NOT park");
-            assert_eq!(ctx.regs[0], SCE_KERNEL_ERROR_WAIT_TIMEOUT, "and must say why");
+            assert_eq!(
+                ctx.regs[0], SCE_KERNEL_ERROR_WAIT_TIMEOUT,
+                "and must say why"
+            );
 
             // The count being available is still a plain success through the same path.
             st.sema_signal(id, 1);
@@ -1270,7 +1398,10 @@ mod zero_timeout_tests {
             ctx.regs[0] = id as u32;
             ctx.regs[1] = 1;
             ctx.regs[2] = 0; // NULL - wait forever
-            assert!(matches!(wait_sema(ctx, st), SvcOutcome::Block), "null still parks");
+            assert!(
+                matches!(wait_sema(ctx, st), SvcOutcome::Block),
+                "null still parks"
+            );
         });
     }
 
@@ -1291,7 +1422,10 @@ mod zero_timeout_tests {
             assert!(matches!(out, SvcOutcome::Continue), "a poll must NOT park");
             assert_eq!(ctx.regs[0], SCE_KERNEL_ERROR_WAIT_TIMEOUT);
             let owner = st.mutex_info(ctx, mutex).expect("a live mutex").4;
-            assert_eq!(owner, 1, "the mutex is still ours - a poll must not unlock it");
+            assert_eq!(
+                owner, 1,
+                "the mutex is still ours - a poll must not unlock it"
+            );
         });
     }
 
@@ -1401,7 +1535,11 @@ mod rwlock_tests {
         assert_eq!(st.rwlock_try(rec, false), R::Done);
         assert_eq!(st.rwlock_unlock(rec, false), R::Done);
         assert_eq!(st.rwlock_unlock(rec, true), R::Done);
-        assert_eq!(as_thread(&mut st, 2).rwlock_try(rec, false), R::Busy, "still write-held once");
+        assert_eq!(
+            as_thread(&mut st, 2).rwlock_try(rec, false),
+            R::Busy,
+            "still write-held once"
+        );
         assert_eq!(as_thread(&mut st, 1).rwlock_unlock(rec, true), R::Done);
         assert_eq!(as_thread(&mut st, 2).rwlock_try(rec, false), R::Done);
     }
@@ -1423,7 +1561,11 @@ mod rwlock_tests {
         woke.sort();
         assert_eq!(woke, vec![2, 3]);
         assert_eq!(st.take_resume_code(2), Some(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
-        assert_eq!(st.take_resume_code(3), None, "the reader was GRANTED, not timed out");
+        assert_eq!(
+            st.take_resume_code(3),
+            None,
+            "the reader was GRANTED, not timed out"
+        );
     }
 
     /// Deleting a lock with parked lockers releases them with WAIT_DELETE.
@@ -1436,7 +1578,67 @@ mod rwlock_tests {
         st.rwlock_block(id, true, None);
         assert!(st.delete_rwlock(id));
         assert_eq!(st.take_wakes(), vec![2]);
-        assert_eq!(st.take_resume_code(2), Some(crate::host::SCE_KERNEL_ERROR_WAIT_DELETE));
+        assert_eq!(
+            st.take_resume_code(2),
+            Some(crate::host::SCE_KERNEL_ERROR_WAIT_DELETE)
+        );
         assert_eq!(st.rwlock_try(id, false), R::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod event_flag_info_tests {
+    use super::*;
+    use crate::world::DeterministicWorld;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    const INFO: u32 = 0x1000;
+
+    /// The struct reads back the flag's own record at the vitasdk offsets, the caller's
+    /// `size` is left alone, and an unknown uid is refused rather than answered with zeros.
+    #[test]
+    fn info_reports_the_flag_at_the_published_offsets() {
+        let mut st = VitaState::new(0, 0x4000, Box::new(DeterministicWorld::default()));
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 0x4000];
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        let id = st.create_event_flag(0x5);
+        st.name_event_flag(id, "Flag");
+        st.record_event_flag_params(id, 0x200, 0x5);
+        st.event_set(id, 0x30);
+        ctx.write_u32(INFO, EVENT_FLAG_INFO_BYTES);
+        ctx.write_u32(INFO + EVENT_FLAG_INFO_BYTES, 0xdead_beef); // the word past the struct
+        (ctx.regs[0], ctx.regs[1]) = (id as u32, INFO);
+        assert!(matches!(
+            get_event_flag_info(&mut ctx, &mut st),
+            SvcOutcome::Continue
+        ));
+        assert_eq!(ctx.regs[0], 0);
+        assert_eq!(
+            ctx.read_u32(INFO),
+            EVENT_FLAG_INFO_BYTES,
+            "size is the caller's"
+        );
+        assert_eq!(ctx.read_u32(INFO + 4), id as u32);
+        assert_eq!(ctx.read_bytes(INFO + 8, 5), b"Flag\0");
+        assert_eq!(ctx.read_u32(INFO + 0x28), 0x200, "attr");
+        assert_eq!(ctx.read_u32(INFO + 0x2c), 0x5, "initPattern");
+        assert_eq!(ctx.read_u32(INFO + 0x30), 0x35, "currentPattern");
+        assert_eq!(ctx.read_u32(INFO + 0x34), 0, "numWaitThreads");
+        assert_eq!(
+            ctx.read_u32(INFO + EVENT_FLAG_INFO_BYTES),
+            0xdead_beef,
+            "nothing past the struct"
+        );
+
+        (ctx.regs[0], ctx.regs[1]) = (0x7777, INFO);
+        assert!(matches!(
+            get_event_flag_info(&mut ctx, &mut st),
+            SvcOutcome::Continue
+        ));
+        assert_eq!(ctx.regs[0], SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
     }
 }
