@@ -51,7 +51,9 @@ pub(super) fn assertion_handler(ctx: &mut GuestCtx, st: &mut VitaState) {
     );
     // Also into the captured console, so it lands beside the title's own printf
     // output in the order it actually happened.
-    st.write_stdout(format!("ASSERT {}:{line}: {msg}\n", file.as_deref().unwrap_or("?")).as_bytes());
+    st.write_stdout(
+        format!("ASSERT {}:{line}: {msg}\n", file.as_deref().unwrap_or("?")).as_bytes(),
+    );
     ctx.ret(unk);
 }
 

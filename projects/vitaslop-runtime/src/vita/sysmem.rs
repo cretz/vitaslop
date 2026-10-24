@@ -13,7 +13,14 @@ use crate::hostcall;
 /// SceUID sceKernelAllocMemBlock(const char *name, SceKernelMemBlockType type,
 ///                               SceSize size, SceKernelAllocMemBlockOpt *opt)
 #[hostcall]
-pub(super) fn alloc_mem_block(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, ty: u32, size: u32, _opt: Ptr) -> i32 {
+pub(super) fn alloc_mem_block(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    name: Ptr,
+    ty: u32,
+    size: u32,
+    _opt: Ptr,
+) -> i32 {
     // The block's NAME is what the guest calls it, and on the failure path below it is the
     // only thing that says which subsystem asked - worth the read exactly there.
     let named = || {
@@ -105,7 +112,12 @@ pub(crate) const PHYCONT_BUDGET_BYTES: u32 = 32 * 1024 * 1024;
 
 /// int sceKernelGetMemBlockBase(SceUID uid, void **base)
 #[hostcall]
-pub(super) fn get_mem_block_base(ctx: &mut GuestCtx, st: &mut VitaState, uid: i32, out: Ptr) -> i32 {
+pub(super) fn get_mem_block_base(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    uid: i32,
+    out: Ptr,
+) -> i32 {
     let base = st.memblock_base(uid).unwrap_or(0);
     ctx.write_u32(out.addr(), base);
     0
@@ -173,12 +185,22 @@ pub(super) fn free_mem_block(st: &mut VitaState, uid: i32) -> i32 {
 /// `..._USER_RW` 0x0C20D060 reports normal/RW, and `..._USER_RW_UNCACHE` 0x0C208060
 /// reports uncached with the same rights.
 #[hostcall]
-pub(super) fn get_mem_block_info_by_addr(ctx: &mut GuestCtx, st: &mut VitaState, base: Ptr, info: Ptr) -> i32 {
+pub(super) fn get_mem_block_info_by_addr(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    base: Ptr,
+    info: Ptr,
+) -> i32 {
     // Early exits for the two failure cases, which a `#[hostcall]` body cannot have.
     get_mem_block_info_by_addr_impl(ctx, st, base, info)
 }
 
-fn get_mem_block_info_by_addr_impl(ctx: &mut GuestCtx, st: &mut VitaState, base: Ptr, info: Ptr) -> i32 {
+fn get_mem_block_info_by_addr_impl(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    base: Ptr,
+    info: Ptr,
+) -> i32 {
     let Some((block_base, size, ty)) = st.memblock_info_at(base.addr()) else {
         return SCE_KERNEL_ERROR_BLOCK_ERROR;
     };
@@ -193,6 +215,41 @@ fn get_mem_block_info_by_addr_impl(ctx: &mut GuestCtx, st: &mut VitaState, base:
     if declared >= 0x18 {
         ctx.write_u32(info.addr() + 0x14, ty);
     }
+    0
+}
+
+/// int sceKernelGetMemBlockInfoByRange(void *base, SceSize size, SceKernelMemBlockInfo *info)
+///
+/// [`get_mem_block_info_by_addr`] for a whole span: the block must contain all of
+/// `[base, base+size)`, as [`find_mem_block_by_addr`] requires.
+#[hostcall]
+pub(super) fn get_mem_block_info_by_range(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    base: Ptr,
+    size: u32,
+    info: Ptr,
+) -> i32 {
+    if st.memblock_containing(base.addr(), size).is_none() {
+        SCE_KERNEL_ERROR_BLOCK_ERROR
+    } else {
+        get_mem_block_info_by_addr_impl(ctx, st, base, info)
+    }
+}
+
+/// `SCE_KERNEL_MODEL_VITA` (psp2common/kernel/sysmem.h): the handheld, which is the console
+/// this engine presents - a front and a back touch panel, no light bar, no DualShock.
+pub(super) const SCE_KERNEL_MODEL_VITA: u32 = 0x10000;
+
+/// int sceKernelGetModel(void) / sceKernelGetModelForCDialog(void): the handheld model.
+#[hostcall]
+pub(super) fn get_model(_st: &mut VitaState) -> u32 {
+    SCE_KERNEL_MODEL_VITA
+}
+
+/// int sceKernelIsPSVitaTV(void): 0 - this is the handheld (see [`get_model`]).
+#[hostcall]
+pub(super) fn is_ps_vita_tv(_st: &mut VitaState) -> u32 {
     0
 }
 

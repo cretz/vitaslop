@@ -172,10 +172,12 @@ fn unescape(s: &str) -> String {
             "apos" => Some("'".to_string()),
             _ => ent
                 .strip_prefix('#')
-                .and_then(|n| match n.strip_prefix('x').or_else(|| n.strip_prefix('X')) {
-                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                    None => n.parse::<u32>().ok(),
-                })
+                .and_then(
+                    |n| match n.strip_prefix('x').or_else(|| n.strip_prefix('X')) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => n.parse::<u32>().ok(),
+                    },
+                )
                 .and_then(char::from_u32)
                 .map(|c| c.to_string()),
         };
@@ -196,7 +198,10 @@ fn unescape(s: &str) -> String {
 /// Parse `text` into `st`'s arena and return the DOCUMENT node's id, or `None` if the
 /// document is not well-formed.
 pub fn parse_document(st: &mut XmlState, text: &str) -> Option<u64> {
-    let doc = st.push(XmlNode { kind: NODE_TYPE_DOCUMENT, ..Default::default() });
+    let doc = st.push(XmlNode {
+        kind: NODE_TYPE_DOCUMENT,
+        ..Default::default()
+    });
     let b = text.as_bytes();
     let mut i = 0usize;
     // The open-element stack, and each one's last child / last attribute, so appending is
@@ -239,8 +244,12 @@ pub fn parse_document(st: &mut XmlState, text: &str) -> Option<u64> {
             }
             // A CDATA section is character data with its own type, not a text node: the
             // guard sites test `8 || 0x28` precisely because the two are told apart.
-            let id =
-                st.push(XmlNode { kind: NODE_TYPE_CDATA, value: content, parent, ..Default::default() });
+            let id = st.push(XmlNode {
+                kind: NODE_TYPE_CDATA,
+                value: content,
+                parent,
+                ..Default::default()
+            });
             link_child(st, &mut stack, last_child, id);
             i = end + 3;
             continue;
@@ -391,10 +400,14 @@ fn parse_attrs(s: &str) -> Vec<(String, String)> {
         }
         let quote = b[i];
         let (value, next) = if quote == b'"' || quote == b'\'' {
-            let end = s[i + 1..].find(quote as char).map_or(b.len(), |p| i + 1 + p);
+            let end = s[i + 1..]
+                .find(quote as char)
+                .map_or(b.len(), |p| i + 1 + p);
             (&s[i + 1..end.min(s.len())], end + 1)
         } else {
-            let end = s[i..].find(|c: char| c.is_ascii_whitespace()).map_or(b.len(), |p| i + p);
+            let end = s[i..]
+                .find(|c: char| c.is_ascii_whitespace())
+                .map_or(b.len(), |p| i + p);
             (&s[i..end], end)
         };
         out.push((name, unescape(value)));
@@ -489,7 +502,12 @@ pub(super) fn initializer_dtor(_ctx: &mut GuestCtx, _st: &mut VitaState, this: P
 /// only confirms the initializer is one of ours. Returns 0 for success, as the whole
 /// library's `SceInt32` convention does.
 #[hostcall]
-pub(super) fn initializer_initialize(ctx: &mut GuestCtx, _st: &mut VitaState, this: Ptr, _param: Ptr) -> i32 {
+pub(super) fn initializer_initialize(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    this: Ptr,
+    _param: Ptr,
+) -> i32 {
     if this.is_null() || ctx.read_u32(this.addr()) != MAGIC_INITIALIZER {
         -1
     } else {
@@ -537,7 +555,12 @@ pub(super) fn builder_dtor(_ctx: &mut GuestCtx, _st: &mut VitaState, this: Ptr) 
 
 /// `sce::Xml::Dom::DocumentBuilder::initialize(const Initializer*)`
 #[hostcall]
-pub(super) fn builder_initialize(ctx: &mut GuestCtx, _st: &mut VitaState, this: Ptr, _init: Ptr) -> i32 {
+pub(super) fn builder_initialize(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    this: Ptr,
+    _init: Ptr,
+) -> i32 {
     if builder_id(ctx, this.addr()).is_some() {
         0
     } else {
@@ -558,7 +581,12 @@ pub(super) fn builder_initialize(ctx: &mut GuestCtx, _st: &mut VitaState, this: 
 /// nodes than it expects. Nothing observed asks for that, and inventing the other mode
 /// unexercised would be worse than this note.
 #[hostcall]
-pub(super) fn builder_set_flag(ctx: &mut GuestCtx, _st: &mut VitaState, this: Ptr, _on: bool) -> i32 {
+pub(super) fn builder_set_flag(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    this: Ptr,
+    _on: bool,
+) -> i32 {
     if builder_id(ctx, this.addr()).is_some() {
         0
     } else {
@@ -573,7 +601,13 @@ pub(super) fn builder_set_flag(ctx: &mut GuestCtx, _st: &mut VitaState, this: Pt
 /// keeps only the sign bit), so a malformed document reports one rather than handing back
 /// an empty tree that would read as a valid, childless document.
 #[hostcall]
-pub(super) fn builder_parse(ctx: &mut GuestCtx, st: &mut VitaState, this: Ptr, xml: Ptr, _b: bool) -> i32 {
+pub(super) fn builder_parse(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    this: Ptr,
+    xml: Ptr,
+    _b: bool,
+) -> i32 {
     do_parse(ctx, st, this.addr(), xml.addr())
 }
 
@@ -588,15 +622,22 @@ pub(super) fn builder_parse(ctx: &mut GuestCtx, st: &mut VitaState, this: Ptr, x
 fn dump_document(text: &str) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
-    let Ok(dir) = std::env::var("VITASLOP_XML_DUMP") else { return };
+    let Ok(dir) = std::env::var("VITASLOP_XML_DUMP") else {
+        return;
+    };
     let n = N.fetch_add(1, Ordering::Relaxed);
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(std::path::Path::new(&dir).join(format!("doc-{n}.xml")), text);
+    let _ = std::fs::write(
+        std::path::Path::new(&dir).join(format!("doc-{n}.xml")),
+        text,
+    );
 }
 
 /// The body of [`builder_parse`], as a plain function so it can use early returns.
 fn do_parse(ctx: &mut GuestCtx, st: &mut VitaState, this: u32, xml: u32) -> i32 {
-    let Some(id) = builder_id(ctx, this) else { return -1 };
+    let Some(id) = builder_id(ctx, this) else {
+        return -1;
+    };
     let text = read_string(ctx, xml);
     if text.is_empty() {
         return -1;
@@ -832,11 +873,22 @@ mod tests {
         );
         let kids = walk(&st, root);
         assert_eq!(kids[0].1, "kid");
-        assert_eq!(st.node(st.node(root).unwrap().first_child).unwrap().value, "hello");
+        assert_eq!(
+            st.node(st.node(root).unwrap().first_child).unwrap().value,
+            "hello"
+        );
         // The self-closing element is a real, childless node, and the CDATA is character
         // data of its own type.
-        assert_eq!(kids.iter().filter(|(k, _, _)| *k == NODE_TYPE_ELEMENT).count(), 2);
-        assert!(kids.iter().any(|(k, _, v)| *k == NODE_TYPE_CDATA && v == "<raw>"));
+        assert_eq!(
+            kids.iter()
+                .filter(|(k, _, _)| *k == NODE_TYPE_ELEMENT)
+                .count(),
+            2
+        );
+        assert!(
+            kids.iter()
+                .any(|(k, _, v)| *k == NODE_TYPE_CDATA && v == "<raw>")
+        );
     }
 
     /// The node types a calling title's guards test for, pinned as VALUES rather than as
@@ -850,19 +902,31 @@ mod tests {
     #[test]
     fn node_types_answer_the_guards_a_title_writes() {
         let mut st = XmlState::default();
-        let doc = parse_document(&mut st, r#"<Environment><Course>7</Course><![CDATA[x]]></Environment>"#)
-            .expect("well formed");
+        let doc = parse_document(
+            &mut st,
+            r#"<Environment><Course>7</Course><![CDATA[x]]></Environment>"#,
+        )
+        .expect("well formed");
         let container = |k: u32| k == 4 || k == 5;
         let chardata = |k: u32| k == 8 || k == 0x28;
         assert!(container(st.node(doc).unwrap().kind), "the document node");
         let root = st.node(doc).unwrap().first_child;
-        assert!(container(st.node(root).unwrap().kind), "the document element");
+        assert!(
+            container(st.node(root).unwrap().kind),
+            "the document element"
+        );
         let course = st.node(root).unwrap().first_child;
         assert!(container(st.node(course).unwrap().kind), "a nested element");
-        assert!(chardata(st.node(st.node(course).unwrap().first_child).unwrap().kind), "text");
+        assert!(
+            chardata(st.node(st.node(course).unwrap().first_child).unwrap().kind),
+            "text"
+        );
         let cdata = st.node(course).unwrap().next_sibling;
         assert!(chardata(st.node(cdata).unwrap().kind), "a CDATA section");
-        assert_ne!(st.node(cdata).unwrap().kind, st.node(st.node(course).unwrap().first_child).unwrap().kind);
+        assert_ne!(
+            st.node(cdata).unwrap().kind,
+            st.node(st.node(course).unwrap().first_child).unwrap().kind
+        );
     }
 
     /// A `>` inside a quoted attribute value must not end the tag.
@@ -872,8 +936,14 @@ mod tests {
         let doc = parse_document(&mut st, r#"<a b="x>y"><c/></a>"#).expect("well formed");
         let root = st.node(doc).unwrap().first_child;
         assert_eq!(st.node(root).unwrap().name, "a");
-        assert_eq!(st.node(st.node(root).unwrap().first_attr).unwrap().value, "x>y");
-        assert_eq!(st.node(st.node(root).unwrap().first_child).unwrap().name, "c");
+        assert_eq!(
+            st.node(st.node(root).unwrap().first_attr).unwrap().value,
+            "x>y"
+        );
+        assert_eq!(
+            st.node(st.node(root).unwrap().first_child).unwrap().name,
+            "c"
+        );
     }
 
     /// A mismatched or unclosed tag is REFUSED, not silently accepted with a wrong shape.

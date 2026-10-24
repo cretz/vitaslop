@@ -141,7 +141,9 @@ than expected.
 - Dead or Alive Xtreme 3: Venus (Asian release)
 - FIFA Soccer 13
 - Hot Shots Golf: World Invitational
+- Hustle Kings
 - LIMBO
+- LittleBigPlanet
 - Madden NFL 13
 - MLB 12: The Show
 - Mortal Kombat
@@ -152,7 +154,9 @@ than expected.
 - Tales from Space: Mutant Blobs Attack
 - Ultimate Marvel vs. Capcom 3
 - Uncharted: Golden Abyss
+- Virtua Tennis 4
 - WipEout 2048
+- Zen Pinball 2
 
 </details>
 

@@ -13,8 +13,8 @@
 //! `std::time::Instant` (it panics), so the timers compile to nothing and the
 //! counters stay zero - the browser host measures with its own clock.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The phases worth separating. Deliberately a closed enum rather than string keys:
 /// a phase is a decision about what to measure, and adding one should be a visible
@@ -431,8 +431,12 @@ impl Phase {
             Phase::DrawVertexGatherRead => "draw:     ...of which the guest READS",
             Phase::DrawVertexGatherIntern => "draw:     ...of which the content INTERN",
             Phase::DrawVertexInternHit => "draw:       ...of which the intern HIT",
-            Phase::DrawVertexInternCollide => "draw:       ...of which a MISS ON A KEY ALREADY HELD (fingerprint collision)",
-            Phase::DrawVertexGatherMemoHit => "draw:     ...of which the gather MEMO HIT (no read, no scatter)",
+            Phase::DrawVertexInternCollide => {
+                "draw:       ...of which a MISS ON A KEY ALREADY HELD (fingerprint collision)"
+            }
+            Phase::DrawVertexGatherMemoHit => {
+                "draw:     ...of which the gather MEMO HIT (no read, no scatter)"
+            }
             Phase::DrawTextures => "draw: snapshot textures (miss path)",
             Phase::DrawTexFragMiss => "draw:   ...fragment MISS decode",
             Phase::DrawTexRead => "draw:     ...of which get_or_read",
@@ -453,7 +457,9 @@ impl Phase {
             Phase::DrawGxpBlobs => "draw:   ...of which the program blobs",
             Phase::DrawGxpSaImage => "draw:   ...of which the SA images",
             Phase::DrawGxpWindows => "draw:   ...of which the memory-window snapshots",
-            Phase::SnapsLockWait => "snapshot-cache lock WAIT (any caller; entries = contended takes)",
+            Phase::SnapsLockWait => {
+                "snapshot-cache lock WAIT (any caller; entries = contended takes)"
+            }
             Phase::DrawPrelude => "draw: visibility + stale-uniform check",
             Phase::DrawGeometry => "draw: the WHOLE geometry step (any path)",
             Phase::DrawTexAll => "draw: the WHOLE texture step (any path)",
@@ -464,7 +470,9 @@ impl Phase {
             Phase::DrawUniforms => "draw: uniforms + material",
             Phase::BuildClassify => "build: classify the draw (interpret + layout) ONLY",
             Phase::BuildBody => "build: the rest of the draw body (textures, indices, uniforms)",
-            Phase::BuildGxpBindings => "build:   ...of which the recompiled draw's attribute + texture lists",
+            Phase::BuildGxpBindings => {
+                "build:   ...of which the recompiled draw's attribute + texture lists"
+            }
             Phase::BuildIndexExpand => "build:   ...of which the index expansion",
             Phase::BuildRecord => "build: assemble + push the renderer's draw",
             Phase::SceneFold => "scene: signature fold",
@@ -473,13 +481,19 @@ impl Phase {
             Phase::SchedMirror => "scheduler:   ...of which mirror refresh",
             Phase::SchedIdle => "scheduler: idle step",
             Phase::SchedBook => "scheduler: post-resume bookkeeping",
-            Phase::SchedEarlyBatch => "scheduler:   ...of which the EARLY scene batch (encode + submit + GPU readback WAIT)",
+            Phase::SchedEarlyBatch => {
+                "scheduler:   ...of which the EARLY scene batch (encode + submit + GPU readback WAIT)"
+            }
             Phase::FrameBoundary => "flip: end frame + advance clocks",
             Phase::ThreadSpawn => "scheduler: spawn thread (instantiate)",
-            Phase::PatchCreateFrag => "patcher: createFragmentProgram TOTAL (the three below nest in it)",
+            Phase::PatchCreateFrag => {
+                "patcher: createFragmentProgram TOTAL (the three below nest in it)"
+            }
             Phase::PatchCreateFragHandle => "patcher:   ...of which reflect + mint the handle",
             Phase::PatchCreateFragBlend => "patcher:   ...of which the blend equation",
-            Phase::PatchCreateFragPrecompile => "patcher:   ...of which queue the pair for precompile",
+            Phase::PatchCreateFragPrecompile => {
+                "patcher:   ...of which queue the pair for precompile"
+            }
         }
     }
 }
@@ -617,7 +631,10 @@ pub fn note_prefetch(fetched: usize, skipped: usize) {
 
 /// `(ranges fetched, ranges skipped as cache hits)` by the flip-time prefetch, cumulative.
 pub fn prefetch_ranges() -> (u64, u64) {
-    (PREFETCH_FETCHED.load(Relaxed), PREFETCH_SKIPPED.load(Relaxed))
+    (
+        PREFETCH_FETCHED.load(Relaxed),
+        PREFETCH_SKIPPED.load(Relaxed),
+    )
 }
 
 /// >>> WHICH PHASE THE WORD READS HAPPENED IN, because the total names the DEFECT CLASS and
@@ -734,11 +751,19 @@ pub fn scope(phase: Phase) -> Option<Scope> {
         // host had installed one, which silently disabled the COUNTERS as well as the timer -
         // and the browser spent a session with no clock in its run worker and an empty phase
         // table that read as "no phase costs anything".
-        Some(Scope { phase, start: clock(), words: local_accesses().0 })
+        Some(Scope {
+            phase,
+            start: clock(),
+            words: local_accesses().0,
+        })
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        Some(Scope { phase, start: std::time::Instant::now(), words: local_accesses().0 })
+        Some(Scope {
+            phase,
+            start: std::time::Instant::now(),
+            words: local_accesses().0,
+        })
     }
 }
 
@@ -895,7 +920,11 @@ pub fn take_excluded_ms() -> f64 {
 /// [`reset`]. Bytes are zero for a phase that does not report them.
 pub fn read(phase: Phase) -> (u64, u64, u64) {
     let i = phase.index();
-    (NS[i].load(Relaxed), HITS[i].load(Relaxed), BYTES[i].load(Relaxed))
+    (
+        NS[i].load(Relaxed),
+        HITS[i].load(Relaxed),
+        BYTES[i].load(Relaxed),
+    )
 }
 
 /// The phase table as TEXT, one entry per timed phase, empty when nothing was timed.
@@ -917,8 +946,16 @@ pub fn table() -> Vec<String> {
         if ns == 0 && hits == 0 {
             continue;
         }
-        let kb = if bytes > 0 { format!(", {} KB", bytes / 1024) } else { String::new() };
-        out.push(format!("{} {:.2} ms over {hits} entries{kb}", p.label(), ns as f64 / 1.0e6));
+        let kb = if bytes > 0 {
+            format!(", {} KB", bytes / 1024)
+        } else {
+            String::new()
+        };
+        out.push(format!(
+            "{} {:.2} ms over {hits} entries{kb}",
+            p.label(),
+            ns as f64 / 1.0e6
+        ));
     }
     out
 }
@@ -954,7 +991,12 @@ pub fn snaps_waited(holder: u32, ns: u64) {
     let h = u64::from(holder);
     for i in 0..HOLDER_SLOTS {
         let cur = HOLDER_LINE[i].load(Relaxed);
-        if cur == h || (cur == 0 && HOLDER_LINE[i].compare_exchange(0, h, Relaxed, Relaxed).map_or_else(|v| v == h, |_| true)) {
+        if cur == h
+            || (cur == 0
+                && HOLDER_LINE[i]
+                    .compare_exchange(0, h, Relaxed, Relaxed)
+                    .map_or_else(|v| v == h, |_| true))
+        {
             HOLDER_NS[i].fetch_add(ns, Relaxed);
             HOLDER_HITS[i].fetch_add(1, Relaxed);
             return;
@@ -966,7 +1008,13 @@ pub fn snaps_waited(holder: u32, ns: u64) {
 pub fn snaps_waits_by_holder() -> Vec<(u32, f64, u64)> {
     let mut v: Vec<(u32, f64, u64)> = (0..HOLDER_SLOTS)
         .filter(|&i| HOLDER_HITS[i].load(Relaxed) > 0)
-        .map(|i| (HOLDER_LINE[i].load(Relaxed) as u32, HOLDER_NS[i].load(Relaxed) as f64 / 1.0e6, HOLDER_HITS[i].load(Relaxed)))
+        .map(|i| {
+            (
+                HOLDER_LINE[i].load(Relaxed) as u32,
+                HOLDER_NS[i].load(Relaxed) as f64 / 1.0e6,
+                HOLDER_HITS[i].load(Relaxed),
+            )
+        })
         .collect();
     v.sort_by(|a, b| b.1.total_cmp(&a.1));
     v
@@ -982,7 +1030,12 @@ pub fn now_ms() -> Option<f64> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         static T0: OnceLock<std::time::Instant> = OnceLock::new();
-        Some(T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0)
+        Some(
+            T0.get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs_f64()
+                * 1000.0,
+        )
     }
 }
 

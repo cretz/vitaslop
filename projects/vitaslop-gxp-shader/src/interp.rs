@@ -549,7 +549,7 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // The remaining exposure is honest and worth naming: both sides take that addressing
         // from the same decoder, so a WRONG selector rule would agree with itself here. The
         // AUTHORED conformance suite is what can break that tie, not this file.
-        Op::PackFromInt { bits, signed } => {
+        Op::PackFromInt { bits, signed, norm } => {
             let bits = bits as u32;
             if bits != 16 && bits != 8 {
                 return Err("unpack.int at a width other than 8 or 16");
@@ -571,6 +571,13 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
                 ((raw << (32 - bits)) as i32 >> (32 - bits)) as f32
             } else {
                 raw as f32
+            };
+            // The normalized form, exactly as the emitter writes it.
+            let range = if signed { ((1u32 << (bits - 1)) - 1) as f32 } else { ((1u32 << bits) - 1) as f32 };
+            let v = match (norm, signed) {
+                (true, true) => (v / range).max(-1.0),
+                (true, false) => v / range,
+                (false, _) => v,
             };
             let v = if s1.neg { -v } else { v };
             if s1.abs {
@@ -1656,6 +1663,25 @@ mod tests {
 
     fn shader(instrs: Vec<Instr>) -> Shader {
         Shader { kind: ProgramKind::Fragment, instrs }
+    }
+
+    /// The normalized unpack: an S8 code divided by 127 and clamped at -1 (so -128 and -127 both
+    /// read -1), and a U16 code divided by 65535.
+    #[test]
+    fn normalized_unpack_divides_by_the_range() {
+        let mut regs = RegFile::with_lanes(8);
+        regs.pa[0] = f32::from_bits(u32::from_le_bytes([0x7F, 0x80, 0x81, 0x00]));
+        regs.pa[1] = f32::from_bits(0x8000_FFFF);
+        let mut src = Operand::plain(Bank::PrimaryAttr, 0, 2);
+        src.swizzle = [0, 1, 2, 3];
+        let d = Operand::plain(Bank::Temp, 0, 0);
+        run(&shader(vec![instr(Op::PackFromInt { bits: 8, signed: true, norm: true }, d, vec![src])]), &mut regs).unwrap();
+        assert_eq!(&regs.r[0..4], &[1.0, -1.0, -1.0, 0.0]);
+        let mut src16 = Operand::plain(Bank::PrimaryAttr, 1, 2);
+        src16.swizzle = [0, 1, 0, 1];
+        run(&shader(vec![instr(Op::PackFromInt { bits: 16, signed: false, norm: true }, d, vec![src16])]), &mut regs).unwrap();
+        assert_eq!(regs.r[0], 1.0);
+        assert_eq!(regs.r[1], 32768.0 / 65535.0);
     }
 
     #[test]

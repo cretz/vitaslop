@@ -15,10 +15,10 @@
 //! # Threads
 //! Under SMP the dispatch runs on whichever guest thread made the call, so an observer is
 //! `Send + Sync` and does its own locking. It must not call back into the engine.
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::recipe_eval::GuestRead;
+use crate::guest_read::GuestRead;
 
 /// One serviced host call, as the guest made it - before the handler runs, so the argument
 /// registers are still the guest's own.

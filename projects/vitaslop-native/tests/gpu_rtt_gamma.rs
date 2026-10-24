@@ -128,6 +128,7 @@ fn texture_naming_target() -> BoundTexture {
         unit: 0,
         base_format: 0x0c,
         swizzle: 0,
+        yuv_profile: 0,
         tex_type: 3,
         width: size,
         height: size,

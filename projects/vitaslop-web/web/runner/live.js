@@ -51,16 +51,14 @@ async function run(p) {
   // surface before it is presented, posted as a `presentshot` note). The canvas route
   // (`convertToBlob` after the present) failed on the phone for 15 of 15 shots.
   if (p.shots && p.shots.length && !knobs.VITASLOP_SHOT_FRAMES) knobs.VITASLOP_SHOT_FRAMES = p.shots.join(",");
-  const recipe = p.recipe ? await asset(p.recipe) : p.recipeText || "";
   // `params.playbook` (a runner asset path) or `params.playbookText` (+ `playbookName`, named
-  // `<TITLE_ID>/<file>.lua` as the desktop names it): a playbook drives the input instead. The
+  // `<TITLE_ID>/<file>.lua` as the desktop names it): a playbook drives the input. The
   // run then ends when the playbook does, and the result carries its verdict, report and tape.
   const playbook = p.playbook
     ? { name: p.playbook.split("/").slice(-2).join("/"), source: await asset(p.playbook) }
     : p.playbookText
       ? { name: p.playbookName || `${titleId}/job.lua`, source: p.playbookText }
       : null;
-  if (playbook && recipe) throw new Error("a recipe and a playbook both drive input - pass one");
   // The shots a playbook names are taken by the renderer's present probe (src/playbook.rs
   // take_shot_request), which exists only when some shot is asked for: a frame no run reaches.
   if (playbook && !knobs.VITASLOP_SHOT_FRAMES && !knobs.VITASLOP_PRESENT_PROBE) knobs.VITASLOP_SHOT_FRAMES = "4294967295";
@@ -273,7 +271,7 @@ async function run(p) {
 
   const offscreen = canvas.transferControlToOffscreen();
   worker.postMessage(
-    { offscreen, titleId, recipe, playbook, maxFrames: 0xffffffff, knobs, prebuilt, audioRing: audio ? audio.ring : undefined, profile: p.profile || "runner", noPersist: p.persist !== true, forwardConsole: p.console ? Number(p.console) || 5000 : 0, forwardFrom: Number(p.consoleFrom || 0),shots: knobs.VITASLOP_SHOT_FRAMES ? [] : p.shots || [] },
+    { offscreen, titleId, playbook, maxFrames: 0xffffffff, knobs, prebuilt, audioRing: audio ? audio.ring : undefined, profile: p.profile || "runner", noPersist: p.persist !== true, forwardConsole: p.console ? Number(p.console) || 5000 : 0, forwardFrom: Number(p.consoleFrom || 0),shots: knobs.VITASLOP_SHOT_FRAMES ? [] : p.shots || [] },
     [offscreen]
   );
   await finished;
@@ -349,7 +347,14 @@ async function run(p) {
     ? ` | over ${meter.length} readings (f${meter[0].frame}-f${meter[meter.length - 1].frame}): fps mean ${fpsStat.mean} p10 ${fpsStat.p10} min ${fpsStat.min}; speed mean ${speedStat.mean}% p10 ${speedStat.p10}% min ${speedStat.min}%`
     : "";
   const audioSummary = audioResult ? ` | audio ${audioResult.state}: underrun ${audioResult.underrunS}s of ${audioResult.wallS}s (${audioResult.underrunPct}%), made ${audioResult.writtenS}s` : "";
+  // >>> THE RESULT NAMES ITS OWN BUILD: the stamp beside the bundle this run loaded, so a device
+  // result can be told from one taken on a stale bundle (a cached copy, a server left running).
+  const build = await fetch(`../${bundleQ ? "pkg-threads" : "pkg"}/build-stamp.txt`, { cache: "no-store" })
+    .then((r) => (r.ok ? r.text() : `stamp HTTP ${r.status}`))
+    .then((t) => t.trim())
+    .catch((e) => `stamp unavailable: ${e && e.message}`);
   const result = {
+    build,
     summary: error ? error.slice(0, 200) : `${pb ? `${pb.verdict || `playbook ${pb.name} did not finish`} | ` : ""}reached f${lastFrame}; ${reports.fps || ""}${window}${audioSummary}`,
     playbook: pb,
     audio: audioResult,

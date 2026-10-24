@@ -172,6 +172,12 @@ function cue.locate(o)
   return declare({ kind = "locate", x = o.x, y = o.y, w = o.w or 1, h = o.h or 1, rgb = o.rgb, tol = o.tol or 24 })
 end
 
+--- The AVERAGE colour of a rectangle, packed `0xRRGGBB`; `:rgb()` splits it. For a colour the
+--- title picks at run time (a table's cloth), read once and then handed to `cue.pixels`.
+function cue.color(o)
+  return declare({ kind = "color", x = o.x, y = o.y, w = o.w or 1, h = o.h or 1 })
+end
+
 --- Arm-relative durations: `n` input frames, or `s` guest seconds, after the wait begins.
 function cue.frames(n) return declare({ kind = "frames", n = n }) end
 function cue.seconds(s) return declare({ kind = "seconds", s = s }) end
@@ -199,6 +205,12 @@ function Cue:stable(n) return declare({ kind = "stable", src = self, n = n }) en
 function Cue:after(other) return declare({ kind = "after", a = self, b = other }) end
 --- The cue's value now: a call's count, a memory value, a condition's truth.
 function Cue:value() return req({ op = "value", cue = self }).v end
+--- A `cue.color` value as three numbers 0..255 (nil if no frame yet).
+function Cue:rgb()
+  local v = self:value()
+  if v == nil then return nil end
+  return { math.floor(v / 65536) % 256, math.floor(v / 256) % 256, v % 256 }
+end
 --- A `cue.locate`'s position now: x, y in panel coordinates, or nil, nil.
 function Cue:xy()
   local v = self:value()
@@ -251,9 +263,13 @@ function tap(b, down, up) hold(b, down or 6); idle(up or 6) end
 function idle(n) req({ op = "idle", frames = n }) end
 --- Set a stick ("left" or "right") to raw axes 0..255; no axes recentres it.
 function stick(which, x, y) req({ op = "stick", which = which, x = x or 128, y = y or 128 }) end
---- Put one finger on the front panel at panel coordinates (screen x2).
+--- Put one finger on the front panel at PANEL coordinates (0..1919 x 0..1087): a point read off a
+--- 960x544 shot is doubled.
 function touch(x, y) req({ op = "touch", x = x, y = y }) end
 function untouch() req({ op = "touch" }) end
+--- Put one finger on the REAR panel at panel coordinates (0..1919 x 0..889; no screen under it).
+function back_touch(x, y) req({ op = "touch", panel = "back", x = x, y = y }) end
+function back_untouch() req({ op = "touch", panel = "back" }) end
 
 --- Write a screenshot named `name` of the next rendered frame.
 function shot(name) req({ op = "shot", name = name }) end

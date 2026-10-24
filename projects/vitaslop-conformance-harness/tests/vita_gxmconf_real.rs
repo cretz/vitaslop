@@ -69,7 +69,7 @@ fn render_frame_on_gpu(range: std::ops::Range<usize>) -> Option<Framebuffer> {
     let env = env.borrow();
     let cap = &env.state.capture;
     assert!(cap.unimplemented.is_empty(), "unimplemented NIDs: {:?}", cap.unimplemented);
-    assert_eq!(cap.scenes.len(), 19, "gxmconf emits 19 scenes");
+    assert_eq!(cap.scenes.len(), 21, "gxmconf emits 21 scenes");
     let scenes = &cap.scenes[range.clone()];
     assert!(
         scenes.iter().flat_map(|s| s.draws.iter()).all(|d| !d.vprog.is_empty() && !d.fprog.is_empty()),

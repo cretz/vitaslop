@@ -140,7 +140,7 @@ mod hostcalls {
     /// LOADER - and the comment here already warned that "a ratio measured on one
     /// workload does not transfer to another", which is exactly what then happened: on
     /// the front end the same setting ran the clock 5.1x slow and stranded a frame-keyed
-    /// recipe on a timed screen for 14,000 frames.
+    /// input script on a timed screen for 14,000 frames.
     ///
     /// The clock is now driven by [`super::fuel_interval`], which counts guest WORK the
     /// way native's engine fuel does. This stays as a liveness backstop for the one case
@@ -1056,7 +1056,7 @@ fn preempt_note() {
 /// magnitude between a menu and a race, so a clock driven by it is calibrated for
 /// whichever screen the calibration was taken on and wrong on every other. That model
 /// measured 17.37 s of game clock where native had 88.688 s - **5.1x slow** - and it
-/// stranded a frame-keyed recipe on a timed screen for 14,000 frames while native was two
+/// stranded a frame-keyed input script on a timed screen for 14,000 frames while native was two
 /// screens further on.
 ///
 /// # Why fitting a constant never worked
@@ -4903,7 +4903,7 @@ pub(crate) fn apply_early_batch(
                 tracing::info!(target: "vitaslop::status", "gxm rtt: early completion of {addr:#010x} ({w}x{h}): texel(24,1)={t:?}{detail}");
                 // `VITASLOP_RTT_GRID_FRAMES=a+b+..`: the same line STAMPED with the frame, for
                 // the first completion at or after each listed frame. The unstamped line cannot pair a device's target with the
-                // desktop's - both runs log it at unknown moments - and a same-recipe comparison
+                // desktop's - both runs log it at unknown moments - and a same-input comparison
                 // needs the same FRAME on both sides.
                 static GRID_FRAMES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
                 let at = GRID_FRAMES.get_or_init(|| {

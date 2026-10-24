@@ -17,7 +17,7 @@
 //! published Type-2 constant.
 
 use super::vfs::MemVfs;
-use super::{keys, Error, Reader};
+use super::{Error, Reader, keys};
 use aes::cipher::{
     BlockEncrypt, KeyInit, KeyIvInit, StreamCipher, StreamCipherSeek, generic_array::GenericArray,
 };

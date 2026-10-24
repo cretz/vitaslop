@@ -22,7 +22,7 @@
 //! instant; a thread yields control only at a host call (a blocking primitive, or a
 //! fuel-quantum preemption). No two guest threads touch memory truly concurrently, and
 //! scheduling is deterministic - the same inputs drive the same interleaving, which every
-//! recipe, capsule and test depends on.
+//! scripted run, capsule and test depends on.
 //!
 //! The PARALLEL engine (`crate::smp`, `VITASLOP_SMP`) runs these same instances on several
 //! OS threads at once, over the same shared memory, with a module built for it (atomics, the
@@ -486,7 +486,7 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
     fn on_frame(&mut self, frames: u64) {
         // Stamp the frame first, unconditionally: every host-side diagnostic that
         // prints a line reads it, and a trace line with no frame on it cannot be
-        // placed against a crash frame or a recipe cue at all.
+        // placed against a crash frame or a playbook cue at all.
         CURRENT_FRAME.store(frames, std::sync::atomic::Ordering::Relaxed);
         let (Some(off), Some(at)) = (self.arm_word_off, transpiler::arm_at_frame()) else {
             return;
@@ -514,7 +514,7 @@ static DIAG_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 /// The frame the run has reached, stamped by [`WasmtimeEngine::on_frame`]. Read by the
 /// host-side diagnostics so every line they print carries a frame number: a block trace
-/// that says only "this happened" cannot be lined up with a crash frame, a recipe cue or
+/// that says only "this happened" cannot be lined up with a crash frame, a playbook cue or
 /// another instrument's output, which is most of what such a trace is for.
 static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -547,7 +547,7 @@ struct MainBirth {
     priority: i32,
 }
 
-/// One guest thread at a time (deterministic - every recipe, capsule and test), or several at
+/// One guest thread at a time (deterministic - every scripted run, capsule and test), or several at
 /// once on OS threads (`crate::smp`, `VITASLOP_SMP`).
 enum Inner<H: ImportDispatch + Send + 'static> {
     Baton(Box<Scheduler<WasmtimeEngine<H>, H>>),
@@ -1534,7 +1534,15 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         true
     }
 
-    /// Diagnostic write into guest memory. No-op if out of bounds.
+    /// A host write into guest memory - the probe's POKE knob, and the render-target WRITEBACK
+    /// of rendered pixels. No-op if out of bounds.
+    ///
+    /// >>> IT STAMPS THE PAGES IT WRITES, like every other host write (`write_mem`). It did not
+    /// when it was only a diagnostic poke; once the writeback used it, a target the guest renders
+    /// and then SAMPLES as an ordinary texture was served from a snapshot the stamps called
+    /// current. MEASURED (`VITASLOP_STAMP_VERIFY=1`): a pool title's rendered cube map,
+    /// 0x90767d60+0x20c00, changed every frame with no stamp, and the balls reflecting it
+    /// rendered as blocky noise.
     pub(crate) fn write_guest(&self, addr: u32, bytes: &[u8]) {
         let off = addr.wrapping_sub(self.base) as usize;
         let data = self.shared_mem.data();
@@ -1547,6 +1555,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                 *data[off + i].get() = *b;
             }
         }
+        SharedView::new(&self.shared_mem, self.dirty_off).stamp_written(off, bytes.len());
     }
 
     /// Build one thread from a single entry (a spawned worker).
@@ -1708,8 +1717,17 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                     .get_typed_func::<(), ()>(&mut store, &abi::func_export(entry))
                 {
                     Ok(f) => f,
-                    // The entry was not a transpiled function; skip it.
-                    Err(_) => continue,
+                    // >>> AN ENTRY THAT WAS NEVER LIFTED IS A FAILURE, NOT A SKIP. Skipping it
+                    // ended the thread as if it had RETURNED code 0: MEASURED, a title's
+                    // UI/graphics/loader threads (an ARM-state entry discovery had missed) all
+                    // "finished" before running an instruction, and the run stalled on a
+                    // semaphore one of them owed, with nothing naming the cause.
+                    Err(_) => {
+                        return FiberEnd::Error(format!(
+                            "thread {thid:#x}: entry {entry:#010x} is not a transpiled function \
+                             (discovery never reached it) - the thread cannot run"
+                        ));
+                    }
                 };
                 let call_res = func.call_async(&mut store, ()).await;
                 last_r0 = get_reg_store(&mut store, &instance, 0);

@@ -88,7 +88,12 @@ pub const WORK_SIZE: u32 = 32;
 
 /// The offsets, packaged for the transpiler. One definition, two readers.
 pub fn layout() -> LwMutexLayout {
-    LwMutexLayout { id: off::ID, owner: off::OWNER, count: off::COUNT, waiters: off::WAITERS }
+    LwMutexLayout {
+        id: off::ID,
+        owner: off::OWNER,
+        count: off::COUNT,
+        waiters: off::WAITERS,
+    }
 }
 
 fn get(w: &dyn GuestWords, work: u32, offset: u32) -> u32 {
@@ -164,7 +169,12 @@ pub fn take_free(w: &mut dyn GuestWords, work: u32, thid: i32, contended: bool) 
 /// [`CONTENDED`] bit stated. A plain store is exact here: only the owner changes a held count,
 /// and the owner is not running.
 pub fn set_held(w: &mut dyn GuestWords, work: u32, held: u32, contended: bool) {
-    set(w, work, off::COUNT, held | if contended { CONTENDED } else { 0 });
+    set(
+        w,
+        work,
+        off::COUNT,
+        held | if contended { CONTENDED } else { 0 },
+    );
 }
 
 /// Mark a HELD mutex contended, if its count word still reads `raw` (a held value without
@@ -292,9 +302,20 @@ mod tests {
             );
         }
         assert_eq!(claimed[0].0, 0, "the state starts at the work pointer");
-        assert_eq!(claimed[3].0 + 4, BYTES, "BYTES must end just past the last word");
-        assert!(BYTES <= WORK_SIZE, "{BYTES} bytes against a SceKernelLwMutexWork of {WORK_SIZE}");
-        assert_eq!(layout().top() + 4, BYTES, "the emitter's pointer bound covers every word");
+        assert_eq!(
+            claimed[3].0 + 4,
+            BYTES,
+            "BYTES must end just past the last word"
+        );
+        assert!(
+            BYTES <= WORK_SIZE,
+            "{BYTES} bytes against a SceKernelLwMutexWork of {WORK_SIZE}"
+        );
+        assert_eq!(
+            layout().top() + 4,
+            BYTES,
+            "the emitter's pointer bound covers every word"
+        );
     }
 
     /// A created mutex identifies itself; an untouched work area does not, and neither does
@@ -311,8 +332,15 @@ mod tests {
             let v = w.word(WORK + i * 4);
             w.set_word(copy + i * 4, v);
         }
-        assert!(!is_mutex(&w, copy), "a copy must not pass as the canonical mutex");
-        assert_eq!(carried_id(&w, copy), WORK, "...but it names the one it came from");
+        assert!(
+            !is_mutex(&w, copy),
+            "a copy must not pass as the canonical mutex"
+        );
+        assert_eq!(
+            carried_id(&w, copy),
+            WORK,
+            "...but it names the one it came from"
+        );
         clear(&mut w, WORK);
         assert!(!is_mutex(&w, WORK), "a deleted mutex cannot be taken");
     }
@@ -328,16 +356,32 @@ mod tests {
         assert_eq!(owner(&w, WORK), 7);
         assert!(fast_lock(&mut w, WORK, 7, 1), "the owner recurses");
         assert_eq!(count(&w, WORK), 2);
-        assert!(!fast_lock(&mut w, WORK, 9, 1), "another thread must reach the host");
+        assert!(
+            !fast_lock(&mut w, WORK, 9, 1),
+            "another thread must reach the host"
+        );
         assert_eq!(count(&w, WORK), 2, "and must not have changed anything");
         assert!(fast_unlock(&mut w, WORK, 7, 1));
         assert_eq!(count(&w, WORK), 1, "still held after one of two releases");
-        assert!(!fast_unlock(&mut w, WORK, 9, 1), "a non-owner cannot release it");
+        assert!(
+            !fast_unlock(&mut w, WORK, 9, 1),
+            "a non-owner cannot release it"
+        );
         assert!(fast_unlock(&mut w, WORK, 7, 1));
         assert_eq!(count(&w, WORK), 0, "free");
-        assert_eq!(owner(&w, WORK), 7, "the owner word is left stale, by design");
-        assert!(!fast_unlock(&mut w, WORK, 7, 1), "releasing a free mutex is the handler's case");
-        assert!(fast_lock(&mut w, WORK, 9, 1), "a free mutex goes to whoever asks, stale owner or not");
+        assert_eq!(
+            owner(&w, WORK),
+            7,
+            "the owner word is left stale, by design"
+        );
+        assert!(
+            !fast_unlock(&mut w, WORK, 7, 1),
+            "releasing a free mutex is the handler's case"
+        );
+        assert!(
+            fast_lock(&mut w, WORK, 9, 1),
+            "a free mutex goes to whoever asks, stale owner or not"
+        );
         assert_eq!(owner(&w, WORK), 9);
     }
 
@@ -347,9 +391,21 @@ mod tests {
     #[test]
     fn each_guard_term_refuses_by_itself() {
         for (why, prepare, lock_count) in [
-            ("a lockCount the handler defines", (|_: &mut Words| {}) as fn(&mut Words), 2u32),
-            ("a zero lockCount", (|_: &mut Words| {}) as fn(&mut Words), 0),
-            ("an unstamped work area", (|w: &mut Words| clear(w, WORK)) as fn(&mut Words), 1),
+            (
+                "a lockCount the handler defines",
+                (|_: &mut Words| {}) as fn(&mut Words),
+                2u32,
+            ),
+            (
+                "a zero lockCount",
+                (|_: &mut Words| {}) as fn(&mut Words),
+                0,
+            ),
+            (
+                "an unstamped work area",
+                (|w: &mut Words| clear(w, WORK)) as fn(&mut Words),
+                1,
+            ),
             (
                 "a parked waiter",
                 (|w: &mut Words| set_waiters(w, WORK, 1)) as fn(&mut Words),
@@ -359,16 +415,30 @@ mod tests {
             let mut w = Words::default();
             init(&mut w, WORK);
             prepare(&mut w);
-            assert!(!fast_lock(&mut w, WORK, 7, lock_count), "lock must refuse: {why}");
-            assert_eq!(count(&w, WORK), 0, "and must not have written anything: {why}");
+            assert!(
+                !fast_lock(&mut w, WORK, 7, lock_count),
+                "lock must refuse: {why}"
+            );
+            assert_eq!(
+                count(&w, WORK),
+                0,
+                "and must not have written anything: {why}"
+            );
 
             // ...and the same for release, from a held mutex.
             let mut w = Words::default();
             init(&mut w, WORK);
             assert!(fast_lock(&mut w, WORK, 7, 1));
             prepare(&mut w);
-            assert!(!fast_unlock(&mut w, WORK, 7, lock_count), "unlock must refuse: {why}");
-            assert_eq!(count(&w, WORK), 1, "and must not have written anything: {why}");
+            assert!(
+                !fast_unlock(&mut w, WORK, 7, lock_count),
+                "unlock must refuse: {why}"
+            );
+            assert_eq!(
+                count(&w, WORK),
+                1,
+                "and must not have written anything: {why}"
+            );
         }
     }
 }

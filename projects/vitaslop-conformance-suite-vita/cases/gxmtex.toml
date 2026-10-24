@@ -4,7 +4,13 @@ description = "GXM texture state lives in the 16-byte SceGxmTexture - RUNNABLE"
 # Source: ../gxmtex-src/gxmtex.c (clean-room, -nostdlib). A new texture has no LOD bias
 # (the field is excess-31, so the getter reads 31); a LINEAR_STRIDED texture's byte stride
 # is in its control words, so a by-value copy keeps it and two strided views of one
-# surface keep their own pitches; an unaligned stride is refused. Executable form:
-# tests/vita_gxmtex.rs.
+# surface keep their own pitches; an unaligned stride is refused. Then the init's
+# accept/reject boundaries as a console recorded them, and what a fresh texture reads back.
+# Executable form: tests/vita_gxmtex.rs.
 [out]
-output = "l0 b31 b40 t0 3968 3968 t0 3840 3968 e805b0005"
+output = """l0 b31 b40 t0 3968 3968 t0 3840 3968 e805b0005
+stride 0:4 0:512 0:1028 0:131072 805b0005 805b0005 805b0003 805b0003
+mips 0 0 0 0 805b0003 805b0003
+size 805b0003 805b0003 805b0005 805b0005 0 0 0
+ptr 805b0005 805b0004 0 805b0019
+fresh u2 v2 n80000000 m5 s0 m0 256x64 512x64 0 65536"""

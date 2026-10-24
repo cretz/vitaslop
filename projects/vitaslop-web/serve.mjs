@@ -10,7 +10,6 @@
 //   --games <dir>  a directory of titles; every subtree containing a `vitaslop-dump.txt` is
 //                  one title, and its id comes from that file (see `discoverTitles`).
 //   --game <dir>   a single title directory (an extracted app dir or a decrypted dump).
-//   --recipes <d>  where to look for playable recipes (default: the committed recipe tree).
 //   --host <h>     interface to bind. DEFAULT 0.0.0.0, i.e. reachable from other devices on
 //                  this network - that is the point (a phone cannot open 127.0.0.1). See the
 //                  banner it prints: this exposes the titles' bytes to that network.
@@ -19,15 +18,21 @@
 //                  use. Needed for AUDIO from another device: SharedArrayBuffer requires a
 //                  cross-origin-isolated SECURE context, and a plain http:// LAN address is
 //                  not one. The page says so either way rather than running silently.
-//   --no-build     skip the wasm rebuild (serve the existing web/pkg).
+//   --no-build     skip the wasm rebuild (serve the existing bundles).
+//   --production-build  serve web/pkg + web/pkg-threads, exactly what Pages publishes, instead
+//                  of the playbook build in web-playbook/ (the default here: the device runner
+//                  plays titles with playbooks). See playbook-build.mjs.
 //   --open         launch a local browser at the URL.
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { spawnSync } from "node:child_process";
 import { readFile, readdir, stat, mkdir, writeFile, appendFile } from "node:fs/promises";
 import { existsSync, createReadStream } from "node:fs";
+import { brotliCompress, constants as zlibConstants } from "node:zlib";
+import { promisify } from "node:util";
 import { pipeline } from "node:stream/promises";
 import { createRunner } from "./runner-server.mjs";
+import { playbookFile, requirePlaybookBundle } from "./playbook-build.mjs";
 import { LANE_VALUE_SRC } from "./e2e/caseinputs.mjs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -54,7 +59,6 @@ const opt = (name) => {
 };
 const gamesDir = opt("--games") || process.env.GAMES_DIR;
 const singleGame = opt("--game") || process.env.GAME_DIR;
-const recipesDir = opt("--recipes") || join(projects, "vitaslop-gamerun-recipes", "recipes");
 const host = opt("--host") || process.env.HOST || "0.0.0.0";
 const port = Number(opt("--port") || process.env.PORT || 8080);
 const diagDir =
@@ -66,6 +70,10 @@ let runner = null; // built on first request, once `coi` exists (it is per-reque
 const useHttps = args.includes("--https");
 const noBuild = args.includes("--no-build");
 const doOpen = args.includes("--open");
+// >>> THE DEV SERVER SERVES THE PLAYBOOK BUILD (`web-playbook/`, see playbook-build.mjs): its device
+// runner drives titles with playbooks, which the shipped bundles cannot run. `--production-build`
+// serves exactly what Pages publishes instead.
+const productionBuild = args.includes("--production-build");
 
 if (!gamesDir && !singleGame) {
   console.error("error: pass --games <dir> (a directory of titles) or --game <dir> (one title).");
@@ -76,11 +84,29 @@ if (!gamesDir && !singleGame) {
 // --- build ---
 if (!noBuild) {
   console.log("building wasm bundle...");
-  const r = spawnSync(process.execPath, [join(crateDir, "build.mjs")], { stdio: "inherit" });
+  const r = spawnSync(process.execPath, [join(crateDir, "build.mjs"), ...(productionBuild ? [] : ["--playbook"])], {
+    stdio: "inherit",
+  });
   if (r.status !== 0) {
     console.error("build failed; fix the build or pass --no-build to serve the existing bundle.");
     process.exit(1);
   }
+}
+if (!productionBuild) requirePlaybookBundle();
+
+/// The brotli body of a bundle file, keyed by path and ETag so a rebuild compresses once and
+/// concurrent requests share the one compression. Only the newest tag per path is kept.
+const brotliCache = new Map();
+const brotliAsync = promisify(brotliCompress);
+function brotliOf(file, etag) {
+  const hit = brotliCache.get(file);
+  if (hit && hit.etag === etag) return hit.body;
+  const body = readFile(file).then((b) =>
+    brotliAsync(b, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 5, [zlibConstants.BROTLI_PARAM_SIZE_HINT]: b.length } })
+  );
+  brotliCache.set(file, { etag, body });
+  body.catch(() => brotliCache.get(file)?.body === body && brotliCache.delete(file));
+  return body;
 }
 
 const MIME = {
@@ -116,9 +142,9 @@ async function walk(root, dir = root, out = []) {
 /// # Why this is read out of the container and not configured
 /// A title's id is IN it: the decrypted-dump manifest carries a
 /// `content_id=<region>-<title id>_00-<...>` line, and the id is the middle field. Reading it means no table mapping directory names to ids
-/// can go stale, and - the reason that matters - the id is what the recipe tree is keyed by
-/// and what OPFS stores the import under, so a wrong one would silently play the wrong
-/// recipe or re-import a title that is already stored.
+/// can go stale, and - the reason that matters - the id is what the playbooks are keyed by
+/// and what OPFS stores the import under, so a wrong one would silently re-import a title
+/// that is already stored.
 async function titleIdOf(dir) {
   const manifest = join(dir, "vitaslop-dump.txt");
   if (!existsSync(manifest)) return null;
@@ -152,47 +178,32 @@ async function discoverTitles(root) {
   return found;
 }
 
-/// The friendly names in the committed registry, by title id. Provenance for humans; a title
-/// missing from it still plays, listed by its id.
-async function readRegistry() {
-  const path = join(projects, "vitaslop-gamerun-recipes", "games.toml");
-  const names = {};
-  try {
-    const text = await readFile(path, "utf8");
-    let id = null;
-    for (const line of text.split(/\r?\n/)) {
-      const mid = /^\s*id\s*=\s*"([^"]+)"/.exec(line);
-      const mname = /^\s*name\s*=\s*"([^"]+)"/.exec(line);
-      if (mid) id = mid[1];
-      else if (mname && id) {
-        names[id] = mname[1];
-        id = null;
-      }
-    }
-  } catch {
-    /* no registry: ids are names enough */
+/// A title's display name: the `TITLE` its own `param.sfo` (`files/sce_sys/param.sfo`) carries,
+/// or null. Read out of the container, so no committed list of names can go stale - the same
+/// reason the id is.
+///
+/// SFO: magic `\0PSF`, then key-table offset (u32 @8), data-table offset (u32 @12), entry count
+/// (u32 @16), and 16-byte index entries from 0x14: key offset (u16), format (u16), length (u32),
+/// max length (u32), data offset (u32).
+async function titleNameOf(dir) {
+  const path = join(dir, "files", "sce_sys", "param.sfo");
+  if (!existsSync(path)) return null;
+  const b = await readFile(path);
+  if (b.length < 0x14 || b.readUInt32LE(0) !== 0x46535000) return null;
+  const keys = b.readUInt32LE(8), data = b.readUInt32LE(12), n = b.readUInt32LE(16);
+  for (let i = 0; i < n; i++) {
+    const e = 0x14 + i * 16;
+    if (e + 16 > b.length) break;
+    const k = keys + b.readUInt16LE(e);
+    const key = b.toString("utf8", k, b.indexOf(0, k));
+    if (key !== "TITLE") continue;
+    const at = data + b.readUInt32LE(e + 12), len = b.readUInt32LE(e + 4);
+    return b.toString("utf8", at, at + len).replace(/\0+$/, "").replace(/\s+/g, " ").trim() || null;
   }
-  return names;
-}
-
-/// The recipes for a title id: every `*.recipe` under `<recipes>/<id>/`, with the `@title`
-/// line as its description so the picker says what a recipe DOES rather than only its filename.
-async function recipesFor(id) {
-  const dir = join(recipesDir, id);
-  if (!existsSync(dir)) return [];
-  const out = [];
-  for (const name of await readdir(dir)) {
-    if (!name.endsWith(".recipe")) continue;
-    const text = await readFile(join(dir, name), "utf8");
-    const m = /^@title\s+(.*)$/m.exec(text);
-    out.push({ name, description: m ? m[1].trim() : "" });
-  }
-  out.sort((a, b) => a.name.localeCompare(b.name));
-  return out;
+  return null;
 }
 
 // --- discover ---
-const registry = await readRegistry();
 const roots = gamesDir ? await discoverTitles(gamesDir) : [];
 if (singleGame) {
   const id = (await titleIdOf(singleGame)) || basename(singleGame);
@@ -204,23 +215,14 @@ if (roots.length === 0) {
 }
 
 /// One entry per playable title: its files (for the manifest the page imports into storage),
-/// its size, and its recipes.
+/// its size, and its display name.
 const titles = [];
 for (const { id, dir } of roots) {
   const files = await walk(dir);
   const bytes = (await Promise.all(files.map((p) => stat(join(dir, p))))).reduce((a, s) => a + s.size, 0);
-  titles.push({
-    id,
-    name: registry[id] || id,
-    dir,
-    files,
-    bytes,
-    recipes: await recipesFor(id),
-  });
-  console.log(
-    `title ${id} (${registry[id] || "unregistered"}): ${files.length} files, ` +
-      `${(bytes / 1e6).toFixed(0)} MB, ${(await recipesFor(id)).length} recipes  [${dir}]`
-  );
+  const name = (await titleNameOf(dir)) || id;
+  titles.push({ id, name, dir, files, bytes });
+  console.log(`title ${id} (${name}): ${files.length} files, ${(bytes / 1e6).toFixed(0)} MB  [${dir}]`);
 }
 const byId = new Map(titles.map((t) => [t.id, t]));
 
@@ -231,7 +233,6 @@ const listing = titles.map((t) => ({
   name: t.name,
   files: t.files.length,
   mb: Math.round(t.bytes / 1e6),
-  recipes: t.recipes,
 }));
 
 /// A self-signed certificate for `--https`, generated once into the OS temp directory (never
@@ -363,18 +364,6 @@ const handler = async (req, res) => {
       res.writeHead(200, { "content-type": "application/json", ...coi });
       return res.end(JSON.stringify(t.files));
     }
-    if (path === "/recipe") {
-      const t = byId.get(url.searchParams.get("title"));
-      const name = url.searchParams.get("name") || "";
-      // A traversal-proof name: recipes are picked from a list this server produced, so
-      // anything not IN that list is a request nobody meant to make.
-      if (!t || !t.recipes.some((r) => r.name === name)) {
-        res.writeHead(404, { "content-type": "text/plain", ...coi });
-        return res.end("no such recipe");
-      }
-      res.writeHead(200, { "content-type": "text/plain", ...coi });
-      return res.end(await readFile(join(recipesDir, t.id, name)));
-    }
     // Title bytes. `/game/<TITLE_ID>/<path>` in multi-title mode; `/game/<path>` still works
     // when a single title is served.
     if (path.startsWith("/game/")) {
@@ -403,7 +392,7 @@ const handler = async (req, res) => {
     }
 
     // A directory path serves its index.html (`/`, `/runner/`).
-    const file = join(webDir, path.endsWith("/") ? path + "index.html" : path);
+    const file = (!productionBuild && playbookFile(path)) || join(webDir, path.endsWith("/") ? path + "index.html" : path);
     // >>> THE BUNDLE IS REVALIDATED, NOT RE-DOWNLOADED. `no-store` made every worker of every
     // play fetch the 9 MB emulator wasm again, and a phone on this LAN takes ~1 MB/s - MEASURED
     // (runner 117, a baseball title): `init` 9.6 s of the run worker's start, and the transpile worker pays
@@ -417,6 +406,16 @@ const handler = async (req, res) => {
       const headers = { ...coi, "Cache-Control": "no-cache", ETag: etag, "content-type": MIME[".wasm"] || "application/wasm" };
       if (req.headers["if-none-match"] === etag) {
         res.writeHead(304, headers).end();
+        return;
+      }
+      // >>> AND COMPRESSED, as the static host compresses it. A changed build is a cold 10 MB
+      // download, and the title page's Play waits on it: MEASURED cold (headless, CPU x4) Play's
+      // bundle ready at 0.4 s unthrottled, 1.2 s at 100 Mbps, 2.5 s at 40 Mbps - and the phone
+      // gets ~1 MB/s here. Brotli q5 is 2.5 MB of 10 for ~0.2 s, paid once per build per file.
+      if (/\bbr\b/.test(req.headers["accept-encoding"] || "")) {
+        const br = await brotliOf(file, etag);
+        res.writeHead(200, { ...headers, Vary: "Accept-Encoding", "Content-Encoding": "br", "content-length": br.length });
+        res.end(br);
         return;
       }
       res.writeHead(200, { ...headers, "content-length": st.size });

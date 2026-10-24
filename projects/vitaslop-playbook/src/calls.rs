@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use vitaslop_runtime::observer::ObservedCall;
-use vitaslop_runtime::recipe_eval::GuestRead;
+use vitaslop_runtime::guest_read::GuestRead;
 
 pub const MAX_SLOTS: usize = 64;
 

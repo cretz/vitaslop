@@ -52,7 +52,7 @@ function serially(step) {
 
 /// A job's longest allowed run. A phone that is needed "here and there" cannot host a sweep.
 export const MAX_TIMEOUT_MS = 90_000;
-/// A LIVE job (the installed game played by a recipe, web/runner/live.html) has to boot, reach
+/// A LIVE job (the installed game played by a playbook, web/runner/live.html) has to boot, reach
 /// the frames it measures and measure them; still bounded, so a phone is not held for long.
 export const MAX_LIVE_TIMEOUT_MS = 360_000;
 /// A SOAK (a live job with `params.wallMs`): a defect that needs time to show (a renderer that

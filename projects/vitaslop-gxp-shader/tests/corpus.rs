@@ -26,6 +26,31 @@ use vitaslop_gxp_shader::ir::{Bank, Op, TestAlu, TestCmp};
 use vitaslop_gxp_shader::wgsl::{HALF_HI_FN, HALF_LO_FN, HALF_PK_FN, HALF_QUANT_FN};
 use vitaslop_gxp_shader::{link_programs, recompile_fragment, recompile_vertex, Program, ProgramKind};
 
+/// Every allocation this test binary makes, counted - `profile_slow_pairs` reports a link's
+/// allocations next to its time, because in the threaded browser build each one takes the one
+/// global allocator lock every worker contends on.
+struct CountingAlloc;
+static ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ALLOC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// SAFETY: forwards to `System` unchanged; the counters are the only addition.
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(l.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(p, l, n) }
+    }
+}
+#[global_allocator]
+static GLOBAL: CountingAlloc = CountingAlloc;
+
 fn corpus_dir() -> Option<PathBuf> {
     std::env::var_os("VITASLOP_GXP_CORPUS").map(PathBuf::from)
 }
@@ -6354,6 +6379,29 @@ fn instructions_whose_write_mask_is_empty() {
     for ((df, m16, m32, en), n) in &g00_bits {
         println!("  df={df} m16={m16} m32={m32} en={en}: {n}");
     }
+    // EVERY group-0x00 mad, not only the empty-mask ones, by the four adjacent control bits
+    // (`unk0`, `swz_mask16`, `swz_mask32`, `swz_en`) and `unk4`: the census that says whether
+    // `unk0` is the lane-3 bit of the same per-lane mask.
+    let mut all_bits: BTreeMap<(u32, u32, u32, u32, u32, u32), usize> = BTreeMap::new();
+    for (_, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        for shader in [
+            vitaslop_gxp_shader::usse::decode_shader(&p),
+            vitaslop_gxp_shader::usse::decode_secondary_shader(&p),
+        ] {
+            for ins in shader.instrs.iter().filter(|i| i.group == 0x00) {
+                let hi = (ins.raw >> 32) as u32;
+                let f = |n: &str| field(hi, g00.1, n);
+                *all_bits
+                    .entry((f("data_format"), f("unk4"), f("unk0"), f("swz_mask16"), f("swz_mask32"), f("swz_en")))
+                    .or_default() += 1;
+            }
+        }
+    }
+    println!("every group 0x00 mad by (data_format, unk4, unk0, swz_mask16, swz_mask32, swz_en):");
+    for ((df, u4, u0, m16, m32, en), n) in &all_bits {
+        println!("  df={df} unk4={u4} unk0={u0} m16={m16} m32={m32} en={en}: {n}");
+    }
 }
 
 /// Hash the LINKED WGSL of every vert x frag pairing in a corpus, so a LINK-STAGE change can be
@@ -7715,7 +7763,7 @@ fn the_colour_no_op_fold_over_every_eligible_program() {
 /// every module to disk in a second, so a directory of them can be handed to Chrome's own
 /// `createShaderModule` - one page, one device, `createShaderModule` per file and the
 /// compilation info read back - and every emitted module checked at once, whether or not any
-/// recipe reaches the draw that uses it.
+/// playbook reaches the draw that uses it.
 ///
 /// The vertex is whichever one links, so the VERTEX entry in these files is not necessarily one
 /// the title ever pairs with that fragment. That is deliberate and stated: this answers questions
@@ -8385,6 +8433,63 @@ fn census_repeating_pack_destinations_live_or_dead() {
         }
     }
     println!("\nslot={slot}: later pack iterations LIVE {live}, DEAD {dead}");
+}
+
+/// Time each pair a run dumped as a SLOW in-frame translation (`VITASLOP_DUMP_SLOW_PAIRS`:
+/// `<key>_vert.gxp` + `<key>_frag.gxp`), one line per pair split by link phase, slowest first.
+///
+/// ```text
+/// VITASLOP_SLOW_PAIRS=<dir> VITASLOP_LINK_PROFILE=1 \
+///   cargo test --release -p vitaslop-gxp-shader --test corpus -- --ignored --nocapture profile_slow_pairs
+/// ```
+#[test]
+#[ignore = "needs a VITASLOP_DUMP_SLOW_PAIRS output dir"]
+fn profile_slow_pairs() {
+    let Some(dir) = std::env::var_os("VITASLOP_SLOW_PAIRS").map(PathBuf::from) else { return };
+    let mut keys: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read the dump dir")
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix("_frag.gxp").map(str::to_string))
+        .collect();
+    keys.sort();
+    let _ = vitaslop_gxp_shader::link::LINK_ALLOC_COUNTER.set(|| ALLOCS.load(std::sync::atomic::Ordering::Relaxed));
+    let lap = || -> Vec<u64> {
+        vitaslop_gxp_shader::link::LINK_PROFILE_US.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect()
+    };
+    let lap_allocs = || -> Vec<u64> {
+        vitaslop_gxp_shader::link::LINK_PROFILE_ALLOCS.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect()
+    };
+    let mut rows = Vec::new();
+    for k in keys {
+        let (Ok(v), Ok(f)) = (std::fs::read(dir.join(format!("{k}_vert.gxp"))), std::fs::read(dir.join(format!("{k}_frag.gxp")))) else {
+            continue;
+        };
+        let p0 = lap();
+        let a0 = lap_allocs();
+        let (n0, b0) = (ALLOCS.load(std::sync::atomic::Ordering::Relaxed), ALLOC_BYTES.load(std::sync::atomic::Ordering::Relaxed));
+        let t = std::time::Instant::now();
+        let r = vitaslop_gxp_shader::link_programs(&v, &f);
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let allocs = ALLOCS.load(std::sync::atomic::Ordering::Relaxed) - n0;
+        let alloc_kb = (ALLOC_BYTES.load(std::sync::atomic::Ordering::Relaxed) - b0) / 1024;
+        let p: Vec<f64> = lap().iter().zip(&p0).map(|(a, b)| (a - b) as f64 / 1000.0).collect();
+        let pa: Vec<u64> = lap_allocs().iter().zip(&a0).map(|(a, b)| a - b).collect();
+        let n1 = ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = (Program::parse(&v), Program::parse(&f));
+        let parse_allocs = ALLOCS.load(std::sync::atomic::Ordering::Relaxed) - n1;
+        let wgsl = r.as_ref().map(|l| l.wgsl.len()).unwrap_or(0);
+        rows.push((ms, format!(
+            "{k} {ms:.1} ms ({}, vert {} B frag {} B, wgsl {wgsl} B, {allocs} allocations {alloc_kb} KB) | recompile {:.1} plans {:.1} emit {:.1} assemble {:.1} (post {:.1}: strip {:.1} sa-init {:.1} half {:.1} bank {:.1} fold {:.1})",
+            if r.is_ok() { "ok" } else { "refused" },
+            v.len(),
+            f.len(),
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]
+        ) + &format!(" | allocations: (parse alone {parse_allocs}) recompile {} plans {} emit {} assemble {} (strip {} sa-init {} half {} bank {} fold {})", pa[0], pa[1], pa[2], pa[3], pa[5], pa[6], pa[7], pa[8], pa[9])));
+    }
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (_, r) in rows {
+        println!("{r}");
+    }
 }
 
 /// Time the translation of every pair a corpus links - the in-frame cost of a first draw -

@@ -35,12 +35,12 @@ use std::rc::Rc;
 use super::filesdb::FilesDb;
 use super::pfs::{FileCtx, PfsImage};
 use super::pfscrypt::GameData;
-use super::pipeline::{is_exec_alternate, DUMP_MAGIC, DUMP_MANIFEST, WORK_BIN_PATH};
-use super::pkg::{is_directory, PkgHeader, PkgItem};
+use super::pipeline::{DUMP_MAGIC, DUMP_MANIFEST, WORK_BIN_PATH, is_exec_alternate};
+use super::pkg::{PkgHeader, PkgItem, is_directory};
 use super::rif::Rif;
 use super::self2elf::self2elf;
 use super::unicv::UnicvDb;
-use super::{sfo, Error};
+use super::{Error, sfo};
 use aes::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 
 /// Random access over a set of named files. `read_at` may return short only at the
@@ -102,7 +102,9 @@ impl Probe {
     /// Whether this is an add-on rather than a title: it belongs on its title's page, and
     /// importing it over the title's own directory would wipe the game.
     pub fn is_addcont(&self) -> bool {
-        self.category.as_deref().is_some_and(super::addcont::is_addcont_category)
+        self.category
+            .as_deref()
+            .is_some_and(super::addcont::is_addcont_category)
     }
 
     /// Whether this is a game UPDATE (`CATEGORY` `gp`): only the files the patch changes,
@@ -122,7 +124,11 @@ impl Probe {
             ));
         }
         if self.is_update() {
-            let v = self.app_version.as_deref().map(|v| format!(" (v{v})")).unwrap_or_default();
+            let v = self
+                .app_version
+                .as_deref()
+                .map(|v| format!(" (v{v})"))
+                .unwrap_or_default();
             return Some(format!(
                 "this is an update{v} for {id}, not the game - game updates are not supported yet, \
                  and importing one would replace the game"
@@ -143,7 +149,9 @@ pub fn is_update_category(category: &str) -> bool {
 const CHUNK: usize = 1 << 20;
 
 fn read_whole(src: &dyn ByteSource, path: &str) -> Result<Vec<u8>, Error> {
-    let n = src.size(path).ok_or_else(|| Error::MissingFile(path.to_string()))?;
+    let n = src
+        .size(path)
+        .ok_or_else(|| Error::MissingFile(path.to_string()))?;
     let mut out = vec![0u8; n as usize];
     let mut off = 0usize;
     while off < out.len() {
@@ -214,7 +222,9 @@ fn le32(b: &[u8], at: usize) -> Result<u32, Error> {
 
 impl ZipSource {
     pub fn open(inner: Rc<dyn ByteSource>, path: &str) -> Result<ZipSource, Error> {
-        let size = inner.size(path).ok_or_else(|| Error::MissingFile(path.to_string()))?;
+        let size = inner
+            .size(path)
+            .ok_or_else(|| Error::MissingFile(path.to_string()))?;
         // The end-of-central-directory record is in the last 64 KB + 22 bytes.
         let tail_len = size.min(22 + 0xFFFF) as usize;
         let mut tail = vec![0u8; tail_len];
@@ -235,7 +245,9 @@ impl ZipSource {
         let cd_size = le32(&tail, eocd + 12)? as u64;
         let cd_off = le32(&tail, eocd + 16)? as u64;
         if total == 0xFFFF || cd_off == 0xFFFF_FFFF || cd_size == 0xFFFF_FFFF {
-            return Err(Error::BadMagic("zip64 archive (not supported) - unzip it first"));
+            return Err(Error::BadMagic(
+                "zip64 archive (not supported) - unzip it first",
+            ));
         }
         let mut cd = vec![0u8; cd_size as usize];
         let mut off = 0;
@@ -259,17 +271,30 @@ impl ZipSource {
             let extra_len = le16(&cd, at + 30)? as usize;
             let comment_len = le16(&cd, at + 32)? as usize;
             let local_off = le32(&cd, at + 42)? as u64;
-            let name = cd.get(at + 46..at + 46 + name_len).ok_or(Error::OutOfBounds("zip name"))?;
+            let name = cd
+                .get(at + 46..at + 46 + name_len)
+                .ok_or(Error::OutOfBounds("zip name"))?;
             let name = String::from_utf8_lossy(name).into_owned();
             if !name.ends_with('/') {
                 entries.insert(
                     name,
-                    ZipEntry { method, comp_size, uncomp_size, local_off, data_off: RefCell::new(None) },
+                    ZipEntry {
+                        method,
+                        comp_size,
+                        uncomp_size,
+                        local_off,
+                        data_off: RefCell::new(None),
+                    },
                 );
             }
             at += 46 + name_len + extra_len + comment_len;
         }
-        Ok(ZipSource { inner, path: path.to_string(), entries, inflated: RefCell::new(HashMap::new()) })
+        Ok(ZipSource {
+            inner,
+            path: path.to_string(),
+            entries,
+            inflated: RefCell::new(HashMap::new()),
+        })
     }
 
     fn data_off(&self, e: &ZipEntry) -> Result<u64, Error> {
@@ -296,16 +321,23 @@ impl ZipSource {
         let mut comp = vec![0u8; e.comp_size as usize];
         let mut off = 0;
         while off < comp.len() {
-            let got = self.inner.read_at(&self.path, d + off as u64, &mut comp[off..])?;
+            let got = self
+                .inner
+                .read_at(&self.path, d + off as u64, &mut comp[off..])?;
             if got == 0 {
                 return Err(Error::OutOfBounds("zip entry data"));
             }
             off += got;
         }
-        let out = miniz_oxide::inflate::decompress_to_vec_with_limit(&comp, (e.uncomp_size as usize).max(1))
-            .map_err(|_| Error::IntegrityCheck("zip deflate"))?;
+        let out = miniz_oxide::inflate::decompress_to_vec_with_limit(
+            &comp,
+            (e.uncomp_size as usize).max(1),
+        )
+        .map_err(|_| Error::IntegrityCheck("zip deflate"))?;
         let out = Rc::new(out);
-        self.inflated.borrow_mut().insert(name.to_string(), out.clone());
+        self.inflated
+            .borrow_mut()
+            .insert(name.to_string(), out.clone());
         Ok(out)
     }
 }
@@ -320,7 +352,10 @@ impl ByteSource for ZipSource {
         self.entries.get(path).map(|e| e.uncomp_size)
     }
     fn read_at(&self, path: &str, off: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        let e = self.entries.get(path).ok_or_else(|| Error::MissingFile(path.to_string()))?;
+        let e = self
+            .entries
+            .get(path)
+            .ok_or_else(|| Error::MissingFile(path.to_string()))?;
         match e.method {
             0 => {
                 if off >= e.uncomp_size {
@@ -363,11 +398,22 @@ pub struct PkgSource {
 }
 
 impl PkgSource {
-    pub fn open(inner: Rc<dyn ByteSource>, path: &str, work_bin: Option<String>) -> Result<PkgSource, Error> {
+    pub fn open(
+        inner: Rc<dyn ByteSource>,
+        path: &str,
+        work_bin: Option<String>,
+    ) -> Result<PkgSource, Error> {
         let head = read_head(&*inner, path, 0x1000)?;
         let header = PkgHeader::parse(&head)?;
         let session_key = header.session_key()?;
-        let mut me = PkgSource { inner, path: path.to_string(), header, session_key, items: HashMap::new(), work_bin };
+        let mut me = PkgSource {
+            inner,
+            path: path.to_string(),
+            header,
+            session_key,
+            items: HashMap::new(),
+            work_bin,
+        };
         let table_len = me.header.item_count as usize * 0x20;
         let table = me.decrypt_at(me.header.data_offset, table_len)?;
         let be32 = |at: usize| -> Result<u32, Error> {
@@ -376,7 +422,9 @@ impl PkgSource {
         };
         let be64 = |at: usize| -> Result<u64, Error> {
             let s = table.get(at..at + 8).ok_or(Error::OutOfBounds("pkg u64"))?;
-            Ok(u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+            Ok(u64::from_be_bytes([
+                s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+            ]))
         };
         // Parse every entry first, then fetch all the NAMES IN ONE READ. The names sit
         // in one contiguous run right after the table, and a read here is a round trip
@@ -401,7 +449,13 @@ impl PkgSource {
         // per-item read is still correct, just slower).
         const NAME_SPAN_MAX: u64 = 8 << 20;
         let names = if name_lo <= name_hi && name_hi - name_lo <= NAME_SPAN_MAX {
-            Some((name_lo, me.decrypt_at(me.header.data_offset + name_lo, (name_hi - name_lo) as usize)?))
+            Some((
+                name_lo,
+                me.decrypt_at(
+                    me.header.data_offset + name_lo,
+                    (name_hi - name_lo) as usize,
+                )?,
+            ))
         } else {
             None
         };
@@ -413,14 +467,21 @@ impl PkgSource {
             let name_bytes = match &names {
                 Some((lo, blob)) => {
                     let at = (name_offset - lo) as usize;
-                    blob.get(at..at + name_size).ok_or(Error::OutOfBounds("pkg item name"))?.to_vec()
+                    blob.get(at..at + name_size)
+                        .ok_or(Error::OutOfBounds("pkg item name"))?
+                        .to_vec()
                 }
                 None => me.decrypt_at(me.header.data_offset + name_offset, name_size)?,
             };
             let name = String::from_utf8_lossy(&name_bytes).into_owned();
             items.insert(
                 name.clone(),
-                PkgItem { name, data_offset: me.header.data_offset + data_offset, data_size, flags },
+                PkgItem {
+                    name,
+                    data_offset: me.header.data_offset + data_offset,
+                    data_size,
+                    flags,
+                },
             );
         }
         me.items = items;
@@ -441,13 +502,17 @@ impl PkgSource {
     fn decrypt_into(&self, off: u64, buf: &mut [u8]) -> Result<usize, Error> {
         let mut filled = 0;
         while filled < buf.len() {
-            let got = self.inner.read_at(&self.path, off + filled as u64, &mut buf[filled..])?;
+            let got = self
+                .inner
+                .read_at(&self.path, off + filled as u64, &mut buf[filled..])?;
             if got == 0 {
                 break;
             }
             filled += got;
         }
-        let rel = off.checked_sub(self.header.data_offset).ok_or(Error::OutOfBounds("pkg offset before data"))?;
+        let rel = off
+            .checked_sub(self.header.data_offset)
+            .ok_or(Error::OutOfBounds("pkg offset before data"))?;
         let mut c = Aes128Ctr::new((&self.session_key).into(), (&self.header.riv).into());
         c.seek(rel);
         c.apply_keystream(&mut buf[..filled]);
@@ -469,9 +534,10 @@ impl ByteSource for PkgSource {
             return Some(i.data_size);
         }
         if path == WORK_BIN_PATH
-            && let Some(p) = &self.work_bin {
-                return self.inner.size(p);
-            }
+            && let Some(p) = &self.work_bin
+        {
+            return self.inner.size(p);
+        }
         None
     }
     fn read_at(&self, path: &str, off: u64, buf: &mut [u8]) -> Result<usize, Error> {
@@ -483,9 +549,10 @@ impl ByteSource for PkgSource {
             return self.decrypt_into(i.data_offset + off, &mut buf[..want]);
         }
         if path == WORK_BIN_PATH
-            && let Some(p) = &self.work_bin {
-                return self.inner.read_at(p, off, buf);
-            }
+            && let Some(p) = &self.work_bin
+        {
+            return self.inner.read_at(p, off, buf);
+        }
         Err(Error::MissingFile(path.to_string()))
     }
 }
@@ -495,11 +562,21 @@ impl ByteSource for PkgSource {
 /// A source resolved down to the layer the dump is made from.
 pub enum Opened {
     /// A dump tree this pipeline wrote: copy through.
-    Dump { src: Rc<dyn ByteSource>, root: String },
+    Dump {
+        src: Rc<dyn ByteSource>,
+        root: String,
+    },
     /// A PFS app root (raw dump, or a pkg's items): decrypt.
-    Pfs { src: Rc<dyn ByteSource>, root: String, kind: &'static str },
+    Pfs {
+        src: Rc<dyn ByteSource>,
+        root: String,
+        kind: &'static str,
+    },
     /// A homebrew app root: a plaintext `eboot.bin` beside `sce_sys/`, nothing encrypted.
-    Homebrew { src: Rc<dyn ByteSource>, root: String },
+    Homebrew {
+        src: Rc<dyn ByteSource>,
+        root: String,
+    },
 }
 
 /// Peel the outer layers - a single zip, a pkg - until a dump or PFS root is found.
@@ -513,7 +590,11 @@ pub fn open(src: Rc<dyn ByteSource>) -> Result<(Opened, bool), Error> {
             l.ends_with(".zip") || l.ends_with(".vpk")
         })
         .collect();
-    if zips.len() == 1 && !names.iter().any(|p| p.ends_with("sce_pfs/files.db") || p.ends_with(DUMP_MANIFEST)) {
+    if zips.len() == 1
+        && !names
+            .iter()
+            .any(|p| p.ends_with("sce_pfs/files.db") || p.ends_with(DUMP_MANIFEST))
+    {
         let z = ZipSource::open(src.clone(), zips[0])?;
         let (o, _) = open_unzipped(Rc::new(z))?;
         return Ok((o, true));
@@ -525,14 +606,29 @@ fn open_unzipped(src: Rc<dyn ByteSource>) -> Result<(Opened, bool), Error> {
     let names = src.list();
     for p in &names {
         if p == DUMP_MANIFEST || p.ends_with(&format!("/{DUMP_MANIFEST}")) {
-            let root = p.strip_suffix(DUMP_MANIFEST).unwrap_or("").trim_end_matches('/').to_string();
+            let root = p
+                .strip_suffix(DUMP_MANIFEST)
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .to_string();
             return Ok((Opened::Dump { src, root }, false));
         }
     }
     for p in &names {
         if p == "sce_pfs/files.db" || p.ends_with("/sce_pfs/files.db") {
-            let root = p.strip_suffix("sce_pfs/files.db").unwrap_or("").trim_end_matches('/').to_string();
-            return Ok((Opened::Pfs { src, root, kind: "pfs" }, false));
+            let root = p
+                .strip_suffix("sce_pfs/files.db")
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .to_string();
+            return Ok((
+                Opened::Pfs {
+                    src,
+                    root,
+                    kind: "pfs",
+                },
+                false,
+            ));
         }
     }
     // Homebrew: a plaintext eboot with no PFS around it (checked AFTER the PFS root, since
@@ -541,7 +637,11 @@ fn open_unzipped(src: Rc<dyn ByteSource>) -> Result<(Opened, bool), Error> {
         if p == "eboot.bin" || p.ends_with("/eboot.bin") {
             let head = read_head(&*src, p, 4)?;
             if head.as_slice() == b"SCE\0" || head.as_slice() == b"\x7fELF" {
-                let root = p.strip_suffix("eboot.bin").unwrap_or("").trim_end_matches('/').to_string();
+                let root = p
+                    .strip_suffix("eboot.bin")
+                    .unwrap_or("")
+                    .trim_end_matches('/')
+                    .to_string();
                 return Ok((Opened::Homebrew { src, root }, false));
             }
         }
@@ -556,11 +656,21 @@ fn open_unzipped(src: Rc<dyn ByteSource>) -> Result<(Opened, bool), Error> {
                 let dir = p.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
                 let work = names
                     .iter()
-                    .find(|w| w.ends_with("work.bin") && w.rsplit_once('/').map(|(d, _)| d).unwrap_or("") == dir)
+                    .find(|w| {
+                        w.ends_with("work.bin")
+                            && w.rsplit_once('/').map(|(d, _)| d).unwrap_or("") == dir
+                    })
                     .or_else(|| names.iter().find(|w| w.ends_with("work.bin")))
                     .cloned();
                 let pkg = PkgSource::open(src.clone(), p, work)?;
-                return Ok((Opened::Pfs { src: Rc::new(pkg), root: String::new(), kind: "pkg" }, false));
+                return Ok((
+                    Opened::Pfs {
+                        src: Rc::new(pkg),
+                        root: String::new(),
+                        kind: "pkg",
+                    },
+                    false,
+                ));
             }
         }
     }
@@ -602,7 +712,9 @@ impl PfsLayer {
         mut tick: impl FnMut(u64),
     ) -> Result<u64, Error> {
         let full = under(root, path);
-        let size = src.size(&full).ok_or_else(|| Error::MissingFile(full.clone()))?;
+        let size = src
+            .size(&full)
+            .ok_or_else(|| Error::MissingFile(full.clone()))?;
         let mut consumed = 0u64;
         if !ctx.encrypted {
             let mut buf = vec![0u8; CHUNK];
@@ -678,9 +790,11 @@ fn is_exec_candidate_path(path: &str) -> bool {
 
 fn sfo_probe(probe: &mut Probe, sfo_bytes: &[u8]) {
     probe.title_id = sfo::title_id(sfo_bytes);
-    probe.title = sfo::text_field(sfo_bytes, "TITLE").or_else(|| sfo::text_field(sfo_bytes, "STITLE"));
+    probe.title =
+        sfo::text_field(sfo_bytes, "TITLE").or_else(|| sfo::text_field(sfo_bytes, "STITLE"));
     // An add-on has no APP_VER; its own version is VERSION.
-    probe.app_version = sfo::text_field(sfo_bytes, "APP_VER").or_else(|| sfo::text_field(sfo_bytes, "VERSION"));
+    probe.app_version =
+        sfo::text_field(sfo_bytes, "APP_VER").or_else(|| sfo::text_field(sfo_bytes, "VERSION"));
     probe.category = sfo::text_field(sfo_bytes, "CATEGORY");
     if probe.content_id.is_none() {
         probe.content_id = sfo::text_field(sfo_bytes, "CONTENT_ID");
@@ -710,16 +824,26 @@ pub fn probe(src: Rc<dyn ByteSource>) -> Result<Probe, Error> {
         Opened::Dump { src, root } => {
             p.kind = "dump";
             let prefix = under(&root, "");
-            let names: Vec<String> = src.list().into_iter().filter(|n| n.starts_with(&prefix)).collect();
+            let names: Vec<String> = src
+                .list()
+                .into_iter()
+                .filter(|n| n.starts_with(&prefix))
+                .collect();
             p.files = names.len();
             p.bytes = names.iter().map(|n| src.size(n).unwrap_or(0)).sum();
-            let mut outs: Vec<String> = names.iter().map(|n| n[prefix.len()..].to_string()).filter(|n| n != DUMP_MANIFEST).collect();
+            let mut outs: Vec<String> = names
+                .iter()
+                .map(|n| n[prefix.len()..].to_string())
+                .filter(|n| n != DUMP_MANIFEST)
+                .collect();
             outs.sort();
             outs.push(DUMP_MANIFEST.to_string());
             p.outputs = outs;
             if let Ok(m) = read_whole(&*src, &under(&root, DUMP_MANIFEST)) {
                 let m = String::from_utf8_lossy(&m);
-                p.content_id = m.lines().find_map(|l| l.strip_prefix("content_id=").map(str::to_string));
+                p.content_id = m
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content_id=").map(str::to_string));
             }
             if let Ok(s) = read_whole(&*src, &under(&root, "files/sce_sys/param.sfo")) {
                 sfo_probe(&mut p, &s);
@@ -730,12 +854,23 @@ pub fn probe(src: Rc<dyn ByteSource>) -> Result<Probe, Error> {
         Opened::Homebrew { src, root } => {
             p.kind = "vpk";
             let prefix = under(&root, "");
-            let names: Vec<String> = src.list().into_iter().filter(|n| n.starts_with(&prefix)).collect();
+            let names: Vec<String> = src
+                .list()
+                .into_iter()
+                .filter(|n| n.starts_with(&prefix))
+                .collect();
             p.files = names.len();
             p.bytes = names.iter().map(|n| src.size(n).unwrap_or(0)).sum();
-            let rels: Vec<String> = names.iter().map(|n| n[prefix.len()..].to_string()).collect();
+            let rels: Vec<String> = names
+                .iter()
+                .map(|n| n[prefix.len()..].to_string())
+                .collect();
             let mut outs: Vec<String> = rels.iter().map(|r| format!("files/{r}")).collect();
-            outs.extend(rels.iter().filter(|r| is_module_path(r) || is_exec_candidate_path(r)).map(|r| format!("modules/{r}")));
+            outs.extend(
+                rels.iter()
+                    .filter(|r| is_module_path(r) || is_exec_candidate_path(r))
+                    .map(|r| format!("modules/{r}")),
+            );
             outs.push(DUMP_MANIFEST.to_string());
             p.outputs = outs;
             if let Ok(s) = read_whole(&*src, &under(&root, "sce_sys/param.sfo")) {
@@ -762,9 +897,17 @@ pub fn probe(src: Rc<dyn ByteSource>) -> Result<Probe, Error> {
             p.content_id = Some(pfs.rif.content_id.clone());
             let files = pfs.image.files();
             p.files = files.len();
-            p.bytes = files.iter().map(|f| src.size(&under(&root, &f.path)).unwrap_or(0)).sum();
+            p.bytes = files
+                .iter()
+                .map(|f| src.size(&under(&root, &f.path)).unwrap_or(0))
+                .sum();
             let mut outs: Vec<String> = files.iter().map(|f| format!("files/{}", f.path)).collect();
-            outs.extend(files.iter().filter(|f| is_module_path(&f.path) || is_exec_candidate_path(&f.path)).map(|f| format!("modules/{}", f.path)));
+            outs.extend(
+                files
+                    .iter()
+                    .filter(|f| is_module_path(&f.path) || is_exec_candidate_path(&f.path))
+                    .map(|f| format!("modules/{}", f.path)),
+            );
             outs.push(DUMP_MANIFEST.to_string());
             p.outputs = outs;
             if let Ok(s) = pfs.read_file(&*src, &root, "sce_sys/param.sfo") {
@@ -802,7 +945,11 @@ fn import_homebrew(
     progress: &mut dyn FnMut(Progress<'_>),
 ) -> Result<String, Error> {
     let prefix = under(root, "");
-    let mut names: Vec<String> = src.list().into_iter().filter(|n| n.starts_with(&prefix)).collect();
+    let mut names: Vec<String> = src
+        .list()
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
     names.sort();
     let total: u64 = names.iter().map(|n| src.size(n).unwrap_or(0)).sum();
     let mut done = 0u64;
@@ -812,7 +959,12 @@ fn import_homebrew(
         let rel = &n[prefix.len()..];
         copy_through(src, n, &format!("files/{rel}"), sink, |b| {
             done += b;
-            progress(Progress { stage: "copy", file: rel, done, total });
+            progress(Progress {
+                stage: "copy",
+                file: rel,
+                done,
+                total,
+            });
         })?;
         if is_module_path(rel) || is_exec_candidate_path(rel) {
             let head = read_head(src, n, 4)?;
@@ -836,7 +988,11 @@ fn import_homebrew(
         .as_deref()
         .and_then(|s| sfo::text_field(s, "CONTENT_ID"))
         .filter(|c| !c.is_empty())
-        .or_else(|| sfo.as_deref().and_then(sfo::title_id).map(|t| format!("HOMEBREW-{t}")))
+        .or_else(|| {
+            sfo.as_deref()
+                .and_then(sfo::title_id)
+                .map(|t| format!("HOMEBREW-{t}"))
+        })
         .unwrap_or_else(|| "HOMEBREW".to_string());
     let mut manifest = String::new();
     manifest.push_str(DUMP_MAGIC);
@@ -861,7 +1017,9 @@ fn copy_through(
     sink: &mut dyn DumpSink,
     mut tick: impl FnMut(u64),
 ) -> Result<(), Error> {
-    let size = src.size(from).ok_or_else(|| Error::MissingFile(from.to_string()))?;
+    let size = src
+        .size(from)
+        .ok_or_else(|| Error::MissingFile(from.to_string()))?;
     sink.begin(to, size)?;
     let mut buf = vec![0u8; CHUNK];
     let mut off = 0u64;
@@ -884,7 +1042,11 @@ fn import_dump(
     progress: &mut dyn FnMut(Progress<'_>),
 ) -> Result<String, Error> {
     let prefix = under(root, "");
-    let mut names: Vec<String> = src.list().into_iter().filter(|n| n.starts_with(&prefix)).collect();
+    let mut names: Vec<String> = src
+        .list()
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
     names.sort();
     let total: u64 = names.iter().map(|n| src.size(n).unwrap_or(0)).sum();
     let mut done = 0u64;
@@ -895,13 +1057,20 @@ fn import_dump(
         if m.lines().next() != Some(DUMP_MAGIC) {
             return Err(Error::BadMagic("dump manifest"));
         }
-        m.lines().find_map(|l| l.strip_prefix("content_id=").map(str::to_string)).unwrap_or_default()
+        m.lines()
+            .find_map(|l| l.strip_prefix("content_id=").map(str::to_string))
+            .unwrap_or_default()
     };
     for n in names.iter().filter(|n| **n != manifest) {
         let rel = &n[prefix.len()..];
         copy_through(src, n, rel, sink, |b| {
             done += b;
-            progress(Progress { stage: "copy", file: rel, done, total });
+            progress(Progress {
+                stage: "copy",
+                file: rel,
+                done,
+                total,
+            });
         })?;
     }
     // Last: the marker.
@@ -917,7 +1086,10 @@ fn import_pfs(
 ) -> Result<String, Error> {
     let pfs = PfsLayer::open(src, root)?;
     let files = pfs.image.files();
-    let total: u64 = files.iter().map(|f| src.size(&under(root, &f.path)).unwrap_or(0)).sum();
+    let total: u64 = files
+        .iter()
+        .map(|f| src.size(&under(root, &f.path)).unwrap_or(0))
+        .sum();
     let mut done = 0u64;
     let mut modules: Vec<(String, Vec<u8>)> = Vec::new();
     let mut execs: Vec<(String, Vec<u8>)> = Vec::new();
@@ -926,11 +1098,12 @@ fn import_pfs(
         let out_path = format!("files/{}", f.path);
         sink.begin(&out_path, ctx.plaintext_size as u64)?;
         // An executable is kept whole for the SELF unwrap that follows.
-        let mut keep: Option<Vec<u8>> = if is_module_path(&f.path) || is_exec_candidate_path(&f.path) {
-            Some(Vec::with_capacity(ctx.plaintext_size))
-        } else {
-            None
-        };
+        let mut keep: Option<Vec<u8>> =
+            if is_module_path(&f.path) || is_exec_candidate_path(&f.path) {
+                Some(Vec::with_capacity(ctx.plaintext_size))
+            } else {
+                None
+            };
         // Progress per CHUNK, not per file: a title's bytes are not spread evenly over
         // its files, and a counter that only moves when a file finishes sits still for
         // the whole of a gigabyte file, which reads as a hang and was reported as one.
@@ -948,7 +1121,12 @@ fn import_pfs(
             },
             |n| {
                 done += n;
-                progress(Progress { stage: "decrypt", file: &f.path, done, total });
+                progress(Progress {
+                    stage: "decrypt",
+                    file: &f.path,
+                    done,
+                    total,
+                });
             },
         )?;
         sink.finish()?;
@@ -969,7 +1147,12 @@ fn import_pfs(
     manifest.push('\n');
     manifest.push_str(&format!("content_id={}\n", pfs.rif.content_id));
     for (path, bytes) in &modules {
-        progress(Progress { stage: "unwrap", file: path, done, total });
+        progress(Progress {
+            stage: "unwrap",
+            file: path,
+            done,
+            total,
+        });
         let elf = self2elf(bytes, &pfs.rif.key)?;
         let out_path = format!("modules/{path}");
         sink.begin(&out_path, elf.len() as u64)?;
@@ -978,7 +1161,12 @@ fn import_pfs(
         manifest.push_str(&format!("module={path}\n"));
     }
     for (path, bytes) in &execs {
-        progress(Progress { stage: "unwrap", file: path, done, total });
+        progress(Progress {
+            stage: "unwrap",
+            file: path,
+            done,
+            total,
+        });
         let elf = self2elf(bytes, &pfs.rif.key)?;
         let out_path = format!("modules/{path}");
         sink.begin(&out_path, elf.len() as u64)?;
@@ -1010,7 +1198,10 @@ impl ByteSource for MemSource {
         self.files.get(path).map(|b| b.len() as u64)
     }
     fn read_at(&self, path: &str, off: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        let b = self.files.get(path).ok_or_else(|| Error::MissingFile(path.to_string()))?;
+        let b = self
+            .files
+            .get(path)
+            .ok_or_else(|| Error::MissingFile(path.to_string()))?;
         let off = off as usize;
         if off >= b.len() {
             return Ok(0);
@@ -1034,11 +1225,18 @@ impl DumpSink for MemSink {
         Ok(())
     }
     fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.cur.as_mut().ok_or_else(|| Error::Io("write before begin".into()))?.1.extend_from_slice(bytes);
+        self.cur
+            .as_mut()
+            .ok_or_else(|| Error::Io("write before begin".into()))?
+            .1
+            .extend_from_slice(bytes);
         Ok(())
     }
     fn finish(&mut self) -> Result<(), Error> {
-        let f = self.cur.take().ok_or_else(|| Error::Io("finish before begin".into()))?;
+        let f = self
+            .cur
+            .take()
+            .ok_or_else(|| Error::Io("finish before begin".into()))?;
         self.files.push(f);
         Ok(())
     }
@@ -1074,7 +1272,12 @@ mod tests {
         assert!(up.is_update() && !up.is_addcont());
         let why = up.refused_as_title().unwrap();
         assert!(why.contains("update (v01.03) for ABCD12345"), "{why}");
-        assert!(probe("ac").refused_as_title().unwrap().contains("add-on for ABCD12345"));
+        assert!(
+            probe("ac")
+                .refused_as_title()
+                .unwrap()
+                .contains("add-on for ABCD12345")
+        );
     }
 
     fn dir_source(root: &std::path::Path) -> MemSource {
@@ -1091,7 +1294,9 @@ mod tests {
     /// manifest. Needs `VITASLOP_GAME_DIR` (a pkg + work.bin dir, or a PFS dump).
     #[test]
     fn streaming_matches_resident_on_a_real_title() {
-        let Some(dir) = crate::ingest::testfix::game_dir() else { return };
+        let Some(dir) = crate::ingest::testfix::game_dir() else {
+            return;
+        };
         let src = Rc::new(dir_source(&dir));
         let mut sink = MemSink::default();
         let mut last = 0;
@@ -1107,7 +1312,11 @@ mod tests {
         expect.sort_by(|a, b| a.0.cmp(&b.0));
         let mut got = sink.files;
         got.sort_by(|a, b| a.0.cmp(&b.0));
-        let names = |v: &[(String, Vec<u8>)]| v.iter().map(|f| f.0.clone()).collect::<std::collections::BTreeSet<_>>();
+        let names = |v: &[(String, Vec<u8>)]| {
+            v.iter()
+                .map(|f| f.0.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
         let (g, e) = (names(&got), names(&expect));
         assert_eq!(
             got.len(),
@@ -1118,7 +1327,12 @@ mod tests {
         );
         for ((gp, gb), (ep, eb)) in got.iter().zip(expect.iter()) {
             assert_eq!(gp, ep);
-            assert!(gb == eb, "{gp}: bytes differ ({} vs {})", gb.len(), eb.len());
+            assert!(
+                gb == eb,
+                "{gp}: bytes differ ({} vs {})",
+                gb.len(),
+                eb.len()
+            );
         }
     }
 
@@ -1129,7 +1343,9 @@ mod tests {
     /// has written anything.
     #[test]
     fn a_pkgs_item_names_read_in_one_go() {
-        let Some(path) = std::env::var_os("VITASLOP_PKG") else { return };
+        let Some(path) = std::env::var_os("VITASLOP_PKG") else {
+            return;
+        };
         struct FileSource(std::path::PathBuf);
         impl ByteSource for FileSource {
             fn list(&self) -> Vec<String> {
@@ -1141,10 +1357,14 @@ mod tests {
             fn read_at(&self, _p: &str, off: u64, buf: &mut [u8]) -> Result<usize, Error> {
                 use std::io::{Read, Seek, SeekFrom};
                 let mut f = std::fs::File::open(&self.0).map_err(|e| Error::Io(e.to_string()))?;
-                f.seek(SeekFrom::Start(off)).map_err(|e| Error::Io(e.to_string()))?;
+                f.seek(SeekFrom::Start(off))
+                    .map_err(|e| Error::Io(e.to_string()))?;
                 let mut got = 0;
                 while got < buf.len() {
-                    match f.read(&mut buf[got..]).map_err(|e| Error::Io(e.to_string()))? {
+                    match f
+                        .read(&mut buf[got..])
+                        .map_err(|e| Error::Io(e.to_string()))?
+                    {
                         0 => break,
                         n => got += n,
                     }
@@ -1155,15 +1375,27 @@ mod tests {
         let src: Rc<dyn ByteSource> = Rc::new(FileSource(std::path::PathBuf::from(&path)));
         let pkg = PkgSource::open(src, "game.pkg", None).expect("open pkg");
         let names = pkg.list();
-        assert!(names.iter().any(|n| n == "sce_sys/param.sfo"), "no param.sfo among {} items", names.len());
-        assert!(names.iter().any(|n| n == "sce_pfs/files.db"), "no sce_pfs/files.db");
-        assert!(names.iter().all(|n| !n.is_empty() && n.is_ascii()), "an item name did not decrypt");
+        assert!(
+            names.iter().any(|n| n == "sce_sys/param.sfo"),
+            "no param.sfo among {} items",
+            names.len()
+        );
+        assert!(
+            names.iter().any(|n| n == "sce_pfs/files.db"),
+            "no sce_pfs/files.db"
+        );
+        assert!(
+            names.iter().all(|n| !n.is_empty() && n.is_ascii()),
+            "an item name did not decrypt"
+        );
         assert!(names.iter().all(|n| pkg.size(n).is_some()));
     }
 
     #[test]
     fn probe_names_a_real_title() {
-        let Some(dir) = crate::ingest::testfix::game_dir() else { return };
+        let Some(dir) = crate::ingest::testfix::game_dir() else {
+            return;
+        };
         let src = Rc::new(dir_source(&dir));
         let p = probe(src.clone()).expect("probe");
         let mut sink = MemSink::default();
@@ -1181,7 +1413,9 @@ mod tests {
     /// module the loader accepts.
     #[test]
     fn a_vpk_imports_and_its_eboot_loads() {
-        let Some(path) = std::env::var_os("VITASLOP_VPK") else { return };
+        let Some(path) = std::env::var_os("VITASLOP_VPK") else {
+            return;
+        };
         let bytes = std::fs::read(&path).expect("read vpk");
         let mut files = HashMap::new();
         files.insert("app.vpk".to_string(), bytes);
@@ -1193,7 +1427,11 @@ mod tests {
         let mut sink = MemSink::default();
         let cid = import(src, &mut sink, &mut |_| {}).expect("import");
         assert!(!cid.is_empty());
-        let eboot = sink.files.iter().find(|f| f.0 == "modules/eboot.bin").expect("module");
+        let eboot = sink
+            .files
+            .iter()
+            .find(|f| f.0 == "modules/eboot.bin")
+            .expect("module");
         vitaslop_loader::load(&eboot.1).expect("the loader takes the fSELF");
         for (path, _) in &sink.files {
             assert!(p.outputs.contains(path), "{path} written but not planned");
@@ -1215,12 +1453,29 @@ mod tests {
         let p = probe(src.clone()).expect("probe");
         let mut sink = MemSink::default();
         import(src, &mut sink, &mut |_| {}).expect("import");
-        let manifest = sink.files.iter().find(|f| f.0 == DUMP_MANIFEST).expect("manifest");
+        let manifest = sink
+            .files
+            .iter()
+            .find(|f| f.0 == DUMP_MANIFEST)
+            .expect("manifest");
         let manifest = String::from_utf8_lossy(&manifest.1);
-        assert!(manifest.lines().any(|l| l == "module=eboot.bin"), "{manifest}");
-        assert!(manifest.lines().any(|l| l == "exec=game.self"), "{manifest}");
-        assert!(!manifest.contains("inner.self") && !manifest.contains("notes.self"), "{manifest}");
-        let exec = sink.files.iter().find(|f| f.0 == "modules/game.self").expect("the exec is written under modules/");
+        assert!(
+            manifest.lines().any(|l| l == "module=eboot.bin"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.lines().any(|l| l == "exec=game.self"),
+            "{manifest}"
+        );
+        assert!(
+            !manifest.contains("inner.self") && !manifest.contains("notes.self"),
+            "{manifest}"
+        );
+        let exec = sink
+            .files
+            .iter()
+            .find(|f| f.0 == "modules/game.self")
+            .expect("the exec is written under modules/");
         assert_eq!(exec.1, b"\x7fELF-exec");
         for (path, _) in &sink.files {
             assert!(p.outputs.contains(path), "{path} written but not planned");
@@ -1230,10 +1485,14 @@ mod tests {
     #[test]
     fn a_zip_of_a_dump_round_trips() {
         let mut files = HashMap::new();
-        files.insert("d/vitaslop-dump.txt".to_string(), format!("{DUMP_MAGIC}\ncontent_id=X\nmodule=eboot.bin\n").into_bytes());
+        files.insert(
+            "d/vitaslop-dump.txt".to_string(),
+            format!("{DUMP_MAGIC}\ncontent_id=X\nmodule=eboot.bin\n").into_bytes(),
+        );
         files.insert("d/files/a.bin".to_string(), vec![1, 2, 3]);
         files.insert("d/modules/eboot.bin".to_string(), b"\x7fELF".to_vec());
-        let entries: Vec<(String, Vec<u8>)> = files.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let entries: Vec<(String, Vec<u8>)> =
+            files.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let zip = crate::ingest::zip::write_zip(&entries);
         let mut outer = HashMap::new();
         outer.insert("t.zip".to_string(), zip);

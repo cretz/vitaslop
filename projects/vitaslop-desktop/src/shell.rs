@@ -1068,7 +1068,8 @@ impl Shell {
                 if let Some(g) = self.gfx.as_ref() {
                     guest.install_complete_scene_hook(g.completion_hook());
                 }
-                let session = Session::new(guest, l.input, input, l.settings.pause_on_blur);
+                let mut session = Session::new(guest, l.input, input, l.settings.pause_on_blur);
+                session.rear_touch = l.settings.rear_touch;
                 if let Some(a) = session.audio.as_ref()
                     && library::muted()
                 {
@@ -1128,13 +1129,12 @@ impl Shell {
         let dir = library::title_dir(id);
         let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
         let (tx, rx) = channel();
-        let recipe = (!s.recipe.trim().is_empty()).then(|| s.recipe.clone());
         let repatch = library::active_repatch(id);
         let input2 = input.clone();
         std::thread::Builder::new()
             .name("loader".into())
             .spawn(move || {
-                let r = RetailGuest::new_with_exec(&dir, input2, recipe.as_deref(), main_exec.as_deref(), repatch.as_deref());
+                let r = RetailGuest::new_with_exec(&dir, input2, main_exec.as_deref(), repatch.as_deref());
                 let _ = tx.send(r);
             })
             .expect("spawn the loader thread");
@@ -1889,6 +1889,8 @@ impl Shell {
                 setting_row(ui, "Stick dead zone", Some("How far a stick must move before the game sees it."), d.changed("stickDeadzone"), |ui| {
                     ui.add(egui::Slider::new(&mut d.s.stick_deadzone, 0.0..=0.5).step_by(0.01));
                 });
+                let rear_changed = d.changed("rearTouch");
+                check_row(ui, &mut d.s.rear_touch, "Rear touch panel", Some("For the few games that use the back of the console: drag with the RIGHT mouse button to touch it."), rear_changed);
                 // The browser's "On-screen controls" card, reduced to what a window can do: over
                 // the game or not at all (a computer has no touch, so Auto keeps them hidden).
                 let mut on_screen = touchpad::shown(&d.s.pad);
@@ -1909,8 +1911,6 @@ impl Shell {
                 egui::CollapsingHeader::new(bold("Advanced").size(16.0)).id_salt("advanced").show(ui, |ui| {
                     field_label(ui, "Knobs", "One VITASLOP_NAME=value per line, set in the environment when the title starts.", d.changed("knobs"));
                     ui.add(egui::TextEdit::multiline(&mut d.knobs_text).code_editor().desired_rows(4).desired_width(f32::INFINITY));
-                    field_label(ui, "Recipe", "A scripted-input recipe, replayed from the first frame; live input still works.", d.changed("recipe"));
-                    ui.add(egui::TextEdit::multiline(&mut d.s.recipe).code_editor().desired_rows(3).desired_width(f32::INFINITY));
                     ui.separator();
                     setting_row(ui, "Fast-forward to frame", Some("Runs unpaced to here first."), d.changed("fastForward"), |ui| {
                         ui.add(egui::DragValue::new(&mut d.s.fast_forward).range(0..=10_000_000).speed(100));

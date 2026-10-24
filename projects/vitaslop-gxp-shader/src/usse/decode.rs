@@ -374,8 +374,8 @@ pub fn decode(word: u64) -> Instr {
 /// The refusal a group-0x80 epilogue with a PA destination carries until the program-level
 /// check (`usse::validate_sop2_pa_epilogues`) sees its result moved to `o[0]` and nothing else.
 pub(crate) const SOP2_PA_DEST_PENDING: &str =
-    "0x80 SOP2 blend into a PA register whose value does not reach o[0] through one final \
-     identity copy - the blend is established only as that epilogue";
+    "0x80 SOP2 blend into a PA or temporary register whose value does not reach o[0] through \
+     one final identity copy - the blend is established only as that epilogue";
 
 fn decode_grp_sop2(word: u64) -> Instr {
     let mut blocked: Option<&'static str> = None;
@@ -433,7 +433,7 @@ fn decode_grp_sop2(word: u64) -> Instr {
         && bits(word, 46, 44) == 0
         && bits(word, 20, 14) == 0
         && ((bits(word, 33, 32) == 1 && bits(word, 27, 21) == 0)   // dest o[0]
-            || bits(word, 33, 32) == 2)                            // ...or a PA register (below)
+            || matches!(bits(word, 33, 32), 0 | 2))                // ...or a temp / PA register (below)
         && bits(word, 29, 28) == 1 && bits(word, 6, 0) == 0        // src2 o[0]
         && bits(word, 40, 38) <= 4 && bits(word, 37, 35) <= 4      // colour selectors 0-4
         && bits(word, 53, 52) <= 2 && bits(word, 42, 41) <= 2;     // alpha selectors 0-2
@@ -441,7 +441,11 @@ fn decode_grp_sop2(word: u64) -> Instr {
     // register and MOVED to `o[0]` by the program's last instruction. Only that program shape
     // makes it the blend, which one word cannot see - so it blocks here with a reason that
     // `super::validate_sop2_pa_epilogues` clears when the whole stream has that shape.
-    if general && bits(word, 33, 32) == 2 {
+    // A TEMPORARY destination is the same statement: one title's world materials end
+    // `sop2 r[0] <- pa[0], o[0]` then `or o[0] <- r[0], #0`.
+    // The ESTABLISHED copy shape into a temp was always read as a plain copy, whatever follows
+    // it (an authored conformance case uses exactly that); only the general reading waits.
+    if general && (bits(word, 33, 32) == 2 || (bits(word, 33, 32) == 0 && !established)) {
         blocked = blocked.or(Some(SOP2_PA_DEST_PENDING));
     }
     // >>> THE SWAPPED ORIENTATION READ THROUGH THE SPEC'S FIELD TABLE: SRC1 the output register
@@ -1920,6 +1924,21 @@ fn mask_table_mad(half: bool, swz_mask16: u32, swz_mask32: u32, swz_en: u32) -> 
     }
 }
 
+/// [`mask_table_mad`] with the group's FOURTH mask bit: `unk0`, the bit beside `swz_mask16`,
+/// selects lane 3 of a 32-bit mad - the four bits are one per-lane mask, high lane first.
+///
+/// MEASURED: in a 1,063-mad corpus over eleven titles `unk0` is set on exactly ONE instruction,
+/// and it is the one whose other three bits are all clear - a depth-of-field composite's
+/// `i0.w = depth * mul + add`, packed by the next instruction as `i0.xyzw`. Read without the bit
+/// it wrote nothing and that pass was refused for reading an unwritten lane.
+fn mask_table_mad_lane3(half: bool, unk0: u32, swz_mask16: u32, swz_mask32: u32, swz_en: u32) -> [bool; 4] {
+    let mut m = mask_table_mad(half, swz_mask16, swz_mask32, swz_en);
+    if !half && unk0 & 1 != 0 {
+        m[3] = true;
+    }
+    m
+}
+
 /// Does `swz_mask16` select destination lane 2 in a 32-bit mad
 /// (`VITASLOP_GXP_MAD_MASK16=0` turns it off)?
 ///
@@ -2005,8 +2024,9 @@ fn decode_grp_mad(word: u64, hi: u32, lo: u32) -> Instr {
         s3
     };
 
-    let write_mask = mask_table_mad(
+    let write_mask = mask_table_mad_lane3(
         half_precision,
+        field(hi, high, "unk0"),
         field(hi, high, "swz_mask16"),
         field(hi, high, "swz_mask32"),
         field(hi, high, "swz_en"),
@@ -4308,9 +4328,13 @@ fn decode_grp_pack(word: u64) -> Instr {
     // integer's range and stored as its bit pattern, exactly where the truncating cast stores
     // one - see `Op::PackToInt::norm`. U8 is the fx8 path above.
     let norm_from_float = scale && is_float(src_fmt) && int_dest.is_some() && dest_fmt != 0;
+    // ...and their inverse, an S8/U16/S16 source NORMALIZED to a float - see
+    // `Op::PackFromInt::norm`. U8 is the fx8 path above.
+    let norm_to_float = scale && int_src.is_some() && is_float(dest_fmt) && src_fmt != 0;
     if (!is_float(src_fmt) || !is_float(dest_fmt))
         && !float_to_int
         && !int_to_float
+        && !norm_to_float
         && !unorm8_from_float
         && !unorm8_to_float
         && !norm_from_float
@@ -4405,6 +4429,22 @@ fn decode_grp_pack(word: u64) -> Instr {
     let c1 = bits(word, 17, 16) as u8;
     let c2 = bits(word, 15, 14) as u8;
     let c3 = bits(word, 20, 19) as u8;
+    // >>> AND WHERE BIT 7 IS NOT A COMPONENT BIT, IT IS THE REGISTER NUMBER'S LOW BIT.
+    //
+    // The "second reading" above, now DISTINGUISHED: a skinned vertex program unpacks its U8
+    // bone weights with `0x4081018ca0050280` / `0x4081018ca6470282` - field 2, bit 7 SET, two
+    // lanes each, bytes [0,1] then [2,3]. Read as field 2 alone that is pa4: the BONE INDICES,
+    // whose lane 0 the instruction before has just overwritten with the normal's z. Read with
+    // bit 7 as the low bit it is pa5, the register the container binds `bone_weights` to.
+    // MEASURED: with pa4 every skinned vertex was blended by a float's bytes and the character
+    // drew as a silhouette trailing a spike to the origin. Formats that spend bit 7 on the
+    // selector (see `pack_comp0_high_bit`) are untouched, and in every other format no corpus
+    // word before this one set it.
+    let i1 = if comp0_bit != 7 && !src1_ext && b1 != Bank::Indexed && bits(word, 7, 7) != 0 {
+        i1 + 1
+    } else {
+        i1
+    };
     let mut s1 = Operand::plain(b1, i1, src1_sel);
     s1.swizzle = [c0, c1, c2, c3];
     // >>> AN INDEXED SOURCE CARRIES NO SWIZZLE - ITS COMPONENTS ARE CONSECUTIVE.
@@ -4497,8 +4537,8 @@ fn decode_grp_pack(word: u64) -> Instr {
                 (Some((bits_, signed)), _) if float_to_int || norm_from_float => {
                     Op::PackToInt { bits: bits_, signed, src_half: src_fmt == 5, norm: norm_from_float }
                 }
-                (_, Some((bits_, signed))) if int_to_float => {
-                    Op::PackFromInt { bits: bits_, signed }
+                (_, Some((bits_, signed))) if int_to_float || norm_to_float => {
+                    Op::PackFromInt { bits: bits_, signed, norm: norm_to_float }
                 }
                 _ => match int_copy {
                     Some((bits_, dest_bits, signed)) => Op::PackIntCopy { bits: bits_, dest_bits, signed },
@@ -7394,6 +7434,13 @@ mod tests {
         let s8 = decode(0x4081_0a4e_a025_0100);
         assert_eq!(s8.op, Op::PackToInt { bits: 8, signed: true, src_half: true, norm: true });
         assert!(s8.blocked.is_none(), "F16 -> snorm8 converts: {:?}", s8.blocked);
+        // ...and its inverse, the retail vertex word unpacking an S8 normal to F32.
+        let unpack = decode(0x40c1_0385_a004_0200);
+        assert_eq!(unpack.op, Op::PackFromInt { bits: 8, signed: true, norm: true });
+        assert!(unpack.blocked.is_none(), "snorm8 -> F32 converts: {:?}", unpack.blocked);
+        // S16 and U16 normalized to float are the same rule at their widths.
+        let s16_unpack = word_bits(&[(0x08, 63, 59), (4, 43, 41), (6, 40, 38), (1, 18, 18)]);
+        assert_eq!(decode(s16_unpack).op, Op::PackFromInt { bits: 16, signed: true, norm: true });
         // S16<-F32 is the width the one shader that needs this uses, and it is SIGNED.
         let s16 = word_bits(&[(0x08, 63, 59), (6, 43, 41), (4, 40, 38)]);
         assert_eq!(decode(s16).op, Op::PackToInt { bits: 16, signed: true, src_half: false, norm: false });
@@ -8196,6 +8243,33 @@ mod tests {
         assert_eq!(unpack.write_mask, [true; 4]);
         assert_eq!(decode(0x04a0_9286_a040_1002).write_mask, [true; 4]);
         assert_eq!(decode(0x0480_08a6_b180_51a3).write_mask, [true, true, false, false]);
+    }
+
+    /// A U8 -> float unpack with bit 7 set reads the NEXT register: bit 7 is the source number's
+    /// low bit where it is not a component selector. Bone weights in pa5, beside indices in pa4.
+    #[test]
+    fn a_u8_unpack_with_bit_7_set_reads_the_odd_register() {
+        for (word, lanes) in [(0x4081_018c_a005_0280u64, [0u8, 1]), (0x4081_018c_a647_0282, [2, 3])] {
+            let ins = decode(word);
+            assert_eq!(ins.op, Op::PackUnorm8 { to_unorm8: false, float_half: false });
+            assert_eq!((ins.srcs[0].bank, ins.srcs[0].index), (Bank::PrimaryAttr, 5), "{word:#018x}");
+            assert_eq!(ins.srcs[0].swizzle[..2], lanes, "{word:#018x}");
+        }
+        // Bit 7 clear: the even register, as before.
+        let idx = decode(0x4081_00c6_a060_0200);
+        assert_eq!((idx.srcs[0].bank, idx.srcs[0].index), (Bank::PrimaryAttr, 4));
+    }
+
+    /// A 32-bit mad whose only mask bit is `unk0` writes lane 3 alone - the alpha of a composite
+    /// the next instruction packs as `xyzw`. The bit adds lane 3 and nothing else.
+    #[test]
+    fn a_32_bit_mad_with_unk0_writes_lane_w() {
+        let ins = decode(0x0080_2404_ff00_0000);
+        assert!(!ins.half_precision);
+        assert_eq!(ins.dest.map(|d| (d.bank, d.index)), Some((Bank::Internal, 0)));
+        assert_eq!(ins.write_mask, [false, false, false, true]);
+        // The same word with `unk0` clear is the empty mask the bit used to leave.
+        assert_eq!(decode(0x0080_2404_ff00_0000 & !(1u64 << (32 + 10))).write_mask, [false; 4]);
     }
 
     #[test]

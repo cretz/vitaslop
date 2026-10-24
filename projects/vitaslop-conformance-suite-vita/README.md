@@ -36,6 +36,10 @@ Vita toolchain via `$VITASDK`).
 - **`compute2-src/`** (`vita_compute2`): a second probe - byte reverse (REV/REV16),
   sign/zero extend (SXTB/UXTB/SXTH), multiply-accumulate (MLA), bitfield extract
   (UBFX). Surfaced and lifted all of them (+ MLS/UXTH/SBFX), qemu-certified.
+- **`touchlive-src/`** (browser: `vitaslop-web/e2e/touch-live.mjs`): reports each press
+  and lift on the front and rear touch panels (panel + a 4x4 cell), so a browser test can
+  press the player's canvas with a mouse or a finger and check where it landed - the opt-in
+  rear-touch input above all. Ends on a front press in the top-left cell, never on a timer.
 - **`cube-src/`** (`cube_*`): the minimal GXM spinning cube - the graphics north
   star. See its README; bring-up was work-backwards over this artifact.
 - **`gxmconf-src/`** (`vita_gxmconf`): GXM **pipeline-state** conformance - eight
@@ -53,7 +57,16 @@ Vita toolchain via `$VITASDK`).
   without writes only its files, and the file reads back through the savedata mount.
 - **`gxmtex-src/`** (`vita_gxmtex`): GXM texture state in the 16-byte struct - a new
   texture has no LOD bias, a `LINEAR_STRIDED` stride survives a by-value copy, two strided
-  views of one surface keep their own pitches, an unaligned stride is refused.
+  views of one surface keep their own pitches, an unaligned stride is refused; then the
+  init boundaries a console recorded and what a fresh texture reads back.
+- **`kernel2-src/`** (`vita_kernel2`): kernel calls that each answer one question - the two
+  thread-priority spellings (on the initial thread too), `sceKernelPollSema`, the default
+  affinity mask, and the libc time helpers' full-year `struct tm`.
+- **`svc2-src/`** (`vita_svc2`): the controller sampling mode (previous mode answered), the
+  console model, and SceAppUtil safe memory's range and persistence rules.
+- **`gxmds-src/`** (`vita_gxmds`): GXM depth-stencil state in the 20-byte struct - init's
+  stride checks, every getter on a fresh surface, setters read back on a by-value copy, and
+  a disabled surface.
 - **`pvf-src/`** (`vita_pvf`): the ScePvf vector-font engine end to end - create a
   library, open a real font file through the host filesystem (the first case to
   read a data file the way a title does), configure size/resolution, and query

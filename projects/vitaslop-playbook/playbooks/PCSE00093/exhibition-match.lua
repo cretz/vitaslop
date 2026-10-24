@@ -2,7 +2,7 @@
 -- KICK-OFF > EXHIBITION MATCH with every default (Chicago Fire v Columbus Crew), the broadcast
 -- intro, and a live match played with the face buttons and the left stick.
 --
--- Converted from the recipe `exhibition-match`, which was already timed by host calls
+-- Converted from the old frame-keyed script `exhibition-match`, which was already timed by host calls
 -- (`@wait call ... pulse`): each hold below is one of its waits. Frames are from its native run:
 --
 --   f3030  title "Press START button"; START -> the autosave notice (game-drawn)
@@ -65,9 +65,9 @@ phase("menus", { timeout = 240 }, function()
   split("broadcast intro")
 end)
 
--- One cycle of the recipe's match loop (400 display frames): sprint right and pass, run
+-- One cycle of the old script's match loop (400 display frames): sprint right and pass, run
 -- up-right and shoot, cut left and play a through ball, sprint down-right and lob. MEASURED:
--- this title reads the pad on every other display flip, so the recipe's gaps are halved.
+-- this title reads the pad on every other display flip, so the old script's gaps are halved.
 local function cycle()
   stick("left", 255, 128); press("r"); idle(45); release("r")
   tap("cross", 6, 0)

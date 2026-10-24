@@ -114,7 +114,10 @@ fn probe_log(addr: u32, w: u32, h: u32) -> bool {
         // `=1` is every target; anything else is a `+`-separated address list, because a
         // per-frame line for every target of every frame is a log nobody can read.
         // Only sizes given: no address list at all (an EMPTY list means every target).
-        if v != "1" && v.split('+').all(|a| a.contains('x') && !a.trim().starts_with("0x")) {
+        if v != "1"
+            && v.split('+')
+                .all(|a| a.contains('x') && !a.trim().starts_with("0x"))
+        {
             return Some(vec![0]);
         }
         Some(if v == "1" {
@@ -171,8 +174,24 @@ fn report_probe_find(addr: u32, w: u32, h: u32, rgba: &[u8]) {
 }
 
 /// The parsed knob: (texel cap, addresses held back, hold back sampled targets, write nothing).
-fn writeback_spec() -> &'static (u32, Vec<u32>, bool, bool, Option<[u8; 4]>, Vec<u32>, Option<(usize, usize)>) {
-    static SPEC: std::sync::OnceLock<(u32, Vec<u32>, bool, bool, Option<[u8; 4]>, Vec<u32>, Option<(usize, usize)>)> = std::sync::OnceLock::new();
+fn writeback_spec() -> &'static (
+    u32,
+    Vec<u32>,
+    bool,
+    bool,
+    Option<[u8; 4]>,
+    Vec<u32>,
+    Option<(usize, usize)>,
+) {
+    static SPEC: std::sync::OnceLock<(
+        u32,
+        Vec<u32>,
+        bool,
+        bool,
+        Option<[u8; 4]>,
+        Vec<u32>,
+        Option<(usize, usize)>,
+    )> = std::sync::OnceLock::new();
     SPEC.get_or_init(|| {
         let Ok(v) = vitaslop_platform::knobs::var("VITASLOP_GXM_RTT_WRITEBACK") else {
             return (256 * 256, Vec::new(), false, false, None, Vec::new(), None);
@@ -235,7 +254,11 @@ fn writeback_spec() -> &'static (u32, Vec<u32>, bool, bool, Option<[u8; 4]>, Vec
 /// would corrupt whatever the guest put there. Only a target this frame's own scenes name as a
 /// colour surface is written, which is also the only one whose stride and format are known.
 pub fn surface_for(scenes: &[Scene], addr: u32) -> Option<ColorSurface> {
-    scenes.iter().filter_map(|s| s.color.as_ref()).find(|c| c.data_addr == addr).copied()
+    scenes
+        .iter()
+        .filter_map(|s| s.color.as_ref())
+        .find(|c| c.data_addr == addr)
+        .copied()
 }
 
 /// Put the rendered pixels of every readback in `writebacks` - `(guest colour address, width,
@@ -249,7 +272,9 @@ pub fn apply_rtt_writebacks(
 ) -> usize {
     let mut done = 0usize;
     for (addr, w, h, rgba) in writebacks {
-        let Some(c) = surface_for(scenes, *addr) else { continue };
+        let Some(c) = surface_for(scenes, *addr) else {
+            continue;
+        };
         // TEMPORARY TELEMETRY. WHERE in the target the guest asked its draws to paint. A CPU-
         // read probe whose content lands away from the origin is either a title packing an
         // atlas or a placement bug, and the guest's own viewport/region clip is the only
@@ -297,7 +322,11 @@ pub fn apply_one(
         return false;
     }
     let texel_bytes = if float_held { 8 } else { 4 };
-    let bpp = if float_held { float_writeback_bytes_per_pixel(c.format) } else { writeback_bytes_per_pixel(c.format) };
+    let bpp = if float_held {
+        float_writeback_bytes_per_pixel(c.format)
+    } else {
+        writeback_bytes_per_pixel(c.format)
+    };
     let Some(bpp) = bpp else {
         report_writeback_skipped(addr, c.format);
         return false;
@@ -347,32 +376,54 @@ pub fn apply_one(
     let fp_bytes = (cols * writeback_bytes_per_pixel(c.format).unwrap_or(4)).min(4096);
     if fp_bytes > 0 && !writeback_still_ours(addr, &read(addr, fp_bytes), fp_bytes) {
         report_writeback_recycled(addr, w, h);
-        writeback_fingerprints().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        writeback_fingerprints()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&addr);
         return false;
     }
     let row_bytes = cols * bpp;
     // The WHOLE region under the parallel scheduler - see [`set_whole_region_guard`].
     if whole_region_guard() {
-        let span = if rows == 0 { 0 } else { (rows - 1) * stride + row_bytes };
+        let span = if rows == 0 {
+            0
+        } else {
+            (rows - 1) * stride + row_bytes
+        };
         let cur = read(addr, span);
         let ok = cur.len() >= span && {
             let mut h = FNV_BASIS;
             let mut uniform = true;
-            let first = cur.get(..4.min(row_bytes)).map(<[u8]>::to_vec).unwrap_or_default();
+            let first = cur
+                .get(..4.min(row_bytes))
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default();
             for y in 0..rows {
                 let r = &cur[y * stride..y * stride + row_bytes];
                 h = fnv_extend(h, r);
-                uniform &= r.len().is_multiple_of(4) && first.len() == 4 && r.chunks_exact(4).all(|w| w == first);
+                uniform &= r.len().is_multiple_of(4)
+                    && first.len() == 4
+                    && r.chunks_exact(4).all(|w| w == first);
             }
-            match region_hashes().lock().unwrap_or_else(|e| e.into_inner()).get(&addr) {
+            match region_hashes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&addr)
+            {
                 Some(&want) => h == want,
                 None => uniform,
             }
         };
         if !ok {
             report_writeback_recycled(addr, w, h);
-            writeback_fingerprints().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
-            region_hashes().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+            writeback_fingerprints()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&addr);
+            region_hashes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&addr);
             return false;
         }
     }
@@ -380,7 +431,11 @@ pub fn apply_one(
     // which is the input side of the feedback loop, plus the frame's own mean so the loop can
     // be read as a trajectory rather than a first step.
     if !float_held && probe_log(addr, w, h) {
-        let t = if w > 24 && h > 1 { &rgba[(w as usize + 24) * 4..(w as usize + 24) * 4 + 4] } else { &[][..] };
+        let t = if w > 24 && h > 1 {
+            &rgba[(w as usize + 24) * 4..(w as usize + 24) * 4 + 4]
+        } else {
+            &[][..]
+        };
         let sum: u64 = rgba.iter().map(|b| *b as u64).sum();
         // Eight ROW means down the target (rgb only), so the readback answers for the whole
         // image and not one texel: a chain-dump PNG of a written-back target can be stale, and
@@ -390,7 +445,10 @@ pub fn apply_one(
             .filter_map(|i| {
                 let y = (h as usize * i as usize) / 8;
                 let r = rgba.get(y * row_bytes..(y + 1) * row_bytes)?;
-                let s: u64 = r.chunks_exact(4).map(|px| px[0] as u64 + px[1] as u64 + px[2] as u64).sum();
+                let s: u64 = r
+                    .chunks_exact(4)
+                    .map(|px| px[0] as u64 + px[1] as u64 + px[2] as u64)
+                    .sum();
                 Some((s / (3 * w as u64).max(1)) as u32)
             })
             .collect();
@@ -407,7 +465,10 @@ pub fn apply_one(
             (0..h as usize)
                 .map(|y| {
                     let r = &rgba[y * row_bytes..((y + 1) * row_bytes).min(rgba.len())];
-                    let s: u64 = r.chunks_exact(4).map(|px| px[0] as u64 + px[1] as u64 + px[2] as u64).sum();
+                    let s: u64 = r
+                        .chunks_exact(4)
+                        .map(|px| px[0] as u64 + px[1] as u64 + px[2] as u64)
+                        .sum();
                     format!("{:02x}", (s / (3 * w as u64).max(1)).min(255))
                 })
                 .collect()
@@ -427,7 +488,11 @@ pub fn apply_one(
         );
     }
     if report_once(0x7100_0000_0000_0000 ^ addr as u64) {
-        let t = if w > 24 && h > 1 { rgba[(w as usize + 24) * 4..(w as usize + 24) * 4 + 4].to_vec() } else { Vec::new() };
+        let t = if w > 24 && h > 1 {
+            rgba[(w as usize + 24) * 4..(w as usize + 24) * 4 + 4].to_vec()
+        } else {
+            Vec::new()
+        };
         tracing::info!(target: "vitaslop::status", "gxm rtt writeback: first frame-end write of {addr:#010x} ({w}x{h}): texel(24,1)={t:?}");
     }
     report_writeback_target(addr, w, h, c, rows, cols, stride);
@@ -468,7 +533,10 @@ pub fn apply_one(
         write(addr.wrapping_add((y * stride) as u32), row);
     }
     if whole_region_guard() {
-        region_hashes().lock().unwrap_or_else(|e| e.into_inner()).insert(addr, written);
+        region_hashes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(addr, written);
     }
     true
 }
@@ -555,12 +623,25 @@ mod whole_region_tests {
         TEST_WHOLE_REGION.with(|c| c.set(true));
         let addr = 0x9f00_0000;
         let mut mem = vec![0u8; 16 * 16 * 4];
-        assert!(write_back(&mut mem, addr, 0x35), "an untouched (uniform) region is ours to write");
-        assert!(write_back(&mut mem, addr, 0x36), "a region holding only our last write is ours");
+        assert!(
+            write_back(&mut mem, addr, 0x35),
+            "an untouched (uniform) region is ours to write"
+        );
+        assert!(
+            write_back(&mut mem, addr, 0x36),
+            "a region holding only our last write is ours"
+        );
         // The guest stores a pointer into row 8.
         mem[8 * 64..8 * 64 + 4].copy_from_slice(&0x8123_4567u32.to_le_bytes());
-        assert!(!write_back(&mut mem, addr, 0x37), "a region the guest wrote into is the guest's");
-        assert_eq!(&mem[8 * 64..8 * 64 + 4], &0x8123_4567u32.to_le_bytes(), "and its bytes survive");
+        assert!(
+            !write_back(&mut mem, addr, 0x37),
+            "a region the guest wrote into is the guest's"
+        );
+        assert_eq!(
+            &mem[8 * 64..8 * 64 + 4],
+            &0x8123_4567u32.to_le_bytes(),
+            "and its bytes survive"
+        );
         TEST_WHOLE_REGION.with(|c| c.set(false));
     }
 
@@ -587,7 +668,11 @@ pub fn probe_len(w: u32, h: u32, c: &ColorSurface) -> usize {
     let stride = c.stride_pixels.max(w) as usize * bpp;
     let rows = h.min(c.height) as usize;
     let row_bytes = w.min(c.width) as usize * bpp;
-    let span = if rows == 0 { 0 } else { (rows - 1) * stride + row_bytes };
+    let span = if rows == 0 {
+        0
+    } else {
+        (rows - 1) * stride + row_bytes
+    };
     span.max(4096)
 }
 
@@ -650,8 +735,8 @@ fn writeback_bytes_per_pixel(format: u32) -> Option<usize> {
         // the empty grey seating on screen. A format with an alpha channel that no
         // readback can see is the worst of both: the picture depends on it and nothing
         // can say what it holds.
-        0x5000_0000 => Some(2),               // U4U4U4U4
-        0x4100_0000 => Some(4),               // U2F10F10F10 - packed, and NOT the readback's
+        0x5000_0000 => Some(2), // U4U4U4U4
+        0x4100_0000 => Some(4), // U2F10F10F10 - packed, and NOT the readback's
         // >>> U8 AND U8U8 - the SINGLE-CHANNEL family, and leaving it out left a whole class of
         // >>> target with no write-back at all AND no way to look at one.
         //
@@ -665,22 +750,26 @@ fn writeback_bytes_per_pixel(format: u32) -> Option<usize> {
         // The renderer holds every target as 8-bit RGBA, so the single channel is the RED one -
         // the same channel `color_format_to_texture_format` maps this format's texture form
         // onto, so what is written back is by construction what reads back.
-        0x8080_0000 => Some(1),               // U8
-        0xB080_0000 => Some(2),               // U8U8
+        0x8080_0000 => Some(1), // U8
+        0xB080_0000 => Some(2), // U8U8
         _ => None,
     }
 }
 
 fn float_writeback_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::var("VITASLOP_RTT_WRITEBACK_FLOAT").map(|v| v.trim() != "0").unwrap_or(true))
+    *ON.get_or_init(|| {
+        crate::knobs::var("VITASLOP_RTT_WRITEBACK_FLOAT")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
 }
 
 /// Bytes a guest pixel of a FLOAT surface the renderer holds as `Rgba16Float` (see
 /// `gpu::float_color_format`) - the formats `encode_row_float` writes.
 fn float_writeback_bytes_per_pixel(format: u32) -> Option<usize> {
     match format & 0xF180_0000 {
-        0xF000_0000 => Some(2),                                         // F16
+        0xF000_0000 => Some(2),                                           // F16
         0x0080_0000 | 0x1080_0000 | 0x2100_0000 | 0x4100_0000 => Some(4), // F16F16, F32, F11F11F10, U2F10F10F10
         _ => None,
     }
@@ -700,7 +789,8 @@ fn encode_row_float(format: u32, row: &[u8], out: &mut Vec<u8>) {
     let swizzle = (format >> 20) & 3;
     out.clear();
     for px in row.chunks_exact(8) {
-        let c = |i: usize| crate::render::half_to_f32(u16::from_le_bytes([px[2 * i], px[2 * i + 1]]));
+        let c =
+            |i: usize| crate::render::half_to_f32(u16::from_le_bytes([px[2 * i], px[2 * i + 1]]));
         match format & 0xF180_0000 {
             0xF000_0000 => out.extend_from_slice(&px[0..2]),
             0x0080_0000 => out.extend_from_slice(&px[0..4]),
@@ -709,14 +799,19 @@ fn encode_row_float(format: u32, row: &[u8], out: &mut Vec<u8>) {
                 let (r, g, b) = (c(0), c(1), c(2));
                 // Swizzle 1 puts red in the 10-bit lane at the top, as the decoder reads it.
                 let (l0, l1, l2) = if swizzle == 1 { (b, g, r) } else { (r, g, b) };
-                let w = unsigned_float(l0, 6) | (unsigned_float(l1, 6) << 11) | (unsigned_float(l2, 5) << 22);
+                let w = unsigned_float(l0, 6)
+                    | (unsigned_float(l1, 6) << 11)
+                    | (unsigned_float(l2, 5) << 22);
                 out.extend_from_slice(&w.to_le_bytes());
             }
             0x4100_0000 => {
                 let (r, g, b, a) = (c(0), c(1), c(2), c(3));
                 let (hi, mid, lo) = if swizzle == 1 { (r, g, b) } else { (b, g, r) };
                 let a2 = ((a.clamp(0.0, 1.0) * 3.0).round() as u32) & 3;
-                let w = (a2 << 30) | (unsigned_float(hi, 5) << 20) | (unsigned_float(mid, 5) << 10) | unsigned_float(lo, 5);
+                let w = (a2 << 30)
+                    | (unsigned_float(hi, 5) << 20)
+                    | (unsigned_float(mid, 5) << 10)
+                    | unsigned_float(lo, 5);
                 out.extend_from_slice(&w.to_le_bytes());
             }
             _ => {}
@@ -767,7 +862,11 @@ fn encode_row(format: u32, rgba: &[u8], out: &mut Vec<u8>) {
     // first channel on the way in, which is what makes the round trip exact rather than a guess
     // about a swizzle this family does not carry across (see `color_format_to_texture_format`).
     if matches!(format & 0xF180_0000, 0x8080_0000 | 0xB080_0000) {
-        let n = if format & 0xF180_0000 == 0x8080_0000 { 1 } else { 2 };
+        let n = if format & 0xF180_0000 == 0x8080_0000 {
+            1
+        } else {
+            2
+        };
         out.clear();
         out.reserve(rgba.len() / 4 * n);
         for px in rgba.chunks_exact(4) {
@@ -891,7 +990,10 @@ fn report_probe_geometry(addr: u32, c: &ColorSurface, scenes: &[Scene]) {
         return;
     }
     let mut seen: Vec<String> = Vec::new();
-    for s in scenes.iter().filter(|s| s.color.as_ref().is_some_and(|k| k.data_addr == addr)) {
+    for s in scenes
+        .iter()
+        .filter(|s| s.color.as_ref().is_some_and(|k| k.data_addr == addr))
+    {
         for d in &s.draws {
             let r = &d.render_state;
             let v = r.viewport;
@@ -904,7 +1006,9 @@ fn report_probe_geometry(addr: u32, c: &ColorSurface, scenes: &[Scene]) {
                     let o = i * stride;
                     (o + 16 <= d.vertices.len()).then(|| {
                         let f = |k: usize| {
-                            f32::from_le_bytes(d.vertices[o + k * 4..o + k * 4 + 4].try_into().unwrap())
+                            f32::from_le_bytes(
+                                d.vertices[o + k * 4..o + k * 4 + 4].try_into().unwrap(),
+                            )
                         };
                         format!("({:.3},{:.3},{:.3},{:.3})", f(0), f(1), f(2), f(3))
                     })
@@ -912,10 +1016,21 @@ fn report_probe_geometry(addr: u32, c: &ColorSurface, scenes: &[Scene]) {
                 .collect();
             let line = format!(
                 "vp_en={} vp=[{:.1},{:.1} {:.1},{:.1}] rc_mode={} rc=[{},{} {},{}] prim={} idx={} vstride={} nverts={} v={}",
-                r.viewport_enable, v[0], v[2], v[1], v[3], r.region_clip_mode,
-                r.region_clip[0], r.region_clip[1], r.region_clip[2], r.region_clip[3],
-                d.primitive, d.index_count, d.vertex_stride,
-                d.vertices.len() / stride, pos.join(" "),
+                r.viewport_enable,
+                v[0],
+                v[2],
+                v[1],
+                v[3],
+                r.region_clip_mode,
+                r.region_clip[0],
+                r.region_clip[1],
+                r.region_clip[2],
+                r.region_clip[3],
+                d.primitive,
+                d.index_count,
+                d.vertex_stride,
+                d.vertices.len() / stride,
+                pos.join(" "),
             );
             if !seen.contains(&line) {
                 seen.push(line);
@@ -1029,7 +1144,9 @@ fn fingerprint(bytes: &[u8]) -> u64 {
 ///
 /// `None` recorded means we have not written this address yet, which is not a mismatch.
 fn writeback_still_ours(addr: u32, probe: &[u8], n: usize) -> bool {
-    let g = writeback_fingerprints().lock().unwrap_or_else(|e| e.into_inner());
+    let g = writeback_fingerprints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     match g.get(&addr) {
         None => true,
         Some(&want) => probe.len() >= n && fingerprint(&probe[..n]) == want,
@@ -1037,7 +1154,9 @@ fn writeback_still_ours(addr: u32, probe: &[u8], n: usize) -> bool {
 }
 
 fn writeback_remember(addr: u32, row: &[u8], n: usize) {
-    let mut g = writeback_fingerprints().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = writeback_fingerprints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if row.len() >= n {
         g.insert(addr, fingerprint(&row[..n]));
     } else {
@@ -1078,7 +1197,15 @@ fn bytes_per_pixel_or_four(format: u32) -> usize {
 /// question first (which of a title's targets now have their pixels in guest memory) and a
 /// correctness one second (the SWIZZLE selector, bits 21:20 of the colour format, says the
 /// byte order a CPU reader expects and a wrong one silently recolours whatever reads it).
-fn report_writeback_target(addr: u32, w: u32, h: u32, c: &ColorSurface, rows: usize, cols: usize, stride: usize) {
+fn report_writeback_target(
+    addr: u32,
+    w: u32,
+    h: u32,
+    c: &ColorSurface,
+    rows: usize,
+    cols: usize,
+    stride: usize,
+) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
@@ -1187,11 +1314,19 @@ mod tests {
         assert_eq!(out.len(), 6, "three texels at two bytes each");
         let px = |i: usize| decode_1555(u16::from_le_bytes([out[i * 2], out[i * 2 + 1]]));
         // 5 bits hold 32 levels, so a channel comes back within half a step (255/31 = 8.2).
-        for (i, want) in [[93u8, 129, 79, 255], [0, 0, 0, 0], [255, 255, 255, 255]].iter().enumerate() {
+        for (i, want) in [[93u8, 129, 79, 255], [0, 0, 0, 0], [255, 255, 255, 255]]
+            .iter()
+            .enumerate()
+        {
             let got = px(i);
             for c in 0..3 {
                 let d = got[c].abs_diff(want[c]);
-                assert!(d <= 5, "texel {i} channel {c}: wrote {}, read {} (off by {d})", want[c], got[c]);
+                assert!(
+                    d <= 5,
+                    "texel {i} channel {c}: wrote {}, read {} (off by {d})",
+                    want[c],
+                    got[c]
+                );
             }
             assert_eq!(got[3], want[3], "texel {i} alpha");
         }
@@ -1202,7 +1337,10 @@ mod tests {
         let r = ((w & 0x1f) as u32 * 255 / 31) as u8;
         let g = (((w >> 5) & 0x3f) as u32 * 255 / 63) as u8;
         let b = (((w >> 11) & 0x1f) as u32 * 255 / 31) as u8;
-        assert!(r.abs_diff(93) <= 5 && g.abs_diff(129) <= 3 && b.abs_diff(79) <= 5, "565 gave {r},{g},{b}");
+        assert!(
+            r.abs_diff(93) <= 5 && g.abs_diff(129) <= 3 && b.abs_diff(79) <= 5,
+            "565 gave {r},{g},{b}"
+        );
     }
 
     /// What `encode_row` writes for a `U2F10F10F10` surface is the NEAREST pixel that format
@@ -1235,11 +1373,21 @@ mod tests {
         encode_row(0x4110_0000, &src, &mut out);
         assert_eq!(out.len(), 12, "three texels at FOUR bytes each");
         let word = |i: usize| u32::from_le_bytes(out[i * 4..i * 4 + 4].try_into().unwrap());
-        for (i, want) in [[93u8, 129, 79, 255], [0, 0, 0, 0], [255, 255, 255, 255]].iter().enumerate() {
+        for (i, want) in [[93u8, 129, 79, 255], [0, 0, 0, 0], [255, 255, 255, 255]]
+            .iter()
+            .enumerate()
+        {
             let w = word(i);
-            let got = [decode_ten(w >> 20 & 0x3ff), decode_ten(w >> 10 & 0x3ff), decode_ten(w & 0x3ff)];
+            let got = [
+                decode_ten(w >> 20 & 0x3ff),
+                decode_ten(w >> 10 & 0x3ff),
+                decode_ten(w & 0x3ff),
+            ];
             for (c, &want_c) in want[..3].iter().enumerate() {
-                let best = (0u32..1024).map(|x| decode_ten(x).abs_diff(want_c)).min().unwrap();
+                let best = (0u32..1024)
+                    .map(|x| decode_ten(x).abs_diff(want_c))
+                    .min()
+                    .unwrap();
                 assert_eq!(
                     got[c].abs_diff(want_c),
                     best,
@@ -1250,15 +1398,27 @@ mod tests {
             }
             // Two bits of alpha: 0, 85, 170, 255.
             let a = ((w >> 30) as f32 / 3.0 * 255.0).round() as u8;
-            let best_a = [0u8, 85, 170, 255].iter().map(|x| x.abs_diff(want[3])).min().unwrap();
-            assert_eq!(a.abs_diff(want[3]), best_a, "texel {i} alpha: wrote {}, read {a}", want[3]);
+            let best_a = [0u8, 85, 170, 255]
+                .iter()
+                .map(|x| x.abs_diff(want[3]))
+                .min()
+                .unwrap();
+            assert_eq!(
+                a.abs_diff(want[3]),
+                best_a,
+                "texel {i} alpha: wrote {}, read {a}",
+                want[3]
+            );
         }
         // Every byte, on its own, against every word there is.
         for c in 0..=255u8 {
             let mut one = Vec::new();
             encode_row(0x4110_0000, &[c, c, c, 255], &mut one);
             let w = u32::from_le_bytes(one[..4].try_into().unwrap());
-            let best = (0u32..1024).map(|x| decode_ten(x).abs_diff(c)).min().unwrap();
+            let best = (0u32..1024)
+                .map(|x| decode_ten(x).abs_diff(c))
+                .min()
+                .unwrap();
             assert_eq!(decode_ten(w >> 20 & 0x3ff).abs_diff(c), best, "byte {c}");
         }
         // Swizzle 0 is ABGR - the same three lanes in the opposite order.
@@ -1284,14 +1444,27 @@ mod tests {
     #[test]
     fn a_window_filled_after_its_draw_is_unwritten_and_one_rewritten_between_draws_is_not() {
         // The crowd's skinning window as it reads at `sceGxmDraw`.
-        assert!(nothing_written_here(&[0u8; 3776]), "all-zero skinning window must be re-read");
+        assert!(
+            nothing_written_here(&[0u8; 3776]),
+            "all-zero skinning window must be re-read"
+        );
         // Golf's vertex window at 0x882c4200: 34 words of real floats. Only the shape matters -
         // a leading run of zeroes, then values - because that leading run is what a prefix-only
         // test would have stopped at.
         let mut win = Vec::new();
         for w in [
-            0x00000000u32, 0x00000000, 0x00000000, 0x3f800000, 0x3f800000, 0x80000000,
-            0x3fa3126e, 0x3fa3126e, 0x3f9e147a, 0x00000000, 0x3f800000, 0x00000000,
+            0x00000000u32,
+            0x00000000,
+            0x00000000,
+            0x3f800000,
+            0x3f800000,
+            0x80000000,
+            0x3fa3126e,
+            0x3fa3126e,
+            0x3f9e147a,
+            0x00000000,
+            0x3f800000,
+            0x00000000,
         ] {
             win.extend_from_slice(&w.to_le_bytes());
         }
@@ -1329,12 +1502,18 @@ mod tests {
         // The whole-window test says "something is here", which is true and not the question.
         assert!(!nothing_written_here(&win));
         // The slot test sees the rows the job thread has not reached.
-        assert!(any_slot_unwritten(&win), "an all-zero 16-byte row must count as unwritten");
+        assert!(
+            any_slot_unwritten(&win),
+            "an all-zero 16-byte row must count as unwritten"
+        );
         // And once every row holds a value, nothing is owed a re-read - this is the golf
         // ambient block's case, which must keep its own draw-time bytes.
         let full = &win[..filled];
         assert!(!nothing_written_here(full));
-        assert!(!any_slot_unwritten(full), "a fully written window must KEEP its draw-time bytes");
+        assert!(
+            !any_slot_unwritten(full),
+            "a fully written window must KEEP its draw-time bytes"
+        );
     }
 
     /// The whole-window answer must stay a SPECIAL CASE of the slot answer, or a window the old
@@ -1462,11 +1641,18 @@ mod float_writeback_tests {
             // Every representable value encodes to exactly its own bits.
             for bits in 0..(31u32 << mant) {
                 let v = decode(bits, mant);
-                assert_eq!(unsigned_float(v, mant), bits, "mant {mant} bits {bits:#x} value {v}");
+                assert_eq!(
+                    unsigned_float(v, mant),
+                    bits,
+                    "mant {mant} bits {bits:#x} value {v}"
+                );
             }
             assert_eq!(unsigned_float(-1.0, mant), 0);
             assert_eq!(unsigned_float(f32::NAN, mant), 0);
-            assert_eq!(unsigned_float(1.0e9, mant), (30 << mant) | ((1 << mant) - 1));
+            assert_eq!(
+                unsigned_float(1.0e9, mant),
+                (30 << mant) | ((1 << mant) - 1)
+            );
         }
         // Halfway between 1.0 and the next value up rounds away from 1.0.
         assert_eq!(unsigned_float(1.0 + 1.0 / 128.0, 6), (15 << 6) | 1);

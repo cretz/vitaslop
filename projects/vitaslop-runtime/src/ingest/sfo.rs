@@ -36,7 +36,8 @@ pub fn text_field(blob: &[u8], key: &str) -> Option<String> {
         return None;
     }
     let word = |off: usize| -> Option<u32> {
-        blob.get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        blob.get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
     let key_table = word(8)? as usize;
     let data_table = word(12)? as usize;
@@ -49,8 +50,10 @@ pub fn text_field(blob: &[u8], key: &str) -> Option<String> {
         let key_off = key_table.checked_add(u16::from_le_bytes([entry[0], entry[1]]) as usize)?;
         let fmt = u16::from_le_bytes([entry[2], entry[3]]);
         let len = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]) as usize;
-        let data_off = data_table
-            .checked_add(u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize)?;
+        let data_off =
+            data_table.checked_add(
+                u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize,
+            )?;
 
         let rest = blob.get(key_off..)?;
         let name_len = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
@@ -74,7 +77,10 @@ pub fn text_field(blob: &[u8], key: &str) -> Option<String> {
 /// file must not be able to name a directory somewhere else.
 pub fn title_id(blob: &[u8]) -> Option<String> {
     let raw = text_field(blob, "TITLE_ID")?;
-    let clean: String = raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+    let clean: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
     (!clean.is_empty()).then_some(clean)
 }
 
@@ -128,16 +134,29 @@ mod tests {
             ("TITLE_ID", "PCSA00000"),
         ]);
         assert_eq!(title_id(&blob).as_deref(), Some("PCSA00000"));
-        assert_eq!(text_field(&blob, "TITLE").as_deref(), Some("A Game, At Length"));
+        assert_eq!(
+            text_field(&blob, "TITLE").as_deref(),
+            Some("A Game, At Length")
+        );
         assert_eq!(text_field(&blob, "NOT_A_KEY"), None);
     }
 
     #[test]
     fn a_title_id_can_never_name_a_directory_of_its_own_choosing() {
         // The value comes out of a game file, and it names a directory on both backends.
-        assert_eq!(title_id(&sfo(&[("TITLE_ID", "../../etc")])).as_deref(), Some("etc"));
-        assert_eq!(title_id(&sfo(&[("TITLE_ID", "a/b\\c:d")])).as_deref(), Some("abcd"));
-        assert_eq!(title_id(&sfo(&[("TITLE_ID", "///")])), None, "nothing usable is left");
+        assert_eq!(
+            title_id(&sfo(&[("TITLE_ID", "../../etc")])).as_deref(),
+            Some("etc")
+        );
+        assert_eq!(
+            title_id(&sfo(&[("TITLE_ID", "a/b\\c:d")])).as_deref(),
+            Some("abcd")
+        );
+        assert_eq!(
+            title_id(&sfo(&[("TITLE_ID", "///")])),
+            None,
+            "nothing usable is left"
+        );
     }
 
     #[test]

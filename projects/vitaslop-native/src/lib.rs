@@ -39,11 +39,9 @@ pub mod perf;
 pub mod gamedata_disk;
 pub use gamedata_disk::SaveStore;
 
-pub mod recipe_runner;
-pub use recipe_runner::{boot_retail, boot_retail_exec, run_recipe, RecipeReport, RunOpts};
+pub mod boot;
+pub use boot::{boot_retail, boot_retail_exec};
 
-pub mod session;
-pub use session::{ControlDir, Session, SessionOpts};
 pub use vitaslop_transpiler::abi;
 use vitaslop_transpiler::{self as transpiler};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store, Val};

@@ -461,8 +461,34 @@ async function play(id, fullscreen) {
   view.innerHTML = "";
   await player.start(meta, eff, {
     fullscreen,
-    onSetting: (patch) => store.saveGlobalSettings(deepMerge(store.globalSettings(), patch)),
+    onSetting: (patch) => saveRuntimeSetting(id, patch),
   });
+}
+
+/// A change made from the in-game menu is kept where that setting already lives: in the title's
+/// patch when this title overrides it, else in the global record. Saved globally regardless, a
+/// title override would win again at the next launch and the change would silently not stick.
+function saveRuntimeSetting(id, patch) {
+  const mine = store.titleSettings(id);
+  const toTitle = {};
+  const toGlobal = {};
+  const split = (p, t, title, global) => {
+    for (const [k, v] of Object.entries(p)) {
+      if (!t || !(k in t)) global[k] = v;
+      else if (v && typeof v === "object" && !Array.isArray(v) && t[k] && typeof t[k] === "object") {
+        title[k] = {};
+        global[k] = {};
+        split(v, t[k], title[k], global[k]);
+      } else title[k] = v;
+    }
+  };
+  split(patch, mine, toTitle, toGlobal);
+  const prune = (o) => {
+    for (const [k, v] of Object.entries(o)) if (v && typeof v === "object" && !Array.isArray(v) && !Object.keys(prune(v)).length) delete o[k];
+    return o;
+  };
+  if (Object.keys(prune(toTitle)).length) store.saveTitleSettings(id, deepMerge(mine, toTitle));
+  if (Object.keys(prune(toGlobal)).length) store.saveGlobalSettings(deepMerge(store.globalSettings(), toGlobal));
 }
 
 async function renderPlay(id) {
@@ -521,6 +547,7 @@ async function renderSettings(id) {
         <label class="row"><span>Opacity over the game</span><input type="range" name="pad.opacity" min="0.1" max="1" step="0.05" value="${eff.pad.opacity}" /></label>
         <label class="row"><span>Size</span><input type="range" name="pad.scale" min="0.6" max="1.6" step="0.05" value="${eff.pad.scale}" /></label>
         <label class="row"><input type="checkbox" name="pad.vibrate" ${eff.pad.vibrate ? "checked" : ""} /><span>Vibrate on press</span></label>
+        <label class="row"><input type="checkbox" name="rearTouch" ${eff.rearTouch ? "checked" : ""} /><span>Rear touch panel<small>For the few games that use the back of the console. With a mouse, drag with the RIGHT button; on a touch screen, a REAR button joins Start and Select, and while it is lit your touches on the game go to the rear panel.</small></span></label>
         <label class="row"><span>Stick dead zone</span><input type="range" name="stickDeadzone" min="0" max="0.5" step="0.01" value="${eff.stickDeadzone}" /></label>
       </section>
       <section class="card" id="controls"><h2>Controls</h2>
@@ -532,7 +559,6 @@ async function renderSettings(id) {
       </section>
       <details class="card"><summary><h2>Advanced</h2></summary>
         <label class="col"><span>Knobs<small>One VITASLOP_NAME=value per line. The browser has no environment; this is the only way to reach one.</small></span><textarea name="knobs" rows="4" spellcheck="false">${esc(knobsText)}</textarea></label>
-        <label class="col"><span>Recipe<small>A scripted-input recipe, replayed from the first frame; live input still works.</small></span><textarea name="recipe" rows="3" spellcheck="false">${esc(eff.recipe)}</textarea></label>
         <label class="row"><span>Fast-forward to frame<small>Runs unpaced and unpresented to here first.</small></span><input type="number" name="fastForward" min="0" step="100" value="${eff.fastForward}" /></label>
         <label class="row"><input type="checkbox" name="debugCapture" ${eff.debugCapture ? "checked" : ""} /><span>Capture debug timings<small>Times every host call for the diagnostics; roughly doubles the frame cost.</small></span></label>
         <label class="row"><input type="checkbox" name="consoleNotes" ${eff.consoleNotes ? "checked" : ""} /><span>Mirror run notes to the console</span></label>
@@ -566,9 +592,9 @@ async function renderSettings(id) {
       keyboard: { ...kb },
       gamepad: { ...gp },
       stickDeadzone: Number(fd.get("stickDeadzone")),
+      rearTouch: form.rearTouch.checked,
       profile: fd.get("profile"),
       knobs: knobsFromText(fd.get("knobs")),
-      recipe: fd.get("recipe"),
       fastForward: Number(fd.get("fastForward")) || 0,
       debugCapture: form.debugCapture.checked,
       consoleNotes: form.consoleNotes.checked,

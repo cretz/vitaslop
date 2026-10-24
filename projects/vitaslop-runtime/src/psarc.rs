@@ -98,15 +98,21 @@ impl Psarc {
     ) -> Result<Psarc, String> {
         let head = read(0, HEADER_LEN).unwrap_or_default();
         if head.len() < HEADER_LEN {
-            return Err(format!("{key}: {} bytes, too short for a PSARC header", head.len()));
+            return Err(format!(
+                "{key}: {} bytes, too short for a PSARC header",
+                head.len()
+            ));
         }
-        let be32 = |at: usize| u32::from_be_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
+        let be32 =
+            |at: usize| u32::from_be_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
         if &head[0..4] != b"PSAR" {
             return Err(format!("{key}: no PSAR magic"));
         }
         let comp = String::from_utf8_lossy(&head[8..12]).to_string();
         if comp != "zlib" {
-            return Err(format!("{key}: {comp} compression is not implemented (only zlib)"));
+            return Err(format!(
+                "{key}: {comp} compression is not implemented (only zlib)"
+            ));
         }
         let toc_len = be32(12) as usize;
         let entry_size = be32(16) as usize;
@@ -120,7 +126,10 @@ impl Psarc {
         }
         let toc = read(HEADER_LEN, toc_len - HEADER_LEN).unwrap_or_default();
         if toc.len() != toc_len - HEADER_LEN {
-            return Err(format!("{key}: read {} of its {toc_len}-byte TOC", toc.len() + HEADER_LEN));
+            return Err(format!(
+                "{key}: read {} of its {toc_len}-byte TOC",
+                toc.len() + HEADER_LEN
+            ));
         }
         // A size or offset is 40 bits: one byte then a big-endian u32.
         let u40 = |b: &[u8], at: usize| -> u64 {
@@ -129,7 +138,9 @@ impl Psarc {
         };
         let table_at = entry_count * entry_size;
         if table_at > toc.len() {
-            return Err(format!("{key}: {entry_count} TOC entries do not fit in {toc_len} bytes"));
+            return Err(format!(
+                "{key}: {entry_count} TOC entries do not fit in {toc_len} bytes"
+            ));
         }
         let mut raw = Vec::with_capacity(entry_count);
         for i in 0..entry_count {
@@ -180,7 +191,12 @@ impl Psarc {
         // Entry 0 is the manifest and is read through the very machinery it is about to
         // name: it is an ordinary entry whose blocks are already indexed.
         let (fb, size, offset) = raw[0];
-        psarc.entries.push(Entry { name: String::new(), first_block: fb, size, offset });
+        psarc.entries.push(Entry {
+            name: String::new(),
+            first_block: fb,
+            size,
+            offset,
+        });
         let mut manifest = vec![0u8; size as usize];
         let got = psarc.read_entry(0, 0, &mut manifest, read);
         if got != manifest.len() {
@@ -221,7 +237,9 @@ impl Psarc {
         buf: &mut [u8],
         read: &dyn Fn(usize, usize) -> Option<Vec<u8>>,
     ) -> usize {
-        let Some(entry) = self.entries.get(idx) else { return 0 };
+        let Some(entry) = self.entries.get(idx) else {
+            return 0;
+        };
         let bs = self.block_size as usize;
         let mut done = 0usize;
         while done < buf.len() {
@@ -232,7 +250,9 @@ impl Psarc {
             let nth = at / bs;
             let within = at % bs;
             let block = entry.first_block as usize + nth;
-            let Some(bytes) = self.block(block, entry, nth, read) else { break };
+            let Some(bytes) = self.block(block, entry, nth, read) else {
+                break;
+            };
             if within >= bytes.len() {
                 break;
             }
@@ -301,11 +321,16 @@ mod tests {
     /// rather than against itself. Two files, one of them longer than a block, and a
     /// deliberately incompressible one so the STORED-block path is exercised too.
     fn synthesise(block_size: u32, files: &[(&str, Vec<u8>)]) -> Vec<u8> {
-        let manifest: Vec<u8> =
-            files.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("\n").into_bytes();
+        let manifest: Vec<u8> = files
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
         // Entry 0 is the manifest; the rest follow in order.
-        let payloads: Vec<&[u8]> =
-            std::iter::once(manifest.as_slice()).chain(files.iter().map(|(_, b)| b.as_slice())).collect();
+        let payloads: Vec<&[u8]> = std::iter::once(manifest.as_slice())
+            .chain(files.iter().map(|(_, b)| b.as_slice()))
+            .collect();
 
         let mut blocks: Vec<u32> = Vec::new();
         let mut data: Vec<u8> = Vec::new();
@@ -320,7 +345,11 @@ mod tests {
                     blocks.push(packed.len() as u32);
                     data.extend_from_slice(&packed);
                 } else {
-                    blocks.push(if chunk.len() == block_size as usize { 0 } else { chunk.len() as u32 });
+                    blocks.push(if chunk.len() == block_size as usize {
+                        0
+                    } else {
+                        chunk.len() as u32
+                    });
                     data.extend_from_slice(chunk);
                 }
             }
@@ -352,7 +381,10 @@ mod tests {
         }
         // Entry offsets were recorded relative to the start of the data area.
         let base = out.len() as u64;
-        let fixed_toc = toc.iter().map(|(f, s, o)| (*f, *s, o + base)).collect::<Vec<_>>();
+        let fixed_toc = toc
+            .iter()
+            .map(|(f, s, o)| (*f, *s, o + base))
+            .collect::<Vec<_>>();
         let mut at = 32;
         for (first, size, offset) in &fixed_toc {
             out[at + 16..at + 20].copy_from_slice(&first.to_be_bytes());
@@ -474,7 +506,12 @@ mod tests {
             "{want}: {} bytes, first {got}: {:02x?}\n  as ascii: {}",
             arc.entries[idx].size,
             &head[..got],
-            String::from_utf8_lossy(&head[..got].iter().map(|b| if b.is_ascii_graphic() { *b } else { b'.' }).collect::<Vec<_>>())
+            String::from_utf8_lossy(
+                &head[..got]
+                    .iter()
+                    .map(|b| if b.is_ascii_graphic() { *b } else { b'.' })
+                    .collect::<Vec<_>>()
+            )
         );
     }
 }

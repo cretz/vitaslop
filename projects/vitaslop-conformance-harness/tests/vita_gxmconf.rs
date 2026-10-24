@@ -47,7 +47,7 @@ const HALF_W: u32 = W / 2;
 
 /// The scenes the app emits, in order, with what each exists to check. Kept beside the
 /// assertions because a scene index on its own says nothing about what failed.
-const SCENES: [&str; 19] = [
+const SCENES: [&str; 21] = [
     "baseline: one quad over the whole viewport",
     "region clip: the same quad clipped to the left half",
     "above the viewport: a quad entirely past y = +1",
@@ -67,6 +67,8 @@ const SCENES: [&str; 19] = [
     "quadrants: red / green / blue / yellow into a 64x64 target",
     "sub-rectangle: a 32x32 strided texture naming the bottom-right quadrant, sampled at uv 0.25: yellow",
     "default uniform buffers set under ANOTHER program: left green (vertex stage), right blue (fragment stage)",
+    "deferred command list: its recorded green left half executed into the scene, then an immediate blue right half",
+    "viewport reset: no viewport set after scene 19 left a half-width one - the full quad paints every pixel",
 ];
 
 /// Is this pixel something other than the clear colour?
@@ -180,6 +182,13 @@ fn render_all() -> (Vec<Framebuffer>, Option<Vec<Framebuffer>>) {
     let env = env.borrow();
     let cap = &env.state.capture;
     assert!(cap.unimplemented.is_empty(), "unimplemented NIDs: {:?}", cap.unimplemented);
+    // Scene 19's setup also checks that a draw on a deferred context OUTSIDE a command list is
+    // refused (SCE_GXM_ERROR_NOT_WITHIN_COMMAND_LIST) rather than drawn into some scene.
+    assert_eq!(
+        String::from_utf8_lossy(&cap.stdout),
+        "deferred draw outside a list: 805b002d\n",
+        "the app's own report of the refused deferred draw"
+    );
     assert_eq!(
         cap.scenes.len(),
         SCENES.len(),
@@ -386,6 +395,34 @@ fn the_depth_test_lets_the_nearer_draw_win() {
          would leave the far quad's red here, got {right:?}",
         SCENES[3]
     );
+}
+
+/// **SCENE 19 - A DEFERRED COMMAND LIST IS SPLICED INTO THE SCENE THAT EXECUTES IT.**
+///
+/// The list is recorded on a deferred context before the scene begins, with its own stream (a
+/// green left half). The scene binds the blue right half on the immediate context, executes the
+/// list, then draws. Left green: the list's draw landed here, with the state it was recorded
+/// with. Right blue: executing it did not leave its stream bound on the immediate context.
+#[test]
+fn a_deferred_command_list_draws_into_the_executing_scene() {
+    let (sw, _) = run_and_render();
+    let fb = &sw[19];
+    let left = fb.pixel(HALF_W / 2, H / 2);
+    let right = fb.pixel(HALF_W + HALF_W / 2, H / 2);
+    assert!(left[1] > 200 && left[0] < 50 && left[2] < 50, "{}: the left half should be the list's green, got {left:?}", SCENES[19]);
+    assert!(right[2] > 200 && right[0] < 50 && right[1] < 50, "{}: the right half should be the immediate blue, got {right:?}", SCENES[19]);
+}
+
+/// **SCENE 20 - `sceGxmBeginScene` RESETS THE VIEWPORT TO THE WHOLE TARGET.**
+///
+/// Scene 19 ends with a left-half viewport set; this scene sets none and draws the full quad.
+/// Inheriting the old viewport paints only the left half.
+#[test]
+fn begin_scene_resets_the_viewport_to_the_whole_target() {
+    let (sw, _) = run_and_render();
+    let fb = &sw[20];
+    let covered = painted_in_columns(fb, 0, W);
+    assert_eq!(covered, (W * H) as usize, "{}: {} pixels unpainted - {}", SCENES[20], (W * H) as usize - covered, shape(fb));
 }
 
 /// **SCENE 4 - A BLEND COMBINES THE SOURCE WITH WHAT IS ALREADY THERE.**

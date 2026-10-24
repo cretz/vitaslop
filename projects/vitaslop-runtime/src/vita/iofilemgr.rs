@@ -11,9 +11,9 @@
 //! macro's 32-bit value model (the offset lands in the r2:r3 even-aligned pair,
 //! the return in r0:r1).
 
+use crate::SvcOutcome;
 use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
-use crate::SvcOutcome;
 
 /// Bound on a path string read from guest memory.
 const MAX_PATH: usize = 1024;
@@ -40,7 +40,7 @@ const MAX_PATH: usize = 1024;
 /// console's loading times.
 ///
 /// So the figure is chosen as the FASTEST rate that still preserves ordering, and that
-/// boundary is measured rather than guessed. Sweeping a retail racer's gameplay recipe
+/// boundary is measured rather than guessed. Sweeping a retail racer's scripted gameplay run
 /// (2500 frames, the title whose race-load crash this model was built for):
 ///
 /// | `VITASLOP_IO_BANDWIDTH_KIBPS` | determinism signature |
@@ -95,7 +95,10 @@ const DEFAULT_REQUEST_US: u64 = 200;
 /// Identical on the desktop - `knobs::var` falls through to `std::env::var` - and identical
 /// with no knob set, which is every product run.
 fn env_u64(name: &str, default: u64) -> u64 {
-    crate::knobs::var(name).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(default)
+    crate::knobs::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// The modelled time a read of `bytes` bytes takes, in microseconds, or `None` when the
@@ -157,7 +160,9 @@ pub(super) fn charge_read(st: &mut VitaState, bytes: usize) -> SvcOutcome {
 /// there turned a few-instruction guest race into a reliable `memory access out of bounds` -
 /// see `vita::video::mp4_get_next_unit_data`.
 pub(super) fn accrue_read(st: &mut VitaState, bytes: usize) {
-    let Some(us) = read_latency_us(bytes) else { return };
+    let Some(us) = read_latency_us(bytes) else {
+        return;
+    };
     if !st.is_preemptive() {
         // Cooperative hosts cannot park a thread at all; keep instant reads there.
         return;
@@ -172,8 +177,8 @@ pub(super) fn park_for_debt(st: &mut VitaState) -> SvcOutcome {
     }
     use std::sync::OnceLock;
     static THRESHOLD: OnceLock<u64> = OnceLock::new();
-    let threshold =
-        *THRESHOLD.get_or_init(|| env_u64("VITASLOP_IO_PARK_THRESHOLD_US", DEFAULT_PARK_THRESHOLD_US));
+    let threshold = *THRESHOLD
+        .get_or_init(|| env_u64("VITASLOP_IO_PARK_THRESHOLD_US", DEFAULT_PARK_THRESHOLD_US));
     let debt = st.io_debt_us();
     if debt < threshold {
         return SvcOutcome::Continue;
@@ -212,7 +217,13 @@ fn write_file_stat(ctx: &mut GuestCtx, stat_addr: u32, size: u64) {
 
 /// SceUID sceIoOpen(const char *file, int flags, SceMode mode)
 #[hostcall]
-pub(super) fn io_open(ctx: &mut GuestCtx, st: &mut VitaState, file: Ptr, flags: u32, _mode: u32) -> i32 {
+pub(super) fn io_open(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    file: Ptr,
+    flags: u32,
+    _mode: u32,
+) -> i32 {
     let path = read_cstr(ctx, file.addr());
     tracing::trace!(target: "vitaslop::io", path, flags = format_args!("{flags:#x}"), lr = format_args!("{:#x}", ctx.regs[14]), "open_from");
     let fd = st.io_open(&path, flags);
@@ -245,7 +256,11 @@ fn report_open_failed(path: &str, flags: u32, err: i32, lr: u32) {
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_string()) {
+    if !seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_string())
+    {
         return;
     }
     // >>> THE RATIONALE ONCE, THEN ONE SHORT LINE PER PATH. Written the other way round first,
@@ -313,7 +328,13 @@ pub(super) fn io_read(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
 /// int sceIoWrite(SceUID fd, const void *buf, SceSize size)
 /// fd 1/2 go to the captured console; other descriptors to the vfs.
 #[hostcall]
-pub(super) fn io_write(ctx: &mut GuestCtx, st: &mut VitaState, fd: i32, buf: Ptr, size: u32) -> i32 {
+pub(super) fn io_write(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    fd: i32,
+    buf: Ptr,
+    size: u32,
+) -> i32 {
     let bytes = ctx.read_bytes(buf.addr(), size as usize);
     match st.io_write(fd, &bytes) {
         Some(n) => n as i32,
@@ -394,7 +415,9 @@ pub(super) fn io_close(st: &mut VitaState, fd: i32) -> i32 {
 /// stat already written at `stat_addr`. Read-after-write on file status is the whole
 /// point of chstat, so what was set has to come back out here.
 fn apply_stat_override(ctx: &mut GuestCtx, st: &VitaState, path: &str, stat_addr: u32) {
-    let Some(over) = st.io_stat_override(path) else { return };
+    let Some(over) = st.io_stat_override(path) else {
+        return;
+    };
     let (mode, attr, times) = (over.mode, over.attr, over.times);
     if let Some(mode) = mode {
         ctx.write_u32(stat_addr, mode);
@@ -436,7 +459,8 @@ pub(super) fn io_getstat(ctx: &mut GuestCtx, st: &mut VitaState, file: Ptr, stat
             // Named once per path, as a failed `sceIoOpen` is: a title that stats a file it
             // cannot find often waits on the loader that was meant to produce it, and the
             // PATH is the whole diagnosis.
-            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+                std::sync::Mutex::new(None);
             let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
             if g.get_or_insert_with(Default::default).insert(path.clone()) {
                 tracing::warn!(target: "vitaslop::warning", path = %path, lr = format_args!("{:#010x}", ctx.regs[14]), "sceIoGetstat: no such file or directory");
@@ -530,7 +554,11 @@ pub(super) fn write_dir_stat(ctx: &mut GuestCtx, addr: u32) {
 
 /// Read the `bits`-selected fields of a guest `SceIoStat` at `addr` into the override
 /// record the filesystem stores. Shared with `SceFios2Kernel`'s DH chstat.
-pub(super) fn read_stat_override(ctx: &GuestCtx, addr: u32, bits: i32) -> crate::host::FileStatOverride {
+pub(super) fn read_stat_override(
+    ctx: &GuestCtx,
+    addr: u32,
+    bits: i32,
+) -> crate::host::FileStatOverride {
     let mut over = crate::host::FileStatOverride::default();
     if bits & SCE_CST_MODE != 0 {
         over.mode = Some(ctx.read_u32(addr));
@@ -610,7 +638,13 @@ const SCE_CST_ATTR: i32 = 0x0002;
 /// is recorded independently and read back by `sceIoGetstat`. A chstat whose effect is
 /// invisible is worse than an error: the title believes the change took.
 #[hostcall]
-pub(super) fn io_chstat(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, stat: Ptr, bits: i32) -> i32 {
+pub(super) fn io_chstat(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    name: Ptr,
+    stat: Ptr,
+    bits: i32,
+) -> i32 {
     let path = read_cstr(ctx, name.addr());
     if stat.addr() == 0 {
         ENOENT
@@ -623,7 +657,13 @@ pub(super) fn io_chstat(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, stat:
 /// int sceIoChstatByFd(SceUID fd, const SceIoStat *stat, unsigned int bits)
 /// `sceIoChstat` addressed by an open descriptor.
 #[hostcall]
-pub(super) fn io_chstat_by_fd(ctx: &mut GuestCtx, st: &mut VitaState, fd: i32, stat: Ptr, bits: i32) -> i32 {
+pub(super) fn io_chstat_by_fd(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    fd: i32,
+    stat: Ptr,
+    bits: i32,
+) -> i32 {
     if stat.addr() == 0 {
         EBADF
     } else {

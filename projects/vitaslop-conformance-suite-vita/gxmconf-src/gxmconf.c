@@ -66,6 +66,15 @@
  *                              the vertex buffer, right half blue from the
  *                              fragment one. The value sits past the end of the
  *                              block the earlier program declares.
+ *   scene 19 DEFERRED LIST     a command list recorded on a deferred context
+ *                              (green left half), executed in an immediate
+ *                              scene that then draws its own blue right half.
+ *                              A draw on the deferred context outside a list
+ *                              is refused (printed at exit).
+ *   scene 20 VIEWPORT RESET    scene 19 ends with a left-half viewport set;
+ *                              this scene sets none and draws the full quad.
+ *                              sceGxmBeginScene resets the viewport to the
+ *                              whole target, so every pixel is painted.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS APP EXISTS, GIVEN THE SHADER CONFORMANCE SUITE ALREADY DOES
@@ -109,6 +118,7 @@
 #include <psp2/types.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/clib.h>
 #include <psp2/gxm.h>
 
 #define SURFACE_WIDTH  128
@@ -128,6 +138,12 @@
 #define ALIGN(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 
 static void rt_memset(void *dst, int v, unsigned int n);
+
+/* Scene 19's deferred context lives here (its hostMem), 8-byte aligned. */
+__attribute__((aligned(8)))
+static unsigned char deferred_host_mem[4096];
+/* What a draw on the deferred context OUTSIDE a command list answered (printed at exit). */
+static int deferred_refused;
 
 /* ---- placeholder shaders (magic only, USSE payload intentionally empty) ---- */
 __attribute__((aligned(64)))
@@ -229,7 +245,7 @@ static void *fragment_usse_alloc(unsigned int size, SceUID *uid, unsigned int *u
  * not reuse a buffer inside a frame" is the real rule is a separate question, and a
  * conformance app is the wrong place to be asking it - so there is nothing to alias: eleven
  * draws, fifty-two vertices (thirteen quads), all written before the first BeginScene. */
-#define QUADS        35
+#define QUADS        37
 #define MAX_VERTICES (QUADS * 4)
 /* First vertex of quad `q`, for `sceGxmSetVertexStream`. */
 #define QUAD_AT(q) ((q) * 4)
@@ -658,6 +674,9 @@ int main(void) {
 	/* 33..34: scene 18's halves, RED in the attribute - which neither program reads. */
 	fill_quad(&vertices[QUAD_AT(33)], -1.0f, -1.0f, 0.0f, 1.0f, 0.5f, RED);   /* 33: vertex uniform, left    */
 	fill_quad(&vertices[QUAD_AT(34)],  0.0f, -1.0f, 1.0f, 1.0f, 0.5f, RED);   /* 34: fragment uniform, right */
+	/* 35..36: scene 19's halves - the command list's (left) and the immediate draw's (right). */
+	fill_quad(&vertices[QUAD_AT(35)], -1.0f, -1.0f, 0.0f, 1.0f, 0.5f, GREEN); /* 35: recorded, left   */
+	fill_quad(&vertices[QUAD_AT(36)],  0.0f, -1.0f, 1.0f, 1.0f, 0.5f, BLUE);  /* 36: immediate, right */
 
 	/* ================================================================== *
 	 *  scene 0 - BASELINE: one quad over the whole viewport.
@@ -1109,6 +1128,69 @@ int main(void) {
 		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
 	sceGxmEndScene(context, NULL, NULL);
 
+	/* ================================================================== *
+	 *  scene 19 - A DEFERRED COMMAND LIST spliced into an immediate scene.
+	 *
+	 *  The list is recorded on a deferred context BEFORE the scene exists:
+	 *  its own programs, its own stream (the green LEFT half). The scene
+	 *  then binds the immediate context's stream for the blue RIGHT half,
+	 *  executes the list, and draws. The left half proves the list's draw
+	 *  landed in this scene with the state it was recorded with; the right
+	 *  half proves executing it did not leak that state into the immediate
+	 *  context (the draw after Execute still uses the right-half stream).
+	 *  A drawing on a deferred context outside a list is refused.
+	 * ================================================================== */
+	SceGxmDeferredContextParams dparams;
+	rt_memset(&dparams, 0, sizeof(dparams));
+	dparams.hostMem = deferred_host_mem;
+	dparams.hostMemSize = sizeof(deferred_host_mem);
+	SceGxmContext *deferred = NULL;
+	sceGxmCreateDeferredContext(&dparams, &deferred);
+	SceGxmCommandList list;
+	sceGxmSetVertexProgram(deferred, vertex_program);
+	sceGxmSetFragmentProgram(deferred, fragment_program);
+	sceGxmSetVertexStream(deferred, 0, &vertices[QUAD_AT(35)]);
+	deferred_refused = sceGxmDraw(deferred, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmBeginCommandList(deferred);
+	sceGxmDraw(deferred, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmEndCommandList(deferred, &list);
+
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &color_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, vertex_program);
+	sceGxmSetFragmentProgram(context, fragment_program);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(36)]);
+	sceGxmExecuteCommandList(context, &list);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	/* Left in force for scene 20, which must not inherit it. */
+	sceGxmSetViewport(context,
+		(float)HALF_W / 2.0f, (float)HALF_W / 2.0f,
+		(float)SURFACE_HEIGHT / 2.0f, -(float)SURFACE_HEIGHT / 2.0f,
+		0.5f, 0.5f);
+	sceGxmEndScene(context, NULL, NULL);
+	sceGxmDestroyDeferredContext(deferred);
+
+	/* ================================================================== *
+	 *  scene 20 - sceGxmBeginScene RESETS THE VIEWPORT to the whole target.
+	 *
+	 *  Scene 19 left a LEFT-HALF viewport set. This scene sets none and
+	 *  draws the full-screen quad, which must paint every pixel. A title
+	 *  that renders a shadow atlas through quadrant viewports and then its
+	 *  world and display composite without setting one depends on exactly
+	 *  this: inheriting the quadrant put its whole frame in a corner.
+	 * ================================================================== */
+	sceGxmBeginScene(context, 0, render_target, NULL, NULL,
+		sync, &color_surface, &depth_surface);
+	sceGxmSetVertexProgram(context, vertex_program);
+	sceGxmSetFragmentProgram(context, fragment_program);
+	sceGxmSetVertexStream(context, 0, &vertices[QUAD_AT(0)]);
+	sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
+		SCE_GXM_INDEX_FORMAT_U16, indices, 6);
+	sceGxmEndScene(context, NULL, NULL);
+
 	sceGxmFinish(context);
 
 	/* --- teardown --- */
@@ -1140,6 +1222,7 @@ int main(void) {
 	sceGxmDestroyRenderTarget(render_target);
 	sceGxmTerminate();
 
+	sceClibPrintf("deferred draw outside a list: %x\n", deferred_refused);
 	sceKernelExitProcess(0);
 	return 0;
 }

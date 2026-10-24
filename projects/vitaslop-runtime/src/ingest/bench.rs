@@ -20,7 +20,7 @@
 
 use super::keys;
 use super::pfs::FileCtx;
-use super::pfscrypt::{hmac_sha1, GameData};
+use super::pfscrypt::{GameData, hmac_sha1};
 use aes::cipher::{KeyIvInit, StreamCipher};
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
@@ -125,5 +125,10 @@ pub fn crypto_rates(budget_ms: f64, now: &dyn Fn() -> f64) -> Rates {
         n
     });
 
-    Rates { pkg_ctr, pfs_hmac, pfs_cbc, chain }
+    Rates {
+        pkg_ctr,
+        pfs_hmac,
+        pfs_cbc,
+        chain,
+    }
 }

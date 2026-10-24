@@ -29,7 +29,6 @@
 //! The demuxer therefore rewrites each sample into Annex B and puts the parameter sets in
 //! front of every sync sample - which is also what makes the stream joinable at a seek.
 
-
 /// One movie being demuxed: the container, and where playback is in it.
 pub struct MovieSession {
     /// The guest path this was opened from, for diagnostics.
@@ -99,6 +98,12 @@ pub struct MovieSession {
     /// run says nothing at all. See `report_unit_gate_stall`.
     pub gate_refusals: u64,
     pub reported_gate_stall: bool,
+    /// The unit a sync-unit call described, as `(track, sample)`: the next
+    /// `sceMp4GetNextUnitData` hands over exactly this one, whatever [`next_unit_track`]'s
+    /// decode-order rule would pick. Cleared when it is taken.
+    pub pinned: Option<(usize, usize)>,
+    /// The bandwidth hint `sceMp4SetAvailableBW` last gave, for `sceMp4GetAvailableBW`.
+    pub available_bw: u32,
 }
 
 /// Where a movie's bytes come from.
@@ -113,7 +118,11 @@ pub enum MovieSource {
     /// opening it as a file fails. The library calls them on the caller's thread, mid-call
     /// ([`crate::SvcOutcome::CallGuest`]), into an I/O buffer from the title's own allocator
     /// (the third argument) when it gave one.
-    Guest { ops: FileOps, mem: Option<MemOps>, buf: u32 },
+    Guest {
+        ops: FileOps,
+        mem: Option<MemOps>,
+        buf: u32,
+    },
 }
 
 /// `sceMp4OpenFile`'s file-operations block: `{ userdata, open, close, read }`. RECOVERED
@@ -181,7 +190,11 @@ fn read_mem_ops(ctx: &crate::host::GuestCtx, addr: u32) -> Option<MemOps> {
     if addr == 0 {
         return None;
     }
-    let ops = MemOps { userdata: ctx.read_u32(addr), alloc: ctx.read_u32(addr + 4), free: ctx.read_u32(addr + 8) };
+    let ops = MemOps {
+        userdata: ctx.read_u32(addr),
+        alloc: ctx.read_u32(addr + 4),
+        free: ctx.read_u32(addr + 8),
+    };
     (ops.alloc != 0 && ops.free != 0).then_some(ops)
 }
 
@@ -243,10 +256,16 @@ fn release_source(st: &mut crate::host::VitaState, source: &MovieSource) -> Resu
             Ok(())
         }
         MovieSource::Guest { ops, mem, buf } => {
-            let close = crate::host::GuestCall { entry: ops.close, args: vec![ops.userdata] };
+            let close = crate::host::GuestCall {
+                entry: ops.close,
+                args: vec![ops.userdata],
+            };
             st.call_guest(close, None).ok_or(Pending)?;
             if let Some(m) = mem {
-                let free = crate::host::GuestCall { entry: m.free, args: vec![m.userdata, buf] };
+                let free = crate::host::GuestCall {
+                    entry: m.free,
+                    args: vec![m.userdata, buf],
+                };
                 st.call_guest(free, None).ok_or(Pending)?;
             }
             Ok(())
@@ -284,7 +303,15 @@ pub(super) fn mp4_open_file(
     buffer: crate::host::Ptr,
     buffer_size: u32,
 ) -> i32 {
-    do_open_file(ctx, st, path.addr(), file_ops.addr(), mem_ops.addr(), buffer.addr(), buffer_size)
+    do_open_file(
+        ctx,
+        st,
+        path.addr(),
+        file_ops.addr(),
+        mem_ops.addr(),
+        buffer.addr(),
+        buffer_size,
+    )
 }
 
 /// The body of [`mp4_open_file`], as a plain function so it can use guard clauses.
@@ -313,10 +340,20 @@ fn do_open_file(
     let use_ops = match mode.as_deref().map(str::trim) {
         Some("0") => false,
         Some("1") => true,
-        _ => !st.io_size(&ctx.read_cstr(path_ptr, 256)).is_some_and(|size| size > 0),
+        _ => !st
+            .io_size(&ctx.read_cstr(path_ptr, 256))
+            .is_some_and(|size| size > 0),
     };
-    let ops = if use_ops { read_file_ops(ctx, file_ops) } else { None };
-    let mem = if use_ops { read_mem_ops(ctx, mem_ops) } else { None };
+    let ops = if use_ops {
+        read_file_ops(ctx, file_ops)
+    } else {
+        None
+    };
+    let mem = if use_ops {
+        read_mem_ops(ctx, mem_ops)
+    } else {
+        None
+    };
     // The title's own path when its own functions will open it - a substitute is a path
     // on OUR file system.
     let path = match ops {
@@ -357,7 +394,10 @@ impl From<Pending> for OpenFail {
 }
 
 /// Open the movie as a file of our own, with its size.
-fn open_host_source(st: &mut crate::host::VitaState, path: &str) -> Result<(MovieSource, u64), OpenFail> {
+fn open_host_source(
+    st: &mut crate::host::VitaState,
+    path: &str,
+) -> Result<(MovieSource, u64), OpenFail> {
     // SCE_O_RDONLY is 1, not 0 - the Vita's flags are a value, not a bit position, and
     // opening with 0 yields a descriptor that is neither readable nor writable: the open
     // SUCCEEDS and every read then returns nothing, which is a much more confusing failure
@@ -365,12 +405,16 @@ fn open_host_source(st: &mut crate::host::VitaState, path: &str) -> Result<(Movi
     const SCE_O_RDONLY: u32 = 0x0001;
     let fd = st.io_open(path, SCE_O_RDONLY);
     if fd < 0 {
-        return Err(OpenFail::Refused(format!("{path} cannot be opened ({fd:#x})")));
+        return Err(OpenFail::Refused(format!(
+            "{path} cannot be opened ({fd:#x})"
+        )));
     }
     let size = st.io_size(path).unwrap_or(0);
     if size == 0 {
         st.io_close(fd);
-        return Err(OpenFail::Refused(format!("{path} is empty or its size is unknown")));
+        return Err(OpenFail::Refused(format!(
+            "{path} is empty or its size is unknown"
+        )));
     }
     Ok((MovieSource::Host { fd }, size))
 }
@@ -388,7 +432,10 @@ fn open_guest_source(
 ) -> Result<(MovieSource, u64), OpenFail> {
     let buf = match mem {
         Some(m) => {
-            let alloc = crate::host::GuestCall { entry: m.alloc, args: vec![m.userdata, 64, guest_io_buf()] };
+            let alloc = crate::host::GuestCall {
+                entry: m.alloc,
+                args: vec![m.userdata, 64, guest_io_buf()],
+            };
             let r = st.call_guest(alloc, None).ok_or(Pending)?;
             if r.r0 == 0 {
                 return Err(OpenFail::Refused(format!(
@@ -400,14 +447,23 @@ fn open_guest_source(
         }
         None => st.mp4_io_scratch(guest_io_buf()),
     };
-    let open = crate::host::GuestCall { entry: ops.open, args: vec![ops.userdata, path_ptr] };
+    let open = crate::host::GuestCall {
+        entry: ops.open,
+        args: vec![ops.userdata, path_ptr],
+    };
     let r = st.call_guest(open, None).ok_or(Pending)?;
     if (r.r0 as i32) < 0 {
         if let Some(m) = mem {
-            let free = crate::host::GuestCall { entry: m.free, args: vec![m.userdata, buf] };
+            let free = crate::host::GuestCall {
+                entry: m.free,
+                args: vec![m.userdata, buf],
+            };
             st.call_guest(free, None).ok_or(Pending)?;
         }
-        return Err(OpenFail::Refused(format!("{path}: the title's own open function refused it ({:#x})", r.r0)));
+        return Err(OpenFail::Refused(format!(
+            "{path}: the title's own open function refused it ({:#x})",
+            r.r0
+        )));
     }
     Ok((MovieSource::Guest { ops, mem, buf }, u64::MAX))
 }
@@ -425,7 +481,9 @@ fn open_guest_source(
 /// would have done, and it says so once: a run that quietly played a different movie than
 /// the title asked for would be a confusing thing to inherit.
 fn substitute_movie(asked: String) -> String {
-    let Ok(sub) = crate::knobs::var("VITASLOP_MOVIE_SUBSTITUTE") else { return asked };
+    let Ok(sub) = crate::knobs::var("VITASLOP_MOVIE_SUBSTITUTE") else {
+        return asked;
+    };
     if sub.trim().is_empty() || sub == asked {
         return asked;
     }
@@ -451,7 +509,15 @@ fn open_movie(
     buffer_size: u32,
 ) -> Result<i32, OpenFail> {
     match parse_movie(st, path, &source, size) {
-        Ok((mp4, avcc)) => Ok(start_session(st, path, source, mp4, avcc, buffer, buffer_size)),
+        Ok((mp4, avcc)) => Ok(start_session(
+            st,
+            path,
+            source,
+            mp4,
+            avcc,
+            buffer,
+            buffer_size,
+        )),
         Err(OpenFail::Pending) => Err(OpenFail::Pending),
         Err(OpenFail::Refused(reason)) => {
             release_source(st, &source)?;
@@ -487,7 +553,9 @@ fn parse_movie(
     // rather than an allocation the size of the file.
     const MAX_MOOV: u64 = 8 * 1024 * 1024;
     if moov_len > MAX_MOOV {
-        return Err(refuse(format!("{path}: its moov box is {moov_len} bytes, past the {MAX_MOOV} cap")));
+        return Err(refuse(format!(
+            "{path}: its moov box is {moov_len} bytes, past the {MAX_MOOV} cap"
+        )));
     }
     let moov = source_read(st, source, moov_at, moov_len as usize)?;
     if moov.len() as u64 != moov_len {
@@ -508,7 +576,9 @@ fn parse_movie(
         )));
     }
     if track.codec_config.is_empty() {
-        return Err(refuse(format!("{path}: the video track carries no avcC record")));
+        return Err(refuse(format!(
+            "{path}: the video track carries no avcC record"
+        )));
     }
     let avcc = crate::mp4::AvcC::parse(&track.codec_config)
         .map_err(|e| refuse(format!("{path}: the avcC record cannot be read ({e:?})")))?;
@@ -533,12 +603,18 @@ fn start_session(
     buffer: u32,
     buffer_size: u32,
 ) -> i32 {
-    let Some(track) = mp4.track(crate::mp4::TrackKind::Video) else { unreachable!("checked by parse_movie") };
+    let Some(track) = mp4.track(crate::mp4::TrackKind::Video) else {
+        unreachable!("checked by parse_movie")
+    };
     let (width, height) = (track.width, track.height);
     let samples = track.samples.len();
-    let audio = mp4
-        .track(crate::mp4::TrackKind::Audio)
-        .map(|t| format!("{} ({} samples)", String::from_utf8_lossy(&t.codec), t.samples.len()));
+    let audio = mp4.track(crate::mp4::TrackKind::Audio).map(|t| {
+        format!(
+            "{} ({} samples)",
+            String::from_utf8_lossy(&t.codec),
+            t.samples.len()
+        )
+    });
 
     // A handle, not a status: see the module docs. Any non-zero value will do; a small
     // counter keeps it recognisable in a log.
@@ -551,7 +627,11 @@ fn start_session(
         MovieSource::Guest { ops, mem, .. } => format!(
             "the title's own file functions (read {:#010x}{})",
             ops.read,
-            if mem.is_some() { ", I/O buffer from its allocator" } else { "" }
+            if mem.is_some() {
+                ", I/O buffer from its allocator"
+            } else {
+                ""
+            }
         ),
     };
     tracing::info!(
@@ -580,6 +660,8 @@ fn start_session(
         delivered: 0,
         gate_refusals: 0,
         reported_gate_stall: false,
+        pinned: None,
+        available_bw: 0,
     });
     handle
 }
@@ -796,7 +878,14 @@ pub(super) fn mp4_get_stream_info(
     stream: u32,
     out: crate::host::Ptr,
 ) -> i32 {
-    do_get_next_unit(ctx, st, handle, stream, out.addr(), StreamInfoLayout::Compact)
+    do_get_next_unit(
+        ctx,
+        st,
+        handle,
+        stream,
+        out.addr(),
+        StreamInfoLayout::Compact,
+    )
 }
 
 /// Which build's stream-info struct the caller holds - see [`mp4_get_stream_info`].
@@ -904,11 +993,14 @@ fn do_get_next_unit(
     else {
         return -1;
     };
-    let audio = st.movie.as_ref().and_then(|m| m.mp4.tracks.get(track)).and_then(|t| {
-        (t.kind == crate::mp4::TrackKind::Audio).then(|| {
-            (t.timescale, asc_channels(&t.audio_specific_config()))
-        })
-    });
+    let audio = st
+        .movie
+        .as_ref()
+        .and_then(|m| m.mp4.tracks.get(track))
+        .and_then(|t| {
+            (t.kind == crate::mp4::TrackKind::Audio)
+                .then(|| (t.timescale, asc_channels(&t.audio_specific_config())))
+        });
     if let Some((sample_rate, channels)) = audio {
         let Some(channels) = channels else {
             // A config this cannot read the channel count from would hand the title a decoder
@@ -932,7 +1024,10 @@ fn do_get_next_unit(
         match layout {
             StreamInfoLayout::Wide => {
                 ctx.write_u32(out + stream_info::SAMPLE_RATE, sample_rate);
-                ctx.write_bytes(out + stream_info::CHANNELS, &(channels as u16).to_le_bytes());
+                ctx.write_bytes(
+                    out + stream_info::CHANNELS,
+                    &(channels as u16).to_le_bytes(),
+                );
                 ctx.write_u32(out + stream_info::UNKNOWN_BYTES, 0);
             }
             StreamInfoLayout::Compact => {
@@ -985,7 +1080,11 @@ fn do_get_next_unit(
         }
         Err(_) if st.guest_call_pending() => return 0,
         Err(reason) => {
-            let path = st.movie.as_ref().map(|m| m.path.clone()).unwrap_or_default();
+            let path = st
+                .movie
+                .as_ref()
+                .map(|m| m.path.clone())
+                .unwrap_or_default();
             report_no_video(st, &path, &reason);
             return -1;
         }
@@ -1177,14 +1276,19 @@ pub fn movie_audio_report() -> Option<String> {
     let unit_frames = UNIT_FRAMES.load(Relaxed) as u64;
     let decoded = FRAMES_DECODED.load(Relaxed);
     let expected = submitted * unit_frames;
-    let (lo, hi) = (OUTPUT_FRAMES_MIN.load(Relaxed), OUTPUT_FRAMES_MAX.load(Relaxed));
+    let (lo, hi) = (
+        OUTPUT_FRAMES_MIN.load(Relaxed),
+        OUTPUT_FRAMES_MAX.load(Relaxed),
+    );
     let outputs = OUTPUTS.load(Relaxed);
     let shape = if outputs == 0 {
         "no output yet".to_string()
     } else if lo == hi {
         format!("{outputs} outputs of {lo} frames each")
     } else {
-        format!("{outputs} outputs of {lo}..{hi} frames - NOT one per unit, which is why frames are cut by sample count")
+        format!(
+            "{outputs} outputs of {lo}..{hi} frames - NOT one per unit, which is why frames are cut by sample count"
+        )
     };
     Some(format!(
         "movie audio: {submitted} units submitted -> {shape} -> {decoded} PCM frames decoded \
@@ -1244,10 +1348,7 @@ fn audio_backlog() -> usize {
 /// codec this engine does not decode, and a host with no decoder at all - each of which is
 /// reported where it is found, because "the movie is silent" otherwise looks the same from
 /// the outside in all three cases.
-fn open_movie_audio(
-    st: &mut crate::host::VitaState,
-    mp4: &crate::mp4::Mp4,
-) -> Option<MovieAudio> {
+fn open_movie_audio(st: &mut crate::host::VitaState, mp4: &crate::mp4::Mp4) -> Option<MovieAudio> {
     let track = mp4.track(crate::mp4::TrackKind::Audio)?;
     if &track.codec != b"mp4a" {
         tracing::warn!(
@@ -1302,13 +1403,10 @@ fn open_movie_audio(
 /// Submit one delivered audio access unit to the movie's decoder and collect whatever has
 /// come back. Called where the unit is handed to the title, which is what makes the decode
 /// run AHEAD of the title's own decode call.
-fn pump_movie_audio(
-    st: &mut crate::host::VitaState,
-    track: usize,
-    at: usize,
-    unit: &AccessUnit,
-) {
-    let Some(audio) = st.movie.as_mut().and_then(|m| m.audio.as_mut()) else { return };
+fn pump_movie_audio(st: &mut crate::host::VitaState, track: usize, at: usize, unit: &AccessUnit) {
+    let Some(audio) = st.movie.as_mut().and_then(|m| m.audio.as_mut()) else {
+        return;
+    };
     // The title's cursor moved somewhere this queue did not follow - a seek, or a reset that
     // did not come through `sceMp4Reset`. Everything decoded is for the wrong units, so it
     // starts again from here rather than serving them.
@@ -1347,7 +1445,9 @@ fn pump_movie_audio(
                 }
             }
         };
-        let Some(audio) = st.movie.as_mut().and_then(|m| m.audio.as_mut()) else { return };
+        let Some(audio) = st.movie.as_mut().and_then(|m| m.audio.as_mut()) else {
+            return;
+        };
         if let Err(e) = audio.decoder.submit(&bytes, pts) {
             report_audio_decode_failed(&e.to_string());
             return;
@@ -1356,7 +1456,11 @@ fn pump_movie_audio(
         let mut head = [0u8; 16];
         let n = bytes.len().min(16);
         head[..n].copy_from_slice(&bytes[..n]);
-        audio.pending.push_back(PendingUnit { es_size: bytes.len() as u32, id: unit_id(&bytes), head });
+        audio.pending.push_back(PendingUnit {
+            es_size: bytes.len() as u32,
+            id: unit_id(&bytes),
+            head,
+        });
         audio.submitted_to = next + 1;
     }
     collect_decoded_audio(st);
@@ -1366,7 +1470,9 @@ fn pump_movie_audio(
 /// Called at every handover and at every decode call: on a browser the decoder answers on a
 /// task, so what arrived between the two is only visible by asking.
 pub(crate) fn collect_decoded_audio(st: &mut crate::host::VitaState) {
-    let Some(audio) = st.movie.as_mut().and_then(|m| m.audio.as_mut()) else { return };
+    let Some(audio) = st.movie.as_mut().and_then(|m| m.audio.as_mut()) else {
+        return;
+    };
     loop {
         match audio.decoder.poll() {
             Ok(Some(pcm)) => audio.take_output(pcm),
@@ -1428,7 +1534,9 @@ impl MovieAudio {
     /// line and would need its priming accounted for here.
     fn cut_frames(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let Some(unit_frames) = self.unit_frames else { return };
+        let Some(unit_frames) = self.unit_frames else {
+            return;
+        };
         let per_frame = unit_frames as usize * self.channels.max(1) as usize;
         while self.pcm.len() >= per_frame {
             let Some(unit) = self.pending.pop_front() else {
@@ -1439,7 +1547,12 @@ impl MovieAudio {
                 continue;
             };
             let samples: Vec<i16> = self.pcm.drain(..per_frame).collect();
-            self.ready.push_back(DecodedFrame { samples, es_size: unit.es_size, id: unit.id, head: unit.head });
+            self.ready.push_back(DecodedFrame {
+                samples,
+                es_size: unit.es_size,
+                id: unit.id,
+                head: unit.head,
+            });
             audio_counters::FRAMES_CUT.fetch_add(1, Relaxed);
             while self.ready.len() > audio_backlog() {
                 self.ready.pop_front();
@@ -1581,6 +1694,9 @@ struct AccessUnit {
 ///
 /// `None` when every served track is exhausted, which is the end of the movie.
 fn next_unit_track(movie: &MovieSession) -> Option<(usize, usize)> {
+    if movie.pinned.is_some() {
+        return movie.pinned;
+    }
     let mut best: Option<(usize, usize, u64)> = None;
     for &(track, at) in &movie.cursors {
         // >>> ONLY THE STREAMS THE TITLE ENABLED, once it has enabled any.
@@ -1597,7 +1713,9 @@ fn next_unit_track(movie: &MovieSession) -> Option<(usize, usize)> {
             continue;
         }
         let t = movie.mp4.tracks.get(track)?;
-        let Some(sample) = t.samples.get(at) else { continue };
+        let Some(sample) = t.samples.get(at) else {
+            continue;
+        };
         let us = match t.timescale {
             0 => sample.dts,
             scale => sample.dts.saturating_mul(1_000_000) / scale as u64,
@@ -1650,19 +1768,21 @@ fn next_access_unit(st: &mut crate::host::VitaState) -> Result<Option<AccessUnit
     };
     let unit = access_unit_at(st, track, at)?;
     if unit.is_some()
-        && let Some(movie) = st.movie.as_mut() {
-            // The gate opened, so the refusal run ends here - see `movie_unit_wait_us`.
-            movie.gate_refusals = 0;
-            movie.read_cache.remove(&(track, at));
-            if let Some(c) = movie.cursors.iter_mut().find(|(t, _)| *t == track) {
-                c.1 += 1;
-            }
-            // Kept in step for the video track, because everything that reports progress
-            // still counts video samples.
-            if movie.mp4.tracks[track].kind == crate::mp4::TrackKind::Video {
-                movie.next_sample = at + 1;
-            }
+        && let Some(movie) = st.movie.as_mut()
+    {
+        // The gate opened, so the refusal run ends here - see `movie_unit_wait_us`.
+        movie.gate_refusals = 0;
+        movie.read_cache.remove(&(track, at));
+        if let Some(c) = movie.cursors.iter_mut().find(|(t, _)| *t == track) {
+            c.1 = at + 1;
         }
+        movie.pinned = None;
+        // Kept in step for the video track, because everything that reports progress
+        // still counts video samples.
+        if movie.mp4.tracks[track].kind == crate::mp4::TrackKind::Video {
+            movie.next_sample = at + 1;
+        }
+    }
     Ok(unit)
 }
 
@@ -1676,12 +1796,18 @@ const READ_CACHE_MAX: usize = 32;
 /// reads are calls into the title, and they must all be made BEFORE the call changes
 /// anything (see `VitaState::call_guest`); the engine's own file can be read at any point.
 fn prefetch_samples(st: &mut crate::host::VitaState) -> Result<(), Pending> {
-    let Some(movie) = st.movie.as_ref() else { return Ok(()) };
+    let Some(movie) = st.movie.as_ref() else {
+        return Ok(());
+    };
     if matches!(movie.source, MovieSource::Host { .. }) {
         return Ok(());
     }
-    let Some((track, at)) = next_unit_track(movie) else { return Ok(()) };
-    let Some(t) = movie.mp4.tracks.get(track) else { return Ok(()) };
+    let Some((track, at)) = next_unit_track(movie) else {
+        return Ok(());
+    };
+    let Some(t) = movie.mp4.tracks.get(track) else {
+        return Ok(());
+    };
     let ahead = if t.kind == crate::mp4::TrackKind::Audio && movie.audio.is_some() {
         1 + AUDIO_LOOKAHEAD
     } else {
@@ -1702,7 +1828,9 @@ fn prefetch_samples(st: &mut crate::host::VitaState) -> Result<(), Pending> {
 fn cache_sample(movie: &mut MovieSession, key: (usize, usize), raw: Vec<u8>) {
     if movie.read_cache.len() >= READ_CACHE_MAX {
         let cursors = movie.cursors.clone();
-        movie.read_cache.retain(|&(t, i), _| cursors.iter().any(|&(ct, c)| ct == t && i >= c));
+        movie
+            .read_cache
+            .retain(|&(t, i), _| cursors.iter().any(|&(ct, c)| ct == t && i >= c));
         if movie.read_cache.len() >= READ_CACHE_MAX
             && let Some(&last) = movie.read_cache.keys().next_back()
         {
@@ -1741,7 +1869,11 @@ fn access_unit_at(
     let source = movie.source;
     // Only a video sample needs rewriting into a self-describing elementary stream; an AAC
     // sample IS the elementary stream the decoder is given.
-    let sets = if video && sync { movie.avcc.annex_b_parameter_sets() } else { Vec::new() };
+    let sets = if video && sync {
+        movie.avcc.annex_b_parameter_sets()
+    } else {
+        Vec::new()
+    };
     // One read per access unit - tens of kilobytes - which is what the device's own
     // streaming demuxer does. Kept until it is handed over: see `MovieSession::read_cache`.
     let raw = match movie.read_cache.get(&(track, index)) {
@@ -1776,7 +1908,16 @@ fn access_unit_at(
     } else {
         raw
     };
-    Ok(Some(AccessUnit { bytes, width, height, pts, dts, sync, stream, video }))
+    Ok(Some(AccessUnit {
+        bytes,
+        width,
+        height,
+        pts,
+        dts,
+        sync,
+        stream,
+        video,
+    }))
 }
 
 /// Which reading of the unit struct to hand back.
@@ -1918,13 +2059,27 @@ fn do_get_next_unit_info(
         ctx.write_u32(info + unit_info::SIZE, 0);
         return 0;
     }
+    describe_next_unit(ctx, st, info)
+}
+
+/// Fill `info` with the unit [`next_unit_track`] owes next, without consuming it: 0 with the
+/// unit described, a POSITIVE value at the end of the stream, negative on a read failure.
+fn describe_next_unit(
+    ctx: &mut crate::host::GuestCtx,
+    st: &mut crate::host::VitaState,
+    info: u32,
+) -> i32 {
     let unit = match peek_access_unit(st) {
         Ok(Some(unit)) => unit,
         // End of stream - see above: POSITIVE, not zero.
         Ok(None) => return 1,
         Err(_) if st.guest_call_pending() => return 0,
         Err(reason) => {
-            let path = st.movie.as_ref().map(|m| m.path.clone()).unwrap_or_default();
+            let path = st
+                .movie
+                .as_ref()
+                .map(|m| m.path.clone())
+                .unwrap_or_default();
             report_no_video(st, &path, &reason);
             return -1;
         }
@@ -1943,7 +2098,8 @@ fn do_get_next_unit_info(
                 if track.timescale == 0 {
                     t
                 } else {
-                    (u128::from(t) * u128::from(m.mp4.timescale) / u128::from(track.timescale)) as u64
+                    (u128::from(t) * u128::from(m.mp4.timescale) / u128::from(track.timescale))
+                        as u64
                 }
             };
             Some((scale(unit.pts), scale(unit.dts)))
@@ -2107,9 +2263,17 @@ fn movie_unit_wait_us(st: &mut crate::host::VitaState, handle: i32) -> Option<u6
     // its buffering state (flow state 12) with the demux's memory full of video it would not
     // decode while paused - a black screen for good. See `AUDIO_READ_AHEAD_US`.
     let audio_enabled = movie.enabled_streams.iter().any(|&s| {
-        movie.mp4.tracks.get(s as usize).is_some_and(|t| t.kind == crate::mp4::TrackKind::Audio)
+        movie
+            .mp4
+            .tracks
+            .get(s as usize)
+            .is_some_and(|t| t.kind == crate::mp4::TrackKind::Audio)
     });
-    let read_ahead = if audio_enabled { audio_read_ahead_us() } else { read_ahead_us() };
+    let read_ahead = if audio_enabled {
+        audio_read_ahead_us()
+    } else {
+        read_ahead_us()
+    };
     let (track_index, at) = next_unit_track(movie)?;
     let track = movie.mp4.tracks.get(track_index)?;
     if track.timescale == 0 {
@@ -2117,7 +2281,9 @@ fn movie_unit_wait_us(st: &mut crate::host::VitaState, handle: i32) -> Option<u6
     }
     let pts = track.samples.get(at)?.pts;
     let pts_us = pts.saturating_mul(1_000_000) / track.timescale as u64;
-    let origin = *movie.timeline_origin_us.get_or_insert(now.saturating_sub(pts_us));
+    let origin = *movie
+        .timeline_origin_us
+        .get_or_insert(now.saturating_sub(pts_us));
     let due = origin.saturating_add(pts_us).saturating_sub(read_ahead);
     if due <= now {
         return None;
@@ -2217,7 +2383,11 @@ fn do_get_next_unit_data(
         Ok(None) => return 0,
         Err(_) if st.guest_call_pending() => return 0,
         Err(reason) => {
-            let path = st.movie.as_ref().map(|m| m.path.clone()).unwrap_or_default();
+            let path = st
+                .movie
+                .as_ref()
+                .map(|m| m.path.clone())
+                .unwrap_or_default();
             report_no_video(st, &path, &reason);
             return -1;
         }
@@ -2226,9 +2396,10 @@ fn do_get_next_unit_data(
     // An AUDIO unit is decoded AHEAD of being handed over, so its PCM is waiting when the
     // title's own decode call comes - see [`MovieAudio`] and [`AUDIO_LOOKAHEAD`].
     if !unit.video
-        && let Some((track, at)) = taking {
-            pump_movie_audio(st, track, at, &unit);
-        }
+        && let Some((track, at)) = taking
+    {
+        pump_movie_audio(st, track, at, &unit);
+    }
     if let Some(movie) = st.movie.as_mut() {
         movie.delivered += 1;
         if movie.delivered <= 4 || movie.delivered % 200 == 0 {
@@ -2266,6 +2437,7 @@ fn do_reset(st: &mut crate::host::VitaState, handle: i32) -> i32 {
         return SCE_ERROR_ERRNO_ENOENT;
     }
     movie.next_sample = 0;
+    movie.pinned = None;
     for c in movie.cursors.iter_mut() {
         c.1 = 0;
     }
@@ -2282,6 +2454,313 @@ fn do_reset(st: &mut crate::host::VitaState, handle: i32) -> i32 {
     }
     tracing::debug!(target: "vitaslop::movie", "sceMp4Reset: back to the first unit");
     0
+}
+
+/// The served video track's `(index into mp4.tracks, cursor)`, if the movie has one.
+fn video_cursor(movie: &MovieSession) -> Option<(usize, usize)> {
+    movie.cursors.iter().copied().find(|&(t, _)| {
+        movie
+            .mp4
+            .tracks
+            .get(t)
+            .is_some_and(|t| t.kind == crate::mp4::TrackKind::Video)
+    })
+}
+
+/// Which sync-sample direction a trick-play fetch moves in.
+#[derive(Clone, Copy)]
+pub(super) enum SyncStep {
+    /// The first sync sample at or after the video cursor.
+    Next,
+    /// The last sync sample strictly before the unit most recently handed over.
+    Prev,
+}
+
+/// int sceMp4GetNextSyncUnit(handle, unitInfo) / int sceMp4GetPrevSyncUnit(handle, unitInfo)
+///
+/// The trick-play forms of `sceMp4GetNextUnit`: the same 0x38-byte descriptor and the same
+/// returns (0 = described, positive = end of stream, negative = error), but the unit is the next
+/// KEYFRAME forward, or the previous one back. The non-key samples skipped are never handed over,
+/// and the described unit is pinned so the following `sceMp4GetNextUnitData` takes exactly it.
+///
+/// "Previous" is anchored on the unit last handed over, not on the cursor, so repeated calls walk
+/// backwards keyframe by keyframe; with no earlier keyframe the answer is end of stream. Trick play
+/// is paced by the player, not by the movie's clock, so there is no gate here - and the timeline
+/// starts again from whatever unit normal playback resumes at.
+pub(super) fn mp4_get_sync_unit(
+    ctx: &mut crate::host::GuestCtx,
+    st: &mut crate::host::VitaState,
+    step: SyncStep,
+) {
+    let (handle, info) = (ctx.arg(0) as i32, ctx.arg(1));
+    let r = do_get_sync_unit(ctx, st, handle, info, step);
+    ctx.ret(r as u32);
+}
+
+fn do_get_sync_unit(
+    ctx: &mut crate::host::GuestCtx,
+    st: &mut crate::host::VitaState,
+    handle: i32,
+    info: u32,
+    step: SyncStep,
+) -> i32 {
+    if info == 0 {
+        return SCE_ERROR_ERRNO_ENOENT;
+    }
+    let Some(movie) = st.movie.as_mut().filter(|m| m.handle == handle) else {
+        return SCE_ERROR_ERRNO_ENOENT;
+    };
+    let Some((track, at)) = video_cursor(movie) else {
+        // Nothing has keyframes but video; an audio-only movie is all sync samples.
+        return describe_next_unit(ctx, st, info);
+    };
+    let Some(index) = sync_index(&movie.mp4.tracks[track].samples, at, step) else {
+        return 1;
+    };
+    for skipped in at.min(index)..at.max(index) {
+        movie.read_cache.remove(&(track, skipped));
+    }
+    if let Some(c) = movie.cursors.iter_mut().find(|(t, _)| *t == track) {
+        c.1 = index;
+    }
+    movie.next_sample = index;
+    movie.pinned = Some((track, index));
+    movie.timeline_origin_us = None;
+    describe_next_unit(ctx, st, info)
+}
+
+/// The keyframe a trick-play fetch lands on from video cursor `at`: the first sync sample at or
+/// after it going forward, or the last one strictly before the unit last handed over (`at - 1`)
+/// going back.
+fn sync_index(samples: &[crate::mp4::Sample], at: usize, step: SyncStep) -> Option<usize> {
+    match step {
+        SyncStep::Next => (at..samples.len()).find(|&i| samples[i].sync),
+        SyncStep::Prev => (0..at.saturating_sub(1)).rev().find(|&i| samples[i].sync),
+    }
+}
+
+/// The 90 kHz clock `sceMp4JumpPTS` is given its target on.
+const JUMP_PTS_HZ: u64 = 90_000;
+
+/// int sceMp4JumpPTS(handle, SceUInt64 pts)
+///
+/// Reposition every stream so the next fetch starts at `pts` (on a 90 kHz clock; the 64-bit
+/// argument is in r2:r3, r1 is padding). Video lands on the last keyframe at or before the
+/// target - the player flushes its decoders around a jump, and a stream it can decode must start
+/// on a keyframe - and every other stream on its first sample at or after that landing time, so
+/// the streams stay in step. A target past the end leaves every cursor at the end, which the next
+/// fetch reports as end of stream. Like `sceMp4Reset`, the read-ahead, the decoded audio and the
+/// pacing timeline all start again from the new position.
+#[hostcall]
+pub(super) fn mp4_jump_pts(
+    _ctx: &mut crate::host::GuestCtx,
+    st: &mut crate::host::VitaState,
+    handle: i32,
+    _pad: u32,
+    pts_lo: u32,
+    pts_hi: u32,
+) -> i32 {
+    let target = (u64::from(pts_hi) << 32) | u64::from(pts_lo);
+    do_jump(st, handle, target)
+}
+
+fn do_jump(st: &mut crate::host::VitaState, handle: i32, target: u64) -> i32 {
+    let Some(movie) = st.movie.as_mut().filter(|m| m.handle == handle) else {
+        return SCE_ERROR_ERRNO_ENOENT;
+    };
+    let (cursors, landing_us) = jump_positions(&movie.mp4, &movie.cursors, target);
+    movie.cursors = cursors;
+    if let Some((_, at)) = video_cursor(movie) {
+        movie.next_sample = at;
+    }
+    movie.pinned = None;
+    movie.read_cache.clear();
+    movie.timeline_origin_us = None;
+    if let Some(audio) = movie.audio.as_mut() {
+        audio.ready.clear();
+        audio.pending.clear();
+        audio.pcm.clear();
+        audio.submitted_to = 0;
+        let _ = audio.decoder.reset();
+    }
+    tracing::debug!(target: "vitaslop::movie", target, landing_us, "sceMp4JumpPTS");
+    0
+}
+
+/// Where every served cursor goes for a jump to `target` (90 kHz), and the video landing time in
+/// microseconds. Video: the last keyframe at or before the target (the first sample if there is
+/// none), or the end when the target is past the last sample. Every other track: its first sample
+/// at or after the video landing time.
+fn jump_positions(
+    mp4: &crate::mp4::Mp4,
+    cursors: &[(usize, usize)],
+    target: u64,
+) -> (Vec<(usize, usize)>, u64) {
+    let us = |pts: u64, scale: u32| {
+        if scale == 0 {
+            pts
+        } else {
+            (u128::from(pts) * 1_000_000 / u128::from(scale)) as u64
+        }
+    };
+    let mut landing_us = (u128::from(target) * 1_000_000 / u128::from(JUMP_PTS_HZ)) as u64;
+    let mut out = cursors.to_vec();
+    for c in out.iter_mut() {
+        let t = &mp4.tracks[c.0];
+        if t.kind != crate::mp4::TrackKind::Video {
+            continue;
+        }
+        let goal = (u128::from(target) * u128::from(t.timescale) / u128::from(JUMP_PTS_HZ)) as u64;
+        c.1 = if t
+            .samples
+            .last()
+            .is_some_and(|s| goal >= s.pts.saturating_add(u64::from(s.duration)))
+        {
+            t.samples.len()
+        } else {
+            t.samples
+                .iter()
+                .rposition(|s| s.sync && s.pts <= goal)
+                .unwrap_or(0)
+        };
+        if let Some(s) = t.samples.get(c.1) {
+            landing_us = us(s.pts, t.timescale);
+        }
+    }
+    for c in out.iter_mut() {
+        let t = &mp4.tracks[c.0];
+        if t.kind != crate::mp4::TrackKind::Video {
+            c.1 = t
+                .samples
+                .iter()
+                .position(|s| us(s.pts, t.timescale) >= landing_us)
+                .unwrap_or(t.samples.len());
+        }
+    }
+    (out, landing_us)
+}
+
+/// The time unit `sceMp4PTSToTime` / `sceMp4TimeToPTS` convert to and from: microseconds.
+const TIME_HZ: u64 = 1_000_000;
+
+/// SceUInt64 sceMp4PTSToTime(SceUInt64 pts) / SceUInt64 sceMp4TimeToPTS(SceUInt64 time)
+///
+/// Fixed-factor conversions with no handle, so between the library's 90 kHz PTS clock and a
+/// time unit that does not depend on any one file (microseconds). One 64-bit argument in r0:r1,
+/// the 64-bit result back in r0:r1, rounded down.
+pub(super) fn mp4_convert_time(
+    ctx: &mut crate::host::GuestCtx,
+    _st: &mut crate::host::VitaState,
+    to_time: bool,
+) {
+    let v = (u64::from(ctx.arg(1)) << 32) | u64::from(ctx.arg(0));
+    let (num, den) = if to_time {
+        (TIME_HZ, JUMP_PTS_HZ)
+    } else {
+        (JUMP_PTS_HZ, TIME_HZ)
+    };
+    let r = (u128::from(v) * u128::from(num) / u128::from(den)) as u64;
+    ctx.regs[0] = r as u32;
+    ctx.regs[1] = (r >> 32) as u32;
+}
+
+/// int sceMp4FlushFileReader(handle)
+///
+/// Called as a player enters keyframe-only playback: the reader is about to jump between
+/// keyframes, so what it read ahead sequentially is no longer wanted. The read-ahead here is the
+/// sample cache, and it is dropped; the cursors are not touched.
+#[hostcall]
+pub(super) fn mp4_flush_file_reader(
+    _ctx: &mut crate::host::GuestCtx,
+    st: &mut crate::host::VitaState,
+    handle: i32,
+) -> i32 {
+    match st.movie.as_mut().filter(|m| m.handle == handle) {
+        Some(movie) => {
+            movie.read_cache.clear();
+            0
+        }
+        None => SCE_ERROR_ERRNO_ENOENT,
+    }
+}
+
+/// int <unnamed SceMp4 0xcb91cebc>(handle)
+///
+/// The counterpart of `sceMp4FlushFileReader`, called as a player leaves keyframe-only playback
+/// for normal speed: sequential reading resumes. Reading here is always on demand, from the
+/// cursor, so resuming it needs nothing beyond a live handle.
+#[hostcall]
+pub(super) fn mp4_resume_file_reader(
+    _ctx: &mut crate::host::GuestCtx,
+    st: &mut crate::host::VitaState,
+    handle: i32,
+) -> i32 {
+    if st.movie.as_ref().is_some_and(|m| m.handle == handle) {
+        0
+    } else {
+        SCE_ERROR_ERRNO_ENOENT
+    }
+}
+
+/// int sceMp4SetAvailableBW(handle, SceUInt32 bandwidth)
+///
+/// A bandwidth hint for a streaming source. A local file is read on demand at storage speed, so
+/// the hint changes nothing; it is kept for `sceMp4GetAvailableBW`.
+#[hostcall]
+pub(super) fn mp4_set_available_bw(
+    _ctx: &mut crate::host::GuestCtx,
+    st: &mut crate::host::VitaState,
+    handle: i32,
+    bw: u32,
+) -> i32 {
+    match st.movie.as_mut().filter(|m| m.handle == handle) {
+        Some(movie) => {
+            movie.available_bw = bw;
+            0
+        }
+        None => SCE_ERROR_ERRNO_ENOENT,
+    }
+}
+
+/// int sceMp4GetAvailableBW(handle, SceUInt32 *bandwidth)
+///
+/// The hint `sceMp4SetAvailableBW` gave (0 until one is given), written through the pointer.
+#[hostcall]
+pub(super) fn mp4_get_available_bw(
+    ctx: &mut crate::host::GuestCtx,
+    st: &mut crate::host::VitaState,
+    handle: i32,
+    out: u32,
+) -> i32 {
+    match st.movie.as_ref().filter(|m| m.handle == handle) {
+        Some(movie) => {
+            if out != 0 {
+                ctx.write_u32(out, movie.available_bw);
+            }
+            0
+        }
+        None => SCE_ERROR_ERRNO_ENOENT,
+    }
+}
+
+/// int <unnamed SceMp4 0xa870587f>(handle, ...)
+///
+/// The entry after the bandwidth pair, whose arguments past the handle are not known. It is
+/// answered for a live handle without touching memory, and every call says what it was given.
+pub(super) fn mp4_a870587f(ctx: &mut crate::host::GuestCtx, st: &mut crate::host::VitaState) {
+    let handle = ctx.arg(0) as i32;
+    let live = st.movie.as_ref().is_some_and(|m| m.handle == handle);
+    tracing::warn!(
+        target: "vitaslop::movie",
+        r1 = format_args!("{:#x}", ctx.arg(1)), r2 = format_args!("{:#x}", ctx.arg(2)), r3 = format_args!("{:#x}", ctx.arg(3)),
+        live,
+        "SceMp4 0xA870587F called; its arguments past the handle are not known, so it is answered with 0 and nothing written"
+    );
+    ctx.ret(if live {
+        0
+    } else {
+        SCE_ERROR_ERRNO_ENOENT as u32
+    });
 }
 
 /// int <unnamed SceMp4 0x609e57ad>(handle, stream, enable)
@@ -2355,8 +2834,11 @@ pub(super) fn mp4_stop_file_streaming(
     handle: i32,
 ) -> i32 {
     if let Some(movie) = st.movie.as_mut().filter(|m| m.handle == handle) {
-        let ends: Vec<usize> =
-            movie.cursors.iter().map(|&(t, _)| movie.mp4.tracks.get(t).map_or(0, |t| t.samples.len())).collect();
+        let ends: Vec<usize> = movie
+            .cursors
+            .iter()
+            .map(|&(t, _)| movie.mp4.tracks.get(t).map_or(0, |t| t.samples.len()))
+            .collect();
         for (c, end) in movie.cursors.iter_mut().zip(ends) {
             c.1 = end;
         }
@@ -2365,7 +2847,9 @@ pub(super) fn mp4_stop_file_streaming(
 }
 
 fn do_close_file(st: &mut crate::host::VitaState, handle: i32) -> i32 {
-    let Some(movie) = st.movie.as_ref() else { return 0 };
+    let Some(movie) = st.movie.as_ref() else {
+        return 0;
+    };
     if movie.handle != handle {
         return 0;
     }
@@ -2375,7 +2859,9 @@ fn do_close_file(st: &mut crate::host::VitaState, handle: i32) -> i32 {
     if release_source(st, &source).is_err() {
         return 0;
     }
-    let Some(movie) = st.movie.as_ref() else { return 0 };
+    let Some(movie) = st.movie.as_ref() else {
+        return 0;
+    };
     // >>> A MOVIE WITH SOUND THE TITLE NEVER ASKED FOR PLAYED SILENT, AND THAT IS SAID OUT
     // >>> LOUD RATHER THAN LEFT AS A QUIET PICTURE.
     //
@@ -2385,12 +2871,9 @@ fn do_close_file(st: &mut crate::host::VitaState, handle: i32) -> i32 {
     // That is a real gap against the console, not a decision - and a run that does not report
     // it looks exactly like a run whose movie had no sound to begin with.
     let audio_track = movie.mp4.track(crate::mp4::TrackKind::Audio).is_some();
-    let audio_enabled = movie
-        .mp4
-        .tracks
-        .iter()
-        .enumerate()
-        .any(|(i, t)| t.kind == crate::mp4::TrackKind::Audio && movie.enabled_streams.contains(&(i as u32)));
+    let audio_enabled = movie.mp4.tracks.iter().enumerate().any(|(i, t)| {
+        t.kind == crate::mp4::TrackKind::Audio && movie.enabled_streams.contains(&(i as u32))
+    });
     if audio_track && !audio_enabled {
         tracing::warn!(
             target: "vitaslop::movie", %path,
@@ -2447,7 +2930,14 @@ mod tests {
             codec_config: Vec::new(),
             samples: dts
                 .iter()
-                .map(|&d| Sample { offset: 0, size: 1, pts: d, dts: d, duration: 1, sync: true })
+                .map(|&d| Sample {
+                    offset: 0,
+                    size: 1,
+                    pts: d,
+                    dts: d,
+                    duration: 1,
+                    sync: true,
+                })
                 .collect(),
         }
     }
@@ -2479,7 +2969,9 @@ mod tests {
             let mut best: Option<(usize, u64)> = None;
             for (i, &(t, at)) in cursors.iter().enumerate() {
                 let tr = &mp4.tracks[t];
-                let Some(sample) = tr.samples.get(at) else { continue };
+                let Some(sample) = tr.samples.get(at) else {
+                    continue;
+                };
                 let us = sample.dts * 1_000_000 / tr.timescale as u64;
                 if best.is_none_or(|(_, b)| us < b) {
                     best = Some((i, us));
@@ -2546,6 +3038,97 @@ mod tests {
         assert_eq!(served.len(), 1);
         assert_eq!(mp4.tracks[served[0].0].id, 1);
     }
+
+    /// A 30 fps video track (timescale 30) with a keyframe every 10 samples, and a 48 kHz audio
+    /// track of 1024-sample frames, both 2 seconds long.
+    fn trick_movie() -> Mp4 {
+        let mut video = track(
+            1,
+            TrackKind::Video,
+            b"avc1",
+            30,
+            &(0..60).collect::<Vec<_>>(),
+        );
+        for (i, s) in video.samples.iter_mut().enumerate() {
+            s.sync = i % 10 == 0;
+        }
+        let audio = track(
+            2,
+            TrackKind::Audio,
+            b"mp4a",
+            48_000,
+            &(0..94).map(|i| i * 1024).collect::<Vec<_>>(),
+        );
+        Mp4 {
+            timescale: 1000,
+            duration: 0,
+            tracks: vec![video, audio],
+        }
+    }
+
+    /// Forward from a cursor finds the keyframe at or after it; back finds the keyframe strictly
+    /// before the unit last handed over, so repeated rewinds step back one keyframe each time and
+    /// stop at the start.
+    #[test]
+    fn trick_play_walks_keyframe_to_keyframe() {
+        use super::{SyncStep, sync_index};
+        let m = trick_movie();
+        let v = &m.tracks[0].samples;
+        assert_eq!(sync_index(v, 0, SyncStep::Next), Some(0));
+        assert_eq!(sync_index(v, 1, SyncStep::Next), Some(10));
+        assert_eq!(sync_index(v, 10, SyncStep::Next), Some(10));
+        assert_eq!(sync_index(v, 51, SyncStep::Next), None);
+        // Having taken 30 (cursor 31), back is 20; having taken 20, back is 10; then 0; then none.
+        assert_eq!(sync_index(v, 31, SyncStep::Prev), Some(20));
+        assert_eq!(sync_index(v, 21, SyncStep::Prev), Some(10));
+        assert_eq!(sync_index(v, 11, SyncStep::Prev), Some(0));
+        assert_eq!(sync_index(v, 1, SyncStep::Prev), None);
+    }
+
+    /// A jump lands video on the keyframe at or before the target and audio on its first frame at
+    /// or after that landing time; past the end, every cursor is at the end.
+    #[test]
+    fn a_jump_lands_on_the_keyframe_before_the_target() {
+        let m = trick_movie();
+        let cursors = super::served_cursors(&m);
+        // 1.25 s = 112500 at 90 kHz -> video sample 37.5 -> keyframe 30 (1.0 s) -> audio frame 47
+        // (47 * 1024 / 48000 = 1.0027 s is the first at or after 1.0 s).
+        let (c, landing) = super::jump_positions(&m, &cursors, 112_500);
+        assert_eq!(landing, 1_000_000);
+        assert_eq!(c, vec![(0, 30), (1, 47)]);
+        // Exactly on a keyframe.
+        assert_eq!(
+            super::jump_positions(&m, &cursors, 90_000 * 2 / 3).0[0],
+            (0, 20)
+        );
+        // Past the end.
+        let (end, _) = super::jump_positions(&m, &cursors, 90_000 * 5);
+        assert_eq!(end, vec![(0, 60), (1, 94)]);
+    }
+
+    /// The conversions are 90 kHz <-> microseconds and invert each other on whole ticks.
+    #[test]
+    fn pts_and_time_convert_on_fixed_clocks() {
+        use crate::host::{GuestCtx, SliceMemory, VFP_ARG_COUNT, VitaState};
+        use crate::world::DeterministicWorld;
+        use vitaslop_transpiler::abi::REG_COUNT;
+        let mut st = VitaState::new(0, 0x100, Box::new(DeterministicWorld::default()));
+        let mut bytes = vec![0u8; 0x100];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut run = |v: u64, to_time: bool| {
+            let mut regs = [0u32; REG_COUNT];
+            regs[0] = v as u32;
+            regs[1] = (v >> 32) as u32;
+            let mut mem = SliceMemory(&mut bytes);
+            let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            super::mp4_convert_time(&mut ctx, &mut st, to_time);
+            u64::from(regs[0]) | (u64::from(regs[1]) << 32)
+        };
+        assert_eq!(run(90_000, true), 1_000_000);
+        assert_eq!(run(1_000_000, false), 90_000);
+        let big = 90_000u64 * 3_600 * 24 * 365;
+        assert_eq!(run(big, true), 1_000_000 * 3_600 * 24 * 365);
+    }
 }
 
 #[cfg(test)]
@@ -2589,7 +3172,11 @@ mod movie_audio_tests {
         };
         let bytes = std::fs::read(&movie).expect("the movie file");
 
-        let mut st = VitaState::new(BASE, MEM as u32, Box::new(crate::world::DeterministicWorld::default()));
+        let mut st = VitaState::new(
+            BASE,
+            MEM as u32,
+            Box::new(crate::world::DeterministicWorld::default()),
+        );
         st.audio_dec = Box::new(vitaslop_platform::audio_dec::AacFactory);
         st.add_file("app0:movie.mp4", bytes);
         let mut mem = vec![0u8; MEM];
@@ -2619,7 +3206,10 @@ mod movie_audio_tests {
         ctx.write_u32(CTRL_AT + 0x10, 1536);
         ctx.write_u32(CTRL_AT + 0x1c, 8192);
         let size = crate::vita::audiodec::do_get_context_size(&mut st, 0x1005);
-        assert!(size > 0, "a context size of zero is how the title decides not to decode");
+        assert!(
+            size > 0,
+            "a context size of zero is how the title decides not to decode"
+        );
         let rc = crate::vita::audiodec::do_create_decoder_external(
             &mut ctx,
             &mut st,
@@ -2649,7 +3239,10 @@ mod movie_audio_tests {
                 .and_then(|m| m.mp4.tracks.get(stream as usize))
                 .is_some_and(|t| t.kind == crate::mp4::TrackKind::Video);
             let got = super::do_get_next_unit_data(&mut ctx, &mut st, handle, ES_AT);
-            assert_eq!(got, size as i32, "the unit's bytes are the size it described");
+            assert_eq!(
+                got, size as i32,
+                "the unit's bytes are the size it described"
+            );
             if video {
                 video_units += 1;
                 continue;
@@ -2677,14 +3270,23 @@ mod movie_audio_tests {
              {pcm_frames} PCM frames, loudest sample {loudest}"
         );
         // The ids are the title's numbering: 0-based INDICES into the container's streams.
-        assert!(streams.len() >= 2, "the units carry TWO stream ids, not one - {streams:?}");
-        assert!(streams.contains(&0), "the first stream is 0, not a track_ID - {streams:?}");
+        assert!(
+            streams.len() >= 2,
+            "the units carry TWO stream ids, not one - {streams:?}"
+        );
+        assert!(
+            streams.contains(&0),
+            "the first stream is 0, not a track_ID - {streams:?}"
+        );
         assert!(video_units > 0 && audio_units > 0, "both tracks are served");
         assert!(pcm_frames > 10, "the guest's decode calls produced PCM");
         // >>> AND IT IS SOUND, NOT SILENCE. A frame count cannot tell those apart
         // ([[vitaslop-count-frames-cannot-tell-silence-from-music]]), and every failure this
         // path can have - the wrong stream, the wrong config, a queue serving nothing -
         // produces silence rather than an error.
-        assert!(loudest > 1000, "the PCM written into guest memory is silent (peak {loudest})");
+        assert!(
+            loudest > 1000,
+            "the PCM written into guest memory is silent (peak {loudest})"
+        );
     }
 }

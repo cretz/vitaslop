@@ -49,26 +49,23 @@ const QUANTUM_FUEL: u64 = vitaslop_runtime::host::QUANTUM_FUEL;
 const PER_FRAME_ROUNDS: u64 = 60_000_000;
 
 /// The live input the window writes and the guest's world reads: the merged controller
-/// frame plus the current mouse-as-touch (front panel). Shared behind a mutex because
+/// frame plus the current mouse-as-touch (front panel, and the rear one when the opt-in rear-touch
+/// setting is on). Shared behind a mutex because
 /// `World` is `Send` (single-threaded here, so it never contends).
 #[derive(Clone, Copy, Default)]
 pub struct DesktopInput {
     pub ctrl: CtrlFrame,
     pub touch: Option<TouchFrame>,
+    pub back_touch: Option<TouchFrame>,
 }
 
 pub type SharedInput = Arc<Mutex<DesktopInput>>;
 
 /// The world the retail guest polls: a virtual 60 Hz clock, a seeded PRNG, and input
-/// drawn from the shared [`DesktopInput`] cell the window updates each frame. An
-/// optional [`RecipeWorld`] overlays a scripted TAS recipe on top of live input, so a
-/// recorded playthrough replays in the window while the user watches (and can still
-/// nudge with the keyboard/mouse) - the native twin of the browser's `BrowserWorld`.
+/// drawn from the shared [`DesktopInput`] cell the window updates each frame - unless a
+/// playbook (or tape) run owns the pad. The native twin of the browser's `BrowserWorld`.
 struct DesktopWorld {
     input: SharedInput,
-    /// A scripted recipe driving input as a function of frame, if `--recipe` was given.
-    /// Frame-keyed, so it replays identically on desktop, browser, and headless.
-    recipe: Option<vitaslop_runtime::RecipeWorld>,
     monotonic_us: u64,
     wall_us: u64,
     rng: u64,
@@ -78,18 +75,10 @@ impl DesktopWorld {
     fn new(input: SharedInput) -> Self {
         DesktopWorld {
             input,
-            recipe: None,
             monotonic_us: 0,
             wall_us: 1_500_000_000_000_000,
             rng: 0x9E37_79B9_7F4A_7C15,
         }
-    }
-
-    /// With a scripted recipe overlaid on the live input.
-    fn with_recipe(input: SharedInput, recipe: vitaslop_runtime::RecipeWorld) -> Self {
-        let mut w = DesktopWorld::new(input);
-        w.recipe = Some(recipe);
-        w
     }
 }
 
@@ -105,43 +94,21 @@ impl World for DesktopWorld {
         if let Some((ctrl, _)) = vitaslop_playbook::engine::input(port) {
             return ctrl;
         }
-        let live = self.input.lock().unwrap().ctrl;
-        let Some(r) = self.recipe.as_mut() else { return live };
-        // Recipe drives; live input is additive so the watcher can nudge. Buttons OR
-        // together; a stick the recipe leaves centered falls back to the live stick.
-        let scripted = r.poll_ctrl(port);
-        CtrlFrame {
-            buttons: scripted.buttons | live.buttons,
-            lx: if scripted.lx != 128 { scripted.lx } else { live.lx },
-            ly: if scripted.ly != 128 { scripted.ly } else { live.ly },
-            rx: if scripted.rx != 128 { scripted.rx } else { live.rx },
-            ry: if scripted.ry != 128 { scripted.ry } else { live.ry },
-        }
+        self.input.lock().unwrap().ctrl
     }
     fn poll_touch(&mut self, port: u32) -> TouchFrame {
-        if port != 0 {
+        if port > 1 {
             return TouchFrame::default();
         }
         if let Some((_, touch)) = vitaslop_playbook::engine::input(port) {
             return touch;
         }
-        let live = self.input.lock().unwrap().touch.unwrap_or_default();
-        let Some(r) = self.recipe.as_mut() else { return live };
-        // Prefer the recipe's scripted finger; fall back to the live mouse-as-touch.
-        let scripted = r.poll_touch(port);
-        if scripted.count > 0 {
-            scripted
-        } else {
-            live
-        }
+        // The rear panel's live input is the opt-in rear-touch setting's right button.
+        let input = self.input.lock().unwrap();
+        if port == 1 { input.back_touch } else { input.touch }.unwrap_or_default()
     }
     fn fill_random(&mut self, buf: &mut [u8]) {
-        // Prefer the recipe's deterministic PRNG when replaying, so a scripted run is
-        // reproducible; otherwise SplitMix64, matching the runtime worlds.
-        if let Some(r) = self.recipe.as_mut() {
-            r.fill_random(buf);
-            return;
-        }
+        // SplitMix64, matching the runtime worlds, so a scripted run is reproducible.
         for chunk in buf.chunks_mut(8) {
             self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = self.rng;
@@ -154,12 +121,28 @@ impl World for DesktopWorld {
         }
     }
     fn set_frame(&mut self, frame: u64) {
-        if let Some(r) = self.recipe.as_mut() {
-            r.set_frame(frame);
-        }
         self.monotonic_us = frame.wrapping_mul(16_666);
         self.wall_us = 1_500_000_000_000_000u64.wrapping_add(self.monotonic_us);
     }
+    fn poll_text(&mut self) -> Vec<vitaslop_runtime::world::TextKey> {
+        std::mem::take(&mut *TEXT.lock().unwrap())
+    }
+}
+
+/// Keys typed for the game's on-screen keyboard, waiting for its next `sceImeUpdate` - the
+/// window pushes them ([`push_text`]), the guest's world drains them.
+static TEXT: Mutex<Vec<vitaslop_runtime::world::TextKey>> = Mutex::new(Vec::new());
+
+/// The most keys held for a keyboard nobody is reading; the oldest are dropped past it.
+const TEXT_QUEUE_MAX: usize = 256;
+
+/// One key typed on the window's keyboard, for the game's on-screen keyboard.
+pub fn push_text(key: vitaslop_runtime::world::TextKey) {
+    let mut q = TEXT.lock().unwrap();
+    if q.len() >= TEXT_QUEUE_MAX {
+        q.remove(0);
+    }
+    q.push(key);
 }
 
 /// Recursively collect every file under `root` as `(forward-slash relative path, bytes)`
@@ -245,9 +228,7 @@ pub struct RetailGuest {
 
 impl RetailGuest {
     /// Load, decrypt, link, transpile, and instantiate the title in `dir` for live
-    /// execution over the shared `input` cell. An optional scripted `recipe` (a
-    /// frame-keyed TAS text) is overlaid on the live input so a recorded playthrough
-    /// replays in the window.
+    /// execution over the shared `input` cell (or a playbook run, which owns the pad).
     ///
     /// `main_exec`: the app's executable (an `sceAppMgrLoadExec` path) in
     /// the main executable's place - the process a title's `LoadExec` asked for. See
@@ -258,7 +239,6 @@ impl RetailGuest {
     pub fn new_with_exec(
         dir: &Path,
         input: SharedInput,
-        recipe: Option<&str>,
         main_exec: Option<&str>,
         repatch: Option<&Path>,
     ) -> Result<RetailGuest, String> {
@@ -357,14 +337,7 @@ impl RetailGuest {
     vitaslop_runtime::vita::set_smp_linking(false);
     let linked = linked.map_err(|e| format!("link: {e:?}"))?;
 
-        let world: Box<dyn World + Send> = match recipe {
-            Some(text) => {
-                let r = vitaslop_runtime::RecipeWorld::parse(text)
-                    .map_err(|e| format!("recipe parse: {e}"))?;
-                Box::new(DesktopWorld::with_recipe(input, r))
-            }
-            None => Box::new(DesktopWorld::new(input)),
-        };
+        let world: Box<dyn World + Send> = Box::new(DesktopWorld::new(input));
         let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
         // Movie playback decodes on this machine's own H.264 decoder. Installing the port
         // here rather than inside the engine is what keeps the engine free of a decoder:
@@ -473,7 +446,7 @@ impl RetailGuest {
             .host()
             .state
             .capture
-            .set_signature_wanted(vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE"));
+            .set_signature_wanted(vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE") || signature_every() != 0);
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(RetailGuest { sched, scenes: Vec::new(), presents: Vec::new(), finished: false, err: None, ended_by: None, save: None, build_ms, last_advance_us: 0 })
     }
@@ -624,11 +597,19 @@ impl RetailGuest {
             // NEXT frame while this one is taken: only the scenes before this frame's flip are
             // its own. `take_scenes_through_flip` leaves the pending ones exactly as the
             // partition below does.
+            // THROUGH the capture, never a raw `mem::take`: `take_frame_scenes` keeps the pending
+            // scenes exactly as a partition would AND folds the taken ones into the determinism
+            // signature. The raw take walked every scene past the fold, so a desktop headless
+            // signature (and its `sigtrace`) covered the egress ledger alone - `scenes=0` at every
+            // frame, the same hash at f500 and f1000 of a run that was rendering.
+            // The running signature (and the one-frame digest) BEFORE the take, while this frame's
+            // scenes are still in the capture to describe - the browser prints at the same point.
+            trace_signature(cap, self.sched.frames());
             let overlapped = self.sched.overlapped();
-            let (pending, ready): (Vec<_>, Vec<_>) = if overlapped {
-                (Vec::new(), cap.take_scenes_through_flips(taken as usize))
+            let ready = if overlapped {
+                cap.take_scenes_through_flips(taken as usize)
             } else {
-                std::mem::take(&mut cap.scenes).into_iter().partition(|s| s.deferred_id != 0)
+                cap.take_frame_scenes()
             };
             if !ready.is_empty() {
                 self.scenes = ready;
@@ -638,9 +619,6 @@ impl RetailGuest {
                 // classifying half of it as an offscreen pass. See
                 // `GxmRenderer::set_presented`.
                 self.presents = cap.presents.clone();
-            }
-            if !overlapped {
-                cap.scenes = pending;
             }
             cap.trace.clear();
             cap.trace_thid.clear();
@@ -876,6 +854,11 @@ impl RetailGuest {
         out
     }
 
+    /// Whether the game has its on-screen keyboard (SceIme) open, so typing goes to it.
+    pub fn ime_open(&mut self) -> bool {
+        self.sched.host().state.ime.is_open()
+    }
+
     pub fn scheduler_report(&self) -> String {
         format!("{}{}", self.sched.cpu_share_report(), self.sched.runnable_report())
     }
@@ -922,6 +905,7 @@ impl RetailGuest {
     pub fn frames(&self) -> u64 {
         self.sched.frames()
     }
+
 
     /// `(total fuel burned, samples, largest single burn)` - the accounting behind the
     /// game clock's CPU charge. See [`vitaslop_runtime::sched::SchedCore::fuel_report`].
@@ -1531,10 +1515,9 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
 /// - `VITASLOP_HEADLESS_FRAMES` - display flips to run to (default 180). A title that
 ///   boots through intro/attract screens before its first interactive frame needs a
 ///   higher target.
-/// - `VITASLOP_HEADLESS_RECIPE` - a frame-keyed TAS recipe to drive input with. When
-///   set, the recipe supplies the touches/buttons; when unset, the built-in Tutorial
-///   tap script runs (the historical title navigation), unless
-///   `VITASLOP_HEADLESS_NO_TAPS` is set, which runs input-free to the title screen.
+/// - Input: `--playbook` / `--tape` drive it; with neither, the built-in tap script runs (the
+///   historical title navigation), unless `VITASLOP_HEADLESS_NO_TAPS` is set, which runs
+///   input-free to the title screen.
 /// - `VITASLOP_HEADLESS_TIMING` - report per-frame GUEST cost (the emulated CPU work
 ///   behind one display flip) and the GPU cost of rendering the final captured scene.
 /// >>> THE DEVICE BUDGET: THE USER'S PHONE'S LIMITS, ASSERTED ON THIS MACHINE.
@@ -2005,7 +1988,7 @@ fn report_frame_timing(
     );
     // WHICH host calls the run made, when the profiler is on. The browser prints the same report
     // from the same counters; this path did not print it at all, so the one engine that can be
-    // driven by a recipe in a loop could not answer "which NIDs" without going through the
+    // driven by a playbook in a loop could not answer "which NIDs" without going through the
     // interactive session. The only way to spend less at the host-call boundary is to cross it
     // fewer times, and that needs the ranking.
     if vitaslop_runtime::knobs::flag("VITASLOP_DBG_CALLSITES") {
@@ -2023,12 +2006,58 @@ fn report_frame_timing(
 /// stable median past the first-render pipeline/upload cost, cheap enough to always run.
 const WARM_RENDER_SAMPLES: usize = 60;
 
-/// What drives a headless run's input instead of a recipe.
+/// What drives a headless run's input instead of the built-in taps.
 pub enum Play {
     /// A playbook (`vitaslop-playbook`), which also records `<shot-dir>/playbook.tape`.
     Playbook(PathBuf),
     /// A tape a playbook run recorded, replayed input frame for input frame.
     Tape(PathBuf),
+}
+
+/// The running determinism signature at frame `f`, as the browser prints it: `sigtrace` every
+/// `VITASLOP_SIGNATURE_EVERY` frames, and at the one `VITASLOP_FRAME_DIGEST=<frame>[:<draw>]`
+/// frame a digest per scene (and that draw's lane hashes and vertex floats), so a cross-engine
+/// difference is located to a frame, then a pass, then a draw. Same text as the browser, so
+/// the two logs diff line for line.
+fn trace_signature(cap: &vitaslop_runtime::capture::Capture, f: u64) {
+    let every = signature_every();
+    if every == 0 || f == 0 || !f.is_multiple_of(every) {
+        return;
+    }
+    let (scenes, egress, calls) = cap.stream_counts();
+    let s = vitaslop_native::observe::signature(cap);
+    println!("sigtrace f{f} {s:#018x} scenes={scenes} egress={egress} calls={calls}");
+    let knob = std::env::var("VITASLOP_FRAME_DIGEST").unwrap_or_default();
+    let mut parts = knob.split(':');
+    if parts.next().and_then(|n| n.trim().parse::<u64>().ok()) != Some(f) {
+        return;
+    }
+    let shapes = cap.frame_scene_shapes();
+    let d: Vec<String> = cap
+        .frame_scene_digests()
+        .iter()
+        .zip(shapes.iter())
+        .map(|(h, (n, a, fmt))| format!("{h:#018x}/draws={n}/surf={a:#x}:{fmt}"))
+        .collect();
+    println!("framedigest f{f} [{}]", d.join(" "));
+    let last = cap.frame_scene_digests().len().saturating_sub(1);
+    if let Some(di) = parts.next().and_then(|d| d.trim().parse::<usize>().ok()) {
+        if let Some((lanes, hs)) = cap.draw_lane_hashes(last, di) {
+            let l: Vec<String> = hs.iter().enumerate().map(|(i, h)| format!("{i}:{h:#010x}")).collect();
+            println!("lanehash f{f} s{last} d{di} lanes={lanes} {}", l.join(" "));
+        }
+        if let Some((stride, len, vals)) = cap.draw_vertex_floats(last, di, 64) {
+            println!("drawbytes f{f} s{last} d{di} stride={stride} len={len} {vals:?}");
+        }
+    }
+}
+
+/// `VITASLOP_SIGNATURE_EVERY=<n>`: print the RUNNING determinism signature every `n` frames, as
+/// `sigtrace f<frame> <hash>` (see [`RetailGuest::trace_signature`]). Two runs that disagree at
+/// the end disagree from some FIRST frame on, and bisecting for it costs a pair of runs per
+/// halving; this prints it for free. Setting it also asks for the signature to be computed.
+fn signature_every() -> u64 {
+    vitaslop_runtime::knobs::var("VITASLOP_SIGNATURE_EVERY").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
 /// Wall-clock milliseconds since the first call, for a playbook's per-phase speed.
@@ -2066,7 +2095,7 @@ fn start_play(play: Option<&Play>, discover: bool, dir: &Path) -> Result<(), Str
             engine::start_tape(tape, path.display().to_string(), discover, Some(wall_ms))
         }
         // Discovery with no playbook: an empty one, so the engine is running to record calls;
-        // the run's own input (a recipe or the built-in taps) still drives it.
+        // the run's own input (the built-in taps) still drives it.
         None => {
             let opts = engine::StartOpts {
                 name: "(discover)".into(),
@@ -2083,11 +2112,6 @@ fn start_play(play: Option<&Play>, discover: bool, dir: &Path) -> Result<(), Str
 pub fn headless_check(
     dir: PathBuf,
     shot_dir: PathBuf,
-    // The `--recipe` flag's contents, if it was given. Taken as a parameter rather than read
-    // from the environment here so the FLAG and the env knob land in the same place - the flag
-    // used to be parsed by `main` and then never passed, which is silent and unfalsifiable
-    // (see the comment at its parse site).
-    flag_recipe: Option<String>,
     // `--save-dir <root>`: keep the guest's own saved state across runs, under
     // `<root>/<title>/`. OFF by default here on purpose - a headless run is the render and
     // timing oracle, and a save read back in changes what the title draws.
@@ -2096,34 +2120,16 @@ pub fn headless_check(
     addons: Option<PathBuf>,
     // `--repatch <dir>`: lay that rePatch overlay over the title (see `ingest::repatch`).
     repatch: Option<PathBuf>,
-    // `--playbook` / `--tape`: what drives input instead of a recipe; `--discover`: record the
+    // `--playbook` / `--tape`: what drives input; `--discover`: record the
     // call table cues are found from. See `vitaslop-playbook`.
     play: Option<Play>,
     discover: bool,
 ) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
-    let env_recipe = std::env::var("VITASLOP_HEADLESS_RECIPE")
-        .ok()
-        .map(|p| std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}")))
-        .transpose()?;
-    // Both spellings exist and the notes use both. If they are BOTH given they must agree,
-    // because silently preferring one is how a run ends up replaying a recipe nobody named.
-    if let (Some(a), Some(b)) = (&flag_recipe, &env_recipe)
-        && a != b {
-            return Err("both --recipe and VITASLOP_HEADLESS_RECIPE are set and they are \
-                        different recipes - pass one, not two".into());
-        }
-    let recipe = flag_recipe.or(env_recipe);
-    if recipe.is_some() && play.is_some() {
-        return Err("a recipe and a playbook/tape both drive input - pass one".into());
-    }
-    // Say which way input is being driven, unconditionally. "Did the recipe apply" was
+    // Say which way input is being driven, unconditionally. "Did the script apply" was
     // previously answerable only by recognising the final screenshot.
     if play.is_none() {
-        println!(
-            "headless: input is {}",
-            if recipe.is_some() { "a RECIPE" } else { "the built-in tap script (no recipe given)" }
-        );
+        println!("headless: input is the built-in tap script (no playbook or tape given)");
     }
     // The playbook engine starts BEFORE the guest exists, so it sees the very first pad read.
     if play.is_some() || discover {
@@ -2134,7 +2140,7 @@ pub fn headless_check(
     // The display frame the playbook finished on: the run stops a frame later, so a shot it
     // asked for last is still written.
     let mut play_over_at: Option<u64> = None;
-    let mut guest = RetailGuest::new_with_exec(&dir, input.clone(), recipe.as_deref(), None, repatch.as_deref())?;
+    let mut guest = RetailGuest::new_with_exec(&dir, input.clone(), None, repatch.as_deref())?;
     if let Some(root) = addons.as_deref() {
         guest.mount_addons(root)?;
     }
@@ -2155,8 +2161,8 @@ pub fn headless_check(
     //
     // Said out loud either way: "the run is under a 120 s watchdog" and "the run is not" are
     // both things the reader of a log needs, and only one of them is visible from an absence.
-    match vitaslop_native::watchdog::spawn(&format!("{} / {}", dir.display(), match &recipe {
-        Some(_) => "recipe",
+    match vitaslop_native::watchdog::spawn(&format!("{} / {}", dir.display(), match &play {
+        Some(_) => "playbook",
         None => "built-in taps",
     }))? {
         true => println!(
@@ -2169,11 +2175,10 @@ pub fn headless_check(
         ),
     }
 
-    // The built-in Tutorial tap script (title menu navigation): used only when no
-    // recipe is given and taps are not disabled. (active_from, active_until, x, y) - a
-    // sticky tap held across a few frames then released.
-    let use_builtin_taps =
-        recipe.is_none() && play.is_none() && std::env::var_os("VITASLOP_HEADLESS_NO_TAPS").is_none();
+    // The built-in tap script (title menu navigation): used only when no playbook drives
+    // input and taps are not disabled. (active_from, active_until, x, y) - a sticky tap held
+    // across a few frames then released.
+    let use_builtin_taps = play.is_none() && std::env::var_os("VITASLOP_HEADLESS_NO_TAPS").is_none();
     let taps = [
         (12u64, 19u64, 450u16, 674u16),
         (30, 37, 230, 230),
@@ -2226,7 +2231,7 @@ pub fn headless_check(
     //
     // The window above bounds BOTH what is rendered and what is written, and that conflation
     // has a measured cost. MEASURED on a baseball title (`hit1`, shots every 4 from f11280): every
-    // player model is BLOWN OUT white-yellow, and in a full replay of the same recipe the
+    // player model is BLOWN OUT white-yellow, and in a full replay of the same input the
     // same batter is the grey-and-blue uniform the device shows. Nothing in the log says a
     // layer is stale - the draw counts agree - because the thing that is missing is a
     // 128x128 ambient probe atlas this title paints at a screen transition long before the
@@ -2339,13 +2344,13 @@ pub fn headless_check(
     let mut steady_frames = 0u64;
     loop {
         // >>> A PROCESS REPLACEMENT. The guest halted on `sceAppMgrLoadExec` of one of its own
-        // app's executables: boot that one in its place, with the same input and recipe, and
+        // app's executables: boot that one in its place, with the same input, and
         // keep going - the new process's frames count from zero, exactly as a new process's do.
         if guest.finished()
             && let Some(path) = guest.take_exec_request()
         {
             println!("headless: frame {}: the title exec'd {path} - booting it", guest.frames());
-            guest = RetailGuest::new_with_exec(&dir, input.clone(), recipe.as_deref(), Some(&path), repatch.as_deref())?;
+            guest = RetailGuest::new_with_exec(&dir, input.clone(), Some(&path), repatch.as_deref())?;
             if let Some(root) = addons.as_deref() {
                 guest.mount_addons(root)?;
             }
@@ -2680,7 +2685,7 @@ pub fn headless_check(
     };
     // Block-visit histogram (`VITASLOP_BLOCK_HIST=<top>`, with `VITASLOP_TRACE_BLOCKS=lo-hi`
     // emitting the hooks). It was only reachable from the boot-probe test, which cannot
-    // replay a recipe - so the one case it is built for, "the title reached screen N and
+    // drive a title past its menus - so the one case it is built for, "the title reached screen N and
     // stopped", could not be measured at all. Restrict the hook range to the suspect
     // functions and the tail of the recorded sequence IS the stuck loop.
     if let Ok(top) = std::env::var("VITASLOP_BLOCK_HIST") {
@@ -2882,7 +2887,7 @@ pub fn headless_check(
     //
     // `numOfOutput` is drained from a HOST DECODER THREAD, so the count the guest is handed on
     // any one call depends on how far that thread got in wall time - and the guest branches on
-    // it. Two runs of one recipe that disagree here have been told two different stories, and
+    // it. Two runs of one input script that disagree here have been told two different stories, and
     // the fuel total above is then expected to differ for that reason and not for a change
     // under test. It is the cheap first check on any two-run comparison of this title, because
     // it disagrees the FIRST time the race resolves differently rather than only when the
@@ -2890,7 +2895,7 @@ pub fn headless_check(
     let (au, pics, calls, _) = vitaslop_runtime::vita::avcdec::movie_counters();
     if calls > 0 {
         println!(
-            "headless: movie delivery digest {:#018x} over {calls} calls ({au} access units, {pics} pictures). TWO RUNS OF ONE RECIPE MUST AGREE ON THIS.",
+            "headless: movie delivery digest {:#018x} over {calls} calls ({au} access units, {pics} pictures). TWO RUNS OF ONE INPUT MUST AGREE ON THIS.",
             vitaslop_runtime::vita::avcdec::delivery_digest(),
         );
     }
@@ -2918,7 +2923,7 @@ pub fn headless_check(
     // from a handful of call sites, and only the site names the loop to fix
     // [[vitaslop-rank-the-loop-not-the-nid]]. `VITASLOP_DBG_CALLSITES=1` keys the count by
     // (NID, guest return address); this is what prints it at the end of a headless run, which
-    // is the only place a recipe-pinned window can be read off.
+    // is the only place a playbook-pinned window can be read off.
     if vitaslop_runtime::vita::callsite_profiling_on() {
         vitaslop_runtime::vita::dump_call_sites(400);
     }
@@ -2939,11 +2944,10 @@ pub fn headless_check(
 }
 
 /// Run the retail title in `dir` in a live window until the window closes or the guest
-/// exits. Blocks until the event loop ends. With `recipe` set, a scripted playthrough
-/// replays in the window (live keyboard/mouse still nudges it).
-pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>, addons: Option<PathBuf>, repatch: Option<PathBuf>) -> Result<(), String> {
+/// exits. Blocks until the event loop ends.
+pub fn run(dir: PathBuf, save_dir: Option<PathBuf>, addons: Option<PathBuf>, repatch: Option<PathBuf>) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
-    let mut guest = RetailGuest::new_with_exec(&dir, input.clone(), recipe.as_deref(), None, repatch.as_deref())?;
+    let mut guest = RetailGuest::new_with_exec(&dir, input.clone(), None, repatch.as_deref())?;
     if let Some(root) = addons.as_deref() {
         guest.mount_addons(root)?;
     }
@@ -2951,9 +2955,6 @@ pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>, addo
         guest.persist_to(root, &dir)?;
     }
     println!("loaded {} (decrypt + link + transpile {:.0} ms)", dir.display(), guest.build_ms);
-    if recipe.is_some() {
-        println!("replaying scripted recipe (keyboard/mouse still nudge live)");
-    }
     println!("controls: the default keyboard map (see the shell's settings); a gamepad also works; Space pauses, Esc quits");
 
     let pause_on_blur = vitaslop_runtime::knobs::var("VITASLOP_PAUSE_ON_BLUR").map(|v| v.trim() != "0").unwrap_or(true);
@@ -2961,11 +2962,11 @@ pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>, addo
     let event_loop = EventLoop::new().map_err(|e| format!("create event loop: {e}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
     // `VITASLOP_WINDOW_FRAMES=<n>`: close the window once the guest reaches frame n - a
-    // scripted window run (with a recipe) that ends by itself, so its exit report can be read.
+    // window run that ends by itself, so its exit report can be read.
     let exit_at = std::env::var("VITASLOP_WINDOW_FRAMES").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let mut app = RetailApp {
         session: Session::new(guest, input.clone(), Input::new(&settings), pause_on_blur),
-        boot: Boot { dir, recipe, save_dir, addons, repatch, input, pause_on_blur },
+        boot: Boot { dir, save_dir, addons, repatch, input, pause_on_blur },
         window: None,
         gfx: None,
         exit_at,
@@ -3089,7 +3090,6 @@ fn shot_from() -> u64 {
 /// What a `--game` window booted its title from.
 struct Boot {
     dir: PathBuf,
-    recipe: Option<String>,
     save_dir: Option<PathBuf>,
     addons: Option<PathBuf>,
     repatch: Option<PathBuf>,
@@ -3099,13 +3099,13 @@ struct Boot {
 
 impl RetailApp {
     /// The guest replaced its own process (`sceAppMgrLoadExec`): boot that executable in its
-    /// place, with the same input, recipe and saves - the headless run's rule. The window waits
+    /// place, with the same input and saves - the headless run's rule. The window waits
     /// for the build (a compile-cache hit after the first time).
     fn follow_exec(&mut self, path: &str) -> Result<(), String> {
         println!("frame {}: the title exec'd {path} - booting it", self.session.guest.frames());
         self.session.guest.flush_save(true);
         let b = &self.boot;
-        let mut guest = RetailGuest::new_with_exec(&b.dir, b.input.clone(), b.recipe.as_deref(), Some(path), b.repatch.as_deref())?;
+        let mut guest = RetailGuest::new_with_exec(&b.dir, b.input.clone(), Some(path), b.repatch.as_deref())?;
         if let Some(root) = b.addons.as_deref() {
             guest.mount_addons(root)?;
         }
@@ -3182,7 +3182,8 @@ impl ApplicationHandler for RetailApp {
                 let pressed = k.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = k.physical_key {
                     match code {
-                        KeyCode::Escape if pressed => {
+                        // Escape is the game's while its on-screen keyboard is open (it closes it).
+                        KeyCode::Escape if pressed && !self.session.guest.ime_open() => {
                             event_loop.exit();
                             return;
                         }

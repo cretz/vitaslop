@@ -85,8 +85,8 @@ fn main() {
         out.push('\n');
     }
     out.push_str("    )\n}\n");
-    let dst = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR is set"))
-        .join("dispatch_cont_only.rs");
+    let dst =
+        Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR is set")).join("dispatch_cont_only.rs");
     std::fs::write(&dst, out).expect("the generated table is writable");
 }
 
@@ -140,9 +140,15 @@ fn handled_nids(src: &str) -> Vec<String> {
     let mut nids = Vec::new();
     let last = arms.len().saturating_sub(1);
     for (i, (pat, _)) in arms.iter().enumerate() {
-        let pat = pat.split_once(" if ").map_or(pat.as_str(), |(p, _)| p).trim();
+        let pat = pat
+            .split_once(" if ")
+            .map_or(pat.as_str(), |(p, _)| p)
+            .trim();
         if pat == "_" {
-            assert_eq!(i, last, "a `_` arm in `dispatch` before the last arm hides the arms after it");
+            assert_eq!(
+                i, last,
+                "a `_` arm in `dispatch` before the last arm hides the arms after it"
+            );
             continue;
         }
         for part in pat.split('|') {
@@ -157,18 +163,26 @@ fn handled_nids(src: &str) -> Vec<String> {
             }
         }
     }
-    assert!(nids.len() > 900, "only {} handled NIDs read from `dispatch` - the parse has come adrift", nids.len());
+    assert!(
+        nids.len() > 900,
+        "only {} handled NIDs read from `dispatch` - the parse has come adrift",
+        nids.len()
+    );
     nids
 }
 
 /// `module::CONST` and nothing else - lowercase module, SCREAMING_CASE constant.
 fn is_nid_const_path(s: &str) -> bool {
-    let Some((m, c)) = s.split_once("::") else { return false };
+    let Some((m, c)) = s.split_once("::") else {
+        return false;
+    };
     !m.is_empty()
-        && m.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        && m.chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
         && !c.is_empty()
         && c.starts_with(|ch: char| ch.is_ascii_uppercase())
-        && c.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        && c.chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 /// The arm body is EXACTLY one `cont!(..)` call, optionally wrapped in a bare block.
@@ -182,7 +196,9 @@ fn is_cont_only(body: &str) -> bool {
         (Some(_), Some(_)) => b[1..b.len() - 1].trim(),
         _ => b,
     };
-    let Some(rest) = b.strip_prefix("cont!(") else { return false };
+    let Some(rest) = b.strip_prefix("cont!(") else {
+        return false;
+    };
     if !rest.ends_with(')') {
         return false;
     }

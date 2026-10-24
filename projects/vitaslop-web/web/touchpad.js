@@ -25,7 +25,9 @@ const GLYPH = {
 };
 
 /// Build the controls into `root`. `keymap` is the settings' `button -> code` map.
-/// Returns { setKeymap(map), setOpacity(v), setScale(v), destroy() }.
+/// `opts.rearTouch` adds a REAR toggle: while it is lit, a touch on the game goes to the back
+/// panel (see worker-input.js); `setRearTouch(on)` adds or removes it mid-run. Returns
+/// { setKeymap(map), setOpacity(v), setScale(v), setRearTouch(on), rearLatched(), destroy() }.
 export function mountTouchPad(root, worker, keymap, opts = {}) {
   root.innerHTML = `
     <div class="tp tp-l"><div class="tp-btn tp-small" data-btn="l">${GLYPH.l}</div></div>
@@ -49,6 +51,7 @@ export function mountTouchPad(root, worker, keymap, opts = {}) {
     <div class="tp tp-mid">
       <div class="tp-btn tp-small" data-btn="select">${GLYPH.select}</div>
       <div class="tp-btn tp-small" data-btn="start">${GLYPH.start}</div>
+      <div class="tp-btn tp-small" data-toggle="rear" title="Touches on the game go to the rear panel while lit"${opts.rearTouch ? "" : " hidden"}>REAR</div>
     </div>`;
 
   let map = { ...keymap };
@@ -88,6 +91,17 @@ export function mountTouchPad(root, worker, keymap, opts = {}) {
     el.addEventListener("pointerdown", press);
     el.addEventListener("pointerup", release);
     el.addEventListener("pointercancel", release);
+    el.addEventListener("contextmenu", stop);
+  }
+
+  let rear = false;
+  for (const el of root.querySelectorAll("[data-toggle=rear]")) {
+    el.addEventListener("pointerdown", (e) => {
+      stop(e);
+      rear = !rear;
+      el.classList.toggle("held", rear);
+      vibrate();
+    });
     el.addEventListener("contextmenu", stop);
   }
 
@@ -164,6 +178,16 @@ export function mountTouchPad(root, worker, keymap, opts = {}) {
     },
     setOpacity: (v) => root.style.setProperty("--tp-opacity", String(v)),
     setScale: (v) => root.style.setProperty("--tp-scale", String(v)),
+    /// Show or hide the REAR toggle; hiding it also lets go of the latch, so touches go to the
+    /// front again.
+    setRearTouch: (on) => {
+      for (const el of root.querySelectorAll("[data-toggle=rear]")) {
+        el.hidden = !on;
+        if (!on) el.classList.remove("held");
+      }
+      if (!on) rear = false;
+    },
+    rearLatched: () => rear,
     destroy: () => {
       root.innerHTML = "";
     },

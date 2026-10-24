@@ -47,12 +47,20 @@ struct ArgCursor<'a, 'b> {
 
 impl<'a, 'b> ArgCursor<'a, 'b> {
     fn new(ctx: &'a GuestCtx<'b>, first_word: usize) -> Self {
-        ArgCursor { ctx, area: ArgArea::Call, word: first_word }
+        ArgCursor {
+            ctx,
+            area: ArgArea::Call,
+            word: first_word,
+        }
     }
 
     /// A cursor over the argument area a `va_list` points at.
     fn over_va_list(ctx: &'a GuestCtx<'b>, base: u32) -> Self {
-        ArgCursor { ctx, area: ArgArea::VaList { base }, word: 0 }
+        ArgCursor {
+            ctx,
+            area: ArgArea::VaList { base },
+            word: 0,
+        }
     }
 
     /// The word at index `n` of whichever area this cursor reads.
@@ -132,7 +140,12 @@ pub fn format_into(out: &mut Vec<u8>, ctx: &GuestCtx, fmt_addr: u32, first_word:
 /// The `v` spelling: the same format, with the arguments taken from the `va_list` at
 /// `va_list_addr` instead of from this call's own argument area.
 pub fn format_into_va(out: &mut Vec<u8>, ctx: &GuestCtx, fmt_addr: u32, va_list_addr: u32) {
-    format_with(out, ctx, fmt_addr, ArgCursor::over_va_list(ctx, va_list_addr));
+    format_with(
+        out,
+        ctx,
+        fmt_addr,
+        ArgCursor::over_va_list(ctx, va_list_addr),
+    );
 }
 
 fn format_with(out: &mut Vec<u8>, ctx: &GuestCtx, fmt_addr: u32, args: ArgCursor) {
@@ -234,13 +247,29 @@ fn format_with(out: &mut Vec<u8>, ctx: &GuestCtx, fmt_addr: u32, args: ArgCursor
             break;
         };
         i += 1;
-        format_conv(out, conv, &Spec { flags, width, precision, iw }, &mut args, ctx);
+        format_conv(
+            out,
+            conv,
+            &Spec {
+                flags,
+                width,
+                precision,
+                iw,
+            },
+            &mut args,
+            ctx,
+        );
     }
 }
 
 /// Emit one conversion's output.
 fn format_conv(out: &mut Vec<u8>, conv: u8, spec: &Spec, args: &mut ArgCursor, ctx: &GuestCtx) {
-    let Spec { flags, width, precision, iw } = *spec;
+    let Spec {
+        flags,
+        width,
+        precision,
+        iw,
+    } = *spec;
     match conv {
         b'%' => pad_and_emit(out, b"", b"%", flags, width, false),
         b'd' | b'i' => {
@@ -257,7 +286,11 @@ fn format_conv(out: &mut Vec<u8>, conv: u8, spec: &Spec, args: &mut ArgCursor, c
         b'o' => {
             let v = read_unsigned(args, iw);
             let digits = to_radix(v, 8, false);
-            let prefix: &[u8] = if flags.alt && !digits.starts_with(b"0") { b"0" } else { b"" };
+            let prefix: &[u8] = if flags.alt && !digits.starts_with(b"0") {
+                b"0"
+            } else {
+                b""
+            };
             emit_unsigned(out, &digits, prefix, flags, width, precision);
         }
         b'x' | b'X' => {
@@ -278,7 +311,17 @@ fn format_conv(out: &mut Vec<u8>, conv: u8, spec: &Spec, args: &mut ArgCursor, c
                 pad_and_emit(out, b"", b"(nil)", flags, width, false);
             } else {
                 let digits = to_radix(v as u64, 16, false);
-                emit_unsigned(out, &digits, b"0x", Flags { zero: false, ..flags }, width, None);
+                emit_unsigned(
+                    out,
+                    &digits,
+                    b"0x",
+                    Flags {
+                        zero: false,
+                        ..flags
+                    },
+                    width,
+                    None,
+                );
             }
         }
         b'c' => {
@@ -425,7 +468,14 @@ fn emit_number(
 /// Emit a floating-point conversion. The magnitude is rendered by Rust's
 /// formatter (correct fixed/scientific rounding); we own the sign, the field
 /// width, and zero-padding to match C.
-fn emit_float(out: &mut Vec<u8>, conv: u8, val: f64, flags: Flags, width: usize, precision: Option<usize>) {
+fn emit_float(
+    out: &mut Vec<u8>,
+    conv: u8,
+    val: f64,
+    flags: Flags,
+    width: usize,
+    precision: Option<usize>,
+) {
     let prec = precision.unwrap_or(6);
     let neg = val.is_sign_negative();
     let mag = val.abs();
@@ -494,7 +544,14 @@ fn trim_g(s: &str) -> String {
 
 /// Emit `prefix` then `body`, space-padded to `width` (no numeric semantics).
 /// Used for `%c`, `%s`, `%%`, and null `%p`.
-fn pad_and_emit(out: &mut Vec<u8>, prefix: &[u8], body: &[u8], flags: Flags, width: usize, _zero: bool) {
+fn pad_and_emit(
+    out: &mut Vec<u8>,
+    prefix: &[u8],
+    body: &[u8],
+    flags: Flags,
+    width: usize,
+    _zero: bool,
+) {
     let total = prefix.len() + body.len();
     let pad = width.saturating_sub(total);
     if flags.left {
@@ -527,8 +584,8 @@ mod tests {
     //! formatting logic; the alignment itself is proven end to end against real
     //! arm-vita-eabi-gcc output in the hello conformance test.
     use super::*;
-    use crate::host::{GuestCtx, SliceMemory};
     use crate::VFP_ARG_COUNT;
+    use crate::host::{GuestCtx, SliceMemory};
     use vitaslop_transpiler::abi::{REG_COUNT, SP};
 
     /// A typed variadic argument, laid out per AAPCS by [`render`].
@@ -651,7 +708,10 @@ mod tests {
         assert_eq!(render("%*d", &[Arg::W(5), Arg::W(42)]), "   42");
         assert_eq!(render("%.*d", &[Arg::W(3), Arg::W(42)]), "042");
         // A negative star width means left-justify.
-        assert_eq!(render("[%*d]", &[Arg::W((-5i32) as u32), Arg::W(42)]), "[42   ]");
+        assert_eq!(
+            render("[%*d]", &[Arg::W((-5i32) as u32), Arg::W(42)]),
+            "[42   ]"
+        );
     }
 
     #[test]
@@ -661,7 +721,14 @@ mod tests {
         assert_eq!(
             render(
                 "%d,%d,%d,%d,%d,%d",
-                &[Arg::W(1), Arg::W(2), Arg::W(3), Arg::W(4), Arg::W(5), Arg::W(6)]
+                &[
+                    Arg::W(1),
+                    Arg::W(2),
+                    Arg::W(3),
+                    Arg::W(4),
+                    Arg::W(5),
+                    Arg::W(6)
+                ]
             ),
             "1,2,3,4,5,6"
         );
@@ -674,12 +741,18 @@ mod tests {
         assert_eq!(render("%.2f", &[Arg::D(0.25)]), "0.25");
         assert_eq!(render("%8.2f", &[Arg::D(1.5)]), "    1.50");
         // Two doubles: the second spills to the stack, 8-byte aligned.
-        assert_eq!(render("%f %f", &[Arg::D(1.5), Arg::D(0.25)]), "1.500000 0.250000");
+        assert_eq!(
+            render("%f %f", &[Arg::D(1.5), Arg::D(0.25)]),
+            "1.500000 0.250000"
+        );
     }
 
     #[test]
     fn long_long() {
         // %lld reads an 8-byte argument.
-        assert_eq!(render("%lld", &[Arg::D(f64::from_bits(0x0000_0001_0000_0000))]), "4294967296");
+        assert_eq!(
+            render("%lld", &[Arg::D(f64::from_bits(0x0000_0001_0000_0000))]),
+            "4294967296"
+        );
     }
 }

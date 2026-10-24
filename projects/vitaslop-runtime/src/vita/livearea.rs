@@ -78,7 +78,9 @@ fn parse_frames(bytes: &[u8]) -> Vec<(String, u64)> {
     let mut out = Vec::new();
     for tag in text.split('<').filter(|t| t.starts_with("frame ")) {
         let Some(id) = attr(tag, "id") else { continue };
-        let rev = attr(tag, "rev").and_then(|r| r.parse::<u64>().ok()).unwrap_or(0);
+        let rev = attr(tag, "rev")
+            .and_then(|r| r.parse::<u64>().ok())
+            .unwrap_or(0);
         out.push((id, rev));
     }
     out
@@ -106,9 +108,21 @@ fn attr(tag: &str, name: &str) -> Option<String> {
 /// next call, it does not test `r0`), so the CORRECTNESS of this call is entirely in
 /// what it writes - which is exactly why an unwritten out-param would be the bug here.
 #[hostcall]
-pub(super) fn get_frame_revision(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, revision: Ptr) -> i32 {
-    let name = if name.is_null() { String::new() } else { ctx.read_cstr(name.addr(), FRAME_NAME_MAX) };
-    let rev = declared_frames(st).into_iter().find(|(id, _)| *id == name).map(|(_, rev)| rev);
+pub(super) fn get_frame_revision(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    name: Ptr,
+    revision: Ptr,
+) -> i32 {
+    let name = if name.is_null() {
+        String::new()
+    } else {
+        ctx.read_cstr(name.addr(), FRAME_NAME_MAX)
+    };
+    let rev = declared_frames(st)
+        .into_iter()
+        .find(|(id, _)| *id == name)
+        .map(|(_, rev)| rev);
     // Write the out-param on BOTH paths. The caller does not check the return, so a
     // revision left unwritten is read as whatever the buffer held - and the failing
     // case must read as "no revision", which is 0, not as a stale one.
@@ -141,7 +155,9 @@ pub(super) fn get_frame_revision(ctx: &mut GuestCtx, st: &mut VitaState, name: P
 /// it.
 #[hostcall]
 pub(super) fn get_frame_user_data(_ctx: &mut GuestCtx, _st: &mut VitaState) -> i32 {
-    report_unestablished("no LiveArea user data exists - nothing here runs a shell that could have stored any");
+    report_unestablished(
+        "no LiveArea user data exists - nothing here runs a shell that could have stored any",
+    );
     SCE_LIVEAREA_UTIL_ERROR_NOT_FOUND
 }
 
@@ -164,13 +180,20 @@ mod tests {
 </livearea>"#;
         assert_eq!(
             parse_frames(xml.as_bytes()),
-            vec![("frame3".into(), 1), ("frame5".into(), 2), ("frame7".into(), 0)]
+            vec![
+                ("frame3".into(), 1),
+                ("frame5".into(), 2),
+                ("frame7".into(), 0)
+            ]
         );
     }
 
     #[test]
     fn attr_reads_one_value() {
-        assert_eq!(attr(r#"frame id="frame3" rev="4""#, "rev"), Some("4".into()));
+        assert_eq!(
+            attr(r#"frame id="frame3" rev="4""#, "rev"),
+            Some("4".into())
+        );
         assert_eq!(attr(r#"frame id="frame3""#, "rev"), None);
     }
 }

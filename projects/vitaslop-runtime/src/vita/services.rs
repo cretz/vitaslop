@@ -9,18 +9,21 @@
 //! (there is no network event to deliver). This keeps a title on its offline path -
 //! menus and gameplay - without waiting on a connection that will never come.
 
+use crate::SvcOutcome;
 use crate::host::{GuestCtx, Ptr, VitaState};
 use crate::hostcall;
-use crate::SvcOutcome;
 
 /// SceNetCtl connection state: disconnected (no link).
 const SCE_NETCTL_STATE_DISCONNECTED: u32 = 0;
 /// SceSysmodule "module is loaded" status.
 const SCE_SYSMODULE_LOADED: i32 = 0;
-/// A generic "no online account / not signed in" error, returned by the online
-/// identity calls so the title takes its offline path instead of dereferencing an
-/// account it will never get.
-pub(super) const SCE_NP_ERROR_SIGNED_OUT: i32 = 0x8055_0605u32 as i32;
+/// The NP manager's "not signed up" error: what its identity calls answer on a console with
+/// no account (the manager's block is 0x80550501..0x8055050B). The libraries with no sign-in
+/// code of their own (auth, message, activity) answer with it too: what they lack is the
+/// account the manager would hand them.
+pub(super) const NP_MANAGER_ERROR_SIGNOUT: i32 = 0x8055_050Au32 as i32;
+/// `SCE_NP_MATCHING2_ERROR_NOT_NP_SIGN_IN`: matching2's own "no account / not signed in".
+pub(super) const NP_MATCHING2_ERROR_NOT_NP_SIGN_IN: i32 = 0x8055_0C34u32 as i32;
 
 /// SceAppUtil system-parameter IDs (from the MIT `psp2/system_param.h`).
 const SCE_SYSTEM_PARAM_ID_LANG: u32 = 1;
@@ -43,7 +46,12 @@ const SCE_SYSTEM_PARAM_ENTER_BUTTON_CROSS: u32 = 1;
 /// fix, not a fix for a touch-driven front-end (that is `sceTouchRead`'s job); on such
 /// a title no button, Cross or Circle, drives a game-drawn touch dialog.
 #[hostcall]
-pub(super) fn apputil_system_param_get_int(ctx: &mut GuestCtx, _st: &mut VitaState, id: u32, value: Ptr) -> i32 {
+pub(super) fn apputil_system_param_get_int(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    id: u32,
+    value: Ptr,
+) -> i32 {
     if !value.is_null() {
         let v = match id {
             SCE_SYSTEM_PARAM_ID_LANG => SCE_SYSTEM_PARAM_LANG_ENGLISH_US,
@@ -139,7 +147,11 @@ pub(super) fn netctl_inet_get_info(
 /// [`netctl_inet_get_info`] does: writing 0.0.0.0 beside an error is a lie a caller that
 /// ignores the return code cannot detect.
 #[hostcall]
-pub(super) fn netctl_adhoc_get_in_addr(_ctx: &mut GuestCtx, _st: &mut VitaState, _inaddr: Ptr) -> i32 {
+pub(super) fn netctl_adhoc_get_in_addr(
+    _ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _inaddr: Ptr,
+) -> i32 {
     SCE_NET_CTL_ERROR_NOT_CONNECTED
 }
 
@@ -191,7 +203,13 @@ pub(super) fn netctl_adhoc_disconnect(_ctx: &mut GuestCtx, _st: &mut VitaState) 
 /// Records the callback so [`net_check_callback`] can deliver the one-time offline
 /// state, and hands back a callback id.
 #[hostcall]
-pub(super) fn netctl_register_callback(ctx: &mut GuestCtx, st: &mut VitaState, func: Ptr, arg: Ptr, cid: Ptr) -> i32 {
+pub(super) fn netctl_register_callback(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    func: Ptr,
+    arg: Ptr,
+    cid: Ptr,
+) -> i32 {
     st.set_net_inet_callback(func.addr(), arg.addr());
     tracing::debug!(target: "vitaslop::cb", func = format_args!("{:#x}", func.addr()), arg = format_args!("{:#x}", arg.addr()), "netCtlRegisterCallback");
     if !cid.is_null() {
@@ -218,7 +236,12 @@ pub(super) fn net_check_callback(_ctx: &mut GuestCtx, st: &mut VitaState) -> i32
 /// Records the callback so [`np_check_callback`] can deliver the one-time offline
 /// (signed-out) service state a title's boot state machine waits for.
 #[hostcall]
-pub(super) fn np_register_service_state_callback(_ctx: &mut GuestCtx, st: &mut VitaState, cb: Ptr, userdata: Ptr) -> i32 {
+pub(super) fn np_register_service_state_callback(
+    _ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    cb: Ptr,
+    userdata: Ptr,
+) -> i32 {
     st.set_np_service_callback(cb.addr(), userdata.addr());
     tracing::debug!(target: "vitaslop::cb", cb = format_args!("{:#x}", cb.addr()), userdata = format_args!("{:#x}", userdata.addr()), "npRegisterServiceStateCallback");
     0
@@ -250,7 +273,11 @@ pub(super) fn np_check_callback(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// walking a friend array that was never filled. The kernel writes the count out-param;
 /// an unwritten one would leave the title's loop bound undefined.
 #[hostcall]
-pub(super) fn np_basic_get_friend_list_entry_count(ctx: &mut GuestCtx, _st: &mut VitaState, count: Ptr) -> i32 {
+pub(super) fn np_basic_get_friend_list_entry_count(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    count: Ptr,
+) -> i32 {
     if !count.is_null() {
         ctx.write_u32(count.addr(), 0);
     }
@@ -288,7 +315,7 @@ const DIALOG_STATUS_FINISHED: i32 = 2;
 /// # Why TWO FLIPS and not a stretch of time
 /// Two flips = the rest of the frame that opened it plus the whole next one, which is the
 /// least any frame-granular observer needs. It was 100 ms of guest time first, and that
-/// MEASURABLY broke recorded recipes (`reg24b`, then the one-knob arm `att24`): six frames
+/// MEASURABLY broke recorded input scripts (`reg24b`, then the one-knob arm `att24`): six frames
 /// of delay at a boot dialog moved every later frame-pinned press, and a golf title's
 /// front end walked into the wrong menu. A person would take far longer than either, so
 /// neither is "the console's" length; the shortest one that is observable is the one that
@@ -296,7 +323,10 @@ const DIALOG_STATUS_FINISHED: i32 = 2;
 fn dialog_running_flips() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        crate::knobs::var("VITASLOP_DIALOG_RUNNING_FRAMES").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(2)
+        crate::knobs::var("VITASLOP_DIALOG_RUNNING_FRAMES")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(2)
     })
 }
 
@@ -347,7 +377,10 @@ pub(super) fn ime_dialog_get_result(ctx: &mut GuestCtx, _st: &mut VitaState) {
     let result = ctx.arg(0);
     if result != 0 {
         ctx.write_u32(result + IME_DIALOG_RESULT_RESULT, 0);
-        ctx.write_u32(result + IME_DIALOG_RESULT_BUTTON, SCE_IME_DIALOG_BUTTON_CLOSE);
+        ctx.write_u32(
+            result + IME_DIALOG_RESULT_BUTTON,
+            SCE_IME_DIALOG_BUTTON_CLOSE,
+        );
     }
     ctx.ret(0);
 }
@@ -372,14 +405,26 @@ fn report_msg_dialog(ctx: &mut GuestCtx) {
         return;
     }
     let mode = ctx.read_u32(param + 0x50);
-    let (user, sys, err) = (ctx.read_u32(param + 0x54), ctx.read_u32(param + 0x58), ctx.read_u32(param + 0x5c));
+    let (user, sys, err) = (
+        ctx.read_u32(param + 0x54),
+        ctx.read_u32(param + 0x58),
+        ctx.read_u32(param + 0x5c),
+    );
     let what = match mode {
         1 if user != 0 => {
             let (buttons, msg) = (ctx.read_u32(user), ctx.read_u32(user + 4));
-            let text = if msg != 0 { ctx.read_cstr(msg, 200) } else { String::new() };
+            let text = if msg != 0 {
+                ctx.read_cstr(msg, 200)
+            } else {
+                String::new()
+            };
             format!("USER message {text:?} (button type {buttons})")
         }
-        2 if sys != 0 => format!("SYSTEM message type {} value {}", ctx.read_u32(sys), ctx.read_u32(sys + 4)),
+        2 if sys != 0 => format!(
+            "SYSTEM message type {} value {}",
+            ctx.read_u32(sys),
+            ctx.read_u32(sys + 4)
+        ),
         3 if err != 0 => format!("ERROR CODE {:#010x}", ctx.read_u32(err)),
         _ => format!("mode {mode}"),
     };
@@ -395,7 +440,11 @@ pub(super) fn dialog_get_status(ctx: &mut GuestCtx, st: &mut VitaState, family: 
     let status = if st.open_dialogs & (1 << family as u32) == 0 {
         DIALOG_STATUS_NONE
     } else if st.is_preemptive()
-        && st.flip_count().saturating_sub(st.dialog_opened_flip[family as usize]) < dialog_running_flips() {
+        && st
+            .flip_count()
+            .saturating_sub(st.dialog_opened_flip[family as usize])
+            < dialog_running_flips()
+    {
         DIALOG_STATUS_RUNNING
     } else {
         DIALOG_STATUS_FINISHED
@@ -438,7 +487,10 @@ const MSG_DIALOG_RESULT_BUTTON_ID_OFFSET: u32 = 8;
 pub(super) fn msg_dialog_get_result(ctx: &mut GuestCtx, _st: &mut VitaState) {
     let result = ctx.arg(0);
     if result != 0 {
-        ctx.write_u32(result + MSG_DIALOG_RESULT_BUTTON_ID_OFFSET, SCE_MSG_DIALOG_BUTTON_ID_YESOK);
+        ctx.write_u32(
+            result + MSG_DIALOG_RESULT_BUTTON_ID_OFFSET,
+            SCE_MSG_DIALOG_BUTTON_ID_YESOK,
+        );
     }
     ctx.ret(0);
 }
@@ -490,10 +542,7 @@ pub(super) fn rtc_get_accumulative_time(ctx: &mut GuestCtx, st: &mut VitaState) 
 /// bring-up single-thread model [`VitaState::guest_wall_us`] returns the HOST's wall clock,
 /// which advances continuously - so there is no word the block could hold that is the call's
 /// answer, and the handler stays the definition.
-pub(crate) fn inline_op(
-    func_nid: u32,
-    preemptive: bool,
-) -> Option<vitaslop_transpiler::InlineOp> {
+pub(crate) fn inline_op(func_nid: u32, preemptive: bool) -> Option<vitaslop_transpiler::InlineOp> {
     use crate::nid::services as sv;
     use crate::vita::mirror::SLOT_RTC_LO;
     match func_nid {
@@ -525,7 +574,11 @@ pub(super) fn rtc_get_tick_resolution(_ctx: &mut GuestCtx, _st: &mut VitaState) 
 /// error path they almost never exercise, to no benefit: the point of the call is to get a
 /// trustworthy timestamp, and ours is already the one deterministic clock in the system.
 #[hostcall]
-pub(super) fn rtc_get_current_network_tick(ctx: &mut GuestCtx, st: &mut VitaState, tick: Ptr) -> i32 {
+pub(super) fn rtc_get_current_network_tick(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    tick: Ptr,
+) -> i32 {
     if !tick.is_null() {
         let t = RTC_UNIX_EPOCH_TICKS + st.guest_wall_us();
         ctx.write_u32(tick.addr(), t as u32);
@@ -544,7 +597,12 @@ pub(super) fn rtc_get_current_network_tick(ctx: &mut GuestCtx, st: &mut VitaStat
 /// A NULL destination is an error, not a silent success: the caller reads the destination
 /// straight after, and a call that "succeeded" without writing hands it stack garbage.
 #[hostcall]
-pub(super) fn rtc_convert_time_zone(ctx: &mut GuestCtx, _st: &mut VitaState, src: Ptr, dst: Ptr) -> i32 {
+pub(super) fn rtc_convert_time_zone(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    src: Ptr,
+    dst: Ptr,
+) -> i32 {
     if src.is_null() || dst.is_null() {
         SCE_RTC_ERROR_INVALID_POINTER
     } else {
@@ -593,7 +651,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 /// days since the Unix epoch, negative for earlier dates. Howard Hinnant's algorithm,
 /// exact across the whole SceRtcTime year range. Added to the RTC-to-Unix epoch offset
 /// this yields the same 0001-01-01 timeline sceRtcGetCurrentTick reports.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(super) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400; // [0, 399]
@@ -653,13 +711,16 @@ fn rtc_decode_broken_down(ctx: &mut GuestCtx, time: Ptr) -> Result<(i64, i64), i
         return Err(SCE_RTC_ERROR_INVALID_MICROSECOND);
     }
     // `days_from_civil` counts days from 1970-01-01, so this is UNIX seconds already.
-    Ok((days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second, micro))
+    Ok((
+        days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second,
+        micro,
+    ))
 }
 
 /// Civil date `(year, month, day)` from a day count since 1970-01-01 - the exact inverse
 /// of [`days_from_civil`], by the same proleptic-Gregorian construction, so a tick
 /// converted out and back is unchanged across the whole SceRtcTime year range.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(super) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]
@@ -680,7 +741,13 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// dates before the Unix epoch (which the RTC's 0001-01-01 range allows) on the same
 /// cycle instead of reflecting them about it.
 #[hostcall]
-pub(super) fn rtc_get_day_of_week(_ctx: &mut GuestCtx, _st: &mut VitaState, year: i32, month: i32, day: i32) -> i32 {
+pub(super) fn rtc_get_day_of_week(
+    _ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    year: i32,
+    month: i32,
+    day: i32,
+) -> i32 {
     // Written as one expression, not a chain of early returns: the `#[hostcall]` body
     // cannot `return` (the macro appends the return-value write after it).
     if !(1..=9999).contains(&year) {
@@ -699,7 +766,12 @@ pub(super) fn rtc_get_day_of_week(_ctx: &mut GuestCtx, _st: &mut VitaState, year
 /// The length of a month, February by the same leap rule as everything else here. Year and
 /// month are validated as [`rtc_get_day_of_week`] validates them.
 #[hostcall]
-pub(super) fn rtc_get_days_in_month(_ctx: &mut GuestCtx, _st: &mut VitaState, year: i32, month: i32) -> i32 {
+pub(super) fn rtc_get_days_in_month(
+    _ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    year: i32,
+    month: i32,
+) -> i32 {
     if !(1..=9999).contains(&year) {
         SCE_RTC_ERROR_INVALID_YEAR
     } else if !(1..=12).contains(&month) {
@@ -745,7 +817,10 @@ pub(super) fn rtc_compare_tick(ctx: &mut GuestCtx, _st: &mut VitaState, a: Ptr, 
     if a.is_null() || b.is_null() {
         SCE_RTC_ERROR_INVALID_POINTER
     } else {
-        let (x, y) = (read_tick(ctx, a.addr()) as u64, read_tick(ctx, b.addr()) as u64);
+        let (x, y) = (
+            read_tick(ctx, a.addr()) as u64,
+            read_tick(ctx, b.addr()) as u64,
+        );
         match x.cmp(&y) {
             std::cmp::Ordering::Less => -1,
             std::cmp::Ordering::Equal => 0,
@@ -763,8 +838,14 @@ fn write_date_time(ctx: &mut GuestCtx, time: u32, secs: i64, micro: i64) -> i32 
         return SCE_RTC_ERROR_INVALID_YEAR;
     }
     let sod = secs.rem_euclid(86_400);
-    let fields: [u16; 6] =
-        [y as u16, m as u16, d as u16, (sod / 3600) as u16, (sod / 60 % 60) as u16, (sod % 60) as u16];
+    let fields: [u16; 6] = [
+        y as u16,
+        m as u16,
+        d as u16,
+        (sod / 3600) as u16,
+        (sod / 60 % 60) as u16,
+        (sod % 60) as u16,
+    ];
     let mut bytes = [0u8; 16];
     for (i, f) in fields.iter().enumerate() {
         bytes[i * 2..i * 2 + 2].copy_from_slice(&f.to_le_bytes());
@@ -779,7 +860,12 @@ fn write_date_time(ctx: &mut GuestCtx, time: u32, secs: i64, micro: i64) -> i32 
 /// The inverse of [`rtc_get_time_t`]: a signed 32-bit UNIX second count (the Vita's
 /// `time_t`) broken down, so a date before 1970 expands to the right day.
 #[hostcall]
-pub(super) fn rtc_set_time_t(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, seconds: i32) -> i32 {
+pub(super) fn rtc_set_time_t(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    time: Ptr,
+    seconds: i32,
+) -> i32 {
     if time.is_null() {
         SCE_RTC_ERROR_INVALID_POINTER
     } else {
@@ -793,13 +879,25 @@ pub(super) fn rtc_set_time_t(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr,
 /// broken down, the sub-microsecond remainder dropped (the field has no room for it). The
 /// 64-bit count arrives in the r2:r3 pair, as `sceRtcSetTime64_t`'s does.
 #[hostcall]
-pub(super) fn rtc_set_win32_file_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, _pad: u32, lo: u32, hi: u32) -> i32 {
+pub(super) fn rtc_set_win32_file_time(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    time: Ptr,
+    _pad: u32,
+    lo: u32,
+    hi: u32,
+) -> i32 {
     if time.is_null() {
         SCE_RTC_ERROR_INVALID_POINTER
     } else {
         const FILETIME_UNIX_OFFSET_S: i64 = 11_644_473_600;
         let us = ((((hi as u64) << 32) | lo as u64) / 10) as i64;
-        write_date_time(ctx, time.addr(), us.div_euclid(1_000_000) - FILETIME_UNIX_OFFSET_S, us.rem_euclid(1_000_000))
+        write_date_time(
+            ctx,
+            time.addr(),
+            us.div_euclid(1_000_000) - FILETIME_UNIX_OFFSET_S,
+            us.rem_euclid(1_000_000),
+        )
     }
 }
 
@@ -809,7 +907,12 @@ pub(super) fn rtc_set_win32_file_time(ctx: &mut GuestCtx, _st: &mut VitaState, t
 /// minute << 5 | second / 2`. A valid date the form cannot hold (before 1980 or after
 /// 2107) is refused as a year out of range rather than wrapped.
 #[hostcall]
-pub(super) fn rtc_get_dos_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, out: Ptr) -> i32 {
+pub(super) fn rtc_get_dos_time(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    time: Ptr,
+    out: Ptr,
+) -> i32 {
     rtc_get_dos_time_impl(ctx, time, out)
 }
 
@@ -826,7 +929,12 @@ fn rtc_get_dos_time_impl(ctx: &mut GuestCtx, time: Ptr, out: Ptr) -> i32 {
     if !(1980..=2107).contains(&year) {
         return SCE_RTC_ERROR_INVALID_YEAR;
     }
-    let dos = ((year - 1980) << 25) | (f(1) << 21) | (f(2) << 16) | (f(3) << 11) | (f(4) << 5) | (f(5) / 2);
+    let dos = ((year - 1980) << 25)
+        | (f(1) << 21)
+        | (f(2) << 16)
+        | (f(3) << 11)
+        | (f(4) << 5)
+        | (f(5) / 2);
     ctx.write_u32(out.addr(), dos);
     0
 }
@@ -837,7 +945,12 @@ fn rtc_get_dos_time_impl(ctx: &mut GuestCtx, time: Ptr, out: Ptr) -> i32 {
 /// broken-down time is (a DOS word can spell month 0 or second 60), and nothing is written
 /// for one that fails.
 #[hostcall]
-pub(super) fn rtc_set_dos_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, dos: u32) -> i32 {
+pub(super) fn rtc_set_dos_time(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    time: Ptr,
+    dos: u32,
+) -> i32 {
     rtc_set_dos_time_impl(ctx, time, dos)
 }
 
@@ -847,7 +960,11 @@ fn rtc_set_dos_time_impl(ctx: &mut GuestCtx, time: Ptr, dos: u32) -> i32 {
     }
     let year = 1980 + (dos >> 25) as i64;
     let (month, day) = ((dos >> 21 & 0xf) as i64, (dos >> 16 & 0x1f) as i64);
-    let (hour, minute, second) = ((dos >> 11 & 0x1f) as i64, (dos >> 5 & 0x3f) as i64, (dos & 0x1f) as i64 * 2);
+    let (hour, minute, second) = (
+        (dos >> 11 & 0x1f) as i64,
+        (dos >> 5 & 0x3f) as i64,
+        (dos & 0x1f) as i64 * 2,
+    );
     if !(1..=12).contains(&month) {
         return SCE_RTC_ERROR_INVALID_MONTH;
     }
@@ -863,7 +980,12 @@ fn rtc_set_dos_time_impl(ctx: &mut GuestCtx, time: Ptr, dos: u32) -> i32 {
     if second > 59 {
         return SCE_RTC_ERROR_INVALID_SECOND;
     }
-    write_date_time(ctx, time.addr(), days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second, 0)
+    write_date_time(
+        ctx,
+        time.addr(),
+        days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second,
+        0,
+    )
 }
 
 /// int sceRtcFormatRFC3339LocalTime(char *pszDateTime, const SceRtcTick *utc)
@@ -877,7 +999,12 @@ fn rtc_set_dos_time_impl(ctx: &mut GuestCtx, time: Ptr, dos: u32) -> i32 {
 /// The tick is expanded through the same [`civil_from_days`] path as `sceRtcSetTick`, so
 /// a title that formats a stamp and one that expands it cannot disagree about the date.
 #[hostcall]
-pub(super) fn rtc_format_rfc3339_local_time(ctx: &mut GuestCtx, _st: &mut VitaState, out: Ptr, tick: Ptr) -> i32 {
+pub(super) fn rtc_format_rfc3339_local_time(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    out: Ptr,
+    tick: Ptr,
+) -> i32 {
     // The validation wants early exits, which a `#[hostcall]` body cannot have.
     rtc_format_rfc3339_local_time_impl(ctx, out, tick)
 }
@@ -892,7 +1019,13 @@ fn rtc_format_rfc3339_local_time_impl(ctx: &mut GuestCtx, out: Ptr, tick: Ptr) -
 /// are the UTC tick moved by `iTimeZoneMinutes`, and the offset printed is that same amount,
 /// so [`rtc_parse_rfc3339`] reading the text back lands on the tick it was given.
 #[hostcall]
-pub(super) fn rtc_format_rfc3339(ctx: &mut GuestCtx, _st: &mut VitaState, out: Ptr, tick: Ptr, tz_minutes: i32) -> i32 {
+pub(super) fn rtc_format_rfc3339(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    out: Ptr,
+    tick: Ptr,
+    tz_minutes: i32,
+) -> i32 {
     rtc_format_rfc3339_impl(ctx, out, tick, tz_minutes)
 }
 
@@ -946,7 +1079,12 @@ fn rtc_format_rfc3339_impl(ctx: &mut GuestCtx, out: Ptr, tick: Ptr, tz_minutes: 
 /// library publishes. There is no documented "malformed string" code to return instead, and
 /// inventing one would put a value in front of a title that no console produces.
 #[hostcall]
-pub(super) fn rtc_parse_rfc3339(ctx: &mut GuestCtx, _st: &mut VitaState, tick: Ptr, text: Ptr) -> i32 {
+pub(super) fn rtc_parse_rfc3339(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    tick: Ptr,
+    text: Ptr,
+) -> i32 {
     rtc_parse_rfc3339_impl(ctx, tick, text)
 }
 
@@ -1019,11 +1157,7 @@ fn rtc_parse_rfc3339_impl(ctx: &mut GuestCtx, tick: Ptr, text: Ptr) -> i32 {
                 return SCE_RTC_ERROR_INVALID_MINUTE;
             }
             let magnitude = oh * 60 + om;
-            if c == b'-' {
-                -magnitude
-            } else {
-                magnitude
-            }
+            if c == b'-' { -magnitude } else { magnitude }
         }
         _ => return SCE_RTC_ERROR_INVALID_HOUR,
     };
@@ -1049,9 +1183,9 @@ fn rtc_parse_rfc3339_impl(ctx: &mut GuestCtx, tick: Ptr, text: Ptr) -> i32 {
     if second > 59 {
         return SCE_RTC_ERROR_INVALID_SECOND;
     }
-    let unix_secs = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60
-        + second
-        - offset_minutes * 60;
+    let unix_secs =
+        days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
+            - offset_minutes * 60;
     let t = unix_secs * 1_000_000 + micro + RTC_UNIX_EPOCH_TICKS as i64;
     write_tick(ctx, tick.addr(), t);
     0
@@ -1086,8 +1220,14 @@ fn rtc_set_tick_impl(ctx: &mut GuestCtx, time: Ptr, tick: Ptr) -> i32 {
     if !(1..=9999).contains(&y) {
         return SCE_RTC_ERROR_INVALID_YEAR;
     }
-    let fields: [u16; 6] =
-        [y as u16, m as u16, d as u16, (sod / 3600) as u16, (sod / 60 % 60) as u16, (sod % 60) as u16];
+    let fields: [u16; 6] = [
+        y as u16,
+        m as u16,
+        d as u16,
+        (sod / 3600) as u16,
+        (sod / 60 % 60) as u16,
+        (sod % 60) as u16,
+    ];
     let mut bytes = [0u8; 16];
     for (i, f) in fields.iter().enumerate() {
         bytes[i * 2..i * 2 + 2].copy_from_slice(&f.to_le_bytes());
@@ -1180,7 +1320,12 @@ pub(super) fn rtc_tick_add_calendar(ctx: &mut GuestCtx, months_per_unit: i64) {
 /// ordering derived from it, so the same exact range checks apply and an invalid date is
 /// rejected rather than folded into a plausible number.
 #[hostcall]
-pub(super) fn rtc_get_time64_t(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, out: Ptr) -> i32 {
+pub(super) fn rtc_get_time64_t(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    time: Ptr,
+    out: Ptr,
+) -> i32 {
     rtc_get_time64_t_impl(ctx, time, out)
 }
 
@@ -1204,7 +1349,12 @@ fn rtc_get_time64_t_impl(ctx: &mut GuestCtx, time: Ptr, out: Ptr) -> i32 {
 /// 1601-01-01 00:00 UTC, which is 11,644,473,600 seconds before the UNIX epoch. Validated by
 /// the one decoder every conversion shares, and written as a little-endian 64-bit value.
 #[hostcall]
-pub(super) fn rtc_get_win32_file_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, out: Ptr) -> i32 {
+pub(super) fn rtc_get_win32_file_time(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    time: Ptr,
+    out: Ptr,
+) -> i32 {
     rtc_get_win32_file_time_impl(ctx, time, out)
 }
 
@@ -1339,7 +1489,12 @@ pub(super) fn motion_get_sensor_state(
 }
 
 /// The body of [`motion_get_sensor_state`], split out so it can use early returns.
-fn write_sensor_records(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, num_records: usize) -> i32 {
+fn write_sensor_records(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+    num_records: usize,
+) -> i32 {
     let now = st.guest_mono_us();
     let mut buf = vec![0u8; MOTION_SENSOR_STATE_SIZE * num_records];
     for i in 0..num_records {
@@ -1376,6 +1531,32 @@ pub(super) fn power_set_clock(ctx: &mut GuestCtx, st: &mut VitaState, which: usi
 /// int scePowerGet{Arm,Bus,Gpu,GpuXbar}ClockFrequency(void)
 pub(super) fn power_get_clock(ctx: &mut GuestCtx, st: &mut VitaState, which: usize) {
     ctx.ret(st.power_clocks[which]);
+}
+
+/// The battery this engine presents: the console is on its AC adapter with a full battery -
+/// so power is online, a battery exists, it is not charging (it is full), it is not low, it is
+/// at 100%, and nothing asks the title to suspend. One state, so the calls cannot contradict
+/// each other. `answer` is what the dispatch arm asks for.
+pub(super) fn power_state(ctx: &mut GuestCtx, answer: u32) {
+    ctx.ret(answer);
+}
+
+/// SceBool `scePowerIsPowerOnline` / `IsBatteryExist`: yes.
+pub(super) const POWER_YES: u32 = 1;
+/// SceBool `scePowerIsBatteryCharging` / `IsLowBattery` / `IsSuspendRequired`: no.
+pub(super) const POWER_NO: u32 = 0;
+/// int `scePowerGetBatteryLifePercent`: full.
+pub(super) const POWER_FULL_PERCENT: u32 = 100;
+
+/// int scePowerSetUsingWireless(SceBool enabled) / scePowerGetUsingWireless(void): the title's
+/// own setting, held and read back.
+pub(super) fn power_using_wireless(ctx: &mut GuestCtx, st: &mut VitaState, set: bool) {
+    if set {
+        st.power_using_wireless = ctx.arg(0) != 0;
+        ctx.ret(0);
+    } else {
+        ctx.ret(u32::from(st.power_using_wireless));
+    }
 }
 
 /// int sceMotionSetAngleThreshold(float angle) / float sceMotionGetAngleThreshold(void)
@@ -1475,7 +1656,11 @@ pub(super) fn shared_fb_end(ctx: &mut GuestCtx, st: &mut VitaState) {
     match st.shared_fb {
         Some((u, base, cur)) if u == uid => {
             // The guest drew the buffer that was NOT on screen; show it and swap.
-            let drawn = if cur == 0 { base + SHARED_FB_BYTES } else { base };
+            let drawn = if cur == 0 {
+                base + SHARED_FB_BYTES
+            } else {
+                base
+            };
             st.shared_fb = Some((u, base, cur ^ 1));
             st.resolve_at_flip(ctx);
             st.present(drawn);
@@ -1494,7 +1679,11 @@ pub(super) fn shared_fb_end(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// int sceSharedFbClose(SceUID fb)
 pub(super) fn shared_fb_close(ctx: &mut GuestCtx, st: &mut VitaState) {
     let uid = ctx.arg(0) as i32;
-    ctx.ret(if matches!(st.shared_fb, Some((u, _, _)) if u == uid) { 0 } else { 0x8002_0005 });
+    ctx.ret(if matches!(st.shared_fb, Some((u, _, _)) if u == uid) {
+        0
+    } else {
+        0x8002_0005
+    });
 }
 
 /// int sceMotionGetMagnetometerState(void)
@@ -1525,7 +1714,11 @@ pub(super) fn motion_set_tuning(ctx: &mut GuestCtx, st: &mut VitaState, tilt: bo
 /// 1 if the bit is enabled, 0 if not. Both power up enabled, which is what the device
 /// documents, so a title that only ever reads them sees the device's own defaults.
 pub(super) fn motion_get_tuning(ctx: &mut GuestCtx, st: &mut VitaState, tilt: bool) {
-    let on = if tilt { st.motion_tilt_correction } else { st.motion_deadband };
+    let on = if tilt {
+        st.motion_tilt_correction
+    } else {
+        st.motion_deadband
+    };
     ctx.ret(u32::from(on));
 }
 
@@ -1562,7 +1755,12 @@ const SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT: i32 = 0x8010_0660u32 as i32;
 /// NO_ENTITLEMENT. A blanket success is a trap: the title then reads the absent add-on's
 /// data, fails, and retries the open every frame - wedging its boot flow on a probe loop.
 #[hostcall]
-pub(super) fn apputil_drm_open(ctx: &mut GuestCtx, st: &mut VitaState, dir: Ptr, _mount: Ptr) -> i32 {
+pub(super) fn apputil_drm_open(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    dir: Ptr,
+    _mount: Ptr,
+) -> i32 {
     let name = if dir.is_null() {
         String::new()
     } else {
@@ -1652,7 +1850,13 @@ fn read_mount_name(ctx: &GuestCtx, mount: Ptr) -> String {
 /// success stub would instead leave `param` as stack garbage the title reads as a real
 /// save. The kernel leaves `param` untouched on error, so we do too.
 #[hostcall]
-pub(super) fn apputil_savedata_slot_get_param(ctx: &mut GuestCtx, st: &mut VitaState, slot_id: u32, param: Ptr, mount: Ptr) -> i32 {
+pub(super) fn apputil_savedata_slot_get_param(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    slot_id: u32,
+    param: Ptr,
+    mount: Ptr,
+) -> i32 {
     let mount_name = read_mount_name(ctx, mount);
     match st.savedata_slot_get(&mount_name, slot_id) {
         Some(bytes) => {
@@ -1678,7 +1882,13 @@ pub(super) fn apputil_savedata_slot_get_param(ctx: &mut GuestCtx, st: &mut VitaS
 /// as the kernel does. A null `param` stores a zeroed blob (the slot exists but carries
 /// no metadata). Nothing is persisted to a real disk - the store is per-run and offline.
 #[hostcall]
-pub(super) fn apputil_savedata_slot_create(ctx: &mut GuestCtx, st: &mut VitaState, slot_id: u32, param: Ptr, mount: Ptr) -> i32 {
+pub(super) fn apputil_savedata_slot_create(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    slot_id: u32,
+    param: Ptr,
+    mount: Ptr,
+) -> i32 {
     let mount_name = read_mount_name(ctx, mount);
     if st.savedata_slot_exists(&mount_name, slot_id) {
         tracing::debug!(target: "vitaslop::cb", slot = slot_id, "sceAppUtilSaveDataSlotCreate -> SLOT_EXISTS");
@@ -1704,7 +1914,13 @@ pub(super) fn apputil_savedata_slot_create(ctx: &mut GuestCtx, st: &mut VitaStat
 /// title that sets before creating learns it, as it would on hardware. On success the param
 /// blob replaces the stored one verbatim, so a later `GetParam` reads back what was last set.
 #[hostcall]
-pub(super) fn apputil_savedata_slot_set_param(ctx: &mut GuestCtx, st: &mut VitaState, slot_id: u32, param: Ptr, mount: Ptr) -> i32 {
+pub(super) fn apputil_savedata_slot_set_param(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    slot_id: u32,
+    param: Ptr,
+    mount: Ptr,
+) -> i32 {
     let mount_name = read_mount_name(ctx, mount);
     if st.savedata_slot_exists(&mount_name, slot_id) {
         let bytes = if param.is_null() {
@@ -1777,6 +1993,39 @@ const SAVEDATA_FILE_MODE_OFF: u32 = 24;
 /// in the same call. Ignored, a title that saves this way and on its next boot checks the slot
 /// before reading its file finds the file with no slot - which it reports as a save it cannot
 /// read, offers a retry, and fails again forever.
+/// The range check `sceAppUtil{Save,Load}SafeMemory` make: `size` bytes at `offset` must lie
+/// inside [`crate::host::SAFE_MEMORY_SIZE`], over a buffer that is not NULL.
+fn safe_memory_range(buf: u32, size: u32, offset: u64) -> Option<(usize, usize)> {
+    let end = offset.checked_add(u64::from(size))?;
+    (buf != 0 && (offset as i64) >= 0 && end <= crate::host::SAFE_MEMORY_SIZE as u64)
+        .then_some((offset as usize, size as usize))
+}
+
+/// SceInt32 sceAppUtilSaveSafeMemory(const void *buf, SceSize size, SceOff offset) and
+/// sceAppUtilLoadSafeMemory(void *buf, SceSize size, SceOff offset): the title's 64 KiB of
+/// safe memory, a small store that persists with its saved data (`gamedata.rs`'s
+/// `safememory.bin`). A save leaves the bytes outside its range alone; memory never written
+/// reads as zeroes. Success answers the byte count. The 64-bit `offset` is the third
+/// argument, so it arrives in r2:r3.
+pub(super) fn apputil_safe_memory(ctx: &mut GuestCtx, st: &mut VitaState, save: bool) {
+    let (buf, size) = (ctx.arg(0), ctx.arg(1));
+    let offset = u64::from(ctx.arg(2)) | (u64::from(ctx.arg(3)) << 32);
+    let r = match safe_memory_range(buf, size, offset) {
+        None => SCE_APPUTIL_ERROR_PARAMETER,
+        Some((at, n)) => {
+            if save {
+                let bytes = ctx.read_bytes(buf, n);
+                st.safe_memory_write(at, &bytes);
+            } else {
+                let bytes = st.safe_memory_read(at, n);
+                ctx.write_bytes(buf, &bytes);
+            }
+            size as i32
+        }
+    };
+    ctx.ret(r as u32);
+}
+
 #[hostcall]
 pub(super) fn apputil_savedata_data_save(
     ctx: &mut GuestCtx,
@@ -1803,12 +2052,20 @@ pub(super) fn apputil_savedata_data_save(
         let buf_size = ctx.read_u32(entry + SAVEDATA_FILE_BUFSIZE_OFF);
         let offset = ctx.read_u32(entry + SAVEDATA_FILE_OFFSET_OFF);
         let mode = ctx.read_u32(entry + SAVEDATA_FILE_MODE_OFF);
-        let rel = if path_ptr != 0 { ctx.read_cstr(path_ptr, 512) } else { String::new() };
+        let rel = if path_ptr != 0 {
+            ctx.read_cstr(path_ptr, 512)
+        } else {
+            String::new()
+        };
         // Resolve to a mount-qualified path (e.g. "savedata0:/foo"); vfs_key normalizes.
         let full = if rel.contains(':') {
             rel.clone()
         } else {
-            format!("{}/{}", mount_name.trim_end_matches('/'), rel.trim_start_matches('/'))
+            format!(
+                "{}/{}",
+                mount_name.trim_end_matches('/'),
+                rel.trim_start_matches('/')
+            )
         };
         tracing::debug!(
             target: "vitaslop::io",
@@ -1855,7 +2112,13 @@ const APP_MGR_APP_STATE_SIZE: usize = 0x80;
 /// that never arrive. Only `len` bytes are written (the caller-declared buffer size),
 /// capped at the real struct size.
 #[hostcall]
-pub(super) fn app_mgr_get_app_state(ctx: &mut GuestCtx, _st: &mut VitaState, state: Ptr, len: u32, _version: u32) -> i32 {
+pub(super) fn app_mgr_get_app_state(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    state: Ptr,
+    len: u32,
+    _version: u32,
+) -> i32 {
     if !state.is_null() {
         let n = (len as usize).min(APP_MGR_APP_STATE_SIZE);
         ctx.write_bytes(state.addr(), &vec![0u8; n]);
@@ -1918,7 +2181,12 @@ const SCE_APPUTIL_ERROR_PARAMETER: i32 = 0x8010_0600u32 as i32;
 /// value off-console, so it truthfully errors rather than returning a fabricated int the
 /// title would trust. The kernel leaves `value` untouched on error, so we do too.
 #[hostcall]
-pub(super) fn apputil_app_param_get_int(ctx: &mut GuestCtx, _st: &mut VitaState, param_id: u32, value: Ptr) -> i32 {
+pub(super) fn apputil_app_param_get_int(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    param_id: u32,
+    value: Ptr,
+) -> i32 {
     if param_id == SCE_APPUTIL_APPPARAM_ID_SKU_FLAG {
         if !value.is_null() {
             ctx.write_u32(value.addr(), SCE_APPUTIL_APPPARAM_SKU_FLAG_FULL);
@@ -1948,7 +2216,13 @@ pub(super) fn live_area_get_status(_st: &mut VitaState) -> i32 {
 /// (there is no ad-hoc state change to deliver), so the title stays on its offline
 /// path. An unwritten `cid` would leave the title's later unregister on stack garbage.
 #[hostcall]
-pub(super) fn netctl_adhoc_register_callback(ctx: &mut GuestCtx, _st: &mut VitaState, _func: Ptr, _arg: Ptr, cid: Ptr) -> i32 {
+pub(super) fn netctl_adhoc_register_callback(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _func: Ptr,
+    _arg: Ptr,
+    cid: Ptr,
+) -> i32 {
     if !cid.is_null() {
         ctx.write_u32(cid.addr(), 0);
     }
@@ -2031,7 +2305,9 @@ struct OutStruct {
 impl OutStruct {
     /// Start a struct whose leading `SceSize size` field is the declared size.
     fn new(size: usize) -> OutStruct {
-        let mut s = OutStruct { buf: Vec::with_capacity(size) };
+        let mut s = OutStruct {
+            buf: Vec::with_capacity(size),
+        };
         s.u32(size as u32);
         s
     }
@@ -2062,7 +2338,11 @@ impl OutStruct {
         self.buf.extend_from_slice(&field);
     }
     fn finish(self, size: usize) -> Vec<u8> {
-        debug_assert_eq!(self.buf.len(), size, "trophy OUT struct layout does not add up");
+        debug_assert_eq!(
+            self.buf.len(),
+            size,
+            "trophy OUT struct layout does not add up"
+        );
         self.buf
     }
 }
@@ -2073,7 +2353,12 @@ impl OutStruct {
 /// means we never write a layout the caller did not allocate for.
 ///
 /// A null pointer is not an error: a caller can request only one of the two OUT structs.
-fn write_out_struct(ctx: &mut GuestCtx, p: Ptr, expect: usize, build: impl FnOnce() -> Vec<u8>) -> i32 {
+fn write_out_struct(
+    ctx: &mut GuestCtx,
+    p: Ptr,
+    expect: usize,
+    build: impl FnOnce() -> Vec<u8>,
+) -> i32 {
     if p.is_null() {
         return 0;
     }
@@ -2117,7 +2402,10 @@ fn write_icon(ctx: &mut GuestCtx, buffer: Ptr, size: Ptr, icon: Option<&[u8]>) -
 /// `progressPercentage`: unlocked over total, with the platinum excluded from both. The
 /// platinum is awarded FOR completing the set, so counting it would make 100% unreachable
 /// until it lands and then jump past every other trophy's contribution.
-fn progress_percentage(unlocked: &crate::trophy::GradeCounts, total: &crate::trophy::GradeCounts) -> u32 {
+fn progress_percentage(
+    unlocked: &crate::trophy::GradeCounts,
+    total: &crate::trophy::GradeCounts,
+) -> u32 {
     let denom = total.total - total.platinum;
     if denom == 0 {
         return 0;
@@ -2135,7 +2423,11 @@ fn read_comm_id(ctx: &GuestCtx, p: Ptr) -> Option<String> {
     }
     let raw = ctx.read_bytes(p.addr(), 12);
     let end = raw[..9].iter().position(|&b| b == 0).unwrap_or(9);
-    if end == 0 || !raw[..end].iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_') {
+    if end == 0
+        || !raw[..end]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    {
         return None;
     }
     let id = std::str::from_utf8(&raw[..end]).ok()?;
@@ -2201,9 +2493,12 @@ fn load_trophy_set(st: &mut VitaState, comm_id: &str) -> Result<(), i32> {
             tracing::error!(target: "vitaslop::err", %path, error = %e, "cannot read the title's trophy set");
             Err(match e {
                 crate::trophy::TrophyError::NotTrp => SCE_NP_TROPHY_ERROR_INVALID_TRP_FILE_FORMAT,
-                crate::trophy::TrophyError::UnsupportedVersion(_) => SCE_NP_TROPHY_ERROR_UNSUPPORTED_TRP_FILE,
+                crate::trophy::TrophyError::UnsupportedVersion(_) => {
+                    SCE_NP_TROPHY_ERROR_UNSUPPORTED_TRP_FILE
+                }
                 crate::trophy::TrophyError::Truncated(_) => SCE_NP_TROPHY_ERROR_BROKEN_DATA,
-                crate::trophy::TrophyError::MissingConf | crate::trophy::TrophyError::BadConf(_) => {
+                crate::trophy::TrophyError::MissingConf
+                | crate::trophy::TrophyError::BadConf(_) => {
                     SCE_NP_TROPHY_ERROR_INVALID_TROPHY_CONF_FORMAT
                 }
             })
@@ -2227,7 +2522,13 @@ fn load_trophy_set(st: &mut VitaState, comm_id: &str) -> Result<(), i32> {
 // wrapper and cannot use an early `return`, and the SceNpTrophy handlers are all
 // guard-clause shaped.
 #[hostcall]
-pub(super) fn np_trophy_create_context(ctx: &mut GuestCtx, st: &mut VitaState, context: Ptr, comm_id: Ptr, _comm_sig: Ptr) -> i32 {
+pub(super) fn np_trophy_create_context(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: Ptr,
+    comm_id: Ptr,
+    _comm_sig: Ptr,
+) -> i32 {
     create_context(ctx, st, context, comm_id)
 }
 
@@ -2261,8 +2562,16 @@ fn create_context(ctx: &mut GuestCtx, st: &mut VitaState, context: Ptr, comm_id:
 /// Close a context. The set and this run's unlock ledger outlive it, exactly as they do on
 /// hardware: a title that destroys and recreates a context sees the same unlocks.
 #[hostcall]
-pub(super) fn np_trophy_destroy_context(_ctx: &mut GuestCtx, st: &mut VitaState, context: u32) -> i32 {
-    if st.trophies.close_context(context) { 0 } else { SCE_NP_TROPHY_ERROR_INVALID_CONTEXT }
+pub(super) fn np_trophy_destroy_context(
+    _ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+) -> i32 {
+    if st.trophies.close_context(context) {
+        0
+    } else {
+        SCE_NP_TROPHY_ERROR_INVALID_CONTEXT
+    }
 }
 
 /// int sceNpTrophyCreateHandle(SceNpTrophyHandle *handle)
@@ -2284,7 +2593,14 @@ pub(super) fn np_trophy_create_handle(ctx: &mut GuestCtx, st: &mut VitaState, ha
 /// Either OUT pointer may be null (a caller can request only one of the two structs), so
 /// each is filled independently.
 #[hostcall]
-pub(super) fn np_trophy_get_game_info(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, _handle: u32, details: Ptr, data: Ptr) -> i32 {
+pub(super) fn np_trophy_get_game_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    _handle: u32,
+    details: Ptr,
+    data: Ptr,
+) -> i32 {
     game_info(ctx, st, context, details, data)
 }
 
@@ -2327,11 +2643,26 @@ fn game_info(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, details: Ptr,
 /// `INVALID_GROUP_ID` rather than an empty group, so a title enumerating groups learns
 /// where the list ends.
 #[hostcall]
-pub(super) fn np_trophy_get_group_info(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, _handle: u32, group_id: i32, details: Ptr, data: Ptr) -> i32 {
+pub(super) fn np_trophy_get_group_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    _handle: u32,
+    group_id: i32,
+    details: Ptr,
+    data: Ptr,
+) -> i32 {
     group_info(ctx, st, context, group_id, details, data)
 }
 
-fn group_info(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, group_id: i32, details: Ptr, data: Ptr) -> i32 {
+fn group_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    group_id: i32,
+    details: Ptr,
+    data: Ptr,
+) -> i32 {
     let Some(set) = st.trophies.set_for(context) else {
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
     };
@@ -2382,11 +2713,26 @@ fn group_info(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, group_id: i3
 /// at a real wall-clock time, so an unlocked trophy reports the same fixed epoch the rest
 /// of the engine's clock reports, and a locked one reports 0.
 #[hostcall]
-pub(super) fn np_trophy_get_trophy_info(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, _handle: u32, trophy_id: u32, details: Ptr, data: Ptr) -> i32 {
+pub(super) fn np_trophy_get_trophy_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    _handle: u32,
+    trophy_id: u32,
+    details: Ptr,
+    data: Ptr,
+) -> i32 {
     trophy_info(ctx, st, context, trophy_id, details, data)
 }
 
-fn trophy_info(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, trophy_id: u32, details: Ptr, data: Ptr) -> i32 {
+fn trophy_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    trophy_id: u32,
+    details: Ptr,
+    data: Ptr,
+) -> i32 {
     let Some(set) = st.trophies.set_for(context) else {
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
     };
@@ -2428,7 +2774,14 @@ fn trophy_info(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, trophy_id: 
 /// nonsense stack pointer nowhere near the cause. If an icon is genuinely absent the
 /// answer is a definite `ICON_FILE_NOT_FOUND`, never a hollow success.
 #[hostcall]
-pub(super) fn np_trophy_get_game_icon(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, _handle: u32, buffer: Ptr, size: Ptr) -> i32 {
+pub(super) fn np_trophy_get_game_icon(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    _handle: u32,
+    buffer: Ptr,
+    size: Ptr,
+) -> i32 {
     match st.trophies.set_for(context) {
         Some(set) => write_icon(ctx, buffer, size, set.game_icon()),
         None => SCE_NP_TROPHY_ERROR_INVALID_CONTEXT,
@@ -2439,11 +2792,26 @@ pub(super) fn np_trophy_get_game_icon(ctx: &mut GuestCtx, st: &mut VitaState, co
 ///     SceInt32 groupId, void *buffer, SceSize *size)
 /// One group's icon (`GR<nnn>.PNG`).
 #[hostcall]
-pub(super) fn np_trophy_get_group_icon(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, _handle: u32, group_id: i32, buffer: Ptr, size: Ptr) -> i32 {
+pub(super) fn np_trophy_get_group_icon(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    _handle: u32,
+    group_id: i32,
+    buffer: Ptr,
+    size: Ptr,
+) -> i32 {
     group_icon(ctx, st, context, group_id, buffer, size)
 }
 
-fn group_icon(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, group_id: i32, buffer: Ptr, size: Ptr) -> i32 {
+fn group_icon(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    group_id: i32,
+    buffer: Ptr,
+    size: Ptr,
+) -> i32 {
     let Some(set) = st.trophies.set_for(context) else {
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
     };
@@ -2457,11 +2825,26 @@ fn group_icon(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, group_id: i3
 ///     SceNpTrophyId trophyId, void *buffer, SceSize *size)
 /// One trophy's icon (`TROP<nnn>.PNG`).
 #[hostcall]
-pub(super) fn np_trophy_get_trophy_icon(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, _handle: u32, trophy_id: u32, buffer: Ptr, size: Ptr) -> i32 {
+pub(super) fn np_trophy_get_trophy_icon(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    _handle: u32,
+    trophy_id: u32,
+    buffer: Ptr,
+    size: Ptr,
+) -> i32 {
     trophy_icon(ctx, st, context, trophy_id, buffer, size)
 }
 
-fn trophy_icon(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, trophy_id: u32, buffer: Ptr, size: Ptr) -> i32 {
+fn trophy_icon(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    trophy_id: u32,
+    buffer: Ptr,
+    size: Ptr,
+) -> i32 {
     let Some(set) = st.trophies.set_for(context) else {
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
     };
@@ -2477,11 +2860,24 @@ fn trophy_icon(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, trophy_id: 
 /// trophies in the SET - `count` is the set's size, not the number unlocked, which is what
 /// lets a caller know how many bits of the fixed 128-bit array are meaningful.
 #[hostcall]
-pub(super) fn np_trophy_get_trophy_unlock_state(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, _handle: u32, flags: Ptr, count: Ptr) -> i32 {
+pub(super) fn np_trophy_get_trophy_unlock_state(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    _handle: u32,
+    flags: Ptr,
+    count: Ptr,
+) -> i32 {
     unlock_state(ctx, st, context, flags, count)
 }
 
-fn unlock_state(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, flags: Ptr, count: Ptr) -> i32 {
+fn unlock_state(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    flags: Ptr,
+    count: Ptr,
+) -> i32 {
     let Some(set) = st.trophies.set_for(context) else {
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
     };
@@ -2509,15 +2905,31 @@ fn unlock_state(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, flags: Ptr
 /// platinum is awarded by the system, never unlocked directly), and
 /// `SCE_NP_TROPHY_INVALID_TROPHY_ID` otherwise.
 #[hostcall]
-pub(super) fn np_trophy_unlock_trophy(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, _handle: u32, trophy_id: u32, platinum_id: Ptr) -> i32 {
+pub(super) fn np_trophy_unlock_trophy(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    _handle: u32,
+    trophy_id: u32,
+    platinum_id: Ptr,
+) -> i32 {
     unlock_trophy(ctx, st, context, trophy_id, platinum_id)
 }
 
-fn unlock_trophy(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, trophy_id: u32, platinum_id: Ptr) -> i32 {
+fn unlock_trophy(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    context: u32,
+    trophy_id: u32,
+    platinum_id: Ptr,
+) -> i32 {
     let Some(comm_id) = st.trophies.comm_id_of(context).map(str::to_string) else {
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
     };
-    let set = st.trophies.set_for(context).expect("a bound context always has its set");
+    let set = st
+        .trophies
+        .set_for(context)
+        .expect("a bound context always has its set");
     let Some(trophy) = set.trophy(trophy_id) else {
         return SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID;
     };
@@ -2529,8 +2941,17 @@ fn unlock_trophy(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, trophy_id
     }
     // Which trophies must be unlocked for the platinum to be awarded, decided before the
     // ledger write so the set borrow ends here.
-    let platinum = set.trophies.iter().find(|t| t.grade == crate::trophy::Grade::Platinum).map(|p| p.id);
-    let rest: Vec<u32> = set.trophies.iter().map(|t| t.id).filter(|id| Some(*id) != platinum).collect();
+    let platinum = set
+        .trophies
+        .iter()
+        .find(|t| t.grade == crate::trophy::Grade::Platinum)
+        .map(|p| p.id);
+    let rest: Vec<u32> = set
+        .trophies
+        .iter()
+        .map(|t| t.id)
+        .filter(|id| Some(*id) != platinum)
+        .collect();
 
     let tick = RTC_UNIX_EPOCH_TICKS + st.guest_wall_us();
     st.trophies.unlock(&comm_id, trophy_id, tick);
@@ -2569,7 +2990,12 @@ fn write_fixed_date_time(ctx: &mut GuestCtx, time: Ptr) {
 /// We serve a fixed deterministic date regardless of `tz` (the emulated clock has
 /// no real timezone), matching the local-time variant.
 #[hostcall]
-pub(super) fn rtc_get_current_clock(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, _tz: i32) -> i32 {
+pub(super) fn rtc_get_current_clock(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    time: Ptr,
+    _tz: i32,
+) -> i32 {
     write_fixed_date_time(ctx, time);
     0
 }
@@ -2577,7 +3003,11 @@ pub(super) fn rtc_get_current_clock(ctx: &mut GuestCtx, _st: &mut VitaState, tim
 /// int sceRtcGetCurrentClockLocalTime(SceDateTime *time)
 /// Fill a fixed, deterministic local date/time.
 #[hostcall]
-pub(super) fn rtc_get_current_clock_local_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr) -> i32 {
+pub(super) fn rtc_get_current_clock_local_time(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    time: Ptr,
+) -> i32 {
     write_fixed_date_time(ctx, time);
     0
 }
@@ -2629,7 +3059,11 @@ const APP_EVENT_PARAM_SIZE: usize = 0x404;
 /// the type field is what the title switches on and a caller's uninitialised stack
 /// would otherwise read as an event that never happened.
 #[hostcall]
-pub(super) fn apputil_receive_app_event(ctx: &mut GuestCtx, _st: &mut VitaState, event: Ptr) -> i32 {
+pub(super) fn apputil_receive_app_event(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    event: Ptr,
+) -> i32 {
     if event.is_null() {
         SCE_APPUTIL_ERROR_PARAMETER
     } else {
@@ -2683,7 +3117,11 @@ pub(super) fn apputil_savedata_data_remove(
         let full = if rel.contains(':') {
             rel.clone()
         } else {
-            format!("{}/{}", mount_name.trim_end_matches('/'), rel.trim_start_matches('/'))
+            format!(
+                "{}/{}",
+                mount_name.trim_end_matches('/'),
+                rel.trim_start_matches('/')
+            )
         };
         let removed = st.remove_file(&full);
         tracing::debug!(target: "vitaslop::io", path = %full, removed, "sceAppUtilSaveDataDataRemove");
@@ -2723,7 +3161,11 @@ pub(super) fn apputil_savedata_get_quota(
         );
     }
     let mount_name = read_mount_name(ctx, mount);
-    let prefix = if mount_name.is_empty() { "savedata0:".to_string() } else { mount_name };
+    let prefix = if mount_name.is_empty() {
+        "savedata0:".to_string()
+    } else {
+        mount_name
+    };
     let used_kib = st.mount_used_bytes(&prefix).div_ceil(1024) as u32;
     if !quota.is_null() {
         ctx.write_u32(quota.addr(), SAVEDATA_QUOTA_KIB);
@@ -2741,7 +3183,12 @@ pub(super) fn apputil_savedata_get_quota(
 /// here ever starts one - the network is modelled offline and every NetCtl call
 /// completes synchronously - so there is no failure to report and the code is 0.
 #[hostcall]
-pub(super) fn net_ctl_get_result(ctx: &mut GuestCtx, _st: &mut VitaState, _event_type: i32, error_code: Ptr) -> i32 {
+pub(super) fn net_ctl_get_result(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _event_type: i32,
+    error_code: Ptr,
+) -> i32 {
     if !error_code.is_null() {
         ctx.write_u32(error_code.addr(), 0);
     }
@@ -2754,7 +3201,11 @@ pub(super) fn net_ctl_get_result(ctx: &mut GuestCtx, _st: &mut VitaState, _event
 /// emulator never suspends the title, so the queue is empty - and the struct is zeroed
 /// for the same reason `sceAppUtilReceiveAppEvent` zeroes its own.
 #[hostcall]
-pub(super) fn appmgr_receive_system_event(ctx: &mut GuestCtx, _st: &mut VitaState, event: Ptr) -> i32 {
+pub(super) fn appmgr_receive_system_event(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    event: Ptr,
+) -> i32 {
     if !event.is_null() {
         // `SceAppMgrSystemEvent` is `{ int systemEvent; uint8_t reserved[60]; }`.
         ctx.write_bytes(event.addr(), &[0u8; 64]);
@@ -2772,7 +3223,11 @@ pub(super) fn appmgr_receive_system_event(ctx: &mut GuestCtx, _st: &mut VitaStat
 /// point of no return - or a failure it never expects and does not handle.
 pub(super) fn appmgr_load_exec(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let path_ptr = ctx.arg(0);
-    let path = if path_ptr == 0 { String::new() } else { ctx.read_cstr(path_ptr, 256) };
+    let path = if path_ptr == 0 {
+        String::new()
+    } else {
+        ctx.read_cstr(path_ptr, 256)
+    };
     // >>> AN EXECUTABLE OF THIS SAME APP IS A PROCESS REPLACEMENT THIS ENGINE CAN PERFORM.
     // The run halts with the request recorded; the host that owns the process mounts the app
     // again with that executable as its main one (a launcher eboot whose only job is this call
@@ -2913,36 +3368,11 @@ pub(super) fn np_basic_presence_ok(_st: &mut VitaState) -> i32 {
     0
 }
 
-/// int sceNpLookupCreateTitleCtx(const SceNpCommunicationId *titleId,
-///     const SceNpId *selfNpId)
-///
-/// A lookup context is a handle onto the PSN profile service. Signed out there is no
-/// service to look anything up in, so the context cannot be created and the call says
-/// so - a title that treats the failure as "no profile data" is on the path the console
-/// puts it on, whereas a phantom context leads it to poll a request that never lands.
+/// int sceNpAuthDestroyRequest(int reqId)
+/// Destroying a request that was never created is harmless and succeeds.
 #[hostcall]
-pub(super) fn np_lookup_create_title_ctx(_st: &mut VitaState) -> i32 {
-    SCE_NP_ERROR_SIGNED_OUT
-}
-
-/// int sceNpLookupDeleteRequest(int reqId)
-/// Deleting a request that was never created is harmless and succeeds.
-#[hostcall]
-pub(super) fn np_lookup_delete_request(_st: &mut VitaState) -> i32 {
+pub(super) fn np_auth_destroy_request(_st: &mut VitaState) -> i32 {
     0
-}
-
-/// int sceNpLookupUserProfileAsync(...) / int sceNpLookupPollAsync(int reqId, int *result)
-///
-/// Start a profile fetch, and poll it. No context can exist (see above), so any request
-/// id is invalid; the poll reports the same, and writes its `result` out-parameter so a
-/// caller reading it does not read its own stack as a server reply.
-#[hostcall]
-pub(super) fn np_lookup_async(ctx: &mut GuestCtx, _st: &mut VitaState, _req: i32, result: Ptr) -> i32 {
-    if !result.is_null() {
-        ctx.write_u32(result.addr(), SCE_NP_ERROR_SIGNED_OUT as u32);
-    }
-    SCE_NP_ERROR_SIGNED_OUT
 }
 
 /// The SceNpAuth surface: `CreateStartRequest`, `DestroyRequest`, `GetTicket`,
@@ -2951,24 +3381,26 @@ pub(super) fn np_lookup_async(ctx: &mut GuestCtx, _st: &mut VitaState, _req: i32
 /// A ticket is a SIGNED assertion from Sony's authentication service that a particular
 /// account owns a particular entitlement, and a title hands it to its own server. There
 /// is no account, no service and no signing key here - a fabricated ticket would be
-/// both a forgery and useless - so every call reports signed-out. That is the same
-/// answer the console gives a user who is not logged in, and titles handle it.
+/// both a forgery and useless - so every call reports signed-out. The auth block has no
+/// sign-in code of its own, so that is the manager's "not signed up": the account a ticket
+/// would be issued for is the one missing.
 ///
 /// `DestroyRequest` is the exception: tearing down a request that was never created is
 /// harmless, and refusing it would leave a title looping on cleanup.
 #[hostcall]
 pub(super) fn np_auth_signed_out(_st: &mut VitaState) -> i32 {
-    SCE_NP_ERROR_SIGNED_OUT
+    NP_MANAGER_ERROR_SIGNOUT
 }
 
 /// int sceNpActivityPostStatus(...)
 ///
 /// Post an entry to the account's activity feed. Posting requires an account, and there
-/// is none, so this reports signed-out exactly as the console does - nothing leaves the
-/// machine, and nothing is invented on the way back.
+/// is none, so this reports signed-out - nothing leaves the machine, and nothing is invented
+/// on the way back. The activity library has no error block of its own; the missing account
+/// is the manager's, so is the code.
 #[hostcall]
 pub(super) fn np_activity_post_status(_st: &mut VitaState) -> i32 {
-    SCE_NP_ERROR_SIGNED_OUT
+    NP_MANAGER_ERROR_SIGNOUT
 }
 
 /// int sceNetCtlGetNatInfo(SceNetCtlNatInfo *natinfo)
@@ -3068,17 +3500,30 @@ mod calendar_tests {
         let end = days_from_civil(9999, 12, 31);
         while d <= end {
             let (y, m, day) = civil_from_days(d);
-            assert_eq!(days_from_civil(y, m, day), d, "round trip at day {d} -> {y}-{m}-{day}");
+            assert_eq!(
+                days_from_civil(y, m, day),
+                d,
+                "round trip at day {d} -> {y}-{m}-{day}"
+            );
             assert!((1..=12).contains(&m), "month out of range at day {d}: {m}");
-            assert!((1..=31).contains(&day), "day out of range at day {d}: {day}");
+            assert!(
+                (1..=31).contains(&day),
+                "day out of range at day {d}: {day}"
+            );
             if m == 2 && day == 29 {
                 leap_days += 1;
             }
             checked += 1;
             d += 997;
         }
-        assert!(checked > 3_000, "the stride should sample thousands of dates, got {checked}");
-        assert!(leap_days > 0, "the sample should include at least one 29 February");
+        assert!(
+            checked > 3_000,
+            "the stride should sample thousands of dates, got {checked}"
+        );
+        assert!(
+            leap_days > 0,
+            "the sample should include at least one 29 February"
+        );
     }
 
     /// The month arithmetic `sceRtcTickAddMonths` does, over the calendar rather than over
@@ -3094,14 +3539,22 @@ mod calendar_tests {
         };
         // 31 January plus a month is the end of February, not "31 February".
         assert_eq!(add_months(2025, 1, 31, 1), (2025, 2, 28));
-        assert_eq!(add_months(2024, 1, 31, 1), (2024, 2, 29), "2024 is a leap year");
+        assert_eq!(
+            add_months(2024, 1, 31, 1),
+            (2024, 2, 29),
+            "2024 is a leap year"
+        );
         // A day that fits is untouched.
         assert_eq!(add_months(2025, 1, 15, 1), (2025, 2, 15));
         // Crossing a year boundary, forwards and backwards.
         assert_eq!(add_months(2025, 11, 10, 3), (2026, 2, 10));
         assert_eq!(add_months(2025, 2, 10, -3), (2024, 11, 10));
         // A whole year as twelve months, which is how AddYears is dispatched.
-        assert_eq!(add_months(2024, 2, 29, 12), (2025, 2, 28), "29 Feb + 1 year clamps");
+        assert_eq!(
+            add_months(2024, 2, 29, 12),
+            (2025, 2, 28),
+            "29 Feb + 1 year clamps"
+        );
     }
 
     #[test]
@@ -3109,9 +3562,18 @@ mod calendar_tests {
         // 2000 is a leap year (divisible by 400), 1900 and 2100 are not (divisible by 100).
         assert_eq!(civil_from_days(days_from_civil(2000, 2, 29)), (2000, 2, 29));
         // 1900-02-29 does not exist, so the day BEFORE 1900-03-01 must be 1900-02-28.
-        assert_eq!(civil_from_days(days_from_civil(1900, 3, 1) - 1), (1900, 2, 28));
-        assert_eq!(civil_from_days(days_from_civil(2100, 3, 1) - 1), (2100, 2, 28));
-        assert_eq!(civil_from_days(days_from_civil(2004, 3, 1) - 1), (2004, 2, 29));
+        assert_eq!(
+            civil_from_days(days_from_civil(1900, 3, 1) - 1),
+            (1900, 2, 28)
+        );
+        assert_eq!(
+            civil_from_days(days_from_civil(2100, 3, 1) - 1),
+            (2100, 2, 28)
+        );
+        assert_eq!(
+            civil_from_days(days_from_civil(2004, 3, 1) - 1),
+            (2004, 2, 29)
+        );
         // The Unix epoch is day zero, which pins the offset rather than just the deltas.
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(civil_from_days(0), (1970, 1, 1));
@@ -3131,7 +3593,12 @@ mod savedata_slot_tests {
     const BUF: u32 = 0x800;
     const OUT: u32 = 0xA00;
 
-    fn call(bytes: &mut [u8], st: &mut VitaState, args: &[u32], f: fn(&mut GuestCtx, &mut VitaState)) -> i32 {
+    fn call(
+        bytes: &mut [u8],
+        st: &mut VitaState,
+        args: &[u32],
+        f: fn(&mut GuestCtx, &mut VitaState),
+    ) -> i32 {
         let mut regs = [0u32; REG_COUNT];
         regs[..args.len()].copy_from_slice(args);
         let mut vfp = [0u32; VFP_ARG_COUNT];
@@ -3146,26 +3613,65 @@ mod savedata_slot_tests {
     #[test]
     fn a_data_save_with_a_slot_param_creates_the_slot() {
         let mut bytes = vec![0u8; 0x1000];
-        let mut st = VitaState::new(0, 4096, Box::new(crate::world::DeterministicWorld::default()));
-        let param: Vec<u8> = (0..SAVEDATA_SLOT_PARAM_SIZE).map(|i| (i * 7) as u8).collect();
+        let mut st = VitaState::new(
+            0,
+            4096,
+            Box::new(crate::world::DeterministicWorld::default()),
+        );
+        let param: Vec<u8> = (0..SAVEDATA_SLOT_PARAM_SIZE)
+            .map(|i| (i * 7) as u8)
+            .collect();
         bytes[PARAM as usize..PARAM as usize + param.len()].copy_from_slice(&param);
         bytes[PATH as usize..PATH as usize + 9].copy_from_slice(b"SAVE.TXT\0");
         bytes[BUF as usize..BUF as usize + 3].copy_from_slice(b"abc");
         for (off, v) in [(0, PATH), (4, BUF), (8, 3)] {
-            bytes[(FILES + off) as usize..(FILES + off) as usize + 4].copy_from_slice(&v.to_le_bytes());
+            bytes[(FILES + off) as usize..(FILES + off) as usize + 4]
+                .copy_from_slice(&v.to_le_bytes());
         }
         // No param first: the file lands, the slot does not.
         bytes[SLOT as usize..SLOT as usize + 4].copy_from_slice(&245u32.to_le_bytes());
-        assert_eq!(call(&mut bytes, &mut st, &[SLOT, FILES, 1, 0], apputil_savedata_data_save), 0);
-        assert_eq!(st.read_file("savedata0:/SAVE.TXT").as_deref(), Some(&b"abc"[..]));
         assert_eq!(
-            call(&mut bytes, &mut st, &[245, OUT, 0], apputil_savedata_slot_get_param),
+            call(
+                &mut bytes,
+                &mut st,
+                &[SLOT, FILES, 1, 0],
+                apputil_savedata_data_save
+            ),
+            0
+        );
+        assert_eq!(
+            st.read_file("savedata0:/SAVE.TXT").as_deref(),
+            Some(&b"abc"[..])
+        );
+        assert_eq!(
+            call(
+                &mut bytes,
+                &mut st,
+                &[245, OUT, 0],
+                apputil_savedata_slot_get_param
+            ),
             SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND
         );
         // With a param: the slot exists and reads back the title's own bytes.
         bytes[SLOT as usize + 4..SLOT as usize + 8].copy_from_slice(&PARAM.to_le_bytes());
-        assert_eq!(call(&mut bytes, &mut st, &[SLOT, FILES, 1, 0], apputil_savedata_data_save), 0);
-        assert_eq!(call(&mut bytes, &mut st, &[245, OUT, 0], apputil_savedata_slot_get_param), 0);
+        assert_eq!(
+            call(
+                &mut bytes,
+                &mut st,
+                &[SLOT, FILES, 1, 0],
+                apputil_savedata_data_save
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut bytes,
+                &mut st,
+                &[245, OUT, 0],
+                apputil_savedata_slot_get_param
+            ),
+            0
+        );
         assert_eq!(&bytes[OUT as usize..OUT as usize + param.len()], &param[..]);
     }
 }
@@ -3196,10 +3702,21 @@ mod rtc_call_tests {
 
     impl Rig {
         fn new() -> Self {
-            Rig { bytes: vec![0u8; 4096], st: VitaState::new(0, 4096, Box::new(crate::world::DeterministicWorld::default())) }
+            Rig {
+                bytes: vec![0u8; 4096],
+                st: VitaState::new(
+                    0,
+                    4096,
+                    Box::new(crate::world::DeterministicWorld::default()),
+                ),
+            }
         }
 
-        fn with<R>(&mut self, args: &[u32], f: impl FnOnce(&mut GuestCtx, &mut VitaState) -> R) -> R {
+        fn with<R>(
+            &mut self,
+            args: &[u32],
+            f: impl FnOnce(&mut GuestCtx, &mut VitaState) -> R,
+        ) -> R {
             let mut regs = [0u32; REG_COUNT];
             regs[..args.len()].copy_from_slice(args);
             let mut vfp = [0u32; VFP_ARG_COUNT];
@@ -3232,8 +3749,14 @@ mod rtc_call_tests {
             assert_eq!(r.call(&[2024, 2], rtc_get_days_in_month), 29);
             assert_eq!(r.call(&[1900, 2], rtc_get_days_in_month), 28);
             assert_eq!(r.call(&[2025, 4], rtc_get_days_in_month), 30);
-            assert_eq!(r.call(&[2025, 13], rtc_get_days_in_month), SCE_RTC_ERROR_INVALID_MONTH);
-            assert_eq!(r.call(&[0, 1], rtc_get_days_in_month), SCE_RTC_ERROR_INVALID_YEAR);
+            assert_eq!(
+                r.call(&[2025, 13], rtc_get_days_in_month),
+                SCE_RTC_ERROR_INVALID_MONTH
+            );
+            assert_eq!(
+                r.call(&[0, 1], rtc_get_days_in_month),
+                SCE_RTC_ERROR_INVALID_YEAR
+            );
             assert_eq!(r.call(&[2000], rtc_is_leap_year), 1);
             assert_eq!(r.call(&[2100], rtc_is_leap_year), 0);
             assert_eq!(r.call(&[2024], rtc_is_leap_year), 1);
@@ -3245,15 +3768,22 @@ mod rtc_call_tests {
         let mut r = Rig::new();
         {
             // 2026-10-19 16:42:58.
-            let dos = ((2026 - 1980) << 25) | (10 << 21) | (19 << 16) | (16 << 11) | (42 << 5) | (58 / 2);
+            let dos =
+                ((2026 - 1980) << 25) | (10 << 21) | (19 << 16) | (16 << 11) | (42 << 5) | (58 / 2);
             assert_eq!(r.call(&[TIME, dos], rtc_set_dos_time), 0);
             assert_eq!(r.date(), [2026, 10, 19, 16, 42, 58]);
             assert_eq!(r.call(&[TIME], rtc_check_valid), 0);
             assert_eq!(r.call(&[TIME, OUT], rtc_get_dos_time), 0);
             assert_eq!(r.u32_at(OUT), dos);
             // Second field 30 is 60 seconds; month 0 does not exist.
-            assert_eq!(r.call(&[TIME, dos | 30], rtc_set_dos_time), SCE_RTC_ERROR_INVALID_SECOND);
-            assert_eq!(r.call(&[TIME, dos & !(0xf << 21)], rtc_set_dos_time), SCE_RTC_ERROR_INVALID_MONTH);
+            assert_eq!(
+                r.call(&[TIME, dos | 30], rtc_set_dos_time),
+                SCE_RTC_ERROR_INVALID_SECOND
+            );
+            assert_eq!(
+                r.call(&[TIME, dos & !(0xf << 21)], rtc_set_dos_time),
+                SCE_RTC_ERROR_INVALID_MONTH
+            );
         }
     }
 
@@ -3273,7 +3803,13 @@ mod rtc_call_tests {
         let mut r = Rig::new();
         {
             let ft = win32_file_time(1_760_000_000, 123_456);
-            assert_eq!(r.call(&[TIME, 0, ft as u32, (ft >> 32) as u32], rtc_set_win32_file_time), 0);
+            assert_eq!(
+                r.call(
+                    &[TIME, 0, ft as u32, (ft >> 32) as u32],
+                    rtc_set_win32_file_time
+                ),
+                0
+            );
             assert_eq!(r.call(&[TIME, OUT], rtc_get_win32_file_time), 0);
             assert_eq!(r.u32_at(OUT) as u64 | (r.u32_at(OUT + 4) as u64) << 32, ft);
         }
@@ -3289,7 +3825,11 @@ mod rtc_call_tests {
                 assert_eq!(r.call(&[TEXT, TICK_A, tz as u32], rtc_format_rfc3339), 0);
                 let text = r.with(&[], |ctx, _| ctx.read_cstr(TEXT, 64));
                 assert_eq!(r.call(&[TICK_B, TEXT], rtc_parse_rfc3339), 0, "{text}");
-                assert_eq!(r.with(&[], |ctx, _| read_tick(ctx, TICK_B)), t, "tz {tz}: {text}");
+                assert_eq!(
+                    r.with(&[], |ctx, _| read_tick(ctx, TICK_B)),
+                    t,
+                    "tz {tz}: {text}"
+                );
             }
             // The wall clock moves with the offset, and the offset is printed as such.
             r.call(&[TEXT, TICK_A, -300i32 as u32], rtc_format_rfc3339);
@@ -3307,7 +3847,10 @@ mod rtc_call_tests {
             assert_eq!(r.call(&[TICK_A, TICK_B], rtc_compare_tick), -1);
             assert_eq!(r.call(&[TICK_B, TICK_A], rtc_compare_tick), 1);
             assert_eq!(r.call(&[TICK_A, TICK_A], rtc_compare_tick), 0);
-            assert_eq!(r.call(&[0, TICK_A], rtc_compare_tick), SCE_RTC_ERROR_INVALID_POINTER);
+            assert_eq!(
+                r.call(&[0, TICK_A], rtc_compare_tick),
+                SCE_RTC_ERROR_INVALID_POINTER
+            );
         }
     }
 }
@@ -3327,7 +3870,12 @@ const SCE_NET_ERROR_EINVAL: u32 = 0x8041_0116;
 /// First called by a 2011 fighting title at its title screen. `flags` selects nothing a title
 /// can observe here (there is one interface), so it is read and ignored.
 #[hostcall]
-pub(super) fn net_get_mac_address(ctx: &mut GuestCtx, _st: &mut VitaState, addr: Ptr, _flags: i32) -> i32 {
+pub(super) fn net_get_mac_address(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    addr: Ptr,
+    _flags: i32,
+) -> i32 {
     if addr.is_null() {
         SCE_NET_ERROR_EINVAL as i32
     } else {

@@ -382,7 +382,15 @@ pub enum Op {
     /// model does carry that quarter: [`Self::source_packed_bytes`] already describes an
     /// operand as four channels in one register for the `fx8` ops, and every span computation
     /// asks it.
-    PackFromInt { bits: u8, signed: bool },
+    ///
+    /// `norm` is the NORMALIZED form (`scale` set), the inverse of [`Op::PackToInt`]'s: the
+    /// integer is divided by its full range - `s / 127` for S8, `u / 65535` for U16 - and a signed
+    /// result is clamped at -1, so the most negative code (-128, -32768) reads as -1 like the one
+    /// above it. That is the SNORM rule, and it round-trips every value `PackToInt`'s normalized
+    /// store writes. The U8 normalized form is [`Op::PackUnorm8`]. MEASURED need: a retail
+    /// title's vertex programs unpacking S8 normals (every draw of its main scene dropped while
+    /// it was blocked).
+    PackFromInt { bits: u8, signed: bool, norm: bool },
     /// LIMM (group 0xF8, `op2 = 100`, `opcat = 10`): `dest = <32-bit immediate>`.
     ///
     /// The value is a RAW 32-bit pattern, typed by whoever reads it - the corpus carries it

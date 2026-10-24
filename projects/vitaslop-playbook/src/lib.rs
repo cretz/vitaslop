@@ -20,6 +20,8 @@ pub mod engine;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub mod lua_mlua;
 pub mod proto;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub mod session;
 pub mod tape;
 pub mod vm;
 

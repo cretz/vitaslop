@@ -1,19 +1,22 @@
-//! SceAudioIn: the console's microphone, modelled as a MUTED one.
+//! SceAudioIn: the console's microphone, in a SILENT ROOM.
 //!
-//! # Why muted rather than absent, and why that is a real state
+//! # Why a silent microphone rather than an absent or a muted one
 //! A Vita has a built-in microphone, so "there is no such device" is not a state this
-//! API can report - it has no not-mounted error, unlike [`crate::vita::camera`]. What it
-//! does have is `SCE_AUDIO_IN_GETSTATUS_MUTE`: a console whose input is muted is an
-//! ordinary, first-class state, every title ships a path for it, and it is exactly what
-//! this host is. Nothing here opens a host capture device - the same boundary
-//! [`crate::vita::net`] draws, and for the same reason: a run has to be reproducible
-//! from its own inputs, and a room's noise is not one of them.
+//! API can report - it has no not-mounted error, unlike [`crate::vita::camera`]. Nothing
+//! here opens a host capture device - the same boundary [`crate::vita::net`] draws, and
+//! for the same reason: a run has to be reproducible from its own inputs, and a room's
+//! noise is not one of them.
 //!
 //! So a port really opens, `sceAudioInInput` really delivers a grain, and the grain is
-//! DIGITAL SILENCE. That is not a stub standing in for capture - it is what a muted
-//! input records, and [`report_silent`] says so out loud the first time, because a title
-//! that is listening for the player deserves to have that visible in the log rather than
-//! inferred from a voice command that never registers.
+//! DIGITAL SILENCE - what a working microphone records in a quiet room. [`report_silent`]
+//! says so out loud the first time, because a title that is listening for the player
+//! deserves to have that visible in the log rather than inferred from a voice command that
+//! never registers.
+//!
+//! >>> THE INPUT IS NOT MUTED, because a console's is not by default. This used to answer
+//! >>> MUTED, and a title that waits for the microphone to be usable before it opens a port
+//! >>> polled `sceAudioInGetStatus` for the rest of the run: MEASURED, 716 million calls in
+//! >>> 5,000 frames (~140,000 a frame) from one thread that never reached its capture loop.
 //!
 //! # The pacing is the part that is easy to get wrong
 //! On hardware `sceAudioInInput` BLOCKS until a grain has been captured, so a capture
@@ -23,8 +26,8 @@
 //! loop into a spin. So this parks the caller for the grain's own duration, exactly as
 //! [`crate::vita::audio::out_output`] does on the output side.
 
-use crate::host::{GuestCtx, VitaState};
 use crate::SvcOutcome;
+use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
 
 /// `SceAudioInErrorCode` values this surface uses, from `psp2/audioin.h`.
@@ -47,7 +50,7 @@ fn report_silent(grain: i32, freq: i32) {
             target: "vitaslop::audio",
             grain, freq,
             "sceAudioInOpenPort: the title opened the MICROPHONE. This host captures nothing, \
-             so every grain it reads is digital silence - the console's own muted-input state. \
+             so every grain it reads is digital silence - a working microphone in a silent room. \
              Anything the title drives from voice will never trigger."
         );
     });
@@ -113,7 +116,11 @@ pub(super) fn in_input(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     ctx.ret(0);
     // One grain is captured in `grain / freq` seconds; park for exactly that, so a
     // capture loop runs at the microphone's rate instead of spinning.
-    let paced_us = if freq > 0 { (u64::from(grain) * 1_000_000) / u64::from(freq) } else { 0 };
+    let paced_us = if freq > 0 {
+        (u64::from(grain) * 1_000_000) / u64::from(freq)
+    } else {
+        0
+    };
     if paced_us > 0 && st.is_preemptive() {
         st.sleep_park(paced_us);
         SvcOutcome::Block
@@ -132,11 +139,10 @@ pub(super) fn in_get_adopt(_ctx: &mut GuestCtx, st: &mut VitaState, ty: i32) -> 
 
 /// int sceAudioInGetStatus(int select)
 ///
-/// `select` is `SCE_AUDIO_IN_GETSTATUS_MUTE` (1). This host captures nothing, and MUTED
-/// is precisely how the console describes that - so reporting it is not a workaround,
-/// it is the one status query that already has a word for our state, and it agrees with
-/// the silence [`in_input`] delivers.
+/// `select` is `SCE_AUDIO_IN_GETSTATUS_MUTE` (1): 0, NOT muted - a console's default, and the
+/// state [`in_input`]'s paced silence describes. See the module notes for what answering muted
+/// cost.
 #[hostcall]
 pub(super) fn in_get_status(_ctx: &mut GuestCtx, _st: &mut VitaState, _select: i32) -> i32 {
-    1
+    0
 }

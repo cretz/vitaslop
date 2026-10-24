@@ -11,7 +11,7 @@
 // One retail racer steers entirely with the LEFT STICK as a turn RATE - a d-pad press is not
 // a substitute for it, and until now the browser had no way to send a stick at all. The stick
 // is reported in the guest's own 0..255 encoding with 128 centred, and released (not centred)
-// on lift, so a scripted recipe keeps steering when nobody is touching the screen.
+// on lift, so a playbook keeps steering when nobody is touching the screen.
 //
 // # Why the controls live OUTSIDE the canvas
 // The canvas is the Vita's front TOUCH PANEL - the front end of at least two of these titles
@@ -140,7 +140,7 @@ export function installPad(worker, root) {
       e.preventDefault();
       active = null;
       if (knob) knob.style.transform = "";
-      // RELEASE, not centre. A recipe that is steering keeps steering.
+      // RELEASE, not centre. A playbook that is steering keeps steering.
       send("stick", { stick: which, x: 128, y: 128, active: false });
     };
     pad.addEventListener("pointerup", lift);
@@ -228,7 +228,7 @@ export function installGamepad(worker, onStatus = () => {}) {
       const centred = x === 128 && y === 128;
       const prev = lastStick[slot];
       // A centred pad RELEASES the stick rather than holding 128, so an unused gamepad axis
-      // does not silently veto a scripted recipe's steering the whole run.
+      // does not silently veto a playbook's steering the whole run.
       const now = centred ? null : `${x},${y}`;
       if (now === prev) continue;
       lastStick[slot] = now;

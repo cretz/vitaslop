@@ -39,7 +39,11 @@ fn from565(c: u16) -> [u8; 3] {
     let r = ((c >> 11) & 0x1f) as u32;
     let g = ((c >> 5) & 0x3f) as u32;
     let b = (c & 0x1f) as u32;
-    [(r * 255 / 31) as u8, (g * 255 / 63) as u8, (b * 255 / 31) as u8]
+    [
+        (r * 255 / 31) as u8,
+        (g * 255 / 63) as u8,
+        (b * 255 / 31) as u8,
+    ]
 }
 
 /// The four palette colours of a 4-colour BC1 block.
@@ -50,8 +54,16 @@ fn palette(c0: u16, c1: u16) -> [[u8; 3]; 4] {
     [
         a,
         b,
-        [mix(a[0], b[0], 2, 1), mix(a[1], b[1], 2, 1), mix(a[2], b[2], 2, 1)],
-        [mix(a[0], b[0], 1, 2), mix(a[1], b[1], 1, 2), mix(a[2], b[2], 1, 2)],
+        [
+            mix(a[0], b[0], 2, 1),
+            mix(a[1], b[1], 2, 1),
+            mix(a[2], b[2], 2, 1),
+        ],
+        [
+            mix(a[0], b[0], 1, 2),
+            mix(a[1], b[1], 1, 2),
+            mix(a[2], b[2], 1, 2),
+        ],
     ]
 }
 
@@ -134,9 +146,8 @@ fn endpoints(block: &Block) -> ([u8; 3], [u8; 3]) {
         v = [1.0, 1.0, 1.0];
     }
     for _ in 0..4 {
-        let next: [f32; 3] = std::array::from_fn(|i| {
-            (0..3).map(|j| cov[i][j] as f32 * v[j]).sum::<f32>()
-        });
+        let next: [f32; 3] =
+            std::array::from_fn(|i| (0..3).map(|j| cov[i][j] as f32 * v[j]).sum::<f32>());
         let len = (next[0] * next[0] + next[1] * next[1] + next[2] * next[2]).sqrt();
         if len < 1e-6 {
             break;
@@ -146,9 +157,8 @@ fn endpoints(block: &Block) -> ([u8; 3], [u8; 3]) {
     // The texels whose projections onto the axis are extreme. Taking the COLOURS rather than
     // points on the axis is what makes a two-colour block exact: the axis passes through both,
     // but a point computed on it would be rounded twice.
-    let proj = |px: &[u8; 4]| -> f32 {
-        (0..3).map(|c| (px[c] as f32 - mean[c] as f32) * v[c]).sum()
-    };
+    let proj =
+        |px: &[u8; 4]| -> f32 { (0..3).map(|c| (px[c] as f32 - mean[c] as f32) * v[c]).sum() };
     let mut lo_px = block[0];
     let mut hi_px = block[0];
     let (mut lo_p, mut hi_p) = (f32::MAX, f32::MIN);
@@ -163,7 +173,10 @@ fn endpoints(block: &Block) -> ([u8; 3], [u8; 3]) {
             hi_px = *px;
         }
     }
-    ([hi_px[0], hi_px[1], hi_px[2]], [lo_px[0], lo_px[1], lo_px[2]])
+    (
+        [hi_px[0], hi_px[1], hi_px[2]],
+        [lo_px[0], lo_px[1], lo_px[2]],
+    )
 }
 
 /// Encode one 4x4 block to the 8-byte BC1 layout: `c0`, `c1` (little-endian RGB565) then four
@@ -429,7 +442,11 @@ mod tests {
     /// tested against real guest textures long before this encoder existed. An encoder checked
     /// against its own idea of the format would agree with itself about a wrong bit layout.
     fn roundtrip(w: u32, h: u32, rgba: &[u8], bc3: bool) -> Vec<u8> {
-        let data = if bc3 { encode_bc3(w, h, rgba) } else { encode_bc1(w, h, rgba) };
+        let data = if bc3 {
+            encode_bc3(w, h, rgba)
+        } else {
+            encode_bc1(w, h, rgba)
+        };
         let fmt = if bc3 { 0x87 } else { 0x85 };
         let bb = if bc3 { 16 } else { 8 };
         let mut out = vec![0u8; (w * h * 4) as usize];
@@ -446,7 +463,11 @@ mod tests {
     }
 
     fn mad(a: &[u8], b: &[u8]) -> f64 {
-        a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as u64).sum::<u64>() as f64 / a.len() as f64
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| x.abs_diff(*y) as u64)
+            .sum::<u64>() as f64
+            / a.len() as f64
     }
 
     /// A block of one colour must come back EXACTLY. This is the case an encoder has no excuse
@@ -454,14 +475,23 @@ mod tests {
     /// degenerate when every texel sits on one endpoint.
     #[test]
     fn a_flat_block_survives_exactly() {
-        for c in [[0u8, 0, 0, 255], [255, 255, 255, 255], [40, 130, 200, 255], [8, 4, 8, 255]] {
+        for c in [
+            [0u8, 0, 0, 255],
+            [255, 255, 255, 255],
+            [40, 130, 200, 255],
+            [8, 4, 8, 255],
+        ] {
             let rgba: Vec<u8> = c.iter().cycle().take(16 * 4).copied().collect();
             let got = roundtrip(4, 4, &rgba, false);
             // 565 quantisation is exact only for values that survive the round trip, so compare
             // against what the decoder produces for the quantised colour rather than the input.
             let q = from565(to565([c[0], c[1], c[2]]));
             for px in got.chunks_exact(4) {
-                assert_eq!([px[0], px[1], px[2]], q, "a flat block must be one flat colour");
+                assert_eq!(
+                    [px[0], px[1], px[2]],
+                    q,
+                    "a flat block must be one flat colour"
+                );
             }
         }
     }
@@ -495,7 +525,10 @@ mod tests {
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) as u32
         }
         fn byte(&mut self) -> u8 {
@@ -521,7 +554,16 @@ mod tests {
     /// that fails validation or reads someone else's memory.
     #[test]
     fn the_encoded_size_is_exactly_one_block_per_four_by_four() {
-        for &(w, h) in &[(4u32, 4u32), (8, 4), (4, 8), (64, 64), (16, 8), (1, 1), (5, 3), (12, 20)] {
+        for &(w, h) in &[
+            (4u32, 4u32),
+            (8, 4),
+            (4, 8),
+            (64, 64),
+            (16, 8),
+            (1, 1),
+            (5, 3),
+            (12, 20),
+        ] {
             let rgba = vec![128u8; (w * h * 4) as usize];
             let blocks = (w.div_ceil(4) * h.div_ceil(4)) as usize;
             assert_eq!(encode_bc1(w, h, &rgba).len(), blocks * 8, "BC1 {w}x{h}");
@@ -541,11 +583,18 @@ mod tests {
         let (w, h) = (64u32, 64u32);
         let rgba: Vec<u8> = (0..(w * h * 4)).map(|_| rng.byte()).collect();
         for data in [encode_bc1(w, h, &rgba), encode_bc3(w, h, &rgba)] {
-            let (stride, off) = if data.len() == (w / 4 * h / 4 * 8) as usize { (8, 0) } else { (16, 8) };
+            let (stride, off) = if data.len() == (w / 4 * h / 4 * 8) as usize {
+                (8, 0)
+            } else {
+                (16, 8)
+            };
             for block in data.chunks_exact(stride) {
                 let c0 = u16::from_le_bytes([block[off], block[off + 1]]);
                 let c1 = u16::from_le_bytes([block[off + 2], block[off + 3]]);
-                assert!(c0 >= c1, "3-colour mode emitted: c0 {c0:#06x} < c1 {c1:#06x}");
+                assert!(
+                    c0 >= c1,
+                    "3-colour mode emitted: c0 {c0:#06x} < c1 {c1:#06x}"
+                );
             }
         }
     }
@@ -554,11 +603,24 @@ mod tests {
     /// agree on the picture and disagree on the bits, and the bits are what a device reads.
     #[test]
     fn a_flat_block_emits_zero_indices() {
-        let rgba: Vec<u8> = [90u8, 140, 200, 255].iter().cycle().take(16 * 4).copied().collect();
+        let rgba: Vec<u8> = [90u8, 140, 200, 255]
+            .iter()
+            .cycle()
+            .take(16 * 4)
+            .copied()
+            .collect();
         let bc1 = encode_bc1(4, 4, &rgba);
-        assert_eq!(&bc1[4..8], &[0, 0, 0, 0], "a flat block has nothing to index");
+        assert_eq!(
+            &bc1[4..8],
+            &[0, 0, 0, 0],
+            "a flat block has nothing to index"
+        );
         let bc3 = encode_bc3(4, 4, &rgba);
-        assert_eq!(&bc3[2..8], &[0, 0, 0, 0, 0, 0], "flat alpha has nothing to index");
+        assert_eq!(
+            &bc3[2..8],
+            &[0, 0, 0, 0, 0, 0],
+            "flat alpha has nothing to index"
+        );
         assert_eq!(bc3[0], 255, "a0 is the block's max alpha");
         assert_eq!(bc3[1], 255, "a1 is the block's min alpha");
     }
@@ -587,7 +649,11 @@ mod tests {
         let bc1 = encode_bc1(w, h, &rgba);
         let bc3 = encode_bc3(w, h, &rgba);
         for (i, colour) in bc3.chunks_exact(16).enumerate() {
-            assert_eq!(&colour[8..16], &bc1[i * 8..i * 8 + 8], "block {i} colour half");
+            assert_eq!(
+                &colour[8..16],
+                &bc1[i * 8..i * 8 + 8],
+                "block {i} colour half"
+            );
         }
     }
 
@@ -788,7 +854,10 @@ mod tests {
                 "principal-axis error {ours} is far worse than the bounding box's {bbox}"
             );
         }
-        assert!(wins > 300, "the principal axis only beat the bounding box {wins} times of 500");
+        assert!(
+            wins > 300,
+            "the principal axis only beat the bounding box {wins} times of 500"
+        );
     }
 
     /// A smooth gradient - the case a block codec is worst at - must stay close. The bound is
@@ -809,7 +878,10 @@ mod tests {
         }
         let got = roundtrip(w, h, &rgba, false);
         let e = mad(&rgba, &got);
-        assert!(e < 3.0, "gradient mean absolute error {e:.2} is worse than this encoder achieves");
+        assert!(
+            e < 3.0,
+            "gradient mean absolute error {e:.2} is worse than this encoder achieves"
+        );
     }
 
     /// Sharp edges and saturated colour - a UI atlas, the other regime - must also hold up.
@@ -821,12 +893,19 @@ mod tests {
             for x in 0..w {
                 let o = ((y * w + x) * 4) as usize;
                 let on = (x / 3 + y / 5) % 2 == 0;
-                rgba[o..o + 4].copy_from_slice(if on { &[255, 32, 0, 255] } else { &[0, 16, 255, 255] });
+                rgba[o..o + 4].copy_from_slice(if on {
+                    &[255, 32, 0, 255]
+                } else {
+                    &[0, 16, 255, 255]
+                });
             }
         }
         let got = roundtrip(w, h, &rgba, false);
         let e = mad(&rgba, &got);
-        assert!(e < 6.0, "hard-edge mean absolute error {e:.2} is worse than this encoder achieves");
+        assert!(
+            e < 6.0,
+            "hard-edge mean absolute error {e:.2} is worse than this encoder achieves"
+        );
     }
 
     /// A photograph-like signal: smooth low-frequency colour plus fine detail, which is what
@@ -853,14 +932,19 @@ mod tests {
         let mse: f64 = rgba
             .chunks_exact(4)
             .zip(got.chunks_exact(4))
-            .flat_map(|(a, b)| (0..3).map(move |c| {
-                let d = a[c] as f64 - b[c] as f64;
-                d * d
-            }))
+            .flat_map(|(a, b)| {
+                (0..3).map(move |c| {
+                    let d = a[c] as f64 - b[c] as f64;
+                    d * d
+                })
+            })
             .sum::<f64>()
             / ((w * h * 3) as f64);
         let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
-        assert!(psnr > 35.0, "photographic PSNR {psnr:.1} dB is below what this encoder achieves");
+        assert!(
+            psnr > 35.0,
+            "photographic PSNR {psnr:.1} dB is below what this encoder achieves"
+        );
     }
 
     /// Art drawn from a four-entry palette that lies on a LINE in colour space - a shading ramp,
@@ -878,7 +962,12 @@ mod tests {
     /// It is also why the transcode is a knob: the content decides whether it is acceptable.
     #[test]
     fn palettised_art_on_a_colour_line_survives_essentially_intact() {
-        let ramp = [[20u8, 24, 40], [90, 96, 120], [160, 168, 190], [240, 246, 250]];
+        let ramp = [
+            [20u8, 24, 40],
+            [90, 96, 120],
+            [160, 168, 190],
+            [240, 246, 250],
+        ];
         let mut rng = Rng(31337);
         let (w, h) = (32u32, 32u32);
         let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -888,7 +977,10 @@ mod tests {
         }
         let got = roundtrip(w, h, &rgba, false);
         let e = mad(&rgba, &got);
-        assert!(e < 4.0, "four colours ON A LINE came back {e:.2} levels off on average");
+        assert!(
+            e < 4.0,
+            "four colours ON A LINE came back {e:.2} levels off on average"
+        );
     }
 
     /// The stated ceiling for four colours NOT on a line, asserted so the claim above stays a
@@ -897,7 +989,12 @@ mod tests {
     /// updated instead of leaving a stale number in a doc comment.
     #[test]
     fn four_colours_off_a_line_are_a_format_limit_at_about_forty_levels() {
-        let pal = [[220u8, 30, 30], [30, 220, 60], [40, 40, 230], [250, 250, 250]];
+        let pal = [
+            [220u8, 30, 30],
+            [30, 220, 60],
+            [40, 40, 230],
+            [250, 250, 250],
+        ];
         let mut rng = Rng(31337);
         let (w, h) = (32u32, 32u32);
         let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -990,15 +1087,29 @@ mod conformance {
         // c0 > c1 selects the four-colour mode: index 0 is c0, index 1 is c1, and 2 and 3 are
         // the two-thirds/one-third mixes.
         let b = bc1_block(white, black, 0x0000_0000);
-        assert_eq!(decode_bc_texel(&b, UBC1, 0, 0), [255, 255, 255, 255], "index 0 is c0");
+        assert_eq!(
+            decode_bc_texel(&b, UBC1, 0, 0),
+            [255, 255, 255, 255],
+            "index 0 is c0"
+        );
         let b = bc1_block(white, black, 0x0000_0001);
-        assert_eq!(decode_bc_texel(&b, UBC1, 0, 0), [0, 0, 0, 255], "index 1 is c1");
+        assert_eq!(
+            decode_bc_texel(&b, UBC1, 0, 0),
+            [0, 0, 0, 255],
+            "index 1 is c1"
+        );
         let b = bc1_block(white, black, 0x0000_0002);
         let t = decode_bc_texel(&b, UBC1, 0, 0);
-        assert!(t[0] > 150 && t[0] < 200, "index 2 is two thirds c0, got {t:?}");
+        assert!(
+            t[0] > 150 && t[0] < 200,
+            "index 2 is two thirds c0, got {t:?}"
+        );
         let b = bc1_block(white, black, 0x0000_0003);
         let t = decode_bc_texel(&b, UBC1, 0, 0);
-        assert!(t[0] > 60 && t[0] < 110, "index 3 is one third c0, got {t:?}");
+        assert!(
+            t[0] > 60 && t[0] < 110,
+            "index 3 is one third c0, got {t:?}"
+        );
     }
 
     /// EXHAUSTIVE over all 16 texel positions: each two-bit field must move exactly its own
@@ -1010,8 +1121,15 @@ mod conformance {
             for py in 0..4u32 {
                 for px in 0..4u32 {
                     let got = decode_bc_texel(&b, UBC1, px, py);
-                    let want = if py * 4 + px == t { [0, 0, 0, 255] } else { [255, 255, 255, 255] };
-                    assert_eq!(got, want, "index field {t} must move texel ({px},{py}) only");
+                    let want = if py * 4 + px == t {
+                        [0, 0, 0, 255]
+                    } else {
+                        [255, 255, 255, 255]
+                    };
+                    assert_eq!(
+                        got, want,
+                        "index field {t} must move texel ({px},{py}) only"
+                    );
                 }
             }
         }
@@ -1024,13 +1142,20 @@ mod conformance {
             let c = from565(v << 11);
             assert_eq!(c[0], (v as u32 * 255 / 31) as u8, "red code {v}");
         }
-        assert_eq!(from565(0xffff), [255, 255, 255], "the top code must reach full scale");
+        assert_eq!(
+            from565(0xffff),
+            [255, 255, 255],
+            "the top code must reach full scale"
+        );
         assert_eq!(from565(0x0000), [0, 0, 0]);
         // And the pack is its inverse to within the quantisation step.
         for c in [[0u8, 0, 0], [255, 255, 255], [130, 66, 200]] {
             let back = from565(to565(c));
             for i in 0..3 {
-                assert!((back[i] as i32 - c[i] as i32).abs() <= 8, "565 round trip of {c:?}");
+                assert!(
+                    (back[i] as i32 - c[i] as i32).abs() <= 8,
+                    "565 round trip of {c:?}"
+                );
             }
         }
     }
@@ -1044,12 +1169,24 @@ mod conformance {
         b[1] = 40; // a1
         // Index 0 selects a0, index 1 selects a1, so leaving every index at 0 gives a0 back.
         b[8..16].copy_from_slice(&bc1_block(0xffff, 0x0000, 0));
-        assert_eq!(decode_bc_texel(&b, UBC3, 0, 0)[3], 200, "alpha index 0 is a0");
+        assert_eq!(
+            decode_bc_texel(&b, UBC3, 0, 0)[3],
+            200,
+            "alpha index 0 is a0"
+        );
         // Texel 0's three bits are the LOW three of byte 2.
         b[2] = 1;
-        assert_eq!(decode_bc_texel(&b, UBC3, 0, 0)[3], 40, "alpha index 1 is a1");
+        assert_eq!(
+            decode_bc_texel(&b, UBC3, 0, 0)[3],
+            40,
+            "alpha index 1 is a1"
+        );
         // And the colour half is unaffected by the alpha half.
-        assert_eq!(decode_bc_texel(&b, UBC3, 0, 0)[..3], [255, 255, 255], "colour is independent");
+        assert_eq!(
+            decode_bc_texel(&b, UBC3, 0, 0)[..3],
+            [255, 255, 255],
+            "colour is independent"
+        );
     }
 
     /// Encode THROUGHPUT, printed for comparison with `etcenc`'s.

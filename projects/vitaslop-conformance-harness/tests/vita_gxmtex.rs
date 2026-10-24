@@ -1,7 +1,8 @@
 //! GXM texture control words, end to end: a real Vita velf checks that a new texture has no
 //! LOD bias, that a `LINEAR_STRIDED` texture's stride survives a by-value copy of the struct,
 //! that two strided views of one surface keep their own pitches, and that an unaligned stride
-//! is refused.
+//! is refused; then every init boundary a console run recorded (strides, mip counts, sizes,
+//! alignment, NULL data), and what a fresh texture reads back.
 //!
 //! Run with: cargo test -p vitaslop-conformance-harness --test vita_gxmtex
 
@@ -11,8 +12,15 @@ use vitaslop_native::{DeterministicWorld, RunReport, ThreadedScheduler, VitaEnv}
 const GXMTEX: &[u8] = include_bytes!("../../vitaslop-conformance-suite-vita/gxmtex-src/gxmtex.velf");
 
 /// See gxmtex.c: `l`/`t` = init results, `b` = LOD bias read back, the bare numbers are
-/// strides, `e` = the refused init's error.
-const EXPECTED: &str = "l0 b31 b40 t0 3968 3968 t0 3840 3968 e805b0005";
+/// strides, `e` = the refused init's error. The `stride`, `mips`, `size` and `ptr` lines are
+/// the init's accept/reject boundaries as a console recorded them; `fresh` is what a new
+/// texture reads back.
+const EXPECTED: &str = "l0 b31 b40 t0 3968 3968 t0 3840 3968 e805b0005\n\
+stride 0:4 0:512 0:1028 0:131072 805b0005 805b0005 805b0003 805b0003\n\
+mips 0 0 0 0 805b0003 805b0003\n\
+size 805b0003 805b0003 805b0005 805b0005 0 0 0\n\
+ptr 805b0005 805b0004 0 805b0019\n\
+fresh u2 v2 n80000000 m5 s0 m0 256x64 512x64 0 65536";
 
 #[test]
 fn texture_state_lives_in_the_control_words() {

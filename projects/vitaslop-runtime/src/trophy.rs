@@ -133,7 +133,11 @@ impl TrpArchive {
             return Err(TrophyError::UnsupportedVersion(version));
         }
         let table_end = TRP_HEADER_SIZE
-            .checked_add(count.checked_mul(entry_size).ok_or(TrophyError::Truncated("entry table"))?)
+            .checked_add(
+                count
+                    .checked_mul(entry_size)
+                    .ok_or(TrophyError::Truncated("entry table"))?,
+            )
             .ok_or(TrophyError::Truncated("entry table"))?;
         if table_end > data.len() {
             return Err(TrophyError::Truncated("entry table"));
@@ -147,7 +151,9 @@ impl TrpArchive {
             let name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
             let offset = be_u64(&data, base + 32) as usize;
             let size = be_u64(&data, base + 40) as usize;
-            let end = offset.checked_add(size).ok_or(TrophyError::Truncated("entry range"))?;
+            let end = offset
+                .checked_add(size)
+                .ok_or(TrophyError::Truncated("entry range"))?;
             if end > data.len() {
                 return Err(TrophyError::Truncated("entry range"));
             }
@@ -219,7 +225,9 @@ impl TrophySet {
     /// change what the set IS.
     pub fn parse(data: Vec<u8>, lang: u32) -> Result<TrophySet, TrophyError> {
         let archive = TrpArchive::parse(data)?;
-        let conf_bytes = archive.file("TROPCONF.SFM").ok_or(TrophyError::MissingConf)?;
+        let conf_bytes = archive
+            .file("TROPCONF.SFM")
+            .ok_or(TrophyError::MissingConf)?;
         let conf = Conf::parse(conf_bytes)?;
 
         let localized_name = localized_conf_name(&archive, lang);
@@ -245,7 +253,14 @@ impl TrophySet {
             .iter()
             .map(|t| {
                 let (name, detail) = text_for(t.id);
-                TrophyDef { id: t.id, grade: t.grade, group_id: t.group_id, hidden: t.hidden, name, detail }
+                TrophyDef {
+                    id: t.id,
+                    grade: t.grade,
+                    group_id: t.group_id,
+                    hidden: t.hidden,
+                    name,
+                    detail,
+                }
             })
             .collect();
 
@@ -261,11 +276,22 @@ impl TrophySet {
             .iter()
             .map(|g| {
                 let (name, detail) = group_text(g.id);
-                GroupDef { id: g.id, name, detail }
+                GroupDef {
+                    id: g.id,
+                    name,
+                    detail,
+                }
             })
             .collect();
 
-        Ok(TrophySet { comm_id: conf.comm_id, title, detail, groups, trophies, archive })
+        Ok(TrophySet {
+            comm_id: conf.comm_id,
+            title,
+            detail,
+            groups,
+            trophies,
+            archive,
+        })
     }
 
     /// The trophy with this id, or `None` if the set does not declare it.
@@ -390,7 +416,12 @@ impl TrophyStore {
     /// Record an unlock at `tick`. Returns false (and keeps the original tick) if it was
     /// already unlocked.
     pub fn unlock(&mut self, comm_id: &str, id: u32, tick: u64) -> bool {
-        match self.unlocked.entry(comm_id.to_string()).or_default().entry(id) {
+        match self
+            .unlocked
+            .entry(comm_id.to_string())
+            .or_default()
+            .entry(id)
+        {
             std::collections::btree_map::Entry::Occupied(_) => false,
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(tick);
@@ -445,7 +476,11 @@ impl TrophyStore {
 
     /// Counts of the unlocked trophies matching `keep`, so unlocked and total counts are
     /// folded by the same rule.
-    pub fn unlocked_counts(&self, set: &TrophySet, keep: impl Fn(&TrophyDef) -> bool) -> GradeCounts {
+    pub fn unlocked_counts(
+        &self,
+        set: &TrophySet,
+        keep: impl Fn(&TrophyDef) -> bool,
+    ) -> GradeCounts {
         let ledger = self.unlocked.get(&set.comm_id);
         set.counts(|t| keep(t) && ledger.is_some_and(|l| l.contains_key(&t.id)))
     }
@@ -459,7 +494,10 @@ fn localized_conf_name(archive: &TrpArchive, lang: u32) -> Option<String> {
     if archive.names().any(|n| n.eq_ignore_ascii_case(&preferred)) {
         return Some(preferred);
     }
-    archive.names().any(|n| n.eq_ignore_ascii_case("TROP.SFM")).then(|| "TROP.SFM".to_string())
+    archive
+        .names()
+        .any(|n| n.eq_ignore_ascii_case("TROP.SFM"))
+        .then(|| "TROP.SFM".to_string())
 }
 
 /// One parsed `.SFM` conf. `TROPCONF.SFM` and the localized `TROP*.SFM` share this grammar;
@@ -487,7 +525,11 @@ impl Conf {
 
         for ev in XmlEvents::new(text) {
             match ev? {
-                XmlEvent::Start { name, attrs, self_closing } => {
+                XmlEvent::Start {
+                    name,
+                    attrs,
+                    self_closing,
+                } => {
                     match name {
                         "trophyconf" => saw_root = true,
                         "npcommid" | "title-name" | "title-detail" | "name" | "detail" => {
@@ -501,7 +543,11 @@ impl Conf {
                         }
                         "group" => {
                             let id = attr_i32(&attrs, "id", name)?;
-                            open_group = Some(GroupDef { id, name: String::new(), detail: String::new() });
+                            open_group = Some(GroupDef {
+                                id,
+                                name: String::new(),
+                                detail: String::new(),
+                            });
                         }
                         "trophy" => {
                             let id = attr_u32(&attrs, "id", name)?;
@@ -509,7 +555,9 @@ impl Conf {
                                 TrophyError::BadConf(format!("<trophy id={id}> has no ttype"))
                             })?;
                             let grade = Grade::from_ttype(ttype).ok_or_else(|| {
-                                TrophyError::BadConf(format!("<trophy id={id}> has unknown ttype {ttype:?}"))
+                                TrophyError::BadConf(format!(
+                                    "<trophy id={id}> has unknown ttype {ttype:?}"
+                                ))
                             })?;
                             let hidden = matches!(attr(&attrs, "hidden"), Some("yes"));
                             let group_id = match attr(&attrs, "pid") {
@@ -539,13 +587,16 @@ impl Conf {
                     if self_closing {
                         pending_text = None;
                         if name == "group"
-                            && let Some(g) = open_group.take() {
-                                conf.groups.push(g);
-                            }
+                            && let Some(g) = open_group.take()
+                        {
+                            conf.groups.push(g);
+                        }
                     }
                 }
                 XmlEvent::Text(text) => {
-                    let Some(field) = pending_text.take() else { continue };
+                    let Some(field) = pending_text.take() else {
+                        continue;
+                    };
                     match (field, open_trophy.as_mut(), open_group.as_mut()) {
                         ("npcommid", _, _) => conf.comm_id = text,
                         ("title-name", _, _) => conf.title = text,
@@ -587,19 +638,22 @@ impl Conf {
 }
 
 fn attr<'a>(attrs: &'a [(&'a str, String)], key: &str) -> Option<&'a str> {
-    attrs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
+    attrs
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 fn attr_u32(attrs: &[(&str, String)], key: &str, elem: &str) -> Result<u32, TrophyError> {
-    let raw = attr(attrs, key)
-        .ok_or_else(|| TrophyError::BadConf(format!("<{elem}> has no {key}")))?;
+    let raw =
+        attr(attrs, key).ok_or_else(|| TrophyError::BadConf(format!("<{elem}> has no {key}")))?;
     raw.parse::<u32>()
         .map_err(|_| TrophyError::BadConf(format!("<{elem}> {key}={raw:?} is not a number")))
 }
 
 fn attr_i32(attrs: &[(&str, String)], key: &str, elem: &str) -> Result<i32, TrophyError> {
-    let raw = attr(attrs, key)
-        .ok_or_else(|| TrophyError::BadConf(format!("<{elem}> has no {key}")))?;
+    let raw =
+        attr(attrs, key).ok_or_else(|| TrophyError::BadConf(format!("<{elem}> has no {key}")))?;
     raw.parse::<i32>()
         .map_err(|_| TrophyError::BadConf(format!("<{elem}> {key}={raw:?} is not a number")))
 }
@@ -625,8 +679,14 @@ fn be_u64(d: &[u8], at: usize) -> u64 {
 // ---------------------------------------------------------------------------
 
 enum XmlEvent<'a> {
-    Start { name: &'a str, attrs: Vec<(&'a str, String)>, self_closing: bool },
-    End { name: &'a str },
+    Start {
+        name: &'a str,
+        attrs: Vec<(&'a str, String)>,
+        self_closing: bool,
+    },
+    End {
+        name: &'a str,
+    },
     /// Character data with entity references resolved. Whitespace-only runs (the
     /// indentation between elements) are not emitted.
     Text(String),
@@ -640,7 +700,11 @@ struct XmlEvents<'a> {
 
 impl<'a> XmlEvents<'a> {
     fn new(src: &'a str) -> Self {
-        XmlEvents { src, pos: 0, done: false }
+        XmlEvents {
+            src,
+            pos: 0,
+            done: false,
+        }
     }
 }
 
@@ -673,7 +737,9 @@ impl<'a> Iterator for XmlEvents<'a> {
                 if rest.trim().is_empty() {
                     return None;
                 }
-                return Some(Err(TrophyError::BadConf("text after the root element".into())));
+                return Some(Err(TrophyError::BadConf(
+                    "text after the root element".into(),
+                )));
             }
 
             // At a '<'. Comments and declarations are skipped wholesale.
@@ -739,17 +805,25 @@ fn parse_attrs(mut s: &str) -> Result<Vec<(&str, String)>, TrophyError> {
             return Ok(out);
         }
         let Some(eq) = s.find('=') else {
-            return Err(TrophyError::BadConf(format!("attribute without a value near {s:?}")));
+            return Err(TrophyError::BadConf(format!(
+                "attribute without a value near {s:?}"
+            )));
         };
         let key = s[..eq].trim();
         let after = s[eq + 1..].trim_start();
         let quote = match after.chars().next() {
             Some(q @ ('"' | '\'')) => q,
-            _ => return Err(TrophyError::BadConf(format!("unquoted attribute value near {after:?}"))),
+            _ => {
+                return Err(TrophyError::BadConf(format!(
+                    "unquoted attribute value near {after:?}"
+                )));
+            }
         };
         let body = &after[quote.len_utf8()..];
         let Some(close) = body.find(quote) else {
-            return Err(TrophyError::BadConf(format!("unterminated attribute value near {after:?}")));
+            return Err(TrophyError::BadConf(format!(
+                "unterminated attribute value near {after:?}"
+            )));
         };
         out.push((key, decode_entities(&body[..close])?));
         s = &body[close + quote.len_utf8()..];
@@ -769,7 +843,9 @@ fn decode_entities(s: &str) -> Result<String, TrophyError> {
         out.push_str(&rest[..amp]);
         let tail = &rest[amp..];
         let Some(semi) = tail.find(';') else {
-            return Err(TrophyError::BadConf(format!("unterminated entity near {tail:?}")));
+            return Err(TrophyError::BadConf(format!(
+                "unterminated entity near {tail:?}"
+            )));
         };
         let name = &tail[1..semi];
         let ch = match name {
@@ -779,7 +855,9 @@ fn decode_entities(s: &str) -> Result<String, TrophyError> {
             "quot" => '"',
             "apos" => '\'',
             _ => {
-                let code = if let Some(hex) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+                let code = if let Some(hex) =
+                    name.strip_prefix("#x").or_else(|| name.strip_prefix("#X"))
+                {
                     u32::from_str_radix(hex, 16).ok()
                 } else {
                     name.strip_prefix('#').and_then(|d| d.parse::<u32>().ok())
@@ -887,7 +965,10 @@ mod tests {
 
     #[test]
     fn rejects_a_non_trp() {
-        assert_eq!(TrpArchive::parse(vec![0u8; 0x80]).unwrap_err(), TrophyError::NotTrp);
+        assert_eq!(
+            TrpArchive::parse(vec![0u8; 0x80]).unwrap_err(),
+            TrophyError::NotTrp
+        );
         assert!(matches!(
             TrpArchive::parse(vec![0xDC, 0xA2, 0x4D]).unwrap_err(),
             TrophyError::Truncated(_)
@@ -900,7 +981,10 @@ mod tests {
         // Enlarge the first entry's size field beyond the buffer.
         let size_at = TRP_HEADER_SIZE + 40;
         bytes[size_at..size_at + 8].copy_from_slice(&u64::MAX.to_be_bytes());
-        assert!(matches!(TrpArchive::parse(bytes).unwrap_err(), TrophyError::Truncated(_)));
+        assert!(matches!(
+            TrpArchive::parse(bytes).unwrap_err(),
+            TrophyError::Truncated(_)
+        ));
     }
 
     #[test]
@@ -917,20 +1001,41 @@ mod tests {
         assert_eq!(t.name, "Secret");
         assert_eq!(t.detail, "Hidden until earned");
         assert!(!set.trophy(0).unwrap().hidden);
-        assert_eq!(set.groups, vec![GroupDef {
-            id: 0,
-            name: "First group".into(),
-            detail: "Group detail".into()
-        }]);
+        assert_eq!(
+            set.groups,
+            vec![GroupDef {
+                id: 0,
+                name: "First group".into(),
+                detail: "Group detail".into()
+            }]
+        );
     }
 
     #[test]
     fn counts_by_grade_over_the_set_and_one_group() {
         let set = TrophySet::parse(sample(), 1).unwrap();
         let all = set.counts(|_| true);
-        assert_eq!(all, GradeCounts { total: 4, platinum: 1, gold: 1, silver: 1, bronze: 1 });
+        assert_eq!(
+            all,
+            GradeCounts {
+                total: 4,
+                platinum: 1,
+                gold: 1,
+                silver: 1,
+                bronze: 1
+            }
+        );
         let g0 = set.counts(|t| t.group_id == 0);
-        assert_eq!(g0, GradeCounts { total: 2, platinum: 0, gold: 1, silver: 1, bronze: 0 });
+        assert_eq!(
+            g0,
+            GradeCounts {
+                total: 2,
+                platinum: 0,
+                gold: 1,
+                silver: 1,
+                bronze: 0
+            }
+        );
     }
 
     #[test]
@@ -951,9 +1056,19 @@ mod tests {
             ("TROP.SFM", TROP_EN.as_bytes()),
             ("TROP_02.SFM", fr.as_bytes()),
         ]);
-        assert_eq!(TrophySet::parse(bytes.clone(), 2).unwrap().trophy(0).unwrap().name, "Tout");
+        assert_eq!(
+            TrophySet::parse(bytes.clone(), 2)
+                .unwrap()
+                .trophy(0)
+                .unwrap()
+                .name,
+            "Tout"
+        );
         // No TROP_09.SFM in the container, so the default conf is used.
-        assert_eq!(TrophySet::parse(bytes, 9).unwrap().trophy(0).unwrap().name, "All of it");
+        assert_eq!(
+            TrophySet::parse(bytes, 9).unwrap().trophy(0).unwrap().name,
+            "All of it"
+        );
     }
 
     #[test]
@@ -969,13 +1084,19 @@ mod tests {
     fn a_conf_without_a_grade_is_an_error_not_a_guess() {
         let broken = TROPCONF.replace(r#"ttype="P""#, r#"ttype="X""#);
         let bytes = build_trp(&[("TROPCONF.SFM", broken.as_bytes())]);
-        assert!(matches!(TrophySet::parse(bytes, 1).unwrap_err(), TrophyError::BadConf(_)));
+        assert!(matches!(
+            TrophySet::parse(bytes, 1).unwrap_err(),
+            TrophyError::BadConf(_)
+        ));
     }
 
     #[test]
     fn a_container_without_a_conf_is_an_error() {
         let bytes = build_trp(&[("ICON0.PNG", b"x")]);
-        assert_eq!(TrophySet::parse(bytes, 1).unwrap_err(), TrophyError::MissingConf);
+        assert_eq!(
+            TrophySet::parse(bytes, 1).unwrap_err(),
+            TrophyError::MissingConf
+        );
     }
 
     /// The synthetic containers above test the reader against the layout it documents.
@@ -985,22 +1106,33 @@ mod tests {
     #[test]
     fn reads_a_real_retail_trophy_set() {
         use crate::ingest::{testfix, vfs::DirVfs};
-        let Some(dir) = testfix::game_dir() else { return };
+        let Some(dir) = testfix::game_dir() else {
+            return;
+        };
         let Ok(game) = crate::ingest::pipeline::decrypt_container(&mut DirVfs::new(dir)) else {
             return;
         };
         // The set lives under a directory named for its own NP communication id.
         use crate::ingest::vfs::Vfs;
-        let Some(path) =
-            game.files.list().into_iter().find(|p| p.to_ascii_lowercase().ends_with("/trophy.trp"))
+        let Some(path) = game
+            .files
+            .list()
+            .into_iter()
+            .find(|p| p.to_ascii_lowercase().ends_with("/trophy.trp"))
         else {
             return;
         };
-        let dir_name = path.rsplit('/').nth(1).expect("TROPHY.TRP has a parent directory");
+        let dir_name = path
+            .rsplit('/')
+            .nth(1)
+            .expect("TROPHY.TRP has a parent directory");
         let set = TrophySet::parse(game.file(&path).expect("read TROPHY.TRP"), 1)
             .expect("parse the title's own trophy set");
 
-        assert_eq!(set.comm_id, dir_name, "conf npcommid disagrees with its directory");
+        assert_eq!(
+            set.comm_id, dir_name,
+            "conf npcommid disagrees with its directory"
+        );
         let counts = set.counts(|_| true);
         assert_eq!(counts.total as usize, set.trophies.len());
         assert_eq!(
@@ -1010,11 +1142,19 @@ mod tests {
         );
         assert!(counts.total > 0, "a shipped trophy set is never empty");
         assert!(set.game_icon().is_some(), "no ICON0.PNG in the container");
-        assert_eq!(&set.game_icon().unwrap()[..4], b"\x89PNG", "ICON0.PNG is not a PNG");
+        assert_eq!(
+            &set.game_icon().unwrap()[..4],
+            b"\x89PNG",
+            "ICON0.PNG is not a PNG"
+        );
         assert!(!set.title.is_empty(), "no localized <title-name>");
         for t in &set.trophies {
             assert!(!t.name.is_empty(), "trophy {} has no localized name", t.id);
-            assert!(set.trophy_icon(t.id).is_some(), "trophy {} has no icon", t.id);
+            assert!(
+                set.trophy_icon(t.id).is_some(),
+                "trophy {} has no icon",
+                t.id
+            );
         }
     }
 
@@ -1024,9 +1164,9 @@ mod tests {
         assert_eq!(decode_entities("&#65;&#x42;&amp;").unwrap(), "AB&");
         assert!(parse_attrs("id=000").is_err());
         assert!(parse_attrs(r#"id="000"#).is_err());
-        assert_eq!(parse_attrs(r#" id="7" ttype='B' "#).unwrap(), vec![
-            ("id", "7".to_string()),
-            ("ttype", "B".to_string())
-        ]);
+        assert_eq!(
+            parse_attrs(r#" id="7" ttype='B' "#).unwrap(),
+            vec![("id", "7".to_string()), ("ttype", "B".to_string())]
+        );
     }
 }

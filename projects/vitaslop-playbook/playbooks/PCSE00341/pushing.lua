@@ -1,10 +1,10 @@
 -- OlliOlli (PCSE00341): a save-less first launch, through the forced tutorial to the PUSHING
 -- lesson, pushed to the goal until the lesson PASSes.
 --
--- Converted from the recipe `pushing`, which tapped the touch front end at fixed frames and
+-- Converted from the old frame-keyed script `pushing`, which tapped the touch front end at fixed frames and
 -- pressed CROSS every 16 frames for 300 frames. This waits on the lesson's own outcome.
 --
--- HOW THE CUES WERE FOUND: `--discover` on the recipe's run (deterministic, 700 frames) next
+-- HOW THE CUES WERE FOUND: `--discover` on the old script's run (deterministic, 700 frames) next
 -- to a shot every 40 frames. The title loads everything it needs in the first few frames, so
 -- the front end's screens make NO call of their own - only the lesson's end does:
 --
@@ -20,11 +20,11 @@
 -- between taps hold at any speed.
 
 -- The skater's height: 60 on the ground, negative in the air, back through 60 on landing.
--- Found by value search (it is the recipe's @watch); the landing signal for the trick lessons.
+-- Found by value search (it was the old script's watch); the landing signal for the trick lessons.
 local vpos   = cue.i32(0x81502058)
 local SAVE   = "sceAppUtilSaveDataDataSave"
 cue.call(SAVE):trace("savedata written")
--- The recipe's assert: grounded is 60 +-6 (pushing keeps the skater on the deck).
+-- The old script's check: grounded is 60 +-6 (pushing keeps the skater on the deck).
 local not_airborne = vpos:atleast(54)
 local not_buried   = vpos:atmost(66)
 

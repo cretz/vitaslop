@@ -339,6 +339,13 @@ pub struct LinkOptions {
     /// naming why) for a program that blends for itself or is lowered to a dual-source blend,
     /// because an integer attachment cannot blend and a raw pair has no destination colour.
     pub raw64_output: bool,
+    /// The pass is MULTISAMPLED, so a program that blends for itself reads the destination per
+    /// SAMPLE: the copy is a multisampled texture and the fragment loads its own sample of it
+    /// (`@builtin(sample_index)`, which makes that draw shade per sample - its inputs are still
+    /// interpolated at the pixel centre, so only the destination differs between samples, as it
+    /// does in a multisampled framebuffer). Changes nothing for a program that does not read the
+    /// destination.
+    pub dest_multisampled: bool,
     /// What the GUEST bound to each vertex attribute, as `(base lane, GXM attribute format,
     /// component count)` - the `SceGxmVertexAttribute` fields, keyed by the PA base lane the
     /// program's own parameter table names (`resource_index`), so no ordering has to be agreed
@@ -528,6 +535,9 @@ pub fn memo_miss_reason(v: &[u8], f: &[u8], opts: &LinkOptions) -> Option<String
             if o.dual_source != opts.dual_source { d.push(format!("dual_source {}->{}", o.dual_source, opts.dual_source)); }
             if o.raw_units != opts.raw_units { d.push(format!("raw_units {:#x}->{:#x}", o.raw_units, opts.raw_units)); }
             if o.raw64_output != opts.raw64_output { d.push(format!("raw64_output {}->{}", o.raw64_output, opts.raw64_output)); }
+            if o.dest_multisampled != opts.dest_multisampled {
+                d.push(format!("dest_multisampled {}->{}", o.dest_multisampled, opts.dest_multisampled));
+            }
             if o.guest_attrs != opts.guest_attrs { d.push(format!("guest_attrs {:?}->{:?}", o.guest_attrs, opts.guest_attrs)); }
             if o.colour_output_masked_off != opts.colour_output_masked_off {
                 d.push(format!("colour_output_masked_off {}->{}", o.colour_output_masked_off, opts.colour_output_masked_off));
@@ -614,6 +624,11 @@ fn body_memo(stage: u8, bytes: &[u8], emit: impl FnOnce() -> Result<String, Link
 /// `VITASLOP_LINK_PROFILE=1` (native only): cumulative microseconds per link phase -
 /// `[recompile both, interface+plans, emit bodies, assemble module, post-passes]`.
 pub static LINK_PROFILE_US: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+/// ...and the ALLOCATIONS each phase made, when a caller installed [`LINK_ALLOC_COUNTER`] (a
+/// test binary's counting allocator): in the threaded browser build every allocation takes the
+/// one global allocator lock, so a phase's allocation count is a cost of its own there.
+pub static LINK_PROFILE_ALLOCS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+pub static LINK_ALLOC_COUNTER: std::sync::OnceLock<fn() -> u64> = std::sync::OnceLock::new();
 
 #[cfg(not(target_arch = "wasm32"))]
 fn link_profile_on() -> bool {
@@ -624,6 +639,8 @@ fn link_profile_on() -> bool {
 struct LinkPhase {
     #[cfg(not(target_arch = "wasm32"))]
     t: Option<std::time::Instant>,
+    #[cfg(not(target_arch = "wasm32"))]
+    allocs: u64,
 }
 
 impl LinkPhase {
@@ -631,6 +648,8 @@ impl LinkPhase {
         LinkPhase {
             #[cfg(not(target_arch = "wasm32"))]
             t: link_profile_on().then(std::time::Instant::now),
+            #[cfg(not(target_arch = "wasm32"))]
+            allocs: LINK_ALLOC_COUNTER.get().map_or(0, |f| f()),
         }
     }
     #[allow(unused_variables)]
@@ -638,6 +657,11 @@ impl LinkPhase {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(t) = self.t {
             LINK_PROFILE_US[i].fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            if let Some(f) = LINK_ALLOC_COUNTER.get() {
+                let now = f();
+                LINK_PROFILE_ALLOCS[i].fetch_add(now - self.allocs, std::sync::atomic::Ordering::Relaxed);
+                self.allocs = f();
+            }
             self.t = Some(std::time::Instant::now());
         }
     }
@@ -857,6 +881,7 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
         fplan.raw64_output = true;
     }
     fplan.alpha_to_red = opts.alpha_to_red && !opts.raw64_output;
+    fplan.dest_multisampled = opts.dest_multisampled;
 
     // Interpolated scalar components packed four per `@location` vec4. Both stages declare the
     // same interface, so the counts are equal by construction.
@@ -1802,7 +1827,7 @@ fn forwarding_contradicts(vout: &[OutputVarying], claims: &[(VaryingUsage, Vec<u
 /// programs: a golf title's course family forwards a COLOR-semantic attribute into the four
 /// lanes the convention calls `TexCoord(0)`, because passing a colour down a spare texcoord
 /// channel is a thing shaders do. Acting on that one claim re-orders twelve varyings and takes
-/// the sky, the course and the whole UI with it (MEASURED: `hole-one.recipe` f001880, 89% of
+/// the sky, the course and the whole UI with it (MEASURED: the scripted golf hole at f001880, 89% of
 /// pixels, world black and sky flat green).
 ///
 /// What is not weak is a claim set that accounts for the WHOLE layout: every declared varying
@@ -2778,7 +2803,7 @@ fn plan_interface_with(
     // MEASURED: a football title's `frag_90c054e0` is `Nop`, a `Test` on two constants, a
     // predicated `Kill`, `Nop`, `Nop` - an interpolant count of 0 that is TRUE, and no write to
     // any colour register. It was refused as "reads PA register 0 before writing it" and its
-    // draws were DROPPED (168 fallback draws in one browser run of the kickoff recipe). A real
+    // draws were DROPPED (168 fallback draws in one browser run of the scripted kickoff). A real
     // passthrough is the opposite shape: a racing title's flat vertex-coloured polygon is a
     // single `Nop` that DECLARES a Color0, and that declaration is exactly what makes its
     // register file meaningful. So the two are distinguishable after all.
@@ -3539,7 +3564,7 @@ fn build_linked_module(
     m.push_str(GXP_DEPTH_DECL);
     // The destination-colour texture rides in the same group - see `module::GXP_DEST_DECL`.
     if fplan.reads_dest_color && !fplan.dual_source {
-        m.push_str(crate::module::GXP_DEST_DECL);
+        m.push_str(if fplan.dest_multisampled { crate::module::GXP_DEST_DECL_MS } else { crate::module::GXP_DEST_DECL });
     }
 
     // ---- Vertex default-uniform buffer (SA bank) at group 0 ----
@@ -3710,6 +3735,11 @@ fn build_linked_module(
     // the same shape whether or not the body happens to read them.
     let _ = writeln!(m, "  @builtin(position) frag_coord: vec4<f32>,");
     let _ = writeln!(m, "  @builtin(front_facing) front_facing: bool,");
+    // The sample being shaded, for a destination read on a multisampled pass - see
+    // `LinkOptions::dest_multisampled`. Only then: the builtin makes the draw shade per sample.
+    if fplan.reads_dest_color && !fplan.dual_source && fplan.dest_multisampled {
+        let _ = writeln!(m, "  @builtin(sample_index) gxp_sample: u32,");
+    }
     let _ = writeln!(m, "}};");
     // A fragment that writes its own depth (0xF8 DEPTHF) returns a STRUCT carrying
     // `@builtin(frag_depth)` next to the colour. The struct is emitted only for such a
@@ -3761,7 +3791,12 @@ fn build_linked_module(
     // `split_dual_body`. Seeding here would put the destination in `o` before a prefix that
     // may write `o` itself, and then the second arm's reseed would erase that write.
     if fplan.reads_dest_color && dual_split.is_none() {
-        m.push_str(&crate::module::dest_color_init(fplan.color_precision, fplan.dual_source, fplan.alpha_to_red));
+        m.push_str(&crate::module::dest_color_init(
+            fplan.color_precision,
+            fplan.dual_source,
+            fplan.alpha_to_red,
+            fplan.dest_multisampled,
+        ));
     }
     if writes_depth {
         let _ = writeln!(m, "  let gxp_interp_depth = in.frag_coord.z;");
@@ -5408,7 +5443,7 @@ pub fn set_arm(name: &str, value: &str) {
             // zero, and until now they were `std::env::var` reads - which means they could be
             // armed on the desktop and NOWHERE ELSE. That is backwards: a football title's
             // sideline characters render pure BLACK in the browser and are culled natively at
-            // the same recipe frame, so the engine that can be probed is the engine that does
+            // the same scripted frame, so the engine that can be probed is the engine that does
             // not have the defect [[vitaslop-web-is-the-product-not-the-tool]].
             | PROBE_ARM
             | PROBE_SCALE_ARM

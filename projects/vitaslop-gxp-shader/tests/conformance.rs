@@ -22,7 +22,7 @@
 //!
 //! Every case in the first group is a defect this project actually shipped, found months after
 //! the fact because some title drew something visibly wrong. Each is now a five-millisecond
-//! question with no title, no recipe and no frame:
+//! question with no title, no playbook and no frame:
 //!
 //! | case | the defect it would have caught |
 //! |---|---|

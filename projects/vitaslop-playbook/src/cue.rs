@@ -87,6 +87,9 @@ pub enum CueDef {
     /// is, scanning rows top to bottom, as `y * 1024 + x` in panel coordinates. `None` when no
     /// pixel matches (or before the first frame) - for a marker that moves from shot to shot.
     Locate { x: u32, y: u32, w: u32, h: u32, rgb: [u8; 3], tol: u8 },
+    /// The presented frame: the AVERAGE colour of the rectangle, packed `0xRRGGBB` - for a
+    /// colour the title chooses at run time (a table's cloth), which a fixed `rgb` cannot name.
+    Color { x: u32, y: u32, w: u32, h: u32 },
     /// `n` input frames after the wait begins.
     Frames(u64),
     /// `s` guest seconds after the wait begins.
@@ -132,6 +135,7 @@ impl CueDef {
             CueDef::Locate { x, y, w, h, rgb, tol } => {
                 format!("locate {w}x{h}@{x},{y} ~#{:02x}{:02x}{:02x}/{tol}", rgb[0], rgb[1], rgb[2])
             }
+            CueDef::Color { x, y, w, h } => format!("colour of {w}x{h}@{x},{y}"),
             CueDef::Frames(n) => format!("{n} input frames"),
             CueDef::Seconds(s) => format!("{s} s"),
             CueDef::Cmp { src, op, value } => format!("{} {} {value}", label(*src), op.symbol()),
@@ -179,7 +183,9 @@ impl Armed {
     pub fn arm(st: &dyn CueState, id: CueId) -> Armed {
         match st.def(id) {
             CueDef::Call { .. } => Armed::Count { id, base: st.value(id).unwrap_or(0.0) },
-            CueDef::Mem { .. } | CueDef::Pixels { .. } | CueDef::Locate { .. } => Armed::Change { id, base: st.value(id) },
+            CueDef::Mem { .. } | CueDef::Pixels { .. } | CueDef::Locate { .. } | CueDef::Color { .. } => {
+                Armed::Change { id, base: st.value(id) }
+            }
             CueDef::Cmp { .. } | CueDef::Stable(..) => Armed::Level { id },
             CueDef::Changed(_) => Armed::Edge { id, armed_at: st.input_frame() },
             CueDef::Frames(n) => Armed::Frames { until: st.input_frame() + n },

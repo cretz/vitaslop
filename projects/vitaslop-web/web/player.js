@@ -15,6 +15,7 @@ import { startAudio } from "./audio.js";
 import { isComplete } from "./opfs.js";
 import * as gamedata from "./gamedata.js";
 import { mountTouchPad } from "./touchpad.js";
+import { mountImeInput } from "./ime-input.js";
 import { installGamepad } from "./gamepad.js";
 import { runKnobs, vocabulary, touchTitle, bundleLoaded, recoverFromMixedBuild } from "./store.js";
 import { renderVita } from "./vita.js";
@@ -33,7 +34,16 @@ export function createPlayer({ onExit, onRestart }) {
   const stage = $("stage");
   let worker = null;
   let touch = null;
+  // The text field over the game while it has its on-screen keyboard open - see ime-input.js.
+  let imeInput = null;
   let pads = null;
+  // The page's pointer + key listeners for this run (`forwardInput`), re-installed when the
+  // menu turns the rear panel on or off.
+  let inputOff = null;
+  const installInput = () => {
+    if (inputOff) inputOff();
+    inputOff = forwardInput(worker, canvas, { rearTouch: settings.rearTouch, rearLatched: () => !!(touch && touch.rearLatched()) });
+  };
   // Undo functions for listeners installed per run on targets that outlive it.
   const unlisten = [];
   let audioPause = () => {};
@@ -358,6 +368,7 @@ export function createPlayer({ onExit, onRestart }) {
       $("m-pad-mode").value = settings.pad.mode;
       $("m-pad-opacity").value = settings.pad.opacity;
       $("m-pause-blur").checked = !!settings.pauseOnBlur;
+      $("m-rear").checked = !!settings.rearTouch;
       $("m-fullscreen").textContent = isFull() ? "Exit fullscreen" : "Fullscreen";
       $("m-diag").textContent = diagText();
       $("m-settings").href = `#/settings/${meta.titleId}`;
@@ -401,6 +412,12 @@ export function createPlayer({ onExit, onRestart }) {
     settings.pauseOnBlur = e.target.checked;
     applyPause();
     onRuntimeSetting({ pauseOnBlur: settings.pauseOnBlur });
+  });
+  $("m-rear").addEventListener("change", (e) => {
+    settings.rearTouch = e.target.checked;
+    if (worker) installInput();
+    if (touch) touch.setRearTouch(settings.rearTouch);
+    onRuntimeSetting({ rearTouch: settings.rearTouch });
   });
   $("m-copy").addEventListener("click", () => copyText(diagText(), $("m-copy")));
   $("m-download").addEventListener("click", () => download(`vitaslop-${meta.titleId}-diag.txt`, diagText(), "text/plain"));
@@ -636,6 +653,8 @@ export function createPlayer({ onExit, onRestart }) {
             // The first present is the moment the loading screen has nothing to say.
             if (/present|frame|fps/i.test(d.text)) $("loading").hidden = true;
           }
+        } else if (d.type === "ime") {
+          if (imeInput) imeInput.setOpen(d.open);
         } else if (d.type === "note") {
           note(d.text);
           // The title exec'd one of its own executables (`sceAppMgrLoadExec`): the process is
@@ -667,10 +686,15 @@ export function createPlayer({ onExit, onRestart }) {
       });
 
       worker.postMessage({ type: "keymap", json: JSON.stringify(settings.keyboard) });
-      unlisten.push(forwardInput(worker, canvas));
+      installInput();
+      unlisten.push(() => {
+        if (inputOff) inputOff();
+        inputOff = null;
+      });
       vocab = await vocabulary();
-      touch = mountTouchPad($("pad"), worker, settings.keyboard, { vibrate: settings.pad.vibrate });
+      touch = mountTouchPad($("pad"), worker, settings.keyboard, { vibrate: settings.pad.vibrate, rearTouch: settings.rearTouch });
       touch.setOpacity(settings.pad.opacity);
+      imeInput = mountImeInput(worker, stage);
       touch.setScale(settings.pad.scale);
       pads = installGamepad(
         worker,
@@ -709,7 +733,7 @@ export function createPlayer({ onExit, onRestart }) {
       const offscreen = canvas.transferControlToOffscreen();
       fresh = false;
       worker.postMessage(
-        { offscreen, titleId: m.titleId, recipe: settings.recipe || "", maxFrames: MAX_FRAMES, knobs, prebuilt, audioRing, profile: settings.profile },
+        { offscreen, titleId: m.titleId, maxFrames: MAX_FRAMES, knobs, prebuilt, audioRing, profile: settings.profile },
         [offscreen]
       );
       touchTitle(m.titleId, { lastPlayedAt: Date.now() });
@@ -776,6 +800,8 @@ export function createPlayer({ onExit, onRestart }) {
     // outlive a run, so anything left here is still live for the next game.
     for (const undo of unlisten.splice(0)) undo();
     if (touch) touch.destroy();
+    if (imeInput) imeInput.destroy();
+    imeInput = null;
     if (pads) pads.stop();
     audio = null;
     touch = pads = null;

@@ -233,9 +233,12 @@ pub mod gxm {
     pub const UNMAP_FRAGMENT_USSE_MEMORY: u32 = 0x80CC_EDBB;
     // Colour surface: the scale mode `Init` takes, and a data-pointer rebind.
     pub const COLOR_SURFACE_GET_SCALE_MODE: u32 = 0x6E3F_A74D;
+    pub const COLOR_SURFACE_SET_SCALE_MODE: u32 = 0x6B96_EDF7;
+    pub const SET_YUV_PROFILE: u32 = 0xB329_17F0;
     pub const COLOR_SURFACE_SET_DATA: u32 = 0x537C_A400;
     // Reflection + render-target/notification.
     pub const PROGRAM_GET_TYPE: u32 = 0x04BB_3C59;
+    pub const PROGRAM_GET_FRAGMENT_PROGRAM_INPUTS: u32 = 0xC692_4709;
     /// `sceGxmProgramGetSize`: the byte length the container header declares.
     pub const PROGRAM_GET_SIZE: u32 = 0xBF5E_2090;
     /// `sceGxmPrecomputedDrawSetParamsInstanced`: `SetParams` plus an index wrap, the
@@ -271,6 +274,8 @@ pub mod gxm {
     pub const PRECOMPUTED_DRAW_SET_ALL_VERTEX_STREAMS: u32 = 0xB6C6_F571;
     pub const PRECOMPUTED_FRAGMENT_STATE_SET_ALL_TEXTURES: u32 = 0xC383_DE39;
     pub const PRECOMPUTED_VERTEX_STATE_SET_ALL_TEXTURES: u32 = 0xC40C_9127;
+    /// The old-SDK import NID of the same call.
+    pub const PRECOMPUTED_VERTEX_STATE_SET_ALL_TEXTURES_16XX: u32 = 0x8FF6_8274;
     pub const PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS: u32 = 0x5A78_3DC3;
     pub const PRECOMPUTED_FRAGMENT_STATE_SET_UNIFORM_BUFFER: u32 = 0xB452_F1FB;
     pub const PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS: u32 = 0x0389_861D;
@@ -300,6 +305,39 @@ pub mod gxm {
     pub const TEXTURE_GET_LOD_MIN: u32 = 0xBE52_4A2C;
     /// The setter half of [`TEXTURE_GET_MIPMAP_COUNT`]'s field.
     pub const TEXTURE_SET_MIPMAP_COUNT: u32 = 0xD2DC_4643;
+    pub const TEXTURE_SET_STRIDE: u32 = 0x58D0_EB0A;
+    pub const TEXTURE_SET_WIDTH: u32 = 0x2EA1_78BE;
+    pub const TEXTURE_SET_HEIGHT: u32 = 0xAEE7_FDD1;
+    /// The underscore-prefixed exports of the same two setters.
+    pub const TEXTURE_SET_WIDTH_INTERNAL: u32 = 0x5A69_0B60;
+    pub const TEXTURE_SET_HEIGHT_INTERNAL: u32 = 0x1B20_D5DF;
+    pub const TEXTURE_GET_NORMALIZE_MODE: u32 = 0x512B_B86C;
+    pub const TEXTURE_SET_NORMALIZE_MODE: u32 = 0xCE8D_DAD0;
+    pub const TEXTURE_VALIDATE: u32 = 0x5331_BED3;
+    pub const DEPTH_STENCIL_SURFACE_GET_BACKGROUND_DEPTH: u32 = 0x269B_56BE;
+    pub const DEPTH_STENCIL_SURFACE_GET_BACKGROUND_MASK: u32 = 0x85D4_DEFE;
+    pub const DEPTH_STENCIL_SURFACE_GET_BACKGROUND_STENCIL: u32 = 0xAAFC_062B;
+    pub const DEPTH_STENCIL_SURFACE_GET_FORCE_LOAD_MODE: u32 = 0x2F5C_C20C;
+    pub const DEPTH_STENCIL_SURFACE_GET_FORCE_STORE_MODE: u32 = 0x544A_A05A;
+    pub const DEPTH_STENCIL_SURFACE_GET_FORMAT: u32 = 0x8504_038D;
+    pub const DEPTH_STENCIL_SURFACE_GET_STRIDE_IN_SAMPLES: u32 = 0x1162_8789;
+    pub const DEPTH_STENCIL_SURFACE_IS_ENABLED: u32 = 0x0822_00E1;
+    pub const DEPTH_STENCIL_SURFACE_SET_BACKGROUND_MASK: u32 = 0xF28A_688A;
+    pub const PROGRAM_PARAMETER_IS_SAMPLER_CUBE: u32 = 0xF7AA_978B;
+    pub const CREATE_DEFERRED_CONTEXT: u32 = 0x249D_5B00;
+    pub const DESTROY_DEFERRED_CONTEXT: u32 = 0xD6A2_FF2F;
+    pub const BEGIN_COMMAND_LIST: u32 = 0x944D_3F83;
+    pub const END_COMMAND_LIST: u32 = 0x36D8_5916;
+    pub const EXECUTE_COMMAND_LIST: u32 = 0xE8E1_39DD;
+    pub const SET_DEFERRED_CONTEXT_VDM_BUFFER: u32 = 0x0B9D_13CE;
+    pub const SET_DEFERRED_CONTEXT_VERTEX_BUFFER: u32 = 0x27CA_D127;
+    pub const SET_DEFERRED_CONTEXT_FRAGMENT_BUFFER: u32 = 0xC6B3_FCD0;
+    pub const GET_DEFERRED_CONTEXT_VDM_BUFFER: u32 = 0xAD8C_2EBA;
+    pub const GET_DEFERRED_CONTEXT_VERTEX_BUFFER: u32 = 0x8763_2B9C;
+    pub const GET_DEFERRED_CONTEXT_FRAGMENT_BUFFER: u32 = 0xFA08_1D05;
+    pub const PUSH_USER_MARKER: u32 = 0x3276_C475;
+    pub const POP_USER_MARKER: u32 = 0x4FA0_73A6;
+    pub const SET_USER_MARKER: u32 = 0xC7A8_CB77;
 }
 
 /// SceDisplayUser / SceDisplay function NIDs. `SET_FRAME_BUF` is SceDisplayUser
@@ -339,6 +377,9 @@ pub mod ctrl {
     pub const PEEK_BUFFER_NEGATIVE: u32 = 0x104E_D1A7;
     pub const READ_BUFFER_NEGATIVE: u32 = 0x15F9_6FB0;
     pub const SET_SAMPLING_MODE: u32 = 0xA497_B150;
+    pub const SET_SAMPLING_MODE_EXT: u32 = 0xB1DC_4378;
+    pub const GET_SAMPLING_MODE: u32 = 0xEC75_2AAF;
+    pub const GET_SAMPLING_MODE_EXT: u32 = 0xBD27_F830;
     /// The rest of the sample calls: `Ext` (presses a dialog intercepted - none here) and the
     /// `2` spellings (shoulders as L1/R1). See `vita::ctrl::shoulders_as_l1_r1`.
     pub const PEEK_BUFFER_POSITIVE_EXT: u32 = 0xA594_54D3;
@@ -362,6 +403,10 @@ pub mod sysmem {
     pub const FIND_MEM_BLOCK_BY_ADDR: u32 = 0xA33B_99D1;
     /// ...and describe that block (base, size, cacheability, access, type).
     pub const GET_MEM_BLOCK_INFO_BY_ADDR: u32 = 0x4010_AD65;
+    pub const GET_MEM_BLOCK_INFO_BY_RANGE: u32 = 0x006F_3DB4;
+    pub const GET_MODEL: u32 = 0xD0D4_F729;
+    pub const GET_MODEL_FOR_CDIALOG: u32 = 0xA2CB_322F;
+    pub const IS_PS_VITA_TV: u32 = 0x1453_A5E5;
 }
 
 /// SceLibKernel function NIDs: the user-facing clib (string/memory/print) and the
@@ -525,6 +570,7 @@ pub mod net {
     pub const EPOLL_DESTROY: u32 = 0x7915_CAF3;
     pub const EPOLL_CONTROL: u32 = 0x4C87_64AC;
     pub const EPOLL_WAIT: u32 = 0x45CE_337D;
+    pub const EPOLL_ABORT: u32 = 0x93FC_C4E8;
     /// `sceNetEpollWaitCB`: the same wait, at which the kernel also delivers the calling
     /// thread's pending callbacks. A separate NID, so a title linking only this one must
     /// not hard-fail; it shares [`EPOLL_WAIT`]'s handler (see `vita::net`).
@@ -541,12 +587,23 @@ pub mod http {
     pub const CREATE_TEMPLATE: u32 = 0x6224_1DAB;
     pub const DELETE_TEMPLATE: u32 = 0xEC85_ECFB;
     pub const CREATE_CONNECTION_WITH_URL: u32 = 0xC616_C200;
+    pub const CREATE_CONNECTION: u32 = 0xAEB3_307E;
+    pub const CREATE_REQUEST: u32 = 0xB028_4270;
+    pub const SET_AUTH_INFO_CALLBACK: u32 = 0xE0A3_A88D;
+    pub const SET_REDIRECT_CALLBACK: u32 = 0x4E08_167D;
+    pub const GET_ALL_RESPONSE_HEADERS: u32 = 0x11F6_C27F;
+    pub const PARSE_RESPONSE_HEADER: u32 = 0x03A6_C89E;
+    pub const URI_BUILD: u32 = 0x4766_4424;
     pub const DELETE_CONNECTION: u32 = 0xF0F6_5C15;
     pub const CREATE_REQUEST_WITH_URL: u32 = 0xBD5D_A1D0;
     pub const DELETE_REQUEST: u32 = 0x3D3D_29AD;
     pub const SET_CONNECT_TIMEOUT: u32 = 0x237C_A86E;
     pub const SET_SEND_TIMEOUT: u32 = 0x8AE3_F008;
     pub const SET_RECV_TIMEOUT: u32 = 0x94BF_196E;
+    pub const SET_RESOLVE_TIMEOUT: u32 = 0x8455_B5B3;
+    pub const SET_RESOLVE_RETRY: u32 = 0x9AB5_6EA7;
+    pub const SET_REQUEST_CONTENT_LENGTH: u32 = 0x37C3_0C90;
+    pub const URI_ESCAPE: u32 = 0x1DA2_A673;
     pub const ADD_REQUEST_HEADER: u32 = 0x7B51_B122;
     pub const SEND_REQUEST: u32 = 0x9CA5_8B99;
     pub const ABORT_REQUEST: u32 = 0xEA61_662F;
@@ -566,6 +623,63 @@ pub mod http {
     pub const GET_COOKIE_ENABLED: u32 = 0x1B6E_F66E;
     pub const SET_COOKIE_RECV_CALLBACK: u32 = 0xD4F3_2A23;
     pub const GET_COOKIE: u32 = 0x7022_0BFA;
+}
+
+/// SceIme (libime): the on-screen keyboard - see `vita::ime`.
+pub mod ime {
+    pub const OPEN: u32 = 0x0E05_0613;
+    pub const UPDATE: u32 = 0x71D6_898A;
+    pub const CLOSE: u32 = 0x889A_8421;
+    pub const SET_TEXT: u32 = 0xF3BD_9A76;
+    pub const SET_CARET: u32 = 0xD834_2D2A;
+    pub const SET_PREEDIT_GEOMETRY: u32 = 0x7B1E_FAA5;
+}
+
+/// NpCommon, NpBasic, NpCommerce2, Lookup, WordFilter and SceNearUtil - see `vita::np`.
+pub mod np {
+    pub const NP_CMP_NP_ID: u32 = 0xFB8D_82E5;
+    pub const NP_SET_PLATFORM_TYPE: u32 = 0xE807_D0BC;
+    pub const NP_BASIC_GET_BLOCK_LIST_ENTRY_COUNT: u32 = 0x407E_1E6F;
+    pub const NP_BASIC_GET_BLOCK_LIST_ENTRIES: u32 = 0x1211_AE8E;
+    pub const NP_BASIC_GET_GAME_PRESENCE_OF_FRIEND: u32 = 0xEF8A_91BC;
+    pub const NP_COMMERCE2_ABORT_REQ: u32 = 0xE748_6A60;
+    pub const NP_COMMERCE2_DESTROY_GET_PRODUCT_INFO_LIST_RESULT: u32 = 0x24D3_FE34;
+    pub const NP_COMMERCE2_SHOW_PS_STORE_ICON: u32 = 0x84E5_6A6D;
+    pub const NP_COMMERCE2_HIDE_PS_STORE_ICON: u32 = 0xFFC8_B18B;
+    pub const NP_LOOKUP_ABORT_REQUEST: u32 = 0x0275_87C4;
+    pub const NP_LOOKUP_NP_ID: u32 = 0xB1A1_4879;
+    pub const NP_LOOKUP_USER_PROFILE: u32 = 0x6A1B_F429;
+    pub const NP_LOOKUP_WAIT_ASYNC: u32 = 0xCF95_6F23;
+    pub const NP_WORD_FILTER_INIT: u32 = 0x0128_4C6E;
+    pub const NP_WORD_FILTER_TERM: u32 = 0x7D14_0F70;
+    pub const NP_WORD_FILTER_CREATE_TITLE_CTX: u32 = 0x1075_589C;
+    pub const NP_WORD_FILTER_DELETE_TITLE_CTX: u32 = 0xB4E5_A189;
+    pub const NP_WORD_FILTER_CREATE_REQUEST: u32 = 0x7183_047C;
+    pub const NP_WORD_FILTER_DELETE_REQUEST: u32 = 0x6690_D8E2;
+    pub const NP_WORD_FILTER_ABORT_REQUEST: u32 = 0x36DA_662E;
+    pub const NP_WORD_FILTER_SANITIZE_COMMENT_ASYNC: u32 = 0x40EC_7271;
+    pub const NP_WORD_FILTER_POLL_ASYNC: u32 = 0xBAE4_CD1F;
+    pub const NEAR_INITIALIZE: u32 = 0xBBCA_5813;
+    pub const NEAR_FINALIZE: u32 = 0xFF3B_C581;
+    pub const NEAR_REFRESH: u32 = 0x2ED3_6EE2;
+    pub const NEAR_SET_GIFT: u32 = 0x146B_E236;
+    pub const NEAR_GET_GIFT: u32 = 0xDB8B_AC35;
+    pub const NEAR_DELETE_GIFT: u32 = 0x5202_1026;
+    pub const NEAR_GET_DISCOVERED_GIFTS: u32 = 0xDE6F_0859;
+    pub const NEAR_GET_NEIGHBORS: u32 = 0xAD26_4F5F;
+    pub const NEAR_GET_DISCOVERED_GIFT_INFO: u32 = 0x773A_BEA9;
+    pub const NEAR_GET_DISCOVERED_GIFT_SENDER: u32 = 0xEFE6_F060;
+    pub const NEAR_GET_DISCOVERED_GIFT_STATUS: u32 = 0xA64D_9D38;
+    pub const NEAR_CONVERT_DISCOVERED_GIFT_PARAM: u32 = 0x80D6_C552;
+    pub const NEAR_DELETE_DISCOVERED_GIFT: u32 = 0x8CBE_B2DA;
+    pub const NEAR_OPEN_DISCOVERED_GIFT_IMAGE: u32 = 0xF8C1_5008;
+    pub const NEAR_READ_DISCOVERED_GIFT_IMAGE: u32 = 0x2364_D6BD;
+    pub const NEAR_CLOSE_DISCOVERED_GIFT_IMAGE: u32 = 0x88A6_8D20;
+    pub const NEAR_OPEN_RECEIVED_GIFT_DATA: u32 = 0x0680_7CA3;
+    pub const NEAR_READ_RECEIVED_GIFT_DATA: u32 = 0xB141_45DD;
+    pub const NEAR_CLOSE_RECEIVED_GIFT_DATA: u32 = 0x2F35_C196;
+    pub const NEAR_FINALIZE_AND_LAUNCH_NEAR_APP: u32 = 0x3F3F_6D92;
+    pub const NEAR_LAUNCH_NEAR_APP_FOR_UPDATE: u32 = 0xF339_8774;
 }
 
 /// SceLiveAreaUtil: the title's own LiveArea gate (see [`crate::vita::livearea`]).
@@ -658,8 +772,17 @@ pub mod processmgr {
     /// sceKernelPowerTick: reset the idle/power-save countdown. No power management
     /// off-console, so it is an accepted no-op.
     pub const POWER_TICK: u32 = 0x2252_890C;
+    /// sceKernelPowerLock / Unlock: hold off (and release) the idle power-down - which, like
+    /// the tick, has nothing to act on off-console.
+    pub const POWER_LOCK: u32 = 0x7AA7_3378;
+    pub const POWER_UNLOCK: u32 = 0x466C_0CBD;
+    pub const GET_CURRENT_PROCESS: u32 = 0xCD24_8267;
+    pub const GET_REMOTE_PROCESS_TIME: u32 = 0xE6E9_FCA3;
     pub const LIBC_GETTIMEOFDAY: u32 = 0x4B87_9059;
     pub const CALL_ABORT_HANDLER: u32 = 0xEB6E_50BB;
+    pub const LIBC_GMTIME_R: u32 = 0xBCA4_37CD;
+    pub const LIBC_LOCALTIME_R: u32 = 0x94F0_41ED;
+    pub const LIBC_MKTIME: u32 = 0x890B_DC39;
 }
 
 /// System and online-service NIDs the boot path touches (SceSysmodule, SceNet,
@@ -728,6 +851,15 @@ pub mod services {
     pub const FIOS_OVERLAY_GET_LIST: u32 = 0x1DD8_08D1;
     pub const FIOS_OVERLAY_THREAD_SET_DISABLED: u32 = 0x7032_1220;
     pub const FIOS_OVERLAY_GET_RECOMMENDED_SCHEDULER: u32 = 0xF5C1_F928;
+    /// The rest of the user-side `...02` overlay calls: the same arguments and the same
+    /// `SceFiosOverlay` (0x258 bytes) as the kernel calls they front.
+    pub const FIOS_OVERLAY_ADD_FOR_PROCESS: u32 = 0x6C4B_E9CD;
+    pub const FIOS_OVERLAY_GET_INFO_FOR_PROCESS: u32 = 0xAB7B_4213;
+    pub const FIOS_OVERLAY_MODIFY_FOR_PROCESS: u32 = 0xCA38_8053;
+    pub const FIOS_OVERLAY_REMOVE_FOR_PROCESS: u32 = 0xE5D1_B6F5;
+    pub const FIOS_OVERLAY_RESOLVE_SYNC: u32 = 0x9C3A_AAF0;
+    pub const FIOS_OVERLAY_RESOLVE_WITH_RANGE_SYNC: u32 = 0x61C4_AAC4;
+    pub const FIOS_OVERLAY_THREAD_IS_DISABLED: u32 = 0x23B8_DB1D;
     pub const ULOBJ_REGISTER_PROTOCOL_REVISION: u32 = 0x50F2_F2AA;
     // SceAppUtil: app utility init + system parameters (language, button assign, ...).
     pub const APPUTIL_INIT: u32 = 0xDAFF_E671;
@@ -744,12 +876,16 @@ pub mod services {
     pub const APPUTIL_SAVEDATA_SLOT_SET_PARAM: u32 = 0x9863_0136;
     pub const APPUTIL_SAVEDATA_SLOT_DELETE: u32 = 0x266A_7646;
     pub const APPUTIL_SAVEDATA_DATA_SAVE: u32 = 0x6076_47BA;
+    pub const APPUTIL_SAVE_SAFE_MEMORY: u32 = 0x9D8A_C677;
+    pub const APPUTIL_LOAD_SAFE_MEMORY: u32 = 0x3424_D772;
     pub const APPUTIL_SAVEDATA_DATA_REMOVE: u32 = 0xD1C6_AB8E;
     pub const APPUTIL_SAVEDATA_GET_QUOTA: u32 = 0xC560_E716;
     pub const APPUTIL_RECEIVE_APP_EVENT: u32 = 0xEE0D_BED9;
     pub const APPUTIL_APP_EVENT_PARSE_NEAR_GIFT: u32 = 0x7738_0601;
     pub const APPUTIL_APP_EVENT_PARSE_NP_BASIC_JOINABLE_PRESENCE: u32 = 0x28C7_D4F6;
     pub const APPUTIL_APP_EVENT_PARSE_NP_INVITE_MESSAGE: u32 = 0xA249_6814;
+    pub const APPUTIL_APP_EVENT_PARSE_LIVE_AREA: u32 = 0x0F4E_E55F;
+    pub const APPUTIL_APP_EVENT_PARSE_NP_APP_DATA_MESSAGE: u32 = 0x6BED_9B58;
     // SceNetCtl async results, SceAppMgr, SceRtc, SceMotion, and the one-call services.
     pub const NET_CTL_INET_GET_RESULT: u32 = 0x6B20_EC02;
     pub const NET_CTL_ADHOC_GET_RESULT: u32 = 0x7AE0_ED19;
@@ -933,6 +1069,42 @@ pub mod services {
     pub const CAMERA_SET_REVERSE: u32 = 0x1175_F477;
     pub const CAMERA_SET_BACKLIGHT: u32 = 0xAE07_1044;
     pub const CAMERA_SET_WHITE_BALANCE: u32 = 0x4D45_14AC;
+    pub const CAMERA_IS_ACTIVE: u32 = 0x103A_75B8;
+    pub const CAMERA_GET_ANTI_FLICKER: u32 = 0x9FDA_CB99;
+    pub const CAMERA_GET_AUTO_CONTROL_HOLD: u32 = 0x06A2_1BBB;
+    pub const CAMERA_GET_BACKLIGHT: u32 = 0x8DD1_292B;
+    pub const CAMERA_GET_BRIGHTNESS: u32 = 0x85D5_951D;
+    pub const CAMERA_GET_CONTRAST: u32 = 0x8FBE_84BE;
+    pub const CAMERA_GET_DEVICE_LOCATION: u32 = 0x274E_F751;
+    pub const CAMERA_GET_EV: u32 = 0x8B5E_6147;
+    pub const CAMERA_GET_EFFECT: u32 = 0x7E8E_F3B2;
+    pub const CAMERA_GET_EXPOSURE_CEILING: u32 = 0x5FA5_B1BB;
+    pub const CAMERA_GET_GAIN: u32 = 0x2C36_D6F3;
+    pub const CAMERA_GET_ISO: u32 = 0x4EBD_5C68;
+    pub const CAMERA_GET_IMAGE_QUALITY: u32 = 0xE2AC_7BCE;
+    pub const CAMERA_GET_NIGHTMODE: u32 = 0x12B6_FF26;
+    pub const CAMERA_GET_NOISE_REDUCTION: u32 = 0xFEB9_9ACC;
+    pub const CAMERA_GET_SATURATION: u32 = 0x624F_7653;
+    pub const CAMERA_GET_SHARPNESS: u32 = 0xAA72_C3DC;
+    pub const CAMERA_GET_SHARPNESS_OFF: u32 = 0x34CC_AF85;
+    pub const CAMERA_GET_WHITE_BALANCE: u32 = 0xDBFF_A1DA;
+    pub const CAMERA_GET_ZOOM: u32 = 0x06D3_816C;
+    pub const CAMERA_SET_ANTI_FLICKER: u32 = 0xE312_958A;
+    pub const CAMERA_SET_AUTO_CONTROL_HOLD: u32 = 0x3A0D_ABBD;
+    pub const CAMERA_SET_BRIGHTNESS: u32 = 0x98D7_1588;
+    pub const CAMERA_SET_CONTRAST: u32 = 0x06FB_2900;
+    pub const CAMERA_SET_EV: u32 = 0x62AF_F0B8;
+    pub const CAMERA_SET_EFFECT: u32 = 0xE9D2_CFB1;
+    pub const CAMERA_SET_EXPOSURE_CEILING: u32 = 0x04F3_4BEE;
+    pub const CAMERA_SET_GAIN: u32 = 0xE65C_FE86;
+    pub const CAMERA_SET_ISO: u32 = 0x3CF6_30A1;
+    pub const CAMERA_SET_IMAGE_QUALITY: u32 = 0x75C4_300B;
+    pub const CAMERA_SET_NIGHTMODE: u32 = 0x3F26_233E;
+    pub const CAMERA_SET_NOISE_REDUCTION: u32 = 0xF9B7_9556;
+    pub const CAMERA_SET_SATURATION: u32 = 0xF9F7_CA3D;
+    pub const CAMERA_SET_SHARPNESS: u32 = 0xD1A5_BB0B;
+    pub const CAMERA_SET_SHARPNESS_OFF: u32 = 0x4B54_05C8;
+    pub const CAMERA_SET_ZOOM: u32 = 0xF746_4216;
     // SceLibLocation: the positioning service, backed by the HOST's own location
     // provider (see `vita::location`) - real in the browser, absent on a bare desktop.
     // Prototypes: `psp2/location.h`; NIDs: `db/360/SceLibLocation.yml`.
@@ -969,6 +1141,8 @@ pub mod services {
     pub const JPEGENC_SET_OUTPUT_ADDR: u32 = 0x25D5_2D97;
     pub const JPEGENC_SET_COMPRESSION_RATIO: u32 = 0xB2B8_28EC;
     pub const JPEGENC_SET_VALID_REGION: u32 = 0x9511_F3BC;
+    pub const JPEGENC_CSC: u32 = 0x824A_7D4F;
+    pub const JPEGENC_ENCODE: u32 = 0xC60D_E94C;
     // SceJpeg: MJPEG decoder lifecycle only - see `vita::jpeg`.
     pub const JPEG_INIT_MJPEG: u32 = 0xB030_773B;
     pub const JPEG_INIT_MJPEG_WITH_PARAM: u32 = 0x5181_63A7;
@@ -988,6 +1162,11 @@ pub mod services {
     // anywhere (vitasdk ships no `systemgesture.h`), so the argument shapes here are
     // read from the calling title's own code - see `vita::gesture`.
     pub const SYSTEM_GESTURE_INIT_PRIMITIVE_TOUCH_RECOGNIZER: u32 = 0x6078_A08B;
+    pub const SYSTEM_GESTURE_FINALIZE_PRIMITIVE_TOUCH_RECOGNIZER: u32 = 0xB387_5104;
+    pub const SYSTEM_GESTURE_RESET_PRIMITIVE_TOUCH_RECOGNIZER: u32 = 0xFD5A_6504;
+    pub const SYSTEM_GESTURE_GET_PRIMITIVE_TOUCH_EVENTS: u32 = 0xC750_D3DA;
+    pub const SYSTEM_GESTURE_GET_PRIMITIVE_TOUCH_EVENTS_COUNT: u32 = 0xBAB8_ECCB;
+    pub const SYSTEM_GESTURE_GET_PRIMITIVE_TOUCH_EVENT_BY_INDEX: u32 = 0xE057_7765;
     pub const SYSTEM_GESTURE_UPDATE_PRIMITIVE_TOUCH_RECOGNIZER: u32 = 0xDF4C_665A;
     pub const SYSTEM_GESTURE_CREATE_TOUCH_RECOGNIZER: u32 = 0xC336_7370;
     pub const SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER: u32 = 0x851F_B144;
@@ -1134,6 +1313,14 @@ pub mod services {
     pub const POWER_GET_BUS_CLOCK: u32 = 0x478F_E6F5;
     pub const POWER_GET_GPU_CLOCK: u32 = 0x1B04_A1D6;
     pub const POWER_GET_GPU_XBAR_CLOCK: u32 = 0x0A75_0DEE;
+    pub const POWER_IS_POWER_ONLINE: u32 = 0x8744_0F5E;
+    pub const POWER_IS_BATTERY_EXIST: u32 = 0x0AFD_0D8B;
+    pub const POWER_IS_BATTERY_CHARGING: u32 = 0x1E49_0401;
+    pub const POWER_IS_LOW_BATTERY: u32 = 0xD307_5926;
+    pub const POWER_IS_SUSPEND_REQUIRED: u32 = 0x78A1_A796;
+    pub const POWER_GET_BATTERY_LIFE_PERCENT: u32 = 0x2085_D15D;
+    pub const POWER_SET_USING_WIRELESS: u32 = 0x4D69_5C1F;
+    pub const POWER_GET_USING_WIRELESS: u32 = 0xD541_FF03;
     // SceCommonDialog: shared config for the dialog families, plus the trophy-setup
     // dialog's result read.
     pub const COMMON_DIALOG_SET_CONFIG_PARAM: u32 = 0xBECD_35C8;
@@ -1170,6 +1357,21 @@ pub mod services {
     /// two one-line thunks that differ only in a trailing `1` and `0` over
     /// `f(handle, stream, flag)`.
     pub const MP4_ENABLE_STREAM_609E57AD: u32 = 0x609E_57AD;
+    /// SceMp4 trick play and seeking - see `vita::video::mp4_get_sync_unit` and
+    /// `mp4_jump_pts`.
+    pub const MP4_GET_NEXT_SYNC_UNIT: u32 = 0x32A1_5788;
+    pub const MP4_GET_PREV_SYNC_UNIT: u32 = 0x40C6_4DC0;
+    pub const MP4_JUMP_PTS: u32 = 0x9667_6BA0;
+    pub const MP4_PTS_TO_TIME: u32 = 0xA7C0_9746;
+    pub const MP4_TIME_TO_PTS: u32 = 0x6B69_F900;
+    pub const MP4_FLUSH_FILE_READER: u32 = 0xD287_1F1C;
+    /// Unnamed; the counterpart of [`MP4_FLUSH_FILE_READER`] - see
+    /// `vita::video::mp4_resume_file_reader`.
+    pub const MP4_RESUME_FILE_READER_CB91CEBC: u32 = 0xCB91_CEBC;
+    pub const MP4_SET_AVAILABLE_BW: u32 = 0x94E1_305D;
+    pub const MP4_GET_AVAILABLE_BW: u32 = 0xEFE2_99C9;
+    /// Unnamed, arguments past the handle unknown - see `vita::video::mp4_a870587f`.
+    pub const MP4_A870587F: u32 = 0xA870_587F;
     /// SceMp4, unnamed on the henkaku wiki's 3.60 NID list. The 0.945 NAME list has a
     /// `sceMp4Reset` with no 3.60 NID beside it, and the call site fits: the demux thread
     /// logs "Looping back to start of the file", calls this, and asks for the next unit
@@ -1178,12 +1380,6 @@ pub mod services {
     /// SceMp4. Names and NIDs for these come from the henkaku wiki's `SceMp4` page.
     pub const MP4_GET_NEXT_UNIT: u32 = 0x20A0_1112;
     pub const MP4_GET_NEXT_UNIT_DATA: u32 = 0xD092_A066;
-    pub const MP4_GET_NEXT_SYNC_UNIT: u32 = 0x32A1_5788;
-    pub const MP4_GET_PREV_SYNC_UNIT: u32 = 0x40C6_4DC0;
-    pub const MP4_JUMP_PTS: u32 = 0x9667_6BA0;
-    pub const MP4_FLUSH_FILE_READER: u32 = 0xD287_1F1C;
-    pub const MP4_GET_AVAILABLE_BW: u32 = 0xEFE2_99C9;
-    pub const MP4_SET_AVAILABLE_BW: u32 = 0x94E1_305D;
     /// An unnamed SceNearUtil export the title imports ("near" is the offline-social
     /// app; present in no vita-headers revision). Serviced as an offline success.
     pub const NEAR_UTIL_UNKNOWN_A412E9CA: u32 = 0xA412_E9CA;
@@ -1294,6 +1490,8 @@ pub mod lwsync {
     /// forwards to the one implementation). Imported by a 2011 fighting title at its first call.
     pub const LOCK_LW_MUTEX_0: u32 = 0xA781_9967;
     pub const TRY_LOCK_LW_MUTEX: u32 = 0xA6A2_C915;
+    /// The old-SDK ("_16XX") import NID of the same call.
+    pub const TRY_LOCK_LW_MUTEX_16XX: u32 = 0x9EF7_98C1;
     pub const UNLOCK_LW_MUTEX: u32 = 0x91FA_6614;
     pub const UNLOCK_LW_MUTEX2: u32 = 0x120A_FC8C;
     /// The unlock twin of [`LOCK_LW_MUTEX_0`] (Vita3K `sceKernelUnlockLwMutex_0`).
@@ -1397,6 +1595,9 @@ pub mod threadmgr {
     /// trapping, so this only records intent; it never changes numeric results.
     pub const CHANGE_THREAD_VFP_EXCEPTION: u32 = 0xCC18_FBAE;
     pub const CHANGE_THREAD_PRIORITY: u32 = 0xBD01_39F2;
+    pub const CHANGE_THREAD_PRIORITY2: u32 = 0xC5FF_CA61;
+    /// SceLibKernel's `...Mask2`: the mask, with 0 ("default") answered as the user set.
+    pub const GET_THREAD_CPU_AFFINITY_MASK2: u32 = 0x8C57_AC2A;
     /// `sceKernelDelayThreadCB`: the same timed sleep as `DELAY_THREAD`, at which the
     /// kernel also delivers the calling thread's pending callbacks.
     pub const DELAY_THREAD_CB: u32 = 0x9C01_80E1;
@@ -1537,6 +1738,7 @@ pub mod sync {
     pub const OPEN_SEMA: u32 = 0xCBE2_35C7;
     pub const WAIT_SEMA: u32 = 0x0C7B_834B;
     pub const SIGNAL_SEMA: u32 = 0xE6B7_61D1;
+    pub const POLL_SEMA: u32 = 0x866E_F048;
     pub const DELETE_SEMA: u32 = 0xDB32_948A;
     /// `int sceKernelCancelSema(SceUID semaId, int setCount, int *numWaitThreads)`: reset
     /// the count (`setCount` < 0 means the initial count) and release every waiter with
@@ -1684,6 +1886,7 @@ pub mod audio {
 /// MIT vita-headers database (`db/360/SceAvcodecUser.yml`).
 pub mod videodec {
     pub const VIDEODEC_QUERY_MEM_SIZE: u32 = 0x6731_BB2D;
+    pub const VIDEODEC_INIT_LIBRARY: u32 = 0xF1AF_65A3;
     pub const VIDEODEC_INIT_LIBRARY_WITH_UNMAP_MEM: u32 = 0x230A_78FF;
     pub const VIDEODEC_TERM_LIBRARY: u32 = 0x3A5F_4924;
     pub const AVCDEC_QUERY_DECODER_MEM_SIZE: u32 = 0x97E9_5EDB;
@@ -1748,14 +1951,15 @@ pub const UNKNOWN_NAME: &str = "<unknown>";
 /// the unimplemented-call report. Falls back to the raw NIDs.
 pub fn name(func_nid: u32) -> &'static str {
     use {
-        atomic as at, audio as au, audiodec as ad, audioin, avplayer as avp, ctrl as c, display as d, fiber as fb, gxm as g, http,
-        iofilemgr as io, livearea, pgf, xml,
-        libkernel as lk, lwsync as lw, net as nt, ngs as ng, processmgr as pm, pvf as pv, services as sv,
-        sync as sy, sysmem as s, threadmgr as tm, videodec as vd, voice as vo,
+        atomic as at, audio as au, audiodec as ad, audioin, avplayer as avp, ctrl as c,
+        display as d, fiber as fb, gxm as g, http, ime, iofilemgr as io, libkernel as lk, livearea,
+        lwsync as lw, net as nt, ngs as ng, np, pgf, processmgr as pm, pvf as pv, services as sv,
+        sync as sy, sysmem as s, threadmgr as tm, videodec as vd, voice as vo, xml,
     };
     match func_nid {
         // SceVideodec / SceAvcdec, and the codec engine's memory.
         vd::VIDEODEC_QUERY_MEM_SIZE => "sceVideodecQueryMemSize",
+        vd::VIDEODEC_INIT_LIBRARY => "sceVideodecInitLibrary",
         vd::VIDEODEC_INIT_LIBRARY_WITH_UNMAP_MEM => "sceVideodecInitLibraryWithUnmapMem",
         vd::VIDEODEC_TERM_LIBRARY => "sceVideodecTermLibrary",
         vd::AVCDEC_QUERY_DECODER_MEM_SIZE => "sceAvcdecQueryDecoderMemSize",
@@ -1838,6 +2042,7 @@ pub fn name(func_nid: u32) -> &'static str {
         nt::EPOLL_DESTROY => "sceNetEpollDestroy",
         nt::EPOLL_CONTROL => "sceNetEpollControl",
         nt::EPOLL_WAIT => "sceNetEpollWait",
+        nt::EPOLL_ABORT => "sceNetEpollAbort",
         // SceFiber.
         fb::INITIALIZE_IMPL => "_sceFiberInitializeImpl",
         fb::INITIALIZE_WITH_INTERNAL_OPTION_IMPL => "_sceFiberInitializeWithInternalOptionImpl",
@@ -1917,8 +2122,12 @@ pub fn name(func_nid: u32) -> &'static str {
         g::VERTEX_PROGRAM_GET_PROGRAM => "sceGxmVertexProgramGetProgram",
         g::FRAGMENT_PROGRAM_GET_PROGRAM => "sceGxmFragmentProgramGetProgram",
         g::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM => "sceGxmShaderPatcherReleaseVertexProgram",
-        g::SHADER_PATCHER_GET_VERTEX_PROGRAM_REF_COUNT => "sceGxmShaderPatcherGetVertexProgramRefCount",
-        g::SHADER_PATCHER_GET_FRAGMENT_PROGRAM_REF_COUNT => "sceGxmShaderPatcherGetFragmentProgramRefCount",
+        g::SHADER_PATCHER_GET_VERTEX_PROGRAM_REF_COUNT => {
+            "sceGxmShaderPatcherGetVertexProgramRefCount"
+        }
+        g::SHADER_PATCHER_GET_FRAGMENT_PROGRAM_REF_COUNT => {
+            "sceGxmShaderPatcherGetFragmentProgramRefCount"
+        }
         g::SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM => "sceGxmShaderPatcherReleaseFragmentProgram",
         g::PROGRAM_FIND_PARAMETER_BY_NAME => "sceGxmProgramFindParameterByName",
         g::SHADER_PATCHER_GET_PROGRAM_FROM_ID => "sceGxmShaderPatcherGetProgramFromId",
@@ -1978,6 +2187,9 @@ pub fn name(func_nid: u32) -> &'static str {
         c::PEEK_BUFFER_NEGATIVE => "sceCtrlPeekBufferNegative",
         c::READ_BUFFER_NEGATIVE => "sceCtrlReadBufferNegative",
         c::SET_SAMPLING_MODE => "sceCtrlSetSamplingMode",
+        c::SET_SAMPLING_MODE_EXT => "sceCtrlSetSamplingModeExt",
+        c::GET_SAMPLING_MODE => "sceCtrlGetSamplingMode",
+        c::GET_SAMPLING_MODE_EXT => "sceCtrlGetSamplingModeExt",
         c::PEEK_BUFFER_POSITIVE_EXT => "sceCtrlPeekBufferPositiveExt",
         c::PEEK_BUFFER_POSITIVE_EXT2 => "sceCtrlPeekBufferPositiveExt2",
         c::PEEK_BUFFER_NEGATIVE2 => "sceCtrlPeekBufferNegative2",
@@ -2022,11 +2234,18 @@ pub fn name(func_nid: u32) -> &'static str {
         lk::GET_THREAD_EXIT_STATUS => "sceKernelGetThreadExitStatus",
         lk::EXIT_PROCESS => "sceKernelExitProcess",
         pm::POWER_TICK => "sceKernelPowerTick",
+        pm::POWER_LOCK => "sceKernelPowerLock",
+        pm::POWER_UNLOCK => "sceKernelPowerUnlock",
+        pm::GET_CURRENT_PROCESS => "sceKernelGetCurrentProcess",
+        pm::GET_REMOTE_PROCESS_TIME => "sceKernelGetRemoteProcessTime",
         pm::GET_PROCESS_PARAM => "sceKernelGetProcessParam",
         pm::GET_STDIN => "sceKernelGetStdin",
         pm::GET_STDOUT => "sceKernelGetStdout",
         pm::GET_STDERR => "sceKernelGetStderr",
         pm::LIBC_TIME => "sceKernelLibcTime",
+        pm::LIBC_GMTIME_R => "sceKernelLibcGmtime_r",
+        pm::LIBC_LOCALTIME_R => "sceKernelLibcLocaltime_r",
+        pm::LIBC_MKTIME => "sceKernelLibcMktime",
         pm::LIBC_CLOCK => "sceKernelLibcClock",
         tm::GET_PROCESS_ID => "sceKernelGetProcessId",
         sv::SYSMODULE_IS_LOADED => "sceSysmoduleIsLoaded",
@@ -2047,7 +2266,9 @@ pub fn name(func_nid: u32) -> &'static str {
         xml::BUILDER_INITIALIZE => "sce::Xml::Dom::DocumentBuilder::initialize",
         xml::BUILDER_GET_DOCUMENT => "sce::Xml::Dom::DocumentBuilder::getDocument",
         xml::BUILDER_SET_RESOLVE_ENTITY => "sce::Xml::Dom::DocumentBuilder::setResolveEntity",
-        xml::BUILDER_SET_SKIP_IGNORABLE_TEXT => "sce::Xml::Dom::DocumentBuilder::setSkipIgnorableText",
+        xml::BUILDER_SET_SKIP_IGNORABLE_TEXT => {
+            "sce::Xml::Dom::DocumentBuilder::setSkipIgnorableText"
+        }
         xml::BUILDER_SET_SKIP_IGNORABLE_WHITESPACE => {
             "sce::Xml::Dom::DocumentBuilder::setSkipIgnorableWhiteSpace"
         }
@@ -2080,15 +2301,77 @@ pub fn name(func_nid: u32) -> &'static str {
         audioin::GET_STATUS => "sceAudioInGetStatus",
         livearea::GET_FRAME_REVISION => "sceLiveAreaGetFrameRevision",
         livearea::GET_FRAME_USER_DATA => "sceLiveAreaGetFrameUserData",
+        np::NP_CMP_NP_ID => "sceNpCmpNpId",
+        np::NP_SET_PLATFORM_TYPE => "sceNpSetPlatformType",
+        np::NP_BASIC_GET_BLOCK_LIST_ENTRY_COUNT => "sceNpBasicGetBlockListEntryCount",
+        np::NP_BASIC_GET_BLOCK_LIST_ENTRIES => "sceNpBasicGetBlockListEntries",
+        np::NP_BASIC_GET_GAME_PRESENCE_OF_FRIEND => "sceNpBasicGetGamePresenceOfFriend",
+        np::NP_COMMERCE2_ABORT_REQ => "sceNpCommerce2AbortReq",
+        np::NP_COMMERCE2_DESTROY_GET_PRODUCT_INFO_LIST_RESULT => {
+            "sceNpCommerce2DestroyGetProductInfoListResult"
+        }
+        np::NP_COMMERCE2_SHOW_PS_STORE_ICON => "sceNpCommerce2ShowPsStoreIcon",
+        np::NP_COMMERCE2_HIDE_PS_STORE_ICON => "sceNpCommerce2HidePsStoreIcon",
+        np::NP_LOOKUP_ABORT_REQUEST => "sceNpLookupAbortRequest",
+        np::NP_LOOKUP_NP_ID => "sceNpLookupNpId",
+        np::NP_LOOKUP_USER_PROFILE => "sceNpLookupUserProfile",
+        np::NP_LOOKUP_WAIT_ASYNC => "sceNpLookupWaitAsync",
+        np::NP_WORD_FILTER_INIT => "sceNpWordFilterInit",
+        np::NP_WORD_FILTER_TERM => "sceNpWordFilterTerm",
+        np::NP_WORD_FILTER_CREATE_TITLE_CTX => "sceNpWordFilterCreateTitleCtx",
+        np::NP_WORD_FILTER_DELETE_TITLE_CTX => "sceNpWordFilterDeleteTitleCtx",
+        np::NP_WORD_FILTER_CREATE_REQUEST => "sceNpWordFilterCreateRequest",
+        np::NP_WORD_FILTER_DELETE_REQUEST => "sceNpWordFilterDeleteRequest",
+        np::NP_WORD_FILTER_ABORT_REQUEST => "sceNpWordFilterAbortRequest",
+        np::NP_WORD_FILTER_SANITIZE_COMMENT_ASYNC => "sceNpWordFilterSanitizeCommentAsync",
+        np::NP_WORD_FILTER_POLL_ASYNC => "sceNpWordFilterPollAsync",
+        np::NEAR_INITIALIZE => "sceNearInitialize",
+        np::NEAR_FINALIZE => "sceNearFinalize",
+        np::NEAR_REFRESH => "sceNearRefresh",
+        np::NEAR_SET_GIFT => "sceNearSetGift",
+        np::NEAR_GET_GIFT => "sceNearGetGift",
+        np::NEAR_DELETE_GIFT => "sceNearDeleteGift",
+        np::NEAR_GET_DISCOVERED_GIFTS => "sceNearGetDiscoveredGifts",
+        np::NEAR_GET_NEIGHBORS => "sceNearGetNeighbors",
+        np::NEAR_GET_DISCOVERED_GIFT_INFO => "sceNearGetDiscoveredGiftInfo",
+        np::NEAR_GET_DISCOVERED_GIFT_SENDER => "sceNearGetDiscoveredGiftSender",
+        np::NEAR_GET_DISCOVERED_GIFT_STATUS => "sceNearGetDiscoveredGiftStatus",
+        np::NEAR_CONVERT_DISCOVERED_GIFT_PARAM => "sceNearConvertDiscoveredGiftParam",
+        np::NEAR_DELETE_DISCOVERED_GIFT => "sceNearDeleteDiscoveredGift",
+        np::NEAR_OPEN_DISCOVERED_GIFT_IMAGE => "sceNearOpenDiscoveredGiftImage",
+        np::NEAR_READ_DISCOVERED_GIFT_IMAGE => "sceNearReadDiscoveredGiftImage",
+        np::NEAR_CLOSE_DISCOVERED_GIFT_IMAGE => "sceNearCloseDiscoveredGiftImage",
+        np::NEAR_OPEN_RECEIVED_GIFT_DATA => "sceNearOpenReceivedGiftData",
+        np::NEAR_READ_RECEIVED_GIFT_DATA => "sceNearReadReceivedGiftData",
+        np::NEAR_CLOSE_RECEIVED_GIFT_DATA => "sceNearCloseReceivedGiftData",
+        np::NEAR_FINALIZE_AND_LAUNCH_NEAR_APP => "sceNearFinalizeAndLaunchNearApp",
+        np::NEAR_LAUNCH_NEAR_APP_FOR_UPDATE => "sceNearLaunchNearAppForUpdate",
+        ime::OPEN => "sceImeOpen",
+        ime::UPDATE => "sceImeUpdate",
+        ime::CLOSE => "sceImeClose",
+        ime::SET_TEXT => "sceImeSetText",
+        ime::SET_CARET => "sceImeSetCaret",
+        ime::SET_PREEDIT_GEOMETRY => "sceImeSetPreeditGeometry",
         http::CREATE_TEMPLATE => "sceHttpCreateTemplate",
         http::DELETE_TEMPLATE => "sceHttpDeleteTemplate",
         http::CREATE_CONNECTION_WITH_URL => "sceHttpCreateConnectionWithURL",
+        http::CREATE_CONNECTION => "sceHttpCreateConnection",
+        http::CREATE_REQUEST => "sceHttpCreateRequest",
+        http::SET_AUTH_INFO_CALLBACK => "sceHttpSetAuthInfoCallback",
+        http::SET_REDIRECT_CALLBACK => "sceHttpSetRedirectCallback",
+        http::GET_ALL_RESPONSE_HEADERS => "sceHttpGetAllResponseHeaders",
+        http::PARSE_RESPONSE_HEADER => "sceHttpParseResponseHeader",
+        http::URI_BUILD => "sceHttpUriBuild",
         http::DELETE_CONNECTION => "sceHttpDeleteConnection",
         http::CREATE_REQUEST_WITH_URL => "sceHttpCreateRequestWithURL",
         http::DELETE_REQUEST => "sceHttpDeleteRequest",
         http::SET_CONNECT_TIMEOUT => "sceHttpSetConnectTimeOut",
         http::SET_SEND_TIMEOUT => "sceHttpSetSendTimeOut",
         http::SET_RECV_TIMEOUT => "sceHttpSetRecvTimeOut",
+        http::SET_RESOLVE_TIMEOUT => "sceHttpSetResolveTimeOut",
+        http::SET_RESOLVE_RETRY => "sceHttpSetResolveRetry",
+        http::SET_REQUEST_CONTENT_LENGTH => "sceHttpSetRequestContentLength",
+        http::URI_ESCAPE => "sceHttpUriEscape",
         http::ADD_REQUEST_HEADER => "sceHttpAddRequestHeader",
         http::SEND_REQUEST => "sceHttpSendRequest",
         http::ABORT_REQUEST => "sceHttpAbortRequest",
@@ -2115,8 +2398,14 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::APPUTIL_SAVEDATA_GET_QUOTA => "sceAppUtilSaveDataGetQuota",
         sv::APPUTIL_RECEIVE_APP_EVENT => "sceAppUtilReceiveAppEvent",
         sv::APPUTIL_APP_EVENT_PARSE_NEAR_GIFT => "sceAppUtilAppEventParseNearGift",
-        sv::APPUTIL_APP_EVENT_PARSE_NP_BASIC_JOINABLE_PRESENCE => "sceAppUtilAppEventParseNpBasicJoinablePresence",
+        sv::APPUTIL_APP_EVENT_PARSE_NP_BASIC_JOINABLE_PRESENCE => {
+            "sceAppUtilAppEventParseNpBasicJoinablePresence"
+        }
         sv::APPUTIL_APP_EVENT_PARSE_NP_INVITE_MESSAGE => "sceAppUtilAppEventParseNpInviteMessage",
+        sv::APPUTIL_APP_EVENT_PARSE_LIVE_AREA => "sceAppUtilAppEventParseLiveArea",
+        sv::APPUTIL_APP_EVENT_PARSE_NP_APP_DATA_MESSAGE => {
+            "sceAppUtilAppEventParseNpAppDataMessage"
+        }
         sv::NET_CTL_INET_GET_RESULT => "sceNetCtlInetGetResult",
         sv::NET_CTL_ADHOC_GET_RESULT => "sceNetCtlAdhocGetResult",
         sv::APPMGR_LOAD_EXEC => "sceAppMgrLoadExec",
@@ -2170,6 +2459,10 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_AUTH_GET_ENTITLEMENT_ID_LIST => "sceNpAuthGetEntitlementIdList",
         s::FIND_MEM_BLOCK_BY_ADDR => "sceKernelFindMemBlockByAddr",
         s::GET_MEM_BLOCK_INFO_BY_ADDR => "sceKernelGetMemBlockInfoByAddr",
+        s::GET_MEM_BLOCK_INFO_BY_RANGE => "sceKernelGetMemBlockInfoByRange",
+        s::GET_MODEL => "sceKernelGetModel",
+        s::GET_MODEL_FOR_CDIALOG => "sceKernelGetModelForCDialog",
+        s::IS_PS_VITA_TV => "sceKernelIsPSVitaTV",
         sv::MOTION_GET_STATE => "sceMotionGetState",
         sv::RTC_GET_CURRENT_CLOCK_LOCAL_TIME => "sceRtcGetCurrentClockLocalTime",
         sv::RTC_GET_TICK => "sceRtcGetTick",
@@ -2191,6 +2484,13 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::FIOS_OVERLAY_GET_LIST => "sceFiosOverlayGetList02",
         sv::FIOS_OVERLAY_THREAD_SET_DISABLED => "sceFiosOverlayThreadSetDisabled02",
         sv::FIOS_OVERLAY_GET_RECOMMENDED_SCHEDULER => "sceFiosOverlayGetRecommendedScheduler02",
+        sv::FIOS_OVERLAY_ADD_FOR_PROCESS => "sceFiosOverlayAddForProcess02",
+        sv::FIOS_OVERLAY_GET_INFO_FOR_PROCESS => "sceFiosOverlayGetInfoForProcess02",
+        sv::FIOS_OVERLAY_MODIFY_FOR_PROCESS => "sceFiosOverlayModifyForProcess02",
+        sv::FIOS_OVERLAY_REMOVE_FOR_PROCESS => "sceFiosOverlayRemoveForProcess02",
+        sv::FIOS_OVERLAY_RESOLVE_SYNC => "sceFiosOverlayResolveSync02",
+        sv::FIOS_OVERLAY_RESOLVE_WITH_RANGE_SYNC => "sceFiosOverlayResolveWithRangeSync02",
+        sv::FIOS_OVERLAY_THREAD_IS_DISABLED => "sceFiosOverlayThreadIsDisabled02",
         sv::ULOBJ_REGISTER_PROTOCOL_REVISION => "_sceUlobjMgrRegisterLibultProtocolRevision",
         sv::APPUTIL_INIT => "sceAppUtilInit",
         sv::APPUTIL_SYSTEM_PARAM_GET_INT => "sceAppUtilSystemParamGetInt",
@@ -2223,6 +2523,8 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::APPUTIL_SAVEDATA_SLOT_SET_PARAM => "sceAppUtilSaveDataSlotSetParam",
         sv::APPUTIL_SAVEDATA_SLOT_DELETE => "sceAppUtilSaveDataSlotDelete",
         sv::APPUTIL_SAVEDATA_DATA_SAVE => "sceAppUtilSaveDataDataSave",
+        sv::APPUTIL_SAVE_SAFE_MEMORY => "sceAppUtilSaveSafeMemory",
+        sv::APPUTIL_LOAD_SAFE_MEMORY => "sceAppUtilLoadSafeMemory",
         sv::NP_CHECK_CALLBACK => "sceNpCheckCallback",
         sv::TOUCH_SET_SAMPLING_STATE => "sceTouchSetSamplingState",
         sv::TOUCH_GET_SAMPLING_STATE => "sceTouchGetSamplingState",
@@ -2238,6 +2540,42 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::CAMERA_SET_REVERSE => "sceCameraSetReverse",
         sv::CAMERA_SET_BACKLIGHT => "sceCameraSetBacklight",
         sv::CAMERA_SET_WHITE_BALANCE => "sceCameraSetWhiteBalance",
+        sv::CAMERA_IS_ACTIVE => "sceCameraIsActive",
+        sv::CAMERA_GET_ANTI_FLICKER => "sceCameraGetAntiFlicker",
+        sv::CAMERA_GET_AUTO_CONTROL_HOLD => "sceCameraGetAutoControlHold",
+        sv::CAMERA_GET_BACKLIGHT => "sceCameraGetBacklight",
+        sv::CAMERA_GET_BRIGHTNESS => "sceCameraGetBrightness",
+        sv::CAMERA_GET_CONTRAST => "sceCameraGetContrast",
+        sv::CAMERA_GET_DEVICE_LOCATION => "sceCameraGetDeviceLocation",
+        sv::CAMERA_GET_EV => "sceCameraGetEV",
+        sv::CAMERA_GET_EFFECT => "sceCameraGetEffect",
+        sv::CAMERA_GET_EXPOSURE_CEILING => "sceCameraGetExposureCeiling",
+        sv::CAMERA_GET_GAIN => "sceCameraGetGain",
+        sv::CAMERA_GET_ISO => "sceCameraGetISO",
+        sv::CAMERA_GET_IMAGE_QUALITY => "sceCameraGetImageQuality",
+        sv::CAMERA_GET_NIGHTMODE => "sceCameraGetNightmode",
+        sv::CAMERA_GET_NOISE_REDUCTION => "sceCameraGetNoiseReduction",
+        sv::CAMERA_GET_SATURATION => "sceCameraGetSaturation",
+        sv::CAMERA_GET_SHARPNESS => "sceCameraGetSharpness",
+        sv::CAMERA_GET_SHARPNESS_OFF => "sceCameraGetSharpnessOff",
+        sv::CAMERA_GET_WHITE_BALANCE => "sceCameraGetWhiteBalance",
+        sv::CAMERA_GET_ZOOM => "sceCameraGetZoom",
+        sv::CAMERA_SET_ANTI_FLICKER => "sceCameraSetAntiFlicker",
+        sv::CAMERA_SET_AUTO_CONTROL_HOLD => "sceCameraSetAutoControlHold",
+        sv::CAMERA_SET_BRIGHTNESS => "sceCameraSetBrightness",
+        sv::CAMERA_SET_CONTRAST => "sceCameraSetContrast",
+        sv::CAMERA_SET_EV => "sceCameraSetEV",
+        sv::CAMERA_SET_EFFECT => "sceCameraSetEffect",
+        sv::CAMERA_SET_EXPOSURE_CEILING => "sceCameraSetExposureCeiling",
+        sv::CAMERA_SET_GAIN => "sceCameraSetGain",
+        sv::CAMERA_SET_ISO => "sceCameraSetISO",
+        sv::CAMERA_SET_IMAGE_QUALITY => "sceCameraSetImageQuality",
+        sv::CAMERA_SET_NIGHTMODE => "sceCameraSetNightmode",
+        sv::CAMERA_SET_NOISE_REDUCTION => "sceCameraSetNoiseReduction",
+        sv::CAMERA_SET_SATURATION => "sceCameraSetSaturation",
+        sv::CAMERA_SET_SHARPNESS => "sceCameraSetSharpness",
+        sv::CAMERA_SET_SHARPNESS_OFF => "sceCameraSetSharpnessOff",
+        sv::CAMERA_SET_ZOOM => "sceCameraSetZoom",
         sv::LOCATION_OPEN => "sceLocationOpen",
         sv::LOCATION_CLOSE => "sceLocationClose",
         sv::LOCATION_REOPEN => "sceLocationReopen",
@@ -2262,6 +2600,8 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::JPEGENC_SET_OUTPUT_ADDR => "sceJpegEncoderSetOutputAddr",
         sv::JPEGENC_SET_COMPRESSION_RATIO => "sceJpegEncoderSetCompressionRatio",
         sv::JPEGENC_SET_VALID_REGION => "sceJpegEncoderSetValidRegion",
+        sv::JPEGENC_CSC => "sceJpegEncoderCsc",
+        sv::JPEGENC_ENCODE => "sceJpegEncoderEncode",
         sv::JPEG_INIT_MJPEG => "sceJpegInitMJpeg",
         sv::JPEG_INIT_MJPEG_WITH_PARAM => "sceJpegInitMJpegWithParam",
         sv::JPEG_FINISH_MJPEG => "sceJpegFinishMJpeg",
@@ -2271,6 +2611,19 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::JPEG_CSC => "sceJpegCsc",
         sv::SYSTEM_GESTURE_INIT_PRIMITIVE_TOUCH_RECOGNIZER => {
             "sceSystemGestureInitializePrimitiveTouchRecognizer"
+        }
+        sv::SYSTEM_GESTURE_FINALIZE_PRIMITIVE_TOUCH_RECOGNIZER => {
+            "sceSystemGestureFinalizePrimitiveTouchRecognizer"
+        }
+        sv::SYSTEM_GESTURE_RESET_PRIMITIVE_TOUCH_RECOGNIZER => {
+            "sceSystemGestureResetPrimitiveTouchRecognizer"
+        }
+        sv::SYSTEM_GESTURE_GET_PRIMITIVE_TOUCH_EVENTS => "sceSystemGestureGetPrimitiveTouchEvents",
+        sv::SYSTEM_GESTURE_GET_PRIMITIVE_TOUCH_EVENTS_COUNT => {
+            "sceSystemGestureGetPrimitiveTouchEventsCount"
+        }
+        sv::SYSTEM_GESTURE_GET_PRIMITIVE_TOUCH_EVENT_BY_INDEX => {
+            "sceSystemGestureGetPrimitiveTouchEventByIndex"
         }
         sv::SYSTEM_GESTURE_UPDATE_PRIMITIVE_TOUCH_RECOGNIZER => {
             "sceSystemGestureUpdatePrimitiveTouchRecognizer"
@@ -2295,7 +2648,7 @@ pub fn name(func_nid: u32) -> &'static str {
         lw::LOCK_LW_MUTEX => "sceKernelLockLwMutex",
         lw::LOCK_LW_MUTEX_CB => "sceKernelLockLwMutexCB",
         lw::LOCK_LW_MUTEX_0 => "sceKernelLockLwMutex_0",
-        lw::TRY_LOCK_LW_MUTEX => "sceKernelTryLockLwMutex",
+        lw::TRY_LOCK_LW_MUTEX | lw::TRY_LOCK_LW_MUTEX_16XX => "sceKernelTryLockLwMutex",
         lw::UNLOCK_LW_MUTEX => "sceKernelUnlockLwMutex",
         lw::UNLOCK_LW_MUTEX2 => "sceKernelUnlockLwMutex2",
         lw::UNLOCK_LW_MUTEX_0 => "sceKernelUnlockLwMutex_0",
@@ -2365,6 +2718,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sy::UNLOCK_WRITE_RW_LOCK => "sceKernelUnlockWriteRWLock",
         sy::WAIT_SEMA => "sceKernelWaitSema",
         sy::SIGNAL_SEMA => "sceKernelSignalSema",
+        sy::POLL_SEMA => "sceKernelPollSema",
         sy::DELETE_SEMA => "sceKernelDeleteSema",
         sy::CANCEL_SEMA => "sceKernelCancelSema",
         sy::CREATE_TIMER => "sceKernelCreateTimer",
@@ -2450,18 +2804,32 @@ pub fn name(func_nid: u32) -> &'static str {
         g::GET_PRECOMPUTED_FRAGMENT_STATE_SIZE => "sceGxmGetPrecomputedFragmentStateSize",
         g::PRECOMPUTED_VERTEX_STATE_INIT => "sceGxmPrecomputedVertexStateInit",
         g::PRECOMPUTED_FRAGMENT_STATE_INIT => "sceGxmPrecomputedFragmentStateInit",
-        g::PRECOMPUTED_VERTEX_STATE_SET_DEFAULT_UNIFORM_BUFFER => "sceGxmPrecomputedVertexStateSetDefaultUniformBuffer",
-        g::PRECOMPUTED_FRAGMENT_STATE_SET_DEFAULT_UNIFORM_BUFFER => "sceGxmPrecomputedFragmentStateSetDefaultUniformBuffer",
-        g::PRECOMPUTED_VERTEX_STATE_GET_DEFAULT_UNIFORM_BUFFER => "sceGxmPrecomputedVertexStateGetDefaultUniformBuffer",
-        g::PRECOMPUTED_FRAGMENT_STATE_GET_DEFAULT_UNIFORM_BUFFER => "sceGxmPrecomputedFragmentStateGetDefaultUniformBuffer",
+        g::PRECOMPUTED_VERTEX_STATE_SET_DEFAULT_UNIFORM_BUFFER => {
+            "sceGxmPrecomputedVertexStateSetDefaultUniformBuffer"
+        }
+        g::PRECOMPUTED_FRAGMENT_STATE_SET_DEFAULT_UNIFORM_BUFFER => {
+            "sceGxmPrecomputedFragmentStateSetDefaultUniformBuffer"
+        }
+        g::PRECOMPUTED_VERTEX_STATE_GET_DEFAULT_UNIFORM_BUFFER => {
+            "sceGxmPrecomputedVertexStateGetDefaultUniformBuffer"
+        }
+        g::PRECOMPUTED_FRAGMENT_STATE_GET_DEFAULT_UNIFORM_BUFFER => {
+            "sceGxmPrecomputedFragmentStateGetDefaultUniformBuffer"
+        }
         g::PRECOMPUTED_VERTEX_STATE_SET_TEXTURE => "sceGxmPrecomputedVertexStateSetTexture",
         g::PRECOMPUTED_FRAGMENT_STATE_SET_TEXTURE => "sceGxmPrecomputedFragmentStateSetTexture",
         g::SET_PRECOMPUTED_VERTEX_STATE => "sceGxmSetPrecomputedVertexState",
         g::SET_PRECOMPUTED_FRAGMENT_STATE => "sceGxmSetPrecomputedFragmentState",
-        g::DEPTH_STENCIL_SURFACE_SET_BACKGROUND_DEPTH => "sceGxmDepthStencilSurfaceSetBackgroundDepth",
-        g::DEPTH_STENCIL_SURFACE_SET_BACKGROUND_STENCIL => "sceGxmDepthStencilSurfaceSetBackgroundStencil",
+        g::DEPTH_STENCIL_SURFACE_SET_BACKGROUND_DEPTH => {
+            "sceGxmDepthStencilSurfaceSetBackgroundDepth"
+        }
+        g::DEPTH_STENCIL_SURFACE_SET_BACKGROUND_STENCIL => {
+            "sceGxmDepthStencilSurfaceSetBackgroundStencil"
+        }
         g::DEPTH_STENCIL_SURFACE_SET_FORCE_LOAD_MODE => "sceGxmDepthStencilSurfaceSetForceLoadMode",
-        g::DEPTH_STENCIL_SURFACE_SET_FORCE_STORE_MODE => "sceGxmDepthStencilSurfaceSetForceStoreMode",
+        g::DEPTH_STENCIL_SURFACE_SET_FORCE_STORE_MODE => {
+            "sceGxmDepthStencilSurfaceSetForceStoreMode"
+        }
         g::SET_BACK_DEPTH_WRITE_ENABLE => "sceGxmSetBackDepthWriteEnable",
         g::SET_BACK_POLYGON_MODE => "sceGxmSetBackPolygonMode",
         g::SET_VISIBILITY_BUFFER => "sceGxmSetVisibilityBuffer",
@@ -2475,8 +2843,11 @@ pub fn name(func_nid: u32) -> &'static str {
         g::UNMAP_VERTEX_USSE_MEMORY => "sceGxmUnmapVertexUsseMemory",
         g::UNMAP_FRAGMENT_USSE_MEMORY => "sceGxmUnmapFragmentUsseMemory",
         g::COLOR_SURFACE_GET_SCALE_MODE => "sceGxmColorSurfaceGetScaleMode",
+        g::COLOR_SURFACE_SET_SCALE_MODE => "sceGxmColorSurfaceSetScaleMode",
+        g::SET_YUV_PROFILE => "sceGxmSetYuvProfile",
         g::COLOR_SURFACE_SET_DATA => "sceGxmColorSurfaceSetData",
         g::PROGRAM_GET_TYPE => "sceGxmProgramGetType",
+        g::PROGRAM_GET_FRAGMENT_PROGRAM_INPUTS => "sceGxmProgramGetFragmentProgramInputs",
         g::PROGRAM_GET_SIZE => "sceGxmProgramGetSize",
         g::PRECOMPUTED_DRAW_SET_PARAMS_INSTANCED => "sceGxmPrecomputedDrawSetParamsInstanced",
         g::PROGRAM_FIND_PARAMETER_BY_SEMANTIC => "_sceGxmProgramFindParameterBySemantic",
@@ -2486,20 +2857,37 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_VERTEX_TEXTURE => "_sceGxmSetVertexTexture",
         g::SET_VERTEX_TEXTURE_PUBLIC => "sceGxmSetVertexTexture",
         g::SHADER_PATCHER_GET_BUFFER_MEM_ALLOCATED => "sceGxmShaderPatcherGetBufferMemAllocated",
-        g::SHADER_PATCHER_GET_VERTEX_USSE_MEM_ALLOCATED => "sceGxmShaderPatcherGetVertexUsseMemAllocated",
-        g::SHADER_PATCHER_GET_FRAGMENT_USSE_MEM_ALLOCATED => "sceGxmShaderPatcherGetFragmentUsseMemAllocated",
+        g::SHADER_PATCHER_GET_VERTEX_USSE_MEM_ALLOCATED => {
+            "sceGxmShaderPatcherGetVertexUsseMemAllocated"
+        }
+        g::SHADER_PATCHER_GET_FRAGMENT_USSE_MEM_ALLOCATED => {
+            "sceGxmShaderPatcherGetFragmentUsseMemAllocated"
+        }
         g::SHADER_PATCHER_GET_HOST_MEM_ALLOCATED => "sceGxmShaderPatcherGetHostMemAllocated",
         g::TRANSFER_FINISH => "sceGxmTransferFinish",
         g::TEXTURE_INIT_CUBE_ARBITRARY => "sceGxmTextureInitCubeArbitrary",
         g::TEXTURE_SET_PALETTE => "sceGxmTextureSetPalette",
         g::TEXTURE_GET_PALETTE => "sceGxmTextureGetPalette",
         g::PRECOMPUTED_DRAW_SET_ALL_VERTEX_STREAMS => "sceGxmPrecomputedDrawSetAllVertexStreams",
-        g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_TEXTURES => "sceGxmPrecomputedFragmentStateSetAllTextures",
-        g::PRECOMPUTED_VERTEX_STATE_SET_ALL_TEXTURES => "sceGxmPrecomputedVertexStateSetAllTextures",
-        g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS => "sceGxmPrecomputedFragmentStateSetAllUniformBuffers",
-        g::PRECOMPUTED_FRAGMENT_STATE_SET_UNIFORM_BUFFER => "sceGxmPrecomputedFragmentStateSetUniformBuffer",
-        g::PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS => "sceGxmPrecomputedVertexStateSetAllUniformBuffers",
-        g::PRECOMPUTED_VERTEX_STATE_SET_UNIFORM_BUFFER => "sceGxmPrecomputedVertexStateSetUniformBuffer",
+        g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_TEXTURES => {
+            "sceGxmPrecomputedFragmentStateSetAllTextures"
+        }
+        g::PRECOMPUTED_VERTEX_STATE_SET_ALL_TEXTURES
+        | g::PRECOMPUTED_VERTEX_STATE_SET_ALL_TEXTURES_16XX => {
+            "sceGxmPrecomputedVertexStateSetAllTextures"
+        }
+        g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS => {
+            "sceGxmPrecomputedFragmentStateSetAllUniformBuffers"
+        }
+        g::PRECOMPUTED_FRAGMENT_STATE_SET_UNIFORM_BUFFER => {
+            "sceGxmPrecomputedFragmentStateSetUniformBuffer"
+        }
+        g::PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS => {
+            "sceGxmPrecomputedVertexStateSetAllUniformBuffers"
+        }
+        g::PRECOMPUTED_VERTEX_STATE_SET_UNIFORM_BUFFER => {
+            "sceGxmPrecomputedVertexStateSetUniformBuffer"
+        }
         // NGS.
         ng::VOICE_DEF_GET_SIMPLE_VOICE => "sceNgsVoiceDefGetSimpleVoice",
         ng::VOICE_DEF_GET_MIXER_BUSS => "sceNgsVoiceDefGetMixerBuss",
@@ -2638,15 +3026,19 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::MP4_GET_STREAM_INFO => "sceMp4GetStreamInfo",
         sv::MP4_STOP_FILE_STREAMING_C05DFF01 => "sceMp4(unnamed 0xc05dff01, stop streaming)",
         sv::MP4_ENABLE_STREAM_609E57AD => "sceMp4(unnamed 0x609e57ad, enable stream)",
-        sv::MP4_RESET_40351E1A => "sceMp4(unnamed 0x40351e1a, reset)",
-        sv::MP4_GET_NEXT_UNIT => "sceMp4GetNextUnit",
-        sv::MP4_GET_NEXT_UNIT_DATA => "sceMp4GetNextUnitData",
         sv::MP4_GET_NEXT_SYNC_UNIT => "sceMp4GetNextSyncUnit",
         sv::MP4_GET_PREV_SYNC_UNIT => "sceMp4GetPrevSyncUnit",
         sv::MP4_JUMP_PTS => "sceMp4JumpPTS",
+        sv::MP4_PTS_TO_TIME => "sceMp4PTSToTime",
+        sv::MP4_TIME_TO_PTS => "sceMp4TimeToPTS",
         sv::MP4_FLUSH_FILE_READER => "sceMp4FlushFileReader",
-        sv::MP4_GET_AVAILABLE_BW => "sceMp4GetAvailableBW",
+        sv::MP4_RESUME_FILE_READER_CB91CEBC => "sceMp4(unnamed 0xcb91cebc, resume file reader)",
         sv::MP4_SET_AVAILABLE_BW => "sceMp4SetAvailableBW",
+        sv::MP4_GET_AVAILABLE_BW => "sceMp4GetAvailableBW",
+        sv::MP4_A870587F => "sceMp4(unnamed 0xa870587f)",
+        sv::MP4_RESET_40351E1A => "sceMp4(unnamed 0x40351e1a, reset)",
+        sv::MP4_GET_NEXT_UNIT => "sceMp4GetNextUnit",
+        sv::MP4_GET_NEXT_UNIT_DATA => "sceMp4GetNextUnitData",
         sv::NP_TERM => "sceNpTerm",
         sv::NP_UNREGISTER_SERVICE_STATE_CALLBACK => "sceNpUnregisterServiceStateCallback",
         sv::NP_BASIC_TERM => "sceNpBasicTerm",
@@ -2666,7 +3058,9 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_MATCHING2_ABORT_CONTEXT_START => "sceNpMatching2AbortContextStart",
         sv::NP_MATCHING2_REGISTER_CONTEXT_CALLBACK => "sceNpMatching2RegisterContextCallback",
         sv::NP_MATCHING2_REGISTER_ROOM_EVENT_CALLBACK => "sceNpMatching2RegisterRoomEventCallback",
-        sv::NP_MATCHING2_REGISTER_ROOM_MESSAGE_CALLBACK => "sceNpMatching2RegisterRoomMessageCallback",
+        sv::NP_MATCHING2_REGISTER_ROOM_MESSAGE_CALLBACK => {
+            "sceNpMatching2RegisterRoomMessageCallback"
+        }
         sv::NP_MATCHING2_SET_DEFAULT_REQUEST_OPT_PARAM => "sceNpMatching2SetDefaultRequestOptParam",
         sv::NP_MATCHING2_GET_SERVER_LOCAL => "sceNpMatching2GetServerLocal",
         sv::NP_MATCHING2_GET_WORLD_INFO_LIST => "sceNpMatching2GetWorldInfoList",
@@ -2722,6 +3116,14 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::POWER_GET_BUS_CLOCK => "scePowerGetBusClockFrequency",
         sv::POWER_GET_GPU_CLOCK => "scePowerGetGpuClockFrequency",
         sv::POWER_GET_GPU_XBAR_CLOCK => "scePowerGetGpuXbarClockFrequency",
+        sv::POWER_IS_POWER_ONLINE => "scePowerIsPowerOnline",
+        sv::POWER_IS_BATTERY_EXIST => "scePowerIsBatteryExist",
+        sv::POWER_IS_BATTERY_CHARGING => "scePowerIsBatteryCharging",
+        sv::POWER_IS_LOW_BATTERY => "scePowerIsLowBattery",
+        sv::POWER_IS_SUSPEND_REQUIRED => "scePowerIsSuspendRequired",
+        sv::POWER_GET_BATTERY_LIFE_PERCENT => "scePowerGetBatteryLifePercent",
+        sv::POWER_SET_USING_WIRELESS => "scePowerSetUsingWireless",
+        sv::POWER_GET_USING_WIRELESS => "scePowerGetUsingWireless",
         sv::COMMON_DIALOG_SET_CONFIG_PARAM => "sceCommonDialogSetConfigParam",
         // SceCommonDialog lifecycle. These all had dispatch arms already; without a name
         // each the link-time coverage report counted them as MISSING, which is how a
@@ -2782,7 +3184,9 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::STORE_CHECKOUT_DIALOG_TERM => "sceStoreCheckoutDialogTerm",
         sv::NP_SNS_FACEBOOK_DIALOG_INIT => "sceNpSnsFacebookDialogInit",
         sv::NP_SNS_FACEBOOK_DIALOG_GET_STATUS => "sceNpSnsFacebookDialogGetStatus",
-        sv::NP_SNS_FACEBOOK_DIALOG_GET_RESULT_LONG_TOKEN => "sceNpSnsFacebookDialogGetResultLongToken",
+        sv::NP_SNS_FACEBOOK_DIALOG_GET_RESULT_LONG_TOKEN => {
+            "sceNpSnsFacebookDialogGetResultLongToken"
+        }
         sv::IME_DIALOG_INIT => "sceImeDialogInit",
         sv::IME_DIALOG_GET_STATUS => "sceImeDialogGetStatus",
         sv::IME_DIALOG_GET_RESULT => "sceImeDialogGetResult",
@@ -2826,6 +3230,8 @@ pub fn name(func_nid: u32) -> &'static str {
         io::IO_SYNC_BY_FD => "sceIoSyncByFd",
         sy::OPEN_SEMA => "sceKernelOpenSema",
         tm::CHANGE_THREAD_PRIORITY => "sceKernelChangeThreadPriority",
+        tm::CHANGE_THREAD_PRIORITY2 => "sceKernelChangeThreadPriority2",
+        tm::GET_THREAD_CPU_AFFINITY_MASK2 => "sceKernelGetThreadCpuAffinityMask2",
         tm::DELAY_THREAD_CB => "sceKernelDelayThreadCB",
         tm::SEND_SIGNAL => "sceKernelSendSignal",
         pm::LIBC_GETTIMEOFDAY => "sceKernelLibcGettimeofday",
@@ -2871,6 +3277,50 @@ pub fn name(func_nid: u32) -> &'static str {
         g::TEXTURE_SET_LOD_MIN => "sceGxmTextureSetLodMin",
         g::TEXTURE_GET_LOD_MIN => "sceGxmTextureGetLodMin",
         g::TEXTURE_SET_MIPMAP_COUNT => "sceGxmTextureSetMipmapCount",
+        g::TEXTURE_SET_STRIDE => "sceGxmTextureSetStride",
+        g::TEXTURE_SET_WIDTH => "sceGxmTextureSetWidth",
+        g::TEXTURE_SET_HEIGHT => "sceGxmTextureSetHeight",
+        g::TEXTURE_SET_WIDTH_INTERNAL => "_sceGxmTextureSetWidth",
+        g::TEXTURE_SET_HEIGHT_INTERNAL => "_sceGxmTextureSetHeight",
+        g::TEXTURE_GET_NORMALIZE_MODE => "sceGxmTextureGetNormalizeMode",
+        g::TEXTURE_SET_NORMALIZE_MODE => "sceGxmTextureSetNormalizeMode",
+        g::TEXTURE_VALIDATE => "sceGxmTextureValidate",
+        g::DEPTH_STENCIL_SURFACE_GET_BACKGROUND_DEPTH => {
+            "sceGxmDepthStencilSurfaceGetBackgroundDepth"
+        }
+        g::DEPTH_STENCIL_SURFACE_GET_BACKGROUND_MASK => {
+            "sceGxmDepthStencilSurfaceGetBackgroundMask"
+        }
+        g::DEPTH_STENCIL_SURFACE_GET_BACKGROUND_STENCIL => {
+            "sceGxmDepthStencilSurfaceGetBackgroundStencil"
+        }
+        g::DEPTH_STENCIL_SURFACE_GET_FORCE_LOAD_MODE => "sceGxmDepthStencilSurfaceGetForceLoadMode",
+        g::DEPTH_STENCIL_SURFACE_GET_FORCE_STORE_MODE => {
+            "sceGxmDepthStencilSurfaceGetForceStoreMode"
+        }
+        g::DEPTH_STENCIL_SURFACE_GET_FORMAT => "sceGxmDepthStencilSurfaceGetFormat",
+        g::DEPTH_STENCIL_SURFACE_GET_STRIDE_IN_SAMPLES => {
+            "sceGxmDepthStencilSurfaceGetStrideInSamples"
+        }
+        g::DEPTH_STENCIL_SURFACE_IS_ENABLED => "sceGxmDepthStencilSurfaceIsEnabled",
+        g::DEPTH_STENCIL_SURFACE_SET_BACKGROUND_MASK => {
+            "sceGxmDepthStencilSurfaceSetBackgroundMask"
+        }
+        g::PROGRAM_PARAMETER_IS_SAMPLER_CUBE => "sceGxmProgramParameterIsSamplerCube",
+        g::CREATE_DEFERRED_CONTEXT => "sceGxmCreateDeferredContext",
+        g::DESTROY_DEFERRED_CONTEXT => "sceGxmDestroyDeferredContext",
+        g::BEGIN_COMMAND_LIST => "sceGxmBeginCommandList",
+        g::END_COMMAND_LIST => "sceGxmEndCommandList",
+        g::EXECUTE_COMMAND_LIST => "sceGxmExecuteCommandList",
+        g::SET_DEFERRED_CONTEXT_VDM_BUFFER => "sceGxmSetDeferredContextVdmBuffer",
+        g::SET_DEFERRED_CONTEXT_VERTEX_BUFFER => "sceGxmSetDeferredContextVertexBuffer",
+        g::SET_DEFERRED_CONTEXT_FRAGMENT_BUFFER => "sceGxmSetDeferredContextFragmentBuffer",
+        g::GET_DEFERRED_CONTEXT_VDM_BUFFER => "sceGxmGetDeferredContextVdmBuffer",
+        g::GET_DEFERRED_CONTEXT_VERTEX_BUFFER => "sceGxmGetDeferredContextVertexBuffer",
+        g::GET_DEFERRED_CONTEXT_FRAGMENT_BUFFER => "sceGxmGetDeferredContextFragmentBuffer",
+        g::PUSH_USER_MARKER => "sceGxmPushUserMarker",
+        g::POP_USER_MARKER => "sceGxmPopUserMarker",
+        g::SET_USER_MARKER => "sceGxmSetUserMarker",
         d::GET_FRAME_BUF => "sceDisplayGetFrameBuf",
         tm::CHECK_CALLBACK => "sceKernelCheckCallback",
         tm::CREATE_CALLBACK => "sceKernelCreateCallback",

@@ -19,7 +19,9 @@ let run_game_worker,
   set_knob,
   set_system_font,
   worker_input_key,
+  worker_input_text,
   worker_input_pointer,
+  worker_input_back_pointer,
   worker_input_stick,
   worker_set_paused,
   worker_set_output_size,
@@ -97,7 +99,8 @@ async function loadSystemFont() {
 }
 
 // >>> A PLAYBOOK'S LUA VM LIVES HERE, in the run worker: C Lua 5.4 compiled to wasm (wasmoon,
-// vendored under vendor/wasmoon). The engine reaches it through exactly two functions - run a
+// vendored under web-playbook/vendor/wasmoon, served at vendor/wasmoon by the playbook build
+// only - see playbook-build.mjs). The engine reaches it through exactly two functions - run a
 // chunk under a name, call a global with one string - which is the whole backend contract
 // (vitaslop-playbook's vm.rs), so another Lua would replace only this function.
 //
@@ -215,7 +218,9 @@ const bundle = (module) =>
       set_knob,
       set_system_font,
       worker_input_key,
+      worker_input_text,
       worker_input_pointer,
+      worker_input_back_pointer,
       worker_input_stick,
       worker_set_paused,
       worker_set_output_size,
@@ -268,13 +273,23 @@ self.onmessage = async (e) => {
     worker_input_key(d.code, d.pressed);
     return;
   }
+  // A key typed for the game's on-screen keyboard (ime-input.js).
+  if (d.type === "text") {
+    worker_input_text(d.key);
+    return;
+  }
   if (d.type === "pointer") {
     worker_input_pointer(d.x, d.y, d.down);
     return;
   }
+  // The rear panel, from the opt-in "Rear touch panel" setting (worker-input.js).
+  if (d.type === "back-pointer") {
+    worker_input_back_pointer(d.x, d.y, d.down);
+    return;
+  }
   // An analog stick, in the guest's own 0..255 encoding (128 centred). `active: false`
-  // releases it back to whatever a scripted recipe says, which is NOT the same as sending
-  // 128 - see InputState::left_stick.
+  // releases it (no live stick), which is NOT the same as sending 128 - see
+  // InputState::left_stick.
   if (d.type === "stick") {
     worker_input_stick(d.stick, d.x, d.y, d.active);
     return;
@@ -410,7 +425,7 @@ self.onmessage = async (e) => {
   }
 
   // Otherwise this is the start message:
-  // { offscreen, titleId | files, recipe | playbook, maxFrames, knobs }.
+  // { offscreen, titleId | files, playbook, maxFrames, knobs }.
   //
   // `titleId` is the OPFS path: the title was imported once (streamed to storage, never
   // fully resident) and is read a piece at a time from here on. `files` is the older
@@ -419,7 +434,7 @@ self.onmessage = async (e) => {
   // `audioRing` is the SharedArrayBuffer the page's AudioWorklet drains (see
   // web/audio.js). It is shared, not transferred, so it needs no transfer list - and a
   // start message without one simply runs silent, which the setup says on the console.
-  const { offscreen, titleId, files, recipe, playbook, maxFrames, knobs, prebuilt, audioRing, profile, noPersist } = d;
+  const { offscreen, titleId, files, playbook, maxFrames, knobs, prebuilt, audioRing, profile, noPersist } = d;
   forwardConsole = Number(d.forwardConsole || 0);
   forwardFrom = Number(d.forwardFrom || 0);
   // Which game-data profile this run saves into; the page picked it from the settings.
@@ -432,7 +447,10 @@ self.onmessage = async (e) => {
     // Before the run makes its device: see gpu-census.js.
     if (String((knobs || {}).VITASLOP_GPU_CENSUS ?? "") === "1") installGpuCensus((t) => console.log(t));
     await loadSystemFont();
-    // `playbook` ({ name, source }): a run driven by a playbook needs its Lua VM up first.
+    // `playbook` ({ name, source }): a run driven by a playbook needs its Lua VM up first. Only the
+    // playbook build has the engine (`playbook_finish` is its export) and serves the VM - the
+    // shipped bundles have neither (see playbook-build.mjs), so say that rather than a 404.
+    if (playbook && !playbook_finish) throw new Error("playbook: this bundle was built without playbooks - serve the playbook build (`node build.mjs --playbook`)");
     if (playbook) await loadPlaybookLua();
     // Forward each (id, text) metric the run publishes to the page.
     //
@@ -481,7 +499,7 @@ self.onmessage = async (e) => {
     // title id to key storage by, so it plays without persistence rather than guessing one.
     let persist;
     // `noPersist` (the device runner's reproducible runs): no saved state read, none written,
-    // so every run boots as a first boot - a recipe keyed to first-boot screens stays in step.
+    // so every run boots as a first boot - a playbook written against first-boot screens stays in step.
     if (titleId && !noPersist) {
       const stored = await gamedata.read(titleId);
       if (stored) note(`[gamedata] restoring ${stored.length} bytes for ${titleId}`);
@@ -503,7 +521,6 @@ self.onmessage = async (e) => {
     const status = await run_game_worker(
       offscreen,
       source,
-      recipe || "",
       maxFrames,
       report,
       prebuilt ?? undefined,

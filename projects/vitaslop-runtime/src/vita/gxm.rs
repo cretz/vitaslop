@@ -7,10 +7,10 @@
 use super::gxmctx;
 use super::gxmprog;
 use crate::capture::{ColorSurface, VertexAttribute};
-use crate::host::{GuestCtx, VitaState, MAX_VERTEX_STREAMS};
+use crate::host::{GuestCtx, MAX_VERTEX_STREAMS, VitaState};
+use crate::hostcall;
 use crate::render::f32_to_half;
 use vitaslop_gxp_shader::ParamType;
-use crate::hostcall;
 
 /// SceGxmInitializeParams: `flags` at 0, `displayQueueMaxPendingCount` at 4,
 /// `displayQueueCallback` at 8, its data size at 12.
@@ -92,7 +92,12 @@ pub(super) fn create_render_target(ctx: &mut GuestCtx, st: &mut VitaState) {
     );
     st.set_render_target_extent(handle, width, height);
     st.set_render_target_mem_block(handle, ctx.read_u32(params + 0x10));
-    report_multisample_mode(handle, width, height, (ctx.read_u32(params + 0x08) >> 16) & 0xFFFF);
+    report_multisample_mode(
+        handle,
+        width,
+        height,
+        (ctx.read_u32(params + 0x08) >> 16) & 0xFFFF,
+    );
     // A render target whose extent decodes DEGENERATE is either a title creating a real 1x1
     // probe or this reader looking at the wrong bytes, and those need opposite responses. The
     // 20-byte params block is the only thing that tells them apart, so print it unconditionally
@@ -154,14 +159,21 @@ static MULTISAMPLE_BY_TARGET: std::sync::Mutex<Option<std::collections::HashMap<
     std::sync::Mutex::new(None);
 
 fn multisample_mode_of(handle: u32) -> u32 {
-    let g = MULTISAMPLE_BY_TARGET.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().and_then(|m| m.get(&handle).copied()).unwrap_or(0)
+    let g = MULTISAMPLE_BY_TARGET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    g.as_ref()
+        .and_then(|m| m.get(&handle).copied())
+        .unwrap_or(0)
 }
 
 fn report_multisample_mode(handle: u32, width: u32, height: u32, mode: u32) {
     {
-        let mut g = MULTISAMPLE_BY_TARGET.lock().unwrap_or_else(|e| e.into_inner());
-        g.get_or_insert_with(std::collections::HashMap::new).insert(handle, mode);
+        let mut g = MULTISAMPLE_BY_TARGET
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(std::collections::HashMap::new)
+            .insert(handle, mode);
     }
     if mode == 0 {
         return;
@@ -225,6 +237,200 @@ pub(super) fn create_context(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::S
     ctx.write_u32(out, host_mem);
     ctx.ret(0);
     crate::SvcOutcome::Continue
+}
+
+// --- Deferred contexts and command lists (see `VitaState::replay_command_list`) ------------
+
+/// `SCE_GXM_ERROR_NOT_WITHIN_SCENE`.
+const SCE_GXM_ERROR_NOT_WITHIN_SCENE: i32 = 0x805B_0006u32 as i32;
+/// `SCE_GXM_ERROR_WITHIN_COMMAND_LIST` / `NOT_WITHIN_COMMAND_LIST`.
+const SCE_GXM_ERROR_WITHIN_COMMAND_LIST: i32 = 0x805B_002Cu32 as i32;
+const SCE_GXM_ERROR_NOT_WITHIN_COMMAND_LIST: i32 = 0x805B_002Du32 as i32;
+/// Word 0 of a `SceGxmCommandList` (0x20 bytes, the caller's own) this engine filled: word 1
+/// is the list's id. The 32 bytes are opaque to the title and copied by value, so the id is
+/// position-independent - a copy executes the same list.
+const COMMAND_LIST_MAGIC: u32 = 0x4C44_4D43; // "CMDL"
+
+/// int sceGxmCreateDeferredContext(const SceGxmDeferredContextParams *params,
+///     SceGxmContext **deferredContext)
+///
+/// `params` (0x30 bytes): hostMem and its size, the three memory callbacks and their user
+/// data, and an optional initial VDM, vertex and fragment buffer. The context lives in
+/// hostMem, laid out as an immediate context's block is, with its own default-uniform ring.
+pub(super) fn create_deferred_context(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let (params, out) = (ctx.arg(0), ctx.arg(1));
+    if params == 0 || out == 0 {
+        ctx.ret(SCE_GXM_ERROR_INVALID_POINTER as u32);
+        return;
+    }
+    let host_mem = ctx.read_u32(params + CTX_PARAMS_HOST_MEM);
+    if host_mem == 0 || ctx.read_u32(params + CTX_PARAMS_HOST_MEM_SIZE) < gxmctx::BYTES {
+        ctx.ret(SCE_GXM_ERROR_INVALID_VALUE as u32);
+        return;
+    }
+    gxmctx::init(ctx, host_mem);
+    st.attach_uniform_ring(ctx, host_mem);
+    let buffers =
+        [0x18, 0x20, 0x28].map(|o| (ctx.read_u32(params + o), ctx.read_u32(params + o + 4)));
+    st.deferred_contexts.insert(
+        host_mem,
+        crate::host::DeferredContext {
+            recording: None,
+            buffers,
+        },
+    );
+    ctx.write_u32(out, host_mem);
+    ctx.ret(0);
+}
+
+/// The checks every deferred-only call makes: NULL is INVALID_POINTER, an immediate context
+/// is INVALID_VALUE.
+fn deferred_check(st: &VitaState, context: u32) -> Result<(), i32> {
+    if context == 0 {
+        Err(SCE_GXM_ERROR_INVALID_POINTER)
+    } else if !st.is_deferred_context(context) {
+        Err(SCE_GXM_ERROR_INVALID_VALUE)
+    } else {
+        Ok(())
+    }
+}
+
+/// int sceGxmDestroyDeferredContext(SceGxmContext *deferredContext): refused while a list is
+/// being recorded. Lists already ended stay executable - they are the caller's data.
+pub(super) fn destroy_deferred_context(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let context = ctx.arg(0);
+    let r = match deferred_check(st, context) {
+        Err(e) => e,
+        Ok(()) if st.deferred_contexts[&context].recording.is_some() => {
+            SCE_GXM_ERROR_WITHIN_COMMAND_LIST
+        }
+        Ok(()) => {
+            st.deferred_contexts.remove(&context);
+            0
+        }
+    };
+    ctx.ret(r as u32);
+}
+
+/// int sceGxmBeginCommandList(SceGxmContext *deferredContext): start recording.
+pub(super) fn begin_command_list(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let context = ctx.arg(0);
+    let r = match deferred_check(st, context) {
+        Err(e) => e,
+        Ok(()) => match st.deferred_contexts.get_mut(&context) {
+            Some(d) if d.recording.is_some() => SCE_GXM_ERROR_WITHIN_COMMAND_LIST,
+            Some(d) => {
+                d.recording = Some(Vec::new());
+                0
+            }
+            None => SCE_GXM_ERROR_INVALID_VALUE,
+        },
+    };
+    ctx.ret(r as u32);
+}
+
+/// int sceGxmEndCommandList(SceGxmContext *deferredContext, SceGxmCommandList *commandList):
+/// stop recording and fill the caller's 32-byte list with this engine's handle to it.
+pub(super) fn end_command_list(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let (context, list) = (ctx.arg(0), ctx.arg(1));
+    let r = match deferred_check(st, context) {
+        Err(e) => e,
+        Ok(()) if list == 0 => SCE_GXM_ERROR_INVALID_POINTER,
+        Ok(()) => match st
+            .deferred_contexts
+            .get_mut(&context)
+            .and_then(|d| d.recording.take())
+        {
+            None => SCE_GXM_ERROR_NOT_WITHIN_COMMAND_LIST,
+            Some(draws) => {
+                let id = st.command_lists.len() as u32;
+                st.command_lists.push(draws);
+                let mut words = [0u8; 32];
+                words[0..4].copy_from_slice(&COMMAND_LIST_MAGIC.to_le_bytes());
+                words[4..8].copy_from_slice(&id.to_le_bytes());
+                ctx.write_bytes(list, &words);
+                0
+            }
+        },
+    };
+    ctx.ret(r as u32);
+}
+
+/// int sceGxmExecuteCommandList(SceGxmContext *immediateContext, SceGxmCommandList *commandList):
+/// splice the list's draws into the open scene, at this point in it. Only an immediate
+/// context inside a scene may execute one; a list may be executed any number of times.
+pub(super) fn execute_command_list(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let (context, list) = (ctx.arg(0), ctx.arg(1));
+    let r = if context == 0 || list == 0 {
+        SCE_GXM_ERROR_INVALID_POINTER
+    } else if st.is_deferred_context(context) {
+        SCE_GXM_ERROR_INVALID_VALUE
+    } else if !st.scene_open() {
+        SCE_GXM_ERROR_NOT_WITHIN_SCENE
+    } else if ctx.read_u32(list) != COMMAND_LIST_MAGIC
+        || !st.replay_command_list(ctx, ctx.read_u32(list + 4))
+    {
+        SCE_GXM_ERROR_INVALID_VALUE
+    } else {
+        0
+    };
+    ctx.ret(r as u32);
+}
+
+/// int sceGxmSetDeferredContext{Vdm,Vertex,Fragment}Buffer(SceGxmContext *deferredContext,
+///     void *mem, SceSize size): the memory the next list draws on. Only between lists; a
+/// vertex or fragment buffer under 1 KiB, or memory given with no size, is INVALID_VALUE.
+/// `which` is 0 VDM, 1 vertex, 2 fragment.
+pub(super) fn set_deferred_buffer(ctx: &mut GuestCtx, st: &mut VitaState, which: usize) {
+    let (context, mem, size) = (ctx.arg(0), ctx.arg(1), ctx.arg(2));
+    let r = match deferred_check(st, context) {
+        Err(e) => e,
+        Ok(()) if st.deferred_contexts[&context].recording.is_some() => {
+            SCE_GXM_ERROR_WITHIN_COMMAND_LIST
+        }
+        Ok(()) if which != 0 && ((size != 0 && size < 1024) || (mem != 0 && size == 0)) => {
+            SCE_GXM_ERROR_INVALID_VALUE
+        }
+        Ok(()) => {
+            if let Some(d) = st.deferred_contexts.get_mut(&context) {
+                d.buffers[which] = (mem, size);
+            }
+            0
+        }
+    };
+    ctx.ret(r as u32);
+}
+
+/// int sceGxmGetDeferredContext{Vdm,Vertex,Fragment}Buffer(const SceGxmContext *deferredContext,
+///     void **mem): the buffer last given.
+pub(super) fn get_deferred_buffer(ctx: &mut GuestCtx, st: &mut VitaState, which: usize) {
+    let (context, out) = (ctx.arg(0), ctx.arg(1));
+    let r = match deferred_check(st, context) {
+        Err(e) => e,
+        Ok(()) if out == 0 => SCE_GXM_ERROR_INVALID_POINTER,
+        Ok(()) if st.deferred_contexts[&context].recording.is_some() => {
+            SCE_GXM_ERROR_WITHIN_COMMAND_LIST
+        }
+        Ok(()) => {
+            ctx.write_u32(out, st.deferred_contexts[&context].buffers[which].0);
+            0
+        }
+    };
+    ctx.ret(r as u32);
+}
+
+/// A draw made on a deferred context is RECORDED rather than drawn: `Some(answer)` when
+/// `context` is deferred (0, or NOT_WITHIN_COMMAND_LIST outside a list), `None` for an
+/// immediate context, which draws as usual.
+fn defer_draw(ctx: &GuestCtx, st: &mut VitaState, draw: crate::host::DeferredDraw) -> Option<i32> {
+    let context = ctx.arg(0);
+    st.is_deferred_context(context).then(|| {
+        if st.record_deferred_draw(ctx, context, draw) {
+            0
+        } else {
+            SCE_GXM_ERROR_NOT_WITHIN_COMMAND_LIST
+        }
+    })
 }
 
 /// `SceGxmContextParams` field offsets (vitasdk `gxm.h`): `void *hostMem` then
@@ -400,74 +606,112 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
     use crate::nid::gxm as g;
     use gxmctx::off as ctxoff;
     use vitaslop_transpiler::InlineOp::{
-        BindPrecomputedState, CopyArgIndexed, LoadScaled, LoadShiftMask, ReserveUniformBuffer,
-        SetAllUniformBuffers, SetUniformData, StoreArg, StoreArgField, StoreArgFieldInPlace,
-        StoreArgIndexed, StoreArgRun, StoreVfpRun,
+        BindPrecomputedState, CopyArgIndexed, LoadScaled, LoadShiftMask, LoadShiftMaskUnless,
+        ReserveUniformBuffer, SetAllUniformBuffers, SetUniformData, StoreArg, StoreArgField,
+        StoreArgFieldChecked, StoreArgFieldInPlace, StoreArgIndexed, StoreArgRun, StoreVfpRun,
     };
     // A `void sceGxmSet*(SceGxmContext *context, uint32 value)`: one word of the context
     // block, at the offset its handler writes.
     let store = |offset| StoreArg { offset };
     // The packed word's fields; `param_word` masks the word to 16 bits first, which
     // the 4-bit field masks below make redundant.
-    let word = |shift| LoadShiftMask { offset: GXM_PARAM_WORD_OFF, shift, mask: 0xf, plus: 0 };
+    let word = |shift| LoadShiftMask {
+        offset: GXM_PARAM_WORD_OFF,
+        shift,
+        mask: 0xf,
+        plus: 0,
+    };
     // A field of a texture's CONTROL WORD 0, at the pointer itself (offset 0). Every one of
     // these is now a plain field of the guest's own struct rather than an entry in a host-side
     // map, which is what makes inlining them possible at all - see [`texword0`].
-    let tex = |(shift, mask): (u32, u32)| LoadShiftMask { offset: 0, shift, mask, plus: 0 };
+    let tex = |(shift, mask): (u32, u32)| LoadShiftMask {
+        offset: 0,
+        shift,
+        mask,
+        plus: 0,
+    };
     // ...and for the two enums whose values are already IN control-word position, the answer is
     // the masked word with no shift, so the mask is the field in place. See
     // [`texture_get_mip_filter`].
-    let tex_in_place =
-        |(shift, mask): (u32, u32)| LoadShiftMask { offset: 0, shift: 0, mask: mask << shift, plus: 0 };
+    let tex_in_place = |(shift, mask): (u32, u32)| LoadShiftMask {
+        offset: 0,
+        shift: 0,
+        mask: mask << shift,
+        plus: 0,
+    };
     // A SETTER of a control-word-0 field: the read-modify-write twin of `tex`, over the SAME
     // `(shift, mask)` pair, so a setter and its getter cannot disagree about where the field
     // is. Only the setters that store their argument AS PASSED belong here - see
     // [`texture_set_mip_filter`] for the one that does not, and why that matters.
-    let tex_set = |(shift, mask): (u32, u32)| StoreArgField { offset: 0, shift, mask };
+    let tex_set = |(shift, mask): (u32, u32)| StoreArgField {
+        offset: 0,
+        shift,
+        mask,
+    };
     // The setter twin of `tex_in_place`: for an enum whose values are ALREADY in control-word
     // position, the stored bits are the argument masked to the field WHERE IT IS. Given the
     // same `(shift, mask)` pair the getter uses, so the two still cannot disagree about the
     // field - the shift is folded into the mask here rather than applied to the value.
-    let tex_set_in_place =
-        |(shift, mask): (u32, u32)| StoreArgFieldInPlace { offset: 0, mask: mask << shift };
-    // sceGxmTextureGetWidth/Height: the 12-bit SIZE-MINUS-ONE field of control word 1, plus
-    // one - see [`texture_get_dim`], whose `+ 1` this `plus` is.
-    let tex_dim = |shift| LoadShiftMask { offset: 4, shift, mask: 0xfff, plus: 1 };
+    let tex_set_in_place = |(shift, mask): (u32, u32)| StoreArgFieldInPlace {
+        offset: 0,
+        mask: mask << shift,
+    };
+    // The fields a `LINEAR_STRIDED` texture spends on its byte stride (see
+    // [`pack_linear_stride`]): the driver's getters HIDE those bits there and its setters
+    // refuse, so the inline forms hand a strided texture (word 1's type) back to the handler.
+    let (guard_offset, guard_mask, guard_value) = (4, 0x7 << 29, TYPE_LINEAR_STRIDED << 29);
+    let tex_unless_strided = |(shift, mask): (u32, u32)| LoadShiftMaskUnless {
+        offset: 0,
+        shift,
+        mask,
+        guard_offset,
+        guard_mask,
+        guard_value,
+    };
     // A `sceGxmReserve*DefaultUniformBuffer(context, void **out)`: a bump of the ring in the
     // context block, recorded into one stage's three-word slot. Which stage is the only
     // difference between the two, and it is carried by the record's offset.
-    let reserve = |record| ReserveUniformBuffer { layout: uniform_ring_layout(record) };
+    let reserve = |record| ReserveUniformBuffer {
+        layout: uniform_ring_layout(record),
+    };
     Some(match func_nid {
         g::PROGRAM_PARAMETER_GET_CATEGORY => word(0),
         g::PROGRAM_PARAMETER_GET_TYPE => word(4),
         g::PROGRAM_PARAMETER_GET_COMPONENT_COUNT => word(8),
         g::PROGRAM_PARAMETER_GET_CONTAINER_INDEX => word(12),
-        g::PROGRAM_PARAMETER_GET_ARRAY_SIZE => {
-            LoadShiftMask { offset: GXM_PARAM_ARRAY_SIZE_OFF, shift: 0, mask: u32::MAX, plus: 0 }
-        }
-        g::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => {
-            LoadShiftMask { offset: GXM_PARAM_RESOURCE_INDEX_OFF, shift: 0, mask: u32::MAX, plus: 0 }
-        }
+        g::PROGRAM_PARAMETER_GET_ARRAY_SIZE => LoadShiftMask {
+            offset: GXM_PARAM_ARRAY_SIZE_OFF,
+            shift: 0,
+            mask: u32::MAX,
+            plus: 0,
+        },
+        g::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => LoadShiftMask {
+            offset: GXM_PARAM_RESOURCE_INDEX_OFF,
+            shift: 0,
+            mask: u32::MAX,
+            plus: 0,
+        },
         // The texture sampler getters. `sceGxmTextureGetLodBias` is the single hottest host call
         // one title makes - 71,298 in one profile window - and every one of these is one load,
         // one shift and one mask over a struct the guest already owns.
-        g::TEXTURE_GET_LOD_BIAS => tex(texword0::LOD_BIAS),
+        g::TEXTURE_GET_LOD_BIAS => tex_unless_strided(texword0::LOD_BIAS),
         g::TEXTURE_GET_U_ADDR_MODE_SAFE => tex(texword0::UADDR_MODE),
         g::TEXTURE_GET_V_ADDR_MODE_SAFE => tex(texword0::VADDR_MODE),
-        g::TEXTURE_GET_MIN_FILTER => tex(texword0::MIN_FILTER),
+        g::TEXTURE_GET_MIN_FILTER => tex_unless_strided(texword0::MIN_FILTER),
         g::TEXTURE_GET_MAG_FILTER => tex(texword0::MAG_FILTER),
-        // Both the checked and unchecked spellings read the same field, exactly as the two
-        // share one handler - see the note on `TEXTURE_GET_MIPMAP_COUNT` in `nid.rs`.
-        g::TEXTURE_GET_MIPMAP_COUNT | g::TEXTURE_GET_MIPMAP_COUNT_UNSAFE => {
-            tex(texword0::MIP_COUNT)
-        }
+        // NOT the mip count, width or height: the mip field is `count - 1` modulo four bits and
+        // the checked getter answers 0 for a strided texture, and a swizzled or cube texture's
+        // sizes are log2 - none of which is one load, shift and mask.
         g::TEXTURE_GET_GAMMA_MODE => tex_in_place(texword0::GAMMA_MODE),
-        // The three control-word-1 reads. `GetType` is the top three bits put back where they
-        // came from (`((w1 >> 29) & 7) << 29`), which is the whole word masked - the same
-        // shape `tex_in_place` has, one word over.
-        g::TEXTURE_GET_TYPE => LoadShiftMask { offset: 4, shift: 0, mask: 0x7 << 29, plus: 0 },
-        g::TEXTURE_GET_WIDTH => tex_dim(12),
-        g::TEXTURE_GET_HEIGHT => tex_dim(0),
+        // The control-word-1 read. `GetType` is the top three bits put back where they came
+        // from (`((w1 >> 29) & 7) << 29`), which is the whole word masked - the same shape
+        // `tex_in_place` has, one word over.
+        g::TEXTURE_GET_TYPE => LoadShiftMask {
+            offset: 4,
+            shift: 0,
+            mask: 0x7 << 29,
+            plus: 0,
+        },
         // >>> THE DATA POINTER, AND ON ONE TITLE IT IS THE SECOND-BUSIEST HOST CALL THERE IS.
         //
         // `texture_get_data` is `read_u32(texture + 8) & 0xffff_fffc` and nothing else - the
@@ -481,7 +725,12 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // The title calls it around three times per draw, which is what a renderer that walks
         // its own texture list does; the call is not the title being wasteful, it is an
         // accessor being charged like a system call.
-        g::TEXTURE_GET_DATA => LoadShiftMask { offset: 8, shift: 0, mask: 0xffff_fffc, plus: 0 },
+        g::TEXTURE_GET_DATA => LoadShiftMask {
+            offset: 8,
+            shift: 0,
+            mask: 0xffff_fffc,
+            plus: 0,
+        },
         // The control-word-0 SETTERS whose handler is `set_tex_field` and nothing else. Each
         // is a read-modify-write of ONE field, which is why they need their own form: a whole
         // word store would clear the seven settings packed beside the one being set, and the
@@ -503,7 +752,19 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // on-track run:
         // **465.6 calls a frame**, every one of them a boundary crossing to do a
         // read-modify-write of six bits the guest already owns.
-        g::TEXTURE_SET_LOD_BIAS => tex_set(texword0::LOD_BIAS),
+        // CHECKED: the handler refuses a bias above 63 (INVALID_VALUE) and a strided texture
+        // (UNSUPPORTED) rather than writing over the stride - see [`texture_set_lod_bias`].
+        g::TEXTURE_SET_LOD_BIAS => {
+            let (shift, mask) = texword0::LOD_BIAS;
+            StoreArgFieldChecked {
+                offset: 0,
+                shift,
+                mask,
+                guard_offset,
+                guard_mask,
+                guard_value,
+            }
+        }
         // ...and the one whose enum is ALREADY in control-word position, so its handler masks
         // the argument in place rather than shifting it up. That is a different program, which
         // is why it could not use `tex_set` - see [`texture_set_mip_filter`], and
@@ -518,7 +779,10 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // in-place form is the right one for the same reason MIP_FILTER's is. MEASURED at
         // 32 calls per frame on a racing title's race - a texture data swap per animated
         // texture per frame - each one a full crossing to mask one word.
-        g::TEXTURE_SET_DATA => StoreArgFieldInPlace { offset: 8, mask: 0xffff_fffc },
+        g::TEXTURE_SET_DATA => StoreArgFieldInPlace {
+            offset: 8,
+            mask: 0xffff_fffc,
+        },
         // The two PROGRAM-pointer reads. Everything above is handed a parameter record;
         // these are handed the `SceGxmProgram` itself, which changes nothing about the
         // lowering - an inline form is defined by (pointer argument, offset), and which
@@ -526,9 +790,12 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         //
         // Both are called per draw by a title that re-reflects its shader interface every
         // frame: 21,710 and 24,760 calls in one profile window.
-        g::PROGRAM_GET_PARAMETER_COUNT => {
-            LoadShiftMask { offset: GXP_PARAM_COUNT_OFF, shift: 0, mask: u32::MAX, plus: 0 }
-        }
+        g::PROGRAM_GET_PARAMETER_COUNT => LoadShiftMask {
+            offset: GXP_PARAM_COUNT_OFF,
+            shift: 0,
+            mask: u32::MAX,
+            plus: 0,
+        },
         // `default_uniform_buffer_bytes` is `read(+0x64).min(4096) * 4`. The scale is a
         // shift; the CLAMP is not, so the inline form covers values at or below the cap
         // and hands the rest back - see `InlineOp::LoadScaled`. A program whose header we
@@ -570,13 +837,19 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // floats' raw bits into six consecutive context words and returns 0, which is the
         // VFP run form exactly - the hardfloat AAPCS carries them in s0..s5. ~12 calls per
         // frame on a racing title's race, each a full crossing to move 24 bytes.
-        g::SET_VIEWPORT => StoreVfpRun { offset: ctxoff::VIEWPORT, count: 6 },
+        g::SET_VIEWPORT => StoreVfpRun {
+            offset: ctxoff::VIEWPORT,
+            count: 6,
+        },
         // `sceGxmSetRegionClip(context, mode, xMin, yMin, xMax, yMax)`: five argument words
         // stored as passed into the five consecutive words at REGION_CLIP_MODE (the mode,
         // then the four bounds at REGION_CLIP = REGION_CLIP_MODE + 4). The last two
         // arguments ride the guest stack, which the run form reads exactly where
         // `GuestCtx::arg` does. Another ~12 calls per frame from the same draw loop.
-        g::SET_REGION_CLIP => StoreArgRun { offset: ctxoff::REGION_CLIP_MODE, count: 5 },
+        g::SET_REGION_CLIP => StoreArgRun {
+            offset: ctxoff::REGION_CLIP_MODE,
+            count: 5,
+        },
         // `sceGxmSetFrontDepthBias(context, factor, units)`: two argument words stored as
         // passed into two consecutive context words. The handler casts each `i32 as u32`,
         // which is the identity on the bits the register already holds, so the run form
@@ -587,7 +860,10 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // of them from a single call site in its draw loop. On the browser a host call is
         // 91% marshalling ([[vitaslop-browser-host-call-cost]]), so this is 271 crossings a
         // frame to move eight bytes into the guest's own context block.
-        g::SET_FRONT_DEPTH_BIAS => StoreArgRun { offset: ctxoff::FRONT_DEPTH_BIAS_FACTOR, count: 2 },
+        g::SET_FRONT_DEPTH_BIAS => StoreArgRun {
+            offset: ctxoff::FRONT_DEPTH_BIAS_FACTOR,
+            count: 2,
+        },
         // `sceGxmSet{Front,Back}StencilFunc(context, func, fail, depthFail, depthPass,
         // compareMask, writeMask)`: six argument words stored as passed into six consecutive
         // context words (the last three ride the guest stack, which the run form reads
@@ -596,8 +872,14 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // READ-BACK (`gxmctx::render_state`), so the handler now stores as passed and the
         // run form is exact. MEASURED on a retail sports title's round in a browser:
         // sceGxmSetFrontStencilFunc is its third-hottest host call, ~35 a frame.
-        g::SET_FRONT_STENCIL_FUNC => StoreArgRun { offset: ctxoff::FRONT_STENCIL_FUNC, count: 6 },
-        g::SET_BACK_STENCIL_FUNC => StoreArgRun { offset: ctxoff::BACK_STENCIL_FUNC, count: 6 },
+        g::SET_FRONT_STENCIL_FUNC => StoreArgRun {
+            offset: ctxoff::FRONT_STENCIL_FUNC,
+            count: 6,
+        },
+        g::SET_BACK_STENCIL_FUNC => StoreArgRun {
+            offset: ctxoff::BACK_STENCIL_FUNC,
+            count: 6,
+        },
         // `sceGxmSet{Vertex,Fragment}UniformBuffer(context, index, data)`: a bounded indexed
         // pointer store, exactly the `SET_VERTEX_STREAM` shape - in range the store IS the
         // whole call, and an index past `SCE_GXM_MAX_UNIFORM_BUFFERS` falls back to the
@@ -627,8 +909,12 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // The two per-draw-loop state binds: a copy between two guest structures now that
         // the precomputed state lives in guest memory (`vita::gxmstate`). 24 calls per
         // frame EACH on a racing title's race - the last non-draw GXM crossings it makes.
-        g::SET_PRECOMPUTED_VERTEX_STATE => BindPrecomputedState { layout: bind_state_layout(false) },
-        g::SET_PRECOMPUTED_FRAGMENT_STATE => BindPrecomputedState { layout: bind_state_layout(true) },
+        g::SET_PRECOMPUTED_VERTEX_STATE => BindPrecomputedState {
+            layout: bind_state_layout(false),
+        },
+        g::SET_PRECOMPUTED_FRAGMENT_STATE => BindPrecomputedState {
+            layout: bind_state_layout(true),
+        },
         // `sceGxmPrecomputed{Vertex,Fragment}StateSetAllUniformBuffers(state, array)`: the
         // non-default uniform-buffer table copied into the state's own arrays block - the
         // handler (`precomputed_state_set_all_nondefault_uniform_buffers`) is one read of the
@@ -637,12 +923,12 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // one per `sceGxmDrawPrecomputed` - the hottest host call left in its draw path once
         // the yield was inlined. An unstamped struct (the handler allocates its block) and an
         // array whose tail leaves guest memory (the handler reads zeros) both fall back.
-        g::PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS => {
-            SetAllUniformBuffers { layout: set_all_uniform_buffers_layout(false) }
-        }
-        g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS => {
-            SetAllUniformBuffers { layout: set_all_uniform_buffers_layout(true) }
-        }
+        g::PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS => SetAllUniformBuffers {
+            layout: set_all_uniform_buffers_layout(false),
+        },
+        g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS => SetAllUniformBuffers {
+            layout: set_all_uniform_buffers_layout(true),
+        },
         g::SET_FRONT_VISIBILITY_TEST_ENABLE => store(ctxoff::FRONT_VISIBILITY_TEST_ENABLE),
         g::SET_FRONT_VISIBILITY_TEST_INDEX => store(ctxoff::FRONT_VISIBILITY_TEST_INDEX),
         g::SET_FRONT_VISIBILITY_TEST_OP => store(ctxoff::FRONT_VISIBILITY_TEST_OP),
@@ -683,7 +969,9 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // guest already holds. See [`vitaslop_transpiler::InlineOp::SetUniformData`] for what
         // it refuses (F16, an unreadable record, a write past the bank) and why each refusal
         // is a case the handler defines rather than a corner cut here.
-        g::SET_UNIFORM_DATA_F => SetUniformData { layout: uniform_data_layout() },
+        g::SET_UNIFORM_DATA_F => SetUniformData {
+            layout: uniform_data_layout(),
+        },
         _ => return None,
     })
 }
@@ -769,14 +1057,26 @@ fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
         ctx_magic_at: gxmctx::off::MAGIC,
         ctx_magic: gxmctx::MAGIC,
         st_magic_at: gxmstate::off::MAGIC,
-        st_magic: if fragment { gxmstate::MAGIC_FRAGMENT } else { gxmstate::MAGIC_VERTEX },
+        st_magic: if fragment {
+            gxmstate::MAGIC_FRAGMENT
+        } else {
+            gxmstate::MAGIC_VERTEX
+        },
         st_block_at: gxmstate::off::BLOCK,
         st_buf_at: gxmstate::off::BUF,
         st_size_at: gxmstate::off::SIZE,
         st_header_at: gxmstate::off::HEADER,
         st_handle_at: gxmstate::off::HANDLE,
-        ctx_record: if fragment { gxmctx::off::FRAGMENT_UNIFORM } else { gxmctx::off::VERTEX_UNIFORM },
-        copy_dst: if fragment { gxmctx::off::TEXTURES } else { gxmctx::off::VERTEX_UNIFORM_BUFFERS },
+        ctx_record: if fragment {
+            gxmctx::off::FRAGMENT_UNIFORM
+        } else {
+            gxmctx::off::VERTEX_UNIFORM
+        },
+        copy_dst: if fragment {
+            gxmctx::off::TEXTURES
+        } else {
+            gxmctx::off::VERTEX_UNIFORM_BUFFERS
+        },
         copy_bytes: if fragment {
             // The TEXTURE array alone. The fragment block's uniform-buffer table sits behind
             // it and goes somewhere else entirely in the context block, so it is applied by
@@ -802,9 +1102,21 @@ fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
         // The fragment block's NON-DEFAULT UNIFORM-BUFFER table, wholesale, where the handler
         // (`bind_precomputed_fragment_state`) writes it. The vertex stage's table IS its copy
         // above, so it has no second one.
-        table_src: if fragment { gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS } else { 0 },
-        table_dst: if fragment { gxmctx::off::FRAGMENT_UNIFORM_BUFFERS } else { 0 },
-        table_bytes: if fragment { gxmctx::MAX_UNIFORM_BUFFERS as u32 * 4 } else { 0 },
+        table_src: if fragment {
+            gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS
+        } else {
+            0
+        },
+        table_dst: if fragment {
+            gxmctx::off::FRAGMENT_UNIFORM_BUFFERS
+        } else {
+            0
+        },
+        table_bytes: if fragment {
+            gxmctx::MAX_UNIFORM_BUFFERS as u32 * 4
+        } else {
+            0
+        },
         ctx_prog: gxmctx::off::FRAGMENT_PROGRAM,
         has_prog: fragment,
     }
@@ -813,15 +1125,25 @@ fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
 /// Where `InlineOp::SetAllUniformBuffers` finds the state struct's stamp and block, and the
 /// table inside the block - the same constants `ensure_state_block` and
 /// `precomputed_state_set_all_nondefault_uniform_buffers` use, so the two cannot drift.
-fn set_all_uniform_buffers_layout(fragment: bool) -> vitaslop_transpiler::SetAllUniformBuffersLayout {
+fn set_all_uniform_buffers_layout(
+    fragment: bool,
+) -> vitaslop_transpiler::SetAllUniformBuffersLayout {
     use crate::vita::gxmstate;
     vitaslop_transpiler::SetAllUniformBuffersLayout {
         st_magic_at: gxmstate::off::MAGIC,
-        st_magic: if fragment { gxmstate::MAGIC_FRAGMENT } else { gxmstate::MAGIC_VERTEX },
+        st_magic: if fragment {
+            gxmstate::MAGIC_FRAGMENT
+        } else {
+            gxmstate::MAGIC_VERTEX
+        },
         st_block_at: gxmstate::off::BLOCK,
         // The vertex block's table is first; the fragment block's sits behind its texture
         // array - see `gxmstate::VERTEX_BLOCK_BYTES` / `FRAGMENT_BLOCK_BYTES`.
-        table_at: if fragment { gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS } else { 0 },
+        table_at: if fragment {
+            gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS
+        } else {
+            0
+        },
         bytes: gxmctx::MAX_UNIFORM_BUFFERS as u32 * 4,
     }
 }
@@ -864,7 +1186,10 @@ const NOT_INLINABLE: &[(u32, &str)] = &[
     // words (`& 0xff`), which a run form stores as passed" - a fact about WHERE the
     // narrowing lived, not about the call. It lives at the read-back now
     // (`gxmctx::render_state`), the handler stores as passed, and the run form is exact.
-    (crate::nid::gxm::SET_VISIBILITY_BUFFER, "clears the occlusion counters"),
+    (
+        crate::nid::gxm::SET_VISIBILITY_BUFFER,
+        "clears the occlusion counters",
+    ),
 ];
 
 /// unsigned int sceGxmProgramGetParameterCount(const SceGxmProgram *program)
@@ -891,6 +1216,21 @@ pub(super) fn param_get_category(ctx: &mut GuestCtx) {
 pub(super) fn param_get_type(ctx: &mut GuestCtx) {
     let param = ctx.arg(0);
     ctx.ret((param_word(ctx, param) >> 4) & 0xf);
+}
+
+/// SceBool sceGxmProgramParameterIsSamplerCube(param): bit 28 of the packed word - the bit the
+/// shader container parser established marks a cube sampler (`vitaslop_gxp_shader` container's
+/// `SAMPLER_CUBE_BIT`).
+pub(super) fn param_is_sampler_cube(ctx: &mut GuestCtx) {
+    let param = ctx.arg(0);
+    ctx.ret((ctx.read_u32(param.wrapping_add(GXM_PARAM_WORD_OFF)) >> 28) & 1);
+}
+
+/// int sceGxmPushUserMarker / sceGxmSetUserMarker(SceGxmContext *context, const char *tag),
+/// int sceGxmPopUserMarker(SceGxmContext *context): annotations for a GPU capture tool. They
+/// change nothing that is drawn, so they succeed and are otherwise ignored.
+pub(super) fn user_marker(ctx: &mut GuestCtx) {
+    ctx.ret(0);
 }
 
 /// unsigned int sceGxmProgramParameterGetComponentCount(param)
@@ -1100,7 +1440,11 @@ fn write_background_tex(ctx: &mut GuestCtx, addr: u32, s: &ColorSurface) {
         s.data_addr,
         // A colour surface's background texture is a single image - a render target has no mip
         // chain - so one level, or the pitch for the strided case, whose word 0 carries that.
-        if type_field == TYPE_LINEAR_STRIDED { Level0::Stride(byte_stride) } else { Level0::Mips(1) },
+        if type_field == TYPE_LINEAR_STRIDED {
+            Level0::Stride(byte_stride)
+        } else {
+            Level0::Mips(1)
+        },
     );
 }
 
@@ -1161,29 +1505,30 @@ fn write_texture_control_words(
     // `LINEAR_STRIDED` texture, whose word 0 carries that instead (see [`pack_linear_stride`]).
     level0: Level0,
 ) {
-    // Word 0's sampler fields are left ZERO here, which is not a shortcut: GXM's default for
-    // each of them IS zero - REPEAT addressing, POINT filtering, mip filter disabled, gamma off.
-    // The ONE exception is the LOD bias: its field is excess-31 (`(raw - 31) / 8` levels), so
-    // "no bias" is raw 31 and that is what init writes. Left zero, every texture a title never
-    // calls `sceGxmTextureSetLodBias` on would sample 3.875 mip levels too sharp. A
-    // `LINEAR_STRIDED` texture has no bias field - those bits are its stride.
-    let mip = match level0 {
+    // Word 0: both address modes CLAMP, POINT filters, no mip filter, gamma off - the driver's
+    // defaults (see `texword0`). The LOD bias field is excess-31 (`(raw - 31) / 8` levels), so
+    // "no bias" is raw 31; left zero, every texture a title never calls
+    // `sceGxmTextureSetLodBias` on would sample 3.875 mip levels too sharp. A `LINEAR_STRIDED`
+    // texture has no bias or mip count - those bits are its stride.
+    let clamp = (SCE_GXM_TEXTURE_ADDR_CLAMP << texword0::UADDR_MODE.0)
+        | (SCE_GXM_TEXTURE_ADDR_CLAMP << texword0::VADDR_MODE.0);
+    let level = match level0 {
         Level0::Mips(n) => {
-            let (mip_shift, mip_mask) = texword0::MIP_COUNT;
-            let (bias_shift, _) = texword0::LOD_BIAS;
-            ((n & mip_mask) << mip_shift) | (LOD_BIAS_NONE << bias_shift)
+            (mip_count_field(n) << texword0::MIP_COUNT.0) | (LOD_BIAS_NONE << texword0::LOD_BIAS.0)
         }
         Level0::Stride(byte_stride) => pack_linear_stride(byte_stride),
     };
-    let w0 = (((base_format >> 7) & 1) << 31) | mip;
-    let w1 = (height.saturating_sub(1) & 0xfff)
-        | ((width.saturating_sub(1) & 0xfff) << 12)
+    let w0 = (((base_format >> 7) & 1) << 31) | clamp | level;
+    let w1 = texture_dims_field(type_field, width, height)
         | ((base_format & 0x1f) << 24)
         | (type_field << 29);
     ctx.write_u32(addr, w0);
     ctx.write_u32(addr + 4, w1);
     ctx.write_u32(addr + 8, data & 0xffff_fffc);
-    ctx.write_u32(addr + 12, (swizzle & 0x7) << texword3::SWIZZLE_SHIFT);
+    ctx.write_u32(
+        addr + 12,
+        ((swizzle & 0x7) << texword3::SWIZZLE_SHIFT) | texword3::NORMALIZE,
+    );
 }
 
 /// Map a `SceGxmColorFormat` to the `SceGxmTextureFormat` naming the same pixels.
@@ -1275,7 +1620,13 @@ pub(super) fn read_color_surface(ctx: &mut GuestCtx, addr: u32) -> Option<ColorS
     if b.len() < 32 {
         return None;
     }
-    let w = |off: u32| u32::from_le_bytes(b[off as usize..off as usize + 4].try_into().expect("4 bytes"));
+    let w = |off: u32| {
+        u32::from_le_bytes(
+            b[off as usize..off as usize + 4]
+                .try_into()
+                .expect("4 bytes"),
+        )
+    };
     if w(0) != COLOR_SURFACE_MAGIC {
         return None;
     }
@@ -1319,7 +1670,16 @@ pub(super) fn color_surface_init(ctx: &mut GuestCtx, st: &mut VitaState) {
         caller = format_args!("{:#010x}", ctx.regs[14]),
         "colorSurfaceInit"
     );
-    let s = ColorSurface { format, surface_type, width, height, stride_pixels, data_addr, scale_mode, gamma: 0 };
+    let s = ColorSurface {
+        format,
+        surface_type,
+        width,
+        height,
+        stride_pixels,
+        data_addr,
+        scale_mode,
+        gamma: 0,
+    };
     report_color_surface_scale_mode(data_addr, scale_mode);
     write_color_surface(ctx, surface, &s);
     st.set_color_surface(surface, s);
@@ -1511,10 +1871,15 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     // >>> on every call. Keyed by the program and the RAW attribute and stream arrays, so two
     // >>> creates share only when every byte the program was built from agrees.
     // >>> `VITASLOP_GXM_SHARE_PROGRAMS=0` is the arm back.
-    let share = crate::knobs::var("VITASLOP_GXM_SHARE_PROGRAMS").map(|v| v.trim() != "0").unwrap_or(true);
+    let share = crate::knobs::var("VITASLOP_GXM_SHARE_PROGRAMS")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true);
     let key = share.then(|| {
         let mut raw = ctx.read_bytes(attributes_addr, (attribute_count as usize).min(64) * 8);
-        raw.extend(ctx.read_bytes(streams_addr, (stream_count as usize).min(MAX_VERTEX_STREAMS) * 4));
+        raw.extend(ctx.read_bytes(
+            streams_addr,
+            (stream_count as usize).min(MAX_VERTEX_STREAMS) * 4,
+        ));
         raw.extend(stream_count.to_le_bytes());
         (program_header, raw)
     });
@@ -1562,7 +1927,10 @@ fn report_blend_info(program_header: u32, blend_info: u32, blend: crate::capture
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<(u32, crate::capture::BlendState)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((program_header, blend)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((program_header, blend))
+    {
         return;
     }
     // DEBUG: one line per (program, blend state) is ~170 lines on one title's boot, which is
@@ -1671,13 +2039,19 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     // `create_vertex_program`. MEASURED on a football title before either was shared: it
     // releases a program only when the ref count says a create found an existing one, so a
     // patcher that never shares grew 260,000 live programs by frame 4,450.
-    let share = crate::knobs::var("VITASLOP_GXM_SHARE_PROGRAMS").map(|v| v.trim() != "0").unwrap_or(true);
+    let share = crate::knobs::var("VITASLOP_GXM_SHARE_PROGRAMS")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true);
     let key = share.then(|| {
         let mut raw = vec![b'F'];
         for a in [ctx.arg(2), ctx.arg(3), vertex_program] {
             raw.extend(a.to_le_bytes());
         }
-        raw.extend(if blend_info != 0 { ctx.read_bytes(blend_info, 4) } else { vec![0xff; 4] });
+        raw.extend(if blend_info != 0 {
+            ctx.read_bytes(blend_info, 4)
+        } else {
+            vec![0xff; 4]
+        });
         (st.shader_program(program_id), raw)
     });
     if let Some(handle) = key.as_ref().and_then(|k| st.share_program(k)) {
@@ -1774,6 +2148,10 @@ fn report_unknown_program_handle(call: &str, handle: u32, program: u32) {
 const SCE_GXM_ERROR_INVALID_VALUE: i32 = 0x805B_0003u32 as i32;
 /// `SCE_GXM_ERROR_INVALID_ALIGNMENT` (`psp2/gxm.h`).
 const SCE_GXM_ERROR_INVALID_ALIGNMENT: i32 = 0x805B_0005u32 as i32;
+/// `SCE_GXM_ERROR_UNSUPPORTED` (`psp2/gxm.h`).
+const SCE_GXM_ERROR_UNSUPPORTED: i32 = 0x805B_0009u32 as i32;
+/// `SCE_GXM_ERROR_INVALID_TEXTURE_DATA_POINTER` (`psp2/gxm.h`).
+const SCE_GXM_ERROR_INVALID_TEXTURE_DATA_POINTER: i32 = 0x805B_0019u32 as i32;
 
 /// int sceGxmShaderPatcherGetVertexProgramRefCount(patcher, vertexProgram, uint *count)
 /// int sceGxmShaderPatcherGetFragmentProgramRefCount(patcher, fragmentProgram, uint *count)
@@ -1829,18 +2207,21 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
     // target through a colour surface initialised 1x1, and reading the surface made
     // that whole pass a single pixel. Where both are known the render target wins.
     if let (Some(c), Some((w, h))) = (color.as_mut(), st.render_target_extent(render_target))
-        && w != 0 && h != 0 && (c.width, c.height) != (w, h) {
-            tracing::debug!(
-                target: "vitaslop::gxm",
-                surface = format_args!("{color_surface:#x}"),
-                surface_extent = format_args!("{}x{}", c.width, c.height),
-                target_extent = format_args!("{w}x{h}"),
-                "beginScene: taking the scene extent from the render target, not the \
-                 colour surface"
-            );
-            c.width = w;
-            c.height = h;
-        }
+        && w != 0
+        && h != 0
+        && (c.width, c.height) != (w, h)
+    {
+        tracing::debug!(
+            target: "vitaslop::gxm",
+            surface = format_args!("{color_surface:#x}"),
+            surface_extent = format_args!("{}x{}", c.width, c.height),
+            target_extent = format_args!("{w}x{h}"),
+            "beginScene: taking the scene extent from the render target, not the \
+             colour surface"
+        );
+        c.width = w;
+        c.height = h;
+    }
     if color.is_none() {
         tracing::debug!(
             target: "vitaslop::gxm",
@@ -1877,7 +2258,9 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
     );
     // The render target's extent travels with the scene. It is the only statement of size a
     // COLOUR-LESS pass has - see `capture::Scene::target_extent`.
-    let target_extent = st.render_target_extent(render_target).filter(|(w, h)| *w != 0 && *h != 0);
+    let target_extent = st
+        .render_target_extent(render_target)
+        .filter(|(w, h)| *w != 0 && *h != 0);
     // >>> A REGION CLIP BELONGS TO THE TARGET IT WAS STATED FOR. RESET IT HERE.
     //
     // `sceGxmSetRegionClip`'s rectangle is in the CURRENT render target's pixels, so a
@@ -1905,16 +2288,66 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
     // Cached: read per SCENE (hundreds a frame on some titles), and a knob read is a lock, a map
     // lookup and an environment probe.
     static REGION_CLIP_SCENE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *REGION_CLIP_SCENE
-        .get_or_init(|| crate::knobs::var("VITASLOP_REGION_CLIP_SCENE").ok().as_deref() != Some("0"))
-    {
+    if *REGION_CLIP_SCENE.get_or_init(|| {
+        crate::knobs::var("VITASLOP_REGION_CLIP_SCENE")
+            .ok()
+            .as_deref()
+            != Some("0")
+    }) {
         let context = ctx.arg(0);
         gxmctx::set(ctx, context, gxmctx::off::REGION_CLIP_MODE, 0); // SCE_GXM_REGION_CLIP_NONE
         for i in 0..4 {
             gxmctx::set(ctx, context, gxmctx::off::REGION_CLIP + i * 4, 0);
         }
     }
-    st.begin_scene(ctx, color, depth, multisample_mode_of(render_target), target_extent);
+    // >>> SO IS THE VIEWPORT: `sceGxmBeginScene` RESETS IT TO COVER THE WHOLE TARGET.
+    //
+    // The scene starts from offset = scale = extent/2 in x and y (y negated) and z 0.5/0.5,
+    // the extent being the valid region's max + 1 when one is passed and the render target's
+    // otherwise. The ENABLE mode is not touched - it is the one part of this state that carries
+    // across scenes. MEASURED on a title that renders its shadow atlas through quadrant
+    // viewports and then draws its whole world and its display composite without setting one:
+    // inheriting the last quadrant put the world into a 336x384 corner of its 720x408 target
+    // and the composite into a 360x32 strip at the bottom of the screen.
+    //
+    // `VITASLOP_VIEWPORT_SCENE=0` is the arm back.
+    static VIEWPORT_SCENE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *VIEWPORT_SCENE
+        .get_or_init(|| crate::knobs::var("VITASLOP_VIEWPORT_SCENE").ok().as_deref() != Some("0"))
+    {
+        let region_max = (valid_region != 0)
+            .then(|| {
+                (
+                    ctx.read_u32(valid_region + 8),
+                    ctx.read_u32(valid_region + 12),
+                )
+            })
+            .filter(|&(x, y)| x < 4096 && y < 4096)
+            .map(|(x, y)| (x + 1, y + 1));
+        if let Some((w, h)) = region_max
+            .or(target_extent)
+            .or(surface_extent)
+            .filter(|&(w, h)| w != 0 && h != 0)
+        {
+            let (hw, hh) = (w as f32 / 2.0, h as f32 / 2.0);
+            let context = ctx.arg(0);
+            for (i, v) in [hw, hw, hh, -hh, 0.5, 0.5].iter().enumerate() {
+                gxmctx::set(
+                    ctx,
+                    context,
+                    gxmctx::off::VIEWPORT + i as u32 * 4,
+                    v.to_bits(),
+                );
+            }
+        }
+    }
+    st.begin_scene(
+        ctx,
+        color,
+        depth,
+        multisample_mode_of(render_target),
+        target_extent,
+    );
     ctx.ret(0);
 }
 
@@ -1961,7 +2394,12 @@ fn report_scene_target(
     static SEEN: Mutex<Option<HashSet<(u32, u32, u32, u32)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let (w, h) = extent.unwrap_or((0, 0));
-    if !g.get_or_insert_with(HashSet::new).insert((w, h, multisample_mode_of(render_target), scale_mode)) {
+    if !g.get_or_insert_with(HashSet::new).insert((
+        w,
+        h,
+        multisample_mode_of(render_target),
+        scale_mode,
+    )) {
         return;
     }
     tracing::info!(
@@ -2015,10 +2453,20 @@ fn report_scene_extent_sources(
     // ...and NOT on the address at all: a fresh colour buffer every frame is the same fact
     // every frame (see `report_scene_target`).
     static SEEN: Mutex<
-        Option<HashSet<(Option<(u32, u32)>, Option<(u32, u32)>, Option<(u32, u32)>, Option<(u32, u32)>)>>,
+        Option<
+            HashSet<(
+                Option<(u32, u32)>,
+                Option<(u32, u32)>,
+                Option<(u32, u32)>,
+                Option<(u32, u32)>,
+            )>,
+        >,
     > = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((surface, target, valid_region, used)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((surface, target, valid_region, used))
+    {
         return;
     }
     let fmt = |e: Option<(u32, u32)>| match e {
@@ -2049,7 +2497,8 @@ fn report_scene_depth(
     depth: Option<crate::capture::DepthSurface>,
 ) {
     use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<std::collections::HashSet<(u32, u32, bool, bool, u32, u32)>>> = OnceLock::new();
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(u32, u32, bool, bool, u32, u32)>>> =
+        OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
     let d = depth.unwrap_or_default();
@@ -2110,9 +2559,14 @@ pub(super) fn end_scene(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOut
     // The scene remembers its notifications: a `sceGxmNotificationWait` on one of them is
     // a wait for THIS scene's GPU work, and completes it - see `notification_wait`.
     let read = |ctx: &mut GuestCtx, n: u32| {
-        (n != 0).then(|| (ctx.read_u32(n), ctx.read_u32(n + 4))).filter(|(a, _)| *a != 0)
+        (n != 0)
+            .then(|| (ctx.read_u32(n), ctx.read_u32(n + 4)))
+            .filter(|(a, _)| *a != 0)
     };
-    let recorded = [read(ctx, vertex_notification), read(ctx, fragment_notification)];
+    let recorded = [
+        read(ctx, vertex_notification),
+        read(ctx, fragment_notification),
+    ];
     if let Some(scene) = st.capture.scenes.last_mut() {
         scene.notifications = recorded;
     }
@@ -2185,9 +2639,7 @@ pub(super) fn notification_wait(ctx: &mut GuestCtx, st: &mut VitaState) -> crate
         .iter()
         .rposition(|s| s.notifications.contains(&Some((address, value))));
     let blocked = match carrier {
-        Some(i) if !st.capture.scenes[i].completed_early => {
-            complete_scenes_through(ctx, st, i + 1)
-        }
+        Some(i) if !st.capture.scenes[i].completed_early => complete_scenes_through(ctx, st, i + 1),
         _ => false,
     };
     if address != 0 && ctx.read_u32(address) != value {
@@ -2201,7 +2653,11 @@ pub(super) fn notification_wait(ctx: &mut GuestCtx, st: &mut VitaState) -> crate
         ctx.write_u32(address, value);
     }
     ctx.ret(0);
-    if blocked { crate::SvcOutcome::Block } else { crate::SvcOutcome::Continue }
+    if blocked {
+        crate::SvcOutcome::Block
+    } else {
+        crate::SvcOutcome::Continue
+    }
 }
 
 /// void sceGxmSetVertexProgram(context, vertexProgram)
@@ -2211,7 +2667,12 @@ pub(super) fn notification_wait(ctx: &mut GuestCtx, st: &mut VitaState) -> crate
 /// per bind to once per draw and leaves this call as one guest store - the shape an inline
 /// form can take over. See [`gxmctx`].
 #[hostcall]
-pub(super) fn set_vertex_program(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, vertex_program: u32) -> i32 {
+pub(super) fn set_vertex_program(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    vertex_program: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::VERTEX_PROGRAM, vertex_program);
     0
 }
@@ -2223,8 +2684,18 @@ pub(super) fn set_vertex_program(ctx: &mut GuestCtx, _st: &mut VitaState, contex
 /// creation (see [`crate::capture::BlendState`]), so it is a pure function of this handle
 /// and needs no separate record.
 #[hostcall]
-pub(super) fn set_fragment_program(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, fragment_program: u32) -> i32 {
-    gxmctx::set(ctx, context, gxmctx::off::FRAGMENT_PROGRAM, fragment_program);
+pub(super) fn set_fragment_program(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    fragment_program: u32,
+) -> i32 {
+    gxmctx::set(
+        ctx,
+        context,
+        gxmctx::off::FRAGMENT_PROGRAM,
+        fragment_program,
+    );
     0
 }
 
@@ -2284,7 +2755,10 @@ pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
     // own 16 bytes (name_rel, packed, array_size, resource_index), and the type is the second
     // nibble of `packed` - the same field `SceGxmProgramParameter` reflection reads.
     let half = parameter != 0
-        && matches!(ParamType::from_bits(((ctx.read_u32(parameter + 4) >> 4) & 0xf) as u8), ParamType::F16);
+        && matches!(
+            ParamType::from_bits(((ctx.read_u32(parameter + 4) >> 4) & 0xf) as u8),
+            ParamType::F16
+        );
     // ONE read of the source and ONE write of the destination run, not a word each. Every
     // guest access from the host is a boundary crossing in the browser, and the sampled
     // host-call table read this handler at w25 per call, ~120 calls a frame on a football
@@ -2292,7 +2766,10 @@ pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
     let n = component_count as usize;
     let src = ctx.read_bytes(source, n * 4);
     let values: Vec<f32> = (0..n)
-        .map(|i| src.get(i * 4..i * 4 + 4).map_or(0.0, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        .map(|i| {
+            src.get(i * 4..i * 4 + 4)
+                .map_or(0.0, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        })
         .collect();
     // Faithful copy into the reserved buffer (in case the guest reads it back, and because a
     // recompiled shader reads this buffer verbatim).
@@ -2318,10 +2795,22 @@ pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
             ctx.write_bytes(addr, &words);
         }
     } else {
-        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect();
         ctx.write_bytes(uniform_buffer + first * 4, &bytes);
     }
-    report_uniform_write(ctx, uniform_buffer, parameter, base, component_offset, half, &values, source);
+    report_uniform_write(
+        ctx,
+        uniform_buffer,
+        parameter,
+        base,
+        component_offset,
+        half,
+        &values,
+        source,
+    );
     tracing::trace!(
         target: "vitaslop::gxm",
         buffer = format_args!("{uniform_buffer:#x}"),
@@ -2377,7 +2866,10 @@ fn report_uniform_write(
         // WROTE a uniform, and the uniform this project needs it for (`screenTintColour`, the
         // white-out) is written on the BROWSER and never on the desktop - so the one engine
         // that can answer could not set the knob at all.
-        for t in crate::knobs::var("VITASLOP_UNIFORM_WATCH").unwrap_or_default().split(',') {
+        for t in crate::knobs::var("VITASLOP_UNIFORM_WATCH")
+            .unwrap_or_default()
+            .split(',')
+        {
             let t = t.trim();
             if t.is_empty() {
                 continue;
@@ -2409,7 +2901,8 @@ fn report_uniform_write(
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "<unnamed>".into());
-    if !addrs.iter().any(|&a| a >= lo && a <= hi) && !names.iter().any(|n| name.contains(n.as_str()))
+    if !addrs.iter().any(|&a| a >= lo && a <= hi)
+        && !names.iter().any(|n| name.contains(n.as_str()))
     {
         return;
     }
@@ -2432,7 +2925,13 @@ fn report_uniform_write(
 /// A stream binding is a POINTER on hardware - unlike a texture binding, which GXM copies
 /// by value - so it lives in the context block like the rest of the sticky state.
 #[hostcall]
-pub(super) fn set_vertex_stream(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, stream_index: u32, data: u32) -> i32 {
+pub(super) fn set_vertex_stream(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    stream_index: u32,
+    data: u32,
+) -> i32 {
     gxmctx::set_stream(ctx, context, stream_index, data);
     0
 }
@@ -2444,6 +2943,17 @@ pub(super) fn draw(ctx: &mut GuestCtx, st: &mut VitaState) {
     let index_format = ctx.arg(2);
     let index_data = ctx.arg(3);
     let index_count = ctx.arg(4);
+    let draw = crate::host::DeferredDraw::Indexed {
+        primitive,
+        index_format,
+        index_data,
+        index_count,
+        index_wrap: 0,
+    };
+    if let Some(r) = defer_draw(ctx, st, draw) {
+        ctx.ret(r as u32);
+        return;
+    }
     st.record_draw(ctx, primitive, index_format, index_data, index_count, 0);
     ctx.ret(0);
 }
@@ -2463,13 +2973,31 @@ pub(super) fn draw_instanced(ctx: &mut GuestCtx, st: &mut VitaState) {
     let index_data = ctx.arg(3);
     let index_count = ctx.arg(4);
     let index_wrap = ctx.arg(5);
+    let draw = crate::host::DeferredDraw::Indexed {
+        primitive,
+        index_format,
+        index_data,
+        index_count,
+        index_wrap,
+    };
+    if let Some(r) = defer_draw(ctx, st, draw) {
+        ctx.ret(r as u32);
+        return;
+    }
     tracing::debug!(
         target: "vitaslop::gxm",
         index_count, index_wrap,
         instances = index_count.checked_div(index_wrap).unwrap_or(1),
         "drawInstanced"
     );
-    st.record_draw(ctx, primitive, index_format, index_data, index_count, index_wrap);
+    st.record_draw(
+        ctx,
+        primitive,
+        index_format,
+        index_data,
+        index_count,
+        index_wrap,
+    );
     ctx.ret(0);
 }
 
@@ -2509,6 +3037,44 @@ pub(super) fn set_fragment_texture(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// unsigned int mipCount|byteStride). Writes the 16-byte control-word struct the
 /// guest will later hand to sceGxmSetFragmentTexture, and records the exact format
 /// so the channel swizzle survives. Layout per vitasdk `gxm.h struct SceGxmTexture`.
+/// The argument checks every `sceGxmTextureInit*` makes before it writes anything. The
+/// boundaries are the ones a homebrew test recorded on a real console: a NULL texture is
+/// INVALID_POINTER; a width or height of 0 or above 4096 is INVALID_VALUE; data that is not
+/// 4-byte aligned is INVALID_ALIGNMENT; a swizzled or cube texture whose sides are not powers
+/// of two is INVALID_ALIGNMENT (255x256 fails, 4096x4096 succeeds); a mip count above 13 is
+/// INVALID_VALUE; and a strided texture's stride is held to [`check_byte_stride`]. NULL data is
+/// accepted - it is `sceGxmTextureValidate` that refuses it.
+///
+/// Not checked, because the rule is not known: the same run saw a TILED 1x1 texture refused
+/// (INVALID_VALUE) and a tiled 33x32 one accepted.
+fn check_texture_init(
+    texture: u32,
+    data: u32,
+    type_field: u32,
+    width: u32,
+    height: u32,
+    mip_or_stride: u32,
+) -> Result<(), i32> {
+    if texture == 0 {
+        return Err(SCE_GXM_ERROR_INVALID_POINTER);
+    }
+    if !(1..=4096).contains(&width) || !(1..=4096).contains(&height) {
+        return Err(SCE_GXM_ERROR_INVALID_VALUE);
+    }
+    if type_field == TYPE_LINEAR_STRIDED {
+        check_byte_stride(mip_or_stride)?;
+    } else if mip_or_stride > MAX_MIP_COUNT {
+        return Err(SCE_GXM_ERROR_INVALID_VALUE);
+    }
+    if data & 3 != 0 {
+        return Err(SCE_GXM_ERROR_INVALID_ALIGNMENT);
+    }
+    if pot_type(type_field) && !(width.is_power_of_two() && height.is_power_of_two()) {
+        return Err(SCE_GXM_ERROR_INVALID_ALIGNMENT);
+    }
+    Ok(())
+}
+
 pub(super) fn texture_init(ctx: &mut GuestCtx, st: &mut VitaState, type_field: u32) {
     let texture = ctx.arg(0);
     let data = ctx.arg(1);
@@ -2521,17 +3087,14 @@ pub(super) fn texture_init(ctx: &mut GuestCtx, st: &mut VitaState, type_field: u
     // the struct and `sceGxmTextureGetStride` reads it back out of the words.
     let mip_or_stride = ctx.arg(5);
     let strided = type_field == TYPE_LINEAR_STRIDED;
-    if strided && (!mip_or_stride.is_multiple_of(4) || !(4..=MAX_PACKED_STRIDE).contains(&mip_or_stride)) {
-        // Word 0 holds 13 bits of `stride / 4 - 1`; where a larger stride's top bits go is not
-        // known. Refused loudly rather than truncated into a texture that samples the wrong rows
-        // - a title that reaches this is the evidence for where those bits live.
-        tracing::error!(
+    if let Err(e) = check_texture_init(texture, data, type_field, width, height, mip_or_stride) {
+        tracing::warn!(
             target: "vitaslop::warning",
-            texture = format_args!("{texture:#x}"), byte_stride = mip_or_stride,
-            "sceGxmTextureInitLinearStrided: a byte stride that is not a multiple of 4 in 4..={MAX_PACKED_STRIDE} \
-             cannot be packed into the control words - refused"
+            texture = format_args!("{texture:#x}"), data = format_args!("{data:#x}"),
+            type_field, width, height, mip_or_stride, error = format_args!("{:#010x}", e as u32),
+            "sceGxmTextureInit*: arguments the console rejects - refused with its error, and the texture left unwritten"
         );
-        ctx.ret((if !mip_or_stride.is_multiple_of(4) { SCE_GXM_ERROR_INVALID_ALIGNMENT } else { SCE_GXM_ERROR_INVALID_VALUE }) as u32);
+        ctx.ret(e as u32);
         return;
     }
 
@@ -2544,7 +3107,11 @@ pub(super) fn texture_init(ctx: &mut GuestCtx, st: &mut VitaState, type_field: u
         width,
         height,
         data,
-        if strided { Level0::Stride(mip_or_stride) } else { Level0::Mips(mip_or_stride) },
+        if strided {
+            Level0::Stride(mip_or_stride)
+        } else {
+            Level0::Mips(mip_or_stride)
+        },
     );
     if strided {
         tracing::debug!(
@@ -2597,11 +3164,116 @@ pub(super) fn texture_get_data(ctx: &mut GuestCtx) {
     ctx.ret(data);
 }
 
-/// sceGxmTextureGetWidth/Height: the 12-bit size-1 field at `shift` in word 1.
-pub(super) fn texture_get_dim(ctx: &mut GuestCtx, shift: u32) {
+/// sceGxmTextureGetWidth/Height, out of control word 1 by the texture's own type - see
+/// [`texture_dims`].
+pub(super) fn texture_get_dim(ctx: &mut GuestCtx, width: bool) {
     let texture = ctx.arg(0);
-    let field = (ctx.read_u32(texture + 4) >> shift) & 0xfff;
-    ctx.ret(field + 1);
+    let (w, h) = texture_dims(ctx.read_u32(texture + 4));
+    ctx.ret(if width { w } else { h });
+}
+
+/// int sceGxmTextureSetWidth/SetHeight(SceGxmTexture *texture, unsigned int size): rewrite one
+/// side in control word 1, held to the same checks init makes of it - 1..=4096, and a power of
+/// two for a swizzled or cube texture, whose word stores the log2.
+pub(super) fn texture_set_dim(ctx: &mut GuestCtx, width: bool) {
+    let texture = ctx.arg(0);
+    let size = ctx.arg(1);
+    if texture == 0 {
+        ctx.ret(SCE_GXM_ERROR_INVALID_POINTER as u32);
+        return;
+    }
+    let w1 = ctx.read_u32(texture + 4);
+    let type_field = (w1 >> 29) & 0x7;
+    if !(1..=4096).contains(&size) {
+        ctx.ret(SCE_GXM_ERROR_INVALID_VALUE as u32);
+        return;
+    }
+    if pot_type(type_field) && !size.is_power_of_two() {
+        ctx.ret(SCE_GXM_ERROR_INVALID_ALIGNMENT as u32);
+        return;
+    }
+    let (w, h) = texture_dims(w1);
+    let (w, h) = if width { (size, h) } else { (w, size) };
+    let sizes = texture_dims_field(type_field, w, h);
+    let mask = texture_dims_field(type_field, 4096, 4096) | texture_dims_field(type_field, 1, 1);
+    let keep = if pot_type(type_field) {
+        !0x000f_000f
+    } else {
+        !0x00ff_ffff
+    };
+    debug_assert_eq!(mask & keep, 0);
+    ctx.write_u32(texture + 4, (w1 & keep) | sizes);
+    ctx.ret(0);
+}
+
+/// int sceGxmTextureSetStride(SceGxmTexture *texture, unsigned int byteStride): re-pack a
+/// strided texture's stride. Any other type has no stride - its bits are sampler state - and
+/// is refused UNSUPPORTED; the stride is held to init's own check.
+pub(super) fn texture_set_stride(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let byte_stride = ctx.arg(1);
+    if texture == 0 {
+        ctx.ret(SCE_GXM_ERROR_INVALID_POINTER as u32);
+        return;
+    }
+    if (ctx.read_u32(texture + 4) >> 29) & 0x7 != TYPE_LINEAR_STRIDED {
+        ctx.ret(SCE_GXM_ERROR_UNSUPPORTED as u32);
+        return;
+    }
+    if let Err(e) = check_byte_stride(byte_stride) {
+        ctx.ret(e as u32);
+        return;
+    }
+    let w0 = ctx.read_u32(texture);
+    ctx.write_u32(
+        texture,
+        (w0 & !STRIDE_BITS) | pack_linear_stride(byte_stride),
+    );
+    ctx.ret(0);
+}
+
+/// SceGxmTextureNormalizeMode sceGxmTextureGetNormalizeMode(const SceGxmTexture *texture):
+/// control word 3 bit 31, answered in the enum's own position (`0x80000000` when set).
+pub(super) fn texture_get_normalize_mode(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    ctx.ret(ctx.read_u32(texture + 12) & texword3::NORMALIZE);
+}
+
+/// int sceGxmTextureSetNormalizeMode(SceGxmTexture *texture, SceGxmTextureNormalizeMode mode):
+/// stores bit 31 of the mode. Cleared, the texture is addressed in texels rather than 0..1 -
+/// which the renderer does not do, so that is reported once.
+pub(super) fn texture_set_normalize_mode(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let mode = ctx.arg(1) & texword3::NORMALIZE;
+    if mode == 0 {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                target: "vitaslop::warning",
+                texture = format_args!("{texture:#x}"),
+                "sceGxmTextureSetNormalizeMode(DISABLED): a texture addressed in texels - stored, \
+                 but still sampled with 0..1 coordinates, so it will sample the wrong texels"
+            );
+        }
+    }
+    let w3 = ctx.read_u32(texture + 12);
+    ctx.write_u32(texture + 12, (w3 & !texword3::NORMALIZE) | mode);
+    ctx.ret(0);
+}
+
+/// int sceGxmTextureValidate(const SceGxmTexture *texture): NULL is INVALID_POINTER, and a
+/// texture with no data is refused with the code a console run recorded for one initialised
+/// over NULL data (init itself accepts it).
+pub(super) fn texture_validate(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let r = if texture == 0 {
+        SCE_GXM_ERROR_INVALID_POINTER
+    } else if ctx.read_u32(texture + 8) & 0xffff_fffc == 0 {
+        SCE_GXM_ERROR_INVALID_TEXTURE_DATA_POINTER
+    } else {
+        0
+    };
+    ctx.ret(r as u32);
 }
 
 /// SceGxmTextureFormat sceGxmTextureGetFormat(const SceGxmTexture *texture)
@@ -2612,7 +3284,8 @@ pub(super) fn texture_get_format(ctx: &mut GuestCtx, st: &mut VitaState) {
     // word 3 swizzle).
     let fmt = st.texture_format(texture).unwrap_or_else(|| {
         let base = ((ctx.read_u32(texture + 4) >> 24) & 0x1f) | (ctx.read_u32(texture) >> 31) << 7;
-        let swizzle = (ctx.read_u32(texture + 12) >> texword3::SWIZZLE_SHIFT) & texword3::SWIZZLE_MASK;
+        let swizzle =
+            (ctx.read_u32(texture + 12) >> texword3::SWIZZLE_SHIFT) & texword3::SWIZZLE_MASK;
         (base << 24) | (swizzle << 12)
     });
     ctx.ret(fmt);
@@ -2646,8 +3319,13 @@ pub(super) fn display_queue_add_entry(ctx: &mut GuestCtx, st: &mut VitaState) {
     st.resolve_at_flip(ctx);
     let callback_data = ctx.arg(2);
     if callback_data != 0 {
-        let words: Vec<u32> = (0..8).map(|i| ctx.read_u32(callback_data + i * 4)).collect();
-        let named = words.iter().copied().find(|w| *w != 0 && st.flip_candidates.contains(w));
+        let words: Vec<u32> = (0..8)
+            .map(|i| ctx.read_u32(callback_data + i * 4))
+            .collect();
+        let named = words
+            .iter()
+            .copied()
+            .find(|w| *w != 0 && st.flip_candidates.contains(w));
         if let Some(buffer) = named {
             st.present(buffer);
         }
@@ -2706,21 +3384,36 @@ const FRAME_US: u64 = 1_000_000 / 60;
 
 /// void sceGxmSetCullMode(SceGxmContext *context, SceGxmCullMode mode)
 #[hostcall]
-pub(super) fn set_cull_mode(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, mode: u32) -> i32 {
+pub(super) fn set_cull_mode(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    mode: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::CULL_MODE, mode);
     0
 }
 
 /// void sceGxmSetTwoSidedEnable(SceGxmContext *context, SceGxmTwoSidedMode enable)
 #[hostcall]
-pub(super) fn set_two_sided_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+pub(super) fn set_two_sided_enable(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    enable: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::TWO_SIDED, enable);
     0
 }
 
 /// void sceGxmSetFrontDepthFunc(SceGxmContext *context, SceGxmDepthFunc depthFunc)
 #[hostcall]
-pub(super) fn set_front_depth_func(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, func: u32) -> i32 {
+pub(super) fn set_front_depth_func(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    func: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::FRONT_DEPTH_FUNC, func);
     0
 }
@@ -2736,57 +3429,118 @@ pub(super) fn set_front_depth_func(ctx: &mut GuestCtx, _st: &mut VitaState, cont
 /// and reading it unsigned would turn a small negative offset into an enormous positive
 /// one.
 #[hostcall]
-pub(super) fn set_front_depth_bias(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, factor: i32, units: i32) -> i32 {
-    gxmctx::set(ctx, context, gxmctx::off::FRONT_DEPTH_BIAS_FACTOR, factor as u32);
-    gxmctx::set(ctx, context, gxmctx::off::FRONT_DEPTH_BIAS_UNITS, units as u32);
+pub(super) fn set_front_depth_bias(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    factor: i32,
+    units: i32,
+) -> i32 {
+    gxmctx::set(
+        ctx,
+        context,
+        gxmctx::off::FRONT_DEPTH_BIAS_FACTOR,
+        factor as u32,
+    );
+    gxmctx::set(
+        ctx,
+        context,
+        gxmctx::off::FRONT_DEPTH_BIAS_UNITS,
+        units as u32,
+    );
     0
 }
 
 /// void sceGxmSetBackDepthFunc(SceGxmContext *context, SceGxmDepthFunc depthFunc)
 #[hostcall]
-pub(super) fn set_back_depth_func(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, func: u32) -> i32 {
+pub(super) fn set_back_depth_func(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    func: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::BACK_DEPTH_FUNC, func);
     0
 }
 
 /// void sceGxmSetFrontDepthWriteEnable(SceGxmContext *context, SceGxmDepthWriteMode enable)
 #[hostcall]
-pub(super) fn set_front_depth_write_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+pub(super) fn set_front_depth_write_enable(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    enable: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::FRONT_DEPTH_WRITE, enable);
     0
 }
 
 /// void sceGxmSetFrontFragmentProgramEnable(SceGxmContext *context, SceGxmFragmentProgramMode enable)
 #[hostcall]
-pub(super) fn set_front_fragment_program_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
-    gxmctx::set(ctx, context, gxmctx::off::FRONT_FRAGMENT_PROGRAM_ENABLE, enable);
+pub(super) fn set_front_fragment_program_enable(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    enable: u32,
+) -> i32 {
+    gxmctx::set(
+        ctx,
+        context,
+        gxmctx::off::FRONT_FRAGMENT_PROGRAM_ENABLE,
+        enable,
+    );
     0
 }
 
 /// void sceGxmSetBackFragmentProgramEnable(SceGxmContext *context, SceGxmFragmentProgramMode enable)
 #[hostcall]
-pub(super) fn set_back_fragment_program_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
-    gxmctx::set(ctx, context, gxmctx::off::BACK_FRAGMENT_PROGRAM_ENABLE, enable);
+pub(super) fn set_back_fragment_program_enable(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    enable: u32,
+) -> i32 {
+    gxmctx::set(
+        ctx,
+        context,
+        gxmctx::off::BACK_FRAGMENT_PROGRAM_ENABLE,
+        enable,
+    );
     0
 }
 
 /// void sceGxmSetFrontPointLineWidth(SceGxmContext *context, unsigned int width)
 #[hostcall]
-pub(super) fn set_front_point_line_width(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, width: u32) -> i32 {
+pub(super) fn set_front_point_line_width(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    width: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::FRONT_POINT_LINE_WIDTH, width);
     0
 }
 
 /// void sceGxmSetFrontPolygonMode(SceGxmContext *context, SceGxmPolygonMode mode)
 #[hostcall]
-pub(super) fn set_front_polygon_mode(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, mode: u32) -> i32 {
+pub(super) fn set_front_polygon_mode(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    mode: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::FRONT_POLYGON_MODE, mode);
     0
 }
 
 /// void sceGxmSetFrontStencilRef(SceGxmContext *context, unsigned int sref)
 #[hostcall]
-pub(super) fn set_front_stencil_ref(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, sref: u32) -> i32 {
+pub(super) fn set_front_stencil_ref(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    sref: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::FRONT_STENCIL_REF, sref);
     0
 }
@@ -2797,7 +3551,12 @@ pub(super) fn set_front_stencil_ref(ctx: &mut GuestCtx, _st: &mut VitaState, con
 /// reason the back stencil FUNC block is: a title sets it once and enables two-sided later,
 /// and state dropped when it was set is not there when it starts mattering.
 #[hostcall]
-pub(super) fn set_back_stencil_ref(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, sref: u32) -> i32 {
+pub(super) fn set_back_stencil_ref(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    sref: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::BACK_STENCIL_REF, sref);
     0
 }
@@ -2879,15 +3638,28 @@ pub(super) fn set_viewport(
     z_offset: f32,
     z_scale: f32,
 ) -> i32 {
-    for (i, v) in [x_offset, x_scale, y_offset, y_scale, z_offset, z_scale].iter().enumerate() {
-        gxmctx::set(ctx, context, gxmctx::off::VIEWPORT + i as u32 * 4, v.to_bits());
+    for (i, v) in [x_offset, x_scale, y_offset, y_scale, z_offset, z_scale]
+        .iter()
+        .enumerate()
+    {
+        gxmctx::set(
+            ctx,
+            context,
+            gxmctx::off::VIEWPORT + i as u32 * 4,
+            v.to_bits(),
+        );
     }
     0
 }
 
 /// void sceGxmSetViewportEnable(SceGxmContext *context, SceGxmViewportMode enable)
 #[hostcall]
-pub(super) fn set_viewport_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+pub(super) fn set_viewport_enable(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    enable: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::VIEWPORT_ENABLE, enable);
     0
 }
@@ -2918,8 +3690,14 @@ pub(super) fn set_region_clip(
 /// Returns the exact format the guest set on this surface (recorded at
 /// `sceGxmColorSurfaceInit`), or 0 if the surface was never initialized here.
 #[hostcall]
-pub(super) fn color_surface_get_format(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
-    resolve_color_surface(ctx, st, surface).map(|s| s.format).unwrap_or(0)
+pub(super) fn color_surface_get_format(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: u32,
+) -> u32 {
+    resolve_color_surface(ctx, st, surface)
+        .map(|s| s.format)
+        .unwrap_or(0)
 }
 
 /// The live surface at `addr`: from the guest struct's own contents if it holds one
@@ -2940,7 +3718,9 @@ fn resolve_color_surface(ctx: &mut GuestCtx, st: &VitaState, addr: u32) -> Optio
 /// `sceGxmColorSurfaceInit`, or 0 (LINEAR, the enum default) if never initialized here.
 #[hostcall]
 pub(super) fn color_surface_get_type(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
-    resolve_color_surface(ctx, st, surface).map(|s| s.surface_type).unwrap_or(0)
+    resolve_color_surface(ctx, st, surface)
+        .map(|s| s.surface_type)
+        .unwrap_or(0)
 }
 
 /// void sceGxmColorSurfaceSetClip(SceGxmColorSurface *surface, unsigned int xMin,
@@ -2977,7 +3757,12 @@ pub(super) fn color_surface_get_clip(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// int sceGxmColorSurfaceSetFormat(SceGxmColorSurface *surface, SceGxmColorFormat format)
 /// Written into the guest struct and the address table, like `SetData`.
 #[hostcall]
-pub(super) fn color_surface_set_format(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32, format: u32) -> i32 {
+pub(super) fn color_surface_set_format(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: u32,
+    format: u32,
+) -> i32 {
     match resolve_color_surface(ctx, st, surface) {
         Some(mut s) => {
             s.format = format;
@@ -2991,22 +3776,37 @@ pub(super) fn color_surface_set_format(ctx: &mut GuestCtx, st: &mut VitaState, s
 
 /// SceGxmColorSurfaceGammaMode sceGxmColorSurfaceGetGammaMode(const SceGxmColorSurface *surface)
 #[hostcall]
-pub(super) fn color_surface_get_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
-    resolve_color_surface(ctx, st, surface).map(|s| s.gamma).unwrap_or(0)
+pub(super) fn color_surface_get_gamma_mode(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: u32,
+) -> u32 {
+    resolve_color_surface(ctx, st, surface)
+        .map(|s| s.gamma)
+        .unwrap_or(0)
 }
 
 /// int sceGxmColorSurfaceSetDitherMode(SceGxmColorSurface *surface, SceGxmColorSurfaceDitherMode mode)
 /// Recorded for the getter. Dithering changes the low bit of an 8-bit write at most; the
 /// renderer writes undithered.
 #[hostcall]
-pub(super) fn color_surface_set_dither_mode(_ctx: &mut GuestCtx, st: &mut VitaState, surface: u32, mode: u32) -> i32 {
+pub(super) fn color_surface_set_dither_mode(
+    _ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: u32,
+    mode: u32,
+) -> i32 {
     st.color_surface_dither.insert(surface, mode);
     0
 }
 
 /// SceGxmColorSurfaceDitherMode sceGxmColorSurfaceGetDitherMode(const SceGxmColorSurface *surface)
 #[hostcall]
-pub(super) fn color_surface_get_dither_mode(_ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
+pub(super) fn color_surface_get_dither_mode(
+    _ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: u32,
+) -> u32 {
     st.color_surface_dither.get(&surface).copied().unwrap_or(0)
 }
 
@@ -3095,22 +3895,19 @@ pub(super) fn param_get_semantic_index(ctx: &mut GuestCtx, _st: &mut VitaState, 
 ///    a profile window, 66,405 of them from one call site. Reading the guest's own word makes
 ///    it a load, a shift and a mask emitted straight into the guest code, crossing nothing.
 ///
-/// The defaults are why the shadow worked for so long: GXM's defaults for every field here are
-/// zero (REPEAT, POINT, no mip filter, bias 0, gamma off), and `write_texture_control_words`
-/// leaves word 0 zero apart from the format bit - so the word and the shadow agreed on any
-/// texture the guest never copied.
+/// # What init writes, and how sure that is
+/// Init clears the struct and then writes CLAMP for both address modes, POINT filters, no mip
+/// filter, no gamma, LOD bias raw 31 (none), `normalize_mode` 1 and `mip_count` as the count
+/// MINUS ONE (see [`mip_count_field`]) - a reading of the driver's behaviour, not a hardware
+/// dump of the words. A console run has recorded the init's accept/reject boundaries (sizes,
+/// alignments, mip counts, strides; see [`texture_init`]) but not the words themselves.
+/// Neither choice is observable through our own setters and getters, which agree with each
+/// other either way; it is observable to a title that builds or reads the words itself, and
+/// that is the case the hardware's encoding must win.
 ///
-/// # What is NOT settled, stated rather than guessed
-/// - `mip_count` is four bits and the header says only "Mip count". Whether the driver packs
-///   the count or the count MINUS ONE (as it does for width and height, which this project
-///   established from observed behaviour) is not stated by any clean source. It is also
-///   unobservable through the API: every path that can see it goes through our own writer and
-///   reader, and both choices satisfy `Set(n)` then `Get() == n` and survive a struct copy.
-///   Stored raw, and this comment is the record of the ambiguity.
 /// - `byte_stride` for a `LINEAR_STRIDED` texture is packed into the mip filter, min filter,
-///   mip count and LOD bias fields, which such a texture does not have - see
-///   [`pack_linear_stride`]. Only 13 bits of it fit; where a stride above
-///   [`MAX_PACKED_STRIDE`] keeps its top bits is not known, so init refuses one.
+///   mip count, LOD bias and stride-extension fields, which such a texture does not otherwise
+///   have - see [`pack_linear_stride`].
 /// Control word 3, from vitasdk `gxm.h struct SceGxmTexture` (an approved permissive
 /// reference), declared LSB-first:
 ///
@@ -3137,10 +3934,14 @@ pub(crate) mod texword3 {
     /// Low bit of the 3-bit `swizzle_format` field.
     pub const SWIZZLE_SHIFT: u32 = 28;
     pub const SWIZZLE_MASK: u32 = 0x7;
+    /// `normalize_mode`: set, the texture is sampled with 0..1 coordinates (every init sets it).
+    pub const NORMALIZE: u32 = 1 << 31;
 }
 
 mod texword0 {
     /// `(shift, mask)` of each field of control word 0.
+    /// The top two bits of a `LINEAR_STRIDED` texture's stride (see [`super::pack_linear_stride`]).
+    pub const STRIDE_EXT: (u32, u32) = (1, 0x3);
     pub const VADDR_MODE: (u32, u32) = (3, 0x7);
     pub const UADDR_MODE: (u32, u32) = (6, 0x7);
     pub const MIP_FILTER: (u32, u32) = (9, 0x1);
@@ -3154,20 +3955,53 @@ mod texword0 {
 /// The raw `lod_bias` that means NO bias (the field is excess-31) - what texture init writes.
 const LOD_BIAS_NONE: u32 = 31;
 
-/// The largest byte stride word 0 can carry: 13 bits of `stride / 4 - 1`.
-pub(crate) const MAX_PACKED_STRIDE: u32 = 1 << 15;
+/// `SCE_GXM_TEXTURE_ADDR_CLAMP`, the address mode every init writes for U and V.
+const SCE_GXM_TEXTURE_ADDR_CLAMP: u32 = 2;
+
+/// The largest `mipCount` a texture init or `sceGxmTextureSetMipmapCount` accepts. Recorded on
+/// a real console: 13 succeeds, 14 and 16 fail INVALID_VALUE.
+const MAX_MIP_COUNT: u32 = 13;
+
+/// The largest byte stride `sceGxmTextureInitLinearStrided` accepts: 15 bits of
+/// `stride / 4 - 1`. A stride of exactly this many bytes is recorded round-tripping through
+/// init and `sceGxmTextureGetStride` on a real console, which is what places the top two bits
+/// in `stride_ext` rather than nowhere.
+pub(crate) const MAX_PACKED_STRIDE: u32 = 1 << 17;
 
 /// A `LINEAR_STRIDED` texture's byte stride as word-0 bits. There is no stride field: the
 /// stride in words minus one, `E`, is spread over four SAMPLER fields that such a texture does
 /// not have - E bit 0 in the mip filter, bits 1-2 in the min filter, bits 3-6 in the mip count
-/// and bits 7-12 in the LOD bias. So the stride travels inside the 16 bytes, and a by-value copy
-/// of the struct samples at the same pitch as the original.
+/// and bits 7-12 in the LOD bias - and its top two bits, 13-14, in `stride_ext` (vitasdk
+/// `gxm.h` names bits 1-2 "Stride extension for a LINEAR_STRIDED texture"). So the stride
+/// travels inside the 16 bytes, and a by-value copy of the struct samples at the same pitch as
+/// the original.
 pub(crate) fn pack_linear_stride(byte_stride: u32) -> u32 {
-    let e = (byte_stride >> 2).wrapping_sub(1) & 0x1fff;
+    let e = (byte_stride >> 2).wrapping_sub(1) & 0x7fff;
     ((e & 1) << texword0::MIP_FILTER.0)
         | (((e >> 1) & 3) << texword0::MIN_FILTER.0)
         | (((e >> 3) & 0xf) << texword0::MIP_COUNT.0)
         | (((e >> 7) & 0x3f) << texword0::LOD_BIAS.0)
+        | (((e >> 13) & 3) << texword0::STRIDE_EXT.0)
+}
+
+/// Every word-0 bit [`pack_linear_stride`] may set.
+const STRIDE_BITS: u32 = (texword0::MIP_FILTER.1 << texword0::MIP_FILTER.0)
+    | (texword0::MIN_FILTER.1 << texword0::MIN_FILTER.0)
+    | (texword0::MIP_COUNT.1 << texword0::MIP_COUNT.0)
+    | (texword0::LOD_BIAS.1 << texword0::LOD_BIAS.0)
+    | (texword0::STRIDE_EXT.1 << texword0::STRIDE_EXT.0);
+
+/// The init-time check on a strided texture's byte stride, shared with
+/// `sceGxmTextureSetStride`: a multiple of 4 in `4..=MAX_PACKED_STRIDE`. Recorded on a real
+/// console: 2 and 6 fail INVALID_ALIGNMENT, 0 and 131076 fail INVALID_VALUE.
+fn check_byte_stride(byte_stride: u32) -> Result<(), i32> {
+    if !byte_stride.is_multiple_of(4) {
+        Err(SCE_GXM_ERROR_INVALID_ALIGNMENT)
+    } else if !(4..=MAX_PACKED_STRIDE).contains(&byte_stride) {
+        Err(SCE_GXM_ERROR_INVALID_VALUE)
+    } else {
+        Ok(())
+    }
 }
 
 /// The inverse of [`pack_linear_stride`]: the byte stride a strided texture's word 0 carries.
@@ -3177,8 +4011,47 @@ pub(crate) fn linear_stride_from_word0(w0: u32) -> u32 {
     let e = field(texword0::MIP_FILTER)
         | (field(texword0::MIN_FILTER) << 1)
         | (field(texword0::MIP_COUNT) << 3)
-        | (field(texword0::LOD_BIAS) << 7);
+        | (field(texword0::LOD_BIAS) << 7)
+        | (field(texword0::STRIDE_EXT) << 13);
     (e + 1) * 4
+}
+
+/// The mip-count field's encoding: the hardware stores `count - 1`, clamped to the four bits,
+/// computed unsigned - so a count of 0 is stored as 15.
+fn mip_count_field(count: u32) -> u32 {
+    count.wrapping_sub(1).min(texword0::MIP_COUNT.1)
+}
+
+/// The mip count a stored field means: `field + 1`, in four bits - so the 15 a count of 0
+/// stores reads back as 0 again. Shared with the renderer, which reads it out of the words.
+pub(crate) fn mip_count_of_field(field: u32) -> u32 {
+    (field + 1) & texword0::MIP_COUNT.1
+}
+
+/// Width and height out of control word 1. SWIZZLED and CUBE textures keep each as a 4-bit
+/// log2 (vitasdk `gxm.h` `swizzled_cube`: height at bits 0-3, width at bits 16-19), which is
+/// why they only take powers of two; every other type keeps a 12-bit `size - 1` (`generic2`).
+pub(crate) fn texture_dims(w1: u32) -> (u32, u32) {
+    if pot_type((w1 >> 29) & 0x7) {
+        (1 << ((w1 >> 16) & 0xf), 1 << (w1 & 0xf))
+    } else {
+        (((w1 >> 12) & 0xfff) + 1, (w1 & 0xfff) + 1)
+    }
+}
+
+/// The size fields of control word 1 for a texture of this type - the inverse of
+/// [`texture_dims`]. A power-of-two type's sizes are stored as their log2.
+fn texture_dims_field(type_field: u32, width: u32, height: u32) -> u32 {
+    if pot_type(type_field) {
+        (height.max(1).ilog2() & 0xf) | ((width.max(1).ilog2() & 0xf) << 16)
+    } else {
+        (height.saturating_sub(1) & 0xfff) | ((width.saturating_sub(1) & 0xfff) << 12)
+    }
+}
+
+/// The types whose control word 1 stores log2 sizes, and whose init rejects anything else.
+fn pot_type(type_field: u32) -> bool {
+    type_field == TYPE_SWIZZLED || type_field == TYPE_CUBE
 }
 
 /// Read one field of a texture's control word 0.
@@ -3213,11 +4086,31 @@ pub(super) fn texture_set_v_addr_mode(ctx: &mut GuestCtx) {
 }
 
 /// int sceGxmTextureSetLodBias(SceGxmTexture *texture, unsigned int bias)
+///
+/// The raw 6-bit field (31 = no bias). Refused rather than truncated: a NULL texture is
+/// INVALID_POINTER, a bias above 63 INVALID_VALUE, and a `LINEAR_STRIDED` texture
+/// UNSUPPORTED - those word-0 bits are its byte stride (working-area spec gxm-lod-bias,
+/// gxm-lod-min section 3). The inline form ([`inline_op`]) hands exactly these cases here.
 pub(super) fn texture_set_lod_bias(ctx: &mut GuestCtx) {
     let texture = ctx.arg(0);
     let bias = ctx.arg(1);
-    set_tex_field(ctx, texture, texword0::LOD_BIAS, bias);
-    ctx.ret(0);
+    let (_, mask) = texword0::LOD_BIAS;
+    if texture == 0 {
+        ctx.ret(SCE_GXM_ERROR_INVALID_POINTER as u32);
+    } else if is_strided(ctx, texture) {
+        ctx.ret(SCE_GXM_ERROR_UNSUPPORTED as u32);
+    } else if bias > mask {
+        ctx.ret(SCE_GXM_ERROR_INVALID_VALUE as u32);
+    } else {
+        set_tex_field(ctx, texture, texword0::LOD_BIAS, bias);
+        ctx.ret(0);
+    }
+}
+
+/// Whether `texture` is `LINEAR_STRIDED` (word 1's type field), whose word-0 sampler bits
+/// carry its byte stride instead.
+fn is_strided(ctx: &GuestCtx, texture: u32) -> bool {
+    (ctx.read_u32(texture + 4) >> 29) & 0x7 == TYPE_LINEAR_STRIDED
 }
 
 /// int sceGxmTextureSetMipmapCount(SceGxmTexture *texture, unsigned int mipCount)
@@ -3225,10 +4118,22 @@ pub(super) fn texture_set_lod_bias(ctx: &mut GuestCtx) {
 /// The setter half of the field [`texture_get_mipmap_count`] reads. A title calls it after
 /// `sceGxmTextureInitLinear` when it uploads a chain whose length differs from the one the
 /// init declared, and the count is what says how many levels the sampler may walk.
+///
+/// Held to init's own rules: a strided texture has no mip count (those bits are its stride)
+/// and is refused UNSUPPORTED, a count above 13 is INVALID_VALUE, and the field stores
+/// `count - 1` (see [`mip_count_field`]).
 pub(super) fn texture_set_mipmap_count(ctx: &mut GuestCtx) {
     let texture = ctx.arg(0);
     let count = ctx.arg(1);
-    set_tex_field(ctx, texture, texword0::MIP_COUNT, count);
+    if (ctx.read_u32(texture + 4) >> 29) & 0x7 == TYPE_LINEAR_STRIDED {
+        ctx.ret(SCE_GXM_ERROR_UNSUPPORTED as u32);
+        return;
+    }
+    if count > MAX_MIP_COUNT {
+        ctx.ret(SCE_GXM_ERROR_INVALID_VALUE as u32);
+        return;
+    }
+    set_tex_field(ctx, texture, texword0::MIP_COUNT, mip_count_field(count));
     ctx.ret(0);
 }
 
@@ -3251,8 +4156,15 @@ const TEX_W2_LOD_MIN_HI_SHIFT: u32 = 0;
 const TEX_W3_LOD_MIN_LO_SHIFT: u32 = 26;
 
 /// int sceGxmTextureSetLodMin(SceGxmTexture *texture, unsigned int lodMin)
+///
+/// A `LINEAR_STRIDED` texture has no LOD min and is refused UNSUPPORTED (gxm-lod-min spec,
+/// section 3).
 pub(super) fn texture_set_lod_min(ctx: &mut GuestCtx) {
     let texture = ctx.arg(0);
+    if is_strided(ctx, texture) {
+        ctx.ret(SCE_GXM_ERROR_UNSUPPORTED as u32);
+        return;
+    }
     // Masked, not asserted, for the reason `set_tex_field` gives: the field is this wide,
     // so a wider value gets what the hardware would keep.
     let lod_min = ctx.arg(1) & 0xf;
@@ -3273,8 +4185,14 @@ pub(super) fn texture_set_lod_min(ctx: &mut GuestCtx) {
 ///
 /// Registered alongside the setter rather than left to hard-fail: they are one field, and a
 /// getter that disagreed with the setter would be worse than either alone.
+///
+/// 0 for a `LINEAR_STRIDED` texture, which has no LOD min.
 pub(super) fn texture_get_lod_min(ctx: &mut GuestCtx) {
     let texture = ctx.arg(0);
+    if is_strided(ctx, texture) {
+        ctx.ret(0);
+        return;
+    }
     let hi = (ctx.read_u32(texture + TEX_WORD2) >> TEX_W2_LOD_MIN_HI_SHIFT) & 0x3;
     let lo = (ctx.read_u32(texture + TEX_WORD3) >> TEX_W3_LOD_MIN_LO_SHIFT) & 0x3;
     ctx.ret((hi << 2) | lo);
@@ -3316,10 +4234,16 @@ pub(super) fn texture_set_mip_filter(ctx: &mut GuestCtx) {
 ///
 /// The inverse of [`texture_set_mip_filter`]: the enum is the register bits in place, so the
 /// field is shifted back up. A fighting title links it (NID from the vitasdk db, called at runtime).
+///
+/// DISABLED (0) for a `LINEAR_STRIDED` texture, whose bit there is stride.
 pub(super) fn texture_get_mip_filter(ctx: &mut GuestCtx) {
     let texture = ctx.arg(0);
     let (shift, _) = texword0::MIP_FILTER;
-    let v = tex_field(ctx, texture, texword0::MIP_FILTER) << shift;
+    let v = if is_strided(ctx, texture) {
+        0
+    } else {
+        tex_field(ctx, texture, texword0::MIP_FILTER) << shift
+    };
     ctx.ret(v);
 }
 
@@ -3370,16 +4294,30 @@ pub(super) fn set_uniform_buffer(ctx: &mut GuestCtx, stage: &'static str) {
 // --- Texture getters (read back the sticky sampler/format state) -------------
 
 /// unsigned int sceGxmTextureGetMipmapCountUnsafe(const SceGxmTexture *texture)
-pub(super) fn texture_get_mipmap_count(ctx: &mut GuestCtx) {
+///
+/// The field is `count - 1` (see [`mip_count_of_field`]). The checked spelling answers 0 for a
+/// strided texture, whose field holds stride bits; the Unsafe one does not look at the type.
+pub(super) fn texture_get_mipmap_count(ctx: &mut GuestCtx, checked: bool) {
     let texture = ctx.arg(0);
-    let v = tex_field(ctx, texture, texword0::MIP_COUNT);
+    let strided = (ctx.read_u32(texture + 4) >> 29) & 0x7 == TYPE_LINEAR_STRIDED;
+    let v = if checked && strided {
+        0
+    } else {
+        mip_count_of_field(tex_field(ctx, texture, texword0::MIP_COUNT))
+    };
     ctx.ret(v);
 }
 
 /// unsigned int sceGxmTextureGetLodBias(const SceGxmTexture *texture)
+///
+/// 0 for a `LINEAR_STRIDED` texture: those bits are its stride, and the driver hides them.
 pub(super) fn texture_get_lod_bias(ctx: &mut GuestCtx) {
     let texture = ctx.arg(0);
-    let v = tex_field(ctx, texture, texword0::LOD_BIAS);
+    let v = if is_strided(ctx, texture) {
+        0
+    } else {
+        tex_field(ctx, texture, texword0::LOD_BIAS)
+    };
     ctx.ret(v);
 }
 
@@ -3398,9 +4336,17 @@ pub(super) fn texture_get_v_addr_mode(ctx: &mut GuestCtx) {
 }
 
 /// SceGxmTextureFilter sceGxmTextureGetMinFilter(const SceGxmTexture *texture)
+///
+/// For a `LINEAR_STRIDED` texture the min-filter bits are stride and the MAG filter serves
+/// for both, so that is what the driver reports.
 pub(super) fn texture_get_min_filter(ctx: &mut GuestCtx) {
     let texture = ctx.arg(0);
-    let v = tex_field(ctx, texture, texword0::MIN_FILTER);
+    let field = if is_strided(ctx, texture) {
+        texword0::MAG_FILTER
+    } else {
+        texword0::MIN_FILTER
+    };
+    let v = tex_field(ctx, texture, field);
     ctx.ret(v);
 }
 
@@ -3425,9 +4371,12 @@ pub(super) fn texture_get_gamma_mode(ctx: &mut GuestCtx) {
 }
 
 /// unsigned int sceGxmTextureGetStride(const SceGxmTexture *texture)
+///
+/// The byte stride of a `LINEAR_STRIDED` texture, and 0 for every other type - not a pitch
+/// derived from the width. Only a strided texture HAS a stride in its words.
 pub(super) fn texture_get_stride(ctx: &mut GuestCtx, st: &mut VitaState) {
     let texture = ctx.arg(0);
-    let stride = st.texture_stride(ctx, texture);
+    let stride = st.linear_strided_stride(ctx, texture);
     ctx.ret(stride);
 }
 
@@ -3436,7 +4385,9 @@ pub(super) fn texture_get_stride(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// void *sceGxmColorSurfaceGetData(const SceGxmColorSurface *surface)
 #[hostcall]
 pub(super) fn color_surface_get_data(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
-    let data = resolve_color_surface(ctx, st, surface).map(|s| s.data_addr).unwrap_or(0);
+    let data = resolve_color_surface(ctx, st, surface)
+        .map(|s| s.data_addr)
+        .unwrap_or(0);
     // A getter that answers zero for a surface the title is about to build a texture from makes
     // the title skip the build and bind an uninitialised `SceGxmTexture` - which then samples
     // as a 1x1 zero texel and blacks out whatever pass reads it, a long way from here. Say it
@@ -3459,13 +4410,24 @@ pub(super) fn color_surface_get_data(ctx: &mut GuestCtx, st: &mut VitaState, sur
 
 /// unsigned int sceGxmColorSurfaceGetStrideInPixels(const SceGxmColorSurface *surface)
 #[hostcall]
-pub(super) fn color_surface_get_stride_in_pixels(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
-    resolve_color_surface(ctx, st, surface).map(|s| s.stride_pixels).unwrap_or(0)
+pub(super) fn color_surface_get_stride_in_pixels(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: u32,
+) -> u32 {
+    resolve_color_surface(ctx, st, surface)
+        .map(|s| s.stride_pixels)
+        .unwrap_or(0)
 }
 
 /// int sceGxmColorSurfaceSetGammaMode(SceGxmColorSurface *surface, SceGxmColorSurfaceGammaMode gammaMode)
 #[hostcall]
-pub(super) fn color_surface_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32, gamma: u32) -> i32 {
+pub(super) fn color_surface_set_gamma_mode(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: u32,
+    gamma: u32,
+) -> i32 {
     // The buffer this surface writes, recorded beside the pointer so the mode survives the
     // guest describing the same surface through a different struct - see
     // `VitaState::color_surface_gamma`. Read from the struct's own contents first, exactly as
@@ -3508,15 +4470,20 @@ pub(super) fn color_surface_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaStat
         // Once per (surface data, mode) for the run - see `set_color_surface_gamma`.
         // Keyed on the surface's SIZE and the mode, not its address (a fresh surface every
         // frame is the same fact every frame); the address printed is the first sighting's.
-        if crate::rtt_writeback::report_once(0x6c00_0000_0000_0000 ^ ((s.width as u64) << 40) ^ ((s.height as u64) << 16) ^ gamma as u64) {
-        tracing::info!(
-            target: "vitaslop::status",
-            "gxm surface: {} on the surface at data {:#x} ({}x{}), mode {gamma:#x}",
-            if gamma != 0 { "GAMMA-CORRECT writes ENABLED" } else { "gamma-correct writes DISABLED (linear)" },
-            s.data_addr,
-            s.width,
-            s.height
-        );
+        if crate::rtt_writeback::report_once(
+            0x6c00_0000_0000_0000
+                ^ ((s.width as u64) << 40)
+                ^ ((s.height as u64) << 16)
+                ^ gamma as u64,
+        ) {
+            tracing::info!(
+                target: "vitaslop::status",
+                "gxm surface: {} on the surface at data {:#x} ({}x{}), mode {gamma:#x}",
+                if gamma != 0 { "GAMMA-CORRECT writes ENABLED" } else { "gamma-correct writes DISABLED (linear)" },
+                s.data_addr,
+                s.width,
+                s.height
+            );
         }
         st.set_color_surface(surface, s);
     }
@@ -3634,7 +4601,15 @@ pub(super) fn precomputed_draw_set_params(
     index_data: u32,
     index_count: u32,
 ) -> i32 {
-    st.precomputed_draw_set_params(ctx, precomputed, prim_type, index_type, index_data, index_count, 0);
+    st.precomputed_draw_set_params(
+        ctx,
+        precomputed,
+        prim_type,
+        index_type,
+        index_data,
+        index_count,
+        0,
+    );
     0
 }
 
@@ -3662,7 +4637,15 @@ pub(super) fn precomputed_draw_set_params_instanced(
         instances = index_count.checked_div(index_wrap).unwrap_or(1),
         "precomputedDrawSetParamsInstanced"
     );
-    st.precomputed_draw_set_params(ctx, precomputed, prim_type, index_type, index_data, index_count, index_wrap);
+    st.precomputed_draw_set_params(
+        ctx,
+        precomputed,
+        prim_type,
+        index_type,
+        index_data,
+        index_count,
+        index_wrap,
+    );
     0
 }
 
@@ -3670,6 +4653,14 @@ pub(super) fn precomputed_draw_set_params_instanced(
 ///     *precomputedDraw): replay the bundled draw into the current scene.
 pub(super) fn draw_precomputed(ctx: &mut GuestCtx, st: &mut VitaState) {
     let precomputed = ctx.arg(1);
+    if let Some(r) = defer_draw(
+        ctx,
+        st,
+        crate::host::DeferredDraw::Precomputed { precomputed },
+    ) {
+        ctx.ret(r as u32);
+        return;
+    }
     st.draw_precomputed(ctx, precomputed);
     ctx.ret(0);
 }
@@ -3708,7 +4699,13 @@ pub(super) fn get_precomputed_fragment_state_size(_program: u32) -> u32 {
 /// int sceGxmPrecomputedVertexStateInit(SceGxmPrecomputedVertexState *state,
 ///     const SceGxmVertexProgram *vertexProgram, void *memBlock)
 #[hostcall]
-pub(super) fn precomputed_vertex_state_init(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, vertex_program: u32, _mem_block: u32) -> i32 {
+pub(super) fn precomputed_vertex_state_init(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+    vertex_program: u32,
+    _mem_block: u32,
+) -> i32 {
     st.precomputed_vertex_state_init(ctx, state, vertex_program);
     0
 }
@@ -3716,41 +4713,71 @@ pub(super) fn precomputed_vertex_state_init(ctx: &mut GuestCtx, st: &mut VitaSta
 /// int sceGxmPrecomputedFragmentStateInit(SceGxmPrecomputedFragmentState *state,
 ///     const SceGxmFragmentProgram *fragmentProgram, void *memBlock)
 #[hostcall]
-pub(super) fn precomputed_fragment_state_init(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, fragment_program: u32, _mem_block: u32) -> i32 {
+pub(super) fn precomputed_fragment_state_init(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+    fragment_program: u32,
+    _mem_block: u32,
+) -> i32 {
     st.precomputed_fragment_state_init(ctx, state, fragment_program);
     0
 }
 
 /// void sceGxmPrecomputedVertexStateSetDefaultUniformBuffer(state, void *defaultBuffer)
 #[hostcall]
-pub(super) fn precomputed_vertex_state_set_default_uniform_buffer(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, buffer: u32) -> i32 {
+pub(super) fn precomputed_vertex_state_set_default_uniform_buffer(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+    buffer: u32,
+) -> i32 {
     st.precomputed_vertex_state_set_uniform_buffer(ctx, state, buffer);
     0
 }
 
 /// void sceGxmPrecomputedFragmentStateSetDefaultUniformBuffer(state, void *defaultBuffer)
 #[hostcall]
-pub(super) fn precomputed_fragment_state_set_default_uniform_buffer(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, buffer: u32) -> i32 {
+pub(super) fn precomputed_fragment_state_set_default_uniform_buffer(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+    buffer: u32,
+) -> i32 {
     st.precomputed_fragment_state_set_uniform_buffer(ctx, state, buffer);
     0
 }
 
 /// void *sceGxmPrecomputedVertexStateGetDefaultUniformBuffer(const ...State *state)
 #[hostcall]
-pub(super) fn precomputed_vertex_state_get_default_uniform_buffer(ctx: &mut GuestCtx, st: &mut VitaState, state: u32) -> u32 {
+pub(super) fn precomputed_vertex_state_get_default_uniform_buffer(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+) -> u32 {
     st.precomputed_vertex_state_uniform_buffer(ctx, state)
 }
 
 /// void *sceGxmPrecomputedFragmentStateGetDefaultUniformBuffer(const ...State *state)
 #[hostcall]
-pub(super) fn precomputed_fragment_state_get_default_uniform_buffer(ctx: &mut GuestCtx, st: &mut VitaState, state: u32) -> u32 {
+pub(super) fn precomputed_fragment_state_get_default_uniform_buffer(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+) -> u32 {
     st.precomputed_fragment_state_uniform_buffer(ctx, state)
 }
 
 /// int sceGxmPrecomputedVertexStateSetTexture(state, unsigned int textureIndex,
 ///     const SceGxmTexture *texture)
 #[hostcall]
-pub(super) fn precomputed_vertex_state_set_texture(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, index: u32, texture: u32) -> i32 {
+pub(super) fn precomputed_vertex_state_set_texture(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+    index: u32,
+    texture: u32,
+) -> i32 {
     st.precomputed_vertex_state_set_texture(ctx, state, index, texture);
     0
 }
@@ -3758,7 +4785,13 @@ pub(super) fn precomputed_vertex_state_set_texture(ctx: &mut GuestCtx, st: &mut 
 /// int sceGxmPrecomputedFragmentStateSetTexture(state, unsigned int textureIndex,
 ///     const SceGxmTexture *texture)
 #[hostcall]
-pub(super) fn precomputed_fragment_state_set_texture(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, index: u32, texture: u32) -> i32 {
+pub(super) fn precomputed_fragment_state_set_texture(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+    index: u32,
+    texture: u32,
+) -> i32 {
     st.precomputed_fragment_state_set_texture(ctx, state, index, texture);
     0
 }
@@ -3766,7 +4799,12 @@ pub(super) fn precomputed_fragment_state_set_texture(ctx: &mut GuestCtx, st: &mu
 /// void sceGxmSetPrecomputedVertexState(SceGxmContext *context,
 ///     const SceGxmPrecomputedVertexState *precomputedState)
 #[hostcall]
-pub(super) fn set_precomputed_vertex_state(ctx: &mut GuestCtx, st: &mut VitaState, _context: u32, state: u32) -> i32 {
+pub(super) fn set_precomputed_vertex_state(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    _context: u32,
+    state: u32,
+) -> i32 {
     st.bind_precomputed_vertex_state(ctx, state);
     0
 }
@@ -3774,7 +4812,12 @@ pub(super) fn set_precomputed_vertex_state(ctx: &mut GuestCtx, st: &mut VitaStat
 /// void sceGxmSetPrecomputedFragmentState(SceGxmContext *context,
 ///     const SceGxmPrecomputedFragmentState *precomputedState)
 #[hostcall]
-pub(super) fn set_precomputed_fragment_state(ctx: &mut GuestCtx, st: &mut VitaState, _context: u32, state: u32) -> i32 {
+pub(super) fn set_precomputed_fragment_state(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    _context: u32,
+    state: u32,
+) -> i32 {
     st.bind_precomputed_fragment_state(ctx, state);
     0
 }
@@ -3801,18 +4844,29 @@ const DS_BACKGROUND_CONTROL: u32 = 0x10;
 /// `SceGxmDepthStencilForceLoadMode` / `ForceStoreMode` occupy these bits of `zlsControl`.
 const DS_FORCE_LOAD_MASK: u32 = 0x0000_0002;
 const DS_FORCE_STORE_MASK: u32 = 0x0000_0004;
+/// Bits 0 and 20 of `zlsControl`, set on every enabled surface.
+const DS_ENABLED_BITS: u32 = 0x0010_0001;
+/// `strideInSamples / 32 - 1`, eight bits at bit 3.
+const DS_STRIDE_SHIFT: u32 = 3;
+const DS_STRIDE_MASK: u32 = 0xff;
+/// `SceGxmDepthStencilSurfaceType` and `SceGxmDepthStencilFormat`, each in its own bits.
+const DS_TYPE_MASK: u32 = 0x0001_1000;
+const DS_FORMAT_MASK: u32 = 0x07EE_E000;
+/// `backgroundControl`: stencil in bits 0-7, the background MASK bit 8, and bit 9 always set.
+const DS_BACKGROUND_MASK_BIT: u32 = 1 << 8;
+const DS_BACKGROUND_DEFAULT: u32 = (1 << 9) | DS_BACKGROUND_MASK_BIT;
 
 /// int sceGxmDepthStencilSurfaceInit(SceGxmDepthStencilSurface *surface,
 ///     SceGxmDepthStencilFormat depthStencilFormat, SceGxmDepthStencilSurfaceType
 ///     surfaceType, unsigned int strideInSamples, void *depthData, void *stencilData)
 ///
-/// Fills the published fields, with the GXM defaults for the two background values (a
-/// depth clear of 1.0 - the far plane - and no background stencil). `format`,
-/// `surfaceType` and `strideInSamples` belong to `zlsControl`, whose packing is not
-/// published; they are folded in as the enum words they already are, which keeps the
-/// force bits (the part that IS specified) exact. Nothing here reads that word back, and
-/// every `Get` that would expose the packing is an unimplemented NID that hard-fails, so
-/// a wrong guess cannot be observed as a wrong ANSWER - only as a loud missing call.
+/// Fills the published fields, with the GXM defaults for the background values (a depth
+/// clear of 1.0 - the far plane - no background stencil, and the background mask set).
+/// `zlsControl` packs (as the driver lays it down): bit 0 and bit 20 set on an enabled
+/// surface, the force bits 1-2 clear, `strideInSamples / 32 - 1` in bits 3-10, and the type
+/// (mask `0x00011000`) and format (mask `0x07EEE000`) enums in their own bit positions -
+/// which is what lets [`depth_stencil_surface_get_format`] answer with the mask alone.
+/// A stride that is zero or not a multiple of 32 is INVALID_VALUE.
 pub(super) fn depth_stencil_surface_init(ctx: &mut GuestCtx, _st: &mut VitaState) {
     let surface = ctx.arg(0);
     let format = ctx.arg(1);
@@ -3820,12 +4874,23 @@ pub(super) fn depth_stencil_surface_init(ctx: &mut GuestCtx, _st: &mut VitaState
     let stride_in_samples = ctx.arg(3);
     let depth_data = ctx.arg(4);
     let stencil_data = ctx.arg(5);
-    let zls = format | surface_type | (stride_in_samples & !(DS_FORCE_LOAD_MASK | DS_FORCE_STORE_MASK));
+    if surface == 0 {
+        ctx.ret(SCE_GXM_ERROR_INVALID_POINTER as u32);
+        return;
+    }
+    if stride_in_samples == 0 || !stride_in_samples.is_multiple_of(32) {
+        ctx.ret(SCE_GXM_ERROR_INVALID_VALUE as u32);
+        return;
+    }
+    let zls = DS_ENABLED_BITS
+        | ((((stride_in_samples >> 5) - 1) & DS_STRIDE_MASK) << DS_STRIDE_SHIFT)
+        | (surface_type & DS_TYPE_MASK)
+        | (format & DS_FORMAT_MASK);
     ctx.write_u32(surface + DS_ZLS_CONTROL, zls);
     ctx.write_u32(surface + DS_DEPTH_DATA, depth_data);
     ctx.write_u32(surface + DS_STENCIL_DATA, stencil_data);
     ctx.write_u32(surface + DS_BACKGROUND_DEPTH, 1.0f32.to_bits());
-    ctx.write_u32(surface + DS_BACKGROUND_CONTROL, 0);
+    ctx.write_u32(surface + DS_BACKGROUND_CONTROL, DS_BACKGROUND_DEFAULT);
     ctx.ret(0);
 }
 
@@ -3842,9 +4907,98 @@ pub(super) fn depth_stencil_surface_init_disabled(ctx: &mut GuestCtx, _st: &mut 
         ctx.write_u32(surface + DS_DEPTH_DATA, 0);
         ctx.write_u32(surface + DS_STENCIL_DATA, 0);
         ctx.write_u32(surface + DS_BACKGROUND_DEPTH, 1.0f32.to_bits());
-        ctx.write_u32(surface + DS_BACKGROUND_CONTROL, 0);
+        ctx.write_u32(surface + DS_BACKGROUND_CONTROL, DS_BACKGROUND_DEFAULT);
     }
     ctx.ret(0);
+}
+
+/// float sceGxmDepthStencilSurfaceGetBackgroundDepth(const SceGxmDepthStencilSurface *surface)
+#[hostcall]
+pub(super) fn depth_stencil_surface_get_background_depth(ctx: &mut GuestCtx, surface: u32) -> f32 {
+    if surface == 0 {
+        0.0
+    } else {
+        f32::from_bits(ctx.read_u32(surface + DS_BACKGROUND_DEPTH))
+    }
+}
+
+/// The `zlsControl` or `backgroundControl` word of a surface, or 0 for NULL - the getters of a
+/// NULL surface answer 0 rather than fault.
+fn ds_word(ctx: &GuestCtx, surface: u32, offset: u32) -> u32 {
+    if surface == 0 {
+        0
+    } else {
+        ctx.read_u32(surface + offset)
+    }
+}
+
+/// SceBool sceGxmDepthStencilSurfaceGetBackgroundMask(const SceGxmDepthStencilSurface *surface)
+#[hostcall]
+pub(super) fn depth_stencil_surface_get_background_mask(ctx: &mut GuestCtx, surface: u32) -> u32 {
+    (ds_word(ctx, surface, DS_BACKGROUND_CONTROL) & DS_BACKGROUND_MASK_BIT) >> 8
+}
+
+/// void sceGxmDepthStencilSurfaceSetBackgroundMask(SceGxmDepthStencilSurface *surface, SceBool mask)
+#[hostcall]
+pub(super) fn depth_stencil_surface_set_background_mask(
+    ctx: &mut GuestCtx,
+    surface: u32,
+    mask: u32,
+) -> i32 {
+    if surface != 0 {
+        let w = ctx.read_u32(surface + DS_BACKGROUND_CONTROL) & !DS_BACKGROUND_MASK_BIT;
+        ctx.write_u32(
+            surface + DS_BACKGROUND_CONTROL,
+            w | if mask != 0 { DS_BACKGROUND_MASK_BIT } else { 0 },
+        );
+    }
+    0
+}
+
+/// unsigned char sceGxmDepthStencilSurfaceGetBackgroundStencil(const SceGxmDepthStencilSurface *surface)
+#[hostcall]
+pub(super) fn depth_stencil_surface_get_background_stencil(
+    ctx: &mut GuestCtx,
+    surface: u32,
+) -> u32 {
+    ds_word(ctx, surface, DS_BACKGROUND_CONTROL) & 0xff
+}
+
+/// SceGxmDepthStencilForceLoadMode sceGxmDepthStencilSurfaceGetForceLoadMode(surface): the
+/// enum is the bit in place.
+#[hostcall]
+pub(super) fn depth_stencil_surface_get_force_load_mode(ctx: &mut GuestCtx, surface: u32) -> u32 {
+    ds_word(ctx, surface, DS_ZLS_CONTROL) & DS_FORCE_LOAD_MASK
+}
+
+/// SceGxmDepthStencilForceStoreMode sceGxmDepthStencilSurfaceGetForceStoreMode(surface)
+#[hostcall]
+pub(super) fn depth_stencil_surface_get_force_store_mode(ctx: &mut GuestCtx, surface: u32) -> u32 {
+    ds_word(ctx, surface, DS_ZLS_CONTROL) & DS_FORCE_STORE_MASK
+}
+
+/// SceGxmDepthStencilFormat sceGxmDepthStencilSurfaceGetFormat(surface): the format enum,
+/// which `zlsControl` keeps in its own bit positions.
+#[hostcall]
+pub(super) fn depth_stencil_surface_get_format(ctx: &mut GuestCtx, surface: u32) -> u32 {
+    ds_word(ctx, surface, DS_ZLS_CONTROL) & DS_FORMAT_MASK
+}
+
+/// unsigned int sceGxmDepthStencilSurfaceGetStrideInSamples(surface)
+#[hostcall]
+pub(super) fn depth_stencil_surface_get_stride_in_samples(ctx: &mut GuestCtx, surface: u32) -> u32 {
+    // Expression-bodied: `#[hostcall]` inlines this, so an early `return` would leave the wrapper.
+    if surface == 0 {
+        0
+    } else {
+        (((ds_word(ctx, surface, DS_ZLS_CONTROL) >> DS_STRIDE_SHIFT) & DS_STRIDE_MASK) + 1) * 32
+    }
+}
+
+/// SceBool sceGxmDepthStencilSurfaceIsEnabled(surface): any format bits at all.
+#[hostcall]
+pub(super) fn depth_stencil_surface_is_enabled(ctx: &mut GuestCtx, surface: u32) -> u32 {
+    u32::from(ds_word(ctx, surface, DS_ZLS_CONTROL) & DS_FORMAT_MASK != 0)
 }
 
 /// void sceGxmDepthStencilSurfaceSetBackgroundDepth(SceGxmDepthStencilSurface *surface,
@@ -3875,7 +5029,10 @@ pub(super) fn depth_stencil_surface_set_background_stencil(
     background_stencil: u32,
 ) -> i32 {
     let w = ctx.read_u32(surface + DS_BACKGROUND_CONTROL);
-    ctx.write_u32(surface + DS_BACKGROUND_CONTROL, (w & !0xff) | (background_stencil & 0xff));
+    ctx.write_u32(
+        surface + DS_BACKGROUND_CONTROL,
+        (w & !0xff) | (background_stencil & 0xff),
+    );
     0
 }
 
@@ -3889,7 +5046,10 @@ pub(super) fn depth_stencil_surface_set_force_load_mode(
     force_load: u32,
 ) -> i32 {
     let w = ctx.read_u32(surface + DS_ZLS_CONTROL);
-    ctx.write_u32(surface + DS_ZLS_CONTROL, (w & !DS_FORCE_LOAD_MASK) | (force_load & DS_FORCE_LOAD_MASK));
+    ctx.write_u32(
+        surface + DS_ZLS_CONTROL,
+        (w & !DS_FORCE_LOAD_MASK) | (force_load & DS_FORCE_LOAD_MASK),
+    );
     0
 }
 
@@ -3903,7 +5063,10 @@ pub(super) fn depth_stencil_surface_set_force_store_mode(
     force_store: u32,
 ) -> i32 {
     let w = ctx.read_u32(surface + DS_ZLS_CONTROL);
-    ctx.write_u32(surface + DS_ZLS_CONTROL, (w & !DS_FORCE_STORE_MASK) | (force_store & DS_FORCE_STORE_MASK));
+    ctx.write_u32(
+        surface + DS_ZLS_CONTROL,
+        (w & !DS_FORCE_STORE_MASK) | (force_store & DS_FORCE_STORE_MASK),
+    );
     0
 }
 
@@ -3911,14 +5074,24 @@ pub(super) fn depth_stencil_surface_set_force_store_mode(
 
 /// void sceGxmSetBackDepthWriteEnable(SceGxmContext *context, SceGxmDepthWriteMode enable)
 #[hostcall]
-pub(super) fn set_back_depth_write_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+pub(super) fn set_back_depth_write_enable(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    enable: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::BACK_DEPTH_WRITE, enable);
     0
 }
 
 /// void sceGxmSetBackPolygonMode(SceGxmContext *context, SceGxmPolygonMode mode)
 #[hostcall]
-pub(super) fn set_back_polygon_mode(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, mode: u32) -> i32 {
+pub(super) fn set_back_polygon_mode(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    mode: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::BACK_POLYGON_MODE, mode);
     0
 }
@@ -3928,7 +5101,12 @@ pub(super) fn set_back_polygon_mode(ctx: &mut GuestCtx, _st: &mut VitaState, con
 /// int sceGxmSetVisibilityBuffer(SceGxmContext *context, void *bufferBase,
 ///     unsigned int stridePerCore)
 #[hostcall]
-pub(super) fn set_visibility_buffer(st: &mut VitaState, _context: u32, base: u32, stride_per_core: u32) -> i32 {
+pub(super) fn set_visibility_buffer(
+    st: &mut VitaState,
+    _context: u32,
+    base: u32,
+    stride_per_core: u32,
+) -> i32 {
     st.set_visibility_buffer(base, stride_per_core);
     0
 }
@@ -3936,21 +5114,46 @@ pub(super) fn set_visibility_buffer(st: &mut VitaState, _context: u32, base: u32
 /// void sceGxmSetFrontVisibilityTestEnable(SceGxmContext *context,
 ///     SceGxmVisibilityTestMode enable)
 #[hostcall]
-pub(super) fn set_front_visibility_test_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
-    gxmctx::set(ctx, context, gxmctx::off::FRONT_VISIBILITY_TEST_ENABLE, enable);
+pub(super) fn set_front_visibility_test_enable(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    enable: u32,
+) -> i32 {
+    gxmctx::set(
+        ctx,
+        context,
+        gxmctx::off::FRONT_VISIBILITY_TEST_ENABLE,
+        enable,
+    );
     0
 }
 
 /// void sceGxmSetFrontVisibilityTestIndex(SceGxmContext *context, unsigned int index)
 #[hostcall]
-pub(super) fn set_front_visibility_test_index(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, index: u32) -> i32 {
-    gxmctx::set(ctx, context, gxmctx::off::FRONT_VISIBILITY_TEST_INDEX, index);
+pub(super) fn set_front_visibility_test_index(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    index: u32,
+) -> i32 {
+    gxmctx::set(
+        ctx,
+        context,
+        gxmctx::off::FRONT_VISIBILITY_TEST_INDEX,
+        index,
+    );
     0
 }
 
 /// void sceGxmSetFrontVisibilityTestOp(SceGxmContext *context, SceGxmVisibilityTestOp op)
 #[hostcall]
-pub(super) fn set_front_visibility_test_op(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, op: u32) -> i32 {
+pub(super) fn set_front_visibility_test_op(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    op: u32,
+) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::FRONT_VISIBILITY_TEST_OP, op);
     0
 }
@@ -3979,12 +5182,61 @@ pub(super) fn unmap_memory(st: &mut VitaState, base: u32) -> i32 {
     st.gxm_unmap(base)
 }
 
+/// int sceGxmSetYuvProfile(SceGxmContext *context, unsigned int index, SceGxmYuvProfile profile)
+///
+/// Which conversion the context's YUV slot `index` (0 = `CSC0`, 1 = `CSC1`) applies: BT.601 or
+/// BT.709, studio or full range. Read by every YUV texture whose swizzle names that slot.
+#[hostcall]
+pub(super) fn set_yuv_profile(
+    _ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    _context: u32,
+    index: u32,
+    profile: u32,
+) -> i32 {
+    if index > 1 || profile > 3 {
+        SCE_GXM_ERROR_INVALID_VALUE
+    } else {
+        st.yuv_profiles[index as usize] = profile;
+        tracing::debug!(target: "vitaslop::gxm", index, profile, "sceGxmSetYuvProfile");
+        0
+    }
+}
+
 // --- Colour surface: scale mode + data rebind --------------------------------
 
 /// SceGxmColorSurfaceScaleMode sceGxmColorSurfaceGetScaleMode(const SceGxmColorSurface *surface)
 #[hostcall]
-pub(super) fn color_surface_get_scale_mode(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
-    resolve_color_surface(ctx, st, surface).map(|s| s.scale_mode).unwrap_or(0)
+pub(super) fn color_surface_get_scale_mode(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: u32,
+) -> u32 {
+    resolve_color_surface(ctx, st, surface)
+        .map(|s| s.scale_mode)
+        .unwrap_or(0)
+}
+
+/// void sceGxmColorSurfaceSetScaleMode(SceGxmColorSurface *surface, SceGxmColorSurfaceScaleMode mode)
+/// Written into the guest struct and the address table, like `SetFormat`: the scene's render
+/// target reads the mode off the surface it is begun with (MSAA_DOWNSCALE resolves on store).
+#[hostcall]
+pub(super) fn color_surface_set_scale_mode(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: u32,
+    mode: u32,
+) -> i32 {
+    match resolve_color_surface(ctx, st, surface) {
+        Some(mut s) => {
+            s.scale_mode = mode;
+            report_color_surface_scale_mode(s.data_addr, mode);
+            write_color_surface(ctx, surface, &s);
+            st.set_color_surface(surface, s);
+            0
+        }
+        None => SCE_GXM_ERROR_INVALID_POINTER,
+    }
 }
 
 /// int sceGxmColorSurfaceSetData(SceGxmColorSurface *surface, void *data)
@@ -3994,7 +5246,12 @@ pub(super) fn color_surface_get_scale_mode(ctx: &mut GuestCtx, st: &mut VitaStat
 /// begun after this must be captured against the new buffer - a title double-buffers by
 /// calling exactly this between frames, and missing it renders every frame into one.
 #[hostcall]
-pub(super) fn color_surface_set_data(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32, data: u32) -> i32 {
+pub(super) fn color_surface_set_data(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: u32,
+    data: u32,
+) -> i32 {
     match resolve_color_surface(ctx, st, surface) {
         Some(mut s) => {
             s.data_addr = data;
@@ -4029,6 +5286,68 @@ pub(super) fn program_get_type(ctx: &mut GuestCtx, _st: &mut VitaState, program:
     ctx.read_u32(program.wrapping_add(0x14)) & 1
 }
 
+/// SceGxmFragmentProgramInputs sceGxmProgramGetFragmentProgramInputs(const SceGxmProgram *program)
+///
+/// The interpolants a fragment program reads, as flags: POSITION 0x1, FOG 0x2, COLOR0 0x4,
+/// COLOR1 0x8, TEXCOORDn `0x10 << n`, SPRITECOORD 0x4000; 0 for a vertex program. Read out of the
+/// program's own varying descriptors - the block at header +0x2C (self-relative), whose u16 at
+/// +0x0C counts the 16-byte descriptors that the self-relative offset at +0x10 points to. Each
+/// descriptor's `attribute_info` names up to two inputs: its semantic nibble (bits 12..15 - the
+/// same field `vitaslop_gxp_shader`'s container parser decodes a varying's usage from, 0..9
+/// texcoords, 0xA COLOR0, 0xB COLOR1, 0xC FOG, 0xD POSITION, 0xF none, with bit 30 making it a
+/// sprite coordinate) and a texcoord nibble (bits 0..3, 0xF none, bit 10 making it a sprite
+/// coordinate). The mapping is read from a reimplementation; the semantic nibble agrees with
+/// this project's own measured decode.
+#[hostcall]
+pub(super) fn program_get_fragment_program_inputs(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    program: u32,
+) -> u32 {
+    const SPRITECOORD: u32 = 0x4000;
+    let texcoord = |n: u32| 0x10u32 << n;
+    if program == 0 || ctx.read_u32(program.wrapping_add(0x14)) & 1 == 0 {
+        0
+    } else {
+        let varyings = program
+            .wrapping_add(0x2c)
+            .wrapping_add(ctx.read_u32(program.wrapping_add(0x2c)));
+        let count = ctx.read_u32(varyings.wrapping_add(0x0c)) & 0xffff;
+        let rel = ctx.read_u32(varyings.wrapping_add(0x10));
+        let table = varyings.wrapping_add(0x10).wrapping_add(rel);
+        let mut flags = 0;
+        for i in 0..if rel == 0 { 0 } else { count } {
+            let info = ctx.read_u32(table.wrapping_add(i * 16));
+            let a = info & 0xf;
+            if a != 0xf {
+                flags |= if info & 0x400 != 0 {
+                    SPRITECOORD
+                } else if a <= 9 {
+                    texcoord(a)
+                } else {
+                    0
+                };
+            }
+            let b = (info >> 12) & 0xf;
+            if b != 0xf {
+                flags |= if info & 0x4000_0000 != 0 {
+                    SPRITECOORD
+                } else {
+                    match b {
+                        0..=9 => texcoord(b),
+                        0xa => 0x4,
+                        0xb => 0x8,
+                        0xc => 0x2,
+                        0xd => 0x1,
+                        _ => 0,
+                    }
+                };
+            }
+        }
+        flags
+    }
+}
+
 /// unsigned int sceGxmProgramGetSize(const SceGxmProgram *program)
 ///
 /// The container header's own `size` field (+0x08), which is the length in bytes of the
@@ -4058,8 +5377,14 @@ pub(super) fn find_parameter_by_semantic(
     semantic: u32,
     index: u32,
 ) -> u32 {
-    let count = if semantic == 0 { 0 } else { ctx.read_u32(program.wrapping_add(0x24)) };
-    let base = program.wrapping_add(0x28).wrapping_add(ctx.read_u32(program.wrapping_add(0x28)));
+    let count = if semantic == 0 {
+        0
+    } else {
+        ctx.read_u32(program.wrapping_add(0x24))
+    };
+    let base = program
+        .wrapping_add(0x28)
+        .wrapping_add(ctx.read_u32(program.wrapping_add(0x28)));
     let want = (semantic & GXM_SEMANTIC_MASK) | ((index & 0xff) << GXM_SEMANTIC_INDEX_SHIFT);
     (0..count)
         .map(|i| base.wrapping_add(i.wrapping_mul(16)))
@@ -4125,7 +5450,12 @@ pub(super) fn set_vertex_texture(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// The host map is kept beside it, because it is what a `Get` can answer for a texture whose
 /// words were never ours to write.
 #[hostcall]
-pub(super) fn texture_set_palette(ctx: &mut GuestCtx, st: &mut VitaState, texture: u32, palette: u32) -> i32 {
+pub(super) fn texture_set_palette(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    texture: u32,
+    palette: u32,
+) -> i32 {
     report_unaligned_palette(texture, palette);
     if texture != 0 {
         let w3 = ctx.read_u32(texture.wrapping_add(12));
@@ -4329,6 +5659,46 @@ pub(crate) mod inline_op_tests {
         handler_result_over(func_nid, param_record())
     }
 
+    /// `sceGxmProgramGetFragmentProgramInputs` over a synthetic fragment program with three
+    /// varying descriptors: one naming TEXCOORD1 by its semantic nibble and TEXCOORD0 by its
+    /// texcoord nibble, one naming COLOR0, and one sprite coordinate. A vertex program has none.
+    #[test]
+    fn fragment_program_inputs_are_read_from_the_varying_descriptors() {
+        const PROG: u32 = 0x100;
+        let mut bytes = vec![0u8; 4096];
+        let put = |b: &mut Vec<u8>, at: u32, v: u32| {
+            b[at as usize..at as usize + 4].copy_from_slice(&v.to_le_bytes())
+        };
+        put(&mut bytes, PROG + 0x14, 1);
+        put(&mut bytes, PROG + 0x2c, 0x200 - (PROG + 0x2c));
+        put(&mut bytes, 0x200 + 0x0c, 3);
+        put(&mut bytes, 0x200 + 0x10, 0x300 - 0x210);
+        for (i, info) in [0x2cc0_1100u32, 0x0000_af0f, 0x4000_0f0f]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut bytes, 0x300 + 16 * i as u32, info);
+        }
+        let run = |bytes: &mut Vec<u8>| {
+            let mut regs = [0u32; REG_COUNT];
+            regs[0] = PROG;
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+            let mut mem = SliceMemory(bytes);
+            let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            super::super::dispatch(
+                crate::nid::lib::SCE_GXM,
+                g::PROGRAM_GET_FRAGMENT_PROGRAM_INPUTS,
+                &mut ctx,
+                &mut st,
+            );
+            regs[0]
+        };
+        assert_eq!(run(&mut bytes), 0x4000 | 0x4 | 0x20 | 0x10);
+        put(&mut bytes, PROG + 0x14, 0);
+        assert_eq!(run(&mut bytes), 0, "a vertex program reads no interpolants");
+    }
+
     /// As [`handler_result`], over a caller-supplied record.
     pub(crate) fn handler_result_over(func_nid: u32, record: [u32; 4]) -> u32 {
         let mut regs = [0u32; REG_COUNT];
@@ -4364,7 +5734,9 @@ pub(crate) mod inline_op_tests {
     fn inline_ops_match_their_handlers() {
         for func_nid in COVERED {
             let op = inline_op(func_nid).expect("listed NID has an inline form");
-            let offset = op.offset().expect("a GXM getter reads through its pointer argument");
+            let offset = op
+                .offset()
+                .expect("a GXM getter reads through its pointer argument");
             assert_eq!(
                 op.eval(word_at(offset)),
                 handler_result(func_nid),
@@ -4381,7 +5753,9 @@ pub(crate) mod inline_op_tests {
     fn program_inline_ops_match_their_handlers() {
         for func_nid in COVERED_PROGRAM {
             let op = inline_op(func_nid).expect("listed NID has an inline form");
-            let offset = op.offset().expect("a program getter reads through its pointer argument");
+            let offset = op
+                .offset()
+                .expect("a program getter reads through its pointer argument");
             let word = fixture_word(PROGRAM, offset);
             assert!(
                 !op.falls_back(word),
@@ -4442,11 +5816,32 @@ pub(crate) mod inline_op_tests {
         let valloc = VSIZE.max(gxmctx::UNIFORM_MIN_ALLOC);
         let falloc = gxmctx::UNIFORM_MIN_ALLOC;
         let expect = [
-            (g::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER, gxmctx::off::VERTEX_UNIFORM, align(RING), VSIZE, VHEADER, valloc),
-            (g::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER, gxmctx::off::FRAGMENT_UNIFORM, align(RING) + valloc, 0, FHEADER, falloc),
+            (
+                g::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER,
+                gxmctx::off::VERTEX_UNIFORM,
+                align(RING),
+                VSIZE,
+                VHEADER,
+                valloc,
+            ),
+            (
+                g::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER,
+                gxmctx::off::FRAGMENT_UNIFORM,
+                align(RING) + valloc,
+                0,
+                FHEADER,
+                falloc,
+            ),
             // A second vertex reserve, to prove the cursor really moved rather than being
             // rewritten to the same place.
-            (g::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER, gxmctx::off::VERTEX_UNIFORM, align(RING) + valloc + falloc, VSIZE, VHEADER, valloc),
+            (
+                g::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER,
+                gxmctx::off::VERTEX_UNIFORM,
+                align(RING) + valloc + falloc,
+                VSIZE,
+                VHEADER,
+                valloc,
+            ),
         ];
         for (nid, record, buf, size, header, alloc) in expect {
             regs[0] = CONTEXT;
@@ -4456,7 +5851,11 @@ pub(crate) mod inline_op_tests {
             let name = crate::nid::name(nid);
             assert_eq!(regs[0], 0, "{name} succeeds");
             let ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
-            assert_eq!(ctx.read_u32(OUT), buf, "{name} hands back the aligned block");
+            assert_eq!(
+                ctx.read_u32(OUT),
+                buf,
+                "{name} hands back the aligned block"
+            );
             assert_eq!(
                 gxmctx::uniform_binding(&ctx, CONTEXT, record),
                 gxmctx::UniformBinding { buf, size, header },
@@ -4508,8 +5907,14 @@ pub(crate) mod inline_op_tests {
         st.draw_precomputed(&mut ctx, PDRAW);
         let mut after = [0u8; gxmctx::BYTES as usize];
         ctx.read_into(CONTEXT, &mut after);
-        assert_eq!(after, before, "the context block is byte-for-byte what the setters left");
-        assert_eq!(gxmctx::get(&ctx, CONTEXT, gxmctx::off::VERTEX_PROGRAM), VHANDLE);
+        assert_eq!(
+            after, before,
+            "the context block is byte-for-byte what the setters left"
+        );
+        assert_eq!(
+            gxmctx::get(&ctx, CONTEXT, gxmctx::off::VERTEX_PROGRAM),
+            VHANDLE
+        );
         assert_eq!(gxmctx::stream(&ctx, CONTEXT, 0), STREAM);
     }
 
@@ -4524,30 +5929,50 @@ pub(crate) mod inline_op_tests {
     /// first and reads as a shader bug.
     #[test]
     fn the_uniform_data_layout_is_closed() {
-        let op = inline_op(g::SET_UNIFORM_DATA_F).expect("sceGxmSetUniformDataF has an inline form");
+        let op =
+            inline_op(g::SET_UNIFORM_DATA_F).expect("sceGxmSetUniformDataF has an inline form");
         let vitaslop_transpiler::InlineOp::SetUniformData { layout: l } = op else {
             panic!("it must lower to the uniform-copy form, got {op:?}");
         };
-        assert_eq!(l.param_packed_at, GXM_PARAM_WORD_OFF, "the packed word the handler reads");
-        assert_eq!(l.param_index_at, GXM_PARAM_RESOURCE_INDEX_OFF, "...and the resource index");
-        assert_eq!(l.bank_data_at, crate::host::SA_BANK_DATA, "the bank's first float");
+        assert_eq!(
+            l.param_packed_at, GXM_PARAM_WORD_OFF,
+            "the packed word the handler reads"
+        );
+        assert_eq!(
+            l.param_index_at, GXM_PARAM_RESOURCE_INDEX_OFF,
+            "...and the resource index"
+        );
+        assert_eq!(
+            l.bank_data_at,
+            crate::host::SA_BANK_DATA,
+            "the bank's first float"
+        );
         assert_eq!(l.bank_len_at, 0, "the high-water word sits before it");
-        assert_eq!(l.max_regs, crate::host::MAX_DEFAULT_UNIFORM_REGS, "the same ceiling both sides");
-        assert_eq!(l.bank_slot, super::super::mirror::SLOT_SA_BANK, "the slot the host publishes");
+        assert_eq!(
+            l.max_regs,
+            crate::host::MAX_DEFAULT_UNIFORM_REGS,
+            "the same ceiling both sides"
+        );
+        assert_eq!(
+            l.bank_slot,
+            super::super::mirror::SLOT_SA_BANK,
+            "the slot the host publishes"
+        );
         // The type field, decoded by the SAME function the handler decodes it with. The
         // emitted code compares a raw nibble, so this is where a renumbering is caught.
         assert!(
-            matches!(
-                ParamType::from_bits(l.f16_type as u8),
-                ParamType::F16
-            ),
+            matches!(ParamType::from_bits(l.f16_type as u8), ParamType::F16),
             "the nibble the inline form refuses must be the one `ParamType` calls F16"
         );
         assert!(
             !matches!(ParamType::from_bits(0), ParamType::F16),
             "...and F32, the case it DOES answer, must not be"
         );
-        assert_eq!((l.type_shift, l.type_mask), (4, 0xf), "the handler's own shift and mask");
+        assert_eq!(
+            (l.type_shift, l.type_mask),
+            (4, 0xf),
+            "the handler's own shift and mask"
+        );
     }
 
     /// The clamped default-uniform-buffer case must NOT be answered inline.
@@ -4586,8 +6011,10 @@ pub(crate) mod inline_op_tests {
     ];
 
     /// The NIDs the program-header test checks.
-    const COVERED_PROGRAM: [u32; 2] =
-        [g::PROGRAM_GET_PARAMETER_COUNT, g::PROGRAM_GET_DEFAULT_UNIFORM_BUFFER_SIZE];
+    const COVERED_PROGRAM: [u32; 2] = [
+        g::PROGRAM_GET_PARAMETER_COUNT,
+        g::PROGRAM_GET_DEFAULT_UNIFORM_BUFFER_SIZE,
+    ];
 
     /// Only a call with NO host behaviour may be inlined. Inlining is invisible to
     /// the host - the handler simply never runs - so inlining a NID that touches
@@ -4599,7 +6026,10 @@ pub(crate) mod inline_op_tests {
     /// `inline_op`), and a sample of NIDs with real behaviour do not.
     #[test]
     fn only_calls_with_no_other_behaviour_are_inlined() {
-        for &nid in COVERED.iter().chain(COVERED_PROGRAM.iter()).chain(COVERED_SETTERS.iter().map(|(n, _)| n))
+        for &nid in COVERED
+            .iter()
+            .chain(COVERED_PROGRAM.iter())
+            .chain(COVERED_SETTERS.iter().map(|(n, _)| n))
         {
             assert!(
                 inline_op(nid).is_some(),
@@ -4693,14 +6123,20 @@ pub(crate) mod inline_op_tests {
         let untouched = setter_block(g::SET_CULL_MODE, 0, 0);
         for &(func_nid, name) in COVERED_SETTERS {
             let op = inline_op(func_nid).expect("listed NID has an inline form");
-            let offset = op.store_offset().expect("a context setter writes through its pointer");
+            let offset = op
+                .store_offset()
+                .expect("a context setter writes through its pointer");
             let block = setter_block(func_nid, SET_VALUE, 0);
             assert_eq!(
                 block_word(&block, offset),
                 SET_VALUE,
                 "{name}: the handler must write the value at the offset its inline form uses"
             );
-            assert_eq!(op.eval(0), 0, "{name}: a void setter returns the success code");
+            assert_eq!(
+                op.eval(0),
+                0,
+                "{name}: a void setter returns the success code"
+            );
             // Every OTHER word of the block must be exactly what a no-op left.
             for w in 0..(gxmctx::BYTES / 4) {
                 let at = w * 4;
@@ -4729,10 +6165,17 @@ pub(crate) mod inline_op_tests {
         for index in 0..gxmctx::MAX_VERTEX_STREAMS as u32 {
             assert!(!op.falls_back_on_index(index), "index {index} is in range");
             let block = setter_block(g::SET_VERTEX_STREAM, index, SET_VALUE);
-            assert_eq!(block_word(&block, offset + index * 4), SET_VALUE, "stream {index}");
+            assert_eq!(
+                block_word(&block, offset + index * 4),
+                SET_VALUE,
+                "stream {index}"
+            );
         }
         let past = gxmctx::MAX_VERTEX_STREAMS as u32;
-        assert!(op.falls_back_on_index(past), "one past the end is the handler's case");
+        assert!(
+            op.falls_back_on_index(past),
+            "one past the end is the handler's case"
+        );
         let block = setter_block(g::SET_VERTEX_STREAM, past, SET_VALUE);
         for w in 0..(gxmctx::BYTES / 4) {
             assert_eq!(
@@ -4753,21 +6196,45 @@ pub(crate) mod inline_op_tests {
         (g::SET_FRAGMENT_PROGRAM, "sceGxmSetFragmentProgram"),
         (g::SET_CULL_MODE, "sceGxmSetCullMode"),
         (g::SET_FRONT_DEPTH_FUNC, "sceGxmSetFrontDepthFunc"),
-        (g::SET_FRONT_DEPTH_WRITE_ENABLE, "sceGxmSetFrontDepthWriteEnable"),
+        (
+            g::SET_FRONT_DEPTH_WRITE_ENABLE,
+            "sceGxmSetFrontDepthWriteEnable",
+        ),
         (g::SET_TWO_SIDED_ENABLE, "sceGxmSetTwoSidedEnable"),
         (g::SET_BACK_DEPTH_FUNC, "sceGxmSetBackDepthFunc"),
-        (g::SET_BACK_DEPTH_WRITE_ENABLE, "sceGxmSetBackDepthWriteEnable"),
-        (g::SET_FRONT_FRAGMENT_PROGRAM_ENABLE, "sceGxmSetFrontFragmentProgramEnable"),
-        (g::SET_BACK_FRAGMENT_PROGRAM_ENABLE, "sceGxmSetBackFragmentProgramEnable"),
+        (
+            g::SET_BACK_DEPTH_WRITE_ENABLE,
+            "sceGxmSetBackDepthWriteEnable",
+        ),
+        (
+            g::SET_FRONT_FRAGMENT_PROGRAM_ENABLE,
+            "sceGxmSetFrontFragmentProgramEnable",
+        ),
+        (
+            g::SET_BACK_FRAGMENT_PROGRAM_ENABLE,
+            "sceGxmSetBackFragmentProgramEnable",
+        ),
         (g::SET_FRONT_POLYGON_MODE, "sceGxmSetFrontPolygonMode"),
         (g::SET_BACK_POLYGON_MODE, "sceGxmSetBackPolygonMode"),
-        (g::SET_FRONT_POINT_LINE_WIDTH, "sceGxmSetFrontPointLineWidth"),
+        (
+            g::SET_FRONT_POINT_LINE_WIDTH,
+            "sceGxmSetFrontPointLineWidth",
+        ),
         (g::SET_FRONT_STENCIL_REF, "sceGxmSetFrontStencilRef"),
         (g::SET_BACK_STENCIL_REF, "sceGxmSetBackStencilRef"),
         (g::SET_VIEWPORT_ENABLE, "sceGxmSetViewportEnable"),
-        (g::SET_FRONT_VISIBILITY_TEST_ENABLE, "sceGxmSetFrontVisibilityTestEnable"),
-        (g::SET_FRONT_VISIBILITY_TEST_INDEX, "sceGxmSetFrontVisibilityTestIndex"),
-        (g::SET_FRONT_VISIBILITY_TEST_OP, "sceGxmSetFrontVisibilityTestOp"),
+        (
+            g::SET_FRONT_VISIBILITY_TEST_ENABLE,
+            "sceGxmSetFrontVisibilityTestEnable",
+        ),
+        (
+            g::SET_FRONT_VISIBILITY_TEST_INDEX,
+            "sceGxmSetFrontVisibilityTestIndex",
+        ),
+        (
+            g::SET_FRONT_VISIBILITY_TEST_OP,
+            "sceGxmSetFrontVisibilityTestOp",
+        ),
     ];
 }
 
@@ -4783,8 +6250,8 @@ mod run_setter_tests {
     use super::*;
     use crate::nid::gxm as g;
     use crate::{DeterministicWorld, SliceMemory, VFP_ARG_COUNT};
-    use vitaslop_transpiler::abi::{REG_COUNT, SP};
     use vitaslop_transpiler::InlineOp;
+    use vitaslop_transpiler::abi::{REG_COUNT, SP};
 
     const CTX: u32 = 0x100;
     const STACK: u32 = 0x800;
@@ -4825,7 +6292,10 @@ mod run_setter_tests {
         let op = inline_op(g::SET_VIEWPORT).expect("has an inline form");
         assert_eq!(
             op,
-            InlineOp::StoreVfpRun { offset: gxmctx::off::VIEWPORT, count: 6 },
+            InlineOp::StoreVfpRun {
+                offset: gxmctx::off::VIEWPORT,
+                count: 6
+            },
             "sceGxmSetViewport lowers to the six-word VFP run at the viewport block"
         );
         let bits: [u32; 6] = [
@@ -4849,7 +6319,11 @@ mod run_setter_tests {
             );
         }
         assert_eq!(regs[0], 0, "the handler returns success");
-        assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+        assert_eq!(
+            op.eval(0),
+            0,
+            "the inline form returns the same success code"
+        );
     }
 
     /// The region-clip handler stores its five argument words AS PASSED - the last two off
@@ -4865,12 +6339,21 @@ mod run_setter_tests {
         let op = inline_op(g::SET_REGION_CLIP).expect("has an inline form");
         assert_eq!(
             op,
-            InlineOp::StoreArgRun { offset: gxmctx::off::REGION_CLIP_MODE, count: 5 },
+            InlineOp::StoreArgRun {
+                offset: gxmctx::off::REGION_CLIP_MODE,
+                count: 5
+            },
             "sceGxmSetRegionClip lowers to the five-word argument run at the mode word"
         );
         // Values wider than any plausible clip bound, so a handler that masked one would
         // disagree with the run form and this test is what would say so.
-        let args = [0xAAAA_0001u32, 0xBBBB_0002, 0xCCCC_0003, 0xDDDD_0004, 0xEEEE_0005];
+        let args = [
+            0xAAAA_0001u32,
+            0xBBBB_0002,
+            0xCCCC_0003,
+            0xDDDD_0004,
+            0xEEEE_0005,
+        ];
         let mut regs = [0u32; REG_COUNT];
         regs[0] = CTX;
         regs[1] = args[0]; // mode
@@ -4888,7 +6371,11 @@ mod run_setter_tests {
             );
         }
         assert_eq!(regs[0], 0, "the handler returns success");
-        assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+        assert_eq!(
+            op.eval(0),
+            0,
+            "the inline form returns the same success code"
+        );
     }
 
     /// The depth-bias handler stores its two argument words AS PASSED into two consecutive
@@ -4905,7 +6392,10 @@ mod run_setter_tests {
         let op = inline_op(g::SET_FRONT_DEPTH_BIAS).expect("has an inline form");
         assert_eq!(
             op,
-            InlineOp::StoreArgRun { offset: gxmctx::off::FRONT_DEPTH_BIAS_FACTOR, count: 2 },
+            InlineOp::StoreArgRun {
+                offset: gxmctx::off::FRONT_DEPTH_BIAS_FACTOR,
+                count: 2
+            },
             "sceGxmSetFrontDepthBias lowers to the two-word argument run at the factor word"
         );
         let args = [(-3i32) as u32, (-129i32) as u32];
@@ -4917,14 +6407,21 @@ mod run_setter_tests {
         let bytes = dispatch_over(g::SET_FRONT_DEPTH_BIAS, &mut regs, &mut vfp, &[]);
         for (i, &v) in args.iter().enumerate() {
             assert_eq!(
-                word(&bytes, CTX + gxmctx::off::FRONT_DEPTH_BIAS_FACTOR + i as u32 * 4),
+                word(
+                    &bytes,
+                    CTX + gxmctx::off::FRONT_DEPTH_BIAS_FACTOR + i as u32 * 4
+                ),
                 v,
                 "depth-bias word {i} must be argument {} as passed",
                 i + 1
             );
         }
         assert_eq!(regs[0], 0, "the handler returns success");
-        assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+        assert_eq!(
+            op.eval(0),
+            0,
+            "the inline form returns the same success code"
+        );
     }
 
     /// The two stencil-func handlers store their six argument words AS PASSED - the last
@@ -4935,31 +6432,41 @@ mod run_setter_tests {
     #[test]
     fn the_stencil_funcs_store_their_six_argument_words_as_passed() {
         for (nid, base, name) in [
-            (g::SET_FRONT_STENCIL_FUNC, gxmctx::off::FRONT_STENCIL_FUNC, "front"),
-            (g::SET_BACK_STENCIL_FUNC, gxmctx::off::BACK_STENCIL_FUNC, "back"),
+            (
+                g::SET_FRONT_STENCIL_FUNC,
+                gxmctx::off::FRONT_STENCIL_FUNC,
+                "front",
+            ),
+            (
+                g::SET_BACK_STENCIL_FUNC,
+                gxmctx::off::BACK_STENCIL_FUNC,
+                "back",
+            ),
         ] {
             for k in 1..6 {
                 assert_eq!(
                     base + k * 4,
-                    [
-                        base,
-                        base + 4,
-                        base + 8,
-                        base + 12,
-                        base + 16,
-                        base + 20
-                    ][k as usize],
+                    [base, base + 4, base + 8, base + 12, base + 16, base + 20][k as usize],
                     "the six {name}-stencil words are ONE contiguous run"
                 );
             }
             let op = inline_op(nid).expect("has an inline form");
             assert_eq!(
                 op,
-                InlineOp::StoreArgRun { offset: base, count: 6 },
+                InlineOp::StoreArgRun {
+                    offset: base,
+                    count: 6
+                },
                 "sceGxmSet{name}StencilFunc lowers to the six-word argument run"
             );
-            let args =
-                [0xAAAA_0001u32, 0xBBBB_0002, 0xCCCC_0003, 0xDDDD_0004, 0xEEEE_01FE, 0xFFFF_02FD];
+            let args = [
+                0xAAAA_0001u32,
+                0xBBBB_0002,
+                0xCCCC_0003,
+                0xDDDD_0004,
+                0xEEEE_01FE,
+                0xFFFF_02FD,
+            ];
             let mut regs = [0u32; REG_COUNT];
             regs[0] = CTX;
             regs[1] = args[0]; // func
@@ -4977,7 +6484,11 @@ mod run_setter_tests {
                 );
             }
             assert_eq!(regs[0], 0, "the handler returns success");
-            assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+            assert_eq!(
+                op.eval(0),
+                0,
+                "the inline form returns the same success code"
+            );
         }
     }
 
@@ -4988,13 +6499,24 @@ mod run_setter_tests {
     #[test]
     fn the_force_modes_update_their_zls_bit_in_place() {
         for (nid, mask, name) in [
-            (g::DEPTH_STENCIL_SURFACE_SET_FORCE_LOAD_MODE, super::DS_FORCE_LOAD_MASK, "load"),
-            (g::DEPTH_STENCIL_SURFACE_SET_FORCE_STORE_MODE, super::DS_FORCE_STORE_MASK, "store"),
+            (
+                g::DEPTH_STENCIL_SURFACE_SET_FORCE_LOAD_MODE,
+                super::DS_FORCE_LOAD_MASK,
+                "load",
+            ),
+            (
+                g::DEPTH_STENCIL_SURFACE_SET_FORCE_STORE_MODE,
+                super::DS_FORCE_STORE_MASK,
+                "store",
+            ),
         ] {
             let op = inline_op(nid).expect("has an inline form");
             assert_eq!(
                 op,
-                InlineOp::StoreArgFieldInPlace { offset: super::DS_ZLS_CONTROL, mask },
+                InlineOp::StoreArgFieldInPlace {
+                    offset: super::DS_ZLS_CONTROL,
+                    mask
+                },
                 "force-{name} lowers to the in-place field store of its zlsControl bit"
             );
             for value in [0u32, mask, 0xFFFF_FFFF] {
@@ -5020,7 +6542,11 @@ mod run_setter_tests {
                 );
                 assert_eq!(regs[0], 0, "the handler returns success");
             }
-            assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+            assert_eq!(
+                op.eval(0),
+                0,
+                "the inline form returns the same success code"
+            );
         }
     }
 
@@ -5031,8 +6557,16 @@ mod run_setter_tests {
     #[test]
     fn the_uniform_buffer_binds_write_the_slot_their_inline_forms_claim() {
         for (nid, base, name) in [
-            (g::SET_VERTEX_UNIFORM_BUFFER, gxmctx::off::VERTEX_UNIFORM_BUFFERS, "vertex"),
-            (g::SET_FRAGMENT_UNIFORM_BUFFER, gxmctx::off::FRAGMENT_UNIFORM_BUFFERS, "fragment"),
+            (
+                g::SET_VERTEX_UNIFORM_BUFFER,
+                gxmctx::off::VERTEX_UNIFORM_BUFFERS,
+                "vertex",
+            ),
+            (
+                g::SET_FRAGMENT_UNIFORM_BUFFER,
+                gxmctx::off::FRAGMENT_UNIFORM_BUFFERS,
+                "fragment",
+            ),
         ] {
             let op = inline_op(nid).expect("has an inline form");
             assert_eq!(
@@ -5157,7 +6691,10 @@ mod precomputed_state_binds {
             for y in 0..w {
                 for x in 0..w {
                     let at = (xs[x as usize] + ys[y as usize]) as usize;
-                    assert!(at < seen.len(), "{w}x{w}: texel {x},{y} lands outside the image at {at}");
+                    assert!(
+                        at < seen.len(),
+                        "{w}x{w}: texel {x},{y} lands outside the image at {at}"
+                    );
                     assert!(!seen[at], "{w}x{w}: texel {x},{y} collides at {at}");
                     seen[at] = true;
                     // ...and the table form must be the scalar form, or the writer and the
@@ -5169,7 +6706,10 @@ mod precomputed_state_binds {
                     );
                 }
             }
-            assert!(seen.iter().all(|&b| b), "{w}x{w}: some texel is never written");
+            assert!(
+                seen.iter().all(|&b| b),
+                "{w}x{w}: some texel is never written"
+            );
         }
     }
 
@@ -5217,8 +6757,17 @@ mod precomputed_state_binds {
     fn the_u4x4_swar_average_is_the_per_field_average() {
         let fields = super::transfer_fields(0x0001_0000).expect("U4U4U4U4 has a field table");
         for v in 0..=0xffffu32 {
-            let t = [v, v.rotate_left(4) & 0xffff, (v ^ 0x5a3c) & 0xffff, (!v) & 0xffff];
-            assert_eq!(super::average_u4x4(t), super::average_packed(fields, t), "{t:04x?}");
+            let t = [
+                v,
+                v.rotate_left(4) & 0xffff,
+                (v ^ 0x5a3c) & 0xffff,
+                (!v) & 0xffff,
+            ];
+            assert_eq!(
+                super::average_u4x4(t),
+                super::average_packed(fields, t),
+                "{t:04x?}"
+            );
         }
     }
 
@@ -5268,11 +6817,23 @@ mod precomputed_state_binds {
     fn vertex_bind_fills_the_slots_the_state_carries_and_leaves_the_rest() {
         let mut r = Rig::new();
         r.call(g::PRECOMPUTED_VERTEX_STATE_INIT, &[VSTATE, 0, 0]);
-        assert_eq!(r.word(VSTATE + gxmstate::off::MAGIC), gxmstate::MAGIC_VERTEX);
+        assert_eq!(
+            r.word(VSTATE + gxmstate::off::MAGIC),
+            gxmstate::MAGIC_VERTEX
+        );
         let block = r.word(VSTATE + gxmstate::off::BLOCK);
-        assert_ne!(block, 0, "Init attaches an arrays block from the guest heap");
-        r.call(g::PRECOMPUTED_VERTEX_STATE_SET_DEFAULT_UNIFORM_BUFFER, &[VSTATE, UB]);
-        r.call(g::PRECOMPUTED_VERTEX_STATE_SET_UNIFORM_BUFFER, &[VSTATE, 3, 0xAB00_0000]);
+        assert_ne!(
+            block, 0,
+            "Init attaches an arrays block from the guest heap"
+        );
+        r.call(
+            g::PRECOMPUTED_VERTEX_STATE_SET_DEFAULT_UNIFORM_BUFFER,
+            &[VSTATE, UB],
+        );
+        r.call(
+            g::PRECOMPUTED_VERTEX_STATE_SET_UNIFORM_BUFFER,
+            &[VSTATE, 3, 0xAB00_0000],
+        );
         // A direct binding in a slot the state does NOT declare SURVIVES the bind: the
         // state's zero there is this engine's fill, not a guest unbind.
         {
@@ -5293,7 +6854,11 @@ mod precomputed_state_binds {
                 "table slot {i} after the bind"
             );
         }
-        assert_eq!(r.word(CTX + gxmctx::off::VERTEX_UNIFORM), UB, "record: buffer");
+        assert_eq!(
+            r.word(CTX + gxmctx::off::VERTEX_UNIFORM),
+            UB,
+            "record: buffer"
+        );
         assert_eq!(
             r.word(CTX + gxmctx::off::VERTEX_UNIFORM + 8),
             r.word(VSTATE + gxmstate::off::HEADER),
@@ -5307,13 +6872,22 @@ mod precomputed_state_binds {
     fn fragment_bind_replaces_the_texture_array_program_and_record() {
         let mut r = Rig::new();
         // A texture struct with distinctive control words for the state to copy by value.
-        for (k, w) in [0x1111_2222u32, 0x3333_4444, 0x5555_6666, 0x7777_0004].iter().enumerate() {
+        for (k, w) in [0x1111_2222u32, 0x3333_4444, 0x5555_6666, 0x7777_0004]
+            .iter()
+            .enumerate()
+        {
             let at = (TEXTURE as usize) + k * 4;
             r.bytes[at..at + 4].copy_from_slice(&w.to_le_bytes());
         }
         r.call(g::PRECOMPUTED_FRAGMENT_STATE_INIT, &[FSTATE, 0x77, 0]);
-        r.call(g::PRECOMPUTED_FRAGMENT_STATE_SET_DEFAULT_UNIFORM_BUFFER, &[FSTATE, UB]);
-        r.call(g::PRECOMPUTED_FRAGMENT_STATE_SET_TEXTURE, &[FSTATE, 2, TEXTURE]);
+        r.call(
+            g::PRECOMPUTED_FRAGMENT_STATE_SET_DEFAULT_UNIFORM_BUFFER,
+            &[FSTATE, UB],
+        );
+        r.call(
+            g::PRECOMPUTED_FRAGMENT_STATE_SET_TEXTURE,
+            &[FSTATE, 2, TEXTURE],
+        );
         // >>> BIND UNIT 7 DIRECTLY, THEN APPLY THE STATE. THE DIRECT BIND MUST SURVIVE, AND
         // >>> THIS TEST ASSERTED THE OPPOSITE UNTIL A SHIPPING TITLE PROVED IT WRONG.
         //
@@ -5330,7 +6904,7 @@ mod precomputed_state_binds {
         // sequence: the guest binds its sprite texture, twenty state binds follow, and the
         // immediate `sceGxmDraw` that samples it reaches the renderer with all sixteen slots
         // zero. Its title screen could not draw. With empty slots skipped the title runs the
-        // whole recipe with the recompiler STRICT and no fallback at all.
+        // whole scripted run with the recompiler STRICT and no fallback at all.
         {
             let mut mem = SliceMemory(&mut r.bytes);
             let mut ctx = crate::host::GuestCtx::new(&mut r.regs, &mut r.vfp, &mut mem, 0);
@@ -5338,13 +6912,21 @@ mod precomputed_state_binds {
                 &mut ctx,
                 CTX,
                 7,
-                gxmctx::TexBinding { addr: 0x1234, words: [1, 2, 3, 4], from_precomputed: false },
+                gxmctx::TexBinding {
+                    addr: 0x1234,
+                    words: [1, 2, 3, 4],
+                    from_precomputed: false,
+                },
             );
         }
         r.call(g::SET_PRECOMPUTED_FRAGMENT_STATE, &[CTX, FSTATE]);
         let slot = CTX + gxmctx::off::TEXTURES + 2 * gxmctx::TEXTURE_STRIDE;
         assert_eq!(r.word(slot), TEXTURE, "unit 2: the bound texture's address");
-        assert_eq!(r.word(slot + 4), 0x1111_2222, "unit 2: control word 0, copied BY VALUE");
+        assert_eq!(
+            r.word(slot + 4),
+            0x1111_2222,
+            "unit 2: control word 0, copied BY VALUE"
+        );
         assert_eq!(r.word(slot + 20), 1, "unit 2: marked from_precomputed");
         let undeclared = CTX + gxmctx::off::TEXTURES + 7 * gxmctx::TEXTURE_STRIDE;
         assert_eq!(
@@ -5352,8 +6934,16 @@ mod precomputed_state_binds {
             0x1234,
             "unit 7: the state carries nothing for this unit, so the DIRECT bind must survive"
         );
-        assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_PROGRAM), 0x77, "the program handle");
-        assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_UNIFORM), UB, "record: buffer");
+        assert_eq!(
+            r.word(CTX + gxmctx::off::FRAGMENT_PROGRAM),
+            0x77,
+            "the program handle"
+        );
+        assert_eq!(
+            r.word(CTX + gxmctx::off::FRAGMENT_UNIFORM),
+            UB,
+            "record: buffer"
+        );
     }
 
     /// A state the guest `memcpy`s keeps working - the fidelity half of moving the state
@@ -5363,12 +6953,19 @@ mod precomputed_state_binds {
     fn a_memcpyd_state_binds_like_the_original() {
         let mut r = Rig::new();
         r.call(g::PRECOMPUTED_FRAGMENT_STATE_INIT, &[FSTATE, 0x77, 0]);
-        r.call(g::PRECOMPUTED_FRAGMENT_STATE_SET_DEFAULT_UNIFORM_BUFFER, &[FSTATE, UB]);
+        r.call(
+            g::PRECOMPUTED_FRAGMENT_STATE_SET_DEFAULT_UNIFORM_BUFFER,
+            &[FSTATE, UB],
+        );
         let (from, to) = (FSTATE as usize, COPY as usize);
         let bytes: Vec<u8> = r.bytes[from..from + gxmstate::off::BYTES as usize].to_vec();
         r.bytes[to..to + bytes.len()].copy_from_slice(&bytes);
         r.call(g::SET_PRECOMPUTED_FRAGMENT_STATE, &[CTX, COPY]);
-        assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_UNIFORM), UB, "the copy binds");
+        assert_eq!(
+            r.word(CTX + gxmctx::off::FRAGMENT_UNIFORM),
+            UB,
+            "the copy binds"
+        );
         assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_PROGRAM), 0x77);
     }
 
@@ -5380,8 +6977,16 @@ mod precomputed_state_binds {
     fn the_set_all_uniform_buffers_layout_matches_the_handler() {
         const ARRAY: u32 = 0x1400;
         for (nid, init, fragment) in [
-            (g::PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS, g::PRECOMPUTED_VERTEX_STATE_INIT, false),
-            (g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS, g::PRECOMPUTED_FRAGMENT_STATE_INIT, true),
+            (
+                g::PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS,
+                g::PRECOMPUTED_VERTEX_STATE_INIT,
+                false,
+            ),
+            (
+                g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS,
+                g::PRECOMPUTED_FRAGMENT_STATE_INIT,
+                true,
+            ),
         ] {
             let op = inline_op(nid).expect("the table copy has an inline form");
             let vitaslop_transpiler::InlineOp::SetAllUniformBuffers { layout: l } = op else {
@@ -5390,7 +6995,14 @@ mod precomputed_state_binds {
             assert_eq!(l, super::set_all_uniform_buffers_layout(fragment));
             assert_eq!(l.st_magic_at, gxmstate::off::MAGIC);
             assert_eq!(l.st_block_at, gxmstate::off::BLOCK);
-            assert_eq!(l.st_magic, if fragment { gxmstate::MAGIC_FRAGMENT } else { gxmstate::MAGIC_VERTEX });
+            assert_eq!(
+                l.st_magic,
+                if fragment {
+                    gxmstate::MAGIC_FRAGMENT
+                } else {
+                    gxmstate::MAGIC_VERTEX
+                }
+            );
             assert_eq!(l.bytes, gxmctx::MAX_UNIFORM_BUFFERS as u32 * 4);
             let mut r = Rig::new();
             let state = if fragment { FSTATE } else { VSTATE };
@@ -5401,10 +7013,18 @@ mod precomputed_state_binds {
             }
             // Unstamped: the struct reads as anything but our magic, and the handler must
             // stamp it and attach a block - the inline form's guard sends this case to it.
-            assert_ne!(r.word(state + gxmstate::off::MAGIC), l.st_magic, "starts unstamped");
+            assert_ne!(
+                r.word(state + gxmstate::off::MAGIC),
+                l.st_magic,
+                "starts unstamped"
+            );
             r.call(nid, &[state, ARRAY]);
             assert_eq!(r.regs[0], 0, "{} succeeds", crate::nid::name(nid));
-            assert_eq!(r.word(state + gxmstate::off::MAGIC), l.st_magic, "the handler stamps it");
+            assert_eq!(
+                r.word(state + gxmstate::off::MAGIC),
+                l.st_magic,
+                "the handler stamps it"
+            );
             let block = r.word(state + gxmstate::off::BLOCK);
             assert_ne!(block, 0, "...and attaches a block");
             for k in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
@@ -5418,7 +7038,11 @@ mod precomputed_state_binds {
             // A stamped struct - the inline arm's case - keeps the same block and the
             // handler overwrites the same words, so the two writers agree on every byte.
             r.call(init, &[state, 0x77, 0]);
-            assert_eq!(r.word(state + gxmstate::off::BLOCK), block, "init keeps the block");
+            assert_eq!(
+                r.word(state + gxmstate::off::BLOCK),
+                block,
+                "init keeps the block"
+            );
             for k in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
                 let at = (ARRAY + k * 4) as usize;
                 r.bytes[at..at + 4].copy_from_slice(&(0x0C00_0000 + k).to_le_bytes());
@@ -5434,9 +7058,10 @@ mod precomputed_state_binds {
     /// one place the emitted form could silently drift from the handlers.
     #[test]
     fn the_inline_layout_matches_the_guest_structures() {
-        for (nid, fragment) in
-            [(g::SET_PRECOMPUTED_VERTEX_STATE, false), (g::SET_PRECOMPUTED_FRAGMENT_STATE, true)]
-        {
+        for (nid, fragment) in [
+            (g::SET_PRECOMPUTED_VERTEX_STATE, false),
+            (g::SET_PRECOMPUTED_FRAGMENT_STATE, true),
+        ] {
             let op = inline_op(nid).expect("the bind has an inline form");
             let vitaslop_transpiler::InlineOp::BindPrecomputedState { layout: l } = op else {
                 panic!("{} must lower to a state bind", crate::nid::name(nid));
@@ -5447,7 +7072,12 @@ mod precomputed_state_binds {
             assert_eq!(l.st_block_at, gxmstate::off::BLOCK);
             assert_eq!(
                 (l.st_buf_at, l.st_size_at, l.st_header_at, l.st_handle_at),
-                (gxmstate::off::BUF, gxmstate::off::SIZE, gxmstate::off::HEADER, gxmstate::off::HANDLE)
+                (
+                    gxmstate::off::BUF,
+                    gxmstate::off::SIZE,
+                    gxmstate::off::HEADER,
+                    gxmstate::off::HANDLE
+                )
             );
             if fragment {
                 assert_eq!(l.st_magic, gxmstate::MAGIC_FRAGMENT);
@@ -5460,7 +7090,10 @@ mod precomputed_state_binds {
                 assert_eq!(l.st_magic, gxmstate::MAGIC_VERTEX);
                 assert_eq!(l.copy_dst, gxmctx::off::VERTEX_UNIFORM_BUFFERS);
                 assert_eq!(l.copy_bytes, gxmstate::VERTEX_BLOCK_TEXTURES);
-                assert!(!l.has_prog, "the vertex bind leaves the bound program alone");
+                assert!(
+                    !l.has_prog,
+                    "the vertex bind leaves the bound program alone"
+                );
                 assert_eq!(l.ctx_record, gxmctx::off::VERTEX_UNIFORM);
             }
         }
@@ -5482,12 +7115,12 @@ mod texture_inline_tests {
     //! whose address mode, mip count and LOD bias had all silently gone to zero - a picture
     //! that reads as a decode bug, on a call the host no longer sees.
 
-    use super::inline_op_tests::{handler_result_over, PARAM};
+    use super::inline_op_tests::{PARAM, handler_result_over};
     use super::*;
     use crate::nid::gxm as g;
     use crate::{DeterministicWorld, SliceMemory, VFP_ARG_COUNT};
-    use vitaslop_transpiler::abi::REG_COUNT;
     use vitaslop_transpiler::InlineOp;
+    use vitaslop_transpiler::abi::REG_COUNT;
 
     /// A synthetic texture's four control words. Every field a form under test reads holds a
     /// DIFFERENT value, so a form that shifts by the wrong amount or masks the wrong width
@@ -5499,8 +7132,15 @@ mod texture_inline_tests {
         [
             // word 0: gamma 1, lod bias 0x15, mip count 0xb, mag 0x2, min 0x1, mip filter 1,
             // uaddr 0x4, vaddr 0x3, and the low three bits set so a mask that is too wide shows.
-            (1 << 27) | (0x15 << 21) | (0xb << 17) | (0x2 << 12) | (0x1 << 10) | (1 << 9)
-                | (0x4 << 6) | (0x3 << 3) | 0x7,
+            (1 << 27)
+                | (0x15 << 21)
+                | (0xb << 17)
+                | (0x2 << 12)
+                | (0x1 << 10)
+                | (1 << 9)
+                | (0x4 << 6)
+                | (0x3 << 3)
+                | 0x7,
             // word 1: type 0x5 at bit 29, base format 0x0c at bit 24, width-1 = 1023 at bit 12,
             // height-1 = 511 at bit 0. Width and height differ, so a form reading one shift for
             // the other fails.
@@ -5527,7 +7167,13 @@ mod texture_inline_tests {
             let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
             super::super::dispatch(crate::nid::lib::SCE_GXM, init_nid, &mut ctx, &mut st);
         }
-        [0, 4, 8, 12].map(|o| u32::from_le_bytes(bytes[PARAM as usize + o..PARAM as usize + o + 4].try_into().unwrap()))
+        [0, 4, 8, 12].map(|o| {
+            u32::from_le_bytes(
+                bytes[PARAM as usize + o..PARAM as usize + o + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        })
     }
 
     /// A freshly initialised texture carries NO LOD bias: the field is excess-31, so init writes
@@ -5536,15 +7182,28 @@ mod texture_inline_tests {
     #[test]
     fn a_new_texture_has_no_lod_bias() {
         let (shift, mask) = texword0::LOD_BIAS;
-        for nid in [g::TEXTURE_INIT_LINEAR, g::TEXTURE_INIT_SWIZZLED, g::TEXTURE_INIT_TILED] {
+        for nid in [
+            g::TEXTURE_INIT_LINEAR,
+            g::TEXTURE_INIT_SWIZZLED,
+            g::TEXTURE_INIT_TILED,
+        ] {
             let w = init_words(nid, 1);
             let raw = (w[0] >> shift) & mask;
             assert_eq!(raw, LOD_BIAS_NONE, "init {nid:#x} wrote lod_bias {raw}");
-            assert_eq!(inline_op(g::TEXTURE_GET_LOD_BIAS).expect("inline getter").eval(w[0]), 31);
+            assert_eq!(
+                inline_op(g::TEXTURE_GET_LOD_BIAS)
+                    .expect("inline getter")
+                    .eval(w[0]),
+                31
+            );
         }
         // A strided texture's bits there are its stride, so init leaves the bias field alone.
         let w = init_words(g::TEXTURE_INIT_LINEAR_STRIDED, 256);
-        assert_eq!((w[0] >> shift) & mask, 0, "a strided init must not write a bias");
+        assert_eq!(
+            (w[0] >> shift) & mask,
+            0,
+            "a strided init must not write a bias"
+        );
     }
 
     /// The word an inline form reads out of [`texture_record`], at its own offset.
@@ -5557,7 +7216,9 @@ mod texture_inline_tests {
     fn texture_getters_match_their_handlers() {
         for func_nid in COVERED_GETTERS {
             let op = inline_op(func_nid).expect("listed NID has an inline form");
-            let offset = op.offset().expect("a texture getter reads through its pointer argument");
+            let offset = op
+                .offset()
+                .expect("a texture getter reads through its pointer argument");
             assert_eq!(
                 op.eval(word_at(offset)),
                 handler_result_over(func_nid, texture_record()),
@@ -5567,18 +7228,103 @@ mod texture_inline_tests {
         }
     }
 
-    /// `sceGxmTextureGetWidth`/`GetHeight` return SIZE, and the control word stores SIZE
-    /// MINUS ONE. The bias is the whole reason `LoadShiftMask` carries a `plus`, and a form
-    /// that dropped it would be off by one on every texture - which resizes a render target
-    /// by a pixel and is far easier to blame on a viewport than on a getter.
+    /// `sceGxmTextureGetWidth`/`GetHeight` return SIZE. Most types store SIZE MINUS ONE in
+    /// twelve bits; a SWIZZLED or CUBE texture stores the LOG2 in four (vitasdk `gxm.h`
+    /// `swizzled_cube`), so a 256x64 swizzled texture's word 1 carries 8 and 6, not 255 and 63.
     #[test]
-    fn the_dimension_getters_carry_the_size_minus_one_bias() {
-        let width = inline_op(g::TEXTURE_GET_WIDTH).expect("has an inline form");
-        let height = inline_op(g::TEXTURE_GET_HEIGHT).expect("has an inline form");
-        assert_eq!(width.eval(word_at(4)), 1024, "the fixture stores 1023 and the API says 1024");
-        assert_eq!(height.eval(word_at(4)), 512, "the fixture stores 511 and the API says 512");
+    fn the_dimension_getters_read_each_types_own_layout() {
+        assert_eq!(
+            handler_result_over(g::TEXTURE_GET_WIDTH, texture_record()),
+            1024,
+            "the fixture stores 1023"
+        );
+        assert_eq!(
+            handler_result_over(g::TEXTURE_GET_HEIGHT, texture_record()),
+            512,
+            "the fixture stores 511"
+        );
         // ...and a field of all ones still reads as the largest size, not as zero.
-        assert_eq!(width.eval(0xffff_ffff), 4096);
+        assert_eq!(
+            texture_dims((TYPE_LINEAR << 29) | 0x00ff_ffff),
+            (4096, 4096)
+        );
+        for (nid, ty) in [
+            (g::TEXTURE_INIT_SWIZZLED, TYPE_SWIZZLED),
+            (g::TEXTURE_INIT_CUBE, TYPE_CUBE),
+        ] {
+            // `init_words` makes a 64x32 texture.
+            let w = init_words(nid, 1);
+            assert_eq!((w[1] >> 29) & 7, ty);
+            assert_eq!(
+                w[1] & 0x00ff_ffff,
+                (5 << 0) | (6 << 16),
+                "log2 sizes for {nid:#x}"
+            );
+            assert_eq!(texture_dims(w[1]), (64, 32));
+        }
+        // The arbitrary variants keep size-1, as the linear types do.
+        let w = init_words(g::TEXTURE_INIT_SWIZZLED_ARBITRARY, 1);
+        assert_eq!(w[1] & 0x00ff_ffff, 31 | (63 << 12));
+    }
+
+    /// The mip-count field holds `count - 1`, unsigned and clamped to four bits, so a count of
+    /// 0 is stored as 15 and read back as 0; counts above 13 are refused, as a console refuses
+    /// them; and a strided texture answers 0 from the checked getter.
+    #[test]
+    fn the_mip_count_field_holds_the_count_minus_one() {
+        for n in [1u32, 2, 9, 13] {
+            let w = init_words(g::TEXTURE_INIT_LINEAR, n);
+            assert_eq!((w[0] >> 17) & 0xf, n - 1, "count {n}");
+            assert_eq!(handler_result_over(g::TEXTURE_GET_MIPMAP_COUNT, w), n);
+            assert_eq!(
+                handler_result_over(g::TEXTURE_GET_MIPMAP_COUNT_UNSAFE, w),
+                n
+            );
+        }
+        let w = init_words(g::TEXTURE_INIT_LINEAR, 0);
+        assert_eq!((w[0] >> 17) & 0xf, 15);
+        assert_eq!(handler_result_over(g::TEXTURE_GET_MIPMAP_COUNT, w), 0);
+        let w = init_words(g::TEXTURE_INIT_LINEAR_STRIDED, 4096);
+        assert_eq!(handler_result_over(g::TEXTURE_GET_MIPMAP_COUNT, w), 0);
+    }
+
+    /// Every init leaves U and V CLAMP and `normalize_mode` set, strided included.
+    #[test]
+    fn init_writes_clamp_addressing_and_normalized_coordinates() {
+        for (nid, arg5) in [
+            (g::TEXTURE_INIT_LINEAR, 1),
+            (g::TEXTURE_INIT_SWIZZLED, 1),
+            (g::TEXTURE_INIT_TILED, 1),
+            (g::TEXTURE_INIT_CUBE, 1),
+            (g::TEXTURE_INIT_LINEAR_STRIDED, 256),
+        ] {
+            let w = init_words(nid, arg5);
+            assert_eq!((w[0] >> 6) & 7, 2, "U of {nid:#x}");
+            assert_eq!((w[0] >> 3) & 7, 2, "V of {nid:#x}");
+            assert_eq!(w[3] >> 31, 1, "normalize of {nid:#x}");
+            assert_eq!(
+                handler_result_over(g::TEXTURE_GET_NORMALIZE_MODE, w),
+                0x8000_0000
+            );
+        }
+    }
+
+    /// `sceGxmTextureGetStride` answers 0 for a texture that is not strided, and the stride
+    /// itself for one that is - up to 131072 bytes, which needs the two `stride_ext` bits.
+    #[test]
+    fn get_stride_is_zero_unless_strided_and_reaches_131072() {
+        assert_eq!(
+            handler_result_over(g::TEXTURE_GET_STRIDE, init_words(g::TEXTURE_INIT_LINEAR, 1)),
+            0
+        );
+        for s in [4u32, 512, 1028, 3968, 32768, 65536, 131072] {
+            let w = init_words(g::TEXTURE_INIT_LINEAR_STRIDED, s);
+            assert_eq!(
+                handler_result_over(g::TEXTURE_GET_STRIDE, w),
+                s,
+                "stride {s}"
+            );
+        }
     }
 
     /// Run a texture setter through the real dispatch over [`texture_record`] and hand back
@@ -5618,15 +7364,31 @@ mod texture_inline_tests {
         const WIDE: u32 = 0xFFFF_FFFF;
         for &(func_nid, name) in COVERED_SETTERS {
             let op = inline_op(func_nid).expect("listed NID has an inline form");
-            let InlineOp::StoreArgField { offset, shift, mask } = op else {
-                panic!("{name} must lower to a field store, got {op:?}");
+            let (offset, shift, mask) = match op {
+                InlineOp::StoreArgField {
+                    offset,
+                    shift,
+                    mask,
+                }
+                | InlineOp::StoreArgFieldChecked {
+                    offset,
+                    shift,
+                    mask,
+                    ..
+                } => (offset, shift, mask),
+                _ => panic!("{name} must lower to a field store, got {op:?}"),
             };
             assert_eq!(offset, 0, "{name}: every one of these is control word 0");
             for value in [0u32, 1, 2, WIDE] {
                 let got = setter_words(func_nid, value);
                 let before = texture_record();
-                let want =
-                    (before[0] & !(mask << shift)) | ((value & mask) << shift);
+                // A checked form refuses a value wider than its field - its handler does too,
+                // and must leave the word alone.
+                let want = if op.falls_back_on_value(value) {
+                    before[0]
+                } else {
+                    (before[0] & !(mask << shift)) | ((value & mask) << shift)
+                };
                 assert_eq!(
                     got[0], want,
                     "{name}: the handler must write the field the inline form writes (value {value:#x})"
@@ -5635,8 +7397,111 @@ mod texture_inline_tests {
                     assert_eq!(got[i], before[i], "{name} changed control word {i}");
                 }
             }
-            assert_eq!(op.eval(0), 0, "{name}: a void setter returns the success code");
+            assert_eq!(
+                op.eval(0),
+                0,
+                "{name}: a void setter returns the success code"
+            );
         }
+    }
+
+    /// A `LINEAR_STRIDED` texture spends its mip filter, min filter, mip count and LOD bias
+    /// bits on its byte stride. The driver's getters HIDE them (LOD bias / LOD min 0, mip
+    /// filter DISABLED, min filter = the mag filter) and its LOD setters refuse UNSUPPORTED
+    /// without touching the stride; the inline forms hand exactly that type to the handler.
+    #[test]
+    fn a_strided_textures_stride_bits_are_hidden_and_kept() {
+        let w = init_words(g::TEXTURE_INIT_LINEAR_STRIDED, 4096);
+        assert_ne!(
+            w[0] & 0x7fff_fe06,
+            0,
+            "a 4096-byte stride must set some sampler-shared bits"
+        );
+        for (nid, want) in [
+            (g::TEXTURE_GET_LOD_BIAS, 0),
+            (g::TEXTURE_GET_LOD_MIN, 0),
+            (g::TEXTURE_GET_MIP_FILTER, 0),
+            (
+                g::TEXTURE_GET_MIN_FILTER,
+                tex_field_of(w[0], texword0::MAG_FILTER),
+            ),
+        ] {
+            assert_eq!(
+                handler_result_over(nid, w),
+                want,
+                "{}",
+                crate::nid::name(nid)
+            );
+        }
+        for nid in [g::TEXTURE_GET_LOD_BIAS, g::TEXTURE_GET_MIN_FILTER] {
+            let op = inline_op(nid).expect("inline getter");
+            assert!(
+                op.falls_back_on_guard(w[1]),
+                "{} must not answer a strided texture inline",
+                crate::nid::name(nid)
+            );
+            assert!(
+                !op.falls_back_on_guard(texture_record()[1]),
+                "...and must answer any other type inline"
+            );
+        }
+        let set = inline_op(g::TEXTURE_SET_LOD_BIAS).expect("inline setter");
+        assert!(
+            set.falls_back_on_guard(w[1])
+                && set.falls_back_on_value(64)
+                && !set.falls_back_on_value(63)
+        );
+        for nid in [g::TEXTURE_SET_LOD_BIAS, g::TEXTURE_SET_LOD_MIN] {
+            let (r0, got) = call_over(nid, w, 1);
+            assert_eq!(
+                r0,
+                SCE_GXM_ERROR_UNSUPPORTED as u32,
+                "{}",
+                crate::nid::name(nid)
+            );
+            assert_eq!(
+                got,
+                w,
+                "{} must leave a strided texture's words alone",
+                crate::nid::name(nid)
+            );
+        }
+        let (r0, got) = call_over(g::TEXTURE_SET_LOD_BIAS, texture_record(), 64);
+        assert_eq!(r0, SCE_GXM_ERROR_INVALID_VALUE as u32);
+        assert_eq!(got, texture_record());
+        assert_eq!(
+            call_over(g::TEXTURE_SET_LOD_BIAS, texture_record(), 63).0,
+            0
+        );
+    }
+
+    fn tex_field_of(word: u32, (shift, mask): (u32, u32)) -> u32 {
+        (word >> shift) & mask
+    }
+
+    /// Run `func_nid(PARAM, value)` over `record`: r0 and the four words after.
+    fn call_over(func_nid: u32, record: [u32; 4], value: u32) -> (u32, [u32; 4]) {
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = PARAM;
+        regs[1] = value;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 4096];
+        for (i, w) in record.iter().enumerate() {
+            let off = PARAM as usize + i * 4;
+            bytes[off..off + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        let mut mem = SliceMemory(&mut bytes);
+        {
+            let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            super::super::dispatch(crate::nid::lib::SCE_GXM, func_nid, &mut ctx, &mut st);
+        }
+        let mut out = [0u32; 4];
+        for (i, w) in out.iter_mut().enumerate() {
+            let off = PARAM as usize + i * 4;
+            *w = u32::from_le_bytes(bytes[off..off + 4].try_into().expect("4 bytes"));
+        }
+        (regs[0], out)
     }
 
     /// A setter and the getter of the SAME field must round-trip: what one writes, the other
@@ -5645,34 +7510,50 @@ mod texture_inline_tests {
     #[test]
     fn a_setter_and_its_getter_name_the_same_field() {
         for &(set_nid, get_nid, name) in &[
-            (g::TEXTURE_SET_MAG_FILTER, g::TEXTURE_GET_MAG_FILTER, "magFilter"),
-            (g::TEXTURE_SET_MIN_FILTER, g::TEXTURE_GET_MIN_FILTER, "minFilter"),
-            (g::TEXTURE_SET_U_ADDR_MODE, g::TEXTURE_GET_U_ADDR_MODE_SAFE, "uAddrMode"),
-            (g::TEXTURE_SET_V_ADDR_MODE, g::TEXTURE_GET_V_ADDR_MODE_SAFE, "vAddrMode"),
+            (
+                g::TEXTURE_SET_MAG_FILTER,
+                g::TEXTURE_GET_MAG_FILTER,
+                "magFilter",
+            ),
+            (
+                g::TEXTURE_SET_MIN_FILTER,
+                g::TEXTURE_GET_MIN_FILTER,
+                "minFilter",
+            ),
+            (
+                g::TEXTURE_SET_U_ADDR_MODE,
+                g::TEXTURE_GET_U_ADDR_MODE_SAFE,
+                "uAddrMode",
+            ),
+            (
+                g::TEXTURE_SET_V_ADDR_MODE,
+                g::TEXTURE_GET_V_ADDR_MODE_SAFE,
+                "vAddrMode",
+            ),
             (g::TEXTURE_SET_LOD_BIAS, g::TEXTURE_GET_LOD_BIAS, "lodBias"),
         ] {
             let get = inline_op(get_nid).expect("the getter has an inline form");
             // A value that fits every field under test, and is not the fixture's own.
             let written = setter_words(set_nid, 2);
-            assert_eq!(get.eval(written[0]), 2, "{name} does not read back what it wrote");
+            assert_eq!(
+                get.eval(written[0]),
+                2,
+                "{name} does not read back what it wrote"
+            );
         }
     }
 
     /// The texture getters this module checks. Written out rather than derived from
     /// `inline_op`, so a NID added there without a line here is not silently uncovered.
-    const COVERED_GETTERS: [u32; 12] = [
+    const COVERED_GETTERS: [u32; 8] = [
         g::TEXTURE_GET_DATA,
         g::TEXTURE_GET_LOD_BIAS,
         g::TEXTURE_GET_U_ADDR_MODE_SAFE,
         g::TEXTURE_GET_V_ADDR_MODE_SAFE,
         g::TEXTURE_GET_MIN_FILTER,
         g::TEXTURE_GET_MAG_FILTER,
-        g::TEXTURE_GET_MIPMAP_COUNT,
-        g::TEXTURE_GET_MIPMAP_COUNT_UNSAFE,
         g::TEXTURE_GET_GAMMA_MODE,
         g::TEXTURE_GET_TYPE,
-        g::TEXTURE_GET_WIDTH,
-        g::TEXTURE_GET_HEIGHT,
     ];
 
     /// The texture setters this module checks, with the safe spellings included: they share a
@@ -5683,8 +7564,14 @@ mod texture_inline_tests {
         (g::TEXTURE_SET_MIN_FILTER, "sceGxmTextureSetMinFilter"),
         (g::TEXTURE_SET_U_ADDR_MODE, "sceGxmTextureSetUAddrMode"),
         (g::TEXTURE_SET_V_ADDR_MODE, "sceGxmTextureSetVAddrMode"),
-        (g::TEXTURE_SET_U_ADDR_MODE_SAFE, "sceGxmTextureSetUAddrModeSafe"),
-        (g::TEXTURE_SET_V_ADDR_MODE_SAFE, "sceGxmTextureSetVAddrModeSafe"),
+        (
+            g::TEXTURE_SET_U_ADDR_MODE_SAFE,
+            "sceGxmTextureSetUAddrModeSafe",
+        ),
+        (
+            g::TEXTURE_SET_V_ADDR_MODE_SAFE,
+            "sceGxmTextureSetVAddrModeSafe",
+        ),
         (g::TEXTURE_SET_LOD_BIAS, "sceGxmTextureSetLodBias"),
     ];
 
@@ -5709,7 +7596,10 @@ mod texture_inline_tests {
             panic!("sceGxmTextureSetData must lower to an in-place field store, got {op:?}");
         };
         assert_eq!(offset, 8, "the data address is control word 2");
-        assert_eq!(mask, 0xffff_fffc, "the field is every bit but the two low LOD bits");
+        assert_eq!(
+            mask, 0xffff_fffc,
+            "the field is every bit but the two low LOD bits"
+        );
         // Word 2 carries LOD bits 0b11 and a data-address bit beside them; the argument
         // carries dirty low bits, so a form that failed to mask either side would show.
         let before: [u32; 4] = [0x1111_1111, 0x2222_2222, 0xDEAD_0007, 0x4444_4444];
@@ -5727,7 +7617,12 @@ mod texture_inline_tests {
         let mut mem = SliceMemory(&mut bytes);
         {
             let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
-            super::super::dispatch(crate::nid::lib::SCE_GXM, g::TEXTURE_SET_DATA, &mut ctx, &mut st);
+            super::super::dispatch(
+                crate::nid::lib::SCE_GXM,
+                g::TEXTURE_SET_DATA,
+                &mut ctx,
+                &mut st,
+            );
         }
         let mut after = [0u32; 4];
         for (i, w) in after.iter_mut().enumerate() {
@@ -5735,13 +7630,23 @@ mod texture_inline_tests {
             *w = u32::from_le_bytes(bytes[off..off + 4].try_into().expect("4 bytes"));
         }
         let want = (before[2] & !mask) | (data & mask);
-        assert_eq!(after[2], want, "the handler must write what the inline form writes");
-        assert_eq!(after[2], 0x1234_5677, "aligned pointer over preserved LOD bits 0b11");
+        assert_eq!(
+            after[2], want,
+            "the handler must write what the inline form writes"
+        );
+        assert_eq!(
+            after[2], 0x1234_5677,
+            "aligned pointer over preserved LOD bits 0b11"
+        );
         for i in [0usize, 1, 3] {
             assert_eq!(after[i], before[i], "control word {i} must not move");
         }
         assert_eq!(regs[0], 0, "the handler returns success");
-        assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+        assert_eq!(
+            op.eval(0),
+            0,
+            "the inline form returns the same success code"
+        );
     }
 
     /// `sceGxmTextureSetFormat` rewrites the WHOLE format in the words: the 5-bit base in
@@ -5751,6 +7656,50 @@ mod texture_inline_tests {
     /// The guest sequence is a fighting title's IBL cubes: initialised as U2F10F10F10 (0x9a,
     /// extension bit SET), then set to F11F11F10 (0x1a, the same 5-bit field). A setter that
     /// wrote only word 1 left bit 31 standing, and every copy sampled the cube as 0x9a.
+    /// `sceGxmColorSurfaceSetScaleMode` lands in the surface's own words and the table, so the
+    /// getter and a COPY of the struct both read the new mode back.
+    #[test]
+    fn set_scale_mode_is_read_back_from_the_surface_and_a_copy() {
+        let mut bytes = vec![0u8; 4096];
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        let call = |bytes: &mut Vec<u8>, st: &mut VitaState, nid: u32, r0: u32, r1: u32| {
+            let mut regs = [0u32; REG_COUNT];
+            regs[0] = r0;
+            regs[1] = r1;
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            let mut mem = SliceMemory(bytes);
+            let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            super::super::dispatch(crate::nid::lib::SCE_GXM, nid, &mut ctx, st);
+            regs[0]
+        };
+        let s = ColorSurface {
+            format: 0,
+            surface_type: 0,
+            width: 960,
+            height: 544,
+            stride_pixels: 960,
+            data_addr: 0x800,
+            scale_mode: 0,
+            gamma: 0,
+        };
+        {
+            let mut regs = [0u32; REG_COUNT];
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            let mut mem = SliceMemory(&mut bytes);
+            let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            write_color_surface(&mut ctx, PARAM, &s);
+        }
+        st.set_color_surface(PARAM, s);
+        assert_eq!(call(&mut bytes, &mut st, g::COLOR_SURFACE_GET_SCALE_MODE, PARAM, 0), 0);
+        call(&mut bytes, &mut st, g::COLOR_SURFACE_SET_SCALE_MODE, PARAM, 1);
+        assert_eq!(call(&mut bytes, &mut st, g::COLOR_SURFACE_GET_SCALE_MODE, PARAM, 0), 1);
+        // A byte copy of the struct, never seen by any setter, reads the mode out of its words.
+        let copy = PARAM + 0x80;
+        let words = bytes[PARAM as usize..PARAM as usize + 0x40].to_vec();
+        bytes[copy as usize..copy as usize + 0x40].copy_from_slice(&words);
+        assert_eq!(call(&mut bytes, &mut st, g::COLOR_SURFACE_GET_SCALE_MODE, copy, 0), 1);
+    }
+
     #[test]
     fn set_format_rewrites_the_extension_bit_and_swizzle_a_copy_reads() {
         let copy = PARAM + 0x40;
@@ -5759,13 +7708,18 @@ mod texture_inline_tests {
             bytes[addr as usize..addr as usize + 4].copy_from_slice(&w.to_le_bytes());
         };
         let get = |bytes: &[u8], addr: u32| {
-            u32::from_le_bytes(bytes[addr as usize..addr as usize + 4].try_into().expect("4 bytes"))
+            u32::from_le_bytes(
+                bytes[addr as usize..addr as usize + 4]
+                    .try_into()
+                    .expect("4 bytes"),
+            )
         };
-        // What `sceGxmTextureInitCube(.., 0x9A000000 | swizzle 3, 16, 16, 0)` lays down, with a
-        // sampler field in word 0 and a palette/lod bit in word 3 that must both survive.
+        // A cube in the words `sceGxmTextureInitCube(.., 0x9A000000 | swizzle 3, 16, 16, 0)`
+        // leaves for its format (16x16 as log2 4 and 4), with a sampler field in word 0 and a
+        // palette/lod bit in word 3 that must both survive.
         let init = [
             (1 << 31) | (0x2 << 12),
-            (TYPE_CUBE << 29) | (0x1a << 24) | (15 << 12) | 15,
+            (TYPE_CUBE << 29) | (0x1a << 24) | (4 << 16) | 4,
             0x0000_1000,
             (3 << texword3::SWIZZLE_SHIFT) | (1 << 26),
         ];
@@ -5784,20 +7738,43 @@ mod texture_inline_tests {
             super::super::dispatch(crate::nid::lib::SCE_GXM, nid, &mut ctx, st);
             regs[0]
         };
-        call(&mut bytes, &mut st, g::TEXTURE_SET_FORMAT, PARAM, 0x1A00_1000);
+        call(
+            &mut bytes,
+            &mut st,
+            g::TEXTURE_SET_FORMAT,
+            PARAM,
+            0x1A00_1000,
+        );
         let w: Vec<u32> = (0..4).map(|i| get(&bytes, PARAM + 4 * i)).collect();
         assert_eq!(w[0], 0x2 << 12, "extension bit cleared, sampler field kept");
         assert_eq!(w[1], init[1], "base 0x1a in word 1 (unchanged 5-bit field)");
         assert_eq!(w[2], init[2]);
-        assert_eq!(w[3], (1 << texword3::SWIZZLE_SHIFT) | (1 << 26), "swizzle 1, lod bit kept");
+        assert_eq!(
+            w[3],
+            (1 << texword3::SWIZZLE_SHIFT) | (1 << 26),
+            "swizzle 1, lod bit kept"
+        );
         // The COPY has no recorded format: GetFormat resolves it from its words alone.
         for (i, x) in w.iter().enumerate() {
             put(&mut bytes, copy + 4 * i as u32, *x);
         }
-        assert_eq!(call(&mut bytes, &mut st, g::TEXTURE_GET_FORMAT, copy, 0), 0x1A00_1000);
+        assert_eq!(
+            call(&mut bytes, &mut st, g::TEXTURE_GET_FORMAT, copy, 0),
+            0x1A00_1000
+        );
         // And back the other way: setting an extended format sets the bit.
-        call(&mut bytes, &mut st, g::TEXTURE_SET_FORMAT, PARAM, 0x9A00_0000);
-        assert_eq!(get(&bytes, PARAM) >> 31, 1, "0x9a carries its extension bit");
+        call(
+            &mut bytes,
+            &mut st,
+            g::TEXTURE_SET_FORMAT,
+            PARAM,
+            0x9A00_0000,
+        );
+        assert_eq!(
+            get(&bytes, PARAM) >> 31,
+            1,
+            "0x9a carries its extension bit"
+        );
     }
 
     /// The in-place twin of [`texture_setters_write_the_field_their_inline_forms_claim`].
@@ -5817,7 +7794,11 @@ mod texture_inline_tests {
             };
             assert_eq!(offset, 0, "{name}: every one of these is control word 0");
             let (shift, field) = super::texword0::MIP_FILTER;
-            assert_eq!(mask, field << shift, "{name}: the mask must be the field in place");
+            assert_eq!(
+                mask,
+                field << shift,
+                "{name}: the mask must be the field in place"
+            );
             // 0x200 is `SCE_GXM_TEXTURE_MIP_FILTER_ENABLED` - the value a shifting form loses.
             for value in [0u32, 0x200, 0xFFFF_FFFF] {
                 let got = setter_words(func_nid, value);
@@ -5831,7 +7812,11 @@ mod texture_inline_tests {
                     assert_eq!(got[i], before[i], "{name} changed control word {i}");
                 }
             }
-            assert_eq!(op.eval(0), 0, "{name}: a void setter returns the success code");
+            assert_eq!(
+                op.eval(0),
+                0,
+                "{name}: a void setter returns the success code"
+            );
         }
     }
 }
@@ -5899,7 +7884,11 @@ mod semantic_tests {
         let word = 0x060e;
         let semantic = handler_result_over(g::PROGRAM_PARAMETER_GET_SEMANTIC, record(word));
         let index = handler_result_over(g::PROGRAM_PARAMETER_GET_SEMANTIC_INDEX, record(word));
-        assert_eq!(semantic | (index << 8), word as u32, "the two fields reassemble the word");
+        assert_eq!(
+            semantic | (index << 8),
+            word as u32,
+            "the two fields reassemble the word"
+        );
     }
 
     /// `FindParameterBySemantic(program, semantic, index)` over a program whose parameter
@@ -5912,7 +7901,8 @@ mod semantic_tests {
         const PROGRAM: u32 = 0x100;
         let table = PROGRAM + 0x40;
         let mut bytes = vec![0u8; 4096];
-        let mut put = |at: u32, w: u32| bytes[at as usize..at as usize + 4].copy_from_slice(&w.to_le_bytes());
+        let mut put =
+            |at: u32, w: u32| bytes[at as usize..at as usize + 4].copy_from_slice(&w.to_le_bytes());
         put(PROGRAM + 0x24, words.len() as u32);
         put(PROGRAM + 0x28, table - (PROGRAM + 0x28)); // self-relative, like every program offset
         for (i, &w) in words.iter().enumerate() {
@@ -5936,13 +7926,20 @@ mod semantic_tests {
     fn find_by_semantic_matches_semantic_and_index_through_either_export() {
         let table = 0x140;
         let words = [0x000b, 0x000e, 0x010e, 0x0000];
-        for nid in [g::PROGRAM_FIND_PARAMETER_BY_SEMANTIC, g::PROGRAM_FIND_PARAMETER_BY_SEMANTIC_PUBLIC] {
+        for nid in [
+            g::PROGRAM_FIND_PARAMETER_BY_SEMANTIC,
+            g::PROGRAM_FIND_PARAMETER_BY_SEMANTIC_PUBLIC,
+        ] {
             assert_eq!(find_over(nid, &words, POSITION, 0), table);
             assert_eq!(find_over(nid, &words, TEXCOORD, 0), table + 16);
             assert_eq!(find_over(nid, &words, TEXCOORD, 1), table + 32);
             assert_eq!(find_over(nid, &words, TEXCOORD, 2), 0, "no such index");
             assert_eq!(find_over(nid, &words, NORMAL, 0), 0, "no such semantic");
-            assert_eq!(find_over(nid, &words, 0, 0), 0, "SEMANTIC_NONE names no parameter");
+            assert_eq!(
+                find_over(nid, &words, 0, 0),
+                0,
+                "SEMANTIC_NONE names no parameter"
+            );
         }
     }
 }
@@ -5962,7 +7959,11 @@ mod texture_control_word_field_tests {
     /// wrote a swizzle and read it back would have passed against the bug.
     #[test]
     fn control_word_3_places_the_swizzle_at_bit_28_with_normalize_mode_above_it() {
-        assert_eq!(texword3::SWIZZLE_SHIFT, 26 + 2, "palette_addr:26 then lod_min1:2");
+        assert_eq!(
+            texword3::SWIZZLE_SHIFT,
+            26 + 2,
+            "palette_addr:26 then lod_min1:2"
+        );
         assert_eq!(texword3::SWIZZLE_MASK, 0x7, "swizzle_format is 3 bits");
         // The field ends exactly below normalize_mode (bit 31); it does not overlap it.
         assert_eq!(texword3::SWIZZLE_SHIFT + 3, 31);
@@ -5973,7 +7974,11 @@ mod texture_control_word_field_tests {
         let noise = 0x03ff_ffff | (0b11 << 26) | (1 << 31);
         for s in 0..8u32 {
             let w = (noise & !(0x7 << texword3::SWIZZLE_SHIFT)) | (s << texword3::SWIZZLE_SHIFT);
-            assert_eq!(read(w), s, "selector {s} round-trips through a fully populated word");
+            assert_eq!(
+                read(w),
+                s,
+                "selector {s} round-trips through a fully populated word"
+            );
         }
         // ...and the old shift is genuinely different, so this test fails against the bug:
         // at shift 29 a word carrying swizzle 2 reads back as 1 (plus normalize_mode's bit).
@@ -5982,7 +7987,6 @@ mod texture_control_word_field_tests {
         assert_eq!((w >> 29) & 0x7, 1, "the old reader halved every selector");
     }
 }
-
 
 /// Complete the frame's scenes ended so far, up to `through` (one past the last scene
 /// index), at a point where the GUEST WAITS FOR THE GPU: render them in submission order
@@ -6026,7 +8030,9 @@ fn complete_scenes_through(ctx: &mut GuestCtx, st: &mut VitaState, through: usiz
         return queued && park_for_resolve(st);
     }
     let small = |scene: &crate::capture::Scene| {
-        scene.color.is_some_and(|c| c.width.max(1) * c.height.max(1) <= cap)
+        scene
+            .color
+            .is_some_and(|c| c.width.max(1) * c.height.max(1) <= cap)
     };
     // >>> IN SUBMISSION ORDER, WITH EVERYTHING THIS FRAME OWES IT. The hardware completes
     // scenes in the order they were ended, so a probe that samples a cube whose faces ended
@@ -6038,17 +8044,24 @@ fn complete_scenes_through(ctx: &mut GuestCtx, st: &mut VitaState, through: usiz
         .iter()
         .rposition(|s| s.completed_early)
         .map_or(0, |i| i + 1)
-        .max(st.capture.scenes.len().saturating_sub(st.capture.frame_scene_count_so_far()));
+        .max(
+            st.capture
+                .scenes
+                .len()
+                .saturating_sub(st.capture.frame_scene_count_so_far()),
+        );
     if start >= n {
         return queued && park_for_resolve(st);
     }
     // Only the DISPLAY buffer's own passes stay out (they compose the frame at its end;
     // rendered here they would be lost) - see below.
     let display: Vec<u32> = st.capture.presents.iter().rev().take(4).copied().collect();
-    let in_batch = |s: &crate::capture::Scene| {
-        s.color.is_none_or(|c| !display.contains(&c.data_addr))
-    };
-    if !st.capture.scenes[start..n].iter().any(|s| in_batch(s) && small(s)) {
+    let in_batch =
+        |s: &crate::capture::Scene| s.color.is_none_or(|c| !display.contains(&c.data_addr));
+    if !st.capture.scenes[start..n]
+        .iter()
+        .any(|s| in_batch(s) && small(s))
+    {
         return queued && park_for_resolve(st);
     }
     if st.complete_scene_now.is_none() && !st.complete_scene_async {
@@ -6068,8 +8081,11 @@ fn complete_scenes_through(ctx: &mut GuestCtx, st: &mut VitaState, through: usiz
     // the small scenes alone changed two frames of a racer and of a hover title - their
     // blur targets sampled the previous frame's world. Only the DISPLAY buffer's own passes
     // stay out (they compose the frame at its end; rendered here they would be lost).
-    let batch: Vec<crate::capture::Scene> =
-        st.capture.scenes[start..n].iter().filter(|s| in_batch(s)).cloned().collect();
+    let batch: Vec<crate::capture::Scene> = st.capture.scenes[start..n]
+        .iter()
+        .filter(|s| in_batch(s))
+        .cloned()
+        .collect();
     let readbacks = {
         let hook = st.complete_scene_now.as_mut().expect("checked above");
         hook(&batch)
@@ -6088,14 +8104,21 @@ fn complete_scenes_through(ctx: &mut GuestCtx, st: &mut VitaState, through: usiz
                 *h,
                 rgba,
                 &c,
-                &mut |_, n| { probe.truncate(n.min(probe.len())); probe.clone() },
+                &mut |_, n| {
+                    probe.truncate(n.min(probe.len()));
+                    probe.clone()
+                },
                 &mut |a, b| ctx.write_bytes(a, b),
             );
             if ok {
                 written += 1;
                 if crate::rtt_writeback::report_once(0x7000_0000_0000_0000 ^ *addr as u64) {
                     let (w, h) = (*w as usize, *h as usize);
-                    let t = if w > 24 && h > 1 { rgba[(w + 24) * 4..(w + 24) * 4 + 4].to_vec() } else { Vec::new() };
+                    let t = if w > 24 && h > 1 {
+                        rgba[(w + 24) * 4..(w + 24) * 4 + 4].to_vec()
+                    } else {
+                        Vec::new()
+                    };
                     tracing::info!(target: "vitaslop::status", "gxm rtt: first completion of {addr:#010x} ({w}x{h}) in a batch of {}: texel(24,1)={t:?}", batch.len());
                 }
             }
@@ -6140,14 +8163,22 @@ pub fn report_completed_early(addr: u32, w: u32, h: u32) {
 /// far has had its callback run - see [`VitaState::display_queue_finish`].
 pub(super) fn display_queue_finish(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOutcome {
     ctx.ret(0);
-    if st.display_queue_finish() { crate::SvcOutcome::Block } else { crate::SvcOutcome::Continue }
+    if st.display_queue_finish() {
+        crate::SvcOutcome::Block
+    } else {
+        crate::SvcOutcome::Continue
+    }
 }
 
 pub(super) fn finish(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOutcome {
     let n = st.capture.scenes.len();
     let blocked = complete_scenes_through(ctx, st, n);
     ctx.ret(0);
-    if blocked { crate::SvcOutcome::Block } else { crate::SvcOutcome::Continue }
+    if blocked {
+        crate::SvcOutcome::Block
+    } else {
+        crate::SvcOutcome::Continue
+    }
 }
 
 // --- the TRANSFER ENGINE ---------------------------------------------------------
@@ -6190,9 +8221,9 @@ fn transfer_bpp(format: u32) -> Option<usize> {
 /// that nothing here depends on.
 fn transfer_fields(kind: u32) -> Option<&'static [(u32, u32)]> {
     Some(match kind {
-        0x0001_0000 => &[(0, 4), (4, 4), (8, 4), (12, 4)],   // U4U4U4U4
-        0x0002_0000 => &[(0, 5), (5, 5), (10, 5), (15, 1)],  // U1U5U5U5
-        0x0003_0000 => &[(0, 5), (5, 6), (11, 5)],           // U5U6U5
+        0x0001_0000 => &[(0, 4), (4, 4), (8, 4), (12, 4)], // U4U4U4U4
+        0x0002_0000 => &[(0, 5), (5, 5), (10, 5), (15, 1)], // U1U5U5U5
+        0x0003_0000 => &[(0, 5), (5, 6), (11, 5)],         // U5U6U5
         0x000d_0000 => &[(0, 10), (10, 10), (20, 10), (30, 2)], // U2U10U10U10_ABGR
         _ => return None,
     })
@@ -6216,7 +8247,11 @@ fn average_u4x4(t: [u32; 4]) -> u32 {
 fn average_packed(fields: &[(u32, u32)], t: [u32; 4]) -> u32 {
     let mut out = 0u32;
     for &(shift, bits) in fields {
-        let mask = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+        let mask = if bits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << bits) - 1
+        };
         let sum: u32 = t.iter().map(|v| (v >> shift) & mask).sum();
         out |= (((sum + 2) / 4) & mask) << shift;
     }
@@ -6274,7 +8309,12 @@ pub(super) fn transfer_copy(ctx: &mut GuestCtx) {
     let (dst_x, dst_y, dst_stride) = (ctx.arg(14), ctx.arg(15), ctx.arg(16) as i32);
     let notification = ctx.arg(19);
     let (Some(sbpp), Some(dbpp)) = (transfer_bpp(src_format), transfer_bpp(dst_format)) else {
-        report_transfer_unsupported("sceGxmTransferCopy", "a format it cannot size", src_format, dst_format);
+        report_transfer_unsupported(
+            "sceGxmTransferCopy",
+            "a format it cannot size",
+            src_format,
+            dst_format,
+        );
         ctx.ret(0);
         return;
     };
@@ -6325,9 +8365,18 @@ pub(super) fn transfer_copy(ctx: &mut GuestCtx) {
         return;
     }
     if !linear || !same {
-        let reason = if linear { "a format CONVERSION" } else { "a TILED or SWIZZLED layout" };
+        let reason = if linear {
+            "a format CONVERSION"
+        } else {
+            "a TILED or SWIZZLED layout"
+        };
         report_transfer_unsupported_typed(
-            "sceGxmTransferCopy", reason, src_format, dst_format, Some(src_type), Some(dst_type),
+            "sceGxmTransferCopy",
+            reason,
+            src_format,
+            dst_format,
+            Some(src_type),
+            Some(dst_type),
         );
         // >>> AND THE GEOMETRY, because that is what a FIX for this needs and what the report
         // >>> cannot be written without asking for twice.
@@ -6384,12 +8433,20 @@ pub(super) fn transfer_downscale(ctx: &mut GuestCtx) {
     let (dst_x, dst_y, dst_stride) = (ctx.arg(9), ctx.arg(10), ctx.arg(11) as i32);
     let notification = ctx.arg(14);
     let (Some(sbpp), Some(dbpp)) = (transfer_bpp(src_format), transfer_bpp(dst_format)) else {
-        report_transfer_unsupported("sceGxmTransferDownscale", "a format it cannot size", src_format, dst_format);
+        report_transfer_unsupported(
+            "sceGxmTransferDownscale",
+            "a format it cannot size",
+            src_format,
+            dst_format,
+        );
         ctx.ret(0);
         return;
     };
     // U8_R, U8U8_GR, U8U8U8_BGR and U8U8U8U8_ABGR are exactly the byte-per-channel family.
-    let byte_channels = matches!(transfer_kind(src_format), 0x0000_0000 | 0x0004_0000 | 0x0005_0000 | 0x0006_0000);
+    let byte_channels = matches!(
+        transfer_kind(src_format),
+        0x0000_0000 | 0x0004_0000 | 0x0005_0000 | 0x0006_0000
+    );
     let same_kind = sbpp == dbpp && transfer_kind(src_format) == transfer_kind(dst_format);
     // >>> A PACKED format is averaged PER BIT FIELD rather than refused.
     //
@@ -6439,14 +8496,15 @@ pub(super) fn transfer_downscale(ctx: &mut GuestCtx) {
         // contiguous span, so it is read once and the rows are sliced out of it; a negative
         // stride keeps the per-row reads.
         let row_bytes = out_w as usize * 2 * sbpp;
-        let span = (src_stride > 0)
-            .then(|| (2 * out_h as usize - 1) * src_stride as usize + row_bytes);
+        let span =
+            (src_stride > 0).then(|| (2 * out_h as usize - 1) * src_stride as usize + row_bytes);
         let block = span.map(|n| ctx.read_bytes(s0, n));
         // The packed FORMAT this title measured - U4U4U4U4, four 4-bit fields - averaged four
         // fields at once in byte lanes (SWAR). Each lane sums four nibbles (at most 60), so no
         // lane carries into the next, and `(sum + 2) >> 2` masked to four bits is exactly the
         // per-field `(sum + 2) / 4` of `average_packed`.
-        let u4x4 = packed.is_some() && transfer_kind(src_format) == 0x0001_0000 && sbpp == 2 && dbpp == 2;
+        let u4x4 =
+            packed.is_some() && transfer_kind(src_format) == 0x0001_0000 && sbpp == 2 && dbpp == 2;
         for y in 0..out_h {
             let (a_owned, b_owned);
             let (a, b): (&[u8], &[u8]) = match block.as_ref() {
@@ -6466,7 +8524,8 @@ pub(super) fn transfer_downscale(ctx: &mut GuestCtx) {
             for x in 0..out_w as usize {
                 let (left, right) = (x * 2 * sbpp, (x * 2 + 1) * sbpp);
                 if u4x4 {
-                    let h = |buf: &[u8], at: usize| u32::from(buf[at]) | (u32::from(buf[at + 1]) << 8);
+                    let h =
+                        |buf: &[u8], at: usize| u32::from(buf[at]) | (u32::from(buf[at + 1]) << 8);
                     let out = average_u4x4([h(a, left), h(a, right), h(b, left), h(b, right)]);
                     row[x * 2] = out as u8;
                     row[x * 2 + 1] = (out >> 8) as u8;
@@ -6525,14 +8584,19 @@ fn report_transfer_geometry(
     sbpp: usize,
     dbpp: usize,
 ) {
-    if !crate::rtt_writeback::report_once(0x7467_0000_0000_0000 ^ ((width as u64) << 32) ^ height as u64)
-    {
+    if !crate::rtt_writeback::report_once(
+        0x7467_0000_0000_0000 ^ ((width as u64) << 32) ^ height as u64,
+    ) {
         return;
     }
     // If the destination stride DOES carry the image width, this is that width - the single
     // number a swizzled placement turns on. Printed beside the rectangle so the two can be
     // compared rather than one of them assumed.
-    let dst_row_texels = if dbpp > 0 { dst_stride.unsigned_abs() / dbpp as u32 } else { 0 };
+    let dst_row_texels = if dbpp > 0 {
+        dst_stride.unsigned_abs() / dbpp as u32
+    } else {
+        0
+    };
     tracing::warn!(
         target: "vitaslop::gxm",
         rect = format_args!("{width}x{height}"),

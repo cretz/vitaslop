@@ -1,7 +1,7 @@
 -- WipEout 2048 (PCSA00015): the boot ladder with NO INPUT - the baseline every deeper run
--- builds on. Converted from the recipe `boot`.
+-- builds on. Converted from the old frame-keyed script `boot`.
 --
--- Calls, from `--discover` on the campaign recipe's run (deterministic, 10000 frames):
+-- Calls, from `--discover` on the campaign script's run (deterministic, 10000 frames):
 --
 --   f545   sceMp4OpenFile data/Videos/intro.mp4   the intro movie (the attract demo)
 --   f5151  sceMp4CloseFile                        the movie is over

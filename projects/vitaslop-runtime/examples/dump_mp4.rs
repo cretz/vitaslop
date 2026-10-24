@@ -48,8 +48,12 @@ fn main() {
                 t.codec_config.len(),
             );
             if !t.codec_config.is_empty() {
-                let head: Vec<String> =
-                    t.codec_config.iter().take(24).map(|b| format!("{b:02x}")).collect();
+                let head: Vec<String> = t
+                    .codec_config
+                    .iter()
+                    .take(24)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
                 println!("    setup: {}", head.join(" "));
             }
             if let Some(first) = t.samples.first() {

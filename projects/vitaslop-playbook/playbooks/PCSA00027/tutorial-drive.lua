@@ -2,9 +2,9 @@
 -- RC car sandbox in a skatepark - the render target), walk the tutorial's intro dialogs, and
 -- DRIVE: accelerate, steer, reverse out of a wall, drive off on a new heading.
 --
--- Converted from the recipes `main-screen` (boot to the sandbox), `gameplay-prefix` (the same,
+-- Converted from the old frame-keyed scripts `main-screen` (boot to the sandbox), `gameplay-prefix` (the same,
 -- plus the dialogs, ending with nothing held) and `tutorial-drive` (the prefix, then the drive).
--- Each recipe's end point is a phase here.
+-- Each old script's end point is a phase here.
 --
 -- HOW THE CUES WERE FOUND: `--discover` on `tutorial-drive`'s run (deterministic, 2500 frames)
 -- next to a shot every 60 frames (frames from that run):
@@ -17,7 +17,7 @@
 -- is saved. CROSS accepts. The legal splash, the logos and a "Communicating with server"
 -- spinner before it take no input.
 --
--- THE CONTROL SCHEME (got wrong twice, in both directions - see the recipe's history):
+-- THE CONTROL SCHEME (got wrong twice, in both directions - see the old script's history):
 --   RIGHT stick UP (ry=0) accelerate, RIGHT stick DOWN (ry=255) brake / reverse,
 --   LEFT stick X steers as a TURN RATE (lx>128 one way, lx<128 the other); `ly` is NOT read.
 -- Measured over 90 frames at full throttle: lx=218 turned about -90 degrees, lx=255 about

@@ -3657,8 +3657,8 @@ fn emit_instr(
         Op::PackToInt { bits, signed, norm, .. } => {
             emit_pack_to_int(s, instr, dest, mask, bits, signed, norm).ok_or_else(unmapped)
         }
-        Op::PackFromInt { bits, signed } => {
-            emit_pack_from_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
+        Op::PackFromInt { bits, signed, norm } => {
+            emit_pack_from_int(s, instr, dest, mask, bits, signed, norm).ok_or_else(unmapped)
         }
         Op::PackIntCopy { bits, dest_bits, signed } => {
             emit_pack_int_copy(s, instr, dest, mask, bits, dest_bits, signed).ok_or_else(unmapped)
@@ -4066,10 +4066,13 @@ fn emit_pack_from_int(
     mask: [bool; 4],
     bits: u8,
     signed: bool,
+    norm: bool,
 ) -> Option<()> {
     debug_assert!(bits == 16 || bits == 8, "only the 16- and 8-bit widths decode to this op");
     let s1 = instr.srcs.first()?;
     let dp = Prec::of(instr);
+    // The normalized form's divisor: the integer's full positive range (see `Op::PackFromInt`).
+    let range = if signed { (1u32 << (bits - 1)) - 1 } else { (1u32 << bits) - 1 };
     for c in 0..4 {
         if !mask[c] {
             continue;
@@ -4080,6 +4083,11 @@ fn emit_pack_from_int(
         let lo = (sel % elems_per_reg) * bits as u32;
         let half = raw_elem_expr(&reg, lo, bits as u32, signed);
         let e = format!("f32({half})");
+        let e = match (norm, signed) {
+            (true, true) => format!("max({e} / {range}.0, -1.0)"),
+            (true, false) => format!("({e} / {range}.0)"),
+            (false, _) => e,
+        };
         let e = if s1.neg { format!("(-{e})") } else { e };
         let e = if s1.abs { format!("abs({e})") } else { e };
         body.store(dest, c, &e, dp)?;
@@ -5429,7 +5437,7 @@ mod tests {
         };
         let dest = Operand::plain(Bank::SecondaryAttr, 60, 2);
         for (sel, lo) in [(0u8, 0u32), (1, 8), (2, 16), (3, 24)] {
-            let mut i = instr(Op::PackFromInt { bits: 8, signed: false }, Some(dest), vec![src(sel)]);
+            let mut i = instr(Op::PackFromInt { bits: 8, signed: false, norm: false }, Some(dest), vec![src(sel)]);
             i.write_mask = [true, false, false, false];
             let wgsl = emit_fragment(&shader(vec![i])).unwrap();
             // ONE register - the operand's own - and the byte at the selector's position.

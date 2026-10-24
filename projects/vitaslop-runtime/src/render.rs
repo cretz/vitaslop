@@ -1,4 +1,4 @@
-﻿//! A software rasterizer over the captured GXM stream: the first, blob-free way
+//! A software rasterizer over the captured GXM stream: the first, blob-free way
 //! to turn a recorded scene into pixels. It is a fixed-function equivalent of the
 //! cube's (placeholder) shaders - transform each vertex position by the captured
 //! MVP uniform, interpolate the per-vertex color, depth-test - which is exactly
@@ -22,7 +22,11 @@ impl Framebuffer {
         for _ in 0..width * height {
             rgba.extend_from_slice(&clear);
         }
-        Framebuffer { width, height, rgba }
+        Framebuffer {
+            width,
+            height,
+            rgba,
+        }
     }
 
     /// Count of pixels not equal to `clear` (how much got drawn).
@@ -40,7 +44,11 @@ impl Framebuffer {
     /// factor) is ignored, so callers should rasterize at exactly `factor * out` dimensions.
     pub fn downsampled(&self, factor: u32) -> Framebuffer {
         if factor <= 1 {
-            return Framebuffer { width: self.width, height: self.height, rgba: self.rgba.clone() };
+            return Framebuffer {
+                width: self.width,
+                height: self.height,
+                rgba: self.rgba.clone(),
+            };
         }
         let ow = self.width / factor;
         let oh = self.height / factor;
@@ -67,7 +75,11 @@ impl Framebuffer {
                 ]);
             }
         }
-        Framebuffer { width: ow, height: oh, rgba }
+        Framebuffer {
+            width: ow,
+            height: oh,
+            rgba,
+        }
     }
 
     /// Bilinearly scale to `(w, h)` - what the display controller does to a framebuffer
@@ -84,9 +96,16 @@ impl Framebuffer {
     /// nothing, so every title that already declares the panel is unaffected.
     pub fn scaled_to(&self, w: u32, h: u32) -> Framebuffer {
         if (w, h) == (self.width, self.height) {
-            return Framebuffer { width: w, height: h, rgba: self.rgba.clone() };
+            return Framebuffer {
+                width: w,
+                height: h,
+                rgba: self.rgba.clone(),
+            };
         }
-        assert!(w > 0 && h > 0 && self.width > 0 && self.height > 0, "empty framebuffer scale");
+        assert!(
+            w > 0 && h > 0 && self.width > 0 && self.height > 0,
+            "empty framebuffer scale"
+        );
         let mut rgba = Vec::with_capacity((w * h * 4) as usize);
         // Sample at pixel CENTRES, so the scale does not shift the image by half a texel -
         // a half-pixel offset on a 2D front end is a visibly soft edge on every glyph.
@@ -117,13 +136,22 @@ impl Framebuffer {
                 rgba.extend_from_slice(&out);
             }
         }
-        Framebuffer { width: w, height: h, rgba }
+        Framebuffer {
+            width: w,
+            height: h,
+            rgba,
+        }
     }
 
     /// The RGBA color at `(x, y)`.
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * self.width + x) * 4) as usize;
-        [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2], self.rgba[i + 3]]
+        [
+            self.rgba[i],
+            self.rgba[i + 1],
+            self.rgba[i + 2],
+            self.rgba[i + 3],
+        ]
     }
 
     /// Encode as a PNG (8-bit RGBA). Self-contained: uncompressed DEFLATE (stored
@@ -210,13 +238,19 @@ pub fn png_to_rgba(png: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let row_bytes = width as usize * 4;
     let expect = (row_bytes + 1) * height as usize;
     if raw.len() != expect {
-        return Err(format!("image data is {} bytes, expected {expect}", raw.len()));
+        return Err(format!(
+            "image data is {} bytes, expected {expect}",
+            raw.len()
+        ));
     }
     let mut rgba = Vec::with_capacity(row_bytes * height as usize);
     for y in 0..height as usize {
         let at = y * (row_bytes + 1);
         if raw[at] != 0 {
-            return Err(format!("row {y} uses filter {} (only filter 0 is supported)", raw[at]));
+            return Err(format!(
+                "row {y} uses filter {} (only filter 0 is supported)",
+                raw[at]
+            ));
         }
         rgba.extend_from_slice(&raw[at + 1..at + 1 + row_bytes]);
     }
@@ -395,7 +429,10 @@ fn layout_of(d: &Draw) -> Layout {
         .collect();
     floats.sort_unstable();
     // Position: the first attribute with >= 3 components, else the first of any.
-    let pos = floats.iter().find(|(_, c, _)| *c >= 3).or_else(|| floats.first());
+    let pos = floats
+        .iter()
+        .find(|(_, c, _)| *c >= 3)
+        .or_else(|| floats.first());
     let (pos_off, pos_comps, pos_fmt) = pos.copied().unwrap_or((0, 3, FORMAT_F32));
     // Texcoord: prefer a dedicated 2-component attribute (the classic pos.xyz + uv.xy
     // layout); otherwise fall back to the lowest-offset non-position float attribute
@@ -421,7 +458,16 @@ fn layout_of(d: &Draw) -> Layout {
         Some((o, _, f)) => (Some(*o), *f),
         None => (None, FORMAT_F32),
     };
-    Layout { pos_off, pos_comps, pos_fmt, uv_off, uv_fmt, color_off, normal_off, normal_fmt }
+    Layout {
+        pos_off,
+        pos_comps,
+        pos_fmt,
+        uv_off,
+        uv_fmt,
+        color_off,
+        normal_off,
+        normal_fmt,
+    }
 }
 
 /// Decode an IEEE-754 half-float (F16) to f32.
@@ -432,7 +478,11 @@ pub fn half_to_f32(h: u16) -> f32 {
     let v = if exp == 0 {
         mant * 2f32.powi(-24)
     } else if exp == 0x1f {
-        if h & 0x3ff == 0 { f32::INFINITY } else { f32::NAN }
+        if h & 0x3ff == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
     } else {
         (mant / 1024.0 + 1.0) * 2f32.powi(exp - 15)
     };
@@ -467,7 +517,9 @@ pub fn f32_to_half(v: f32) -> u16 {
         let shift = (14 - e) as u32;
         let half = m >> shift;
         // Round to nearest, ties to even, on the bit shifted out.
-        let round = u32::from((m >> (shift - 1)) & 1 == 1 && (m & ((1 << (shift - 1)) - 1) != 0 || half & 1 == 1));
+        let round = u32::from(
+            (m >> (shift - 1)) & 1 == 1 && (m & ((1 << (shift - 1)) - 1) != 0 || half & 1 == 1),
+        );
         return sign | (half + round) as u16;
     }
     let half = ((e as u32) << 10) | (mant >> 13);
@@ -503,7 +555,12 @@ fn decode_vertex(d: &Draw, layout: &Layout, i: usize) -> Vertex {
                 0.0
             }
         } else if o + 4 <= d.vertices.len() {
-            f32::from_le_bytes([d.vertices[o], d.vertices[o + 1], d.vertices[o + 2], d.vertices[o + 3]])
+            f32::from_le_bytes([
+                d.vertices[o],
+                d.vertices[o + 1],
+                d.vertices[o + 2],
+                d.vertices[o + 3],
+            ])
         } else {
             0.0
         }
@@ -511,7 +568,11 @@ fn decode_vertex(d: &Draw, layout: &Layout, i: usize) -> Vertex {
     let pstep = if layout.pos_fmt == FORMAT_F16 { 2 } else { 4 };
     let px = lane(layout.pos_off, layout.pos_fmt);
     let py = lane(layout.pos_off + pstep, layout.pos_fmt);
-    let pz = if layout.pos_comps >= 3 { lane(layout.pos_off + 2 * pstep, layout.pos_fmt) } else { 0.0 };
+    let pz = if layout.pos_comps >= 3 {
+        lane(layout.pos_off + 2 * pstep, layout.pos_fmt)
+    } else {
+        0.0
+    };
     let ustep = if layout.uv_fmt == FORMAT_F16 { 2 } else { 4 };
     let uv = match layout.uv_off {
         Some(o) => [lane(o, layout.uv_fmt), lane(o + ustep, layout.uv_fmt)],
@@ -521,7 +582,12 @@ fn decode_vertex(d: &Draw, layout: &Layout, i: usize) -> Vertex {
         Some(o) => {
             let c = base + o;
             if c + 4 <= d.vertices.len() {
-                [d.vertices[c], d.vertices[c + 1], d.vertices[c + 2], d.vertices[c + 3]]
+                [
+                    d.vertices[c],
+                    d.vertices[c + 1],
+                    d.vertices[c + 2],
+                    d.vertices[c + 3],
+                ]
             } else {
                 [255, 255, 255, 255]
             }
@@ -530,12 +596,25 @@ fn decode_vertex(d: &Draw, layout: &Layout, i: usize) -> Vertex {
     };
     let normal = match layout.normal_off {
         Some(o) => {
-            let nstep = if layout.normal_fmt == FORMAT_F16 { 2 } else { 4 };
-            [lane(o, layout.normal_fmt), lane(o + nstep, layout.normal_fmt), lane(o + 2 * nstep, layout.normal_fmt)]
+            let nstep = if layout.normal_fmt == FORMAT_F16 {
+                2
+            } else {
+                4
+            };
+            [
+                lane(o, layout.normal_fmt),
+                lane(o + nstep, layout.normal_fmt),
+                lane(o + 2 * nstep, layout.normal_fmt),
+            ]
         }
         None => [0.0, 0.0, 0.0],
     };
-    Vertex { pos: [px, py, pz], uv, color, normal }
+    Vertex {
+        pos: [px, py, pz],
+        uv,
+        color,
+        normal,
+    }
 }
 
 /// Just the POSITION of vertex `i`, decoded exactly as [`decode_vertex`] decodes it.
@@ -557,7 +636,12 @@ fn decode_vertex_pos(d: &Draw, layout: &Layout, i: usize) -> [f32; 3] {
                 0.0
             }
         } else if o + 4 <= d.vertices.len() {
-            f32::from_le_bytes([d.vertices[o], d.vertices[o + 1], d.vertices[o + 2], d.vertices[o + 3]])
+            f32::from_le_bytes([
+                d.vertices[o],
+                d.vertices[o + 1],
+                d.vertices[o + 2],
+                d.vertices[o + 3],
+            ])
         } else {
             0.0
         }
@@ -566,7 +650,11 @@ fn decode_vertex_pos(d: &Draw, layout: &Layout, i: usize) -> [f32; 3] {
     [
         lane(layout.pos_off, layout.pos_fmt),
         lane(layout.pos_off + pstep, layout.pos_fmt),
-        if layout.pos_comps >= 3 { lane(layout.pos_off + 2 * pstep, layout.pos_fmt) } else { 0.0 },
+        if layout.pos_comps >= 3 {
+            lane(layout.pos_off + 2 * pstep, layout.pos_fmt)
+        } else {
+            0.0
+        },
     ]
 }
 
@@ -591,12 +679,21 @@ fn world_normal(n: [f32; 3], world: &[f32; 16]) -> [f32; 3] {
 /// tone-mapped so HDR light (this title's key light is ~2.8x) rolls off instead of clipping.
 /// `n_world` is the interpolated, world-space surface normal (already normalized). Shared by
 /// the software rasterizer and mirrored exactly in the WGSL `fs_opaque` so the two agree.
-fn shade_lit(albedo: [f32; 3], n_world: [f32; 3], mat: &crate::capture::FragmentMaterial, exposure: f32) -> [u8; 3] {
+fn shade_lit(
+    albedo: [f32; 3],
+    n_world: [f32; 3],
+    mat: &crate::capture::FragmentMaterial,
+    exposure: f32,
+) -> [u8; 3] {
     // Light direction is world-space "direction to the light"; N.L is clamped to the front.
     let l = {
         let d = mat.light_dir;
         let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        if len > 1e-6 { [d[0] / len, d[1] / len, d[2] / len] } else { [0.0, 1.0, 0.0] }
+        if len > 1e-6 {
+            [d[0] / len, d[1] / len, d[2] / len]
+        } else {
+            [0.0, 1.0, 0.0]
+        }
     };
     let ndotl = (n_world[0] * l[0] + n_world[1] * l[1] + n_world[2] * l[2]).max(0.0);
     let mut out = [0u8; 3];
@@ -798,7 +895,11 @@ fn tri_indices(d: &Draw, t: usize) -> [usize; 3] {
             if t & 1 == 0 { [a, b, c] } else { [a, c, b] }
         }
         PRIM_TRIANGLE_FAN => [index_at(d, 0), index_at(d, t + 1), index_at(d, t + 2)],
-        _ => [index_at(d, t * 3), index_at(d, t * 3 + 1), index_at(d, t * 3 + 2)],
+        _ => [
+            index_at(d, t * 3),
+            index_at(d, t * 3 + 1),
+            index_at(d, t * 3 + 2),
+        ],
     }
 }
 
@@ -828,7 +929,12 @@ fn index_at(d: &Draw, i: usize) -> usize {
     } else {
         let o = i * 4;
         if o + 4 <= d.indices.len() {
-            return u32::from_le_bytes([d.indices[o], d.indices[o + 1], d.indices[o + 2], d.indices[o + 3]]) as usize;
+            return u32::from_le_bytes([
+                d.indices[o],
+                d.indices[o + 1],
+                d.indices[o + 2],
+                d.indices[o + 3],
+            ]) as usize;
         }
     }
     0
@@ -868,13 +974,7 @@ pub fn palette_entries(base_format: u32) -> Option<u32> {
 ///
 /// Shared by the palette expansion's source walk and its destination walk so the two cannot
 /// address a level differently. `bits` is 4, 8 or 32.
-pub fn texel_element(
-    tex_type: u32,
-    l: &LevelLayout,
-    bits: u32,
-    x: u32,
-    y: u32,
-) -> (usize, u32) {
+pub fn texel_element(tex_type: u32, l: &LevelLayout, bits: u32, x: u32, y: u32) -> (usize, u32) {
     if swizzled_type(tex_type) {
         // Morton order over the TEXEL grid, power-of-two padded. Every width here is a whole
         // number of texels per element or a whole number of elements per texel, so the texel
@@ -950,7 +1050,13 @@ fn align_up_to(v: u32, to: u32) -> u32 {
 /// compressed rows block-packed.
 ///
 /// `None` for a format [`block_layout`] cannot size.
-pub fn level_layout(base_format: u32, tex_type: u32, width: u32, height: u32, level: u32) -> Option<LevelLayout> {
+pub fn level_layout(
+    base_format: u32,
+    tex_type: u32,
+    width: u32,
+    height: u32,
+    level: u32,
+) -> Option<LevelLayout> {
     let (block_w, block_h, block_bytes) = block_layout(base_format)?;
     let w = (width >> level).max(1);
     let h = (height >> level).max(1);
@@ -979,10 +1085,24 @@ pub fn level_layout(base_format: u32, tex_type: u32, width: u32, height: u32, le
         let padded_y = blocks_y.next_power_of_two();
         (padded_x * block_bytes, padded_x * padded_y * block_bytes)
     } else {
-        let row_blocks = if block_w == 1 { align_up_to(w, 8) } else { blocks_x };
-        (row_blocks * block_bytes, row_blocks * block_bytes * blocks_y)
+        let row_blocks = if block_w == 1 {
+            align_up_to(w, 8)
+        } else {
+            blocks_x
+        };
+        (
+            row_blocks * block_bytes,
+            row_blocks * block_bytes * blocks_y,
+        )
     };
-    Some(LevelLayout { width: w, height: h, blocks_x, blocks_y, stride, bytes })
+    Some(LevelLayout {
+        width: w,
+        height: h,
+        blocks_x,
+        blocks_y,
+        stride,
+        bytes,
+    })
 }
 
 /// One mip level's geometry in guest memory - see [`level_layout`].
@@ -1014,7 +1134,13 @@ pub fn max_mip_levels(width: u32, height: u32) -> u32 {
 /// level is approximately a box filter of the one above it, and on this title's 2048x2048 atlas
 /// the mean absolute difference against that reference runs 2.4-6.6 for nine levels against
 /// 22-30 for an X-flipped control. See [[vitaslop-guest-mip-chain-layout]].
-pub fn level_offset(base_format: u32, tex_type: u32, width: u32, height: u32, level: u32) -> Option<u32> {
+pub fn level_offset(
+    base_format: u32,
+    tex_type: u32,
+    width: u32,
+    height: u32,
+    level: u32,
+) -> Option<u32> {
     let mut off = 0u32;
     for l in 0..level {
         off += level_layout(base_format, tex_type, width, height, l)?.bytes;
@@ -1044,7 +1170,13 @@ pub fn cube_face_stride(base_format: u32, tex_type: u32, width: u32, height: u32
     if level0 < ALIGN {
         return Some(level0);
     }
-    let chain = level_offset(base_format, tex_type, width, height, max_mip_levels(width, height))?;
+    let chain = level_offset(
+        base_format,
+        tex_type,
+        width,
+        height,
+        max_mip_levels(width, height),
+    )?;
     Some(align_up_to(chain, ALIGN))
 }
 
@@ -1060,7 +1192,9 @@ pub fn cube_face_stride(base_format: u32, tex_type: u32, width: u32, height: u32
 /// `None` when `t` does not hold that level, or when the format cannot be sized.
 pub fn level_view(t: &BoundTexture, face: u32, level: u32) -> Option<BoundTexture> {
     let l = level_layout(t.base_format, t.tex_type, t.width, t.height, level)?;
-    let off = (face * t.face_bytes + level_offset(t.base_format, t.tex_type, t.width, t.height, level)?) as usize;
+    let off = (face * t.face_bytes
+        + level_offset(t.base_format, t.tex_type, t.width, t.height, level)?)
+        as usize;
     let end = off.checked_add(l.bytes as usize)?;
     if level >= t.levels || end > t.pixels.len() {
         return None;
@@ -1114,7 +1248,10 @@ fn block_format_for(base_format: u32) -> Option<BlockFormat> {
 ///
 /// A cube map passes through face by face (see [`cube_face_stride`]); the two transcodes, which
 /// build one face, refuse it.
-fn compressed_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Option<CompressedUpload> {
+fn compressed_source(
+    t: &BoundTexture,
+    force_format: Option<BlockFormat>,
+) -> Option<CompressedUpload> {
     // Nothing here is worth doing on a GPU that cannot take the result - and this runs on the
     // texture decode path of every engine, including one whose adapter exposes ASTC and ETC2
     // but not BC.
@@ -1298,7 +1435,12 @@ fn encode_chunk_blocks() -> u32 {
 /// presence-only [[vitaslop-knob-is-the-gate-not-the-level]].
 fn encode_resume_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::var("VITASLOP_TEX_ENCODE_RESUME").ok().as_deref() != Some("0"))
+    *ON.get_or_init(|| {
+        crate::knobs::var("VITASLOP_TEX_ENCODE_RESUME")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
 }
 
 /// `VITASLOP_GXP_INDEX16=0` restores the OLD behaviour: every index widened to u32 whatever
@@ -1326,8 +1468,6 @@ fn reset_inline_encode_budget() {
         }
     });
 }
-
-
 
 /// The lossless half of [`compressed_source`]: the guest's own blocks, or `None` with a report.
 fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
@@ -1392,8 +1532,13 @@ fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
     let mut data: Vec<u8> = Vec::with_capacity((t.face_bytes * faces) as usize);
     for (face, level) in (0..faces).flat_map(|f| (0..t.levels).map(move |l| (f, l))) {
         let l = level_layout(t.base_format, t.tex_type, t.width, t.height, level)?;
-        let base = (face * t.face_bytes + level_offset(t.base_format, t.tex_type, t.width, t.height, level)?) as usize;
-        let (pw, ph) = (l.blocks_x.next_power_of_two(), l.blocks_y.next_power_of_two());
+        let base = (face * t.face_bytes
+            + level_offset(t.base_format, t.tex_type, t.width, t.height, level)?)
+            as usize;
+        let (pw, ph) = (
+            l.blocks_x.next_power_of_two(),
+            l.blocks_y.next_power_of_two(),
+        );
         for by in 0..l.blocks_y {
             for bx in 0..l.blocks_x {
                 // The ONLY transformation between guest memory and the GPU: a swizzled texture
@@ -1401,7 +1546,11 @@ fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
                 // wants them in linear block rows. It permutes whole blocks and touches no bit
                 // inside one, so it is still a passthrough - the picture the GPU decodes is the
                 // picture the hardware decodes.
-                let index = if swizzled { morton_index(bx, by, pw, ph) } else { by * (l.stride / bb) + bx };
+                let index = if swizzled {
+                    morton_index(bx, by, pw, ph)
+                } else {
+                    by * (l.stride / bb) + bx
+                };
                 let off = base + (index * bb) as usize;
                 match t.pixels.get(off..off + bb as usize) {
                     Some(block) => data.extend_from_slice(block),
@@ -1484,8 +1633,16 @@ pub fn raw_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpa
             // STRIDE IN TEXELS, which is what a LINEAR level addresses through.
             blocks_x: if level == 0 { t.stride / 4 } else { l.width },
             blocks_y: l.height,
-            padded_x: if swizzled { l.width.next_power_of_two() } else { l.width },
-            padded_y: if swizzled { l.height.next_power_of_two() } else { l.height },
+            padded_x: if swizzled {
+                l.width.next_power_of_two()
+            } else {
+                l.width
+            },
+            padded_y: if swizzled {
+                l.height.next_power_of_two()
+            } else {
+                l.height
+            },
             swizzled,
         });
     }
@@ -1564,8 +1721,16 @@ pub fn block_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawEx
             blocks_y: l.blocks_y,
             // A swizzled block image is Morton-addressed over BLOCKS, so the padding is the
             // block count rounded up - not the texel count. Same as `gpu_transcode`.
-            padded_x: if swizzled { l.blocks_x.next_power_of_two() } else { l.blocks_x },
-            padded_y: if swizzled { l.blocks_y.next_power_of_two() } else { l.blocks_y },
+            padded_x: if swizzled {
+                l.blocks_x.next_power_of_two()
+            } else {
+                l.blocks_x
+            },
+            padded_y: if swizzled {
+                l.blocks_y.next_power_of_two()
+            } else {
+                l.blocks_y
+            },
             swizzled,
         });
     }
@@ -1580,7 +1745,9 @@ pub fn block_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawEx
         // Unused by the block decoder - see the refusal above.
         swizzle: 0,
         src_levels,
-        codec: Some(SourceCodec::Bc { base_format: t.base_format }),
+        codec: Some(SourceCodec::Bc {
+            base_format: t.base_format,
+        }),
     })
 }
 
@@ -1626,7 +1793,10 @@ fn compression_enabled() -> bool {
 /// Unlike the passthrough, this path OWNS the encode, so a texture the guest left mipless can
 /// still be given a box-filtered chain - built in RGBA8, where a box filter is meaningful, and
 /// encoded level by level. That removes the one condition that refuses a passthrough outright.
-fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Option<CompressedUpload> {
+fn transcoded_source(
+    t: &BoundTexture,
+    force_format: Option<BlockFormat>,
+) -> Option<CompressedUpload> {
     // Only formats that are ALREADY block-compressed on the guest. Re-encoding an uncompressed
     // texture would be a pure quality loss to save memory the title never asked to spend, and
     // the uncompressed formats are 0.8 MB of a 274 MB frame - there is nothing there to win.
@@ -1723,7 +1893,9 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
     // use PVRTC for nearly everything (this race binds 99 PVRTC textures against 8 BC ones), so
     // "the same 8x" applies to a completely different share of the working set. That is what
     // makes the BC case affordable and this one not.
-    if block_format_for(t.base_format).is_some() && !vitaslop_platform::gpu::texture_budget_pressure() {
+    if block_format_for(t.base_format).is_some()
+        && !vitaslop_platform::gpu::texture_budget_pressure()
+    {
         return why(
             "it is a BC format that already fits the texture budget as RGBA8, and re-encoding it \
              to ETC2 costs a block decode plus an alpha-carrying encode - CPU this device needs \
@@ -1808,14 +1980,15 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
         let mut levels: Vec<(u32, u32, Vec<u8>)> = Vec::new();
         for level in 0..want {
             if level < t.levels
-                && let Some(view) = level_view(t, 0, level) {
-                    let (w, h, rgba, seam) = decode_texture_seam(&view);
-                    if seam != TexelSeam::Rgba8 {
-                        return why("it decodes onto the half seam, which is DATA and not colour");
-                    }
-                    levels.push((w, h, rgba));
-                    continue;
+                && let Some(view) = level_view(t, 0, level)
+            {
+                let (w, h, rgba, seam) = decode_texture_seam(&view);
+                if seam != TexelSeam::Rgba8 {
+                    return why("it decodes onto the half seam, which is DATA and not colour");
                 }
+                levels.push((w, h, rgba));
+                continue;
+            }
             let Some((pw, ph, prev)) = levels.last() else {
                 return why("its level 0 could not be decoded");
             };
@@ -1982,7 +2155,10 @@ fn gpu_transcode(t: &BoundTexture, force_format: Option<BlockFormat>) -> Option<
     let face = &t.pixels[..t.face_bytes.min(t.pixels.len() as u32) as usize];
     let (codec, opaque) = match crate::pvrtc::Variant::from_base_format(t.base_format) {
         Some(v) => (
-            SourceCodec::Pvrtc { two: v.two, four_bpp: v.four_bpp },
+            SourceCodec::Pvrtc {
+                two: v.two,
+                four_bpp: v.four_bpp,
+            },
             crate::pvrtc::face_is_opaque(face, v),
         ),
         None => match t.base_format {
@@ -2008,14 +2184,20 @@ fn gpu_transcode(t: &BoundTexture, force_format: Option<BlockFormat>) -> Option<
                     return None;
                 }
                 (
-                    SourceCodec::Bc { base_format: t.base_format },
+                    SourceCodec::Bc {
+                        base_format: t.base_format,
+                    },
                     t.base_format == 0x85 && bc1_face_is_opaque(face),
                 )
             }
             _ => return None,
         },
     };
-    let format = force_format.unwrap_or(if opaque { BlockFormat::Etc2Rgb8 } else { BlockFormat::Etc2Rgba8 });
+    let format = force_format.unwrap_or(if opaque {
+        BlockFormat::Etc2Rgb8
+    } else {
+        BlockFormat::Etc2Rgba8
+    });
     if format.family() != BlockFamily::Etc2 {
         return None;
     }
@@ -2040,8 +2222,16 @@ fn gpu_transcode(t: &BoundTexture, force_format: Option<BlockFormat>) -> Option<
             height: l.height,
             blocks_x: l.blocks_x,
             blocks_y: l.blocks_y,
-            padded_x: if swizzled { l.blocks_x.next_power_of_two() } else { l.blocks_x },
-            padded_y: if swizzled { l.blocks_y.next_power_of_two() } else { l.blocks_y },
+            padded_x: if swizzled {
+                l.blocks_x.next_power_of_two()
+            } else {
+                l.blocks_x
+            },
+            padded_y: if swizzled {
+                l.blocks_y.next_power_of_two()
+            } else {
+                l.blocks_y
+            },
             swizzled,
         });
     }
@@ -2151,7 +2341,10 @@ fn report_passthrough_refused(base_format: u32, reason: &'static str) {
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<(u32, &'static str)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((base_format, reason)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((base_format, reason))
+    {
         return;
     }
     tracing::warn!(
@@ -2273,7 +2466,11 @@ fn rgb565(c: u16) -> [u8; 3] {
     let r = ((c >> 11) & 0x1f) as u32;
     let g = ((c >> 5) & 0x3f) as u32;
     let b = (c & 0x1f) as u32;
-    [(r * 255 / 31) as u8, (g * 255 / 63) as u8, (b * 255 / 31) as u8]
+    [
+        (r * 255 / 31) as u8,
+        (g * 255 / 63) as u8,
+        (b * 255 / 31) as u8,
+    ]
 }
 
 /// Decode one texel `(px, py)` in `[0,4)` from a 4x4 BC/DXT block. Handles BC1
@@ -2319,7 +2516,11 @@ pub(crate) fn decode_bc_texel(block: &[u8], base_format: u32, px: u32, py: u32) 
         // BC2: 4-bit alpha per texel, two texels per byte, low nibble first.
         0x86 => {
             let byte = g(t / 2);
-            let a4 = if t.is_multiple_of(2) { byte & 0xf } else { byte >> 4 };
+            let a4 = if t.is_multiple_of(2) {
+                byte & 0xf
+            } else {
+                byte >> 4
+            };
             (a4 as u32 * 255 / 15) as u8
         }
         // BC3: two 8-bit endpoints + 3-bit interpolation indices.
@@ -2650,11 +2851,14 @@ fn predicted_texture_bytes(
     compressed: Option<&CompressedUpload>,
 ) -> usize {
     if let Some(c) = compressed
-        && c.format.family() == vitaslop_platform::gpu::block_family() {
-            return c.byte_len();
-        }
-    let level0 =
-        (width.max(1) as usize) * (height.max(1) as usize) * (faces.max(1) as usize) * texel.bytes_per_texel();
+        && c.format.family() == vitaslop_platform::gpu::block_family()
+    {
+        return c.byte_len();
+    }
+    let level0 = (width.max(1) as usize)
+        * (height.max(1) as usize)
+        * (faces.max(1) as usize)
+        * texel.bytes_per_texel();
     // The same 4/3 the uploader's own budget uses for a chain it builds, and the same reason:
     // rounding UP is the safe direction for a budget.
     if texel == TexelSeam::Rgba8 {
@@ -2742,7 +2946,8 @@ fn decode_texture_yuv420p2(
     // conversion profile. Only the swap changes anything here - see the doc comment.
     let swizzle = (t.swizzle >> 12) & 0x3;
     let swapped = swizzle & 1 != 0;
-    report_yuv_profile_assumed(t.swizzle);
+    let profile = t.yuv_profile.min(3) as usize;
+    report_yuv_profile(t.swizzle, profile);
 
     let (w_us, h_us) = (w as usize, h as usize);
     let mut rgba = vec![0u8; w_us * h_us * 4];
@@ -2763,7 +2968,7 @@ fn decode_texture_yuv420p2(
     // Each chroma sample serves a 2x2 group, so the group is the unit: the chroma pair is
     // read and converted ONCE and applied to four luma samples, and the row slices are taken
     // outside the inner loop so the bounds checks are hoisted out of it.
-    let tables = &*BT601_TABLES;
+    let tables = &YUV_TABLES[profile];
     for cy in 0..h_us.div_ceil(2) {
         let chroma = chroma_base + cy * chroma_stride;
         let Some(chroma_row) = px.get(chroma..chroma + (w_us.div_ceil(2)) * 2) else {
@@ -2805,12 +3010,13 @@ fn decode_texture_yuv420p2(
     (w, h, rgba, TexelSeam::Rgba8)
 }
 
-/// The BT.601 studio-swing conversion, precomputed per input byte.
+/// One YUV conversion, precomputed per input byte - see [`YUV_PROFILES`].
 ///
 /// Every term is a function of ONE sample, so all of them fit in 256-entry tables and the
-/// per-pixel work becomes three adds and three clamps. Built once.
-struct Bt601Tables {
-    /// `(y - 16) * 255/219`, in 16.16.
+/// per-pixel work becomes three adds and three clamps. Built once per profile.
+struct YuvTables {
+    /// The luma term, in 16.16: `(y - 16) * 255/219` for a studio-swing profile, `y` for a
+    /// full-range one.
     luma: [i32; 256],
     cr_r: [i32; 256],
     cr_g: [i32; 256],
@@ -2818,23 +3024,36 @@ struct Bt601Tables {
     cb_b: [i32; 256],
 }
 
-static BT601_TABLES: std::sync::LazyLock<Bt601Tables> = std::sync::LazyLock::new(|| {
-    let mut t = Bt601Tables {
-        luma: [0; 256],
-        cr_r: [0; 256],
-        cr_g: [0; 256],
-        cb_g: [0; 256],
-        cb_b: [0; 256],
-    };
-    for i in 0..256usize {
-        t.luma[i] = (i as i32 - 16) * 76309;
-        let c = i as i32 - 128;
-        t.cr_r[i] = 104597 * c;
-        t.cr_g[i] = -53279 * c;
-        t.cb_g[i] = -25675 * c;
-        t.cb_b[i] = 132201 * c;
-    }
-    t
+/// The four `SceGxmYuvProfile`s, in 16.16, indexed by the enum: `(luma offset, luma scale,
+/// Cr->R, Cb->G, Cr->G, Cb->B)`. The standard BT.601 / BT.709 matrices over studio-swing
+/// ranges (luma 16..235, chroma 16..240) or full range (0..255).
+///
+/// - 0 `BT601_STANDARD`: Y' x 1.164383, Cr x 1.596027, Cb x -0.391762, Cr x -0.812968, Cb x 2.017232
+/// - 1 `BT709_STANDARD`: Y' x 1.164383, Cr x 1.792741, Cb x -0.213249, Cr x -0.532909, Cb x 2.112402
+/// - 2 `BT601_FULL_RANGE`: Y, Cr x 1.402, Cb x -0.344136, Cr x -0.714136, Cb x 1.772
+/// - 3 `BT709_FULL_RANGE`: Y, Cr x 1.5748, Cb x -0.187324, Cr x -0.468124, Cb x 1.8556
+///
+/// The GPU path (`texenc.wgsl`, `yuv_to_rgb`) carries the same numbers; a test holds them equal.
+pub const YUV_PROFILES: [(i32, i32, i32, i32, i32, i32); 4] = [
+    (16, 76309, 104597, -25675, -53279, 132201),
+    (16, 76309, 117489, -13975, -34925, 138438),
+    (0, 65536, 91881, -22554, -46802, 116130),
+    (0, 65536, 103206, -12276, -30679, 121609),
+];
+
+static YUV_TABLES: std::sync::LazyLock<[YuvTables; 4]> = std::sync::LazyLock::new(|| {
+    YUV_PROFILES.map(|(off, scale, cr_r, cb_g, cr_g, cb_b)| {
+        let mut t = YuvTables { luma: [0; 256], cr_r: [0; 256], cr_g: [0; 256], cb_g: [0; 256], cb_b: [0; 256] };
+        for i in 0..256usize {
+            t.luma[i] = (i as i32 - off) * scale;
+            let c = i as i32 - 128;
+            t.cr_r[i] = cr_r * c;
+            t.cr_g[i] = cr_g * c;
+            t.cb_g[i] = cb_g * c;
+            t.cb_b[i] = cb_b * c;
+        }
+        t
+    })
 });
 
 /// Round a 16.16 fixed-point channel to a byte.
@@ -2842,24 +3061,21 @@ fn clamp8(v: i32) -> u8 {
     ((v + 32768) >> 16).clamp(0, 255) as u8
 }
 
-/// BT.601 studio-swing YUV to full-range RGB, the `SCE_GXM_YUV_PROFILE_BT601_STANDARD`
-/// conversion. Integer arithmetic in 16.16, which is exact enough that no channel differs
-/// from the float form by more than one step.
+/// YUV to full-range RGB under `SceGxmYuvProfile` `profile` ([`YUV_PROFILES`]). Integer
+/// arithmetic in 16.16, which is exact enough that no channel differs from the float form by
+/// more than one step.
 ///
-/// The bulk path uses [`BT601_TABLES`]; this is the same arithmetic written out, and the
-/// test below holds the two together.
+/// The bulk path uses [`YUV_TABLES`]; this is the same arithmetic written out, and the test
+/// below holds the two together.
 // Kept: the written-out arithmetic the table path is checked against.
 #[allow(dead_code)]
-fn bt601_studio_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
-    let y = (y as i32 - 16) * 76309;
+fn yuv_to_rgb(profile: usize, y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    let (off, scale, cr_r, cb_g, cr_g, cb_b) = YUV_PROFILES[profile];
+    let y = (y as i32 - off) * scale;
     let u = cb as i32 - 128;
     let v = cr as i32 - 128;
     let clamp = |v: i32| ((v + 32768) >> 16).clamp(0, 255) as u8;
-    [
-        clamp(y + 104597 * v),
-        clamp(y - 25675 * u - 53279 * v),
-        clamp(y + 132201 * u),
-    ]
+    [clamp(y + cr_r * v), clamp(y + cb_g * u + cr_g * v), clamp(y + cb_b * u)]
 }
 
 #[cfg(test)]
@@ -2874,18 +3090,20 @@ mod yuv_tests {
     /// would trace back to a lookup table.
     #[test]
     fn the_fast_path_matches_the_reference_conversion() {
-        let tables = &*BT601_TABLES;
-        for y in (0..=255u8).step_by(5) {
-            for cb in (0..=255u8).step_by(17) {
-                for cr in (0..=255u8).step_by(17) {
-                    let want = bt601_studio_to_rgb(y, cb, cr);
-                    let luma = tables.luma[y as usize];
-                    let got = [
-                        clamp8(luma + tables.cr_r[cr as usize]),
-                        clamp8(luma + tables.cb_g[cb as usize] + tables.cr_g[cr as usize]),
-                        clamp8(luma + tables.cb_b[cb as usize]),
-                    ];
-                    assert_eq!(got, want, "y={y} cb={cb} cr={cr}");
+        for profile in 0..4 {
+            let tables = &YUV_TABLES[profile];
+            for y in (0..=255u8).step_by(5) {
+                for cb in (0..=255u8).step_by(17) {
+                    for cr in (0..=255u8).step_by(17) {
+                        let want = yuv_to_rgb(profile, y, cb, cr);
+                        let luma = tables.luma[y as usize];
+                        let got = [
+                            clamp8(luma + tables.cr_r[cr as usize]),
+                            clamp8(luma + tables.cb_g[cb as usize] + tables.cr_g[cr as usize]),
+                            clamp8(luma + tables.cb_b[cb as usize]),
+                        ];
+                        assert_eq!(got, want, "profile={profile} y={y} cb={cb} cr={cr}");
+                    }
                 }
             }
         }
@@ -2894,31 +3112,53 @@ mod yuv_tests {
     /// Studio swing: video black is 16 and video white is 235, not 0 and 255.
     #[test]
     fn studio_swing_endpoints_map_to_full_range() {
-        assert_eq!(bt601_studio_to_rgb(16, 128, 128), [0, 0, 0]);
-        assert_eq!(bt601_studio_to_rgb(235, 128, 128), [255, 255, 255]);
+        for profile in [0, 1] {
+            assert_eq!(yuv_to_rgb(profile, 16, 128, 128), [0, 0, 0]);
+            assert_eq!(yuv_to_rgb(profile, 235, 128, 128), [255, 255, 255]);
+        }
+    }
+
+    /// Full range: black is 0 and white is 255, so a studio-swing black (16) is NOT black.
+    #[test]
+    fn full_range_endpoints_are_the_byte_range() {
+        for profile in [2, 3] {
+            assert_eq!(yuv_to_rgb(profile, 0, 128, 128), [0, 0, 0]);
+            assert_eq!(yuv_to_rgb(profile, 255, 128, 128), [255, 255, 255]);
+            assert_eq!(yuv_to_rgb(profile, 16, 128, 128), [16, 16, 16]);
+        }
+    }
+
+    /// The two matrices differ where they should: pure red (Cr high) is redder under BT.601's
+    /// smaller Cr->R weight than ... no - BT.709's Cr->R weight is the LARGER, so the same Cr
+    /// gives more red under 709, and less green taken away.
+    #[test]
+    fn bt709_weights_red_more_and_green_less_than_bt601() {
+        let a = yuv_to_rgb(0, 100, 128, 200);
+        let b = yuv_to_rgb(1, 100, 128, 200);
+        assert!(b[0] > a[0] && b[1] > a[1], "601 {a:?} vs 709 {b:?}");
     }
 }
 
-/// Say, once per swizzle, that a YUV texture's conversion profile is the DEFAULT rather than
-/// one the title chose.
+/// Say, once per (slot, channel order, profile), which conversion a YUV texture is decoded with.
 ///
-/// `sceGxmSetYuvProfile` is what picks between BT.601 and BT.709 and between studio and full
-/// range, and it is per context, so nothing about the texture itself records which applies.
-/// A title that never sets one gets the default - but a title that DOES set one and is
-/// converted with the default here comes out with washed-out or over-saturated video that
-/// looks like a decoder problem and is not.
-fn report_yuv_profile_assumed(swizzle: u32) {
+/// `sceGxmSetYuvProfile` picks between BT.601 and BT.709 and between studio and full range,
+/// per context and per slot, so nothing about the texture records which applies. Converting
+/// with the wrong one comes out washed-out or over-saturated and looks like a decoder fault.
+fn report_yuv_profile(swizzle: u32, profile: usize) {
     use std::collections::HashSet;
     use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    static SEEN: Mutex<Option<HashSet<(u32, usize)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((swizzle >> 12) & 0x3) {
+    if !g.get_or_insert_with(HashSet::new).insert(((swizzle >> 12) & 0x3, profile)) {
         return;
     }
     let csc = if (swizzle >> 13) & 1 == 0 { "CSC0" } else { "CSC1" };
     let order = if (swizzle >> 12) & 1 == 0 { "YUV" } else { "YVU" };
-    eprintln!(
-        "gxm texture: a two-plane 4:2:0 (video) texture is bound as {order}/{csc}. The channel order is read from the format; the CONVERSION is BT.601 studio-swing, which is the GXM default profile - if the title ever calls sceGxmSetYuvProfile, this run is converting with the wrong one and the picture's colour is an assumption."
+    let name = ["BT601_STANDARD", "BT709_STANDARD", "BT601_FULL_RANGE", "BT709_FULL_RANGE"][profile];
+    tracing::info!(
+        target: "vitaslop::render",
+        "gxm yuv: a two-plane {order} texture on slot {csc} is converted with {name} (the \
+         profile the context has set for that slot; BT601_STANDARD until sceGxmSetYuvProfile)"
     );
 }
 
@@ -3040,7 +3280,6 @@ impl SingleChannel {
         }
     }
 }
-
 
 /// Decode one face of a BLOCK-COMPRESSED texture a block at a time, into `out`. Returns
 /// false for anything this path does not cover, leaving the caller on the per-texel path.
@@ -3185,7 +3424,10 @@ fn decode_face_fast(t: &BoundTexture, face: u32, out: &mut [u8]) -> bool {
     let swizzle = (t.swizzle >> 12) & 0x7;
     let swizzled = swizzled_type(t.tex_type);
     let (pw, ph) = if swizzled {
-        (t.width.div_ceil(block_w).next_power_of_two(), t.height.div_ceil(block_h).next_power_of_two())
+        (
+            t.width.div_ceil(block_w).next_power_of_two(),
+            t.height.div_ceil(block_h).next_power_of_two(),
+        )
     } else {
         (0, 0)
     };
@@ -3240,7 +3482,15 @@ fn texel_rgba_face(t: &BoundTexture, face: u32, x: u32, y: u32) -> [u8; 4] {
     // surround it, so it cannot go through the single-block path below.
     if let Some(variant) = crate::pvrtc::Variant::from_base_format(t.base_format) {
         let face = t.pixels.get(face_base..).unwrap_or(&[]);
-        return crate::pvrtc::texel(face, t.width, t.height, x, y, variant, swizzled_type(t.tex_type));
+        return crate::pvrtc::texel(
+            face,
+            t.width,
+            t.height,
+            x,
+            y,
+            variant,
+            swizzled_type(t.tex_type),
+        );
     }
     // Block-compressed (BC/DXT): locate the 4x4 block (Morton-addressed when the
     // texture is swizzled, else row-major), decode it, and apply the channel
@@ -3432,7 +3682,11 @@ fn decode_uncompressed_at(t: &BoundTexture, off: usize) -> [u8; 4] {
             let w = u16::from_le_bytes([byte(0), byte(1)]);
             let s5 = |v: u32| -> u8 {
                 // Sign-extend a 5-bit two's-complement lane, then map [-1,1] -> [0,255].
-                let s = if v & 0x10 != 0 { v as i32 - 32 } else { v as i32 };
+                let s = if v & 0x10 != 0 {
+                    v as i32 - 32
+                } else {
+                    v as i32
+                };
                 (((s as f32 / 15.0).clamp(-1.0, 1.0) * 0.5 + 0.5) * 255.0).round() as u8
             };
             let hi = s5((w >> 11) as u32 & 0x1f);
@@ -3470,7 +3724,12 @@ fn decode_uncompressed_at(t: &BoundTexture, off: usize) -> [u8; 4] {
         // Two-channel 32-bit lanes (F32F32 / U32U32), 64 bits total. SWIZZLE2.
         0x1e | 0x1f => {
             let lane = |i: usize| -> u8 {
-                let raw = u32::from_le_bytes([byte(i * 4), byte(i * 4 + 1), byte(i * 4 + 2), byte(i * 4 + 3)]);
+                let raw = u32::from_le_bytes([
+                    byte(i * 4),
+                    byte(i * 4 + 1),
+                    byte(i * 4 + 2),
+                    byte(i * 4 + 3),
+                ]);
                 let v = match t.base_format {
                     0x1e => f32::from_bits(raw),
                     _ => raw as f32 / u32::MAX as f32,
@@ -3560,7 +3819,13 @@ pub(crate) fn report_degenerate_texture(whence: &str, t: &BoundTexture) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<(String, u32, u32, u32, u32)>>> = Mutex::new(None);
-    let key = (whence.to_string(), t.base_format, t.width, t.height, t.tex_type);
+    let key = (
+        whence.to_string(),
+        t.base_format,
+        t.width,
+        t.height,
+        t.tex_type,
+    );
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !g.get_or_insert_with(HashSet::new).insert(key) {
         return;
@@ -3617,7 +3882,6 @@ fn snorm16_to_u8(raw: u16) -> u8 {
     }
     ((v as u32 * 255 + 16383) / 32767) as u8
 }
-
 
 /// Route a single-channel (U8/S8) texel to straight RGBA per its GXM `SWIZZLE1`
 /// selector (already reduced to `(format >> 12) & 0x7` by the caller, exactly as
@@ -3683,12 +3947,12 @@ fn swizzle1(r: u8, swizzle: u32) -> [u8; 4] {
 /// that atlas is (grey from the low lane, coverage from the high one), and the scene draws.
 fn swizzle2(r: u8, g: u8, swizzle: u32) -> [u8; 4] {
     match swizzle {
-        1 => [r, g, 0, 0],       // 00GR
-        2 => [r, r, r, g],       // GRRR - luminance, coverage
-        3 => [g, g, g, r],       // RGGG
-        4 => [r, g, r, g],       // GRGR
-        5 => [g, r, 0, 0],       // 00RG
-        _ => [r, g, 0, 255],     // GR
+        1 => [r, g, 0, 0],   // 00GR
+        2 => [r, r, r, g],   // GRRR - luminance, coverage
+        3 => [g, g, g, r],   // RGGG
+        4 => [r, g, r, g],   // GRGR
+        5 => [g, r, 0, 0],   // 00RG
+        _ => [r, g, 0, 255], // GR
     }
 }
 
@@ -3891,7 +4155,13 @@ fn interpret_draw_for(d: &Draw, recompiled: bool) -> DrawInterp {
     // sprite centres - which is exactly how a shadow-blob pass reads on screen as a
     // striped quad welded to the object casting it.
     let skip = d.shader_expanded || (layout.uv_off.is_none() && layout.color_off.is_none());
-    DrawInterp { layout, space, textured, uv_div, skip }
+    DrawInterp {
+        layout,
+        space,
+        textured,
+        uv_div,
+        skip,
+    }
 }
 
 /// One locatable object in a captured scene: the draws that share a model-to-world
@@ -3961,7 +4231,7 @@ pub struct ObjectLoc {
 ///
 /// This deliberately does not try to name anything. Which group is the player is a
 /// title-specific fact, and the way to establish it is behavioural: hold the throttle,
-/// see which world position moves. That belongs in a recipe, not in the engine.
+/// see which world position moves. That belongs in a playbook, not in the engine.
 ///
 impl Scene {
     /// Triangles this scene draws through a model-to-world matrix, i.e. how much WORLD
@@ -3996,7 +4266,9 @@ pub fn locate_scene(scene: &Scene, width: u32, height: u32) -> Vec<ObjectLoc> {
     let mut groups: HashMap<[i64; 3], ObjectLoc> = HashMap::new();
     for (di, d) in scene.draws.iter().enumerate() {
         let interp = interpret_draw(d);
-        let Space::Mvp(mvp) = interp.space else { continue };
+        let Space::Mvp(mvp) = interp.space else {
+            continue;
+        };
         let stride = d.vertex_stride.max(1) as usize;
         let nverts = d.vertices.len() / stride;
         if nverts == 0 {
@@ -4015,7 +4287,12 @@ pub fn locate_scene(scene: &Scene, width: u32, height: u32) -> Vec<ObjectLoc> {
         } else {
             None
         };
-        let mut bbox = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let mut bbox = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
         let mut wsum = 0.0f64;
         let mut wcount = 0usize;
         // The same viewport the picture is drawn through, so a reported bounding box is where
@@ -4023,7 +4300,9 @@ pub fn locate_scene(scene: &Scene, width: u32, height: u32) -> Vec<ObjectLoc> {
         let vp = viewport_raster_rect(d, width, height, 1.0);
         for i in 0..nverts {
             let v = decode_vertex(d, &interp.layout, i);
-            let Some(p) = project(&v, &Space::Mvp(mvp), width, height, 1.0, vp) else { continue };
+            let Some(p) = project(&v, &Space::Mvp(mvp), width, height, 1.0, vp) else {
+                continue;
+            };
             bbox[0] = bbox[0].min(p[0]);
             bbox[1] = bbox[1].min(p[1]);
             bbox[2] = bbox[2].max(p[0]);
@@ -4065,7 +4344,12 @@ pub fn locate_scene(scene: &Scene, width: u32, height: u32) -> Vec<ObjectLoc> {
                 None => mean,
             });
             e.screen = Some(match e.screen {
-                Some(b) => [b[0].min(bbox[0]), b[1].min(bbox[1]), b[2].max(bbox[2]), b[3].max(bbox[3])],
+                Some(b) => [
+                    b[0].min(bbox[0]),
+                    b[1].min(bbox[1]),
+                    b[2].max(bbox[2]),
+                    b[3].max(bbox[3]),
+                ],
                 None => bbox,
             });
         }
@@ -4147,7 +4431,11 @@ fn modal_shift(deltas: &[[f32; 3]], tol: f32) -> Option<([f32; 3], usize)> {
         n += 1;
     }
     Some((
-        [(sum[0] / n as f64) as f32, (sum[1] / n as f64) as f32, (sum[2] / n as f64) as f32],
+        [
+            (sum[0] / n as f64) as f32,
+            (sum[1] / n as f64) as f32,
+            (sum[2] / n as f64) as f32,
+        ],
         n,
     ))
 }
@@ -4164,7 +4452,11 @@ pub fn origin_drift(prev: &[ObjectLoc], now: &[ObjectLoc], tol: f32) -> Option<O
             .iter()
             .filter(|p| p.id == o.id)
             .map(|p| {
-                let d = [o.world[0] - p.world[0], o.world[1] - p.world[1], o.world[2] - p.world[2]];
+                let d = [
+                    o.world[0] - p.world[0],
+                    o.world[1] - p.world[1],
+                    o.world[2] - p.world[2],
+                ];
                 (d, d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
             })
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -4173,7 +4465,11 @@ pub fn origin_drift(prev: &[ObjectLoc], now: &[ObjectLoc], tol: f32) -> Option<O
         }
     }
     let (delta, agreed) = modal_shift(&deltas, tol)?;
-    Some(OriginDrift { delta, agreed, matched: deltas.len() })
+    Some(OriginDrift {
+        delta,
+        agreed,
+        matched: deltas.len(),
+    })
 }
 
 /// One 2D drawn thing in a captured scene: where it is ON SCREEN, and an identity that
@@ -4225,8 +4521,18 @@ pub fn locate_sprites(scene: &Scene, width: u32, height: u32) -> Vec<SpriteLoc> 
         if nverts == 0 {
             continue;
         }
-        let mut bbox = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
-        let mut uv = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let mut bbox = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let mut uv = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
         let mut seen = 0usize;
         // As in `locate_scene`: a sprite's reported rectangle is where the viewport puts it.
         let vp = viewport_raster_rect(d, width, height, 1.0);
@@ -4265,7 +4571,11 @@ pub fn locate_sprites(scene: &Scene, width: u32, height: u32) -> Vec<SpriteLoc> 
         // across frames, and every frame snapshots the atlas into a different buffer.
         mix(d.albedo().map(tex_binding_key).unwrap_or(0));
         for c in uv {
-            mix(if c.is_finite() { (c * 4096.0).round() as i64 as u64 } else { 0 });
+            mix(if c.is_finite() {
+                (c * 4096.0).round() as i64 as u64
+            } else {
+                0
+            });
         }
         mix((size[0].round() as i64 as u64) << 32 | size[1].round() as i64 as u64);
         mix(d.index_count as u64);
@@ -4294,7 +4604,11 @@ pub fn scroll_drift(prev: &[SpriteLoc], now: &[SpriteLoc], tol: f32) -> Option<O
             .iter()
             .filter(|p| p.id == s.id)
             .map(|p| {
-                let d = [s.centroid[0] - p.centroid[0], s.centroid[1] - p.centroid[1], 0.0];
+                let d = [
+                    s.centroid[0] - p.centroid[0],
+                    s.centroid[1] - p.centroid[1],
+                    0.0,
+                ];
                 (d, d[0] * d[0] + d[1] * d[1])
             })
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -4303,7 +4617,11 @@ pub fn scroll_drift(prev: &[SpriteLoc], now: &[SpriteLoc], tol: f32) -> Option<O
         }
     }
     let (delta, agreed) = modal_shift(&deltas, tol)?;
-    Some(OriginDrift { delta, agreed, matched: deltas.len() })
+    Some(OriginDrift {
+        delta,
+        agreed,
+        matched: deltas.len(),
+    })
 }
 
 /// A sprite's motion on screen with the scene's scroll removed, and its magnitude.
@@ -4340,11 +4658,19 @@ pub fn world_motion(
     now: &ObjectLoc,
     drift: [f32; 3],
 ) -> Option<([f32; 3], f32)> {
-    let expect = [now.world[0] - drift[0], now.world[1] - drift[1], now.world[2] - drift[2]];
+    let expect = [
+        now.world[0] - drift[0],
+        now.world[1] - drift[1],
+        now.world[2] - drift[2],
+    ];
     prev.iter()
         .filter(|p| p.id == now.id)
         .map(|p| {
-            let d = [expect[0] - p.world[0], expect[1] - p.world[1], expect[2] - p.world[2]];
+            let d = [
+                expect[0] - p.world[0],
+                expect[1] - p.world[1],
+                expect[2] - p.world[2],
+            ];
             (d, (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
         })
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -4449,7 +4775,9 @@ impl WorldMap {
         for h in self.top_y.iter().filter(|h| !h.is_nan()) {
             *hist.entry((h / bucket).round() as i64).or_insert(0) += 1;
         }
-        hist.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k as f32 * bucket)
+        hist.into_iter()
+            .max_by_key(|(_, n)| *n)
+            .map(|(k, _)| k as f32 * bucket)
     }
 
     /// An ASCII height field over `cols` x `rows` cells: a machine-readable obstacle map
@@ -4469,9 +4797,13 @@ impl WorldMap {
                 // Cell -> pixel span. Integer division deliberately: every pixel belongs
                 // to exactly one cell, so nothing is sampled twice or missed.
                 let x0 = c * self.fb.width / cols;
-                let x1 = ((c + 1) * self.fb.width / cols).max(x0 + 1).min(self.fb.width);
+                let x1 = ((c + 1) * self.fb.width / cols)
+                    .max(x0 + 1)
+                    .min(self.fb.width);
                 let y0 = r * self.fb.height / rows;
-                let y1 = ((r + 1) * self.fb.height / rows).max(y0 + 1).min(self.fb.height);
+                let y1 = ((r + 1) * self.fb.height / rows)
+                    .max(y0 + 1)
+                    .min(self.fb.height);
                 let mut peak = f32::NEG_INFINITY;
                 for y in y0..y1 {
                     for x in x0..x1 {
@@ -4515,7 +4847,10 @@ impl WorldMap {
         for h in self.top_y.iter().filter(|h| !h.is_nan()) {
             *hist.entry((h / bucket).floor() as i64).or_insert(0) += 1;
         }
-        let mut v: Vec<(f32, u32)> = hist.into_iter().map(|(k, n)| (k as f32 * bucket, n)).collect();
+        let mut v: Vec<(f32, u32)> = hist
+            .into_iter()
+            .map(|(k, n)| (k as f32 * bucket, n))
+            .collect();
         v.sort_by_key(|e| std::cmp::Reverse(e.1));
         v
     }
@@ -4578,12 +4913,21 @@ pub fn world_extent(scene: &Scene, keep: f32) -> Option<[f32; 4]> {
     let cut = ((1.0 - keep) * 0.5 * xs.len() as f32) as usize;
     let pick = |mut v: Vec<f32>| -> (f32, f32) {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        (v[cut.min(v.len() - 1)], v[(v.len() - 1 - cut).min(v.len() - 1)])
+        (
+            v[cut.min(v.len() - 1)],
+            v[(v.len() - 1 - cut).min(v.len() - 1)],
+        )
     };
     let (x0, x1) = pick(xs);
     let (z0, z1) = pick(zs);
     // A degenerate axis (everything at one X) would divide by zero in the transform.
-    let pad = |a: f32, b: f32| if (b - a).abs() < 1e-3 { (a - 1.0, b + 1.0) } else { (a, b) };
+    let pad = |a: f32, b: f32| {
+        if (b - a).abs() < 1e-3 {
+            (a - 1.0, b + 1.0)
+        } else {
+            (a, b)
+        }
+    };
     let (x0, x1) = pad(x0, x1);
     let (z0, z1) = pad(z0, z1);
     Some([x0, z0, x1, z1])
@@ -4621,10 +4965,13 @@ impl Traversable {
                 }
                 // A rise to ANY 4-neighbour that exceeds the limit makes this a lip, a
                 // kerb or the foot of a wall - all of which stop a vehicle.
-                let ok = [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)].iter().all(|&(nx, ny)| {
-                    let n = at(nx, ny);
-                    !n.is_nan() && (n - c).abs() <= rise
-                });
+                let ok =
+                    [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
+                        .iter()
+                        .all(|&(nx, ny)| {
+                            let n = at(nx, ny);
+                            !n.is_nan() && (n - c).abs() <= rise
+                        });
                 open[(y * w + x) as usize] = ok;
             }
         }
@@ -4641,9 +4988,14 @@ impl Traversable {
                     let edge = x == 0 || y == 0 || x + 1 >= w || y + 1 >= h;
                     let blocked_neighbour = !edge
                         && [
-                            (x - 1, y - 1), (x, y - 1), (x + 1, y - 1),
-                            (x - 1, y), (x + 1, y),
-                            (x - 1, y + 1), (x, y + 1), (x + 1, y + 1),
+                            (x - 1, y - 1),
+                            (x, y - 1),
+                            (x + 1, y - 1),
+                            (x - 1, y),
+                            (x + 1, y),
+                            (x - 1, y + 1),
+                            (x, y + 1),
+                            (x + 1, y + 1),
                         ]
                         .iter()
                         .any(|&(nx, ny)| !prev[(ny * w + nx) as usize]);
@@ -4653,7 +5005,11 @@ impl Traversable {
                 }
             }
         }
-        Traversable { width: w, height: h, open }
+        Traversable {
+            width: w,
+            height: h,
+            open,
+        }
     }
 
     /// The mask as an RGBA image: open ground pale, blocked dark.
@@ -4696,7 +5052,13 @@ impl Traversable {
     /// exactly when it is needed. Callers pass an `ok` stricter than "open" - see
     /// [`plan_route`], which requires the pixel to be REACHABLE, because the flat top of a
     /// wall is open ground that happens to be an island.
-    pub fn nearest(&self, x: i64, y: i64, radius: u32, ok: impl Fn(i64, i64) -> bool) -> Option<(i64, i64)> {
+    pub fn nearest(
+        &self,
+        x: i64,
+        y: i64,
+        radius: u32,
+        ok: impl Fn(i64, i64) -> bool,
+    ) -> Option<(i64, i64)> {
         if ok(x, y) {
             return Some((x, y));
         }
@@ -4771,7 +5133,16 @@ pub fn plan_route(
         if d > dist[idx(x, y)] {
             continue;
         }
-        for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+        for (dx, dy) in [
+            (1i64, 0i64),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ] {
             let (nx, ny) = (x + dx, y + dy);
             if !mask.is_open(nx, ny) {
                 continue;
@@ -4791,9 +5162,7 @@ pub fn plan_route(
     }
 
     let sp = px(from);
-    let reached = |x: i64, y: i64| -> bool {
-        mask.is_open(x, y) && dist[idx(x, y)] != u32::MAX
-    };
+    let reached = |x: i64, y: i64| -> bool { mask.is_open(x, y) && dist[idx(x, y)] != u32::MAX };
     let start = mask.nearest(sp.0, sp.1, snap_radius, reached)?;
 
     // Walk downhill on the cost field. Guaranteed to terminate at the goal: every open
@@ -4802,12 +5171,24 @@ pub fn plan_route(
     let mut cur = start;
     while cur != goal {
         let mut best: Option<((i64, i64), u32)> = None;
-        for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+        for (dx, dy) in [
+            (1i64, 0i64),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ] {
             let (nx, ny) = (cur.0 + dx, cur.1 + dy);
             if !reached(nx, ny) {
                 continue;
             }
-            if dx != 0 && dy != 0 && !(mask.is_open(cur.0 + dx, cur.1) && mask.is_open(cur.0, cur.1 + dy)) {
+            if dx != 0
+                && dy != 0
+                && !(mask.is_open(cur.0 + dx, cur.1) && mask.is_open(cur.0, cur.1 + dy))
+            {
                 continue;
             }
             let d = dist[idx(nx, ny)];
@@ -4901,22 +5282,70 @@ fn invert4(m: &[f32; 16]) -> Option<[f32; 16]> {
     // which is not affine (its last row is a perspective divide), so the cheap
     // transpose-and-negate trick for rigid transforms does not apply here.
     let mut inv = [0f32; 16];
-    inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
-    inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
-    inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
-    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
-    inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
-    inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
-    inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
-    inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
-    inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
-    inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
-    inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
-    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
-    inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
-    inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
-    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
-    inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15]
+        + m[9] * m[7] * m[14]
+        + m[13] * m[6] * m[11]
+        - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15]
+        - m[8] * m[7] * m[14]
+        - m[12] * m[6] * m[11]
+        + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15]
+        + m[8] * m[7] * m[13]
+        + m[12] * m[5] * m[11]
+        - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14]
+        - m[8] * m[6] * m[13]
+        - m[12] * m[5] * m[10]
+        + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15]
+        - m[9] * m[3] * m[14]
+        - m[13] * m[2] * m[11]
+        + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15]
+        + m[8] * m[3] * m[14]
+        + m[12] * m[2] * m[11]
+        - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15]
+        - m[8] * m[3] * m[13]
+        - m[12] * m[1] * m[11]
+        + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14]
+        + m[8] * m[2] * m[13]
+        + m[12] * m[1] * m[10]
+        - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15]
+        + m[5] * m[3] * m[14]
+        + m[13] * m[2] * m[7]
+        - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15]
+        - m[4] * m[3] * m[14]
+        - m[12] * m[2] * m[7]
+        + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15]
+        + m[4] * m[3] * m[13]
+        + m[12] * m[1] * m[7]
+        - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14]
+        - m[4] * m[2] * m[13]
+        - m[12] * m[1] * m[6]
+        + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11]
+        - m[5] * m[3] * m[10]
+        - m[9] * m[2] * m[7]
+        + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11]
+        + m[4] * m[3] * m[10]
+        + m[8] * m[2] * m[7]
+        - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11]
+        - m[4] * m[3] * m[9]
+        - m[8] * m[1] * m[7]
+        + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10]
+        + m[4] * m[2] * m[9]
+        + m[8] * m[1] * m[6]
+        - m[8] * m[2] * m[5];
     let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
     if !det.is_finite() || det.abs() < 1e-20 {
         return None;
@@ -4969,7 +5398,9 @@ pub fn scene_eye(scene: &Scene) -> Option<Eye> {
     // scale: there is no "near the origin" constant here, and nothing per title.
     let mut tally: Vec<([f32; 16], (usize, usize))> = Vec::new();
     for d in &scene.draws {
-        let Space::Mvp(m) = interpret_draw(d).space else { continue };
+        let Space::Mvp(m) = interpret_draw(d).space else {
+            continue;
+        };
         let n = triangle_count(d);
         if n == 0 {
             continue;
@@ -5004,7 +5435,11 @@ pub fn scene_eye(scene: &Scene) -> Option<Eye> {
     if f[3].abs() < 1e-12 {
         return None;
     }
-    let mut dir = [f[0] / f[3] - pos[0], f[1] / f[3] - pos[1], f[2] / f[3] - pos[2]];
+    let mut dir = [
+        f[0] / f[3] - pos[0],
+        f[1] / f[3] - pos[1],
+        f[2] / f[3] - pos[2],
+    ];
     let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
     if !len.is_finite() || len < 1e-9 {
         return None;
@@ -5114,7 +5549,12 @@ pub fn surface_tris(scene: &Scene) -> Vec<SurfaceTri> {
 /// or a banner gantry with depth writes would otherwise answer with that. The ceiling is
 /// the caller's statement of "the thing I am standing on is below this", which for a
 /// vehicle is just above its own roof.
-pub fn surface_at(tris: &[SurfaceTri], x: f32, z: f32, ceiling: Option<f32>) -> Option<(SurfaceTri, f32)> {
+pub fn surface_at(
+    tris: &[SurfaceTri],
+    x: f32,
+    z: f32,
+    ceiling: Option<f32>,
+) -> Option<(SurfaceTri, f32)> {
     let mut best: Option<(SurfaceTri, f32)> = None;
     for t in tris {
         let Some(y) = t.height_at(x, z) else { continue };
@@ -5153,7 +5593,11 @@ pub fn render_map(
 ) -> WorldMap {
     let s = ssaa.clamp(1, 8);
     let (rw, rh) = (view.width.max(1) * s, view.height.max(1) * s);
-    let raster = MapView { extent: view.extent, width: rw, height: rh };
+    let raster = MapView {
+        extent: view.extent,
+        width: rw,
+        height: rh,
+    };
     let mut fb = Framebuffer::new(rw, rh, clear);
     // The depth buffer holds NEGATED world Y, so the rasterizer's existing "smaller
     // wins" test keeps the HIGHEST surface - which is what looking down from above
@@ -5168,7 +5612,12 @@ pub fn render_map(
         if !is_map_surface(d) {
             continue;
         }
-        let DrawInterp { layout, textured, uv_div, .. } = interpret_draw(d);
+        let DrawInterp {
+            layout,
+            textured,
+            uv_div,
+            ..
+        } = interpret_draw(d);
         let texture = if textured { d.albedo() } else { None };
         for t in 0..tri_count {
             let vs = tri_indices(d, t);
@@ -5203,8 +5652,20 @@ pub fn render_map(
             // the guest's winding here would punch holes in single-sided ground panels
             // seen from a direction the game never views them from.
             raster_triangle(
-                &mut fb, &mut depth, &screen, &verts, texture, uv_div, true,
-                SCE_GXM_DEPTH_FUNC_LESS_EQUAL, d.exposure, &d.material, &d.world, None, 0, false,
+                &mut fb,
+                &mut depth,
+                &screen,
+                &verts,
+                texture,
+                uv_div,
+                true,
+                SCE_GXM_DEPTH_FUNC_LESS_EQUAL,
+                d.exposure,
+                &d.material,
+                &d.world,
+                None,
+                0,
+                false,
                 // This is the top-down HEIGHT-FIELD render, not the guest's screen: its
                 // projection is the tool's own, so a screen-space scissor has no meaning here.
                 None,
@@ -5214,7 +5675,10 @@ pub fn render_map(
     }
     // Resolve: average the image, take the MAX height per output cell.
     let top_y: Vec<f32> = if s == 1 {
-        depth.iter().map(|z| if z.is_finite() { -z } else { f32::NAN }).collect()
+        depth
+            .iter()
+            .map(|z| if z.is_finite() { -z } else { f32::NAN })
+            .collect()
     } else {
         let (ow, oh) = (rw / s, rh / s);
         let mut out = Vec::with_capacity((ow * oh) as usize);
@@ -5229,12 +5693,24 @@ pub fn render_map(
                         }
                     }
                 }
-                out.push(if peak == f32::NEG_INFINITY { f32::NAN } else { peak });
+                out.push(if peak == f32::NEG_INFINITY {
+                    f32::NAN
+                } else {
+                    peak
+                });
             }
         }
         out
     };
-    WorldMap { view: MapView { extent: view.extent, width: rw / s, height: rh / s }, fb: fb.downsampled(s), top_y }
+    WorldMap {
+        view: MapView {
+            extent: view.extent,
+            width: rw / s,
+            height: rh / s,
+        },
+        fb: fb.downsampled(s),
+        top_y,
+    }
 }
 
 /// Rasterize one scene into a fresh framebuffer at native resolution. `clear` is the
@@ -5250,7 +5726,13 @@ pub fn render_scene(scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> F
 /// coincident-panel z-fighting produce as speckle at 1x, and mirrors the GPU renderer's
 /// `set_supersample` so the software oracle and the GPU stay in lockstep at any factor.
 /// `ssaa == 1` is identical to [`render_scene`].
-pub fn render_scene_supersampled(scene: &Scene, width: u32, height: u32, clear: [u8; 4], ssaa: u32) -> Framebuffer {
+pub fn render_scene_supersampled(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    clear: [u8; 4],
+    ssaa: u32,
+) -> Framebuffer {
     let s = ssaa.max(1);
     if s == 1 {
         return render_scene(scene, width, height, clear);
@@ -5323,7 +5805,11 @@ pub fn render_frame_chain(
                 .iter()
                 .filter_map(|d| d.albedo())
                 .map(|t| {
-                    let hit = if rendered.contains_key(&t.data_addr) { "*" } else { "" };
+                    let hit = if rendered.contains_key(&t.data_addr) {
+                        "*"
+                    } else {
+                        ""
+                    };
                     format!("{:#x}{hit}", t.data_addr)
                 })
                 .collect::<std::collections::BTreeSet<_>>()
@@ -5339,7 +5825,8 @@ pub fn render_frame_chain(
             }
             eprintln!(
                 "SWCHAIN pass{i} target={} draws={} exposure={lo:.3}..{hi:.3} samples=[{}]",
-                addr.map(|a| format!("{a:#x}")).unwrap_or_else(|| "none".into()),
+                addr.map(|a| format!("{a:#x}"))
+                    .unwrap_or_else(|| "none".into()),
                 scene.draws.len(),
                 sampled.join(" ")
             );
@@ -5357,7 +5844,10 @@ pub fn render_frame_chain(
                 }
                 eprintln!(
                     "SWCHAIN   -> DISPLAY after pass{i} mean=({},{},{},{})",
-                    acc[0] / cnt, acc[1] / cnt, acc[2] / cnt, acc[3] / cnt
+                    acc[0] / cnt,
+                    acc[1] / cnt,
+                    acc[2] / cnt,
+                    acc[3] / cnt
                 );
                 if let Some(dir) = std::env::var_os("VITASLOP_SW_CHAIN_DIR") {
                     let dir = std::path::PathBuf::from(dir);
@@ -5429,9 +5919,19 @@ pub fn render_frame_chain(
             // An intermediate image clears to TRANSPARENT black, not to the display's
             // clear colour: a composite that blends it must see nothing where the pass
             // drew nothing.
-            (Framebuffer::new(tw, th, [0, 0, 0, 0]), vec![soft_depth_clear(scene); (tw * th) as usize])
+            (
+                Framebuffer::new(tw, th, [0, 0, 0, 0]),
+                vec![soft_depth_clear(scene); (tw * th) as usize],
+            )
         });
-        render_scene_onto(&mut entry.0, &mut entry.1, scene, s as f32, [0, 0, 0, 0], &rendered);
+        render_scene_onto(
+            &mut entry.0,
+            &mut entry.1,
+            scene,
+            s as f32,
+            [0, 0, 0, 0],
+            &rendered,
+        );
         if debug {
             // The MEAN colour, not just a drawn-pixel count. "Drawn" only means "not the
             // transparent clear", which opaque black satisfies - so a pass that rendered
@@ -5453,7 +5953,10 @@ pub fn render_frame_chain(
                 entry.0.height,
                 entry.0.drawn_pixels([0, 0, 0, 0]),
                 entry.0.width * entry.0.height,
-                acc[0] / n, acc[1] / n, acc[2] / n, acc[3] / n
+                acc[0] / n,
+                acc[1] / n,
+                acc[2] / n,
+                acc[3] / n
             );
             // VITASLOP_SW_CHAIN_DIR=<dir> writes each pass's own image. This is the software
             // twin of VITASLOP_CHAIN_LIMIT: when a composite comes out wrong the question is
@@ -5511,16 +6014,31 @@ fn rtt_substitute(image: &Framebuffer, proto: &BoundTexture) -> BoundTexture {
         // whatever space the pass wrote them - there is no gamma-encoded memory here for a
         // sampler to decode, so the mode does not carry over from the prototype binding.
         gamma: 0,
+        // Rendered RGBA, not YUV.
+        yuv_profile: 0,
     }
 }
 
 /// The rasterizer core. `width`/`height` are the RASTER dimensions and `ssaa` the supersample
 /// factor those already fold in (so Pixel-space draws scale by it - see [`project`]); the
 /// caller downsamples the result. `clear` is the background color.
-fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], ssaa: u32) -> Framebuffer {
+fn render_scene_raster(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    clear: [u8; 4],
+    ssaa: u32,
+) -> Framebuffer {
     let mut fb = Framebuffer::new(width, height, clear);
     let mut depth = vec![soft_depth_clear(scene); (width * height) as usize];
-    render_scene_onto(&mut fb, &mut depth, scene, ssaa.max(1) as f32, clear, &HashMap::new());
+    render_scene_onto(
+        &mut fb,
+        &mut depth,
+        scene,
+        ssaa.max(1) as f32,
+        clear,
+        &HashMap::new(),
+    );
     fb
 }
 
@@ -5546,7 +6064,10 @@ fn render_scene_onto(
     // never do), and the value it starts at: the low byte of the depth-stencil surface's
     // `backgroundControl`.
     let mut stencil_buf: Vec<u8> = Vec::new();
-    let stencil_clear = scene.depth.map(|d| (d.background_control & 0xff) as u8).unwrap_or(0);
+    let stencil_clear = scene
+        .depth
+        .map(|d| (d.background_control & 0xff) as u8)
+        .unwrap_or(0);
     // The GUEST'S surface extent, which is what a region clip and a viewport are stated in
     // pixels of. The raster is `ssaa` times that, so every guest rectangle is divided out of
     // it here and multiplied back on the way in - the same round trip `Space::Pixel` makes.
@@ -5577,17 +6098,18 @@ fn render_scene_onto(
     // Diagnostic: VITASLOP_DRAW_ONLY=<i>,<i>.. rasterizes only those draw indices (the `di`
     // DSTAT prints), leaving the rest of the frame at the clear colour. Attributing a hole
     // or an artifact to one draw is otherwise guesswork on a 90-draw scene.
-    let only: Option<Vec<usize>> = std::env::var("VITASLOP_DRAW_ONLY").ok().map(|s| {
-        s.split(',').filter_map(|p| p.trim().parse().ok()).collect()
-    });
+    let only: Option<Vec<usize>> = std::env::var("VITASLOP_DRAW_ONLY")
+        .ok()
+        .map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect());
 
     // Diagnostic: VITASLOP_DUMP_TRIS=<draw>:<n> prints the first `n` triangles of that draw
     // as (index triple, model-space positions, screen positions). This is what distinguishes
     // "the mesh really is a set of ribbons" from "we are decoding its vertices wrongly".
-    let dump_tris: Option<(usize, usize)> = std::env::var("VITASLOP_DUMP_TRIS").ok().and_then(|s| {
-        let (a, b) = s.split_once(':')?;
-        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-    });
+    let dump_tris: Option<(usize, usize)> =
+        std::env::var("VITASLOP_DUMP_TRIS").ok().and_then(|s| {
+            let (a, b) = s.split_once(':')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        });
 
     for (di, d) in scene.draws.iter().enumerate() {
         if only.as_ref().is_some_and(|list| !list.contains(&di)) {
@@ -5598,11 +6120,20 @@ fn render_scene_onto(
         let tri_count = triangle_count(d);
         if tri_count == 0 {
             if stats {
-                eprintln!("DSTAT draw {di} SKIP=nontriangle prim={:#x} idx={}", d.primitive, d.index_count);
+                eprintln!(
+                    "DSTAT draw {di} SKIP=nontriangle prim={:#x} idx={}",
+                    d.primitive, d.index_count
+                );
             }
             continue;
         }
-        let DrawInterp { layout, space, textured, uv_div, skip } = interpret_draw(d);
+        let DrawInterp {
+            layout,
+            space,
+            textured,
+            uv_div,
+            skip,
+        } = interpret_draw(d);
         if skip {
             // An approximation that drops geometry must say so unconditionally - a silently
             // skipped draw is indistinguishable on screen from one the game never made. This
@@ -5618,8 +6149,15 @@ fn render_scene_onto(
                 );
             }
             if stats {
-                let why = if d.shader_expanded { "shader-expanded" } else { "no-color-no-uv" };
-                eprintln!("DSTAT draw {di} SKIP={why} tris={tri_count} stride={}", d.vertex_stride);
+                let why = if d.shader_expanded {
+                    "shader-expanded"
+                } else {
+                    "no-color-no-uv"
+                };
+                eprintln!(
+                    "DSTAT draw {di} SKIP={why} tris={tri_count} stride={}",
+                    d.vertex_stride
+                );
             }
             continue;
         }
@@ -5651,7 +6189,12 @@ fn render_scene_onto(
             _ => {
                 let r = d.render_state.region_clip;
                 let sc = |v: u32| (v as f32 * ssaa) as i32;
-                Some([sc(r[0]), sc(r[1]), sc(r[2].saturating_add(1)) - 1, sc(r[3].saturating_add(1)) - 1])
+                Some([
+                    sc(r[0]),
+                    sc(r[1]),
+                    sc(r[2].saturating_add(1)) - 1,
+                    sc(r[3].saturating_add(1)) - 1,
+                ])
             }
         };
         // The guest's VIEWPORT, which `project` below maps clip space into - and which also
@@ -5669,7 +6212,12 @@ fn render_scene_onto(
                 (vy + vh).ceil() as i32 - 1,
             ];
             scissor = Some(match scissor {
-                Some(s) => [s[0].max(v[0]), s[1].max(v[1]), s[2].min(v[2]), s[3].min(v[3])],
+                Some(s) => [
+                    s[0].max(v[0]),
+                    s[1].max(v[1]),
+                    s[2].min(v[2]),
+                    s[3].min(v[3]),
+                ],
                 None => v,
             });
         }
@@ -5727,33 +6275,82 @@ fn render_scene_onto(
                 let p = |v: &Vertex| format!("({:.2},{:.2},{:.2})", v.pos[0], v.pos[1], v.pos[2]);
                 eprintln!(
                     "TRI draw {di} #{t} idx={vs:?} model={} {} {} screen=({:.0},{:.0}) ({:.0},{:.0}) ({:.0},{:.0})",
-                    p(&verts[0]), p(&verts[1]), p(&verts[2]),
-                    screen[0][0], screen[0][1], screen[1][0], screen[1][1], screen[2][0], screen[2][1]
+                    p(&verts[0]),
+                    p(&verts[1]),
+                    p(&verts[2]),
+                    screen[0][0],
+                    screen[0][1],
+                    screen[1][0],
+                    screen[1][1],
+                    screen[2][0],
+                    screen[2][1]
                 );
             }
             if stats {
-                let on = screen.iter().any(|s| s[0] >= 0.0 && s[0] < width as f32 && s[1] >= 0.0 && s[1] < height as f32);
-                if on { n_on += 1 } else { n_off += 1 }
+                let on = screen.iter().any(|s| {
+                    s[0] >= 0.0 && s[0] < width as f32 && s[1] >= 0.0 && s[1] < height as f32
+                });
+                if on {
+                    n_on += 1
+                } else {
+                    n_off += 1
+                }
                 for s in &screen {
-                    bb_lo[0] = bb_lo[0].min(s[0]); bb_lo[1] = bb_lo[1].min(s[1]);
-                    bb_hi[0] = bb_hi[0].max(s[0]); bb_hi[1] = bb_hi[1].max(s[1]);
+                    bb_lo[0] = bb_lo[0].min(s[0]);
+                    bb_lo[1] = bb_lo[1].min(s[1]);
+                    bb_hi[0] = bb_hi[0].max(s[0]);
+                    bb_hi[1] = bb_hi[1].max(s[1]);
                 }
             }
             // Cull back faces before rasterizing (screen-space winding).
-            if cull_mode != SCE_GXM_CULL_NONE && cull_backface(edge(&screen[0], &screen[1], &screen[2]), cull_mode) {
+            if cull_mode != SCE_GXM_CULL_NONE
+                && cull_backface(edge(&screen[0], &screen[1], &screen[2]), cull_mode)
+            {
                 n_culled += 1;
                 continue;
             }
-            let sb = if sw_stencil.is_some() { Some(stencil_buf.as_mut_slice()) } else { None };
-            raster_triangle(fb, depth, &screen, &verts, texture, uv_div, depth_test, depth_func, d.exposure, &d.material, &d.world, trace, di, uv_debug, scissor, sb.zip(sw_stencil.as_ref()));
+            let sb = if sw_stencil.is_some() {
+                Some(stencil_buf.as_mut_slice())
+            } else {
+                None
+            };
+            raster_triangle(
+                fb,
+                depth,
+                &screen,
+                &verts,
+                texture,
+                uv_div,
+                depth_test,
+                depth_func,
+                d.exposure,
+                &d.material,
+                &d.world,
+                trace,
+                di,
+                uv_debug,
+                scissor,
+                sb.zip(sw_stencil.as_ref()),
+            );
         }
         if stats {
             let wrote = fb.drawn_pixels(clear).saturating_sub(pixels_before);
-            let sp = match space { Space::Mvp(_) => "mvp", Space::Ndc => "ndc", Space::Pixel => "pixel" };
+            let sp = match space {
+                Space::Mvp(_) => "mvp",
+                Space::Ndc => "ndc",
+                Space::Pixel => "pixel",
+            };
             eprintln!(
                 "DSTAT draw {di} space={sp} dtest={depth_test} cull={:#x} tris={tri_count} on={n_on} off={n_off} behind={n_behind} culled={n_culled} wrote+{wrote} bbox=[{:.0},{:.0}..{:.0},{:.0}] tex={}",
-                cull_mode, bb_lo[0], bb_lo[1], bb_hi[0], bb_hi[1],
-                d.textures.first().map(|t| format!("{}x{}", t.width, t.height)).unwrap_or_default()
+                cull_mode,
+                bb_lo[0],
+                bb_lo[1],
+                bb_hi[0],
+                bb_hi[1],
+                d.textures
+                    .first()
+                    .map(|t| format!("{}x{}", t.width, t.height))
+                    .unwrap_or_default()
             );
         }
     }
@@ -5789,13 +6386,36 @@ fn raster_triangle(
     // World-space normals at the three vertices (constant per triangle), interpolated per
     // pixel below for the lit opaque path. Object-space normals are brought to world space
     // by the draw's model-to-world matrix so N.L matches the world-space light direction.
-    let wn: [[f32; 3]; 3] =
-        [world_normal(verts[0].normal, world), world_normal(verts[1].normal, world), world_normal(verts[2].normal, world)];
+    let wn: [[f32; 3]; 3] = [
+        world_normal(verts[0].normal, world),
+        world_normal(verts[1].normal, world),
+        world_normal(verts[2].normal, world),
+    ];
     let has_normal = verts.iter().any(|v| v.normal != [0.0, 0.0, 0.0]);
-    let mut min_x = s.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min).floor().max(0.0) as i32;
-    let mut max_x = s.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max).ceil().min((w - 1) as f32) as i32;
-    let mut min_y = s.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min).floor().max(0.0) as i32;
-    let mut max_y = s.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max).ceil().min((h - 1) as f32) as i32;
+    let mut min_x = s
+        .iter()
+        .map(|p| p[0])
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as i32;
+    let mut max_x = s
+        .iter()
+        .map(|p| p[0])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min((w - 1) as f32) as i32;
+    let mut min_y = s
+        .iter()
+        .map(|p| p[1])
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as i32;
+    let mut max_y = s
+        .iter()
+        .map(|p| p[1])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min((h - 1) as f32) as i32;
     // The guest's REGION CLIP, which is GXM's hardware scissor. The GPU path issues it as
     // `set_scissor_rect`; here the only thing that restricts a triangle is its bounding box,
     // so the clip narrows that. Same restriction, expressed in the terms this rasterizer has.
@@ -5822,8 +6442,8 @@ fn raster_triangle(
             let w1 = edge(&s[2], &s[0], &[p[0], p[1], 0.0, 0.0]);
             let w2 = edge(&s[0], &s[1], &[p[0], p[1], 0.0, 0.0]);
             // Inside if all barycentrics share the triangle's sign (either winding).
-            let inside = (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
-                || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+            let inside =
+                (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
             if !inside {
                 continue;
             }
@@ -5891,9 +6511,10 @@ fn raster_triangle(
             const ALPHA_TEST: u8 = 128;
             if depth_test {
                 if let Some(t) = texel
-                    && t[3] < ALPHA_TEST {
-                        continue;
-                    }
+                    && t[3] < ALPHA_TEST
+                {
+                    continue;
+                }
                 depth[idx] = z;
             }
 
@@ -5935,21 +6556,29 @@ fn raster_triangle(
             }
 
             if let Some((tx, ty)) = trace
-                && x == tx && y == ty {
-                    let (tu, tv, texel) = match texture {
-                        Some(tex) => {
-                            let u = interp(verts[0].uv[0], verts[1].uv[0], verts[2].uv[0]) / uv_div[0];
-                            let v = interp(verts[0].uv[1], verts[1].uv[1], verts[2].uv[1]) / uv_div[1];
-                            (u, v, sample_texture(tex, u, v))
-                        }
-                        None => (0.0, 0.0, [0, 0, 0, 0]),
-                    };
-                    eprintln!(
-                        "PXTRACE ({tx},{ty}) draw {draw_idx} textured={} depth_test={} src=[{:.0},{:.0},{:.0},{:.0}] vcol0={:?} uv=({tu:.3},{tv:.3}) texel={:?}",
-                        texture.is_some(), depth_test, src[0], src[1], src[2], src[3],
-                        verts[0].color, texel
-                    );
-                }
+                && x == tx
+                && y == ty
+            {
+                let (tu, tv, texel) = match texture {
+                    Some(tex) => {
+                        let u = interp(verts[0].uv[0], verts[1].uv[0], verts[2].uv[0]) / uv_div[0];
+                        let v = interp(verts[0].uv[1], verts[1].uv[1], verts[2].uv[1]) / uv_div[1];
+                        (u, v, sample_texture(tex, u, v))
+                    }
+                    None => (0.0, 0.0, [0, 0, 0, 0]),
+                };
+                eprintln!(
+                    "PXTRACE ({tx},{ty}) draw {draw_idx} textured={} depth_test={} src=[{:.0},{:.0},{:.0},{:.0}] vcol0={:?} uv=({tu:.3},{tv:.3}) texel={:?}",
+                    texture.is_some(),
+                    depth_test,
+                    src[0],
+                    src[1],
+                    src[2],
+                    src[3],
+                    verts[0].color,
+                    texel
+                );
+            }
             let dst = idx * 4;
             if depth_test {
                 // Opaque 3D replace (z-buffer already updated): run the reflected forward-lit
@@ -5964,7 +6593,11 @@ fn raster_triangle(
                     let ny = interp(wn[0][1], wn[1][1], wn[2][1]);
                     let nz = interp(wn[0][2], wn[1][2], wn[2][2]);
                     let len = (nx * nx + ny * ny + nz * nz).sqrt();
-                    if len > 1e-6 { [nx / len, ny / len, nz / len] } else { [0.0, 1.0, 0.0] }
+                    if len > 1e-6 {
+                        [nx / len, ny / len, nz / len]
+                    } else {
+                        [0.0, 1.0, 0.0]
+                    }
                 } else {
                     [0.0, 1.0, 0.0]
                 };
@@ -6031,15 +6664,30 @@ impl SwStencil {
         let st = SwStencil {
             func: [rs.front_stencil_func, rs.back_stencil_func],
             ops: [
-                [rs.front_stencil_op_fail, rs.front_stencil_op_depth_fail, rs.front_stencil_op_depth_pass],
-                [rs.back_stencil_op_fail, rs.back_stencil_op_depth_fail, rs.back_stencil_op_depth_pass],
+                [
+                    rs.front_stencil_op_fail,
+                    rs.front_stencil_op_depth_fail,
+                    rs.front_stencil_op_depth_pass,
+                ],
+                [
+                    rs.back_stencil_op_fail,
+                    rs.back_stencil_op_depth_fail,
+                    rs.back_stencil_op_depth_pass,
+                ],
             ],
-            compare_mask: [rs.front_stencil_compare_mask as u8, rs.back_stencil_compare_mask as u8],
-            write_mask: [rs.front_stencil_write_mask as u8, rs.back_stencil_write_mask as u8],
+            compare_mask: [
+                rs.front_stencil_compare_mask as u8,
+                rs.back_stencil_compare_mask as u8,
+            ],
+            write_mask: [
+                rs.front_stencil_write_mask as u8,
+                rs.back_stencil_write_mask as u8,
+            ],
             reference: [rs.front_stencil_ref as u8, rs.back_stencil_ref as u8],
             two_sided,
         };
-        let default_face = |f: usize| (st.func[f] >> 25) & 7 == 7 && st.ops[f].iter().all(|o| o & 7 == 0);
+        let default_face =
+            |f: usize| (st.func[f] >> 25) & 7 == 7 && st.ops[f].iter().all(|o| o & 7 == 0);
         (!(default_face(0) && (!two_sided || default_face(1)))).then_some(st)
     }
 }
@@ -6085,8 +6733,8 @@ fn depth_passes(z: f32, stored: f32, func: u32) -> bool {
 use std::collections::HashMap;
 use std::sync::Arc;
 use vitaslop_platform::gpu::{
-    BlockFamily, BlockFormat, CompressedUpload, DrawSpace, GxmDraw, GxmTexture, RenderScene,
-    TexelSeam, GXM_VERTEX_STRIDE,
+    BlockFamily, BlockFormat, CompressedUpload, DrawSpace, GXM_VERTEX_STRIDE, GxmDraw, GxmTexture,
+    RenderScene, TexelSeam,
 };
 
 /// Map the software rasterizer's internal [`Space`] to the neutral GPU
@@ -6518,7 +7166,10 @@ fn build_fastpath() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        vitaslop_platform::knobs::var("VITASLOP_BUILD_FASTPATH").ok().as_deref() != Some("0")
+        vitaslop_platform::knobs::var("VITASLOP_BUILD_FASTPATH")
+            .ok()
+            .as_deref()
+            != Some("0")
     })
 }
 
@@ -6784,7 +7435,10 @@ pub fn decode_by_format_line() -> String {
         .take(8)
         .map(|(f, mb)| format!("{:#04x} {} {:.1} MB", f, format_family(*f), mb))
         .collect();
-    format!("texture decode by format: {total:.1} MB total - {}", parts.join(", "))
+    format!(
+        "texture decode by format: {total:.1} MB total - {}",
+        parts.join(", ")
+    )
 }
 
 /// Which upload family a base format belongs to, which is the question the split exists to
@@ -6872,9 +7526,7 @@ enum DropKind {
 impl DropKind {
     fn describe(self) -> &'static str {
         match self {
-            DropKind::Topology => {
-                "not a triangle topology (a line/point list emits no triangles)"
-            }
+            DropKind::Topology => "not a triangle topology (a line/point list emits no triangles)",
             DropKind::Expanded => {
                 "the vertex stream holds shader-expanded sprite RECORDS, not vertices"
             }
@@ -6965,7 +7617,11 @@ fn report_drop(kind: DropKind, di: usize, d: &Draw, tri_count: usize) {
         d.index_count,
         d.vertex_stride,
         d.attributes.len(),
-        if d.vprog.is_empty() { "none" } else { "yes (the recompiler could draw this)" },
+        if d.vprog.is_empty() {
+            "none"
+        } else {
+            "yes (the recompiler could draw this)"
+        },
     );
     if strict {
         panic!("{detail}\n(VITASLOP_STRICT_DRAWS is set, so a dropped draw is fatal)");
@@ -6989,7 +7645,9 @@ fn report_drop(kind: DropKind, di: usize, d: &Draw, tri_count: usize) {
 fn zfix_consumes_scene_depth_range() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        crate::knobs::var("VITASLOP_GXP_ZFIX").map(|v| v.trim() == "range").unwrap_or(false)
+        crate::knobs::var("VITASLOP_GXP_ZFIX")
+            .map(|v| v.trim() == "range")
+            .unwrap_or(false)
     })
 }
 
@@ -7085,7 +7743,10 @@ fn report_color_surface_format(c: &crate::capture::ColorSurface) {
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((c.data_addr, c.format)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((c.data_addr, c.format))
+    {
         return;
     }
     // The `SceGxmColorFormat` base, which is what decides the channel WIDTHS; the low bits are
@@ -7282,7 +7943,9 @@ impl RenderSceneBuilder {
         // encode `transcoded_source` already names, not a smaller retry count.
         const ENCODE_RETRIES_PER_FRAME: usize = 1;
         for _ in 0..ENCODE_RETRIES_PER_FRAME {
-            let Some(key) = self.encode_deferred.pop() else { break };
+            let Some(key) = self.encode_deferred.pop() else {
+                break;
+            };
             if self.decode_cache.remove(&key).is_some() {
                 let bytes = self.decode_used.remove(&key).map_or(0, |(_, b)| b);
                 self.decode_cache_bytes = self.decode_cache_bytes.saturating_sub(bytes);
@@ -7312,7 +7975,8 @@ impl RenderSceneBuilder {
         const GXP_SET_KEEP_FRAMES: u64 = 4;
         let epoch = self.decode_epoch;
         if build_fastpath() {
-            self.gxp_tex_sets.retain(|_, e| epoch.wrapping_sub(e.used) < GXP_SET_KEEP_FRAMES);
+            self.gxp_tex_sets
+                .retain(|_, e| epoch.wrapping_sub(e.used) < GXP_SET_KEEP_FRAMES);
         } else {
             self.gxp_tex_sets.clear();
         }
@@ -7322,18 +7986,18 @@ impl RenderSceneBuilder {
     }
 
     /// A bound texture's own LOD bias in mip levels: control word 0's 6-bit `lod_bias`, an
-/// unsigned value offset by 31 with three fractional bits - `(raw - 31) / 8`, so raw 31 is no
-/// bias and the range is -3.875..=+4.0. A `LINEAR_STRIDED` texture has no bias: those bits are
-/// part of its stride.
-pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
-    const TYPE_LINEAR_STRIDED: u32 = 6;
-    if t.tex_type == TYPE_LINEAR_STRIDED {
-        return 0.0;
+    /// unsigned value offset by 31 with three fractional bits - `(raw - 31) / 8`, so raw 31 is no
+    /// bias and the range is -3.875..=+4.0. A `LINEAR_STRIDED` texture has no bias: those bits are
+    /// part of its stride.
+    pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
+        const TYPE_LINEAR_STRIDED: u32 = 6;
+        if t.tex_type == TYPE_LINEAR_STRIDED {
+            return 0.0;
+        }
+        (t.lod_bias as f32 - 31.0) / 8.0
     }
-    (t.lod_bias as f32 - 31.0) / 8.0
-}
 
-/// The recompiler's `GxpTex` list for a captured binding set, derived once per frame per
+    /// The recompiler's `GxpTex` list for a captured binding set, derived once per frame per
     /// set. See [`RenderSceneBuilder::gxp_tex_sets`] for why once per frame is exactly what the
     /// per-draw derivation did.
     fn gxp_textures(
@@ -7365,7 +8029,8 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
         {
             // Taken out and put back: the stamp below needs `self` mutably while the key list
             // is borrowed, and the list is a few `u64`s rather than something worth cloning.
-            let held = std::mem::take(&mut self.gxp_tex_sets.get_mut(&key).expect("just probed").keys);
+            let held =
+                std::mem::take(&mut self.gxp_tex_sets.get_mut(&key).expect("just probed").keys);
             let all_live = held.iter().all(|k| self.stamp_decode_used(*k));
             if let Some(e) = self.gxp_tex_sets.get_mut(&key) {
                 e.keys = held;
@@ -7396,7 +8061,12 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
         }
         self.gxp_tex_sets.insert(
             key,
-            GxpTexSet { src: src.clone(), out: out.clone(), keys: keys.into_boxed_slice(), used: epoch },
+            GxpTexSet {
+                src: src.clone(),
+                out: out.clone(),
+                keys: keys.into_boxed_slice(),
+                used: epoch,
+            },
         );
         out
     }
@@ -7408,7 +8078,9 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
     /// it - so any derived list built from that decode is stale. See [`Self::gxp_textures`].
     fn stamp_decode_used(&mut self, key: u64) -> bool {
         let epoch = self.decode_epoch;
-        let Some(slot) = self.decode_used.get_mut(&key) else { return false };
+        let Some(slot) = self.decode_used.get_mut(&key) else {
+            return false;
+        };
         let (used, bytes) = *slot;
         *slot = (epoch, bytes);
         if used != epoch {
@@ -7426,11 +8098,15 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
         if src.is_empty() {
             return Arc::from(&[][..]);
         }
-        let key = (Arc::as_ptr(src) as *const crate::capture::VertexAttribute as usize, src.len());
+        let key = (
+            Arc::as_ptr(src) as *const crate::capture::VertexAttribute as usize,
+            src.len(),
+        );
         if let Some(e) = self.gxp_attr_sets.get(&key)
-            && Arc::ptr_eq(&e.src, src) {
-                return e.out.clone();
-            }
+            && Arc::ptr_eq(&e.src, src)
+        {
+            return e.out.clone();
+        }
         let out: Arc<[vitaslop_platform::gpu::GxpAttr]> = src
             .iter()
             .map(|a| vitaslop_platform::gpu::GxpAttr {
@@ -7443,7 +8119,13 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
         if self.gxp_attr_sets.len() >= GXP_SET_CACHE_CAP {
             self.gxp_attr_sets.clear();
         }
-        self.gxp_attr_sets.insert(key, GxpAttrSet { src: src.clone(), out: out.clone() });
+        self.gxp_attr_sets.insert(
+            key,
+            GxpAttrSet {
+                src: src.clone(),
+                out: out.clone(),
+            },
+        );
         out
     }
 
@@ -7478,7 +8160,11 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     let bytes = predicted_texture_bytes(
-                        g.width, g.height, g.faces, g.texel, g.compressed.as_ref(),
+                        g.width,
+                        g.height,
+                        g.faces,
+                        g.texel,
+                        g.compressed.as_ref(),
                     );
                     e.insert((epoch, bytes));
                     (bytes, true)
@@ -7523,7 +8209,8 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
         let has_compressed = compressed.is_some();
         // What this entry will actually HOLD, priced without forcing the decode - see
         // [`resident_texture_bytes`].
-        let cost = predicted_texture_bytes(width, height, t.faces.max(1), texel, compressed.as_ref());
+        let cost =
+            predicted_texture_bytes(width, height, t.faces.max(1), texel, compressed.as_ref());
         self.decode_cache_bytes += cost;
         // The budget, floored at ONE FRAME's working set - see `decode_frame_high`. Eviction
         // is per entry and never takes something this frame has already decoded, because that
@@ -7641,6 +8328,7 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
                     chroma_stride: align_up_to(t.width.div_ceil(2), 8) * 2,
                     chroma_offset: align_up_to(t.width, 8) * t.height,
                     swap_chroma: (t.swizzle >> 12) & 1 != 0,
+                    profile: t.yuv_profile,
                     data: t.pixels.clone(),
                 }
             }),
@@ -7703,8 +8391,11 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
                 // with fewer words than the sample is read whole, which is what a stride of 1
                 // does. `VITASLOP_GXM_TEX_UNWRITTEN=prefix` pins it to 1 and so reads the old
                 // contiguous prefix - see `tex_unwritten_samples_prefix_only`.
-                let stride =
-                    if tex_unwritten_samples_prefix_only() { 1 } else { (words / SAMPLE_WORDS).max(1) };
+                let stride = if tex_unwritten_samples_prefix_only() {
+                    1
+                } else {
+                    (words / SAMPLE_WORDS).max(1)
+                };
                 let mut it = (0..words).step_by(stride).take(SAMPLE_WORDS).map(|i| {
                     let b = i * 4;
                     &t.pixels[b..b + 4]
@@ -7736,7 +8427,13 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
             // turn into ETC2 under budget pressure, would preempt both with a strictly worse
             // answer. `compressed` being `None` is exactly the statement "this one is going to
             // be decoded to RGBA8" - so this decides only WHERE that happens.
-            raw: raw_source(t).or_else(|| if has_compressed { None } else { block_source(t) }),
+            raw: raw_source(t).or_else(|| {
+                if has_compressed {
+                    None
+                } else {
+                    block_source(t)
+                }
+            }),
         };
         // >>> THE PREVIOUS DECODE OF THIS SAME GUEST TEXTURE IS DROPPED HERE, and the choice
         // between dropping it and merely marking it for eviction was MEASURED, both ways, on
@@ -7756,11 +8453,13 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
         // happen HERE, on the CPU side; the same experiment on the GPU-side view cache says
         // the opposite, and that cache marks instead (see `GxpLive::view_dead`).
         if let Some(stale) = self.decode_slots.insert(tex_slot_key(t), key)
-            && stale != key && self.decode_cache.remove(&stale).is_some() {
-                let bytes = self.decode_used.remove(&stale).map_or(0, |(_, b)| b);
-                self.decode_cache_bytes = self.decode_cache_bytes.saturating_sub(bytes);
-                work.tex_superseded += 1;
-            }
+            && stale != key
+            && self.decode_cache.remove(&stale).is_some()
+        {
+            let bytes = self.decode_used.remove(&stale).map_or(0, |(_, b)| b);
+            self.decode_cache_bytes = self.decode_cache_bytes.saturating_sub(bytes);
+            work.tex_superseded += 1;
+        }
         self.decode_cache.insert(key, (g.clone(), t.pixels.clone()));
         self.touch_decode(key, cost);
         // The miss path's whole cost. The cached path returns above without charging it, so
@@ -7834,7 +8533,10 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
         let mut deferred: Vec<(usize, Layout, [f32; 16])> = Vec::new();
         // Has a reader turned up? `ZFix::Range` makes every recompiled draw one.
         let mut range_has_reader = zfix_range;
-        let mut tally = DropTally { total: scene.draws.len(), ..Default::default() };
+        let mut tally = DropTally {
+            total: scene.draws.len(),
+            ..Default::default()
+        };
         for (di, d) in scene.draws.iter().enumerate() {
             // A list emits idx/3 triangles; a strip or fan emits idx-2.
             let tri_count = triangle_count(d);
@@ -7921,7 +8623,11 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
                         d.vertex_stride,
                         d.attributes.len(),
                         d.uniform_bank_floats(),
-                        if d.vprog.is_empty() { "none" } else { "captured" },
+                        if d.vprog.is_empty() {
+                            "none"
+                        } else {
+                            "captured"
+                        },
                     );
                 }
                 continue;
@@ -7941,7 +8647,11 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
             };
             // Cull mode: only 3D (MVP) draws have a meaningful facing; a 2D sprite's
             // winding is submission-defined, so it is never culled (matches `render_scene`).
-            let cull_mode = if mvp.is_some() { d.render_state.cull_mode } else { SCE_GXM_CULL_NONE };
+            let cull_mode = if mvp.is_some() {
+                d.render_state.cull_mode
+            } else {
+                SCE_GXM_CULL_NONE
+            };
 
             // ...and if the fixed-function form will not be used, the ONLY thing the per-vertex walk still produces is
             // the opaque depth RANGE, which the recompiled path maps its clip depth
@@ -7981,7 +8691,11 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
                 work.indices_scanned += d.index_count as u64;
             }
             let stride = d.vertex_stride.max(1) as usize;
-            let nverts = if walk { (d.vertices.len() / stride).max(max_idx + 1) } else { 0 };
+            let nverts = if walk {
+                (d.vertices.len() / stride).max(max_idx + 1)
+            } else {
+                0
+            };
             work.draws += 1;
             work.draws_fixed_function += fixed_function as u64;
             work.verts_walked += nverts as u64;
@@ -7995,12 +8709,18 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
             // when it is dead: on a race frame that is a few hundred thousand vertices'
             // worth of buffer writes, two matrix multiplies per vertex and an index
             // expansion, all of which `encode` then steps over.
-            let mut screen_pos: Vec<Option<[f32; 4]>> =
-                if fixed_function && mvp.is_some() { Vec::with_capacity(nverts) } else { Vec::new() };
+            let mut screen_pos: Vec<Option<[f32; 4]>> = if fixed_function && mvp.is_some() {
+                Vec::with_capacity(nverts)
+            } else {
+                Vec::new()
+            };
 
             let (mut draw_dmin, mut draw_dmax) = (f32::INFINITY, f32::NEG_INFINITY);
-            let mut vertices =
-                Vec::with_capacity(if fixed_function { nverts * GXM_VERTEX_STRIDE as usize } else { 0 });
+            let mut vertices = Vec::with_capacity(if fixed_function {
+                nverts * GXM_VERTEX_STRIDE as usize
+            } else {
+                0
+            });
             for i in 0..nverts {
                 if !fixed_function {
                     // Only the depth range is left, and it reads the position alone. Same
@@ -8049,19 +8769,18 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
                 // Accumulate the visible opaque depth range (post-divide c.z/c.w over
                 // on-screen vertices) so the GPU can linearly normalize depth into [0,1]
                 // at full precision - see `RenderScene::depth_min`/`depth_scale`.
-                if opaque
-                    && let Some(m) = mvp {
-                        let c = transform(&m, v.pos[0], v.pos[1], v.pos[2]);
-                        if c[3] > 1e-4 {
-                            let (nx, ny, depth) = (c[0] / c[3], c[1] / c[3], -1.0 / c[3]);
-                            if nx.abs() <= 1.0 && ny.abs() <= 1.0 && depth.is_finite() {
-                                dmin = dmin.min(depth);
-                                dmax = dmax.max(depth);
-                                draw_dmin = draw_dmin.min(depth);
-                                draw_dmax = draw_dmax.max(depth);
-                            }
+                if opaque && let Some(m) = mvp {
+                    let c = transform(&m, v.pos[0], v.pos[1], v.pos[2]);
+                    if c[3] > 1e-4 {
+                        let (nx, ny, depth) = (c[0] / c[3], c[1] / c[3], -1.0 / c[3]);
+                        if nx.abs() <= 1.0 && ny.abs() <= 1.0 && depth.is_finite() {
+                            dmin = dmin.min(depth);
+                            dmax = dmax.max(depth);
+                            draw_dmin = draw_dmin.min(depth);
+                            draw_dmax = draw_dmax.max(depth);
                         }
                     }
+                }
             }
 
             // Expand the topology into a flat triangle-LIST index buffer with winding
@@ -8069,18 +8788,22 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
             // faces and dropping behind-eye triangles exactly as the software rasterizer
             // does. Doing the cull here (not via GPU pipeline state) keeps the GPU a
             // pixel-faithful twin with one cull-free pipeline and no per-draw facing state.
-            let mut indices = Vec::with_capacity(if fixed_function { tri_count * 3 * 4 } else { 0 });
+            let mut indices =
+                Vec::with_capacity(if fixed_function { tri_count * 3 * 4 } else { 0 });
             for t in 0..tri_count {
                 if !fixed_function {
                     break;
                 }
                 let vs = tri_indices(d, t);
                 if mvp.is_some() {
-                    let s: [[f32; 4]; 3] = match [screen_pos[vs[0]], screen_pos[vs[1]], screen_pos[vs[2]]] {
-                        [Some(a), Some(b), Some(c)] => [a, b, c],
-                        _ => continue, // a vertex is behind the eye - drop the triangle
-                    };
-                    if cull_mode != SCE_GXM_CULL_NONE && cull_backface(edge(&s[0], &s[1], &s[2]), cull_mode) {
+                    let s: [[f32; 4]; 3] =
+                        match [screen_pos[vs[0]], screen_pos[vs[1]], screen_pos[vs[2]]] {
+                            [Some(a), Some(b), Some(c)] => [a, b, c],
+                            _ => continue, // a vertex is behind the eye - drop the triangle
+                        };
+                    if cull_mode != SCE_GXM_CULL_NONE
+                        && cull_backface(edge(&s[0], &s[1], &s[2]), cull_mode)
+                    {
                         continue;
                     }
                 }
@@ -8236,7 +8959,8 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
                         // address, and a dropped buffer's address can be reused by an unrelated
                         // mesh. Holding it is what stops that entry from serving someone else's
                         // triangles.
-                        self.index_cache.insert(ikey, (out.clone(), d.indices.clone()));
+                        self.index_cache
+                            .insert(ikey, (out.clone(), d.indices.clone()));
                         out
                     }
                 };
@@ -8457,7 +9181,11 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
         } else if target.is_none() && depth_addr != 0 {
             let mut seen: Option<(u32, u32)> = None;
             let mut agreed = true;
-            for d in scene.draws.iter().filter(|d| d.render_state.viewport_enable == 0) {
+            for d in scene
+                .draws
+                .iter()
+                .filter(|d| d.render_state.viewport_enable == 0)
+            {
                 let v = d.render_state.viewport;
                 let e = ((2.0 * v[1].abs()) as u32, (2.0 * v[3].abs()) as u32);
                 if e.0 <= 1 || e.1 <= 1 {
@@ -8489,7 +9217,10 @@ pub(crate) fn texture_lod_bias_levels(t: &BoundTexture) -> f32 {
             depth_min,
             depth_scale,
             depth_addr,
-            stencil_clear: scene.depth.map(|d| (d.background_control & 0xff) as u8).unwrap_or(0),
+            stencil_clear: scene
+                .depth
+                .map(|d| (d.background_control & 0xff) as u8)
+                .unwrap_or(0),
             depth_clear: scene_depth_clear(scene.depth.as_ref()),
             depth_extent,
             depth_extent_ambiguous,
@@ -8517,7 +9248,11 @@ mod geometry_tests {
             vertices: Arc::from(&[][..]),
             vertex_stride: 1,
             attributes: vec![].into(),
-            indices: indices.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>().into(),
+            indices: indices
+                .iter()
+                .flat_map(|i| i.to_le_bytes())
+                .collect::<Vec<u8>>()
+                .into(),
             uniforms: vec![],
             textures: vec![].into(),
             vertex_textures: std::sync::Arc::from(&[][..]),
@@ -8525,7 +9260,9 @@ mod geometry_tests {
             blend: crate::capture::BlendState::default(),
             exposure: 1.0,
             material: crate::capture::FragmentMaterial::default(),
-            world: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            world: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
             vprog: crate::capture::no_program(),
             fprog: crate::capture::no_program(),
             fprog_patched_vprog: crate::capture::no_program(),
@@ -8567,7 +9304,8 @@ mod geometry_tests {
                 component_count: 4,
                 reg_index: 1,
             },
-        ].into();
+        ]
+        .into();
         d.uniforms = mvp.to_vec();
         d.world[12] = world[0];
         d.world[13] = world[1];
@@ -8585,7 +9323,10 @@ mod geometry_tests {
         mvp[10] = 1.0;
         mvp[11] = 1.0; // w = z
         let tri = [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]];
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -8624,10 +9365,34 @@ mod geometry_tests {
         // convention as the `lang=` stick directive, so a commanded bearing and a
         // measured heading are directly comparable numbers.
         let d = located_draw([0.0, 0.0, 0.0], &tri, mvp);
-        let found = locate_scene(&Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![d.clone()] }, 100, 100);
-        let h = found[0].heading.expect("an identity rotation has a heading");
-        assert!((h[0] - 0.0).abs() < 1e-3, "local +X is bearing 0, got {}", h[0]);
-        assert!((h[1] + 90.0).abs() < 1e-3, "local +Z is bearing -90, got {}", h[1]);
+        let found = locate_scene(
+            &Scene {
+                completed_early: false,
+                notifications: [None; 2],
+                deferred_id: 0,
+                precompile: Default::default(),
+                color: None,
+                depth: None,
+                multisample: 0,
+                target_extent: None,
+                draws: vec![d.clone()],
+            },
+            100,
+            100,
+        );
+        let h = found[0]
+            .heading
+            .expect("an identity rotation has a heading");
+        assert!(
+            (h[0] - 0.0).abs() < 1e-3,
+            "local +X is bearing 0, got {}",
+            h[0]
+        );
+        assert!(
+            (h[1] + 90.0).abs() < 1e-3,
+            "local +Z is bearing -90, got {}",
+            h[1]
+        );
 
         // Rotate 90 degrees so local +X points along world -Z: bearing 90.
         let mut turned = d.clone();
@@ -8635,16 +9400,48 @@ mod geometry_tests {
         turned.world[2] = -1.0;
         turned.world[8] = 1.0;
         turned.world[10] = 0.0;
-        let found = locate_scene(&Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![turned] }, 100, 100);
+        let found = locate_scene(
+            &Scene {
+                completed_early: false,
+                notifications: [None; 2],
+                deferred_id: 0,
+                precompile: Default::default(),
+                color: None,
+                depth: None,
+                multisample: 0,
+                target_extent: None,
+                draws: vec![turned],
+            },
+            100,
+            100,
+        );
         let h = found[0].heading.unwrap();
-        assert!((h[0] - 90.0).abs() < 1e-3, "expected bearing 90, got {}", h[0]);
+        assert!(
+            (h[0] - 90.0).abs() < 1e-3,
+            "expected bearing 90, got {}",
+            h[0]
+        );
 
         // A world matrix with no in-plane rotation at all reports no heading rather
         // than a fabricated zero.
         let mut flat = d;
         flat.world[0] = 0.0;
         flat.world[2] = 0.0;
-        let found = locate_scene(&Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![flat] }, 100, 100);
+        let found = locate_scene(
+            &Scene {
+                completed_early: false,
+                notifications: [None; 2],
+                deferred_id: 0,
+                precompile: Default::default(),
+                color: None,
+                depth: None,
+                multisample: 0,
+                target_extent: None,
+                draws: vec![flat],
+            },
+            100,
+            100,
+        );
         assert_eq!(found[0].heading, None);
     }
 
@@ -8661,9 +9458,22 @@ mod geometry_tests {
         let car = [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
         let other = [[0.0, 0.0, 2.0], [5.0, 0.0, 2.0], [0.0, 5.0, 2.0]];
 
-        let before = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
+        let before = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
+            precompile: Default::default(),
+            color: None,
+            depth: None,
+            multisample: 0,
+            target_extent: None,
+            draws: vec![located_draw([0.0, 0.0, 0.0], &car, mvp)],
+        };
         // Next frame: something new is submitted first, and the car has moved.
-        let after = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        let after = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -8784,7 +9594,10 @@ mod geometry_tests {
     fn cull_mode_discards_the_back_face_only() {
         let (f, b) = (tri(true), tri(false));
         let (af, ab) = (edge(&f[0], &f[1], &f[2]), edge(&b[0], &b[1], &b[2]));
-        assert!(af > 0.0 && ab < 0.0, "front area positive, back negative: {af} {ab}");
+        assert!(
+            af > 0.0 && ab < 0.0,
+            "front area positive, back negative: {af} {ab}"
+        );
         // CCW-cull discards the back face (area < 0), keeps the front.
         assert!(!cull_backface(af, SCE_GXM_CULL_CCW));
         assert!(cull_backface(ab, SCE_GXM_CULL_CCW));
@@ -8840,16 +9653,32 @@ mod geometry_tests {
         m[10] = 1.0;
         let space = Space::Mvp(m);
         let at = |x: f32, y: f32, z: f32| {
-            let v = Vertex { pos: [x, y, z], uv: [0.0; 2], color: [255; 4], normal: [0.0; 3] };
+            let v = Vertex {
+                pos: [x, y, z],
+                uv: [0.0; 2],
+                color: [255; 4],
+                normal: [0.0; 3],
+            };
             project(&v, &space, 100, 100, 1.0, None).expect("in front of the eye")
         };
 
         // Same screen position (x/w, y/w equal), different distances.
         let near = at(2.0, 4.0, 10.0);
         let far = at(4.0, 8.0, 20.0);
-        assert!((near[0] - far[0]).abs() < 1e-5 && (near[1] - far[1]).abs() < 1e-5, "same pixel");
-        assert!(near[2] < far[2], "nearer must be smaller: {} vs {}", near[2], far[2]);
-        assert!(depth_passes(near[2], far[2], 0x00C0_0000), "nearer wins under LESS_EQUAL");
+        assert!(
+            (near[0] - far[0]).abs() < 1e-5 && (near[1] - far[1]).abs() < 1e-5,
+            "same pixel"
+        );
+        assert!(
+            near[2] < far[2],
+            "nearer must be smaller: {} vs {}",
+            near[2],
+            far[2]
+        );
+        assert!(
+            depth_passes(near[2], far[2], 0x00C0_0000),
+            "nearer wins under LESS_EQUAL"
+        );
 
         // The clip z of both is identical (the degenerate case), so a z/w depth would tie and
         // let submission order decide - which is exactly the failure this model removes.
@@ -8891,7 +9720,10 @@ mod geometry_tests {
         );
         d.primitive = PRIM_TRIANGLES;
         d.index_count = 6;
-        d.indices = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
+        d.indices = [0u16, 1, 2, 0, 2, 3]
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
         // The REAL GXM attribute format codes, so `layout_of` recognizes the position and
         // the colour and `interpret_draw` therefore does not skip the draw as having no
         // colour source. (`located_draw` predates the map and gets away with placeholder
@@ -8913,7 +9745,11 @@ mod geometry_tests {
     }
 
     fn square_view(extent: [f32; 4], n: u32) -> MapView {
-        MapView { extent, width: n, height: n }
+        MapView {
+            extent,
+            width: n,
+            height: n,
+        }
     }
 
     #[test]
@@ -8923,13 +9759,19 @@ mod geometry_tests {
         for (px, py) in [(0.0, 0.0), (57.0, 133.0), (199.0, 199.0)] {
             let w = v.world_of(px, py);
             let back = v.pixel_of(w[0], w[1]);
-            assert!((back[0] - px).abs() < 1e-3 && (back[1] - py).abs() < 1e-3, "{px},{py}");
+            assert!(
+                (back[0] - px).abs() < 1e-3 && (back[1] - py).abs() < 1e-3,
+                "{px},{py}"
+            );
         }
         // Orientation, which is the part a caller cannot check by eye without a title in
         // front of it: +X is right, and world -Z is UP the image (smaller y).
         let origin = v.pixel_of(0.0, 0.0);
         assert!(v.pixel_of(50.0, 0.0)[0] > origin[0], "+X goes right");
-        assert!(v.pixel_of(0.0, -40.0)[1] < origin[1], "-Z goes up the image");
+        assert!(
+            v.pixel_of(0.0, -40.0)[1] < origin[1],
+            "-Z goes up the image"
+        );
         // Scale is world units per pixel on each axis, independently.
         assert!((v.scale()[0] - 1.0).abs() < 1e-6 && (v.scale()[1] - 1.0).abs() < 1e-6);
     }
@@ -8961,12 +9803,26 @@ mod geometry_tests {
         // One object that genuinely moved, by a completely different vector.
         let car = [500.0, -50.0, 300.0];
         prev.push(obj(999, car));
-        now.push(obj(999, [car[0] + shift[0] + 12.0, car[1] + shift[1], car[2] + shift[2] + 8.0]));
+        now.push(obj(
+            999,
+            [
+                car[0] + shift[0] + 12.0,
+                car[1] + shift[1],
+                car[2] + shift[2] + 8.0,
+            ],
+        ));
 
         let d = origin_drift(&prev, &now, 0.05).expect("a match");
-        assert!(d.reliable(), "a scene that is 20/21 static must yield a majority");
+        assert!(
+            d.reliable(),
+            "a scene that is 20/21 static must yield a majority"
+        );
         for k in 0..3 {
-            assert!((d.delta[k] - shift[k]).abs() < 1e-3, "axis {k}: {:?}", d.delta);
+            assert!(
+                (d.delta[k] - shift[k]).abs() < 1e-3,
+                "axis {k}: {:?}",
+                d.delta
+            );
         }
         assert_eq!(d.agreed, 20, "the mover must not be counted in the cluster");
         assert_eq!(d.matched, 21);
@@ -8974,10 +9830,15 @@ mod geometry_tests {
         // And with the drift removed, the mover's residual is its TRUE motion while every
         // static object reads zero - the property navigation depends on.
         for (p, n) in prev.iter().zip(now.iter()) {
-            let resid: Vec<f32> = (0..3).map(|k| n.world[k] - p.world[k] - d.delta[k]).collect();
+            let resid: Vec<f32> = (0..3)
+                .map(|k| n.world[k] - p.world[k] - d.delta[k])
+                .collect();
             let mag = (resid[0] * resid[0] + resid[1] * resid[1] + resid[2] * resid[2]).sqrt();
             if n.id == 999 {
-                assert!((mag - (12.0f32 * 12.0 + 8.0 * 8.0).sqrt()).abs() < 1e-2, "mover {mag}");
+                assert!(
+                    (mag - (12.0f32 * 12.0 + 8.0 * 8.0).sqrt()).abs() < 1e-2,
+                    "mover {mag}"
+                );
             } else {
                 assert!(mag < 1e-3, "static object read as moving: {mag}");
             }
@@ -9000,10 +9861,14 @@ mod geometry_tests {
         // Every object moved by a different amount: there is no origin displacement to
         // find, and inventing one would silently corrupt every delta in the report.
         let prev: Vec<ObjectLoc> = (0..12u64).map(|i| obj(i, [0.0, 0.0, 0.0])).collect();
-        let now: Vec<ObjectLoc> =
-            (0..12u64).map(|i| obj(i, [i as f32 * 5.0, 0.0, i as f32 * -3.0])).collect();
+        let now: Vec<ObjectLoc> = (0..12u64)
+            .map(|i| obj(i, [i as f32 * 5.0, 0.0, i as f32 * -3.0]))
+            .collect();
         let d = origin_drift(&prev, &now, 0.05).expect("objects did match");
-        assert!(!d.reliable(), "no majority must be reported as unreliable, not as a vector");
+        assert!(
+            !d.reliable(),
+            "no majority must be reported as unreliable, not as a vector"
+        );
         // Too small a sample is also not a majority worth trusting.
         let d2 = origin_drift(&prev[..3], &now[..3], 0.05).unwrap();
         assert!(!d2.reliable());
@@ -9027,17 +9892,26 @@ mod geometry_tests {
         };
         let spacing = 20.0;
         let drift = [-23.0, 0.0, 0.0];
-        let prev: Vec<ObjectLoc> = (0..8).map(|i| post([i as f32 * spacing, 0.0, 0.0])).collect();
-        let now: Vec<ObjectLoc> =
-            (0..8).map(|i| post([i as f32 * spacing + drift[0], 0.0, 0.0])).collect();
+        let prev: Vec<ObjectLoc> = (0..8)
+            .map(|i| post([i as f32 * spacing, 0.0, 0.0]))
+            .collect();
+        let now: Vec<ObjectLoc> = (0..8)
+            .map(|i| post([i as f32 * spacing + drift[0], 0.0, 0.0]))
+            .collect();
         for o in &now {
             let (_, mag) = world_motion(&prev, o, drift).expect("matched");
-            assert!(mag < 1e-3, "a static post must read 0, got {mag} at {:?}", o.world);
+            assert!(
+                mag < 1e-3,
+                "a static post must read 0, got {mag} at {:?}",
+                o.world
+            );
         }
         // The naive version this replaced: nearest RAW candidate, i.e. drift of zero.
         // Kept as a test so the bug cannot come back quietly.
-        let naive: Vec<f32> =
-            now.iter().filter_map(|o| world_motion(&prev, o, [0.0; 3]).map(|(_, m)| m)).collect();
+        let naive: Vec<f32> = now
+            .iter()
+            .filter_map(|o| world_motion(&prev, o, [0.0; 3]).map(|(_, m)| m))
+            .collect();
         assert!(
             naive.iter().any(|m| *m > 1.0),
             "the uncorrected match should mis-pair posts - if it no longer does, this \
@@ -9048,7 +9922,10 @@ mod geometry_tests {
     #[test]
     fn map_keeps_the_higher_surface_and_measures_its_height() {
         // A wide floor with a small block standing on it.
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -9063,22 +9940,38 @@ mod geometry_tests {
         let map = render_map(&scene, view, [0, 0, 0, 255], 1, None, [0.0; 3]);
         // Looking down keeps the block, not the floor beneath it.
         assert_eq!(map.height_at(10.0, 10.0), Some(8.0), "the block is on top");
-        assert_eq!(map.height_at(-25.0, -25.0), Some(0.0), "open floor reads the floor");
+        assert_eq!(
+            map.height_at(-25.0, -25.0),
+            Some(0.0),
+            "open floor reads the floor"
+        );
         // The floor is the bulk of the covered area, so it is the ground level.
         assert_eq!(map.ground_level(0.25), Some(0.0));
         // Densest band first: the floor, then the block.
         let bins = map.height_bins(2.0);
         assert_eq!(bins[0].0, 0.0);
-        assert!(bins.iter().any(|(h, _)| *h == 8.0), "the block has its own band: {bins:?}");
+        assert!(
+            bins.iter().any(|(h, _)| *h == 8.0),
+            "the block has its own band: {bins:?}"
+        );
         // In the grid the block is an obstacle and the open floor is drivable.
         let grid = map.height_grid(10, 10, 0.0, 1.0);
         let g: Vec<&str> = grid.lines().collect();
         // Grid row 0 is the TOP of the image, which is the most negative Z; the block
         // occupies world x 0..20, z 0..20, so it lands below and right of centre.
         assert_eq!(g[0].chars().next(), Some('.'), "a corner of open floor");
-        assert!(g.iter().any(|row| row.contains('#')), "the block reads as an obstacle");
-        let blocked = g.iter().map(|r| r.chars().filter(|c| *c == '#').count()).sum::<usize>();
-        assert_eq!(blocked, 4, "a 20x20 block over a 100x100 map is 2x2 of a 10x10 grid");
+        assert!(
+            g.iter().any(|row| row.contains('#')),
+            "the block reads as an obstacle"
+        );
+        let blocked = g
+            .iter()
+            .map(|r| r.chars().filter(|c| *c == '#').count())
+            .sum::<usize>();
+        assert_eq!(
+            blocked, 4,
+            "a 20x20 block over a 100x100 map is 2x2 of a 10x10 grid"
+        );
     }
 
     /// The failure that made the first map of this title a picture of the inside of the
@@ -9087,8 +9980,25 @@ mod geometry_tests {
     #[test]
     fn map_excludes_geometry_that_does_not_write_depth() {
         let sky = ground_quad(5000.0, -50.0, -50.0, 50.0, 50.0, false);
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
-        let map = render_map(&scene, square_view([-50.0, -50.0, 50.0, 50.0], 40), [0, 0, 0, 255], 1, None, [0.0; 3]);
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
+            precompile: Default::default(),
+            color: None,
+            depth: None,
+            multisample: 0,
+            target_extent: None,
+            draws: vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky],
+        };
+        let map = render_map(
+            &scene,
+            square_view([-50.0, -50.0, 50.0, 50.0], 40),
+            [0, 0, 0, 255],
+            1,
+            None,
+            [0.0; 3],
+        );
         assert_eq!(map.height_at(0.0, 0.0), Some(0.0), "the floor, not the sky");
         assert_eq!(map.ground_level(0.25), Some(0.0));
     }
@@ -9097,7 +10007,10 @@ mod geometry_tests {
     fn map_ceiling_drops_geometry_above_it_and_reveals_the_floor_below() {
         // A depth-WRITING roof over half the floor: the ceiling option is the only way to
         // see what is under it.
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -9110,22 +10023,52 @@ mod geometry_tests {
         };
         let view = square_view([-50.0, -50.0, 50.0, 50.0], 40);
         let roofed = render_map(&scene, view, [0, 0, 0, 255], 1, None, [0.0; 3]);
-        assert_eq!(roofed.height_at(-25.0, 0.0), Some(30.0), "without a ceiling, the roof wins");
+        assert_eq!(
+            roofed.height_at(-25.0, 0.0),
+            Some(30.0),
+            "without a ceiling, the roof wins"
+        );
         let under = render_map(&scene, view, [0, 0, 0, 255], 1, Some(10.0), [0.0; 3]);
-        assert_eq!(under.height_at(-25.0, 0.0), Some(0.0), "with a ceiling, the floor shows");
-        assert_eq!(under.height_at(25.0, 0.0), Some(0.0), "the open half is unaffected");
+        assert_eq!(
+            under.height_at(-25.0, 0.0),
+            Some(0.0),
+            "with a ceiling, the floor shows"
+        );
+        assert_eq!(
+            under.height_at(25.0, 0.0),
+            Some(0.0),
+            "the open half is unaffected"
+        );
     }
 
     #[test]
     fn map_origin_shifts_every_coordinate_into_the_anchored_frame() {
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
+            precompile: Default::default(),
+            color: None,
+            depth: None,
+            multisample: 0,
+            target_extent: None,
+            draws: vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)],
+        };
         let origin = [100.0, 4.0, -200.0];
         // The same geometry, asked for in a frame measured from `origin`: the quad now
         // lives at x -110..-90, z 190..210, and its height is 0 rather than 4.
         let view = square_view([-160.0, 140.0, -40.0, 260.0], 120);
         let map = render_map(&scene, view, [0, 0, 0, 255], 1, None, origin);
-        assert_eq!(map.height_at(-100.0, 200.0), Some(0.0), "shifted in x, z AND y");
-        assert_eq!(map.height_at(0.0, 0.0), None, "nothing at the raw position any more");
+        assert_eq!(
+            map.height_at(-100.0, 200.0),
+            Some(0.0),
+            "shifted in x, z AND y"
+        );
+        assert_eq!(
+            map.height_at(0.0, 0.0),
+            None,
+            "nothing at the raw position any more"
+        );
     }
 
     // --- 2D sprite locating -----------------------------------------------------------
@@ -9136,10 +10079,18 @@ mod geometry_tests {
         let mut d = located_draw([0.0, 0.0, 0.0], &[], [0f32; 16]);
         d.primitive = PRIM_TRIANGLES;
         d.index_count = 6;
-        d.indices = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
+        d.indices = [0u16, 1, 2, 0, 2, 3]
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
         // pos.xy at 0, uv.xy at 8, colour at 16.
         d.vertex_stride = 20;
-        let corners = [(x0, y0, u0, v0), (x1, y0, u0 + 0.1, v0), (x1, y1, u0 + 0.1, v0 + 0.1), (x0, y1, u0, v0 + 0.1)];
+        let corners = [
+            (x0, y0, u0, v0),
+            (x1, y0, u0 + 0.1, v0),
+            (x1, y1, u0 + 0.1, v0 + 0.1),
+            (x0, y1, u0, v0 + 0.1),
+        ];
         d.vertices = corners
             .iter()
             .flat_map(|(x, y, u, v)| {
@@ -9153,10 +10104,29 @@ mod geometry_tests {
             })
             .collect();
         d.attributes = vec![
-            crate::capture::VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 3, reg_index: 0 },
-            crate::capture::VertexAttribute { stream_index: 0, offset: 12, format: FORMAT_F32, component_count: 2, reg_index: 1 },
-            crate::capture::VertexAttribute { stream_index: 0, offset: 16, format: FORMAT_U8N, component_count: 4, reg_index: 2 },
-        ].into();
+            crate::capture::VertexAttribute {
+                stream_index: 0,
+                offset: 0,
+                format: FORMAT_F32,
+                component_count: 3,
+                reg_index: 0,
+            },
+            crate::capture::VertexAttribute {
+                stream_index: 0,
+                offset: 12,
+                format: FORMAT_F32,
+                component_count: 2,
+                reg_index: 1,
+            },
+            crate::capture::VertexAttribute {
+                stream_index: 0,
+                offset: 16,
+                format: FORMAT_U8N,
+                component_count: 4,
+                reg_index: 2,
+            },
+        ]
+        .into();
         // No uniforms: that is what makes this 2D rather than MVP, which is the whole point.
         d.uniforms = vec![];
         d.textures = [BoundTexture {
@@ -9183,6 +10153,7 @@ mod geometry_tests {
             mag_filter: 0,
             mip_filter: 0,
             gamma: 0,
+            yuv_profile: 0,
         }]
         .into();
         d
@@ -9190,7 +10161,10 @@ mod geometry_tests {
 
     #[test]
     fn sprites_are_located_on_screen_and_keep_their_identity_when_they_move() {
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -9207,7 +10181,10 @@ mod geometry_tests {
 
         // The SAME sprite 300 pixels along keeps its id - which a 3D geometry hash could
         // not do, because a 2D sprite's position IS its vertex data.
-        let moved = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        let moved = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -9218,7 +10195,10 @@ mod geometry_tests {
         let after = locate_sprites(&moved, 960, 544);
         assert_eq!(after[0].id, s.id, "identity must survive motion");
         // A different region of the same sheet is a DIFFERENT sprite.
-        let other = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        let other = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -9226,13 +10206,20 @@ mod geometry_tests {
             target_extent: None,
             draws: vec![sprite_quad(100.0, 200.0, 180.0, 280.0, 0.5, 0.5, 7)],
         };
-        assert_ne!(locate_sprites(&other, 960, 544)[0].id, s.id, "another atlas region");
+        assert_ne!(
+            locate_sprites(&other, 960, 544)[0].id,
+            s.id,
+            "another atlas region"
+        );
     }
 
     #[test]
     fn sprite_motion_removes_the_scene_scroll() {
         // A backdrop of many sprites panning left by 6px, and one that moves against it.
-        let build = |shift: f32, hero_extra: f32| Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        let build = |shift: f32, hero_extra: f32| Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -9257,8 +10244,15 @@ mod geometry_tests {
         let before = locate_sprites(&build(0.0, 0.0), 960, 544);
         let after = locate_sprites(&build(-6.0, 20.0), 960, 544);
         let drift = scroll_drift(&before, &after, 0.75).expect("matched");
-        assert!(drift.reliable(), "12 of 13 sprites agree, so this is a majority");
-        assert!((drift.delta[0] + 6.0).abs() < 1e-3, "the pan is -6px: {:?}", drift.delta);
+        assert!(
+            drift.reliable(),
+            "12 of 13 sprites agree, so this is a majority"
+        );
+        assert!(
+            (drift.delta[0] + 6.0).abs() < 1e-3,
+            "the pan is -6px: {:?}",
+            drift.delta
+        );
 
         for s in &after {
             let (_, mag) = sprite_motion(&before, s, drift.delta).expect("matched");
@@ -9266,7 +10260,10 @@ mod geometry_tests {
                 // The hero moved 20px through the world on top of the scroll.
                 assert!((mag - 20.0).abs() < 1e-2, "hero motion {mag}");
             } else {
-                assert!(mag < 1e-2, "a backdrop sprite must read as still, got {mag}");
+                assert!(
+                    mag < 1e-2,
+                    "a backdrop sprite must read as still, got {mag}"
+                );
             }
         }
     }
@@ -9275,7 +10272,10 @@ mod geometry_tests {
     fn sprites_ignore_3d_draws_and_locate_ignores_2d_ones() {
         // The two locators must partition the scene, or an object gets counted twice - or,
         // worse, a title gets an empty report from the one that does not apply to it.
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: None,
             depth: None,
@@ -9307,13 +10307,27 @@ mod geometry_tests {
                 draws.push(ground_quad(20.0, g1, -4.0, 100.0, 4.0, true));
             }
         }
-        Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws }
+        Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
+            precompile: Default::default(),
+            color: None,
+            depth: None,
+            multisample: 0,
+            target_extent: None,
+            draws,
+        }
     }
 
     fn walled_map(gap: Option<(f32, f32)>) -> WorldMap {
         render_map(
             &walled_scene(gap),
-            MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
+            MapView {
+                extent: [-100.0, -100.0, 100.0, 100.0],
+                width: 200,
+                height: 200,
+            },
             [0, 0, 0, 255],
             1,
             None,
@@ -9340,7 +10354,10 @@ mod geometry_tests {
         // A mask that came out almost entirely closed means the slope limit is wrong, and
         // the caller needs to be able to see that rather than just get "no route".
         let f = mask.open_fraction();
-        assert!(f > 0.5 && f < 1.0, "most of a mostly-open floor should be open, got {f}");
+        assert!(
+            f > 0.5 && f < 1.0,
+            "most of a mostly-open floor should be open, got {f}"
+        );
     }
 
     #[test]
@@ -9352,10 +10369,24 @@ mod geometry_tests {
             draws.push(ground_quad(i as f32 * 0.1, x, -50.0, x + 1.0, -20.0, true));
         }
         draws.push(ground_quad(6.0, 20.0, -50.0, 60.0, -20.0, true));
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws };
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
+            precompile: Default::default(),
+            color: None,
+            depth: None,
+            multisample: 0,
+            target_extent: None,
+            draws,
+        };
         let map = render_map(
             &scene,
-            MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
+            MapView {
+                extent: [-100.0, -100.0, 100.0, 100.0],
+                width: 200,
+                height: 200,
+            },
             [0, 0, 0, 255],
             1,
             None,
@@ -9370,7 +10401,10 @@ mod geometry_tests {
         // The abrupt slab's own top is flat, but its EDGE is not passable - which is the
         // property that matters, since a route has to cross the edge to get on it.
         let p = map.view.pixel_of(20.0, -35.0);
-        assert!(!mask.is_open(p[0] as i64, p[1] as i64), "the foot of a step is blocked");
+        assert!(
+            !mask.is_open(p[0] as i64, p[1] as i64),
+            "the foot of a step is blocked"
+        );
     }
 
     #[test]
@@ -9379,22 +10413,33 @@ mod geometry_tests {
         let mask = Traversable::from_map(&map, 1.0, 2);
         let route = plan_route(&map, &mask, [-60.0, -60.0], [-60.0, 60.0], 20)
             .expect("a gap exists, so a route must be found");
-        assert!(route.len() >= 3, "a route around a wall has turns in it: {route:?}");
+        assert!(
+            route.len() >= 3,
+            "a route around a wall has turns in it: {route:?}"
+        );
         // Every straight leg must stay on open ground - the property that makes a route
         // followable rather than a set of suggestions.
         for pair in route.windows(2) {
-            let (a, b) = (map.view.pixel_of(pair[0][0], pair[0][1]), map.view.pixel_of(pair[1][0], pair[1][1]));
+            let (a, b) = (
+                map.view.pixel_of(pair[0][0], pair[0][1]),
+                map.view.pixel_of(pair[1][0], pair[1][1]),
+            );
             let steps = ((b[0] - a[0]).abs().max((b[1] - a[1]).abs()).max(1.0)) as i64;
             for s in 0..=steps {
                 let t = s as f32 / steps as f32;
                 let x = (a[0] + (b[0] - a[0]) * t).round() as i64;
                 let y = (a[1] + (b[1] - a[1]) * t).round() as i64;
-                assert!(mask.is_open(x, y), "leg {pair:?} crosses blocked ground at ({x},{y})");
+                assert!(
+                    mask.is_open(x, y),
+                    "leg {pair:?} crosses blocked ground at ({x},{y})"
+                );
             }
         }
         // And it must actually pass through the gap, not teleport across the wall.
         assert!(
-            route.iter().any(|p| p[0] > 5.0 && p[0] < 35.0 && p[1].abs() < 20.0),
+            route
+                .iter()
+                .any(|p| p[0] > 5.0 && p[0] < 35.0 && p[1].abs() < 20.0),
             "the route should thread the gap at x 10..30: {route:?}"
         );
     }
@@ -9411,10 +10456,24 @@ mod geometry_tests {
 
     #[test]
     fn plan_route_simplifies_open_ground_to_two_points() {
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
+            precompile: Default::default(),
+            color: None,
+            depth: None,
+            multisample: 0,
+            target_extent: None,
+            draws: vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)],
+        };
         let map = render_map(
             &scene,
-            MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
+            MapView {
+                extent: [-100.0, -100.0, 100.0, 100.0],
+                width: 200,
+                height: 200,
+            },
             [0, 0, 0, 255],
             1,
             None,
@@ -9422,7 +10481,11 @@ mod geometry_tests {
         );
         let mask = Traversable::from_map(&map, 1.0, 0);
         let route = plan_route(&map, &mask, [-60.0, -60.0], [60.0, 60.0], 10).expect("open ground");
-        assert_eq!(route.len(), 2, "nothing in the way means start and finish: {route:?}");
+        assert_eq!(
+            route.len(),
+            2,
+            "nothing in the way means start and finish: {route:?}"
+        );
         assert!((route[1][0] - 60.0).abs() < 3.0 && (route[1][1] - 60.0).abs() < 3.0);
     }
 
@@ -9463,9 +10526,22 @@ mod geometry_tests {
             let x = -30.0 + i as f32;
             draws.push(ground_quad(0.0, x, -30.0, x + 1.0, 30.0, true));
         }
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws };
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
+            precompile: Default::default(),
+            color: None,
+            depth: None,
+            multisample: 0,
+            target_extent: None,
+            draws,
+        };
         let strict = world_extent(&scene, 1.0).unwrap();
-        assert!(strict[0] < -8000.0, "at keep=1.0 the backdrop sets the extent");
+        assert!(
+            strict[0] < -8000.0,
+            "at keep=1.0 the backdrop sets the extent"
+        );
         let dense = world_extent(&scene, 0.90).unwrap();
         assert!(
             dense[0] > -200.0 && dense[2] < 200.0,
@@ -9514,7 +10590,12 @@ mod supersample_tests {
         let (w, h) = (16u32, 12u32);
         // A pixel-space quad covering [0,w]x[0,h]: pos.xy f32 @0, uv.xy f32 @8, no color.
         let mut verts = Vec::new();
-        for (x, y, u, v) in [(0.0, 0.0, 0.0, 0.0), (w as f32, 0.0, 1.0, 0.0), (w as f32, h as f32, 1.0, 1.0), (0.0, h as f32, 0.0, 1.0)] {
+        for (x, y, u, v) in [
+            (0.0, 0.0, 0.0, 0.0),
+            (w as f32, 0.0, 1.0, 0.0),
+            (w as f32, h as f32, 1.0, 1.0),
+            (0.0, h as f32, 0.0, 1.0),
+        ] {
             for f in [x, y, u, v] {
                 verts.extend_from_slice(&f.to_le_bytes());
             }
@@ -9523,27 +10604,85 @@ mod supersample_tests {
             // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
             // one id would collide in every cache keyed on it.
             pixels_id: crate::capture::next_pixels_id(),
-            unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 1, height: 1, stride: 4,
-            faces: 1, face_bytes: 4, levels: 1,
-            pixels: vec![200, 100, 50, 255].into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0,
-            lod_bias: 0, lod_min: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0,
+            unit: 0,
+            base_format: 0x0c,
+            swizzle: 0,
+            tex_type: 0,
+            width: 1,
+            height: 1,
+            stride: 4,
+            faces: 1,
+            face_bytes: 4,
+            levels: 1,
+            pixels: vec![200, 100, 50, 255].into(),
+            data_addr: 0,
+            u_addr_mode: 0,
+            v_addr_mode: 0,
+            lod_bias: 0,
+            lod_min: 0,
+            min_filter: 0,
+            mag_filter: 0,
+            mip_filter: 0,
+            gamma: 0,
+            yuv_profile: 0,
         };
         let draw = Draw {
             fragment_program_header: 0,
-            primitive: PRIM_TRIANGLES, index_format: 0, index_count: 6,
-            vertices: verts.into(), vertex_stride: 16,
+            primitive: PRIM_TRIANGLES,
+            index_format: 0,
+            index_count: 6,
+            vertices: verts.into(),
+            vertex_stride: 16,
             attributes: vec![
-                VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 2, reg_index: 0 },
-                VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
-            ].into(),
-            indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
-            uniforms: vec![], textures: vec![tex].into(), vertex_textures: std::sync::Arc::from(&[][..]), render_state: std::sync::Arc::new(RenderState::default()),
+                VertexAttribute {
+                    stream_index: 0,
+                    offset: 0,
+                    format: FORMAT_F32,
+                    component_count: 2,
+                    reg_index: 0,
+                },
+                VertexAttribute {
+                    stream_index: 0,
+                    offset: 8,
+                    format: FORMAT_F32,
+                    component_count: 2,
+                    reg_index: 1,
+                },
+            ]
+            .into(),
+            indices: [0u16, 1, 2, 0, 2, 3]
+                .iter()
+                .flat_map(|i| i.to_le_bytes())
+                .collect(),
+            uniforms: vec![],
+            textures: vec![tex].into(),
+            vertex_textures: std::sync::Arc::from(&[][..]),
+            render_state: std::sync::Arc::new(RenderState::default()),
             blend: crate::capture::BlendState::default(),
-            exposure: 1.0, material: Default::default(), world: [0.0; 16],
-            vprog: crate::capture::no_program(), fprog: crate::capture::no_program(), fprog_patched_vprog: crate::capture::no_program(),
-            vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), frag_mem_windows: Vec::new(), shader_expanded: false,
+            exposure: 1.0,
+            material: Default::default(),
+            world: [0.0; 16],
+            vprog: crate::capture::no_program(),
+            fprog: crate::capture::no_program(),
+            fprog_patched_vprog: crate::capture::no_program(),
+            vert_sa: std::sync::Arc::from(&[][..]),
+            frag_sa: std::sync::Arc::from(&[][..]),
+            frag_sa_addr: 0,
+            mem_windows: Vec::new(),
+            frag_mem_windows: Vec::new(),
+            shader_expanded: false,
         };
-        let scene = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![draw] };
+        let scene = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
+            precompile: Default::default(),
+            color: None,
+            depth: None,
+            multisample: 0,
+            target_extent: None,
+            draws: vec![draw],
+        };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
         let b = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 2);
         assert_eq!((b.width, b.height), (w, h));
@@ -9575,35 +10714,99 @@ mod supersample_tests {
             // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
             // one id would collide in every cache keyed on it.
             pixels_id: crate::capture::next_pixels_id(),
-            unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: tw, height: th, stride: tw * 4,
-            faces: 1, face_bytes: tw * th * 4, levels: 1,
-            pixels: pixels.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, lod_min: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0,
+            unit: 0,
+            base_format: 0x0c,
+            swizzle: 0,
+            tex_type: 0,
+            width: tw,
+            height: th,
+            stride: tw * 4,
+            faces: 1,
+            face_bytes: tw * th * 4,
+            levels: 1,
+            pixels: pixels.into(),
+            data_addr: 0,
+            u_addr_mode: 0,
+            v_addr_mode: 0,
+            lod_bias: 0,
+            lod_min: 0,
+            min_filter: 0,
+            mag_filter: 0,
+            mip_filter: 0,
+            gamma: 0,
+            yuv_profile: 0,
         };
         // A full-frame Pixel-space quad over a 32px frame, uv 0..1 across the 64px checker, so
         // it is minified 2x - the aliasing regime one sample per pixel cannot resolve.
         let (w, h) = (32u32, 32u32);
         let mut verts = Vec::new();
-        for (x, y, u, v) in [(0.0f32, 0.0, 0.0, 0.0), (w as f32, 0.0, 1.0, 0.0), (w as f32, h as f32, 1.0, 1.0), (0.0, h as f32, 0.0, 1.0)] {
+        for (x, y, u, v) in [
+            (0.0f32, 0.0, 0.0, 0.0),
+            (w as f32, 0.0, 1.0, 0.0),
+            (w as f32, h as f32, 1.0, 1.0),
+            (0.0, h as f32, 0.0, 1.0),
+        ] {
             for f in [x, y, u, v] {
                 verts.extend_from_slice(&f.to_le_bytes());
             }
         }
         let draw = Draw {
             fragment_program_header: 0,
-            primitive: PRIM_TRIANGLES, index_format: 0, index_count: 6,
-            vertices: verts.into(), vertex_stride: 16,
+            primitive: PRIM_TRIANGLES,
+            index_format: 0,
+            index_count: 6,
+            vertices: verts.into(),
+            vertex_stride: 16,
             attributes: vec![
-                VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 2, reg_index: 0 },
-                VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
-            ].into(),
-            indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
-            uniforms: vec![], textures: vec![tex].into(), vertex_textures: std::sync::Arc::from(&[][..]), render_state: std::sync::Arc::new(RenderState::default()),
+                VertexAttribute {
+                    stream_index: 0,
+                    offset: 0,
+                    format: FORMAT_F32,
+                    component_count: 2,
+                    reg_index: 0,
+                },
+                VertexAttribute {
+                    stream_index: 0,
+                    offset: 8,
+                    format: FORMAT_F32,
+                    component_count: 2,
+                    reg_index: 1,
+                },
+            ]
+            .into(),
+            indices: [0u16, 1, 2, 0, 2, 3]
+                .iter()
+                .flat_map(|i| i.to_le_bytes())
+                .collect(),
+            uniforms: vec![],
+            textures: vec![tex].into(),
+            vertex_textures: std::sync::Arc::from(&[][..]),
+            render_state: std::sync::Arc::new(RenderState::default()),
             blend: crate::capture::BlendState::default(),
-            exposure: 1.0, material: Default::default(), world: [0.0; 16],
-            vprog: crate::capture::no_program(), fprog: crate::capture::no_program(), fprog_patched_vprog: crate::capture::no_program(),
-            vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), frag_mem_windows: Vec::new(), shader_expanded: false,
+            exposure: 1.0,
+            material: Default::default(),
+            world: [0.0; 16],
+            vprog: crate::capture::no_program(),
+            fprog: crate::capture::no_program(),
+            fprog_patched_vprog: crate::capture::no_program(),
+            vert_sa: std::sync::Arc::from(&[][..]),
+            frag_sa: std::sync::Arc::from(&[][..]),
+            frag_sa_addr: 0,
+            mem_windows: Vec::new(),
+            frag_mem_windows: Vec::new(),
+            shader_expanded: false,
         };
-        let s = Scene { completed_early: false, notifications: [None; 2], deferred_id: 0, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![draw] };
+        let s = Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
+            precompile: Default::default(),
+            color: None,
+            depth: None,
+            multisample: 0,
+            target_extent: None,
+            draws: vec![draw],
+        };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
         fn h_variance(fb: &Framebuffer) -> f64 {
             let mut acc = 0f64;
@@ -9619,7 +10822,10 @@ mod supersample_tests {
         let one = h_variance(&render_scene_supersampled(&s, w, h, [0, 0, 0, 255], 1));
         let four = h_variance(&render_scene_supersampled(&s, w, h, [0, 0, 0, 255], 4));
         // 4x must markedly smooth the aliased checker: adjacent-pixel jumps shrink substantially.
-        assert!(four < one * 0.6, "supersampling should reduce speckle variance: 1x={one:.1} 4x={four:.1}");
+        assert!(
+            four < one * 0.6,
+            "supersampling should reduce speckle variance: 1x={one:.1} 4x={four:.1}"
+        );
     }
 }
 
@@ -9637,13 +10843,21 @@ mod texture_tests {
     #[test]
     fn swizzle2_reads_high_to_low() {
         let (lo, hi) = (0x10, 0xf0);
-        assert_eq!(swizzle2(0, 255, 2), [0, 0, 0, 255], "GRRR: a black, opaque texel");
+        assert_eq!(
+            swizzle2(0, 255, 2),
+            [0, 0, 0, 255],
+            "GRRR: a black, opaque texel"
+        );
         assert_eq!(swizzle2(lo, hi, 2), [lo, lo, lo, hi], "GRRR");
         assert_eq!(swizzle2(lo, hi, 3), [hi, hi, hi, lo], "RGGG");
         assert_eq!(swizzle2(lo, hi, 4), [lo, hi, lo, hi], "GRGR");
         assert_eq!(swizzle2(lo, hi, 1), [lo, hi, 0, 0], "00GR");
         assert_eq!(swizzle2(lo, hi, 5), [hi, lo, 0, 0], "00RG");
-        assert_eq!(swizzle2(lo, hi, 0), [lo, hi, 0, 255], "GR: red is the low lane, as in ABGR");
+        assert_eq!(
+            swizzle2(lo, hi, 0),
+            [lo, hi, 0, 255],
+            "GR: red is the low lane, as in ABGR"
+        );
     }
 
     /// `transcoded_source`, driven to COMPLETION the way a run drives it.
@@ -9698,7 +10912,14 @@ mod texture_tests {
     fn a_resumed_encode_is_the_one_shot_encode() {
         let (w, h) = (64u32, 64u32);
         let level0 = level_layout(0x83, 0, w, h, 0).unwrap();
-        let mut t = tex(0x83, 0, w, h, level0.stride, vec![0x5Au8; level0.bytes as usize]);
+        let mut t = tex(
+            0x83,
+            0,
+            w,
+            h,
+            level0.stride,
+            vec![0x5Au8; level0.bytes as usize],
+        );
         t.tex_type = 0;
         t.levels = 1;
         t.face_bytes = level0.bytes;
@@ -9738,7 +10959,14 @@ mod texture_tests {
         );
     }
 
-    fn tex(base_format: u32, swizzle: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
+    fn tex(
+        base_format: u32,
+        swizzle: u32,
+        w: u32,
+        h: u32,
+        stride: u32,
+        pixels: Vec<u8>,
+    ) -> BoundTexture {
         BoundTexture {
             // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
             // one id would collide in every cache keyed on it.
@@ -9764,6 +10992,7 @@ mod texture_tests {
             mag_filter: 0,
             mip_filter: 0,
             gamma: 0,
+            yuv_profile: 0,
         }
     }
 
@@ -9886,21 +11115,25 @@ mod texture_tests {
             // 64-bit. NOT 0x1e (F32F32): it decodes through its own RAW seam
             // (`decode_texture_rg32f`, the two words as stored), which is by design not the
             // per-texel RGBA8 reading this test compares against.
-            0x1b, 0x1c, 0x1d, 0x1f,
-            0x9a, // 32-bit packed float + 2-bit alpha
+            0x1b, 0x1c, 0x1d, 0x1f, 0x9a, // 32-bit packed float + 2-bit alpha
             0x98, 0x99, // 24-bit
         ];
         for fmt in formats {
-            let Some((bw, bh, bytes)) = block_layout(fmt) else { continue };
-            assert_eq!((bw, bh), (1, 1), "format {fmt:#x} is not one texel per block");
+            let Some((bw, bh, bytes)) = block_layout(fmt) else {
+                continue;
+            };
+            assert_eq!(
+                (bw, bh),
+                (1, 1),
+                "format {fmt:#x} is not one texel per block"
+            );
             for &(w, h) in &[(4u32, 4u32), (8, 4), (5, 3)] {
                 for &tex_type in &[3u32 /* linear */, 0 /* swizzled */] {
                     for &chan_swizzle in &[0u32, 1, 2, 3] {
                         let pw = w.next_power_of_two() as usize;
                         let ph = h.next_power_of_two() as usize;
                         let n = (pw * ph + w as usize * h as usize + 8) * bytes as usize;
-                        let pixels: Vec<u8> =
-                            (0..n).map(|i| ((i * 53 + 7) % 251) as u8).collect();
+                        let pixels: Vec<u8> = (0..n).map(|i| ((i * 53 + 7) % 251) as u8).collect();
                         let mut t = tex(fmt, chan_swizzle, w, h, w * bytes, pixels);
                         t.tex_type = tex_type;
                         let (_, _, fast) = decode_texture_rgba8(&t);
@@ -9932,14 +11165,23 @@ mod texture_tests {
     fn a_mip_level_is_laid_out_like_a_level_zero_of_its_own_size() {
         // BC3 (16-byte 4x4 blocks), LINEAR: level l is w>>l wide, block-packed rows.
         let l0 = level_layout(0x87, 3, 64, 32, 0).unwrap();
-        assert_eq!((l0.width, l0.height, l0.blocks_x, l0.blocks_y), (64, 32, 16, 8));
+        assert_eq!(
+            (l0.width, l0.height, l0.blocks_x, l0.blocks_y),
+            (64, 32, 16, 8)
+        );
         assert_eq!((l0.stride, l0.bytes), (16 * 16, 16 * 8 * 16));
         let l2 = level_layout(0x87, 3, 64, 32, 2).unwrap();
-        assert_eq!((l2.width, l2.height, l2.blocks_x, l2.blocks_y), (16, 8, 4, 2));
+        assert_eq!(
+            (l2.width, l2.height, l2.blocks_x, l2.blocks_y),
+            (16, 8, 4, 2)
+        );
         assert_eq!(l2.bytes, 4 * 2 * 16);
         // Offsets accumulate, so level 2 sits after levels 0 and 1.
         let l1 = level_layout(0x87, 3, 64, 32, 1).unwrap();
-        assert_eq!(level_offset(0x87, 3, 64, 32, 2).unwrap(), l0.bytes + l1.bytes);
+        assert_eq!(
+            level_offset(0x87, 3, 64, 32, 2).unwrap(),
+            l0.bytes + l1.bytes
+        );
         // SWIZZLED: the stored grid is padded to a power of two IN BLOCKS, which is why a
         // level's size is not simply its block count times the block size.
         let s = level_layout(0x87, 0, 12, 12, 0).unwrap();
@@ -9972,20 +11214,31 @@ mod texture_tests {
                 t.tex_type = tex_type;
                 t.levels = levels;
                 t.face_bytes = total as u32;
-                let c = compressed_source(&t, None).expect("a mipped, identity-swizzled, block-aligned texture");
+                let c = compressed_source(&t, None)
+                    .expect("a mipped, identity-swizzled, block-aligned texture");
                 assert_eq!(c.levels, levels);
-                let bytes = c.cpu_bytes().expect("a passthrough is always built on the CPU");
-                assert_eq!(bytes.len(), (0..levels).map(|l| {
-                    let ll = level_layout(fmt, tex_type, w, h, l).unwrap();
-                    (ll.blocks_x * ll.blocks_y * bb) as usize
-                }).sum::<usize>());
+                let bytes = c
+                    .cpu_bytes()
+                    .expect("a passthrough is always built on the CPU");
+                assert_eq!(
+                    bytes.len(),
+                    (0..levels)
+                        .map(|l| {
+                            let ll = level_layout(fmt, tex_type, w, h, l).unwrap();
+                            (ll.blocks_x * ll.blocks_y * bb) as usize
+                        })
+                        .sum::<usize>()
+                );
                 // Level 0 of the passthrough, read back as a LINEAR texture of the same size.
                 let l0 = level_layout(fmt, tex_type, w, h, 0).unwrap();
                 let n0 = (l0.blocks_x * l0.blocks_y * bb) as usize;
                 let linear = tex(fmt, 0, w, h, l0.blocks_x * bb, bytes[..n0].to_vec());
                 let (_, _, want) = decode_texture_rgba8(&t);
                 let (_, _, got) = decode_texture_rgba8(&linear);
-                assert_eq!(got, want, "passthrough changed the image for {fmt:#x} type {tex_type}");
+                assert_eq!(
+                    got, want,
+                    "passthrough changed the image for {fmt:#x} type {tex_type}"
+                );
             }
         }
     }
@@ -10012,23 +11265,41 @@ mod texture_tests {
             t.face_bytes = total as u32;
             t
         };
-        assert!(passthrough_source(&build(0x87, 3, 16, 8)).is_some(), "the accepted case");
+        assert!(
+            passthrough_source(&build(0x87, 3, 16, 8)).is_some(),
+            "the accepted case"
+        );
         // A format WebGPU does not have.
-        assert!(passthrough_source(&build(0x83, 3, 16, 8)).is_none(), "PVRTC has no WebGPU format");
-        assert!(passthrough_source(&build(0x88, 3, 16, 8)).is_none(), "BC4 is not a four-channel format");
+        assert!(
+            passthrough_source(&build(0x83, 3, 16, 8)).is_none(),
+            "PVRTC has no WebGPU format"
+        );
+        assert!(
+            passthrough_source(&build(0x88, 3, 16, 8)).is_none(),
+            "BC4 is not a four-channel format"
+        );
         // A non-identity channel swizzle - applied during the decode, with no shader path.
         let mut s = build(0x87, 3, 16, 8);
         s.swizzle = 1 << 12;
-        assert!(passthrough_source(&s).is_none(), "a permuted texture must not pass through raw");
+        assert!(
+            passthrough_source(&s).is_none(),
+            "a permuted texture must not pass through raw"
+        );
         // A size that is not a multiple of the 4x4 block: WebGPU refuses to create it.
-        assert!(passthrough_source(&build(0x87, 3, 14, 8)).is_none(), "14 is not a multiple of 4");
+        assert!(
+            passthrough_source(&build(0x87, 3, 14, 8)).is_none(),
+            "14 is not a multiple of 4"
+        );
         // No guest mip chain on a texture big enough to need one, while the guest asks the
         // hardware to FILTER between levels - so the device really is reading levels we would
         // not be supplying.
         let mut m = build(0x87, 3, 16, 8);
         m.levels = 1;
         m.mip_filter = 1;
-        assert!(passthrough_source(&m).is_none(), "level 0 alone is the white-speckle failure");
+        assert!(
+            passthrough_source(&m).is_none(),
+            "level 0 alone is the white-speckle failure"
+        );
         // The same texture with mip filtering OFF is one the DEVICE samples from its base level
         // alone, so one level is the faithful answer and not a dropped chain. This is the
         // largest single texture in a measured race frame - 42.7 MB as RGBA8, 8 MB as blocks.
@@ -10040,7 +11311,10 @@ mod texture_tests {
         // ... but a 4x4 texture HAS no chain to have, so one level is the whole truth.
         let mut tiny = build(0x87, 3, 4, 4);
         tiny.levels = 1;
-        assert!(passthrough_source(&tiny).is_some(), "a 4x4 texture's chain is one level");
+        assert!(
+            passthrough_source(&tiny).is_some(),
+            "a 4x4 texture's chain is one level"
+        );
     }
 
     /// A cube passes through as six chains, face after face, each read from `face_bytes` apart -
@@ -10065,11 +11339,16 @@ mod texture_tests {
         t.levels = levels;
         t.face_bytes = stride;
         let c = passthrough_source(&t).expect("a cube with its chains passes through");
-        let vitaslop_platform::gpu::CompressedData::Cpu(data) = &c.data else { panic!("CPU bytes") };
+        let vitaslop_platform::gpu::CompressedData::Cpu(data) = &c.data else {
+            panic!("CPU bytes")
+        };
         assert_eq!(data.len(), (chain * 6) as usize);
         for f in 0..6u32 {
             let face = &data[(f * chain) as usize..((f + 1) * chain) as usize];
-            assert!(face.iter().all(|&b| b == f as u8), "face {f} read its own chain");
+            assert!(
+                face.iter().all(|&b| b == f as u8),
+                "face {f} read its own chain"
+            );
         }
     }
 
@@ -10102,10 +11381,19 @@ mod texture_tests {
         t.levels = 1;
         t.mip_filter = 1;
         t.face_bytes = total as u32;
-        assert!(passthrough_source(&t).is_none(), "the passthrough must refuse this");
+        assert!(
+            passthrough_source(&t).is_none(),
+            "the passthrough must refuse this"
+        );
         let c = compressed_done(&t).expect("but it must still reach the GPU compressed");
-        assert!(c.transcoded, "and it must be labelled as re-encoded, not as guest blocks");
-        assert_eq!(c.levels, levels, "the transcode owns the encode, so it supplies the chain");
+        assert!(
+            c.transcoded,
+            "and it must be labelled as re-encoded, not as guest blocks"
+        );
+        assert_eq!(
+            c.levels, levels,
+            "the transcode owns the encode, so it supplies the chain"
+        );
     }
 
     /// The PVRTC transcode must produce a texture the GPU can actually be given: one block
@@ -10123,7 +11411,14 @@ mod texture_tests {
         // chain's SHAPE, and the decoder's own correctness has its own tests.
         let (w, h) = (64u32, 64u32);
         let level0 = level_layout(0x83, 0, w, h, 0).unwrap();
-        let mut t = tex(0x83, 0, w, h, level0.stride, vec![0x5Au8; level0.bytes as usize]);
+        let mut t = tex(
+            0x83,
+            0,
+            w,
+            h,
+            level0.stride,
+            vec![0x5Au8; level0.bytes as usize],
+        );
         t.tex_type = 0;
         t.levels = 1;
         t.face_bytes = level0.bytes;
@@ -10137,8 +11432,14 @@ mod texture_tests {
                 (lw.div_ceil(4) * lh.div_ceil(4) * bb) as usize
             })
             .sum();
-        let bytes = c.cpu_bytes().expect("the BC target is always encoded on the CPU");
-        assert_eq!(bytes.len(), want, "every level is its own block count, no more and no less");
+        let bytes = c
+            .cpu_bytes()
+            .expect("the BC target is always encoded on the CPU");
+        assert_eq!(
+            bytes.len(),
+            want,
+            "every level is its own block count, no more and no less"
+        );
     }
 
     /// The transcode picks ONE format for the whole texture, and picks it by whether any level
@@ -10164,7 +11465,12 @@ mod texture_tests {
         let want: usize = (0..c.levels)
             .map(|l| (((w >> l).max(1).div_ceil(4)) * ((h >> l).max(1).div_ceil(4)) * bb) as usize)
             .sum();
-        assert_eq!(c.cpu_bytes().expect("the BC target is always encoded on the CPU").len(), want);
+        assert_eq!(
+            c.cpu_bytes()
+                .expect("the BC target is always encoded on the CPU")
+                .len(),
+            want
+        );
     }
 
     /// >>> A COMPRESSED UPLOAD IS ALWAYS THE GUEST'S OWN RESOLUTION. NEVER SMALLER.
@@ -10196,7 +11502,11 @@ mod texture_tests {
 
             // A refusal is allowed. A SMALLER texture is not.
             if let Some(c) = transcode_done(&t) {
-                assert_eq!((c.width, c.height), (w, h), "{w}x{h} was encoded at a reduced size");
+                assert_eq!(
+                    (c.width, c.height),
+                    (w, h),
+                    "{w}x{h} was encoded at a reduced size"
+                );
                 assert_eq!(
                     c.levels,
                     max_mip_levels(w, h),
@@ -10211,8 +11521,14 @@ mod texture_tests {
                         (lw.div_ceil(4) * lh.div_ceil(4) * bb) as usize
                     })
                     .sum();
-                let bytes = c.cpu_bytes().expect("the BC target is always encoded on the CPU");
-                assert_eq!(bytes.len(), want, "{w}x{h} is short of its own declared chain");
+                let bytes = c
+                    .cpu_bytes()
+                    .expect("the BC target is always encoded on the CPU");
+                assert_eq!(
+                    bytes.len(),
+                    want,
+                    "{w}x{h} is short of its own declared chain"
+                );
             }
         }
     }
@@ -10239,7 +11555,10 @@ mod texture_tests {
     #[test]
     fn an_ordinary_uncompressed_texture_is_not_transcoded() {
         let t = tex(0x0c, 0, 16, 16, 64, vec![9u8; 16 * 16 * 4]);
-        assert!(transcoded_source(&t, None).is_none(), "U8U8U8U8 has nothing to transcode");
+        assert!(
+            transcoded_source(&t, None).is_none(),
+            "U8U8U8U8 has nothing to transcode"
+        );
         assert!(compressed_source(&t, None).is_none());
     }
 
@@ -10262,9 +11581,15 @@ mod texture_tests {
                         // Enough bytes for the padded Morton grid, filled with a pattern
                         // that varies per byte so every endpoint and index bit differs.
                         let n = bx * by * block_bytes + block_bytes;
-                        let pixels: Vec<u8> =
-                            (0..n).map(|i| ((i * 37 + 11) % 251) as u8).collect();
-                        let mut t = tex(fmt, chan_swizzle, w, h, w.div_ceil(4) * block_bytes as u32, pixels);
+                        let pixels: Vec<u8> = (0..n).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+                        let mut t = tex(
+                            fmt,
+                            chan_swizzle,
+                            w,
+                            h,
+                            w.div_ceil(4) * block_bytes as u32,
+                            pixels,
+                        );
                         t.tex_type = tex_type;
                         let (_, _, fast) = decode_texture_rgba8(&t);
                         let mut slow = Vec::with_capacity(fast.len());
@@ -10429,7 +11754,11 @@ mod texture_tests {
         t.mag_filter = 1; // SCE_GXM_TEXTURE_FILTER_LINEAR
         // Texel centers at u=0.25 and u=0.75; the midpoint u=0.5 averages to ~100.
         let mid = sample_texture(&t, 0.5, 0.0);
-        assert!((mid[0] as i32 - 100).abs() <= 1, "expected ~100, got {}", mid[0]);
+        assert!(
+            (mid[0] as i32 - 100).abs() <= 1,
+            "expected ~100, got {}",
+            mid[0]
+        );
         // POINT (default) at the same point snaps to one texel (0 or 200), not ~100.
         let p = tex(0x00, 3, 2, 1, 2, vec![0, 200]);
         assert!(sample_texture(&p, 0.5, 0.0)[0] == 0 || sample_texture(&p, 0.5, 0.0)[0] == 200);
@@ -10453,9 +11782,39 @@ mod texture_tests {
 
     // Build a texture with an explicit `SceGxmTextureType` selector (LINEAR = 3,
     // SWIZZLED = 0), so the block-compressed / swizzled paths can be exercised.
-    fn tex_typed(base_format: u32, tex_type: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
+    fn tex_typed(
+        base_format: u32,
+        tex_type: u32,
+        w: u32,
+        h: u32,
+        stride: u32,
+        pixels: Vec<u8>,
+    ) -> BoundTexture {
         let face_bytes = pixels.len() as u32;
-        BoundTexture { pixels_id: crate::capture::next_pixels_id(), unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, faces: 1, face_bytes, levels: 1, data_addr: 0, pixels: pixels.into(), u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, lod_min: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0 }
+        BoundTexture {
+            pixels_id: crate::capture::next_pixels_id(),
+            unit: 0,
+            base_format,
+            swizzle: 0,
+            tex_type,
+            width: w,
+            height: h,
+            stride,
+            faces: 1,
+            face_bytes,
+            levels: 1,
+            data_addr: 0,
+            pixels: pixels.into(),
+            u_addr_mode: 0,
+            v_addr_mode: 0,
+            lod_bias: 0,
+            lod_min: 0,
+            min_filter: 0,
+            mag_filter: 0,
+            mip_filter: 0,
+            gamma: 0,
+            yuv_profile: 0,
+        }
     }
 
     #[test]
@@ -10470,8 +11829,14 @@ mod texture_tests {
         block[8] = 0xFF; // c0 low byte
         block[9] = 0xFF; // c0 high byte -> 0xFFFF = white
         let t = tex_typed(0x86, 3, 4, 4, 16, block); // LINEAR layout
-        assert_eq!(sample_texture(&t, u_of(0, 4), u_of(0, 4)), [255, 255, 255, 255]);
-        assert_eq!(sample_texture(&t, u_of(1, 4), u_of(0, 4)), [255, 255, 255, 0]);
+        assert_eq!(
+            sample_texture(&t, u_of(0, 4), u_of(0, 4)),
+            [255, 255, 255, 255]
+        );
+        assert_eq!(
+            sample_texture(&t, u_of(1, 4), u_of(0, 4)),
+            [255, 255, 255, 0]
+        );
     }
 
     #[test]
@@ -10517,7 +11882,7 @@ mod texture_tests {
         assert_eq!(target, 9);
         px[target * 16] = 0x00; // block (2,1): texel 0 alpha 0
         let t = tex_typed(0x86, 0, 16, 16, 0, px); // SWIZZLED
-                                                   // Texel (8,4) is texel 0 of block (2,1).
+        // Texel (8,4) is texel 0 of block (2,1).
         assert_eq!(sample_texture(&t, u_of(8, 16), u_of(4, 16))[3], 0);
         // A neighboring block (texel (0,0), block (0,0)) stays opaque.
         assert_eq!(sample_texture(&t, u_of(0, 16), u_of(0, 16))[3], 255);
@@ -10537,7 +11902,11 @@ mod texture_tests {
         let mut px = vec![0u8; (w * h * 4) as usize];
         let target = morton_index(2, 1, w, h) as usize;
         assert_eq!(target, 9);
-        assert_ne!(target, (1 * w + 2) as usize, "row-major and Morton must differ here");
+        assert_ne!(
+            target,
+            (1 * w + 2) as usize,
+            "row-major and Morton must differ here"
+        );
         px[target * 4] = 0xFF; // mark that texel's first channel
         let t = tex_typed(0x0c, 0, w, h, w * 4, px);
         assert_eq!(sample_texture(&t, u_of(2, 8), u_of(1, 8))[0], 0xFF);
@@ -10637,7 +12006,12 @@ mod png_tests {
                 continue; // Inf/NaN: not a value equality holds for
             }
             let back = f32_to_half(half_to_f32(h));
-            assert_eq!(back, h, "half {h:#06x} -> {} -> {back:#06x}", half_to_f32(h));
+            assert_eq!(
+                back,
+                h,
+                "half {h:#06x} -> {} -> {back:#06x}",
+                half_to_f32(h)
+            );
         }
     }
 
@@ -10661,12 +12035,19 @@ mod png_tests {
     /// than decode part of an image.
     #[test]
     fn png_decode_rejects_what_it_cannot_read() {
-        assert!(png_to_rgba(b"not a png at all").unwrap_err().contains("signature"));
+        assert!(
+            png_to_rgba(b"not a png at all")
+                .unwrap_err()
+                .contains("signature")
+        );
         let mut png = rgba_to_png(2, 2, &[0u8; 16]);
         // Flip the colour type to greyscale (0) in IHDR: byte 8+8+4+4+1 = 25.
         png[25] = 0;
         let err = png_to_rgba(&png).unwrap_err();
-        assert!(err.contains("color=0"), "error should name the field: {err}");
+        assert!(
+            err.contains("color=0"),
+            "error should name the field: {err}"
+        );
     }
 }
 
@@ -10677,7 +12058,9 @@ mod png_tests {
 fn scene_depth_clear(depth: Option<&crate::capture::DepthSurface>) -> f32 {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ON.get_or_init(|| {
-        vitaslop_platform::knobs::var("VITASLOP_GXM_BACKGROUND_DEPTH").map(|v| v.trim() != "0").unwrap_or(true)
+        vitaslop_platform::knobs::var("VITASLOP_GXM_BACKGROUND_DEPTH")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
     });
     match depth {
         Some(d) if on => {

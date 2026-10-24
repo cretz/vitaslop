@@ -35,8 +35,7 @@ impl Rif {
     pub fn parse(bytes: &[u8]) -> Result<Rif, Error> {
         let r = Reader::new(bytes);
         let account_id = r.u64(AID_OFF)?;
-        let cid = r
-            .bytes::<CONTENT_ID_LEN>(CONTENT_ID_OFF)?;
+        let cid = r.bytes::<CONTENT_ID_LEN>(CONTENT_ID_OFF)?;
         let n = cid.iter().position(|&b| b == 0).unwrap_or(cid.len());
         let content_id = String::from_utf8_lossy(&cid[..n]).into_owned();
         let key = r.bytes::<KEY_LEN>(KEY_OFF)?;
@@ -75,7 +74,11 @@ mod tests {
         assert!(rif.is_fake());
         // A content id is present and printable ASCII (format is title-independent).
         assert!(!rif.content_id.is_empty());
-        assert!(rif.content_id.bytes().all(|b| b.is_ascii_graphic() || b == b'-' || b == b'_'));
+        assert!(
+            rif.content_id
+                .bytes()
+                .all(|b| b.is_ascii_graphic() || b == b'-' || b == b'_')
+        );
         // The key field is present and non-zero.
         assert_ne!(rif.key, [0u8; 16]);
     }

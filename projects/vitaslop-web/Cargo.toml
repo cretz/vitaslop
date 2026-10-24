@@ -6,6 +6,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# The playbook engine (src/playbook.rs). OFF in the shipped bundles: a player never runs a
+# playbook, so its engine, exports and per-present step stay out of the wasm. The e2e harness and
+# the device runner serve the bundles built WITH it (`node build.mjs --playbook`).
+playbook = ["dep:vitaslop-playbook"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -15,8 +21,9 @@ crate-type = ["cdylib", "rlib"]
 # `cargo build --target wasm32-unknown-unknown -p vitaslop-web` pulls the stack.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 vitaslop-runtime = { path = "../vitaslop-runtime" }
-# Playbooks, without the native Lua backend: the browser brings wasmoon (src/playbook.rs).
-vitaslop-playbook = { path = "../vitaslop-playbook", default-features = false }
+# Playbooks, without the native Lua backend: the browser brings wasmoon (src/playbook.rs). Only
+# in the `playbook` build - see the feature below.
+vitaslop-playbook = { path = "../vitaslop-playbook", default-features = false, optional = true }
 vitaslop-frontend = { path = "../vitaslop-frontend" }
 vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu", "video", "aac"] }
 # Direct, for `run_h264_conformance` only: the decoder crate's own suite has to run in a

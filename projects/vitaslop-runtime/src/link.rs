@@ -62,13 +62,19 @@ const HOST_VARS_BYTES: u32 = 0x1000;
 ///   every protected function reads its canary through whatever the image left in the slot.
 fn host_var_exports(image: &mut [u8], base: u32, var_exports: &mut HashMap<(u32, u32), u32>) {
     let off = base.wrapping_sub(IMAGE_BASE) as usize;
-    let Some(page) = image.get_mut(off..off + 12) else { return };
+    let Some(page) = image.get_mut(off..off + 12) else {
+        return;
+    };
     let flag_addr = base + 4;
     page[0..4].copy_from_slice(&flag_addr.to_le_bytes());
     page[4..8].copy_from_slice(&0u32.to_le_bytes());
     page[8..12].copy_from_slice(&STACK_CHK_GUARD.to_le_bytes());
-    var_exports.entry((0x447f_047d, 0x936a_5f31)).or_insert(base);
-    var_exports.entry((0xcae9_ace6, 0x93b8_aa67)).or_insert(base + 8);
+    var_exports
+        .entry((0x447f_047d, 0x936a_5f31))
+        .or_insert(base);
+    var_exports
+        .entry((0xcae9_ace6, 0x93b8_aa67))
+        .or_insert(base + 8);
 }
 
 /// The stack-protector canary [`host_var_exports`] provides (low byte zero, see there).
@@ -172,9 +178,9 @@ pub struct LoadedModule {
 impl LoadedModule {
     /// Whether `addr` falls inside any of this module's placed segments.
     pub fn contains(&self, addr: u32) -> bool {
-        self.segments.iter().any(|&(vaddr, mem_size, ..)| {
-            addr >= vaddr && addr < vaddr.wrapping_add(mem_size)
-        })
+        self.segments
+            .iter()
+            .any(|&(vaddr, mem_size, ..)| addr >= vaddr && addr < vaddr.wrapping_add(mem_size))
     }
 }
 
@@ -213,7 +219,11 @@ impl LinkedProgram {
         };
         let priority = deref(0x14).map(|v| crate::host::resolve_priority(v as i32));
         let affinity = deref(0x28).and_then(|m| {
-            let m = if m & 0x0007_0000 == 0 { (m & 0x7) << 16 } else { m & 0x0007_0000 };
+            let m = if m & 0x0007_0000 == 0 {
+                (m & 0x7) << 16
+            } else {
+                m & 0x0007_0000
+            };
             (m != 0).then_some(m as i32)
         });
         (priority, affinity)
@@ -344,7 +354,9 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
             }
         }
         if !hit {
-            let owner = modules.iter().find(|m| want >= m.base && want < m.image_end());
+            let owner = modules
+                .iter()
+                .find(|m| want >= m.base && want < m.image_end());
             // ...and the NEAREST PRECEDING export in the same module, which is the exported
             // function this internal code most likely belongs to. Walking up the call chain one
             // run at a time answers the same question in N runs instead of one; this is a
@@ -407,7 +419,11 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
     // real bytes that linear memory never gives back. That is the shape that reached 3,155 MB
     // before a single instruction was transpiled, and it is worth shouting about.
     const GAP_WARN_BYTES: usize = 64 * 1024 * 1024;
-    let segment_bytes: usize = modules.iter().flat_map(|m| &m.segments).map(|s| s.data.len()).sum();
+    let segment_bytes: usize = modules
+        .iter()
+        .flat_map(|m| &m.segments)
+        .map(|s| s.data.len())
+        .sum();
     let gap = image_bytes.saturating_sub(segment_bytes);
     if gap >= GAP_WARN_BYTES {
         tracing::warn!(
@@ -468,18 +484,30 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
     // export so the normal fixup loop binds SceLibc's import to the real struct.
     // Unresolved, SceLibc reads a null/garbage param and falls back to a default heap
     // whose layout differs from the title's, which misplaces later allocations.
-    if let Some(pp) = modules.last().and_then(|m| find_process_param(&image, IMAGE_BASE, m)) {
+    if let Some(pp) = modules
+        .last()
+        .and_then(|m| find_process_param(&image, IMAGE_BASE, m))
+    {
         let off = pp.wrapping_sub(IMAGE_BASE) as usize;
         let rd = |o: usize| -> u32 {
-            image.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0)
+            image
+                .get(o..o + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .unwrap_or(0)
         };
         let ver = rd(off + 8);
         // v6+ carries the SceLibcParam pointer at +0x28; v5 (and earlier) one word
         // later at +0x2c. Pick whichever slot holds a non-zero in-image pointer.
-        let (a, b) = if ver >= 6 { (rd(off + 0x28), rd(off + 0x2c)) } else { (rd(off + 0x2c), rd(off + 0x28)) };
+        let (a, b) = if ver >= 6 {
+            (rd(off + 0x28), rd(off + 0x2c))
+        } else {
+            (rd(off + 0x2c), rd(off + 0x28))
+        };
         let libcparam = if a != 0 { a } else { b };
         if libcparam != 0 {
-            var_exports.entry((0x5ad9_c136, 0xdf08_4dfa)).or_insert(libcparam);
+            var_exports
+                .entry((0x5ad9_c136, 0xdf08_4dfa))
+                .or_insert(libcparam);
         }
     }
     host_var_exports(&mut image, host_vars, &mut var_exports);
@@ -497,14 +525,25 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
     for m in &modules {
         for vi in &m.var_imports {
             match var_exports.get(&(vi.library_nid, vi.var_nid)) {
-                Some(&sym) => {
-                    apply_var_fixups(&mut image, m.base, vi.blob_ptr, sym, &mut var_fixups_applied)?
-                }
+                Some(&sym) => apply_var_fixups(
+                    &mut image,
+                    m.base,
+                    vi.blob_ptr,
+                    sym,
+                    &mut var_fixups_applied,
+                )?,
                 None => {
                     if poison_unresolved {
                         // Distinct per unresolved symbol so a trap names which one.
-                        let poison = 0xE000_0000u32.wrapping_add(unresolved_var_imports.len() as u32 * 4);
-                        apply_var_fixups(&mut image, m.base, vi.blob_ptr, poison, &mut var_fixups_applied)?;
+                        let poison =
+                            0xE000_0000u32.wrapping_add(unresolved_var_imports.len() as u32 * 4);
+                        apply_var_fixups(
+                            &mut image,
+                            m.base,
+                            vi.blob_ptr,
+                            poison,
+                            &mut var_fixups_applied,
+                        )?;
                     }
                     unresolved_var_imports.push((vi.library_nid, vi.var_nid));
                 }
@@ -521,7 +560,11 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         eprintln!(
             "link: WARNING {} variable import(s) unresolved (no matching export){}:",
             unresolved_var_imports.len(),
-            if poison_unresolved { " - bound to poison, first access will trap" } else { "" },
+            if poison_unresolved {
+                " - bound to poison, first access will trap"
+            } else {
+                ""
+            },
         );
         for (lib, var) in &unresolved_var_imports {
             eprintln!("  unresolved var import: library_nid={lib:#010x} var_nid={var:#010x}");
@@ -564,7 +607,10 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
                     name = crate::nid::name(imp.func_nid),
                     "import stub"
                 );
-                externs.push(Extern { addr: imp.stub_addr, import: imports.len() as u32 });
+                externs.push(Extern {
+                    addr: imp.stub_addr,
+                    import: imports.len() as u32,
+                });
                 imports.push((imp.library_nid, imp.func_nid));
             }
         }
@@ -687,7 +733,12 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
             let mut libs: Vec<u32> = m.exports.iter().map(|e| e.library_nid).collect();
             libs.sort_unstable();
             libs.dedup();
-            eprintln!("    export libs: {:?}", libs.iter().map(|l| format!("{l:#010x}")).collect::<Vec<_>>());
+            eprintln!(
+                "    export libs: {:?}",
+                libs.iter()
+                    .map(|l| format!("{l:#010x}"))
+                    .collect::<Vec<_>>()
+            );
         }
         // SceProcessParam+0x28 = pointer to SceLibcParam (__sce_libcparam).
         if process_param != 0 {
@@ -722,7 +773,15 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
             segments: m
                 .segments
                 .iter()
-                .map(|s| (s.vaddr, s.mem_size, s.data.len() as u32, s.executable, s.writable))
+                .map(|s| {
+                    (
+                        s.vaddr,
+                        s.mem_size,
+                        s.data.len() as u32,
+                        s.executable,
+                        s.writable,
+                    )
+                })
                 .collect(),
         })
         .collect();
@@ -744,8 +803,13 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
             crate::vita::inline_op(func_nid)
                 // No inline form, but a handler that can only continue: the real call, through
                 // the non-suspending trap. See `vita::fast_nid`.
-                .or_else(|| crate::vita::fast_nid(func_nid).then_some(vitaslop_transpiler::InlineOp::Fast))
-                .map(|op| vitaslop_transpiler::InlineImport { import: i as u32, op })
+                .or_else(|| {
+                    crate::vita::fast_nid(func_nid).then_some(vitaslop_transpiler::InlineOp::Fast)
+                })
+                .map(|op| vitaslop_transpiler::InlineImport {
+                    import: i as u32,
+                    op,
+                })
         })
         .collect();
     // >>> WHICH CALLS WERE EMITTED AS A BARE CONSTANT, SAID ONCE, HERE.
@@ -873,7 +937,10 @@ fn blit(image: &mut [u8], image_base: u32, seg: &Segment) {
 /// Whether variable-import fixups apply the code word's addend - see [`apply_var_fixups`].
 /// `VITASLOP_LINK_VAR_ADDEND=0` drops it, as the linker did before 2026-09-28: an A/B arm.
 fn var_addend_on() -> bool {
-    !matches!(crate::knobs::var("VITASLOP_LINK_VAR_ADDEND").as_deref(), Ok("0"))
+    !matches!(
+        crate::knobs::var("VITASLOP_LINK_VAR_ADDEND").as_deref(),
+        Ok("0")
+    )
 }
 
 /// Apply one variable import's fixup blob, binding every listed site to the
@@ -885,8 +952,8 @@ fn var_addend_on() -> bool {
 /// `R_ARM_*` relocation code; `site_offset` is the fixup site's byte offset from the
 /// importing module's link base, so its runtime address is `module_base +
 /// site_offset`. Supports the codes Vita variable imports emit: the Thumb
-/// `MOVW`/`MOVT` pair that materializes the address in a register, and `ABS32` for a
-/// plain pointer word.
+/// `MOVW`/`MOVT` pair that materializes the address in a register (and its ARM-mode
+/// twin, codes 43/44, from a title built for ARM state), and `ABS32` for a plain pointer word.
 ///
 /// # >>> THE CODE WORD'S HIGH HALF IS AN ADDEND, AND C++ RTTI DEPENDS ON IT.
 /// This read "the addend is always zero for a variable import" and wrote the bare symbol.
@@ -907,9 +974,11 @@ fn apply_var_fixups(
     use vitaslop_loader::reloc::code;
     let rd32 = |img: &[u8], addr: u32| -> Option<u32> {
         let o = addr.checked_sub(IMAGE_BASE)? as usize;
-        img.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        img.get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
-    let header = rd32(image, blob_ptr).ok_or(vitaslop_loader::Error::OutOfBounds("var fixup header"))?;
+    let header =
+        rd32(image, blob_ptr).ok_or(vitaslop_loader::Error::OutOfBounds("var fixup header"))?;
     let byte_len = (header >> 4) as usize;
     if byte_len < 4 {
         return Ok(());
@@ -918,7 +987,8 @@ fn apply_var_fixups(
     let mut entry_addr = blob_ptr.wrapping_add(4);
     let mut remaining = byte_len - 4;
     while remaining >= 8 {
-        let code_word = rd32(image, entry_addr).ok_or(vitaslop_loader::Error::OutOfBounds("var fixup entry"))?;
+        let code_word = rd32(image, entry_addr)
+            .ok_or(vitaslop_loader::Error::OutOfBounds("var fixup entry"))?;
         let site_offset = rd32(image, entry_addr.wrapping_add(4))
             .ok_or(vitaslop_loader::Error::OutOfBounds("var fixup entry"))?;
         let rcode = ((code_word >> 8) & 0xFF) as u8;
@@ -926,12 +996,24 @@ fn apply_var_fixups(
         let off = site.wrapping_sub(IMAGE_BASE) as usize;
         // Signed: a symbol-relative displacement. Only 0 and +8 have been seen.
         // `VITASLOP_LINK_VAR_ADDEND=0` is the old arm (addend dropped), for A/B only.
-        let addend = if var_addend_on() { (code_word >> 16) as u16 as i16 as i32 } else { 0 };
+        let addend = if var_addend_on() {
+            (code_word >> 16) as u16 as i16 as i32
+        } else {
+            0
+        };
         let target = sym.wrapping_add(addend as u32);
         match rcode {
             code::NONE => {}
-            code::THM_MOVW_ABS_NC => vitaslop_loader::patch_thumb_mov(image, off, (target & 0xFFFF) as u16)?,
-            code::THM_MOVT_ABS => vitaslop_loader::patch_thumb_mov(image, off, (target >> 16) as u16)?,
+            code::THM_MOVW_ABS_NC => {
+                vitaslop_loader::patch_thumb_mov(image, off, (target & 0xFFFF) as u16)?
+            }
+            code::THM_MOVT_ABS => {
+                vitaslop_loader::patch_thumb_mov(image, off, (target >> 16) as u16)?
+            }
+            code::MOVW_ABS_NC => {
+                vitaslop_loader::patch_arm_mov(image, off, (target & 0xFFFF) as u16)?
+            }
+            code::MOVT_ABS => vitaslop_loader::patch_arm_mov(image, off, (target >> 16) as u16)?,
             code::ABS32 | code::TARGET1 => {
                 let slot = image
                     .get_mut(off..off + 4)

@@ -84,6 +84,13 @@ pub(super) fn init_primitive_touch_recognizer(
     0
 }
 
+/// SceInt32 sceSystemGestureFinalizePrimitiveTouchRecognizer(void): the release of the layer
+/// [`init_primitive_touch_recognizer`] set up, which holds nothing here - so it succeeds.
+#[hostcall]
+pub(super) fn finalize_primitive_touch_recognizer(_ctx: &mut GuestCtx, _st: &mut VitaState) -> i32 {
+    0
+}
+
 /// Marker written at the head of a recognizer's guest work area by
 /// [`create_touch_recognizer`], so a later call on that area can tell a recognizer this
 /// run created from an uninitialized buffer.
@@ -282,6 +289,7 @@ pub(super) fn update_primitive_touch_recognizer(
     // a point present last frame and gone this frame is a finger that LIFTED. See
     // [`released_points`].
     advance_frame(st);
+    advance_primitives(st);
     let world = st.world.poll_touch(0).active().len() + st.world.poll_touch(1).active().len();
     if reported as usize != world {
         report_once(
@@ -492,7 +500,11 @@ fn recognizer_events(
     }
     let half = |off: u32| -> i16 {
         let w = ctx.read_u32(recognizer + (off & !3));
-        (if off & 2 == 0 { w as u16 } else { (w >> 16) as u16 }) as i16
+        (if off & 2 == 0 {
+            w as u16
+        } else {
+            (w >> 16) as u16
+        }) as i16
     };
     let (x, y, w, h) = (half(8), half(10), half(12), half(14));
     let port = ctx.read_u32(recognizer + 16);
@@ -740,68 +752,27 @@ pub(super) fn get_touch_event_by_event_id(
 ///   LDRSH r4, [sp, #0xa]          ; r1 + 0x0a - only read when this returned 0
 /// ```
 ///
-/// **THE PRIMITIVE EVENT'S FIELD LAYOUT IS NOT ESTABLISHED, so this deliberately leaves
-/// the buffer as the caller had it** - the same choice, for the same reason, as
-/// [`get_touch_recognizer_information`]. Two `LDRSH` offsets are all the consumer gives,
-/// nothing names them, and writing a position or a status at a guessed offset would be
-/// inventing the struct. What IS established is that the call must SUCCEED: a non-zero
-/// return makes the title dispatch a UI event carrying an uninitialized register. The
-/// primitive id is validated against the touch points actually down, so an id no finger
-/// owns is refused rather than silently reported as a live primitive.
+/// The event is this frame's primitive with that id ([`Primitive`] for the layout): on both
+/// paths the title reads back `+0x0a` and `+0x10`, the pressed and current FORCE, and stores
+/// each as a byte (a force is at most 128). An id no live primitive carries is refused, and
+/// the buffer is then left alone - the title only reads it after a zero return.
 #[hostcall]
 pub(super) fn get_primitive_touch_event_by_primitive_id(
     ctx: &mut GuestCtx,
-    st: &mut VitaState,
+    _st: &mut VitaState,
     primitive_id: u32,
     event: Ptr,
 ) -> i32 {
-    note_primitive_event_not_filled();
-    if let (Some(v), false) = (primitive_state(), event.is_null()) {
-        ctx.write_bytes(event.addr() + PRIMITIVE_STATE_OFF, &v.to_le_bytes());
+    match primitives()
+        .iter()
+        .find(|p| u32::from(p.id) == primitive_id)
+    {
+        Some(p) if !event.is_null() => {
+            write_primitive(ctx, event.addr(), p);
+            0
+        }
+        _ => SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT,
     }
-    let live = (0..2).any(|port| {
-        st.world
-            .poll_touch(port)
-            .active()
-            .iter()
-            .any(|p| p.id as u32 == primitive_id)
-    });
-    if live {
-        0
-    } else {
-        SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT
-    }
-}
-
-/// Report, once, that the primitive touch event struct is left as the caller had it.
-fn note_primitive_event_not_filled() {
-    report_once(
-        "gesture-primitive-event-not-filled",
-        "sceSystemGestureGetPrimitiveTouchEventByPrimitiveID: success is reported for a \
-         primitive id that a touch point really owns, but the \
-         SceSystemGesturePrimitiveTouchEvent buffer is LEFT UNTOUCHED - its field layout \
-         is established by nothing, and the two offsets the calling title reads back \
-         (+0x0a, +0x10) are not named by anything. The title will read whatever it had \
-         there, which for a freshly used stack slot is zero.",
-    );
-}
-
-/// Byte offset, within `SceSystemGesturePrimitiveTouchEvent`, of the halfword the golf
-/// title reads back on BOTH paths (`LDRSH r4, [r1, #0x0a]` on the tap path,
-/// `LDRSH r4, [sp, #0x6a]` off the `sp+0x60` buffer on the drag path) and then stores as
-/// a single BYTE into the UI event it dispatches. A small enumerated per-touch value; what
-/// its values mean is established by nothing, which is why it is only written when asked.
-const PRIMITIVE_STATE_OFF: u32 = 0x0a;
-
-/// `VITASLOP_GESTURE_PRIMITIVE_STATE`: write this halfword at [`PRIMITIVE_STATE_OFF`].
-/// Unset leaves the buffer as the caller had it, which is what the handler documents.
-fn primitive_state() -> Option<i16> {
-    static CELL: std::sync::OnceLock<Option<i16>> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("VITASLOP_GESTURE_PRIMITIVE_STATE")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-    })
 }
 
 /// Byte offset, within `SceSystemGestureTouchEvent`, of a BYTE the golf title's consumer
@@ -829,6 +800,170 @@ fn event_kind() -> Option<u8> {
 /// lifted between the two updates.
 static PREV_POINTS: std::sync::Mutex<Option<[Vec<crate::world::TouchPoint>; 2]>> =
     std::sync::Mutex::new(None);
+
+/// One `SceSystemGesturePrimitiveTouchEvent` (0x60 bytes): `state` (1 begin, 2 active, 3 end)
+/// at 0x00, the primitive id at 0x04, the pressed position and force at 0x06/0x0A, the current
+/// position and force at 0x0C/0x10, the delta since the previous update at 0x12/0x16, the time
+/// since the previous update at 0x18 and since the press at 0x20, and 56 reserved bytes. The
+/// layout is read from a reimplementation, not a hardware dump; the golf title's two reads of a
+/// primitive event, `+0x0a` and `+0x10`, land on the two force fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Primitive {
+    state: i32,
+    id: u16,
+    port: u32,
+    pressed: (i16, i16, i16),
+    current: (i16, i16, i16),
+    delta: (i16, i16, i16),
+    delta_time: u64,
+    elapsed: u64,
+    began_us: u64,
+}
+
+const PRIMITIVE_EVENT_SIZE: u32 = 0x60;
+const PRIM_BEGIN: i32 = 1;
+const PRIM_ACTIVE: i32 = 2;
+const PRIM_END: i32 = 3;
+
+/// This frame's primitive events and the clock of the update that produced them. Advanced
+/// once per frame by [`update_primitive_touch_recognizer`]; every getter reads it.
+static PRIMITIVES: std::sync::Mutex<(Vec<Primitive>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+
+/// Turn the points down now into this frame's primitive events, against last frame's: a point
+/// that was not live is a BEGIN, one that was is ACTIVE (with its movement since), and a live
+/// one that is gone is an END at its last position. An END is reported for one frame only.
+///
+/// NOT ESTABLISHED: whether front- and back-panel primitives share one id space. Both panels
+/// are reported, with the panel's own touch ids.
+fn advance_primitives(st: &mut VitaState) {
+    let now = st.now_us();
+    let mut guard = PRIMITIVES.lock().unwrap();
+    let (prev, last_us) = &*guard;
+    let dt = now.saturating_sub(*last_us);
+    let mut next = Vec::new();
+    for port in 0..2u32 {
+        let frame = st.world.poll_touch(port);
+        for p in frame.active() {
+            let cur = (p.x as i16, p.y as i16, i16::from(p.force));
+            let was = prev
+                .iter()
+                .find(|q| q.port == port && q.id == u16::from(p.id) && q.state != PRIM_END);
+            next.push(match was {
+                Some(q) => Primitive {
+                    state: PRIM_ACTIVE,
+                    current: cur,
+                    delta: (
+                        cur.0 - q.current.0,
+                        cur.1 - q.current.1,
+                        cur.2 - q.current.2,
+                    ),
+                    delta_time: dt,
+                    elapsed: now.saturating_sub(q.began_us),
+                    ..*q
+                },
+                None => Primitive {
+                    state: PRIM_BEGIN,
+                    id: u16::from(p.id),
+                    port,
+                    pressed: cur,
+                    current: cur,
+                    delta: (0, 0, 0),
+                    delta_time: dt,
+                    elapsed: 0,
+                    began_us: now,
+                },
+            });
+        }
+        for q in prev
+            .iter()
+            .filter(|q| q.port == port && q.state != PRIM_END)
+        {
+            if !frame.active().iter().any(|p| u16::from(p.id) == q.id) {
+                next.push(Primitive {
+                    state: PRIM_END,
+                    delta: (0, 0, 0),
+                    delta_time: dt,
+                    elapsed: now.saturating_sub(q.began_us),
+                    ..*q
+                });
+            }
+        }
+    }
+    *guard = (next, now);
+}
+
+/// This frame's primitive events, as the getters see them.
+fn primitives() -> Vec<Primitive> {
+    PRIMITIVES.lock().unwrap().0.clone()
+}
+
+fn write_primitive(ctx: &mut GuestCtx, at: u32, p: &Primitive) {
+    let mut b = [0u8; PRIMITIVE_EVENT_SIZE as usize];
+    b[0..4].copy_from_slice(&p.state.to_le_bytes());
+    b[4..6].copy_from_slice(&p.id.to_le_bytes());
+    for (off, (x, y, f)) in [(0x06, p.pressed), (0x0C, p.current), (0x12, p.delta)] {
+        b[off..off + 2].copy_from_slice(&x.to_le_bytes());
+        b[off + 2..off + 4].copy_from_slice(&y.to_le_bytes());
+        b[off + 4..off + 6].copy_from_slice(&f.to_le_bytes());
+    }
+    b[0x18..0x20].copy_from_slice(&p.delta_time.to_le_bytes());
+    b[0x20..0x28].copy_from_slice(&p.elapsed.to_le_bytes());
+    ctx.write_bytes(at, &b);
+}
+
+/// `SceInt32 sceSystemGestureGetPrimitiveTouchEvents(SceSystemGesturePrimitiveTouchEvent *events,
+///     SceUInt32 capacity, SceUInt32 *count)`: this frame's events, as many as fit.
+#[hostcall]
+pub(super) fn get_primitive_touch_events(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    events: Ptr,
+    capacity: u32,
+    count: Ptr,
+) -> i32 {
+    if events.is_null() || count.is_null() {
+        SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT
+    } else {
+        let list = primitives();
+        let n = list.len().min(capacity as usize);
+        for (i, p) in list.iter().take(n).enumerate() {
+            write_primitive(ctx, events.addr() + i as u32 * PRIMITIVE_EVENT_SIZE, p);
+        }
+        ctx.write_u32(count.addr(), n as u32);
+        0
+    }
+}
+
+/// `SceInt32 sceSystemGestureGetPrimitiveTouchEventsCount(void)`: how many events this frame has.
+#[hostcall]
+pub(super) fn get_primitive_touch_events_count(_ctx: &mut GuestCtx, _st: &mut VitaState) -> i32 {
+    primitives().len() as i32
+}
+
+/// `SceInt32 sceSystemGestureGetPrimitiveTouchEventByIndex(SceUInt32 index,
+///     SceSystemGesturePrimitiveTouchEvent *event)`
+#[hostcall]
+pub(super) fn get_primitive_touch_event_by_index(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    index: u32,
+    event: Ptr,
+) -> i32 {
+    match primitives().get(index as usize) {
+        Some(p) if !event.is_null() => {
+            write_primitive(ctx, event.addr(), p);
+            0
+        }
+        _ => SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT,
+    }
+}
+
+/// `SceInt32 sceSystemGestureResetPrimitiveTouchRecognizer(void)`: forget every live primitive.
+#[hostcall]
+pub(super) fn reset_primitive_touch_recognizer(_ctx: &mut GuestCtx, _st: &mut VitaState) -> i32 {
+    PRIMITIVES.lock().unwrap().0.clear();
+    0
+}
 
 /// Roll this frame's touch points into [`PREV_POINTS`]. Called once per frame from
 /// [`update_primitive_touch_recognizer`], which is the primitive layer's own per-frame
@@ -864,4 +999,77 @@ fn released_points(st: &mut VitaState, port: u32) -> Vec<crate::world::TouchPoin
 fn tap_on_release() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| std::env::var("VITASLOP_GESTURE_TAP_ON_RELEASE").is_ok())
+}
+
+#[cfg(test)]
+mod primitive_tests {
+    use super::*;
+    use crate::world::{CtrlFrame, TouchFrame, TouchPoint, World};
+    use std::sync::{Arc, Mutex};
+
+    /// A world whose front panel shows whatever the test last put there.
+    struct Panel(Arc<Mutex<TouchFrame>>);
+    impl World for Panel {
+        fn monotonic_us(&mut self) -> u64 {
+            0
+        }
+        fn wall_us(&mut self) -> u64 {
+            0
+        }
+        fn poll_ctrl(&mut self, _port: u32) -> CtrlFrame {
+            CtrlFrame::default()
+        }
+        fn fill_random(&mut self, _buf: &mut [u8]) {}
+        fn poll_touch(&mut self, port: u32) -> TouchFrame {
+            if port == 0 {
+                *self.0.lock().unwrap()
+            } else {
+                TouchFrame::default()
+            }
+        }
+    }
+
+    /// A press is a BEGIN at the pressed position, a held finger that moves is ACTIVE with
+    /// its movement and its first position kept, and a lift is one END at the last position,
+    /// after which the primitive is gone.
+    #[test]
+    fn a_press_drag_and_lift_is_begin_active_end() {
+        let panel = Arc::new(Mutex::new(TouchFrame::default()));
+        let mut st = VitaState::new(0, 4096, Box::new(Panel(panel.clone())));
+        let set = |x: u16, y: u16| {
+            let mut f = TouchFrame::default();
+            f.points[0] = TouchPoint {
+                id: 7,
+                force: 90,
+                x,
+                y,
+            };
+            f.count = 1;
+            *panel.lock().unwrap() = f;
+        };
+        set(100, 200);
+        advance_primitives(&mut st);
+        let p = primitives();
+        assert_eq!(p.len(), 1);
+        assert_eq!(
+            (p[0].state, p[0].id, p[0].pressed, p[0].current),
+            (PRIM_BEGIN, 7, (100, 200, 90), (100, 200, 90))
+        );
+        set(130, 190);
+        advance_primitives(&mut st);
+        let p = primitives();
+        assert_eq!(
+            (p[0].state, p[0].pressed, p[0].current, p[0].delta),
+            (PRIM_ACTIVE, (100, 200, 90), (130, 190, 90), (30, -10, 0))
+        );
+        *panel.lock().unwrap() = TouchFrame::default();
+        advance_primitives(&mut st);
+        let p = primitives();
+        assert_eq!(
+            (p.len(), p[0].state, p[0].current),
+            (1, PRIM_END, (130, 190, 90))
+        );
+        advance_primitives(&mut st);
+        assert!(primitives().is_empty(), "an END is reported once");
+    }
 }

@@ -98,7 +98,12 @@ fn write_overlay(ctx: &mut GuestCtx, addr: u32, o: &FiosOverlay) {
 /// int _sceFiosKernelOverlayAdd(const SceFiosKernelOverlay *overlay,
 ///                              SceFiosKernelOverlayID *out_id)
 #[hostcall]
-pub(super) fn overlay_add(ctx: &mut GuestCtx, st: &mut VitaState, overlay: Ptr, out_id: Ptr) -> i32 {
+pub(super) fn overlay_add(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    overlay: Ptr,
+    out_id: Ptr,
+) -> i32 {
     if overlay.is_null() {
         EINVAL
     } else {
@@ -108,7 +113,10 @@ pub(super) fn overlay_add(ctx: &mut GuestCtx, st: &mut VitaState, overlay: Ptr, 
             kind = rec.kind, order = rec.order, dst = %rec.dst, src = %rec.src,
             "fios2 overlay add"
         );
-        let line = format!("fios overlay add kind {} order {} {:?} -> {:?}", rec.kind, rec.order, rec.dst, rec.src);
+        let line = format!(
+            "fios overlay add kind {} order {} {:?} -> {:?}",
+            rec.kind, rec.order, rec.dst, rec.src
+        );
         let id = st.fios_overlay_add(rec);
         st.journal(|| format!("{line} = id {id}"));
         if !out_id.is_null() {
@@ -136,7 +144,10 @@ pub(super) fn overlay_add_for_process(
         EINVAL
     } else {
         let rec = read_overlay(ctx, overlay.addr());
-        let line = format!("fios overlay add kind {} order {} {:?} -> {:?}", rec.kind, rec.order, rec.dst, rec.src);
+        let line = format!(
+            "fios overlay add kind {} order {} {:?} -> {:?}",
+            rec.kind, rec.order, rec.dst, rec.src
+        );
         let id = st.fios_overlay_add(rec);
         st.journal(|| format!("{line} = id {id}"));
         if !out_id.is_null() {
@@ -146,11 +157,10 @@ pub(super) fn overlay_add_for_process(
     }
 }
 
-/// The single process this kernel runs (matching `sceKernelGetProcessId`). `0` and
-/// `-1` are the usual "the calling process" spellings.
-const PROCESS_ID: i32 = 0x1000;
+/// The single process this kernel runs ([`super::threadmgr::PROCESS_ID`]). `0` and `-1` are the
+/// usual "the calling process" spellings.
 fn is_own_process(pid: i32) -> bool {
-    pid == 0 || pid == -1 || pid == PROCESS_ID
+    pid == 0 || pid == -1 || pid == super::threadmgr::PROCESS_ID
 }
 
 /// int _sceFiosKernelOverlayGetInfo(SceFiosKernelOverlayID id,
@@ -196,7 +206,12 @@ pub(super) fn overlay_get_info_for_process(
 /// int _sceFiosKernelOverlayModify(SceFiosKernelOverlayID id,
 ///                                 const SceFiosKernelOverlay *new_value)
 #[hostcall]
-pub(super) fn overlay_modify(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, new_value: Ptr) -> i32 {
+pub(super) fn overlay_modify(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    id: i32,
+    new_value: Ptr,
+) -> i32 {
     if new_value.is_null() {
         EINVAL
     } else {
@@ -302,7 +317,11 @@ fn write_resolved(ctx: &mut GuestCtx, args: u32, resolved: &str) -> i32 {
     let max = ctx.read_u32(args + RESOLVE_OUT_LEN) as usize;
     // A caller that passes no length still passes a buffer; the overlay path size is
     // the interface's own bound and the only defensible cap in that case.
-    let max = if max == 0 { OVERLAY_PATH_SIZE as usize } else { max };
+    let max = if max == 0 {
+        OVERLAY_PATH_SIZE as usize
+    } else {
+        max
+    };
     if out == 0 {
         EINVAL
     } else {
@@ -342,7 +361,12 @@ pub(super) fn overlay_resolve_sync(
         let path = read_cstr(ctx, in_path.addr());
         let resolved = st.fios_resolve(&path, ORDER_MIN, ORDER_MAX);
         tracing::trace!(target: "vitaslop::io", path, resolved, "fios2 resolve");
-        st.journal(|| format!("fios resolve {path:?} -> {resolved:?} (disabled here: {})", st.fios_overlay_disabled()));
+        st.journal(|| {
+            format!(
+                "fios resolve {path:?} -> {resolved:?} (disabled here: {})",
+                st.fios_overlay_disabled()
+            )
+        });
         write_resolved(ctx, args.addr(), &resolved)
     }
 }
@@ -445,7 +469,11 @@ pub(super) fn dh_open_sync(
     if path.is_null() {
         EINVAL
     } else {
-        let to_order = if args.is_null() { ORDER_MAX } else { ctx.read_u32(args.addr()) as u8 };
+        let to_order = if args.is_null() {
+            ORDER_MAX
+        } else {
+            ctx.read_u32(args.addr()) as u8
+        };
         let raw = read_cstr(ctx, path.addr());
         let resolved = st.fios_resolve(&raw, from_order as u8, to_order);
         let dh = st.io_dopen(&resolved);
@@ -495,7 +523,13 @@ pub(super) fn dh_stat_sync(ctx: &mut GuestCtx, st: &mut VitaState, dh: i32, out_
 /// directory descriptor, and this filesystem records status overrides by PATH, so
 /// the descriptor's path is what the change is applied to.
 #[hostcall]
-pub(super) fn dh_chstat_sync(ctx: &mut GuestCtx, st: &mut VitaState, dh: i32, new_stat: Ptr, cbit: u32) -> i32 {
+pub(super) fn dh_chstat_sync(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    dh: i32,
+    new_stat: Ptr,
+    cbit: u32,
+) -> i32 {
     match st.io_dir_path(dh) {
         None => EBADF,
         Some(_) if new_stat.is_null() => EINVAL,
@@ -513,11 +547,7 @@ pub(super) fn dh_chstat_sync(ctx: &mut GuestCtx, st: &mut VitaState, dh: i32, ne
 /// still matters, because syncing a closed handle is an error the caller wants back.
 #[hostcall]
 pub(super) fn dh_sync_sync(st: &mut VitaState, dh: i32, _flag: i32) -> i32 {
-    if st.io_dir_is_open(dh) {
-        0
-    } else {
-        EBADF
-    }
+    if st.io_dir_is_open(dh) { 0 } else { EBADF }
 }
 
 /// int _sceFiosKernelOverlayDHCloseSync(SceFiosKernelOverlayDH dh)

@@ -103,7 +103,12 @@ pub trait FontBackend: Send {
     /// face has no such glyph. A whitespace glyph yields an empty (0x0) bitmap with
     /// valid advance metrics. Takes `&mut self` so a backend can memoize expensive
     /// per-size setup (the skrifa backend caches its hinting instances).
-    fn rasterize(&mut self, face: FaceId, size: PixelSize, ch: u32) -> Option<(GlyphBitmap, GlyphMetrics)>;
+    fn rasterize(
+        &mut self,
+        face: FaceId,
+        size: PixelSize,
+        ch: u32,
+    ) -> Option<(GlyphBitmap, GlyphMetrics)>;
 }
 
 /// A ScePvf library instance: unit configuration shared by the fonts opened under it.
@@ -119,7 +124,11 @@ impl Default for LibState {
     fn default() -> Self {
         // 72 DPI makes point == pixel until the title sets a resolution, and a 0 EM
         // reads as "unset".
-        LibState { em: 0.0, h_res: 72.0, v_res: 72.0 }
+        LibState {
+            em: 0.0,
+            h_res: 72.0,
+            v_res: 72.0,
+        }
     }
 }
 
@@ -167,7 +176,10 @@ pub struct FontLibrary {
 
 /// The probe repertoire as code points.
 fn probe_chars() -> impl Iterator<Item = u32> {
-    FILL_PROBE_ASCII.chars().map(|c| c as u32).chain(FILL_PROBE_EXTRA.iter().copied())
+    FILL_PROBE_ASCII
+        .chars()
+        .map(|c| c as u32)
+        .chain(FILL_PROBE_EXTRA.iter().copied())
 }
 
 /// The characters the substitute's ink box is measured over.
@@ -265,13 +277,11 @@ impl FontLibrary {
     /// `scePvfPixelToPointH/V`: point = pixel * 72 / resolution. A missing lib or a
     /// non-positive resolution yields 0.
     pub fn pixel_to_point(&self, lib: u32, pixel: f32, vertical: bool) -> f32 {
-        let Some(l) = self.libs.get(&lib) else { return 0.0 };
+        let Some(l) = self.libs.get(&lib) else {
+            return 0.0;
+        };
         let res = if vertical { l.v_res } else { l.h_res };
-        if res > 0.0 {
-            pixel * 72.0 / res
-        } else {
-            0.0
-        }
+        if res > 0.0 { pixel * 72.0 / res } else { 0.0 }
     }
 
     // --- font lifecycle -------------------------------------------------------
@@ -287,7 +297,15 @@ impl FontLibrary {
         let h = self.alloc_handle();
         // Default to a 16px em until the title sets a size, so an immediate metrics
         // query does not divide by zero.
-        self.fonts.insert(h, FontState { lib, face, size: PixelSize { h: 16.0, v: 16.0 }, substitute: false });
+        self.fonts.insert(
+            h,
+            FontState {
+                lib,
+                face,
+                size: PixelSize { h: 16.0, v: 16.0 },
+                substitute: false,
+            },
+        );
         Some(h)
     }
 
@@ -332,7 +350,9 @@ impl FontLibrary {
     /// The face is only dropped when NO other open font is using it, so closing one of two
     /// handles on the same face does not pull the cache out from under the other.
     pub fn close(&mut self, font: u32) -> bool {
-        let Some(state) = self.fonts.remove(&font) else { return false };
+        let Some(state) = self.fonts.remove(&font) else {
+            return false;
+        };
         let face = state.face;
         if self.fonts.values().any(|f| f.face == face) {
             return true;
@@ -448,7 +468,11 @@ impl FontLibrary {
             let f = self.fonts.get(&font)?;
             (f.face, f.size)
         };
-        let key = GlyphKey { face, size: size.key(), ch };
+        let key = GlyphKey {
+            face,
+            size: size.key(),
+            ch,
+        };
         if !self.cache.contains_key(&key) {
             let (bitmap, metrics) = self.backend.rasterize(face, size, ch)?;
             self.cache.insert(key, CachedGlyph { bitmap, metrics });
@@ -465,8 +489,8 @@ mod tests {
     //! font file - the real skrifa backend is covered end to end by the `vita_pvf`
     //! conformance case.
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A stand-in backend: every char < 128 is a glyph, and each `rasterize` bumps a
     /// shared counter so a test can assert the cache prevents repeat work.
@@ -482,18 +506,41 @@ mod tests {
             ch < 128
         }
         fn face_metrics(&self, _face: FaceId, _size: PixelSize) -> Option<FaceMetrics> {
-            Some(FaceMetrics { ascender: 12.0, descender: -3.0, height: 16.0, max_advance: 16.0, num_glyphs: 128 })
+            Some(FaceMetrics {
+                ascender: 12.0,
+                descender: -3.0,
+                height: 16.0,
+                max_advance: 16.0,
+                num_glyphs: 128,
+            })
         }
-        fn rasterize(&mut self, _face: FaceId, size: PixelSize, _ch: u32) -> Option<(GlyphBitmap, GlyphMetrics)> {
+        fn rasterize(
+            &mut self,
+            _face: FaceId,
+            size: PixelSize,
+            _ch: u32,
+        ) -> Option<(GlyphBitmap, GlyphMetrics)> {
             self.raster_calls.fetch_add(1, Ordering::Relaxed);
-            let m = GlyphMetrics { h_advance: size.v, ..GlyphMetrics::default() };
-            Some((GlyphBitmap { width: 2, height: 2, coverage: vec![255; 4] }, m))
+            let m = GlyphMetrics {
+                h_advance: size.v,
+                ..GlyphMetrics::default()
+            };
+            Some((
+                GlyphBitmap {
+                    width: 2,
+                    height: 2,
+                    coverage: vec![255; 4],
+                },
+                m,
+            ))
         }
     }
 
     fn lib_with_counter() -> (FontLibrary, Arc<AtomicU32>) {
         let calls = Arc::new(AtomicU32::new(0));
-        let lib = FontLibrary::new(Box::new(MockBackend { raster_calls: calls.clone() }));
+        let lib = FontLibrary::new(Box::new(MockBackend {
+            raster_calls: calls.clone(),
+        }));
         (lib, calls)
     }
 
@@ -544,7 +591,11 @@ mod tests {
         f.set_char_size(font, 16.0, 16.0);
         assert!(f.glyph(font, u32::from('A')).is_some());
         assert!(f.glyph(font, u32::from('A')).is_some()); // cache hit
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "second query must hit the cache");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "second query must hit the cache"
+        );
         // A different char rasterizes again.
         assert!(f.glyph(font, u32::from('B')).is_some());
         assert_eq!(calls.load(Ordering::Relaxed), 2);

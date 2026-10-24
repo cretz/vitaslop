@@ -139,6 +139,8 @@ pub struct PlanarYuv<'a> {
     pub chroma_offset: u32,
     /// The format's swizzle says the pair is Cr,Cb rather than Cb,Cr.
     pub swap_chroma: bool,
+    /// The `SceGxmYuvProfile` (0..3) of the slot the texture names - see `texenc.wgsl`.
+    pub profile: u32,
     /// The guest's bytes, both planes.
     pub data: &'a [u8],
 }
@@ -407,6 +409,8 @@ const FLAG_4BPP: u32 = 4;
 const FLAG_ALPHA: u32 = 8;
 /// `convert_yuv420p2` only: the format's swizzle says the chroma pair is Cr,Cb not Cb,Cr.
 const FLAG_SWAP_CHROMA: u32 = 16;
+/// `convert_yuv420p2` only: flags bits 5..6 carry the `SceGxmYuvProfile`.
+const YUV_PROFILE_SHIFT: u32 = 5;
 
 fn align_up(v: u32, to: u32) -> u32 {
     v.div_ceil(to) * to
@@ -502,8 +506,8 @@ pub fn last_raw_refusal() -> &'static str {
 /// is spare (down to rule 1's floor) before refusing anything -
 /// `if want + want_rgba + want_out > BUDGET { return need_src.max(room) }`.
 ///
-/// **It was written, and the pixel oracle refused it.** Frame-pinned headless replay of the golf
-/// recipe, 4,700 frames, 12 shots:
+/// **It was written, and the pixel oracle refused it.** Frame-pinned headless replay of the scripted
+/// golf run, 4,700 frames, 12 shots:
 ///
 /// ```text
 ///   with the clamp    vs baseline:  9 identical, 3 DIFFER  (mean abs 0.29-0.75, p99.9 66-111,
@@ -841,7 +845,8 @@ impl Transcoder {
             rgba_word: planes.chroma_stride,
             out_word: planes.chroma_offset,
             out_row_words: w,
-            flags: if planes.swap_chroma { FLAG_SWAP_CHROMA } else { 0 },
+            flags: if planes.swap_chroma { FLAG_SWAP_CHROMA } else { 0 }
+                | (planes.profile.min(3) << YUV_PROFILE_SHIFT),
             ..Params::default()
         };
         queue.write_buffer(&scratch.params, 0, &params.to_bytes());

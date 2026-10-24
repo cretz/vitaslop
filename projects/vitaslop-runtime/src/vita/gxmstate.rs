@@ -115,5 +115,8 @@ pub fn write_texture_slot(
     for (k, w) in words.iter().enumerate() {
         ctx.write_u32(at.wrapping_add(4 + k as u32 * 4), *w);
     }
-    ctx.write_u32(at.wrapping_add(4 + super::gxmctx::TEXTURE_CONTROL_WORDS * 4), 1);
+    ctx.write_u32(
+        at.wrapping_add(4 + super::gxmctx::TEXTURE_CONTROL_WORDS * 4),
+        1,
+    );
 }

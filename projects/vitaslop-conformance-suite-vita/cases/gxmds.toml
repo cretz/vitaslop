@@ -1,0 +1,15 @@
+category = "vita"
+description = "GXM depth-stencil state lives in the 20-byte SceGxmDepthStencilSurface - RUNNABLE"
+
+# Source: ../gxmds-src/gxmds.c (clean-room, -nostdlib). Init refuses a stride that is 0 or
+# not a multiple of 32; a fresh surface reads back its format, stride, a background depth of
+# 1.0, stencil 0, the mask set and no forced load/store; every setter reads back on the
+# original and on a by-value copy; a disabled surface is not enabled. Executable form:
+# tests/vita_gxmds.rs.
+[out]
+output = """init 805b0003 805b0003 0
+fresh f1266000 st960 d1000 s0 m1 l0 w0 e1
+set f1266000 st960 d250 s90 m0 l2 w4 e1
+copy f1266000 st960 d250 s90 m0 l2 w4 e1
+linear fcc000 st32 d1000 s0 m1 l0 w0 e1
+off f0 st32 d1000 s0 m1 l0 w0 e0"""

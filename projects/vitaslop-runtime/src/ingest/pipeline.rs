@@ -26,7 +26,7 @@ use super::rif::Rif;
 use super::self2elf::self2elf;
 use super::unicv::UnicvDb;
 use super::vfs::{MemVfs, Vfs};
-use super::{detect, Container, Error};
+use super::{Container, Error, detect};
 
 /// Where a NoNpDrm license (the fake RIF) lives, relative to the app root.
 pub(crate) const WORK_BIN_PATH: &str = "sce_sys/package/work.bin";
@@ -86,8 +86,13 @@ impl Game {
     /// executable.
     pub fn with_main_exec(&mut self, path: &str) -> bool {
         let rel = exec_rel_path(path);
-        let Some(i) = self.execs.iter().position(|m| m.path == rel) else { return false };
-        let exec = GameModule { path: self.execs[i].path.clone(), elf: self.execs[i].elf.clone() };
+        let Some(i) = self.execs.iter().position(|m| m.path == rel) else {
+            return false;
+        };
+        let exec = GameModule {
+            path: self.execs[i].path.clone(),
+            elf: self.execs[i].elf.clone(),
+        };
         match self.modules.iter().position(|m| m.path == "eboot.bin") {
             Some(slot) => self.modules[slot] = exec,
             None => self.modules.push(exec),
@@ -99,7 +104,9 @@ impl Game {
 /// The app-relative path an `sceAppMgrLoadExec` argument names: `app0:` and any leading `/`
 /// stripped (`"app0:game.self"`, `"app0:/game.self"` -> `"game.self"`).
 pub fn exec_rel_path(path: &str) -> &str {
-    path.strip_prefix("app0:").unwrap_or(path).trim_start_matches('/')
+    path.strip_prefix("app0:")
+        .unwrap_or(path)
+        .trim_start_matches('/')
 }
 
 /// Decrypt and unwrap a mounted container into a [`Game`].
@@ -216,7 +223,10 @@ pub fn mount_dump_lazy(vfs: &dyn Vfs, root: &str) -> Result<LazyDump, Error> {
     let files = vfs
         .list()
         .into_iter()
-        .filter_map(|p| p.strip_prefix(&files_prefix).map(|rel| (rel.to_string(), p.clone())))
+        .filter_map(|p| {
+            p.strip_prefix(&files_prefix)
+                .map(|rel| (rel.to_string(), p.clone()))
+        })
         .collect();
     let mut modules = Vec::with_capacity(module_paths.len());
     for path in module_paths {
@@ -228,7 +238,13 @@ pub fn mount_dump_lazy(vfs: &dyn Vfs, root: &str) -> Result<LazyDump, Error> {
         let elf = vfs.read(&under(root, &format!("modules/{path}")))?;
         execs.push(GameModule { path, elf });
     }
-    Ok(LazyDump { content_id, modules, execs, files, files_prefix })
+    Ok(LazyDump {
+        content_id,
+        modules,
+        execs,
+        files,
+        files_prefix,
+    })
 }
 
 /// Detect the container at the vfs root and return the dump root if it is a decrypted
@@ -411,12 +427,15 @@ fn decrypt_pfs(vfs: &dyn Vfs, root: &str) -> Result<Game, Error> {
 /// A root-level `*.self` carrying the SELF magic: an executable the app can `LoadExec` into,
 /// not one loaded at boot (see [`Game::execs`]).
 pub(crate) fn is_exec_alternate(path: &str, plaintext: &[u8]) -> bool {
-    !path.contains('/') && path.ends_with(".self") && plaintext.len() >= 4 && &plaintext[..4] == SCE_MAGIC
+    !path.contains('/')
+        && path.ends_with(".self")
+        && plaintext.len() >= 4
+        && &plaintext[..4] == SCE_MAGIC
 }
 
 fn is_executable(path: &str, plaintext: &[u8]) -> bool {
-    let named_module = path == "eboot.bin"
-        || (path.starts_with("sce_module/") && path.ends_with(".suprx"));
+    let named_module =
+        path == "eboot.bin" || (path.starts_with("sce_module/") && path.ends_with(".suprx"));
     named_module && plaintext.len() >= 4 && &plaintext[..4] == SCE_MAGIC
 }
 
@@ -442,10 +461,11 @@ pub fn ingest_cached(vfs: &mut dyn Vfs, cache: &dyn Cache) -> Result<Game, Error
     // Peek the content id from the RIF without decrypting anything.
     if let Ok(Container::Pfs { root }) = detect(&*vfs)
         && let Ok(work) = vfs.read(&under(&root, "sce_sys/package/work.bin"))
-            && let Ok(rif) = Rif::parse(&work)
-                && let Some(game) = cache.load(&rif.content_id) {
-                    return Ok(game);
-                }
+        && let Ok(rif) = Rif::parse(&work)
+        && let Some(game) = cache.load(&rif.content_id)
+    {
+        return Ok(game);
+    }
     let game = decrypt_container(vfs)?;
     cache.store(&game)?;
     Ok(game)
@@ -470,10 +490,19 @@ mod tests {
             content_id: "XX0000-ABCD00001_00-TEST".to_string(),
             files,
             modules: vec![
-                GameModule { path: "sce_module/libx.suprx".into(), elf: b"\x7fELF-lib".to_vec() },
-                GameModule { path: "eboot.bin".into(), elf: b"\x7fELF-main".to_vec() },
+                GameModule {
+                    path: "sce_module/libx.suprx".into(),
+                    elf: b"\x7fELF-lib".to_vec(),
+                },
+                GameModule {
+                    path: "eboot.bin".into(),
+                    elf: b"\x7fELF-main".to_vec(),
+                },
             ],
-            execs: vec![GameModule { path: "game.self".into(), elf: b"\x7fELF-exec".to_vec() }],
+            execs: vec![GameModule {
+                path: "game.self".into(),
+                elf: b"\x7fELF-exec".to_vec(),
+            }],
         };
 
         let mut tree = MemVfs::new();
@@ -508,7 +537,10 @@ mod tests {
         // real ELF, and the eboot ordered last (after the libraries it imports).
         let names: Vec<&str> = game.modules.iter().map(|m| m.path.as_str()).collect();
         assert!(names.contains(&"eboot.bin"), "no eboot.bin among {names:?}");
-        assert!(game.modules.len() > 1, "expected eboot plus at least one library");
+        assert!(
+            game.modules.len() > 1,
+            "expected eboot plus at least one library"
+        );
         assert_eq!(game.modules.last().unwrap().path, "eboot.bin");
         for m in &game.modules {
             assert_eq!(&m.elf[..4], b"\x7fELF", "module {} is not an ELF", m.path);
@@ -544,22 +576,46 @@ mod tests {
         let mut vfs = pkgo.extract().expect("extract");
         vfs.insert("sce_sys/package/work.bin", work.clone());
         // Decrypt just the eboot to its inner ELF, bypassing loader::load.
-        use crate::ingest::{filesdb::FilesDb, pfs::PfsImage, rif::Rif, unicv::UnicvDb, self2elf::self2elf};
+        use crate::ingest::{
+            filesdb::FilesDb, pfs::PfsImage, rif::Rif, self2elf::self2elf, unicv::UnicvDb,
+        };
         let fdb = FilesDb::parse(&vfs.read("sce_pfs/files.db").unwrap()).unwrap();
         let ucv = UnicvDb::parse(&vfs.read("sce_pfs/unicv.db").unwrap()).unwrap();
         let rif = Rif::parse(&work).unwrap();
         let img = PfsImage::new(fdb, ucv).unwrap();
         let crypto = crate::ingest::pfscrypt::GameData::from_klicensee(&rif.key);
-        let self_bytes = img.decrypt("eboot.bin", &vfs.read("eboot.bin").unwrap(), &rif.key, &crypto).unwrap();
+        let self_bytes = img
+            .decrypt(
+                "eboot.bin",
+                &vfs.read("eboot.bin").unwrap(),
+                &rif.key,
+                &crypto,
+            )
+            .unwrap();
         let b = self2elf(&self_bytes, &rif.key).expect("self2elf");
-        let rd32 = |o: usize| u32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
-        let rd16 = |o: usize| u16::from_le_bytes([b[o], b[o+1]]);
-        eprintln!("e_type={:#06x} e_entry={:#010x} e_phoff={:#x} e_phnum={}", rd16(16), rd32(24), rd32(28), rd16(44));
+        let rd32 = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let rd16 = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        eprintln!(
+            "e_type={:#06x} e_entry={:#010x} e_phoff={:#x} e_phnum={}",
+            rd16(16),
+            rd32(24),
+            rd32(28),
+            rd16(44)
+        );
         let phoff = rd32(28) as usize;
         for i in 0..rd16(44) as usize {
             let ph = phoff + i * 32;
-            eprintln!("  ph{i}: type={:#010x} off={:#010x} vaddr={:#010x} paddr={:#010x} filesz={:#x} memsz={:#x} flags={:#x} align={:#x}",
-                rd32(ph), rd32(ph+4), rd32(ph+8), rd32(ph+12), rd32(ph+16), rd32(ph+20), rd32(ph+24), rd32(ph+28));
+            eprintln!(
+                "  ph{i}: type={:#010x} off={:#010x} vaddr={:#010x} paddr={:#010x} filesz={:#x} memsz={:#x} flags={:#x} align={:#x}",
+                rd32(ph),
+                rd32(ph + 4),
+                rd32(ph + 8),
+                rd32(ph + 12),
+                rd32(ph + 16),
+                rd32(ph + 20),
+                rd32(ph + 24),
+                rd32(ph + 28)
+            );
         }
     }
 
@@ -582,13 +638,22 @@ mod tests {
         let pkgo = crate::ingest::pkg::Pkg::open(&pkg).expect("open");
         let mut vfs = pkgo.extract().expect("extract");
         vfs.insert("sce_sys/package/work.bin", work.clone());
-        use crate::ingest::{filesdb::FilesDb, pfs::PfsImage, rif::Rif, unicv::UnicvDb, self2elf::self2elf};
+        use crate::ingest::{
+            filesdb::FilesDb, pfs::PfsImage, rif::Rif, self2elf::self2elf, unicv::UnicvDb,
+        };
         let fdb = FilesDb::parse(&vfs.read("sce_pfs/files.db").unwrap()).unwrap();
         let ucv = UnicvDb::parse(&vfs.read("sce_pfs/unicv.db").unwrap()).unwrap();
         let rif = Rif::parse(&work).unwrap();
         let img = PfsImage::new(fdb, ucv).unwrap();
         let crypto = crate::ingest::pfscrypt::GameData::from_klicensee(&rif.key);
-        let self_bytes = img.decrypt("eboot.bin", &vfs.read("eboot.bin").unwrap(), &rif.key, &crypto).unwrap();
+        let self_bytes = img
+            .decrypt(
+                "eboot.bin",
+                &vfs.read("eboot.bin").unwrap(),
+                &rif.key,
+                &crypto,
+            )
+            .unwrap();
         let elf = self2elf(&self_bytes, &rif.key).expect("self2elf");
         let path = std::path::Path::new(&out).join("eboot.elf");
         std::fs::write(&path, &elf).expect("write eboot.elf");
@@ -658,7 +723,11 @@ mod tests {
         use crate::ingest::unicv::UnicvDb;
         let fdb = FilesDb::parse(&vfs.read("sce_pfs/files.db").unwrap()).expect("files.db");
         let ucv = UnicvDb::parse(&vfs.read("sce_pfs/unicv.db").unwrap()).expect("unicv.db");
-        eprintln!("files.db nodes={} unicv tables={}", fdb.nodes.len(), ucv.tables.len());
+        eprintln!(
+            "files.db nodes={} unicv tables={}",
+            fdb.nodes.len(),
+            ucv.tables.len()
+        );
         let n_dirs = fdb.nodes.iter().filter(|n| n.is_dir()).count();
         let n_files = fdb.nodes.len() - n_dirs;
         eprintln!("  dirs={n_dirs} files={n_files}");
@@ -676,13 +745,24 @@ mod tests {
         };
         let work = std::fs::read(work_path).expect("read work.bin");
         let rif = crate::ingest::rif::Rif::parse(&work).expect("parse rif");
-        eprintln!("rif: account_id={:#x} fake={} content_id={}", rif.account_id, rif.is_fake(), rif.content_id);
+        eprintln!(
+            "rif: account_id={:#x} fake={} content_id={}",
+            rif.account_id,
+            rif.is_fake(),
+            rif.content_id
+        );
         eprintln!("rif key: {:02x?}", rif.key);
 
         let fdb_bytes = vfs.read("sce_pfs/files.db").unwrap();
         let h = img.files_db.header;
-        eprintln!("files.db: version={} block_size={:#x} key_id={} seed={:#x}", h.version, h.block_size, h.key_id, h.seed);
-        eprintln!("unicv.db: version={} block_size={:#x}", img.unicv.header.version, img.unicv.header.block_size);
+        eprintln!(
+            "files.db: version={} block_size={:#x} key_id={} seed={:#x}",
+            h.version, h.block_size, h.key_id, h.seed
+        );
+        eprintln!(
+            "unicv.db: version={} block_size={:#x}",
+            img.unicv.header.version, img.unicv.header.block_size
+        );
 
         // Decisive: does the files.db header ICV validate? This depends only on the
         // drv_key keygen (icv_salt=0, no tweak), so it isolates keygen from cipher.
@@ -690,14 +770,32 @@ mod tests {
         eprintln!("drv_key = F00D(klicensee) = {:02x?}", drv);
         let secret = crate::ingest::pfscrypt::integrity_secret_pub(&drv, h.seed, 0);
         let mut hdr = fdb_bytes[..0x160].to_vec();
-        for b in &mut hdr[0x4c..0x160] { *b = 0; }
+        for b in &mut hdr[0x4c..0x160] {
+            *b = 0;
+        }
         let got = crate::ingest::pfscrypt::hmac_sha1(&secret, &hdr);
-        eprintln!("header ICV match={} (got {:02x?} vs {:02x?})", got[..] == fdb_bytes[0x4c..0x60], &got[..8], &fdb_bytes[0x4c..0x4c+8]);
+        eprintln!(
+            "header ICV match={} (got {:02x?} vs {:02x?})",
+            got[..] == fdb_bytes[0x4c..0x60],
+            &got[..8],
+            &fdb_bytes[0x4c..0x4c + 8]
+        );
 
-        let eboot_file = files.iter().find(|f| f.path == "eboot.bin").expect("eboot node");
+        let eboot_file = files
+            .iter()
+            .find(|f| f.path == "eboot.bin")
+            .expect("eboot node");
         let etbl = &img.unicv.tables[eboot_file.table_index];
-        eprintln!("eboot node: ftype={:#x} size={} is_encrypted={}", eboot_file.node.ftype, eboot_file.node.size, eboot_file.node.is_encrypted());
-        eprintln!("eboot table: page_no={} page_size={:#x} n_sectors={} iv_seed={:02x?}", etbl.page_no, etbl.page_size, etbl.n_sectors, etbl.iv_seed);
+        eprintln!(
+            "eboot node: ftype={:#x} size={} is_encrypted={}",
+            eboot_file.node.ftype,
+            eboot_file.node.size,
+            eboot_file.node.is_encrypted()
+        );
+        eprintln!(
+            "eboot table: page_no={} page_size={:#x} n_sectors={} iv_seed={:02x?}",
+            etbl.page_no, etbl.page_size, etbl.n_sectors, etbl.iv_seed
+        );
         let ct = vfs.read("eboot.bin").expect("eboot ciphertext");
         eprintln!("eboot ct[0..32]={:02x?}", &ct[..32]);
 
@@ -711,12 +809,17 @@ mod tests {
             let mut b = GenericArray::clone_from_slice(&ct[16..32]);
             c.decrypt_block(&mut b);
             let mut pt = [0u8; 16];
-            for j in 0..16 { pt[j] = b[j] ^ ct[j]; }
+            for j in 0..16 {
+                pt[j] = b[j] ^ ct[j];
+            }
             pt
         };
         let pt_drv = recover(&drv);
         eprintln!("CBC-chain pt[16..32] with K=drv_key: {:02x?}", pt_drv);
-        eprintln!("  expected pt[16..24] = [00,10,00,00,00,00,00,00] -> match={}", pt_drv[..8] == [0,0x10,0,0,0,0,0,0]);
+        eprintln!(
+            "  expected pt[16..24] = [00,10,00,00,00,00,00,00] -> match={}",
+            pt_drv[..8] == [0, 0x10, 0, 0, 0, 0, 0, 0]
+        );
 
         // Recover sector-0 IV. AES_dec(drv,ct[0..16]) XOR IV = pt[0..16]. Known pt:
         // 53 43 45 00 03 00 00 00 [kr kr] 01 00 00 06 00 00 (kr = key_revision).
@@ -724,40 +827,82 @@ mod tests {
             let c = aes::Aes128::new(GenericArray::from_slice(&drv));
             let mut b = GenericArray::clone_from_slice(&ct[..16]);
             c.decrypt_block(&mut b);
-            let mut o = [0u8; 16]; o.copy_from_slice(&b); o
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&b);
+            o
         };
         let known_pt: [Option<u8>; 16] = [
-            Some(0x53),Some(0x43),Some(0x45),Some(0x00),Some(0x03),Some(0x00),Some(0x00),Some(0x00),
-            None,None,Some(0x01),Some(0x00),Some(0x00),Some(0x06),Some(0x00),Some(0x00),
+            Some(0x53),
+            Some(0x43),
+            Some(0x45),
+            Some(0x00),
+            Some(0x03),
+            Some(0x00),
+            Some(0x00),
+            Some(0x00),
+            None,
+            None,
+            Some(0x01),
+            Some(0x00),
+            Some(0x00),
+            Some(0x06),
+            Some(0x00),
+            Some(0x00),
         ];
         let mut iv = [0u8; 16];
         let mut mask = [false; 16];
         for j in 0..16 {
-            if let Some(p) = known_pt[j] { iv[j] = dec0[j] ^ p; mask[j] = true; }
+            if let Some(p) = known_pt[j] {
+                iv[j] = dec0[j] ^ p;
+                mask[j] = true;
+            }
         }
         eprintln!("recovered IV (known bytes; ?? = unknown):");
         eprint!("  ");
-        for j in 0..16 { if mask[j] { eprint!("{:02x} ", iv[j]); } else { eprint!("?? "); } }
+        for j in 0..16 {
+            if mask[j] {
+                eprint!("{:02x} ", iv[j]);
+            } else {
+                eprint!("?? ");
+            }
+        }
         eprintln!();
 
         // Candidate IV formulas.
-        let enc = |key: &[u8;16], blk: &[u8;16]| {
+        let enc = |key: &[u8; 16], blk: &[u8; 16]| {
             use aes::cipher::BlockEncrypt;
             let c = aes::Aes128::new(GenericArray::from_slice(key));
             let mut b = GenericArray::clone_from_slice(blk);
             c.encrypt_block(&mut b);
-            let mut o=[0u8;16]; o.copy_from_slice(&b); o
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&b);
+            o
         };
-        let le128 = |n: u64| { let mut b=[0u8;16]; b[..8].copy_from_slice(&n.to_le_bytes()); b };
+        let le128 = |n: u64| {
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&n.to_le_bytes());
+            b
+        };
         let icv_salt = etbl.page_no as u64;
-        let cands: Vec<(&str,[u8;16])> = vec![
-            ("AES_enc(drv, 0)", enc(&drv, &[0u8;16])),
+        let cands: Vec<(&str, [u8; 16])> = vec![
+            ("AES_enc(drv, 0)", enc(&drv, &[0u8; 16])),
             ("AES_enc(drv, LE128(icv_salt))", enc(&drv, &le128(icv_salt))),
-            ("AES_enc(drv, LE128(node.id))", enc(&drv, &le128(eboot_file.node.id as u64))),
-            ("integrity_secret[..16]", { let s = crate::ingest::pfscrypt::integrity_secret_pub(&drv, 0, icv_salt as u32); let mut o=[0u8;16]; o.copy_from_slice(&s[..16]); o }),
-            ("tweak_key(zeros)", crate::ingest::pfscrypt::tweak_key_pub(&[0u8;20])),
+            (
+                "AES_enc(drv, LE128(node.id))",
+                enc(&drv, &le128(eboot_file.node.id as u64)),
+            ),
+            ("integrity_secret[..16]", {
+                let s = crate::ingest::pfscrypt::integrity_secret_pub(&drv, 0, icv_salt as u32);
+                let mut o = [0u8; 16];
+                o.copy_from_slice(&s[..16]);
+                o
+            }),
+            (
+                "tweak_key(zeros)",
+                crate::ingest::pfscrypt::tweak_key_pub(&[0u8; 20]),
+            ),
         ];
-        let matches = |c: &[u8;16]| (0..16).all(|j| !mask[j] || c[j]==iv[j]);
+        let matches = |c: &[u8; 16]| (0..16).all(|j| !mask[j] || c[j] == iv[j]);
         for (name, c) in &cands {
             eprintln!("  cand {:36} = {:02x?} match={}", name, &c[..8], matches(c));
         }
@@ -766,19 +911,32 @@ mod tests {
 
         // Recover FULL sector-0 IVs from files whose first 16 plaintext bytes are
         // fully known (PNG signature + IHDR), across different icv_salt values.
-        let png16: [u8;16] = [0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,0x49,0x48,0x44,0x52];
-        let recover_iv = |path: &str, known: &[u8;16]| -> Option<([u8;16], u32)> {
+        let png16: [u8; 16] = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52,
+        ];
+        let recover_iv = |path: &str, known: &[u8; 16]| -> Option<([u8; 16], u32)> {
             let f = files.iter().find(|f| f.path == path)?;
-            if !f.node.is_encrypted() { return None; }
+            if !f.node.is_encrypted() {
+                return None;
+            }
             let ct = vfs.read(path).ok()?;
             let c = aes::Aes128::new(GenericArray::from_slice(&drv));
             let mut b = GenericArray::clone_from_slice(&ct[..16]);
             c.decrypt_block(&mut b);
-            let mut ivv = [0u8;16];
-            for j in 0..16 { ivv[j] = b[j] ^ known[j]; }
+            let mut ivv = [0u8; 16];
+            for j in 0..16 {
+                ivv[j] = b[j] ^ known[j];
+            }
             Some((ivv, img.unicv.tables[f.table_index].page_no))
         };
-        for p in ["sce_sys/icon0.png","sce_sys/pic0.png","sce_sys/manual/001.png","sce_sys/manual/002.png","sce_sys/livearea/contents/image_common/background.png"] {
+        for p in [
+            "sce_sys/icon0.png",
+            "sce_sys/pic0.png",
+            "sce_sys/manual/001.png",
+            "sce_sys/manual/002.png",
+            "sce_sys/livearea/contents/image_common/background.png",
+        ] {
             if let Some((ivv, page_no)) = recover_iv(p, &png16) {
                 eprintln!("IV[{}] page_no={} : {:02x?}", p, page_no, ivv);
             }
@@ -850,8 +1008,13 @@ mod tests {
                 let ph = e_phoff + i * 32;
                 eprintln!(
                     "  ph{i}: type={:#010x} off={:#010x} vaddr={:#010x} filesz={:#010x} memsz={:#010x} flags={:#x} align={:#x}",
-                    rd32(ph), rd32(ph + 4), rd32(ph + 8), rd32(ph + 16),
-                    rd32(ph + 20), rd32(ph + 24), rd32(ph + 28),
+                    rd32(ph),
+                    rd32(ph + 4),
+                    rd32(ph + 8),
+                    rd32(ph + 16),
+                    rd32(ph + 20),
+                    rd32(ph + 24),
+                    rd32(ph + 28),
                 );
             }
             // Histogram the relocation codes and entry formats in every
@@ -875,10 +1038,15 @@ mod tests {
                 while o + 8 <= blob.len() {
                     let w0 = u32::from_le_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]);
                     match w0 & 0xF {
-                        1 => { short_n += 1; o += 8; }
+                        1 => {
+                            short_n += 1;
+                            o += 8;
+                        }
                         0 => {
                             long_n += 1;
-                            if (w0 >> 20) & 0xFF != 0 { piggyback += 1; }
+                            if (w0 >> 20) & 0xFF != 0 {
+                                piggyback += 1;
+                            }
                             o += 12;
                         }
                         _ => break,

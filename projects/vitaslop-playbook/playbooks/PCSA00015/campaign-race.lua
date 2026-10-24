@@ -2,8 +2,8 @@
 -- SINGLE PLAYER CAMPAIGN, the campaign intro, the campaign MAP, the first event (EMPIRE CLIMB),
 -- its briefing and START, the load, the pre-race RACE card, and a LIVE RACE (LAP 1/3, POS 8/8).
 --
--- Converted from the recipes `boot` (the boot ladder), `front-end` (to the campaign map) and
--- `campaign-race` (to the live race). Each recipe's end point is a phase here.
+-- Converted from the old frame-keyed scripts `boot` (the boot ladder), `front-end` (to the campaign map) and
+-- `campaign-race` (to the live race). Each old script's end point is a phase here.
 --
 -- HOW THE CUES WERE FOUND: `--discover` on `campaign-race`'s run (deterministic, 10000 frames)
 -- next to a shot every 200 frames, and a value search over dumps taken twice on each of six

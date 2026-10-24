@@ -1,0 +1,3 @@
+# Built by `node build.mjs --playbook` (see playbook-build.mjs); vendor/ is committed.
+pkg/
+pkg-threads/

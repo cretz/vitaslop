@@ -15,9 +15,9 @@
 //! one part of PFS not published in any clean source (see [`crate::ingest`] and
 //! the crypto seam below).
 
+use super::Error;
 use super::filesdb::{FilesDb, Node};
 use super::unicv::{FileTable, UnicvDb};
-use super::Error;
 
 /// A file inside a PFS image, paired with its integrity table.
 pub struct PfsFile<'a> {
@@ -48,7 +48,9 @@ impl PfsImage {
     /// table (they are emitted 1:1, in the same order).
     pub fn new(files_db: FilesDb, unicv: UnicvDb) -> Result<PfsImage, Error> {
         if files_db.nodes.len() != unicv.tables.len() {
-            return Err(Error::IntegrityCheck("files.db / unicv.db node count mismatch"));
+            return Err(Error::IntegrityCheck(
+                "files.db / unicv.db node count mismatch",
+            ));
         }
         Ok(PfsImage { files_db, unicv })
     }
@@ -265,7 +267,12 @@ mod tests {
         // The structure is complete; only the crypto seam is unfilled, so an
         // encrypted file surfaces the precise missing-key gap (not a parse error).
         let err = img
-            .decrypt("eboot.bin", b"ciphertext-placeholder", &[0u8; 16], &Unavailable)
+            .decrypt(
+                "eboot.bin",
+                b"ciphertext-placeholder",
+                &[0u8; 16],
+                &Unavailable,
+            )
             .unwrap_err();
         assert!(matches!(err, Error::MissingKey(_)));
     }

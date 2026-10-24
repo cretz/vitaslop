@@ -9,7 +9,6 @@ members = [
     "vitaslop-conformance-suite-arm",
     "vitaslop-desktop",
     "vitaslop-frontend",
-    "vitaslop-gamerun-recipes",
     "vitaslop-gxp-shader",
     "vitaslop-h264",
     "vitaslop-hostcall",

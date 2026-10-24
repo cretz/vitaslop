@@ -13,7 +13,7 @@
 
 use crate::audio::AudioFormat;
 use crate::host::{GuestCtx, VitaState};
-use crate::{hostcall, SvcOutcome};
+use crate::{SvcOutcome, hostcall};
 
 /// Where `sceAudioIn` port ids start. Deliberately above anything `sceAudioOutOpenPort`
 /// hands out, so the two families cannot be confused for each other.
@@ -198,7 +198,12 @@ impl AudioState {
     /// reverse) is refused instead of naming somebody else's port.
     pub(crate) fn in_open(&mut self, ty: i32, grain: u32, freq: u32) -> i32 {
         let port = IN_PORT_BASE + self.in_ports.len() as i32;
-        self.in_ports.push(AudioInPort { port, ty, grain, freq });
+        self.in_ports.push(AudioInPort {
+            port,
+            ty,
+            grain,
+            freq,
+        });
         port
     }
 
@@ -211,7 +216,10 @@ impl AudioState {
 
     /// `(grain, freq)` of an open input port.
     pub(crate) fn in_format(&self, port: i32) -> Option<(u32, u32)> {
-        self.in_ports.iter().find(|p| p.port == port).map(|p| (p.grain, p.freq))
+        self.in_ports
+            .iter()
+            .find(|p| p.port == port)
+            .map(|p| (p.grain, p.freq))
     }
 
     /// Whether a port of `ty` is open (`sceAudioInGetAdopt`).
@@ -239,15 +247,15 @@ impl AudioState {
     /// A volume for a patch we never saw created is DROPPED rather than applied to some
     /// other voice - a misattributed gain is a voice at the wrong level, which is worse
     /// than one at unity because it looks deliberate.
-    /// Unwired today, for the same reason as [`crate::vita::at9::At9Bank::set_gain`]: the
-    /// routing call that would reach it is not implemented. The rule above is the finding.
+    /// Unwired today: no NGS call sets a whole patch to one scalar. The rule above is the
+    /// finding.
     #[allow(dead_code)]
     pub(crate) fn set_patch_volume(&mut self, patch: u32, volume: f32) {
         self.set_patch_cells(patch, None, volume, [[volume, 0.0], [0.0, volume]]);
     }
 
     /// One cell (`Some((source channel, destination channel))`) or the whole 2x2 matrix
-    /// (`None`, `matrix`) of a patch's volume - see `At9Voice::patch`. A non-finite or
+    /// (`None`, `matrix`) of a patch's volume - see `at9::PatchOut`. A non-finite or
     /// negative value is not a volume and is dropped, as the scalar form always did.
     pub(crate) fn set_patch_cells(
         &mut self,
@@ -271,8 +279,8 @@ impl AudioState {
                     "routing volume applied"
                 );
                 match cell {
-                    Some((src, dst)) => self.at9.set_patch_cell(voice, src, dst, volume),
-                    None => self.at9.set_patch_matrix(voice, matrix),
+                    Some((src, dst)) => self.at9.set_patch_cell(patch, src, dst, volume),
+                    None => self.at9.set_patch_matrix(patch, matrix),
                 }
             }
             None => tracing::debug!(
@@ -287,7 +295,10 @@ impl AudioState {
     /// The cached params buffer for a `(voice, module, param)` triple, if one was
     /// already handed out.
     pub(crate) fn ngs_param_buf(&self, key: (u32, u32, u32)) -> Option<u32> {
-        self.ngs_param_bufs.iter().find(|(k, _)| *k == key).map(|(_, a)| *a)
+        self.ngs_param_bufs
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, a)| *a)
     }
 
     /// Append one grain of a port's PCM to that port's raw-s16le capture file, if
@@ -295,13 +306,18 @@ impl AudioState {
     fn capture_pcm(&mut self, port: i32, pcm: &[i16]) {
         if !self.capture_inited {
             self.capture_inited = true;
-            self.capture_base = std::env::var_os("VITASLOP_AUDIO_RAW").map(std::path::PathBuf::from);
+            self.capture_base =
+                std::env::var_os("VITASLOP_AUDIO_RAW").map(std::path::PathBuf::from);
         }
-        let Some(base) = self.capture_base.as_ref() else { return };
+        let Some(base) = self.capture_base.as_ref() else {
+            return;
+        };
         if !self.capture.iter().any(|(p, _)| *p == port) {
             let mut path = base.clone().into_os_string();
             path.push(format!(".p{port}"));
-            let Ok(f) = std::fs::File::create(path) else { return };
+            let Ok(f) = std::fs::File::create(path) else {
+                return;
+            };
             self.capture.push((port, f));
         }
         if let Some((_, f)) = self.capture.iter_mut().find(|(p, _)| *p == port) {
@@ -319,7 +335,14 @@ impl AudioState {
 /// `len` is the grain (frames per output), `mode` 0 = mono / 1 = stereo. Returns
 /// the guest port number (from [`OUT_PORT_BASE`], so always > 0).
 #[hostcall]
-pub(super) fn out_open_port(_ctx: &mut GuestCtx, st: &mut VitaState, ty: i32, len: i32, freq: i32, mode: i32) -> i32 {
+pub(super) fn out_open_port(
+    _ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    ty: i32,
+    len: i32,
+    freq: i32,
+    mode: i32,
+) -> i32 {
     let channels = if mode == 1 { 2 } else { 1 };
     let format = AudioFormat {
         channels,
@@ -406,8 +429,14 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     // port volume is downstream of that buffer, and a title that reads its own output back
     // must see what the DSP wrote, not what the speaker got.
     let port_gain = st.audio_state.gain_of(port);
+    // A REPLAY of this call (see below): the grain was mixed and submitted on the first pass,
+    // and only its callbacks are still being run.
+    let replay = st.ngs_sync_replaying();
     // A null buffer means "drain/stop" on real hardware; nothing to submit.
-    if buf != 0 {
+    if buf != 0 && !replay {
+        if st.audio_state.ngs_port == Some(port) {
+            note_mix_before_callbacks(st.ngs_callbacks_pending());
+        }
         let grain = format.grain as usize;
         let channels = format.channels as usize;
         // The Vita's NGS DSP would have mixed the playing AT9 voices into the master
@@ -434,7 +463,10 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
         //
         // A port that is elected wrongly is audible as the mix arriving at another port's
         // volume, so the election says which port it took, once.
-        let guest_silent = ctx.read_bytes(buf, (grain * channels * 2).min(4096)).iter().all(|&b| b == 0);
+        let guest_silent = ctx
+            .read_bytes(buf, (grain * channels * 2).min(4096))
+            .iter()
+            .all(|&b| b == 0);
         let playing = st.audio_state.at9.any_playing() && !no_ngs_mix();
         if playing && guest_silent && st.audio_state.ngs_port.is_none() {
             st.audio_state.ngs_port = Some(port);
@@ -452,7 +484,9 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             let mut mix = std::mem::take(&mut st.audio_state.scratch_mix);
             mix.clear();
             mix.resize(samples, 0);
-            st.audio_state.at9.mix_grain(ctx, &mut mix, grain, channels, format.sample_rate);
+            st.audio_state
+                .at9
+                .mix_grain(ctx, &mut mix, grain, channels, format.sample_rate);
             super::ngs::report_failed_voices(st);
             // >>> CLAMPED ONCE, INTO BOTH FORMS. The guest's buffer has to receive the mix
             // (the title may read its own buffer back, and on the device the DSP would have
@@ -486,9 +520,19 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             // Stereo is the case that matters and its gain alternates L,R,L,R; a mono port
             // uses one gain throughout. Hoisted out of the loop so the common path has no
             // remainder in it.
-            let (g0, g1) = (port_gain[0], if channels > 1 { port_gain[1] } else { port_gain[0] });
-            for (i, ((b, p), &s)) in
-                bytes.chunks_exact_mut(2).zip(pcm.iter_mut()).zip(mix.iter()).enumerate()
+            let (g0, g1) = (
+                port_gain[0],
+                if channels > 1 {
+                    port_gain[1]
+                } else {
+                    port_gain[0]
+                },
+            );
+            for (i, ((b, p), &s)) in bytes
+                .chunks_exact_mut(2)
+                .zip(pcm.iter_mut())
+                .zip(mix.iter())
+                .enumerate()
             {
                 peak = peak.max(s.saturating_abs());
                 // The guest's buffer gets the mix as the DSP would have written it; the
@@ -524,7 +568,14 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             // already i16 and the gain is <= 1), so this is arithmetically what the sink used
             // to do; it lives here so there is ONE place the port volume is applied. Sized
             // and zipped for the same reason as the mixed path above.
-            let (g0, g1) = (port_gain[0], if channels > 1 { port_gain[1] } else { port_gain[0] });
+            let (g0, g1) = (
+                port_gain[0],
+                if channels > 1 {
+                    port_gain[1]
+                } else {
+                    port_gain[0]
+                },
+            );
             pcm.resize(samples, 0);
             for (i, (p, c)) in pcm.iter_mut().zip(bytes.chunks_exact(2)).enumerate() {
                 let s = i16::from_le_bytes([c[0], c[1]]);
@@ -535,19 +586,49 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
         st.audio_state.capture_pcm(port, &pcm);
         // Counted where the grain is SUBMITTED, so it measures what the guest actually
         // handed the device rather than what it mixed - see `produced_seconds`.
-        match st.audio_state.submitted.iter_mut().find(|(p, ..)| *p == port) {
+        match st
+            .audio_state
+            .submitted
+            .iter_mut()
+            .find(|(p, ..)| *p == port)
+        {
             Some((_, frames, rate)) => {
                 *frames += grain as u64;
                 *rate = format.sample_rate;
             }
-            None => st.audio_state.submitted.push((port, grain as u64, format.sample_rate)),
+            None => st
+                .audio_state
+                .submitted
+                .push((port, grain as u64, format.sample_rate)),
         }
         st.audio.submit(backend_port, &pcm);
         st.audio_state.scratch_pcm = pcm;
         // The buffer boundaries the mix just crossed are module callbacks the title is
         // owed. On the device they fire from the DSP's update; here the update IS the
         // mix, so they fire from it.
-        super::ngs::deliver_player_events(ctx, st);
+        let calls = super::ngs::player_event_calls(st);
+        if !(ngs_cb_sync() && st.ngs_sync_stash(ctx, &calls)) {
+            for (entry, info) in calls {
+                st.enqueue_ngs_callback(ctx, entry, &info);
+            }
+        }
+    }
+    // >>> THE CALLBACKS RUN HERE, ON THIS THREAD, BEFORE THE CALL RETURNS.
+    //
+    // On the device the player module's callbacks come out of the update the audio thread
+    // drives, ON that thread, so a streaming title's refill of the slot it was told about has
+    // always landed before that thread's next update reads the ring. Run on a serial thread of
+    // their own, they raced it: MEASURED (desktop browser, SMP, an RPG whose rings are two slots
+    // of ONE superframe each against its grain - every grain swaps a slot) 8380 of 29184 grains
+    // were mixed before an earlier grain's callbacks had finished, and a stale or half-copied
+    // superframe stopped a voice (`UnpackScaleFactor*`, `UnpackBandParamsInvalid`). Its callback
+    // FILLS the slot itself, spinning on `sceKernelDelayThread(50)` until its stream has data,
+    // so waiting on that thread from here cost 3.3 s of underrun in 164 s; run here, as the
+    // device runs it, it costs what the callback costs. Each call is a guest call made by this
+    // host call (`VitaState::call_guest`), so this dispatch replays once per callback;
+    // `VITASLOP_NGS_CB_SYNC=0` is the arm back to the serial callback thread.
+    if !st.ngs_sync_run() {
+        return SvcOutcome::CallGuest;
     }
     ctx.ret(0);
     // One grain plays for `grain / sample_rate` seconds.
@@ -556,6 +637,66 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     } else {
         0
     };
+    let pace = pace_output(st, port, buf, paced_us);
+    match pace {
+        Pace::Continue => SvcOutcome::Continue,
+        Pace::Wall(until) => {
+            st.wall_park(until);
+            SvcOutcome::Block
+        }
+        Pace::Sleep(us) => {
+            st.sleep_park(us);
+            SvcOutcome::Block
+        }
+    }
+}
+/// What [`pace_output`] decided: return at once, or park until a wall-clock time or for a
+/// guest-clock span. Applied by the caller.
+enum Pace {
+    Continue,
+    Wall(u64),
+    Sleep(u64),
+}
+
+/// Count the NGS grains mixed while an earlier grain's callbacks were still pending - the
+/// race [`out_output`]'s synchronous callbacks remove, measured directly so an A/B does not
+/// have to wait for the rare voice it loses to show up. Reported every 256 grains once it has
+/// happened.
+fn note_mix_before_callbacks(pending: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static GRAINS: AtomicU64 = AtomicU64::new(0);
+    static EARLY: AtomicU64 = AtomicU64::new(0);
+    let n = GRAINS.fetch_add(1, Relaxed) + 1;
+    let early = if pending {
+        EARLY.fetch_add(1, Relaxed) + 1
+    } else {
+        EARLY.load(Relaxed)
+    };
+    if early > 0 && n.is_multiple_of(256) {
+        tracing::info!(
+            target: "vitaslop::status",
+            "ngs: {early} of {n} grain(s) were mixed while an earlier grain's callbacks had not \
+             finished - a streaming slot read before its refill"
+        );
+    }
+}
+
+/// Whether `sceAudioOutOutput` runs the NGS callbacks its mix raised on its own thread before
+/// returning (the device's order) - see [`out_output`]. `0` sends them to the serial callback
+/// thread instead.
+fn ngs_cb_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::knobs::var("VITASLOP_NGS_CB_SYNC")
+            .as_deref()
+            .map(str::trim)
+            != Ok("0")
+    })
+}
+
+/// The pacing half of [`out_output`]: when the port's thread should next run - its grain's
+/// slot in the port's play-out schedule.
+fn pace_output(st: &mut VitaState, port: i32, buf: u32, paced_us: u64) -> Pace {
     // >>> PACED BY THE PORT'S PLAY-OUT SCHEDULE, NOT BY A SLEEP FROM NOW.
     //
     // The device plays a port's grains back to back and `sceAudioOutOutput` returns once the
@@ -582,9 +723,19 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     // catches straight back up. Only its park is on the virtual clock, which is the one the
     // scheduler has. `VITASLOP_AUDIO_WALL=0` is the arm back; off during a fast-forward and on
     // a host that installed no wall clock.
-    if paced_us > 0 && st.is_preemptive() && audio_schedule() && buf != 0 && let Some(now_w) = audio_wall_pacing(st) {
+    if paced_us > 0
+        && st.is_preemptive()
+        && audio_schedule()
+        && buf != 0
+        && let Some(now_w) = audio_wall_pacing(st)
+    {
         let lead = paced_us * AUDIO_WALL_LEAD;
-        let ahead = match st.audio_state.ports.iter_mut().find(|p| p.guest_port == port) {
+        let ahead = match st
+            .audio_state
+            .ports
+            .iter_mut()
+            .find(|p| p.guest_port == port)
+        {
             Some(p) => {
                 // A port that fell behind (the ring underran, or the thread was not scheduled)
                 // restarts from now - the device does not replay silence it already played.
@@ -599,24 +750,31 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
         };
         return if ahead > lead {
             if crate::host::wall_parks_served() {
-                st.wall_park(now_w + (ahead - lead));
+                Pace::Wall(now_w + (ahead - lead))
             } else {
-                st.sleep_park(ahead - lead);
+                Pace::Sleep(ahead - lead)
             }
-            SvcOutcome::Block
         } else {
-            SvcOutcome::Continue
+            Pace::Continue
         };
     }
     if paced_us > 0 && st.is_preemptive() && !audio_schedule() {
         // The arm back: one grain's sleep from now.
-        st.sleep_park(paced_us);
-        SvcOutcome::Block
+        Pace::Sleep(paced_us)
     } else if paced_us > 0 && st.is_preemptive() {
         let now = st.now_us();
-        let wake = match st.audio_state.ports.iter_mut().find(|p| p.guest_port == port) {
+        let wake = match st
+            .audio_state
+            .ports
+            .iter_mut()
+            .find(|p| p.guest_port == port)
+        {
             Some(p) => {
-                let start = if buf != 0 { p.play_end_us.max(now) } else { p.play_end_us };
+                let start = if buf != 0 {
+                    p.play_end_us.max(now)
+                } else {
+                    p.play_end_us
+                };
                 if buf != 0 {
                     p.play_end_us = start + paced_us;
                 }
@@ -625,13 +783,12 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             None => now + paced_us,
         };
         if wake > now {
-            st.sleep_park(wake - now);
-            SvcOutcome::Block
+            Pace::Sleep(wake - now)
         } else {
-            SvcOutcome::Continue
+            Pace::Continue
         }
     } else {
-        SvcOutcome::Continue
+        Pace::Continue
     }
 }
 
@@ -673,8 +830,14 @@ const AUDIO_WALL_LEAD: u64 = 4;
 fn audio_wall_pacing(st: &VitaState) -> Option<u64> {
     static CFG: std::sync::OnceLock<(bool, u64)> = std::sync::OnceLock::new();
     let (on, ff) = *CFG.get_or_init(|| {
-        let on = crate::knobs::var("VITASLOP_AUDIO_WALL").as_deref().map(str::trim) != Ok("0");
-        let ff = crate::knobs::var("VITASLOP_BROWSER_FASTFORWARD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        let on = crate::knobs::var("VITASLOP_AUDIO_WALL")
+            .as_deref()
+            .map(str::trim)
+            != Ok("0");
+        let ff = crate::knobs::var("VITASLOP_BROWSER_FASTFORWARD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
         (on, ff)
     });
     if !on || st.cur_frame() < ff {
@@ -688,21 +851,33 @@ fn audio_wall_pacing(st: &VitaState) -> Option<u64> {
 /// call.
 fn audio_schedule() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::var("VITASLOP_AUDIO_SCHEDULE").as_deref().map(str::trim) != Ok("0"))
+    *ON.get_or_init(|| {
+        crate::knobs::var("VITASLOP_AUDIO_SCHEDULE")
+            .as_deref()
+            .map(str::trim)
+            != Ok("0")
+    })
 }
 
 /// int sceAudioOutSetVolume(int port, SceAudioOutChannelFlag ch, int *vol)
 /// `ch` is a bitmask of channels to set; `vol` points to one value per set channel.
 #[hostcall]
-pub(super) fn out_set_volume(ctx: &mut GuestCtx, st: &mut VitaState, port: i32, ch: i32, vol: Ptr) -> i32 {
+pub(super) fn out_set_volume(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    port: i32,
+    ch: i32,
+    vol: Ptr,
+) -> i32 {
     match st.audio_state.format_of(port) {
         None => -1,
         Some((backend_port, _)) => {
             // `vol` carries one entry per bit set in `ch` (L=1, R=2), ascending.
             let count = (ch & 0x3).count_ones() as usize;
             if vol.addr() != 0 && count > 0 {
-                let vols: Vec<i32> =
-                    (0..count).map(|i| ctx.read_u32(vol.addr() + (i as u32) * 4) as i32).collect();
+                let vols: Vec<i32> = (0..count)
+                    .map(|i| ctx.read_u32(vol.addr() + (i as u32) * 4) as i32)
+                    .collect();
                 tracing::debug!(
                     target: "vitaslop::at9",
                     port,
@@ -717,8 +892,11 @@ pub(super) fn out_set_volume(ctx: &mut GuestCtx, st: &mut VitaState, port: i32, 
                 // it now precisely so this is not applied twice.
                 for (c, v) in vols.iter().enumerate().take(2) {
                     let g = (*v as f32 / 32768.0).clamp(0.0, 1.0);
-                    if let Some(p) =
-                        st.audio_state.ports.iter_mut().find(|p| p.guest_port == port)
+                    if let Some(p) = st
+                        .audio_state
+                        .ports
+                        .iter_mut()
+                        .find(|p| p.guest_port == port)
                     {
                         p.gain[c] = g;
                         // A one-channel set on a stereo port applies to both, which is what
@@ -739,7 +917,12 @@ pub(super) fn out_set_volume(ctx: &mut GuestCtx, st: &mut VitaState, port: i32, 
 /// int sceAudioOutReleasePort(int port)
 #[hostcall]
 pub(super) fn out_release_port(_ctx: &mut GuestCtx, st: &mut VitaState, port: i32) -> i32 {
-    if let Some(pos) = st.audio_state.ports.iter().position(|p| p.guest_port == port) {
+    if let Some(pos) = st
+        .audio_state
+        .ports
+        .iter()
+        .position(|p| p.guest_port == port)
+    {
         let backend = st.audio_state.ports.remove(pos).backend_port;
         st.audio.close_port(backend);
         0
@@ -763,7 +946,12 @@ mod open_port_tests {
         let mut bytes = vec![0u8; 64];
         let mut mem = SliceMemory(&mut bytes);
         let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
-        super::super::dispatch(crate::nid::lib::SCE_AUDIO, crate::nid::audio::OUT_OPEN_PORT, &mut ctx, st);
+        super::super::dispatch(
+            crate::nid::lib::SCE_AUDIO,
+            crate::nid::audio::OUT_OPEN_PORT,
+            &mut ctx,
+            st,
+        );
         regs[0] as i32
     }
 
@@ -776,6 +964,9 @@ mod open_port_tests {
         let b = open(&mut st);
         assert!(a > 0, "first port {a}");
         assert!(b > 0 && b != a, "second port {b}");
-        assert!(b < super::IN_PORT_BASE, "out ports stay below the sceAudioIn range");
+        assert!(
+            b < super::IN_PORT_BASE,
+            "out ports stay below the sceAudioIn range"
+        );
     }
 }

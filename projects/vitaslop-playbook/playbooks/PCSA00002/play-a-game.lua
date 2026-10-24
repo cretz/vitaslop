@@ -3,7 +3,7 @@
 -- lineup, stadium and options screens, load into the game, and SWING at the plate until the
 -- ball is put in play.
 --
--- Converted from the recipes `boot-user-settings` (boot to the first screen), `into-a-game` and
+-- Converted from the old frame-keyed scripts `boot-user-settings` (boot to the first screen), `into-a-game` and
 -- `fast-at-bat` (the menu walk to a live game) and `play-a-game` (the same, as P1, swinging).
 -- `swing-and-play` was the CPU playing itself (P1 never assigned) and is superseded.
 --

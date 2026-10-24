@@ -1,12 +1,12 @@
 -- Hot Shots Golf: World Invitational (PCSA00009): boot, clear the autosave dialog, walk the
 -- front end to a STROKE PLAY round at Maple Leaf Golf Club, and play HOLE 1 into the cup.
 --
--- Converted from the recipe `hole-one`, which played the hole as ~250 presses at fixed frames.
+-- Converted from the old frame-keyed script `hole-one`, which played the hole as ~250 presses at fixed frames.
 -- Measured 10-16: that sequence no longer holes out - its drive now lands on a staircase lie
 -- ("Cannot hit in this direction") and every later press is ignored for 23,000 frames. This
 -- plays each stroke off the game's own stroke state instead.
 --
--- HOW THE CUES WERE FOUND: `--discover` on the recipe's run (deterministic, 26000 frames) next
+-- HOW THE CUES WERE FOUND: `--discover` on the old script's run (deterministic, 26000 frames) next
 -- to a shot every 200 frames; the stroke state by value search over memory dumps taken every
 -- 20 frames across two strokes. Frames are from that run:
 --
@@ -45,7 +45,7 @@ local addressing = stroke:is(20)
 local in_flight  = stroke:isnt(20)
 
 phase("boot", { timeout = 120 }, function()
-  -- The autosave dialog is drawn by the game and makes no call. The recipe cleared it with
+  -- The autosave dialog is drawn by the game and makes no call. The old script cleared it with
   -- cross, circle, cross, circle; CROSS also skips the title movie and takes the title screen.
   -- MEASURED in the browser: a profile that already has the save skips the dialog and the
   -- movie entirely - so the only wait is for the main menu's music, checked after EACH press
@@ -63,7 +63,7 @@ phase("boot", { timeout = 120 }, function()
 end)
 
 phase("front-end", { timeout = 180 }, function()
-  -- The main menu opens on SINGLE PLAYER. (The recipe called its first CROSS here "New Game";
+  -- The main menu opens on SINGLE PLAYER. (The old script called its first CROSS here "New Game";
   -- that press was taken by the title screen.) A second CROSS picks CHALLENGE, the mode list's
   -- first entry - a first draft did, and its own loop played a Challenge round.
   tap("cross", 6, 90)

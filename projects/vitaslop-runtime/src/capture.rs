@@ -1,4 +1,4 @@
-﻿//! The GXM command-stream capture: the blob-free "it works" signal. The host
+//! The GXM command-stream capture: the blob-free "it works" signal. The host
 //! records what the guest asked the GPU to do (surfaces, programs, per-draw
 //! vertex/index/uniform snapshots) without emulating a GPU or drawing a pixel.
 //! A software rasterizer or wgpu backend later consumes this to produce frames.
@@ -109,43 +109,43 @@ pub struct RenderState {
 impl Default for RenderState {
     fn default() -> Self {
         RenderState {
-            cull_mode: 0x0000_0000,               // SCE_GXM_CULL_NONE
-            two_sided: 0x0000_0000,               // SCE_GXM_TWO_SIDED_DISABLED
-            front_depth_func: 0x00C0_0000,        // SCE_GXM_DEPTH_FUNC_LESS_EQUAL
-            front_depth_bias_factor: 0,           // no polygon offset
+            cull_mode: 0x0000_0000,        // SCE_GXM_CULL_NONE
+            two_sided: 0x0000_0000,        // SCE_GXM_TWO_SIDED_DISABLED
+            front_depth_func: 0x00C0_0000, // SCE_GXM_DEPTH_FUNC_LESS_EQUAL
+            front_depth_bias_factor: 0,    // no polygon offset
             front_depth_bias_units: 0,
-            back_depth_func: 0x00C0_0000,         // SCE_GXM_DEPTH_FUNC_LESS_EQUAL
-            front_depth_write: 0x0000_0000,       // SCE_GXM_DEPTH_WRITE_ENABLED
-            back_depth_write: 0x0000_0000,        // SCE_GXM_DEPTH_WRITE_ENABLED
-            front_fragment_program_enable: 0x0,   // SCE_GXM_FRAGMENT_PROGRAM_ENABLED
-            back_fragment_program_enable: 0x0,    // SCE_GXM_FRAGMENT_PROGRAM_ENABLED
-            front_polygon_mode: 0x0000_0000,      // SCE_GXM_POLYGON_MODE_TRIANGLE_FILL
-            back_polygon_mode: 0x0000_0000,       // SCE_GXM_POLYGON_MODE_TRIANGLE_FILL
+            back_depth_func: 0x00C0_0000, // SCE_GXM_DEPTH_FUNC_LESS_EQUAL
+            front_depth_write: 0x0000_0000, // SCE_GXM_DEPTH_WRITE_ENABLED
+            back_depth_write: 0x0000_0000, // SCE_GXM_DEPTH_WRITE_ENABLED
+            front_fragment_program_enable: 0x0, // SCE_GXM_FRAGMENT_PROGRAM_ENABLED
+            back_fragment_program_enable: 0x0, // SCE_GXM_FRAGMENT_PROGRAM_ENABLED
+            front_polygon_mode: 0x0000_0000, // SCE_GXM_POLYGON_MODE_TRIANGLE_FILL
+            back_polygon_mode: 0x0000_0000, // SCE_GXM_POLYGON_MODE_TRIANGLE_FILL
             front_point_line_width: 1,
             front_stencil_ref: 0,
-            front_stencil_func: 0x0E00_0000,      // SCE_GXM_STENCIL_FUNC_ALWAYS
-            front_stencil_op_fail: 0,             // SCE_GXM_STENCIL_OP_KEEP
-            front_stencil_op_depth_fail: 0,       // SCE_GXM_STENCIL_OP_KEEP
-            front_stencil_op_depth_pass: 0,       // SCE_GXM_STENCIL_OP_KEEP
+            front_stencil_func: 0x0E00_0000, // SCE_GXM_STENCIL_FUNC_ALWAYS
+            front_stencil_op_fail: 0,        // SCE_GXM_STENCIL_OP_KEEP
+            front_stencil_op_depth_fail: 0,  // SCE_GXM_STENCIL_OP_KEEP
+            front_stencil_op_depth_pass: 0,  // SCE_GXM_STENCIL_OP_KEEP
             front_stencil_compare_mask: 0xff,
             front_stencil_write_mask: 0xff,
             // The same defaults as the front face: with two-sided disabled (the default)
             // the front state applies to both, so matching it is what makes an unset back
             // face agree with the face it is actually rendered as.
-            back_stencil_func: 0x0E00_0000,       // SCE_GXM_STENCIL_FUNC_ALWAYS
-            back_stencil_op_fail: 0,              // SCE_GXM_STENCIL_OP_KEEP
-            back_stencil_op_depth_fail: 0,        // SCE_GXM_STENCIL_OP_KEEP
-            back_stencil_op_depth_pass: 0,        // SCE_GXM_STENCIL_OP_KEEP
+            back_stencil_func: 0x0E00_0000, // SCE_GXM_STENCIL_FUNC_ALWAYS
+            back_stencil_op_fail: 0,        // SCE_GXM_STENCIL_OP_KEEP
+            back_stencil_op_depth_fail: 0,  // SCE_GXM_STENCIL_OP_KEEP
+            back_stencil_op_depth_pass: 0,  // SCE_GXM_STENCIL_OP_KEEP
             back_stencil_compare_mask: 0xff,
             back_stencil_write_mask: 0xff,
             back_stencil_ref: 0,
-            viewport_enable: 0x0000_0000,         // SCE_GXM_VIEWPORT_ENABLED
+            viewport_enable: 0x0000_0000, // SCE_GXM_VIEWPORT_ENABLED
             viewport: [0.0; 6],
-            region_clip_mode: 0x0000_0000,        // SCE_GXM_REGION_CLIP_NONE
+            region_clip_mode: 0x0000_0000, // SCE_GXM_REGION_CLIP_NONE
             region_clip: [0; 4],
-            front_visibility_test_enable: 0,      // SCE_GXM_VISIBILITY_TEST_DISABLED
+            front_visibility_test_enable: 0, // SCE_GXM_VISIBILITY_TEST_DISABLED
             front_visibility_test_index: 0,
-            front_visibility_test_op: 0,          // SCE_GXM_VISIBILITY_TEST_OP_INCREMENT
+            front_visibility_test_op: 0, // SCE_GXM_VISIBILITY_TEST_OP_INCREMENT
         }
     }
 }
@@ -339,6 +339,10 @@ pub struct BoundTexture {
     /// hands the shader the encoded bytes as if they were linear, and everything derived from
     /// that texture comes out too BRIGHT in the mid-tones.
     pub gamma: u32,
+    /// For a YUV texture: the `SceGxmYuvProfile` (0 BT.601 studio, 1 BT.709 studio, 2 BT.601
+    /// full range, 3 BT.709 full range) of the conversion slot its swizzle names, as the context
+    /// had it set (`sceGxmSetYuvProfile`) when the draw was captured. 0, the default, otherwise.
+    pub yuv_profile: u32,
 }
 
 /// The per-material fragment-shader inputs recovered by reflecting the bound fragment
@@ -535,15 +539,15 @@ pub struct Draw {
     /// Raw vertex default-uniform-buffer (SA bank) bytes exactly as the guest wrote them -
     /// the recompiled vertex shader reads these directly, NOT the MVP-stamped `uniforms`
     /// above (which the fixed-function path needs but the real shader recomputes itself).
-///
-/// >>> SHARED (`Arc<[u8]>`), NOT OWNED: THIS BANK WAS COPIED TWICE PER DRAW.
-/// > > > It is read out of guest memory in `record_draw` and CLONED again when
-/// > > > `RenderSceneBuilder::build` turns the captured draw into a render draw, so a 525-draw
-/// > > > race frame at 60 fps made ~126,000 heap allocations a second for byte ranges nobody
-/// > > > mutates - a V8 worker profile put 1.0% of the whole thread in `malloc` under
-/// > > > `record_draw` alone. Every reader wants `&[u8]` (hash it, walk it in `chunks_exact(4)`,
-/// > > > ask its length), so sharing costs them nothing and the clone becomes a refcount bump.
-/// > > > The program blobs beside it are already carried this way.
+    ///
+    /// >>> SHARED (`Arc<[u8]>`), NOT OWNED: THIS BANK WAS COPIED TWICE PER DRAW.
+    /// > > > It is read out of guest memory in `record_draw` and CLONED again when
+    /// > > > `RenderSceneBuilder::build` turns the captured draw into a render draw, so a 525-draw
+    /// > > > race frame at 60 fps made ~126,000 heap allocations a second for byte ranges nobody
+    /// > > > mutates - a V8 worker profile put 1.0% of the whole thread in `malloc` under
+    /// > > > `record_draw` alone. Every reader wants `&[u8]` (hash it, walk it in `chunks_exact(4)`,
+    /// > > > ask its length), so sharing costs them nothing and the clone becomes a refcount bump.
+    /// > > > The program blobs beside it are already carried this way.
     pub vert_sa: std::sync::Arc<[u8]>,
     /// Raw fragment default-uniform-buffer (SA bank) bytes exactly as the guest wrote them,
     /// consumed by the recompiled fragment shader's `@group(1)` uniform. Empty off-path.
@@ -719,7 +723,10 @@ fn report_adopted_viewport_extent(data_addr: u32, from: (u32, u32), to: (u32, u3
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<(u32, u32, u32, u32, u32)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((data_addr, from.0, from.1, to.0, to.1)) {
+    if !g
+        .get_or_insert_with(HashSet::new)
+        .insert((data_addr, from.0, from.1, to.0, to.1))
+    {
         return;
     }
     tracing::warn!(
@@ -759,7 +766,9 @@ impl Scene {
         if c.width > 1 && c.height > 1 {
             return;
         }
-        let Some(first) = self.draws.first() else { return };
+        let Some(first) = self.draws.first() else {
+            return;
+        };
         // Only when the viewport is actually in effect (`SCE_GXM_VIEWPORT_ENABLED` is
         // 0); with it disabled the transform is the render target's and this says
         // nothing.
@@ -803,9 +812,9 @@ impl Scene {
 /// A game->OS "egress" event: something the guest handed to the system that
 /// carries game-authored, human-readable meaning - a savedata write, a trophy
 /// unlock, a leaderboard score submission. This is the content-ful, title-agnostic
-/// seam a conformance recipe asserts on: it is the Vita OS API surface, NOT the
+/// seam a run's checks read: it is the Vita OS API surface, NOT the
 /// game's private memory (which would be per-title RE and brittle). Every event is
-/// tagged with the display frame it occurred on, so a recipe can assert both what
+/// tagged with the display frame it occurred on, so a check can establish both what
 /// the game did and (loosely) when - the human-readable proof a run reached a game
 /// milestone, replacing a screenshot assertion.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -824,7 +833,11 @@ pub enum EgressKind {
     /// `ascii` is a printable-ASCII preview (non-printable bytes shown as `.`), so a
     /// human-readable save - a high score, an unlocked level id - is visible without
     /// a pixel. This is where a title's score often lands on the offline path.
-    SaveWrite { path: String, bytes: usize, ascii: String },
+    SaveWrite {
+        path: String,
+        bytes: usize,
+        ascii: String,
+    },
     /// A trophy was unlocked (`sceNpTrophyUnlockTrophy`): the trophy id.
     Trophy { id: i32 },
     /// A score was submitted to a leaderboard (`sceNpScore*`): board id and value.
@@ -838,7 +851,13 @@ pub enum EgressKind {
 pub fn ascii_preview(data: &[u8], max: usize) -> String {
     data.iter()
         .take(max)
-        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
         .collect()
 }
 
@@ -966,7 +985,7 @@ const FNV_LANES: usize = 8;
 /// or allocation dependence. It is NOT the same VALUE as the serial fold, so
 /// signatures do not compare across this change - they never had to, since a
 /// signature is only ever compared between runs of the same build (`explore`'s
-/// bucketing, a recipe's `@sig`).
+/// bucketing, a replayed tape's signature).
 fn fnv_bulk(h: &mut u64, bytes: &[u8]) {
     // Length first, so appending zero bytes cannot leave the digest unchanged and two
     // differently-split blobs cannot collide by concatenation.
@@ -1055,7 +1074,10 @@ fn report_frame_scene_cap(passes: usize) {
 
 impl Capture {
     pub fn new() -> Self {
-        Capture { retired_digest: FNV_OFFSET, ..Capture::default() }
+        Capture {
+            retired_digest: FNV_OFFSET,
+            ..Capture::default()
+        }
     }
 
     /// Record a completed scene, evicting the oldest if `scene_limit` is set.
@@ -1070,7 +1092,9 @@ impl Capture {
         self.scenes.push(scene);
         self.frame_scenes += 1;
         self.scenes_pushed += 1;
-        let Some(limit) = self.scene_limit else { return };
+        let Some(limit) = self.scene_limit else {
+            return;
+        };
         // Never evict below ONE WHOLE FRAME - the scenes of the last completed frame
         // plus the one being built. A frame is not a scene: a title renders its world,
         // shadows and post passes offscreen and then composites them, so a capture
@@ -1096,8 +1120,7 @@ impl Capture {
             // a frame on this title's race, MEASURED at 7.9% of the whole frame. That is the
             // right price for the only cross-engine equivalence check there is, and it is pure
             // waste on a live player session, which never asks for the number: the browser reads
-            // `signature()` only when it is EVALUATING a recipe, and the user's own captures say
-            // `recipe: (none)`.
+            // `signature()` only when a harness asks for it, and the user's own captures never do.
             //
             // Skipping silently would be far worse than the cost, so the skip is remembered and
             // `signature()` refuses to make one up - see there.
@@ -1148,7 +1171,11 @@ impl Capture {
         for v in d.vertices.chunks_exact(stride) {
             for (l, c) in v.chunks_exact(4).enumerate() {
                 let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                let bits = if f.is_nan() { f32::NAN.to_bits() } else { f.to_bits() };
+                let bits = if f.is_nan() {
+                    f32::NAN.to_bits()
+                } else {
+                    f.to_bits()
+                };
                 fnv_bulk(&mut hs[l], &bits.to_le_bytes());
             }
         }
@@ -1195,7 +1222,11 @@ impl Capture {
         self.scenes
             .iter()
             .map(|s| {
-                let (addr, fmt) = s.color.as_ref().map(|c| (c.data_addr, c.format)).unwrap_or((0, 0));
+                let (addr, fmt) = s
+                    .color
+                    .as_ref()
+                    .map(|c| (c.data_addr, c.format))
+                    .unwrap_or((0, 0));
                 (s.draws.len(), addr, fmt)
             })
             .collect()
@@ -1244,7 +1275,11 @@ impl Capture {
                     let mut cbuf = Vec::with_capacity(d.vertices.len());
                     for c in d.vertices.chunks_exact(4) {
                         let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                        let bits = if v.is_nan() { f32::NAN.to_bits() } else { v.to_bits() };
+                        let bits = if v.is_nan() {
+                            f32::NAN.to_bits()
+                        } else {
+                            v.to_bits()
+                        };
                         cbuf.extend_from_slice(&bits.to_le_bytes());
                     }
                     fnv_bulk(&mut hc, &cbuf);
@@ -1280,7 +1315,11 @@ impl Capture {
     /// did differently), while a different count means it took a different PATH earlier in
     /// that same frame. Cumulative on both engines, so the two logs subtract.
     pub fn stream_counts(&self) -> (u64, usize, u64) {
-        (self.retired_scenes + self.scenes.len() as u64, self.egress.len(), self.call_count)
+        (
+            self.retired_scenes + self.scenes.len() as u64,
+            self.egress.len(),
+            self.call_count,
+        )
     }
 
     /// Take every scene captured so far, folding each into the determinism digest on the way
@@ -1294,8 +1333,8 @@ impl Capture {
     /// a number which looks exactly like a real hash and compares unequal for a reason nothing
     /// records, i.e. precisely the failure `signature` documents as the worst one available.
     ///
-    /// MEASURED before the fix: every `sigtrace` line of a browser run of a golf recipe read
-    /// `0xcbf29ce484222325` - the empty fold - and the recipe's `@sig` assertion "FAILED" for
+    /// MEASURED before the fix: every `sigtrace` line of a browser run of a scripted golf session read
+    /// `0xcbf29ce484222325` - the empty fold - and the run's signature check "FAILED" for
     /// that reason rather than for any divergence, which is exactly the wrong diagnosis to hand
     /// someone chasing a browser-only bug.
     pub fn take_frame_scenes(&mut self) -> Vec<Scene> {
@@ -1304,8 +1343,9 @@ impl Capture {
         // A scene whose geometry is still pending (`deferred_id != 0`) is NOT taken: its
         // bytes are read at the guest's flip, which on some titles comes after this frame
         // boundary. It stays for the next take - see the desktop's twin in `retail.rs`.
-        let (pending, taken): (Vec<_>, Vec<_>) =
-            core::mem::take(&mut self.scenes).into_iter().partition(|s| s.deferred_id != 0);
+        let (pending, taken): (Vec<_>, Vec<_>) = core::mem::take(&mut self.scenes)
+            .into_iter()
+            .partition(|s| s.deferred_id != 0);
         self.scenes = pending;
         for old in &taken {
             if self.fold_disabled {
@@ -1326,7 +1366,7 @@ impl Capture {
 
     /// Whether this run will ever be asked for its determinism [`signature`](Self::signature).
     ///
-    /// ON by default, so every existing tool - `explore`, `memdiff`, the recipe runner, the
+    /// ON by default, so every existing tool - `explore`, `memdiff`, the headless runner, the
     /// session - keeps working with no change and no chance of being handed a hash of half a
     /// run. A LIVE PLAYER turns it off, because it never asks.
     ///
@@ -1341,7 +1381,7 @@ impl Capture {
     /// scene's render stream (evicted ones via `retired_digest`) then the egress
     /// ledger. Engine-independent by construction - it covers what the guest
     /// PRODUCED, never internal RAM or thread timing - so native, headless and
-    /// browser runs of the same recipe must agree on it.
+    /// browser runs of the same input must agree on it.
     ///
     /// # It REFUSES rather than answering when scenes were retired unfolded
     /// A run that turned [`set_signature_wanted`](Self::set_signature_wanted) off dropped scenes
@@ -1393,7 +1433,9 @@ impl Capture {
     /// Folded into the signature as any evicted scene is; a scene whose geometry is still
     /// pending stays, for its own resolve.
     fn retire_oldest_untaken_frame(&mut self) {
-        let Some(end) = self.flip_ends.pop_front() else { return };
+        let Some(end) = self.flip_ends.pop_front() else {
+            return;
+        };
         let first = self.scenes_pushed - self.scenes.len() as u64;
         let n = end.saturating_sub(first).min(self.scenes.len() as u64) as usize;
         let rest = self.scenes.split_off(n);
@@ -1440,7 +1482,9 @@ impl Capture {
                 self.flip_ends.pop_front();
             }
         }
-        let Some(end) = self.flip_ends.pop_front() else { return self.take_frame_scenes() };
+        let Some(end) = self.flip_ends.pop_front() else {
+            return self.take_frame_scenes();
+        };
         // Serial of `scenes[0]`: everything before it was evicted or taken. (A scene left
         // behind as pending by an earlier take keeps its slot at the front, so this reads it as
         // one serial newer than it is and the take reaches one scene further - the one extra
@@ -1523,13 +1567,22 @@ impl Capture {
         // Every texture the final pass reads, by guest address.
         let composited: std::collections::BTreeSet<u32> = frame
             .last()
-            .map(|s| s.draws.iter().flat_map(|d| d.textures.iter()).map(|t| t.data_addr).collect())
+            .map(|s| {
+                s.draws
+                    .iter()
+                    .flat_map(|d| d.textures.iter())
+                    .map(|t| t.data_addr)
+                    .collect()
+            })
             .unwrap_or_default();
         frame
             .iter()
             .filter(|s| crate::render::scene_eye(s).is_some())
             .max_by_key(|s| {
-                let area = s.color.as_ref().map_or(0u64, |c| c.width as u64 * c.height as u64);
+                let area = s
+                    .color
+                    .as_ref()
+                    .map_or(0u64, |c| c.width as u64 * c.height as u64);
                 let sampled = s
                     .color
                     .as_ref()
@@ -1565,8 +1618,13 @@ impl Capture {
 
     /// Note an unimplemented call once (deduplicated by NID pair).
     pub fn note_unimplemented(&mut self, library_nid: u32, func_nid: u32, name: &str) {
-        if !self.unimplemented.iter().any(|(l, f, _)| *l == library_nid && *f == func_nid) {
-            self.unimplemented.push((library_nid, func_nid, name.to_string()));
+        if !self
+            .unimplemented
+            .iter()
+            .any(|(l, f, _)| *l == library_nid && *f == func_nid)
+        {
+            self.unimplemented
+                .push((library_nid, func_nid, name.to_string()));
         }
     }
 }
@@ -1588,7 +1646,11 @@ mod flip_take_tests {
         for _ in 0..2 {
             c.push_scene(Scene::default());
         }
-        assert_eq!(c.take_scenes_through_flip().len(), 3, "exactly the flipped frame");
+        assert_eq!(
+            c.take_scenes_through_flip().len(),
+            3,
+            "exactly the flipped frame"
+        );
         assert_eq!(c.scenes.len(), 2, "the next frame's scenes stay");
         c.end_frame();
         assert_eq!(c.take_scenes_through_flip().len(), 2);
@@ -1624,7 +1686,11 @@ mod flip_take_tests {
             c.end_frame();
         }
         c.push_scene(Scene::default());
-        assert_eq!(c.take_scenes_through_flips(3).len(), 6, "all three frames, in order");
+        assert_eq!(
+            c.take_scenes_through_flips(3).len(),
+            6,
+            "all three frames, in order"
+        );
         assert_eq!(c.scenes.len(), 1, "the frame under way stays");
         c.take_frame_scenes();
 
@@ -1635,8 +1701,16 @@ mod flip_take_tests {
             }
             c.end_frame();
         }
-        assert_eq!(c.scenes.len(), 5, "the oldest untaken frame's 5 scenes are retired");
-        assert_eq!(c.take_scenes_through_flips(3).len(), 5, "what is left: the last two frames");
+        assert_eq!(
+            c.scenes.len(),
+            5,
+            "the oldest untaken frame's 5 scenes are retired"
+        );
+        assert_eq!(
+            c.take_scenes_through_flips(3).len(),
+            5,
+            "what is left: the last two frames"
+        );
         assert!(c.scenes.is_empty());
     }
 }
@@ -1666,7 +1740,11 @@ mod fold_tests {
             for bit in 0..8 {
                 let mut v = base.clone();
                 v[i] ^= 1 << bit;
-                assert_ne!(digest(&v), want, "byte {i} bit {bit} did not affect the digest");
+                assert_ne!(
+                    digest(&v),
+                    want,
+                    "byte {i} bit {bit} did not affect the digest"
+                );
             }
         }
     }
@@ -1746,7 +1824,10 @@ mod extent_tests {
             frag_mem_windows: Vec::new(),
             shader_expanded: false,
         };
-        Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: Some(ColorSurface {
                 format: 0,
@@ -1802,7 +1883,10 @@ mod retention_tests {
 
     /// A scene distinguishable by `tag` through the part of it the signature folds.
     fn scene(tag: u8) -> Scene {
-        Scene { completed_early: false, notifications: [None; 2], deferred_id: 0,
+        Scene {
+            completed_early: false,
+            notifications: [None; 2],
+            deferred_id: 0,
             precompile: Default::default(),
             color: Some(ColorSurface {
                 format: tag as u32,
@@ -1842,7 +1926,11 @@ mod retention_tests {
             folded.end_frame();
             skipped.end_frame();
         }
-        assert_ne!(folded.signature(), u64::MAX, "a folding run gives a real signature");
+        assert_ne!(
+            folded.signature(),
+            u64::MAX,
+            "a folding run gives a real signature"
+        );
         assert_eq!(
             skipped.signature(),
             u64::MAX,
@@ -1856,7 +1944,11 @@ mod retention_tests {
             untouched.push_scene(scene(i));
             untouched.end_frame();
         }
-        assert_ne!(untouched.signature(), u64::MAX, "nothing was dropped, so nothing is missing");
+        assert_ne!(
+            untouched.signature(),
+            u64::MAX,
+            "nothing was dropped, so nothing is missing"
+        );
     }
 
     /// Folding must be ON unless a caller explicitly says otherwise - the safe state has to be
@@ -1893,11 +1985,22 @@ mod retention_tests {
             bounded.end_frame();
         }
         for c in [&mut unbounded, &mut bounded] {
-            c.egress.push(EgressEvent { frame: 7, kind: EgressKind::Trophy { id: 3 } });
+            c.egress.push(EgressEvent {
+                frame: 7,
+                kind: EgressKind::Trophy { id: 3 },
+            });
         }
         assert_eq!(unbounded.scenes.len(), 40);
-        assert_eq!(bounded.scenes.len(), 3, "retention did not bound the scene list");
-        assert_eq!(bounded.total_scenes(), 40, "evicted scenes must still be counted");
+        assert_eq!(
+            bounded.scenes.len(),
+            3,
+            "retention did not bound the scene list"
+        );
+        assert_eq!(
+            bounded.total_scenes(),
+            40,
+            "evicted scenes must still be counted"
+        );
         assert_eq!(
             unbounded.signature(),
             bounded.signature(),
@@ -1918,7 +2021,11 @@ mod retention_tests {
             }
             c.end_frame();
         }
-        assert_eq!(c.frame_scenes().len(), 6, "a shot of this frame would be missing passes");
+        assert_eq!(
+            c.frame_scenes().len(),
+            6,
+            "a shot of this frame would be missing passes"
+        );
         assert_eq!(c.total_scenes(), 30, "evicted scenes must still be counted");
     }
 
