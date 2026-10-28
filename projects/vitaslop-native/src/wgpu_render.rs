@@ -165,6 +165,23 @@ pub struct GeneralRenderer {
     pub software: bool,
     /// Where the last [`GeneralRenderer::render_scene`] went. See [`RenderSplit`].
     last_split: RenderSplit,
+    /// Which part of each target the last frame encoded asks [`Self::rtt_writebacks`] to copy,
+    /// by colour address - `rtt_writeback::writeback_region`'s answer, taken while the scenes
+    /// are in hand (the write-back comes after and is not handed them).
+    wb_regions: std::collections::HashMap<u32, (u32, u32, u32, u32, u32)>,
+}
+
+/// [`GeneralRenderer::wb_regions`] for a frame's scenes.
+fn writeback_regions(scenes: &[Scene]) -> std::collections::HashMap<u32, (u32, u32, u32, u32, u32)> {
+    let cap = rtt_writeback_texels();
+    scenes
+        .iter()
+        .filter_map(|s| s.color.as_ref())
+        .filter_map(|c| {
+            vitaslop_runtime::rtt_writeback::writeback_region(scenes, c.data_addr, c.width, c.height, cap)
+                .map(|r| (c.data_addr, r))
+        })
+        .collect()
 }
 
 /// Where one whole `render_scene` went, in milliseconds.
@@ -255,7 +272,14 @@ fn is_software(info: &wgpu::AdapterInfo) -> bool {
 impl GeneralRenderer {
     /// Acquire a GPU and build the general pipeline. `None` if no adapter is available.
     pub fn new() -> Option<Self> {
-        let instance = wgpu::Instance::default();
+        // `WGPU_BACKEND` (wgpu's own convention, e.g. `dx12`) narrows the backends this instance
+        // offers; unset it is `Backends::all()`, exactly the `Instance::default()` it replaces.
+        // The desktop browser on Windows renders through D3D12, and a picture that differs
+        // between the browser and this renderer is a backend question first - which this lets
+        // the desktop answer in seconds instead of a browser run per arm.
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = desc.backends.with_env();
+        let instance = wgpu::Instance::new(desc);
         let adapter = pick_adapter(&instance)?;
         let adapter_name = adapter.get_info().name;
         let software = is_software(&adapter.get_info());
@@ -314,6 +338,7 @@ impl GeneralRenderer {
             adapter_name,
             software,
             last_split: RenderSplit::default(),
+            wb_regions: std::collections::HashMap::new(),
         }
     }
 
@@ -334,6 +359,7 @@ impl GeneralRenderer {
         clear: [u8; 4],
     ) {
         self.builder.begin_frame();
+        self.wb_regions = writeback_regions(scenes);
         let built: Vec<_> = scenes.iter().filter(|s| !s.completed_early).map(|s| self.builder.build(s)).collect();
         self.gxm.set_presented(presents);
         let (fw, fh) = (target.width(), target.height());
@@ -418,6 +444,7 @@ impl GeneralRenderer {
         // black. This shows any single pass on its own.
         // Scenes completed at their own `sceGxmEndScene` are not rendered again: their target
         // already holds the image (see `Scene::completed_early`).
+        self.wb_regions = writeback_regions(scenes);
         let owned: Vec<Scene>;
         let scenes: &[Scene] = if scenes.iter().any(|s| s.completed_early) {
             owned = scenes.iter().filter(|s| !s.completed_early).cloned().collect();
@@ -627,9 +654,14 @@ impl GeneralRenderer {
                 continue;
             }
             let (w, h) = (w.max(1), h.max(1));
-            if w * h > cap {
-                continue;
-            }
+            // The whole target within the cap; above it, only the region the frame's last draw
+            // into it painted - see `rtt_writeback::writeback_region`. `addr` becomes the
+            // region's own guest address, which is how the apply finds it again.
+            let (x, y, w, h, addr) = match self.wb_regions.get(&addr) {
+                Some(&(x, y, rw, rh, at)) if x + rw <= tex.width() && y + rh <= tex.height() => (x, y, rw, rh, at),
+                _ if w * h <= cap => (0, 0, w, h, addr),
+                _ => continue,
+            };
             let texel_bytes = tex.format().block_copy_size(None).unwrap_or(4);
             let padded = (w * texel_bytes).div_ceil(ALIGN) * ALIGN;
             let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -642,7 +674,7 @@ impl GeneralRenderer {
                 wgpu::TexelCopyTextureInfo {
                     texture: tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyBufferInfo {

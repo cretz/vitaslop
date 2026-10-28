@@ -72,7 +72,31 @@ pub(super) fn initialize(ctx: &mut GuestCtx, st: &mut crate::host::VitaState) {
         context_addr,
         context_size,
     );
+    if r != 0 {
+        report_fiber_refusal("_sceFiberInitializeImpl", fiber, r, st);
+    }
     ctx.ret(r as u32);
+}
+
+/// >>> A REFUSED FIBER CALL IS REPORTED, every time, with the fiber's state.
+///
+/// A title's fiber scheduler does not check these returns: a Switch it believes parked the
+/// caller simply falls through, and the fiber carries on as if it had been woken - into a job
+/// whose result does not exist yet. MEASURED on an action title: a refused `sceFiberSwitch`
+/// let an entity loader read a handle its job had not filled, and the run died 4 KB below
+/// guest address 0 two hundred frames later with nothing at the fault naming a fiber. On
+/// hardware these calls fail only for a guest error, so a refusal here is either that or
+/// this model's bookkeeping, and both need the line.
+fn report_fiber_refusal(call: &str, fiber: u32, err: i32, st: &crate::host::VitaState) {
+    tracing::warn!(
+        target: "vitaslop::thread",
+        call,
+        fiber = format_args!("{fiber:#x}"),
+        err = format_args!("{:#010x}", err as u32),
+        thread = st.current_thread(),
+        state = %st.fiber_state_line(fiber),
+        "fiber call REFUSED - the guest is not told by a crash, it carries on as if the call took effect"
+    );
 }
 
 /// SceInt32 _sceFiberInitializeWithInternalOptionImpl(...)
@@ -98,12 +122,13 @@ pub(super) fn run(ctx: &mut GuestCtx, st: &mut crate::host::VitaState) -> SvcOut
     let fiber = ctx.arg(0);
     let arg_on_run_to = ctx.arg(1);
     let arg_on_run = ctx.arg(2);
-    match st.fiber_run(fiber, arg_on_run_to, arg_on_run) {
+    match st.fiber_run(fiber, arg_on_run_to, arg_on_run, ctx.regs[13]) {
         Ok(()) => {
             ctx.ret(0);
             SvcOutcome::Block
         }
         Err(e) => {
+            report_fiber_refusal("sceFiberRun", fiber, e, st);
             ctx.ret(e as u32);
             SvcOutcome::Continue
         }
@@ -153,11 +178,14 @@ fn switch_inner(
         None => (ctx.arg(1), ctx.arg(2)),
     };
     match st.fiber_switch(fiber, arg_on_run_to, arg_on_run, context) {
-        Ok(()) => {
+        Ok(abandoned) => {
             ctx.ret(0);
-            SvcOutcome::Block
+            // A context-less fiber is not parked when it switches away: its frames are
+            // discarded and it restarts at its entry - see `VitaState::fiber_restart_later`.
+            if abandoned { SvcOutcome::ThreadExit } else { SvcOutcome::Block }
         }
         Err(e) => {
+            report_fiber_refusal("sceFiberSwitch", fiber, e, st);
             ctx.ret(e as u32);
             SvcOutcome::Continue
         }
@@ -173,11 +201,13 @@ pub(super) fn return_to_thread(ctx: &mut GuestCtx, st: &mut crate::host::VitaSta
     let arg_on_return = ctx.arg(0);
     let arg_on_run = ctx.arg(1);
     match st.fiber_return_to_thread(arg_on_return, arg_on_run) {
-        Ok(()) => {
+        Ok(abandoned) => {
             ctx.ret(0);
-            SvcOutcome::Block
+            // See `switch_inner`: a context-less fiber ends here rather than parking.
+            if abandoned { SvcOutcome::ThreadExit } else { SvcOutcome::Block }
         }
         Err(e) => {
+            report_fiber_refusal("sceFiberReturnToThread", st.current_fiber(), e, st);
             ctx.ret(e as u32);
             SvcOutcome::Continue
         }

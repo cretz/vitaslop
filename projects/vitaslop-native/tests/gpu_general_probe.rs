@@ -71,6 +71,7 @@ fn quad(vertices: Vec<u8>, attrs: Vec<VertexAttribute>, textures: Vec<BoundTextu
         frag_sa_addr: 0,
         mem_windows: Vec::new(),
         frag_mem_windows: Vec::new(),
+        frag_store_windows: Vec::new(),
         // These probes hand the renderer real triangles, not point-sprite records a
         // vertex program would expand into quads.
         shader_expanded: false,
@@ -249,6 +250,7 @@ fn mvp_quad(
         frag_sa_addr: 0,
         mem_windows: Vec::new(),
         frag_mem_windows: Vec::new(),
+        frag_store_windows: Vec::new(),
         // These probes hand the renderer real triangles, not point-sprite records a
         // vertex program would expand into quads.
         shader_expanded: false,
@@ -342,6 +344,7 @@ color: None,
         frag_sa_addr: 0,
         mem_windows: Vec::new(),
         frag_mem_windows: Vec::new(),
+        frag_store_windows: Vec::new(),
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
         };
@@ -531,6 +534,7 @@ color: None,
         frag_sa_addr: 0,
         mem_windows: Vec::new(),
         frag_mem_windows: Vec::new(),
+        frag_store_windows: Vec::new(),
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
         };
@@ -584,6 +588,7 @@ color: None,
         frag_sa_addr: 0,
         mem_windows: Vec::new(),
         frag_mem_windows: Vec::new(),
+        frag_store_windows: Vec::new(),
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
             };

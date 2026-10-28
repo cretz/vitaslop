@@ -105,6 +105,87 @@ fn tabulate_blob_hashes() {
     }
 }
 
+/// Every group-0x1a IMA32 STEP in the corpus, one line each: blob, stream, index, which step,
+/// whether it is half of an adjacent pair (same `src0`/`src1`, the second's `src2` the first's
+/// destination) or ALONE, and its three operands.
+///
+/// A PAIR's value is the whole `src0 * src1 + src2` whichever source the 16-bit multiplier
+/// reads, so only a LONE step says which one it is - and a lone step's meaning changes with that
+/// reading. This is the list a change to the step's operand rule has to be checked against.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn ima32_step_census() {
+    let Some(dir) = corpus_dir() else { return };
+    let show = |o: &vitaslop_gxp_shader::ir::Operand| match o.bank {
+        Bank::Immediate => format!("#{}", o.index),
+        b => format!("{b:?}[{}]", o.index),
+    };
+    let (mut pairs, mut lone) = (0usize, 0usize);
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        for (label, sh) in [
+            ("primary", vitaslop_gxp_shader::usse::decode_shader(&p)),
+            ("secondary", vitaslop_gxp_shader::usse::decode_secondary_shader(&p)),
+        ] {
+            let step = |i: usize| match sh.instrs.get(i).map(|x| x.op) {
+                Some(Op::IntMadStep { high_half, .. }) => Some(high_half),
+                _ => None,
+            };
+            let same = |a: usize, b: usize| {
+                let (x, y) = (&sh.instrs[a], &sh.instrs[b]);
+                x.srcs.len() == 3
+                    && y.srcs.len() == 3
+                    && (x.srcs[0].bank, x.srcs[0].index) == (y.srcs[0].bank, y.srcs[0].index)
+                    && (x.srcs[1].bank, x.srcs[1].index) == (y.srcs[1].bank, y.srcs[1].index)
+                    && x.dest.as_ref().is_some_and(|d| (d.bank, d.index) == (y.srcs[2].bank, y.srcs[2].index))
+            };
+            for (i, ins) in sh.instrs.iter().enumerate() {
+                let Some(high) = step(i) else { continue };
+                let paired = (!high && step(i + 1) == Some(true) && same(i, i + 1))
+                    || (high && i > 0 && step(i - 1) == Some(false) && same(i - 1, i));
+                if paired {
+                    pairs += 1;
+                } else {
+                    lone += 1;
+                }
+                let srcs: Vec<String> = ins.srcs.iter().map(show).collect();
+                let dest = ins.dest.as_ref().map(show).unwrap_or_default();
+                println!(
+                    "{name} {label} #{i} {} {} {dest} <- {}",
+                    if high { "HIGH" } else { "low " },
+                    if paired { "pair" } else { "LONE" },
+                    srcs.join(", ")
+                );
+            }
+        }
+    }
+    println!("ima32 steps: {pairs} in pairs, {lone} lone");
+}
+
+/// Every blob whose memory windows resolve, one line each: the windows' extents and whether
+/// they are sized PER DRAW (`module::MemWindow::per_draw`). Run under both readings of a change
+/// to the window resolution and diff, the way `hash_every_blob_wgsl` is used for the decoder.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn mem_window_census() {
+    let Some(dir) = corpus_dir() else { return };
+    for (name, bytes) in blobs(&dir) {
+        let windows = match Program::parse(&bytes).map(|p| p.kind) {
+            Ok(ProgramKind::Vertex) => vitaslop_gxp_shader::mem_windows_for_vertex_blob(&bytes),
+            Ok(ProgramKind::Fragment) => vitaslop_gxp_shader::mem_windows_for_fragment_blob(&bytes),
+            Err(_) => continue,
+        };
+        if windows.is_empty() {
+            continue;
+        }
+        let shown: Vec<String> = windows
+            .iter()
+            .map(|w| format!("{}:{}{}", w.buffer_index, w.bytes, if w.per_draw { " PER-DRAW" } else { "" }))
+            .collect();
+        println!("{name} {}", shown.join(", "));
+    }
+}
+
 /// One line per blob: its name and a hash of the WGSL the recompiler emits for it.
 ///
 /// # What this is for, and why a hash rather than the text
@@ -3488,7 +3569,9 @@ fn memory_window_resolution_census() {
     for (name, bytes) in blobs(&dir) {
         let Ok(p) = Program::parse(&bytes) else { continue };
         let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
-        if !shader.instrs.iter().any(|i| matches!(i.op, Op::MemLoad { .. })) {
+        // BOTH streams: a program whose only loads are in its prologue resolves windows too.
+        let secondary = vitaslop_gxp_shader::usse::decode_secondary_shader(&p);
+        if !shader.instrs.iter().chain(secondary.instrs.iter()).any(|i| matches!(i.op, Op::MemLoad { .. })) {
             continue;
         }
         let sa_resident = p.sa_uniform_buffers();
@@ -4927,6 +5010,31 @@ fn fragment_programs_that_still_read_the_destination_under_each_lowering() {
             println!("  still reads the destination under every shape: {name}");
         }
     }
+}
+
+/// The renderer's PASS SCAN (`fragment_reads_dest_color`) and the LINK must agree on whether a
+/// program reads the destination. The scan decides whether the pass takes a copy of its
+/// attachment; the link decides whether the module declares one. Where the link says yes and
+/// the scan says no, every draw of that program is refused with "the pipeline declares a
+/// DESTINATION texture and this pass has none".
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn the_pass_scan_and_the_link_agree_on_destination_readers() {
+    use vitaslop_gxp_shader::module;
+    let Some(dir) = corpus_dir() else { return };
+    let mut disagree = Vec::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        if p.kind != ProgramKind::Fragment {
+            continue;
+        }
+        let Ok(rc) = recompile_fragment(&bytes) else { continue };
+        let (scan, link) = (vitaslop_gxp_shader::fragment_reads_dest_color(&bytes), module::declares_dest_color(&rc.shader));
+        if scan != link {
+            disagree.push(format!("{name} (hash {:016x}): scan {scan}, link {link}", p.hash));
+        }
+    }
+    assert!(disagree.is_empty(), "scan and link disagree:\n  {}", disagree.join("\n  "));
 }
 
 /// The fragment body of one blob under each dest-blend lowering setting, so a shape that is
@@ -7987,9 +8095,11 @@ fn which_index_scale_lands_inside_the_declared_layout() {
             vitaslop_gxp_shader::usse::decode_secondary_shader(&p),
         ] {
             let mut pending: Option<i32> = None;
+            let mut load_word = 0u64;
             for i in &shader.instrs {
                 if let Op::LoadIndex { addend, to_index: true, .. } = i.op {
                     pending = Some(addend);
+                    load_word = i.raw;
                     continue;
                 }
                 let Some(addend) = pending else { continue };
@@ -7999,6 +8109,9 @@ fn which_index_scale_lands_inside_the_declared_layout() {
                 if sub != Bank::SecondaryAttr {
                     continue;
                 }
+                // The load-index WORD and the consuming GROUP too: a scale that differs between
+                // programs has to be carried by something, and those are the places to look.
+                print!("  load {load_word:#018x} reader grp {:#04x} number {}", i.group, src.index);
                 let (s1, s2) = (addend + base as i32, addend * 2 + base as i32);
                 let inside = |v: i32| {
                     v >= 0
@@ -8014,7 +8127,8 @@ fn which_index_scale_lands_inside_the_declared_layout() {
                     if inside(s1) { "INSIDE" } else { "outside" },
                     if inside(s2) { "INSIDE" } else { "outside" },
                 );
-                pending = None;
+                // EVERY reader of this load, not only the first: one load read through two
+                // groups of different field widths is the comparison that settles the scale.
             }
         }
     }
@@ -8065,6 +8179,9 @@ fn every_indexed_sa_read_names_a_register_the_program_populates() {
                     continue;
                 }
                 let base = vitaslop_gxp_shader::ir::indexed_offset(src.index) as i32;
+                // The READING operand's pair scale too (`ir::indexed_index_scale`): a six-bit
+                // field counts register pairs, a seven-bit one single registers.
+                let scale = scale * vitaslop_gxp_shader::ir::indexed_index_scale(src);
                 // The index the program produces is not known statically, so the test asks the
                 // weakest honest question: does the read land inside the layout for ANY index
                 // the register file can hold? A reading that fails even that is reading nothing.
@@ -8533,4 +8650,175 @@ fn profile_linked_pairs() {
         ms / pairs.len().max(1) as f64,
         p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]
     );
+}
+
+/// For every REPEATING VPCK, the destination walk under each candidate MULTIPLIER (1 and 2) for
+/// the slot-0 byte in force, against the registers the rest of the program READS - the closure
+/// that decides what one unit of a 32-bit destination field steps. A secondary program's
+/// destinations are SA registers the PRIMARY reads, so those count as readers too.
+///
+/// ```text
+/// VITASLOP_GXP_CORPUS=<dir> cargo test --release -p vitaslop-gxp-shader --test corpus -- \
+///   --ignored --nocapture repeating_pack_destination_walks_against_their_readers
+/// ```
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn repeating_pack_destination_walks_against_their_readers() {
+    use vitaslop_gxp_shader::usse::decode::{bits, decode, decode_smlsi, is_smlsi, opcode1, repeat_extra_iterations, SmlsiSlot};
+    let Some(dir) = corpus_dir() else { return };
+    // The registers of `bank` an instruction list reads, per lane.
+    let readers = |instrs: &[vitaslop_gxp_shader::ir::Instr], bank: Bank| -> std::collections::BTreeSet<i32> {
+        let mut out = std::collections::BTreeSet::new();
+        for ins in instrs {
+            let half = ins.source_half_precision();
+            for s in ins.srcs.iter().filter(|s| s.bank == bank) {
+                for c in 0..4 {
+                    let sel = s.swizzle[c];
+                    if sel > 3 {
+                        continue;
+                    }
+                    out.insert(i32::from(s.index) + if half { i32::from(sel / 2) } else { i32::from(sel) });
+                }
+            }
+        }
+        out
+    };
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let sh = vitaslop_gxp_shader::usse::decode_shader(&p);
+        let primary: Vec<_> = sh.instrs.clone();
+        for (label, code) in [("primary", p.code.clone()), ("secondary", p.secondary_code.clone())] {
+            let mut state = [SmlsiSlot::Increment(1); 4];
+            for (i, &word) in code.iter().enumerate() {
+                if is_smlsi(word) {
+                    state = decode_smlsi(word);
+                    continue;
+                }
+                if opcode1(word) != 0x08 {
+                    continue;
+                }
+                let Some(extra) = repeat_extra_iterations(word) else { continue };
+                if extra == 0 {
+                    continue;
+                }
+                let ins = decode(word);
+                let Some(d) = ins.dest else { continue };
+                let bank = if label == "secondary" { Bank::SecondaryAttr } else { d.bank };
+                // Everything after this word in its own stream, decoded one word at a time, and
+                // for a secondary program the whole primary as well.
+                let later: Vec<_> = code[i + 1..].iter().map(|&w| decode(w)).collect();
+                let mut read = readers(&later, bank);
+                if label == "secondary" {
+                    read.extend(readers(&primary, Bank::SecondaryAttr));
+                }
+                let lanes = ins.write_mask.iter().filter(|m| **m).count() as i32;
+                let dest_fmt = bits(word, 40, 38);
+                let per_iter_regs = if matches!(dest_fmt, 3..=5) { (lanes + 1) / 2 } else { lanes };
+                let SmlsiSlot::Increment(inc) = state[0] else {
+                    println!("{name} {label}[{i}] {word:#018x}: dest slot in OFFSET mode - skipped");
+                    continue;
+                };
+                let mut line = format!(
+                    "{name} {label}[{i}] {word:#018x} dest {:?}[{}] fmt {dest_fmt} lanes {lanes} x{} slot0 {inc}:",
+                    bank,
+                    d.index,
+                    extra + 1
+                );
+                for stride in [1i32, 2] {
+                    let walk: Vec<i32> = (0..=extra as i32).map(|k| i32::from(d.index) + i32::from(inc) * stride * k).collect();
+                    let escapes = walk.iter().any(|&r| !(0..=255).contains(&r));
+                    let live = walk
+                        .iter()
+                        .filter(|&&r| (0..per_iter_regs).all(|o| read.contains(&(r + o))))
+                        .count();
+                    line += &format!(
+                        "  x{stride} -> {walk:?}{} read {live}/{}",
+                        if escapes { " ESCAPES" } else { "" },
+                        walk.len()
+                    );
+                }
+                println!("{line}");
+            }
+        }
+    }
+}
+
+/// How every vertex program in the corpus READS each of its attributes, tabulated against the
+/// attribute's declared `SceGxmParameterType` and the PA span the compiler allocated it (the gap
+/// to the next attribute's `resource_index`).
+///
+/// The question it settles is what the vertex DMA leaves in the PA bank for a non-F32
+/// attribute. The module feeds every attribute one F32 component per register; if the compiler
+/// allocated an F16 vec4 TWO registers and the code reads it as packed halves, that feed is not
+/// what the hardware does. The first instruction that reads a lane of the attribute before
+/// anything writes it is classified by the width it reads at: `f32`, `f16` (packed halves),
+/// `bytes` (four to a register) or `pack<src_fmt>` for a VPCK whose source format is neither
+/// float (C10 is format 7).
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn attribute_read_width_by_declared_type() {
+    use vitaslop_gxp_shader::ParamCategory;
+    let Some(dir) = corpus_dir() else {
+        eprintln!("set VITASLOP_GXP_CORPUS");
+        return;
+    };
+    let mut tally: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        if p.kind != ProgramKind::Vertex {
+            continue;
+        }
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+        let mut attrs: Vec<_> =
+            p.parameters.iter().filter(|a| a.category == ParamCategory::Attribute && a.resource_index >= 0).collect();
+        attrs.sort_by_key(|a| a.resource_index);
+        for (k, a) in attrs.iter().enumerate() {
+            let lo = a.resource_index as u32;
+            let span = attrs.get(k + 1).map_or("last".to_string(), |n| (n.resource_index as u32 - lo).to_string());
+            let hi = attrs.get(k + 1).map_or(lo + 4, |n| n.resource_index as u32);
+            let mut written = std::collections::HashSet::new();
+            let mut how = "unread".to_string();
+            'scan: for i in &shader.instrs {
+                for s in i.srcs.iter().filter(|s| s.bank == Bank::PrimaryAttr) {
+                    for c in 0..4 {
+                        if !i.read_channels()[c] {
+                            continue;
+                        }
+                        let Some((reg, _)) = i.source_register(s, c) else { continue };
+                        if reg < lo || reg >= hi || written.contains(&reg) {
+                            continue;
+                        }
+                        let src_fmt = (i.raw >> 41) & 7;
+                        how = if matches!(i.op, Op::Pack { .. }) && i.blocked.is_some() {
+                            format!("pack{src_fmt}")
+                        } else if i.source_packed_bytes() {
+                            "bytes".into()
+                        } else if i.source_half_precision() {
+                            "f16".into()
+                        } else {
+                            "f32".into()
+                        };
+                        how = format!("{how} ({} sel {:?})", i.op.mnemonic(), s.swizzle);
+                        break 'scan;
+                    }
+                }
+                if let Some(d) = i.dest.as_ref().filter(|d| d.bank == Bank::PrimaryAttr) {
+                    for c in 0..4 {
+                        if i.write_mask[c] {
+                            written.insert(u32::from(d.index) + c as u32);
+                        }
+                    }
+                }
+            }
+            let key = format!("{:?} comp {} span {span} read {}", a.ptype, a.component_count, how.split(" (").next().unwrap_or(""));
+            let e = tally.entry(key).or_insert((0, String::new()));
+            e.0 += 1;
+            if e.1.is_empty() {
+                e.1 = format!("{name} {} {how}", a.name);
+            }
+        }
+    }
+    for (k, (n, ex)) in &tally {
+        println!("{n:5}  {k:<45}  e.g. {ex}");
+    }
 }

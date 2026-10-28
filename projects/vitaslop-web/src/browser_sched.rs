@@ -1985,7 +1985,27 @@ extern "C" {
 /// straight back unchanged, ~630 times a frame on a race. They are r4..r11 (callee-saved, so a
 /// host call must not touch them) and the VFP argument file (which only a handler with a FLOAT
 /// parameter reads, and the GXM/kernel calls a race makes have none).
+///
+/// >>> BUT A HANDLER WITH A FLOAT PARAMETER MUST GET ITS FLOAT. The calls that have one are
+/// read [`WIDE_REGS`] instead - see `vitaslop_runtime::vita::float_abi` for the MEASURED
+/// failure (a depth clear of 1.0 arriving as 0.0 drew a whole world as its sky, then black).
 const NARROW_REGS: [u32; 7] = [0, 1, 2, 3, abi::SP as u32, 14, 15];
+
+/// [`NARROW_REGS`] plus every VFP argument lane - the read for a call whose handler takes or
+/// returns a float (`ThreadRt::float_sel`).
+const WIDE_REGS: [u32; NARROW_REGS.len() + VFP_ARG_COUNT] = {
+    let mut v = [0u32; NARROW_REGS.len() + VFP_ARG_COUNT];
+    let mut i = 0;
+    while i < NARROW_REGS.len() {
+        v[i] = NARROW_REGS[i];
+        i += 1;
+    }
+    while i < v.len() {
+        v[i] = (abi::REG_COUNT + i - NARROW_REGS.len()) as u32;
+        i += 1;
+    }
+    v
+};
 
 
 // >>> BULK GUEST-MEMORY MOVES AND THE DIRTY SCAN, EACH AS ONE CROSSING.
@@ -2047,6 +2067,11 @@ struct ThreadRt {
     /// [`NARROW_REGS`] as a `Uint32Array`, built once per thread so the per-call read does
     /// not allocate one.
     narrow: js_sys::Uint32Array,
+    /// [`WIDE_REGS`] as a `Uint32Array`, for the calls [`ThreadRt::float_sel`] names.
+    wide: js_sys::Uint32Array,
+    /// Per import selector, whether its handler reads or writes the VFP argument file
+    /// (`VitaEnv::import_float_abi`). A selector past its end reads wide - the safe direction.
+    float_sel: Rc<[bool]>,
     /// The diagnostic guest-PC global (`VITASLOP_TRACK_PC`), when the module carries one.
     /// `None` on an ordinary build, which does not export it - and that is the ONLY reason
     /// a browser trap could ever say `pc=0`: the ARM `pc` register a translated module keeps
@@ -2067,8 +2092,13 @@ impl ThreadRt {
     /// A register value is a `u32` carried as an `f64`, which is exact (an `f64` holds
     /// every integer up to 2^53), so nothing is lost in the round trip - the per-register
     /// path this replaced used the same representation.
-    fn read_file(&self) -> ([u32; abi::REG_COUNT], [u32; VFP_ARG_COUNT]) {
+    fn read_file(&self, selector: u32) -> ([u32; abi::REG_COUNT], [u32; VFP_ARG_COUNT]) {
         let mut buf = [0u32; FILE_LEN];
+        let lanes = if self.float_sel.get(selector as usize).copied().unwrap_or(true) {
+            &self.wide
+        } else {
+            &self.narrow
+        };
         // SAFETY: the view borrows this module's linear memory for the duration of the call
         // below. `save_some` is synchronous JS that allocates nothing, so the memory cannot
         // grow and the view cannot be detached while it is live, and nothing else holds a
@@ -2078,7 +2108,7 @@ impl ThreadRt {
         // if the handler CHANGED it, which the write-back's diff already decides.
         unsafe {
             let view = js_sys::Uint32Array::view_mut_raw(buf.as_mut_ptr(), FILE_LEN);
-            save_some(&self.file, &self.narrow, &view);
+            save_some(&self.file, lanes, &view);
         }
         let mut regs = [0u32; abi::REG_COUNT];
         let mut vfp = [0u32; VFP_ARG_COUNT];
@@ -2285,9 +2315,10 @@ struct ThreadEngine {
     /// block/yield) or an entry's completion fills it with the encoded event; the
     /// scheduler awaits the matching Promise. Reset each loop turn.
     signal: Rc<RefCell<Option<Function>>>,
-    /// The resolver of the Promise a suspended thread is parked on; the scheduler calls
-    /// it to un-park (resume) the thread.
-    cont: Rc<RefCell<Option<Function>>>,
+    /// The `(resolve, reject)` pair of the Promise a suspended thread is parked on: the
+    /// scheduler calls `resolve` to un-park (resume) the thread, and `reject` to UNWIND a
+    /// parked stack that will never be resumed (see [`BrowserThread::terminate`]).
+    cont: ParkCell,
     /// The import closure must outlive every call the instance can make into it.
     _import: Closure<dyn FnMut(i32) -> JsValue>,
     /// The non-suspending trap's closure - see `abi::IMPORT_FAST_NAME`. Kept for the same
@@ -2591,6 +2622,34 @@ impl ThreadHandle for BrowserThread {
     /// A pooled instance is made indistinguishable from a fresh one by the module's own
     /// `reset` export, which is the only thing that CAN do it completely - see
     /// [`abi::RESET_EXPORT`].
+    /// A thread the runtime ENDED while it was parked: its JSPI stack is suspended in a host
+    /// call and will never be resumed. It is UNWOUND the way an exiting thread's is (see
+    /// [`exit_unwinds`]) - the parked Promise is rejected with the exit sentinel, so the stack
+    /// resumes into a throw that runs no guest code and the entry's rejection handler ignores
+    /// it - and then released, which can POOL the instance.
+    ///
+    /// >>> DROPPING IT INSTEAD WOULD BE THE INSTANTIATION STORM AGAIN. A title that finalizes
+    /// suspended fibers does it per job, every frame, and each fiber's thread is a pooled
+    /// instance: an abandoned stack makes `release` discard its instance, so every fiber after
+    /// would build a new one - exactly the pattern `exit_unwinds` measured at 141 -> 784
+    /// instantiations in 850 frames and ~8% speed. With the knob off, or with no park to
+    /// reject, the stack is abandoned and the instance dropped, as an exit's is.
+    fn terminate(&mut self) {
+        if let Some(engine) = self.engine.as_ref() {
+            let parked = engine.cont.borrow_mut().take();
+            match parked {
+                Some((_, reject)) if exit_unwinds() => {
+                    let _ = reject.call1(&JsValue::UNDEFINED, &JsValue::from_str(EXIT_UNWIND_SENTINEL));
+                }
+                _ => {
+                    engine.abandoned.set(true);
+                    hostcalls::note_abandoned_stack();
+                }
+            }
+        }
+        self.release();
+    }
+
     fn release(&mut self) {
         let Some(mut engine) = self.engine.take() else { return };
         // Break the closure -> register-file reference before dropping or pooling, so
@@ -2719,6 +2778,9 @@ pub struct BrowserEngine {
     /// call. See [`GuestMem`].
     view: GuestMem,
     host: Host,
+    /// Per import selector, whether the call's handler takes or returns a float - see
+    /// `ThreadRt::float_sel`. Fixed for the module, so computed once per engine.
+    float_sel: Rc<[bool]>,
     base: u32,
     /// `WebAssembly.promising` (not in the wasm-bindgen bindings; fetched by name).
     promising: Function,
@@ -2877,7 +2939,7 @@ impl BrowserEngine {
     /// is in [`make_thread`].
     fn new_instance(&self) -> Result<ThreadEngine, JsValue> {
         let signal: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
-        let cont: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
+        let cont: ParkCell = Rc::new(RefCell::new(None));
         // The import closure needs the instance's globals, which only exist after
         // instantiation - the chicken-and-egg the runtime cell resolves (imports fire
         // only during execution, by when the cell is filled).
@@ -2953,7 +3015,7 @@ impl BrowserEngine {
                 let acc0 = if sampling { vitaslop_runtime::perf::guest_accesses() } else { (0, 0) };
                 let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
-                let (mut regs, mut vfp) = rt.read_file();
+                let (mut regs, mut vfp) = rt.read_file(selector as u32);
                 // >>> SMP: a call this worker may not run is parked and FORWARDED - the thread
                 // suspends as if blocked, and the run worker dispatches it and sends the
                 // registers back (`crate::smp`). Never reached on the one-baton engine.
@@ -3174,7 +3236,7 @@ impl BrowserEngine {
                 let acc0 = if sampling { vitaslop_runtime::perf::guest_accesses() } else { (0, 0) };
                 let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
-                let (mut regs, mut vfp) = rt.read_file();
+                let (mut regs, mut vfp) = rt.read_file(selector as u32);
                 let before = (regs, vfp);
                 let d0 = clock();
                 let outcome = {
@@ -3333,6 +3395,8 @@ impl BrowserEngine {
         let globals: Vec<WebAssembly::Global> = regs.into_iter().chain(vfp).collect();
         let narrow = js_sys::Uint32Array::new_with_length(NARROW_REGS.len() as u32);
         narrow.copy_from(&NARROW_REGS);
+        let wide = js_sys::Uint32Array::new_with_length(WIDE_REGS.len() as u32);
+        wide.copy_from(&WIDE_REGS);
         // Absent on an ordinary build - `VITASLOP_TRACK_PC` is what exports it - so a lookup
         // failure is the normal case and must not fail the instantiation.
         let guest_pc = Reflect::get(&exports, &JsValue::from_str(abi::GUEST_PC_EXPORT))
@@ -3342,6 +3406,8 @@ impl BrowserEngine {
             regs: globals,
             file,
             narrow,
+            wide,
+            float_sel: self.float_sel.clone(),
             guest_pc,
             view: self.view.clone(),
             base: self.base,
@@ -3536,14 +3602,17 @@ fn guest_call_chain(g: GuestCallCtx, selector: i32) -> JsValue {
     .into()
 }
 
+/// The `(resolve, reject)` pair of a parked thread's Promise - see `ThreadEngine::cont`.
+type ParkCell = Rc<RefCell<Option<(Function, Function)>>>;
+
 fn suspend(
     signal: &Rc<RefCell<Option<Function>>>,
-    cont: &Rc<RefCell<Option<Function>>>,
+    cont: &ParkCell,
     stop: Stop,
 ) -> JsValue {
     let cont = cont.clone();
-    let park = Promise::new(&mut |resolve, _reject| {
-        *cont.borrow_mut() = Some(resolve);
+    let park = Promise::new(&mut |resolve, reject| {
+        *cont.borrow_mut() = Some((resolve, reject));
     });
     hostcalls::note_suspend();
     deliver(signal, &Ev::Suspend(stop));
@@ -3851,7 +3920,7 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
                 "resume of thid {thid:#x} with no parked continuation and its entry \
                  already started: nothing to run"
             );
-        } else if let Some(res) = t.cont.borrow_mut().take() {
+        } else if let Some((res, _)) = t.cont.borrow_mut().take() {
             // SMP: the registers a FORWARDED call produced on the run worker, written before
             // anything else - a timed wait's code below must still win over them, exactly as
             // it would over a call this worker had dispatched itself.
@@ -4509,12 +4578,14 @@ fn build_engine(
         // difference from native is on the record rather than inferred from timings.
         preempt_note();
 
+        let float_sel: Rc<[bool]> = env.import_float_abi().into();
         let host: Host = Arc::new(Mutex::new(env));
         let engine = BrowserEngine {
             module,
             shared_mem,
             view,
             host: host.clone(),
+            float_sel,
             base,
             promising,
             suspending,
@@ -4579,11 +4650,13 @@ impl BrowserEngine {
             wasm_bindgen::throw_str(&msg)
         }) as Box<dyn FnMut(i32, i32)>);
         let dispatch_miss_fn: JsValue = dispatch_miss.as_ref().clone();
+        let float_sel: Rc<[bool]> = crate::smp::lock_host(&host).import_float_abi().into();
         Ok(BrowserEngine {
             module,
             shared_mem,
             view: GuestMem::Host(region),
             host,
+            float_sel,
             base,
             promising,
             suspending,

@@ -160,6 +160,22 @@ fn w_f32s(o: &mut impl Write, v: &[f32]) -> io::Result<()> {
     Ok(())
 }
 
+/// Split a draw's STORE windows off the end of its fragment window list, where the writer put
+/// them (see `capture::Draw::frag_store_windows`). The program says how many of each it has; a
+/// list that is not exactly that long is a capsule written before store windows were captured,
+/// and keeps everything as load windows - which is all it ever held.
+fn split_store_windows(fprog: &[u8], windows: &mut Vec<(u32, Arc<[u8]>)>) -> Vec<(u32, Arc<[u8]>)> {
+    let stores = vitaslop_gxp_shader::store_windows_for_fragment_blob(fprog).len();
+    if stores == 0 {
+        return Vec::new();
+    }
+    let loads = vitaslop_gxp_shader::mem_windows_for_fragment_blob(fprog).len();
+    if windows.len() != loads + stores {
+        return Vec::new();
+    }
+    windows.split_off(loads)
+}
+
 fn r_u8(i: &mut impl Read) -> io::Result<u8> {
     let mut b = [0u8; 1];
     i.read_exact(&mut b)?;
@@ -469,8 +485,10 @@ impl Capsule {
             w_u32(o, *addr)?;
             w_bytes(o, bytes)?;
         }
-        w_u32(o, d.frag_mem_windows.len() as u32)?;
-        for (addr, bytes) in &d.frag_mem_windows {
+        // The STORE windows ride appended to the fragment load windows, so the format is
+        // unchanged - see `capture::Draw::frag_store_windows` and the reader's split.
+        w_u32(o, (d.frag_mem_windows.len() + d.frag_store_windows.len()) as u32)?;
+        for (addr, bytes) in d.frag_mem_windows.iter().chain(&d.frag_store_windows) {
             w_u32(o, *addr)?;
             w_bytes(o, bytes)?;
         }
@@ -566,6 +584,9 @@ impl Capsule {
             let addr = r_u32(i)?;
             frag_mem_windows.push((addr, Arc::<[u8]>::from(r_bytes(i)?)));
         }
+        // Split the STORE windows back off the end: the program's own load-window count says
+        // where (a capsule written before store windows were captured has none to split).
+        let frag_store_windows = split_store_windows(&fprog, &mut frag_mem_windows);
         let shader_expanded = r_u8(i)? != 0;
 
         Ok(Capsule {
@@ -594,6 +615,7 @@ impl Capsule {
                 frag_sa_addr,
                 mem_windows,
                 frag_mem_windows,
+                frag_store_windows,
                 shader_expanded,
             },
             width,
@@ -798,6 +820,7 @@ pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
                 stencil_addr: v[2],
                 background_depth: v[3],
                 background_control: v[4],
+                load_addr: 0,
             });
         }
         s.multisample = r_u32(i)?;
@@ -994,6 +1017,9 @@ mod tests {
                 (0x8e1d_2fb0, Arc::from(&[5u8, 6][..])),
             ],
             frag_mem_windows: vec![(0x8b40_0000, Arc::from(&[9u8, 8, 7, 6][..]))],
+            // The program bytes here are not a storing program, so a store window would not
+            // survive the reader's split - that path has its own test.
+            frag_store_windows: Vec::new(),
             shader_expanded: true,
         };
         let c = Capsule {
@@ -1185,6 +1211,7 @@ pub fn maybe_capture(d: &Draw) {
     d.frag_sa.hash(&mut h);
     d.mem_windows.hash(&mut h);
     d.frag_mem_windows.hash(&mut h);
+    d.frag_store_windows.hash(&mut h);
     d.vertices.hash(&mut h);
     let inputs = h.finish();
 

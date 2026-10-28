@@ -4278,6 +4278,7 @@ version = "0.1.0"
 dependencies = [
  "dlmalloc",
  "js-sys",
+ "pollster 1.0.1",
  "tracing",
  "vitaslop-aac",
  "vitaslop-gxp-shader",

@@ -355,6 +355,33 @@ pub(super) enum DialogFamily {
     /// The camera picker - "take a picture for your player". There is no camera here, so
     /// it opens and closes with nothing captured, the same shape as the photo picker.
     CameraImport = 11,
+    /// An UNNAMED SceCommonDialog family - five exports no NID database or wiki names
+    /// (`SceCommonDialog_33626E2C` and siblings, see `nid::services`). Its shape is read off
+    /// the one title that calls it: an `Init(param)` whose 0x80-byte param opens with the
+    /// common-dialog header and carries an NP communication id and a stored "accepted
+    /// version" word, a `GetStatus()` polled for FINISHED, a `GetResult(result)` whose word
+    /// at +4 the title reads as accepted / not accepted and whose word at +8 it saves as the
+    /// newly accepted version, then `Term()`. It sits in the title's PSN sign-in chain
+    /// beside its terms-of-service flags: a TERMS-ACCEPTANCE dialog. Its text lives on the
+    /// server, there is no account and no network, and nobody is here to accept anything -
+    /// so it opens, completes, and reports NOTHING ACCEPTED (see
+    /// [`unnamed_terms_dialog_get_result`]), the answer a person declining gives.
+    UnnamedTerms = 12,
+}
+
+/// `int SceCommonDialog_D1858A78(result *)` - the [`DialogFamily::UnnamedTerms`] result read.
+///
+/// Writes the three words the calling title is seen to read - a leading word it never reads,
+/// the outcome at +4 and the accepted version at +8 - all zero: "not accepted, no version",
+/// which the title answers the way it answers a declined dialog (it keeps no new version and
+/// stays off its online path). Nothing past +0xC is written; the title's buffer is no larger
+/// than 0x2C, and no other field of it is established.
+pub(super) fn unnamed_terms_dialog_get_result(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let result = ctx.arg(0);
+    if result != 0 {
+        ctx.write_bytes(result, &[0u8; 0xC]);
+    }
+    ctx.ret(0);
 }
 
 /// `SceImeDialogButton`: which button dismissed the text-entry dialog.
@@ -1056,6 +1083,58 @@ fn rtc_format_rfc3339_impl(ctx: &mut GuestCtx, out: Ptr, tick: Ptr, tz_minutes: 
     0
 }
 
+/// int sceRtcFormatRFC2822LocalTime(char *pszDateTime, const SceRtcTick *utc)
+///
+/// The same tick as [`rtc_format_rfc3339_local_time`], in the RFC 2822 section 3.3 (mail)
+/// form: `Www, DD Mmm YYYY HH:MM:SS +HHMM`. Local time is the zero offset here for the reason
+/// that formatter gives, and the zone is written numerically - the one zone form RFC 2822
+/// requires a writer to produce. The date comes from the same [`civil_from_days`] expansion,
+/// so the two formatters cannot disagree about which day a tick is.
+#[hostcall]
+pub(super) fn rtc_format_rfc2822_local_time(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    out: Ptr,
+    tick: Ptr,
+) -> i32 {
+    // The validation wants early exits, which a `#[hostcall]` body cannot have.
+    rtc_format_rfc2822_impl(ctx, out, tick, 0)
+}
+
+fn rtc_format_rfc2822_impl(ctx: &mut GuestCtx, out: Ptr, tick: Ptr, tz_minutes: i32) -> i32 {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    if out.is_null() || tick.is_null() {
+        return SCE_RTC_ERROR_INVALID_POINTER;
+    }
+    let t = read_tick(ctx, tick.addr());
+    let us = t - RTC_UNIX_EPOCH_TICKS as i64 + tz_minutes as i64 * 60_000_000;
+    let secs = us.div_euclid(1_000_000);
+    let days = secs.div_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    if !(1..=9999).contains(&y) {
+        return SCE_RTC_ERROR_INVALID_YEAR;
+    }
+    // 1970-01-01, day 0, was a Thursday.
+    let weekday = DAYS[(days + 4).rem_euclid(7) as usize];
+    let sign = if tz_minutes < 0 { '-' } else { '+' };
+    let tz_abs = (tz_minutes as i64).abs();
+    let sod = secs.rem_euclid(86_400);
+    let text = format!(
+        "{weekday}, {d:02} {} {y:04} {:02}:{:02}:{:02} {sign}{:02}{:02}\0",
+        MONTHS[(m - 1) as usize],
+        sod / 3600,
+        sod / 60 % 60,
+        sod % 60,
+        tz_abs / 60,
+        tz_abs % 60
+    );
+    ctx.write_bytes(out.addr(), text.as_bytes());
+    0
+}
+
 /// int sceRtcParseRFC3339(SceRtcTick *utc, const char *pszDateTime)
 ///
 /// The exact inverse of [`rtc_format_rfc3339_local_time`]: read an RFC 3339 timestamp and
@@ -1066,7 +1145,7 @@ fn rtc_format_rfc3339_impl(ctx: &mut GuestCtx, out: Ptr, tick: Ptr, tz_minutes: 
 ///
 /// The grammar accepted is RFC 3339 section 5.6 as the console emits and consumes it:
 /// `YYYY-MM-DDTHH:MM:SS`, an OPTIONAL fractional second of any length, and an offset that is
-/// either `Z` (`z`) or `±HH:MM`. The offset is SUBTRACTED, because the tick is UTC and the
+/// either `Z` (`z`) or `+HH:MM` / `-HH:MM`. The offset is SUBTRACTED, because the tick is UTC and the
 /// text is local to whoever wrote it - dropping it would silently shift a stamp by hours.
 /// The date/time separator is accepted in either case (`T` or `t`), which the grammar allows.
 ///
@@ -1140,7 +1219,7 @@ fn rtc_parse_rfc3339_impl(ctx: &mut GuestCtx, tick: Ptr, text: Ptr) -> i32 {
             micro *= 10;
         }
     }
-    // The offset. RFC 3339 requires one; `Z` and `±HH:MM` are the two spellings.
+    // The offset. RFC 3339 requires one; `Z` and `+HH:MM` / `-HH:MM` are the two spellings.
     let offset_minutes = match b.get(i) {
         Some(&c) if (c | 0x20) == b'z' => 0,
         Some(&c) if c == b'+' || c == b'-' => {
@@ -1509,28 +1588,75 @@ fn write_sensor_records(
     0
 }
 
+/// What SceMotion keeps between calls - the guest's own settings, each held so its getter
+/// answers with what the setter was given. Owned here; `VitaState` holds one.
+pub(crate) struct MotionState {
+    /// Whether `sceMotionMagnetometerOn` has been called and not turned off again. The
+    /// guest's own state, read back by `sceMotionGetMagnetometerState`.
+    magnetometer: bool,
+    /// `sceMotionSetDeadband` / `sceMotionSetTiltCorrection`: the two tuning bits, held
+    /// for the same reason the magnetometer bit is - each has a getter, and a title told
+    /// its setting did not take has been told two different things. Both change nothing
+    /// about what `sceMotionGetState` reports, since the modelled device is at rest.
+    /// The device powers up with both enabled.
+    deadband: bool,
+    tilt_correction: bool,
+    /// `sceMotionSetAngleThreshold`'s float, as bits; held for its getter.
+    angle_threshold: u32,
+}
+
+impl Default for MotionState {
+    fn default() -> Self {
+        MotionState {
+            magnetometer: false,
+            deadband: true,
+            tilt_correction: true,
+            angle_threshold: 0,
+        }
+    }
+}
+
+/// What ScePower keeps between calls, owned here; `VitaState` holds one.
+pub(crate) struct PowerState {
+    /// ScePower's four clocks in MHz (ARM, bus, GPU, GPU crossbar), as the guest last
+    /// set them; the device's defaults until it does. Held so a getter answers with
+    /// what the setter was given.
+    clocks: [u32; 4],
+    /// `scePowerSetUsingWireless`, read back by `scePowerGetUsingWireless`.
+    using_wireless: bool,
+}
+
+impl Default for PowerState {
+    fn default() -> Self {
+        PowerState {
+            clocks: [333, 166, 111, 166],
+            using_wireless: false,
+        }
+    }
+}
+
 /// int sceMotionMagnetometerOn(void) / int sceMotionMagnetometerOff(void)
 ///
 /// Really flips the sampling bit, because [`motion_get_magnetometer_state`] reads it back
 /// and a title that turns the magnetometer on and then finds it off has been told two
 /// different things. `on` selects which way.
 pub(super) fn motion_magnetometer_set(ctx: &mut GuestCtx, st: &mut VitaState, on: bool) {
-    st.motion_magnetometer = on;
+    st.motion.magnetometer = on;
     ctx.ret(0);
 }
 
 /// int scePowerSet{Arm,Bus,Gpu,GpuXbar}ClockFrequency(int mhz)
-/// Held in `power_clocks[which]` so the matching getter reads it back. Nothing here
+/// Held in `PowerState::clocks[which]` so the matching getter reads it back. Nothing here
 /// runs faster or slower for it: this engine's clock is the emulated device's, and the
 /// guest's request is recorded, not obeyed.
 pub(super) fn power_set_clock(ctx: &mut GuestCtx, st: &mut VitaState, which: usize) {
-    st.power_clocks[which] = ctx.arg(0);
+    st.power.clocks[which] = ctx.arg(0);
     ctx.ret(0);
 }
 
 /// int scePowerGet{Arm,Bus,Gpu,GpuXbar}ClockFrequency(void)
 pub(super) fn power_get_clock(ctx: &mut GuestCtx, st: &mut VitaState, which: usize) {
-    ctx.ret(st.power_clocks[which]);
+    ctx.ret(st.power.clocks[which]);
 }
 
 /// The battery this engine presents: the console is on its AC adapter with a full battery -
@@ -1552,10 +1678,10 @@ pub(super) const POWER_FULL_PERCENT: u32 = 100;
 /// own setting, held and read back.
 pub(super) fn power_using_wireless(ctx: &mut GuestCtx, st: &mut VitaState, set: bool) {
     if set {
-        st.power_using_wireless = ctx.arg(0) != 0;
+        st.power.using_wireless = ctx.arg(0) != 0;
         ctx.ret(0);
     } else {
-        ctx.ret(u32::from(st.power_using_wireless));
+        ctx.ret(u32::from(st.power.using_wireless));
     }
 }
 
@@ -1563,12 +1689,12 @@ pub(super) fn power_using_wireless(ctx: &mut GuestCtx, st: &mut VitaState, set: 
 /// Held as bits; the modelled device never moves, so the threshold changes nothing
 /// it reports, but the getter answers with what was set.
 pub(super) fn motion_set_angle_threshold(ctx: &mut GuestCtx, st: &mut VitaState) {
-    st.motion_angle_threshold = ctx.arg(0);
+    st.motion.angle_threshold = ctx.arg(0);
     ctx.ret(0);
 }
 pub(super) fn motion_get_angle_threshold(ctx: &mut GuestCtx, st: &mut VitaState) {
     // A float return travels in r0 on this ABI (softfp), which `ret` writes.
-    ctx.ret(st.motion_angle_threshold);
+    ctx.ret(st.motion.angle_threshold);
 }
 
 /// int sceAppMgrGetBudgetInfo(SceAppMgrBudgetInfo *info)
@@ -1691,7 +1817,7 @@ pub(super) fn shared_fb_close(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// set. This is the guest's own state, so it is exact.
 #[hostcall]
 pub(super) fn motion_get_magnetometer_state(_ctx: &mut GuestCtx, st: &mut VitaState) -> i32 {
-    i32::from(st.motion_magnetometer)
+    i32::from(st.motion.magnetometer)
 }
 
 /// int sceMotionSetDeadband(int setValue) / int sceMotionSetTiltCorrection(int setValue)
@@ -1703,9 +1829,9 @@ pub(super) fn motion_get_magnetometer_state(_ctx: &mut GuestCtx, st: &mut VitaSt
 pub(super) fn motion_set_tuning(ctx: &mut GuestCtx, st: &mut VitaState, tilt: bool) {
     let on = ctx.arg(0) != 0;
     if tilt {
-        st.motion_tilt_correction = on;
+        st.motion.tilt_correction = on;
     } else {
-        st.motion_deadband = on;
+        st.motion.deadband = on;
     }
     ctx.ret(0);
 }
@@ -1715,9 +1841,9 @@ pub(super) fn motion_set_tuning(ctx: &mut GuestCtx, st: &mut VitaState, tilt: bo
 /// documents, so a title that only ever reads them sees the device's own defaults.
 pub(super) fn motion_get_tuning(ctx: &mut GuestCtx, st: &mut VitaState, tilt: bool) {
     let on = if tilt {
-        st.motion_tilt_correction
+        st.motion.tilt_correction
     } else {
-        st.motion_deadband
+        st.motion.deadband
     };
     ctx.ret(u32::from(on));
 }
@@ -2970,46 +3096,42 @@ fn unlock_trophy(
     0
 }
 
-/// Write the fixed, deterministic wall-clock date into a `SceDateTime`, which is
-/// {u16 year, month, day, hour, minute, second; u32 microsecond}. Both RTC clock
-/// getters serve the same constant so a title reading the struct sees a defined
-/// value rather than stack garbage.
-fn write_fixed_date_time(ctx: &mut GuestCtx, time: Ptr) {
-    if !time.is_null() {
-        let mut buf = [0u8; 16];
-        buf[0..2].copy_from_slice(&2016u16.to_le_bytes()); // year
-        buf[2..4].copy_from_slice(&1u16.to_le_bytes()); // month
-        buf[4..6].copy_from_slice(&1u16.to_le_bytes()); // day
-        // hour/minute/second/microsecond stay zero.
-        ctx.write_bytes(time.addr(), &buf);
+/// Break the world wall clock, shifted by `tz_minutes`, down into the `SceDateTime` at `time`.
+///
+/// It is the SAME clock `sceRtcGetCurrentTick` reports ([`VitaState::guest_wall_us`]), so the
+/// date a title displays and the tick it stamps or diffs agree. A fixed date here made the
+/// two disagree: the tick advanced while the clock read 2016-01-01 00:00 for ever, and a
+/// title that schedules by the hour or the day off the broken-down clock never saw it move.
+fn write_wall_date_time(ctx: &mut GuestCtx, st: &mut VitaState, time: Ptr, tz_minutes: i32) -> i32 {
+    if time.is_null() {
+        return SCE_RTC_ERROR_INVALID_POINTER;
     }
+    let us = st.guest_wall_us() as i64 + i64::from(tz_minutes) * 60_000_000;
+    write_date_time(ctx, time.addr(), us.div_euclid(1_000_000), us.rem_euclid(1_000_000))
 }
 
 /// int sceRtcGetCurrentClock(SceDateTime *time, int tzMinutes)
 /// The UTC wall clock adjusted by a caller-supplied timezone offset in minutes.
-/// We serve a fixed deterministic date regardless of `tz` (the emulated clock has
-/// no real timezone), matching the local-time variant.
 #[hostcall]
 pub(super) fn rtc_get_current_clock(
     ctx: &mut GuestCtx,
-    _st: &mut VitaState,
+    st: &mut VitaState,
     time: Ptr,
-    _tz: i32,
+    tz: i32,
 ) -> i32 {
-    write_fixed_date_time(ctx, time);
-    0
+    write_wall_date_time(ctx, st, time, tz)
 }
 
 /// int sceRtcGetCurrentClockLocalTime(SceDateTime *time)
-/// Fill a fixed, deterministic local date/time.
+/// The wall clock in the system's time zone, which is UTC here - see
+/// [`rtc_convert_time_zone`] for why there is no offset to apply.
 #[hostcall]
 pub(super) fn rtc_get_current_clock_local_time(
     ctx: &mut GuestCtx,
-    _st: &mut VitaState,
+    st: &mut VitaState,
     time: Ptr,
 ) -> i32 {
-    write_fixed_date_time(ctx, time);
-    0
+    write_wall_date_time(ctx, st, time, 0)
 }
 
 /// int sceRtcSetTime64_t(SceDateTime *time, time_t iTime)
@@ -3742,6 +3864,40 @@ mod rtc_call_tests {
         }
     }
 
+    /// The broken-down clocks are the tick's clock: the date `sceRtcGetCurrentClockLocalTime`
+    /// writes is the tick `sceRtcGetCurrentTick` writes, expanded, and `sceRtcGetCurrentClock`
+    /// shifts it by exactly its minutes argument.
+    #[test]
+    fn the_broken_down_clocks_read_the_same_clock_as_the_tick() {
+        let mut r = Rig::new();
+        assert_eq!(r.call(&[TICK_A], rtc_get_current_tick), 0);
+        let tick = u64::from(r.u32_at(TICK_A)) | u64::from(r.u32_at(TICK_A + 4)) << 32;
+        let unix_us = (tick - RTC_UNIX_EPOCH_TICKS) as i64;
+        let expect = |shift_s: i64| {
+            let secs = unix_us.div_euclid(1_000_000) + shift_s;
+            let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+            let sod = secs.rem_euclid(86_400);
+            [
+                y as u16,
+                m as u16,
+                d as u16,
+                (sod / 3600) as u16,
+                (sod / 60 % 60) as u16,
+                (sod % 60) as u16,
+            ]
+        };
+        assert_eq!(r.call(&[TIME], rtc_get_current_clock_local_time), 0);
+        assert_eq!(r.date(), expect(0));
+        assert_eq!(r.call(&[TIME, 90], rtc_get_current_clock), 0);
+        assert_eq!(r.date(), expect(90 * 60));
+        assert_eq!(r.call(&[TIME, (-330i32) as u32], rtc_get_current_clock), 0);
+        assert_eq!(r.date(), expect(-330 * 60));
+        assert_eq!(
+            r.call(&[0], rtc_get_current_clock_local_time),
+            SCE_RTC_ERROR_INVALID_POINTER
+        );
+    }
+
     #[test]
     fn days_in_month_and_leap_years_follow_the_gregorian_rules() {
         let mut r = Rig::new();
@@ -3838,6 +3994,33 @@ mod rtc_call_tests {
         }
     }
 
+    /// The mail-date form of a known instant, its weekday from the same day count, and the
+    /// fixed `+0000` zone of local time here; the RFC 3339 text of the same tick names the
+    /// same date and time.
+    #[test]
+    fn rfc2822_local_time_names_the_same_instant_as_rfc3339() {
+        let mut r = Rig::new();
+        {
+            let t = RTC_UNIX_EPOCH_TICKS as i64 + 1_760_000_000 * 1_000_000 + 250_000;
+            r.with(&[], |ctx, _| write_tick(ctx, TICK_A, t));
+            assert_eq!(r.call(&[TEXT, TICK_A], rtc_format_rfc2822_local_time), 0);
+            let text = r.with(&[], |ctx, _| ctx.read_cstr(TEXT, 64));
+            assert_eq!(text, "Thu, 09 Oct 2025 08:53:20 +0000");
+            assert_eq!(r.call(&[TEXT, TICK_A], rtc_format_rfc3339_local_time), 0);
+            let text = r.with(&[], |ctx, _| ctx.read_cstr(TEXT, 64));
+            assert!(text.starts_with("2025-10-09T08:53:20"), "{text}");
+            // The epoch itself: a Thursday, and the first day of its month.
+            r.with(&[], |ctx, _| write_tick(ctx, TICK_A, RTC_UNIX_EPOCH_TICKS as i64));
+            r.call(&[TEXT, TICK_A], rtc_format_rfc2822_local_time);
+            let text = r.with(&[], |ctx, _| ctx.read_cstr(TEXT, 64));
+            assert_eq!(text, "Thu, 01 Jan 1970 00:00:00 +0000");
+            assert_eq!(
+                r.call(&[0, TICK_A], rtc_format_rfc2822_local_time),
+                SCE_RTC_ERROR_INVALID_POINTER
+            );
+        }
+    }
+
     #[test]
     fn compare_tick_orders_ticks() {
         let mut r = Rig::new();
@@ -3881,5 +4064,45 @@ pub(super) fn net_get_mac_address(
     } else {
         ctx.write_bytes(addr.addr(), &NET_MAC_ADDRESS);
         0
+    }
+}
+
+#[cfg(test)]
+mod unnamed_terms_dialog_tests {
+    //! The unnamed terms-acceptance family through the real dispatch: it opens, finishes, an
+    //! abort leaves it to finish, the result is "nothing accepted", and term closes it.
+    use crate::host::{GuestCtx, VitaState};
+    use crate::nid::services as sv;
+    use crate::world::DeterministicWorld;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    fn call(st: &mut VitaState, bytes: &mut [u8], nid: u32, a0: u32) -> u32 {
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = a0;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut mem = SliceMemory(bytes);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        crate::vita::dispatch(0xE537_816C, nid, &mut ctx, st);
+        regs[0]
+    }
+
+    #[test]
+    fn opens_finishes_and_accepts_nothing() {
+        let mut st = VitaState::new(0, 0x400, Box::new(DeterministicWorld::default()));
+        let mut b = vec![0xAAu8; 0x400];
+        assert_eq!(call(&mut st, &mut b, sv::COMMON_DIALOG_UNNAMED_TERMS_GET_STATUS, 0), 0);
+        assert_eq!(call(&mut st, &mut b, sv::COMMON_DIALOG_UNNAMED_TERMS_INIT, 0x100), 0);
+        assert_eq!(call(&mut st, &mut b, sv::COMMON_DIALOG_UNNAMED_TERMS_ABORT, 0), 0);
+        assert_eq!(
+            call(&mut st, &mut b, sv::COMMON_DIALOG_UNNAMED_TERMS_GET_STATUS, 0),
+            2,
+            "an abort leaves it to finish"
+        );
+        assert_eq!(call(&mut st, &mut b, sv::COMMON_DIALOG_UNNAMED_TERMS_GET_RESULT, 0x200), 0);
+        assert_eq!(&b[0x200..0x20C], &[0u8; 0xC], "nothing accepted, no version");
+        assert_eq!(b[0x20C], 0xAA, "nothing past the established words");
+        assert_eq!(call(&mut st, &mut b, sv::COMMON_DIALOG_UNNAMED_TERMS_TERM, 0), 0);
+        assert_eq!(call(&mut st, &mut b, sv::COMMON_DIALOG_UNNAMED_TERMS_GET_STATUS, 0), 0);
     }
 }

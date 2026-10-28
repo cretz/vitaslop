@@ -1041,6 +1041,43 @@ pub(super) fn create_rwlock(
     id
 }
 
+/// Layout of `SceKernelRWLockInfo` (`psp2/kernel/threadmgr/rwlock.h`, asserted there at 0x3C):
+/// `{ size, rwLockId, name[32], attr, lockCount, writeOwnerId, numReadWaitThreads,
+/// numWriteWaitThreads }`.
+const RW_LOCK_INFO_SIZE: u32 = 0x3C;
+const RW_LOCK_INFO_NAME: u32 = 8;
+const RW_LOCK_INFO_ATTR: u32 = 40;
+
+/// int sceKernelGetRWLockInfo(SceUID rwlock_id, SceKernelRWLockInfo *info)
+///
+/// The [`get_mutex_info`] shape for a reader/writer lock, and every field is the lock's live
+/// state (`VitaState::rwlock_info`): who holds it for writing, how deep, and how many threads
+/// are parked for each mode - the waiter counts split by what they asked for, because a title
+/// that reports a stall needs to see a queued WRITER holding readers back.
+#[hostcall]
+pub(super) fn get_rwlock_info(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, info: Ptr) -> i32 {
+    // Expression-bodied, for the reason `get_sema_info` states.
+    match st.rwlock_info(id) {
+        Some((name, attr, count, owner, read_waiters, write_waiters)) if info.addr() != 0 => {
+            let addr = info.addr();
+            let mut name_buf = [0u8; 32];
+            let bytes = name.as_bytes();
+            let n = bytes.len().min(31);
+            name_buf[..n].copy_from_slice(&bytes[..n]);
+            ctx.write_u32(addr, RW_LOCK_INFO_SIZE);
+            ctx.write_u32(addr + 4, id as u32);
+            ctx.write_bytes(addr + RW_LOCK_INFO_NAME, &name_buf);
+            ctx.write_u32(addr + RW_LOCK_INFO_ATTR, attr);
+            ctx.write_u32(addr + RW_LOCK_INFO_ATTR + 4, count);
+            ctx.write_u32(addr + RW_LOCK_INFO_ATTR + 8, owner as u32);
+            ctx.write_u32(addr + RW_LOCK_INFO_ATTR + 12, read_waiters);
+            ctx.write_u32(addr + RW_LOCK_INFO_ATTR + 16, write_waiters);
+            0
+        }
+        _ => SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID as i32,
+    }
+}
+
 /// int sceKernelDeleteRWLock(SceUID rwlock_id)
 #[hostcall]
 pub(super) fn delete_rwlock(st: &mut VitaState, id: i32) -> i32 {
@@ -1583,6 +1620,76 @@ mod rwlock_tests {
             Some(crate::host::SCE_KERNEL_ERROR_WAIT_DELETE)
         );
         assert_eq!(st.rwlock_try(id, false), R::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod rwlock_info_tests {
+    use super::*;
+    use crate::world::DeterministicWorld;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    const INFO: u32 = 0x1000;
+
+    /// The info struct reads back the lock's live holders and its parked threads split by
+    /// mode, at the published offsets; an unknown id is refused.
+    #[test]
+    fn info_reports_holders_and_waiters_by_mode() {
+        // A FRESH context per call: `#[hostcall]` reads its arguments through the context's
+        // cursor, so a reused one would hand the second call the first call's tail.
+        fn info(bytes: &mut [u8], st: &mut VitaState, id: u32) -> u32 {
+            let mut regs = [0u32; REG_COUNT];
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            (regs[0], regs[1]) = (id, INFO);
+            let mut mem = SliceMemory(bytes);
+            let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            get_rwlock_info(&mut ctx, st);
+            regs[0]
+        }
+        let word = |b: &[u8], a: u32| u32::from_le_bytes(b[a as usize..a as usize + 4].try_into().unwrap());
+        let mut st = VitaState::new(0, 0x4000, Box::new(DeterministicWorld::default()));
+        st.set_preemptive(true);
+        let mut bytes = vec![0u8; 0x4000];
+        let id = st.create_rwlock("Lock", 0x02);
+        st.set_current(1);
+        st.rwlock_try(id, true);
+        st.rwlock_try(id, true);
+        st.set_current(2);
+        st.rwlock_block(id, false, None);
+        st.set_current(3);
+        st.rwlock_block(id, true, None);
+        st.set_current(4);
+        st.rwlock_block(id, false, None);
+        let end = (INFO + RW_LOCK_INFO_SIZE) as usize;
+        bytes[end..end + 4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        assert_eq!(info(&mut bytes, &mut st, id as u32), 0);
+        assert_eq!(word(&bytes, INFO), RW_LOCK_INFO_SIZE);
+        assert_eq!(word(&bytes, INFO + 4), id as u32);
+        assert_eq!(&bytes[INFO as usize + 8..INFO as usize + 13], b"Lock\0");
+        assert_eq!(word(&bytes, INFO + 0x28), 0x02, "attr");
+        assert_eq!(word(&bytes, INFO + 0x2c), 2, "the writer's recursion depth");
+        assert_eq!(word(&bytes, INFO + 0x30), 1, "writeOwnerId");
+        assert_eq!(word(&bytes, INFO + 0x34), 2, "readers parked");
+        assert_eq!(word(&bytes, INFO + 0x38), 1, "writers parked");
+        assert_eq!(word(&bytes, INFO + RW_LOCK_INFO_SIZE), 0xdead_beef);
+
+        // Released, then shared by two readers: the count is theirs and no thread writes.
+        let mut st2 = VitaState::new(0, 0x4000, Box::new(DeterministicWorld::default()));
+        st2.set_preemptive(true);
+        let id2 = st2.create_rwlock("R", 0);
+        st2.set_current(5);
+        st2.rwlock_try(id2, false);
+        st2.set_current(6);
+        st2.rwlock_try(id2, false);
+        assert_eq!(info(&mut bytes, &mut st2, id2 as u32), 0);
+        assert_eq!(word(&bytes, INFO + 0x2c), 2);
+        assert_eq!(word(&bytes, INFO + 0x30), 0);
+
+        assert_eq!(
+            info(&mut bytes, &mut st, 0x7777),
+            SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID
+        );
     }
 }
 

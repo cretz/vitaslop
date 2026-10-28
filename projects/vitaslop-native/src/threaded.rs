@@ -320,6 +320,21 @@ impl ThreadHandle for WasmtimeThread {
         Some(self.signal.lock().unwrap().fuel)
     }
 
+    /// Drop the in-flight guest call, and with it the store, the instance and the fiber stack.
+    ///
+    /// A thread that FINISHED has a completed future, whose store is already gone, so this
+    /// only frees the box. A thread the runtime TERMINATED while parked
+    /// (`ImportDispatch::take_terminations`) has a future suspended inside its host call, and
+    /// dropping it is how wasmtime is told it will never be resumed: its `FiberFuture` drop
+    /// resumes the fiber once with a "future dropped" error, the host call's `block_on` returns
+    /// that error without polling our closure again - so none of the code after its suspend
+    /// runs and no host lock is taken - the guest frames unwind as a trap, and the stack goes
+    /// back to the allocator. Holding the future instead kept every terminated thread's store
+    /// and stack for the rest of the run, which is the leak termination exists to end.
+    fn release(&mut self) {
+        self.future = Box::pin(std::future::ready(FiberEnd::Returned(0)));
+    }
+
     /// Guest ARM instructions this thread has retired, from the EMITTED per-block counter
     /// - the unit the game clock is billed in on both engines.
     ///
@@ -1880,7 +1895,10 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
                         // exact entry sequence for the first few thousand) instead of printing.
                         // Reveals a hot loop's structure without flooding stderr or perturbing
                         // the schedule the way a per-block eprintln does.
-                        if block_hist_enabled() {
+                        // Inside the `VITASLOP_TRACE_FRAMES` window only, when one is set: a
+                        // histogram of the frames around one event is what two runs can be
+                        // DIFFED by, and the boot's millions of entries would drown it.
+                        if block_hist_enabled() && trace_frame_window_open(current_frame()) {
                             block_hist_record(sel);
                         }
                         // The verbose per-block eprintln is the human trace; suppress it when
@@ -2320,6 +2338,10 @@ struct BlockHist {
     /// holds the STEADY-STATE cycle at run end, not the warmup prefix).
     seq: std::collections::VecDeque<u32>,
     total: u64,
+    /// The first and last display frame each block was entered on. `VITASLOP_BLOCK_HIST_FIRST=<path>`
+    /// writes them per block, ordered by first frame, so two runs can be diffed by which
+    /// code an input reached (see `dump_block_hist`).
+    span: std::collections::HashMap<u32, (u64, u64)>,
 }
 const BLOCK_HIST_SEQ_CAP: usize = 8192;
 static BLOCK_HIST: Mutex<Option<BlockHist>> = Mutex::new(None);
@@ -2336,8 +2358,11 @@ fn block_hist_record(pc: u32) {
         counts: std::collections::HashMap::new(),
         seq: std::collections::VecDeque::new(),
         total: 0,
+        span: std::collections::HashMap::new(),
     });
     *h.counts.entry(pc).or_insert(0) += 1;
+    let frame = current_frame();
+    h.span.entry(pc).or_insert((frame, frame)).1 = frame;
     if h.seq.len() >= BLOCK_HIST_SEQ_CAP {
         h.seq.pop_front();
     }
@@ -2365,6 +2390,25 @@ pub fn dump_block_hist(top: usize) {
         match std::fs::write(&path, &s) {
             Ok(()) => eprintln!("wrote {} block-seq entries to {path}", h.seq.len()),
             Err(e) => eprintln!("block-seq write to {path} failed: {e}"),
+        }
+    }
+    // If VITASLOP_BLOCK_HIST_FIRST=<path> is set, write EVERY recorded block as
+    // `<pc> <first frame> <last frame> <count>` (hex pc, decimal rest), ordered by first
+    // frame. This is the file two runs are DIFFED by: over a window that straddles one input,
+    // the blocks first entered on or after that input's frame are the code the input reached,
+    // and the earliest of them that one run enters and the other never does is where the two
+    // diverge. The `top` list cannot say this - a handler that runs once is never near the top.
+    if let Ok(path) = std::env::var("VITASLOP_BLOCK_HIST_FIRST") {
+        let mut rows: Vec<(u32, (u64, u64), u64)> =
+            h.span.iter().map(|(&pc, &span)| (pc, span, h.counts[&pc])).collect();
+        rows.sort_by_key(|&(pc, (first, _), _)| (first, pc));
+        let mut s = String::with_capacity(rows.len() * 32);
+        for (pc, (first, last), count) in &rows {
+            s.push_str(&format!("{pc:08x} {first} {last} {count}\n"));
+        }
+        match std::fs::write(&path, &s) {
+            Ok(()) => eprintln!("wrote {} block first/last-frame rows to {path}", rows.len()),
+            Err(e) => eprintln!("block-first write to {path} failed: {e}"),
         }
     }
     eprintln!(

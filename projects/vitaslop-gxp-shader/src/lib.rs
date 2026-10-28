@@ -27,6 +27,8 @@ pub mod interp;
 pub mod ir;
 pub mod link;
 pub mod module;
+pub mod reach;
+pub mod tile;
 pub mod usse;
 pub mod wgsl;
 
@@ -210,7 +212,12 @@ pub fn recompile_fragment(bytes: &[u8]) -> Result<RecompiledFragment, RecompileE
     // rewritten here to emit only its source term, and the equation comes back as pipeline
     // state. See `module::lower_dest_blend` for the shapes and for what it refuses.
     let dest_blend = module::lower_dest_blend(&mut shader);
-    let wgsl_body = wgsl::emit_fragment(&shader)?;
+    // The tile registers are admitted only for a program proved to read them through their
+    // pixel-coordinate sums - see `tile`.
+    let wgsl_body = {
+        let _tile = tile::fragment_tile_scope(&program, &shader);
+        wgsl::emit_fragment(&shader)?
+    };
     let hash = program.hash;
     Ok(RecompiledFragment { program, shader, wgsl_body, hash, dest_blend })
 }
@@ -225,9 +232,12 @@ pub fn recompile_fragment_module(bytes: &[u8]) -> Result<(RecompiledFragment, Fr
     if module::writes_no_color_register(&rc.shader) {
         return Err(RecompileError::ColorRegisterNeverWritten);
     }
-    let plan = module::plan_bindings(&rc.shader, rc.program.sa_carried_extent(), |o| {
+    let mut plan = module::plan_bindings(&rc.shader, rc.program.sa_carried_extent(), |o| {
         rc.program.sampler_is_cube(o as u32)
     });
+    // A storing program's windows (an unresolved one leaves the store helper undeclared, and
+    // the module then fails validation naming it rather than writing nowhere).
+    plan.store_windows = module::resolve_store_windows(&rc.program, &rc.shader).unwrap_or_default();
     let writes_depth = rc.shader.instrs.iter().any(|i| i.op == ir::Op::DepthF);
     let module = module::build_module(&rc.wgsl_body, &plan, writes_depth);
     Ok((rc, module))
@@ -294,6 +304,26 @@ pub fn mem_windows_for_vertex_blob(bytes: &[u8]) -> Vec<module::MemWindow> {
 /// refused outright the whole screen was black while the frame kept flipping.
 pub fn mem_windows_for_fragment_blob(bytes: &[u8]) -> Vec<module::MemWindow> {
     mem_windows_for_blob(bytes, ProgramKind::Fragment)
+}
+
+/// The buffers a FRAGMENT blob's 0xF0 guest-memory STORES write through
+/// ([`module::resolve_store_windows`]), which the capture snapshots at draw time to seed the
+/// renderer's writable mirror. EMPTY for a program that stores nothing (the opcode scan
+/// short-circuits before decoding, so this costs nothing for the rest) and for one whose store
+/// windows cannot be resolved - which refuses to link, naming why.
+pub fn store_windows_for_fragment_blob(bytes: &[u8]) -> Vec<module::MemWindow> {
+    let Ok(program) = Program::parse(bytes) else { return Vec::new() };
+    if program.kind != ProgramKind::Fragment {
+        return Vec::new();
+    }
+    // 0x1e with the ABSOLUTE address mode (`addr_mode`, bits 43:42, zero) - a local store is
+    // per-invocation scratch, not guest memory.
+    let stores = |code: &[u64]| code.iter().any(|&w| usse::opcode1(w) == 0x1e && (w >> 42) & 3 == 0);
+    if !stores(&program.code) && !stores(&program.secondary_code) {
+        return Vec::new();
+    }
+    let shader = usse::decode_shader(&program);
+    module::resolve_store_windows(&program, &shader).unwrap_or_default()
 }
 
 /// The stage-agnostic body of the two above: the window resolution is a property of the
@@ -529,6 +559,33 @@ pub fn fragment_uses_frag_color(bytes: &[u8]) -> bool {
     module::reads_output_bank(&usse::decode_shader(&program))
 }
 
+/// Whether a FRAGMENT blob BLENDS AGAINST THE DESTINATION AT REGISTER PRECISION: it reads its
+/// own output bank (the frame-buffer colour, see [`fragment_uses_frag_color`]) and leaves a
+/// half- or full-float colour there rather than the packed 8-bit form.
+///
+/// # Why the renderer has to know
+/// On this hardware a scene's pixels live in the on-chip OUTPUT REGISTERS until the tile is
+/// written out, and only then does the pixel back end pack them into the colour surface's
+/// format. A program compiled for an 8-bit surface packs its colour itself (the `pack.unorm8`
+/// / `mov.fx8` epilogue, [`module::ColorPrecision::Fx8`]); one that leaves HALVES in the
+/// register is relying on the pack happening at emit - and a later draw of the same scene that
+/// reads the register reads those halves, not an 8-bit rounding of them.
+///
+/// So when such a program accumulates over an 8-bit surface (light sprites summed into a bloom
+/// buffer), every intermediate keeps ~11 bits of mantissa. Rendering the scene straight into an
+/// 8-bit attachment rounds after EVERY draw instead, and dim accumulations collapse into a
+/// handful of levels - visible as hard concentric bands that differ per channel.
+///
+/// A blob that does not parse, or is not a fragment program, answers `false`.
+pub fn fragment_blends_at_register_precision(bytes: &[u8]) -> bool {
+    let Ok(program) = Program::parse(bytes) else { return false };
+    if program.kind != ProgramKind::Fragment {
+        return false;
+    }
+    let shader = usse::decode_shader(&program);
+    module::reads_output_bank(&shader) && module::colour_precision_of(&shader) != ColorPrecision::Fx8
+}
+
 /// Whether a FRAGMENT blob can DISCARD a fragment - the question `sceGxmProgramIsDiscardUsed`
 /// asks of a program, answered from the program itself: whether any instruction is a `kill`,
 /// predicated or not (a kill that only sometimes fires still makes the program one that
@@ -744,6 +801,75 @@ pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
         found = Some(RopBlend { dst, alpha_op_differs, factors: None, funcs: (1, 1) });
     }
     found
+}
+
+#[cfg(test)]
+mod register_precision_blend_tests {
+    use super::*;
+    use crate::gxpwrite::{write, ProgramSpec};
+    use crate::ir::Bank;
+    use crate::usse::asm::{self, Dest, Src};
+
+    fn blob(code: Vec<u64>) -> Vec<u8> {
+        write(&ProgramSpec::fragment(code).with_registers(4, 0, 4))
+    }
+
+    /// `o0 = o0 + pa0` at half precision: an accumulation over the destination that leaves
+    /// HALVES in the output register - what the pixel back end packs only at tile emit.
+    #[test]
+    fn a_half_precision_accumulation_over_the_destination_blends_wide() {
+        let add = asm::alu(
+            Op::Add,
+            true,
+            Dest::new(Bank::Output, 0),
+            [true; 4],
+            Src::reg(Bank::Output, 0),
+            Src::reg(Bank::PrimaryAttr, 0),
+        )
+        .unwrap();
+        assert!(fragment_blends_at_register_precision(&blob(vec![add])));
+    }
+
+    /// The same half-precision colour WITHOUT reading the destination: the value is packed
+    /// once whatever the tile holds, so nothing depends on the intermediate precision.
+    #[test]
+    fn a_half_colour_that_never_reads_the_destination_does_not() {
+        let add = asm::alu(
+            Op::Add,
+            true,
+            Dest::new(Bank::Output, 0),
+            [true; 4],
+            Src::reg(Bank::PrimaryAttr, 0),
+            Src::reg(Bank::PrimaryAttr, 2),
+        )
+        .unwrap();
+        assert!(!fragment_blends_at_register_precision(&blob(vec![add])));
+    }
+
+    /// A destination read whose result the program PACKS to 8 bits itself (`mov.fx8`): the
+    /// register already holds the surface's own form, so an 8-bit attachment is exact for it.
+    #[test]
+    fn a_destination_read_packed_to_eight_bits_by_the_program_does_not() {
+        let add = asm::alu(
+            Op::Add,
+            true,
+            Dest::new(Bank::Temp, 0),
+            [true; 4],
+            Src::reg(Bank::Output, 0),
+            Src::reg(Bank::PrimaryAttr, 0),
+        )
+        .unwrap();
+        let pack = asm::copy_fx8(Dest::new(Bank::Output, 0), (Bank::Temp, 0)).unwrap();
+        assert!(!fragment_blends_at_register_precision(&blob(vec![add, pack])));
+    }
+
+    /// Not a fragment program, or not a program at all: no destination to blend against.
+    #[test]
+    fn a_vertex_program_or_garbage_does_not() {
+        let mov = asm::mov(false, Dest::new(Bank::Output, 0), [true; 4], Src::reg(Bank::PrimaryAttr, 0)).unwrap();
+        assert!(!fragment_blends_at_register_precision(&write(&ProgramSpec::vertex(vec![mov]))));
+        assert!(!fragment_blends_at_register_precision(&[0u8; 16]));
+    }
 }
 
 #[cfg(test)]

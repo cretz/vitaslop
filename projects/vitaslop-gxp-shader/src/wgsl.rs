@@ -46,7 +46,9 @@ pub enum EmitError {
     /// A source read a SPECIAL/GLOBAL hardware register whose contents have not been
     /// established. Names the GLOBAL index so the next one to appear says what to go and
     /// establish, rather than reading as a generic unmapped-bank failure.
-    UnmodeledGlobal { index: usize, byte_offset: usize, global: u8, raw: u64 },
+    /// `why` is the tile-register sum proof's refusal (`tile::tile_sums_only`) when the register
+    /// is one of the three it can admit.
+    UnmodeledGlobal { index: usize, byte_offset: usize, global: u8, raw: u64, why: Option<&'static str> },
 }
 
 impl core::fmt::Display for EmitError {
@@ -75,14 +77,55 @@ impl core::fmt::Display for EmitError {
                  iterator/PDS pre-load of internal registers is not modeled; wire that before \
                  emitting this shader",
             ),
-            EmitError::UnmodeledGlobal { index, byte_offset, global, raw } => write!(
+            EmitError::UnmodeledGlobal { index, byte_offset, global, raw, why } => write!(
                 f,
                 "USSE instruction #{index} at code byte {byte_offset:#x} (raw {raw:#018x}) reads \
-                 SPECIAL/GLOBAL hardware register {global} - its contents are not established; \
-                 establish what GLOBAL[{global}] holds and wire it, do not substitute a value",
+                 SPECIAL/GLOBAL hardware register {global}{} - its contents are not established; \
+                 establish what GLOBAL[{global}] holds and wire it, do not substitute a value{}",
+                global_register_name(*global).map(|n| format!(" ({n})")).unwrap_or_default(),
+                why.map(|w| format!(" (only the tile registers' pixel-coordinate SUMS are established, and the proof that this program reads nothing else refused: {w})"))
+                    .unwrap_or_default(),
             ),
         }
     }
+}
+
+/// The NAME the SGX543 special-register bank gives a GLOBAL register, from the vendor driver's
+/// own bank definitions - a NAME only. It says what to go and establish; it is not a value,
+/// and a register whose per-task contents the definitions do not describe stays refused.
+///
+/// 24 is `TILEY`: a shooter's edge-mask fragment program forms a pixel's byte address from it
+/// (with 23, `QUADRANTX`) and then STORES to guest memory. What the program itself settles is
+/// the SUM: its secondary takes the two bytes of 43 (`TILEXY`), and the primary forms
+/// `16 * TILEXY.x + QUADRANTX` and `16 * TILEXY.y + TILEY` - the only per-pixel layout that is
+/// dense and collision-free is the fragment's own pixel coordinate. How the hardware splits
+/// that sum between the registers is not established, so the three are emitted only for a
+/// program [`crate::tile::tile_sums_only`] PROVES depends on them through the sums alone - see
+/// that module for the argument - and stay refused for every other.
+pub fn global_register_name(global: u8) -> Option<&'static str> {
+    Some(match global {
+        0..=15 => "a general global register",
+        16 => "BFCONTROL",
+        17 => "PIPENUMBER",
+        18 => "OUTPUTBASE",
+        19 => "SEQUENCENUMBER",
+        20 => "INSTANCEVALIDMASK",
+        21 => "TASKID",
+        22 => "SLOTNUMBER",
+        23 => "QUADRANTX",
+        24 => "TILEY",
+        25 => "INSTNRINSLOT",
+        26 => "MOEITERATIONNR",
+        27..=33 => "a TASKQUEUEDATA register",
+        34 => "TASKTYPE",
+        36..=39 => "an EDGEMASK register",
+        40 => "INSTNRINTASK",
+        41 => "SECCATTRSIZE",
+        42 => "BATCHNUMBER",
+        43 => "TILEXY",
+        45 => "CORENUMBER",
+        _ => return None,
+    })
 }
 
 /// Number of internal-register scalar lanes the pipeline exposes: i0..i3, four lanes each.
@@ -147,10 +190,93 @@ fn global_u32_expr(op: &Operand, kind: ProgramKind) -> Option<String> {
     // Fragment-only: `front_facing` exists per fragment and nowhere else. A vertex program
     // reading GLOBAL[16] would be a different register file and must hard-fail, not inherit
     // this reading.
-    if op.index != GLOBAL_FACING || kind != ProgramKind::Fragment {
+    if kind != ProgramKind::Fragment {
+        return None;
+    }
+    // The TILE registers, for a program whose emission runs inside a [`tile_sums_scope`] - i.e.
+    // one `tile::tile_sums_only` proved reads them through the pixel-coordinate sums alone.
+    if crate::tile::is_tile_register(op.index) {
+        if !tile_sums_on() {
+            return None;
+        }
+        return Some(
+            match op.index {
+                crate::tile::TILEXY => TILEXY_VAR,
+                crate::tile::QUADRANTX => QUADRANTX_VAR,
+                _ => TILEY_VAR,
+            }
+            .to_string(),
+        );
+    }
+    if op.index != GLOBAL_FACING {
         return None;
     }
     Some(format!("select(0u, 1u, {FRONT_FACING_VAR})"))
+}
+
+/// The WGSL function a guest-memory store calls: `fn gxp_store_word(addr: u32, v: u32)`, which
+/// [`crate::module::store_window_helper`] defines over the draw's store windows.
+pub const STORE_HELPER: &str = "gxp_store_word";
+
+/// The WGSL names the tile registers are read through - see [`TILE_REGISTERS_DECL`].
+pub const TILEXY_VAR: &str = "gxp_tile_xy";
+pub const QUADRANTX_VAR: &str = "gxp_tile_qx";
+pub const TILEY_VAR: &str = "gxp_tile_y";
+
+/// The fragment-entry declarations of the tile registers, from the fragment's PIXEL position
+/// (`in.frag_coord`, the pixel centre, so the truncation is the pixel index): `TILEXY` holds
+/// `x >> 4` in byte 0 and `y >> 4` in byte 1, `QUADRANTX` = `x & 15`, `TILEY` = `y & 15`.
+///
+/// ONE split whose sums `16 * TILEXY.byte0 + QUADRANTX` and `16 * TILEXY.byte1 + TILEY` are the
+/// pixel coordinates - which is all that is established, and all a program admitted by
+/// `tile::tile_sums_only` can observe. `tile::tile_register_value` is the same split for the
+/// Rust side. A module builder emits this when the body names [`TILEXY_VAR`] or its siblings.
+pub const TILE_REGISTERS_DECL: &str = "  let gxp_tile_px = vec2<u32>(in.frag_coord.xy);
+  let gxp_tile_xy: u32 = ((gxp_tile_px.x >> 4u) & 0xffu) | (((gxp_tile_px.y >> 4u) & 0xffu) << 8u);
+  let gxp_tile_qx: u32 = gxp_tile_px.x & 15u;
+  let gxp_tile_y: u32 = gxp_tile_px.y & 15u;
+";
+
+/// Whether an emitted body reads a tile register, so its module must carry
+/// [`TILE_REGISTERS_DECL`].
+pub fn body_reads_tile_registers(body: &str) -> bool {
+    body.contains(TILEXY_VAR) || body.contains(QUADRANTX_VAR) || body.contains(TILEY_VAR)
+}
+
+thread_local! {
+    static TILE_SUMS: std::cell::Cell<Result<bool, &'static str>> = const { std::cell::Cell::new(Ok(false)) };
+}
+
+/// While the returned guard lives, the emitter on this thread materialises the tile registers
+/// (see [`global_u32_expr`]) when `verdict` is `Ok(true)`, and names the refusal when it is an
+/// `Err`. `verdict` must be what `tile::tile_sums_only` answered for the program being emitted -
+/// `tile::fragment_tile_scope` is the one caller. Dropping the guard restores the previous state.
+pub fn tile_sums_scope(verdict: Result<bool, &'static str>) -> TileSumsScope {
+    TileSumsScope(TILE_SUMS.with(|t| t.replace(verdict)))
+}
+
+/// See [`tile_sums_scope`].
+pub struct TileSumsScope(Result<bool, &'static str>);
+
+impl Drop for TileSumsScope {
+    fn drop(&mut self) {
+        TILE_SUMS.with(|t| t.set(self.0));
+    }
+}
+
+fn tile_sums_on() -> bool {
+    TILE_SUMS.with(|t| t.get()) == Ok(true)
+}
+
+fn tile_refusal() -> Option<&'static str> {
+    TILE_SUMS.with(|t| t.get()).err()
+}
+
+/// A raw-lane read of a tile register by one of the integer emitters, or `None` (the operand is
+/// not a tile register, or no [`tile_sums_scope`] admits it). `emit_instr` has already refused
+/// every other GLOBAL read these emitters could see.
+fn tile_u32_expr(o: &Operand) -> Option<String> {
+    global_u32_expr(o, ProgramKind::Fragment).filter(|_| crate::tile::is_tile_register(o.index))
 }
 
 /// The WGSL array prefix for a register bank, or `None` for a bank the emitter cannot
@@ -1243,8 +1369,12 @@ pub fn emit_body_marked(shader: &Shader) -> Result<String, EmitError> {
     // translates as the zero the vertex path has always given it. This is the same lesson the
     // SA bank already taught: refusing an unwritten scratch register dropped 39 of 40 pairs,
     // and zero was faithful.
+    //
+    // >>> AND LIVENESS IS PER CHANNEL where the dependence is: a vector MAD into an internal
+    // register whose `xyz` are consumed and whose `w` is not reads its `w` sources for nothing
+    // (see `live_instructions`).
     let live = live_instructions(shader);
-    let guard_internal_reads: &[bool] =
+    let guard_internal_reads: &[[bool; 4]] =
         if shader.kind == ProgramKind::Fragment { &live } else { &[] };
     let mut internal_written = [false; INTERNAL_LANES];
     emit_range(
@@ -1433,7 +1563,7 @@ fn emit_range(
     start: usize,
     end: usize,
     exit: usize,
-    guard_internal_reads: &[bool],
+    guard_internal_reads: &[[bool; 4]],
     internal_written: &mut [bool; INTERNAL_LANES],
     open_loop: Option<usize>,
     depth: usize,
@@ -1497,10 +1627,12 @@ fn emit_range(
         }
         let Op::Branch { rel } = instr.op else {
             // `guard_internal_reads` is empty for a vertex program (no guard at all) and
-            // otherwise the per-instruction liveness mask: an undefined read whose result
-            // reaches nothing is translated, not refused. See `emit_body_marked`.
-            if guard_internal_reads.get(index).copied().unwrap_or(false) {
-                check_internal_reads(instr, index, byte_offset, internal_written)?;
+            // otherwise the per-instruction, per-channel liveness mask: an undefined read whose
+            // result reaches nothing is translated, not refused. See `emit_body_marked`.
+            if let Some(&live) = guard_internal_reads.get(index)
+                && live.iter().any(|&l| l)
+            {
+                check_internal_reads(instr, index, byte_offset, internal_written, live)?;
             }
             emit_instr(body, instr, index, byte_offset, shader.kind, shader, prelude, cond_start, enclosing)?;
             emit_probe_snapshot(body, index, depth);
@@ -1784,7 +1916,7 @@ fn emit_loop(
     shader: &Shader,
     head: usize,
     tail: usize,
-    guard_internal_reads: &[bool],
+    guard_internal_reads: &[[bool; 4]],
     internal_written: &mut [bool; INTERNAL_LANES],
     depth: usize,
     prelude: &mut String,
@@ -1883,7 +2015,9 @@ fn read_channels(instr: &Instr) -> [bool; 4] {
         // `elements` consecutive registers), so taking the mask as the read count claims the
         // three registers ABOVE the pointer are read too. That is how a pointer sitting near
         // the top of the SA bank made a program look like it read past its uniform buffer.
-        Op::MemLoad { .. } | Op::LocalLoad { .. } | Op::LocalStore { .. } => [true, false, false, false],
+        Op::MemLoad { .. } | Op::LocalLoad { .. } | Op::LocalStore { .. } | Op::MemStore { .. } => {
+            [true, false, false, false]
+        }
         _ => instr.write_mask,
     }
 }
@@ -1903,9 +2037,10 @@ fn read_channels(instr: &Instr) -> [bool; 4] {
 ///   the same lane can still be the value a later read sees - and calling that earlier write
 ///   dead would silence a refusal that is owed. (This is the same "on EVERY path" distinction
 ///   `link::conditionally_executed` was written for.)
-/// * An instruction with no destination, and any write to the OUTPUT bank, is live by
-///   definition - the output IS the result, and a sideways effect this model does not name
-///   must not be optimised away on the strength of not being named.
+/// * An instruction with no destination is live by definition - a sideways effect this model
+///   does not name must not be optimised away on the strength of not being named. A write to
+///   the OUTPUT bank is live unless an unconditional write further down replaces that lane
+///   first: the end of the program reads every output, and nothing else is special about it.
 ///
 /// # Why "any branch at all is live" was not good enough
 /// That was the original rule, and it was fine while every program it had to judge was
@@ -1916,86 +2051,184 @@ fn read_channels(instr: &Instr) -> [bool; 4] {
 ///
 /// This decides only whether to REFUSE. It never removes an instruction: every instruction is
 /// still emitted, so a wrong answer here cannot change what the shader computes.
-fn live_instructions(shader: &Shader) -> Vec<bool> {
+///
+/// # Per CHANNEL, where the channel is the unit of the dependence
+/// The answer is a mask per instruction - which of its channels produce a value something
+/// consumes - because "this instruction is live" is not "every channel it reads matters". A
+/// [`channelwise`] operation (channel `c` of the result depends on channel `c` of each source
+/// and nothing else) gets its own per-channel answer, and only its live channels' reads are
+/// wanted from the instructions above. Every other instruction is whole: all channels live or
+/// none, and its reads are every channel [`read_channels`] names.
+///
+/// This was once confined to INTERNAL destinations, because the walk keyed a lane as
+/// `index + channel` - a register for an F32 view and HALF of one for an F16 view - and only the
+/// internal bank (one 32-bit lane per channel at any precision) made that exact. The keys are
+/// now register HALVES placed by the emitter's own rules ([`dest_live_keys`], [`src_live_keys`]),
+/// which is exact in every bank, so the per-channel answer applies in every bank. MEASURED need:
+/// a shooter's world fragments write a four-channel F16 MAD into PA whose `w` reads an unwritten
+/// internal lane and feeds only a `w` the final multiply replaces with the constant 1 - 37 of
+/// its fragment programs were refused for that lane.
+///
+/// MEASURED: one title's deferred-lighting program rotates a normal into world space as three
+/// F16 MADs into internal registers - `i1.xyz = row0 * n.x`, then `i1 = n.y * row1 + i1` and
+/// `i0 = n.z * row2 + i1` with FOUR-channel masks - and packs only `i0.xyz` onward. The `w`
+/// channel of the two accumulating MADs reads `i1.w`, which nothing ever wrote; at instruction
+/// granularity the MAD is live (its `xyz` are) and the guard refused the whole program over a
+/// lane whose only consumer is a channel nothing reads.
+fn live_instructions(shader: &Shader) -> Vec<[bool; 4]> {
     let n = shader.instrs.len();
     let backward_branch = shader.instrs.iter().enumerate().any(|(i, instr)| {
         matches!(instr.op, Op::Branch { rel } if i as i64 + rel as i64 <= i as i64)
     });
     if backward_branch {
-        return vec![true; n];
+        return vec![[true; 4]; n];
     }
     let conditional = crate::link::conditionally_executed(shader);
-    // A register lane, keyed by bank and by `index + channel` - the same flat addressing the
-    // emitter reads and writes the banks with.
-    let key = |b: Bank, idx: u32, c: usize| -> (u8, u32) {
-        let d = match b {
-            Bank::Temp => 0u8,
-            Bank::PrimaryAttr => 1,
-            Bank::SecondaryAttr => 2,
-            Bank::Internal => 3,
-            Bank::Output => 4,
-            _ => 5,
-        };
-        (d, idx + c as u32)
-    };
-    let mut wanted: std::collections::BTreeSet<(u8, u32)> = Default::default();
-    let mut live = vec![false; n];
+    let mut wanted: std::collections::BTreeSet<LiveKey> = Default::default();
+    // OUTPUT halves an unconditional write BELOW has replaced with nothing reading them in
+    // between. The end of the program reads every output, so an output write is live unless its
+    // lane is in here: `o0 = a; ...; o0.w = b` makes the first write's `w` dead exactly as a
+    // temp's would be. MEASURED: a shooter's world fragments accumulate `o0.xyzw` from an F16
+    // MAD whose `w` reads an internal lane nothing wrote, and then overwrite `o0.w` with the
+    // alpha - refused as an undefined read while the frame could never see it.
+    let mut dead_out: std::collections::BTreeSet<LiveKey> = Default::default();
+    let mut live = vec![[false; 4]; n];
     for i in (0..n).rev() {
         let instr = &shader.instrs[i];
         if matches!(instr.op, Op::Nop) {
             continue;
         }
-        let mut is_live = false;
+        // Which of this instruction's channels a later read wants.
+        let mut channels = [false; 4];
         match instr.dest.as_ref() {
             // No destination named: this model cannot say what it produces, so it stays.
-            None => is_live = true,
+            None => channels = [true; 4],
             Some(d) => {
-                if matches!(d.bank, Bank::Output) {
-                    is_live = true;
-                }
+                let is_out = matches!(d.bank, Bank::Output);
                 for c in 0..4 {
-                    if instr.write_mask[c] && wanted.contains(&key(d.bank, u32::from(d.index), c)) {
-                        is_live = true;
+                    if instr.write_mask[c]
+                        && dest_live_keys(instr, d, c)
+                            .iter()
+                            .any(|k| wanted.contains(k) || (is_out && !dead_out.contains(k)))
+                    {
+                        channels[c] = true;
                     }
                 }
                 // Redefined here, so reads BELOW this point no longer keep the lane live
                 // above it - but ONLY if this write happens on every path. A conditional write
                 // leaves the older value in place wherever it is skipped.
-                if is_live && !conditional.get(i).copied().unwrap_or(true) {
+                if channels.iter().any(|&l| l) && !conditional.get(i).copied().unwrap_or(true) {
                     for c in 0..4 {
                         if instr.write_mask[c] {
-                            wanted.remove(&key(d.bank, u32::from(d.index), c));
+                            for k in dest_live_keys(instr, d, c) {
+                                wanted.remove(&k);
+                                if is_out {
+                                    dead_out.insert(k);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        live[i] = is_live;
-        if !is_live {
+        if !channels.iter().any(|&l| l) {
             continue;
         }
+        let per_channel = channelwise(instr.op);
+        // The channels whose reads this instruction makes: its live ones when the dependence is
+        // per channel, otherwise every channel it reads at all - a DOT reads all of its
+        // components into the one channel it writes, so the write mask does not say which. The
+        // live set is narrowed to the channels it reads, so an instruction with no destination
+        // (all four live) claims no read it does not make.
+        let all_reads = read_channels(instr);
+        let reads = if per_channel { std::array::from_fn(|c| channels[c] && all_reads[c]) } else { all_reads };
+        live[i] = if per_channel { reads } else { [true; 4] };
         for src in &instr.srcs {
             for c in 0..4 {
-                if !instr.write_mask[c] {
-                    continue;
+                if reads[c] {
+                    wanted.extend(src_live_keys(instr, src, c));
                 }
-                let sel = src.swizzle[c];
-                if sel > 3 {
-                    continue; // a swizzle constant reads no register lane
-                }
-                wanted.insert(key(src.bank, u32::from(src.index), sel as usize));
             }
         }
     }
     live
 }
 
-/// Hard-fail if any source reads an internal-register lane not yet written in-stream.
+/// One HALF of one register in one bank - the unit [`live_instructions`] tracks.
+///
+/// A half and not a register because an F16 operand's channel is half a register
+/// (`read_lane`'s `Prec::F16` arm): keying by `index + channel`, as this walk once did, made
+/// an F16 channel `c` and an F32 channel `c` the same key while naming different storage, which
+/// is why per-channel liveness was confined to the internal bank (whose lanes are whole
+/// registers at any precision). Halves make the key the storage itself at every precision.
+type LiveKey = (u8, u32, u8);
+
+fn live_bank(b: Bank) -> u8 {
+    match b {
+        Bank::Temp => 0,
+        Bank::PrimaryAttr => 1,
+        Bank::SecondaryAttr => 2,
+        Bank::Internal => 3,
+        Bank::Output => 4,
+        _ => 5,
+    }
+}
+
+/// The halves destination channel `c` of `instr` writes. The placement is the emitter's own:
+/// an internal register is a whole lane per channel (`bank_prec`); a raw packed integer result
+/// follows [`Instr::dest_raw_packed_bits`]; otherwise [`Prec::of`] - an F16 channel is half `c & 1`
+/// of register `index + c / 2`, a packed-byte channel is byte `c` of `index` (so half `c / 2`),
+/// and an F32 channel is all of register `index + c`.
+fn dest_live_keys(instr: &Instr, d: &Operand, c: usize) -> Vec<LiveKey> {
+    let (b, idx, c32) = (live_bank(d.bank), u32::from(d.index), c as u32);
+    let whole = |r: u32| vec![(b, r, 0), (b, r, 1)];
+    if matches!(d.bank, Bank::Internal) {
+        return whole(idx + c32);
+    }
+    match instr.dest_raw_packed_bits() {
+        Some(16) => return vec![(b, idx + c32 / 2, (c32 & 1) as u8)],
+        Some(8) => return vec![(b, idx, (c32 / 2) as u8)],
+        _ => {}
+    }
+    match Prec::of(instr) {
+        Prec::F16 => vec![(b, idx + c32 / 2, (c32 & 1) as u8)],
+        Prec::Fx8 => vec![(b, idx, (c32 / 2) as u8)],
+        Prec::F32 => whole(idx + c32),
+    }
+}
+
+/// The halves source channel `c` of `src` reads - [`Instr::source_register`], the linker's read
+/// model, except in the internal bank, whose lanes are whole registers at any precision.
+fn src_live_keys(instr: &Instr, src: &Operand, c: usize) -> Vec<LiveKey> {
+    let b = live_bank(src.bank);
+    if matches!(src.bank, Bank::Internal) {
+        let sel = src.swizzle[c];
+        return if sel > 3 { Vec::new() } else { vec![(b, u32::from(src.index) + u32::from(sel), 0), (b, u32::from(src.index) + u32::from(sel), 1)] };
+    }
+    match instr.source_register(src, c) {
+        Some((reg, halves)) => halves.map(|h| (b, reg, h as u8)).collect(),
+        None => Vec::new(), // a swizzle constant reads no register lane
+    }
+}
+
+/// Whether channel `c` of `op`'s result depends on channel `c` of each source and on nothing
+/// else - the vector ALU and the swizzled moves, whose emitters (`emit_mad`, `emit_binop`,
+/// `emit_func2`, `emit_unary`, `emit_cmov`) each build channel `c` from `src_channel(_, c, _)`
+/// alone. A reduction (DOT), a scalar transcendental, a pack, a sample or anything reading
+/// memory is not on this list, and stays whole in [`live_instructions`].
+fn channelwise(op: Op) -> bool {
+    matches!(op, Op::Mad | Op::Mul | Op::Add | Op::Min | Op::Max | Op::Mov | Op::Cmov { .. })
+}
+
+/// Hard-fail if any source reads an internal-register lane not yet written in-stream, in a
+/// channel whose result is `live` (see [`live_instructions`]: all four for anything that is not
+/// a per-channel operation into an internal register).
 fn check_internal_reads(
     instr: &Instr,
     index: usize,
     byte_offset: usize,
     written: &[bool; INTERNAL_LANES],
+    live: [bool; 4],
 ) -> Result<(), EmitError> {
     let read = read_channels(instr);
     for src in &instr.srcs {
@@ -2003,7 +2236,7 @@ fn check_internal_reads(
             continue;
         }
         for c in 0..4 {
-            if !read[c] {
+            if !read[c] || !live[c] {
                 continue;
             }
             let sel = src.swizzle[c];
@@ -2123,6 +2356,7 @@ pub fn wrap_vertex_module(body: &str, varying_vec4s: u32) -> String {
             bytes: 16,
             base_sa: 0,
             base_offset: 0,
+            per_draw: false,
         }]));
     }
     for bank in ["r", "pa", "sa", "o", "i"] {
@@ -3408,13 +3642,24 @@ fn emit_instr(
         Op::Test { alu: TestAlu::BitAnd | TestAlu::BitShl | TestAlu::IntSub, .. }
             | Op::TestMask { alu: TestAlu::IntSub16U, .. }
     );
+    // The TILE registers are read by the three raw-lane operations `tile::tile_sums_only`
+    // follows, and only there - the proof is what admits them, and it admits no other reader.
+    let tile_op = matches!(instr.op, Op::IntMadStep { .. } | Op::Bitwise { .. } | Op::PackIntCopy { .. });
+    let admitted = |o: &Operand, is_src: bool| {
+        let tile = crate::tile::is_tile_register(o.index);
+        let established = global_u32_expr(o, kind).is_some();
+        (global_ok && !tile && established) || (is_src && tile && tile_op && established)
+    };
     if let Some(g) = instr
         .srcs
         .iter()
-        .chain(instr.dest.iter())
-        .find(|o| matches!(o.bank, Bank::Global) && !(global_ok && global_u32_expr(o, kind).is_some()))
+        .map(|o| (o, true))
+        .chain(instr.dest.iter().map(|o| (o, false)))
+        .find(|(o, is_src)| matches!(o.bank, Bank::Global) && !admitted(o, *is_src))
+        .map(|(o, _)| o)
     {
-        return Err(EmitError::UnmodeledGlobal { index, byte_offset, global: g.index, raw: instr.raw });
+        let why = if crate::tile::is_tile_register(g.index) { tile_refusal() } else { None };
+        return Err(EmitError::UnmodeledGlobal { index, byte_offset, global: g.index, raw: instr.raw, why });
     }
     let unmapped = || EmitError::UnmappedOperand { index, raw: instr.raw };
     let mask = instr.write_mask;
@@ -3478,6 +3723,44 @@ fn emit_instr(
 ",
             data.index as u32
         );
+        return finish_predicated(body, instr, &stmt, index);
+    }
+    // MEMORY STORE: one 32-bit word to guest memory through the draw's STORE windows (see
+    // `module::resolve_store_windows` and `STORE_HELPER`). The address is formed exactly as a
+    // load's (`emit_mem_load`) - the pointer, the immediate, each register offset narrowed by
+    // the same `MEM_OFFSET16_ARM` rule, because the operand fields are the format's one encoding.
+    // Only a FRAGMENT program has the store binding; a vertex store is not modelled.
+    if let Op::MemStore { offset_bytes } = instr.op {
+        if !matches!(kind, ProgramKind::Fragment) {
+            return Err(EmitError::Blocked {
+                index,
+                byte_offset,
+                reason: "a guest-memory store in a VERTEX program is not modelled (only the fragment stage binds a store window)",
+                raw: instr.raw,
+            });
+        }
+        if !crate::link::arm_on(crate::link::MEM_STORE_ARM) {
+            return Err(EmitError::Blocked {
+                index,
+                byte_offset,
+                reason: "guest-memory stores are refused by VITASLOP_GXP_MEM_STORE=0",
+                raw: instr.raw,
+            });
+        }
+        let data = instr.srcs.first().ok_or_else(unmapped)?;
+        let ptr = instr.srcs.get(1).ok_or_else(unmapped)?;
+        let lane = |o: &Operand| bank_prefix(o.bank).map(|b| format!("{b}[{}]", o.index as u32));
+        let narrow = crate::link::arm_on(crate::link::MEM_OFFSET16_ARM);
+        let mut addr = format!("{} + {offset_bytes}u", lane(ptr).ok_or_else(unmapped)?);
+        for o in instr.srcs.iter().skip(2) {
+            let v = lane(o).ok_or_else(unmapped)?;
+            if narrow {
+                let _ = write!(addr, " + ({v} & 0xffffu)");
+            } else {
+                let _ = write!(addr, " + {v}");
+            }
+        }
+        let stmt = format!("  {STORE_HELPER}({addr}, {});\n", lane(data).ok_or_else(unmapped)?);
         return finish_predicated(body, instr, &stmt, index);
     }
     let dest = instr.dest.as_ref().ok_or_else(unmapped)?;
@@ -3596,7 +3879,7 @@ fn emit_instr(
         Op::Add => emit_binop(s, instr, dest, mask, "+", index).ok_or_else(unmapped),
         Op::Min => emit_func2(s, instr, dest, mask, "min", index).ok_or_else(unmapped),
         Op::Max => emit_func2(s, instr, dest, mask, "max", index).ok_or_else(unmapped),
-        Op::Frc => emit_func1(s, instr, dest, mask, "fract", index).ok_or_else(unmapped),
+        Op::Frc => emit_frc(s, instr, dest, mask).ok_or_else(unmapped),
         // The call itself may already be hoisted above this instruction's predicate `if` -
         // see `hoisted` above. When it is, the store reads the temporary rather than
         // calling the builtin again (calling it twice would put one back inside the `if`).
@@ -3660,6 +3943,7 @@ fn emit_instr(
         Op::PackFromInt { bits, signed, norm } => {
             emit_pack_from_int(s, instr, dest, mask, bits, signed, norm).ok_or_else(unmapped)
         }
+        Op::PackFromC10 => emit_pack_from_c10(s, instr, dest, mask).ok_or_else(unmapped),
         Op::PackIntCopy { bits, dest_bits, signed } => {
             emit_pack_int_copy(s, instr, dest, mask, bits, dest_bits, signed).ok_or_else(unmapped)
         }
@@ -3714,10 +3998,17 @@ fn emit_instr(
         Op::LoadIndex { addend, to_index, stride } => {
             emit_load_index(s, instr, dest, addend, to_index, stride).ok_or_else(unmapped)
         }
-        Op::Sop2 { color, alpha, f1, f1_complement, f2, f2_complement } => {
-            emit_sop2(s, instr, dest, mask, color, alpha, (f1, f1_complement), (f2, f2_complement))
-                .ok_or_else(unmapped)
-        }
+        Op::Sop2 { color, alpha, f1, f1_complement, f2, f2_complement, alpha_coeffs } => emit_sop2(
+            s,
+            instr,
+            dest,
+            mask,
+            color,
+            alpha,
+            [(f1, f1_complement), (f2, f2_complement)],
+            alpha_coeffs,
+        )
+        .ok_or_else(unmapped),
         other => Err(EmitError::UnsupportedOp {
             index,
             byte_offset,
@@ -3888,6 +4179,61 @@ fn emit_func2(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4], f
         body.store(dest, c, &e, p)?;
     }
     Some(())
+}
+
+/// `dest.c = src1.c - floor(src2.c)`: what FRC computes. It is a TWO-source operation, and the
+/// fractional part is only the case where both sources name the same value (emitted as `fract`
+/// then). MEASURED on a shooter's RGBM encode: `frc dst, c0(=0), -m` is `ceil(m)`, the multiplier
+/// it stores in alpha; read as `fract(0)` the multiplier was 0, its reciprocal infinite, and the
+/// whole encoded downsample of the frame came out black.
+///
+/// "The same value" is decided PER WRITTEN CHANNEL: the common encoding names one register
+/// twice with swizzles that differ only in lanes the mask does not write (`frc d.x, r.xyzw,
+/// r.xxxx`), which is the fractional part, and stays `fract`.
+fn emit_frc(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4]) -> Option<()> {
+    let s1 = instr.srcs.first()?;
+    let Some(s2) = instr.srcs.get(1).filter(|s2| *s2 != s1 && frc_two_source()) else {
+        return emit_func1(body, instr, dest, mask, "fract", 0);
+    };
+    let p = Prec::of(instr);
+    for c in 0..4 {
+        if !mask[c] {
+            continue;
+        }
+        let (a, b) = (src_channel(s1, c, p)?, src_channel(s2, c, p)?);
+        let e = if a == b { format!("fract({a})") } else { format!("({a} - floor({b}))") };
+        body.store(dest, c, &e, p)?;
+    }
+    Some(())
+}
+
+/// Whether FRC reads its SECOND source as the value to floor (`src1 - floor(src2)`), the
+/// reading the hardware's own RGBM encodes need; otherwise it is `fract(src1)`.
+///
+/// >>> OFF BY DEFAULT, AND WHY. The two-source reading is the faithful one, but the only
+/// programs it changes (MEASURED: a census over every loadable capsule program - a shooter's
+/// two RGBM encodes; every other FRC names one value twice) feed a post-process chain whose
+/// held-target feedback is not yet right: with it on, that title's live picture washes out to
+/// white within seconds, while the one-source reading leaves the chain dark and the picture
+/// as it was. `VITASLOP_GXP_FRC_TWO_SOURCE=1` turns it on; turn it on by default once the
+/// chain's feedback renders right live.
+pub fn frc_two_source() -> bool {
+    if let Some(v) = FRC_TWO_SOURCE_OVERRIDE.with(|o| o.get()) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VITASLOP_GXP_FRC_TWO_SOURCE").is_ok_and(|v| v.trim() == "1"))
+}
+
+thread_local! {
+    /// A per-thread answer for [`frc_two_source`], so a test can pin either reading without
+    /// racing the tests that run beside it.
+    static FRC_TWO_SOURCE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`frc_two_source`] for the calling thread (tests).
+pub fn set_frc_two_source_for_thread(v: Option<bool>) {
+    FRC_TWO_SOURCE_OVERRIDE.with(|o| o.set(v));
 }
 
 /// `dest.c = FN(src1.c)` for each written channel (fract/dpdx/dpdy).
@@ -4095,6 +4441,31 @@ fn emit_pack_from_int(
     Some(())
 }
 
+/// Widen a C10 component to the destination float: field `sel` of the operand's ONE register,
+/// bits `[10 * sel, 10 * sel + 10)`, sign-extended and divided by 256 - see [`Op::PackFromC10`]
+/// for the measured layout and scale. The sign extension is `raw_elem_expr`'s shift pair, the
+/// same one the integer widen uses.
+fn emit_pack_from_c10(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4]) -> Option<()> {
+    let s1 = instr.srcs.first()?;
+    let dp = Prec::of(instr);
+    let reg = format!("{}[{}]", bank_prefix(s1.bank)?, s1.index);
+    for c in 0..4 {
+        if !mask[c] {
+            continue;
+        }
+        let sel = s1.swizzle[c] as u32;
+        // The decoder refuses a selector of 3; a constant selector names no field at all.
+        if sel > 2 {
+            return None;
+        }
+        let e = format!("(f32({}) / 256.0)", raw_elem_expr(&reg, sel * 10, 10, true));
+        let e = if s1.neg { format!("(-{e})") } else { e };
+        let e = if s1.abs { format!("abs({e})") } else { e };
+        body.store(dest, c, &e, dp)?;
+    }
+    Some(())
+}
+
 /// A 16-bit integer VPCK whose destination is 16-bit too: a swizzled copy of HALVES.
 ///
 /// Neither end converts, so this is the source reader of [`emit_pack_from_int`] and the
@@ -4123,7 +4494,16 @@ fn emit_pack_int_copy(
             continue;
         }
         let sel = s1.swizzle[c] as u32;
-        let reg = format!("{}[{}]", bank_prefix(s1.bank)?, s1.index as u32 + sel / elems_per_reg);
+        // A TILE register's low bytes (`TILEXY`), admitted only under the sum proof; an element
+        // past the register's own four would be the NEXT global, which nothing establishes.
+        let reg = if matches!(s1.bank, Bank::Global) {
+            if sel >= elems_per_reg {
+                return None;
+            }
+            tile_u32_expr(s1)?
+        } else {
+            format!("{}[{}]", bank_prefix(s1.bank)?, s1.index as u32 + sel / elems_per_reg)
+        };
         let lo = (sel % elems_per_reg) * bits as u32;
         let elem = raw_elem_expr(&reg, lo, bits as u32, extend);
         let elem = if extend { format!("bitcast<u32>({elem})") } else { elem };
@@ -4172,7 +4552,7 @@ fn emit_load_index(
     // program indexes its corner table at `src*2 + 21 + 14` = SA 35..45 - which is the TAIL of
     // the default uniform container, then the DATA container's uniform-buffer POINTERS. A
     // pointer used as a texcoord weight is a texture coordinate in the millions, and the draw
-    // came out as a full-screen neon moiré (`1a8667f6685d5f47`, capsule 177 of
+    // came out as a full-screen neon moire (`1a8667f6685d5f47`, capsule 177 of
     // `caps869b`) [[vitaslop-a-region-clip-outlives-its-scene]].
     //
     // The scale is not fitted, it is the only one that closes. That program's literal block
@@ -4502,8 +4882,19 @@ fn emit_test(
         }
         Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32))
     };
+    // VDP's one sum, the value EVERY channel of the result holds - see `TestAlu::Dot`. Formed
+    // exactly as `emit_dot` forms the ALU group's own dot, so the two agree term for term.
+    let dot = |p: Prec| -> Option<String> {
+        let terms: Option<Vec<String>> =
+            (0..4).map(|c| Some(format!("{} * {}", src_channel(s1, c, p)?, src_channel(s2, c, p)?))).collect();
+        Some(format!("({})", terms?.join(" + ")))
+    };
     let mut bools = Vec::with_capacity(channels.len());
     for &c in &channels {
+        if matches!(alu, TestAlu::Dot) {
+            bools.push(format!("({} {op} 0.0)", dot(p)?));
+            continue;
+        }
         if matches!(alu, TestAlu::BitAnd) {
             // The AND must be parenthesised: WGSL binds the equality operators TIGHTER than
             // `&`, so `a & b != 0u` parses as `a & (b != 0u)` and fails to validate (u32 vs
@@ -4542,9 +4933,9 @@ fn emit_test(
             TestAlu::Add => format!("({a} + {b})"),
             TestAlu::Sub | TestAlu::Fx8Sub => format!("({a} - {b})"),
             TestAlu::Mul => format!("({a} * {b})"),
-            // Resolved above - the raw-lane paths never reach here.
-            TestAlu::BitAnd | TestAlu::BitShl | TestAlu::IntSub => {
-                unreachable!("raw-lane test resolved before the float path")
+            // Resolved above - the raw-lane paths and the dot never reach here.
+            TestAlu::BitAnd | TestAlu::BitShl | TestAlu::IntSub | TestAlu::Dot => {
+                unreachable!("raw-lane and dot tests resolved before the per-channel path")
             }
             // VTSTMSK's decoder is the only producer of this family; VTST cannot reach it.
             TestAlu::IntSub16U => return None,
@@ -4572,6 +4963,7 @@ fn emit_test(
                 TestAlu::Add => format!("({a} + {b})"),
                 TestAlu::Sub | TestAlu::Fx8Sub => format!("({a} - {b})"),
                 TestAlu::Mul => format!("({a} * {b})"),
+                TestAlu::Dot => dot(wp)?,
                 // A raw-lane write-back is not modelled in the float store path; the corpus
                 // has no such instruction, so refusing is exact rather than restrictive.
                 TestAlu::BitAnd | TestAlu::BitShl | TestAlu::IntSub | TestAlu::IntSub16U => {
@@ -4741,7 +5133,8 @@ fn emit_test_mask(
             | TestAlu::BitAnd
             | TestAlu::BitShl
             | TestAlu::IntSub
-            | TestAlu::IntSub16U => return None,
+            | TestAlu::IntSub16U
+            | TestAlu::Dot => return None,
         };
         if byte_mask {
             bytes.push(format!("select(0u, {:#x}u, ({value} {op} 0.0))", 0xffu32 << (8 * c)));
@@ -4911,6 +5304,9 @@ fn tex_call(instr: &Instr, unit: u8, coords: u8, coord_half: bool, lod: TexLod, 
 /// of its source register. Reading the selector as "the operand is zero" instead makes this
 /// instruction a constant and leaves the register it names doing nothing, which is how the
 /// family read as unusable for several sessions. See [`SopFactor`].
+///
+/// `alpha_coeffs` is the plain group-0x80 form's SECOND coefficient pair, which channel 3 takes
+/// in place of `coeffs` (see [`Op::Sop2`]); SOP2M has none.
 #[allow(clippy::too_many_arguments)]
 fn emit_sop2(
     body: &mut Dest,
@@ -4919,8 +5315,8 @@ fn emit_sop2(
     mask: [bool; 4],
     color: SopOp,
     alpha: SopOp,
-    (f1, f1_complement): (SopFactor, bool),
-    (f2, f2_complement): (SopFactor, bool),
+    coeffs: [(SopFactor, bool); 2],
+    alpha_coeffs: Option<[(SopFactor, bool); 2]>,
 ) -> Option<()> {
     let (s1, s2) = (instr.srcs.first()?, instr.srcs.get(1)?);
     // The coefficient for channel `c`. An ALPHA selector broadcasts channel 3, which is what
@@ -4939,6 +5335,10 @@ fn emit_sop2(
         if !mask[c] {
             continue;
         }
+        let [(f1, f1_complement), (f2, f2_complement)] = match alpha_coeffs {
+            Some(pair) if c == 3 => pair,
+            _ => coeffs,
+        };
         let t1 = format!("({} * {})", coeff(f1, f1_complement, c)?, src_channel(s1, c, Prec::Fx8)?);
         let t2 = format!("({} * {})", coeff(f2, f2_complement, c)?, src_channel(s2, c, Prec::Fx8)?);
         let op = if c == 3 { alpha } else { color };
@@ -5124,15 +5524,23 @@ fn emit_int_mad_step(
         if matches!(o.bank, Bank::Indexed) {
             return indexed_element(o, 0);
         }
+        // A TILE register, admitted only under the sum proof - see `tile::tile_sums_only`.
+        if matches!(o.bank, Bank::Global) {
+            return tile_u32_expr(o);
+        }
         Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32))
     };
     let a = raw(instr.srcs.first()?)?;
     let b = raw(instr.srcs.get(1)?)?;
     let c = raw(instr.srcs.get(2)?)?;
-    let expr = if high_half {
-        format!("((({a} >> 16u) * {b}) << 16u) + {c}")
-    } else {
-        format!("(({a} & 0xffffu) * {b}) + {c}")
+    // >>> THE 16-BIT MULTIPLIER INPUT IS `src1`. `src0` is read whole. See
+    // `decode_grp_imad32_step` for the evidence; `VITASLOP_GXP_IMA32_STEP_SRC0=1` is the old
+    // reading, emitted exactly as it was.
+    let expr = match (crate::link::ima32_step_halves_src1(), high_half) {
+        (true, true) => format!("(({a} * ({b} >> 16u)) << 16u) + {c}"),
+        (true, false) => format!("({a} * ({b} & 0xffffu)) + {c}"),
+        (false, true) => format!("((({a} >> 16u) * {b}) << 16u) + {c}"),
+        (false, false) => format!("(({a} & 0xffffu) * {b}) + {c}"),
     };
     writeln!(body, "  {}[{}] = {};", bank_prefix(dest.bank)?, dest.index as u32, expr).ok();
     Some(())
@@ -5168,6 +5576,10 @@ fn emit_bitwise(
         // the address rather than a constant index. See [`indexed_element`].
         if matches!(o.bank, crate::ir::Bank::Indexed) {
             return indexed_element(o, 0);
+        }
+        // A TILE register (`TILEXY & 0xff`), admitted only under the sum proof.
+        if matches!(o.bank, Bank::Global) {
+            return tile_u32_expr(o);
         }
         Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32))
     };
@@ -5212,10 +5624,15 @@ fn indexed_element(o: &Operand, iteration: u32) -> Option<String> {
     let bank = bank_prefix(crate::ir::indexed_sub_bank(o.index))?;
     let offset = crate::ir::indexed_offset(o.index) + iteration;
     // `bank_sel` records which index register the extension row named: INDEXED1 -> i0,
-    // INDEXED2 -> i1.
-    let reg = if o.bank_sel == 0 { 0 } else { 1 };
+    // INDEXED2 -> i1 - and, above those two bits, whether the field counts register PAIRS
+    // (`crate::ir::indexed_index_scale`).
+    let reg = crate::ir::indexed_register(o);
+    let index = match crate::ir::indexed_index_scale(o) {
+        1 => format!("idx[{reg}]"),
+        scale => format!("idx[{reg}] * {scale}i"),
+    };
     Some(format!(
-        "{bank}[min(u32(max(idx[{reg}] + {offset}i, 0i)), {}u)]",
+        "{bank}[min(u32(max({index} + {offset}i, 0i)), {}u)]",
         BANK_REGS - 1
     ))
 }
@@ -5679,6 +6096,7 @@ mod tests {
                 f1_complement: true,
                 f2: SopFactor::Zero,
                 f2_complement: false,
+                alpha_coeffs: None,
             },
             Some(d),
             vec![a, b],
@@ -5783,6 +6201,8 @@ mod tests {
 
     #[test]
     fn emits_min_max_frc_dpdx_and_dot() {
+        // The two-source FRC reading is what is asserted below - see `frc_two_source`.
+        set_frc_two_source_for_thread(Some(true));
         // Non-aliasing registers, for the same reason as `honours_partial_write_mask`.
         let d = || Some(Operand::plain(Bank::Temp, 0, 0));
         let a = Operand::plain(Bank::Temp, 8, 0);
@@ -5791,6 +6211,20 @@ mod tests {
         assert!(mn.contains(&st("r", 0, &format!("min({}, {})", rd("r", 8), rd("r", 12)))), "got:\n{mn}");
         let fr = emit_fragment(&shader(vec![instr(Op::Frc, d(), vec![a])])).unwrap();
         assert!(fr.contains(&st("r", 0, &format!("fract({})", rd("r", 8)))), "got:\n{fr}");
+        // FRC is `src1 - floor(src2)`: one value named twice is the fractional part...
+        let fr = emit_fragment(&shader(vec![instr(Op::Frc, d(), vec![a, a])])).unwrap();
+        assert!(fr.contains(&st("r", 0, &format!("fract({})", rd("r", 8)))), "got:\n{fr}");
+        // ...and two different ones floor the SECOND (an RGBM encode's `0 - floor(-m)`).
+        let fr = emit_fragment(&shader(vec![instr(Op::Frc, d(), vec![a, b])])).unwrap();
+        assert!(fr.contains(&st("r", 0, &format!("({} - floor({}))", rd("r", 8), rd("r", 12)))), "got:\n{fr}");
+        // ...but one register named with swizzles that differ only in UNWRITTEN lanes
+        // (`frc d.x, r.xyzw, r.xxxx`, the common encoding) is still one value: `fract`.
+        let mut ax = a;
+        ax.swizzle = [0, 0, 0, 0];
+        let mut one = instr(Op::Frc, d(), vec![a, ax]);
+        one.write_mask = [true, false, false, false];
+        let fr = emit_fragment(&shader(vec![one])).unwrap();
+        assert!(fr.contains(&st("r", 0, &format!("fract({})", rd("r", 8)))) && !fr.contains("floor("), "got:\n{fr}");
         let dx = emit_fragment(&shader(vec![instr(Op::Dsx, d(), vec![a])])).unwrap();
         assert!(dx.contains(&st("r", 0, &format!("dpdx({})", rd("r", 8)))), "got:\n{dx}");
         let dt = emit_fragment(&shader(vec![instr(Op::Dot { components: 4 }, d(), vec![a, b])])).unwrap();
@@ -5895,6 +6329,12 @@ mod tests {
             EmitError::UnmodeledGlobal { global, .. } => assert_eq!(global, 17),
             other => panic!("expected UnmodeledGlobal, got {other:?}"),
         }
+        // The refusal carries the register's NAME from the special-bank definitions, so the
+        // next reader knows what to establish - and still refuses.
+        let err = emit_fragment(&shader(vec![test_of(24)])).unwrap_err();
+        assert!(matches!(err, EmitError::UnmodeledGlobal { global: 24, .. }), "{err:?}");
+        assert!(err.to_string().contains("register 24 (TILEY)"), "{err}");
+        assert_eq!(global_register_name(35), None);
         // GLOBAL[16] in a VERTEX program: there is no per-fragment facing bit there.
         let vsh = Shader { kind: ProgramKind::Vertex, instrs: vec![test_of(16)] };
         match emit_body(&vsh).unwrap_err() {
@@ -5950,6 +6390,93 @@ mod tests {
             .expect("a dead over-read of an internal lane must emit, not refuse");
         assert!(wgsl.contains(&rd("i", 0)), "got:
 {wgsl}");
+    }
+
+    /// The deferred-lighting rotation one title's program carries: `i1.xyz = row0 * n.x`, then
+    /// two FOUR-channel accumulating MADs into internal registers, of which only `xyz` reach the
+    /// output. Each MAD's `w` channel reads `i1.w`, which nothing wrote - and that channel feeds
+    /// only the next MAD's `w`, which feeds nothing. Liveness per CHANNEL lets it through; the
+    /// same program with the final move taking `w` as well is refused, naming that lane.
+    #[test]
+    fn a_dead_channel_of_a_live_internal_mad_does_not_refuse() {
+        let i1 = Operand::plain(Bank::Internal, 4, 0);
+        let i0 = Operand::plain(Bank::Internal, 0, 0);
+        let pa = |n| Operand::plain(Bank::PrimaryAttr, n, 2);
+        let program = |final_mask: [bool; 4]| {
+            let mut first = instr(Op::Mul, Some(i1), vec![pa(8), pa(2)]);
+            first.write_mask = [true, true, true, false];
+            let second = instr(Op::Mad, Some(i1), vec![pa(3), pa(12), i1]);
+            let third = instr(Op::Mad, Some(i0), vec![pa(4), pa(16), i1]);
+            let mut out = instr(Op::Mov, Some(Operand::plain(Bank::Output, 0, 1)), vec![i0]);
+            out.write_mask = final_mask;
+            shader(vec![first, second, third, out])
+        };
+        let wgsl = emit_fragment(&program([true, true, true, false]))
+            .expect("the w channel of the accumulating MADs reaches nothing - it must not refuse");
+        assert!(wgsl.contains("i[7]"), "the dead channel is still EMITTED (it reads the zero scratch):\n{wgsl}");
+        match emit_fragment(&program([true; 4])).unwrap_err() {
+            EmitError::UndefinedInternal { lane, index, .. } => assert_eq!((lane, index), (7, 1)),
+            other => panic!("expected UndefinedInternal, got {other:?}"),
+        }
+    }
+
+    /// The same per-channel answer outside the internal bank, on a shooter's world-fragment
+    /// shape: an F16 MAD into PA whose `w` reads `i[11]`, which nothing wrote (the internal write
+    /// above it is `xyz` only). Read back `xyz`, the `w` half is never consumed - F16 channels are
+    /// HALVES, so `pa6.xyz` is `pa6.lo, pa6.hi, pa7.lo` and the unwritten value sits in `pa7.hi`.
+    /// The second half of the test is the OUTPUT form: a MAD into `o0.xyzw` whose `w` is then
+    /// replaced outright by a later write. Each is refused again once its `w` is really read.
+    #[test]
+    fn a_dead_channel_outside_the_internal_bank_does_not_refuse() {
+        let pa = |n| Operand::plain(Bank::PrimaryAttr, n, 2);
+        let i8 = Operand::plain(Bank::Internal, 8, 0);
+        let o0 = Operand::plain(Bank::Output, 0, 1);
+        let mut feed = instr(Op::Mul, Some(i8), vec![pa(14), pa(12)]);
+        feed.write_mask = [true, true, true, false];
+        let mut mad = instr(Op::Mad, Some(pa(6)), vec![pa(4), pa(2), i8]);
+        mad.half_precision = true;
+        let via_pa = |out_mask: [bool; 4]| {
+            let mut out = instr(Op::Mov, Some(o0), vec![pa(6)]);
+            out.half_precision = true;
+            out.write_mask = out_mask;
+            shader(vec![feed.clone(), mad.clone(), out])
+        };
+        emit_fragment(&via_pa([true, true, true, false])).expect("pa7.hi is never read - must not refuse");
+        match emit_fragment(&via_pa([true; 4])).unwrap_err() {
+            EmitError::UndefinedInternal { lane, index, .. } => assert_eq!((lane, index), (11, 1)),
+            other => panic!("expected UndefinedInternal, got {other:?}"),
+        }
+        let mut into_out = mad.clone();
+        into_out.dest = Some(o0);
+        let mut alpha = instr(Op::Mov, Some(o0), vec![pa(16)]);
+        alpha.half_precision = true;
+        alpha.write_mask = [false, false, false, true];
+        emit_fragment(&shader(vec![feed.clone(), into_out.clone(), alpha]))
+            .expect("o0.w is replaced before the program ends - must not refuse");
+        match emit_fragment(&shader(vec![feed, into_out])).unwrap_err() {
+            EmitError::UndefinedInternal { lane, index, .. } => assert_eq!((lane, index), (11, 1)),
+            other => panic!("expected UndefinedInternal, got {other:?}"),
+        }
+    }
+
+    /// The other direction of the same walk: a DOT reads every one of its components into the
+    /// one channel it writes, so the instructions feeding components 1..3 are live too. The
+    /// walk used to want only the lanes the WRITE MASK names - component 0 - which left a move
+    /// feeding component 1 dead and its undefined internal read unrefused.
+    #[test]
+    fn a_dot_wants_every_component_it_reduces() {
+        let mut feed = instr(Op::Mov, Some(Operand::plain(Bank::Temp, 5, 0)), vec![Operand::plain(Bank::Internal, 0, 0)]);
+        feed.write_mask = [true, false, false, false];
+        let mut dot = instr(
+            Op::Dot { components: 4 },
+            Some(Operand::plain(Bank::Output, 0, 1)),
+            vec![Operand::plain(Bank::Temp, 4, 0), Operand::plain(Bank::PrimaryAttr, 0, 2)],
+        );
+        dot.write_mask = [true, false, false, false];
+        match emit_fragment(&shader(vec![feed, dot])).unwrap_err() {
+            EmitError::UndefinedInternal { lane, index, .. } => assert_eq!((lane, index), (0, 0)),
+            other => panic!("expected UndefinedInternal, got {other:?}"),
+        }
     }
 
     #[test]

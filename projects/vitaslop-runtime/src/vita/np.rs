@@ -41,6 +41,14 @@ const COMMERCE2_ERROR_REQ_NOT_FOUND: i32 = 0x8055_0F0Eu32 as i32;
 /// `SCE_NP_COMMERCE2_ERROR_NOT_SIGNIN`: "not signed in to PlayStation Network".
 pub(super) const COMMERCE2_ERROR_NOT_SIGNIN: i32 = 0x8055_0F72u32 as i32;
 
+/// The SceNpPartyGameUtil code (block `0x805525xx`) for "there is no party to describe". NO
+/// LOCAL OR PUBLISHED SOURCE NAMES IT: the name is this module's, and the value and meaning are
+/// read off two titles' own code, which test the member queries' return against exactly this
+/// value and take a no-party path on it (one maps it to a "not in a party" status). Signed out
+/// the console cannot be in a party - the system party runs over PSN - so every party query
+/// answers with it. See the party group in `vita::dispatch`.
+pub(super) const PARTY_ERROR_NOT_IN_PARTY: i32 = 0x8055_2506u32 as i32;
+
 const NEAR_ERROR_INVALID_ARGUMENT: i32 = 0x8010_4901u32 as i32;
 const NEAR_ERROR_ALREADY_INITIALIZED: i32 = 0x8010_4903u32 as i32;
 const NEAR_ERROR_NO_MEMORY: i32 = 0x8010_4904u32 as i32;
@@ -173,6 +181,111 @@ pub(super) fn basic_get_game_presence_of_friend(
         BASIC_ERROR_INVALID_ARGUMENT
     } else {
         BASIC_ERROR_SIGNED_OUT
+    }
+}
+
+/// int sceNpBasicRegisterJoinGameAckHandler(SceNpBasicJoinGameAckHandler handler, void *userdata)
+///
+/// The handler a friend's request to join this title's session is delivered to. Registering
+/// it is local and succeeds; signed out no friend exists to ask, so it is never called. A
+/// null handler is the caller's error.
+#[hostcall]
+pub(super) fn basic_register_join_game_ack_handler(
+    st: &mut VitaState,
+    handler: u32,
+    userdata: u32,
+) -> i32 {
+    if handler == 0 {
+        BASIC_ERROR_INVALID_ARGUMENT
+    } else {
+        st.np.join_game_ack_handler = Some((handler, userdata));
+        0
+    }
+}
+
+/// int sceNpBasicUnregisterJoinGameAckHandler(void)
+///
+/// Drops the handler. Succeeds with none registered too: a title unwinding its online setup
+/// must not be handed an error on the way out (see the teardown group in `vita::dispatch`).
+#[hostcall]
+pub(super) fn basic_unregister_join_game_ack_handler(st: &mut VitaState) -> i32 {
+    let _ = st.np.join_game_ack_handler.take();
+    0
+}
+
+// --- SceNpMatching2: the two calls that need no context ---------------------------------------
+//
+// Everything else in matching2 hangs off a context only a signed-in account can create, and
+// answers NOT_NP_SIGN_IN (see the group in `vita::dispatch`). These two do not: one reads back
+// the pool the library was initialised with, the other asks for this console's own addresses.
+// The codes are matching2's and signaling's own blocks (0x80550Cxx / 0x80550Exx) - from a
+// public Vita error-name list, since the local wiki has no matching2 block.
+
+const MATCHING2_ERROR_ALREADY_INITIALIZED: i32 = 0x8055_0C02u32 as i32;
+const MATCHING2_ERROR_NOT_INITIALIZED: i32 = 0x8055_0C03u32 as i32;
+const MATCHING2_ERROR_INVALID_ARGUMENT: i32 = 0x8055_0C0Au32 as i32;
+const MATCHING2_SIGNALING_ERROR_NOT_INITIALIZED: i32 = 0x8055_0E01u32 as i32;
+/// `SCE_NP_MATCHING2_SIGNALING_ERROR_NETINFO_NOT_AVAILABLE`: signaling cannot say what this
+/// console's addresses are - which, with no interface up, it cannot.
+const MATCHING2_SIGNALING_ERROR_NETINFO_NOT_AVAILABLE: i32 = 0x8055_0E0Bu32 as i32;
+
+/// int sceNpMatching2Init(SceSize poolSize, int threadPriority, int cpuAffinityMask,
+///                        SceSize threadStackSize)
+///
+/// The library's pool is recorded (see [`matching2_get_memory_info`]); a second init while one
+/// is live is the library's ALREADY_INITIALIZED.
+#[hostcall]
+pub(super) fn matching2_init(st: &mut VitaState, pool_size: u32) -> i32 {
+    if st.np.matching2_pool.is_some() {
+        MATCHING2_ERROR_ALREADY_INITIALIZED
+    } else {
+        st.np.matching2_pool = Some(pool_size);
+        0
+    }
+}
+
+/// int sceNpMatching2Term(void)
+///
+/// Releases the pool. Succeeds with no init behind it too, as the rest of the online stack's
+/// teardown does.
+#[hostcall]
+pub(super) fn matching2_term(st: &mut VitaState) -> i32 {
+    st.np.matching2_pool = None;
+    0
+}
+
+/// int sceNpMatching2GetMemoryInfo(SceNpMatching2MemoryInfo *memInfo)
+///
+/// `{ totalMemSize, curMemUsage, maxMemUsage }`: the pool `Init` was handed, and how much of it
+/// is used now and at most. None of it, ever - this engine keeps the library's state on the
+/// host and no context or request is created to take any - so both usage figures are a true 0.
+#[hostcall]
+pub(super) fn matching2_get_memory_info(ctx: &mut GuestCtx, st: &mut VitaState, info: Ptr) -> i32 {
+    match st.np.matching2_pool {
+        None => MATCHING2_ERROR_NOT_INITIALIZED,
+        Some(_) if info.is_null() => MATCHING2_ERROR_INVALID_ARGUMENT,
+        Some(pool) => {
+            for (i, v) in [pool, 0, 0].iter().enumerate() {
+                ctx.write_u32(info.addr() + 4 * i as u32, *v);
+            }
+            0
+        }
+    }
+}
+
+/// int sceNpMatching2SignalingGetLocalNetInfo(SceNpMatching2SignalingNetInfo *netinfo)
+///
+/// This console's local and NAT-mapped addresses as signaling sees them. It needs no context
+/// and no account - only a network, and there is none up: the interface `sceNetCtl` reports
+/// disconnected has no address to give, so the answer is signaling's own
+/// NETINFO_NOT_AVAILABLE and `*netinfo` is left as the caller had it. Before `Init` it is
+/// signaling's NOT_INITIALIZED.
+#[hostcall]
+pub(super) fn matching2_signaling_get_local_net_info(st: &mut VitaState, _netinfo: Ptr) -> i32 {
+    if st.np.matching2_pool.is_none() {
+        MATCHING2_SIGNALING_ERROR_NOT_INITIALIZED
+    } else {
+        MATCHING2_SIGNALING_ERROR_NETINFO_NOT_AVAILABLE
     }
 }
 
@@ -749,6 +862,10 @@ pub struct NpState {
     near: Near,
     /// Where the PS Store icon overlay was asked for, while shown.
     store_icon: Option<i32>,
+    /// `sceNpBasicRegisterJoinGameAckHandler`'s `(handler, userdata)`, while registered.
+    join_game_ack_handler: Option<(u32, u32)>,
+    /// `sceNpMatching2Init`'s pool size, while initialised.
+    matching2_pool: Option<u32>,
 }
 
 #[cfg(test)]
@@ -1065,6 +1182,60 @@ mod tests {
         assert_eq!(
             r.call(basic_get_game_presence_of_friend, &[0x100, 0x200]),
             BASIC_ERROR_SIGNED_OUT
+        );
+    }
+
+    /// The join-game handler registers locally (a null one refused) and unregisters with or
+    /// without one in place.
+    #[test]
+    fn join_game_ack_handler_registers_locally() {
+        let mut r = Run::new();
+        assert_eq!(
+            r.call(basic_register_join_game_ack_handler, &[0, 0]),
+            BASIC_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(r.call(basic_register_join_game_ack_handler, &[0x81_0001, 7]), 0);
+        assert_eq!(r.st.np.join_game_ack_handler, Some((0x81_0001, 7)));
+        assert_eq!(r.call(basic_unregister_join_game_ack_handler, &[]), 0);
+        assert_eq!(r.st.np.join_game_ack_handler, None);
+        assert_eq!(r.call(basic_unregister_join_game_ack_handler, &[]), 0);
+    }
+
+    /// Matching2's pool reads back from `GetMemoryInfo` with nothing used, the local net info
+    /// is signaling's NETINFO_NOT_AVAILABLE, and both refuse before `Init`.
+    #[test]
+    fn matching2_pool_and_local_net_info() {
+        let mut r = Run::new();
+        assert_eq!(
+            r.call(matching2_get_memory_info, &[0x100]),
+            MATCHING2_ERROR_NOT_INITIALIZED
+        );
+        assert_eq!(
+            r.call(matching2_signaling_get_local_net_info, &[0x100]),
+            MATCHING2_SIGNALING_ERROR_NOT_INITIALIZED
+        );
+        assert_eq!(r.call(matching2_init, &[0x2_0000, 100, 0, 0x4000]), 0);
+        assert_eq!(
+            r.call(matching2_init, &[0x2_0000, 100, 0, 0x4000]),
+            MATCHING2_ERROR_ALREADY_INITIALIZED
+        );
+        assert_eq!(r.call(matching2_get_memory_info, &[0x100]), 0);
+        assert_eq!(
+            [r.word(0x100), r.word(0x104), r.word(0x108)],
+            [0x2_0000, 0, 0]
+        );
+        assert_eq!(
+            r.call(matching2_get_memory_info, &[0]),
+            MATCHING2_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            r.call(matching2_signaling_get_local_net_info, &[0x100]),
+            MATCHING2_SIGNALING_ERROR_NETINFO_NOT_AVAILABLE
+        );
+        assert_eq!(r.call(matching2_term, &[]), 0);
+        assert_eq!(
+            r.call(matching2_get_memory_info, &[0x100]),
+            MATCHING2_ERROR_NOT_INITIALIZED
         );
     }
 }

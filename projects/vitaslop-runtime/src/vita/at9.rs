@@ -298,6 +298,10 @@ pub(crate) struct At9Voice {
     /// [`At9::state_words`]).
     generated_keyon: u32,
     generated_total: u32,
+    /// `sceNgsSystemUpdate` calls that processed this voice since its last key-on - the
+    /// `SceNgsVoiceInfo` word a streaming engine checks before it trusts the player's state
+    /// block. See [`At9Bank::updates_active`].
+    updates_active: u32,
     /// Source bytes consumed out of buffers already LEFT (a lap or a swap), since key-on
     /// and over the voice's life - the state words add the current buffer's position.
     bytes_keyon_done: u32,
@@ -425,6 +429,7 @@ impl At9Voice {
             consumed: 0,
             generated_keyon: 0,
             generated_total: 0,
+            updates_active: 0,
             bytes_keyon_done: 0,
             bytes_total_done: 0,
             start_buffer: 0,
@@ -886,6 +891,7 @@ impl At9Voice {
         self.enter_buffer();
         self.events.clear();
         self.generated_keyon = 0;
+        self.updates_active = 0;
         self.bytes_keyon_done = 0;
         if self.kind == SourceKind::Pcm {
             // Nothing to construct: the source is already samples, and playing it is a
@@ -2572,6 +2578,25 @@ impl At9Bank {
     /// Whether `voice` is producing audio - what `sceNgsVoiceGetInfo` reports as ACTIVE.
     pub(crate) fn is_playing(&self, voice: u32) -> bool {
         self.voices.get(&voice).is_some_and(|v| v.playing)
+    }
+
+    /// One `sceNgsSystemUpdate`: every voice it processes - playing, and not held by
+    /// `sceNgsVoicePause` - has now been through one more update since its key-on.
+    pub(crate) fn note_system_update(&mut self) {
+        for v in self.voices.values_mut() {
+            if v.playing && !v.paused {
+                v.updates_active = v.updates_active.saturating_add(1);
+            }
+        }
+    }
+
+    /// `sceNgsSystemUpdate` calls that processed `voice` since its key-on, or 0 when it is
+    /// not playing - the `SceNgsVoiceInfo` word `sceNgsVoiceGetInfo` reports beside the state.
+    pub(crate) fn updates_active(&self, voice: u32) -> u32 {
+        self.voices
+            .get(&voice)
+            .filter(|v| v.playing)
+            .map_or(0, |v| v.updates_active)
     }
 
     /// >>> THE PLAYER MODULE'S STATE BLOCK, the 24 bytes `sceNgsVoiceGetStateData` hands a

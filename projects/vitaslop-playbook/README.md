@@ -48,7 +48,10 @@ The title id each playbook directory is named by, and the game it is. The test
 | `PCSE00341` | OlliOlli |
 | `PCSH00250` | Dead or Alive Xtreme 3 Venus |
 | `best-effort/PCSA00007` | Hustle Kings |
+| `best-effort/PCSA00008` | Resistance: Burning Skies |
+| `best-effort/PCSA00011` | Gravity Rush |
 | `best-effort/PCSA00017` | LittleBigPlanet |
+| `best-effort/PCSA00107` | Killzone: Mercenary |
 | `best-effort/PCSE00034` | Mutant Blobs Attack |
 | `best-effort/PCSE00003` | Virtua Tennis 4 |
 | `best-effort/PCSE00050` | Zen Pinball 2 |

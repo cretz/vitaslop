@@ -305,7 +305,7 @@ pub(super) fn io_read(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let (ret, got) = match st.io_read(fd, size as usize) {
         Some(data) => {
             ctx.write_bytes(buf, &data);
-            // The DESTINATION, which the read trace in `host.rs` cannot see - it knows the
+            // The DESTINATION, which the read trace in `host/state_storage.rs` cannot see - it knows the
             // path and the length but not where the bytes landed. Without it, "this asset is
             // read in full and its contents never reach the table they belong in" is a dead
             // end: the buffer is heap, so the only way to aim the READ WATCHPOINT at it (the

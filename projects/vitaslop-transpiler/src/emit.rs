@@ -1466,6 +1466,64 @@ fn emit_watch_store_inline(f: &mut Body, base: u32, addr_local: u32, at: u32, le
     f.instruction(&W::End);
 }
 
+/// `InlineLowering::BindState`'s PER-SLOT copy: `bytes / stride` slots from the arrays block
+/// (`L_T2` + `src_off`) to the context block (`L_T0` + `dst_off`), each copied only when its
+/// first word is non-zero - see `BindStateLayout::copy_slot_stride`. Uses `L_T3` as the slot
+/// cursor and `L_SLOT` for the destination, so the watchpoint names the one slot written.
+///
+/// >>> PER-SLOT, SKIPPING THE EMPTY ONES. The handlers (`bind_precomputed_*_state`) walk the
+/// same slots with the same test, because a slot of zeros is this engine's own default and not
+/// an unbind the guest asked for.
+///
+/// A LOOP rather than sixteen unrolled slots: this lowering is emitted at every call site of
+/// the bind, and a title binds states from many of them.
+fn emit_bind_state_slot_copy(f: &mut Body, base: u32, src_off: u32, dst_off: u32, bytes: u32, stride: u32, index: u32) {
+    // src = block + src_off + i. The add is left out at offset zero, so the first copy's
+    // emitted code is exactly what it was before a second per-slot copy existed.
+    let src = |f: &mut Body| {
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::LocalGet(L_T3));
+        f.instruction(&W::I32Add);
+        if src_off != 0 {
+            f.instruction(&W::I32Const(src_off as i32));
+            f.instruction(&W::I32Add);
+        }
+    };
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::LocalSet(L_T3));
+    f.instruction(&W::Loop(BlockType::Empty));
+    // The slot's FIRST WORD decides: it is the texture's (or buffer's) guest address, and zero
+    // there is what every reader already treats as "this unit is unbound".
+    src(f);
+    f.instruction(&W::I32Load(mem_arg()));
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::I32Ne);
+    f.instruction(&W::If(BlockType::Empty));
+    // dst = ctx + dst_off + i, kept in a local so the watchpoint names THIS slot.
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::LocalGet(L_T3));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::I32Const(dst_off as i32));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::LocalSet(L_SLOT));
+    emit_watch_store_inline(f, base, L_SLOT, 0, stride, index);
+    f.instruction(&W::LocalGet(L_SLOT));
+    emit_host_off(f);
+    src(f);
+    emit_host_off(f);
+    f.instruction(&W::I32Const(stride as i32));
+    f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    f.instruction(&W::End); // the non-empty test
+    f.instruction(&W::LocalGet(L_T3));
+    f.instruction(&W::I32Const(stride as i32));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::LocalTee(L_T3));
+    f.instruction(&W::I32Const(bytes as i32));
+    f.instruction(&W::I32LtU);
+    f.instruction(&W::BrIf(0));
+    f.instruction(&W::End); // the loop
+}
+
 /// The shared body of [`emit_watch_store_range`], with the written extent either constant or
 /// in a local. Expects the rebased destination offset in `L_T0`.
 ///
@@ -8562,6 +8620,10 @@ fn emit_lock_take(
     layout: crate::LwMutexLayout,
     thread_off: u64,
     lock: bool,
+    // A release to zero writes `NO_OWNER` (the lightweight form, whose SMP inline take reads a
+    // stale owner as a recursive take); the kernel form has no parallel take and keeps the
+    // owner word as its definition (`kmutex::fast_unlock`) leaves it.
+    clear_owner: bool,
     base: u32,
     index: u32,
 ) {
@@ -8632,10 +8694,22 @@ fn emit_lock_take(
         f.instruction(&W::LocalGet(L_T0));
         f.instruction(&W::LocalGet(L_T2));
         f.instruction(&W::I32Store(word_at(layout.owner)));
+    } else if clear_owner {
+        // A release to zero clears the owner, as `lwwork::fast_unlock` does - see
+        // `lwwork::NO_OWNER` (-1; thid 0 is a real thread, so it cannot mean "nobody").
+        // The two forms are held against each other per arm, and the SMP form's inline
+        // take reads a stale owner as a recursive take.
+        emit_watch_store_inline(f, base, L_T0, layout.owner, 4, index);
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Const(1));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::If(BlockType::Empty));
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Const(-1));
+        f.instruction(&W::I32Store(word_at(layout.owner)));
+        f.instruction(&W::End);
     }
-    // count += 1 (take) or -= 1 (release). The release deliberately leaves `owner`
-    // alone: every reader tests `count` first, and thid 0 is a real thread, so
-    // there is no owner value that could mean "nobody".
+    // count += 1 (take) or -= 1 (release).
     f.instruction(&W::LocalGet(L_T0));
     f.instruction(&W::LocalGet(L_T1));
     f.instruction(&W::I32Const(1));
@@ -9292,13 +9366,13 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::I32Const(table_off as i32));
             f.instruction(&W::I32Add);
             f.instruction(&W::LocalSet(L_T0));
-            emit_lock_take(f, layout, thread_off, lock, base, index);
+            emit_lock_take(f, layout, thread_off, lock, false, base, index);
             f.instruction(&W::End); // the predicate's `if`
             return;
         }
         Some(InlineLowering::LwMutex { layout, thread_off, limit, lock }) => {
             emit_pointer_guard(f, base, limit, index);
-            emit_lock_take(f, layout, thread_off, lock, base, index);
+            emit_lock_take(f, layout, thread_off, lock, true, base, index);
             f.instruction(&W::End); // the predicate's `if`
             f.instruction(&W::End); // the pointer guard's `if`
             return;
@@ -9654,46 +9728,7 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
                 // because a slot of zeros is this engine's own default and not an unbind the
                 // guest asked for - see `BindStateLayout::copy_slot_stride`.
                 //
-                // A LOOP rather than sixteen unrolled slots: this lowering is emitted at every
-                // call site of the bind, and a title binds states from many of them.
-                let stride = l.copy_slot_stride;
-                f.instruction(&W::I32Const(0));
-                f.instruction(&W::LocalSet(L_T3));
-                f.instruction(&W::Loop(BlockType::Empty));
-                // The slot's FIRST WORD decides: it is the texture's guest address, and zero
-                // there is what every reader already treats as "this unit is unbound".
-                f.instruction(&W::LocalGet(L_T2));
-                f.instruction(&W::LocalGet(L_T3));
-                f.instruction(&W::I32Add);
-                f.instruction(&W::I32Load(mem_arg()));
-                f.instruction(&W::I32Const(0));
-                f.instruction(&W::I32Ne);
-                f.instruction(&W::If(BlockType::Empty));
-                // dst = ctx + copy_dst + i, kept in a local so the watchpoint names THIS slot.
-                f.instruction(&W::LocalGet(L_T0));
-                f.instruction(&W::LocalGet(L_T3));
-                f.instruction(&W::I32Add);
-                f.instruction(&W::I32Const(l.copy_dst as i32));
-                f.instruction(&W::I32Add);
-                f.instruction(&W::LocalSet(L_SLOT));
-                emit_watch_store_inline(f, base, L_SLOT, 0, stride, index);
-                f.instruction(&W::LocalGet(L_SLOT));
-                emit_host_off(f);
-                f.instruction(&W::LocalGet(L_T2));
-                f.instruction(&W::LocalGet(L_T3));
-                f.instruction(&W::I32Add);
-                emit_host_off(f);
-                f.instruction(&W::I32Const(stride as i32));
-                f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
-                f.instruction(&W::End); // the non-empty test
-                f.instruction(&W::LocalGet(L_T3));
-                f.instruction(&W::I32Const(stride as i32));
-                f.instruction(&W::I32Add);
-                f.instruction(&W::LocalTee(L_T3));
-                f.instruction(&W::I32Const(l.copy_bytes as i32));
-                f.instruction(&W::I32LtU);
-                f.instruction(&W::BrIf(0));
-                f.instruction(&W::End); // the loop
+                emit_bind_state_slot_copy(f, base, 0, l.copy_dst, l.copy_bytes, l.copy_slot_stride, index);
             }
             // The stage's three-word uniform record: buffer, memoised size, program header.
             emit_watch_store_inline(f, base, L_T0, l.ctx_record, 12, index);
@@ -9709,7 +9744,11 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::LocalGet(L_T1));
             f.instruction(&W::I32Load(word_at(l.st_header_at)));
             f.instruction(&W::I32Store(word_at(l.ctx_record + 8)));
-            if l.table_bytes != 0 {
+            if l.table_bytes != 0 && l.table_slot_stride != 0 {
+                // The second copy PER SLOT, skipping empty ones - the vertex state's texture
+                // array, see `BindStateLayout::table_slot_stride`.
+                emit_bind_state_slot_copy(f, base, l.table_src, l.table_dst, l.table_bytes, l.table_slot_stride, index);
+            } else if l.table_bytes != 0 {
                 // The non-default uniform-buffer table, WHOLESALE - see
                 // `BindStateLayout::table_src`: the handler writes it replace-not-merge.
                 emit_watch_store_inline(f, base, L_T0, l.table_dst, l.table_bytes, index);

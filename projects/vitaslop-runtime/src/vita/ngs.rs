@@ -256,9 +256,12 @@ pub(super) fn voice_init(ctx: &mut GuestCtx, st: &mut VitaState) {
 }
 
 /// `SceNgsVoiceInfo.uVoiceState` at offset 0: the voice's lifecycle state, a BITFIELD
-/// (available 0, active 1, finalizing 2, unloading 4). Only offset 0 is written - see
-/// [`voice_get_info`].
+/// (available 0, active 1, finalizing 2, unloading 4) - see [`voice_get_info`].
 const NGS_VOICE_INFO_STATE_OFF: u32 = 0;
+
+/// `SceNgsVoiceInfo` word 5 (offset 0x14): how many `sceNgsSystemUpdate` calls have
+/// processed the voice since its key-on - see [`voice_get_info`].
+const NGS_VOICE_INFO_UPDATES_OFF: u32 = 0x14;
 
 /// `SCE_NGS_VOICE_STATE_AVAILABLE`: the voice is idle and holds nothing.
 const NGS_VOICE_STATE_AVAILABLE: u32 = 0;
@@ -280,10 +283,21 @@ const NGS_VOICE_STATE_PAUSED: u32 = 0x20;
 /// >>> RUNS HERE. Synthesis does run here - the bank decodes and mixes every playing
 /// >>> voice - and a state that contradicts the mixer is what a title acts on.
 ///
-/// Writes ONLY the state word. The rest of `SceNgsVoiceInfo` has no layout in any source
-/// available here, and zeroing a struct whose length is a guess would scribble over
-/// whatever the caller put after it - a stack frame, in the observed call. A field this
-/// function does not know is a field it leaves alone.
+/// >>> WORD 5 IS THE UPDATE COUNT, AND A STREAMING ENGINE GATES ITS PLAY CURSOR ON IT.
+/// `SceNgsVoiceInfo` is `{ uVoiceState, uNumModules, uNumInputs, uNumOutputs,
+/// uNumPatchesPerOutput, uUpdateCallsActive }`: the last word counts the
+/// `sceNgsSystemUpdate` calls that have processed the voice since its key-on. A streamer
+/// reads it right after the state - MEASURED in one title's audio middleware: ACTIVE and
+/// word 5 non-zero, and only then does it read the player's state block for the play cursor;
+/// ACTIVE with word 5 ZERO means "not processed yet", and it takes the cursor as still at the
+/// start. Left unwritten, word 5 was whatever the caller's stack held. While that happened to
+/// be non-zero every stream advanced; the moment it read zero, every stream that engine ran
+/// froze at once - nothing more decoded, no ring refilled - and a one-shot narration line
+/// that never reached its end stayed "playing" for good, holding the scripted scene that
+/// waited on it (and the touch input that scene blocks) forever.
+///
+/// Words 1-4 describe the voice's definition and routing, which this engine does not model
+/// per voice; they stay as the caller left them rather than carry an invented count.
 #[hostcall]
 pub(super) fn voice_get_info(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, info: Ptr) -> i32 {
     if info.addr() != 0 {
@@ -298,6 +312,7 @@ pub(super) fn voice_get_info(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32,
             0
         };
         ctx.write_u32(info.addr() + NGS_VOICE_INFO_STATE_OFF, state);
+        ctx.write_u32(info.addr() + NGS_VOICE_INFO_UPDATES_OFF, bank.updates_active(voice));
     }
     0
 }
@@ -388,6 +403,19 @@ pub(super) fn player_event_calls(st: &mut VitaState) -> Vec<(u32, [u8; 0x1c])> {
             finished_cb = finished_cb.is_some(),
             "player event"
         );
+        // A voice that runs out of data stops reporting ACTIVE, and a streaming engine that
+        // polls `sceNgsVoiceGetInfo` reads that as "this sound is over". Rare enough to say at
+        // debug, and the line a "sound never ends" or "sound ended early" question starts from.
+        if let super::at9::PlayerEvent::EndOfData { last } = event {
+            tracing::debug!(
+                target: "vitaslop::ngs",
+                voice = format_args!("{voice:#x}"),
+                last,
+                frame = st.cur_frame(),
+                finished_cb = finished_cb.is_some(),
+                "voice ENDED: its buffer chain ran out"
+            );
+        }
         for (entry, userdata) in module_cb.into_iter().chain(finished_cb) {
             let mut info = [0u8; 0x1c];
             let words = [
@@ -453,9 +481,13 @@ pub(super) fn voice_set_paused(ctx: &mut GuestCtx, st: &mut VitaState, paused: b
     ctx.ret(0);
 }
 
-/// SceInt32 sceNgsSystemUpdate(SceNgsHSynSystem system) - dump the surrounding
-/// output/work region so the master-buss mix destination becomes visible.
-pub(super) fn system_update(ctx: &mut GuestCtx, _st: &mut VitaState) {
+/// SceInt32 sceNgsSystemUpdate(SceNgsHSynSystem system)
+///
+/// One update of the synthesizer: every active voice is processed once more, which is what
+/// `sceNgsVoiceGetInfo` counts back to a title (see [`voice_get_info`]). At trace, also dump
+/// the surrounding output/work region so the master-buss mix destination becomes visible.
+pub(super) fn system_update(ctx: &mut GuestCtx, st: &mut VitaState) {
+    st.audio_state.at9.note_system_update();
     if tracing::enabled!(target: "vitaslop::ngs", tracing::Level::TRACE) {
         let a3 = ctx.arg(3);
         dump_mem(ctx, "sysupdate-a3", a3, 64);
@@ -1464,6 +1496,56 @@ mod lock_params_tests {
         h.call(voice_stop, [voice, 0, 0, 0]);
         h.call(voice_get_info, [voice, info, 0, 0]);
         assert_eq!(h.read_u32(info), 0, "a killed voice is AVAILABLE again");
+    }
+
+    /// THE REGRESSION. `SceNgsVoiceInfo` word 5 is the count of system updates that processed
+    /// the voice since its key-on, and it is WRITTEN, whatever the caller's buffer held: a
+    /// streamer reads the player's play cursor only once it is non-zero, so a stale zero
+    /// there froze every stream of one title and kept a narration line "playing" forever.
+    #[test]
+    fn voice_info_counts_the_updates_since_key_on() {
+        let mut h = Harness::new();
+        let voice = 0x1234;
+        let buf = h.lock(voice);
+        h.write_source(buf, 0x0020_0000, 0x3fc0);
+        h.call(voice_unlock_params, [voice, 0, 0, 0]);
+        let info = 0x3000u32;
+        let updates = |h: &mut Harness| {
+            // Stack garbage in the word, as the caller's frame had it.
+            h.write_u32(info + NGS_VOICE_INFO_UPDATES_OFF, 0xdead_beef);
+            h.call(voice_get_info, [voice, info, 0, 0]);
+            h.read_u32(info + NGS_VOICE_INFO_UPDATES_OFF)
+        };
+        assert_eq!(updates(&mut h), 0, "a voice that was never played has had no updates");
+        h.call(system_update, [0, 0, 0, 0]);
+        assert_eq!(updates(&mut h), 0, "an update does not count a voice that is not playing");
+        h.call(voice_play, [voice, 0, 0, 0]);
+        assert_eq!(
+            updates(&mut h),
+            0,
+            "just keyed on, the voice has not been through an update yet - the streamer must \
+             still see its cursor at the start"
+        );
+        h.call(system_update, [0, 0, 0, 0]);
+        h.call(system_update, [0, 0, 0, 0]);
+        assert_eq!(updates(&mut h), 2, "each system update that processes the voice counts");
+        h.call(voice_set_paused_for_test, [voice, 1, 0, 0]);
+        h.call(system_update, [0, 0, 0, 0]);
+        assert_eq!(updates(&mut h), 2, "a paused voice is not processed, so it is not counted");
+        h.call(voice_set_paused_for_test, [voice, 0, 0, 0]);
+        h.call(system_update, [0, 0, 0, 0]);
+        assert_eq!(updates(&mut h), 3);
+        h.call(voice_play, [voice, 0, 0, 0]);
+        assert_eq!(updates(&mut h), 0, "a new key-on starts the count again");
+        h.call(system_update, [0, 0, 0, 0]);
+        h.call(voice_stop, [voice, 0, 0, 0]);
+        assert_eq!(updates(&mut h), 0, "a voice that is not playing reports no updates");
+    }
+
+    /// `voice_set_paused` with its `paused` flag taken from r1, so the harness can drive it.
+    fn voice_set_paused_for_test(ctx: &mut GuestCtx, st: &mut VitaState) {
+        let paused = ctx.arg(1) != 0;
+        voice_set_paused(ctx, st, paused);
     }
 
     /// Releasing a rack stops the voices it handed out, and only those: a title frees the

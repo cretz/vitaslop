@@ -1055,7 +1055,7 @@ pub struct BindStateLayout {
     ///
     /// Zero keeps the plain bulk `memory.copy`, which nothing uses today.
     pub copy_slot_stride: u32,
-    /// A second, WHOLESALE copy: `table_bytes` bytes from `block + table_src` to
+    /// A second copy, WHOLESALE unless [`Self::table_slot_stride`] says otherwise: `table_bytes` bytes from `block + table_src` to
     /// `ctx + table_dst` (zero bytes = none). The fragment state's NON-DEFAULT UNIFORM-BUFFER
     /// table sits behind its texture array in the block and lands far from the context's
     /// texture array, so it cannot ride the texture copy - and it has to land, replace-not-merge,
@@ -1068,6 +1068,17 @@ pub struct BindStateLayout {
     pub table_src: u32,
     pub table_dst: u32,
     pub table_bytes: u32,
+    /// When non-zero, the SECOND copy is per-slot and skips empty ones, exactly as
+    /// [`Self::copy_slot_stride`] makes the first: `table_bytes / table_slot_stride` slots, a
+    /// slot whose first word is zero left alone. Zero keeps the wholesale copy the fragment
+    /// stage's uniform-buffer table needs.
+    ///
+    /// The VERTEX stage's second copy is its TEXTURE array, onto the context's vertex sampler
+    /// block: binding a precomputed vertex state binds its vertex textures, and the array lives
+    /// in the same host-zeroed block as the fragment state's, so its zero slots are unwritten
+    /// rather than unbinds. While the bind skipped this array a vertex program that samples a
+    /// texture found its unit empty and every draw using it was DROPPED.
+    pub table_slot_stride: u32,
     /// Context slot the program handle is stored to, when `has_prog`.
     pub ctx_prog: u32,
     pub has_prog: bool,

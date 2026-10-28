@@ -188,6 +188,212 @@ mod ledger {
     }
 }
 
+/// # The OWNER ledger (`VITASLOP_HEAP_OWNERS=<min KB>`, both engines)
+///
+/// The backtrace ledger above cannot run in the browser - there is no backtrace there - and
+/// the browser is where the heap decides whether a title runs at all. This one keeps, for every
+/// live block of at least the threshold, its size and the OWNER TAG of the code that allocated
+/// it: a thread-local tag set by [`owner_scope`] around the few call sites that can hold
+/// hundreds of megabytes (shader translation, texture and geometry snapshots, the renderer's
+/// frame). A block allocated outside every scope is filed by SIZE CLASS instead, so even the
+/// untagged remainder says whether it is a few huge blocks or many medium ones.
+///
+/// Blocks under the threshold are not tracked at all; the report prices them as the live
+/// figure minus everything tracked, so the small-block share is known even though its owners
+/// are not.
+mod owners {
+    use super::Owner;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimum size that is tracked; 0 = off.
+    pub static THRESHOLD: AtomicUsize = AtomicUsize::new(0);
+
+    static LIVE: Mutex<Option<HashMap<usize, (usize, u8)>>> = Mutex::new(None);
+
+    thread_local! {
+        static INSIDE: Cell<bool> = const { Cell::new(false) };
+        pub static TAG: Cell<u8> = const { Cell::new(0) };
+    }
+
+    fn guarded<R>(f: impl FnOnce() -> R) -> Option<R> {
+        INSIDE.with(|g| {
+            if g.get() {
+                return None;
+            }
+            g.set(true);
+            let r = f();
+            g.set(false);
+            Some(r)
+        })
+    }
+
+    pub fn record(ptr: *mut u8, size: usize) {
+        let min = THRESHOLD.load(Ordering::Relaxed);
+        if min == 0 || size < min {
+            return;
+        }
+        let tag = TAG.with(|t| t.get());
+        guarded(|| {
+            let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            g.get_or_insert_with(HashMap::new).insert(ptr as usize, (size, tag));
+        });
+    }
+
+    pub fn forget(ptr: *mut u8, size: usize) {
+        let min = THRESHOLD.load(Ordering::Relaxed);
+        if min == 0 || size < min {
+            return;
+        }
+        guarded(|| {
+            let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(m) = g.as_mut() {
+                m.remove(&(ptr as usize));
+            }
+        });
+    }
+
+    /// `(tag, bytes, blocks)` per tag, and `(size class, bytes, blocks)` for untagged blocks.
+    #[allow(clippy::type_complexity)]
+    pub fn totals() -> Option<(Vec<(u8, usize, usize)>, [(usize, usize); 4])> {
+        guarded(|| {
+            let g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            let m = g.as_ref()?;
+            let mut by_tag: HashMap<u8, (usize, usize)> = HashMap::new();
+            let mut classes = [(0usize, 0usize); 4];
+            for &(size, tag) in m.values() {
+                // The run worker's catch-all is filed under its tag AND by size, because it is
+                // the one tag that is a whole thread rather than a call site.
+                if tag == Owner::RunWorker as u8 {
+                    let e = by_tag.entry(tag).or_insert((0, 0));
+                    e.0 += size;
+                    e.1 += 1;
+                }
+                if tag == 0 || tag == Owner::RunWorker as u8 {
+                    let c = match size {
+                        s if s < 256 << 10 => 0,
+                        s if s < 4 << 20 => 1,
+                        s if s < 64 << 20 => 2,
+                        _ => 3,
+                    };
+                    classes[c].0 += size;
+                    classes[c].1 += 1;
+                } else {
+                    let e = by_tag.entry(tag).or_insert((0, 0));
+                    e.0 += size;
+                    e.1 += 1;
+                }
+            }
+            let mut v: Vec<(u8, usize, usize)> = by_tag.into_iter().map(|(t, (b, n))| (t, b, n)).collect();
+            v.sort_by_key(|x| std::cmp::Reverse(x.1));
+            Some((v, classes))
+        })
+        .flatten()
+    }
+}
+
+/// Who owns an allocation, for the owner ledger ([`owners`]). The innermost [`owner_scope`]
+/// on the allocating thread wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Owner {
+    /// Shader translation: linking a pair, emitting its WGSL, and the memos that keep both.
+    Shader = 1,
+    /// Building a render pipeline from a linked pair (layouts, the module, the pipeline).
+    Pipeline = 2,
+    /// Guest TEXTURE bytes read into the snapshot cache.
+    TextureSnapshot = 3,
+    /// Guest VERTEX / INDEX bytes read into the snapshot caches.
+    GeometrySnapshot = 4,
+    /// Decoding or re-encoding a texture for upload.
+    TextureDecode = 5,
+    /// The renderer's frame (encode and submit), outside the narrower scopes above.
+    RenderFrame = 6,
+    /// The resolver building a frame's scene from guest memory, outside the narrower scopes.
+    Resolve = 7,
+    /// Anything else a GUEST thread's worker allocates (HLE calls, kernel objects, audio).
+    GuestThread = 8,
+    /// Anything else the resolver's worker allocates.
+    ResolverThread = 9,
+    /// Title files read through the file table.
+    FileIo = 10,
+    /// Anything else the RUN worker (the present loop and the renderer) allocates.
+    RunWorker = 11,
+}
+
+impl Owner {
+    fn name(tag: u8) -> &'static str {
+        match tag {
+            1 => "shader translation",
+            2 => "pipeline build",
+            3 => "texture snapshots",
+            4 => "geometry snapshots",
+            5 => "texture decode",
+            6 => "render frame",
+            7 => "resolve",
+            8 => "guest-thread other",
+            9 => "resolver-thread other",
+            10 => "file io",
+            11 => "run-worker other",
+            _ => "?",
+        }
+    }
+}
+
+/// Restores the previous owner tag when dropped - see [`owner_scope`].
+pub struct OwnerScope(u8);
+
+impl Drop for OwnerScope {
+    fn drop(&mut self) {
+        let prev = self.0;
+        owners::TAG.with(|t| t.set(prev));
+    }
+}
+
+/// Tag every allocation this thread makes until the guard drops as `owner`'s, for the owner
+/// ledger. A thread-local store and nothing else when the ledger is off.
+pub fn owner_scope(owner: Owner) -> OwnerScope {
+    OwnerScope(owners::TAG.with(|t| t.replace(owner as u8)))
+}
+
+/// Make `owner` this thread's BASE tag for the rest of its life - what an allocation outside
+/// every [`owner_scope`] is filed under. For a worker's entry point, which never returns to a
+/// caller that could restore anything.
+pub fn set_thread_owner(owner: Owner) {
+    owners::TAG.with(|t| t.set(owner as u8));
+}
+
+/// Arm the owner ledger at `min_bytes` (0 disarms). See [`owners`].
+pub fn track_owners(min_bytes: usize) {
+    owners::THRESHOLD.store(min_bytes, Ordering::Relaxed);
+}
+
+/// The owner ledger as one report line, or `None` when it is not armed.
+pub fn owners_report() -> Option<String> {
+    let min = owners::THRESHOLD.load(Ordering::Relaxed);
+    if min == 0 {
+        return None;
+    }
+    let (tags, classes) = owners::totals()?;
+    const MB: usize = 1024 * 1024;
+    // The run worker's bytes appear both under its tag and in the size classes: count them once.
+    let tracked: usize = tags.iter().filter(|t| t.0 != Owner::RunWorker as u8).map(|t| t.1).sum::<usize>()
+        + classes.iter().map(|c| c.0).sum::<usize>();
+    let mut s = format!("RUST HEAP BY OWNER (blocks >= {} KB):", min / 1024);
+    for (t, b, n) in &tags {
+        s += &format!(" {} {} MB in {n},", Owner::name(*t), b / MB);
+    }
+    const CLASS: [&str; 4] = ["< 256 KB", "256 KB - 4 MB", "4 - 64 MB", ">= 64 MB"];
+    s += " UNTAGGED + run-worker other, by size:";
+    for (i, (b, n)) in classes.iter().enumerate() {
+        s += &format!(" {} {} MB in {n},", CLASS[i], b / MB);
+    }
+    s += &format!(" | blocks under {} KB (untracked) {} MB", min / 1024, live_bytes().saturating_sub(tracked) / MB);
+    Some(s)
+}
+
 /// Arm the large-allocation ledger: every allocation of `min_bytes` or more keeps its
 /// backtrace while live. See [`ledger`]. `0` disarms it.
 pub fn trace_large(min_bytes: usize) {
@@ -430,6 +636,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
         if !p.is_null() {
             took(layout.size());
             ledger::record(p, layout.size());
+            owners::record(p, layout.size());
         }
         p
     }
@@ -437,6 +644,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         gave(layout.size());
         ledger::forget(ptr, layout);
+        owners::forget(ptr, layout.size());
         unsafe { self.0.dealloc(ptr, layout) }
     }
 
@@ -445,15 +653,18 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
         if !p.is_null() {
             took(layout.size());
             ledger::record(p, layout.size());
+            owners::record(p, layout.size());
         }
         p
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ledger::forget(ptr, layout);
+        owners::forget(ptr, layout.size());
         let p = unsafe { self.0.realloc(ptr, layout, new_size) };
         if !p.is_null() {
             ledger::record(p, new_size);
+            owners::record(p, new_size);
             // Count the DELTA, and count a grow as a peak event: a realloc that grows may have
             // copied, in which case both blocks were live for the length of the copy - but the
             // allocator has already released the old one by the time it returns, so the honest

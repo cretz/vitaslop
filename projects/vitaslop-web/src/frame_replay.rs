@@ -68,7 +68,12 @@ pub async fn frame_replay(bytes: Vec<u8>, scene_limits: Vec<u32>, draw_limit: i3
         }
     }));
     vitaslop_platform::gpu::set_wasm_clock(crate::perf_now);
-    let mut gxm = GxmRenderer::new(&device, &queue, OUTPUT_FORMAT);
+    // `VITASLOP_REPLAY_BGRA=1`: hold every target in `Bgra8Unorm`, the format the live page's
+    // renderer takes from a desktop canvas, instead of RGBA8. The pixels handed back are swapped
+    // to memory-order RGBA either way, so the two arms compare byte for byte.
+    let bgra = vitaslop_runtime::knobs::var("VITASLOP_REPLAY_BGRA").is_ok_and(|v| v.trim() == "1");
+    let output_format = if bgra { wgpu::TextureFormat::Bgra8Unorm } else { OUTPUT_FORMAT };
+    let mut gxm = GxmRenderer::new(&device, &queue, output_format);
     let mut builder = RenderSceneBuilder::new();
     let (width, height) = (fc.width, fc.height);
     // Passes completed at their own end-scene already hold their image and are not rendered
@@ -95,7 +100,7 @@ pub async fn frame_replay(bytes: Vec<u8>, scene_limits: Vec<u32>, draw_limit: i3
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: OUTPUT_FORMAT,
+            format: output_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -196,6 +201,11 @@ pub async fn frame_replay(bytes: Vec<u8>, scene_limits: Vec<u32>, draw_limit: i3
             }
         }
         readback.unmap();
+        if bgra && src_tex.format() == wgpu::TextureFormat::Bgra8Unorm {
+            for px in rgba.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
         // The timestamp map was asked for after the same submit; give it a moment to land.
         for _ in 0..50 {
             gxm.ts_poll();

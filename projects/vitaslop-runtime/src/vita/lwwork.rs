@@ -242,9 +242,15 @@ pub fn fast_lock(w: &mut dyn GuestWords, work: u32, thid: i32, lock_count: u32) 
 /// released. The mirror of [`fast_lock`], and the definition
 /// `InlineOp::LwMutexUnlock` is held against.
 ///
-/// `owner` is deliberately left alone when the count reaches zero: every reader tests the
-/// count first, so a stale owner is unobservable, and clearing it would need a sentinel
-/// that thid 0 already rules out.
+/// A release to zero writes [`NO_OWNER`] BEFORE the count, as every release to zero must. It
+/// used to leave the owner stale ("every reader tests the count first"), which stopped being
+/// true once the inline parallel lock existed: that lock reads "held, and the owner is me"
+/// as a RECURSIVE take: thread B releases through here (owner left = B), thread A takes the
+/// mutex inline (count 0 -> 1, owner not yet written), and B, locking again inline in that
+/// window, reads its own stale id and "recurses" into a mutex A holds. (A GPU-heap allocator
+/// crash first blamed on this window was MEASURED to be something else - an occupancy count
+/// kept beside the lock never saw two holders, and the crash reproduced with the inline form
+/// off. See `jpeg::do_get_output_info`.)
 pub fn fast_unlock(w: &mut dyn GuestWords, work: u32, thid: i32, unlock_count: u32) -> bool {
     if unlock_count != 1 || !is_mutex(w, work) || get(w, work, off::WAITERS) != 0 {
         return false;
@@ -252,6 +258,9 @@ pub fn fast_unlock(w: &mut dyn GuestWords, work: u32, thid: i32, unlock_count: u
     let held = get(w, work, off::COUNT);
     if held == 0 || get(w, work, off::OWNER) != thid as u32 {
         return false;
+    }
+    if held == 1 {
+        set(w, work, off::OWNER, NO_OWNER);
     }
     set(w, work, off::COUNT, held - 1);
     true
@@ -345,8 +354,8 @@ mod tests {
         assert!(!is_mutex(&w, WORK), "a deleted mutex cannot be taken");
     }
 
-    /// The uncontended take and release, including recursion, and the fact that the count
-    /// is what says "free" - not the owner, which is left stale on purpose.
+    /// The uncontended take and release, including recursion. A release to zero leaves
+    /// [`NO_OWNER`] - see [`fast_unlock`] for the race a stale owner opened.
     #[test]
     fn the_fast_paths_take_release_and_recurse() {
         let mut w = Words::default();
@@ -370,9 +379,9 @@ mod tests {
         assert!(fast_unlock(&mut w, WORK, 7, 1));
         assert_eq!(count(&w, WORK), 0, "free");
         assert_eq!(
-            owner(&w, WORK),
-            7,
-            "the owner word is left stale, by design"
+            owner(&w, WORK) as u32,
+            NO_OWNER,
+            "a free mutex names no owner"
         );
         assert!(
             !fast_unlock(&mut w, WORK, 7, 1),
@@ -380,7 +389,7 @@ mod tests {
         );
         assert!(
             fast_lock(&mut w, WORK, 9, 1),
-            "a free mutex goes to whoever asks, stale owner or not"
+            "a free mutex goes to whoever asks"
         );
         assert_eq!(owner(&w, WORK), 9);
     }

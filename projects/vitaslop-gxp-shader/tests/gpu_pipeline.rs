@@ -20,6 +20,8 @@ use std::path::PathBuf;
 
 use vitaslop_gxp_shader::{link_programs, LinkedProgram};
 
+mod common;
+
 /// Acquire a headless GPU device, or `None` when no adapter is available (skip the test).
 fn device() -> Option<(wgpu::Device, wgpu::Queue, String)> {
     let instance = wgpu::Instance::default();
@@ -239,4 +241,315 @@ fn linked_pairs_build_real_pipelines() {
     }
     eprintln!("=> {built} linked pairs built a real wgpu pipeline; {fell_back} fell back (unlinkable)");
     assert!(built > 0, "no linkable pairs built a pipeline - check VITASLOP_GXP_PAIRS");
+}
+
+/// A program whose guest-memory windows outgrow a uniform binding declares them as a
+/// read-only STORAGE array, and that module builds a real pipeline against a layout whose
+/// binding 1 is `Storage { read_only: true }` with a dynamic offset - the layout the renderer
+/// builds for it - and a bind group over a 1 MiB storage range binds to it. Authored, so it
+/// needs no corpus; skips with no adapter.
+#[test]
+fn a_storage_window_module_builds_a_real_pipeline() {
+    use vitaslop_gxp_shader::gxpwrite::{self, ContainerSpec, ParamSpec, ProgramSpec, VertexOutputs};
+    use vitaslop_gxp_shader::ir::Bank;
+    use vitaslop_gxp_shader::usse::asm::{self, Dest, IntSrc};
+    let t = Bank::Temp;
+    let code = vec![
+        asm::imad_step(false, false, Dest::new(t, 8), (Bank::PrimaryAttr, 0), IntSrc::Imm(16), IntSrc::Reg(Bank::SecondaryAttr, 20))
+            .unwrap(),
+        asm::ldmem(Dest::new(t, 0), 4, (t, 8), IntSrc::Imm(0), IntSrc::Imm(0)).unwrap(),
+    ];
+    let blob = gxpwrite::write(
+        &ProgramSpec::vertex(code)
+            .with_parameters(vec![
+                ParamSpec::attribute("IN.position", 0, 4),
+                ParamSpec::uniform_buffer("g_Grid", 0, 4 << 20),
+            ])
+            .with_default_uniform_regs(16)
+            .with_containers(vec![
+                ContainerSpec { index: 14, base_sa: 0, size_regs: 16 },
+                ContainerSpec { index: 19, base_sa: 20, size_regs: 4 },
+            ])
+            .with_ub_bindings(vec![(0, 0)])
+            .with_registers(8, 24, 16)
+            .with_outputs(VertexOutputs { color0: false, texcoords: vec![(0, 4)] }),
+    );
+    let (_, module) = vitaslop_gxp_shader::recompile_vertex_module(&blob).expect("recompiles");
+    let windows = &module.bindings.mem_windows;
+    assert!(vitaslop_gxp_shader::module::mem_window_storage(windows));
+    let Some((device, _queue, adapter)) = device() else {
+        eprintln!("no GPU adapter - skipping the storage-window pipeline test");
+        return;
+    };
+    let bind_bytes = u64::from(vitaslop_gxp_shader::module::mem_window_vec4_count(windows)) * 16;
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("storage-window"),
+        source: wgpu::ShaderSource::Wgsl(module.wgsl.clone().into()),
+    });
+    let mut entries = Vec::new();
+    if module.bindings.sa_lane_count > 0 {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(u64::from(module.bindings.sa_vec4_count()) * 16),
+            },
+            count: None,
+        });
+    }
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: 1,
+        visibility: wgpu::ShaderStages::VERTEX,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: true,
+            min_binding_size: wgpu::BufferSize::new(bind_bytes),
+        },
+        count: None,
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
+    let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[] });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&bgl), Some(&empty)],
+        immediate_size: 0,
+    });
+    let attrs = [wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 }];
+    let _pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("storage-window"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: 16,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &attrs,
+            })],
+            compilation_options: Default::default(),
+        },
+        // Vertex-only: a depth-only pass, the shape of the draw that found this.
+        fragment: None,
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    // The arena the renderer binds it from: UNIFORM | STORAGE, the window at a 256-aligned
+    // dynamic offset past the SA block.
+    let arena = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 256 + bind_bytes,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut bg_entries = Vec::new();
+    if module.bindings.sa_lane_count > 0 {
+        bg_entries.push(wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &arena,
+                offset: 0,
+                size: wgpu::BufferSize::new(u64::from(module.bindings.sa_vec4_count()) * 16),
+            }),
+        });
+    }
+    bg_entries.push(wgpu::BindGroupEntry {
+        binding: 1,
+        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &arena,
+            offset: 0,
+            size: wgpu::BufferSize::new(bind_bytes),
+        }),
+    });
+    let _bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &bg_entries });
+    if let Some(err) = pollster::block_on(scope.pop()) {
+        panic!("{adapter}: wgpu rejected the storage-window pipeline: {err}\n{}", module.wgsl);
+    }
+}
+
+/// **A FRAGMENT PROGRAM THAT STORES TO GUEST MEMORY, END TO END ON A REAL GPU.**
+///
+/// The authored edge-mask arithmetic (`common::tile_store_pair`) addresses each fragment's store
+/// through the TILE registers and writes the word's own index. Linked, built against the group-3
+/// layout the renderer gives a storing pipeline (the depth block at binding 0, the writable
+/// mirror at 2, the window headers at 3), and drawn over a 40x36 target - which crosses the
+/// 16-pixel boundary of both registers' split twice in each axis - every pixel's word must hold
+/// its own index, and every word past a row's 40 pixels (the stride is 48) must be untouched.
+/// That is the emitted split, the store helper, the pointer seeded from the header and the
+/// bindings, all at once. Authored, so it needs no corpus; skips with no adapter.
+#[test]
+fn a_storing_fragment_program_writes_each_pixel_through_a_real_pipeline() {
+    const BASE: u32 = 0x8100_0000;
+    const UNTOUCHED: u32 = 0xaaaa_aaaa;
+    let (stride, w, h) = (48u32, 40u32, 36u32);
+    let (vblob, fblob) = common::tile_store_pair(stride, h);
+    let linked = link_programs(&vblob, &fblob).expect("the storing pair links");
+    assert_eq!(linked.fragment_bindings.store_windows.len(), 1);
+    let Some((device, queue, adapter)) = device() else {
+        eprintln!("no GPU adapter - skipping the storing-pipeline test");
+        return;
+    };
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("storing-pair"),
+        source: wgpu::ShaderSource::Wgsl(linked.wgsl.clone().into()),
+    });
+    let uniform = |binding: u32, vis: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: vis,
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    };
+    let frag = wgpu::ShaderStages::FRAGMENT;
+    let layout = |entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries });
+    assert_eq!(linked.vertex_bindings.sa_lane_count, 0, "the pass-through vertex program reads no uniforms");
+    let g0 = layout(&[]);
+    let g1 = layout(&[uniform(0, frag)]);
+    let g2 = layout(&[]);
+    let g3 = layout(&[
+        uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+        wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: frag,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+        uniform(3, frag),
+    ]);
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&g0), Some(&g1), Some(&g2), Some(&g3)],
+        immediate_size: 0,
+    });
+    let (attrs, vstride) = vertex_attributes(&linked);
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("storing-pair"),
+        layout: Some(&pl),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[Some(wgpu::VertexBufferLayout { array_stride: vstride, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attrs })],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            compilation_options: Default::default(),
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let buffer = |usage: wgpu::BufferUsages, bytes: &[u8]| {
+        let b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes.len() as u64, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        queue.write_buffer(&b, 0, bytes);
+        b
+    };
+    let words = |w: &[u32]| w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    // A full-screen quad, clip position straight through.
+    let quad: Vec<f32> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        .iter()
+        .flat_map(|&(x, y)| [x, y, 0.5f32, 1.0])
+        .collect();
+    let vbuf = buffer(wgpu::BufferUsages::VERTEX, &quad.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    // The fragment SA bank: `sa[0]` the stride as a raw integer, padded to the binding's vec4s.
+    let sa_vec4s = linked.fragment_bindings.sa_vec4_count().max(1) as usize;
+    let mut sa = vec![0u32; sa_vec4s * 4];
+    sa[common::TILE_STORE_STRIDE_SA] = stride;
+    let sa_buf = buffer(wgpu::BufferUsages::UNIFORM, &words(&sa));
+    let depth_buf = buffer(wgpu::BufferUsages::UNIFORM, &[0u8; 112]);
+    let mirror = buffer(wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, &words(&vec![UNTOUCHED; (stride * h) as usize]));
+    let header = buffer(wgpu::BufferUsages::UNIFORM, &words(&[BASE, stride * h, 0, 0]));
+    let bind = |layout: &wgpu::BindGroupLayout, entries: &[wgpu::BindGroupEntry]| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries })
+    };
+    let bg0 = bind(&g0, &[]);
+    let bg1 = bind(&g1, &[wgpu::BindGroupEntry { binding: 0, resource: sa_buf.as_entire_binding() }]);
+    let bg2 = bind(&g2, &[]);
+    let bg3 = bind(
+        &g3,
+        &[
+            wgpu::BindGroupEntry { binding: 0, resource: depth_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: mirror.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: header.as_entire_binding() },
+        ],
+    );
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: mirror.size(),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline);
+        for (i, bg) in [&bg0, &bg1, &bg2, &bg3].into_iter().enumerate() {
+            pass.set_bind_group(i as u32, bg, &[]);
+        }
+        pass.set_vertex_buffer(0, vbuf.slice(..));
+        pass.draw(0..6, 0..1);
+    }
+    enc.copy_buffer_to_buffer(&mirror, 0, &readback, 0, mirror.size());
+    queue.submit([enc.finish()]);
+    readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    if let Some(err) = pollster::block_on(scope.pop()) {
+        panic!("{adapter}: wgpu rejected the storing pipeline: {err}\n{}", linked.wgsl);
+    }
+    let got: Vec<u32> = readback
+        .slice(..)
+        .get_mapped_range()
+        .expect("mapped")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for y in 0..h {
+        for x in 0..stride {
+            let i = y * stride + x;
+            let want = if x < w { i } else { UNTOUCHED };
+            assert_eq!(got[i as usize], want, "{adapter}: the word for pixel ({x}, {y})");
+        }
+    }
 }

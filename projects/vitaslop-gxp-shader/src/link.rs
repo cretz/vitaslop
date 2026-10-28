@@ -335,9 +335,11 @@ pub struct LinkOptions {
     /// instead, every fragment failed the alpha test, and the stands were empty.
     pub raw_units: u64,
     /// The pass renders into a 64-bit colour surface bound as an `Rg32Uint` attachment: the
-    /// entry point returns the colour register PAIR as raw words. Refused (the link fails,
-    /// naming why) for a program that blends for itself or is lowered to a dual-source blend,
-    /// because an integer attachment cannot blend and a raw pair has no destination colour.
+    /// entry point returns the colour register PAIR as raw words. A program that blends for
+    /// itself reads the destination from a copy of those words (`module::dest_raw_init`); one
+    /// that writes its own depth, or reads the destination of a multisampled pass, is refused
+    /// (the link fails, naming why). Never lowered to a dual-source blend: an integer
+    /// attachment cannot blend.
     pub raw64_output: bool,
     /// The pass is MULTISAMPLED, so a program that blends for itself reads the destination per
     /// SAMPLE: the copy is a multisampled texture and the fragment loads its own sample of it
@@ -695,6 +697,10 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
     let mut fplan =
         plan_bindings(&frc.shader, fprog.sa_carried_extent(), |u| fprog.sampler_is_cube(u as u32));
     fplan.mem_windows = fmem_windows;
+    // Memory STORES, fragment stage only: each program that stores must resolve the buffers it
+    // writes through, or the pair falls back naming why.
+    fplan.store_windows = crate::module::resolve_store_windows(&fprog, &frc.shader)
+        .map_err(|why| LinkError::FragmentMemWindowUnresolved { why })?;
 
     // The vertex must place clip POSITION in o0..o3 (what the rasteriser consumes) and its
     // varyings block must have VALIDATED - otherwise its varying placement is unknown.
@@ -869,9 +875,12 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
     // fall in the primary.
     fplan.dual_split = crate::module::first_dest_reader(&frc.shader);
     if opts.raw64_output {
-        if fplan.reads_dest_color {
+        // A destination read is served from a copy of the attachment's WORDS (see
+        // `module::dest_raw_init`). Not on a multisampled pass: no 64-bit surface rendered
+        // here is one, and a per-sample copy of an integer attachment is not established.
+        if fplan.reads_dest_color && opts.dest_multisampled {
             return Err(LinkError::Raw64OutputUnsupported {
-                why: "it reads the destination colour, and an integer attachment has none to blend with",
+                why: "it reads the destination colour of a MULTISAMPLED pass, and a per-sample copy of the raw words is not emitted",
             });
         }
         if frc.shader.instrs.iter().any(|i| i.op == Op::DepthF) {
@@ -907,6 +916,8 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
         ))
     })?;
     let fbody = body_memo(1, fbytes, || {
+        // Both streams under the program's one tile-register verdict - see `tile`.
+        let _tile = crate::tile::fragment_tile_scope(&fprog, &frc.shader);
         Ok(format!(
             "{}{}",
             emit_secondary_body(&fprog).map_err(|e| LinkError::FragmentRecompile(e.into()))?,
@@ -984,6 +995,36 @@ fn output_written_lanes(shader: &Shader) -> Vec<bool> {
 /// the corpus checks cannot drift apart; this is the linker's local name for it.
 pub(crate) fn read_channels(instr: &crate::ir::Instr) -> [bool; 4] {
     instr.read_channels()
+}
+
+/// The first register of the PAIR a 64-bit colour surface stores, from the colour output
+/// [`crate::module::ColorOutput`] names.
+///
+/// >>> A 64-BIT COLOUR IS AN ALIGNED REGISTER PAIR, AND THE LAST WRITE CAN BE EITHER HALF.
+///
+/// `ColorOutput::NonNativePa` is the base of the program's LAST primary-attribute write, which
+/// names the colour register when the colour is one register. A 64-bit colour is two, and a
+/// program fills them in whichever order its arithmetic finishes - so the last write is the low
+/// register in some programs and the HIGH one in others, and reading `(last, last + 1)` takes
+/// the high half plus a register past the colour. Rounding down to the even register - the
+/// register-PAIR unit every double-register operand field addresses in - is the reading that
+/// closes on every 64-bit program of one title's deferred G-buffer pass:
+///
+///  * four programs write the pair `(pa0, pa1)` with `pa0` last; four more write it with `pa1`
+///    last, and two of those then hold a SCRATCH F16 value in `pa2` (both halves the same
+///    `x * k - k`, consumed by the next instruction) - read as `(pa1, pa2)` that scratch became
+///    the G-buffer's second word, and a `pa0` pack the program spends four instructions on was
+///    dead;
+///  * a two-register passthrough (`primary_reg_count = 2`) writes `pa0` then copies it to
+///    `pa1`; `(pa1, pa2)` reads a register the program does not allocate;
+///  * two programs write `(pa2, pa3)` with `pa2` last - their pair is aligned and unchanged.
+///
+/// The output bank's pair is `o[0..1]` and is already aligned.
+pub(crate) fn raw64_pair_base(color: crate::module::ColorOutput) -> u32 {
+    match color {
+        crate::module::ColorOutput::NativeO0 => 0,
+        crate::module::ColorOutput::NonNativePa(base) => base & !1,
+    }
 }
 
 /// The PA-bank REGISTERS a fragment shader reads before writing them, i.e. the registers whose
@@ -3281,9 +3322,11 @@ pub(crate) fn secondary_attr_init(
     }
     // The mem-window base register is DRIVER data, not texture state: the module initialises
     // it from the bound window's own header (see `MemWindow::base_sa`), so a read of it is fed.
+    // A store window's pointer is fed the same way, from its own header.
     let mem_base_sa: Vec<u32> = crate::module::resolve_mem_windows(program, shader)
         .unwrap_or_default()
         .iter()
+        .chain(crate::module::resolve_store_windows(program, shader).unwrap_or_default().iter())
         .map(|w| w.base_sa)
         .collect();
     // The top of everything the program's own tables DECLARE: the SA-carried uniform extent,
@@ -3564,7 +3607,13 @@ fn build_linked_module(
     m.push_str(GXP_DEPTH_DECL);
     // The destination-colour texture rides in the same group - see `module::GXP_DEST_DECL`.
     if fplan.reads_dest_color && !fplan.dual_source {
-        m.push_str(if fplan.dest_multisampled { crate::module::GXP_DEST_DECL_MS } else { crate::module::GXP_DEST_DECL });
+        m.push_str(if fplan.raw64_output {
+            crate::module::GXP_DEST_DECL_RAW
+        } else if fplan.dest_multisampled {
+            crate::module::GXP_DEST_DECL_MS
+        } else {
+            crate::module::GXP_DEST_DECL
+        });
     }
 
     // ---- Vertex default-uniform buffer (SA bank) at group 0 ----
@@ -3582,11 +3631,7 @@ fn build_linked_module(
     // Only present when the program's 0xE8 loads resolved to one (see `MemWindow`): vec4 0
     // lane x is the window's own guest base address, the window's words follow.
     if !vplan.mem_windows.is_empty() {
-        let _ = writeln!(
-            m,
-            "@group(0) @binding(1) var<uniform> gxp_mem: array<vec4<u32>, {}>;",
-            crate::module::mem_window_vec4_count(&vplan.mem_windows)
-        );
+        m.push_str(&crate::module::mem_window_decl(0, 1, "gxp_mem", &vplan.mem_windows));
         m.push_str(&crate::module::mem_window_helper(&vplan.mem_windows));
     }
 
@@ -3602,12 +3647,15 @@ fn build_linked_module(
     // The exact mirror of the vertex one in group 0, with its own name because WGSL has a
     // single global namespace and the two are different buffers.
     if !fplan.mem_windows.is_empty() {
-        let _ = writeln!(
-            m,
-            "@group(1) @binding(1) var<uniform> gxp_fmem: array<vec4<u32>, {}>;",
-            crate::module::mem_window_vec4_count(&fplan.mem_windows)
-        );
+        m.push_str(&crate::module::mem_window_decl(1, 1, "gxp_fmem", &fplan.mem_windows));
         m.push_str(&crate::module::mem_window_helper_named(&fplan.mem_windows, "gxp_fmem"));
+    }
+    // ---- ...and the buffers its guest-memory STORES write through, in group 3 ----
+    // Group 3 because its bind group is already per draw state, and the mirror a draw writes is
+    // per draw state - see `module::resolve_store_windows`.
+    if !fplan.store_windows.is_empty() {
+        m.push_str(&crate::module::store_window_decl(&fplan.store_windows));
+        m.push_str(&crate::module::store_window_helper(&fplan.store_windows));
     }
 
     // ---- Fragment sampled textures + samplers at group 2 ----
@@ -3752,7 +3800,7 @@ fn build_linked_module(
         );
     }
     // A RAW 64-bit attachment takes the colour register pair's words; the link refused the
-    // depth-writing and destination-reading shapes, so this is the plain entry only.
+    // depth-writing shape, so this is the plain entry only.
     let ret_ty = match (writes_depth, fplan.raw64_output) {
         (true, _) => "FsOut",
         (false, true) => "@location(0) vec2<u32>",
@@ -3790,7 +3838,9 @@ fn build_linked_module(
     // A SPLIT body seeds the output bank inside each arm instead, at the cut - see
     // `split_dual_body`. Seeding here would put the destination in `o` before a prefix that
     // may write `o` itself, and then the second arm's reseed would erase that write.
-    if fplan.reads_dest_color && dual_split.is_none() {
+    if fplan.reads_dest_color && fplan.raw64_output {
+        m.push_str(&crate::module::dest_raw_init());
+    } else if fplan.reads_dest_color && dual_split.is_none() {
         m.push_str(&crate::module::dest_color_init(
             fplan.color_precision,
             fplan.dual_source,
@@ -3945,12 +3995,22 @@ fn build_linked_module(
             // bytes drew every layer as a translucent yellow/blue wash. The program's own reads
             // settle which it is, the same evidence the full-precision case was measured on.
             // `VITASLOP_GXP_PREFETCH_U8=0` restores the full-precision reading everywhere.
+            //
+            // >>> AND THE SAME FOR TWO PACKED HALVES. A one-channel F16 texture fills the register
+            // with its texel as an F16 in the low half. MEASURED on a shooter's world fragments:
+            // a one-register prefetch of an F16 lightmap-scale map, read back ONLY as packed
+            // halves (`pa17.x` of an F16 multiply), with the float's BITS in the register read the
+            // low 16 mantissa bits of the sample as a half - values swinging between +-1e4 and NaN
+            // as the sample varied smoothly, which drew every lit world surface as moire contours.
             let reg = format!("pa[{}]", pf.pa_base);
             let read_u8 = fbody.contains(&format!("unpack4x8unorm({reg})"));
-            let read_f32 = fbody.contains(&format!("bitcast<f32>({reg})"))
-                || fbody.contains(&format!("unpack2x16float({reg})"));
+            let read_full = fbody.contains(&format!("bitcast<f32>({reg})"));
+            let read_half = fbody.contains(&format!("unpack2x16float({reg})"));
+            let read_f32 = read_full || read_half;
             if read_u8 && !read_f32 && arm(PREFETCH_U8_ARM) != Some("0") {
                 let _ = writeln!(m, "  pa[{}] = pack4x8unorm(pf{i});", pf.pa_base);
+            } else if read_half && !read_full && !read_u8 {
+                let _ = writeln!(m, "  pa[{}] = {HALF_PK_FN}(pf{i}.x, pf{i}.y);", pf.pa_base);
             } else {
                 let _ = writeln!(m, "  pa[{}] = bitcast<u32>(pf{i}.x);", pf.pa_base);
             }
@@ -3962,6 +4022,14 @@ fn build_linked_module(
     // address arithmetic runs bit-exact. After the literals, for the same reason.
     for (i, w) in fplan.mem_windows.iter().enumerate() {
         let _ = writeln!(m, "  sa[{}] = gxp_fmem[{i}u].x;", w.base_sa);
+    }
+    // A stored-through buffer's pointer likewise, from its store-window header.
+    for (i, w) in fplan.store_windows.iter().enumerate() {
+        let _ = writeln!(m, "  sa[{}] = gxp_sthdr[{i}u].x;", w.base_sa);
+    }
+    // The tile registers, for a body the sum proof admitted - see `wgsl::TILE_REGISTERS_DECL`.
+    if crate::wgsl::body_reads_tile_registers(fbody) {
+        m.push_str(crate::wgsl::TILE_REGISTERS_DECL);
     }
     // >>> AND WHEN THE POSITION PROBE IS ARMED, THE FRAGMENT BODY DOES NOT RUN AT ALL.
     //
@@ -3998,6 +4066,7 @@ fn build_linked_module(
         // The register pair's bits, as the hardware stores them into a 64-bit surface. Whatever
         // precision the program wrote them at - packed halves, packed bytes, a float - the
         // surface holds the words, and a later raw sample reads them back unchanged.
+        let base = raw64_pair_base(fplan.color);
         let _ = writeln!(m, "  return vec2<u32>({ret}[{base}], {ret}[{}]);\n}}", base + 1);
         return finish_linked_module(&m);
     }
@@ -5435,6 +5504,9 @@ pub fn set_arm(name: &str, value: &str) {
             | VARYING_CODE_ORDER_ARM
             | IEEE_RCP_ARM
             | IMAD_SRC1_WHOLE_ARM
+            | IMA32_STEP_SRC0_ARM
+            | MEM_WINDOW_PER_DRAW_ARM
+            | MEM_STORE_ARM
             | PREFETCH_U8_ARM
             | INDEXED_REACH_ARM
             // >>> THE SHADER PROBES, for the same reason as the arms above and more urgently.
@@ -5663,6 +5735,23 @@ pub const VARYING_CODE_ORDER_ARM: &str = "VITASLOP_GXP_VARYING_CODE_ORDER";
 /// `1` reads a 16-bit integer MAD's src1 as the WHOLE register when its half-select bit is clear
 /// (the old reading) instead of its LOW half - see `wgsl::emit_int_mad`.
 pub const IMAD_SRC1_WHOLE_ARM: &str = "VITASLOP_GXP_IMAD_SRC1_WHOLE";
+/// `1` gives a group-0x1a IMA32 step's 16-bit multiplier input to `src0` (the old reading)
+/// instead of `src1` - see `usse::decode::decode_grp_imad32_step`.
+pub const IMA32_STEP_SRC0_ARM: &str = "VITASLOP_GXP_IMA32_STEP_SRC0";
+/// `0` sizes a fragment program's statically unbounded memory windows at their DECLARED extent
+/// instead of per draw from the draw's own inputs - see `reach::DrawReach`.
+pub const MEM_WINDOW_PER_DRAW_ARM: &str = "VITASLOP_GXP_MEM_WINDOW_PER_DRAW";
+/// `0` refuses a fragment program that STORES to guest memory (0xF0 in the absolute address
+/// mode), which is what every build did before the store windows existed - see
+/// `module::resolve_store_windows`.
+pub const MEM_STORE_ARM: &str = "VITASLOP_GXP_MEM_STORE";
+
+/// Whether a group-0x1a IMA32 step's 16-bit multiplier input is `src1` (the default) rather than
+/// `src0` ([`IMA32_STEP_SRC0_ARM`]). Read by the emitter, the reference interpreter and the
+/// window-reach analysis, which must all agree.
+pub fn ima32_step_halves_src1() -> bool {
+    arm(IMA32_STEP_SRC0_ARM) != Some("1")
+}
 
 /// [`IDX_MUL_ARM`]'s value as a multiplier, or `None` when it is unset - in which case the
 /// stride the program itself carries (`usse::resolve_index_load_stride`) is used.
@@ -5778,7 +5867,7 @@ fn folded_unpack(word: u32) -> String {
 /// every crowd card sampled the transparent part of the atlas and the alpha test discarded all
 /// of them (the empty grey stands). Folding only that one read restored the crowd on the phone.
 ///
-/// Folded: `unpack2x16float(0x…u)` anywhere, and `unpack2x16float(sa[N])` inside a stage whose
+/// Folded: `unpack2x16float(0x...u)` anywhere, and `unpack2x16float(sa[N])` inside a stage whose
 /// `sa[N]` is written exactly once, with a hex literal, and whose `sa` bank takes no dynamically
 /// indexed store. `VITASLOP_GXP_FOLD_LITERALS=0` is the arm back.
 fn fold_literal_unpacks(module: &str) -> String {
@@ -7309,6 +7398,16 @@ mod tests {
         assert!(bytes.contains(&format!("pa[{b}] = pack4x8unorm(pf0);")), "{bytes}");
         let (full, b) = emit(&|b| format!("  r[0] = bitcast<u32>(bitcast<f32>(pa[{b}]) * 2.0);\n"));
         assert!(full.contains(&format!("pa[{b}] = bitcast<u32>(pf0.x);")), "{full}");
+        // Read ONLY as packed halves (a one-channel F16 texture), it is packed as halves.
+        let (half, b) = emit(&|b| format!("  r[0] = bitcast<u32>(unpack2x16float(pa[{b}]).x * 2.0);\n"));
+        // (The register-home pass gives a register read only as halves a `vec2` home, so the
+        // packed store arrives there as the quantised pair.)
+        assert!(
+            half.contains(&format!("pa[{b}] = {HALF_PK_FN}(pf0.x, pf0.y);"))
+                || half.contains(&format!("pa_h[{b}] = gxp_q2(vec2<f32>(pf0.x, pf0.y));")),
+            "{half}"
+        );
+        assert!(!half.contains("bitcast<u32>(pf0.x)"), "{half}");
     }
 
     #[test]

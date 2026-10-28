@@ -640,9 +640,9 @@ fn place_mode() -> Place {
 enum TraceEv {
     /// `sel`: the host-call selector a `b`locked run parked in (0 = unknown).
     Run { w: u8, thid: i32, t0: f64, t1: f64, stop: u8, sel: u32 },
-    /// `wby`/`line`: the thread whose host call queued the wake and the `host.rs` line that did
-    /// (0 = not recorded).
-    Wake { thid: i32, t: f64, by: u8, wby: i32, line: u32 },
+    /// `wby`/`site`: the thread whose host call queued the wake and the `file:line` in the host
+    /// that did (`?` = not recorded).
+    Wake { thid: i32, t: f64, by: u8, wby: i32, site: &'static str },
     Jump { t: f64 },
     Flip { frame: u64, t: f64, gate: u64 },
     /// `run_frames(target)` opened the gate to `gate`.
@@ -805,7 +805,7 @@ fn trace_dump(frame: u64) {
             TraceEv::Run { w, thid, t0, t1, stop, sel } => {
                 format!("R {w} {thid:#x} {} {} {} {sel}", us(t0), us(t1), stop as char)
             }
-            TraceEv::Wake { thid, t, by, wby, line } => format!("W {thid:#x} {} {by} {wby:#x} {line}", us(t)),
+            TraceEv::Wake { thid, t, by, wby, site } => format!("W {thid:#x} {} {by} {wby:#x} {site}", us(t)),
             TraceEv::Jump { t } => format!("J {}", us(t)),
             TraceEv::Flip { frame, t, gate } => format!("V {frame} {} {gate}", us(t)),
             TraceEv::Gate { target, gate, t } => format!("G {target} {gate} {}", us(t)),
@@ -930,6 +930,9 @@ struct Slot {
     patch: Option<RegPatch>,
     /// Finished while its engine state still lives on its worker: that worker drops it.
     release: bool,
+    /// ...and it finished by being ENDED while parked, so its stack is still suspended in a
+    /// host call: the worker hands it back with `BrowserThread::terminate`, not `release`.
+    terminated: bool,
     /// When another worker made this thread runnable ([`abs_ms`]), until its worker picks it;
     /// 0 when the last transition was its own. See [`Handoffs`].
     ready_at: f64,
@@ -954,6 +957,10 @@ struct State {
     wake_tokens: HashSet<i32>,
     /// Threads TIME released whose next wake is `cooled` - see the note in `drain`.
     yield_next: HashSet<i32>,
+    /// Threads the runtime ended while still `Running` or `Forwarding` (the resume or the
+    /// forwarded call that parked them not yet folded back) - dropped when it is. See
+    /// [`State::terminate`].
+    doomed: HashSet<i32>,
     cursor: Vec<usize>,
     frames: u64,
     /// Guest threads run while `frames < gate`.
@@ -1093,6 +1100,7 @@ impl State {
             live: Vec::new(),
             wake_tokens: HashSet::new(),
             yield_next: HashSet::new(),
+            doomed: HashSet::new(),
             cursor: vec![0; workers + 1],
             frames: 0,
             gate: 0,
@@ -1335,6 +1343,7 @@ impl State {
             forward: None,
             patch: None,
             release: false,
+            terminated: false,
             ready_at: abs_ms(),
             since: abs_ms(),
             queued_ms: 0.0,
@@ -1426,6 +1435,59 @@ impl State {
     fn retire(&mut self, idx: usize) {
         if let Ok(at) = self.live.binary_search(&idx) {
             self.live.remove(at);
+        }
+    }
+
+    /// The runtime ENDED thread `thid` while it was parked (`ImportDispatch::take_terminations`):
+    /// drop it as `finish` drops a `ThreadExit`, without resuming it. The host already recorded
+    /// its end, so nothing is reported back.
+    ///
+    /// >>> ITS PARK MAY NOT BE FOLDED YET. The svc that parked it returned `Block` under the host
+    /// lock, and the runner it handed the baton to can run on another worker, finalize it and
+    /// have this drained before the parked thread's own worker - or the run worker, for a
+    /// FORWARDED svc - takes the state lock to fold that resume back. So it can still read
+    /// `Running` or `Forwarding` here, and marking it finished now would let that fold overwrite
+    /// the state and leave a dead thread live. It is `doomed` instead, and the fold drops it.
+    fn terminate(&mut self, sh: &Shared, thid: i32) {
+        let Some(idx) = self.live.iter().copied().find(|&i| self.threads[i].thid == thid) else {
+            return;
+        };
+        if matches!(self.threads[idx].state, SState::Running | SState::Forwarding) {
+            self.doomed.insert(thid);
+        } else {
+            self.drop_terminated(sh, idx);
+        }
+    }
+
+    /// Finish terminated thread `idx`: off the live list, nothing owed to it kept, and its
+    /// instance - a JSPI stack parked in its host call - handed back by the worker that holds
+    /// it (`BrowserThread::terminate`, which unwinds that stack so the instance can be pooled).
+    fn drop_terminated(&mut self, sh: &Shared, idx: usize) {
+        let thid = self.threads[idx].thid;
+        tracing::debug!(target: "vitaslop::thread", "thread {thid:#x} TERMINATED at frame {} while parked", self.frames);
+        self.threads[idx].state = SState::Finished(0);
+        self.threads[idx].release = true;
+        self.threads[idx].terminated = true;
+        self.threads[idx].birth = None;
+        self.threads[idx].patch = None;
+        self.threads[idx].forward = None;
+        self.retire(idx);
+        self.wake_tokens.remove(&thid);
+        self.yield_next.remove(&thid);
+        sh.ring(self.threads[idx].home);
+    }
+
+    /// Drop thread `idx` now if the runtime ended it while this fold was pending - see
+    /// [`Self::terminate`]. Called once the resume or forwarded call has been folded back.
+    fn drop_if_doomed(&mut self, sh: &Shared, idx: usize) {
+        // A call still to be served on the run worker keeps it: `serve_forward` folds that back
+        // and asks again.
+        if self.threads[idx].state == SState::Forwarding {
+            return;
+        }
+        let thid = self.threads[idx].thid;
+        if self.doomed.remove(&thid) && !matches!(self.threads[idx].state, SState::Finished(_)) {
+            self.drop_terminated(sh, idx);
         }
     }
 
@@ -1635,11 +1697,13 @@ impl State {
                 }
             }
         }
+        // Ended by the runtime while this resume was still being folded - see `terminate`.
+        self.drop_if_doomed(sh, idx);
     }
 
     /// Start the threads the host spawned and wake the ones it released - `SchedCore::drain`.
     fn drain(&mut self, sh: &Shared, engine: &BrowserEngine) {
-        let (spawns, wakes, stat_writes, masks, causes, rt_woke, timed_out) = {
+        let (spawns, wakes, terminations, stat_writes, masks, causes, rt_woke, timed_out) = {
             let mut host = lock_host(&sh.host);
             let held = self.frames >= self.gate || self.paused;
             if wall_floor(self.frames) && host.state.wall_floor_tick(abs_ms(), held) {
@@ -1660,8 +1724,11 @@ impl State {
             host.state.trace_wakes = trace().is_some();
             let causes = host.state.take_wake_causes();
             let timed_out = host.state.take_timeout_wakes();
-            (spawns, host.take_wakes(), host.take_stat_writes(), masks, causes, rt_woke, timed_out)
+            (spawns, host.take_wakes(), host.take_terminations(), host.take_stat_writes(), masks, causes, rt_woke, timed_out)
         };
+        for thid in terminations {
+            self.terminate(sh, thid);
+        }
         for thid in rt_woke {
             if let Some(i) = self.live.iter().copied().find(|&i| self.threads[i].thid == thid) {
                 self.threads[i].rt = true;
@@ -1732,7 +1799,7 @@ impl State {
             self.yield_next.extend(timed_out);
         }
         for thid in wakes {
-            let cause = causes.iter().find(|c| c.0 == thid).map_or((0, 0), |c| (c.1, c.2));
+            let cause = causes.iter().find(|c| c.0 == thid).map_or((0, "?"), |c| (c.1, c.2));
             let found = self
                 .live
                 .iter()
@@ -1746,7 +1813,7 @@ impl State {
                     self.threads[i].cooled = yields;
                     self.threads[i].ready_at = abs_ms();
                     if tracing() {
-                        trace_ev(self.frames, TraceEv::Wake { thid, t: abs_ms(), by: TRACE_WORKER.with(|c| c.get()), wby: cause.0, line: cause.1 });
+                        trace_ev(self.frames, TraceEv::Wake { thid, t: abs_ms(), by: TRACE_WORKER.with(|c| c.get()), wby: cause.0, site: cause.1 });
                     }
                     if !yields {
                         self.preempt_for(sh, i);
@@ -1960,6 +2027,7 @@ pub async fn smp_helper_main(
     storage: JsValue,
 ) -> Result<(), JsValue> {
     crate::logging::install_panic_hook();
+    vitaslop_platform::heap::set_thread_owner(vitaslop_platform::heap::Owner::GuestThread);
     let w = worker as usize;
     TRACE_WORKER.with(|c| c.set(worker as u8));
     let sh = SHARED
@@ -2005,6 +2073,7 @@ pub async fn smp_helper_main(
 #[wasm_bindgen]
 pub fn smp_resolver_main() -> Result<(), JsValue> {
     crate::logging::install_panic_hook();
+    vitaslop_platform::heap::set_thread_owner(vitaslop_platform::heap::Owner::ResolverThread);
     let sh = SHARED
         .get()
         .cloned()
@@ -2040,11 +2109,12 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
         }
         let (job, releases, frame_now) = {
             let mut st = sh.state.lock().unwrap();
-            let releases: Vec<usize> = local
+            let releases: Vec<(usize, bool)> = local
                 .borrow()
                 .keys()
                 .copied()
                 .filter(|&i| st.threads[i].release)
+                .map(|i| (i, st.threads[i].terminated))
                 .collect();
             if st.late_open(sh) {
                 sh.ring_all();
@@ -2085,9 +2155,13 @@ async fn helper_loop(sh: &Arc<Shared>, engine: &BrowserEngine, w: usize) {
             };
             (job, releases, st.frames)
         };
-        for i in releases {
+        for (i, terminated) in releases {
             if let Some(mut t) = local.borrow_mut().remove(&i) {
-                t.release();
+                if terminated {
+                    t.terminate();
+                } else {
+                    t.release();
+                }
             }
         }
         match job {
@@ -3215,7 +3289,7 @@ impl SmpRun {
                 st.threads[i].since = abs_ms();
                 st.threads[i].ready_at = abs_ms();
                 if tracing() {
-                    trace_ev(st.frames, TraceEv::Wake { thid, t: abs_ms(), by: 0, wby: thid, line: 0 });
+                    trace_ev(st.frames, TraceEv::Wake { thid, t: abs_ms(), by: 0, wby: thid, site: "?" });
                 }
                 st.preempt_for(&self.sh, i);
             }
@@ -3226,6 +3300,8 @@ impl SmpRun {
             SvcOutcome::Halt => st.finish(&self.sh, i, FiberEnd::ProcessHalt(regs[0])),
             SvcOutcome::Fatal(m) => st.finish(&self.sh, i, FiberEnd::Error(m)),
         }
+        // Ended by the runtime while this call was being served - see `State::terminate`.
+        st.drop_if_doomed(&self.sh, i);
         st.drain(&self.sh, &self.engine);
         self.sh.ring(home);
     }

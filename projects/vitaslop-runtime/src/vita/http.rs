@@ -32,7 +32,7 @@
 //! being asked about a reply to a request that has not been sent. That is true here:
 //! the send failed, so no request was ever sent.
 
-use crate::host::{GuestCtx, HttpKind, Ptr, VitaState};
+use crate::host::{GuestCtx, HttpKind, HttpSwitch, Ptr, VitaState};
 use crate::hostcall;
 
 /// `SceHttpErrorCode` values this surface uses, from `psp2/net/http.h`.
@@ -682,6 +682,99 @@ fn uri_build_in(
     }
 }
 
+// --- The library pools: what `sceHttpInit` / `sceSslInit` were handed ----------------
+//
+// Each library is initialised with the size of a memory pool it allocates its own objects
+// from. That is the guest's own memory budget, so it is RECORDED (in `VitaState::net_libs`)
+// and reported back by the pool-stats call, and a second init while one is live is refused
+// with the library's own ALREADY_INITED, as the header documents. The pool's IN-USE figures
+// are 0, and that is a statement about this engine, not a placeholder: every template,
+// connection and request here is host state, so not one byte of the guest's pool is ever
+// taken - the pool the title sized is exactly as empty as it reads.
+
+/// `SCE_HTTP_ERROR_BEFORE_INIT` / `_ALREADY_INITED` (`psp2/net/http.h`).
+const SCE_HTTP_ERROR_BEFORE_INIT: i32 = 0x8043_1001u32 as i32;
+const SCE_HTTP_ERROR_ALREADY_INITED: i32 = 0x8043_1020u32 as i32;
+/// `SCE_SSL_ERROR_BEFORE_INIT` / `_ALREADY_INITED` (`psp2/libssl.h`).
+const SCE_SSL_ERROR_BEFORE_INIT: i32 = 0x8043_5001u32 as i32;
+const SCE_SSL_ERROR_ALREADY_INITED: i32 = 0x8043_5020u32 as i32;
+/// `SCE_SSL_ERROR_INVALID_VALUE` (`psp2/libssl.h`).
+const SCE_SSL_ERROR_INVALID_VALUE: i32 = 0x8043_51FEu32 as i32;
+
+/// Record a library's pool at init: the pool size, or `already` when one is live.
+fn pool_init(slot: &mut Option<u32>, pool_size: u32, already: i32) -> i32 {
+    if slot.is_some() {
+        already
+    } else {
+        *slot = Some(pool_size);
+        0
+    }
+}
+
+/// Fill a `{ poolSize, maxInuseSize, currentInuseSize, reserved }` stats struct (the shape
+/// `SceHttpMemoryPoolStats` and `SceSslMemoryPoolStats` share, both 0x10) for a live pool.
+fn write_pool_stats(ctx: &mut GuestCtx, out: u32, pool_size: u32) {
+    for (i, v) in [pool_size, 0, 0, 0].iter().enumerate() {
+        ctx.write_u32(out + 4 * i as u32, *v);
+    }
+}
+
+/// int sceHttpInit(unsigned int poolSize)
+#[hostcall]
+pub(super) fn http_init(st: &mut VitaState, pool_size: u32) -> i32 {
+    pool_init(&mut st.net_libs.http_pool, pool_size, SCE_HTTP_ERROR_ALREADY_INITED)
+}
+
+/// int sceHttpTerm(void)
+///
+/// Releases the pool. It succeeds even with no init behind it, as the rest of the online
+/// stack's teardown does (see the success group in `vita::dispatch`): a title unwinding its
+/// offline path must not be handed an error on the way out.
+#[hostcall]
+pub(super) fn http_term(st: &mut VitaState) -> i32 {
+    st.net_libs.http_pool = None;
+    0
+}
+
+/// int sceHttpGetMemoryPoolStats(SceHttpMemoryPoolStats *currentStat)
+#[hostcall]
+pub(super) fn get_memory_pool_stats(ctx: &mut GuestCtx, st: &mut VitaState, out: Ptr) -> i32 {
+    match st.net_libs.http_pool {
+        None => SCE_HTTP_ERROR_BEFORE_INIT,
+        Some(_) if out.is_null() => SCE_HTTP_ERROR_INVALID_VALUE,
+        Some(pool) => {
+            write_pool_stats(ctx, out.addr(), pool);
+            0
+        }
+    }
+}
+
+/// int sceSslInit(unsigned int poolSize)
+#[hostcall]
+pub(super) fn ssl_init(st: &mut VitaState, pool_size: u32) -> i32 {
+    pool_init(&mut st.net_libs.ssl_pool, pool_size, SCE_SSL_ERROR_ALREADY_INITED)
+}
+
+/// int sceSslTerm(void) - see [`http_term`].
+#[hostcall]
+pub(super) fn ssl_term(st: &mut VitaState) -> i32 {
+    st.net_libs.ssl_pool = None;
+    0
+}
+
+/// int sceSslGetMemoryPoolStats(SceSslMemoryPoolStats *currentStat)
+#[hostcall]
+pub(super) fn ssl_get_memory_pool_stats(ctx: &mut GuestCtx, st: &mut VitaState, out: Ptr) -> i32 {
+    match st.net_libs.ssl_pool {
+        None => SCE_SSL_ERROR_BEFORE_INIT,
+        Some(_) if out.is_null() => SCE_SSL_ERROR_INVALID_VALUE,
+        Some(pool) => {
+            write_pool_stats(ctx, out.addr(), pool);
+            0
+        }
+    }
+}
+
 /// int sceHttpsLoadCert(int caCertNum, const SceHttpsData **caList,
 ///                      const SceHttpsData *cert, const SceHttpsData *privKey)
 ///
@@ -692,6 +785,44 @@ fn uri_build_in(
 #[hostcall]
 pub(super) fn ssl_load_cert(_st: &mut VitaState) -> i32 {
     0
+}
+
+/// int sceHttpsUnloadCert(void)
+///
+/// The other half of [`ssl_load_cert`]: emptying the library's own certificate store is
+/// local work and succeeds.
+#[hostcall]
+pub(super) fn ssl_unload_cert(_st: &mut VitaState) -> i32 {
+    0
+}
+
+/// int sceHttpsEnableOption(unsigned int sslFlags)
+/// int sceHttpsDisableOption(unsigned int sslFlags)
+///
+/// Library-wide verification switches (`SCE_HTTPS_FLAG_*`: server verify, CN check, the
+/// two date checks, known CA). Recorded as the guest set them; they would steer a
+/// handshake, and none ever happens. `on` is supplied by the dispatch arm.
+pub(super) fn ssl_set_option(ctx: &mut GuestCtx, st: &mut VitaState, on: bool) {
+    st.https_set_options(ctx.arg(0), on);
+    ctx.ret(0);
+}
+
+/// int sceHttpGetLastErrno(int reqId, int *errNum)
+///
+/// The socket `errno` behind a request's last failure. The only failure a request can meet
+/// here is the resolver's (see [`send_request`]), which comes before any socket exists, so
+/// no socket call failed and the errno is 0 - the value a request carries before it ever
+/// touches the network.
+#[hostcall]
+pub(super) fn get_last_errno(ctx: &mut GuestCtx, st: &mut VitaState, req: i32, err_num: Ptr) -> i32 {
+    if !st.http_is(req, HttpKind::Request) {
+        SCE_HTTP_ERROR_INVALID_ID
+    } else {
+        if !err_num.is_null() {
+            ctx.write_u32(err_num.addr(), 0);
+        }
+        0
+    }
 }
 
 /// int sceHttpsSetSslCallback(int id, SceHttpsCallback cbfunc, void *userArg)
@@ -747,36 +878,37 @@ pub(super) fn ssl_get_ssl_error(
 // such.
 
 /// int sceHttpSetCookieEnabled(int id, int enable)
+/// int sceHttpSetAuthEnabled(int id, int enable)
+/// int sceHttpSetAutoRedirect(int id, int enable)
 ///
-/// Really recorded against the object, and really read back by [`get_cookie_enabled`]. This
-/// is the guest's own setting, so dropping it and reporting success would be the one thing
-/// this module does not do.
-#[hostcall]
-pub(super) fn set_cookie_enabled(st: &mut VitaState, id: i32, enable: i32) -> i32 {
-    if st.http_set_cookies_enabled(id, enable != 0) {
+/// Really recorded against the object, and really read back by [`get_switch`]. These are
+/// the guest's own settings, so dropping them and reporting success would be the one thing
+/// this module does not do. `which` is supplied by the dispatch arm, as in [`set_timeout`].
+pub(super) fn set_switch(ctx: &mut GuestCtx, st: &mut VitaState, which: HttpSwitch) {
+    let (id, enable) = (ctx.arg(0) as i32, ctx.arg(1));
+    let r = if st.http_set_switch(id, which, enable != 0) {
         0
     } else {
         SCE_HTTP_ERROR_INVALID_ID
-    }
+    };
+    ctx.ret(r as u32);
 }
 
 /// int sceHttpGetCookieEnabled(int id, int *enable)
-#[hostcall]
-pub(super) fn get_cookie_enabled(
-    ctx: &mut GuestCtx,
-    st: &mut VitaState,
-    id: i32,
-    enable: Ptr,
-) -> i32 {
-    match st.http_cookies_enabled(id) {
+/// int sceHttpGetAuthEnabled(int id, int *enable)
+/// int sceHttpGetAutoRedirect(int id, int *enable)
+pub(super) fn get_switch(ctx: &mut GuestCtx, st: &mut VitaState, which: HttpSwitch) {
+    let (id, enable) = (ctx.arg(0) as i32, ctx.arg(1));
+    let r = match st.http_switch(id, which) {
         None => SCE_HTTP_ERROR_INVALID_ID,
         Some(on) => {
-            if !enable.is_null() {
-                ctx.write_u32(enable.addr(), on as u32);
+            if enable != 0 {
+                ctx.write_u32(enable, on as u32);
             }
             0
         }
-    }
+    };
+    ctx.ret(r as u32);
 }
 
 /// int sceHttpSetCookieRecvCallback(int id, SceHttpCookieRecvCallback cbfunc, void *userArg)
@@ -1155,5 +1287,99 @@ mod tests {
             r.call(set_response_callback, &[tmpl as u32, 0, 0]),
             SCE_HTTP_ERROR_INVALID_ID
         );
+    }
+
+    /// Each switch starts at the library's default (cookies off, auth and redirect on), reads
+    /// back what the guest set, is independent of the other two, and refuses a dead id.
+    #[test]
+    fn switches_read_back_what_was_set() {
+        let mut r = Run::new();
+        let ua = r.cstr(0x10, "agent");
+        let tmpl = r.call(create_template, &[ua, 2, 0]) as u32;
+        let get = |r: &mut Run, f: Entry| -> u32 {
+            assert_eq!(r.call(f, &[tmpl, 0x200]), 0);
+            u32::from_le_bytes(r.bytes[0x200..0x204].try_into().unwrap())
+        };
+        let get_cookies: Entry = |c, s| get_switch(c, s, HttpSwitch::Cookies);
+        let get_auth: Entry = |c, s| get_switch(c, s, HttpSwitch::Auth);
+        let get_redirect: Entry = |c, s| get_switch(c, s, HttpSwitch::AutoRedirect);
+        let set_redirect: Entry = |c, s| set_switch(c, s, HttpSwitch::AutoRedirect);
+        assert_eq!(
+            (get(&mut r, get_cookies), get(&mut r, get_auth), get(&mut r, get_redirect)),
+            (0, 1, 1)
+        );
+        assert_eq!(r.call(set_redirect, &[tmpl, 0]), 0);
+        assert_eq!(
+            (get(&mut r, get_cookies), get(&mut r, get_auth), get(&mut r, get_redirect)),
+            (0, 1, 0)
+        );
+        assert_eq!(r.call(set_redirect, &[0x7777, 1]), SCE_HTTP_ERROR_INVALID_ID);
+        assert_eq!(r.call(get_auth, &[0x7777, 0x200]), SCE_HTTP_ERROR_INVALID_ID);
+    }
+
+    /// Enable/disable record the bits named, newest call winning per bit; the errno of a live
+    /// request is 0 (it never reached a socket) and a dead id is refused.
+    #[test]
+    fn https_options_and_last_errno() {
+        let mut r = Run::new();
+        let on: Entry = |c, s| ssl_set_option(c, s, true);
+        let off: Entry = |c, s| ssl_set_option(c, s, false);
+        assert_eq!(r.call(on, &[0x3D]), 0);
+        assert_eq!(r.call(off, &[0x18]), 0);
+        assert_eq!(r.st.https_options(), (0x25, 0x18));
+
+        let ua = r.cstr(0x10, "agent");
+        let tmpl = r.call(create_template, &[ua, 2, 0]);
+        let url = r.cstr(0x40, "https://example.com/");
+        let conn = r.call(create_connection_with_url, &[tmpl as u32, url, 1]);
+        let req = r.call(create_request_with_url, &[conn as u32, 0, url]);
+        r.bytes[0x200..0x204].copy_from_slice(&[0xAA; 4]);
+        assert_eq!(r.call(get_last_errno, &[req as u32, 0x200]), 0);
+        assert_eq!(&r.bytes[0x200..0x204], &[0; 4]);
+        assert_eq!(
+            r.call(get_last_errno, &[conn as u32, 0x200]),
+            SCE_HTTP_ERROR_INVALID_ID
+        );
+    }
+
+    /// Each library's pool stats read back the size its init was handed, with nothing in use;
+    /// before init (and after term) the library's BEFORE_INIT, and a second init is refused.
+    #[test]
+    fn pool_stats_report_the_init_pool() {
+        let mut r = Run::new();
+        let stats = |r: &mut Run| -> [u32; 4] {
+            std::array::from_fn(|i| {
+                u32::from_le_bytes(r.bytes[0x200 + 4 * i..0x204 + 4 * i].try_into().unwrap())
+            })
+        };
+        assert_eq!(
+            r.call(get_memory_pool_stats, &[0x200]),
+            SCE_HTTP_ERROR_BEFORE_INIT
+        );
+        assert_eq!(
+            r.call(ssl_get_memory_pool_stats, &[0x200]),
+            SCE_SSL_ERROR_BEFORE_INIT
+        );
+        assert_eq!(r.call(http_init, &[0x4_0000]), 0);
+        assert_eq!(r.call(http_init, &[0x4_0000]), SCE_HTTP_ERROR_ALREADY_INITED);
+        assert_eq!(r.call(ssl_init, &[0x2_8000]), 0);
+        assert_eq!(r.call(ssl_init, &[1]), SCE_SSL_ERROR_ALREADY_INITED);
+        r.bytes[0x200..0x210].fill(0xAA);
+        assert_eq!(r.call(get_memory_pool_stats, &[0x200]), 0);
+        assert_eq!(stats(&mut r), [0x4_0000, 0, 0, 0]);
+        assert_eq!(r.call(ssl_get_memory_pool_stats, &[0x200]), 0);
+        assert_eq!(stats(&mut r), [0x2_8000, 0, 0, 0]);
+        assert_eq!(
+            r.call(get_memory_pool_stats, &[0]),
+            SCE_HTTP_ERROR_INVALID_VALUE
+        );
+        assert_eq!(r.call(http_term, &[]), 0);
+        assert_eq!(
+            r.call(get_memory_pool_stats, &[0x200]),
+            SCE_HTTP_ERROR_BEFORE_INIT
+        );
+        assert_eq!(r.call(http_init, &[0x1000]), 0, "init again after term");
+        assert_eq!(r.call(ssl_term, &[]), 0);
+        assert_eq!(r.call(ssl_term, &[]), 0, "teardown without an init succeeds");
     }
 }

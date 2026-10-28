@@ -312,6 +312,122 @@ pub(super) fn show_netstat(ctx: &mut GuestCtx, st: &mut VitaState) {
     ctx.ret(0);
 }
 
+/// What the SceNet family was initialised with, kept on [`VitaState`] as `net_libs`: each
+/// library's pool size while it is initialised (`None` otherwise), and SceLibRudp's objects.
+#[derive(Default)]
+pub struct NetLibs {
+    /// `sceNetInit`'s `SceNetInitParam::size` - libnet's own memory pool.
+    pub(crate) net_pool: Option<u32>,
+    /// `sceHttpInit`'s pool - see `vita::http`.
+    pub(crate) http_pool: Option<u32>,
+    /// `sceSslInit`'s pool - see `vita::http`.
+    pub(crate) ssl_pool: Option<u32>,
+    /// SceLibRudp - see [`Rudp`].
+    pub(crate) rudp: Rudp,
+}
+
+/// `SceNetInitParam`: `{ void *memory, int size, int flags }` (`psp2/net/net.h`, 0xC).
+const NET_INIT_PARAM_SIZE_OFF: u32 = 4;
+
+/// int sceNetInit(SceNetInitParam *param)
+///
+/// libnet runs out of a pool the CALLER provides, so initialising it is recording that pool -
+/// which is what [`get_statistics_info`] reports back. Initialising succeeds with the link down,
+/// as it does on a console; a missing parameter block is the caller's error.
+///
+/// A SECOND init while libnet is up is `SCE_NET_ERROR_EBUSY`, and the first pool stays. That
+/// code is the one titles are written to expect: two retail titles' own init paths compare the
+/// return against exactly `0x80410110` and carry on as initialised - which only means anything
+/// if the console answers a repeat init with it. Titles routinely init libnet from two places
+/// (a game layer and a middleware layer), so this is a path they take every boot.
+#[hostcall]
+pub(super) fn net_init(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr) -> i32 {
+    if param.is_null() {
+        SCE_NET_ERROR_EINVAL
+    } else if st.net_libs.net_pool.is_some() {
+        SCE_NET_ERROR_EBUSY
+    } else {
+        st.net_libs.net_pool = Some(ctx.read_u32(param.addr() + NET_INIT_PARAM_SIZE_OFF));
+        0
+    }
+}
+
+/// int sceNetTerm(void)
+///
+/// Releases the pool. Succeeds even with no init behind it, as the rest of the online stack's
+/// teardown does (see the success group in `vita::dispatch`).
+#[hostcall]
+pub(super) fn net_term(st: &mut VitaState) -> i32 {
+    st.net_libs.net_pool = None;
+    0
+}
+
+/// `SCE_NET_ERROR_EINVAL` / `SCE_NET_ERROR_ENOTINIT` (`psp2common/net.h`): the CALL-return forms
+/// of the errno values, which the non-socket calls return directly.
+const SCE_NET_ERROR_EINVAL: i32 = 0x8041_0116u32 as i32;
+const SCE_NET_ERROR_ENOTINIT: i32 = 0x8041_01C8u32 as i32;
+const SCE_NET_ERROR_EBUSY: i32 = 0x8041_0110u32 as i32;
+
+/// int sceNetGetStatisticsInfo(SceNetStatisticsInfo *info, int flags)
+///
+/// `SceNetStatisticsInfo` (`psp2common/net.h`, 0x18): `{ kernel_mem_free_size,
+/// kernel_mem_free_min, packet_count, packet_qos_count, libnet_mem_free_size,
+/// libnet_mem_free_min }`.
+/// - The packet counters are 0: no packet has ever crossed an interface that is down.
+/// - libnet's pool is the size [`net_init`] was handed, all of it free now and at its
+///   low-water mark - this engine keeps libnet's state on the host and never takes a byte of
+///   the guest's pool.
+/// - The two kernel words are the stack's own 1 MiB heap, all free - see
+///   [`NET_KERNEL_HEAP_BYTES`].
+///
+/// Before `sceNetInit` there is no libnet to describe: `SCE_NET_ERROR_ENOTINIT`.
+#[hostcall]
+pub(super) fn get_statistics_info(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    info: Ptr,
+    flags: i32,
+) -> i32 {
+    match st.net_libs.net_pool {
+        None => SCE_NET_ERROR_ENOTINIT,
+        Some(_) if info.is_null() => SCE_NET_ERROR_EINVAL,
+        Some(pool) => {
+            // The kernel words are the stack's own heap (`NET_KERNEL_HEAP_BYTES`), all of it
+            // free: this engine's stack allocates nothing there. A non-zero `flags` returns
+            // those four kernel words byte-swapped.
+            let k = |v: u32| if flags != 0 { v.swap_bytes() } else { v };
+            let heap = NET_KERNEL_HEAP_BYTES;
+            for (i, v) in [k(heap), k(heap), k(0), k(0), pool, pool].iter().enumerate() {
+                ctx.write_u32(info.addr() + 4 * i as u32, *v);
+            }
+            0
+        }
+    }
+}
+
+/// The kernel network stack's private heap: one 1 MiB kernel block it allocates its packet
+/// buffers, interfaces and sockets from. `kernel_mem_free_size` / `_min` report this heap's
+/// free bytes, now and at their low-water mark. From the firmware's own stack as
+/// reverse-engineered (no device reading): a console reports a little under this once it has
+/// used the stack; one that never brought an interface up, which is this engine's model, has
+/// all of it. Below 0x8000 free the stack reports out-of-memory, so a small stand-in here
+/// would read as a starved network.
+const NET_KERNEL_HEAP_BYTES: u32 = 0x10_0000;
+
+/// int sceNetShowRoute(void)
+///
+/// A DIAGNOSTIC dump of the routing table, the sibling of `sceNetShowIfconfig` and reported
+/// the same way: with no interface up there is no route, so it says so once and succeeds.
+#[hostcall]
+pub(super) fn show_route(st: &mut VitaState) -> i32 {
+    tracing::info!(
+        target: "vitaslop::status",
+        thread = st.current_thread(),
+        "sceNetShowRoute: no routes - no interface is up (see `vita::net`)"
+    );
+    0
+}
+
 // --- Byte order and address conversion: pure, and exactly right ---------------
 
 /// unsigned int sceNetHtonl(unsigned int n) / sceNetNtohl(unsigned int n)
@@ -856,6 +972,470 @@ pub(super) fn errno_loc(st: &mut VitaState) -> u32 {
     st.net_errno_addr()
 }
 
+// --- SceLibRudp: reliable UDP, over a network that is down -------------------------
+//
+// RUDP layers numbered, acknowledged streams ("contexts") over a SceNet UDP socket. The same
+// line SceNet draws applies one layer up: everything LOCAL is real - the library's
+// initialisation and pool, its event handler, contexts created, bound to a socket and
+// terminated, poll sets - and the first call that needs a PEER reports that none can be
+// reached. No context ever leaves its initial state, so every question about traffic has a
+// true answer of zero: nothing readable, nothing writable, no packet counted, no event to
+// poll.
+//
+// The error facility (0x077, `SCE_ERROR_FACILITY_RUDP`) is from the local wiki's error-code
+// page. No local source lists the codes inside it; the values here are the RUDP library's
+// numbering as published for its PS3 release, which the Vita library is a port of - CHECK any
+// of them against a console trace before relying on one beyond "it is negative".
+
+const SCE_RUDP_ERROR_NOT_INITIALIZED: i32 = 0x8077_0001u32 as i32;
+const SCE_RUDP_ERROR_ALREADY_INITIALIZED: i32 = 0x8077_0002u32 as i32;
+const SCE_RUDP_ERROR_INVALID_CONTEXT_ID: i32 = 0x8077_0003u32 as i32;
+const SCE_RUDP_ERROR_INVALID_ARGUMENT: i32 = 0x8077_0004u32 as i32;
+const SCE_RUDP_ERROR_INVALID_OPTION: i32 = 0x8077_0005u32 as i32;
+const SCE_RUDP_ERROR_CONN_TIMEOUT: i32 = 0x8077_000Bu32 as i32;
+const SCE_RUDP_ERROR_NOT_ACCEPTABLE: i32 = 0x8077_0011u32 as i32;
+const SCE_RUDP_ERROR_NOT_BOUND: i32 = 0x8077_0013u32 as i32;
+const SCE_RUDP_ERROR_WOULDBLOCK: i32 = 0x8077_0016u32 as i32;
+const SCE_RUDP_ERROR_ALREADY_BOUND: i32 = 0x8077_001Du32 as i32;
+const SCE_RUDP_ERROR_INVALID_POLL_ID: i32 = 0x8077_001Fu32 as i32;
+
+/// One RUDP context, and the socket and virtual port it was bound to. Its event handler is
+/// not kept: a context that never opens has no event to call it with.
+struct RudpContext {
+    id: i32,
+    bound: Option<(i32, u16)>,
+    /// Options as the guest set them on this context, by option number - see
+    /// [`rudp_get_option`].
+    options: std::collections::BTreeMap<i32, Vec<u8>>,
+}
+
+/// SceLibRudp's state. Ids start at 1 and are never reused within a run.
+#[derive(Default)]
+pub struct Rudp {
+    /// The pool `sceRudpInit` was handed, as `(address, size)`, while initialised.
+    pool: Option<(u32, u32)>,
+    contexts: Vec<RudpContext>,
+    polls: Vec<i32>,
+    next_id: i32,
+}
+
+impl Rudp {
+    fn mint(&mut self) -> i32 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    fn context(&mut self, id: i32) -> Option<&mut RudpContext> {
+        self.contexts.iter_mut().find(|c| c.id == id)
+    }
+}
+
+/// The library's own answer for a call before `sceRudpInit`: `Err(NOT_INITIALIZED)`.
+fn rudp(st: &mut VitaState) -> Result<&mut Rudp, i32> {
+    let r = &mut st.net_libs.rudp;
+    if r.pool.is_some() {
+        Ok(r)
+    } else {
+        Err(SCE_RUDP_ERROR_NOT_INITIALIZED)
+    }
+}
+
+/// The context `id` names, or the library's error for why there is none.
+fn rudp_context(st: &mut VitaState, id: i32) -> Result<&mut RudpContext, i32> {
+    rudp(st)?
+        .context(id)
+        .ok_or(SCE_RUDP_ERROR_INVALID_CONTEXT_ID)
+}
+
+/// Collapse a `Result` carrying the call's return into it.
+fn rc(r: Result<i32, i32>) -> i32 {
+    r.unwrap_or_else(|e| e)
+}
+
+/// int sceRudpInit(void *memPool, int memPoolSize)
+///
+/// The library runs out of a pool the caller provides; initialising records it. A missing or
+/// empty pool is the caller's error, a second init the library's ALREADY_INITIALIZED.
+#[hostcall]
+pub(super) fn rudp_init(st: &mut VitaState, pool: u32, size: i32) -> i32 {
+    let r = &mut st.net_libs.rudp;
+    if r.pool.is_some() {
+        SCE_RUDP_ERROR_ALREADY_INITIALIZED
+    } else if pool == 0 || size <= 0 {
+        SCE_RUDP_ERROR_INVALID_ARGUMENT
+    } else {
+        *r = Rudp {
+            pool: Some((pool, size as u32)),
+            ..Default::default()
+        };
+        0
+    }
+}
+
+/// int sceRudpEnd(void)
+///
+/// Tears the library down with everything created under it - contexts and poll sets.
+#[hostcall]
+pub(super) fn rudp_end(st: &mut VitaState) -> i32 {
+    rc(rudp(st).map(|r| {
+        *r = Rudp::default();
+        0
+    }))
+}
+
+/// int sceRudpEnableInternalIOThread(SceUInt32 stackSize, SceUInt32 priority)
+///
+/// Asks the library to service its sockets on a thread of its own instead of the title's
+/// `sceRudpProcessEvents` calls. Accepted, and no thread is created: that thread's whole job is
+/// reading packets off bound sockets and running retransmit timers, and with the interface down
+/// no packet arrives and no context ever has anything in flight - so it would only ever sleep,
+/// and a guest-visible thread that only sleeps is not something a title can observe the
+/// absence of.
+#[hostcall]
+pub(super) fn rudp_enable_internal_io_thread(st: &mut VitaState, _stack: u32, _prio: u32) -> i32 {
+    rc(rudp(st).map(|_| 0))
+}
+
+/// int sceRudpSetEventHandler(SceRudpEventHandler handler, void *arg)
+///
+/// Accepted. The library-wide events it would deliver are about traffic on bound sockets, and
+/// there is none, so the handler is never called - and not kept.
+#[hostcall]
+pub(super) fn rudp_set_event_handler(st: &mut VitaState, _handler: u32, _arg: u32) -> i32 {
+    rc(rudp(st).map(|_| 0))
+}
+
+/// int sceRudpSetOption(int ctxId, int option, const void *optval, size_t optlen)
+///
+/// A PER-CONTEXT option: FOUR arguments, the first the id `sceRudpCreateContext` just handed
+/// back - read off a title that creates a context and immediately sets option 2 on it to a
+/// 4-byte value. (The PS4 library's form takes no context; this one does.) The value is kept
+/// exactly as given, to be read back by [`rudp_get_option`]. Nothing here acts on an option:
+/// each tunes retransmission, buffering or keep-alive of traffic that never flows.
+#[hostcall]
+pub(super) fn rudp_set_option(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    id: i32,
+    option: i32,
+    optval: Ptr,
+    optlen: u32,
+) -> i32 {
+    let bytes = if optval.is_null() {
+        None
+    } else {
+        Some(ctx.read_bytes(optval.addr(), optlen.min(64) as usize))
+    };
+    rc(rudp_context(st, id).and_then(|c| match bytes {
+        None => Err(SCE_RUDP_ERROR_INVALID_ARGUMENT),
+        Some(b) => {
+            c.options.insert(option, b);
+            Ok(0)
+        }
+    }))
+}
+
+/// int sceRudpGetOption(int ctxId, int option, void *optval, size_t optlen)
+///
+/// [`rudp_set_option`]'s reader, in the same four-argument form. An option the title SET reads
+/// back as it set it. One it never set would read back the library's default, and no local
+/// source gives any option's default - so that is refused with INVALID_OPTION and said out
+/// loud rather than answered with an invented value.
+#[hostcall]
+pub(super) fn rudp_get_option(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    id: i32,
+    option: i32,
+    optval: Ptr,
+    optlen: u32,
+) -> i32 {
+    let got = rudp_context(st, id).and_then(|c| {
+        if optval.is_null() {
+            Err(SCE_RUDP_ERROR_INVALID_ARGUMENT)
+        } else {
+            c.options
+                .get(&option)
+                .cloned()
+                .ok_or(SCE_RUDP_ERROR_INVALID_OPTION)
+        }
+    });
+    match got {
+        Ok(b) => {
+            let n = b.len().min(optlen as usize);
+            ctx.write_bytes(optval.addr(), &b[..n]);
+            0
+        }
+        Err(e) => {
+            if e == SCE_RUDP_ERROR_INVALID_OPTION {
+                tracing::warn!(
+                    target: "vitaslop::net",
+                    option,
+                    "sceRudpGetOption: the title asked for an option it never set - its default \
+                     is not established, so the call is refused rather than answered"
+                );
+            }
+            e
+        }
+    }
+}
+
+/// int sceRudpCreateContext(SceRudpContextEventHandler handler, void *arg, int *ctxId)
+///
+/// A context is local until it is bound and initiated, so it is really created.
+#[hostcall]
+pub(super) fn rudp_create_context(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    _handler: u32,
+    _arg: u32,
+    out: Ptr,
+) -> i32 {
+    let made = rudp(st).and_then(|r| {
+        if out.is_null() {
+            Err(SCE_RUDP_ERROR_INVALID_ARGUMENT)
+        } else {
+            let id = r.mint();
+            r.contexts.push(RudpContext {
+                id,
+                bound: None,
+                options: Default::default(),
+            });
+            Ok(id)
+        }
+    });
+    match made {
+        Ok(id) => {
+            ctx.write_u32(out.addr(), id as u32);
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+/// int sceRudpBind(int ctxId, int soc, SceUInt16 vport, SceUInt8 muxMode)
+///
+/// Associates the context with one of the title's SceNet sockets and a virtual port on it:
+/// local, so recorded. A context binds once.
+#[hostcall]
+pub(super) fn rudp_bind(st: &mut VitaState, id: i32, soc: i32, vport: u32, _mux: u32) -> i32 {
+    rc(rudp_context(st, id).and_then(|c| match c.bound {
+        Some(_) => Err(SCE_RUDP_ERROR_ALREADY_BOUND),
+        None => {
+            c.bound = Some((soc, vport as u16));
+            Ok(0)
+        }
+    }))
+}
+
+/// int sceRudpInitiate(int ctxId, const SceNetSockaddr *to, size_t toLen, SceUInt16 vport)
+/// int sceRudpActivate(int ctxId, const SceNetSockaddr *to, size_t toLen)
+///
+/// The two ways a bound context opens a connection - the active and the passive side - and
+/// the first calls that need a PEER. With the interface down the handshake cannot reach one
+/// (the socket under the context cannot send - see the module docs), and a handshake that gets
+/// no answer ends in CONN_TIMEOUT. It is reported here, at the call, because this engine runs
+/// no RUDP retransmit timer for it to expire on later; the context stays as it was, unopened.
+/// An unbound context is the library's NOT_BOUND first.
+#[hostcall]
+pub(super) fn rudp_connect(st: &mut VitaState, id: i32) -> i32 {
+    rc(rudp_context(st, id).and_then(|c| match c.bound {
+        None => Err(SCE_RUDP_ERROR_NOT_BOUND),
+        Some(_) => Err(SCE_RUDP_ERROR_CONN_TIMEOUT),
+    }))
+}
+
+/// int sceRudpTerminate(int ctxId)
+///
+/// Releases the context. Nothing was ever open on it, so there is nothing to close first.
+#[hostcall]
+pub(super) fn rudp_terminate(st: &mut VitaState, id: i32) -> i32 {
+    rc(rudp(st).and_then(|r| {
+        let before = r.contexts.len();
+        r.contexts.retain(|c| c.id != id);
+        if r.contexts.len() == before {
+            Err(SCE_RUDP_ERROR_INVALID_CONTEXT_ID)
+        } else {
+            Ok(0)
+        }
+    }))
+}
+
+/// Zero `size` bytes at `out`: a status struct every field of which is truly zero here.
+fn zero_status(ctx: &mut GuestCtx, out: Ptr, size: u32) {
+    ctx.write_bytes(out.addr(), &vec![0u8; size.min(0x1000) as usize]);
+}
+
+/// int sceRudpGetContextStatus(int ctxId, SceRudpContextStatus *status, size_t statusSize)
+///
+/// No local source gives this struct's layout, and none is needed: a context that was never
+/// opened is in the INITIAL state (the zero of the library's state enumeration) and every
+/// counter it keeps - bytes and packets sent, received, retransmitted - is zero. So the
+/// caller's struct, at the size the caller declares, is zeroed and that is the whole answer.
+#[hostcall]
+pub(super) fn rudp_get_context_status(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    id: i32,
+    out: Ptr,
+    size: u32,
+) -> i32 {
+    let r = rudp_context(st, id).and_then(|_| {
+        if out.is_null() {
+            Err(SCE_RUDP_ERROR_INVALID_ARGUMENT)
+        } else {
+            Ok(0)
+        }
+    });
+    if r == Ok(0) {
+        zero_status(ctx, out, size);
+    }
+    rc(r)
+}
+
+/// int sceRudpGetStatus(SceRudpStatus *status, size_t statusSize)
+///
+/// The library-wide traffic counters, for the same reason as [`rudp_get_context_status`]: all
+/// zero, at the caller's declared size.
+#[hostcall]
+pub(super) fn rudp_get_status(ctx: &mut GuestCtx, st: &mut VitaState, out: Ptr, size: u32) -> i32 {
+    let r = rudp(st).and_then(|_| {
+        if out.is_null() {
+            Err(SCE_RUDP_ERROR_INVALID_ARGUMENT)
+        } else {
+            Ok(0)
+        }
+    });
+    if r == Ok(0) {
+        zero_status(ctx, out, size);
+    }
+    rc(r)
+}
+
+/// int sceRudpGetSizeReadable(int ctxId) / sceRudpGetSizeWritable(int ctxId)
+///
+/// Bytes that can be read now / written now: none of either, on a context that never opened.
+#[hostcall]
+pub(super) fn rudp_get_size(st: &mut VitaState, id: i32) -> i32 {
+    rc(rudp_context(st, id).map(|_| 0))
+}
+
+/// int sceRudpRead(int ctxId, void *data, size_t len, SceUInt8 flags, SceRudpReadInfo *info)
+///
+/// Nothing has arrived and nothing will: the non-blocking answer, WOULDBLOCK.
+#[hostcall]
+pub(super) fn rudp_read(st: &mut VitaState, id: i32) -> i32 {
+    rc(rudp_context(st, id).and(Err(SCE_RUDP_ERROR_WOULDBLOCK)))
+}
+
+/// int sceRudpWrite(int ctxId, const void *data, size_t len, SceUInt8 flags)
+///
+/// A context only accepts data once it is open, and this one never opens: NOT_ACCEPTABLE.
+#[hostcall]
+pub(super) fn rudp_write(st: &mut VitaState, id: i32) -> i32 {
+    rc(rudp_context(st, id).and(Err(SCE_RUDP_ERROR_NOT_ACCEPTABLE)))
+}
+
+/// int sceRudpFlush(int ctxId)
+///
+/// Nothing was ever queued on the context, so there is nothing to push out: done.
+#[hostcall]
+pub(super) fn rudp_flush(st: &mut VitaState, id: i32) -> i32 {
+    rc(rudp_context(st, id).map(|_| 0))
+}
+
+/// int sceRudpProcessEvents(SceUInt32 timeout)
+///
+/// The title's own pump, for when it services the sockets itself: there are no packets and no
+/// timers, so there are no events to process.
+#[hostcall]
+pub(super) fn rudp_process_events(st: &mut VitaState, _timeout: u32) -> i32 {
+    rc(rudp(st).map(|_| 0))
+}
+
+/// int sceRudpNetReceived(int soc, const SceUInt8 *data, size_t dataLen,
+///                        const SceNetSockaddr *from, size_t fromLen)
+///
+/// The title hands RUDP a datagram it received itself (multiplexed mode). None can arrive on
+/// a down interface; were one handed over, it would name no context this library opened, and
+/// RUDP drops such a datagram as UDP would. The call validates the buffer and reports success.
+#[hostcall]
+pub(super) fn rudp_net_received(st: &mut VitaState, _soc: i32, data: u32, len: u32) -> i32 {
+    let valid = if data == 0 || len == 0 {
+        Err(SCE_RUDP_ERROR_INVALID_ARGUMENT)
+    } else {
+        Ok(0)
+    };
+    rc(rudp(st).and(valid))
+}
+
+/// int sceRudpPollCreate(size_t size)
+///
+/// A poll set is local: really created, and its id returned.
+#[hostcall]
+pub(super) fn rudp_poll_create(st: &mut VitaState, _size: u32) -> i32 {
+    rc(rudp(st).map(|r| {
+        let id = r.mint();
+        r.polls.push(id);
+        id
+    }))
+}
+
+/// int sceRudpPollDestroy(int pollId)
+#[hostcall]
+pub(super) fn rudp_poll_destroy(st: &mut VitaState, id: i32) -> i32 {
+    rc(rudp(st).and_then(|r| {
+        let before = r.polls.len();
+        r.polls.retain(|&p| p != id);
+        if r.polls.len() == before {
+            Err(SCE_RUDP_ERROR_INVALID_POLL_ID)
+        } else {
+            Ok(0)
+        }
+    }))
+}
+
+/// int sceRudpPollControl(int pollId, int op, int ctxId, SceUInt16 events)
+///
+/// Adds, modifies or removes a context's interest in the set. Both ids are checked; the
+/// interest itself is not kept, because no context can ever raise an event for it to select.
+#[hostcall]
+pub(super) fn rudp_poll_control(st: &mut VitaState, poll: i32, _op: i32, id: i32) -> i32 {
+    rc(rudp(st).and_then(|r| {
+        if !r.polls.contains(&poll) {
+            Err(SCE_RUDP_ERROR_INVALID_POLL_ID)
+        } else if r.context(id).is_none() {
+            Err(SCE_RUDP_ERROR_INVALID_CONTEXT_ID)
+        } else {
+            Ok(0)
+        }
+    }))
+}
+
+/// int sceRudpPollWait(int pollId, SceRudpPollEvent *events, size_t eventLen,
+///                     SceRudpUsec timeout)
+///
+/// A REAL WAIT, as `sceNetEpollWait` is (see [`epoll_wait`] for what answering at once did to a
+/// polling thread): no context can become readable or writable, so the caller is parked for
+/// `timeout` microseconds of guest time and gets zero events - the timeout answer. A zero
+/// timeout is a poll and returns at once.
+pub(super) fn rudp_poll_wait(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let (poll, timeout) = (ctx.arg(0) as i32, ctx.arg(3));
+    let r = rc(rudp(st).and_then(|r| {
+        if r.polls.contains(&poll) {
+            Ok(0)
+        } else {
+            Err(SCE_RUDP_ERROR_INVALID_POLL_ID)
+        }
+    }));
+    ctx.ret(r as u32);
+    if r != 0 || timeout == 0 || !st.is_preemptive() {
+        return SvcOutcome::Continue;
+    }
+    st.sleep_park(u64::from(timeout));
+    SvcOutcome::Block
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,5 +1551,108 @@ mod tests {
         assert!(c != a && c != b);
         assert_eq!(r.call(wait, &[c as u32, 0x100, 1, 0]), 0);
         assert_eq!(r.call(wait, &[a as u32, 0x100, 1, 0]), NET_FAIL);
+    }
+
+    fn word(r: &Run, at: usize) -> u32 {
+        u32::from_le_bytes(r.bytes[at..at + 4].try_into().unwrap())
+    }
+
+    /// The statistics need an initialised libnet and report its pool with no packet counted;
+    /// a term forgets the pool again.
+    #[test]
+    fn statistics_report_the_init_pool_and_no_traffic() {
+        let mut r = Run::new();
+        assert_eq!(
+            r.call(get_statistics_info, &[0x100, 0]),
+            SCE_NET_ERROR_ENOTINIT
+        );
+        assert_eq!(r.call(net_init, &[0]), SCE_NET_ERROR_EINVAL);
+        r.bytes[0x84..0x88].copy_from_slice(&0x8000u32.to_le_bytes()); // param.size
+        assert_eq!(r.call(net_init, &[0x80]), 0);
+        assert_eq!(r.call(net_init, &[0x80]), SCE_NET_ERROR_EBUSY, "a repeat init");
+        r.bytes[0x100..0x118].fill(0xAA);
+        assert_eq!(r.call(get_statistics_info, &[0x100, 0]), 0);
+        assert_eq!(word(&r, 0x100), NET_KERNEL_HEAP_BYTES, "kernel_mem_free_size");
+        assert_eq!(word(&r, 0x104), NET_KERNEL_HEAP_BYTES, "kernel_mem_free_min");
+        assert_eq!(word(&r, 0x108), 0, "packet_count");
+        assert_eq!(word(&r, 0x10C), 0, "packet_qos_count");
+        assert_eq!(word(&r, 0x110), 0x8000, "libnet_mem_free_size");
+        assert_eq!(word(&r, 0x114), 0x8000, "libnet_mem_free_min");
+        assert_eq!(r.call(get_statistics_info, &[0x100, 1]), 0);
+        assert_eq!(word(&r, 0x100), NET_KERNEL_HEAP_BYTES.swap_bytes(), "flags swap the kernel words");
+        assert_eq!(word(&r, 0x110), 0x8000, "but not libnet's");
+        assert_eq!(r.call(get_statistics_info, &[0, 0]), SCE_NET_ERROR_EINVAL);
+        assert_eq!(r.call(net_term, &[]), 0);
+        assert_eq!(
+            r.call(get_statistics_info, &[0x100, 0]),
+            SCE_NET_ERROR_ENOTINIT
+        );
+    }
+
+    /// RUDP's local objects are real - init once, contexts and poll sets minted and released,
+    /// a context binding once - and every call that needs a peer or traffic says there is none.
+    #[test]
+    fn rudp_local_objects_are_real_and_peers_are_unreachable() {
+        let mut r = Run::new();
+        let ctx_out = 0x100u32;
+        assert_eq!(
+            r.call(rudp_create_context, &[0, 0, ctx_out]),
+            SCE_RUDP_ERROR_NOT_INITIALIZED
+        );
+        assert_eq!(r.call(rudp_init, &[0, 0x1000]), SCE_RUDP_ERROR_INVALID_ARGUMENT);
+        assert_eq!(r.call(rudp_init, &[0x200, 0x1000]), 0);
+        assert_eq!(
+            r.call(rudp_init, &[0x200, 0x1000]),
+            SCE_RUDP_ERROR_ALREADY_INITIALIZED
+        );
+        assert_eq!(r.call(rudp_create_context, &[0x8100_0001, 0, ctx_out]), 0);
+        let id = word(&r, ctx_out as usize);
+        assert!(id > 0);
+        assert_eq!(r.call(rudp_connect, &[id]), SCE_RUDP_ERROR_NOT_BOUND);
+        assert_eq!(r.call(rudp_bind, &[id, 3, 1, 0]), 0);
+        assert_eq!(r.call(rudp_bind, &[id, 3, 1, 0]), SCE_RUDP_ERROR_ALREADY_BOUND);
+        assert_eq!(r.call(rudp_connect, &[id]), SCE_RUDP_ERROR_CONN_TIMEOUT);
+        assert_eq!(r.call(rudp_get_size, &[id]), 0);
+        assert_eq!(r.call(rudp_read, &[id]), SCE_RUDP_ERROR_WOULDBLOCK);
+        assert_eq!(r.call(rudp_write, &[id]), SCE_RUDP_ERROR_NOT_ACCEPTABLE);
+        assert_eq!(r.call(rudp_flush, &[id]), 0);
+
+        // Status structs are zeroed at the size the caller declares, and no further.
+        r.bytes[0x300..0x320].fill(0xAA);
+        assert_eq!(r.call(rudp_get_context_status, &[id, 0x300, 0x10]), 0);
+        assert_eq!(&r.bytes[0x300..0x310], &[0u8; 0x10]);
+        assert_eq!(r.bytes[0x310], 0xAA);
+
+        // Options read back as set; an unset one has no established default.
+        r.bytes[0x340..0x344].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(r.call(rudp_set_option, &[id, 2, 0x340, 4]), 0);
+        assert_eq!(r.call(rudp_get_option, &[id, 2, 0x348, 4]), 0);
+        assert_eq!(word(&r, 0x348), 5);
+        assert_eq!(
+            r.call(rudp_get_option, &[id, 9, 0x348, 4]),
+            SCE_RUDP_ERROR_INVALID_OPTION
+        );
+        assert_eq!(
+            r.call(rudp_set_option, &[0x77, 2, 0x340, 4]),
+            SCE_RUDP_ERROR_INVALID_CONTEXT_ID
+        );
+
+        let poll = r.call(rudp_poll_create, &[4]);
+        assert!(poll > 0 && poll != id as i32);
+        assert_eq!(r.call(rudp_poll_control, &[poll as u32, 1, id, 1]), 0);
+        assert_eq!(
+            r.call(rudp_poll_control, &[poll as u32, 1, 0x77, 1]),
+            SCE_RUDP_ERROR_INVALID_CONTEXT_ID
+        );
+        assert_eq!(r.call(rudp_poll_destroy, &[poll as u32]), 0);
+        assert_eq!(
+            r.call(rudp_poll_destroy, &[poll as u32]),
+            SCE_RUDP_ERROR_INVALID_POLL_ID
+        );
+
+        assert_eq!(r.call(rudp_terminate, &[id]), 0);
+        assert_eq!(r.call(rudp_terminate, &[id]), SCE_RUDP_ERROR_INVALID_CONTEXT_ID);
+        assert_eq!(r.call(rudp_end, &[]), 0);
+        assert_eq!(r.call(rudp_end, &[]), SCE_RUDP_ERROR_NOT_INITIALIZED);
     }
 }

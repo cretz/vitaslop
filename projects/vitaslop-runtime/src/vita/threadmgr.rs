@@ -92,7 +92,7 @@ pub(super) fn change_thread_vfp_exception(_clear_mask: i32, _set_mask: i32) -> i
 
 /// int sceKernelCheckCallback(void)
 ///
-/// Run the CALLING thread's pending kernel callbacks (see [`crate::host::KCallback`]). A
+/// Run the CALLING thread's pending kernel callbacks (see `host/kcallbacks.rs`). A
 /// title puts it in its main loop so callbacks it made with `sceKernelCreateCallback` -
 /// its vblank handler, its own `sceKernelNotifyCallback` posts - run at a point of its
 /// choosing. One pending callback is delivered per call: it runs on its own fiber at the

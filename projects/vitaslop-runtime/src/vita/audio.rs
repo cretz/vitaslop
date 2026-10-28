@@ -388,6 +388,42 @@ pub(super) fn out_get_adopt(_ctx: &mut GuestCtx, st: &mut VitaState, ty: i32) ->
     i32::from(st.audio_state.ports.iter().any(|p| p.ty == ty))
 }
 
+/// `SCE_AUDIO_OUT_ERROR_NOT_OPENED` / `_INVALID_PORT` (`psp2/audioout.h`).
+const SCE_AUDIO_OUT_ERROR_NOT_OPENED: i32 = 0x8026_0001u32 as i32;
+const SCE_AUDIO_OUT_ERROR_INVALID_PORT: i32 = 0x8026_0003u32 as i32;
+
+/// int sceAudioOutGetRestSample(int port)
+///
+/// The samples (per channel) the port has been handed and not yet played. That is the port's
+/// PLAY-OUT SCHEDULE - the same one [`pace_output`] parks its thread by - read against the
+/// clock it is kept on: the wall schedule while output is wall-paced, else the guest's virtual
+/// one. A port whose grains have all played (or that has had none) has nothing left: 0. A
+/// port id this run handed out and has since released is `NOT_OPENED`; one it never handed
+/// out is `INVALID_PORT`.
+#[hostcall]
+pub(super) fn out_get_rest_sample(_ctx: &mut GuestCtx, st: &mut VitaState, port: i32) -> i32 {
+    let wall = audio_wall_pacing(st);
+    let now = st.now_us();
+    match st
+        .audio_state
+        .ports
+        .iter()
+        .find(|p| p.guest_port == port)
+    {
+        Some(p) => {
+            let left_us = match wall {
+                Some(now_w) if p.play_end_wall_us != 0 => p.play_end_wall_us.saturating_sub(now_w),
+                _ => p.play_end_us.saturating_sub(now),
+            };
+            (left_us * u64::from(p.format.sample_rate) / 1_000_000).min(i32::MAX as u64) as i32
+        }
+        None if port >= OUT_PORT_BASE && port < OUT_PORT_BASE + st.audio_state.next_guest_port => {
+            SCE_AUDIO_OUT_ERROR_NOT_OPENED
+        }
+        None => SCE_AUDIO_OUT_ERROR_INVALID_PORT,
+    }
+}
+
 /// int sceAudioOutOutput(int port, const void *buf)
 /// Submit one grain of interleaved S16 PCM. Returns 0 on success. On real hardware
 /// this blocks until the previous grain has drained; under the preemptive scheduler
@@ -968,5 +1004,34 @@ mod open_port_tests {
             b < super::IN_PORT_BASE,
             "out ports stay below the sceAudioIn range"
         );
+    }
+
+    /// `sceAudioOutGetRestSample(port)` on `st`, returning r0.
+    fn rest(st: &mut VitaState, port: i32) -> i32 {
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = port as u32;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 64];
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        super::out_get_rest_sample(&mut ctx, st);
+        regs[0] as i32
+    }
+
+    /// What is left is the port's play-out schedule ahead of the clock, in samples at the
+    /// port's rate; nothing queued is 0, and a released or never-opened port is refused.
+    #[test]
+    fn rest_sample_is_the_unplayed_schedule() {
+        let mut st = VitaState::new(0, 64, Box::new(DeterministicWorld::default()));
+        let port = open(&mut st);
+        assert_eq!(rest(&mut st, port), 0, "nothing handed over yet");
+        let now = st.now_us();
+        st.audio_state.ports[0].play_end_us = now + 10_000;
+        assert_eq!(rest(&mut st, port), 480, "10 ms at 48 kHz");
+        st.audio_state.ports[0].play_end_us = now.saturating_sub(1);
+        assert_eq!(rest(&mut st, port), 0, "already played out");
+        st.audio_state.ports.clear();
+        assert_eq!(rest(&mut st, port), super::SCE_AUDIO_OUT_ERROR_NOT_OPENED);
+        assert_eq!(rest(&mut st, 99), super::SCE_AUDIO_OUT_ERROR_INVALID_PORT);
     }
 }

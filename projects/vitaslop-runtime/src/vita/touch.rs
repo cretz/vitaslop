@@ -13,6 +13,39 @@
 use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
 
+/// What SceTouch keeps between calls, owned here - `VitaState` holds one and nothing outside
+/// this module reaches into it.
+pub(crate) struct TouchState {
+    /// Per-port touch sampling state (`sceTouchSetSamplingState`), front then back.
+    /// Held only so `sceTouchGetSamplingState` reads back what the title set rather
+    /// than a constant: the panels here always deliver a sample, so the value does not
+    /// gate `sceTouchRead`/`Peek`. Starts at START, which is what every title that
+    /// never calls the setter is already getting.
+    sampling: [u32; 2],
+    /// The touch panels' contact ids, per port: `(world id, panel id)` of each finger down at the
+    /// last sample, and the next id a NEW contact gets - see [`panel_ids`].
+    contacts: [Vec<(u8, u8)>; 2],
+    next_id: u8,
+    /// Ports whose FORCE output the title switched on (`sceTouchEnableTouchForce`); a report
+    /// on any other port carries force 0.
+    force: [bool; 2],
+    /// The last sample each panel handed the guest, `(timestamp us, the SceTouchData bytes)`,
+    /// so a read can report the samples taken SINCE it - see [`fill_touch`].
+    last: [Option<(u64, Vec<u8>)>; 2],
+}
+
+impl Default for TouchState {
+    fn default() -> Self {
+        TouchState {
+            sampling: [1, 1],
+            contacts: [Vec::new(), Vec::new()],
+            next_id: 0,
+            force: [false; 2],
+            last: [None, None],
+        }
+    }
+}
+
 /// Size of one `SceTouchData`: timeStamp(8) + status(4) + reportNum(4) +
 /// report[8] * sizeof(SceTouchReport=0x10) = 0x90 bytes.
 const TOUCH_DATA_SIZE: usize = 0x90;
@@ -64,7 +97,7 @@ fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbuf
     let report_count = points.len().min(8);
     let ids = panel_ids(st, port, &points[..report_count]);
     // Force is OPT-IN per port: without `sceTouchEnableTouchForce` the panel reports 0.
-    let force_on = st.touch_force.get(port as usize).copied().unwrap_or(false);
+    let force_on = st.touch.force.get(port as usize).copied().unwrap_or(false);
     let mut now = [0u8; TOUCH_DATA_SIZE];
     now[0..8].copy_from_slice(&ts.to_le_bytes());
     now[12..16].copy_from_slice(&(report_count as u32).to_le_bytes());
@@ -85,7 +118,7 @@ fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbuf
     // the earlier samples of the window carry the last sample the guest was handed, restamped
     // at their own panel times, and the newest carries the current contact.
     let slot = port as usize % 2;
-    let n = match &st.touch_last[slot] {
+    let n = match &st.touch.last[slot] {
         Some((last_ts, _)) => {
             let periods = ts.saturating_sub(*last_ts) / PANEL_PERIOD_US;
             (periods.max(1) as u32).min(nbufs.clamp(1, MAX_BUFS))
@@ -93,7 +126,7 @@ fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbuf
         None => 1,
     };
     if data != 0 {
-        let prev = st.touch_last[slot].as_ref().map(|(_, b)| b.clone());
+        let prev = st.touch.last[slot].as_ref().map(|(_, b)| b.clone());
         for i in 0..n {
             let newest = i + 1 == n;
             let mut buf = match (&prev, newest) {
@@ -109,7 +142,7 @@ fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbuf
             ctx.write_bytes(data + i * TOUCH_DATA_SIZE as u32, &buf);
         }
     }
-    st.touch_last[slot] = Some((ts, now.to_vec()));
+    st.touch.last[slot] = Some((ts, now.to_vec()));
     n as i32
 }
 
@@ -126,7 +159,7 @@ const PANEL_PERIOD_US: u64 = 16_667;
 /// table by exactly this byte.)
 fn panel_ids(st: &mut VitaState, port: u32, points: &[crate::world::TouchPoint]) -> [u8; 8] {
     let mut ids = [0u8; 8];
-    let Some(prev) = st.touch_contacts.get(port as usize).cloned() else {
+    let Some(prev) = st.touch.contacts.get(port as usize).cloned() else {
         return ids;
     };
     let mut now = Vec::with_capacity(points.len());
@@ -134,15 +167,15 @@ fn panel_ids(st: &mut VitaState, port: u32, points: &[crate::world::TouchPoint])
         let id = match prev.iter().find(|(w, _)| *w == p.id) {
             Some(&(_, id)) => id,
             None => {
-                let id = st.touch_next_id;
-                st.touch_next_id = (id + 1) & 0x7f;
+                let id = st.touch.next_id;
+                st.touch.next_id = (id + 1) & 0x7f;
                 id
             }
         };
         ids[j] = id;
         now.push((p.id, id));
     }
-    st.touch_contacts[port as usize] = now;
+    st.touch.contacts[port as usize] = now;
     ids
 }
 
@@ -206,10 +239,10 @@ const SCE_TOUCH_ERROR_INVALID_ARG: i32 = 0x8035_0001u32 as i32;
 ///
 /// STOP(0) / START(1) for one panel. Recorded so [`get_sampling_state`] reads back what
 /// the title set; the panels here always deliver a sample, so this does not gate
-/// `sceTouchRead`/`sceTouchPeek` - see [`crate::host::VitaState::touch_sampling`].
+/// `sceTouchRead`/`sceTouchPeek` - see [`TouchState`].
 #[hostcall]
 pub(super) fn set_sampling_state(st: &mut VitaState, port: u32, state: u32) -> i32 {
-    match st.touch_sampling.get_mut(port as usize) {
+    match st.touch.sampling.get_mut(port as usize) {
         Some(slot) => {
             *slot = state;
             0
@@ -230,7 +263,7 @@ pub(super) fn get_sampling_state(
     out: Ptr,
 ) -> i32 {
     // One expression, no early return: a `#[hostcall]` body cannot `return`.
-    match st.touch_sampling.get(port as usize) {
+    match st.touch.sampling.get(port as usize) {
         Some(&state) => {
             if !out.is_null() {
                 ctx.write_u32(out.addr(), state);
@@ -259,7 +292,7 @@ pub(super) fn read(
 /// Switch on the FORCE byte of `port`'s reports; until then it reads 0 (see `fill_touch`).
 #[hostcall]
 pub(super) fn enable_touch_force(_ctx: &mut GuestCtx, st: &mut VitaState, port: u32) -> i32 {
-    match st.touch_force.get_mut(port as usize) {
+    match st.touch.force.get_mut(port as usize) {
         Some(on) => {
             *on = true;
             0
@@ -369,7 +402,7 @@ mod tests {
         assert_eq!(panel_ids(&mut st, 0, &[finger(0), finger(1)])[..2], [1, 2]);
         // The back panel tracks its own contacts.
         assert_eq!(panel_ids(&mut st, 1, &[finger(0)])[0], 3);
-        st.touch_next_id = 127;
+        st.touch.next_id = 127;
         panel_ids(&mut st, 0, &[]);
         assert_eq!(panel_ids(&mut st, 0, &[finger(0)])[0], 127);
         panel_ids(&mut st, 0, &[]);

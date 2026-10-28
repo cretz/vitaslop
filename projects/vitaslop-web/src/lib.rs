@@ -848,13 +848,17 @@ impl RttWriteback {
         const ALIGN: u32 = 256;
         for &(addr, tex, w, h) in targets {
             let (w, h) = (w.max(1), h.max(1));
-            if w * h > cap {
-                continue;
-            }
             // Only a target this frame's scenes render into - the same bound as native's.
             let Some(surface) = vitaslop_runtime::rtt_writeback::surface_for(scenes, addr) else {
                 continue;
             };
+            // The whole target within the cap; above it, only the region the frame's last draw
+            // into it painted, written as a surface of its own - see `writeback_region`.
+            let Some((x, y, w, h, addr)) = vitaslop_runtime::rtt_writeback::writeback_region(scenes, addr, w, h, cap)
+            else {
+                continue;
+            };
+            let surface = vitaslop_runtime::capture::ColorSurface { data_addr: addr, width: w, height: h, ..surface };
             // The bytes a texel of the TEXTURE copies as - which is what lands in the buffer, and is
             // not always what the guest's surface format implies (see `take`).
             let tex_texel = tex.format().block_copy_size(None).unwrap_or(4);
@@ -898,7 +902,7 @@ impl RttWriteback {
                 wgpu::TexelCopyTextureInfo {
                     texture: tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyBufferInfo {
@@ -3955,6 +3959,31 @@ impl LivePlayback {
             self.split.worst_enc_work = enc_work;
             self.split.worst_enc_phases = ph;
         }
+        // >>> A SLOW ENCODE NAMES ITS OWN PHASES, on the present it happened. The window's
+        // worst-encode line keeps only the last window's, and the lost-time list says only
+        // `encode 7235` - a load's first present of a new world was exactly that, with 479
+        // draws, and nothing said which half of `encode_chain` held it.
+        if t2 - t_acq > 500.0 {
+            logging::note(&format!(
+                "[slow-encode] f{} {:.0} ms over {} scene(s) / {draws} draws: prepare {:.0} + upload {:.0} [arena {:.0}] + pass {:.0} + CHAIN {:.0} (precompile {:.0}, retire {:.0}, resident {:.0}; head {:.0}, scene-loop {:.0}, passes-wall {:.0}, tail {:.0}) | {}",
+                guest_frame,
+                t2 - t_acq,
+                scenes.len(),
+                ph.prepare_ms,
+                ph.upload_ms,
+                ph.arena_ms,
+                ph.pass_ms,
+                (t2 - t_acq - (ph.prepare_ms + ph.upload_ms + ph.pass_ms)).max(0.0),
+                ph.precompile_ms,
+                ph.retire_ms,
+                ph.resident_ms,
+                ph.chain_head_ms,
+                ph.scene_loop_ms,
+                ph.pass_wall_ms,
+                ph.chain_tail_ms,
+                enc_work.line(1),
+            ));
+        }
         self.split.work.add_pub(&work);
         self.split.enc_work.add(&enc_work);
         // Taken every present whether or not the knob is on: `take_prepare_split` is a handful
@@ -5335,6 +5364,10 @@ pub fn set_knob(name: &str, value: &str) {
     if name == "VITASLOP_HEAP_BIG_GROW" {
         vitaslop_platform::heap::route_all_allocations(value.trim() != "0");
     }
+    // The owner ledger is armed here for the same reason: see `heap::owners`.
+    if name == "VITASLOP_HEAP_OWNERS" {
+        vitaslop_platform::heap::track_owners(value.trim().parse::<usize>().unwrap_or(0) * 1024);
+    }
 }
 
 /// Read a knob from JavaScript - a guest worker's script shares the override table (it is in
@@ -5545,6 +5578,7 @@ pub async fn run_game_worker(
     playbook: JsValue,
 ) -> Result<String, JsValue> {
     crate::logging::install_panic_hook();
+    vitaslop_platform::heap::set_thread_owner(vitaslop_platform::heap::Owner::RunWorker);
     logging::init();
     // >>> BEFORE ANYTHING ALLOCATES A CACHE. Every memory budget in the engine is scaled by what
     // this reports, and a budget read before it lands would be the desktop-sized one.
@@ -6196,7 +6230,7 @@ async fn live_loop(
         // out this way. With a guest frame costing C and a present costing R, a tick that runs N
         // frames and presents once takes `N*C + R`, so
         //
-        //     speed  ∝  N / (N*C + R)      rises with N, towards a ceiling of 1/C
+        //     speed  ~  N / (N*C + R)      rises with N, towards a ceiling of 1/C (proportional)
         //     fps    =  1 / (N*C + R)      falls with N, in proportion
         //
         // Every point of speed catch-up buys is bought by amortising ONE present over more
@@ -7022,9 +7056,16 @@ async fn live_loop(
             }
             // What the guest did WHILE this present ran - the game time it moved, the sound it
             // made, how long the speakers went dry - named on a slow one.
+            // And what the capture retired of the frames it ran on (`Capture::retire_counts`):
+            // the scenes the NEXT present will not have to draw.
             let around = |sched: &browser_sched::BrowserSched| {
                 let st = &sched.host.lock().unwrap().state;
-                (st.now_us(), st.audio_produced_seconds(), audio::ring_underrun_frames().unwrap_or(0))
+                (
+                    st.now_us(),
+                    st.audio_produced_seconds(),
+                    audio::ring_underrun_frames().unwrap_or(0),
+                    st.capture.retire_counts,
+                )
             };
             let around0 = around(&sched);
             vitaslop_platform::gpu::set_guest_frame(sched.frames());
@@ -7036,12 +7077,18 @@ async fn live_loop(
             note_audio_gaps(sched.frames());
             if present_wall_ms > 100.0 {
                 let around1 = around(&sched);
+                let (ra, rb) = (around0.3, around1.3);
                 logging::note(&format!(
-                    "[late] f{} present {present_wall_ms:.0} ms: game {} ms, sound made {:.0} ms, dry {:.0} ms",
+                    "[late] f{} present {present_wall_ms:.0} ms of {} scene(s): game {} ms, sound made {:.0} ms, dry {:.0} ms; \
+                     retired meanwhile {} scene(s) a newer frame redraws ({} still pending), kept {}",
                     sched.frames(),
+                    scene.len(),
                     around1.0.saturating_sub(around0.0) / 1000,
                     (around1.1 - around0.1) * 1000.0,
                     f64::from(around1.2.saturating_sub(around0.2)) / 48.0,
+                    rb.0 - ra.0,
+                    rb.1 - ra.1,
+                    rb.2 - ra.2,
                 ));
             }
             stall_note("present", &stall_mark);
@@ -8249,6 +8296,10 @@ async fn live_loop(
                         },
                     ),
                 );
+                // WHO holds the Rust heap, when `VITASLOP_HEAP_OWNERS` armed the ledger.
+                if let Some(owners) = vitaslop_platform::heap::owners_report() {
+                    line(&mut diag, "MEMORY", &owners);
+                }
                 // ...and INSIDE `prepare`, when it was asked for. See `WindowSplit::prep`.
                 if !s.prep.is_empty() {
                     line(&mut diag, "PREPARE SPLIT, window mean", &s.prep.line(s.presents.max(1)));
@@ -8360,7 +8411,7 @@ async fn live_loop(
                     if !holders.is_empty() {
                         let h: Vec<String> = holders
                             .iter()
-                            .map(|(l, ms, n)| format!("host.rs:{l} {:.2} ms/frame over {:.1} waits", ms / np, *n as f64 / np))
+                            .map(|(l, ms, n)| format!("{l} {:.2} ms/frame over {:.1} waits", ms / np, *n as f64 / np))
                             .collect();
                         line(
                             &mut diag,

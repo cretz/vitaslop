@@ -542,6 +542,24 @@ mod tests {
         });
     }
 
+    /// A release to zero on the HOST's fast path leaves no owner behind. The inline parallel
+    /// lock reads "held, and the owner is me" as a recursive take, so a stale owner lets its
+    /// old holder walk into a mutex another thread has just taken (inline: count first, owner
+    /// after) - two threads in one critical section.
+    #[test]
+    fn a_fast_release_to_zero_clears_the_owner() {
+        with(|ctx, st| {
+            create(ctx, st, WORK);
+            assert!(lwwork::fast_lock(ctx, WORK, 7, 1));
+            assert!(lwwork::fast_lock(ctx, WORK, 7, 1), "recursive");
+            assert!(lwwork::fast_unlock(ctx, WORK, 7, 1));
+            assert_eq!(lwwork::owner(ctx, WORK), 7, "still held once - the owner stays");
+            assert!(lwwork::fast_unlock(ctx, WORK, 7, 1));
+            assert_eq!(lwwork::count(ctx, WORK), 0);
+            assert_eq!(lwwork::owner(ctx, WORK) as u32, lwwork::NO_OWNER, "free means unowned");
+        });
+    }
+
     /// A work area no create ever touched is ADOPTED on its first host-side lock, so the
     /// second lock is inline. Statically-initialized lightweight mutexes are ordinary in
     /// libc, and a title that uses one would otherwise never see the fast path at all.

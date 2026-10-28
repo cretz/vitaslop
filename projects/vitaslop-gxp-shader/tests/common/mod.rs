@@ -1134,3 +1134,72 @@ pub fn seeded_pa_baseline(seed: u32, overrides: &[(usize, u32)]) -> Vec<f32> {
     }
     pa
 }
+
+/// The SA register a [`tile_store_pair`] fragment program's store buffer pointer sits in (DATA
+/// container base 2, slot 0), its stride uniform's register, and its literal `1`.
+pub const TILE_STORE_POINTER_SA: usize = 2;
+pub const TILE_STORE_STRIDE_SA: usize = 0;
+pub const TILE_STORE_ONE_SA: usize = 12;
+
+/// An AUTHORED storing pair: a vertex program passing its clip position through, and a fragment
+/// program that forms each fragment's pixel coordinates from the TILE registers exactly as the
+/// one storing program in any corpus does - `Y = 1 * (16 * TILEXY.byte1) + TILEY` (an IMA32
+/// step pair), `X = 16 * TILEXY.byte0 + QUADRANTX` - and stores `Y * stride + X` (the word's
+/// own index) at `pointer + 4 * (Y * stride + X)` into a `stride * rows * 4`-byte buffer.
+///
+/// The instruction words are the ISA encodings of that address arithmetic (the byte extraction
+/// in the secondary stream, the step pairs and the store in the primary); the store keeps the
+/// format's `moe_expand` immediate of one, which debiases to a zero offset. `stride` arrives as
+/// the raw integer in `sa[0]`.
+pub fn tile_store_pair(stride: u32, rows: u32) -> (Vec<u8>, Vec<u8>) {
+    use vitaslop_gxp_shader::gxpwrite::{self, ParamSpec, ProgramSpec, VertexOutputs};
+    use vitaslop_gxp_shader::usse::asm::{self, Dest, Src};
+    let vertex = gxpwrite::write(
+        &ProgramSpec::vertex(vec![
+            asm::mov(false, Dest::new(Bank::Output, 0), [true; 4], Src::reg(Bank::PrimaryAttr, 0)).expect("mov"),
+        ])
+        .with_parameters(vec![ParamSpec::attribute("IN.position", 0, 4)])
+        .with_registers(4, 0, 0)
+        .with_outputs(VertexOutputs { color0: false, texcoords: vec![] }),
+    );
+    (vertex, tile_store_fragment(stride, rows, &TILE_STORE_SECONDARY))
+}
+
+/// The secondary stream of [`tile_store_pair`]'s fragment program: the two `TILEXY` bytes, the
+/// high one already scaled by 16.
+pub const TILE_STORE_SECONDARY: [u64; 4] = [
+    0x40c3_0006_6020_3581, // pack.u8 sa1.byte0 <- TILEXY.byte1
+    0x5081_0000_af80_40ff, // i0 = sa1 & 0xff
+    0xd083_0002_a03f_0800, // sa1 = i0 * 16 + 0
+    0x5083_0002_61a0_75ff, // sa13 = TILEXY & 0xff
+];
+
+/// [`tile_store_pair`]'s fragment program over the secondary stream `secondary`.
+pub fn tile_store_fragment(stride: u32, rows: u32, secondary: &[u64]) -> Vec<u8> {
+    use vitaslop_gxp_shader::gxpwrite::{self, ContainerSpec, ParamSpec, ProgramSpec};
+    let primary = vec![
+        0xd0c1_8004_df83_00d8, // i0 = sa12 * lo16(sa1) + TILEY
+        0xd0d0_8004_cfa3_00fc, // i4 = ((sa12 * hi16(sa1)) << 16) + i0
+        0xd083_8004_9f83_4857, // i0 = sa13 * 16 + QUADRANTX
+        0xd080_0002_c07f_407c, // pa3 = i4 * lo16(sa0) + i0
+        0xd082_0006_b000_c202, // pa0 = pa3 * 4 + sa2
+        0xf0a2_0004_a000_0083, // st [pa0 + #1 (debiased: +0)], pa3
+    ];
+    gxpwrite::write(
+        &ProgramSpec::fragment(primary)
+            .with_secondary_code(secondary.to_vec())
+            .with_parameters(vec![
+                ParamSpec::uniform("inStride", 0, 1),
+                ParamSpec::uniform_buffer("outWords", 0, stride * rows * 4),
+            ])
+            .with_default_uniform_regs(2)
+            .with_containers(vec![
+                ContainerSpec { index: 14, base_sa: 0, size_regs: 2 },
+                ContainerSpec { index: 19, base_sa: 2, size_regs: 11 },
+            ])
+            // The literal table counts from the DATA container's base (no LITERAL container).
+            .with_literals(vec![(TILE_STORE_ONE_SA as u32 - TILE_STORE_POINTER_SA as u32, 1)])
+            .with_ub_bindings(vec![(0, 0)])
+            .with_registers(10, 14, 0),
+    )
+}

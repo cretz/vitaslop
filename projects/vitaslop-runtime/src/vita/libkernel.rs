@@ -656,18 +656,95 @@ const MPP_MODE_DONT_WAIT: u32 = 0x10;
 /// pipe parking it is not modelled, and would show up as a pipe that only ever grows.
 pub(super) fn msg_pipe_create(ctx: &mut GuestCtx, st: &mut VitaState) {
     let uid = st.new_uid();
-    st.msg_pipes.insert(uid, std::collections::VecDeque::new());
+    st.msg_pipe_create(uid);
     ctx.ret(uid as u32);
 }
 
 /// int sceKernelDeleteMsgPipe(SceUID uid)
+///
+/// A receiver still parked on the pipe is woken with `SCE_KERNEL_ERROR_WAIT_DELETE`: the
+/// object it waited on is gone and nothing else would ever release it, as for every other
+/// deleted waitable here.
 pub(super) fn msg_pipe_delete(ctx: &mut GuestCtx, st: &mut VitaState) {
     let uid = ctx.arg(0) as i32;
-    ctx.ret(if st.msg_pipes.remove(&uid).is_some() {
+    ctx.ret(if st.msg_pipe_remove(uid) {
+        st.msgpipe_release(uid, crate::host::SCE_KERNEL_ERROR_WAIT_DELETE);
         0
     } else {
         0x8002_0005
     });
+}
+
+/// `SCE_KERNEL_BACKTRACE_MODE_DONT_EXCEED` (henkaku wiki, SceKernelModulemgr): stop at the end
+/// of the buffer and return SCE_OK instead of the stack depth.
+const BACKTRACE_MODE_DONT_EXCEED: i32 = 0x2;
+/// `SceKernelCallFrame`: `{ sp, pc }`, 8 bytes.
+const CALL_FRAME_SIZE: u32 = 8;
+
+/// SceInt32 sceKernelBacktraceSelf(SceKernelCallFrame *pCallFrameBuffer, SceSize numBytesBuffer,
+///                                 SceUInt32 *pNumReturn, SceInt32 mode)
+///
+/// The henkaku wiki's prototype: walk the calling thread's stack into `{ sp, pc }` frames, put
+/// how many were filled in `*pNumReturn`, and return the call-stack depth - or SCE_OK under
+/// DONT_EXCEED. The one title seen calling it prints the frames' `pc` words into a crash report
+/// on its fatal out-of-memory path, after checking the return is positive.
+///
+/// >>> ONE FRAME, BECAUSE ONE FRAME IS ALL THAT IS KNOWN. The console unwinds through each
+/// module's ARM exception-index tables; this engine runs the guest as recompiled code whose
+/// frames the host cannot walk, and parses no unwind tables. What it DOES know exactly is the
+/// innermost frame: the caller's stack pointer and the address the call returns to (`sp` and
+/// `lr` at the call). So that frame is reported, and the depth is reported as 1 - a short
+/// stack, never a frame read off a guessed stack word. (`guest_return_trail` is that guess,
+/// and it stays a diagnostic.)
+pub(super) fn backtrace_self(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let (buf, size, pnum, mode) = (ctx.arg(0), ctx.arg(1), ctx.arg(2), ctx.arg(3) as i32);
+    if buf == 0 || pnum == 0 {
+        ctx.ret(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        return;
+    }
+    let fits = size >= CALL_FRAME_SIZE;
+    if fits {
+        let (sp, lr) = (ctx.regs[13], ctx.regs[14]);
+        ctx.write_u32(buf, sp);
+        ctx.write_u32(buf + 4, lr);
+    }
+    ctx.write_u32(pnum, fits as u32);
+    ctx.ret(if mode & BACKTRACE_MODE_DONT_EXCEED != 0 {
+        0
+    } else {
+        1
+    });
+}
+
+/// `SCE_KERNEL_ERROR_WAIT_CANCEL` (`psp2/kernel/error.h`): the wait was cancelled.
+const SCE_KERNEL_ERROR_WAIT_CANCEL: u32 = 0x8002_8007;
+
+/// int sceKernelCancelMsgPipe(SceUID uid, int *psend, int *precv)
+///
+/// Releases every thread waiting on the pipe with `SCE_KERNEL_ERROR_WAIT_CANCEL` and reports
+/// how many were waiting to send and to receive (`psp2/kernel/threadmgr/msgpipe.h`; either
+/// pointer may be NULL). Senders never park here - the buffer is unbounded, see
+/// [`msg_pipe_create`] - so the send count is a true 0, and the receive count is the receivers
+/// actually woken. The pipe's buffered bytes are discarded, which is what a cancel does to the
+/// PSP kernel's message pipe this one descends from: the pipe is left as freshly created.
+pub(super) fn msg_pipe_cancel(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = ctx.arg(0) as i32;
+    let (psend, precv) = (ctx.arg(1), ctx.arg(2));
+    let code = match st.msg_pipe_mut(uid) {
+        None => 0x8002_0005,
+        Some(pipe) => {
+            pipe.clear();
+            let woken = st.msgpipe_release(uid, SCE_KERNEL_ERROR_WAIT_CANCEL);
+            if psend != 0 {
+                ctx.write_u32(psend, 0);
+            }
+            if precv != 0 {
+                ctx.write_u32(precv, woken);
+            }
+            0
+        }
+    };
+    ctx.ret(code);
 }
 
 /// int sceKernelSendMsgPipe(SceUID uid, const void *buf, unsigned int size, int mode, unsigned int *result, unsigned int *timeout)
@@ -676,7 +753,7 @@ pub(super) fn msg_pipe_delete(ctx: &mut GuestCtx, st: &mut VitaState) {
 pub(super) fn msg_pipe_send(ctx: &mut GuestCtx, st: &mut VitaState) {
     let uid = ctx.arg(0) as i32;
     let (buf, size, result) = (ctx.arg(1), ctx.arg(2), ctx.arg(4));
-    let Some(pipe) = st.msg_pipes.get_mut(&uid) else {
+    let Some(pipe) = st.msg_pipe_mut(uid) else {
         ctx.ret(0x8002_0005);
         return;
     };
@@ -705,7 +782,7 @@ pub(super) fn msg_pipe_receive(
     let (buf, size, mode, result) = (ctx.arg(1), ctx.arg(2), ctx.arg(3), ctx.arg(4));
     let timeout_ptr = if try_form { 0 } else { ctx.arg(5) };
     let full = mode & MPP_MODE_FULL != 0;
-    let Some(pipe) = st.msg_pipes.get_mut(&uid) else {
+    let Some(pipe) = st.msg_pipe_mut(uid) else {
         ctx.ret(0x8002_0005);
         return SvcOutcome::Continue;
     };
@@ -1327,5 +1404,101 @@ mod atomic_tests {
         assert!(!op(&mut b, AtomicOp::AddAndGet, 32, [WORD + 2, 1, 0]).1);
         assert!(!op(&mut b, AtomicOp::AddAndGet, 16, [WORD + 1, 1, 0]).1);
         assert!(op(&mut b, AtomicOp::AddAndGet, 8, [WORD + 3, 1, 0]).1);
+    }
+}
+
+#[cfg(test)]
+mod msg_pipe_tests {
+    use super::*;
+    use crate::world::DeterministicWorld;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    const COUNTS: u32 = 0x100;
+
+    fn call(
+        st: &mut VitaState,
+        bytes: &mut [u8],
+        f: fn(&mut GuestCtx, &mut VitaState),
+        args: &[u32],
+    ) -> u32 {
+        let mut regs = [0u32; REG_COUNT];
+        regs[..args.len()].copy_from_slice(args);
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut mem = SliceMemory(bytes);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        f(&mut ctx, st);
+        ctx.regs[0]
+    }
+
+    /// The backtrace is the caller's own frame - `sp` and the return address - counted, with
+    /// the depth (or SCE_OK under DONT_EXCEED) returned; a buffer too small for a frame gets
+    /// none.
+    #[test]
+    fn backtrace_self_reports_the_callers_frame() {
+        let mut st = VitaState::new(0, 0x4000, Box::new(DeterministicWorld::default()));
+        let mut b = vec![0u8; 0x400];
+        let mut run = |b: &mut [u8], args: [u32; 4]| {
+            let mut regs = [0u32; REG_COUNT];
+            regs[..4].copy_from_slice(&args);
+            regs[13] = 0x3F0;
+            regs[14] = 0x8100_1235;
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            let mut mem = SliceMemory(b);
+            let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            backtrace_self(&mut ctx, &mut st);
+            ctx.regs[0]
+        };
+        let w = |b: &[u8], a: usize| u32::from_le_bytes(b[a..a + 4].try_into().unwrap());
+        assert_eq!(run(&mut b, [0x100, 0x100, 0x200, 0]), 1);
+        assert_eq!((w(&b, 0x100), w(&b, 0x104), w(&b, 0x200)), (0x3F0, 0x8100_1235, 1));
+        assert_eq!(run(&mut b, [0x100, 0x100, 0x200, 2]), 0, "DONT_EXCEED returns SCE_OK");
+        assert_eq!(run(&mut b, [0x100, 4, 0x200, 0]), 1);
+        assert_eq!(w(&b, 0x200), 0, "no room for a frame");
+        assert_eq!(run(&mut b, [0, 0x100, 0x200, 0]), SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+
+    /// A cancel wakes each parked receiver with WAIT_CANCEL, counts them (and the senders,
+    /// which never park), and empties the pipe; a delete wakes the rest with WAIT_DELETE.
+    #[test]
+    fn cancel_releases_receivers_and_empties_the_pipe() {
+        let mut st = VitaState::new(0, 0x4000, Box::new(DeterministicWorld::default()));
+        st.set_preemptive(true);
+        let mut b = vec![0xAAu8; 0x400];
+        let uid = call(&mut st, &mut b, msg_pipe_create, &[0, 0, 0, 0x100]) as i32;
+        st.msg_pipe_mut(uid).unwrap().extend([1u8, 2]);
+        st.set_current(7);
+        st.msgpipe_block(uid, 0x200, 4, true, 0, None);
+        st.set_current(8);
+        st.msgpipe_block(uid, 0x200, 4, true, 0, None);
+        st.take_wakes();
+
+        assert_eq!(
+            call(&mut st, &mut b, msg_pipe_cancel, &[uid as u32, COUNTS, COUNTS + 4]),
+            0
+        );
+        assert_eq!(u32::from_le_bytes(b[0x100..0x104].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(b[0x104..0x108].try_into().unwrap()), 2);
+        assert_eq!(st.take_wakes(), vec![7, 8]);
+        assert_eq!(st.take_resume_code(7), Some(SCE_KERNEL_ERROR_WAIT_CANCEL));
+        assert_eq!(st.take_resume_code(8), Some(SCE_KERNEL_ERROR_WAIT_CANCEL));
+        assert!(st.msg_pipe(uid).unwrap().is_empty());
+        assert_eq!(b[0x200], 0xAA, "a cancelled receive writes nothing");
+
+        // NULL count pointers are allowed; nothing is waiting now.
+        assert_eq!(call(&mut st, &mut b, msg_pipe_cancel, &[uid as u32, 0, 0]), 0);
+        assert!(st.take_wakes().is_empty());
+
+        st.set_current(9);
+        st.msgpipe_block(uid, 0x200, 4, true, 0, None);
+        assert_eq!(call(&mut st, &mut b, msg_pipe_delete, &[uid as u32]), 0);
+        assert_eq!(
+            st.take_resume_code(9),
+            Some(crate::host::SCE_KERNEL_ERROR_WAIT_DELETE)
+        );
+        assert_eq!(
+            call(&mut st, &mut b, msg_pipe_cancel, &[uid as u32, 0, 0]),
+            0x8002_0005
+        );
     }
 }

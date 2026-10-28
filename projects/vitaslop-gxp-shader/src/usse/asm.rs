@@ -392,8 +392,10 @@ fn expected_operand(src: &Src) -> Operand {
         }
         Src::Const { sel, .. } => (Bank::Constant, sel, 0b01),
         Src::Imm { value, .. } => (Bank::Immediate, value, 0b10),
+        // Only the six-bit rows encode an indexed operand here (`fields6`), so the decoder marks
+        // it as counting register PAIRS (`crate::ir::indexed_index_scale`).
         Src::Indexed { number, which, .. } => {
-            (Bank::Indexed, number, if which == 0 { 0b00 } else { 0b11 })
+            (Bank::Indexed, number, (if which == 0 { 0b00 } else { 0b11 }) | crate::ir::INDEXED_PAIRS)
         }
     };
     Operand { bank, index, bank_sel, swizzle: src.swizzle(), abs, neg }
@@ -870,6 +872,7 @@ pub fn vtst(
         TestAlu::Add => (0u64, 2u64),
         TestAlu::Mul => (0, 13),
         TestAlu::Sub => (0, 14),
+        TestAlu::Dot => (0, 8),
         _ => return Err(AsmError::RoundTrip { what: "vtst: only the FLOAT ALU families are assembled" }),
     };
     // `(sign_test, zero_test, combiner)`, the three fields the decoder folds into one relation.
@@ -2229,7 +2232,7 @@ pub fn sop2(
     put(&mut w, 27, 21, dn, "dest_n")?;
     put(&mut w, 13, 7, s1n, "src1_n")?;
     put(&mut w, 6, 0, s2n, "src2_n")?;
-    let want_op = Op::Sop2 { color, alpha, f1, f1_complement, f2, f2_complement };
+    let want_op = Op::Sop2 { color, alpha, f1, f1_complement, f2, f2_complement, alpha_coeffs: None };
     let srcs = [Want::reg(src1.0, src1.1), Want::reg(src2.0, src2.1)];
     for raw in 0..16u64 {
         let mut cand = w;
@@ -2275,6 +2278,91 @@ pub fn copy_fx8(dest: Dest, src: (Bank, u8)) -> Result<u64, AsmError> {
     )
 }
 
+/// Assemble a group-0x80 SOP2 COMBINE - the plain-SOP2 field table over two ordinary registers
+/// (neither the output bank, which would make it the epilogue blend [`copy_fx8`] builds):
+/// `rgb = color(c1 * src1.rgb, c2 * src2.rgb)`, `a = alpha(a1 * src1.a, a2 * src2.a)`, each
+/// coefficient a `(factor, complement)` pair. The colour pair takes any [`SopFactor`]; the alpha
+/// pair only `Zero`, `Src1Alpha` and `Src2Alpha`, the three entries of its two-bit table. No write
+/// mask: all four bytes are written. Operand numbers are DIRECT, as every 8-bit group's are.
+///
+/// [`SopFactor`]: crate::ir::SopFactor
+#[allow(clippy::too_many_arguments)]
+pub fn sop2_combine(
+    color: crate::ir::SopOp,
+    alpha: crate::ir::SopOp,
+    colour_coeffs: [(crate::ir::SopFactor, bool); 2],
+    alpha_coeffs: [(crate::ir::SopFactor, bool); 2],
+    dest: Dest,
+    src1: (Bank, u8),
+    src2: (Bank, u8),
+) -> Result<u64, AsmError> {
+    use crate::ir::{SopFactor, SopOp};
+    let op = |o: SopOp| match o {
+        SopOp::Add => Ok(0u64),
+        SopOp::Sub => Ok(1),
+        SopOp::Min | SopOp::Max => Err(AsmError::UnsupportedOp("a group-0x80 MIN/MAX op is not established")),
+    };
+    let colour_sel = |f: SopFactor| match f {
+        SopFactor::Zero => 0u64,
+        SopFactor::Src1Color => 1,
+        SopFactor::Src2Color => 2,
+        SopFactor::Src1Alpha => 3,
+        SopFactor::Src2Alpha => 4,
+    };
+    let alpha_sel = |f: SopFactor| match f {
+        SopFactor::Zero => Ok(0u64),
+        SopFactor::Src1Alpha => Ok(1),
+        SopFactor::Src2Alpha => Ok(2),
+        SopFactor::Src1Color | SopFactor::Src2Color => {
+            Err(AsmError::UnsupportedOp("the group-0x80 alpha table has no colour selector"))
+        }
+    };
+    if src1.0 == Bank::Output || src2.0 == Bank::Output {
+        return Err(AsmError::UnsupportedOp("a group-0x80 word reading o[] is the epilogue blend, not a combine"));
+    }
+    let (dsel, dn) = r7_direct(dest.bank, dest.index, true)?;
+    let (s1sel, s1n) = r7_direct(src1.0, src1.1, false)?;
+    let (s2sel, s2n) = r7_direct(src2.0, src2.1, false)?;
+    let [(c1, c1_mod), (c2, c2_mod)] = colour_coeffs;
+    let [(a1, a1_mod), (a2, a2_mod)] = alpha_coeffs;
+    let mut w = 0u64;
+    put(&mut w, 63, 59, 0x10, "opcode")?;
+    put(&mut w, 56, 56, u64::from(c1_mod), "mod1")?;
+    put(&mut w, 53, 52, alpha_sel(a1)?, "asel1")?;
+    put(&mut w, 47, 47, u64::from(c2_mod), "mod2")?;
+    put(&mut w, 43, 43, u64::from(a1_mod), "amod1")?;
+    put(&mut w, 42, 41, alpha_sel(a2)?, "asel2")?;
+    put(&mut w, 40, 38, colour_sel(c1), "sel1")?;
+    put(&mut w, 37, 35, colour_sel(c2), "sel2")?;
+    put(&mut w, 34, 34, u64::from(a2_mod), "amod2")?;
+    put(&mut w, 33, 32, dsel, "dest_bank")?;
+    put(&mut w, 31, 30, s1sel, "src1_bank")?;
+    put(&mut w, 29, 28, s2sel, "src2_bank")?;
+    put(&mut w, 27, 21, dn, "dest_n")?;
+    put(&mut w, 19, 18, op(color)?, "cop")?;
+    put(&mut w, 17, 16, op(alpha)?, "aop")?;
+    put(&mut w, 13, 7, s1n, "src1_n")?;
+    put(&mut w, 6, 0, s2n, "src2_n")?;
+    let want_op = Op::Sop2 {
+        color,
+        alpha,
+        f1: c1,
+        f1_complement: c1_mod,
+        f2: c2,
+        f2_complement: c2_mod,
+        alpha_coeffs: Some(alpha_coeffs),
+    };
+    expect_decodes_to(
+        w,
+        want_op,
+        Predicate::Always,
+        Some((dest.bank, dest.index)),
+        [true; 4],
+        &[Want::reg(src1.0, src1.1), Want::reg(src2.0, src2.1)],
+        false,
+    )
+}
+
 /// Assemble a group-0xE8 MEMORY LOAD: `elements` consecutive 32-bit guest words from `src0 +
 /// offset1 + offset2` into `dest..dest+elements`.
 ///
@@ -2301,15 +2389,23 @@ pub fn ldmem(
         return Err(AsmError::RegIndex { bank: dest.bank, index: dest.index });
     }
     let (s0ext, s0sel) = match src0.0 {
-        Bank::Temp => (0u64, 0u64),
+        Bank::Temp | Bank::Internal => (0u64, 0u64),
         Bank::PrimaryAttr => (0, 1),
         Bank::Output => (1, 0),
         Bank::SecondaryAttr => (1, 1),
         other => return Err(AsmError::SrcBank { which: 0, bank: other }),
     };
-    if src0.1 > 0x7f {
+    // An internal register is the `r` row's field 124..127; a temp may not name that range.
+    let src0_n = if src0.0 == Bank::Internal {
+        if !src0.1.is_multiple_of(4) || src0.1 / 4 > 3 {
+            return Err(AsmError::RegIndex { bank: src0.0, index: src0.1 });
+        }
+        124 + src0.1 / 4
+    } else if src0.1 > 0x7f || (src0.0 == Bank::Temp && src0.1 >= 124) {
         return Err(AsmError::RegIndex { bank: src0.0, index: src0.1 });
-    }
+    } else {
+        src0.1
+    };
     let mut w = 0u64;
     put(&mut w, 63, 59, 0x1d, "opcode")?;
     put(&mut w, 47, 44, u64::from(elements - 1), "mask_count")?;
@@ -2317,7 +2413,7 @@ pub fn ldmem(
     put(&mut w, 27, 21, u64::from(dest.index), "dest_n")?;
     put(&mut w, 50, 50, s0ext, "src0_ext")?;
     put(&mut w, 34, 34, s0sel, "src0_bank")?;
-    put(&mut w, 20, 14, u64::from(src0.1), "src0_n")?;
+    put(&mut w, 20, 14, u64::from(src0_n), "src0_n")?;
     let mut imm = 0u32;
     let mut regs = vec![Want::reg(src0.0, src0.1)];
     for (src, (ext_bit, sel_hi, n_hi)) in [(offset1, (49u32, 31u32, 13u32)), (offset2, (48, 29, 6))] {

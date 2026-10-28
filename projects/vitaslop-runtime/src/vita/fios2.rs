@@ -310,11 +310,17 @@ const RESOLVE_OUT_PATH: u32 = 0;
 const RESOLVE_OUT_LEN: u32 = 4;
 const RESOLVE_RANGE_ORDERS: u32 = 8;
 
-/// Write a resolved path into the caller's buffer, NUL-terminated and bounded.
-/// Returns the errno, or 0.
+/// Write a resolved path into the buffer an args block names, NUL-terminated and
+/// bounded. Returns the errno, or 0.
 fn write_resolved(ctx: &mut GuestCtx, args: u32, resolved: &str) -> i32 {
     let out = ctx.read_u32(args + RESOLVE_OUT_PATH);
-    let max = ctx.read_u32(args + RESOLVE_OUT_LEN) as usize;
+    let max = ctx.read_u32(args + RESOLVE_OUT_LEN);
+    write_resolved_to(ctx, out, max, resolved)
+}
+
+/// Write a resolved path into `out` (`max` bytes, 0 = unstated), NUL-terminated.
+fn write_resolved_to(ctx: &mut GuestCtx, out: u32, max: u32, resolved: &str) -> i32 {
+    let max = max as usize;
     // A caller that passes no length still passes a buffer; the overlay path size is
     // the interface's own bound and the only defensible cap in that case.
     let max = if max == 0 {
@@ -396,6 +402,67 @@ pub(super) fn overlay_resolve_with_range_sync(
         let resolved = st.fios_resolve(&path, min_order, max_order);
         st.journal(|| format!("fios resolve [{min_order}..{max_order}] {path:?} -> {resolved:?}"));
         write_resolved(ctx, args.addr(), &resolved)
+    }
+}
+
+/// int sceFiosOverlayResolveSync02(SceUID pid, int resolve_flag, const char *in_path,
+///     char *out_path, SceSize max_path)
+/// int sceFiosOverlayResolveWithRangeSync02(SceUID pid, int resolve_flag,
+///     const char *in_path, char *out_path, SceSize max_path, SceUInt8 min_order,
+///     SceUInt8 max_order)
+///
+/// The user library's `...02` spellings take the output buffer, its size and the order
+/// bounds as FLAT arguments, not the syscall's args block - the newer shipped
+/// `libfios2.suprx` builds that import them (the older ones call the kernel names above)
+/// pass them so: its wrapper for the range form loads the fifth argument and the two
+/// stack bytes it zero-extends straight into the call, and the caller's `r3` points at
+/// the path buffer it then opens. Read as an args block, `r3` handed this layer the
+/// first bytes of the caller's (uninitialised) output buffer as an out pointer and a
+/// length of zero, and the title opened whatever stack byte was left behind.
+///
+/// No shipped library seen imports `sceFiosOverlayResolveSync02`; its form is the range
+/// form's without the two bounds, the same relation the kernel pair has.
+#[hostcall]
+pub(super) fn overlay_resolve_sync02(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    pid: i32,
+    _resolve_flag: i32,
+    in_path: Ptr,
+    out_path: Ptr,
+    max_path: u32,
+) -> i32 {
+    if !is_own_process(pid) || in_path.is_null() || out_path.is_null() {
+        EINVAL
+    } else {
+        let path = read_cstr(ctx, in_path.addr());
+        let resolved = st.fios_resolve(&path, ORDER_MIN, ORDER_MAX);
+        st.journal(|| format!("fios resolve02 {path:?} -> {resolved:?}"));
+        write_resolved_to(ctx, out_path.addr(), max_path, &resolved)
+    }
+}
+
+#[hostcall]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn overlay_resolve_with_range_sync02(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    pid: i32,
+    _resolve_flag: i32,
+    in_path: Ptr,
+    out_path: Ptr,
+    max_path: u32,
+    min_order: u32,
+    max_order: u32,
+) -> i32 {
+    if !is_own_process(pid) || in_path.is_null() || out_path.is_null() {
+        EINVAL
+    } else {
+        let (min_order, max_order) = (min_order as u8, max_order as u8);
+        let path = read_cstr(ctx, in_path.addr());
+        let resolved = st.fios_resolve(&path, min_order, max_order);
+        st.journal(|| format!("fios resolve02 [{min_order}..{max_order}] {path:?} -> {resolved:?}"));
+        write_resolved_to(ctx, out_path.addr(), max_path, &resolved)
     }
 }
 

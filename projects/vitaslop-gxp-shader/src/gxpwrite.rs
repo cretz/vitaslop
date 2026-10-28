@@ -576,6 +576,34 @@ mod tests {
     use crate::ir::Bank;
     use crate::usse::asm::{self, Dest, Src};
 
+    /// A program with no container 14 whose +0x78 table hands buffer 14's address to a DATA
+    /// slot keeps the whole default buffer in MEMORY: none of it is copied into the SA file, so
+    /// the binding carries nothing and the DATA registers (pointer and literals) are left alone.
+    /// The same program WITHOUT the entry keeps the old reading - the buffer at sa[0].
+    #[test]
+    fn a_default_buffer_reached_only_by_pointer_is_not_in_the_sa_file() {
+        let code = vec![
+            asm::mov(false, Dest::new(Bank::Output, 0), [true; 4], Src::reg(Bank::PrimaryAttr, 0))
+                .unwrap(),
+        ];
+        let spec = || {
+            ProgramSpec::vertex(code.clone())
+                .with_parameters(vec![
+                    ParamSpec::attribute("pos", 0, 4),
+                    ParamSpec::uniform("rows", 0, 4).array(120),
+                ])
+                .with_literals(vec![(3, 0x3f80_0000), (6, 0x4080_0000)])
+                .with_containers(vec![ContainerSpec { index: 19, base_sa: 0, size_regs: 8 }])
+                .with_default_uniform_regs(480)
+                .with_registers(16, 10, 8)
+        };
+        let by_pointer = Program::parse(&write(&spec().with_ub_bindings(vec![(14, 2)]))).unwrap();
+        assert_eq!(by_pointer.default_uniform_sa_span(), (0, 0));
+        assert_eq!(by_pointer.sa_carried_extent(), 0);
+        let copied = Program::parse(&write(&spec())).unwrap();
+        assert_eq!(copied.default_uniform_sa_span(), (0, 480));
+    }
+
     /// Everything the writer states must come back out of the READER, field for field. This is
     /// the test that makes the writer usable as a test fixture at all: a blob whose parameter
     /// table or whose code extent came back different would silently build every later case on
