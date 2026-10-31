@@ -417,6 +417,18 @@ impl NetState {
         }
     }
 
+    /// Drop every header named `name` (case-insensitive, as HTTP names are) from object `id`;
+    /// false when `id` names no live object.
+    pub(super) fn http_remove_header(&mut self, id: i32, name: &str) -> bool {
+        match self.http_object_mut(id) {
+            Some(o) => {
+                o.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(super) fn http_report(&self) -> Vec<String> {
         self.http_objects
             .iter()

@@ -195,6 +195,18 @@ pub mod off {
     /// that samples one was dropped for want of a binding. Appended last, like every field
     /// added after the original layout.
     pub const VERTEX_TEXTURES: u32 = BACK_STENCIL_REF + 4;
+    /// `sceGxmSetBackDepthBias(context, factor, units)` - the two-sided counterpart of
+    /// [`FRONT_DEPTH_BIAS_FACTOR`], as signed words. Appended after the vertex sampler array,
+    /// like every field added after the original layout.
+    pub const BACK_DEPTH_BIAS_FACTOR: u32 = VERTEX_TEXTURES + super::TEXTURE_ARRAY_BYTES;
+    pub const BACK_DEPTH_BIAS_UNITS: u32 = BACK_DEPTH_BIAS_FACTOR + 4;
+    /// `sceGxmSetWClampEnable` (`SCE_GXM_WCLAMP_MODE_ENABLED` = 0x8000), `sceGxmSetWClampValue`
+    /// (the clamp as its f32 bit pattern) and `sceGxmSetWBufferEnable`
+    /// (`SCE_GXM_WBUFFER_ENABLED` = 0x4000). Appended last, like every field added after the
+    /// original layout.
+    pub const W_CLAMP_ENABLE: u32 = BACK_DEPTH_BIAS_UNITS + 4;
+    pub const W_CLAMP_VALUE: u32 = W_CLAMP_ENABLE + 4;
+    pub const W_BUFFER_ENABLE: u32 = W_CLAMP_VALUE + 4;
 }
 
 /// Word offsets WITHIN a `VERTEX_UNIFORM` / `FRAGMENT_UNIFORM` record. Both stages have
@@ -241,7 +253,7 @@ pub const MAX_UNIFORM_BUFFERS: usize = 14;
 
 /// Total bytes the block occupies. Every guest context must have at least this much host
 /// memory behind it.
-pub const BYTES: u32 = off::VERTEX_TEXTURES + TEXTURE_ARRAY_BYTES;
+pub const BYTES: u32 = off::W_BUFFER_ENABLE + 4;
 
 /// Bytes of one stage's sampler array ([`off::TEXTURES`], [`off::VERTEX_TEXTURES`]).
 pub const TEXTURE_ARRAY_BYTES: u32 = MAX_TEXTURE_UNITS as u32 * TEXTURE_STRIDE;
@@ -944,6 +956,11 @@ pub(crate) const SCALARS: &[(u32, &str)] = &[
     (off::FRONT_DEPTH_FUNC, "front_depth_func"),
     (off::FRONT_DEPTH_BIAS_FACTOR, "front_depth_bias_factor"),
     (off::FRONT_DEPTH_BIAS_UNITS, "front_depth_bias_units"),
+    (off::BACK_DEPTH_BIAS_FACTOR, "back_depth_bias_factor"),
+    (off::BACK_DEPTH_BIAS_UNITS, "back_depth_bias_units"),
+    (off::W_CLAMP_ENABLE, "w_clamp_enable"),
+    (off::W_CLAMP_VALUE, "w_clamp_value"),
+    (off::W_BUFFER_ENABLE, "w_buffer_enable"),
     (off::BACK_DEPTH_FUNC, "back_depth_func"),
     (off::FRONT_DEPTH_WRITE, "front_depth_write"),
     (off::BACK_DEPTH_WRITE, "back_depth_write"),

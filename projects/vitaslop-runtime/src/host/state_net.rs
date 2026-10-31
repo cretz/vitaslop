@@ -205,6 +205,10 @@ impl VitaState {
         self.net.http_add_header(id, name, value)
     }
 
+    pub fn http_remove_header(&mut self, id: i32, name: &str) -> bool {
+        self.net.http_remove_header(id, name)
+    }
+
     /// One line per live SceHttp object, for a shutdown report or a trace: the graph
     /// the title built, and what it asked for over it.
     #[inline]

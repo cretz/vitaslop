@@ -305,12 +305,28 @@ impl Module {
                 reloc::code::V4BX => {}
                 reloc::code::THM_MOVW_ABS_NC => {
                     patch_thumb_mov(&mut data.data, off, (target & 0xFFFF) as u16)?;
+                    if target & 1 == 1 && in_exec(target & !1) {
+                        code_pointers.push(target & !1);
+                    }
                 }
                 reloc::code::THM_MOVT_ABS => {
                     patch_thumb_mov(&mut data.data, off, (target >> 16) as u16)?;
                 }
+                // >>> A `MOVW`/`MOVT` PAIR IS HOW ARM-STATE CODE TAKES A FUNCTION'S ADDRESS, and
+                // the relocation names the whole of it. A callback handed to a library in
+                // ARM-state code (an allocator, a reader, a protected-call body) is built this
+                // way and never called directly, so no other seed finds it - it was translated
+                // only when first reached. The low half's relocation carries the full target;
+                // an even one inside an executable segment is an ARM function pointer. Only the
+                // ARM encoding is taken this way: Thumb code materializes its string addresses
+                // in that segment just as often, and its function pointers are odd.
                 reloc::code::MOVW_ABS_NC => {
                     patch_arm_mov(&mut data.data, off, (target & 0xFFFF) as u16)?;
+                    if target & 1 == 1 && in_exec(target & !1) {
+                        code_pointers.push(target & !1);
+                    } else if target != 0 && in_exec(target) {
+                        arm_code_pointers.push(target);
+                    }
                 }
                 reloc::code::MOVT_ABS => {
                     patch_arm_mov(&mut data.data, off, (target >> 16) as u16)?;

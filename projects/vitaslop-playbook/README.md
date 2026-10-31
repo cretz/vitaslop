@@ -52,6 +52,7 @@ The title id each playbook directory is named by, and the game it is. The test
 | `best-effort/PCSA00011` | Gravity Rush |
 | `best-effort/PCSA00017` | LittleBigPlanet |
 | `best-effort/PCSA00107` | Killzone: Mercenary |
+| `best-effort/PCSA00134` | Helldivers |
 | `best-effort/PCSE00034` | Mutant Blobs Attack |
 | `best-effort/PCSE00003` | Virtua Tennis 4 |
 | `best-effort/PCSE00050` | Zen Pinball 2 |

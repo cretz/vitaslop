@@ -2,8 +2,8 @@
 -- "There is no saved data" notice with CROSS, open Single Player, start a New Game on Normal, sit
 -- through the opening movie and the fire-truck ride, and at the first objective ("Break Door - press
 -- R to swing your axe") break the power station's door and walk into the burning building.
--- last verified: 2026-10-25, uncommitted next-work tree (desktop headless SMP, every frame rendered;
--- shots viewed: menus with text, the street and fire truck, the door, the axe, the interior)
+-- last verified: 2026-10-28, uncommitted next-work tree (desktop headless SMP, DONE - control at
+-- f4637 on the HUD cue; shots viewed: the first objective, the door broken, the interior)
 --
 -- HOW THE CUES WERE FOUND: shots every 100-200 frames of exploratory runs. The front end is touch
 -- driven (every menu says "Select by using the screen"); positions are panel coordinates, twice the
@@ -15,9 +15,9 @@
 --   difficulty    Normal, the middle of three                (960, 602)
 --
 -- The title is cued on its orange logo (the first frames are the seizure warning and a publisher
--- card, whose white text an earlier cue matched). Everything after the title is timed: each screen
--- takes its touch as soon as it is drawn, and the opening movie and ride run to the first objective
--- by about 3000 frames after New Game.
+-- card, whose white text an earlier cue matched). The menus after the title are timed: each screen
+-- takes its touch as soon as it is drawn. The opening movie and ride are waited out on the in-game
+-- HUD's axe badge (below), ~3000 frames after New Game.
 
 local function tap_at(x, y, after)
   touch(x, y)
@@ -48,11 +48,28 @@ phase("new game", { timeout = 120 }, function()
   split("new game")
 end)
 
+-- The in-game HUD's axe badge (right edge): ~1,524 white pixels inside ~6,790 dark ones. The
+-- PAIR, each in a narrow band, is the cue - one movie frame has the white count (1,526) but only
+-- 5,426 dark. Measured on every shot of two runs (2026-10-28): the HUD reads 6,789-6,795.
+local axe_white = cue.pixels{ x = 850, y = 310, w = 100, h = 95, rgb = { 220, 220, 220 }, tol = 70 }
+local axe_dark = cue.pixels{ x = 850, y = 310, w = 100, h = 95, rgb = { 30, 30, 30 }, tol = 30 }
+local white_lo, white_hi = axe_white:above(1400), axe_white:below(1650)
+local dark_lo, dark_hi = axe_dark:above(6500), axe_dark:below(7100)
+
+local function hud_up()
+  return try_wait(white_lo, 0.3) and try_wait(white_hi, 0.01) and try_wait(dark_lo, 0.01)
+    and try_wait(dark_hi, 0.01)
+end
+
 phase("opening", { timeout = 300 }, function()
-  for i = 1, 15 do
-    idle(200)
-    if i % 3 == 0 then shot("opening-" .. i) end
-  end
+  -- The opening movie and the fire-truck ride do not skip: start (tap or hold), a front tap,
+  -- cross, circle, select and triangle were each tried mid-movie on 2026-10-28. So it is waited
+  -- out, and play starts the moment the HUD is drawn.
+  local n = 0
+  repeat
+    n = n + 1
+    if n % 200 == 0 then shot(string.format("opening-%02d", n // 200)) end
+  until hud_up()
   split("first objective")
   shot("break-door")
 end)

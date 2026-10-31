@@ -356,6 +356,14 @@ fn main() {
         for (a, b) in d.frag_mem_windows.iter() {
             let nonzero = b.iter().filter(|&&v| v != 0).count();
             println!("  fwindow {a:#x} {} B ({nonzero} nonzero)", b.len());
+            // A small one is a uniform buffer, and its values are the question.
+            if b.len() <= 1024 {
+                println!("    as f32: {}", floats(b));
+                println!(
+                    "    as f16: {}",
+                    b.chunks_exact(2).map(|c| format!("{:.4}", half_to_f32(u16::from_le_bytes([c[0], c[1]])))).collect::<Vec<_>>().join(" ")
+                );
+            }
         }
         println!("  uniforms (lanes 0..16): {:?}", &d.uniforms[..d.uniforms.len().min(16)]);
         for t in d.vertex_textures.iter() {

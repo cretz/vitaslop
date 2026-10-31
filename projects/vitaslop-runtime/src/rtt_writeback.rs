@@ -462,53 +462,57 @@ pub fn apply_one(
         report_writeback_unowned(addr, w, h);
         return false;
     }
+    let row_bytes = cols * bpp;
+    // >>> UNCHANGED SINCE THE GUEST SUBMITTED THE SCENE = THE GPU'S TO WRITE. On hardware the
+    // GPU writes the target when the scene runs, right after its submission, so the only bytes
+    // that may survive our write are ones the guest changed AFTER ending the scene. The checks
+    // below compare against OUR last write instead, and once the guest touched the memory a
+    // single time they refused every later frame for the rest of the run - MEASURED on a
+    // baseball title: its 32x32 exposure probe was dropped once, never written back again, and
+    // the auto-exposure loop read frozen bytes and washed every at-bat out. See
+    // [`note_scene_submitted`].
+    let (span, cur_hash, cur_uniform) = if whole_region_guard() {
+        let span = if rows == 0 { 0 } else { (rows - 1) * stride + row_bytes };
+        let cur = read(addr, span);
+        let (h, uniform) = region_hash(&cur, rows, stride, row_bytes);
+        (span, (cur.len() >= span).then_some(h), uniform)
+    } else {
+        (0, None, false)
+    };
+    let unchanged_since_submit = cur_hash.is_some_and(|h| {
+        submitted_hashes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&addr)
+            == Some(&(h, span))
+    });
     // >>> AND IT MUST STILL BE OURS. See `writeback_still_ours`: the latch above answers only
     // for the FIRST sight of an address, and a deferred write that lands after the title has
     // recycled a pooled target writes pixels over whatever the allocator has since put there.
     // The probe is the same 4096 bytes the latch read, so this costs one hash of one row.
     let fp_bytes = (cols * writeback_bytes_per_pixel(c.format).unwrap_or(4)).min(4096);
-    if fp_bytes > 0 && !writeback_still_ours(addr, &read(addr, fp_bytes), fp_bytes) {
-        report_writeback_recycled(addr, w, h);
+    if !unchanged_since_submit && fp_bytes > 0 && !writeback_still_ours(addr, &read(addr, fp_bytes), fp_bytes) {
+        report_writeback_recycled(addr, w, h, "first row differs from our last write");
         writeback_fingerprints()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&addr);
         return false;
     }
-    let row_bytes = cols * bpp;
     // The WHOLE region under the parallel scheduler - see [`set_whole_region_guard`].
-    if whole_region_guard() {
-        let span = if rows == 0 {
-            0
-        } else {
-            (rows - 1) * stride + row_bytes
-        };
-        let cur = read(addr, span);
-        let ok = cur.len() >= span && {
-            let mut h = FNV_BASIS;
-            let mut uniform = true;
-            let first = cur
-                .get(..4.min(row_bytes))
-                .map(<[u8]>::to_vec)
-                .unwrap_or_default();
-            for y in 0..rows {
-                let r = &cur[y * stride..y * stride + row_bytes];
-                h = fnv_extend(h, r);
-                uniform &= r.len().is_multiple_of(4)
-                    && first.len() == 4
-                    && r.chunks_exact(4).all(|w| w == first);
-            }
+    if whole_region_guard() && !unchanged_since_submit {
+        let ok = cur_hash.is_some_and(|h| {
             match region_hashes()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&addr)
             {
                 Some(&want) => h == want,
-                None => uniform,
+                None => cur_uniform,
             }
-        };
+        });
         if !ok {
-            report_writeback_recycled(addr, w, h);
+            report_writeback_recycled(addr, w, h, "whole region differs from our last write");
             writeback_fingerprints()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -738,6 +742,75 @@ mod whole_region_tests {
         TEST_WHOLE_REGION.with(|c| c.set(false));
     }
 
+    /// The baseball title's exposure probe: the guest writes into the target BEFORE submitting the
+    /// next scene into it (on hardware the GPU then overwrites those bytes), so that frame's
+    /// write-back must land - and keep landing on later frames, not latch a refusal for the run.
+    /// A write AFTER the submission is still the guest's.
+    #[test]
+    fn a_target_the_guest_wrote_before_resubmitting_is_written_back_again() {
+        TEST_WHOLE_REGION.with(|c| c.set(true));
+        let addr = 0x9f20_0000;
+        let mut mem = vec![0u8; 16 * 16 * 4];
+        assert!(write_back(&mut mem, addr, 0x35));
+        // The guest touches the target, THEN ends a scene into it.
+        mem[3 * 64..3 * 64 + 4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let snapshot = mem.clone();
+        note_scene_submitted(&[], &surface(addr), &mut |a, n| {
+            let o = (a - addr) as usize;
+            snapshot[o..(o + n).min(snapshot.len())].to_vec()
+        });
+        assert!(write_back(&mut mem, addr, 0x36), "unchanged since submission: the GPU's to write");
+        assert!(mem.iter().all(|&b| b == 0x36), "every byte is the scene's");
+        assert!(write_back(&mut mem, addr, 0x37), "and the next frame's lands too");
+        // A guest write AFTER the latest submission still wins.
+        mem[8 * 64..8 * 64 + 4].copy_from_slice(&0x8123_4567u32.to_le_bytes());
+        assert!(!write_back(&mut mem, addr, 0x38), "written after submission: the guest's");
+        TEST_WHOLE_REGION.with(|c| c.set(false));
+    }
+
+    /// A caller hands `apply_one` a SNAPSHOT of guest memory (the GPU-wait path cannot lend it
+    /// `ctx`), and under the guard that snapshot must cover the whole region, `probe_len` of it.
+    /// MEASURED on a baseball title: its GPU-wait path snapshotted 4096 bytes, so every target
+    /// over 4 KB - its 128x128 ambient probes - was refused at the very read the CPU then made,
+    /// and the stadium's first frame lit its ground map from the allocator's poison.
+    #[test]
+    fn a_target_over_four_kilobytes_is_written_back_from_a_probe_len_snapshot() {
+        TEST_WHOLE_REGION.with(|c| c.set(true));
+        let addr = 0x9f30_0000;
+        let c = ColorSurface { width: 64, height: 64, stride_pixels: 64, ..surface(addr) };
+        assert!(probe_len(64, 64, &c) >= 64 * 64 * 4, "the snapshot spans every row");
+        // The guest's own non-uniform bytes, there BEFORE it ends the scene (a first frame:
+        // never written back, and not a single repeated word either).
+        let mut mem: Vec<u8> = (0..64 * 64 * 4).map(|i| (i % 251) as u8).collect();
+        // Not a one-word fill, so the latch needs the address to have been ours before.
+        assert!(writeback_owns(addr, || true));
+        let submitted = mem.clone();
+        note_scene_submitted(&[], &c, &mut |a, n| {
+            let o = (a - addr) as usize;
+            submitted[o..(o + n).min(submitted.len())].to_vec()
+        });
+        let rgba = vec![0x44u8; 64 * 64 * 4];
+        let write = |mem: &mut Vec<u8>, len: usize| {
+            let snapshot = mem[..len.min(mem.len())].to_vec();
+            apply_one(
+                addr,
+                64,
+                64,
+                &rgba,
+                &c,
+                &mut |_, n| snapshot[..n.min(snapshot.len())].to_vec(),
+                &mut |a, b| {
+                    let o = (a - addr) as usize;
+                    mem[o..o + b.len()].copy_from_slice(b);
+                },
+            )
+        };
+        assert!(!write(&mut mem.clone(), 4096), "a 4 KB snapshot cannot vouch for 16 KB");
+        assert!(write(&mut mem, probe_len(64, 64, &c)), "unchanged since submission: the GPU's");
+        assert!(mem.iter().all(|&b| b == 0x44), "every byte is the scene's");
+        TEST_WHOLE_REGION.with(|c| c.set(false));
+    }
+
     /// The negative control: WITHOUT the guard the first-row fingerprint passes the same
     /// recycled region, and the write lands on the guest's pointer - the defect.
     #[test]
@@ -757,7 +830,13 @@ pub fn probe_len(w: u32, h: u32, c: &ColorSurface) -> usize {
     if !whole_region_guard() {
         return 4096;
     }
-    let bpp = writeback_bytes_per_pixel(c.format).unwrap_or(4);
+    // The width `apply_one` will write at: a float surface's own, not the 8-bit one.
+    let bpp = if vitaslop_platform::gpu::float_color_format(c.format) {
+        float_writeback_bytes_per_pixel(c.format)
+    } else {
+        writeback_bytes_per_pixel(c.format)
+    }
+    .unwrap_or(4);
     let stride = c.stride_pixels.max(w) as usize * bpp;
     let rows = h.min(c.height) as usize;
     let row_bytes = w.min(c.width) as usize * bpp;
@@ -774,6 +853,71 @@ fn region_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<u32, u
     static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u64>>> =
         std::sync::OnceLock::new();
     M.get_or_init(Default::default)
+}
+
+/// The whole-region hash of a small target's memory when the guest ENDED a scene into it, with
+/// the span it covers - see [`note_scene_submitted`].
+fn submitted_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<u32, (u64, usize)>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, (u64, usize)>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// The whole-region hash of `rows` rows of `row_bytes` at `stride` in `cur`, and whether every
+/// row is one repeated 4-byte word (memory nothing has written). `cur` shorter than the region
+/// hashes what it holds; the caller compares lengths.
+fn region_hash(cur: &[u8], rows: usize, stride: usize, row_bytes: usize) -> (u64, bool) {
+    let mut h = FNV_BASIS;
+    let mut uniform = true;
+    let first = cur.get(..4.min(row_bytes)).map(<[u8]>::to_vec).unwrap_or_default();
+    for y in 0..rows {
+        let Some(r) = cur.get(y * stride..y * stride + row_bytes) else { break };
+        h = fnv_extend(h, r);
+        uniform &= r.len().is_multiple_of(4) && first.len() == 4 && r.chunks_exact(4).all(|w| w == first);
+    }
+    (h, uniform)
+}
+
+/// Record what a small target's memory holds at the moment the guest ENDS a scene into it.
+///
+/// The write-back of that scene may then overwrite exactly those bytes: on hardware the GPU
+/// writes them when the scene runs, and only a byte the guest changes AFTER submitting survives
+/// the GPU's write. Without this record the write-back could only compare against its own last
+/// write, and a target the guest touched once between two of our writes was refused forever.
+/// Only under the parallel scheduler's whole-region guard, which is the check this feeds.
+///
+/// >>> A TARGET OVER THE CAP IS RECORDED OVER ITS WRITE-BACK REGION, the rectangle the frame's last
+/// draw painted ([`writeback_region`]) - that is the span its write-back checks, at the address it
+/// writes. MEASURED on a racer: a 1024x1024 target whose last draw paints ONE texel the CPU then
+/// polls before it starts a race; refused every frame, the race waited ~95 s of taps to begin.
+pub fn note_scene_submitted(scenes: &[Scene], c: &ColorSurface, read: &mut impl FnMut(u32, usize) -> Vec<u8>) {
+    if !whole_region_guard() {
+        return;
+    }
+    let cap = rtt_writeback_texels();
+    if cap == 0 || c.data_addr == 0 {
+        return;
+    }
+    let Some((_, _, rw, rh, at)) = writeback_region(scenes, c.data_addr, c.width, c.height, cap) else {
+        return;
+    };
+    let bpp = if vitaslop_platform::gpu::float_color_format(c.format) {
+        float_writeback_bytes_per_pixel(c.format)
+    } else {
+        writeback_bytes_per_pixel(c.format)
+    };
+    let Some(bpp) = bpp else { return };
+    let (rows, cols) = (rh as usize, rw as usize);
+    // The write-back's own stride: `apply_one` is handed the PARENT surface and takes its pitch.
+    let stride = c.stride_pixels.max(rw) as usize * bpp;
+    let row_bytes = cols * bpp;
+    let span = if rows == 0 { 0 } else { (rows - 1) * stride + row_bytes };
+    let cur = read(at, span);
+    if cur.len() < span {
+        return;
+    }
+    let (h, _) = region_hash(&cur, rows, stride, row_bytes);
+    submitted_hashes().lock().unwrap_or_else(|e| e.into_inner()).insert(at, (h, span));
 }
 
 const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1286,17 +1430,28 @@ fn writeback_remember(addr: u32, row: &[u8], n: usize) {
 /// At `warn`, unconditionally, because both readings need a fix and they are opposite ones: a
 /// target a CPU-reading title still wants has silently lost its pixels, or a target it has
 /// recycled is one we were about to corrupt.
-fn report_writeback_recycled(addr: u32, w: u32, h: u32) {
-    use std::collections::HashSet;
+///
+/// Again at the 10th, 100th and 1000th drop of the same address: once per address could not tell
+/// a single recycled block from a CPU-read probe refused EVERY frame, and the second is a title
+/// reading frozen pixels for the rest of the run. `why` names the check that refused it.
+fn report_writeback_recycled(addr: u32, w: u32, h: u32, why: &str) {
+    use std::collections::HashMap;
     use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    static SEEN: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert(addr) {
+    let n = {
+        let c = g.get_or_insert_with(HashMap::new).entry(addr).or_insert(0);
+        *c += 1;
+        *c
+    };
+    if !matches!(n, 1 | 10 | 100 | 1000) {
         return;
     }
+    let submitted = submitted_hashes().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&addr);
     tracing::warn!(
         target: "vitaslop::gxm",
-        "gxm rtt writeback: DROPPED the readback of {addr:#010x} ({w}x{h}) - the bytes there are          neither the uniform fill this address started as nor the row this module last wrote, so          something else owns that memory now and writing pixels over it would corrupt it. A          pooled render target handed back to the title's allocator between the GPU copy and the          map landing is how that happens."
+        "gxm rtt writeback: DROPPED the readback of {addr:#010x} ({w}x{h}) [drop #{n}, {why}, submission hash {}] - the bytes there are          neither the uniform fill this address started as nor the row this module last wrote, so          something else owns that memory now and writing pixels over it would corrupt it. A          pooled render target handed back to the title's allocator between the GPU copy and the          map landing is how that happens.",
+        if submitted { "recorded but CHANGED since" } else { "NONE" }
     );
 }
 

@@ -479,6 +479,17 @@ pub(super) fn dialog_get_status(ctx: &mut GuestCtx, st: &mut VitaState, family: 
     ctx.ret(status as u32);
 }
 
+/// SceBool sceCommonDialogIsRunning(void): whether any dialog family would report RUNNING to
+/// its own `GetStatus` now - see [`dialog_get_status`], whose rule this reads.
+pub(super) fn common_dialog_is_running(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let running = st.is_preemptive()
+        && (0..st.dialog_opened_flip.len()).any(|f| {
+            st.open_dialogs & (1 << f) != 0
+                && st.flip_count().saturating_sub(st.dialog_opened_flip[f]) < dialog_running_flips()
+        });
+    ctx.ret(u32::from(running));
+}
+
 /// `*DialogTerm`: close the family. Also the landing spot for the lifecycle
 /// helpers that need nothing from us (`Continue`/`Finish`/`SubClose`/`Abort`
 /// route to [`dialog_ok`]).

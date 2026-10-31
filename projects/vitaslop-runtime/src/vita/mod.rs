@@ -687,6 +687,7 @@ pub fn float_abi(func_nid: u32) -> bool {
     matches!(
         func_nid,
         gxm_nid::SET_VIEWPORT
+            | gxm_nid::SET_W_CLAMP_VALUE
             | gxm_nid::DEPTH_STENCIL_SURFACE_SET_BACKGROUND_DEPTH
             | gxm_nid::DEPTH_STENCIL_SURFACE_GET_BACKGROUND_DEPTH
             | ngs_nid::VOICE_PATCH_SET_VOLUME
@@ -709,7 +710,6 @@ fn stub_inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
             | n::VOICE_GET_PARAMS_OUT_OF_RANGE
             | n::SYSTEM_LOCK
             | n::SYSTEM_UNLOCK
-            | n::AT9_GET_SECTION_DETAILS
     );
     if is_stub {
         return Some(vitaslop_transpiler::InlineOp::RetConst { value: 0 });
@@ -960,6 +960,30 @@ pub(crate) fn texture_slot_writers_are_host_routed() -> (bool, bool) {
 fn no_inline_imports() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_IMPORTS"))
+}
+
+/// >>> EVERY SETTING THAT DECIDES WHICH IMPORTS ARE EMITTED INLINE, as a short token for a
+/// compiled-module cache key. These choices are made here at LINK time and baked into the
+/// module, so a cache named only by the transpiler's own settings served the INLINED module
+/// to a run that had switched an inline family off - MEASURED: a lightweight-mutex A/B
+/// loaded the cached module in 68 ms and measured the very form it meant to remove. Every
+/// reader the link consults belongs in this list; a new one that is missing makes its own
+/// A/B silently void on any cached boot.
+pub fn inline_settings_fingerprint() -> String {
+    let bits = [
+        no_inline_imports(),
+        no_inline_stubs(),
+        no_inline_delay(),
+        no_inline_clib(),
+        no_inline_reserve(),
+        no_inline_uniform_data(),
+        no_inline_lwmutex(),
+        no_inline_mutex(),
+        no_inline_texture(),
+        smp_lwmutex_inline(),
+    ];
+    let word = bits.iter().enumerate().fold(0u32, |w, (i, &b)| w | (u32::from(b) << i));
+    format!(";inline{word:x}")
 }
 
 /// Diagnostic call-site profiler (`VITASLOP_DBG_CALLSITES`): counts host calls
@@ -1978,6 +2002,8 @@ fn dispatch_inner(
         http_nid::URI_BUILD => cont!(http::uri_build(ctx, st)),
         http_nid::DELETE_CONNECTION => cont!(http::delete_connection(ctx, st)),
         http_nid::CREATE_REQUEST_WITH_URL => cont!(http::create_request_with_url(ctx, st)),
+        http_nid::CREATE_REQUEST_WITH_URL2 => cont!(http::create_request_with_url2(ctx, st)),
+        http_nid::CREATE_REQUEST2 => cont!(http::create_request2(ctx, st)),
         http_nid::DELETE_REQUEST => cont!(http::delete_request(ctx, st)),
         // The timeout slot is named by the ARM, not read from the guest: the three NIDs
         // differ only in which of the three values they set.
@@ -1990,6 +2016,7 @@ fn dispatch_inner(
         http_nid::SET_REQUEST_CONTENT_LENGTH => cont!(http::set_request_content_length(ctx, st)),
         http_nid::URI_ESCAPE => cont!(http::uri_escape(ctx, st)),
         http_nid::ADD_REQUEST_HEADER => cont!(http::add_request_header(ctx, st)),
+        http_nid::REMOVE_REQUEST_HEADER => cont!(http::remove_request_header(ctx, st)),
         http_nid::SEND_REQUEST => cont!(http::send_request(ctx, st)),
         http_nid::ABORT_REQUEST => cont!(http::abort_request(ctx, st)),
         http_nid::GET_STATUS_CODE => cont!(http::get_status_code(ctx, st)),
@@ -2411,6 +2438,10 @@ fn dispatch_inner(
         gxm_nid::SET_TWO_SIDED_ENABLE => cont!(gxm::set_two_sided_enable(ctx, st)),
         gxm_nid::SET_FRONT_DEPTH_FUNC => cont!(gxm::set_front_depth_func(ctx, st)),
         gxm_nid::SET_FRONT_DEPTH_BIAS => cont!(gxm::set_front_depth_bias(ctx, st)),
+        gxm_nid::SET_BACK_DEPTH_BIAS => cont!(gxm::set_back_depth_bias(ctx, st)),
+        gxm_nid::SET_W_CLAMP_ENABLE => cont!(gxm::set_w_clamp_enable(ctx, st)),
+        gxm_nid::SET_W_CLAMP_VALUE => cont!(gxm::set_w_clamp_value(ctx, st)),
+        gxm_nid::SET_W_BUFFER_ENABLE => cont!(gxm::set_w_buffer_enable(ctx, st)),
         gxm_nid::SET_BACK_DEPTH_FUNC => cont!(gxm::set_back_depth_func(ctx, st)),
         gxm_nid::SET_FRONT_DEPTH_WRITE_ENABLE => cont!(gxm::set_front_depth_write_enable(ctx, st)),
         gxm_nid::SET_FRONT_FRAGMENT_PROGRAM_ENABLE => {
@@ -2581,6 +2612,9 @@ fn dispatch_inner(
         sm_nid::GET_MODEL | sm_nid::GET_MODEL_FOR_CDIALOG => cont!(sysmem::get_model(ctx, st)),
         sm_nid::IS_PS_VITA_TV => cont!(sysmem::is_ps_vita_tv(ctx, st)),
         sm_nid::GET_FREE_MEMORY_SIZE => cont!(sysmem::get_free_memory_size(ctx, st)),
+        sm_nid::ALLOC_MEM_BLOCK_FOR_VM => cont!(sysmem::alloc_mem_block_for_vm(ctx, st)),
+        sm_nid::OPEN_VM_DOMAIN | sm_nid::CLOSE_VM_DOMAIN => cont!(sysmem::switch_vm_domain(ctx, st)),
+        sm_nid::SYNC_VM_DOMAIN => cont!(sysmem::sync_vm_domain(ctx, st)),
 
         // --- display ------------------------------------------------------------
         display_nid::SET_FRAME_BUF => cont!(display::set_frame_buf(ctx, st)),
@@ -2650,7 +2684,8 @@ fn dispatch_inner(
         | ngs_nid::VOICE_DEF_GET_SCREAM_VOICE
         | ngs_nid::VOICE_DEF_GET_TEMPLATE1
         | ngs_nid::VOICE_DEF_GET_ATRAC9_VOICE
-        | ngs_nid::VOICE_DEF_GET_SAS_EMU_VOICE => {
+        | ngs_nid::VOICE_DEF_GET_SAS_EMU_VOICE
+        | ngs_nid::VOICE_DEF_GET_ENVELOPE_BUSS => {
             // One blob per definition, keyed by the NID this call arrived on - the pointer
             // is the only thing a rack description says about what it is made of.
             let addr = ngs::voice_def_get_for(st, func_nid);
@@ -2661,7 +2696,7 @@ fn dispatch_inner(
         ngs_nid::VOICE_GET_OUTPUT_PATCH => cont!(ngs::voice_get_output_patch(ctx, st)),
         // The remaining NGS calls are state transitions / per-frame pumps that
         // succeed silently: update/flags/release, voice play/keyoff/kill/pause/
-        // resume, param unlock, callbacks, bypass, patch info, AT9 details,
+        // resume, param unlock, callbacks, bypass, patch info,
         // out-of-range query (0 = in range).
         ngs_nid::SYSTEM_UPDATE => cont!(ngs::system_update(ctx, st)),
         ngs_nid::VOICE_UNLOCK_PARAMS => cont!(ngs::voice_unlock_params(ctx, st)),
@@ -2673,14 +2708,20 @@ fn dispatch_inner(
         // Releasing a rack (or the whole system) stops its voices - see `ngs::rack_release`.
         ngs_nid::RACK_RELEASE => cont!(ngs::rack_release(ctx, st)),
         ngs_nid::SYSTEM_RELEASE => cont!(ngs::system_release(ctx, st)),
+        // The callback is where a parameter block that FAILS VALIDATION is reported. This NGS
+        // applies what it can read and never range-checks a block into an error, so there is
+        // nothing to deliver and registering succeeds. If validation is ever added, this is
+        // the callback it must call.
+        ngs_nid::SYSTEM_SET_PARAM_ERROR_CALLBACK => cont!(ctx.ret(0)),
         ngs_nid::SYSTEM_SET_FLAGS
         | ngs_nid::VOICE_BYPASS_MODULE
         | ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE
         // System lock/unlock guard the mix graph; single-thread-of-control here, so
         // there is no contention - both succeed immediately.
         | ngs_nid::SYSTEM_LOCK
-        | ngs_nid::SYSTEM_UNLOCK
-        | ngs_nid::AT9_GET_SECTION_DETAILS => cont!(ctx.ret(0)),
+        | ngs_nid::SYSTEM_UNLOCK => cont!(ctx.ret(0)),
+        // Where a run of samples lies in an ATRAC9 stream - see `ngs::at9_get_section_details`.
+        ngs_nid::AT9_GET_SECTION_DETAILS => cont!(ngs::at9_get_section_details(ctx, st)),
         // Sizes the title's volume matrix - see `ngs::patch_get_info`.
         ngs_nid::PATCH_GET_INFO => cont!(ngs::patch_get_info(ctx, st)),
         // Takes a patch out of the mix graph - see `ngs::patch_remove_routing`.
@@ -3521,6 +3562,7 @@ fn dispatch_inner(
         | sv_nid::MSG_DIALOG_CLOSE
         | sv_nid::SAVEDATA_DIALOG_ABORT => cont!(ctx.ret(0)),
         sv_nid::MSG_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::Msg)),
+        sv_nid::COMMON_DIALOG_IS_RUNNING => cont!(services::common_dialog_is_running(ctx, st)),
         sv_nid::MSG_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::Msg)),
         sv_nid::MSG_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::Msg)),
         sv_nid::NET_CHECK_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::NetCheck)),
@@ -3887,7 +3929,6 @@ mod frame_boundary_tests {
             ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE,
             ngs_nid::SYSTEM_LOCK,
             ngs_nid::SYSTEM_UNLOCK,
-            ngs_nid::AT9_GET_SECTION_DETAILS,
         ] {
             assert!(
                 super::stub_inline_op(nid_fn).is_some(),

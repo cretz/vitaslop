@@ -100,6 +100,7 @@ self.onmessage = async (e) => {
           funcAddrs: Uint32Array.from(m.funcAddrs),
           mirrorOff: m.mirrorOff,
           dirtyOff: m.dirtyOff,
+          runtimeOff: m.runtimeOff,
           readyMs,
           split: `transpile cache HIT: key+read ${Math.round(tRead - tKey)} ms, browser wasm compile ${Math.round(tComp - tRead)} ms, wasm ${Math.round(hit.wasm.length / 1024)} KB`,
         };
@@ -155,6 +156,7 @@ self.onmessage = async (e) => {
           memPages: built.memPages,
           mirrorOff: built.mirrorOff,
           dirtyOff: built.dirtyOff,
+          runtimeOff: built.runtimeOff,
           funcAddrs: Array.from(built.funcAddrs),
         }, variant);
         built.split = `transpile cache MISS (${invalidated}), stored in ${Math.round(performance.now() - tStore)} ms; ${built.split}`;

@@ -1261,6 +1261,16 @@ pub(crate) fn dest_geom_bounds_enabled() -> bool {
     *CELL.get_or_init(|| crate::knobs::var("VITASLOP_GXM_DEST_GEOM").map(|v| v.trim() != "0").unwrap_or(true))
 }
 
+/// `VITASLOP_GXM_DEST_GEOM_SLICE=0`: interpret a draw's WHOLE vertex program for its footprint,
+/// as before, instead of only the instructions that reach its position
+/// (`vitaslop_gxp_shader::module::output_slice`). The arm back; both arms must be bit-identical.
+#[cfg(feature = "gpu")]
+pub(crate) fn dest_geom_slice_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| crate::knobs::var("VITASLOP_GXM_DEST_GEOM_SLICE").map(|v| v.trim() != "0").unwrap_or(true))
+}
+
 /// `VITASLOP_GXM_DEST_GEOM_GATE=0`: ask for vertex footprints in every pass, every frame, with
 /// no CPU budget - the arm back from the per-pass profitability gate (`gxm::DestGeomGate`). The
 /// gate only decides how much CPU is spent proving copies shareable; every arm is bit-identical.
@@ -3064,6 +3074,7 @@ pub(crate) fn subrect_held_sampling() -> bool {
 /// whose first pass samples three windows of the previous frame's post-process atlas into a
 /// temporal history strip) feed a chain that is not yet right live - with them on the first-person
 /// weapon bleaches white with a bright fringe. Turn it on by default once that chain renders right.
+#[cfg(feature = "gpu")]
 pub(crate) fn subrect_held_interior() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -3086,6 +3097,16 @@ pub(crate) fn self_window_sampling() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::knobs::var("VITASLOP_RTT_SELF_WINDOW").map(|v| v.trim() != "0").unwrap_or(true))
+}
+
+/// Whether a self window lying under its reader's own pixels is filled from the attachment as
+/// the pass found it (the tile GPU's answer) rather than as the earlier draws left it - see the
+/// self-window block in `encode_chain`. `VITASLOP_RTT_SELF_WINDOW_SCENE_START=0` is the arm back.
+#[cfg(feature = "gpu")]
+pub(crate) fn self_window_scene_start() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_RTT_SELF_WINDOW_SCENE_START").map(|v| v.trim() != "0").unwrap_or(true))
 }
 
 /// Say, once per address, why a sampler naming an address inside a rendered target was NOT

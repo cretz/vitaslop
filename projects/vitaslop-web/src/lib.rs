@@ -4652,6 +4652,10 @@ struct Prebuilt {
     /// The guest region offset the module was emitted for (`Program::host_off`); 0 for a
     /// memory of its own. The run worker refuses a module built for another offset.
     host_off: u32,
+    /// Layout offset of the runtime entry table, for code found at run time - see
+    /// `vitaslop_runtime::runtime_code`. `None` from a worker that did not send it, which
+    /// leaves a dispatch miss the loud trap it was.
+    runtime_off: Option<u64>,
 }
 
 impl Prebuilt {
@@ -4696,7 +4700,8 @@ impl Prebuilt {
         let host_off = get("hostOff")?
             .as_f64()
             .ok_or_else(|| JsValue::from_str("prebuilt.hostOff missing"))? as u32;
-        Ok(Some(Prebuilt { module, mem_pages, mirror_off, dirty_off, func_addrs, host_off }))
+        let runtime_off = get("runtimeOff")?.as_f64().map(|v| v as u64);
+        Ok(Some(Prebuilt { module, mem_pages, mirror_off, dirty_off, func_addrs, host_off, runtime_off }))
     }
 }
 
@@ -4706,6 +4711,8 @@ struct Transpiled {
     mem_pages: u32,
     mirror_off: Option<u64>,
     dirty_off: Option<u64>,
+    /// Layout offset of the runtime entry table - see `vitaslop_runtime::runtime_code`.
+    runtime_off: u64,
     ms: f64,
     /// Guest address of each transpiled function - see [`Prebuilt::func_addrs`].
     func_addrs: Vec<u32>,
@@ -4763,6 +4770,17 @@ fn configure_transpiler() {
     // fix, `emit::dirty_mark_tested`). `=0` is the arm back to the unconditional store.
     vitaslop_transpiler::set_dirty_mark_tested(!matches!(
         vitaslop_runtime::knobs::var("VITASLOP_DIRTY_MARK_TEST").as_deref(),
+        Ok("0")
+    ));
+    // And the two control-flow forms code found at run time leans on: guest tail jumps as
+    // `return_call`, and following a return that does not land on its caller. Both on by
+    // default; `=0` is each one's arm back. Routed because a browser has no environment.
+    vitaslop_transpiler::set_tail_calls(!matches!(
+        vitaslop_runtime::knobs::var("VITASLOP_TAIL_CALLS").as_deref(),
+        Ok("0")
+    ));
+    vitaslop_transpiler::set_nonlocal_returns(!matches!(
+        vitaslop_runtime::knobs::var("VITASLOP_NONLOCAL_RETURNS").as_deref(),
         Ok("0")
     ));
     // Hand the engine-agnostic runtime this engine's clock, so its per-phase timers work
@@ -4883,9 +4901,37 @@ fn transpile_here(
         mem_pages: built.artifact.mem_pages,
         mirror_off: built.artifact.mirror_off,
         dirty_off: built.artifact.dirty_off,
+        runtime_off: built.artifact.runtime_off,
         ms,
         func_addrs,
     })
+}
+
+/// The record of code found at run time for this run (see `vitaslop_runtime::runtime_code`),
+/// made against the program the module was transpiled from, under this worker's transpile
+/// settings - the ones `configure_transpiler` selects, which named the module in the transpile
+/// cache - so a side module agrees with its main module about every offset.
+///
+/// `None`, and a dispatch miss the loud trap it was, when the module came without its entry
+/// table's offset, or when the guest has a memory of its own: the table is written from here,
+/// through this worker's memory, which is then not the guest's.
+fn runtime_code(
+    linked: &vitaslop_runtime::link::LinkedProgram,
+    host_off: u32,
+    func_addrs: Vec<u32>,
+    runtime_off: Option<u64>,
+) -> Option<std::sync::Arc<vitaslop_runtime::runtime_code::RuntimeCode>> {
+    let runtime_off = runtime_off?;
+    if host_off == 0 || func_addrs.is_empty() {
+        return None;
+    }
+    configure_transpiler();
+    Some(std::sync::Arc::new(vitaslop_runtime::runtime_code::RuntimeCode::new(
+        linked.shared_program_at(host_off).to_owned(),
+        func_addrs,
+        vitaslop_transpiler::EmitSettings::capture(),
+        runtime_off,
+    )))
 }
 
 /// Bytes reserved for the guest region inside the emulator's memory: the guest's own
@@ -4969,6 +5015,7 @@ pub async fn transpile_title(source: JsValue, host_off: u32) -> Result<JsValue, 
             None => JsValue::NULL,
         },
     )?;
+    js_sys::Reflect::set(&out, &JsValue::from_str("runtimeOff"), &JsValue::from_f64(built.runtime_off as f64))?;
     // The module's BYTES, for the transpile cache (transpile-worker.js stores them and drops
     // them before posting the result - they are tens of MB).
     js_sys::Reflect::set(&out, &JsValue::from_str("wasm"), &js_sys::Uint8Array::from(&built.wasm[..]))?;
@@ -4984,7 +5031,10 @@ pub async fn transpile_title(source: JsValue, host_off: u32) -> Result<JsValue, 
 pub fn transpile_settings_key() -> String {
     configure_transpiler();
     let mut s = 0xcbf2_9ce4_8422_2325u64;
-    for byte in vitaslop_transpiler::codegen_fingerprint().bytes() {
+    // The link's inline choices are baked into the module as well - see the runtime's
+    // `inline_settings_fingerprint` for the A/B that loaded the wrong module without them.
+    let settings = vitaslop_transpiler::codegen_fingerprint() + &vitaslop_runtime::vita::inline_settings_fingerprint();
+    for byte in settings.bytes() {
         s = (s ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{s:016x}")
@@ -5258,7 +5308,7 @@ async fn setup_game(
     //
     // Built in a throwaway worker instead, the peak dies with that worker and only the
     // compiled `WebAssembly.Module` crosses over (it is structured-cloneable).
-    let (module, mem_pages, mirror_off, dirty_off, host_off, transpile_ms) = match prebuilt {
+    let (module, mem_pages, mirror_off, dirty_off, host_off, transpile_ms, func_addrs, runtime_off) = match prebuilt {
         Some(p) => {
             logging::note(&format!(
                 "[setup] using a PREBUILT module (transpiled in a throwaway worker); \
@@ -5266,8 +5316,8 @@ async fn setup_game(
                 wasm_heap_mb(),
                 if p.host_off == 0 { "a memory of its own".to_string() } else { format!("inside the emulator's memory at {:#x}", p.host_off) }
             ));
-            browser_sched::record_function_addresses(p.func_addrs);
-            (p.module, p.mem_pages, p.mirror_off, p.dirty_off, p.host_off, 0.0)
+            browser_sched::record_function_addresses(p.func_addrs.clone());
+            (p.module, p.mem_pages, p.mirror_off, p.dirty_off, p.host_off, 0.0, p.func_addrs, p.runtime_off)
         }
         None => {
             // Transpiling here: reserve the region here too, so this path and the prebuilt
@@ -5275,9 +5325,11 @@ async fn setup_game(
             let host_off = reserve_guest_region()?;
             let built = transpile_here(&linked, &perf, host_off)?;
             let module = browser_sched::compile_module(&built.wasm).await?;
-            (module, built.mem_pages, built.mirror_off, built.dirty_off, host_off, built.ms)
+            let addrs = built.func_addrs;
+            (module, built.mem_pages, built.mirror_off, built.dirty_off, host_off, built.ms, addrs, Some(built.runtime_off))
         }
     };
+    let runtime = runtime_code(&linked, host_off, func_addrs, runtime_off);
 
     let main_sp = main_stack_top(linked.base, linked.mem_bytes);
     // `VITASLOP_SMP=1`: the guest's threads run in parallel on guest workers (`smp.rs`). The
@@ -5299,6 +5351,7 @@ async fn setup_game(
             main_sp,
             env,
             audio_ring,
+            runtime,
         )
         .await?
     } else {
@@ -5313,6 +5366,7 @@ async fn setup_game(
             &linked.module_inits,
             main_sp,
             env,
+            runtime,
         )?
     };
 

@@ -193,6 +193,58 @@ pub(super) fn create_request(
     }
 }
 
+/// The `SceHttpMethods` value of a method NAME, as the `2` request forms take it: the eight
+/// the enumeration has, spelled as HTTP spells them.
+fn method_named(ctx: &mut GuestCtx, method: Ptr) -> Option<i32> {
+    if method.is_null() {
+        return None;
+    }
+    const NAMES: [&str; 8] = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE", "CONNECT"];
+    let name = ctx.read_cstr(method.addr(), 16);
+    NAMES.iter().position(|n| *n == name).map(|i| i as i32)
+}
+
+/// int sceHttpCreateRequestWithURL2(int connId, const char *method, const char *url,
+///                                  unsigned long long contentLength)
+///
+/// [`create_request_with_url`] with the method named rather than numbered; one that is not an
+/// HTTP method the enumeration has is refused like an out-of-range number.
+#[hostcall]
+pub(super) fn create_request_with_url2(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    conn: i32,
+    method: Ptr,
+    url: Ptr,
+) -> i32 {
+    match method_named(ctx, method) {
+        _ if !st.http_is(conn, HttpKind::Connection) => SCE_HTTP_ERROR_INVALID_ID,
+        None => SCE_HTTP_ERROR_UNKNOWN_METHOD,
+        Some(_) if url.is_null() => SCE_HTTP_ERROR_INVALID_VALUE,
+        Some(method) => {
+            let url = ctx.read_cstr(url.addr(), LABEL_MAX);
+            st.http_create(HttpKind::Request, conn, &url, method)
+        }
+    }
+}
+
+/// int sceHttpCreateRequest2(int connId, const char *method, const char *path,
+///                           unsigned long long contentLength)
+///
+/// [`create_request`] with the method named - see [`create_request_with_url2`].
+#[hostcall]
+pub(super) fn create_request2(ctx: &mut GuestCtx, st: &mut VitaState, conn: i32, method: Ptr, path: Ptr) -> i32 {
+    match method_named(ctx, method) {
+        _ if !st.http_is(conn, HttpKind::Connection) => SCE_HTTP_ERROR_INVALID_ID,
+        None => SCE_HTTP_ERROR_UNKNOWN_METHOD,
+        Some(_) if path.is_null() => SCE_HTTP_ERROR_INVALID_VALUE,
+        Some(method) => {
+            let path = ctx.read_cstr(path.addr(), LABEL_MAX);
+            st.http_create(HttpKind::Request, conn, &path, method)
+        }
+    }
+}
+
 /// int sceHttpDeleteRequest(int reqId)
 #[hostcall]
 pub(super) fn delete_request(st: &mut VitaState, req: i32) -> i32 {
@@ -311,6 +363,21 @@ pub(super) fn add_request_header(
         } else {
             SCE_HTTP_ERROR_INVALID_ID
         }
+    }
+}
+
+/// int sceHttpRemoveRequestHeader(int id, const char *name)
+///
+/// Undoes [`add_request_header`] for every header of that name. Removing one that was never
+/// added is not reported as an error here: nothing documents what the library says then, and a
+/// title clearing an `Authorization` header before it re-adds one does exactly that.
+#[hostcall]
+pub(super) fn remove_request_header(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, name: Ptr) -> i32 {
+    if name.is_null() {
+        SCE_HTTP_ERROR_INVALID_VALUE
+    } else {
+        let name = ctx.read_cstr(name.addr(), LABEL_MAX);
+        if st.http_remove_header(id, &name) { 0 } else { SCE_HTTP_ERROR_INVALID_ID }
     }
 }
 

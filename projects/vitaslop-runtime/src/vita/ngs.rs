@@ -1092,6 +1092,69 @@ pub(super) fn patch_get_info(ctx: &mut GuestCtx, st: &mut VitaState, patch: u32,
     0
 }
 
+/// SceInt32 sceNgsAT9GetSectionDetails(SceInt32 startSample, SceInt32 numSamples,
+/// SceUInt32 configData, SceNgsAT9SkipBufferInfo *info) - which bytes of an ATRAC9 stream
+/// hold a run of samples, and how many samples to drop off each end.
+///
+/// >>> A TITLE READS ITS STREAM AT THE OFFSET THIS WRITES, AND THE STUB HANDED IT STACK.
+/// EVIDENCE, off one title's streaming reader: it calls this with the struct on its stack,
+/// then copies `numBytes` bytes from `buffer + startByte` into the voice's buffers and stores
+/// the two skips as one word in the player params. Stubbed to `ret(0)`, `startByte` was
+/// whatever the stack held (0xb5bdb000 once) and the copy faulted far outside guest memory.
+/// The same code pins the layout: two words at +0/+4, then two signed halves at +8/+10.
+///
+/// The section is whole superframes, the unit the decoder consumes: from the one holding
+/// `startSample` to the one holding the last sample, with the samples before the first and
+/// after the last as the two skips.
+#[hostcall]
+pub(super) fn at9_get_section_details(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    start: u32,
+    count: u32,
+    config: u32,
+    info: Ptr,
+) -> i32 {
+    let section = vitaslop_atrac9::CodecInfo::parse(config.to_le_bytes())
+        .ok()
+        .and_then(|geo| at9_section(geo, start as i32, count as i32));
+    match section {
+        Some(s) if !info.is_null() => {
+            ctx.write_u32(info.addr(), s.start_byte);
+            ctx.write_u32(info.addr() + 4, s.num_bytes);
+            ctx.write_u32(info.addr() + 8, s.start_skip as u16 as u32 | (s.end_skip as u16 as u32) << 16);
+            0
+        }
+        _ => SCE_NGS_ERROR_INVALID_PARAM,
+    }
+}
+
+/// [`at9_get_section_details`]'s answer, split out so it is testable without guest memory.
+#[derive(Debug, PartialEq)]
+struct At9Section {
+    start_byte: u32,
+    num_bytes: u32,
+    start_skip: i16,
+    end_skip: i16,
+}
+
+fn at9_section(geo: vitaslop_atrac9::CodecInfo, start: i32, count: i32) -> Option<At9Section> {
+    let sf_samples = i64::from(geo.frame_samples) * i64::from(geo.frames_in_superframe);
+    if start < 0 || count <= 0 || sf_samples <= 0 {
+        return None;
+    }
+    let (start, end) = (i64::from(start), i64::from(start) + i64::from(count));
+    let first = start / sf_samples;
+    let last = (end + sf_samples - 1) / sf_samples;
+    let sf_bytes = i64::from(geo.superframe_size);
+    Some(At9Section {
+        start_byte: u32::try_from(first * sf_bytes).ok()?,
+        num_bytes: u32::try_from((last - first) * sf_bytes).ok()?,
+        start_skip: i16::try_from(start - first * sf_samples).ok()?,
+        end_skip: i16::try_from(last * sf_samples - end).ok()?,
+    })
+}
+
 /// `(output channels, input channels)` of `patch`: its source voice's rack channels and its
 /// destination voice's. `None` for a patch or voice this engine did not see created.
 fn patch_channels(st: &VitaState, patch: u32) -> Option<(u32, u32)> {
@@ -1335,6 +1398,36 @@ fn report_block_layout_mismatch(size: u32, walked: u32, entries: u32) {
              {entries} entr(ies). The entry layout is REd from one title; the remainder \
              was NOT applied."
         );
+    }
+}
+
+#[cfg(test)]
+mod at9_section_tests {
+    use super::{at9_section, At9Section};
+
+    /// 48 kHz mono, 256-sample frames, 4 per 256-byte superframe: 1024 samples a superframe.
+    fn geo() -> vitaslop_atrac9::CodecInfo {
+        vitaslop_atrac9::CodecInfo::parse([0xFE, 0x70, 0x07, 0xF0]).unwrap()
+    }
+
+    #[test]
+    fn a_section_is_whole_superframes_with_the_overhang_as_skips() {
+        // Samples 1500..4000 lie in superframes 1..=3: bytes 256..1024, skip 476 + 96.
+        assert_eq!(
+            at9_section(geo(), 1500, 2500),
+            Some(At9Section { start_byte: 256, num_bytes: 768, start_skip: 476, end_skip: 96 })
+        );
+        // Aligned on both ends: no skips.
+        assert_eq!(
+            at9_section(geo(), 0, 2048),
+            Some(At9Section { start_byte: 0, num_bytes: 512, start_skip: 0, end_skip: 0 })
+        );
+    }
+
+    #[test]
+    fn an_empty_or_negative_run_is_refused() {
+        assert_eq!(at9_section(geo(), 0, 0), None);
+        assert_eq!(at9_section(geo(), -1, 10), None);
     }
 }
 

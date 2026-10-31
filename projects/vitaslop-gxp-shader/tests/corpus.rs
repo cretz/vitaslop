@@ -8822,3 +8822,91 @@ fn attribute_read_width_by_declared_type() {
         println!("{n:5}  {k:<45}  e.g. {ex}");
     }
 }
+
+/// >>> A VERTEX PROGRAM'S POSITION SLICE COMPUTES THE SAME POSITION, bit for bit.
+///
+/// `module::output_slice` keeps only what can reach the position (`o0..o3`), so the renderer's
+/// footprint interpretation can skip the rest of the program. This runs every vertex program of
+/// the corpus whole and sliced, from the same seeded registers, the same texture fetch and the
+/// same guest memory - each a function of its input, so a value that reaches the position through
+/// a fetch or a load is still exercised - and requires the four position registers to agree
+/// exactly. A program the whole run cannot interpret is skipped; one the slice refuses is counted.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn the_position_slice_computes_the_same_position() {
+    use vitaslop_gxp_shader::interp::{run_watching_for_nan_with_env, RegFile, TexLodArg};
+    let Some(dir) = corpus_dir() else {
+        println!("set VITASLOP_GXP_CORPUS to a directory of .gxp blobs");
+        return;
+    };
+    let (mut checked, mut refused, mut skipped, mut kept, mut total) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut wrong: Vec<String> = Vec::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        if program.kind != ProgramKind::Vertex {
+            continue;
+        }
+        let Ok(rc) = recompile_vertex(&bytes) else { continue };
+        let Some(slice) = vitaslop_gxp_shader::module::output_slice(&rc.shader, 0..4) else {
+            refused += 1;
+            continue;
+        };
+        let tex = |unit: u8, c: [f32; 4], _lod: TexLodArg| -> Option<[f32; 4]> {
+            let h = (c[0] * 37.0 + c[1] * 11.0 + unit as f32).sin();
+            Some([h, h * 0.5 + 0.25, c[2] * 0.125 + h, 0.75])
+        };
+        let mem = |addr: u32| -> u32 {
+            // A float of modest size, so loaded matrices transform rather than overflow.
+            let x = (addr.wrapping_mul(2_654_435_761) >> 8) as f32 / 16_777_216.0;
+            (x * 2.0 - 1.0).to_bits()
+        };
+        let mut same = true;
+        let mut ran = true;
+        for seed in 0..3u32 {
+            let fill = |f: &mut RegFile| {
+                let v = |i: usize, k: f32| ((i as f32 + 1.0) * k + seed as f32 * 0.37).sin();
+                for (i, x) in f.pa.iter_mut().enumerate() { *x = v(i, 0.031); }
+                for (i, x) in f.sa.iter_mut().enumerate() { *x = v(i, 0.027); }
+                for (i, x) in f.r.iter_mut().enumerate() { *x = v(i, 0.019); }
+                for (i, x) in f.i.iter_mut().enumerate() { *x = v(i, 0.023); }
+            };
+            let (mut a, mut b) = (RegFile::with_lanes(512), RegFile::with_lanes(512));
+            fill(&mut a);
+            fill(&mut b);
+            if run_watching_for_nan_with_env(&rc.shader, &mut a, &tex, Some(&mem)).is_err() {
+                ran = false;
+                break;
+            }
+            if let Err(e) = run_watching_for_nan_with_env(&slice, &mut b, &tex, Some(&mem)) {
+                wrong.push(format!("{name}: the slice did not run: {e:?}"));
+                same = false;
+                break;
+            }
+            for l in 0..4 {
+                if a.o[l].to_bits() != b.o[l].to_bits() {
+                    wrong.push(format!("{name} seed {seed}: o[{l}] {} vs sliced {}", a.o[l], b.o[l]));
+                    same = false;
+                }
+            }
+        }
+        if !ran {
+            skipped += 1;
+            continue;
+        }
+        checked += 1;
+        if same {
+            kept += slice.instrs.len();
+            total += rc.shader.instrs.len();
+        }
+    }
+    println!(
+        "position slice: {checked} programs checked, {} differ, {refused} not sliceable, {skipped} not interpretable; \
+         the slices keep {kept} of {total} instructions ({:.0}%)",
+        wrong.len(),
+        100.0 * kept as f64 / total.max(1) as f64
+    );
+    for w in &wrong {
+        println!("  {w}");
+    }
+    assert!(wrong.is_empty(), "{} position slices disagree with their whole program", wrong.len());
+}

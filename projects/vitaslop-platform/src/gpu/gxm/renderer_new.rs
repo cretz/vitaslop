@@ -642,6 +642,7 @@ impl GxmRenderer {
             rtt_pitch: HashMap::default(),
             subrect_keep: Vec::new(),
             subrect_free: HashMap::default(),
+            self_window_start: HashMap::default(),
             rtt_ever_rendered: HashSet::default(),
             rtt_raw: HashMap::default(),
             pass_shapes: HashMap::default(),

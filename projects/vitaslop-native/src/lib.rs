@@ -33,6 +33,10 @@ pub mod watchdog;
 
 pub mod perf;
 
+/// Code found at run time, translated on a dispatch miss - see the module docs.
+pub mod runtime_code;
+pub use runtime_code::{RuntimeCode, RuntimeStats};
+
 /// The disk backend for the guest's own saved state. The browser's is OPFS; both go
 /// through `vitaslop_runtime::gamedata`, which is the only thing that decides what a save
 /// contains.
@@ -106,6 +110,15 @@ struct Host {
     /// The instantiated module, so a host call can re-enter guest code (run a
     /// thread entry). Set once, right after instantiation.
     instance: Option<Instance>,
+    /// Code found at run time, and the linker a side module takes its host functions from -
+    /// see [`runtime_code`]. Set once, right after instantiation.
+    runtime: Option<(std::sync::Arc<RuntimeCode>, Linker<Host>)>,
+}
+
+impl Host {
+    fn new(base: u32, import_fn: SvcHandler) -> Host {
+        Host { output: Vec::new(), halted: false, base, import_fn, import_env: None, instance: None, runtime: None }
+    }
 }
 
 /// Errors running a program end to end.
@@ -249,17 +262,7 @@ impl Vm {
         let base = program.base;
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &artifact.wasm)?;
-        let mut store = Store::new(
-            &engine,
-            Host {
-                output: Vec::new(),
-                halted: false,
-                base,
-                import_fn: host_abi.import,
-                import_env: None,
-                instance: None,
-            },
-        );
+        let mut store = Store::new(&engine, Host::new(base, host_abi.import));
 
         let mut linker = Linker::new(&engine);
         bind_host(&mut linker, abi::SVC_NAME, host_abi.svc)?;
@@ -268,6 +271,7 @@ impl Vm {
         let instance = linker.instantiate(&mut store, &module)?;
         // Record the instance so an import handler can re-enter guest code.
         store.data_mut().instance = Some(instance);
+        store.data_mut().runtime = Some((runtime_code(&engine, program, &artifact), linker));
 
         let mut vm =
             Vm { store, instance, base, mirror_off: artifact.mirror_off, dirty_off: artifact.dirty_off };
@@ -310,7 +314,7 @@ impl Vm {
         mem_bytes: u32,
         host_abi: &HostAbi,
     ) -> Result<(Vm, Vec<u32>), RunError> {
-        let built = transpiler::transpile_lenient(&transpiler::Program {
+        let program = transpiler::Program {
             code,
             base,
             thumb,
@@ -325,25 +329,16 @@ impl Vm {
             mem_bytes,
             discover_code_pointers: true,
             import_memory: false,
-                host_off: 0,
-        });
+            host_off: 0,
+        };
+        let built = transpiler::transpile_lenient(&program);
 
         wasmparser::validate(&built.artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
 
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &built.artifact.wasm)?;
-        let mut store = Store::new(
-            &engine,
-            Host {
-                output: Vec::new(),
-                halted: false,
-                base,
-                import_fn: host_abi.import,
-                import_env: None,
-                instance: None,
-            },
-        );
+        let mut store = Store::new(&engine, Host::new(base, host_abi.import));
 
         let mut linker = Linker::new(&engine);
         bind_host(&mut linker, abi::SVC_NAME, host_abi.svc)?;
@@ -351,6 +346,7 @@ impl Vm {
         bind_dispatch_miss(&mut linker)?;
         let instance = linker.instantiate(&mut store, &module)?;
         store.data_mut().instance = Some(instance);
+        store.data_mut().runtime = Some((runtime_code(&engine, &program, &built.artifact), linker));
 
         let mut vm = Vm {
             store,
@@ -374,7 +370,8 @@ impl Vm {
         linked: &vitaslop_runtime::link::LinkedProgram,
         host_abi: &HostAbi,
     ) -> Result<(Vm, Vec<(u32, u32)>), RunError> {
-        let built = transpiler::transpile_lenient(&linked.program());
+        let program = linked.program();
+        let built = transpiler::transpile_lenient(&program);
         wasmparser::validate(&built.artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
         // This host has no scheduler, so nothing here can honour the host-mirror
@@ -394,17 +391,7 @@ impl Vm {
         let engine = Engine::new(Config::new().consume_fuel(true))
             .map_err(|e| RunError::Wasm(e.to_string()))?;
         let module = Module::from_binary(&engine, &built.artifact.wasm)?;
-        let mut store = Store::new(
-            &engine,
-            Host {
-                output: Vec::new(),
-                halted: false,
-                base: linked.base,
-                import_fn: host_abi.import,
-                import_env: None,
-                instance: None,
-            },
-        );
+        let mut store = Store::new(&engine, Host::new(linked.base, host_abi.import));
         store.set_fuel(u64::MAX).map_err(|e| RunError::Wasm(e.to_string()))?;
 
         let mut linker = Linker::new(&engine);
@@ -413,6 +400,7 @@ impl Vm {
         bind_dispatch_miss(&mut linker)?;
         let instance = linker.instantiate(&mut store, &module)?;
         store.data_mut().instance = Some(instance);
+        store.data_mut().runtime = Some((runtime_code(&engine, &program, &built.artifact), linker));
 
         // `from_linked` refused a mirror-inlining program above, so this is always None
         // here - carried rather than hardcoded so the refusal stays the single place that
@@ -567,6 +555,11 @@ impl Vm {
         }
     }
 
+    /// What this run has translated at run time - see [`runtime_code`].
+    pub fn runtime_stats(&self) -> RuntimeStats {
+        self.store.data().runtime.as_ref().map(|(r, _)| r.stats()).unwrap_or_default()
+    }
+
     fn memory(&mut self) -> wasmtime::Memory {
         self.instance
             .get_memory(&mut self.store, abi::MEMORY_EXPORT)
@@ -691,11 +684,30 @@ fn bind_dispatch_miss(linker: &mut Linker<Host>) -> Result<(), RunError> {
     linker.func_wrap(
         abi::IMPORT_MODULE,
         abi::DISPATCH_MISS_NAME,
-        move |_caller: Caller<'_, Host>, target: i32, caller: i32| -> Result<(), wasmtime::Error> {
-            Err(DispatchMiss { target: target as u32, caller: caller as u32 }.into())
+        move |mut caller: Caller<'_, Host>, target: i32, from: i32| -> Result<i32, wasmtime::Error> {
+            let Some((runtime, linker)) = caller.data().runtime.clone() else {
+                return Err(DispatchMiss { target: target as u32, caller: from as u32 }.into());
+            };
+            runtime_code::dispatch_miss(&mut caller, Some(&runtime), Some(&linker), target as u32, from as u32)
         },
     )?;
     Ok(())
+}
+
+/// The runtime-code record for a `Vm` over the module `artifact` made from `program` on this
+/// thread - so under this thread's emit settings, which are taken here.
+fn runtime_code(
+    engine: &Engine,
+    program: &transpiler::Program,
+    artifact: &transpiler::Artifact,
+) -> std::sync::Arc<RuntimeCode> {
+    std::sync::Arc::new(RuntimeCode::new(
+        engine,
+        program.to_owned(),
+        artifact.funcs.iter().map(|f| f.addr).collect(),
+        transpiler::EmitSettings::capture(),
+        artifact.runtime_off,
+    ))
 }
 
 /// Run the guest call the last dispatch of `selector` asked for, then dispatch it again -

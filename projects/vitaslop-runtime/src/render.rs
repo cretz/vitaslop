@@ -1590,6 +1590,18 @@ fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
 /// and the power-of-two padding a swizzled level's Morton order runs over. A second
 /// implementation of that addressing is exactly the kind of duplicate that drifts, and its
 /// failure mode is a texture read plausibly out of the wrong bytes.
+/// How many levels the GPU expansion builds for `t`: a full chain, EXCEPT for a texture the guest
+/// gave ONE level - the device has no level 1 for it and reads level 0 whatever the derivatives
+/// say. The same rule the CPU upload applies (`mips_for_texture` in the platform's GXM caches,
+/// whose comment carries the measurement); `VITASLOP_GXP_MIPS_GUEST_LEVELS=0` is the arm back
+/// for both.
+fn expanded_levels(t: &BoundTexture, w: u32, h: u32) -> u32 {
+    static GUEST_LEVELS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let rule = *GUEST_LEVELS
+        .get_or_init(|| crate::knobs::var("VITASLOP_GXP_MIPS_GUEST_LEVELS").ok().as_deref() != Some("0"));
+    if rule && t.levels <= 1 { 1 } else { max_mip_levels(w, h) }
+}
+
 pub fn raw_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpand> {
     // Byte-permutation formats only. These are the arms `decode_uncompressed_at` answers with a
     // bare `swizzle4(byte(0), byte(1), byte(2), byte(3), swizzle)` - the specials inside the
@@ -1653,7 +1665,7 @@ pub fn raw_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpa
         src: t.pixels.clone(),
         width: w,
         height: h,
-        levels: max_mip_levels(w, h),
+        levels: expanded_levels(t, w, h),
         swizzle: (t.swizzle >> 12) & 0x7,
         src_levels,
         codec: None,
@@ -1741,7 +1753,7 @@ pub fn block_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawEx
         src: t.pixels.clone(),
         width: w,
         height: h,
-        levels: max_mip_levels(w, h),
+        levels: expanded_levels(t, w, h),
         // Unused by the block decoder - see the refusal above.
         swizzle: 0,
         src_levels,

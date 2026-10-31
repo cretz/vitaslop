@@ -294,6 +294,44 @@ pub(crate) fn colour_precision_of(shader: &Shader) -> ColorPrecision {
     color_precision(shader, color_output(shader))
 }
 
+/// The PRIMARY-ATTRIBUTE register the colour is a plain copy of, when NO instruction of the
+/// program writes that register - i.e. the hardware filled it (an interpolant or a texture
+/// prefetch) before the program ran. `None` when the colour is computed, or copied from a
+/// register the program writes.
+///
+/// [`color_precision`] follows copies back to the instruction that built the value; a
+/// register no instruction builds ends that walk at the COPY, whose own width (32 bits, no
+/// half flag) then reads as F32 - which is wrong whenever the register holds packed halves.
+/// The program cannot say what the hardware put there; the interface (the interpolant that
+/// lands there) can, so the linker asks it. See `link`'s use.
+pub(crate) fn colour_copied_from_unwritten_pa(shader: &Shader) -> Option<u32> {
+    let (bank, base) = match color_output(shader) {
+        ColorOutput::NativeO0 => (Bank::Output, 0),
+        ColorOutput::NonNativePa(base) => (Bank::PrimaryAttr, base),
+    };
+    let writer_of = |bank: Bank, index: u32, before: usize| -> Option<(usize, &crate::ir::Instr)> {
+        shader.instrs[..before].iter().enumerate().rev().find(|(_, i)| {
+            i.dest.as_ref().is_some_and(|d| d.bank == bank && d.index as u32 == index && i.write_mask.iter().any(|&m| m))
+        })
+    };
+    let mut found = writer_of(bank, base, shader.instrs.len());
+    for _ in 0..8 {
+        let (at, i) = found?;
+        if !matches!(i.op, Op::Mov) || i.half_precision {
+            return None;
+        }
+        let src = i.srcs.first()?;
+        if !matches!(src.bank, Bank::PrimaryAttr | Bank::Temp | Bank::Internal | Bank::Output) {
+            return None;
+        }
+        match writer_of(src.bank, u32::from(src.index), at) {
+            Some(next) => found = Some(next),
+            None => return (src.bank == Bank::PrimaryAttr).then_some(u32::from(src.index)),
+        }
+    }
+    None
+}
+
 fn color_precision(shader: &Shader, color: ColorOutput) -> ColorPrecision {
     let (bank, base) = match color {
         ColorOutput::NativeO0 => (Bank::Output, 0),
@@ -1197,7 +1235,7 @@ fn cross_channel_gates(shader: &Shader, uniform_regs: u32, literals: &[(u32, u32
 
 /// Whether the destination read is declared at all - [`DEST_COLOR_READ`] AND the program.
 pub fn declares_dest_color(shader: &Shader) -> bool {
-    DEST_COLOR_READ.load(core::sync::atomic::Ordering::Relaxed) && reads_output_bank(shader)
+    DEST_COLOR_READ.load(core::sync::atomic::Ordering::Relaxed) && reads_output_bank_seed(shader)
 }
 
 /// Recognise a blend the fragment program performs ITSELF over the destination colour, rewrite
@@ -1655,6 +1693,109 @@ pub fn first_dest_reader(shader: &Shader) -> Option<usize> {
     None
 }
 
+/// The instructions of `shader` that can affect output registers `outs` (`o{n}`, whole), in
+/// their original order - or `None` when the program is not one this can slice.
+///
+/// # Why
+/// Placing a draw's footprint (the renderer's destination-copy coalescing) runs the VERTEX
+/// program on the reference interpreter over every vertex, and reads nothing back but the
+/// position. Most of a vertex program is everything else - normals, texture coordinates,
+/// colours, fog - so most of that interpretation computes values nobody reads. MEASURED on a
+/// shooter's world pass: 12 ms of CPU a frame to bound 103 draws, enough that the footprints
+/// could not pay for the copies they saved.
+///
+/// # Why the slice computes the same outputs, bit for bit
+/// It is a backward liveness walk, and every approximation in it errs toward KEEPING:
+/// - registers are whole `(bank, index)` pairs, never lanes;
+/// - an instruction is kept when ANY register it may write is live, and what it may write is
+///   over-counted (eight registers from its destination, more for a load that says so);
+/// - a kept instruction makes every register its operands may read live (four from each
+///   operand of the plain per-channel ops, eight for anything else), and its predicate;
+/// - a register stops being live only below an UNPREDICATED, plain, full-precision write that
+///   covers it - anything else may leave part of the old value standing, so it stays live;
+/// - stores, discards and depth writes are always kept.
+///
+/// What it does not try: a program with a BRANCH (a slice would need the control flow too), an
+/// indirectly addressed operand or an index-register load (which register is read is a
+/// run-time value), or local memory (a load reads what an earlier store left). Those return
+/// `None` and are interpreted whole, as before.
+pub fn output_slice(shader: &Shader, outs: std::ops::Range<u8>) -> Option<Shader> {
+    let key = |op: &Operand, k: u32| (bank_id(op.bank), u32::from(op.index) + k);
+    for i in &shader.instrs {
+        let indexed = |o: &Operand| matches!(o.bank, Bank::Indexed | Bank::Index | Bank::Raw(_));
+        if matches!(
+            i.op,
+            Op::Branch { .. } | Op::LocalLoad { .. } | Op::LocalStore { .. } | Op::LoadIndex { to_index: true, .. }
+        ) || i.srcs.iter().any(indexed)
+            || i.dest.as_ref().is_some_and(indexed)
+        {
+            return None;
+        }
+    }
+    let plain = |op: &Op| {
+        matches!(
+            op,
+            Op::Mad | Op::Mul | Op::Add | Op::Min | Op::Max | Op::Frc | Op::Dot { .. } | Op::Rcp | Op::Rsq | Op::Log | Op::Exp | Op::Mov
+        )
+    };
+    let mut live: std::collections::HashSet<(u8, u32)> = outs.map(|o| (bank_id(Bank::Output), u32::from(o))).collect();
+    let mut live_p = [false; 4];
+    let mut keep = vec![false; shader.instrs.len()];
+    for (ix, i) in shader.instrs.iter().enumerate().rev() {
+        if matches!(i.op, Op::Nop) {
+            continue;
+        }
+        let pred = match i.pred {
+            Predicate::Always => None,
+            Predicate::IfP(n) | Predicate::IfNotP(n) => Some((n & 3) as usize),
+            Predicate::Raw(_) => return None,
+        };
+        let side_effect = matches!(i.op, Op::MemStore { .. } | Op::Kill | Op::DepthF);
+        let writes_p = match i.op {
+            Op::Test { pdst, .. } => Some((pdst & 3) as usize),
+            _ => None,
+        };
+        let span = match i.op {
+            Op::MemLoad { elements, .. } => u32::from(elements).max(8),
+            _ => 8,
+        };
+        let writes_reg = !matches!(i.op, Op::Test { write_back: false, .. });
+        let hits_reg = writes_reg && i.dest.as_ref().is_some_and(|d| (0..span).any(|k| live.contains(&key(d, k))));
+        let hits_p = writes_p.is_some_and(|p| live_p[p]);
+        if !(side_effect || hits_reg || hits_p) {
+            continue;
+        }
+        keep[ix] = true;
+        // Kill what this instruction certainly overwrites whole, before adding what it reads.
+        if pred.is_none() {
+            if let Some(p) = writes_p {
+                live_p[p] = false;
+            }
+            if let Some(d) = i.dest.as_ref()
+                && plain(&i.op)
+                && crate::wgsl::Prec::of(i) == crate::wgsl::Prec::F32
+            {
+                for c in (0..4).filter(|&c| i.write_mask[c]) {
+                    live.remove(&key(d, c as u32));
+                }
+            }
+        }
+        if let Some(p) = pred {
+            live_p[p] = true;
+        }
+        let reach = if plain(&i.op) { 4 } else { 8 };
+        for s in &i.srcs {
+            for k in 0..reach {
+                live.insert(key(s, k));
+            }
+        }
+    }
+    Some(Shader {
+        kind: shader.kind,
+        instrs: shader.instrs.iter().zip(&keep).filter(|(_, k)| **k).map(|(i, _)| i.clone()).collect(),
+    })
+}
+
 /// A small local id per [`Bank`], so the taint sets key on something `Hash`/`Ord` without the
 /// IR growing those derives for one analysis's scratch.
 fn bank_id(b: Bank) -> u8 {
@@ -1696,6 +1837,126 @@ pub fn reads_output_bank(shader: &Shader) -> bool {
         !matches!(i.op, Op::Sop2 { .. })
             && i.srcs.iter().any(|s| s.bank == Bank::Output)
     })
+}
+
+/// Whether the DESTINATION colour seeded into the O bank can reach anything: [`reads_output_bank`]
+/// narrowed to the reads that come BEFORE the program's own writes of what they read.
+///
+/// # Why
+/// A compiler is free to use an output register as a scratch temporary - write a dot product
+/// into `o0.x`, normalise it with an `rsq`, then overwrite the whole colour at the end. Every
+/// read of the output bank in such a program reads a value the program itself put there, and
+/// the destination seed is dead. Counting it as a destination read costs a render-pass split
+/// and a copy of the whole attachment per draw. MEASURED on a deferred title's G-buffer pass:
+/// 154 of 156 draws were such readers - 189 splits and 373 MB of copies a frame, half a phone
+/// GPU's frame time.
+///
+/// # Why the answer is exact, not a guess
+/// It answers "no" only when it can PROVE the seed is dead, and then dropping the seed changes
+/// no bit of the output:
+/// - every output-bank read is of bytes an earlier instruction of this program definitely
+///   wrote - unpredicated, before any branch, and of an op whose store layout is the plain
+///   per-channel one (`wgsl::Prec::of`: a whole register per channel at F32, one half at F16,
+///   one byte at Fx8). Anything else writes nothing as far as this is concerned;
+/// - every register the seed fills (four at an F32 colour, two otherwise - which covers a
+///   64-bit colour's pair) is wholly written by the end, so none of the seed survives into
+///   the colour either.
+///
+/// Reads are the emitter's own: the plain ops and the float-to-integer pack read source channel
+/// `c` for each channel `Instr::read_channels` names (the write mask, or a dot product's
+/// `components`), through `Instr::source_register`; any other op is charged the whole
+/// four-register span of an output-bank operand, and an indirectly addressed operand
+/// anywhere keeps the conservative answer. Erring that way only keeps a split.
+pub fn reads_output_bank_seed(shader: &Shader) -> bool {
+    if !reads_output_bank(shader) {
+        return false;
+    }
+    if !dest_seed_liveness() {
+        return true;
+    }
+    let indexed = |o: &Operand| o.bank == Bank::Indexed;
+    if shader.instrs.iter().any(|i| i.srcs.iter().any(indexed) || i.dest.as_ref().is_some_and(indexed)) {
+        return true;
+    }
+    // The ops whose destination store is the plain per-channel one at `Prec::of`.
+    let plain = |op: &Op| {
+        matches!(
+            op,
+            Op::Mad
+                | Op::Mul
+                | Op::Add
+                | Op::Min
+                | Op::Max
+                | Op::Frc
+                | Op::Dot { .. }
+                | Op::Rcp
+                | Op::Rsq
+                | Op::Log
+                | Op::Exp
+                | Op::Mov
+                | Op::Pack { .. }
+                | Op::PackUnorm8 { .. }
+                | Op::CopyFx8
+        )
+    };
+    // The ops whose sources the emitter reads channel by channel at the source precision
+    // `source_register` models: the plain ones, and the float-to-integer pack (which stores its
+    // own packed layout, so it is not plain on the write side).
+    let read_plain = |op: &Op| plain(op) || matches!(op, Op::PackToInt { .. });
+    let mut written = vec![false; BANK_REGS * 4];
+    let all_written = |w: &[bool], bytes: std::ops::Range<usize>| bytes.clone().all(|b| w.get(b).copied().unwrap_or(false));
+    let mut straight = true;
+    for i in &shader.instrs {
+        // An instruction reads all of its sources before it writes, so reads go first.
+        if !matches!(i.op, Op::Sop2 { .. }) {
+            for s in i.srcs.iter().filter(|s| s.bank == Bank::Output) {
+                let base = s.index as usize;
+                let unwritten = if read_plain(&i.op) {
+                    let read = i.read_channels();
+                    (0..4).filter(|&c| read[c]).filter_map(|c| i.source_register(s, c)).any(|(reg, halves)| {
+                        let r = reg as usize * 4;
+                        !all_written(&written, r + halves.start * 2..r + halves.end * 2)
+                    })
+                } else {
+                    !all_written(&written, base * 4..(base + 4) * 4)
+                };
+                if unwritten {
+                    return true;
+                }
+            }
+        }
+        if matches!(i.op, Op::Branch { .. }) {
+            straight = false;
+        }
+        let Some(d) = i.dest.as_ref().filter(|d| d.bank == Bank::Output) else { continue };
+        if !straight || i.pred != Predicate::Always || !plain(&i.op) {
+            continue;
+        }
+        let base = d.index as usize;
+        for c in (0..4).filter(|&c| i.write_mask[c]) {
+            let bytes = match crate::wgsl::Prec::of(i) {
+                crate::wgsl::Prec::F32 => (base + c) * 4..(base + c) * 4 + 4,
+                crate::wgsl::Prec::F16 => (base + c / 2) * 4 + (c & 1) * 2..(base + c / 2) * 4 + (c & 1) * 2 + 2,
+                crate::wgsl::Prec::Fx8 => base * 4 + c..base * 4 + c + 1,
+            };
+            for b in bytes {
+                if let Some(w) = written.get_mut(b) {
+                    *w = true;
+                }
+            }
+        }
+    }
+    let seeded = if colour_precision_of(shader) == ColorPrecision::F32 { 4 } else { 2 };
+    !all_written(&written, 0..seeded * 4)
+}
+
+/// `VITASLOP_GXP_DEST_SEED_LIVE=0`: the arm back to [`reads_output_bank`] alone - every program
+/// that reads its output bank at all is given the destination copy, as before
+/// [`reads_output_bank_seed`] existed.
+fn dest_seed_liveness() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| std::env::var("VITASLOP_GXP_DEST_SEED_LIVE").map(|v| v.trim() != "0").unwrap_or(true))
 }
 
 /// The WGSL that seeds the O bank with the DESTINATION colour, for a program that reads it.
@@ -3785,6 +4046,46 @@ mod tests {
     fn half(mut i: Instr) -> Instr {
         i.half_precision = true;
         i
+    }
+
+    /// An output register used as SCRATCH - written, read back, then the whole colour written -
+    /// never sees the destination, so it costs no copy; every way the seed could still reach
+    /// something keeps the copy. See [`reads_output_bank_seed`].
+    #[test]
+    fn an_output_register_used_as_scratch_does_not_read_the_destination() {
+        let o = |swizzle| Operand { swizzle, ..Operand::plain(Bank::Output, 0, 1) };
+        let pa = || Operand::plain(Bank::PrimaryAttr, 0, 2);
+        let pa4 = || Operand::plain(Bank::PrimaryAttr, 4, 2);
+        // `o0.x = dot(pa, pa); pa4.x = rsq(o0.x); o0..o1 = pa` - the normalise shape a G-buffer
+        // program was measured to compile to.
+        let scratch = |dot: Instr, last_mask| {
+            shader(vec![
+                dot,
+                half(instr(Op::Rsq, Some(pa4()), vec![o([0, 0, 0, 0])], [true, false, false, false])),
+                half(instr(Op::Mov, Some(o([0, 1, 2, 3])), vec![pa()], last_mask)),
+            ])
+        };
+        let dot = || half(instr(Op::Dot { components: 3 }, Some(o([0, 1, 2, 3])), vec![pa(), pa()], [true, false, false, false]));
+        let sh = scratch(dot(), [true; 4]);
+        assert!(reads_output_bank(&sh), "it does source the output bank");
+        assert!(!reads_output_bank_seed(&sh), "but only what it wrote itself");
+
+        // The colour's second register is never written: the seed survives into the colour.
+        assert!(reads_output_bank_seed(&scratch(dot(), [true, true, false, false])));
+        // A PREDICATED write may not happen, so the read after it may see the seed.
+        let mut pred = dot();
+        pred.pred = Predicate::IfP(0);
+        assert!(reads_output_bank_seed(&scratch(pred, [true; 4])));
+        // Past a BRANCH, straight-line order is not execution order.
+        let mut branched = scratch(dot(), [true; 4]);
+        branched.instrs.insert(0, instr(Op::Branch { rel: 2 }, None, vec![], [false; 4]));
+        assert!(reads_output_bank_seed(&branched));
+        // A read BEFORE any write is the destination, as a blend reads it.
+        let blend = shader(vec![
+            half(instr(Op::Mad, Some(pa4()), vec![pa(), pa(), o([0, 1, 2, 3])], [true; 4])),
+            half(instr(Op::Mov, Some(o([0, 1, 2, 3])), vec![pa4()], [true; 4])),
+        ]);
+        assert!(reads_output_bank_seed(&blend));
     }
 
     /// A source-over lerp written longhand IS a blend, and recovering it as pipeline state is

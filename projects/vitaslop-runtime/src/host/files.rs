@@ -124,6 +124,9 @@ pub(super) struct OpenFile {
     pub(super) cursor: usize,
     pub(super) readable: bool,
     pub(super) writable: bool,
+    /// The console device (`tty0:`): writes are the captured console stream, reads find
+    /// nothing, and it has no bytes of its own.
+    pub(super) console: bool,
 }
 
 /// Serves file bytes the host never loaded into memory.
@@ -761,6 +764,25 @@ impl FileTable {
                 cursor,
                 readable,
                 writable,
+                console: false,
+            },
+        );
+        fd
+    }
+
+    /// Open the console device (`tty0:`) per the SCE_O_* `flags`: a new descriptor whose
+    /// writes the caller routes to the captured console (see `VitaState::io_write`).
+    pub(super) fn open_console(&mut self, flags: u32) -> i32 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.open.insert(
+            fd,
+            OpenFile {
+                path: "tty0:".into(),
+                cursor: 0,
+                readable: flags & SCE_O_RDWR == SCE_O_RDONLY || flags & SCE_O_RDWR == SCE_O_RDWR,
+                writable: flags & SCE_O_WRONLY != 0,
+                console: true,
             },
         );
         fd

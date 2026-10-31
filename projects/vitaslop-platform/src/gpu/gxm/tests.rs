@@ -301,10 +301,9 @@ mod texture_budget_accounting_tests {
             texel,
             // These tests are about the MIP ACCOUNTING - that the budget and the uploader
             // agree on what a chain costs - so the fixture has to be a texture that gets
-            // one. `mip_filter = 1` with a single level is exactly the case that still
-            // does: the guest asks the hardware to interpolate between levels it did not
-            // supply, so a chain is generated for it. See `mips_for_texture`.
-            levels: 1,
+            // one: several guest levels. A texture the guest gave ONE level gets no chain
+            // (the device samples level 0 alone) - see `mips_for_texture`.
+            levels: 9,
             mip_filter: 1,
             base_format: 0,
             swizzle: 0,
@@ -359,6 +358,16 @@ mod texture_budget_accounting_tests {
             "priced {got} for a mipped texture whose level 0 alone is {level0}"
         );
         assert_eq!(got, level0 * 4 / 3);
+    }
+
+    /// A texture the guest gave ONE level is sampled from level 0 alone on the device, so no
+    /// chain is generated for it - even with `mip_filter` set - and it is priced at level 0.
+    #[test]
+    fn a_one_level_texture_gets_no_chain_and_is_priced_at_level_zero() {
+        let mut t = tex(256, 256, 1, TexelSeam::Rgba8);
+        t.levels = 1;
+        assert!(!super::mips_for_texture(&t));
+        assert_eq!(uploaded_texture_bytes(&t), 256 * 256 * 4);
     }
 
     /// The half seam is 8 bytes per texel and is uploaded level-0-only. Pricing it as RGBA8

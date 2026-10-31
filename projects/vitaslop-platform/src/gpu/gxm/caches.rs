@@ -139,42 +139,34 @@ pub(super) fn block_wgpu_format(f: BlockFormat, gamma: bool) -> wgpu::TextureFor
 /// uploader and by [`uploaded_texture_bytes`] so the budget and the upload cannot
 /// disagree.
 ///
-/// # A decoded VIDEO frame is the one texture that gets no chain
+/// # A texture the guest gave ONE level gets no chain
 ///
-/// The general rule is a chain for every RGBA8 texture, and it exists to fix real
-/// speckle: a title's images are minified, and level 0 alone is what makes a distant
-/// road sparkle. A frame out of a video decoder is not that. It is drawn once, at 1:1,
-/// by a movie player, so no level below 0 is ever sampled - and it is REPLACED every
-/// frame, so the chain is built and thrown away sixty times a second. MEASURED on the
-/// title-screen movie: 2.66 MB uploaded per frame, of which 0.57 MB was a chain
-/// nothing read.
+/// It has no level 1 on the device, so the hardware reads level 0 whatever the derivatives
+/// say. MEASURED on an action title's colour grade: a 16x256 3D lookup table, one level,
+/// indexed by coordinates computed from each pixel's colour. Neighbouring pixels land far
+/// apart in the table, the derivatives are huge, and with an invented chain the sampler read
+/// a coarse level - the box-filtered AVERAGE of the table - so the lit world came out under
+/// yellow speckle where the device grades it cleanly. Across the capsule corpus the rule
+/// also brings back a thin net a generated chain averaged away and removes edge shimmer.
+/// `VITASLOP_GXP_MIPS_GUEST_LEVELS=0` is the arm back to a chain for every RGBA8 texture.
 ///
-/// The guest agrees, which is what makes this a reading rather than an optimisation:
-/// the movie texture declares one mip level and no filtering between levels.
+/// A decoded VIDEO frame never gets one either: it is drawn once at 1:1 and replaced every
+/// frame (MEASURED: 0.57 MB of an unread chain per title-movie frame), and its texture
+/// declares one level anyway.
 pub(super) fn mips_for_texture(t: &GxmTexture) -> bool {
     if t.base_format == crate::gpu::GXM_BASE_FORMAT_YUV420P2 {
         return false;
     }
-    // >>> GATING THIS ON THE GUEST'S OWN `levels`/`mip_filter` WAS TRIED 2026-08-28b AND
-    // >>> REVERTED. The fields are carried (see `GxmTexture::levels`) so the next attempt
-    // >>> starts with the data rather than the plumbing.
-    //
-    // The argument is the compressed passthrough's own, verbatim: a texture the guest gave
-    // ONE level and told the hardware not to filter between levels is one the DEVICE samples
-    // from its base alone, so a generated chain is filtering the Vita never did. Two paths
-    // applying opposite rules to one question is exactly the kind of split this codebase
-    // fixes elsewhere.
-    //
-    // **It was tried to explain a golf title's smudged club label, and it did not: MEASURED at
-    // f2400, ZERO of the 2400 pixels in the label's own box moved.** What DID move was
-    // 0.256% of the frame, confined to (282,313)-(424,466) - a patch of the golfer's lower
-    // legs - and there is no evidence that patch is more faithful rather than less. A change
-    // that fixes nothing demonstrable, alters a character, and risks the white-speckle
-    // failure the chain exists to prevent is not one to ship on principle alone.
-    //
-    // What it needs is a DEVICE: the honest test is whether a 1-level atlas minified several
-    // times looks sharper or worse on hardware, and that is not answerable from a desktop.
+    if t.levels <= 1 && guest_levels_rule() {
+        return false;
+    }
     mips_for_seam(t.texel)
+}
+
+/// Whether a texture the guest gave ONE level gets no generated chain (see [`mips_for_texture`]).
+fn guest_levels_rule() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_GXP_MIPS_GUEST_LEVELS").ok().as_deref() != Some("0"))
 }
 
 /// Whether a chain is built for a seam, ignoring the per-texture exception above.

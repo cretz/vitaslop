@@ -331,7 +331,7 @@ fn bind_dispatch_miss(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
             abi::DISPATCH_MISS_NAME,
             |_caller: Caller<'_, SchedState>, (target, caller): (i32, i32)| {
                 Box::new(async move {
-                    Err::<(), wasmtime::Error>(wasmtime::Error::msg(format!(
+                    Err::<i32, wasmtime::Error>(wasmtime::Error::msg(format!(
                         "indirect dispatch to unknown target {:#010x} from f_{:x}",
                         target as u32, caller as u32
                     )))

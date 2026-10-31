@@ -1247,6 +1247,10 @@ pub struct GxmRenderer {
     /// 680 / 106 MB of them live at once waiting on a GC - GPU memory the process could not
     /// get back on its own schedule. Reused here, and destroyed past `SUBRECT_FREE_CAP`.
     subrect_free: HashMap<(u32, u32, wgpu::TextureFormat), Vec<wgpu::Texture>>,
+    /// The scene-start snapshots of self windows read under their reader's own pixels, by
+    /// `(width, height, format, slot within the pass)` - see `SelfCopy::from`. A copy source,
+    /// so never mixed into `subrect_free`; a title has a handful.
+    self_window_start: HashMap<(u32, u32, wgpu::TextureFormat, u32), wgpu::Texture>,
     /// Every offscreen target this renderer has rendered into on some EARLIER frame, by
     /// the same `(address, width, height)` key `rtt` uses - so the frame's first pass into
     /// it can LOAD what the last frame left instead of clearing.

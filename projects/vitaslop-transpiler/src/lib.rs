@@ -36,6 +36,13 @@ pub use emit::{parse_trace_blocks, set_trace_blocks};
 pub use emit::set_track_pc;
 /// The on-device guest-function profiler's emit switch - see [`emit::set_guest_prof`].
 pub use emit::set_guest_prof;
+/// Code found at run time - see [`transpile_side`]: the settings a side module must be emitted
+/// under, the runtime entry table a host fills, and the tail-call form that keeps an
+/// interpreter's handler chain off the wasm stack.
+pub use emit::{
+    nonlocal_returns, runtime_entry_hash, set_nonlocal_returns, set_tail_calls, tail_calls, EmitSettings,
+    RUNTIME_ENTRY_LIMIT, RUNTIME_ENTRY_PAIRS,
+};
 /// The emit-time diagnostic knobs (watchpoints, frame arming) on a platform with no
 /// environment - see [`emit::set_emit_knob`].
 pub use emit::{set_emit_knob, EMIT_KNOBS_OVERRIDABLE};
@@ -146,8 +153,74 @@ pub struct Program<'a> {
     pub host_off: u32,
 }
 
+/// A [`Program`] that owns its inputs, so a host can keep one for the whole run: code found
+/// at run time is translated against the very program the main module was made from (see
+/// [`transpile_side`]).
+#[derive(Clone, Debug)]
+pub struct OwnedProgram {
+    pub code: std::sync::Arc<[u8]>,
+    pub base: u32,
+    pub thumb: bool,
+    pub entries: Vec<u32>,
+    pub arm_entries: Vec<u32>,
+    pub externs: Vec<Extern>,
+    pub redirects: Vec<Redirect>,
+    pub inline_imports: Vec<InlineImport>,
+    pub noreturn_svc: Vec<u32>,
+    pub noreturn_imports: Vec<u32>,
+    pub mem_bytes: u32,
+    pub discover_code_pointers: bool,
+    pub import_memory: bool,
+    pub host_off: u32,
+}
+
+impl Program<'_> {
+    /// This program with its inputs copied out.
+    pub fn to_owned(&self) -> OwnedProgram {
+        OwnedProgram {
+            code: self.code.into(),
+            base: self.base,
+            thumb: self.thumb,
+            entries: self.entries.to_vec(),
+            arm_entries: self.arm_entries.to_vec(),
+            externs: self.externs.to_vec(),
+            redirects: self.redirects.to_vec(),
+            inline_imports: self.inline_imports.to_vec(),
+            noreturn_svc: self.noreturn_svc.to_vec(),
+            noreturn_imports: self.noreturn_imports.to_vec(),
+            mem_bytes: self.mem_bytes,
+            discover_code_pointers: self.discover_code_pointers,
+            import_memory: self.import_memory,
+            host_off: self.host_off,
+        }
+    }
+}
+
+impl OwnedProgram {
+    /// Borrow it as the [`Program`] it was copied from.
+    pub fn as_program(&self) -> Program<'_> {
+        Program {
+            code: &self.code,
+            base: self.base,
+            thumb: self.thumb,
+            entries: &self.entries,
+            arm_entries: &self.arm_entries,
+            externs: &self.externs,
+            redirects: &self.redirects,
+            inline_imports: &self.inline_imports,
+            noreturn_svc: &self.noreturn_svc,
+            noreturn_imports: &self.noreturn_imports,
+            mem_bytes: self.mem_bytes,
+            discover_code_pointers: self.discover_code_pointers,
+            import_memory: self.import_memory,
+            host_off: self.host_off,
+        }
+    }
+}
+
 /// A guest address that dispatches to a host import (the Vita NID mechanism): a
 /// `bl`/`blx` to `addr` becomes a host call with dense index `import`.
+#[derive(Clone, Copy, Debug)]
 pub struct Extern {
     pub addr: u32,
     pub import: u32,
@@ -156,6 +229,7 @@ pub struct Extern {
 /// An inter-module redirect: a `bl`/`b` to import stub `addr` is retargeted to
 /// the guest function at `target` (an export of another module in the same link),
 /// lowering to a direct guest call instead of a host import trap.
+#[derive(Clone, Copy, Debug)]
 pub struct Redirect {
     pub addr: u32,
     pub target: u32,
@@ -212,6 +286,7 @@ pub struct Redirect {
 /// out of, because a texture read against a stale stamp is a wrong picture rather than a
 /// missing diagnostic line. See `emit::emit_dirty_range` for which forms owe it a stamp and
 /// why the others do not.
+#[derive(Clone, Copy, Debug)]
 pub struct InlineImport {
     /// The dense host-import index this replaces (the same index `Extern::import`
     /// carries).
@@ -1557,6 +1632,9 @@ pub struct Artifact {
     /// in a build that has no map. `None` means "this module tracks nothing", which is
     /// why it is an `Option` rather than an offset of zero.
     pub dirty_off: Option<u64>,
+    /// Layout offset of the RUNTIME ENTRY TABLE, in every build: where a host records the
+    /// code it translated at run time (see [`transpile_side`] and [`RUNTIME_ENTRY_PAIRS`]).
+    pub runtime_off: u64,
     /// Wasm operators emitted per GUEST INSTRUCTION for this build.
     ///
     /// A host should report it, because it is the hidden term in the emulated CPU's
@@ -1917,7 +1995,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             export: abi::func_export(f.addr),
         })
         .collect();
-    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, expansion } =
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, runtime_off, expansion } =
         emit::emit_module(
             ordered,
             &func_index,
@@ -1927,7 +2005,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             program.import_memory,
             program.host_off,
         );
-    Ok(Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off, expansion })
+    Ok(Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off, runtime_off, expansion })
 }
 
 /// The output of a lenient whole-program build ([`transpile_lenient`]): the module
@@ -2141,7 +2219,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     let func_index: BTreeMap<u32, u32> =
         addrs.iter().enumerate().map(|(i, &a)| (a, emit::IMPORT_FUNCS + i as u32)).collect();
     let exports = addrs.iter().map(|&addr| FuncExport { addr, export: abi::func_export(addr) }).collect();
-    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, expansion } = emit::emit_module_streamed(
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, runtime_off, expansion } = emit::emit_module_streamed(
         addrs,
         arm_total,
         funcs.iter().map(|(&addr, found)| {
@@ -2161,11 +2239,313 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     stubbed.sort_unstable();
     let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
     LenientArtifact {
-        artifact: Artifact { wasm, funcs: exports, mem_pages, arm_word_off, mirror_off, dirty_off, expansion },
+        artifact: Artifact { wasm, funcs: exports, mem_pages, arm_word_off, mirror_off, dirty_off, runtime_off, expansion },
         stubbed,
         stub_wasm_indices,
         decode_gaps: decode_gaps.into_iter().collect(),
     }
+}
+
+/// One side module: guest code found at run time, ready to link against its main module.
+pub struct SideArtifact {
+    /// The module bytes - see [`transpile_side`] for what it imports and how it installs.
+    pub wasm: Vec<u8>,
+    /// Every function it holds, ascending, with the mode it was lifted in. Function `i` is
+    /// written to table slot `slot_base + i`.
+    pub funcs: Vec<(u32, bool)>,
+    /// Where each of `funcs` ends (`lower::Discovered::end`), in the same order - for the
+    /// caller to [`SideMemo::record`] once it keeps them.
+    pub ends: Vec<u32>,
+    /// Which of `funcs`, in the same order, the STRETCH SWEEP guessed (see [`transpile_side`])
+    /// rather than being a target or a callee of one.
+    pub swept: Vec<bool>,
+}
+
+/// What a run's stretch sweeps have learned about the image (see [`transpile_side`]), so no
+/// walk repeats another's work. In memory for one run, never kept across runs.
+#[derive(Default)]
+pub struct SideMemo {
+    /// Start -> end of every function translated at run time, and of every main-module
+    /// function a walk stepped over.
+    ends: BTreeMap<u32, u32>,
+    /// Addresses a guess was tried at and did not lift, with where its code ends if it decoded.
+    /// The image does not change, so neither does that.
+    dead: BTreeMap<u32, Option<u32>>,
+    /// The program's import map (veneers included) and redirect map, made on the first call.
+    #[allow(clippy::type_complexity)]
+    maps: Option<std::sync::Arc<(BTreeMap<u32, u32>, BTreeMap<u32, (u32, bool)>)>>,
+}
+
+impl SideMemo {
+    /// Record that the function translated at `start` ends at `end`.
+    pub fn record(&mut self, start: u32, end: u32) {
+        self.ends.insert(start, end);
+    }
+}
+
+/// How far past a target, and below it to the main-module function under it, the stretch sweep
+/// walks at most (see [`transpile_side`]). It usually stops much sooner, where the stretch of
+/// unseen code does.
+pub const SIDE_SWEEP_WINDOW: u32 = 0x1_0000;
+
+/// >>> TRANSLATE CODE FOUND AT RUN TIME: the functions at `targets` (address, Thumb), and the
+/// direct callees they reach that the main module does not hold, as one SIDE MODULE that links
+/// against the running main module made from the same `program`.
+///
+/// Why this exists: some code is reached only through an address the program COMPUTES - an
+/// interpreter's opcode handlers, found by adding offsets from a table to a base, are the
+/// standing example - and nothing a static pass can see names it: no call reaches it, no
+/// relocation points at it, no constant materializes it. The dispatcher misses on it, and
+/// instead of ending the run the host calls this, installs the result, and carries on. The
+/// mode is not a guess here: it is the Thumb bit of the address the guest branched to.
+///
+/// `main_addrs` is the main module's ascending function list (its table order); `slot_base` is
+/// the table slot the first function goes to. The caller must emit under the main module's
+/// settings ([`EmitSettings::apply`]) - the layout both modules share is planned from them.
+///
+/// A target that does not lift is an error, not a stub: the guest is about to execute it.
+///
+/// >>> THE STRETCH SWEEP (`sweep` > 0): a target the dispatcher missed sits in a stretch of
+/// the image that static discovery never covered, and code that is reached that way rarely
+/// comes alone - so rather than one side module per miss, the rest of the stretch is lifted
+/// with it. The walk starts where the main-module function below the first target ends (or at
+/// the target) and goes up, stepping over main-module functions, until it is
+/// [`SIDE_SWEEP_WINDOW`] past the target or has found nothing new for a while. Where the code
+/// running on from one entry stops (`lower::Discovered::end`: its consecutive instructions and
+/// the literal words they load, never a far branch target) is where the next guess is tried,
+/// in the target's mode. Everything swept is a GUESS and is treated as one: dropped if it does
+/// not decode, decodes malformed, holds an undecodable block, or calls something that does not
+/// lift - at most `sweep` of them are kept. A guess that is kept costs an entry the guest may
+/// never use; one that is wrong costs nothing, because the guest jumping there finds the
+/// translation of exactly the code at that address. Code the sweep did not reach - an entry
+/// into the middle of code it lifted, say - misses later and comes here by itself. `memo` is
+/// what earlier calls of this run learned: where translated functions end, where guesses
+/// failed, and the program's import maps.
+///
+/// MEASURED: an interpreter's handlers went from 106 side modules (one per miss) to 5, and
+/// from 244 ms translating to 39 ms; this suite's embedded LuaJIT from 147 to 48.
+pub fn transpile_side(
+    program: &Program,
+    main_addrs: &[u32],
+    memo: &mut SideMemo,
+    targets: &[(u32, bool)],
+    slot_base: u32,
+    sweep: usize,
+) -> Result<SideArtifact, Error> {
+    // The import and redirect maps depend on the program alone - the veneer scan reads the
+    // whole image - so they are made on a run's first call and kept.
+    let maps = memo
+        .maps
+        .get_or_insert_with(|| {
+            let mut import_map: BTreeMap<u32, u32> = program.externs.iter().map(|e| (e.addr, e.import)).collect();
+            for (veneer, idx) in scan_veneers(program.code, program.base, &import_map) {
+                import_map.insert(veneer, idx);
+            }
+            let redirect_map = program.redirects.iter().map(|r| (r.addr, (r.target, r.thumb))).collect();
+            std::sync::Arc::new((import_map, redirect_map))
+        })
+        .clone();
+    let (import_map, redirect_map) = &*maps;
+    let imports = Imports::new(import_map, redirect_map, program.noreturn_imports);
+    let in_main = |a: u32| main_addrs.binary_search(&a).is_ok();
+
+    // A function and the direct callees it reaches that the main module does not hold, lifted
+    // together; code pointers are not chased - whatever they name is either in the main module
+    // or will miss and come here by itself. A HARD root (the guest is about to run it) that does
+    // not lift is an error; a TENTATIVE one (a sweep guess) that does not lift cleanly, all its
+    // callees included, is `Err` - with where the root's own code ends, when it decoded at all.
+    struct Lifted {
+        func: ir::Func,
+        callees: Vec<u32>,
+        end: u32,
+        guessed: bool,
+    }
+    let lift = |root: (u32, bool), have: &BTreeMap<u32, Lifted>, tentative: bool| {
+        let mut got: BTreeMap<u32, Lifted> = BTreeMap::new();
+        let mut root_end = None;
+        let mut work = vec![root];
+        while let Some((addr, thumb)) = work.pop() {
+            // An import or redirect stub is reached through its thunk in the main module, never
+            // lifted (see `transpile_lenient`).
+            if have.contains_key(&addr)
+                || got.contains_key(&addr)
+                || in_main(addr)
+                || import_map.contains_key(&addr)
+                || redirect_map.contains_key(&addr)
+            {
+                continue;
+            }
+            let found = match lower::discover(
+                program.code,
+                program.base,
+                addr,
+                thumb,
+                &imports,
+                program.noreturn_svc,
+                program.discover_code_pointers,
+                true,
+            ) {
+                Ok(found) => found,
+                Err(_) if tentative => return Ok(Err(root_end)),
+                Err(e) => return Err(e),
+            };
+            // Where the root's own code ends - but no further than its first instruction that
+            // does not lift, which may be the start of real code after a word that is not (and
+            // at the root itself means nothing is known past it).
+            if addr == root.0 {
+                let first_trap = found.trap_leaders.iter().copied().filter(|&t| t >= addr && t < found.end).min();
+                root_end = match first_trap {
+                    Some(t) if t == addr => None,
+                    Some(t) => Some(t),
+                    None => Some(found.end),
+                };
+            }
+            if tentative && (!found.func.well_formed() || !found.trap_leaders.is_empty()) {
+                return Ok(Err(root_end));
+            }
+            work.extend(found.callees.iter().copied());
+            let callees = found.callees.iter().map(|&(a, _)| a).collect();
+            got.insert(addr, Lifted { func: found.func, callees, end: found.end, guessed: tentative });
+        }
+        Ok(Ok(got))
+    };
+    let mut funcs: BTreeMap<u32, Lifted> = BTreeMap::new();
+    for &(addr, thumb) in targets {
+        if let Ok(got) = lift((addr & !1, thumb), &funcs, false)? {
+            funcs.extend(got);
+        }
+    }
+
+    // The stretch sweep - see above.
+    let mut swept = 0usize;
+    if sweep > 0
+        && let Some(&(target, thumb)) = targets.first()
+    {
+        let target = target & !1;
+        let align = if thumb { 2 } else { 4 };
+        let up = |a: u32| a.next_multiple_of(align);
+        let code_end = program.base.wrapping_add(program.code.len() as u32);
+        let hi = target.saturating_add(SIDE_SWEEP_WINDOW).min(code_end);
+        // A main-module function's end, in whichever mode it lifts cleanly - or, if neither
+        // does, the next main-module function, so the walk never guesses inside it. Remembered
+        // in `memo` for the rest of the run.
+        let main_end = |at: u32, memo: &mut SideMemo| -> u32 {
+            if let Some(&end) = memo.ends.get(&at) {
+                return end;
+            }
+            let end = [thumb, !thumb]
+                .into_iter()
+                .find_map(|mode| {
+                    lower::discover_shape(
+                        program.code,
+                        program.base,
+                        at,
+                        mode,
+                        &imports,
+                        program.noreturn_svc,
+                        program.discover_code_pointers,
+                        true,
+                    )
+                    .ok()
+                    .filter(|d| d.func.well_formed() && d.trap_leaders.is_empty())
+                    .map(|d| d.end)
+                })
+                .unwrap_or_else(|| {
+                    let next = main_addrs.partition_point(|&a| a <= at);
+                    main_addrs.get(next).copied().unwrap_or(code_end)
+                });
+            memo.ends.insert(at, end);
+            end
+        };
+        // The walk starts where the main-module function below the target ends, when that is
+        // below the target and within the window; otherwise at the target.
+        let below = main_addrs.partition_point(|&a| a <= target).checked_sub(1).map(|i| main_addrs[i]);
+        let mut at = match below.map(|p| main_end(p, memo)) {
+            Some(end) if end <= target && target - end <= SIDE_SWEEP_WINDOW => up(end),
+            _ => target,
+        };
+        // An all-zero instruction is padding, not the start of code: it decodes (`andeq r0, r0,
+        // r0`, `movs r0, r0`), and a guess started there would run on into the function after
+        // it and keep that function's own entry from being guessed.
+        let padding = |a: u32| {
+            let off = a.wrapping_sub(program.base) as usize;
+            program.code.get(off..off + align as usize).is_some_and(|w| w.iter().all(|&b| b == 0))
+        };
+        // Past the target, a stretch with nothing new for this many bytes has ended (main-module
+        // code, a table or strings follow): what lies beyond misses by itself if it is reached.
+        const STRETCH_GAP: u32 = 0x400;
+        let mut last_new = target;
+        while at < hi && swept < sweep && (at <= target || at - last_new <= STRETCH_GAP) {
+            // `(end, whether it is code found at run time)`: a main-module function is stepped
+            // over without keeping the stretch going; this module's functions, earlier side
+            // modules' and new guesses all do.
+            let step = if in_main(at) {
+                Some((main_end(at, memo), false))
+            } else if let Some(l) = funcs.get(&at) {
+                Some((l.end, true))
+            } else if let Some(&end) = memo.ends.get(&at) {
+                Some((end, true))
+            } else if let Some(&skip) = memo.dead.get(&at) {
+                skip.map(|end| (end, false))
+            } else if padding(at) {
+                None
+            } else {
+                match lift((at, thumb), &funcs, true)? {
+                    Ok(got) if got.contains_key(&at) => {
+                        if swept + got.len() > sweep {
+                            break;
+                        }
+                        let end = got[&at].end;
+                        swept += got.len();
+                        funcs.extend(got);
+                        Some((end, true))
+                    }
+                    Ok(_) => None,
+                    // A guess that decoded but was refused is still code up to where its own
+                    // code ends: the next guess goes there, not one instruction on into it.
+                    Err(skip) => {
+                        memo.dead.insert(at, skip);
+                        skip.map(|end| (end, false))
+                    }
+                }
+            };
+            match step {
+                Some((end, found)) => {
+                    let end = up(end.max(at + align));
+                    if found {
+                        last_new = last_new.max(end);
+                    }
+                    at = end;
+                }
+                None => at += align,
+            }
+        }
+    }
+
+    let call_edges: BTreeMap<u32, Vec<u32>> = funcs.iter().map(|(&a, l)| (a, l.callees.clone())).collect();
+    let recursive = emit::recursive_functions(&call_edges);
+    let ends = funcs.values().map(|l| l.end).collect();
+    let swept = funcs.values().map(|l| l.guessed).collect();
+    let funcs: Vec<ir::Func> = funcs
+        .into_values()
+        .map(|l| {
+            let mut f = l.func;
+            f.recursive = recursive.contains(&f.addr);
+            f
+        })
+        .collect();
+    let listed = funcs.iter().map(|f| (f.addr, f.thumb)).collect();
+    let wasm = emit::emit_side_module(
+        main_addrs,
+        funcs,
+        slot_base,
+        program.base,
+        program.mem_bytes,
+        program.inline_imports,
+        program.import_memory,
+        program.host_off,
+    );
+    Ok(SideArtifact { wasm, funcs: listed, ends, swept })
 }
 
 /// Diagnostic: discover the single function at `addr` and return its lowered IR
@@ -2721,6 +3101,55 @@ mod tests {
         assert_eq!(artifact.funcs[0].export, "f_10000");
         // The module must validate.
         wasmparser::validate(&artifact.wasm).expect("valid wasm");
+    }
+
+    #[test]
+    fn the_stretch_sweep_lifts_the_code_around_a_miss() {
+        // ARM at 0x10000. Two main-module functions (0x00, 0x28) bound code nobody points at.
+        let words: [u32; 13] = [
+            0xe12f_ff1e, // 0x00 main: bx lr
+            0x0000_0000, // 0x04 padding
+            0xe59f_0000, // 0x08 H1 (the miss): ldr r0, [pc, #0]  ; the literal at 0x10
+            0xe12f_ff1e, // 0x0c        bx lr
+            0xe3a0_0007, // 0x10 literal - it also decodes, as `mov r0, #7`
+            0xe3a0_0002, // 0x14 H2: mov r0, #2
+            0xe12f_ff1e, // 0x18     bx lr
+            0xe7f0_00f0, // 0x1c udf: refused
+            0xe3a0_0003, // 0x20 H3: mov r0, #3
+            0xe12f_ff1e, // 0x24     bx lr
+            0xe12f_ff1e, // 0x28 main: bx lr - stepped over
+            0xe3a0_0004, // 0x2c H4: mov r0, #4
+            0xe12f_ff1e, // 0x30     bx lr
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let program = Program {
+            code: &code,
+            base: 0x10000,
+            thumb: false,
+            entries: &[0x10000],
+            arm_entries: &[],
+            externs: &[],
+            redirects: &[],
+            inline_imports: &[],
+            noreturn_svc: &[],
+            noreturn_imports: &[],
+            mem_bytes: 0x20000,
+            discover_code_pointers: false,
+            import_memory: false,
+            host_off: 0,
+        };
+        let main = [0x10000, 0x10028];
+        let lifted = |sweep| {
+            let side = transpile_side(&program, &main, &mut SideMemo::default(), &[(0x10008, false)], 2, sweep)
+                .expect("side module");
+            wasmparser::validate(&side.wasm).expect("valid wasm");
+            (side.funcs.iter().map(|&(a, _)| a).collect::<Vec<_>>(), side.swept.iter().filter(|&&g| g).count())
+        };
+        // Not the padding, the literal, the refused word or a main-module function: every piece
+        // of code in the stretch, and nothing else.
+        assert_eq!(lifted(64), (vec![0x10008, 0x10014, 0x10020, 0x1002c], 3));
+        assert_eq!(lifted(0), (vec![0x10008], 0), "no sweep, the target alone");
+        assert_eq!(lifted(1), (vec![0x10008, 0x10014], 1), "the budget bounds the guesses");
     }
 
     /// The lightweight-mutex forms must contain NO SUSPENSION POINT, and this is the whole

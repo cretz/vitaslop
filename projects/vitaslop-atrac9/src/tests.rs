@@ -16,6 +16,13 @@ fn parses_mono_48k_config() {
 }
 
 #[test]
+fn parses_geometry_without_a_decoder() {
+    let info = crate::CodecInfo::parse([0xFE, 0x70, 0x07, 0xF0]).expect("valid config");
+    assert_eq!((info.frame_samples, info.frames_in_superframe, info.superframe_size), (256, 4, 256));
+    assert!(crate::CodecInfo::parse([0x00, 0x00, 0x00, 0x00]).is_err());
+}
+
+#[test]
 fn rejects_bad_header() {
     assert!(Atrac9Decoder::new([0x00, 0x00, 0x00, 0x00]).is_err());
 }

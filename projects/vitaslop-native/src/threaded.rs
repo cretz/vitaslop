@@ -173,6 +173,27 @@ struct ThreadData<H: ImportDispatch + Send + 'static> {
     /// worker's PREEMPT word and runnable counts, and the elided-yield global the module resets
     /// against. `None` on the one-at-a-time engine.
     smp: Option<SmpThread>,
+    /// Code found at run time - see [`crate::runtime_code`]. Shared by every thread of the run.
+    runtime: Option<Arc<RuntimeLink<H>>>,
+}
+
+/// `VITASLOP_EXPLICIT_BOUNDS=1` - check every guest memory access in code instead of catching
+/// the fault, so an out-of-bounds guest access is an ordinary trap with a backtrace.
+///
+/// A diagnostic, and the one a guest memory fault needs once a run has SIDE MODULES (see
+/// [`crate::runtime_code`]): wasmtime attributes a caught fault by asking every instance in the
+/// store whether the address is in one of its memories, and asserts that only one says yes -
+/// but a side module imports the very memory its main instance does, so two do, and the run
+/// aborts on the assertion instead of reporting the trap.
+fn explicit_bounds() -> bool {
+    // The environment directly: a wasmtime setting, with nothing to mean in the browser.
+    std::env::var("VITASLOP_EXPLICIT_BOUNDS").is_ok_and(|v| v.trim() == "1")
+}
+
+/// A run's runtime-code record and the linker its side modules take their host functions from.
+pub(crate) struct RuntimeLink<H: ImportDispatch + Send + 'static> {
+    code: Arc<crate::RuntimeCode>,
+    linker: Linker<ThreadData<H>>,
 }
 
 /// What a thread's host-call closure needs on a parallel run - the native form of the
@@ -450,6 +471,15 @@ pub struct WasmtimeEngine<H: ImportDispatch + Send + 'static> {
     /// Linear-memory offset of the guest-store dirty block - see [`ThreadData`], which
     /// carries it to the host-call view.
     dirty_off: Option<u64>,
+    /// Code found at run time - see [`ThreadData::runtime`].
+    runtime: Option<Arc<RuntimeLink<H>>>,
+}
+
+impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
+    /// What this run has translated at run time.
+    pub fn runtime_stats(&self) -> crate::RuntimeStats {
+        self.runtime.as_ref().map(|r| r.code.stats()).unwrap_or_default()
+    }
 }
 
 
@@ -573,6 +603,7 @@ enum Inner<H: ImportDispatch + Send + 'static> {
 /// host (`VitaEnv`) has the scheduling state a parallel run needs - see `crate::smp`.
 pub(crate) trait SmpOps<H>: Send {
     fn host(&self) -> std::sync::MutexGuard<'_, H>;
+    fn runtime_stats(&self) -> crate::RuntimeStats;
     fn engine_read_guest(&self, addr: u32, len: usize) -> Vec<u8>;
     fn engine_read_guest_into(&self, addr: u32, buf: &mut [u8]) -> bool;
     fn engine_write_guest(&self, addr: u32, bytes: &[u8]);
@@ -648,7 +679,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
     ) -> Result<ThreadedScheduler<H>, RunError> {
         let entry = entries[0] & !1;
         let entries: Vec<u32> = entries.iter().map(|e| e & !1).collect();
-        let artifact = transpiler::transpile(&transpiler::Program {
+        let program = transpiler::Program {
             code,
             base,
             thumb,
@@ -666,7 +697,9 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             discover_code_pointers: true,
             import_memory: true,
             host_off: 0,
-        })?;
+        };
+        let artifact = transpiler::transpile(&program)?;
+        let settings = transpiler::EmitSettings::capture();
         wasmparser::validate(&artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
 
@@ -676,6 +709,13 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         cfg.consume_fuel(true);
         let engine = Engine::new(&cfg).map_err(|e| RunError::Wasm(e.to_string()))?;
         let module = Module::from_binary(&engine, &artifact.wasm)?;
+        let runtime = Arc::new(crate::RuntimeCode::new(
+            &engine,
+            program.to_owned(),
+            artifact.funcs.iter().map(|f| f.addr).collect(),
+            settings,
+            artifact.runtime_off,
+        ));
 
         // One shared memory, sized exactly as the transpiler declared (the guest
         // region plus the appended indirect-dispatch address table), imported into
@@ -687,8 +727,8 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         write_shared(&shared_mem, 0, code);
 
         let host = Arc::new(Mutex::new(host));
-        let instance_pre =
-            build_instance_pre(&engine, &module, &shared_mem, &host, base, artifact.dirty_off)?;
+        let (instance_pre, runtime) =
+            build_instance_pre(&engine, &module, &shared_mem, &host, base, artifact.dirty_off, Some(runtime))?;
         let engine = WasmtimeEngine {
             engine,
             module,
@@ -705,6 +745,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             arm_word_off: artifact.arm_word_off,
             mirror_off: artifact.mirror_off,
             dirty_off: artifact.dirty_off,
+            runtime,
         };
 
         // The main thread: sp near the top of the region (with startup headroom), no
@@ -803,10 +844,23 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         cfg.wasm_threads(true);
         cfg.shared_memory(true);
         cfg.consume_fuel(true);
+        if explicit_bounds() {
+            cfg.signals_based_traps(false);
+        }
         let engine = Engine::new(&cfg).map_err(|e| RunError::Wasm(e.to_string()))?;
         // The cache's name for this module: this executable's build, the transpile settings in
         // force (read now, with the fuel interval set), and the program - see `compile_cache`.
-        let cache_entry = cache.map(|c| c.entry(&transpiler::codegen_fingerprint()));
+        // The link's inline choices are baked into the module too, so they name it as well.
+        let cache_entry = cache.map(|c| {
+            c.entry(&format!(
+                "{}{}",
+                transpiler::codegen_fingerprint(),
+                vitaslop_runtime::vita::inline_settings_fingerprint()
+            ))
+        });
+        // The settings the main module is made (or was made, on a hit) under, for the side
+        // modules code found at run time becomes - see `crate::runtime_code`.
+        let settings = transpiler::EmitSettings::capture();
         let t_boot = std::time::Instant::now();
         let hit = cache_entry.as_ref().and_then(|e| e.load(&engine));
         let (module, layout) = if let Some(hit) = hit {
@@ -1056,6 +1110,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             arm_word_off: built.artifact.arm_word_off,
             mirror_off: built.artifact.mirror_off,
             dirty_off: built.artifact.dirty_off,
+            runtime_off: built.artifact.runtime_off,
             stubbed: built.stubbed.clone(),
             stub_wasm_indices: built.stub_wasm_indices.clone(),
             decode_gaps: built.decode_gaps.clone(),
@@ -1133,8 +1188,22 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 Err(std::sync::TryLockError::Poisoned(_)) => Err("the host lock is poisoned"),
             }));
         }
-        let instance_pre =
-            build_instance_pre(&engine, &module, &shared_mem, &host, linked.base, layout.dirty_off)?;
+        let runtime = Arc::new(crate::RuntimeCode::new(
+            &engine,
+            linked.shared_program().to_owned(),
+            layout.funcs.clone(),
+            settings,
+            layout.runtime_off,
+        ));
+        let (instance_pre, runtime) = build_instance_pre(
+            &engine,
+            &module,
+            &shared_mem,
+            &host,
+            linked.base,
+            layout.dirty_off,
+            Some(runtime),
+        )?;
         let engine = WasmtimeEngine {
             engine,
             module,
@@ -1147,6 +1216,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             arm_word_off: layout.arm_word_off,
             mirror_off: layout.mirror_off,
             dirty_off: layout.dirty_off,
+            runtime,
         };
 
         // The main thread runs every module_start in load order, then (as the last
@@ -1234,6 +1304,14 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         match &self.inner {
             Inner::Baton(b) => b.engine().host.lock().unwrap(),
             Inner::Smp(s) => s.host(),
+        }
+    }
+
+    /// What this run has translated at run time - see [`crate::runtime_code`].
+    pub fn runtime_stats(&self) -> crate::RuntimeStats {
+        match &self.inner {
+            Inner::Baton(b) => b.engine().runtime_stats(),
+            Inner::Smp(s) => s.runtime_stats(),
         }
     }
 
@@ -1626,6 +1704,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             sw_wasmtime_last: 0,
             fuel_interval: self.fuel_interval,
             smp: None,
+            runtime: self.runtime.clone(),
         };
         let mut store = Store::new(&self.engine, data);
         store.set_fuel(u64::MAX).map_err(|e| RunError::Wasm(e.to_string()))?;
@@ -1836,6 +1915,9 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
 /// store-independent - the three host functions are engine-scoped and a `SharedMemory` belongs
 /// to no store, which is what makes `instantiate_pre` legal at all. The throwaway `Store` is
 /// only there to satisfy `Linker::define`'s signature; nothing from it survives.
+/// The pre-instantiated main module, and - given the run's runtime-code record - the link every
+/// thread's side-module installs go through.
+#[allow(clippy::type_complexity)]
 fn build_instance_pre<H: ImportDispatch + Send + 'static>(
     engine: &Engine,
     module: &Module,
@@ -1843,7 +1925,8 @@ fn build_instance_pre<H: ImportDispatch + Send + 'static>(
     host: &Arc<Mutex<H>>,
     base: u32,
     dirty_off: Option<u64>,
-) -> Result<InstancePre<ThreadData<H>>, RunError> {
+    runtime: Option<Arc<crate::RuntimeCode>>,
+) -> Result<(InstancePre<ThreadData<H>>, Option<Arc<RuntimeLink<H>>>), RunError> {
     let mut linker = Linker::new(engine);
     bind_svc(&mut linker)?;
     bind_import(&mut linker)?;
@@ -1871,12 +1954,15 @@ fn build_instance_pre<H: ImportDispatch + Send + 'static>(
             sw_wasmtime_last: 0,
             fuel_interval: 0,
             smp: None,
+            runtime: None,
         },
     );
     linker
         .define(&scratch, abi::IMPORT_MODULE, abi::MEMORY_EXPORT, shared_mem.clone())
         .map_err(|e| RunError::Wasm(e.to_string()))?;
-    linker.instantiate_pre(module).map_err(|e| RunError::Wasm(e.to_string()))
+    let pre = linker.instantiate_pre(module).map_err(|e| RunError::Wasm(e.to_string()))?;
+    let link = runtime.map(|code| Arc::new(RuntimeLink { code, linker }));
+    Ok((pre, link))
 }
 
 fn bind_svc<H: ImportDispatch + Send + 'static>(
@@ -2467,12 +2553,23 @@ fn bind_dispatch_miss<H: ImportDispatch + Send + 'static>(
         .func_wrap_async(
             abi::IMPORT_MODULE,
             abi::DISPATCH_MISS_NAME,
-            |_caller: Caller<'_, ThreadData<H>>, (target, caller): (i32, i32)| {
+            |mut caller: Caller<'_, ThreadData<H>>, (target, from): (i32, i32)| {
                 Box::new(async move {
-                    Err::<(), wasmtime::Error>(wasmtime::Error::msg(format!(
-                        "indirect dispatch to unknown target {:#010x} from f_{:x}",
-                        target as u32, caller as u32
-                    )))
+                    let link = caller.data().runtime.clone();
+                    let miss = crate::runtime_code::prepare_miss(
+                        &mut caller,
+                        link.as_ref().map(|l| &*l.code),
+                        link.as_ref().map(|l| &l.linker),
+                        target as u32,
+                        from as u32,
+                    )?;
+                    match miss {
+                        crate::runtime_code::Miss::Ready(slot) => Ok(slot),
+                        crate::runtime_code::Miss::Install { slot, module, imports } => {
+                            wasmtime::Instance::new_async(&mut caller, &module, &imports).await?;
+                            Ok(slot)
+                        }
+                    }
                 })
             },
         )

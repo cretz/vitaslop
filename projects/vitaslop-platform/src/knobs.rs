@@ -196,6 +196,9 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_FRAME_TOPUP",
     // Start the guest arena later by N bytes (host/state_kobjects.rs `galloc`): address-vs-timing A/B.
     "VITASLOP_GALLOC_SKEW",
+    // A drag begins only past this many panel units (vita/gesture.rs `drag_slop`): the A/B for a
+    // title whose taps stop landing while a drag recognizer is live.
+    "VITASLOP_GESTURE_DRAG_SLOP",
     // The GPU budget's arm back (`=0`), and the desktop rig that saturates a GPU so the budget
     // can be exercised off the phone - see `LivePlayback::gpu_budget` and `GxmRenderer::gpu_burn`.
     "VITASLOP_GPU_BUDGET",
@@ -260,6 +263,9 @@ pub const OVERRIDABLE: &[&str] = &[
     // `0`: vertex footprints in every pass, every frame, with no CPU budget - the arm back from
     // the per-pass profitability gate (`gpu::dest_geom_gate_enabled`).
     "VITASLOP_GXM_DEST_GEOM_GATE",
+    // `0`: interpret a draw's whole vertex program for its footprint rather than only the
+    // instructions that reach its position (`gpu::dest_geom_slice_enabled`).
+    "VITASLOP_GXM_DEST_GEOM_SLICE",
     "VITASLOP_GXM_DEST_SPLIT_AB",
     "VITASLOP_GXM_DRAW_COVERAGE",
     "VITASLOP_GXM_FLOAT_TARGETS",
@@ -455,6 +461,7 @@ pub const OVERRIDABLE: &[&str] = &[
     // extent instead of being sized per draw from the draw's inputs (`reach::DrawReach`).
     "VITASLOP_GXP_MEM_WINDOW_PER_DRAW",
     "VITASLOP_GXP_MIPS",
+    "VITASLOP_GXP_MIPS_GUEST_LEVELS",
     // Report the first non-finite instruction per vertex program (`count_clip_w_signs`).
     "VITASLOP_GXP_NAN_SITES",
     // The portable f16 narrowing on a device that offers `shader-f16` - see `gpu.rs`.
@@ -641,6 +648,9 @@ pub const OVERRIDABLE: &[&str] = &[
     // is to line a browser run's frames up against a desktop run's and find the first one
     // that differs, and half of that comparison has no environment to read a knob from.
     "VITASLOP_NID_DIGEST",
+    // `0`: a guest return that lands somewhere other than its caller's next instruction is not
+    // followed (`vitaslop_transpiler::emit::nonlocal_returns`).
+    "VITASLOP_NONLOCAL_RETURNS",
     "VITASLOP_NO_BC",
     "VITASLOP_NO_FAST_IMPORT",
     "VITASLOP_NO_INLINE_CLIB",
@@ -812,6 +822,7 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_RTT_PROBE_LOG",
     // Hold each browser RTT writeback copy this long after capture - see `RttWriteback`.
     "VITASLOP_RTT_SELF_WINDOW",
+    "VITASLOP_RTT_SELF_WINDOW_SCENE_START",
     "VITASLOP_RTT_STALE_EXTENT",
     "VITASLOP_RTT_SUBRECT",
     "VITASLOP_RTT_SUBRECT_HELD",
@@ -918,6 +929,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // Listed here so the name is not a browser-boot panic, though the browser cannot open a
     // path: there it supplies the bytes directly instead (`font::system::set_bytes`).
     "VITASLOP_SYSTEM_FONT",
+    // `0`: guest tail jumps are plain calls, not `return_call` (`vitaslop_transpiler::emit::tail_calls`).
+    "VITASLOP_TAIL_CALLS",
     // The texture-expansion scratch sized to the texture at hand when the kept largest-seen
     // buffers do not fit (texenc.rs `shrink_scratch_to_fit`); `0` = refuse to the CPU, as before.
     "VITASLOP_TEXENC_SHRINK_SCRATCH",
@@ -1052,6 +1065,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // at the next flip - see `writeback_at_flip` in vitaslop-web.
     "VITASLOP_WRITEBACK_AT_FLIP",
     "VITASLOP_YIELD_ELIDE",
+    // `<hex depth addr>[@<frame>]`: trace the depth hand-off (zls load/store) of passes into it.
+    "VITASLOP_ZLS_PROBE",
 ];
 
 /// The override map, consulted by every reader in this module BEFORE the environment.

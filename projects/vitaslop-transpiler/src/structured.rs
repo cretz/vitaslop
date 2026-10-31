@@ -416,12 +416,12 @@ impl<'a> Emitter<'a> {
         match &func.blocks[x].term {
             Term::Fallthrough => self.branch_next(x),
             Term::Return => {
-                self.f.instruction(&W::Return);
+                emit_return(self.f, block_sets_ret(&func.blocks[x]));
             }
             Term::ReturnIf { cond } => {
                 emit_cond(self.f, *cond);
                 self.open(&W::If(BlockType::Empty), Frame::Plain);
-                self.f.instruction(&W::Return);
+                emit_return(self.f, block_sets_ret(&func.blocks[x]));
                 self.close();
                 self.branch_next(x);
             }
@@ -429,7 +429,7 @@ impl<'a> Emitter<'a> {
                 if trap_halt() {
                     self.f.instruction(&W::Unreachable);
                 } else {
-                    self.f.instruction(&W::Return);
+                    emit_return(self.f, block_sets_ret(&func.blocks[x]));
                 }
             }
             Term::Unreachable => {

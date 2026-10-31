@@ -1109,12 +1109,19 @@ pub(super) fn build_gxp_pipeline<P>(
         depth_compare = wgpu::CompareFunction::Always;
     }
     // An integer attachment cannot blend: the raw words are STORED, which is what the
-    // hardware does with a 64-bit surface too (a program that reads the destination does
-    // its own blending, from a copy of the words). A guest blend state on such a pass is
-    // reported once.
+    // hardware does with a 64-bit surface too. The blend a title asks for there is PATCHED
+    // INTO its fragment program as ALU over the output registers (the destination), which this
+    // link serves from a copy of the words - so applying the guest's blend state as well would
+    // apply it twice. MEASURED on a title's light pass: every one of its five blended pairs
+    // into an F16F16F16F16 surface reads the destination, and blending them again through a
+    // half-float attachment doubled the destination under every additive sprite (hard-edged
+    // rectangles over its title screen). Only a blended program that does NOT read the
+    // destination has lost something; that one is reported, once.
     let blend = if raw64_output {
-        if blend.is_some_and(|b| b != wgpu::BlendState::REPLACE) {
-            report_raw64_blend_dropped(key);
+        if let Some(b) = blend.filter(|b| *b != wgpu::BlendState::REPLACE)
+            && !fragment_reads_dest(&gxp.fprog)
+        {
+            report_raw64_blend_dropped(key, &b);
         }
         None
     } else {

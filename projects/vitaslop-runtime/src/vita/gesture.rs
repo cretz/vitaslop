@@ -62,6 +62,9 @@ const TYPE_TAP: i32 = 1;
 const TYPE_DRAG: i32 = 2;
 const TYPE_TAP_AND_HOLD: i32 = 4;
 const TYPE_PINCH_OUT_IN: i32 = 8;
+/// `SCE_SYSTEM_GESTURE_TYPE_ROTATION`. A recognizer of this type is CREATED and polled, but
+/// its detection is not modelled: it reports no events (see [`create_touch_recognizer`]).
+const TYPE_ROTATION: i32 = 16;
 
 /// `SceSystemGestureTouchState`, shared by primitive and gesture events.
 const STATE_BEGIN: i32 = 1;
@@ -88,8 +91,9 @@ const STATE_CANCELLED: i32 = 4;
 const STATIONARY_SLOP: i32 = 40;
 
 /// **NOT ESTABLISHED.** The longest press that is still a TAP, microseconds. It must stay
-/// below the default hold time so one press is never both, and above the 20-frame (333 ms)
-/// scripted taps the playbooks press with, which a shorter limit would silently drop.
+/// below the default hold time so one press is never both. A scripted tap is counted in
+/// PRESENTS, not 1/60 s: a 20-frame hold on a 30 fps screen is ~670 ms and is not a tap here
+/// (a racer's pre-race checkmark ignored it); playbooks tap for ~6 frames, as a finger does.
 const TAP_MAX_DURATION_US: u64 = 500_000;
 
 /// **NOT ESTABLISHED.** The `eventState` a TAP event carries. A tap is recognized on
@@ -115,6 +119,19 @@ const MULTI_TAP_SLOP: i32 = 100;
 /// its menus could never be used. Begun only on movement, every tap on them was ignored.
 /// A negative value means no slop test at all, so a primitive that has not moved begins one.
 const DRAG_SLOP: i32 = -1;
+
+/// [`DRAG_SLOP`], or `VITASLOP_GESTURE_DRAG_SLOP=<panel units>` to begin a drag only once the
+/// primitive has moved that far - the A/B for a title whose taps stop landing while a drag
+/// recognizer shares their area.
+fn drag_slop() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        crate::knobs::var("VITASLOP_GESTURE_DRAG_SLOP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DRAG_SLOP)
+    })
+}
 
 /// **NOT ESTABLISHED.** The hold time when the recognizer was created without a parameter
 /// (or with `timeToInvokeEvent = 0`): "on the order of 0.5 s".
@@ -815,9 +832,11 @@ impl Rec {
             report_once(
                 call,
                 &format!(
-                    "{call}: called on a work area that no sceSystemGestureCreateTouchRecognizer \
-                     in this run initialized - refused with INVALID_ARGUMENT. Either the title \
-                     creates recognizers by a path not seen yet, or this argument shape is wrong."
+                    "{call}: called on a work area ({addr:#010x}, head word {:#010x}) that no \
+                     sceSystemGestureCreateTouchRecognizer in this run initialized - refused with \
+                     INVALID_ARGUMENT. Either the title creates recognizers by a path not seen \
+                     yet, or this argument shape is wrong.",
+                    b.first_chunk::<4>().map_or(0, |w| u32::from_le_bytes(*w)),
                 ),
             );
             return Err(SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
@@ -1186,7 +1205,8 @@ fn step(
                 if ended {
                     return;
                 }
-                if DRAG_SLOP >= 0 && !beyond(xy(p.current), xy(p.pressed), DRAG_SLOP) {
+                let slop = drag_slop();
+                if slop >= 0 && !beyond(xy(p.current), xy(p.pressed), slop) {
                     kept.push(ins);
                     return;
                 }
@@ -1272,10 +1292,22 @@ fn create_touch_recognizer_impl(
     if recognizer.is_null() {
         return SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT;
     }
-    if ![TYPE_TAP, TYPE_DRAG, TYPE_TAP_AND_HOLD, TYPE_PINCH_OUT_IN].contains(&kind) {
-        // ROTATION / FLICK exist only on the later console family; on this one any type
-        // outside the four bits is not a gesture the library knows.
+    // >>> ROTATION (16) IS A GESTURE THIS CONSOLE'S LIBRARY CREATES. It was refused here on an
+    // inference that only the later console family has it, and a retail title disproves that:
+    // it creates a rotation recognizer per panel next to its tap/drag/hold/pinch ones and polls
+    // it every frame without checking the create's result. Refused, the block stayed
+    // uninitialised, every poll returned INVALID_ARGUMENT, and the title read that error as an
+    // UNSIGNED event count - appending ~2^31 garbage events, growing its vector until the heap
+    // it shares with its loading thread corrupted (a frame-0 crash). FLICK (32) has no such
+    // evidence and stays refused.
+    if ![TYPE_TAP, TYPE_DRAG, TYPE_TAP_AND_HOLD, TYPE_PINCH_OUT_IN, TYPE_ROTATION].contains(&kind) {
         return SCE_SYSTEM_GESTURE_ERROR_NOT_SUPPORTED_GESTURE;
+    }
+    if kind == TYPE_ROTATION {
+        report_once(
+            "gesture-rotation",
+            "sceSystemGestureCreateTouchRecognizer: a ROTATION recognizer - created, but its              detection is NOT modelled (no source gives its event layout), so it reports no              events. A title that turns things with two fingers will not see the turn.",
+        );
     }
     // A SceUInt8 argument: only the low byte of r2 is the port.
     let port = port & 0xff;
@@ -2016,11 +2048,25 @@ mod tests {
         );
     }
 
+    /// A ROTATION recognizer is created and polled like any other, and - its detection not
+    /// being modelled - reports no events: a count of ZERO, never an error a title could read
+    /// as an unsigned count.
+    #[test]
+    fn a_rotation_recognizer_is_created_and_reports_no_events() {
+        let mut g = Guest::new();
+        assert_eq!(g.create(REC_A, TYPE_ROTATION, 0, None, None), 0);
+        g.frame(&[(4, 140, 100)], &[], &[REC_A]);
+        g.frame(&[(4, 300, 100), (5, 140, 300)], &[], &[REC_A]);
+        assert_eq!(g.call(update_touch_recognizer, &[REC_A]), 0);
+        assert_eq!(g.call(get_touch_events_count, &[REC_A]), 0);
+        assert!(g.events(REC_A).is_empty());
+    }
+
     /// The library's own error codes for the caller errors and the unknown.
     #[test]
     fn errors_are_the_librarys_own() {
         let mut g = Guest::new();
-        assert_eq!(g.create(REC_A, 16, 0, None, None), SCE_SYSTEM_GESTURE_ERROR_NOT_SUPPORTED_GESTURE);
+        assert_eq!(g.create(REC_A, 32, 0, None, None), SCE_SYSTEM_GESTURE_ERROR_NOT_SUPPORTED_GESTURE);
         assert_eq!(g.create(0, TYPE_TAP, 0, None, None), SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
         assert_eq!(g.call(update_touch_recognizer, &[0]), SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
         assert_eq!(

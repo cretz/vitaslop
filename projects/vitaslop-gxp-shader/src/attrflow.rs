@@ -211,11 +211,8 @@ fn src_reg(instr: &Instr, src: &Operand, c: usize) -> Option<(usize, std::ops::R
 
 /// The `(register, halves)` an instruction's destination channel `c` writes.
 fn dest_reg(instr: &Instr, d: &Operand, c: usize) -> (usize, std::ops::Range<usize>) {
-    if instr.half_precision {
-        (d.index as usize + (c >> 1), (c & 1)..(c & 1) + 1)
-    } else {
-        (d.index as usize + c, 0..2)
-    }
+    let (reg, halves) = instr.dest_register(d, c);
+    (reg as usize, halves)
 }
 
 /// One stage's walk. Returns `true` when the taint reached a BLOCKING use.

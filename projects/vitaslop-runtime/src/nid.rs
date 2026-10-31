@@ -127,6 +127,12 @@ pub mod gxm {
     pub const SET_TWO_SIDED_ENABLE: u32 = 0x0DE9_AEB7;
     pub const SET_FRONT_DEPTH_FUNC: u32 = 0x14BD_831F;
     pub const SET_FRONT_DEPTH_BIAS: u32 = 0xAAA9_7F81;
+    pub const SET_BACK_DEPTH_BIAS: u32 = 0x17B3_BF86;
+    /// Named by the henkaku wiki's SceGxm export list and the dev wiki's VSH exports;
+    /// prototypes from vita-headers `gxm.h`.
+    pub const SET_W_CLAMP_ENABLE: u32 = 0x1BF8_B853;
+    pub const SET_W_CLAMP_VALUE: u32 = 0xD096_336E;
+    pub const SET_W_BUFFER_ENABLE: u32 = 0xEED8_6975;
     pub const SET_BACK_DEPTH_FUNC: u32 = 0xB042_A4D2;
     pub const SET_FRONT_DEPTH_WRITE_ENABLE: u32 = 0xF32C_BF34;
     pub const SET_FRONT_FRAGMENT_PROGRAM_ENABLE: u32 = 0x5759_58A8;
@@ -418,6 +424,12 @@ pub mod sysmem {
     pub const IS_PS_VITA_TV: u32 = 0x1453_A5E5;
     /// `sceKernelGetFreeMemorySize`: what is left in each user partition.
     pub const GET_FREE_MEMORY_SIZE: u32 = 0x87CC_580B;
+    /// The JIT interface: a block meant for code the process generates, and the calls that
+    /// switch it between writable and executable and flush it.
+    pub const ALLOC_MEM_BLOCK_FOR_VM: u32 = 0xE2D7_E137;
+    pub const OPEN_VM_DOMAIN: u32 = 0x9CA3_EB2B;
+    pub const CLOSE_VM_DOMAIN: u32 = 0xD6CA_56CA;
+    pub const SYNC_VM_DOMAIN: u32 = 0x19D2_A81A;
 }
 
 /// SceLibKernel function NIDs: the user-facing clib (string/memory/print) and the
@@ -661,6 +673,9 @@ pub mod http {
     pub const URI_BUILD: u32 = 0x4766_4424;
     pub const DELETE_CONNECTION: u32 = 0xF0F6_5C15;
     pub const CREATE_REQUEST_WITH_URL: u32 = 0xBD5D_A1D0;
+    /// The `2` forms take the method as a STRING ("GET", "POST", ...).
+    pub const CREATE_REQUEST2: u32 = 0x857D_9242;
+    pub const CREATE_REQUEST_WITH_URL2: u32 = 0x1B6B_7983;
     pub const DELETE_REQUEST: u32 = 0x3D3D_29AD;
     pub const SET_CONNECT_TIMEOUT: u32 = 0x237C_A86E;
     pub const SET_SEND_TIMEOUT: u32 = 0x8AE3_F008;
@@ -670,6 +685,7 @@ pub mod http {
     pub const SET_REQUEST_CONTENT_LENGTH: u32 = 0x37C3_0C90;
     pub const URI_ESCAPE: u32 = 0x1DA2_A673;
     pub const ADD_REQUEST_HEADER: u32 = 0x7B51_B122;
+    pub const REMOVE_REQUEST_HEADER: u32 = 0x5EB5_F548;
     pub const SEND_REQUEST: u32 = 0x9CA5_8B99;
     pub const ABORT_REQUEST: u32 = 0xEA61_662F;
     pub const GET_STATUS_CODE: u32 = 0x2707_1691;
@@ -1443,6 +1459,7 @@ pub mod services {
     // SceCommonDialog: shared config for the dialog families, plus the trophy-setup
     // dialog's result read.
     pub const COMMON_DIALOG_SET_CONFIG_PARAM: u32 = 0xBECD_35C8;
+    pub const COMMON_DIALOG_IS_RUNNING: u32 = 0x043A_353E;
     /// An UNNAMED SceCommonDialog family (`0xE537_816C`): five exports present in the NID
     /// databases only as `SceCommonDialog_<nid>`. The roles are read off a title's call sites
     /// - see `services::DialogFamily::UnnamedTerms`.
@@ -1996,6 +2013,13 @@ pub mod ngs {
     /// The PSP SAS-emulation voice (vita-headers SceNgsUser 3.60). First imported by a 2011
     /// fighting title's audio thread at boot.
     pub const VOICE_DEF_GET_SAS_EMU_VOICE: u32 = 0x1F51_C2BA;
+    /// The envelope buss (vita-headers SceNgsUser 3.60). First imported by a 2012 open-world
+    /// title.
+    pub const VOICE_DEF_GET_ENVELOPE_BUSS: u32 = 0xF6B6_8C31;
+    /// `SceInt32 sceNgsSystemSetParamErrorCallback(SceNgsHSynSystem, SceNgsParamsErrorCallbackFunc)`
+    /// (vita-headers `ngs_internal.h`, SceNgsUser 3.60): the callback a parameter block that
+    /// fails validation is reported to.
+    pub const SYSTEM_SET_PARAM_ERROR_CALLBACK: u32 = 0x5ADD_22DC;
     pub const VOICE_SET_PARAMS_BLOCK: u32 = 0xFB81_74B1;
     pub const VOICE_PATCH_SET_VOLUME: u32 = 0xA3C8_07BC;
     pub const PATCH_REMOVE_ROUTING: u32 = 0xD0C9_AE5A;
@@ -2332,6 +2356,10 @@ pub fn name(func_nid: u32) -> &'static str {
         c::READ_BUFFER_NEGATIVE2 => "sceCtrlReadBufferNegative2",
         s::ALLOC_MEM_BLOCK => "sceKernelAllocMemBlock",
         s::GET_MEM_BLOCK_BASE => "sceKernelGetMemBlockBase",
+        s::ALLOC_MEM_BLOCK_FOR_VM => "sceKernelAllocMemBlockForVM",
+        s::OPEN_VM_DOMAIN => "sceKernelOpenVMDomain",
+        s::CLOSE_VM_DOMAIN => "sceKernelCloseVMDomain",
+        s::SYNC_VM_DOMAIN => "sceKernelSyncVMDomain",
         lk::CLIB_PRINTF => "sceClibPrintf",
         lk::CLIB_VPRINTF => "sceClibVprintf",
         lk::CLIB_SNPRINTF => "sceClibSnprintf",
@@ -2497,6 +2525,8 @@ pub fn name(func_nid: u32) -> &'static str {
         http::URI_BUILD => "sceHttpUriBuild",
         http::DELETE_CONNECTION => "sceHttpDeleteConnection",
         http::CREATE_REQUEST_WITH_URL => "sceHttpCreateRequestWithURL",
+        http::CREATE_REQUEST2 => "sceHttpCreateRequest2",
+        http::CREATE_REQUEST_WITH_URL2 => "sceHttpCreateRequestWithURL2",
         http::DELETE_REQUEST => "sceHttpDeleteRequest",
         http::SET_CONNECT_TIMEOUT => "sceHttpSetConnectTimeOut",
         http::SET_SEND_TIMEOUT => "sceHttpSetSendTimeOut",
@@ -2506,6 +2536,7 @@ pub fn name(func_nid: u32) -> &'static str {
         http::SET_REQUEST_CONTENT_LENGTH => "sceHttpSetRequestContentLength",
         http::URI_ESCAPE => "sceHttpUriEscape",
         http::ADD_REQUEST_HEADER => "sceHttpAddRequestHeader",
+        http::REMOVE_REQUEST_HEADER => "sceHttpRemoveRequestHeader",
         http::SEND_REQUEST => "sceHttpSendRequest",
         http::ABORT_REQUEST => "sceHttpAbortRequest",
         http::GET_STATUS_CODE => "sceHttpGetStatusCode",
@@ -2892,6 +2923,10 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_TWO_SIDED_ENABLE => "sceGxmSetTwoSidedEnable",
         g::SET_FRONT_DEPTH_FUNC => "sceGxmSetFrontDepthFunc",
         g::SET_FRONT_DEPTH_BIAS => "sceGxmSetFrontDepthBias",
+        g::SET_BACK_DEPTH_BIAS => "sceGxmSetBackDepthBias",
+        g::SET_W_CLAMP_ENABLE => "sceGxmSetWClampEnable",
+        g::SET_W_CLAMP_VALUE => "sceGxmSetWClampValue",
+        g::SET_W_BUFFER_ENABLE => "sceGxmSetWBufferEnable",
         g::SET_BACK_DEPTH_FUNC => "sceGxmSetBackDepthFunc",
         g::SET_FRONT_DEPTH_WRITE_ENABLE => "sceGxmSetFrontDepthWriteEnable",
         g::SET_FRONT_FRAGMENT_PROGRAM_ENABLE => "sceGxmSetFrontFragmentProgramEnable",
@@ -3039,6 +3074,8 @@ pub fn name(func_nid: u32) -> &'static str {
         ng::VOICE_DEF_GET_TEMPLATE1 => "sceNgsVoiceDefGetTemplate1",
         ng::VOICE_DEF_GET_ATRAC9_VOICE => "sceNgsVoiceDefGetAtrac9Voice",
         ng::VOICE_DEF_GET_SAS_EMU_VOICE => "sceNgsVoiceDefGetSasEmuVoice",
+        ng::VOICE_DEF_GET_ENVELOPE_BUSS => "sceNgsVoiceDefGetEnvelopeBuss",
+        ng::SYSTEM_SET_PARAM_ERROR_CALLBACK => "sceNgsSystemSetParamErrorCallback",
         ng::VOICE_SET_PARAMS_BLOCK => "sceNgsVoiceSetParamsBlock",
         ng::VOICE_PATCH_SET_VOLUME => "sceNgsVoicePatchSetVolume",
         ng::PATCH_REMOVE_ROUTING => "sceNgsPatchRemoveRouting",
@@ -3267,6 +3304,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::POWER_SET_USING_WIRELESS => "scePowerSetUsingWireless",
         sv::POWER_GET_USING_WIRELESS => "scePowerGetUsingWireless",
         sv::COMMON_DIALOG_SET_CONFIG_PARAM => "sceCommonDialogSetConfigParam",
+        sv::COMMON_DIALOG_IS_RUNNING => "sceCommonDialogIsRunning",
         // SceCommonDialog lifecycle. These all had dispatch arms already; without a name
         // each the link-time coverage report counted them as MISSING, which is how a
         // "22 unhandled dialog calls" list came to include calls that were implemented.

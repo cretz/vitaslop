@@ -14,7 +14,7 @@ until a chosen display frame with `VITASLOP_ARM_AT_FRAME`, which is what
 makes a first-hit watchpoint usable deep inside a game instead of firing
 during boot.
 
-599 knobs.
+608 knobs.
 
 | knob | read in | what it does |
 |---|---|---|
@@ -109,10 +109,10 @@ during boot.
 | `VITASLOP_DUMP_EXPORTS` | vitaslop-runtime/src/link.rs | - |
 | `VITASLOP_DUMP_FILES` | vitaslop-runtime/src/ingest/pipeline.rs | Diagnostic: decrypt the container and write named plaintext files out to |
 | `VITASLOP_DUMP_FPROG` | vitaslop-runtime/src/host/reflect.rs | Diagnostic (`VITASLOP_DUMP_FPROG`): dump each fragment program's samplers. |
-| `VITASLOP_DUMP_FUNC` | vitaslop-native/tests/retail_boot_probe.rs | - |
+| `VITASLOP_DUMP_FUNC` | vitaslop-native/tests/dump_function.rs | - |
 | `VITASLOP_DUMP_GXP_BIN` | vitaslop-platform/src/gpu/gxm/fallback.rs | >>> A REFUSAL THAT DOES NOT HAND OVER THE EVIDENCE COSTS A PLAY SESSION. |
 | `VITASLOP_DUMP_IMAGE` | vitaslop-native/tests/retail_boot_probe.rs | - |
-| `VITASLOP_DUMP_IMPORTS` | vitaslop-native/tests/retail_boot_probe.rs | - |
+| `VITASLOP_DUMP_IMPORTS` | vitaslop-native/tests/dump_function.rs | - |
 | `VITASLOP_DUMP_IR` | vitaslop-native/tests/homebrew_memcpy.rs | Scratch window well past the code: `[SRC, SRC+WIN)` and `[DST, DST+WIN)`. |
 | `VITASLOP_DUMP_MAP` | vitaslop-native/tests/retail_boot_probe.rs | - |
 | `VITASLOP_DUMP_MEM` | vitaslop-native/tests/retail_boot_probe.rs | - |
@@ -136,6 +136,7 @@ during boot.
 | `VITASLOP_EAGER_FILES` | vitaslop-desktop/src/retail.rs | Load, decrypt, link, transpile, and instantiate the title in `dir` for live |
 | `VITASLOP_EARLY_GRACE_MS` | vitaslop-web/src/lib.rs | >>> SERVE A PARKED GPU WAIT BEFORE THE PRESENT, NOT AFTER IT. |
 | `VITASLOP_EARLY_WAIT_ANY` | vitaslop-web/src/lib.rs | `VITASLOP_EARLY_WAIT_ANY=1`: an early completion waits for EVERY in-flight readback of its |
+| `VITASLOP_EXPLICIT_BOUNDS` | vitaslop-native/src/threaded.rs | `VITASLOP_EXPLICIT_BOUNDS=1` - check every guest memory access in code instead of catching |
 | `VITASLOP_FAST_IMPORT_CURATED` | vitaslop-runtime/src/vita/mod.rs | Whether `func_nid`'s handler can only ever CONTINUE, so the transpiler may route the |
 | `VITASLOP_FIBER_RUNNER_PRIORITY` | vitaslop-runtime/src/host.rs | Whether a fiber's backing thread runs at its runner's priority (the hardware: a fiber IS its |
 | `VITASLOP_FIND_WORD` | vitaslop-native/tests/retail_boot_probe.rs | The span `VITASLOP_FIND_WORD` searches: from the image base up through the guest heap. |
@@ -154,6 +155,7 @@ during boot.
 | `VITASLOP_GAME_WORK` | vitaslop-runtime/src/ingest/pipeline.rs | Diagnostic: write the eboot's decrypted inner ELF to `VITASLOP_DUMP_DIR/eboot.elf`, so |
 | `VITASLOP_GAME_ZIP` | vitaslop-runtime/src/ingest/mod.rs | - |
 | `VITASLOP_GAP_CAP` | vitaslop-native/tests/retail_boot_probe.rs | - |
+| `VITASLOP_GESTURE_DRAG_SLOP` | vitaslop-runtime/src/vita/gesture.rs | [`DRAG_SLOP`], or `VITASLOP_GESTURE_DRAG_SLOP=<panel units>` to begin a drag only once the |
 | `VITASLOP_GPU` | vitaslop-native/tests/retail_boot_probe.rs | - |
 | `VITASLOP_GPU_BUDGET` | vitaslop-web/src/lib.rs | >>> THE GPU BUDGET: a present costs the GPU milliseconds the newest timestamp query |
 | `VITASLOP_GPU_BURN` | vitaslop-platform/src/gpu/gxm/mod.rs | `VITASLOP_GPU_BURN`'s compute work, built on first use - see [`Self::gpu_burn`]. |
@@ -176,6 +178,7 @@ during boot.
 | `VITASLOP_GXM_DEST_COALESCE` | vitaslop-platform/src/gpu.rs | `VITASLOP_GXM_DEST_COALESCE=0`: cut the pass and take a WHOLE destination copy in front of |
 | `VITASLOP_GXM_DEST_GEOM` | vitaslop-platform/src/gpu.rs | `VITASLOP_GXM_DEST_GEOM=0`: bound the destination-copy coalescing by each draw's VIEWPORT |
 | `VITASLOP_GXM_DEST_GEOM_GATE` | vitaslop-platform/src/gpu/gxm/renderer_pass.rs | The CPU budget for vertex footprints in this encode of pass `pass`, or `None` for coarse |
+| `VITASLOP_GXM_DEST_GEOM_SLICE` | vitaslop-platform/src/gpu/gxm/clip.rs | The instructions of `primary` that can reach the POSITION (`o0..o3`) - what a caller |
 | `VITASLOP_GXM_DEST_SPLIT_AB` | vitaslop-platform/src/gpu/gxm/timestamps.rs | `VITASLOP_GXM_DEST_SPLIT_AB`'s two arms: `(frames, summed GPU ms)` for the arm that |
 | `VITASLOP_GXM_DRAW_COVERAGE` | vitaslop-gxp-shader/src/link.rs | `1` - WHERE DID THIS DRAW'S VERTICES GO? Draw the mesh at CLAMPED normalised coordinates and |
 | `VITASLOP_GXM_FLOAT_TARGETS` | vitaslop-platform/src/gpu.rs | Whether a guest `SceGxmColorFormat` is F11F11F10, the packed FLOATING-POINT format a title |
@@ -228,6 +231,7 @@ during boot.
 | `VITASLOP_GXP_DEST_BLEND` | vitaslop-gxp-shader/src/module.rs | Whether [`lower_dest_blend`] is allowed to run. |
 | `VITASLOP_GXP_DEST_POISON` | vitaslop-gxp-shader/src/module.rs | `VITASLOP_GXP_DEST_POISON=<r,g,b,a>` - the constant [`dest_color_init`] seeds the output |
 | `VITASLOP_GXP_DEST_PROBE` | vitaslop-gxp-shader/src/link.rs | Turn each stage's SA-bank marker into the reads the body actually needs. |
+| `VITASLOP_GXP_DEST_SEED_LIVE` | vitaslop-gxp-shader/src/module.rs | `VITASLOP_GXP_DEST_SEED_LIVE=0`: the arm back to [`reads_output_bank`] alone - every program |
 | `VITASLOP_GXP_DISASM` | vitaslop-gxp-shader/tests/oracle.rs | Compact disassembly of one blob (named by `VITASLOP_GXP_DISASM`, matched as a filename |
 | `VITASLOP_GXP_DP_B48_BOTH` | vitaslop-gxp-shader/src/link.rs | `0` holds a repeating DP's internal op2 when bit 47 is clear and bit 48 is set (the old |
 | `VITASLOP_GXP_DP_MOE_BIT47` | vitaslop-gxp-shader/src/link.rs | `0` sends every repeating DP back to the intrinsic four-register source walk, bit 47 or not |
@@ -274,6 +278,7 @@ during boot.
 | `VITASLOP_GXP_MEM_STORE` | vitaslop-gxp-shader/src/link.rs | `0` refuses a fragment program that STORES to guest memory (0xF0 in the absolute address |
 | `VITASLOP_GXP_MEM_WINDOW_PER_DRAW` | vitaslop-gxp-shader/src/link.rs | `0` sizes a fragment program's statically unbounded memory windows at their DECLARED extent |
 | `VITASLOP_GXP_MIPS` | vitaslop-platform/src/gpu/gxm/caches.rs | Whether a chain is built for a seam, ignoring the per-texture exception above. |
+| `VITASLOP_GXP_MIPS_GUEST_LEVELS` | vitaslop-platform/src/gpu/gxm/caches.rs | Whether [`upload_gxp_texture`] builds a mip chain for this texture. |
 | `VITASLOP_GXP_NAN_SITES` | vitaslop-platform/src/gpu/gxm/clip.rs | Interpret a pair's vertex program over its OWN mesh and measure what it says about the |
 | `VITASLOP_GXP_NATIVE_F16` | vitaslop-platform/src/gpu/gxm/renderer_new.rs | Build both pipelines for a `color_format` render target. |
 | `VITASLOP_GXP_NEGW` | vitaslop-platform/src/gpu/gxm/gxp_types.rs | How to choose the clip-`w` sign correction (`VITASLOP_GXP_NEGW`). |
@@ -412,6 +417,7 @@ during boot.
 | `VITASLOP_NGS_VOICE_RAW` | vitaslop-runtime/src/vita/at9.rs | `VITASLOP_NGS_VOICE_RAW=<base>`: every voice's decoded grain, BEFORE any gain, appended to |
 | `VITASLOP_NGS_ZERO_LEVEL` | vitaslop-runtime/src/vita/at9.rs | A level of exactly 0.0 is a field the title never wrote, so unity stands |
 | `VITASLOP_NID_DIGEST` | vitaslop-runtime/src/host/env.rs | The cross-engine host-call digest for the frame in progress - see [`NidDigest`]. |
+| `VITASLOP_NONLOCAL_RETURNS` | vitaslop-transpiler/src/emit.rs | >>> A RETURN THAT DOES NOT GO TO ITS CALLER IS A NON-LOCAL TRANSFER, AND IS FOLLOWED THERE. |
 | `VITASLOP_NO_BC` | vitaslop-runtime/src/render.rs | Decode a whole BC1/BC2/BC3 block to its sixteen RGBA8 texels at once. |
 | `VITASLOP_NO_FAST_IMPORT` | vitaslop-runtime/src/vita/mod.rs | Whether `func_nid`'s handler can only ever CONTINUE, so the transpiler may route the |
 | `VITASLOP_NO_INLINE_CLIB` | vitaslop-runtime/src/vita/mod.rs | `VITASLOP_NO_INLINE_CLIB`: route `sceClibMemcpy`, `sceClibMemset` and `sceClibMemcmp` |
@@ -479,6 +485,7 @@ during boot.
 | `VITASLOP_RTT_PROBE_FIND` | vitaslop-runtime/src/rtt_writeback.rs | TEMPORARY TELEMETRY (`VITASLOP_RTT_PROBE_FIND=<rrggbb>[+<rrggbb>...]`): name every |
 | `VITASLOP_RTT_PROBE_LOG` | vitaslop-runtime/src/rtt_writeback.rs | TEMPORARY TELEMETRY (`VITASLOP_RTT_PROBE_LOG=1`): print every written-back target's |
 | `VITASLOP_RTT_SELF_WINDOW` | vitaslop-platform/src/gpu.rs | `VITASLOP_RTT_SELF_WINDOW=0` is the arm back for a draw sampling a window of the target its |
+| `VITASLOP_RTT_SELF_WINDOW_SCENE_START` | vitaslop-platform/src/gpu.rs | Whether a self window lying under its reader's own pixels is filled from the attachment as |
 | `VITASLOP_RTT_STALE_EXTENT` | vitaslop-platform/src/gpu.rs | Whether a held render target is refused as a sampler source when this frame has written its |
 | `VITASLOP_RTT_SUBRECT` | vitaslop-conformance-harness/tests/vita_gxmconf_real.rs | **SCENES 16 + 17 - A TEXTURE NAMING A SUB-RECTANGLE OF A RENDERED TARGET SAMPLES THAT RECTANGLE.** |
 | `VITASLOP_RTT_SUBRECT_HELD` | vitaslop-conformance-harness/tests/vita_gxmconf_real.rs | **SCENES 16 + 17, AT THE BASE - A TEXTURE AT A TARGET'S OWN ADDRESS, SMALLER THAN IT, IS ITS |
@@ -548,6 +555,7 @@ during boot.
 | `VITASLOP_SYNC_RESOLVE_ASYNC` | vitaslop-runtime/src/host/resolve.rs | `VITASLOP_SYNC_RESOLVE_ASYNC=0` - the arm back to reading a sync point's geometry inline under |
 | `VITASLOP_SYNC_RESOLVE_ON_WORKER` | vitaslop-web/src/browser_sched.rs | >>> A SYNC POINT'S RESOLVE-ONLY PARK, SETTLED ON THE GUEST'S OWN WORKER. |
 | `VITASLOP_SYSTEM_FONT` | vitaslop-runtime/src/font/system.rs | The resolved substitute: its bytes and a human-readable account of where they came from. |
+| `VITASLOP_TAIL_CALLS` | vitaslop-transpiler/src/emit.rs | >>> A CALL THAT IS IMMEDIATELY FOLLOWED BY A RETURN IS EMITTED AS A WASM TAIL CALL. |
 | `VITASLOP_TEXENC_SHRINK_SCRATCH` | vitaslop-platform/src/texenc.rs | >>> HOW BIG THE SHARED SOURCE BUFFER SHOULD BE for a texture needing `need_src` bytes, given |
 | `VITASLOP_TEXTURE_CHECK` | vitaslop-runtime/src/host/snapshot_cache.rs | How a retained texture snapshot is re-validated (`VITASLOP_TEXTURE_CHECK`): `scene` |
 | `VITASLOP_TEX_CACHE_MB` | vitaslop-platform/src/gpu/gxm/mod.rs | Upper bound on the cross-frame texture caches. |
@@ -617,3 +625,4 @@ during boot.
 | `VITASLOP_XML_DUMP` | vitaslop-runtime/src/vita/sce_xml.rs | `VITASLOP_XML_DUMP=<dir>`: write every document handed to `parse` into `<dir>` as |
 | `VITASLOP_Y` | vitaslop-frontend/src/settings.rs | Parse a `NAME=VALUE` per line knobs box into a map. |
 | `VITASLOP_YIELD_ELIDE` | vitaslop-runtime/src/host/state_clock.rs | >>> WHETHER A `sceKernelDelayThread(0)` HAS ANYONE TO GIVE THE CPU TO. |
+| `VITASLOP_ZLS_PROBE` | vitaslop-platform/src/gpu/gxm/renderer_chain.rs | `VITASLOP_ZLS_PROBE=<hex depth address>[@<guest frame>]`: one line per pass into that depth |

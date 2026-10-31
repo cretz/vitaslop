@@ -114,17 +114,22 @@ pub(super) fn report_raw64_fixed_dropped(addr: u32) {
     }
 }
 
-/// A draw into a RAW 64-bit target carried a guest blend state, which an integer
-/// attachment cannot apply: the words are stored unblended. Once per pair.
-pub(super) fn report_raw64_blend_dropped(key: u64) {
+/// A draw into a RAW 64-bit target carried a guest blend state its program does NOT perform
+/// over the destination, which an integer attachment cannot apply: the words are stored
+/// unblended. Once per pair.
+pub(super) fn report_raw64_blend_dropped(key: u64, blend: &wgpu::BlendState) {
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
     let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
     if seen.insert(key) {
         report_warn!(
-            "gxp pair {key:016x}: draws into a 64-bit colour surface with a blend enabled, \
-             and the raw Rg32Uint attachment cannot blend - its words are stored unblended"
+            "gxp pair {key:016x}: draws into a 64-bit colour surface with a blend enabled \
+             (colour {:?}, alpha {:?}) but a program that does not read the destination, so \
+             the blend was not patched into it as ALU and the raw Rg32Uint attachment cannot \
+             apply it - its words are stored unblended",
+            blend.color,
+            blend.alpha,
         );
     }
 }

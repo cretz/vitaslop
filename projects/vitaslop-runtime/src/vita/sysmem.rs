@@ -67,6 +67,48 @@ pub(super) fn alloc_mem_block(
     }
 }
 
+/// SceUID sceKernelAllocMemBlockForVM(const char *name, SceSize size)
+///
+/// A block for code the process GENERATES - a JIT's code cache. It is ordinary guest memory
+/// here: the guest writes into it like any other block, between `sceKernelOpenVMDomain` (make
+/// it writable) and `sceKernelCloseVMDomain` (make it executable again).
+///
+/// >>> WHAT IS NOT SUPPORTED IS RUNNING WHAT IS WRITTEN THERE. Code is translated from the
+/// title's own image (see the transpiler's `transpile_side`), and a branch into this block is
+/// a dispatch to an address outside the image, which ends the run by name. An interpreter that
+/// merely RESERVES the block at start-up and never fills it - LuaJIT with its JIT switched off
+/// - runs, which is the case this exists for today.
+#[hostcall]
+pub(super) fn alloc_mem_block_for_vm(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, size: u32) -> i32 {
+    // Main RAM, read/write: what the block is until a domain switch makes it executable.
+    const USER_RW: u32 = 0x0C20_D060;
+    let uid = st.alloc_memblock(size, 256 * 1024, USER_RW);
+    tracing::debug!(
+        target: "vitaslop::mem",
+        size,
+        name = %if name.is_null() { String::from("<unnamed>") } else { ctx.read_cstr(name.addr(), 64) },
+        uid,
+        "allocMemBlockForVM"
+    );
+    if uid == 0 { SCE_KERNEL_ERROR_NO_MEMORY } else { uid }
+}
+
+/// int sceKernelOpenVMDomain(void) / sceKernelCloseVMDomain(void): switch the process's VM
+/// blocks writable / executable. Guest memory is always both here, so there is nothing to
+/// switch; see [`alloc_mem_block_for_vm`] for what executing them would take.
+#[hostcall]
+pub(super) fn switch_vm_domain(_st: &mut VitaState) -> i32 {
+    0
+}
+
+/// int sceKernelSyncVMDomain(SceUID uid, void *data, SceSize size): make freshly written code
+/// visible to instruction fetch. No cache to flush - and no code from there is run (see
+/// [`alloc_mem_block_for_vm`]).
+#[hostcall]
+pub(super) fn sync_vm_domain(_st: &mut VitaState, _uid: i32, _data: Ptr, _size: u32) -> i32 {
+    0
+}
+
 /// `SCE_KERNEL_ERROR_NO_MEMORY`: the allocation could not be satisfied.
 const SCE_KERNEL_ERROR_NO_MEMORY: i32 = 0x8002_0003u32 as i32;
 

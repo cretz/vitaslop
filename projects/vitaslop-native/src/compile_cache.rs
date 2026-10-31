@@ -47,6 +47,7 @@ pub struct Layout {
     pub arm_word_off: Option<u64>,
     pub mirror_off: Option<u64>,
     pub dirty_off: Option<u64>,
+    pub runtime_off: u64,
     pub stubbed: Vec<u32>,
     pub stub_wasm_indices: Vec<u32>,
     pub decode_gaps: Vec<u32>,
@@ -127,6 +128,7 @@ impl Entry {
                 arm_word_off: parse_opt(field("arm_word_off")?)?,
                 mirror_off: parse_opt(field("mirror_off")?)?,
                 dirty_off: parse_opt(field("dirty_off")?)?,
+                runtime_off: u64::from_str_radix(field("runtime_off")?, 16).ok()?,
                 stubbed: parse_list(field("stubbed")?)?,
                 stub_wasm_indices: parse_list(field("stub_wasm_indices")?)?,
                 decode_gaps: parse_list(field("decode_gaps")?)?,
@@ -165,12 +167,13 @@ impl Entry {
             let bytes = module.serialize().map_err(|e| e.to_string())?;
             std::fs::write(self.path("cwasm"), &bytes).map_err(|e| e.to_string())?;
             let text = format!(
-                "funcs={}\nmem_pages={:x}\narm_word_off={}\nmirror_off={}\ndirty_off={}\nstubbed={}\nstub_wasm_indices={}\ndecode_gaps={}\n",
+                "funcs={}\nmem_pages={:x}\narm_word_off={}\nmirror_off={}\ndirty_off={}\nruntime_off={:x}\nstubbed={}\nstub_wasm_indices={}\ndecode_gaps={}\n",
                 hex_list(&layout.funcs),
                 layout.mem_pages,
                 opt(layout.arm_word_off),
                 opt(layout.mirror_off),
                 opt(layout.dirty_off),
+                layout.runtime_off,
                 hex_list(&layout.stubbed),
                 hex_list(&layout.stub_wasm_indices),
                 hex_list(&layout.decode_gaps),

@@ -4210,19 +4210,24 @@ fn emit_frc(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4]) -> 
 /// Whether FRC reads its SECOND source as the value to floor (`src1 - floor(src2)`), the
 /// reading the hardware's own RGBM encodes need; otherwise it is `fract(src1)`.
 ///
-/// >>> OFF BY DEFAULT, AND WHY. The two-source reading is the faithful one, but the only
-/// programs it changes (MEASURED: a census over every loadable capsule program - a shooter's
-/// two RGBM encodes; every other FRC names one value twice) feed a post-process chain whose
-/// held-target feedback is not yet right: with it on, that title's live picture washes out to
-/// white within seconds, while the one-source reading leaves the chain dark and the picture
-/// as it was. `VITASLOP_GXP_FRC_TWO_SOURCE=1` turns it on; turn it on by default once the
-/// chain's feedback renders right live.
+/// The only programs it changes (MEASURED: a census over every loadable capsule program) are a
+/// shooter's two RGBM encodes, which compute `m = max(r, g, b)`, `x = -m`, then `frc x' = 0, x`
+/// - i.e. `0 - floor(-m) = ceil(m)`, the RGBM multiplier. The one-source reading made that
+/// `fract(-m)`, so the title's whole post chain (its glow and adaptation atlas) was built from
+/// garbage and stayed dark. Every other FRC in the corpus names one value twice.
+///
+/// It was OFF for a while because that title's live picture washed out with it on. Re-measured
+/// live (native, the title's stairwell playbook): the two-source reading ALONE brightens the same
+/// views by 0-2 levels of 255 and adds a glow around the lights; the bleached rifle and milky
+/// wash came with `VITASLOP_RTT_SUBRECT_HELD_INTERIOR`, still off. Capsule A/B on the current
+/// tree: 24 of that title's 29 frames change, four other titles' 57 frames are byte-identical.
+/// `VITASLOP_GXP_FRC_TWO_SOURCE=0` is the arm back to `fract(src1)`.
 pub fn frc_two_source() -> bool {
     if let Some(v) = FRC_TWO_SOURCE_OVERRIDE.with(|o| o.get()) {
         return v;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VITASLOP_GXP_FRC_TWO_SOURCE").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VITASLOP_GXP_FRC_TWO_SOURCE").map(|v| v.trim() != "0").unwrap_or(true))
 }
 
 thread_local! {

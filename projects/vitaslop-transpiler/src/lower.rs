@@ -109,6 +109,33 @@ pub struct Discovered {
     /// register-indirect `blx`/`bx` (a Thumb function reaching an ARM helper via
     /// `blx reg`). Seeded as tentative ARM entries, dropped if they fail to decode.
     pub arm_code_pointers: Vec<u32>,
+    /// One past the last byte this function occupies above its entry: its highest decoded
+    /// instruction, or a literal it loads pc-relative past that (the pool a compiler puts after
+    /// the code). Where the next thing in the image can start - see `transpile_side`.
+    pub end: u32,
+}
+
+/// The bytes `[start, end)` of the literal `inst` at `addr` loads pc-relative, if it is such a
+/// load: the pc it reads is `Align(addr+4, 4)` in Thumb and `addr+8` in ARM, as lowering folds it.
+fn literal_span(inst: &Instruction, addr: u32, thumb: bool) -> Option<(u32, u32)> {
+    use Opcode::*;
+    let (mem, size) = match inst.opcode {
+        LDR => (&inst.operands[1], 4),
+        LDRH | LDRSH => (&inst.operands[1], 2),
+        LDRB | LDRSB => (&inst.operands[1], 1),
+        LDRD => (&inst.operands[2], 8),
+        VLDR => (&inst.operands[1], if simd(&inst.operands[0])?.0 == SIMDSizeCode::D { 8 } else { 4 }),
+        _ => return None,
+    };
+    let pc = if thumb { addr.wrapping_add(4) & !3 } else { addr.wrapping_add(8) };
+    let at = match *mem {
+        Operand::RegDeref(b) if b.number() == 15 => pc,
+        Operand::RegDerefPreindexOffset(b, off, add, _) if b.number() == 15 => {
+            if add { pc.wrapping_add(off.into()) } else { pc.wrapping_sub(off.into()) }
+        }
+        _ => return None,
+    };
+    Some((at, at.wrapping_add(size)))
 }
 
 /// Per-register tracked immediate constants along a straight run, so a `movt`
@@ -146,11 +173,78 @@ fn decode_at(
         return Err(Error::Decode { addr });
     }
     let mut reader = U8Reader::new(&code[off..]);
-    let inst = decoder
-        .decode(&mut reader)
-        .map_err(|_| Error::Decode { addr })?;
+    let mut inst = match decoder.decode(&mut reader) {
+        Ok(inst) => inst,
+        Err(_) if !thumb => arm_decoder_refusal(decoder, &code[off..off + 4]).ok_or(Error::Decode { addr })?,
+        Err(_) => return Err(Error::Decode { addr }),
+    };
+    // >>> THE ARM DECODER NAMES BOTH `add rd, pc, #imm` AND `sub rd, pc, #imm` `adr`, and the
+    // operands it gives (`rd, pc, #imm`) carry no sign - so the subtracting form was lowered
+    // as an ADD, `pc + imm` where the device computes `pc - imm`. Position-independent ARM
+    // code takes its own address exactly this way (`sub rN, pc, #8` is "the address of this
+    // instruction"), and the error is silent: a pointer off by twice the immediate. The
+    // opcode field (bits 24:21) still says which it was; the subtracting form is handed on as
+    // the SUB it is, which every reader of a `pc` operand already lowers correctly.
+    if !thumb && inst.opcode == Opcode::ADR {
+        let word = u32::from_le_bytes([code[off], code[off + 1], code[off + 2], code[off + 3]]);
+        if (word >> 21) & 0xf == 0b0010 {
+            inst.opcode = Opcode::SUB;
+        }
+    }
+    inst.opcode = unprivileged_as_plain(inst.opcode);
     let len = if !thumb || inst.wide { 4 } else { 2 };
     Ok((inst, len))
+}
+
+/// The UNPRIVILEGED loads and stores (`LDRT`, `STRT`, `LDRBT`, ...) as the plain access they are
+/// in a user-mode program. They differ only in performing the access with user privilege from a
+/// privileged mode, and a title only ever runs in user mode - so on the device each IS its
+/// plain counterpart. The decoder already hands them the plain form's operands (Thumb: a
+/// pre-indexed immediate with no writeback; ARM: post-indexed). MEASURED on an action title:
+/// its draw path writes command words with `strt` and every one lifted to `unreachable` - a
+/// trap 121 frames in.
+fn unprivileged_as_plain(op: Opcode) -> Opcode {
+    match op {
+        Opcode::LDRT => Opcode::LDR,
+        Opcode::STRT => Opcode::STR,
+        Opcode::LDRBT => Opcode::LDRB,
+        Opcode::STRBT => Opcode::STRB,
+        Opcode::LDRHT => Opcode::LDRH,
+        Opcode::STRHT => Opcode::STRH,
+        Opcode::LDRSBT => Opcode::LDRSB,
+        Opcode::LDRSHT => Opcode::LDRSH,
+        other => other,
+    }
+}
+
+/// An ARM instruction the decoder refuses although the architecture defines it. Each is decoded
+/// with one field changed to a value the decoder accepts, then given its own operand back:
+///
+/// - `smul<x><y> rd, rn, rm` with `rd` = `rn`: the decoder applies the rule of the neighbouring
+///   `smlal<x><y>` (whose two destinations may not be one register) to an instruction whose only
+///   UNPREDICTABLE operand is r15.
+/// - `ldrd rt, rt2, [pc, #imm]`: LDRD (literal). The decoder takes every base of r15 for the
+///   UNPREDICTABLE writeback forms, which literal loads are not - and hand-written ARM loads its
+///   double constants exactly this way (an interpreter's arithmetic handlers).
+fn arm_decoder_refusal(decoder: &InstDecoder, bytes: &[u8]) -> Option<Instruction> {
+    let word = u32::from_le_bytes(bytes.try_into().ok()?);
+    let decode = |w: u32| decoder.decode(&mut U8Reader::new(&w.to_le_bytes())).ok();
+    // cond 0001 0110 Rd 0000 Rm 1yx0 Rn
+    if word & 0x0ff0_f090 == 0x0160_0080 {
+        let rd = ((word >> 16) & 0xf) as u8;
+        let mut inst = decode((word & !(0xf << 16)) | (((u32::from(rd) + 1) & 0xf) << 16))?;
+        inst.operands[0] = Operand::Reg(Reg::from_u8(rd));
+        return Some(inst);
+    }
+    // cond 000P U1W0 1111 Rt imm4H 1101 imm4L, with P=1 and W=0 (no writeback)
+    if word & 0x0f7f_00f0 == 0x014f_00d0 {
+        let mut inst = decode(word & !(0xf << 16))?;
+        if let Operand::RegDerefPreindexOffset(_, imm, up, wback) = inst.operands[2] {
+            inst.operands[2] = Operand::RegDerefPreindexOffset(Reg::from_u8(15), imm, up, wback);
+            return Some(inst);
+        }
+    }
+    None
 }
 
 /// The control-flow shape of a decoded instruction, used to find successors.
@@ -329,6 +423,27 @@ fn flow(
         // memory (a thunk, a pc-relative jump table). Either way there is no
         // in-function successor; the lowering picks return vs dispatch.
         Opcode::LDR | Opcode::MOV if regnum(&inst.operands[0]) == Some(15) => Flow::Return,
+        // Any other data-processing write of the pc is a computed jump (`add pc, pc, rN, lsl
+        // #2` over a switch's offset table), lowered as a dispatch - see `lower_insn`.
+        Opcode::ADD
+        | Opcode::SUB
+        | Opcode::RSB
+        | Opcode::ADC
+        | Opcode::SBC
+        | Opcode::RSC
+        | Opcode::AND
+        | Opcode::ORR
+        | Opcode::EOR
+        | Opcode::BIC
+        | Opcode::MVN
+        | Opcode::LSL
+        | Opcode::LSR
+        | Opcode::ASR
+        | Opcode::ROR
+            if regnum(&inst.operands[0]) == Some(15) =>
+        {
+            Flow::Return
+        }
         _ => {
             let _ = len;
             Flow::Seq
@@ -508,6 +623,9 @@ struct SwitchInfo {
     /// offset over a window, so it needs both.
     bias: i32,
     shift: u32,
+    /// A CONDITIONAL switch (`addls pc, pc, rN, lsl #2`): taken under the condition, else
+    /// the index of the target that is the next instruction (inside the window).
+    cond: Option<(ConditionCode, u32)>,
 }
 
 /// The window an ARM `add pc, pc, rN` may land in: `pc + 8 + rN` for `rN` in
@@ -545,7 +663,58 @@ fn arm_add_pc_switch(inst: &Instruction, addr: u32, thumb: bool, code_len: u32, 
     if targets.is_empty() {
         return None;
     }
-    Some(SwitchInfo { index: rm.number(), targets, default: None, bias: pc.wrapping_sub(start) as i32, shift: 2 })
+    Some(SwitchInfo { index: rm.number(), targets, default: None, bias: pc.wrapping_sub(start) as i32, shift: 2, cond: None })
+}
+
+/// GCC's ARM word-table switch, `cmp rN, #n ; addls pc, pc, rN, lsl #2 ; b default ; b case0
+/// ...`: the add is CONDITIONAL on the compare right before it, so that compare bounds the
+/// table exactly (`ls`: n + 1 entries, `lo`: n), and its not-taken arm is the next
+/// instruction. Targets are `[next, case0, case1, ...]`. Any other `add pc, pc, rN, lsl #2`
+/// - unconditional, or with no compare to bound it - stays a dynamic dispatch: a fixed
+/// window would cut a longer table short (an interpreter's has dozens of cases).
+fn arm_add_pc_word_switch(
+    inst: &Instruction,
+    addr: u32,
+    thumb: bool,
+    code_len: u32,
+    base: u32,
+    decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
+) -> Option<SwitchInfo> {
+    if thumb || inst.opcode != Opcode::ADD || inst.s() {
+        return None;
+    }
+    let (Some(Operand::Reg(rd)), Some(Operand::Reg(rn)), Some(Operand::RegShift(rs))) =
+        (inst.operands.first(), inst.operands.get(1), inst.operands.get(2))
+    else {
+        return None;
+    };
+    let RegShiftStyle::RegImm(sh) = rs.into_shift() else { return None };
+    let rm = sh.shiftee().number();
+    if rd.number() != 15 || rn.number() != 15 || rm == 15 || sh.stype() != ShiftStyle::LSL || sh.imm() != 2 {
+        return None;
+    }
+    let (cmp, _, cmp_cond, _) = decoded.get(&addr.wrapping_sub(4))?;
+    if cmp.opcode != Opcode::CMP || *cmp_cond != ConditionCode::AL || regnum(&cmp.operands[0]) != Some(rm) {
+        return None;
+    }
+    let n = match cmp.operands.get(1) {
+        Some(Operand::Imm32(n) | Operand::Imm(n)) => n,
+        _ => return None,
+    };
+    let count = match inst.condition {
+        ConditionCode::LS => n.checked_add(1)?,
+        ConditionCode::LO => *n,
+        _ => return None,
+    };
+    if count == 0 || count > MAX_SWITCH_ENTRIES {
+        return None;
+    }
+    let next = addr.wrapping_add(4);
+    let targets: Vec<u32> = (0..=count).map(|i| next.wrapping_add(4 * i)).collect();
+    if targets.iter().any(|t| t.wrapping_sub(base) >= code_len) {
+        return None;
+    }
+    Some(SwitchInfo { index: rm, targets, default: None, bias: 1, shift: 0, cond: Some((inst.condition, 0)) })
 }
 
 /// `ldr pc, [pc, rM, lsl #2]` in ARM mode, unconditional: a jump table of ABSOLUTE
@@ -636,7 +805,7 @@ fn arm_ldr_pc_switch(
         return None;
     }
     let targets = (0..count).map(entry).collect::<Option<Vec<u32>>>()?;
-    Some(SwitchInfo { index, targets, default, bias: 0, shift: 0 })
+    Some(SwitchInfo { index, targets, default, bias: 0, shift: 0, cond: None })
 }
 
 /// libgcc's integer-division ladder (`__aeabi_uidiv`/`__aeabi_idiv`, `lib1funcs.S`
@@ -737,6 +906,7 @@ fn mov_pc_ladder_switch(
         default: None,
         bias: 0u32.wrapping_sub(ladder) as i32,
         shift,
+        cond: None,
     })
 }
 
@@ -881,7 +1051,7 @@ fn arm_slot_dispatch(
             sites.len()
         );
     }
-    let info = SwitchInfo { index: rd, targets, default: None, bias: 0u32.wrapping_sub(slots) as i32, shift };
+    let info = SwitchInfo { index: rd, targets, default: None, bias: 0u32.wrapping_sub(slots) as i32, shift, cond: None };
     Some((info, sites))
 }
 
@@ -1532,7 +1702,7 @@ fn resolve_switch(
         }
         return None;
     };
-    Some(SwitchInfo { index, targets, default, bias: 0, shift: 0 })
+    Some(SwitchInfo { index, targets, default, bias: 0, shift: 0, cond: None })
 }
 
 /// Whether the table-branch diagnostic is on for this address
@@ -1827,6 +1997,7 @@ fn discover_with(
         // through - resolved or not. An unresolved table is reported per-function in
         // pass 2 rather than marching the decoder into table data.
         if let Some(info) = arm_add_pc_switch(&inst, addr, thumb, code.len() as u32, base)
+            .or_else(|| arm_add_pc_word_switch(&inst, addr, thumb, code.len() as u32, base, &decoded))
             .or_else(|| arm_ldr_pc_switch(&inst, addr, thumb, code, base, &decoded))
             .or_else(|| mov_pc_ladder_switch(&inst, addr, &decoded, code.len() as u32, base))
             .or_else(|| slot_sites.get(&addr).cloned())
@@ -2131,6 +2302,16 @@ fn discover_with(
                                 Value::Imm(info.shift),
                             )
                         };
+                        // Conditional: `next ^ ((index ^ next) & -holds)` picks the case index
+                        // when the condition holds and the next instruction's slot when not.
+                        let index = match info.cond {
+                            None => index,
+                            Some((c, next)) => {
+                                let mask = bin(BinOp::Sub, Value::Imm(0), cond_holds(c));
+                                let picked = bin(BinOp::And, bin(BinOp::Xor, index, Value::Imm(next)), mask);
+                                bin(BinOp::Xor, Value::Imm(next), picked)
+                            }
+                        };
                         break Term::Switch {
                             index,
                             targets: info.targets.clone(),
@@ -2287,7 +2468,25 @@ fn discover_with(
     }
 
     arm_code_pointers.extend(arm_built_pointers.into_iter().filter(|&a| opens_like_arm_code(code, base, a)));
+    // The code that RUNS ON from the entry - consecutive decoded instructions and the literal
+    // words they load, in whatever order they sit - and not the highest block reached: a
+    // branch to a shared slow path far below would otherwise claim everything in between.
+    let literals: BTreeMap<u32, u32> = decoded
+        .iter()
+        .filter_map(|(&a, (inst, ..))| literal_span(inst, a, thumb))
+        .collect();
+    let mut end = entry;
+    loop {
+        if let Some(&(_, len, ..)) = decoded.get(&end) {
+            end = end.wrapping_add(len);
+        } else if let Some((_, &lit_end)) = literals.range(..=end).next_back().filter(|&(_, &e)| e > end) {
+            end = lit_end;
+        } else {
+            break;
+        }
+    }
     Ok(Discovered {
+        end,
         func,
         trap_leaders: trap_leaders.union(&lower_gaps).copied().collect(),
         callees: callees.into_iter().collect(),
@@ -2370,11 +2569,13 @@ fn operand_value(op: &Operand, pc: u32) -> Option<Value> {
 
 /// Lower a shifted-register operand into its value. Immediate shifts fold to a
 /// single wasm shift (with the ARM `#0` conventions: LSL #0 is the bare register,
-/// LSR/ASR #0 mean shift by 32, ROR #0 is RRX). Register-controlled shifts mask
-/// the amount to a byte; amounts >= 32 are left to wasm's mod-32 shift for now
-/// (exact wide-shift semantics are a later refinement). `RRX` (needs the carry
-/// flag) is not modeled yet.
+/// LSR/ASR #0 mean shift by 32). A shift by a REGISTER and `rrx` (ROR #0) are what the
+/// [`Stmt::Shifter`] `lower_insn` puts before the instruction computed - see
+/// [`shifter_stmt`].
 fn shift_operand(rs: &RegShift) -> Option<Value> {
+    if shifter_stmt(rs).is_some() {
+        return Some(Value::ShifterOut);
+    }
     match rs.into_shift() {
         RegShiftStyle::RegImm(s) => {
             let base = Value::Reg(s.shiftee().number());
@@ -2404,7 +2605,7 @@ fn shift_operand(rs: &RegShift) -> Option<Value> {
                 }
                 ShiftStyle::ROR => {
                     if n == 0 {
-                        return None; // RRX (rotate through carry) not modeled yet
+                        return None; // RRX - computed by the shifter above
                     }
                     bin(
                         BinOp::Or,
@@ -2414,17 +2615,7 @@ fn shift_operand(rs: &RegShift) -> Option<Value> {
                 }
             })
         }
-        RegShiftStyle::RegReg(s) => {
-            let base = Value::Reg(s.shiftee().number());
-            let amt = bin(BinOp::And, Value::Reg(s.shifter().number()), Value::Imm(0xff));
-            let op = match s.stype() {
-                ShiftStyle::LSL => BinOp::Shl,
-                ShiftStyle::LSR => BinOp::Lsr,
-                ShiftStyle::ASR => BinOp::Asr,
-                ShiftStyle::ROR => return None,
-            };
-            Some(bin(op, base, amt))
-        }
+        RegShiftStyle::RegReg(_) => None, // computed by the shifter above
     }
 }
 
@@ -2471,6 +2662,31 @@ fn store_if(out: &mut Vec<Stmt>, addr: Value, data: Value, size: MemSize, mask: 
 
 fn bin(op: BinOp, a: Value, b: Value) -> Value {
     Value::Bin(op, Box::new(a), Box::new(b))
+}
+
+/// 1 when `c` holds over the current flags, else 0, as a value (for a select).
+fn cond_holds(c: ConditionCode) -> Value {
+    use crate::abi::Flag;
+    let f = |x: Flag| Value::Flag(x);
+    let not = |v: Value| bin(BinOp::Xor, v, Value::Imm(1));
+    let n_ne_v = || bin(BinOp::Xor, f(Flag::N), f(Flag::V));
+    match c {
+        ConditionCode::EQ => f(Flag::Z),
+        ConditionCode::NE => not(f(Flag::Z)),
+        ConditionCode::HS => f(Flag::C),
+        ConditionCode::LO => not(f(Flag::C)),
+        ConditionCode::MI => f(Flag::N),
+        ConditionCode::PL => not(f(Flag::N)),
+        ConditionCode::VS => f(Flag::V),
+        ConditionCode::VC => not(f(Flag::V)),
+        ConditionCode::HI => bin(BinOp::And, f(Flag::C), not(f(Flag::Z))),
+        ConditionCode::LS => bin(BinOp::Or, not(f(Flag::C)), f(Flag::Z)),
+        ConditionCode::GE => not(n_ne_v()),
+        ConditionCode::LT => n_ne_v(),
+        ConditionCode::GT => bin(BinOp::And, not(f(Flag::Z)), not(n_ne_v())),
+        ConditionCode::LE => bin(BinOp::Or, f(Flag::Z), n_ne_v()),
+        ConditionCode::AL => Value::Imm(1),
+    }
 }
 
 /// The [`ParallelOp`] of a parallel add/subtract opcode (callers pass only those).
@@ -2634,7 +2850,95 @@ fn reg_offset_addr(base: u8, offset: Value, add: bool, wback: bool, post: bool) 
 /// Lower one instruction into its statements and, if it terminates the block,
 /// the terminator. `cond` is the applied (possibly IT) condition; when it is not
 /// `AL` the data effects are wrapped in a `Guard`.
+#[allow(clippy::too_many_arguments)]
 fn lower_insn(
+    inst: &Instruction,
+    addr: u32,
+    len: u32,
+    cond: ConditionCode,
+    in_it: bool,
+    thumb: bool,
+    entry: u32,
+    imports: &Imports,
+    indirect_imports: &BTreeMap<u32, u32>,
+    indirect_redirects: &BTreeMap<u32, u32>,
+) -> Result<(Vec<Stmt>, Option<Term>), Error> {
+    let (mut stmts, term) = lower_insn_inner(
+        inst,
+        addr,
+        len,
+        cond,
+        in_it,
+        thumb,
+        entry,
+        imports,
+        indirect_imports,
+        indirect_redirects,
+    )?;
+    // An operand shifted by a register, or rotated through the carry, is read as
+    // `Value::ShifterOut` (see `shift_operand`), so the instruction is preceded by the
+    // `Stmt::Shifter` that computes it.
+    if let Some(shifter) = inst.operands.iter().find_map(|o| match o {
+        Operand::RegShift(rs) => shifter_stmt(rs),
+        _ => None,
+    }) {
+        stmts.insert(0, shifter);
+    }
+    // >>> AN INSTRUCTION THAT WRITES THE PC IS A JUMP, whatever else it is. The forms the
+    // lowering knows - `bx`, `mov pc, lr`, `ldr pc`, `pop {pc}`, the recognized jump tables -
+    // arrive here with their terminator set. Anything else that wrote r15 used to fall
+    // through into the next instruction with the write discarded: an ARM `switch` compiled
+    // to `ldrh rN, [table, i]; add pc, pc, rN, lsl #2` ran its DEFAULT case for every value.
+    // It is a jump through the dispatcher instead, and the target - a case label nothing
+    // else names - is translated when it is first reached.
+    //
+    // A PREDICATED one (`addls pc, pc, rN, lsl #2`) arrives as one guard around its effects; it
+    // is handed back unguarded, with a terminator, so the block builder predicates the jump
+    // and the transfer together the way it does every conditional terminator.
+    if term.is_none() {
+        let writes_pc = |s: &[Stmt]| s.iter().position(|s| matches!(s, Stmt::SetReg(15, _)));
+        if let [Stmt::Guard(_, body)] = stmts.as_slice()
+            && writes_pc(body).is_some()
+        {
+            let Some(Stmt::Guard(_, body)) = stmts.pop() else { unreachable!() };
+            stmts = body;
+        }
+        if let Some(i) = writes_pc(&stmts) {
+            let Stmt::SetReg(_, target) = stmts.remove(i) else { unreachable!() };
+            stmts.insert(i, Stmt::CallIndirect { addr: target, set_lr: None });
+            stmts.truncate(i + 1);
+            return Ok((stmts, Some(Term::Return)));
+        }
+    }
+    Ok((stmts, term))
+}
+
+/// The [`Stmt::Shifter`] a shifted-register operand needs, when it is one of the forms an
+/// expression cannot carry: a shift by a register, or `rrx` (`ror #0`).
+fn shifter_stmt(rs: &RegShift) -> Option<Stmt> {
+    use crate::ir::ShifterKind;
+    match rs.into_shift() {
+        RegShiftStyle::RegReg(s) => Some(Stmt::Shifter {
+            kind: match s.stype() {
+                ShiftStyle::LSL => ShifterKind::Lsl,
+                ShiftStyle::LSR => ShifterKind::Lsr,
+                ShiftStyle::ASR => ShifterKind::Asr,
+                ShiftStyle::ROR => ShifterKind::Ror,
+            },
+            rm: Value::Reg(s.shiftee().number()),
+            amount: Value::Reg(s.shifter().number()),
+        }),
+        RegShiftStyle::RegImm(s) if s.stype() == ShiftStyle::ROR && s.imm() == 0 => Some(Stmt::Shifter {
+            kind: ShifterKind::Rrx,
+            rm: Value::Reg(s.shiftee().number()),
+            amount: Value::Imm(1),
+        }),
+        RegShiftStyle::RegImm(_) => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_insn_inner(
     inst: &Instruction,
     addr: u32,
     len: u32,
@@ -2707,6 +3011,12 @@ fn lower_insn(
             );
             let mut stmts = a.pre;
             if pops_sp {
+                // A return to the popped address (see `emit::nonlocal_returns`).
+                stmts.push(Stmt::SetRet(Value::Load {
+                    addr: Box::new(a.addr),
+                    size: MemSize::Word,
+                    signed: false,
+                }));
                 stmts.extend(a.post);
                 return Ok((stmts, Some(Term::Return)));
             }
@@ -2780,7 +3090,12 @@ fn lower_insn(
                     _ => return Err(err()),
                 },
             };
-            return Ok((stmts, None));
+            // >>> A CONDITIONAL CALL IS A CONDITIONAL CALL. A call does not end its block, so
+            // it is not a terminator the caller predicates - and returning from here skipped
+            // the guard every other non-terminator gets at the end of this function, so ARM's
+            // `blne` called its target whatever the flags said. Hand-written ARM uses it freely
+            // (an interpreter converting an operand only when it is not already an integer).
+            return Ok((predicated(cond, stmts), None));
         }
         POP | LDM(..) if writes_pc(inst) => {
             let mut stmts = lower_ldm(inst, addr)?;
@@ -2790,7 +3105,7 @@ fn lower_insn(
         }
         SVC => {
             let n = imm(&ops[0]).unwrap_or(0);
-            return Ok((vec![Stmt::Svc(n)], None));
+            return Ok((predicated(cond, vec![Stmt::Svc(n)]), None));
         }
         // A breakpoint is a debug trap the compiler plants on an unreachable /
         // abort path (`__builtin_trap`, a failed noreturn guard). Reaching one is
@@ -2805,10 +3120,15 @@ fn lower_insn(
     // Non-control effects. Build the effect list, then wrap in a Guard if
     // predicated.
     let effects = lower_effects(inst, addr, in_it)?;
-    if cond == ConditionCode::AL || effects.is_empty() {
-        Ok((effects, None))
+    Ok((predicated(cond, effects), None))
+}
+
+/// `stmts` under `cond`: a guard unless the condition is always, or there is nothing to guard.
+fn predicated(cond: ConditionCode, stmts: Vec<Stmt>) -> Vec<Stmt> {
+    if cond == ConditionCode::AL || stmts.is_empty() {
+        stmts
     } else {
-        Ok((vec![Stmt::Guard(cond, effects)], None))
+        vec![Stmt::Guard(cond, stmts)]
     }
 }
 
@@ -2886,14 +3206,10 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let src = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             // Flags before the write: the value expression reads original regs.
             if sets_flags {
-                let carry = match (&src, &ops[1]) {
-                    (Value::Imm(v), _) => modified_imm_carry(*v, inst.thumb),
-                    // ARM `movs rd, rm, <shift> #n` (the A32 spelling of `lsls`/`lsrs`/
-                    // `asrs`/`rors`): C is the shifter carry-out. newlib's memcpy tail
-                    // reads it (`lsls r2, r2, #31 ; ldrhhs ...`).
-                    (_, Operand::RegShift(rs)) => reg_shift_carry(rs),
-                    _ => None,
-                };
+                // ARM `movs rd, rm, <shift> #n` (the A32 spelling of `lsls`/`lsrs`/
+                // `asrs`/`rors`): C is the shifter carry-out. newlib's memcpy tail
+                // reads it (`lsls r2, r2, #31 ; ldrhhs ...`).
+                let carry = operand_carry(&ops[1], &src, inst.thumb);
                 out.push(Stmt::FlagsLogic { value: src.clone(), carry, live: ALL_FLAGS });
             }
             out.push(Stmt::SetReg(rd, src));
@@ -2914,11 +3230,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let src = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             // MVN's carry-out comes from the raw immediate expansion, not the ~value;
             // a shifted register contributes its shifter carry-out.
-            let carry = match (&src, &ops[1]) {
-                (Value::Imm(v), _) => modified_imm_carry(*v, inst.thumb),
-                (_, Operand::RegShift(rs)) => reg_shift_carry(rs),
-                _ => None,
-            };
+            let carry = operand_carry(&ops[1], &src, inst.thumb);
             let value = Value::Not(Box::new(src));
             if sets_flags {
                 out.push(Stmt::FlagsLogic { value: value.clone(), carry, live: ALL_FLAGS });
@@ -3074,11 +3386,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             // carry-out instead.
             let op2_operand =
                 if matches!(ops[2], Operand::Nothing) { &ops[1] } else { &ops[2] };
-            let imm_carry = match (&op2, op2_operand) {
-                (Value::Imm(v), _) => modified_imm_carry(*v, inst.thumb),
-                (_, Operand::RegShift(rs)) => reg_shift_carry(rs),
-                _ => None,
-            };
+            let imm_carry = operand_carry(op2_operand, &op2, inst.thumb);
             // BIC/ORN take the bitwise complement of the second operand.
             let op2 = if matches!(inst.opcode, BIC | ORN) {
                 Value::Not(Box::new(op2))
@@ -3158,6 +3466,33 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // ror rd, rn, rm/#imm: rotate right. Amount is masked mod 32 (wasm rotr,
         // matching ARM's register-rotate masking); ROR's carry-out is bit 31 of
         // the result when it sets flags.
+        // A register amount goes through the exact shifter: zero leaves C unchanged.
+        ROR if !matches!(dataproc(inst, pc_const), Some((_, _, Value::Imm(_)))) => {
+            let (rd, rn, sh) = dataproc(inst, pc_const).ok_or_else(err)?;
+            out.push(Stmt::Shifter { kind: crate::ir::ShifterKind::Ror, rm: rn, amount: sh });
+            if sets_flags {
+                out.push(Stmt::FlagsLogic {
+                    value: Value::ShifterOut,
+                    carry: Some(Value::ShifterCarry),
+                    live: ALL_FLAGS,
+                });
+            }
+            out.push(Stmt::SetReg(rd, Value::ShifterOut));
+        }
+        // rrx rd, rm: rotate right by one through the carry.
+        RRX => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            out.push(Stmt::Shifter { kind: crate::ir::ShifterKind::Rrx, rm, amount: Value::Imm(1) });
+            if sets_flags {
+                out.push(Stmt::FlagsLogic {
+                    value: Value::ShifterOut,
+                    carry: Some(Value::ShifterCarry),
+                    live: ALL_FLAGS,
+                });
+            }
+            out.push(Stmt::SetReg(rd, Value::ShifterOut));
+        }
         ROR => {
             let (rd, rn, sh) = dataproc(inst, pc_const).ok_or_else(err)?;
             let result = bin(BinOp::Ror, rn, sh);
@@ -3206,9 +3541,8 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             }
             out.push(Stmt::SetReg(rd, result));
         }
-        // umull/smull rdlo, rdhi, rn, rm: {rdhi:rdlo} = rn * rm (64-bit). The S
-        // form (flag-setting) is not emitted by the compilers we target; ignore
-        // flags here (the widening product's N/Z would need the 64-bit value).
+        // umull/smull rdlo, rdhi, rn, rm: {rdhi:rdlo} = rn * rm (64-bit). The S form sets
+        // N from bit 63 and Z from all 64 bits, C and V unchanged - see `long_nz`.
         UMULL | SMULL | UMLAL | SMLAL => {
             let rdlo = regnum(&ops[0]).ok_or_else(err)?;
             let rdhi = regnum(&ops[1]).ok_or_else(err)?;
@@ -3222,6 +3556,19 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 signed: matches!(inst.opcode, SMULL | SMLAL),
                 accumulate: matches!(inst.opcode, UMLAL | SMLAL),
             });
+            if sets_flags {
+                out.push(Stmt::FlagsLogic { value: long_nz(rdlo, rdhi), carry: None, live: ALL_FLAGS });
+            }
+        }
+        // qadd rd, rm, rn = sat(rm + rn); qsub = sat(rm - rn); the `d` forms double rn first,
+        // saturating that too. The Q flag they set is not modelled (nothing here reads it).
+        QADD | QSUB | QDADD | QDSUB => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            let rn = operand_value(&ops[2], pc_const).ok_or_else(err)?;
+            let rn = if matches!(inst.opcode, QDADD | QDSUB) { sat_add(rn.clone(), rn) } else { rn };
+            let value = if matches!(inst.opcode, QADD | QDADD) { sat_add(rm, rn) } else { sat_sub(rm, rn) };
+            out.push(Stmt::SetReg(rd, value));
         }
         // clz rd, rm.
         CLZ => {
@@ -3387,6 +3734,10 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             } else {
                 bin(BinOp::Add, prod, ra)
             };
+            // `mlas`: N and Z from the result, C and V unchanged.
+            if sets_flags {
+                out.push(Stmt::FlagsLogic { value: result.clone(), carry: None, live: ALL_FLAGS });
+            }
             out.push(Stmt::SetReg(rd, result));
         }
         // rev rd, rm: reverse all four bytes.
@@ -4101,10 +4452,60 @@ fn modified_imm_carry(value: u32, thumb: bool) -> Option<Value> {
     Some(Value::Imm(value >> 31))
 }
 
+/// The carry-out of a flag-setting logical instruction's second operand `op`, whose value
+/// lowered to `value`: a shifted register's shifter carry-out, a modified immediate's from its
+/// expansion. Decided by the operand's FORM, not its value - `rm, lsr #32` lowers to the
+/// constant 0, and taking that for an immediate left C unchanged where the device sets it to
+/// `rm[31]`.
+fn operand_carry(op: &Operand, value: &Value, thumb: bool) -> Option<Value> {
+    match (op, value) {
+        (Operand::RegShift(rs), _) => reg_shift_carry(rs),
+        (_, Value::Imm(v)) => modified_imm_carry(*v, thumb),
+        _ => None,
+    }
+}
+
+/// A value whose N and Z are the 64-bit `{hi:lo}`'s: bit 31 is `hi`'s, and it is zero only
+/// when both halves are. `(lo | -lo) >> 1` is non-zero exactly when `lo` is, with its top bit
+/// clear, so OR-ing it into `hi` decides Z without touching N.
+fn long_nz(lo: u8, hi: u8) -> Value {
+    let lo = Value::Reg(lo);
+    let any = bin(BinOp::Or, lo.clone(), bin(BinOp::Sub, Value::Imm(0), lo));
+    bin(BinOp::Or, Value::Reg(hi), bin(BinOp::Lsr, any, Value::Imm(1)))
+}
+
+/// Signed saturating `a + b`: the wrapped sum, unless it overflowed (both operands' sign
+/// differs from the sum's), when it is the bound on `a`'s side - `(a >> 31) ^ 0x7fffffff`
+/// is 0x7fffffff for a non-negative `a` and 0x80000000 for a negative one. Selected with a
+/// mask, `s ^ ((s ^ bound) & -overflow)`, since the IR has no select.
+fn sat_add(a: Value, b: Value) -> Value {
+    let s = bin(BinOp::Add, a.clone(), b.clone());
+    let ovf = bin(BinOp::And, bin(BinOp::Xor, a.clone(), s.clone()), bin(BinOp::Xor, b, s.clone()));
+    saturate(a, s, ovf)
+}
+
+/// Signed saturating `a - b`: overflow when the operands' signs differ and the result's
+/// differs from `a`'s.
+fn sat_sub(a: Value, b: Value) -> Value {
+    let s = bin(BinOp::Sub, a.clone(), b.clone());
+    let ovf = bin(BinOp::And, bin(BinOp::Xor, a.clone(), b), bin(BinOp::Xor, a.clone(), s.clone()));
+    saturate(a, s, ovf)
+}
+
+/// `s`, or the bound on `a`'s side when bit 31 of `ovf` is set.
+fn saturate(a: Value, s: Value, ovf: Value) -> Value {
+    let mask = bin(BinOp::Asr, ovf, Value::Imm(31));
+    let bound = bin(BinOp::Xor, bin(BinOp::Asr, a, Value::Imm(31)), Value::Imm(0x7fff_ffff));
+    bin(BinOp::Xor, s.clone(), bin(BinOp::And, bin(BinOp::Xor, s, bound), mask))
+}
+
 /// The shifter carry-out of a shifted-register operand with an immediate amount
 /// (`rm, lsl #n` and friends); `None` when the amount is a register or the shift
 /// leaves C unchanged (`lsl #0`).
 fn reg_shift_carry(rs: &RegShift) -> Option<Value> {
+    if shifter_stmt(rs).is_some() {
+        return Some(Value::ShifterCarry);
+    }
     let RegShiftStyle::RegImm(s) = rs.into_shift() else { return None };
     let base = Value::Reg(s.shiftee().number());
     let n = s.imm() as u32;
@@ -4255,7 +4656,14 @@ fn lower_ldm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
     };
     for (i, r) in regs.iter().enumerate() {
         if *r == 15 {
-            continue; // pc -> return, handled by terminator
+            // The pc is the return, made by the terminator - to the address loaded here, which
+            // is where the return really goes (see `emit::nonlocal_returns`).
+            out.push(Stmt::SetRet(Value::Load {
+                addr: Box::new(block_slot_addr(base, first, i)),
+                size: MemSize::Word,
+                signed: false,
+            }));
+            continue;
         }
         if base_in_list && *r == base {
             continue; // deferred below so it does not clobber the base early
@@ -4279,7 +4687,7 @@ fn value_uses_reg(v: &Value, r: u8) -> bool {
     match v {
         Value::Reg(x) => *x == r,
         Value::Imm(_) | Value::Flag(_) | Value::CarryAddResult | Value::ThreadPtr
-        | Value::ExclAddr => false,
+        | Value::ExclAddr | Value::ShifterOut | Value::ShifterCarry => false,
         Value::Not(a) | Value::Clz(a) => value_uses_reg(a, r),
         Value::Bin(_, a, b) => value_uses_reg(a, r) || value_uses_reg(b, r),
         Value::Load { addr, .. } => value_uses_reg(addr, r),
@@ -5322,6 +5730,42 @@ mod switch_bound_tests {
         let mut bad = code.clone();
         bad[0x14..0x18].copy_from_slice(&(base + 0x26).to_le_bytes());
         assert!(arm_ldr_pc_switch(&ldr, base + 8, false, &bad, base, &decoded).is_none());
+    }
+
+    /// GCC's ARM word-table switch, `cmp r0, #3 ; addls pc, pc, r0, lsl #2 ; b default ;
+    /// b case0 ...`, is recovered STATICALLY, bounded by that compare: index `r0` lands on
+    /// `pc + 8 + 4 * r0`, the not-taken arm is the next instruction. Left to a dynamic dispatch
+    /// it needs runtime translation of a mid-function address, which the browser conformance
+    /// VM does not have. The UNCONDITIONAL form has no such bound and stays a dispatch: a fixed
+    /// window cut an interpreter's longer tables short and it trapped.
+    #[test]
+    fn a_conditional_word_indexed_add_pc_is_a_switch() {
+        let base: u32 = 0x8100_0000;
+        let words: [u32; 8] = [
+            0xe350_0003, // cmp r0, #3
+            0x908f_f100, // addls pc, pc, r0, lsl #2
+            0xea00_0000, 0xea00_0000, 0xea00_0000, 0xea00_0000, 0xea00_0000, // b default ; b cases
+            0xe12f_ff1e, // bx lr
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoder = InstDecoder::default();
+        let mut decoded = BTreeMap::new();
+        for a in (base..base + 8).step_by(4) {
+            let (inst, len) = decode_at(&decoder, &code, base, a, false).expect("decodes");
+            let c = inst.condition;
+            decoded.insert(a, (inst, len, c, false));
+        }
+        let add = decoded[&(base + 4)].0;
+        let info = arm_add_pc_word_switch(&add, base + 4, false, code.len() as u32, base, &decoded).expect("recognised");
+        assert_eq!(info.targets, vec![base + 8, base + 0xc, base + 0x10, base + 0x14, base + 0x18]);
+        assert_eq!((info.index, info.bias, info.shift), (0, 1, 0));
+        assert_eq!(info.cond, Some((ConditionCode::LS, 0)), "not taken: the `b default` after it");
+        // `add pc, pc, r0, lsl #2` with no condition: nothing bounds it.
+        let mut always = code.clone();
+        always[4..8].copy_from_slice(&0xe08f_f100u32.to_le_bytes());
+        let (add, _) = decode_at(&decoder, &always, base, base + 4, false).expect("decodes");
+        assert!(arm_add_pc_word_switch(&add, base + 4, false, code.len() as u32, base, &decoded).is_none());
+        assert!(arm_add_pc_switch(&add, base + 4, false, code.len() as u32, base).is_none());
     }
 
     /// The guard can sit ABOVE the block that holds the load, branching INTO it when in range:

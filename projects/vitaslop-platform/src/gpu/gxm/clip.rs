@@ -154,7 +154,7 @@ pub(super) fn count_clip_w_signs(gxp: &GxpRecompile, max_samples: usize) -> Resu
             whi = whi.max(w);
         }
     };
-    let mem = interpret_vertices(gxp, &pick, &mut visit)?;
+    let mem = interpret_vertices(gxp, &pick, &mut visit, false)?;
     let n = sampled as f64;
     let denom = n * sww - sw * sw;
     // A mesh whose vertices all share one `w` (a 2D overlay, a billboard) pins no line
@@ -196,6 +196,10 @@ struct MemStats {
 /// primary and secondary programs, its container literals and its memory-window layout.
 struct VertexInterpPlan {
     primary: vitaslop_gxp_shader::Shader,
+    /// The instructions of `primary` that can reach the POSITION (`o0..o3`) - what a caller
+    /// that reads nothing else runs instead (`vitaslop_gxp_shader::module::output_slice`).
+    /// `None` when the program cannot be sliced or `VITASLOP_GXM_DEST_GEOM_SLICE=0`.
+    position: Option<vitaslop_gxp_shader::Shader>,
     secondary: Option<vitaslop_gxp_shader::Shader>,
     literals: Vec<(u32, u32)>,
     windows: Vec<vitaslop_gxp_shader::module::MemWindow>,
@@ -221,6 +225,9 @@ fn vertex_interp_plan(vprog: &std::sync::Arc<[u8]>) -> Result<std::sync::Arc<Ver
         .map_err(|e| format!("the vertex program does not recompile: {e}"))
         .map(|vrc| {
             Arc::new(VertexInterpPlan {
+                position: crate::gpu::dest_geom_slice_enabled()
+                    .then(|| vitaslop_gxp_shader::module::output_slice(&vrc.shader, 0..4))
+                    .flatten(),
                 secondary: Some(vitaslop_gxp_shader::usse::decode_secondary_shader(&vrc.program)),
                 literals: vrc.program.literals.clone(),
                 windows: vitaslop_gxp_shader::mem_windows_for_vertex_blob(vprog),
@@ -255,19 +262,97 @@ fn reset_regs(dst: &mut vitaslop_gxp_shader::interp::RegFile, src: &vitaslop_gxp
     dst.stores.clone_from(stores);
 }
 
+/// The candidate-texel bookkeeping of one vertex's runs - see `interpret_vertices`.
+#[derive(Default)]
+struct ExactFetch {
+    /// Which candidate each fetch of the current run takes, by call order (missing = 0).
+    choices: Vec<usize>,
+    /// How many candidates each fetch of the last run had.
+    counts: Vec<usize>,
+    /// Fetches made so far in the current run.
+    call: usize,
+    /// Why a fetch could not be made exactly - the whole interpretation is refused.
+    refused: Option<String>,
+}
+
+/// The most runs one vertex may take over its fetches' candidate texels.
+const EXACT_FETCH_MAX_RUNS: usize = 16;
+
+/// How far from a texel edge, in texels, a fetch coordinate must lie for the texel to be
+/// certain. A GPU turns the coordinate into fixed point before it picks a texel, with as few as
+/// four fractional bits (Vulkan's minimum `subTexelPrecisionBits`), and the interpreter's own
+/// coordinate may differ from the shader's in its last bits: a sixteenth covers both.
+const TEXEL_EDGE_MARGIN: f32 = 1.0 / 16.0 + 1.0 / 1024.0;
+
+/// Every texel `(x, y)` of `t`'s level 0 the GPU can return for a vertex-stage sample at
+/// `coord` - one, or two or four when the coordinate lies within [`TEXEL_EDGE_MARGIN`] of an
+/// edge - or why the sample cannot be reproduced exactly at all.
+///
+/// Exact means the texel's own value: a POINT sample (the sampler's minification and
+/// magnification filters are both the guest's one filter, see `make_gxp_sampler`) of level 0,
+/// which an explicit level at or below zero selects, with no sRGB decode in between and from
+/// texels this side decoded itself (a block-compressed passthrough is decoded by the GPU).
+/// Repeat and clamp addressing only; anything else is refused.
+fn exact_vertex_texels(
+    t: &crate::gpu::GxmTexture,
+    coord: [f32; 4],
+    lod: vitaslop_gxp_shader::interp::TexLodArg,
+) -> Result<Vec<(u32, u32)>, String> {
+    use vitaslop_gxp_shader::ir::TexLod;
+    if t.filter_linear {
+        return Err("a vertex texture is FILTERED".into());
+    }
+    if t.gamma || t.compressed.is_some() || t.faces != 1 {
+        return Err("a vertex texture is sRGB-decoded, block-compressed or a cube".into());
+    }
+    if !(lod.mode == TexLod::Level && lod.args[0] <= 0.0 && t.lod_min == 0) {
+        return Err("a vertex texture sample may select a level other than 0".into());
+    }
+    let axis = |v: f32, n: u32, mode: u32| -> Result<Vec<u32>, String> {
+        if !v.is_finite() {
+            return Err("a vertex texture coordinate is not finite".into());
+        }
+        let place = |i: f32| -> Result<u32, String> {
+            match super::textures::gxm_addr_mode(mode) {
+                wgpu::AddressMode::Repeat => Ok(i.rem_euclid(n as f32) as u32),
+                wgpu::AddressMode::ClampToEdge => Ok(i.clamp(0.0, (n - 1) as f32) as u32),
+                _ => Err("a vertex texture's addressing is neither repeat nor clamp".into()),
+            }
+        };
+        let x = v * n as f32;
+        let (lo, hi) = (place((x - TEXEL_EDGE_MARGIN).floor())?, place((x + TEXEL_EDGE_MARGIN).floor())?);
+        Ok(if lo == hi { vec![lo] } else { vec![lo, hi] })
+    };
+    let (w, h) = (t.width.max(1), t.height.max(1));
+    let xs = axis(coord[0], w, t.addr_mode_u)?;
+    let ys = axis(coord[1], h, t.addr_mode_v)?;
+    Ok(ys.iter().flat_map(|&y| xs.iter().map(move |&x| (x, y))).collect())
+}
+
 /// Run a draw's vertex program on the reference interpreter, once per vertex `pick` names
 /// (it is handed the vertex count of the draw's stream), against exactly the inputs the
 /// linked module is given: the default uniform buffer, the container literals, the driver's
 /// pointer registers, the secondary program, the draw's memory windows and vertex textures.
 /// `visit` sees each vertex's index, its first attribute as fed, the register file at program
 /// end, and where a non-finite value first appeared.
+///
+/// `position_only`: the caller reads the POSITION and nothing else, and needs it EXACT (a
+/// footprint, `draw_pixel_bounds`). Then the program run is the position slice, and a vertex
+/// texture is read the way the GPU reads it or not at all (`exact_vertex_texels`) - with every
+/// texel the GPU could pick: a vertex whose fetch lies on a texel edge is run once per
+/// candidate, and `visit` sees each of those runs.
 fn interpret_vertices(
     gxp: &GxpRecompile,
     pick: &dyn Fn(usize) -> Result<Vec<usize>, String>,
     visit: &mut dyn FnMut(usize, [f32; 4], &vitaslop_gxp_shader::interp::RegFile, Option<&vitaslop_gxp_shader::interp::NanSite>),
+    position_only: bool,
 ) -> Result<MemStats, String> {
     let plan = vertex_interp_plan(&gxp.vprog)?;
-    let VertexInterpPlan { primary, secondary, literals, windows } = &*plan;
+    let VertexInterpPlan { primary, position, secondary, literals, windows } = &*plan;
+    let program = match (position_only, position) {
+        (true, Some(p)) => p,
+        _ => primary,
+    };
     // >>> A PROGRAM THAT PACKS 16-BIT HALVES IS INTERPRETED NOW. This refused every such
     // program on the premise that the interpreter held one value per lane, so a
     // four-channel F16 or 16-bit INTEGER pack drifted its register layout from the shader's
@@ -412,7 +497,10 @@ fn interpret_vertices(
     // the geometry LANDS, and a filter would change nothing about that while costing four
     // texel reads per sample.
     // Level 0 whatever the LOD operand says: the texture here is one decoded mip.
-    let fetch = |unit: u8, coord: [f32; 4], _lod: vitaslop_gxp_shader::interp::TexLodArg| -> Option<[f32; 4]> {
+    // (`position_only` instead takes the exact path: `exact_vertex_texels`, and the candidate
+    // the current run is on - see the loop below.)
+    let exact = std::cell::RefCell::new(ExactFetch::default());
+    let fetch = |unit: u8, coord: [f32; 4], lod: vitaslop_gxp_shader::interp::TexLodArg| -> Option<[f32; 4]> {
         let t = &gxp.vertex_textures.iter().find(|t| t.unit == unit)?.tex;
         let (w, h) = (t.width.max(1), t.height.max(1));
         let wrap = |v: f32, n: u32| {
@@ -420,7 +508,26 @@ fn interpret_vertices(
             let p = (v * n).floor().rem_euclid(n);
             p as u32
         };
-        let (x, y) = (wrap(coord[0], w), wrap(coord[1], h));
+        let (x, y) = if position_only {
+            let mut st = exact.borrow_mut();
+            let cands = match exact_vertex_texels(t, coord, lod) {
+                Ok(c) => c,
+                Err(why) => {
+                    st.refused.get_or_insert(why);
+                    return None;
+                }
+            };
+            let call = st.call;
+            st.call += 1;
+            if call < st.counts.len() {
+                st.counts[call] = cands.len();
+            } else {
+                st.counts.push(cands.len());
+            }
+            cands[st.choices.get(call).copied().unwrap_or(0).min(cands.len() - 1)]
+        } else {
+            (wrap(coord[0], w), wrap(coord[1], h))
+        };
         let bpt = t.texel.bytes_per_texel();
         let o = (y * w + x) as usize * bpt;
         let px = t.rgba.get(o..o + bpt)?;
@@ -454,10 +561,7 @@ fn interpret_vertices(
         }
     }
     let mut regs = base.clone();
-    for (n, v) in verts.into_iter().enumerate() {
-        if n > 0 {
-            reset_regs(&mut regs, &base);
-        }
+    let feed = |regs: &mut vitaslop_gxp_shader::interp::RegFile, v: usize| {
         for a in gxp.attributes.iter() {
             let vbase = v * stride + a.offset as usize;
             // All FOUR lanes of the attribute's register, because that is what the pipeline
@@ -480,6 +584,12 @@ fn interpret_vertices(
                 }
             }
         }
+    };
+    for (n, v) in verts.into_iter().enumerate() {
+        if n > 0 {
+            reset_regs(&mut regs, &base);
+        }
+        feed(&mut regs, v);
         // BEFORE the run: the primary uses the PA bank as scratch, so reading the
         // attribute back afterwards reports whatever the shader last left there. That is
         // not a detail - it made this very diagnostic print a screen-space number for a
@@ -488,10 +598,40 @@ fn interpret_vertices(
             let b = a.reg_index as usize;
             std::array::from_fn(|c| regs.pa.get(b + c).copied().unwrap_or(0.0))
         });
-        let run = vitaslop_gxp_shader::interp::run_watching_for_nan_with_env(primary, &mut regs, &fetch, mem);
-        match run {
-            Err(e) => return Err(format!("{e}")),
-            Ok(site) => visit(v, first_in, &regs, site.as_ref()),
+        {
+            let mut st = exact.borrow_mut();
+            st.choices.clear();
+            st.counts.clear();
+            st.call = 0;
+        }
+        // Every combination of the candidate texels this vertex's fetches can land on, as an
+        // odometer over a tree whose later fetches may depend on the earlier choices: run,
+        // then advance the LAST fetch that has another candidate and drop the choices after it.
+        let mut runs = 0usize;
+        loop {
+            let run = vitaslop_gxp_shader::interp::run_watching_for_nan_with_env(program, &mut regs, &fetch, mem);
+            if let Some(why) = exact.borrow_mut().refused.take() {
+                return Err(why);
+            }
+            match run {
+                Err(e) => return Err(format!("{e}")),
+                Ok(site) => visit(v, first_in, &regs, site.as_ref()),
+            }
+            runs += 1;
+            let mut st = exact.borrow_mut();
+            let made = st.call;
+            st.counts.truncate(made);
+            st.choices.resize(made, 0);
+            let Some(k) = (0..made).rev().find(|&k| st.choices[k] + 1 < st.counts[k]) else { break };
+            if runs >= EXACT_FETCH_MAX_RUNS {
+                return Err(format!("a vertex's texture fetches have more than {EXACT_FETCH_MAX_RUNS} candidate texel combinations"));
+            }
+            st.choices[k] += 1;
+            st.choices.truncate(k + 1);
+            st.call = 0;
+            drop(st);
+            reset_regs(&mut regs, &base);
+            feed(&mut regs, v);
         }
     }
     Ok(MemStats {
@@ -527,8 +667,8 @@ fn interpret_vertices(
 /// never by a texel. A rasterised triangle lies inside the hull of its clipped corners, so the
 /// box bounds every pixel the draw can cover. Everything this cannot bound exactly answers
 /// `None` (the viewport stands, as before): a non-finite position, a line or
-/// point topology (a width or a point size reaches past the corners), a vertex stage that
-/// SAMPLES (the interpreter fetches nearest, the GPU may filter), a memory read that landed in
+/// point topology (a width or a point size reaches past the corners), a vertex texture sample
+/// the interpreter cannot reproduce texel for texel (`exact_vertex_texels`), a memory read that landed in
 /// no window, a disabled viewport, an index past the stream, or more than `max_verts`
 /// distinct vertices (the cost bound).
 pub(super) fn draw_pixel_bounds(
@@ -540,7 +680,6 @@ pub(super) fn draw_pixel_bounds(
 ) -> Option<[f32; 4]> {
     if !gxm_topology_has_faces(gxp.primitive)
         || gxm_topology(gxp.primitive) != wgpu::PrimitiveTopology::TriangleList
-        || !gxp.vertex_textures.is_empty()
         || gxp.viewport_enable == crate::gpu::SCE_GXM_VIEWPORT_DISABLED
         || !(sign == 1.0 || sign == -1.0 || sign == 2.0)
     {
@@ -571,8 +710,10 @@ pub(super) fn draw_pixel_bounds(
         }
         Ok(seen)
     };
-    // Each vertex's clip position after the fixup, `(x, y, w)`, by its index in the stream.
-    let mut clip: HashMap<usize, [f64; 3]> = HashMap::default();
+    // Each vertex's clip position after the fixup, `(x, y, w)`, by its index in the stream -
+    // EVERY position it can take: a vertex whose texture fetch lies on a texel edge is run once
+    // per texel the GPU could pick (see `interpret_vertices`).
+    let mut clip: HashMap<usize, Vec<[f64; 3]>> = HashMap::default();
     let mut finite = true;
     let mut visit = |v: usize, _in: [f32; 4], regs: &vitaslop_gxp_shader::interp::RegFile, _nan: Option<&vitaslop_gxp_shader::interp::NanSite>| {
         // `gxp_clipfix`, x/y/w only: `-1` negates all four lanes, `2` negates `w` alone.
@@ -589,9 +730,9 @@ pub(super) fn draw_pixel_bounds(
         if !x.is_finite() || !y.is_finite() || !w.is_finite() {
             finite = false;
         }
-        clip.insert(v, [x as f64, y as f64, w as f64]);
+        clip.entry(v).or_default().push([x as f64, y as f64, w as f64]);
     };
-    let mem = interpret_vertices(gxp, &pick, &mut visit).ok()?;
+    let mem = interpret_vertices(gxp, &pick, &mut visit, true).ok()?;
     if !finite || mem.misses > 0 {
         return None;
     }
@@ -608,8 +749,19 @@ pub(super) fn draw_pixel_bounds(
     }
     let mut tris: Vec<[[f64; 3]; 3]> = Vec::with_capacity(n / 3);
     for t in 0..n / 3 {
-        let corner = |k: usize| clip.get(&index(3 * t + k)).copied();
-        tris.push([corner(0)?, corner(1)?, corner(2)?]);
+        let corner = |k: usize| clip.get(&index(3 * t + k));
+        let (a, b, c) = (corner(0)?, corner(1)?, corner(2)?);
+        if a.len() * b.len() * c.len() > 64 {
+            return None;
+        }
+        // Every triangle the candidates can form - the rasterised one is one of them.
+        for pa in a {
+            for pb in b {
+                for pc in c {
+                    tris.push([*pa, *pb, *pc]);
+                }
+            }
+        }
     }
     Some(clipped_pixel_box(&tris, viewport))
 }

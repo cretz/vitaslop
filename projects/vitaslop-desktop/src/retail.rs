@@ -863,6 +863,11 @@ impl RetailGuest {
         format!("{}{}", self.sched.cpu_share_report(), self.sched.runnable_report())
     }
 
+    /// What this run translated at run time, for the end-of-run report.
+    pub fn runtime_stats(&self) -> vitaslop_native::RuntimeStats {
+        self.sched.runtime_stats()
+    }
+
     /// One line per guest memory space (`sceClibMspace*`): how full it is and whether the
     /// title is DRAINING it. See `vitaslop_runtime::mspace::Mspace`.
     pub fn mspace_report(&mut self) -> Vec<String> {
@@ -2910,6 +2915,14 @@ pub fn headless_check(
     // nothing in a BROWSER run can say whether it agrees with a real engine - this is
     // where that is checked. It reads a little under 1.00 by construction: wasmtime bills
     // the counter's own operators, which the counter does not bill itself.
+    // Code found at run time, totalled: the status line only prints at powers of two.
+    let rt = guest.runtime_stats();
+    if rt.entries > 0 {
+        println!(
+            "headless: runtime code: {} entries ({} swept) in {} side module(s), {} us translating",
+            rt.entries, rt.swept, rt.modules, rt.busy_us
+        );
+    }
     if let Some((sw, wt, n)) = vitaslop_native::threaded::software_fuel_report() {
         println!(
             "headless: software fuel {sw} vs wasmtime {wt} over {n} samples (ratio {:.2}x)",

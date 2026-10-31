@@ -69,7 +69,7 @@ const MAX_BUFS: u32 = 64;
 /// current touch frame for `port`, each stamped with the current time, and return
 /// the count written (at least 1) - the "buffers count" both `sceTouchRead` and
 /// `sceTouchPeek` are documented to return.
-fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbufs: u32) -> i32 {
+fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbufs: u32, peek: bool) -> i32 {
     let ts = st.guest_mono_us();
     let touch = st.world.poll_touch(port);
     let points = touch.active();
@@ -125,6 +125,14 @@ fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbuf
         }
         None => 1,
     };
+    // >>> A PEEK FILLS EVERY BUFFER IT ASKS FOR. `sceTouchPeek` does not consume: like the pad's
+    // peek it copies the newest `nBufs` samples of the panel's ring, so every slot the title
+    // asked for is a real sample. Filling only the window since the last call left the rest of
+    // the title's buffer as whatever its stack held. MEASURED on an action title: it peeks 16
+    // buffers per panel from three threads and walks them into the gesture library, so stale
+    // stack read as 22-24 phantom fingers on a title screen nobody touched. The slots older
+    // than the window carry the contact the guest last saw, on earlier panel periods.
+    let n = if peek { nbufs.clamp(1, MAX_BUFS).max(n) } else { n };
     if data != 0 {
         let prev = st.touch.last[slot].as_ref().map(|(_, b)| b.clone());
         for i in 0..n {
@@ -285,7 +293,7 @@ pub(super) fn read(
     data: Ptr,
     nbufs: u32,
 ) -> i32 {
-    fill_touch(ctx, st, _port, data.addr(), nbufs)
+    fill_touch(ctx, st, _port, data.addr(), nbufs, false)
 }
 
 /// int sceTouchEnableTouchForce(SceUInt32 port)
@@ -302,7 +310,7 @@ pub(super) fn enable_touch_force(_ctx: &mut GuestCtx, st: &mut VitaState, port: 
 }
 
 /// int sceTouchPeek(SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs)
-/// The non-blocking poll; same "no touch" sample.
+/// The non-blocking poll: the newest `nBufs` samples, every slot filled (see `fill_touch`).
 #[hostcall]
 pub(super) fn peek(
     ctx: &mut GuestCtx,
@@ -311,7 +319,7 @@ pub(super) fn peek(
     data: Ptr,
     nbufs: u32,
 ) -> i32 {
-    fill_touch(ctx, st, _port, data.addr(), nbufs)
+    fill_touch(ctx, st, _port, data.addr(), nbufs, true)
 }
 
 #[cfg(test)]
@@ -372,18 +380,42 @@ mod tests {
             u64::from(ctx.read_u32(a)) | (u64::from(ctx.read_u32(a + 4)) << 32)
         };
         set(100, 1_000_000);
-        assert_eq!(fill_touch(&mut ctx, &mut st, 0, 0x100, 4), 1, "the first read has one sample");
+        assert_eq!(fill_touch(&mut ctx, &mut st, 0, 0x100, 4, false), 1, "the first read has one sample");
         // Four panel periods later the finger is at 300: four buffers, oldest first.
         set(300, 1_000_000 + 4 * PANEL_PERIOD_US + 10);
-        assert_eq!(fill_touch(&mut ctx, &mut st, 0, 0x100, 4), 4);
+        assert_eq!(fill_touch(&mut ctx, &mut st, 0, 0x100, 4, false), 4);
         assert_eq!([x_of(&mut ctx, 0), x_of(&mut ctx, 2), x_of(&mut ctx, 3)], [100, 100, 300]);
         assert!(t_of(&mut ctx, 0) < t_of(&mut ctx, 1) && t_of(&mut ctx, 2) < t_of(&mut ctx, 3));
         assert_eq!(t_of(&mut ctx, 3), 1_000_000 + 4 * PANEL_PERIOD_US + 10);
         // Ten periods later, asking for 4: capped at 4.
         set(300, 1_000_000 + 14 * PANEL_PERIOD_US);
-        assert_eq!(fill_touch(&mut ctx, &mut st, 0, 0x100, 4), 4);
+        assert_eq!(fill_touch(&mut ctx, &mut st, 0, 0x100, 4, false), 4);
         // A read inside one period still returns one sample.
-        assert_eq!(fill_touch(&mut ctx, &mut st, 0, 0x100, 4), 1);
+        assert_eq!(fill_touch(&mut ctx, &mut st, 0, 0x100, 4, false), 1);
+    }
+
+    /// A peek fills EVERY buffer it asks for - the newest `nBufs` samples, oldest first - so no
+    /// slot of the title's buffer is left as stack; the newest is the current contact.
+    #[test]
+    fn a_peek_fills_every_buffer_it_asks_for() {
+        use crate::world::TouchFrame;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new((TouchFrame::default(), 1_000_000u64)));
+        let mut st = VitaState::new(0, 0x2000, Box::new(Panel(shared.clone())));
+        let mut mem = vec![0xa5u8; 0x2000];
+        let mut regs = [0u32; vitaslop_transpiler::abi::REG_COUNT];
+        let mut vfp = [0u32; crate::host::VFP_ARG_COUNT];
+        let mut slice = crate::host::SliceMemory(&mut mem);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut slice, 0);
+        assert_eq!(fill_touch(&mut ctx, &mut st, 0, 0x100, 16, true), 16);
+        let mut last_t = 0;
+        for i in 0..16u32 {
+            let a = 0x100 + i * TOUCH_DATA_SIZE as u32;
+            assert_eq!(ctx.read_u32(a + 12), 0, "slot {i}: no finger is down, so no reports");
+            let t = u64::from(ctx.read_u32(a)) | (u64::from(ctx.read_u32(a + 4)) << 32);
+            assert!(t > last_t, "slot {i}: oldest first");
+            last_t = t;
+        }
+        assert_eq!(last_t, 1_000_000, "the newest slot is now");
     }
 
     /// A held finger keeps its id; a lift and a new touch get a NEW id even when the host names

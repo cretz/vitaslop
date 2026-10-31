@@ -1067,6 +1067,7 @@ impl GxmRenderer {
                     self.convert_gxm_stencil(device, encoder, &dtex, scene.stencil_addr);
                 }
                 self.save_depth(device, encoder, scene, t.width, t.height, &dtex);
+                zls_probe(scene, t.width, t.height, format_args!("after RAW pass: sampled later {want_depth}"));
                 if want_depth {
                     self.convert_raw_gxm_depth(device, queue, encoder, raw_key, scene.depth_min, scene.depth_scale);
                     if let Some(v) = self.rtt_raw.get(&raw_key).and_then(|s| s.gxm_depth.as_ref()) {
@@ -1349,6 +1350,12 @@ impl GxmRenderer {
             // depth attachment, so afterwards there is nothing left to convert. A pass that
             // LOADED its depth and wrote none of it already converted it above - the same
             // pixels again would be a full-screen pass for nothing (3.2 ms of a phone frame).
+            zls_probe(
+                scene,
+                t.width,
+                t.height,
+                format_args!("after pass: sampled later {want_depth}, loaded {loaded}, writes depth {writes_depth}"),
+            );
             if want_depth && (!loaded || writes_depth) {
                 self.convert_gxm_depth(
                     device,
@@ -1675,17 +1682,23 @@ impl GxmRenderer {
     pub(super) fn load_saved_depth(&mut self, encoder: &mut wgpu::CommandEncoder, scene: &RenderScene, w: u32, h: u32, dst: Option<&wgpu::Texture>) {
         self.depth_load_now = false;
         if !zls_load(scene) {
+            zls_probe(scene, w, h, "no load");
             return;
         }
         // From the LOAD surface's memory, which `sceGxmBeginSceneEx` may name apart from
         // the surface this scene stores to (`RenderScene::depth_load_addr`).
         let from = if scene.depth_load_addr != 0 { scene.depth_load_addr } else { scene.depth_addr };
-        let Some(src) = self.depth_saved.get(&(from, w, h)) else { return };
+        let Some(src) = self.depth_saved.get(&(from, w, h)) else {
+            zls_probe(scene, w, h, "LOAD asked, NOTHING SAVED at this address and extent - the pass starts cleared");
+            return;
+        };
         let Some(dst) = dst.filter(|d| d.sample_count() == 1 && d.format() == src.format() && d.size() == src.size()) else {
+            zls_probe(scene, w, h, "LOAD asked, saved depth does not fit the attachment - the pass starts cleared");
             crate::gpu::report_zls_unserved(from, w, h);
             return;
         };
         encoder.copy_texture_to_texture(src.as_image_copy(), dst.as_image_copy(), src.size());
+        zls_probe(scene, w, h, "LOAD served");
         self.depth_load_now = true;
     }
 
@@ -1694,8 +1707,10 @@ impl GxmRenderer {
     pub(super) fn save_depth(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, scene: &RenderScene, w: u32, h: u32, src: &wgpu::Texture) {
         self.depth_load_now = false;
         if !zls_store(scene) || src.sample_count() != 1 {
+            zls_probe(scene, w, h, if zls_store(scene) { "STORE asked, attachment multisampled - NOT saved" } else { "no store" });
             return;
         }
+        zls_probe(scene, w, h, "STORE saved");
         let key = (scene.depth_addr, w, h);
         if self.depth_saved.get(&key).is_none_or(|t| t.format() != src.format() || t.size() != src.size()) {
             let t = device.create_texture(&wgpu::TextureDescriptor {
@@ -1713,4 +1728,39 @@ impl GxmRenderer {
         let dst = &self.depth_saved[&key];
         encoder.copy_texture_to_texture(src.as_image_copy(), dst.as_image_copy(), src.size());
     }
+}
+
+/// `VITASLOP_ZLS_PROBE=<hex depth address>[@<guest frame>]`: one line per pass into that depth
+/// surface - its colour target, draw count, zls bits, and what the depth hand-off did (load
+/// served, nothing saved, saved) - for the first 48 passes from that frame. A deferred title's
+/// lighting rebuilds positions from a depth an EARLIER pass stored; when that hand-off fails the
+/// pass starts at the clear value and the whole lit frame reads as the far plane, which no
+/// picture can tell apart from a lighting bug.
+fn zls_probe(scene: &RenderScene, w: u32, h: u32, what: impl std::fmt::Display) {
+    static ARM: std::sync::OnceLock<Option<(u32, u64)>> = std::sync::OnceLock::new();
+    static LEFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(48);
+    let Some((addr, from)) = *ARM.get_or_init(|| {
+        let v = crate::knobs::var("VITASLOP_ZLS_PROBE").ok()?;
+        let (a, f) = v.trim().split_once('@').unwrap_or((v.trim(), "0"));
+        Some((u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, f.parse().unwrap_or(0)))
+    }) else {
+        return;
+    };
+    let frame = crate::gpu::guest_frame();
+    if scene.depth_addr != addr && scene.depth_load_addr != addr || frame < from {
+        return;
+    }
+    if LEFT
+        .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_err()
+    {
+        return;
+    }
+    report_knob!(
+        "zls probe f{frame}: colour {:#010x} {w}x{h} draws {} zls {:#010x} load_addr {:#010x}: {what}",
+        scene.target.map_or(0, |t| t.data_addr),
+        scene.draws.len(),
+        scene.zls_control,
+        scene.depth_load_addr,
+    );
 }

@@ -1107,6 +1107,37 @@ impl Instr {
             (u32::from(src.index) + sel as u32, 0..2)
         })
     }
+
+    /// True when this instruction WRITES packed bytes - four channels in ONE register, channel
+    /// `c` in byte `c`. The destination half of [`Self::source_packed_bytes`]; the emitter
+    /// writes these through `Prec::Fx8` or `store_raw_byte` (see [`Self::dest_raw_packed_bits`]).
+    pub fn dest_packed_bytes(&self) -> bool {
+        matches!(
+            self.op,
+            Op::PackUnorm8 { to_unorm8: true, .. }
+                | Op::CopyFx8
+                | Op::Sop2 { .. }
+                | Op::Test { alu: TestAlu::Fx8Sub, .. }
+        ) || self.dest_raw_packed_bits() == Some(8)
+    }
+
+    /// The register destination `d`'s channel `c` writes, and which 16-bit HALVES of it - the
+    /// destination half of [`Self::source_register`].
+    ///
+    /// A packed-byte destination keeps all four channels in ONE register. Read as one register
+    /// per channel, the 8-bit normal pack of a deferred title's G-buffer material (`PackToInt`
+    /// into `pa[1]`, xy then zw) claimed `pa[2..4]` as written - the registers its diffuse
+    /// prefetch lands in - so the linker judged the prefetch unread, dropped the sample, and the
+    /// whole scene's albedo was zero.
+    pub fn dest_register(&self, d: &Operand, c: usize) -> (u32, std::ops::Range<usize>) {
+        if self.dest_packed_bytes() {
+            (u32::from(d.index), (c >> 1)..(c >> 1) + 1)
+        } else if self.dest_raw_packed_bits() == Some(16) || self.half_precision {
+            (u32::from(d.index) + (c >> 1) as u32, (c & 1)..(c & 1) + 1)
+        } else {
+            (u32::from(d.index) + c as u32, 0..2)
+        }
+    }
 }
 
 /// A fully decoded shader: its kind and instruction list.
@@ -1194,6 +1225,30 @@ mod tests {
         let regs: Vec<_> =
             (0..4).filter_map(|c| fx8.source_register(&fx8.srcs[0], c).map(|(r, _)| r)).collect();
         assert_eq!(regs, vec![4, 4, 4, 4], "four bytes of ONE register");
+    }
+
+    /// The destination spans the same three ways. An 8-bit pack writes all four channels into
+    /// the bytes of ONE register; counted as one register per channel, a normal packed into
+    /// `pa[1]` claimed `pa[2..4]` and hid the prefetched sample that lands there.
+    #[test]
+    fn each_destination_width_spans_its_own_number_of_registers() {
+        let d = Operand::plain(Bank::PrimaryAttr, 1, 2);
+        let regs = |i: &Instr| -> Vec<(u32, std::ops::Range<usize>)> { (0..4).map(|c| i.dest_register(&d, c)).collect() };
+
+        let f32_ = instr(Op::Mad, [true; 4], vec![], false);
+        assert_eq!(regs(&f32_), vec![(1, 0..2), (2, 0..2), (3, 0..2), (4, 0..2)]);
+
+        let f16 = instr(Op::Mad, [true; 4], vec![], true);
+        assert_eq!(regs(&f16), vec![(1, 0..1), (1, 1..2), (2, 0..1), (2, 1..2)]);
+
+        let bytes = instr(Op::PackToInt { bits: 8, signed: true, src_half: true, norm: true }, [true; 4], vec![], false);
+        assert_eq!(regs(&bytes), vec![(1, 0..1), (1, 0..1), (1, 1..2), (1, 1..2)], "four bytes of ONE register");
+
+        let unorm = instr(Op::PackUnorm8 { to_unorm8: true, float_half: true }, [true; 4], vec![], false);
+        assert!(regs(&unorm).iter().all(|(r, _)| *r == 1), "a unorm8 pack writes one register");
+
+        let shorts = instr(Op::PackToInt { bits: 16, signed: false, src_half: false, norm: false }, [true; 4], vec![], false);
+        assert_eq!(regs(&shorts), vec![(1, 0..1), (1, 1..2), (2, 0..1), (2, 1..2)], "16-bit lanes pair up");
     }
 
     /// A swizzle CONSTANT (selector 4..7 - the 0.0/1.0/2.0/0.5 literals) names no register, so

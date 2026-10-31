@@ -575,11 +575,21 @@ impl GxmRenderer {
                 // then sampled the F16 reinterpretation of the words as normals and albedo,
                 // and lit the whole G-buffer white. The pitch comes from the pass that
                 // rendered the surface (`rtt_pitch`), the width when it gave none.
+                //
+                // >>> AND THE VIEW MAY BE A TOP-LEFT WINDOW OF THE SURFACE. Row `y` of the view is
+                // row `y` of the surface at its own pitch whatever the view's extent, so a view
+                // narrower or shorter than the surface reads exactly its top-left texels.
+                // MEASURED on an action title that renders at a reduced resolution: its G-buffer
+                // pass draws 704x576 into a 960x800 render target with a 704-pixel pitch, and the
+                // lighting reads 1408x576 word views. Matched only at the full `2 x 960` by `800`,
+                // every view was refused, the lighting sampled guest bytes the GPU never wrote,
+                // and the whole world came out as red and magenta noise behind a correct HUD.
                 let hit = rendered_raw.keys().copied().find(|&(base, rw, rh)| {
                     let pitch = self.rtt_pitch.get(&(base, rw, rh)).map_or(rw, |&(p, _)| p);
                     (addr == base || addr == base.wrapping_add(4))
-                        && w == rw * 2
-                        && h == rh
+                        && w % 2 == 0
+                        && w <= rw * 2
+                        && h <= rh
                         && row_bytes == pitch * 8
                         && Some(base) != current_target
                 });
@@ -894,8 +904,11 @@ impl GxmRenderer {
         // attachment into its own texture, bound at the address the guest named. Only an
         // address nothing else answers for, only a single-sampled attachment the renderer
         // owns. `VITASLOP_RTT_SELF_WINDOW=0` is the arm back.
-        let mut self_windows: HashMap<usize, Vec<(wgpu::Texture, wgpu::Origin3d, wgpu::Extent3d)>> =
-            HashMap::default();
+        let mut self_windows: HashMap<usize, Vec<SelfCopy>> = HashMap::default();
+        // The windows read under their reader's own pixels, as the attachment held them before the
+        // pass's first draw: `(x, y, width, height)` in attachment texels -> the snapshot, copied
+        // before segment 0. See `SelfCopy::from`.
+        let mut scene_start: HashMap<(u32, u32, u32, u32), wgpu::Texture> = HashMap::default();
         // Not on a RAW 64-bit pass: its attachment is handed in only for the destination
         // copy, and a window of raw words would be bound where a converted colour is read.
         if crate::gpu::self_window_sampling()
@@ -930,6 +943,13 @@ impl GxmRenderer {
                     let (a0, b0, a1, b1) = (x0 as f32, y0 as f32, (x0 + w) as f32, (y0 + h) as f32);
                     drawn.iter().any(|&(x0, y0, x1, y1)| a0 < x1 && x0 < a1 && b0 < y1 && y0 < b1)
                 };
+                let v = g.viewport;
+                let vp = if g.viewport_enable == crate::gpu::SCE_GXM_VIEWPORT_DISABLED || v.iter().all(|c| *c == 0.0) {
+                    full
+                } else {
+                    (v[0] - v[1].abs(), v[2] - v[3].abs(), v[0] + v[1].abs(), v[2] + v[3].abs())
+                };
+                let own = own_pixels(vp, d.region_clip, t.width, t.height);
                 let mut copies = Vec::new();
                 for tx in g.textures.iter().chain(g.vertex_textures.iter()).map(|tx| &tx.tex) {
                     let (addr, w, h) = (tx.data_addr, tx.width, tx.height);
@@ -941,10 +961,58 @@ impl GxmRenderer {
                     if off % bpp != 0 || x0 + w > t.width || y0 + h > t.height {
                         continue;
                     }
+                    // >>> A WINDOW UNDER THE DRAW'S OWN PIXELS READS THE SURFACE AS THE SCENE FOUND IT.
+                    //
+                    // The GPU is tile-based: a tile's colour lives on chip while every draw of
+                    // the scene runs over it, and reaches memory only when the tile is stored.
+                    // A texel the reading draw is itself covering is therefore still in a tile
+                    // that has not been stored, and the sample reads the memory from before
+                    // the scene - never what an earlier draw of the scene put there. MEASURED
+                    // on a shooter: its reflection pass clears its whole target white (draw 0),
+                    // then draws 1-2 blend the frame into a history strip of the same target by
+                    // reading that strip under their own pixels. Handed the live attachment
+                    // they read draw 0's white, the history never survived a frame, and the
+                    // reflections it feeds went white wherever they were near. Such a window
+                    // is filled from a snapshot of the attachment taken before the pass's
+                    // first draw. A window AWAY from the draw (a mip level built by an earlier
+                    // draw and read by a later one) keeps the rule above.
+                    let under_own = window_under(own, x0, y0, w, h);
+                    let origin = wgpu::Origin3d { x: x0 * sx, y: y0 * sy, z: 0 };
+                    let size = wgpu::Extent3d { width: w * sx, height: h * sy, depth_or_array_layers: 1 };
+                    let from = if under_own && crate::gpu::self_window_scene_start() {
+                        // Its own textures, never the window pool's: a snapshot is a copy source,
+                        // which no pooled window is.
+                        // One per window of the pass, so two windows of a size are two textures.
+                        let slot = scene_start.keys().filter(|k| (k.2, k.3) == (size.width, size.height)).count() as u32;
+                        let snap = scene_start.entry((origin.x, origin.y, size.width, size.height)).or_insert_with(|| {
+                            let key = (size.width, size.height, att.format(), slot);
+                            self.self_window_start
+                                .entry(key)
+                                .or_insert_with(|| {
+                                    device.create_texture(&wgpu::TextureDescriptor {
+                                        label: Some("gxm-rtt-self-window-start"),
+                                        size,
+                                        mip_level_count: 1,
+                                        sample_count: 1,
+                                        dimension: wgpu::TextureDimension::D2,
+                                        format: att.format(),
+                                        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                                        view_formats: &[],
+                                    })
+                                })
+                                .clone()
+                        });
+                        Some(snap.clone())
+                    } else {
+                        None
+                    };
                     let tex = match windows.get(&addr) {
                         Some((tex, ww, wh)) if (*ww, *wh) == (w, h) => tex.clone(),
                         Some(_) => continue,
-                        None if sample_views.contains_key(&addr) && !written_here(x0, y0, w, h) => continue,
+                        // Under the draw the window is always this pass's: the bindings are the
+                        // pass's, so a later draw reading the same address away from itself
+                        // shares the texture, and this draw must have it filled.
+                        None if sample_views.contains_key(&addr) && from.is_none() && !written_here(x0, y0, w, h) => continue,
                         None => {
                             let size = wgpu::Extent3d { width: w * sx, height: h * sy, depth_or_array_layers: 1 };
                             let tex = self
@@ -998,25 +1066,17 @@ impl GxmRenderer {
                             tex
                         }
                     };
-                    let origin = wgpu::Origin3d { x: x0 * sx, y: y0 * sy, z: 0 };
-                    let size = wgpu::Extent3d { width: w * sx, height: h * sy, depth_or_array_layers: 1 };
-                    copies.push((tex, origin, size));
+                    copies.push(SelfCopy { dst: tex, origin, size, from });
                 }
                 if !copies.is_empty() {
                     self_windows.insert(di, copies);
                 }
-                let v = g.viewport;
-                drawn.push(if g.viewport_enable == crate::gpu::SCE_GXM_VIEWPORT_DISABLED || v.iter().all(|c| *c == 0.0) {
-                    full
-                } else {
-                    (v[0] - v[1].abs(), v[2] - v[3].abs(), v[0] + v[1].abs(), v[2] + v[3].abs())
-                });
+                drawn.push(vp);
             }
         }
         // Order index (the draw's place in `order`) -> its window copies. Filled as the
         // draws are prepared; the pass is cut at every one of them.
-        let mut self_cuts: HashMap<usize, Vec<(wgpu::Texture, wgpu::Origin3d, wgpu::Extent3d)>> =
-            HashMap::default();
+        let mut self_cuts: HashMap<usize, Vec<SelfCopy>> = HashMap::default();
         // >>> AND THE SAME FOR DEPTH, WHICH IS WHAT A SHADOW MAP IS.
         //
         // `rtt_depth_rendered` is cleared every frame, exactly as `rtt_rendered` is, so a
@@ -1897,6 +1957,24 @@ impl GxmRenderer {
                 // The copy that makes the next draw's destination read real. Before the
                 // segment, outside any render pass, which is the whole reason the pass is
                 // cut here at all.
+                // The windows read under their reader's own pixels, taken once, before any draw:
+                // the surface as the pass found it.
+                if seg == 0
+                    && let Some(tex) = color_texture
+                {
+                    for (&(x, y, width, height), snap) in &scene_start {
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d { x, y, z: 0 },
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            snap.as_image_copy(),
+                            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                        );
+                    }
+                }
                 // The windows of this pass's own target the segment's first draw reads, as
                 // the draws before it left them (before segment 0: as the pass found it).
                 if let (Some(copies), Some(tex)) = (self_cuts.get(&start), color_texture) {
@@ -1907,16 +1985,15 @@ impl GxmRenderer {
                     if seg > 0 && tile.is_some() {
                         self.texel_blit(device, encoder, color_view, real_view, real_format);
                     }
-                    for (dst, origin, size) in copies {
+                    for c in copies {
+                        let (texture, origin) = match &c.from {
+                            Some(snap) => (snap, wgpu::Origin3d::ZERO),
+                            None => (tex, c.origin),
+                        };
                         encoder.copy_texture_to_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: tex,
-                                mip_level: 0,
-                                origin: *origin,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            dst.as_image_copy(),
-                            *size,
+                            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
+                            c.dst.as_image_copy(),
+                            c.size,
                         );
                     }
                 }
@@ -2586,4 +2663,70 @@ fn with_dest_geom_gate<R>(pass: DestGeomKey, f: impl FnOnce(&mut DestGeomGate) -
         g.clear();
     }
     f(g.entry(pass).or_insert_with(DestGeomGate::new))
+}
+
+/// The rectangle a draw can write, `(x0, y0, x1, y1)` in target pixels: its viewport `vp`,
+/// narrowed by an OUTSIDE region clip (which discards every pixel outside its rectangle).
+fn own_pixels(vp: (f32, f32, f32, f32), clip: crate::gpu::RegionClip, w: u32, h: u32) -> (f32, f32, f32, f32) {
+    if clip.mode & 0xC000_0000 == crate::gpu::RegionClip::OUTSIDE
+        && let Some((cx, cy, cw, ch)) = clip.rect_in(w, h)
+    {
+        let (cx, cy, cw, ch) = (cx as f32, cy as f32, cw as f32, ch as f32);
+        return (vp.0.max(cx), vp.1.max(cy), vp.2.min(cx + cw), vp.3.min(cy + ch));
+    }
+    vp
+}
+
+/// Whether the `w` x `h` window at `(x0, y0)` overlaps the rectangle `own` a draw writes - a
+/// window the draw itself covers, which a tile GPU reads from memory as the scene found it.
+fn window_under(own: (f32, f32, f32, f32), x0: u32, y0: u32, w: u32, h: u32) -> bool {
+    let (a0, b0, a1, b1) = (x0 as f32, y0 as f32, (x0 + w) as f32, (y0 + h) as f32);
+    a0 < own.2 && own.0 < a1 && b0 < own.3 && own.1 < b1
+}
+
+/// One self-window refill before a draw that reads a window of its own pass's target - see the
+/// self-window block in `encode_chain`.
+struct SelfCopy {
+    /// The window texture the draw samples.
+    dst: wgpu::Texture,
+    /// Where the window sits in the attachment, in attachment texels.
+    origin: wgpu::Origin3d,
+    size: wgpu::Extent3d,
+    /// `Some(snapshot)` when the window lies under the reading draw's own pixels: it is filled
+    /// from the attachment as the pass FOUND it, not as the draws before it left it.
+    from: Option<wgpu::Texture>,
+}
+
+#[cfg(test)]
+mod self_window_tests {
+    use super::{own_pixels, window_under};
+    use crate::gpu::RegionClip;
+
+    const FULL: (f32, f32, f32, f32) = (0.0, 0.0, 384.0, 192.0);
+
+    /// A history strip read by the draw that blends into it lies under the draw (the shooter's
+    /// reflection pass: whole-target viewport, OUTSIDE clip to rows 128-191, strip 384x64 at
+    /// row 128); the same strip read by a draw clipped to the top rows does not.
+    #[test]
+    fn a_window_the_draw_covers_is_under_it_and_one_beside_it_is_not() {
+        let strip = |own| window_under(own, 0, 128, 384, 64);
+        let clip = |rect| RegionClip { mode: RegionClip::OUTSIDE, rect };
+        assert!(strip(own_pixels(FULL, clip([0, 128, 383, 191]), 384, 192)), "the blend into the strip");
+        assert!(!strip(own_pixels(FULL, clip([256, 0, 383, 63]), 384, 192)), "a reflection draw in the top rows");
+        // With no clip the viewport alone decides: a 128x64 viewport in the top-right corner.
+        let none = RegionClip { mode: RegionClip::NONE, rect: [0; 4] };
+        assert!(!strip(own_pixels((256.0, 0.0, 384.0, 64.0), none, 384, 192)));
+    }
+
+    /// A mip chain built inside one surface reads each level from beside the draw writing the
+    /// next, so none of its reads is under the reader - the earlier-draws rule still applies.
+    #[test]
+    fn a_mip_level_read_beside_the_next_is_not_under_its_reader() {
+        let none = RegionClip { mode: RegionClip::NONE, rect: [0; 4] };
+        // Level 0 at 256x128 on the left of a 512x128 surface; level 1 drawn at x 256..384.
+        let level1 = own_pixels((256.0, 0.0, 384.0, 64.0), none, 512, 128);
+        assert!(!window_under(level1, 0, 0, 256, 128));
+        // Touching edges are not an overlap.
+        assert!(!window_under((256.0, 0.0, 384.0, 64.0), 0, 0, 256, 64));
+    }
 }

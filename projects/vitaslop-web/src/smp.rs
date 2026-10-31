@@ -447,6 +447,9 @@ pub(crate) struct Shared {
     stop: AtomicBool,
     stats: Box<[WorkerStats]>,
     geometry: Geometry,
+    /// The run's record of code found at run time, shared by every worker's engine - see
+    /// `browser_sched::runtime_miss`.
+    runtime: Option<Arc<vitaslop_runtime::runtime_code::RuntimeCode>>,
     owner_only: Vec<bool>,
     /// By SELECTOR: which `owner_only` calls are routed per CALL (`vita::smp_forward_per_call`).
     per_call: Vec<bool>,
@@ -2059,6 +2062,7 @@ pub async fn smp_helper_main(
             preempt_off: g.mirror_off.map(|m| m + 4 * u64::from(vitaslop_transpiler::abi::PREEMPT_SLOT_BASE + w as u32)),
             preempt_ptr: sh.preempt(w).map(|p| p.as_ptr() as usize),
         },
+        sh.runtime.clone(),
     )?;
     // The reserve is filled before the first thread lands here: boot is the one moment a
     // worker is certainly idle, and the first spawns are a title's long-lived threads.
@@ -2485,6 +2489,7 @@ impl SmpRun {
                 dirty_off,
                 host_off,
             },
+            runtime: engine.runtime(),
             owner_only,
             per_call,
             tallies: Mutex::new((HashMap::new(), HashMap::new())),

@@ -826,6 +826,35 @@ pub fn link_programs_with(vbytes: &[u8], fbytes: &[u8], opts: LinkOptions) -> Re
             Some(it) if it.half => crate::module::ColorPrecision::F16,
             _ => crate::module::ColorPrecision::F32,
         };
+    } else if let Some(reg) = crate::module::colour_copied_from_unwritten_pa(&frc.shader) {
+        // >>> THE SAME QUESTION ONE COPY LATER. A program whose colour is a plain MOVE of a
+        // register the hardware filled (`o0 = pa0` over a prefetched texel) is not a passthrough,
+        // so the rule above never ran, and the precision planner - which asks the instruction
+        // that BUILT the colour - stops at the move, whose 32-bit width reads as F32. The packed
+        // halves then went out as two raw floats (denormals): MEASURED on an action title's
+        // post chain, whose first pass copies the lit frame with exactly such a program, and the
+        // whole world behind its HUD was black. The register's format is the interface's: the
+        // prefetch's (`prefetch_regs`) when a sample lands there, else the interpolant's `half`.
+        let precision = fprog.interpolants.iter().find_map(|it| {
+            if it.prefetch_base().map(u32::from) == Some(reg) {
+                Some(if it.prefetch_regs >= 4 {
+                    crate::module::ColorPrecision::F32
+                } else {
+                    crate::module::ColorPrecision::F16
+                })
+            } else if u32::from(it.pa_base) == reg && it.register_count > 0 {
+                Some(if it.half {
+                    crate::module::ColorPrecision::F16
+                } else {
+                    crate::module::ColorPrecision::F32
+                })
+            } else {
+                None
+            }
+        });
+        if let Some(p) = precision {
+            fplan.color_precision = p;
+        }
     }
 
     // A prefetched unit is usually sampled ONLY by the PDS, so the instruction walk that built
@@ -1120,9 +1149,8 @@ fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
     let conditional = conditionally_executed(shader);
     for (index, instr) in shader.instrs.iter().enumerate() {
         // Sources and destination can be at DIFFERENT widths (a format convert), so each side
-        // resolves its own registers - `source_register` answers for the sources, and `half`
-        // here is the DESTINATION's width. See [`crate::ir::Instr::source_half_precision`].
-        let half = instr.half_precision;
+        // resolves its own registers - `source_register` answers for the sources and
+        // `dest_register` for the destination. See [`crate::ir::Instr::source_half_precision`].
         let read = read_channels(instr);
         for src in &instr.srcs {
             if src.bank != Bank::PrimaryAttr {
@@ -1153,8 +1181,8 @@ fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
                     if !instr.write_mask[c] {
                         continue;
                     }
-                    let (reg, halves) =
-                        if half { (d.index as usize + (c >> 1), (c & 1)..(c & 1) + 1) } else { (d.index as usize + c, 0..2) };
+                    let (reg, halves) = instr.dest_register(d, c);
+                    let reg = reg as usize;
                     if reg >= BANK_REGS {
                         continue;
                     }
@@ -5460,10 +5488,21 @@ pub(crate) fn arm(name: &str) -> Option<&'static str> {
     if let Some(v) = arms().lock().unwrap_or_else(|e| e.into_inner()).get(name) {
         return Some(v);
     }
+    // The environment is read ONCE per name and remembered. This is asked from the reference
+    // interpreter's inner loop (every memory load, every integer multiply-add channel), and a
+    // fresh `std::env::var` there cost an environment lookup per instruction - and, with the
+    // variable set, leaked a new string every time.
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let v = std::env::var(name).ok()?;
-        Some(Box::leak(v.trim().to_string().into_boxed_str()))
+        type EnvArms = std::collections::HashMap<String, Option<&'static str>>;
+        static ENV: std::sync::OnceLock<std::sync::Mutex<EnvArms>> = std::sync::OnceLock::new();
+        let mut env = ENV.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = env.get(name) {
+            return *v;
+        }
+        let v = std::env::var(name).ok().map(|v| &*Box::leak(v.trim().to_string().into_boxed_str()));
+        env.insert(name.to_string(), v);
+        v
     }
     #[cfg(target_arch = "wasm32")]
     None

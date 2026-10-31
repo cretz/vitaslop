@@ -95,7 +95,7 @@ fn race(smp: bool) -> u32 {
                 linker.func_wrap(abi::IMPORT_MODULE, abi::IMPORT_NAME, nop1).unwrap();
                 linker.func_wrap(abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME, nop1).unwrap();
                 linker
-                    .func_wrap(abi::IMPORT_MODULE, abi::DISPATCH_MISS_NAME, |_: i32, _: i32| {})
+                    .func_wrap(abi::IMPORT_MODULE, abi::DISPATCH_MISS_NAME, |_: i32, _: i32| -> i32 { 0 })
                     .unwrap();
                 linker.define(&mut store, abi::IMPORT_MODULE, abi::MEMORY_EXPORT, memory).unwrap();
                 let instance: Instance = linker.instantiate(&mut store, &module).expect("instantiate");

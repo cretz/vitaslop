@@ -1046,7 +1046,10 @@ pub fn run_traced_env(
     const MAX_STEPS: u32 = 1 << 20;
     // The per-invocation LOCAL memory (`Op::LocalLoad`/`LocalStore`), zero at the start of a
     // run exactly as the emitted `var` is.
-    let mut local = vec![0u32; crate::wgsl::LOCAL_MEM_WORDS as usize];
+    // Allocated at the first local access, not here: a run is per VERTEX for the renderer's
+    // footprints, and a 1 KiB zeroed allocation per run was a fixed cost several times a short
+    // program's own.
+    let mut local: Vec<u32> = Vec::new();
     while let Some(instr) = shader.instrs.get(index) {
         steps += 1;
         observe(index, regs);
@@ -1135,6 +1138,9 @@ pub fn run_traced_env(
         // LOCAL memory: one word in or out of the invocation's private array, addressed by the
         // immediate plus the LOW 16 BITS of each register offset - `wgsl::local_address`.
         if let Op::LocalLoad { offset_bytes } | Op::LocalStore { offset_bytes } = instr.op {
+            if local.is_empty() {
+                local.resize(crate::wgsl::LOCAL_MEM_WORDS as usize, 0);
+            }
             let raw_lane = |o: &Operand| -> Option<u32> {
                 Some(regs.bank(o.bank)?.get(o.index as usize)?.to_bits())
             };

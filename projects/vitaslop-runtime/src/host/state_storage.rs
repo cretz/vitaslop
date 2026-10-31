@@ -203,6 +203,16 @@ impl VitaState {
 
     /// sceIoOpen: returns a new fd or a negative errno.
     pub fn io_open(&mut self, path: &str, flags: u32) -> i32 {
+        // >>> `tty0:` IS THE CONSOLE. A newer newlib does not ask the kernel for its standard
+        // descriptors (`sceKernelGetStdout`), it OPENS them: `sceIoOpen("tty0:", O_RDONLY)` for
+        // stdin and `O_WRONLY` twice for stdout and stderr. Refused as a missing file, a C
+        // program's `printf` had no descriptor to write to and printed nothing, silently. A
+        // write open is the captured console stream; a read open is stdin, which holds nothing.
+        // Each open is its own descriptor, as on the console: a C library that keeps a table
+        // of them reads a small reserved number as an empty slot.
+        if path.eq_ignore_ascii_case("tty0:") {
+            return self.fs.open_console(flags);
+        }
         let fd = self.fs.open(path, flags);
         tracing::trace!(target: "vitaslop::io", path, flags = format_args!("{flags:#x}"), fd, "open");
         io_journal::push(|| {
@@ -306,6 +316,11 @@ impl VitaState {
             }
             FD_STDERR => {
                 self.capture.stderr.extend_from_slice(bytes);
+                Some(bytes.len())
+            }
+            // A `tty0:` descriptor is the console, captured like fd 1.
+            _ if self.fs.open.get(&fd).is_some_and(|o| o.console) => {
+                self.capture.stdout.extend_from_slice(bytes);
                 Some(bytes.len())
             }
             _ => self.fs.write(fd, bytes),
@@ -676,7 +691,9 @@ impl VitaState {
 
     /// The size of the file behind an open descriptor (for sceIoGetstatByFd).
     pub fn io_size_fd(&self, fd: i32) -> Option<u64> {
-        let r = self.fs.size_of_fd(fd);
+        // The console holds no bytes, but it is a valid descriptor to stat.
+        let console = self.fs.open.get(&fd).is_some_and(|o| o.console);
+        let r = if console { Some(0) } else { self.fs.size_of_fd(fd) };
         io_journal::push(|| {
             format!(
                 "f{} t{:#x} getstat fd{fd} {:?} -> {r:?}",

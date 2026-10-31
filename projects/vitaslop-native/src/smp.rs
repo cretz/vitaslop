@@ -1519,6 +1519,9 @@ impl crate::threaded::SmpOps<VitaEnv> for SmpRun {
     fn host(&self) -> MutexGuard<'_, VitaEnv> {
         self.sh.lock_host()
     }
+    fn runtime_stats(&self) -> crate::RuntimeStats {
+        self.sh.engine.runtime_stats()
+    }
     fn engine_read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
         let mut out = vec![0u8; len];
         if self.sh.engine.read_guest_into(addr, &mut out) { out } else { Vec::new() }

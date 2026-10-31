@@ -2423,13 +2423,12 @@ fn begin_scene_with_depth(
     if *VIEWPORT_SCENE
         .get_or_init(|| crate::knobs::var("VITASLOP_VIEWPORT_SCENE").ok().as_deref() != Some("0"))
     {
-        let region_max = (valid_region != 0)
-            .then(|| {
-                (
-                    ctx.read_u32(valid_region + 8),
-                    ctx.read_u32(valid_region + 12),
-                )
-            })
+        // The region is `{ xMax, yMax }` - EIGHT bytes (see `read_valid_region`). This read
+        // used to take words 2 and 3 of a sixteen-byte `{ xMin, yMin, xMax, yMax }` that does not
+        // exist, i.e. whatever followed the struct in the guest's memory. MEASURED on a racing
+        // title's campaign map: the words past its region were zero, every scene drawn without
+        // a viewport of its own got a 1x1 one, and the whole 3D map behind the menu was black.
+        let region_max = read_valid_region(ctx, valid_region)
             .filter(|&(x, y)| x < 4096 && y < 4096)
             .map(|(x, y)| (x + 1, y + 1));
         if let Some((w, h)) = region_max
@@ -2663,6 +2662,11 @@ pub(super) fn end_scene(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOut
     // bytes are taken at the guest's GPU wait or at its flip, whichever comes first - see
     // `VitaState::resolve_deferred_geometry` for the crowd that made EndScene too early.
     st.end_scene();
+    // What the target's memory holds NOW, at submission: the bytes its write-back may replace.
+    // See `rtt_writeback::note_scene_submitted`.
+    if let Some(c) = st.capture.scenes.last().and_then(|s| s.color) {
+        crate::rtt_writeback::note_scene_submitted(&st.capture.scenes, &c, &mut |a, n| ctx.read_bytes(a, n));
+    }
     st.flush_visibility(ctx);
     let (vertex_notification, fragment_notification) = (ctx.arg(1), ctx.arg(2));
     // The scene remembers its notifications: a `sceGxmNotificationWait` on one of them is
@@ -3545,6 +3549,64 @@ pub(super) fn set_front_depth_func(
     func: u32,
 ) -> i32 {
     gxmctx::set(ctx, context, gxmctx::off::FRONT_DEPTH_FUNC, func);
+    0
+}
+
+/// void sceGxmSetBackDepthBias(SceGxmContext *context, int factor, int units)
+///
+/// The two-sided counterpart of [`set_front_depth_bias`], recorded like the rest of the
+/// back-face state. The renderer draws every face with the FRONT depth state today (see
+/// `render.rs`'s `depth_bias`), two-sided or not.
+#[hostcall]
+pub(super) fn set_back_depth_bias(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, factor: i32, units: i32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::BACK_DEPTH_BIAS_FACTOR, factor as u32);
+    gxmctx::set(ctx, context, gxmctx::off::BACK_DEPTH_BIAS_UNITS, units as u32);
+    0
+}
+
+/// Once per run: a title turned on W-buffering or the W clamp, which this renderer records but
+/// does not apply - a depth or near-plane defect on that title starts here.
+fn report_w_state_unapplied(what: &'static str, key: u64) {
+    if crate::rtt_writeback::report_once(0x5700_0000_0000_0000 ^ key) {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            "gxm: the title ENABLED {what}; it is recorded in the context but the renderer does \
+             not apply it (no published source gives the hardware's exact rule), so depth or \
+             near-plane geometry may differ from the console"
+        );
+    }
+}
+
+/// void sceGxmSetWClampEnable(SceGxmContext *context, SceGxmWClampMode enable)
+///
+/// `SCE_GXM_WCLAMP_MODE_ENABLED` (0x8000) turns on the rasteriser's W clamp; its value comes
+/// from [`set_w_clamp_value`]. Recorded, not applied - see [`report_w_state_unapplied`].
+#[hostcall]
+pub(super) fn set_w_clamp_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::W_CLAMP_ENABLE, enable);
+    if enable != 0 {
+        report_w_state_unapplied("the W clamp (sceGxmSetWClampEnable)", 1);
+    }
+    0
+}
+
+/// void sceGxmSetWClampValue(SceGxmContext *context, float clampValue)
+#[hostcall]
+pub(super) fn set_w_clamp_value(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, value: f32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::W_CLAMP_VALUE, value.to_bits());
+    0
+}
+
+/// void sceGxmSetWBufferEnable(SceGxmContext *context, SceGxmWBufferMode enable)
+///
+/// `SCE_GXM_WBUFFER_ENABLED` (0x4000) makes the depth test and depth buffer use W instead of Z.
+/// Recorded, not applied - see [`report_w_state_unapplied`].
+#[hostcall]
+pub(super) fn set_w_buffer_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::W_BUFFER_ENABLE, enable);
+    if enable != 0 {
+        report_w_state_unapplied("W-buffering (sceGxmSetWBufferEnable)", 2);
+    }
     0
 }
 
@@ -6816,6 +6878,23 @@ mod precomputed_state_binds {
         }
     }
 
+    /// `sceGxmBeginScene` resets the viewport to the VALID REGION, which is the eight-byte
+    /// `{ xMax, yMax }` - not two words past it. With zeros after the region (what a racing
+    /// title's campaign map had there) the old sixteen-byte read made a 1x1 viewport.
+    #[test]
+    fn begin_scene_takes_the_viewport_from_the_eight_byte_valid_region() {
+        const REGION: u32 = 0x1000;
+        let mut r = Rig::new();
+        r.bytes[REGION as usize..REGION as usize + 4].copy_from_slice(&479u32.to_le_bytes());
+        r.bytes[REGION as usize + 4..REGION as usize + 8].copy_from_slice(&271u32.to_le_bytes());
+        // The words after the struct stay zero.
+        r.call(g::BEGIN_SCENE, &[CTX, 0, 0, REGION]);
+        let vp: Vec<f32> = (0..6)
+            .map(|i| f32::from_bits(r.word(CTX + gxmctx::off::VIEWPORT + i * 4)))
+            .collect();
+        assert_eq!(vp, [240.0, 240.0, 136.0, -136.0, 0.5, 0.5]);
+    }
+
     /// The swizzled upload's placement must be a PERMUTATION of the destination: every texel of
     /// a `w x w` square lands at a distinct offset and together they cover exactly `[0, w*w)`.
     ///
@@ -8305,17 +8384,24 @@ fn complete_scenes_through(ctx: &mut GuestCtx, st: &mut VitaState, through: usiz
             if *addr != c.data_addr {
                 continue;
             }
-            let mut probe = ctx.read_bytes(*addr, 4096);
+            // >>> THE WHOLE TARGET, NOT ITS FIRST 4 KB. `apply_one` reads its region at `addr`
+            // (the latch's 4096-byte prefix, then under SMP the whole span it hashes against
+            // the submission), and the write closure holds `ctx`, so the bytes are taken here
+            // once, `probe_len` of them as the frame-end path does. MEASURED on a baseball
+            // title: a 4 KB snapshot let only targets of at most 4 KB through (its 32x32
+            // exposure probe); every 128x128 ambient probe was refused at the guest's GPU wait,
+            // the stadium's first frame read its allocator's poison as a 50x ambient, and the
+            // ground map baked from it washed out the whole at-bat.
+            let probe = ctx.read_bytes(*addr, crate::rtt_writeback::probe_len(*w, *h, &c));
             let ok = crate::rtt_writeback::apply_one(
                 *addr,
                 *w,
                 *h,
                 rgba,
                 &c,
-                &mut |_, n| {
-                    probe.truncate(n.min(probe.len()));
-                    probe.clone()
-                },
+                // A prefix per request - never shrinking the snapshot, which the latch's 4096-byte
+                // read used to do before the whole-region read came.
+                &mut |_, n| probe[..n.min(probe.len())].to_vec(),
                 &mut |a, b| ctx.write_bytes(a, b),
             );
             if ok {
