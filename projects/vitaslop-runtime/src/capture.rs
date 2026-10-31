@@ -520,7 +520,7 @@ pub struct Draw {
     /// is registered and every draw bound to it wants the same bytes: a race frame submits
     /// 400+ draws over a couple of dozen distinct programs, so a per-draw read out of guest
     /// memory plus a per-draw clone copies the same few kilobytes hundreds of times a frame
-    /// for nothing. The cache that hands these out is `VitaState::program_blobs`, invalidated
+    /// for nothing. The cache that hands these out is `VitaState::program_blob`, invalidated
     /// at exactly the moment a header address can come to mean a different program.
     pub vprog: std::sync::Arc<[u8]>,
     /// The bound fragment `SceGxmProgram` container bytes. Empty off the recompiler path.
@@ -574,6 +574,14 @@ pub struct Draw {
     /// snapshotted from the FRAGMENT uniform-buffer table. Empty for almost every program;
     /// one baseball title's whole menu is drawn by a pair that needs it.
     pub frag_mem_windows: Vec<(u32, Arc<[u8]>)>,
+    /// The buffers the FRAGMENT program's guest-memory STORES write through, snapshotted at
+    /// draw time: `(guest base address, the bytes there)` each, in the order its store binding
+    /// lays them out (`vitaslop_gxp_shader::module::resolve_store_windows`). The bytes SEED the
+    /// renderer's writable mirror of that memory. Empty for every program that does not store.
+    ///
+    /// A capsule carries them APPENDED to `frag_mem_windows` (the file format is unchanged), and
+    /// reading one splits the list again at the program's own load-window count.
+    pub frag_store_windows: Vec<(u32, Arc<[u8]>)>,
     /// The vertex program SYNTHESIZES this draw's primitive rather than reading it: the
     /// stream holds one record per sprite (a centre plus an expansion basis - a
     /// scale/rotation, or an explicit right/up billboard axis pair) and the shader builds
@@ -708,6 +716,10 @@ pub struct DepthSurface {
     /// `backgroundControl`: its LOW BYTE is the stencil value the surface clears to
     /// (`sceGxmDepthStencilSurfaceSetBackgroundStencil`), 0 after `...Init`.
     pub background_control: u32,
+    /// Where a FORCE_LOAD scene LOADS its depth from, when that is not [`Self::depth_addr`]:
+    /// `sceGxmBeginSceneEx` names a load surface and a store surface separately, and the
+    /// scene starts from the first and leaves its depth in the second. 0 means "the same".
+    pub load_addr: u32,
 }
 
 /// Report - once per (target, from, to) - that a scene's extent was taken from its draws'
@@ -740,6 +752,17 @@ fn report_adopted_viewport_extent(data_addr: u32, from: (u32, u32), to: (u32, u3
 }
 
 impl Scene {
+    /// The surface this scene renders, as the key a later render of the same surface
+    /// supersedes it by: the colour surface `(address, width, height)`, else the depth
+    /// surface `(address, 0, 0)`, else `None` (a scene that leaves nothing to sample).
+    pub fn target_key(&self) -> Option<(u32, u32, u32)> {
+        match (&self.color, &self.depth) {
+            (Some(c), _) => Some((c.data_addr, c.width, c.height)),
+            (None, Some(d)) => Some((d.depth_addr, 0, 0)),
+            (None, None) => None,
+        }
+    }
+
     /// Give this scene the extent its own draws were rasterized at, when its colour
     /// surface cannot possibly be right.
     ///
@@ -948,6 +971,15 @@ pub struct Capture {
     /// (enough for a frame that samples the one before) and shows the newest, and a long hold
     /// must not hold every frame's vertex snapshots meanwhile. `None` (the default) keeps all.
     pub untaken_frame_limit: Option<usize>,
+    /// `deferred_id`s of still-PENDING scenes a retire dropped (see
+    /// [`Capture::retire_oldest_untaken_frame`]). Their geometry is still owed - queued, or
+    /// being read by a resolver - and the resolve consults this to discard it quietly instead
+    /// of reporting a scene that "left the capture". Each id is removed when it is met.
+    dropped_pending: std::collections::HashSet<u64>,
+    /// What retiring untaken frames did, for the slow-present line: `(scenes dropped because a
+    /// newer frame renders their target again, of those still pending, scenes KEPT because no
+    /// newer frame renders their target)`. Running totals.
+    pub retire_counts: (u64, u64, u64),
 }
 
 /// Upper bound on retained trace entries. When the trace reaches this, the oldest
@@ -1035,6 +1067,13 @@ fn fold_scene(h: &mut u64, s: &Scene) {
         }
         fnv_bulk(h, &buf);
     }
+}
+
+/// `VITASLOP_LATE_RETIRE_SUPERSEDED=0`: the arm back for [`Capture::retire_oldest_untaken_frame`]
+/// - retire every resolved scene of an old untaken frame and keep every pending one.
+fn retire_superseded() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_LATE_RETIRE_SUPERSEDED").as_deref().map(str::trim) != Ok("0"))
 }
 
 /// Say - once - that this run cannot produce a signature because it was not folding scenes.
@@ -1430,8 +1469,26 @@ impl Capture {
     }
 
     /// Retire the scenes of the oldest flipped-but-untaken frame - see `untaken_frame_limit`.
-    /// Folded into the signature as any evicted scene is; a scene whose geometry is still
-    /// pending stays, for its own resolve.
+    /// Folded into the signature as any evicted scene is.
+    ///
+    /// # A scene is retired when a NEWER frame renders its target again - pending or not
+    /// The rule used to be "drop every resolved scene, keep every pending one". Under the
+    /// browser's parallel scheduler a flipped frame's geometry is APPLIED by the run worker
+    /// (`VitaEnv::resolve_flipped_geometry`), and a late present is exactly when the run worker
+    /// is busy - so every scene of the hold stayed pending, none was retired, and the catch-up
+    /// rendered the whole hold. MEASURED (desktop browser, a shooter's mission load): one
+    /// present drew 546 scenes - 91 frames of 6 - with 2025 texture uploads (264 MB) and
+    /// 51,552 draws, took 9.2 s, and the guest ran 90 more frames meanwhile, which the next
+    /// present drew again: 8.1 + 9.2 + 3.9 + 1.9 s of presents, 81% speed over the load.
+    ///
+    /// Now the test is the target, as the browser's `carry_unpresented` does it: a scene whose
+    /// target (colour surface, else depth surface) a newer frame still held here renders again
+    /// is dropped - its picture is overwritten before anything is shown - and its owed geometry
+    /// is discarded with it ([`Self::take_dropped_pending`]). A scene whose target no newer frame
+    /// renders is KEPT, in place at the front, so a target the title paints once (a bake at a
+    /// load) still reaches the GPU; a newer retire re-tests it. A scene with no target draws
+    /// nothing anyone can sample and is dropped. `VITASLOP_LATE_RETIRE_SUPERSEDED=0` is the arm
+    /// back (drop every resolved scene, keep every pending one).
     fn retire_oldest_untaken_frame(&mut self) {
         let Some(end) = self.flip_ends.pop_front() else {
             return;
@@ -1440,11 +1497,33 @@ impl Capture {
         let n = end.saturating_sub(first).min(self.scenes.len() as u64) as usize;
         let rest = self.scenes.split_off(n);
         let old = std::mem::replace(&mut self.scenes, rest);
+        let by_target = retire_superseded();
+        let newer: std::collections::HashSet<(u32, u32, u32)> = if by_target {
+            self.scenes.iter().filter_map(Scene::target_key).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         let mut kept = Vec::new();
         for s in old {
-            if s.deferred_id != 0 {
+            if !by_target {
+                if s.deferred_id != 0 {
+                    kept.push(s);
+                    continue;
+                }
+            } else if s.target_key().is_some_and(|k| !newer.contains(&k)) {
+                self.retire_counts.2 += 1;
                 kept.push(s);
                 continue;
+            } else {
+                self.retire_counts.0 += 1;
+                if s.deferred_id != 0 {
+                    // Its bytes were never read, so there is nothing honest to fold.
+                    self.retire_counts.1 += 1;
+                    self.dropped_pending.insert(s.deferred_id);
+                    self.signature_incomplete = true;
+                    self.retired_scenes += 1;
+                    continue;
+                }
             }
             if self.fold_disabled {
                 self.signature_incomplete = true;
@@ -1459,9 +1538,17 @@ impl Capture {
             self.retired_digest = h;
             self.retired_scenes += 1;
         }
-        // Pending scenes keep their place at the front, as a take leaves them.
+        // Kept scenes keep their place at the front, as a take leaves pending ones; the serial
+        // arithmetic above counts them into the next frame's take.
         kept.append(&mut self.scenes);
         self.scenes = kept;
+    }
+
+    /// Whether the scene with this `deferred_id` was dropped by a retire while its geometry was
+    /// still owed - and forget it. The resolve calls this for a scene it cannot find, so a
+    /// dropped one is discarded quietly while a genuinely lost one is still reported.
+    pub fn take_dropped_pending(&mut self, id: u64) -> bool {
+        self.dropped_pending.remove(&id)
     }
 
     /// Take the scenes of the OLDEST display frame whose flip has not been taken yet, and
@@ -1713,6 +1800,48 @@ mod flip_take_tests {
         );
         assert!(c.scenes.is_empty());
     }
+
+    fn into(addr: u32, deferred_id: u64) -> Scene {
+        Scene {
+            depth: Some(DepthSurface { depth_addr: addr, ..DepthSurface::default() }),
+            deferred_id,
+            ..Scene::default()
+        }
+    }
+
+    /// A long hold whose scenes are still PENDING (their geometry is applied by a worker that
+    /// is busy presenting) is still bounded: a scene a newer frame redraws the target of is
+    /// retired, pending or not, and its owed geometry is marked for quiet discard. A target
+    /// painted once survives the retire and reaches the catch-up.
+    #[test]
+    fn a_retire_drops_what_a_newer_frame_redraws_and_keeps_a_once_painted_target() {
+        let mut c = Capture::new();
+        c.set_signature_wanted(false);
+        c.untaken_frame_limit = Some(2);
+        let mut id = 0;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        // Frame 0 also bakes 0xb000, which no later frame renders.
+        c.push_scene(into(0xb000, next()));
+        for _ in 0..6 {
+            c.push_scene(into(0xa000, next()));
+            c.push_scene(into(0xc000, next()));
+            c.end_frame();
+        }
+        let addrs: Vec<u32> = c.scenes.iter().map(|s| s.depth.unwrap().depth_addr).collect();
+        assert_eq!(
+            addrs,
+            [0xb000, 0xa000, 0xc000, 0xa000, 0xc000],
+            "the bake, then the last two frames - every pending scene older than those is gone"
+        );
+        assert_eq!(c.retire_counts, (8, 8, 4), "8 redrawn (all pending); the bake re-tested 4 times");
+        assert!(c.take_dropped_pending(2), "frame 0's 0xa000 scene owes nothing now");
+        assert!(!c.take_dropped_pending(2), "and is forgotten once met");
+        assert!(!c.take_dropped_pending(1), "the bake was kept, not dropped");
+        assert_eq!(c.take_scenes_through_flips(2).len(), 0, "all still pending, so none is taken yet");
+    }
 }
 
 #[cfg(test)]
@@ -1822,6 +1951,7 @@ mod extent_tests {
             frag_sa_addr: 0,
             mem_windows: Vec::new(),
             frag_mem_windows: Vec::new(),
+            frag_store_windows: Vec::new(),
             shader_expanded: false,
         };
         Scene {

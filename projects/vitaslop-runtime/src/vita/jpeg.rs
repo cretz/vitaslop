@@ -139,7 +139,7 @@ pub struct JpegState {
     cached: Option<(u32, u32, Vec<u8>)>,
     /// Whether the argument report has been made for each entry point, so the panel carries
     /// one line per entry point rather than one per decode.
-    reported: [bool; 4],
+    reported: [bool; 5],
     /// Whether an undecodable image has already been reported.
     reported_undecodable: bool,
 }
@@ -294,10 +294,25 @@ fn do_get_output_info(
     put32(&mut info, 0x00, REPORTED_COLOR_SPACE as u32);
     info[0x04..0x06].copy_from_slice(&(w as u16).to_le_bytes());
     info[0x06..0x08].copy_from_slice(&(h as u16).to_le_bytes());
-    // Three full-resolution planes, so three times one plane. `unk_0xc` and `unk_0x10` stay
-    // zero: no published source says what they carry, and a number invented for them would be
-    // one a title could branch on.
+    // Three full-resolution planes, so three times one plane.
     put32(&mut info, 0x08, plane * 3);
+    // >>> `unk_0xc` IS THE TEMP BUFFER `sceJpegDecodeMJpeg` WORKS IN, AND ZERO WAS A HEAP
+    // CORRUPTION. One title passes it straight to its GPU-heap allocator and hands the block
+    // to `sceJpegDecodeMJpeg` as `temp, tempSize` (read off the call site: the struct's +0xc
+    // is the only field besides the dimensions and `outputSize` it keeps). That allocator
+    // files a free block under `clz(size)`, so a ZERO-byte block lands in bucket 32 - one
+    // halfword past the bucket array, on the allocator's deferred-free ring INDEX. MEASURED:
+    // the three JPEGs that title decodes in play freed empty temp blocks, the ring index read a node
+    // number (0x0f5c), a later drain freed nodes it had already freed, and the free list
+    // looped - the out-of-bounds read or the livelock some 300 frames on, under the parallel
+    // run where the free order lets the bad index survive. The allocator is the title's own
+    // code, so the console cannot be reporting zero here.
+    //
+    // What it reports is not published. The decode to RGBA works THROUGH a YCbCr image, so
+    // the temp buffer is sized as that image in the layout this module states (the same
+    // `outputSize` `decode_mjpeg_ycbcr` fills). `unk_0x10` stays zero: the title does not
+    // read it, and a value invented for it would be one a title could branch on.
+    put32(&mut info, 0x0c, plane * 3);
     // `pitch[i] = { x, y }`: bytes per row and number of rows, for the four possible planes.
     // The fourth is empty - a JPEG has at most three components.
     for (i, (x, y)) in [(w, h), (w, h), (w, h), (0, 0)].into_iter().enumerate() {
@@ -410,6 +425,53 @@ fn do_decode_mjpeg_ycbcr(
     st.jpeg.cached_at = Some((output.0, needed as u32));
     st.jpeg.cached = Some((w, h, rgb));
     needed as i32
+}
+
+/// `int sceJpegDecodeMJpeg(const SceUInt8 *jpeg, SceSize jpegSize, void *rgba, SceSize
+/// rgbaSize, SceInt32 mode, void *temp, SceSize tempSize, void *coef, SceSize coefSize)`
+///
+/// Decode straight to RGBA8, tightly packed, alpha opaque. NO LOCAL PROTOTYPE: the argument
+/// list is read from a title's call site (jpeg 0x4a1b bytes, an RGBA buffer of exactly
+/// 320x240x4, mode 0 and a temp buffer on the stack), which is also the shape of the ARM
+/// sibling `sceJpegArmDecodeMJpeg` in `psp2/jpegarm.h` with the temp pair added. The return
+/// is `(width << 16) | height`, the convention of the console family's earlier
+/// `sceJpegDecodeMJpeg`; both readings are REPORTED once (`report_arguments`), so a title that
+/// disagrees shows it.
+#[hostcall]
+pub(super) fn decode_mjpeg(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    jpeg_data: Ptr,
+    jpeg_size: u32,
+    rgba: Ptr,
+    rgba_size: u32,
+    mode: i32,
+) -> i32 {
+    report_arguments(
+        st,
+        4,
+        "sceJpegDecodeMJpeg",
+        &format!("jpegSize={jpeg_size} rgbaSize={rgba_size:#x} mode={mode:#x}; returns (w<<16)|h"),
+    );
+    if jpeg_data.is_null() || rgba.is_null() {
+        SCE_JPEG_ERROR_INVALID_POINTER
+    } else {
+        let bytes = ctx.read_bytes(jpeg_data.addr(), jpeg_size as usize);
+        match decode_rgb(&bytes) {
+            None => {
+                report_undecodable(st, jpeg_size, &bytes);
+                SCE_JPEG_ERROR_INVALID_DATA
+            }
+            Some((w, h, _)) if (w as usize) * (h as usize) * 4 > rgba_size as usize => {
+                SCE_JPEG_ERROR_INSUFFICIENT_BUFFER
+            }
+            Some((w, h, rgb)) => {
+                let out: Vec<u8> = rgb.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+                ctx.write_bytes(rgba.addr(), &out);
+                ((w << 16) | (h & 0xffff)) as i32
+            }
+        }
+    }
 }
 
 /// `int sceJpegMJpegCsc(SceUInt8 *rgba, const SceUInt8 *yuv, SceSize yuvSize,
@@ -545,6 +607,61 @@ mod tests {
             }
         }
         assert!(worst <= 2, "round trip drifted by {worst} steps");
+    }
+
+    /// The output info names a NON-ZERO temp buffer, sized for the YCbCr image the RGBA decode
+    /// works through. A zero here was MEASURED to corrupt one title's GPU-heap allocator: it
+    /// allocates exactly this many bytes for `sceJpegDecodeMJpeg`'s temp buffer, and a
+    /// zero-byte block's free writes one halfword past its bucket array, onto the
+    /// allocator's deferred-free ring index (see `do_get_output_info`).
+    #[test]
+    fn output_info_names_the_temp_buffer_the_rgba_decode_needs() {
+        use crate::host::VitaState;
+        use crate::nid::services as sv;
+        use crate::{DeterministicWorld, SliceMemory, VFP_ARG_COUNT};
+        use vitaslop_transpiler::abi::{REG_COUNT, SP};
+        const CTX: u32 = 0x100;
+        const STACK: u32 = 0x1F00;
+        const RGBA: u32 = 0x2000;
+        const YUV: u32 = 0x8000;
+        const OUT: u32 = 0xC000;
+        const INFO: u32 = 0x1C000;
+        // A real baseline JPEG, made by this crate's own encoder through its guest API.
+        let call = |bytes: &mut [u8], st: &mut VitaState, nid: u32, args: &[u32]| -> i32 {
+            let mut regs = [0u32; REG_COUNT];
+            for (i, a) in args.iter().take(4).enumerate() {
+                regs[i] = *a;
+            }
+            regs[SP] = STACK;
+            for (i, a) in args.iter().skip(4).enumerate() {
+                let at = (STACK as usize) + 4 * i;
+                bytes[at..at + 4].copy_from_slice(&a.to_le_bytes());
+            }
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            let mut mem = SliceMemory(bytes);
+            let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            super::super::dispatch(crate::nid::lib::SCE_GXM, nid, &mut ctx, st);
+            regs[0] as i32
+        };
+        let (w, h) = (40u32, 24u32);
+        let mut bytes = vec![0u8; 0x20000];
+        let mut st = VitaState::new(0, 0x20000, Box::new(DeterministicWorld::default()));
+        assert_eq!(call(&mut bytes, &mut st, sv::JPEGENC_INIT, &[CTX, w, h, 8 | 16, OUT, 0x8000]), 0);
+        assert_eq!(call(&mut bytes, &mut st, sv::JPEGENC_CSC, &[CTX, YUV, RGBA, w, 0]), 0);
+        let n = call(&mut bytes, &mut st, sv::JPEGENC_ENCODE, &[CTX, YUV]);
+        assert!(n > 0, "encode answered {n:#x}");
+
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        let rc = do_get_output_info(&mut ctx, &mut st, Ptr(OUT), n as u32, 0, 0, Ptr(INFO));
+        assert_eq!(rc, 0);
+        let output_size = ctx.read_u32(INFO + 0x08);
+        let temp_size = ctx.read_u32(INFO + 0x0c);
+        assert_eq!(output_size, w * h * 3, "three full-resolution planes");
+        assert_ne!(temp_size, 0, "a zero-byte temp buffer is a block the title's allocator cannot free");
+        assert_eq!(temp_size, output_size, "the YCbCr image the RGBA decode works through");
     }
 
     /// Grey stays grey: the chroma planes sit at 128 and the luma is the grey level. The one

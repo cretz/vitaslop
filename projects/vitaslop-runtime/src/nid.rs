@@ -127,6 +127,12 @@ pub mod gxm {
     pub const SET_TWO_SIDED_ENABLE: u32 = 0x0DE9_AEB7;
     pub const SET_FRONT_DEPTH_FUNC: u32 = 0x14BD_831F;
     pub const SET_FRONT_DEPTH_BIAS: u32 = 0xAAA9_7F81;
+    pub const SET_BACK_DEPTH_BIAS: u32 = 0x17B3_BF86;
+    /// Named by the henkaku wiki's SceGxm export list and the dev wiki's VSH exports;
+    /// prototypes from vita-headers `gxm.h`.
+    pub const SET_W_CLAMP_ENABLE: u32 = 0x1BF8_B853;
+    pub const SET_W_CLAMP_VALUE: u32 = 0xD096_336E;
+    pub const SET_W_BUFFER_ENABLE: u32 = 0xEED8_6975;
     pub const SET_BACK_DEPTH_FUNC: u32 = 0xB042_A4D2;
     pub const SET_FRONT_DEPTH_WRITE_ENABLE: u32 = 0xF32C_BF34;
     pub const SET_FRONT_FRAGMENT_PROGRAM_ENABLE: u32 = 0x5759_58A8;
@@ -338,6 +344,15 @@ pub mod gxm {
     pub const PUSH_USER_MARKER: u32 = 0x3276_C475;
     pub const POP_USER_MARKER: u32 = 0x4FA0_73A6;
     pub const SET_USER_MARKER: u32 = 0xC7A8_CB77;
+    /// `sceGxmBeginSceneEx`: `sceGxmBeginScene` with the depth/stencil surface split into
+    /// the one the scene LOADS from and the one it STORES to - see `vita::gxm::begin_scene_ex`.
+    pub const BEGIN_SCENE_EX: u32 = 0x4709_CF5A;
+    /// `sceGxmMidSceneFlush` - see `vita::gxm::mid_scene_flush`.
+    pub const MID_SCENE_FLUSH: u32 = 0x2B5C_0444;
+    /// `sceGxmTransferFill` - see `vita::gxm::transfer_fill`.
+    pub const TRANSFER_FILL: u32 = 0x69DD_FF5E;
+    /// `sceGxmProgramIsNativeColorUsed` - see `vita::gxm::program_is_native_color_used`.
+    pub const PROGRAM_IS_NATIVE_COLOR_USED: u32 = 0xA429_7E57;
 }
 
 /// SceDisplayUser / SceDisplay function NIDs. `SET_FRAME_BUF` is SceDisplayUser
@@ -407,6 +422,14 @@ pub mod sysmem {
     pub const GET_MODEL: u32 = 0xD0D4_F729;
     pub const GET_MODEL_FOR_CDIALOG: u32 = 0xA2CB_322F;
     pub const IS_PS_VITA_TV: u32 = 0x1453_A5E5;
+    /// `sceKernelGetFreeMemorySize`: what is left in each user partition.
+    pub const GET_FREE_MEMORY_SIZE: u32 = 0x87CC_580B;
+    /// The JIT interface: a block meant for code the process generates, and the calls that
+    /// switch it between writable and executable and flush it.
+    pub const ALLOC_MEM_BLOCK_FOR_VM: u32 = 0xE2D7_E137;
+    pub const OPEN_VM_DOMAIN: u32 = 0x9CA3_EB2B;
+    pub const CLOSE_VM_DOMAIN: u32 = 0xD6CA_56CA;
+    pub const SYNC_VM_DOMAIN: u32 = 0x19D2_A81A;
 }
 
 /// SceLibKernel function NIDs: the user-facing clib (string/memory/print) and the
@@ -490,6 +513,12 @@ pub mod libkernel {
     pub const IO_RENAME: u32 = 0xF737_E369;
     pub const IO_RMDIR: u32 = 0xE9F9_1EC8;
     pub const IO_SYNC: u32 = 0x98AC_ED6D;
+    /// `sceKernelGetRWLockInfo`: a reader/writer lock's attributes and live holders.
+    pub const GET_RW_LOCK_INFO: u32 = 0x079A_573B;
+    /// `sceKernelBacktraceSelf`: walk the calling thread's own stack.
+    pub const BACKTRACE_SELF: u32 = 0xD16C_03B0;
+    /// `sceKernelCancelMsgPipe`: release every thread waiting on a message pipe.
+    pub const CANCEL_MSG_PIPE: u32 = 0xEF14_BA37;
 }
 
 /// SceFios2Kernel: the kernel-side path OVERLAY layer beneath FIOS2. Titles ship
@@ -578,6 +607,54 @@ pub mod net {
     /// `sceNetSocketAbort`: unblock whatever is waiting on a socket, so a worker parked
     /// in a receive can be torn down.
     pub const SOCKET_ABORT: u32 = 0x891C_1B9B;
+    /// `sceNetGetStatisticsInfo`: the stack's memory and packet counters.
+    pub const GET_STATISTICS_INFO: u32 = 0xA86F_8FE5;
+    /// `sceNetShowIfconfig` / `sceNetShowRoute`: print the interface and route tables to the
+    /// debug console, as [`SHOW_NETSTAT`] prints the socket table.
+    pub const SHOW_IFCONFIG: u32 = 0x658B_903B;
+    pub const SHOW_ROUTE: u32 = 0x6AB3_B74B;
+}
+
+/// SceLibRudp (`0x3291_0D11`): reliable UDP over SceNet, modelled OFFLINE beside it (see
+/// `vita::net`). Every value is from `vita-headers/db/360/SceLibRudp.yml`.
+pub mod rudp {
+    pub const INIT: u32 = 0x22C9_AA29;
+    pub const END: u32 = 0x3EA0_961E;
+    pub const ENABLE_INTERNAL_IO_THREAD: u32 = 0x3A49_5E69;
+    pub const SET_EVENT_HANDLER: u32 = 0x396A_24D6;
+    pub const SET_OPTION: u32 = 0xBD87_A5CA;
+    pub const GET_OPTION: u32 = 0xE680_05E3;
+    pub const CREATE_CONTEXT: u32 = 0x772C_07E8;
+    pub const BIND: u32 = 0x8B76_6108;
+    pub const INITIATE: u32 = 0x46B6_35BD;
+    pub const ACTIVATE: u32 = 0xF115_1D91;
+    pub const TERMINATE: u32 = 0x552B_2D3E;
+    pub const GET_CONTEXT_STATUS: u32 = 0xD620_B557;
+    pub const GET_STATUS: u32 = 0xD779_28C5;
+    pub const GET_SIZE_READABLE: u32 = 0x6B74_CA22;
+    pub const GET_SIZE_WRITABLE: u32 = 0xADE1_96DC;
+    pub const READ: u32 = 0x30A9_438E;
+    pub const WRITE: u32 = 0x69C9_DE15;
+    pub const FLUSH: u32 = 0x8D45_BA52;
+    pub const PROCESS_EVENTS: u32 = 0x24E3_6E39;
+    pub const NET_RECEIVED: u32 = 0x2C1E_736E;
+    pub const POLL_CREATE: u32 = 0x943D_96EC;
+    pub const POLL_DESTROY: u32 = 0xC9AC_BDF0;
+    pub const POLL_CONTROL: u32 = 0x1866_8BD8;
+    pub const POLL_WAIT: u32 = 0x5591_8C7C;
+}
+
+/// SceNpPartyGameUtil (`0xB3B3_4742`): the system party a title can read its members from.
+/// Every value is from the vita-headers NID database.
+pub mod np_party {
+    pub const INIT: u32 = 0xB304_962C;
+    pub const TERM: u32 = 0xF524_AD2B;
+    pub const REGISTER_HANDLER: u32 = 0x324C_76F0;
+    pub const CHECK_CALLBACK: u32 = 0xB613_2502;
+    pub const GET_STATE: u32 = 0x9F99_ADF7;
+    pub const GET_MEMBERS: u32 = 0x420C_30E9;
+    pub const GET_MEMBER_INFO: u32 = 0x0560_D9A1;
+    pub const GET_MEMBER_VOICE_INFO: u32 = 0xFB20_0A6D;
 }
 
 /// SceHttp: the HTTP client surface, modelled OFFLINE (see [`crate::vita::http`]).
@@ -596,6 +673,9 @@ pub mod http {
     pub const URI_BUILD: u32 = 0x4766_4424;
     pub const DELETE_CONNECTION: u32 = 0xF0F6_5C15;
     pub const CREATE_REQUEST_WITH_URL: u32 = 0xBD5D_A1D0;
+    /// The `2` forms take the method as a STRING ("GET", "POST", ...).
+    pub const CREATE_REQUEST2: u32 = 0x857D_9242;
+    pub const CREATE_REQUEST_WITH_URL2: u32 = 0x1B6B_7983;
     pub const DELETE_REQUEST: u32 = 0x3D3D_29AD;
     pub const SET_CONNECT_TIMEOUT: u32 = 0x237C_A86E;
     pub const SET_SEND_TIMEOUT: u32 = 0x8AE3_F008;
@@ -605,6 +685,7 @@ pub mod http {
     pub const SET_REQUEST_CONTENT_LENGTH: u32 = 0x37C3_0C90;
     pub const URI_ESCAPE: u32 = 0x1DA2_A673;
     pub const ADD_REQUEST_HEADER: u32 = 0x7B51_B122;
+    pub const REMOVE_REQUEST_HEADER: u32 = 0x5EB5_F548;
     pub const SEND_REQUEST: u32 = 0x9CA5_8B99;
     pub const ABORT_REQUEST: u32 = 0xEA61_662F;
     pub const GET_STATUS_CODE: u32 = 0x2707_1691;
@@ -613,6 +694,15 @@ pub mod http {
     pub const SSL_LOAD_CERT: u32 = 0xAE8D_7C33;
     pub const SSL_SET_SSL_CALLBACK: u32 = 0xA092_6037;
     pub const SSL_GET_SSL_ERROR: u32 = 0x2B79_BDE0;
+    pub const SSL_UNLOAD_CERT: u32 = 0x8577_833F;
+    pub const SSL_ENABLE_OPTION: u32 = 0x9FBE_2869;
+    pub const SSL_DISABLE_OPTION: u32 = 0xC6D6_0403;
+    pub const GET_LAST_ERRNO: u32 = 0x9A68_C3DE;
+    // Per-object switches, each with its getter - see `vita::http::set_switch`.
+    pub const SET_AUTH_ENABLED: u32 = 0x11EC_42D0;
+    pub const GET_AUTH_ENABLED: u32 = 0x6727_874C;
+    pub const SET_AUTO_REDIRECT: u32 = 0x3489_1C3F;
+    pub const GET_AUTO_REDIRECT: u32 = 0x6EAD_73EB;
     // The cookie jar. Enabling cookies and registering the receive callback are LOCAL
     // settings on the template/connection/request; reading a cookie back asks the jar,
     // which is empty because no response was ever received. See `vita::http`.
@@ -623,6 +713,12 @@ pub mod http {
     pub const GET_COOKIE_ENABLED: u32 = 0x1B6E_F66E;
     pub const SET_COOKIE_RECV_CALLBACK: u32 = 0xD4F3_2A23;
     pub const GET_COOKIE: u32 = 0x7022_0BFA;
+    /// `sceHttpGetMemoryPoolStats`: the pool `sceHttpInit` was handed, and how much of it is
+    /// in use.
+    pub const GET_MEMORY_POOL_STATS: u32 = 0xF98C_DFA9;
+    /// `sceSslGetMemoryPoolStats` (SceSsl, `0xCAF5_F2E9`, `vita-headers/db/360/SceLibSsl.yml`):
+    /// the same question of `sceSslInit`'s pool.
+    pub const SSL_GET_MEMORY_POOL_STATS: u32 = 0xBD20_3262;
 }
 
 /// SceIme (libime): the on-screen keyboard - see `vita::ime`.
@@ -642,6 +738,11 @@ pub mod np {
     pub const NP_BASIC_GET_BLOCK_LIST_ENTRY_COUNT: u32 = 0x407E_1E6F;
     pub const NP_BASIC_GET_BLOCK_LIST_ENTRIES: u32 = 0x1211_AE8E;
     pub const NP_BASIC_GET_GAME_PRESENCE_OF_FRIEND: u32 = 0xEF8A_91BC;
+    // The join-game acknowledgement: a friend asks to join this title's session and the
+    // title answers through the handler it registered.
+    pub const NP_BASIC_REGISTER_JOIN_GAME_ACK_HANDLER: u32 = 0xE02A_445C;
+    pub const NP_BASIC_UNREGISTER_JOIN_GAME_ACK_HANDLER: u32 = 0x2A76_4628;
+    pub const NP_BASIC_JOIN_GAME_ACK_RESPONSE_SEND: u32 = 0x8C90_CC09;
     pub const NP_COMMERCE2_ABORT_REQ: u32 = 0xE748_6A60;
     pub const NP_COMMERCE2_DESTROY_GET_PRODUCT_INFO_LIST_RESULT: u32 = 0x24D3_FE34;
     pub const NP_COMMERCE2_SHOW_PS_STORE_ICON: u32 = 0x84E5_6A6D;
@@ -914,6 +1015,8 @@ pub mod services {
     /// The rest of the SceRtcUser calendar arithmetic: each a pure function of its
     /// arguments over the same proleptic-Gregorian construction as the members above.
     pub const RTC_FORMAT_RFC3339: u32 = 0xCCEA_2B54;
+    /// `sceRtcFormatRFC2822LocalTime`: the same tick, as an RFC 2822 (mail) date in local time.
+    pub const RTC_FORMAT_RFC2822_LOCAL_TIME: u32 = 0x42CA_8EB5;
     pub const RTC_GET_DAYS_IN_MONTH: u32 = 0x49EB_4556;
     pub const RTC_IS_LEAP_YEAR: u32 = 0xF17F_D8B5;
     pub const RTC_CHECK_VALID: u32 = 0xD762_2935;
@@ -958,6 +1061,9 @@ pub mod services {
     // SceAppMgr: app-lifecycle state poll (system/app event counts, overlay flag).
     pub const APP_MGR_GET_APP_STATE: u32 = 0x5E86_319A;
     pub const APP_MGR_IS_GAME_PROGRAM: u32 = 0xFFF8_F7F0;
+    /// `sceAppMgrSetNetworkDisconnectionWarningDialogState`: whether the system may warn
+    /// when the network drops during this title.
+    pub const APP_MGR_SET_NETWORK_DISCONNECTION_WARNING_DIALOG_STATE: u32 = 0xE352_B29C;
     // SceNpScore / SceNpManager: online leaderboards and account identity.
     pub const NP_SCORE_INIT: u32 = 0x0433_069F;
     pub const NP_SCORE_TERM: u32 = 0x2050_F98F;
@@ -1157,10 +1263,15 @@ pub mod services {
     pub const JPEG_MJPEG_CSC: u32 = 0xC238_0E3A;
     /// `sceJpegCsc(...)`: the non-MJpeg twin, with no published prototype - see `vita::jpeg`.
     pub const JPEG_CSC: u32 = 0x6263_AEC2;
+    /// `sceJpegDecodeMJpeg(jpeg, jpegSize, rgba, rgbaSize, mode, temp, tempSize, coef,
+    /// coefSize)`: straight to RGBA. No local prototype - read from its call site; see
+    /// `vita::jpeg::decode_mjpeg`.
+    pub const JPEG_DECODE_MJPEG: u32 = 0x6215_B095;
     // SceSystemGesture: gesture recognition layered on top of the touch panels. The NID
-    // db names these; NO prototype or struct layout for the library is published
-    // anywhere (vitasdk ships no `systemgesture.h`), so the argument shapes here are
-    // read from the calling title's own code - see `vita::gesture`.
+    // db names these; vitasdk ships no header for the library, so the prototypes and
+    // layouts come from the clean-room fact sheet (a third-party declaration of the SDK's
+    // public types, cross-checked against the calling titles' own code) - see
+    // `vita::gesture`.
     pub const SYSTEM_GESTURE_INIT_PRIMITIVE_TOUCH_RECOGNIZER: u32 = 0x6078_A08B;
     pub const SYSTEM_GESTURE_FINALIZE_PRIMITIVE_TOUCH_RECOGNIZER: u32 = 0xB387_5104;
     pub const SYSTEM_GESTURE_RESET_PRIMITIVE_TOUCH_RECOGNIZER: u32 = 0xFD5A_6504;
@@ -1249,6 +1360,30 @@ pub mod services {
     pub const NP_MATCHING2_CREATE_JOIN_ROOM: u32 = 0x818A_9499;
     pub const NP_MATCHING2_JOIN_ROOM: u32 = 0x33F7_D5AE;
     pub const NP_MATCHING2_SEND_ROOM_MESSAGE: u32 = 0x7B90_8D99;
+    // The rest of the room surface, and signaling: each names a context (and most a room
+    // or a member) that only a signed-in account could have created.
+    pub const NP_MATCHING2_LEAVE_ROOM: u32 = 0xC8B0_C9EE;
+    pub const NP_MATCHING2_GRANT_ROOM_OWNER: u32 = 0x8645_8025;
+    pub const NP_MATCHING2_KICKOUT_ROOM_MEMBER: u32 = 0xA802_1394;
+    pub const NP_MATCHING2_GET_ROOM_DATA_EXTERNAL_LIST: u32 = 0x5BE8_B86F;
+    pub const NP_MATCHING2_SET_ROOM_DATA_EXTERNAL: u32 = 0x8F88_AC7E;
+    pub const NP_MATCHING2_SET_ROOM_DATA_INTERNAL: u32 = 0x9478_4A8C;
+    pub const NP_MATCHING2_SET_ROOM_MEMBER_DATA_INTERNAL: u32 = 0xD309_6C55;
+    pub const NP_MATCHING2_REGISTER_SIGNALING_CALLBACK: u32 = 0x1C60_BC5B;
+    pub const NP_MATCHING2_SIGNALING_GET_CONNECTION_STATUS: u32 = 0x4E4C_55BD;
+    pub const NP_MATCHING2_SIGNALING_GET_CONNECTION_INFO: u32 = 0x2059_8618;
+    /// `sceNpMatching2SignalingGetLocalNetInfo`: this console's own addresses as signaling
+    /// sees them - needs no context, only a network.
+    pub const NP_MATCHING2_SIGNALING_GET_LOCAL_NET_INFO: u32 = 0x7931_0806;
+    /// `sceNpMatching2GetMemoryInfo`: the pool `sceNpMatching2Init` was handed.
+    pub const NP_MATCHING2_GET_MEMORY_INFO: u32 = 0x7BD3_9E50;
+    // SceNpTus: the title-user-storage request surface, beside `NP_TUS_CREATE_REQUEST`.
+    pub const NP_TUS_CREATE_TITLE_CTX: u32 = 0xF1D9_529E;
+    pub const NP_TUS_GET_DATA_ASYNC: u32 = 0x883A_C44A;
+    pub const NP_TUS_SET_DATA_ASYNC: u32 = 0x9FAB_A1E5;
+    pub const NP_TUS_POLL_ASYNC: u32 = 0xC003_C588;
+    pub const NP_TUS_DELETE_REQUEST: u32 = 0xB46B_5D7F;
+    pub const NP_TUS_ABORT_REQUEST: u32 = 0x2C5F_1162;
     // SceNpScore: the leaderboard request surface, on top of the title context that
     // `NP_SCORE_CREATE_TITLE_CTX` already reports signed out.
     pub const NP_SCORE_CREATE_REQUEST: u32 = 0xD30D_1993;
@@ -1324,6 +1459,15 @@ pub mod services {
     // SceCommonDialog: shared config for the dialog families, plus the trophy-setup
     // dialog's result read.
     pub const COMMON_DIALOG_SET_CONFIG_PARAM: u32 = 0xBECD_35C8;
+    pub const COMMON_DIALOG_IS_RUNNING: u32 = 0x043A_353E;
+    /// An UNNAMED SceCommonDialog family (`0xE537_816C`): five exports present in the NID
+    /// databases only as `SceCommonDialog_<nid>`. The roles are read off a title's call sites
+    /// - see `services::DialogFamily::UnnamedTerms`.
+    pub const COMMON_DIALOG_UNNAMED_TERMS_INIT: u32 = 0x3362_6E2C;
+    pub const COMMON_DIALOG_UNNAMED_TERMS_GET_STATUS: u32 = 0xB7D4_C911;
+    pub const COMMON_DIALOG_UNNAMED_TERMS_GET_RESULT: u32 = 0xD185_8A78;
+    pub const COMMON_DIALOG_UNNAMED_TERMS_TERM: u32 = 0xBEBA_EF25;
+    pub const COMMON_DIALOG_UNNAMED_TERMS_ABORT: u32 = 0xB55C_F0E3;
     pub const NP_TROPHY_SETUP_DIALOG_GET_RESULT: u32 = 0xE370_69D5;
     /// SceMp4: opening a movie container. Names and NIDs are facts from the henkaku
     /// wiki's `SceMp4` page (the vitasdk NID db has no entry for this library).
@@ -1408,6 +1552,10 @@ pub mod services {
     pub const RTC_PARSE_RFC3339: u32 = 0x2D18_AEEC;
     /// The by-EVENT-ID sibling of [`SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_INDEX`].
     pub const SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_EVENT_ID: u32 = 0x5570_B83E;
+    /// The whole-buffer sibling of [`SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_INDEX`].
+    pub const SYSTEM_GESTURE_GET_TOUCH_EVENTS: u32 = 0x789D_867C;
+    /// Move a recognizer's watched rectangle without recreating it.
+    pub const SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER_RECTANGLE: u32 = 0xA9DB_29F6;
     /// `sceNetCtlGetNatInfo(SceNetCtlNatInfo *)`: the STUN-discovered NAT type. There is
     /// no link to run STUN over, so it reports NOT_CONNECTED like the rest of SceNetCtl.
     pub const NET_CTL_GET_NAT_INFO: u32 = 0x4DDD_6149;
@@ -1634,9 +1782,6 @@ pub mod threadmgr {
     pub const GET_CALLBACK_COUNT: u32 = 0x0386_44D5;
 }
 
-/// ScePvf: the Vita font library. A title creates a lib, configures em/resolution/
-/// skew, and opens fonts. Handles are opaque; the surface is satisfied without a
-/// glyph rasterizer (text is drawn through the captured GXM stream).
 /// SceVoice: voice chat. NIDs from `db/360/SceVoice.yml`; there is no published header
 /// or wiki prototype for the library, so the shapes are read from the callsite - see
 /// `vita::voice`, which models a console with no microphone and no session.
@@ -1654,6 +1799,9 @@ pub mod voice {
     pub const GET_PORT_INFO: u32 = 0x5933_CCFB;
 }
 
+/// ScePvf: the Vita font library. A title creates a lib, configures em/resolution/
+/// skew, and opens fonts. Handles are opaque; the surface is satisfied without a
+/// glyph rasterizer (text is drawn through the captured GXM stream).
 pub mod pvf {
     pub const NEW_LIB: u32 = 0x72E5_8672;
     pub const DONE_LIB: u32 = 0xE177_17EC;
@@ -1865,6 +2013,13 @@ pub mod ngs {
     /// The PSP SAS-emulation voice (vita-headers SceNgsUser 3.60). First imported by a 2011
     /// fighting title's audio thread at boot.
     pub const VOICE_DEF_GET_SAS_EMU_VOICE: u32 = 0x1F51_C2BA;
+    /// The envelope buss (vita-headers SceNgsUser 3.60). First imported by a 2012 open-world
+    /// title.
+    pub const VOICE_DEF_GET_ENVELOPE_BUSS: u32 = 0xF6B6_8C31;
+    /// `SceInt32 sceNgsSystemSetParamErrorCallback(SceNgsHSynSystem, SceNgsParamsErrorCallbackFunc)`
+    /// (vita-headers `ngs_internal.h`, SceNgsUser 3.60): the callback a parameter block that
+    /// fails validation is reported to.
+    pub const SYSTEM_SET_PARAM_ERROR_CALLBACK: u32 = 0x5ADD_22DC;
     pub const VOICE_SET_PARAMS_BLOCK: u32 = 0xFB81_74B1;
     pub const VOICE_PATCH_SET_VOLUME: u32 = 0xA3C8_07BC;
     pub const PATCH_REMOVE_ROUTING: u32 = 0xD0C9_AE5A;
@@ -1879,6 +2034,8 @@ pub mod audio {
     pub const OUT_SET_VOLUME: u32 = 0x6416_7F11;
     pub const OUT_RELEASE_PORT: u32 = 0x69E2_E6B5;
     pub const OUT_GET_ADOPT: u32 = 0x12FB_1767;
+    /// `sceAudioOutGetRestSample`: how much of what a port was handed is still to play.
+    pub const OUT_GET_REST_SAMPLE: u32 = 0x9A53_70C4;
 }
 
 /// SceVideodec / SceAvcdec (library `0x163C3727`) and SceCodecEngine (`0x469AB062`):
@@ -1953,8 +2110,8 @@ pub fn name(func_nid: u32) -> &'static str {
     use {
         atomic as at, audio as au, audiodec as ad, audioin, avplayer as avp, ctrl as c,
         display as d, fiber as fb, gxm as g, http, ime, iofilemgr as io, libkernel as lk, livearea,
-        lwsync as lw, net as nt, ngs as ng, np, pgf, processmgr as pm, pvf as pv, services as sv,
-        sync as sy, sysmem as s, threadmgr as tm, videodec as vd, voice as vo, xml,
+        lwsync as lw, net as nt, ngs as ng, np, np_party, pgf, processmgr as pm, pvf as pv, rudp,
+        services as sv, sync as sy, sysmem as s, threadmgr as tm, videodec as vd, voice as vo, xml,
     };
     match func_nid {
         // SceVideodec / SceAvcdec, and the codec engine's memory.
@@ -2199,6 +2356,10 @@ pub fn name(func_nid: u32) -> &'static str {
         c::READ_BUFFER_NEGATIVE2 => "sceCtrlReadBufferNegative2",
         s::ALLOC_MEM_BLOCK => "sceKernelAllocMemBlock",
         s::GET_MEM_BLOCK_BASE => "sceKernelGetMemBlockBase",
+        s::ALLOC_MEM_BLOCK_FOR_VM => "sceKernelAllocMemBlockForVM",
+        s::OPEN_VM_DOMAIN => "sceKernelOpenVMDomain",
+        s::CLOSE_VM_DOMAIN => "sceKernelCloseVMDomain",
+        s::SYNC_VM_DOMAIN => "sceKernelSyncVMDomain",
         lk::CLIB_PRINTF => "sceClibPrintf",
         lk::CLIB_VPRINTF => "sceClibVprintf",
         lk::CLIB_SNPRINTF => "sceClibSnprintf",
@@ -2364,6 +2525,8 @@ pub fn name(func_nid: u32) -> &'static str {
         http::URI_BUILD => "sceHttpUriBuild",
         http::DELETE_CONNECTION => "sceHttpDeleteConnection",
         http::CREATE_REQUEST_WITH_URL => "sceHttpCreateRequestWithURL",
+        http::CREATE_REQUEST2 => "sceHttpCreateRequest2",
+        http::CREATE_REQUEST_WITH_URL2 => "sceHttpCreateRequestWithURL2",
         http::DELETE_REQUEST => "sceHttpDeleteRequest",
         http::SET_CONNECT_TIMEOUT => "sceHttpSetConnectTimeOut",
         http::SET_SEND_TIMEOUT => "sceHttpSetSendTimeOut",
@@ -2373,6 +2536,7 @@ pub fn name(func_nid: u32) -> &'static str {
         http::SET_REQUEST_CONTENT_LENGTH => "sceHttpSetRequestContentLength",
         http::URI_ESCAPE => "sceHttpUriEscape",
         http::ADD_REQUEST_HEADER => "sceHttpAddRequestHeader",
+        http::REMOVE_REQUEST_HEADER => "sceHttpRemoveRequestHeader",
         http::SEND_REQUEST => "sceHttpSendRequest",
         http::ABORT_REQUEST => "sceHttpAbortRequest",
         http::GET_STATUS_CODE => "sceHttpGetStatusCode",
@@ -2381,6 +2545,14 @@ pub fn name(func_nid: u32) -> &'static str {
         http::SSL_LOAD_CERT => "sceHttpsLoadCert",
         http::SSL_SET_SSL_CALLBACK => "sceHttpsSetSslCallback",
         http::SSL_GET_SSL_ERROR => "sceHttpsGetSslError",
+        http::SSL_UNLOAD_CERT => "sceHttpsUnloadCert",
+        http::SSL_ENABLE_OPTION => "sceHttpsEnableOption",
+        http::SSL_DISABLE_OPTION => "sceHttpsDisableOption",
+        http::GET_LAST_ERRNO => "sceHttpGetLastErrno",
+        http::SET_AUTH_ENABLED => "sceHttpSetAuthEnabled",
+        http::GET_AUTH_ENABLED => "sceHttpGetAuthEnabled",
+        http::SET_AUTO_REDIRECT => "sceHttpSetAutoRedirect",
+        http::GET_AUTO_REDIRECT => "sceHttpGetAutoRedirect",
         sv::SSL_INIT => "sceSslInit",
         sv::NP_INIT => "sceNpInit",
         sv::NP_REGISTER_SERVICE_STATE_CALLBACK => "sceNpRegisterServiceStateCallback",
@@ -2607,6 +2779,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::JPEG_FINISH_MJPEG => "sceJpegFinishMJpeg",
         sv::JPEG_GET_OUTPUT_INFO => "sceJpegGetOutputInfo",
         sv::JPEG_DECODE_MJPEG_YCBCR => "sceJpegDecodeMJpegYCbCr",
+        sv::JPEG_DECODE_MJPEG => "sceJpegDecodeMJpeg",
         sv::JPEG_MJPEG_CSC => "sceJpegMJpegCsc",
         sv::JPEG_CSC => "sceJpegCsc",
         sv::SYSTEM_GESTURE_INIT_PRIMITIVE_TOUCH_RECOGNIZER => {
@@ -2750,6 +2923,10 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_TWO_SIDED_ENABLE => "sceGxmSetTwoSidedEnable",
         g::SET_FRONT_DEPTH_FUNC => "sceGxmSetFrontDepthFunc",
         g::SET_FRONT_DEPTH_BIAS => "sceGxmSetFrontDepthBias",
+        g::SET_BACK_DEPTH_BIAS => "sceGxmSetBackDepthBias",
+        g::SET_W_CLAMP_ENABLE => "sceGxmSetWClampEnable",
+        g::SET_W_CLAMP_VALUE => "sceGxmSetWClampValue",
+        g::SET_W_BUFFER_ENABLE => "sceGxmSetWBufferEnable",
         g::SET_BACK_DEPTH_FUNC => "sceGxmSetBackDepthFunc",
         g::SET_FRONT_DEPTH_WRITE_ENABLE => "sceGxmSetFrontDepthWriteEnable",
         g::SET_FRONT_FRAGMENT_PROGRAM_ENABLE => "sceGxmSetFrontFragmentProgramEnable",
@@ -2897,6 +3074,8 @@ pub fn name(func_nid: u32) -> &'static str {
         ng::VOICE_DEF_GET_TEMPLATE1 => "sceNgsVoiceDefGetTemplate1",
         ng::VOICE_DEF_GET_ATRAC9_VOICE => "sceNgsVoiceDefGetAtrac9Voice",
         ng::VOICE_DEF_GET_SAS_EMU_VOICE => "sceNgsVoiceDefGetSasEmuVoice",
+        ng::VOICE_DEF_GET_ENVELOPE_BUSS => "sceNgsVoiceDefGetEnvelopeBuss",
+        ng::SYSTEM_SET_PARAM_ERROR_CALLBACK => "sceNgsSystemSetParamErrorCallback",
         ng::VOICE_SET_PARAMS_BLOCK => "sceNgsVoiceSetParamsBlock",
         ng::VOICE_PATCH_SET_VOLUME => "sceNgsVoicePatchSetVolume",
         ng::PATCH_REMOVE_ROUTING => "sceNgsPatchRemoveRouting",
@@ -3125,6 +3304,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::POWER_SET_USING_WIRELESS => "scePowerSetUsingWireless",
         sv::POWER_GET_USING_WIRELESS => "scePowerGetUsingWireless",
         sv::COMMON_DIALOG_SET_CONFIG_PARAM => "sceCommonDialogSetConfigParam",
+        sv::COMMON_DIALOG_IS_RUNNING => "sceCommonDialogIsRunning",
         // SceCommonDialog lifecycle. These all had dispatch arms already; without a name
         // each the link-time coverage report counted them as MISSING, which is how a
         // "22 unhandled dialog calls" list came to include calls that were implemented.
@@ -3388,6 +3568,88 @@ pub fn name(func_nid: u32) -> &'static str {
             "sceNpCommerce2GetGameSkuInfoFromGameProductInfo"
         }
         sv::NP_COMMERCE2_GET_PRICE => "sceNpCommerce2GetPrice",
+        s::GET_FREE_MEMORY_SIZE => "sceKernelGetFreeMemorySize",
+        lk::GET_RW_LOCK_INFO => "sceKernelGetRWLockInfo",
+        lk::BACKTRACE_SELF => "sceKernelBacktraceSelf",
+        lk::CANCEL_MSG_PIPE => "sceKernelCancelMsgPipe",
+        sv::RTC_FORMAT_RFC2822_LOCAL_TIME => "sceRtcFormatRFC2822LocalTime",
+        nt::GET_STATISTICS_INFO => "sceNetGetStatisticsInfo",
+        nt::SHOW_IFCONFIG => "sceNetShowIfconfig",
+        nt::SHOW_ROUTE => "sceNetShowRoute",
+        http::GET_MEMORY_POOL_STATS => "sceHttpGetMemoryPoolStats",
+        http::SSL_GET_MEMORY_POOL_STATS => "sceSslGetMemoryPoolStats",
+        sv::APP_MGR_SET_NETWORK_DISCONNECTION_WARNING_DIALOG_STATE => {
+            "sceAppMgrSetNetworkDisconnectionWarningDialogState"
+        }
+        sv::SYSTEM_GESTURE_GET_TOUCH_EVENTS => "sceSystemGestureGetTouchEvents",
+        sv::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER_RECTANGLE => {
+            "sceSystemGestureUpdateTouchRecognizerRectangle"
+        }
+        g::MID_SCENE_FLUSH => "sceGxmMidSceneFlush",
+        g::BEGIN_SCENE_EX => "sceGxmBeginSceneEx",
+        g::TRANSFER_FILL => "sceGxmTransferFill",
+        g::PROGRAM_IS_NATIVE_COLOR_USED => "sceGxmProgramIsNativeColorUsed",
+        np::NP_BASIC_REGISTER_JOIN_GAME_ACK_HANDLER => "sceNpBasicRegisterJoinGameAckHandler",
+        np::NP_BASIC_UNREGISTER_JOIN_GAME_ACK_HANDLER => "sceNpBasicUnregisterJoinGameAckHandler",
+        np::NP_BASIC_JOIN_GAME_ACK_RESPONSE_SEND => "sceNpBasicJoinGameAckResponseSend",
+        sv::NP_MATCHING2_LEAVE_ROOM => "sceNpMatching2LeaveRoom",
+        sv::NP_MATCHING2_GRANT_ROOM_OWNER => "sceNpMatching2GrantRoomOwner",
+        sv::NP_MATCHING2_KICKOUT_ROOM_MEMBER => "sceNpMatching2KickoutRoomMember",
+        sv::NP_MATCHING2_GET_ROOM_DATA_EXTERNAL_LIST => "sceNpMatching2GetRoomDataExternalList",
+        sv::NP_MATCHING2_SET_ROOM_DATA_EXTERNAL => "sceNpMatching2SetRoomDataExternal",
+        sv::NP_MATCHING2_SET_ROOM_DATA_INTERNAL => "sceNpMatching2SetRoomDataInternal",
+        sv::NP_MATCHING2_SET_ROOM_MEMBER_DATA_INTERNAL => "sceNpMatching2SetRoomMemberDataInternal",
+        sv::NP_MATCHING2_REGISTER_SIGNALING_CALLBACK => "sceNpMatching2RegisterSignalingCallback",
+        sv::NP_MATCHING2_SIGNALING_GET_CONNECTION_STATUS => {
+            "sceNpMatching2SignalingGetConnectionStatus"
+        }
+        sv::NP_MATCHING2_SIGNALING_GET_CONNECTION_INFO => "sceNpMatching2SignalingGetConnectionInfo",
+        sv::NP_MATCHING2_SIGNALING_GET_LOCAL_NET_INFO => "sceNpMatching2SignalingGetLocalNetInfo",
+        sv::NP_MATCHING2_GET_MEMORY_INFO => "sceNpMatching2GetMemoryInfo",
+        sv::NP_TUS_CREATE_TITLE_CTX => "sceNpTusCreateTitleCtx",
+        sv::NP_TUS_GET_DATA_ASYNC => "sceNpTusGetDataAsync",
+        sv::NP_TUS_SET_DATA_ASYNC => "sceNpTusSetDataAsync",
+        sv::NP_TUS_POLL_ASYNC => "sceNpTusPollAsync",
+        sv::NP_TUS_DELETE_REQUEST => "sceNpTusDeleteRequest",
+        sv::NP_TUS_ABORT_REQUEST => "sceNpTusAbortRequest",
+        au::OUT_GET_REST_SAMPLE => "sceAudioOutGetRestSample",
+        rudp::INIT => "sceRudpInit",
+        rudp::END => "sceRudpEnd",
+        rudp::ENABLE_INTERNAL_IO_THREAD => "sceRudpEnableInternalIOThread",
+        rudp::SET_EVENT_HANDLER => "sceRudpSetEventHandler",
+        rudp::SET_OPTION => "sceRudpSetOption",
+        rudp::GET_OPTION => "sceRudpGetOption",
+        rudp::CREATE_CONTEXT => "sceRudpCreateContext",
+        rudp::BIND => "sceRudpBind",
+        rudp::INITIATE => "sceRudpInitiate",
+        rudp::ACTIVATE => "sceRudpActivate",
+        rudp::TERMINATE => "sceRudpTerminate",
+        rudp::GET_CONTEXT_STATUS => "sceRudpGetContextStatus",
+        rudp::GET_STATUS => "sceRudpGetStatus",
+        rudp::GET_SIZE_READABLE => "sceRudpGetSizeReadable",
+        rudp::GET_SIZE_WRITABLE => "sceRudpGetSizeWritable",
+        rudp::READ => "sceRudpRead",
+        rudp::WRITE => "sceRudpWrite",
+        rudp::FLUSH => "sceRudpFlush",
+        rudp::PROCESS_EVENTS => "sceRudpProcessEvents",
+        rudp::NET_RECEIVED => "sceRudpNetReceived",
+        rudp::POLL_CREATE => "sceRudpPollCreate",
+        rudp::POLL_DESTROY => "sceRudpPollDestroy",
+        rudp::POLL_CONTROL => "sceRudpPollControl",
+        rudp::POLL_WAIT => "sceRudpPollWait",
+        np_party::INIT => "sceNpPartyInit",
+        np_party::TERM => "sceNpPartyTerm",
+        np_party::REGISTER_HANDLER => "sceNpPartyRegisterHandler",
+        np_party::CHECK_CALLBACK => "sceNpPartyCheckCallback",
+        np_party::GET_STATE => "sceNpPartyGetState",
+        np_party::GET_MEMBERS => "sceNpPartyGetMembers",
+        np_party::GET_MEMBER_INFO => "sceNpPartyGetMemberInfo",
+        np_party::GET_MEMBER_VOICE_INFO => "sceNpPartyGetMemberVoiceInfo",
+        sv::COMMON_DIALOG_UNNAMED_TERMS_INIT => "SceCommonDialog_33626E2C",
+        sv::COMMON_DIALOG_UNNAMED_TERMS_GET_STATUS => "SceCommonDialog_B7D4C911",
+        sv::COMMON_DIALOG_UNNAMED_TERMS_GET_RESULT => "SceCommonDialog_D1858A78",
+        sv::COMMON_DIALOG_UNNAMED_TERMS_TERM => "SceCommonDialog_BEBAEF25",
+        sv::COMMON_DIALOG_UNNAMED_TERMS_ABORT => "SceCommonDialog_B55CF0E3",
 
         _ => UNKNOWN_NAME,
     }

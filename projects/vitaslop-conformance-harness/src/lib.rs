@@ -211,6 +211,51 @@ mod tests {
         );
     }
 
+    /// A directory of GENERATED cases (`ARM_FUZZ_DIR`, written by the suite's `fuzz` tool and
+    /// filled in by `regen`), run like the corpus. Lists every mismatch rather than stopping at
+    /// the first, because a fuzz run is a census.
+    #[test]
+    #[ignore = "needs ARM_FUZZ_DIR"]
+    fn fuzz_dir() {
+        let Some(dir) = std::env::var_os("ARM_FUZZ_DIR") else { return };
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("read ARM_FUZZ_DIR")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        // >>> A CASE WITHOUT ITS GOLDEN IS NOT A PASS. When `regen` stops at an assembler error it
+        // leaves every later case without a binary or an oracle; dropped or run empty, a whole
+        // batch read "0 of 3000 failed" while testing nothing (2026-10-28, a Thumb memory batch).
+        let mut unusable = 0usize;
+        let mut cases: Vec<Case> = Vec::new();
+        for p in &paths {
+            match suite::load_case(p) {
+                Ok(c) if !c.bin.is_empty() => cases.push(c),
+                Ok(_) => {
+                    unusable += 1;
+                    eprintln!("NO GOLDEN {}: no assembled binary - did `regen` finish?", p.display());
+                }
+                Err(e) => {
+                    unusable += 1;
+                    eprintln!("NO GOLDEN {}: {e}", p.display());
+                }
+            }
+        }
+        let outcomes = run_all(&mut NativeEngine, &cases);
+        let failures: Vec<&Outcome> = outcomes.iter().filter(|o| !o.pass).collect();
+        for f in &failures {
+            eprintln!("FAIL {}: {}", f.name, f.detail.as_deref().unwrap_or(""));
+        }
+        eprintln!(
+            "{} of {} generated case(s) failed, {unusable} without a golden",
+            failures.len(),
+            outcomes.len()
+        );
+        assert!(failures.is_empty() && unusable == 0);
+    }
+
     /// The SAME corpus, transpiled as an SMP build (`VITASLOP_SMP`'s codegen: atomic
     /// exclusives over a per-instance monitor, real fences, no dirty-mark coalescing). One
     /// thread runs it, so every golden must still hold exactly - which is what proves the SMP

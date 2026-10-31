@@ -184,6 +184,29 @@ pub mod off {
     /// layout, so no offset a running title already holds moves.
     pub const BACK_STENCIL_REF: u32 =
         FRAGMENT_UNIFORM_BUFFERS + (super::MAX_UNIFORM_BUFFERS as u32) * 4;
+    /// The VERTEX sampler bindings: [`super::MAX_TEXTURE_UNITS`] slots in exactly the shape
+    /// of [`TEXTURES`], written by `sceGxmSetVertexTexture` and by binding a precomputed
+    /// vertex state that carries textures.
+    ///
+    /// Here rather than in a host list because the precomputed bind is an INLINED form: the
+    /// emitted copy can only move state between guest structures, so a vertex texture the
+    /// state holds has to land somewhere the draw reads from guest memory. While these lived
+    /// on the host the state's textures were recorded and never applied, and a vertex program
+    /// that samples one was dropped for want of a binding. Appended last, like every field
+    /// added after the original layout.
+    pub const VERTEX_TEXTURES: u32 = BACK_STENCIL_REF + 4;
+    /// `sceGxmSetBackDepthBias(context, factor, units)` - the two-sided counterpart of
+    /// [`FRONT_DEPTH_BIAS_FACTOR`], as signed words. Appended after the vertex sampler array,
+    /// like every field added after the original layout.
+    pub const BACK_DEPTH_BIAS_FACTOR: u32 = VERTEX_TEXTURES + super::TEXTURE_ARRAY_BYTES;
+    pub const BACK_DEPTH_BIAS_UNITS: u32 = BACK_DEPTH_BIAS_FACTOR + 4;
+    /// `sceGxmSetWClampEnable` (`SCE_GXM_WCLAMP_MODE_ENABLED` = 0x8000), `sceGxmSetWClampValue`
+    /// (the clamp as its f32 bit pattern) and `sceGxmSetWBufferEnable`
+    /// (`SCE_GXM_WBUFFER_ENABLED` = 0x4000). Appended last, like every field added after the
+    /// original layout.
+    pub const W_CLAMP_ENABLE: u32 = BACK_DEPTH_BIAS_UNITS + 4;
+    pub const W_CLAMP_VALUE: u32 = W_CLAMP_ENABLE + 4;
+    pub const W_BUFFER_ENABLE: u32 = W_CLAMP_VALUE + 4;
 }
 
 /// Word offsets WITHIN a `VERTEX_UNIFORM` / `FRAGMENT_UNIFORM` record. Both stages have
@@ -230,7 +253,10 @@ pub const MAX_UNIFORM_BUFFERS: usize = 14;
 
 /// Total bytes the block occupies. Every guest context must have at least this much host
 /// memory behind it.
-pub const BYTES: u32 = off::BACK_STENCIL_REF + 4;
+pub const BYTES: u32 = off::W_BUFFER_ENABLE + 4;
+
+/// Bytes of one stage's sampler array ([`off::TEXTURES`], [`off::VERTEX_TEXTURES`]).
+pub const TEXTURE_ARRAY_BYTES: u32 = MAX_TEXTURE_UNITS as u32 * TEXTURE_STRIDE;
 
 /// `SCE_GXM_MINIMUM_CONTEXT_HOST_MEM_SIZE` (vitasdk `gxm.h`): the smallest `hostMem` GXM
 /// accepts, and therefore the smallest a conforming title can pass.
@@ -255,8 +281,9 @@ pub fn init(ctx: &mut GuestCtx, context: u32) {
     }
     ctx.write_u32(context.wrapping_add(off::VERTEX_PROGRAM), 0);
     ctx.write_u32(context.wrapping_add(off::FRAGMENT_PROGRAM), 0);
-    for i in 0..(MAX_TEXTURE_UNITS as u32) * TEXTURE_STRIDE / 4 {
+    for i in 0..TEXTURE_ARRAY_BYTES / 4 {
         ctx.write_u32(context.wrapping_add(off::TEXTURES + i * 4), 0);
+        ctx.write_u32(context.wrapping_add(off::VERTEX_TEXTURES + i * 4), 0);
     }
     // The default-uniform ring starts EMPTY - a base of 0 is what both the handler and the
     // inline form read as "no ring here yet", and the ring is attached separately (see
@@ -429,7 +456,12 @@ pub fn set_texture_binding(ctx: &mut GuestCtx, context: u32, unit: u32, b: TexBi
         );
         return;
     }
-    let at = texture_at(unit);
+    write_texture_slot(ctx, context, texture_at(unit), b);
+}
+
+/// One binding's six words at byte offset `at` of the block - the one spelling both stages'
+/// setters use.
+fn write_texture_slot(ctx: &mut GuestCtx, context: u32, at: u32, b: TexBinding) {
     set(ctx, context, at, b.addr);
     for (k, w) in b.words.iter().enumerate() {
         set(ctx, context, at + 4 + k as u32 * 4, *w);
@@ -440,6 +472,22 @@ pub fn set_texture_binding(ctx: &mut GuestCtx, context: u32, unit: u32, b: TexBi
         at + 4 + TEXTURE_CONTROL_WORDS * 4,
         b.from_precomputed as u32,
     );
+}
+
+/// Bind `b` to VERTEX sampler `unit` ([`off::VERTEX_TEXTURES`]); an all-zero `b` unbinds it.
+/// A unit beyond [`MAX_TEXTURE_UNITS`] is reported and dropped, as [`set_texture_binding`]
+/// does for the fragment stage.
+pub fn set_vertex_texture_binding(ctx: &mut GuestCtx, context: u32, unit: u32, b: TexBinding) {
+    if unit as usize >= MAX_TEXTURE_UNITS {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            unit,
+            texture = format_args!("{:#x}", b.addr),
+            "setVertexTexture on a unit beyond SCE_GXM_MAX_TEXTURE_UNITS - DROPPED"
+        );
+        return;
+    }
+    write_texture_slot(ctx, context, off::VERTEX_TEXTURES + unit * TEXTURE_STRIDE, b);
 }
 
 /// Read sampler `unit`'s binding.
@@ -908,6 +956,11 @@ pub(crate) const SCALARS: &[(u32, &str)] = &[
     (off::FRONT_DEPTH_FUNC, "front_depth_func"),
     (off::FRONT_DEPTH_BIAS_FACTOR, "front_depth_bias_factor"),
     (off::FRONT_DEPTH_BIAS_UNITS, "front_depth_bias_units"),
+    (off::BACK_DEPTH_BIAS_FACTOR, "back_depth_bias_factor"),
+    (off::BACK_DEPTH_BIAS_UNITS, "back_depth_bias_units"),
+    (off::W_CLAMP_ENABLE, "w_clamp_enable"),
+    (off::W_CLAMP_VALUE, "w_clamp_value"),
+    (off::W_BUFFER_ENABLE, "w_buffer_enable"),
     (off::BACK_DEPTH_FUNC, "back_depth_func"),
     (off::FRONT_DEPTH_WRITE, "front_depth_write"),
     (off::BACK_DEPTH_WRITE, "back_depth_write"),
@@ -998,6 +1051,10 @@ mod tests {
         for unit in 0..MAX_TEXTURE_UNITS as u32 {
             for w in 0..TEXTURE_STRIDE / 4 {
                 claimed.push((off::TEXTURES + unit * TEXTURE_STRIDE + w * 4, "textures"));
+                claimed.push((
+                    off::VERTEX_TEXTURES + unit * TEXTURE_STRIDE + w * 4,
+                    "vertex_textures",
+                ));
             }
         }
         // Both stages' three-word uniform records, word by word for the same reason the

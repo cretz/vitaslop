@@ -71,6 +71,16 @@ pub struct RegFile {
     /// exact screen gradient across the quad. [`Op::Dsx`]/[`Op::Dsy`] of a DIRECT read of that
     /// lane then has a known answer; of anything else it is still 0.
     pub ramp: Option<usize>,
+    /// The fragment's PIXEL position `(x, y)`, from which the TILE registers (`GLOBAL[43]`,
+    /// `[23]`, `[24]`) read the emitter's one split (`tile::tile_register_value`), or `None` -
+    /// in which case a program reading them is refused, as the emitter refuses one the sum
+    /// proof (`tile::tile_sums_only`) did not admit. A caller sets it only for a program that
+    /// proof admits: for any other the split is a value the hardware may not hold.
+    pub tile_pixel: Option<(u32, u32)>,
+    /// Every guest-memory word the program STORED ([`Op::MemStore`]), as `(byte address, word)`
+    /// in program order - part of its result, like `killed`: a store writes no register, so a
+    /// translation that dropped or misaddressed one would agree on every lane.
+    pub stores: Vec<(u32, u32)>,
 }
 
 impl RegFile {
@@ -88,6 +98,8 @@ impl RegFile {
             facing: None,
             frag_depth: None,
             ramp: None,
+            tile_pixel: None,
+            stores: Vec::new(),
         }
     }
 
@@ -236,12 +248,24 @@ fn read_channel_prec(regs: &RegFile, op: &Operand, c: usize, prec: Prec) -> Opti
     // exactly as the emitter's `indexed_element` does. Modelling it here is what lets the
     // interpreter run a program that indexes a uniform ARRAY - the idiom a vector-canvas
     // vertex program is built out of, and the reason such programs used to be unmeasurable.
+    // The lane is the channel's SWIZZLE SELECTOR, and selectors 4..7 are the inline constants,
+    // as in the emitter's `src_channel` - this read the channel ordinal, which agrees with the
+    // emitter only under an identity swizzle.
     let mut v = if matches!(op.bank, Bank::Indexed) {
-        let bank = regs.bank(crate::ir::indexed_sub_bank(op.index))?;
-        let reg = if op.bank_sel == 0 { 0 } else { 1 };
-        let offset = crate::ir::indexed_offset(op.index) as i32 + c as i32;
-        let e = (regs.idx[reg] + offset).max(0) as usize;
-        *bank.get(e.min(bank.len().saturating_sub(1)))?
+        match *op.swizzle.get(c)? {
+            sel @ 0..=3 => {
+                let bank = regs.bank(crate::ir::indexed_sub_bank(op.index))?;
+                let reg = crate::ir::indexed_register(op);
+                let offset = crate::ir::indexed_offset(op.index) as i32 + i32::from(sel);
+                let e = (regs.idx[reg] * crate::ir::indexed_index_scale(op) + offset).max(0) as usize;
+                *bank.get(e.min(bank.len().saturating_sub(1)))?
+            }
+            4 => 0.0,
+            5 => 1.0,
+            6 => 2.0,
+            7 => 0.5,
+            _ => return None,
+        }
     } else if matches!(op.bank, Bank::Constant) {
         // The CHANNEL's swizzle selector chooses the table, not just the lane: selectors 4..7
         // are the inline constants and selector 1 is the second F32 bank. Reading the index
@@ -256,10 +280,18 @@ fn read_channel_prec(regs: &RegFile, op: &Operand, c: usize, prec: Prec) -> Opti
         // Any other global index is pipeline state the interpreter holds nothing for, and it
         // stays refused: a fabricated value would be a number the hardware never produced, and
         // the emitter hard-fails on those too rather than guessing.
-        if op.index != crate::wgsl::GLOBAL_FACING {
-            return None;
+        //
+        // The TILE registers answer from `tile_pixel` - see `RegFile::tile_pixel` for when a
+        // caller may set it.
+        if crate::tile::is_tile_register(op.index) {
+            let (x, y) = regs.tile_pixel?;
+            f32::from_bits(crate::tile::tile_register_value(op.index, x, y)?)
+        } else {
+            if op.index != crate::wgsl::GLOBAL_FACING {
+                return None;
+            }
+            f32::from_bits(u32::from(regs.facing?))
         }
-        f32::from_bits(u32::from(regs.facing?))
     } else if matches!(op.bank, Bank::Immediate) {
         // A scalar literal (spec A.7): the operand's number IS the value, and the swizzle's
         // constant selectors still apply, exactly as the emitter reads it.
@@ -312,9 +344,13 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // so that 1.0 is squared and scaled into a completely different number. The corpus-wide
         // differential found it on seven 99-instruction fighting-title vertex programs whose outputs were
         // ~10^4 times the GPU's.
+        // And FRC is TWO-source, `src1 - floor(src2)`: the fractional part is the case where
+        // both name one value. A program that names two (an RGBM encode's `ceil(m)` as
+        // `0 - floor(-m)`) gets the floor of the SECOND - see `emit_frc`.
         Op::Frc => {
             let v = s(0, c)?;
-            v - v.floor()
+            let f = if instr.srcs.len() > 1 && crate::wgsl::frc_two_source() { s(1, c)? } else { v };
+            v - f.floor()
         }
         // Screen-space derivatives require a pixel quad; 0 in a single-pixel reference - except
         // of the rig's RAMP lane, read directly at full precision, whose gradient the rig
@@ -505,11 +541,16 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
                 }
                 Ok(read_channel(regs, o, 0).ok_or("operand")?.to_bits())
             };
+            // `h` is the operand the 16-bit multiplier input reads a half of, `w` the whole one:
+            // src1 and src0 by default, swapped under `VITASLOP_GXP_IMA32_STEP_SRC0=1` - see
+            // `decode_grp_imad32_step` for the evidence, and `wgsl::emit_int_mad_step`, which
+            // this must agree with.
             let (a, b, d) = (raw(0)?, raw(1)?, raw(2)?);
+            let (w, h) = if crate::link::ima32_step_halves_src1() { (a, b) } else { (b, a) };
             let part = if high_half {
-                (a >> 16).wrapping_mul(b) << 16
+                w.wrapping_mul(h >> 16) << 16
             } else {
-                (a & 0xffff).wrapping_mul(b)
+                w.wrapping_mul(h & 0xffff)
             };
             f32::from_bits(part.wrapping_add(d))
         }
@@ -549,6 +590,23 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // The remaining exposure is honest and worth naming: both sides take that addressing
         // from the same decoder, so a WRONG selector rule would agree with itself here. The
         // AUTHORED conformance suite is what can break that tie, not this file.
+        // Three signed 10-bit fields in ONE register, 1.0 = 256 - exactly as `emit_pack_from_c10`
+        // reads them (see `Op::PackFromC10`).
+        Op::PackFromC10 => {
+            let s1 = instr.srcs.first().ok_or("operand")?;
+            let sel = s1.swizzle[c] as u32;
+            if sel > 2 {
+                return Err("unpack.c10 selector past the three fields a register holds");
+            }
+            let word = regs.bank(s1.bank).and_then(|b| b.get(s1.index as usize)).ok_or("operand")?.to_bits();
+            let v = ((word << (22 - sel * 10)) as i32 >> 22) as f32 / 256.0;
+            let v = if s1.neg { -v } else { v };
+            if s1.abs {
+                v.abs()
+            } else {
+                v
+            }
+        }
         Op::PackFromInt { bits, signed, norm } => {
             let bits = bits as u32;
             if bits != 16 && bits != 8 {
@@ -600,9 +658,14 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // independent over the same pair - see [`Op::Sop2`]. The coefficient is the SELECTOR,
         // not the operand, which is the reading that took several sessions to settle: `Zero`
         // complemented is the coefficient 1, making that term a plain copy of its source. An
-        // alpha selector broadcasts channel 3.
-        Op::Sop2 { color, alpha, f1, f1_complement, f2, f2_complement } => {
+        // alpha selector broadcasts channel 3. The plain group-0x80 form gives channel 3 its own
+        // coefficient pair (`alpha_coeffs`); SOP2M uses the colour pair there too.
+        Op::Sop2 { color, alpha, f1, f1_complement, f2, f2_complement, alpha_coeffs } => {
             use crate::ir::{SopFactor, SopOp};
+            let [(f1, f1_complement), (f2, f2_complement)] = match alpha_coeffs {
+                Some(pair) if c == 3 => pair,
+                _ => [(f1, f1_complement), (f2, f2_complement)],
+            };
             let (s1, s2) = (instr.srcs.first().ok_or("operand")?, instr.srcs.get(1).ok_or("operand")?);
             let fx = |o: &Operand, ch: usize| -> Result<f32, &'static str> {
                 read_channel_prec(regs, o, ch, Prec::Fx8).ok_or("operand")
@@ -654,7 +717,9 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // A memory load reads GUEST MEMORY, which this register-file model does not hold; a
         // fabricated value here would defeat the oracle's whole purpose.
         Op::MemLoad { .. } => return Err("ldmem (resolved before the per-channel evaluator)"),
-        Op::LocalLoad { .. } | Op::LocalStore { .. } => return Err("local memory (resolved before the per-channel evaluator)"),
+        Op::LocalLoad { .. } | Op::LocalStore { .. } | Op::MemStore { .. } => {
+            return Err("memory access (resolved before the per-channel evaluator)")
+        }
         // A TEST with write-back also stores its raw ALU result; the predicate itself was
         // written before this point. Only the float families reach here - the raw-lane ones
         // have no float result to store and the emitter refuses them too.
@@ -669,6 +734,14 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
                 let b = read_channel_prec(regs, instr.srcs.get(1).ok_or("operand")?, c, Prec::Fx8)
                     .ok_or("operand")?;
                 return Ok(a - b);
+            }
+            // VDP writes its one replicated sum to every channel, in `emit_test`'s term order.
+            if matches!(alu, crate::ir::TestAlu::Dot) {
+                let mut d = 0.0f32;
+                for ch in 0..4 {
+                    d += s(0, ch)? * s(1, ch)?;
+                }
+                return Ok(d);
             }
             let (a, b) = (s(0, c)?, s(1, c)?);
             match alu {
@@ -973,7 +1046,10 @@ pub fn run_traced_env(
     const MAX_STEPS: u32 = 1 << 20;
     // The per-invocation LOCAL memory (`Op::LocalLoad`/`LocalStore`), zero at the start of a
     // run exactly as the emitted `var` is.
-    let mut local = vec![0u32; crate::wgsl::LOCAL_MEM_WORDS as usize];
+    // Allocated at the first local access, not here: a run is per VERTEX for the renderer's
+    // footprints, and a 1 KiB zeroed allocation per run was a fixed cost several times a short
+    // program's own.
+    let mut local: Vec<u32> = Vec::new();
     while let Some(instr) = shader.instrs.get(index) {
         steps += 1;
         observe(index, regs);
@@ -1062,6 +1138,9 @@ pub fn run_traced_env(
         // LOCAL memory: one word in or out of the invocation's private array, addressed by the
         // immediate plus the LOW 16 BITS of each register offset - `wgsl::local_address`.
         if let Op::LocalLoad { offset_bytes } | Op::LocalStore { offset_bytes } = instr.op {
+            if local.is_empty() {
+                local.resize(crate::wgsl::LOCAL_MEM_WORDS as usize, 0);
+            }
             let raw_lane = |o: &Operand| -> Option<u32> {
                 Some(regs.bank(o.bank)?.get(o.index as usize)?.to_bits())
             };
@@ -1087,6 +1166,26 @@ pub fn run_traced_env(
                     .ok_or(InterpError::OutOfRange { index })?;
                 *slot = f32::from_bits(v);
             }
+            index += 1;
+            continue;
+        }
+        // A guest-memory STORE: recorded, in order, as part of the result (`RegFile::stores`).
+        // The address is formed exactly as `wgsl`'s `MemStore` arm forms it - raw lanes, the
+        // immediate, each register offset narrowed by the load's `MEM_OFFSET16_ARM` rule. Which
+        // window takes the word is the renderer's business; the reference states the address.
+        if let Op::MemStore { offset_bytes } = instr.op {
+            let raw_lane = |o: &Operand| -> Option<u32> {
+                Some(regs.bank(o.bank)?.get(o.index as usize)?.to_bits())
+            };
+            let data = instr.srcs.first().and_then(raw_lane).ok_or(InterpError::OutOfRange { index })?;
+            let ptr = instr.srcs.get(1).and_then(raw_lane).ok_or(InterpError::OutOfRange { index })?;
+            let narrow = crate::link::arm_on(crate::link::MEM_OFFSET16_ARM);
+            let mut addr = ptr.wrapping_add(offset_bytes);
+            for o in instr.srcs.iter().skip(2) {
+                let v = raw_lane(o).ok_or(InterpError::OutOfRange { index })?;
+                addr = addr.wrapping_add(if narrow { v & 0xffff } else { v });
+            }
+            regs.stores.push((addr, data));
             index += 1;
             continue;
         }
@@ -1340,11 +1439,18 @@ pub fn run_traced_env(
                     continue;
                 }
                 let sel = s1.swizzle[c] as u32;
-                let word = regs
-                    .bank(s1.bank)
-                    .and_then(|b| b.get((s1.index as u32 + sel / per_reg) as usize))
-                    .ok_or(InterpError::OutOfRange { index })?
-                    .to_bits();
+                // A TILE register's own bytes (`RegFile::tile_pixel`), as the emitter reads them.
+                let word = if matches!(s1.bank, Bank::Global) {
+                    regs.tile_pixel
+                        .filter(|_| sel < per_reg)
+                        .and_then(|(x, y)| crate::tile::tile_register_value(s1.index, x, y))
+                        .ok_or(InterpError::OutOfRange { index })?
+                } else {
+                    regs.bank(s1.bank)
+                        .and_then(|b| b.get((s1.index as u32 + sel / per_reg) as usize))
+                        .ok_or(InterpError::OutOfRange { index })?
+                        .to_bits()
+                };
                 let e = (word >> ((sel % per_reg) * bits)) & mask;
                 // The width cast: a widened signed element carries its sign up.
                 elems[c] = if signed && dest_bits > bits && e >> (bits - 1) != 0 { e | !mask } else { e };
@@ -1616,16 +1722,23 @@ fn test_channels(
             //
             // The `Fx8Sub` arm above already took its precision explicitly and says why; the
             // FLOAT family was left on the default beside it.
-            TestAlu::Add | TestAlu::Sub | TestAlu::Mul => {
+            TestAlu::Add | TestAlu::Sub | TestAlu::Mul | TestAlu::Dot => {
                 let tp = Prec::of(instr);
-                let a = read_channel_prec(regs, s1, c, tp)
-                    .ok_or(InterpError::OutOfRange { index })?;
-                let b = read_channel_prec(regs, s2, c, tp)
-                    .ok_or(InterpError::OutOfRange { index })?;
+                let at = |o: &Operand, ch: usize| {
+                    read_channel_prec(regs, o, ch, tp).ok_or(InterpError::OutOfRange { index })
+                };
                 let v = match alu {
-                    TestAlu::Add => a + b,
-                    TestAlu::Sub => a - b,
-                    _ => a * b,
+                    TestAlu::Add => at(s1, c)? + at(s2, c)?,
+                    TestAlu::Sub => at(s1, c)? - at(s2, c)?,
+                    TestAlu::Mul => at(s1, c)? * at(s2, c)?,
+                    // The one replicated sum, whichever channel is asked for - `TestAlu::Dot`.
+                    _ => {
+                        let mut d = 0.0f32;
+                        for ch in 0..4 {
+                            d += at(s1, ch)? * at(s2, ch)?;
+                        }
+                        d
+                    }
                 };
                 match cmp {
                     TestCmp::Eq => v == 0.0,
@@ -1663,6 +1776,25 @@ mod tests {
 
     fn shader(instrs: Vec<Instr>) -> Shader {
         Shader { kind: ProgramKind::Fragment, instrs }
+    }
+
+    /// C10: three signed 10-bit fields of one register, 1.0 = 256. The words are a shooter's
+    /// vertex data - a flat floor's normal and one of its tangents.
+    #[test]
+    fn c10_unpack_reads_signed_fields_over_256() {
+        let mut regs = RegFile::with_lanes(8);
+        regs.pa[0] = f32::from_bits(0x1000_0000);
+        regs.pa[1] = f32::from_bits(0x000E_60E9);
+        let mut src = Operand::plain(Bank::PrimaryAttr, 0, 2);
+        src.swizzle = [0, 1, 2, 0];
+        let d = Operand::plain(Bank::Temp, 0, 0);
+        let mut i = instr(Op::PackFromC10, d, vec![src]);
+        i.write_mask = [true, true, true, false];
+        run(&shader(vec![i.clone()]), &mut regs).unwrap();
+        assert_eq!(&regs.r[0..3], &[0.0, 0.0, 1.0]);
+        i.srcs[0].index = 1;
+        run(&shader(vec![i]), &mut regs).unwrap();
+        assert_eq!(&regs.r[0..3], &[233.0 / 256.0, -104.0 / 256.0, 0.0]);
     }
 
     /// The normalized unpack: an S8 code divided by 127 and clamped at -1 (so -128 and -127 both
@@ -1830,6 +1962,8 @@ mod tests {
 
     #[test]
     fn min_max_frc_and_negate() {
+        // The two-source FRC reading is what is asserted below - see `wgsl::frc_two_source`.
+        crate::wgsl::set_frc_two_source_for_thread(Some(true));
         let mut regs = RegFile::with_lanes(4);
         regs.r[0] = 3.5;
         regs.r[1] = -2.0;
@@ -1847,6 +1981,14 @@ mod tests {
         fr.write_mask = [true, false, false, false];
         run(&shader(vec![fr]), &mut regs).unwrap();
         assert_eq!(regs.r[3], 0.5);
+        // Two sources: `src1 - floor(src2)`. With src1 = 0 and src2 = -m it is `ceil(m)` -
+        // the multiplier an RGBM encode computes this way: 0 - floor(-3.5) = 4.
+        regs.r[0] = 0.0;
+        regs.r[1] = -3.5;
+        let mut fr2 = instr(Op::Frc, Operand::plain(Bank::Temp, 3, 0), vec![Operand::plain(Bank::Temp, 0, 0), Operand::plain(Bank::Temp, 1, 0)]);
+        fr2.write_mask = [true, false, false, false];
+        run(&shader(vec![fr2]), &mut regs).unwrap();
+        assert_eq!(regs.r[3], 4.0);
     }
 
     #[test]

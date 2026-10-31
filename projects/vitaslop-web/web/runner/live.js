@@ -43,7 +43,11 @@ async function releaseAndTerminate(worker) {
 async function run(p) {
   const titleId = p.titleId;
   if (!titleId) throw new Error("params.titleId is required");
+  // Named before each await that can stall (an OPFS handle another worker still holds, the
+  // settings wasm compiling): a job that sat on the page's first line said nothing of where.
+  progress("checking the title is imported...");
   if (!(await isComplete(titleId))) throw new Error(`${titleId} is not (completely) imported on this device`);
+  progress("reading the title's settings...");
   // The product's own knobs for this title, then the job's over them - the same merge
   // player.js does with a link's `?knobs=`.
   const knobs = { ...(await runKnobs(await effective(titleId))), ...(p.knobs || {}) };
@@ -391,4 +395,9 @@ addEventListener("message", async (e) => {
     up({ type: "error", error: `${err && err.message}\n${(err && err.stack) || ""}`.slice(0, 4000) });
   }
 });
+// Loaded: the next load failure gets its own retry (see live-boot.js).
+window.liveModuleLoaded = true;
+try {
+  sessionStorage.removeItem("vitaslop.live.retry");
+} catch {}
 up({ type: "ready" });

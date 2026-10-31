@@ -14,7 +14,7 @@
 //! counters stay zero - the browser host measures with its own clock.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 /// The phases worth separating. Deliberately a closed enum rather than string keys:
 /// a phase is a decision about what to measure, and adding one should be a visible
@@ -287,10 +287,26 @@ pub enum Phase {
     WindowHitStamp,
     WindowHitCompare,
     WindowMiss,
+    /// The reach of a PER-DRAW window set (`reach::per_draw_extents`) at the draw, walked or
+    /// answered from its memo, nested in [`Self::DrawGxpWindows`]. The memo hits among its
+    /// entries are [`Self::DrawWindowReachHit`].
+    DrawWindowReach,
+    /// A per-draw reach answered from the memo - counted, not timed.
+    DrawWindowReachHit,
+    /// The WHOLE deferred-geometry resolve (`compute_resolve_job`): the textures, the two
+    /// prefetch stages and the per-draw reads. Nested in [`Self::DrawTotal`], which brackets
+    /// every resolve, so this is the part of the total no `draw:` row sees.
+    ResolveJob,
+    /// Stage 1 of the resolve: probing every index buffer and window against its cache and
+    /// fetching the misses into the overlay.
+    ResolveStage1,
+    /// The resolve's window RE-READS: every window whose draw-time bytes say nothing was
+    /// written yet (a deferred placeholder included) read again at the GPU wait.
+    ResolveWindows,
 }
 
 impl Phase {
-    const COUNT: usize = 58;
+    const COUNT: usize = 63;
 
     pub(crate) fn index(self) -> usize {
         match self {
@@ -352,6 +368,11 @@ impl Phase {
             Phase::WindowHitStamp => 55,
             Phase::WindowHitCompare => 56,
             Phase::WindowMiss => 57,
+            Phase::DrawWindowReach => 58,
+            Phase::DrawWindowReachHit => 59,
+            Phase::ResolveJob => 60,
+            Phase::ResolveStage1 => 61,
+            Phase::ResolveWindows => 62,
         }
     }
 
@@ -394,7 +415,12 @@ impl Phase {
             Phase::WindowHitStamp,
             Phase::WindowHitCompare,
             Phase::WindowMiss,
+            Phase::DrawWindowReach,
+            Phase::DrawWindowReachHit,
             Phase::SnapsLockWait,
+            Phase::ResolveJob,
+            Phase::ResolveStage1,
+            Phase::ResolveWindows,
             Phase::DrawRecord,
             Phase::BuildClassify,
             Phase::BuildBody,
@@ -466,6 +492,11 @@ impl Phase {
             Phase::WindowHitStamp => "draw:     ...window proven by the DIRTY MAP",
             Phase::WindowHitCompare => "draw:     ...window proven by an IN-PLACE compare",
             Phase::WindowMiss => "draw:     ...window MISS (read + memo insert)",
+            Phase::DrawWindowReach => "draw:     ...of which the per-draw window REACH (walk or memo)",
+            Phase::DrawWindowReachHit => "draw:     ...per-draw window reach from the MEMO",
+            Phase::ResolveJob => "resolve: the WHOLE deferred read at the GPU wait",
+            Phase::ResolveStage1 => "resolve:   ...of which stage 1 (probe + fetch indices, windows)",
+            Phase::ResolveWindows => "resolve:   ...of which the window RE-READS",
             Phase::DrawRecord => "draw: build record + push scene",
             Phase::DrawUniforms => "draw: uniforms + material",
             Phase::BuildClassify => "build: classify the draw (interpret + layout) ONLY",
@@ -966,34 +997,65 @@ pub fn table() -> Vec<String> {
 /// `SnapsLockWait` names the WAITER's cost and nothing about the holder, and the obvious
 /// suspect (the resolver's flip read) was chunked with no effect on the wait (phone 022/023:
 /// 2.02 -> 2.05 ms/f over ~2 contended takes a frame). Every acquisition stores its source
-/// line here; a contended take bills its wait to the line that held the lock when it started
+/// site here; a contended take bills its wait to the site that held the lock when it started
 /// waiting. One relaxed store per take when `VITASLOP_PERF` is on, nothing when it is off.
-static SNAPS_HOLDER: AtomicU64 = AtomicU64::new(0);
+///
+/// A site is `file:line`, not a bare line: the takers are spread over several files of
+/// `host/`, and a line number alone names none of them.
+static SNAPS_HOLDER: AtomicUsize = AtomicUsize::new(0);
 const HOLDER_SLOTS: usize = 24;
-static HOLDER_LINE: [AtomicU64; HOLDER_SLOTS] = [const { AtomicU64::new(0) }; HOLDER_SLOTS];
+static HOLDER_SITE: [AtomicUsize; HOLDER_SLOTS] = [const { AtomicUsize::new(0) }; HOLDER_SLOTS];
 static HOLDER_NS: [AtomicU64; HOLDER_SLOTS] = [const { AtomicU64::new(0) }; HOLDER_SLOTS];
 static HOLDER_HITS: [AtomicU64; HOLDER_SLOTS] = [const { AtomicU64::new(0) }; HOLDER_SLOTS];
 
-/// Record that the snapshot lock was just taken at `line` (see [`SNAPS_HOLDER`]).
-pub fn snaps_taken(line: u32) {
+/// A source site, `file:line`, held in a `static` at the call - see [`site!`](crate::site).
+pub type Site = &'static &'static str;
+
+/// `file:line` of the call, as a [`Site`].
+#[macro_export]
+macro_rules! site {
+    () => {{
+        static SITE: &str = concat!(file!(), ":", line!());
+        &SITE
+    }};
+}
+
+/// A [`Site`] as the word the holder table stores; 0 is "no site".
+fn site_word(site: Site) -> usize {
+    site as *const &'static str as usize
+}
+
+/// The site a word from [`site_word`] names, or `"?"` for 0.
+fn site_of(word: usize) -> &'static str {
+    if word == 0 {
+        return "?";
+    }
+    // SAFETY: every non-zero word in the holder table came from `site_word` on a
+    // `&'static &'static str`, so it is the address of a live, immutable static.
+    unsafe { *(word as *const &'static str) }
+}
+
+/// Record that the snapshot lock was just taken at `site` (see [`SNAPS_HOLDER`]).
+pub fn snaps_taken(site: Site) {
     if enabled() {
-        SNAPS_HOLDER.store(u64::from(line), Relaxed);
+        SNAPS_HOLDER.store(site_word(site), Relaxed);
     }
 }
 
-/// The line holding the snapshot lock right now, read by a take that found it held.
-pub fn snaps_holder() -> u32 {
-    SNAPS_HOLDER.load(Relaxed) as u32
+/// The site holding the snapshot lock right now, read by a take that found it held. Opaque:
+/// hand it back to [`snaps_waited`].
+pub fn snaps_holder() -> usize {
+    SNAPS_HOLDER.load(Relaxed)
 }
 
 /// Bill `ns` of waiting to `holder` (see [`SNAPS_HOLDER`]).
-pub fn snaps_waited(holder: u32, ns: u64) {
-    let h = u64::from(holder);
+pub fn snaps_waited(holder: usize, ns: u64) {
+    let h = holder;
     for i in 0..HOLDER_SLOTS {
-        let cur = HOLDER_LINE[i].load(Relaxed);
+        let cur = HOLDER_SITE[i].load(Relaxed);
         if cur == h
             || (cur == 0
-                && HOLDER_LINE[i]
+                && HOLDER_SITE[i]
                     .compare_exchange(0, h, Relaxed, Relaxed)
                     .map_or_else(|v| v == h, |_| true))
         {
@@ -1004,13 +1066,13 @@ pub fn snaps_waited(holder: u32, ns: u64) {
     }
 }
 
-/// The waits by holder line, largest first: `L<line> <ms total> ms / <n>`; empty when none.
-pub fn snaps_waits_by_holder() -> Vec<(u32, f64, u64)> {
-    let mut v: Vec<(u32, f64, u64)> = (0..HOLDER_SLOTS)
+/// The waits by holder site, largest first: `(file:line, ms total, n)`; empty when none.
+pub fn snaps_waits_by_holder() -> Vec<(&'static str, f64, u64)> {
+    let mut v: Vec<(&'static str, f64, u64)> = (0..HOLDER_SLOTS)
         .filter(|&i| HOLDER_HITS[i].load(Relaxed) > 0)
         .map(|i| {
             (
-                HOLDER_LINE[i].load(Relaxed) as u32,
+                site_of(HOLDER_SITE[i].load(Relaxed)),
                 HOLDER_NS[i].load(Relaxed) as f64 / 1.0e6,
                 HOLDER_HITS[i].load(Relaxed),
             )

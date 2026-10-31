@@ -42,6 +42,8 @@ pub mod psarc;
 pub mod pvrtc;
 pub mod render;
 pub mod rtt_writeback;
+/// Code found at run time, translated on a dispatch miss - the engine-independent half.
+pub mod runtime_code;
 pub mod sched;
 pub mod timeline;
 pub mod trophy;

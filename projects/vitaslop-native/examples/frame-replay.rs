@@ -63,6 +63,45 @@ fn main() {
         scene.draws.truncate(n);
         eprintln!("  scene {si} truncated to its first {} draw(s)", scene.draws.len());
     }
+    // `--restride <stride> <marker offset> <marker u16 hex>`: re-step every single-stream draw
+    // captured at a WIDER stride than `stride` whose records carry the marker half at
+    // `marker offset` every `stride` bytes - for a capsule taken before the runtime stopped
+    // widening a stream's stride to an overhanging attribute (`set_vertex_program`). The
+    // captured bytes are the guest's buffer read contiguously, so the narrower records are all
+    // there; only a draw whose first record sits at byte 0 can be re-stepped, because its rebased
+    // indices then still name records.
+    if let Some(at) = args.iter().position(|a| a == "--restride") {
+        let p = |i: usize| args.get(at + i).and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), if i == 3 { 16 } else { 10 }).ok());
+        let (Some(stride), Some(moff), Some(mark)) = (p(1), p(2), p(3)) else {
+            eprintln!("frame-replay: --restride <stride> <marker offset> <marker u16 hex>");
+            std::process::exit(2);
+        };
+        let (s, mo) = (stride as usize, moff as usize);
+        let mut fixed = 0;
+        for d in fc.scenes.iter_mut().flat_map(|s| s.draws.iter_mut()) {
+            if d.vertex_stride <= stride || d.attributes.iter().any(|a| a.stream_index != 0) {
+                continue;
+            }
+            let v = &d.vertices;
+            let hits = |ph: usize| (0..8).filter(|k| {
+                let o = ph + k * s + mo;
+                v.get(o..o + 2).is_some_and(|b| u16::from_le_bytes([b[0], b[1]]) as u32 == mark)
+            }).count();
+            // Phase 0 only: the capture began at `min_index * old_stride`, so a draw whose first
+            // record is not at byte 0 started reading mid-buffer and its rebased indices no
+            // longer name records - those are left alone and counted.
+            if hits(0) < 7 {
+                if (1..s).any(|ph| hits(ph) >= 7) {
+                    eprintln!("  restride: a {}-byte draw has the marker at a nonzero phase - left alone", d.vertices.len());
+                }
+                continue;
+            }
+            eprintln!("  restride: a {}-byte draw: stride {} -> {stride}", d.vertices.len(), d.vertex_stride);
+            d.vertex_stride = stride;
+            fixed += 1;
+        }
+        eprintln!("  restride: {fixed} draw(s) re-stepped");
+    }
     eprintln!(
         "frame {} - {} scene(s), {} draw(s), {}x{}",
         fc.frame,
@@ -87,7 +126,7 @@ fn main() {
     let list = args.iter().any(|a| a == "--list");
     for (i, s) in fc.scenes.iter().enumerate() {
         let target = s.color.map_or("no colour".to_string(), |c| {
-            format!("{:#x} {}x{} pitch {} fmt {:#x}", c.data_addr, c.width, c.height, c.stride_pixels, c.format)
+            format!("{:#x} {}x{} pitch {} fmt {:#x} gamma {:#x}", c.data_addr, c.width, c.height, c.stride_pixels, c.format, c.gamma)
         });
         let depth = s.depth.map_or(String::new(), |d| {
             format!(", depth {:#x} (stencil {:#x}, zls {:#x}, clears to {} / stencil {:#x})", d.depth_addr, d.stencil_addr, d.zls_control, f32::from_bits(d.background_depth), d.background_control & 0xff)
@@ -105,10 +144,10 @@ fn main() {
                 );
                 for t in d.textures.iter() {
                     eprintln!(
-                        "    draw {di} unit {} tex {:#x} {}x{} type {} fmt {:#x} stride {} faces {} min {} mag {} mip {} mips {} addr {}/{} bias {} lodmin {}",
+                        "    draw {di} unit {} tex {:#x} {}x{} type {} fmt {:#x} stride {} faces {} min {} mag {} mip {} mips {} addr {}/{} bias {} lodmin {} gamma {:#x}",
                         t.unit, t.data_addr, t.width, t.height, t.tex_type, t.base_format, t.stride, t.faces,
                         t.min_filter, t.mag_filter, t.mip_filter, t.levels, t.u_addr_mode, t.v_addr_mode,
-                        t.lod_bias, t.lod_min
+                        t.lod_bias, t.lod_min, t.gamma
                     );
                 }
             }
@@ -153,6 +192,59 @@ fn main() {
             std::fs::write(&path, &blob[..]).expect("write program blob");
             eprintln!("  wrote {}", path.display());
         }
+    }
+    // `--attrs <scene> <draw> [n]`: that draw's vertex attributes as the GUEST bound them (format,
+    // component count, offset, the PA register each lands in) with the raw bytes of the first few
+    // vertices - what a question about how an attribute reaches the PA bank has to start from,
+    // since the program's declared parameter type and the guest's format are separate facts.
+    if let Some(at) = args.iter().position(|a| a == "--attrs") {
+        let (Some(si), Some(di)) = (
+            args.get(at + 1).and_then(|s| s.parse::<usize>().ok()),
+            args.get(at + 2).and_then(|s| s.parse::<usize>().ok()),
+        ) else {
+            eprintln!("frame-replay: --attrs <scene> <draw> [n]");
+            std::process::exit(2);
+        };
+        let Some(d) = fc.scenes.get(si).and_then(|s| s.draws.get(di)) else {
+            eprintln!("frame-replay: --attrs: no draw {di} in scene {si}");
+            std::process::exit(2);
+        };
+        let stride = d.vertex_stride as usize;
+        // An optional third argument widens the sample past the first four vertices, for a
+        // census of a packed attribute's value range.
+        let n = args.get(at + 3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(4);
+        for a in d.attributes.iter() {
+            let mut line = format!(
+                "  attr pa[{}] stream {} offset {} gxm format {} x{}:",
+                a.reg_index, a.stream_index, a.offset, a.format, a.component_count
+            );
+            for v in 0..n {
+                let o = v * stride + a.offset as usize;
+                if let Some(b) = d.vertices.get(o..o + 8) {
+                    line += &format!(" [{}]", b.iter().map(|x| format!("{x:02x}")).collect::<String>());
+                }
+            }
+            eprintln!("{line}");
+        }
+        // The first indices too, so a vertex attribute can be checked against the FACE its
+        // triangle forms (a normal against the cross product of its positions).
+        let wide = d.index_format != 0;
+        let idx: Vec<String> = (0..12)
+            .filter_map(|i| {
+                if wide {
+                    d.indices.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string())
+                } else {
+                    d.indices.get(i * 2..i * 2 + 2).map(|b| u16::from_le_bytes([b[0], b[1]]).to_string())
+                }
+            })
+            .collect();
+        eprintln!(
+            "  primitive {:#x} index format {:#x} count {}: {}",
+            d.primitive,
+            d.index_format,
+            d.index_count,
+            idx.join(" ")
+        );
     }
     // `--tex <addr> <dir>`: every DISTINCT binding of the texture at that guest address, as the
     // capture decoded it - format, swizzle, a hash of its snapshotted bytes, and the decoded
@@ -258,6 +350,20 @@ fn main() {
         );
         for (a, b) in d.mem_windows.iter() {
             println!("  vwindow {a:#x} {} B: {}", b.len(), floats(b));
+        }
+        // The fragment windows by ADDRESS and size only: they can be megabytes (a whole
+        // full-screen buffer), and which guest range a draw reads is the question asked of them.
+        for (a, b) in d.frag_mem_windows.iter() {
+            let nonzero = b.iter().filter(|&&v| v != 0).count();
+            println!("  fwindow {a:#x} {} B ({nonzero} nonzero)", b.len());
+            // A small one is a uniform buffer, and its values are the question.
+            if b.len() <= 1024 {
+                println!("    as f32: {}", floats(b));
+                println!(
+                    "    as f16: {}",
+                    b.chunks_exact(2).map(|c| format!("{:.4}", half_to_f32(u16::from_le_bytes([c[0], c[1]])))).collect::<Vec<_>>().join(" ")
+                );
+            }
         }
         println!("  uniforms (lanes 0..16): {:?}", &d.uniforms[..d.uniforms.len().min(16)]);
         for t in d.vertex_textures.iter() {

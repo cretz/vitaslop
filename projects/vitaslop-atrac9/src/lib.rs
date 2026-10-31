@@ -71,6 +71,27 @@ pub struct CodecInfo {
     pub config_data: [u8; 4],
 }
 
+impl CodecInfo {
+    /// The geometry of a config word without building a decoder - for a caller that only
+    /// needs to map samples to superframes (the decoder's tables and frame state are not
+    /// free to build).
+    pub fn parse(config_data: [u8; 4]) -> Result<CodecInfo, Error> {
+        Ok(CodecInfo::of(&Config::parse(config_data)?))
+    }
+
+    fn of(config: &Config) -> CodecInfo {
+        CodecInfo {
+            channels: config.channel_count,
+            channel_config_index: config.channel_config_index,
+            sample_rate: config.sample_rate,
+            superframe_size: config.superframe_bytes,
+            frames_in_superframe: config.frames_per_superframe,
+            frame_samples: config.frame_samples,
+            config_data: config.config_data,
+        }
+    }
+}
+
 /// A stateful ATRAC9 decoder for one stream configuration. Holds the per-channel
 /// MDCT overlap and delta-coding history, so frames must be decoded in order.
 pub struct Atrac9Decoder {
@@ -161,15 +182,7 @@ impl Atrac9Decoder {
 
     /// Codec geometry, for callers that need the RIFF-independent view.
     pub fn info(&self) -> CodecInfo {
-        CodecInfo {
-            channels: self.config.channel_count,
-            channel_config_index: self.config.channel_config_index,
-            sample_rate: self.config.sample_rate,
-            superframe_size: self.config.superframe_bytes,
-            frames_in_superframe: self.config.frames_per_superframe,
-            frame_samples: self.config.frame_samples,
-            config_data: self.config.config_data,
-        }
+        CodecInfo::of(&self.config)
     }
 
     /// Decode one ATRAC9 frame from `input` into `out` (interleaved signed-16,

@@ -67,6 +67,48 @@ pub(super) fn alloc_mem_block(
     }
 }
 
+/// SceUID sceKernelAllocMemBlockForVM(const char *name, SceSize size)
+///
+/// A block for code the process GENERATES - a JIT's code cache. It is ordinary guest memory
+/// here: the guest writes into it like any other block, between `sceKernelOpenVMDomain` (make
+/// it writable) and `sceKernelCloseVMDomain` (make it executable again).
+///
+/// >>> WHAT IS NOT SUPPORTED IS RUNNING WHAT IS WRITTEN THERE. Code is translated from the
+/// title's own image (see the transpiler's `transpile_side`), and a branch into this block is
+/// a dispatch to an address outside the image, which ends the run by name. An interpreter that
+/// merely RESERVES the block at start-up and never fills it - LuaJIT with its JIT switched off
+/// - runs, which is the case this exists for today.
+#[hostcall]
+pub(super) fn alloc_mem_block_for_vm(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, size: u32) -> i32 {
+    // Main RAM, read/write: what the block is until a domain switch makes it executable.
+    const USER_RW: u32 = 0x0C20_D060;
+    let uid = st.alloc_memblock(size, 256 * 1024, USER_RW);
+    tracing::debug!(
+        target: "vitaslop::mem",
+        size,
+        name = %if name.is_null() { String::from("<unnamed>") } else { ctx.read_cstr(name.addr(), 64) },
+        uid,
+        "allocMemBlockForVM"
+    );
+    if uid == 0 { SCE_KERNEL_ERROR_NO_MEMORY } else { uid }
+}
+
+/// int sceKernelOpenVMDomain(void) / sceKernelCloseVMDomain(void): switch the process's VM
+/// blocks writable / executable. Guest memory is always both here, so there is nothing to
+/// switch; see [`alloc_mem_block_for_vm`] for what executing them would take.
+#[hostcall]
+pub(super) fn switch_vm_domain(_st: &mut VitaState) -> i32 {
+    0
+}
+
+/// int sceKernelSyncVMDomain(SceUID uid, void *data, SceSize size): make freshly written code
+/// visible to instruction fetch. No cache to flush - and no code from there is run (see
+/// [`alloc_mem_block_for_vm`]).
+#[hostcall]
+pub(super) fn sync_vm_domain(_st: &mut VitaState, _uid: i32, _data: Ptr, _size: u32) -> i32 {
+    0
+}
+
 /// `SCE_KERNEL_ERROR_NO_MEMORY`: the allocation could not be satisfied.
 const SCE_KERNEL_ERROR_NO_MEMORY: i32 = 0x8002_0003u32 as i32;
 
@@ -109,6 +151,43 @@ pub(crate) const CDRAM_BUDGET_BYTES: u32 = 112 * 1024 * 1024;
 
 /// Physically contiguous main RAM available to a game.
 pub(crate) const PHYCONT_BUDGET_BYTES: u32 = 32 * 1024 * 1024;
+
+/// int sceKernelGetFreeMemorySize(SceKernelFreeMemorySizeInfo *info)
+///
+/// `SceKernelFreeMemorySizeInfo` is `{ size, size_user, size_cdram, size_phycont }`
+/// (`psp2/kernel/sysmem.h`, asserted there at 0x10), and like `SceKernelMemBlockInfo` its
+/// leading `size` is an IN field the caller stamps: only the fields that fit inside it are
+/// written, so a caller built against a shorter struct is not written past.
+///
+/// Every figure is the ALLOCATOR'S OWN, never a constant: what `sceKernelAllocMemBlock` would
+/// still grant from each partition right now. CDRAM and phycont are their budgets
+/// ([`CDRAM_BUDGET_BYTES`], [`PHYCONT_BUDGET_BYTES`]) less what is outstanding in them - the
+/// same numbers `sceAppMgrGetBudgetInfo` reports - and main RAM is what the guest arena can
+/// still hand out (`VitaState::main_free_bytes`). Blocks of every partition come out of that
+/// one arena here, so a partition is never reported as having more free than the arena
+/// could actually place.
+#[hostcall]
+pub(super) fn get_free_memory_size(ctx: &mut GuestCtx, st: &mut VitaState, info: Ptr) -> i32 {
+    if info.is_null() {
+        SCE_KERNEL_ERROR_ILLEGAL_ADDR
+    } else {
+        let declared = ctx.read_u32(info.addr());
+        let main = st.main_free_bytes();
+        let fields = [
+            main,
+            (CDRAM_BUDGET_BYTES - st.cdram_used()).min(main),
+            (PHYCONT_BUDGET_BYTES - st.phycont_used()).min(main),
+        ];
+        for (i, v) in fields.iter().enumerate() {
+            let off = 4 + 4 * i as u32;
+            if off + 4 <= declared {
+                // The fields are `int`: a figure past 2 GiB would read back negative.
+                ctx.write_u32(info.addr() + off, (*v).min(i32::MAX as u32));
+            }
+        }
+        0
+    }
+}
 
 /// int sceKernelGetMemBlockBase(SceUID uid, void **base)
 #[hostcall]
@@ -270,5 +349,66 @@ pub(super) fn find_mem_block_by_addr(st: &mut VitaState, addr: u32, size: u32) -
     match st.memblock_containing(addr, size) {
         Some(uid) => uid,
         None => SCE_KERNEL_ERROR_BLOCK_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::{SliceMemory, VFP_ARG_COUNT};
+    use crate::world::DeterministicWorld;
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    /// The guest region the state accounts for: large enough that the arena has headroom
+    /// above the main-stack reserve. Nothing is written into it - only the small slice below.
+    const REGION: u32 = 0x0800_0000;
+
+    fn free_sizes(st: &mut VitaState, bytes: &mut [u8], declared: u32) -> (i32, [u32; 3]) {
+        bytes[0x10..0x14].copy_from_slice(&declared.to_le_bytes());
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        regs[0] = 0x10;
+        let mut mem = SliceMemory(bytes);
+        let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        get_free_memory_size(&mut ctx, st);
+        let w = |i: usize| u32::from_le_bytes(bytes[0x14 + 4 * i..0x18 + 4 * i].try_into().unwrap());
+        (regs[0] as i32, [w(0), w(1), w(2)])
+    }
+
+    /// Each partition's free figure moves with the allocator: a main block takes from main,
+    /// a CDRAM block takes from its budget AND the shared arena, and a free gives it back.
+    #[test]
+    fn free_memory_tracks_the_allocator() {
+        let mut st = VitaState::new(0, REGION, Box::new(DeterministicWorld::default()));
+        let mut bytes = vec![0u8; 0x100];
+        let (rc, [main0, cdram0, phy0]) = free_sizes(&mut st, &mut bytes, 0x10);
+        assert_eq!(rc, 0);
+        assert_eq!(main0, st.main_free_bytes());
+        assert_eq!(cdram0, CDRAM_BUDGET_BYTES);
+        assert_eq!(phy0, PHYCONT_BUDGET_BYTES);
+
+        let main_block = st.alloc_memblock(0x10_0000, 4096, 0x0C20_D060);
+        assert!(main_block > 0);
+        let cdram_block = st.alloc_memblock(0x20_0000, 256 * 1024, 0x0940_D060);
+        assert!(cdram_block > 0);
+        let (_, [main1, cdram1, phy1]) = free_sizes(&mut st, &mut bytes, 0x10);
+        assert_eq!(cdram1, CDRAM_BUDGET_BYTES - 0x20_0000);
+        assert_eq!(phy1, PHYCONT_BUDGET_BYTES);
+        assert!(main1 <= main0 - 0x30_0000, "both blocks came out of the one arena");
+
+        assert!(st.free_memblock(main_block));
+        let (_, [main2, ..]) = free_sizes(&mut st, &mut bytes, 0x10);
+        assert_eq!(main2, main1 + 0x10_0000, "a released block is free again");
+    }
+
+    /// A caller stamping a shorter struct gets only the fields inside it.
+    #[test]
+    fn free_memory_honours_the_declared_size() {
+        let mut st = VitaState::new(0, REGION, Box::new(DeterministicWorld::default()));
+        let mut bytes = vec![0xAAu8; 0x100];
+        let (rc, [main, cdram, _]) = free_sizes(&mut st, &mut bytes, 0x8);
+        assert_eq!(rc, 0);
+        assert_eq!(main, st.main_free_bytes());
+        assert_eq!(cdram, 0xAAAA_AAAA, "past the declared size is left alone");
     }
 }

@@ -400,16 +400,35 @@ pub const IMPORT_NAME: &str = "import";
 ///
 /// [`InlineOp::Fast`]: crate::InlineOp::Fast
 pub const IMPORT_FAST_NAME: &str = "import_fast";
-/// Import name of the indirect-dispatch miss reporter: `(i32 target, i32 caller) ->
-/// ()`. The dispatcher calls it when a runtime function-pointer resolves to no
-/// translated function; the host records the addresses and traps, turning an
-/// otherwise opaque `unreachable` into a debuggable "unknown target from caller".
+/// Import name of the indirect-dispatch miss handler: `(i32 target, i32 caller) -> i32`.
+/// The dispatcher calls it when a runtime function-pointer resolves to no translated
+/// function and to no entry of the runtime entry table either. `target` keeps its Thumb bit,
+/// which is the mode the code there runs in. The host translates the code at `target` into a
+/// side module (see `crate::transpile_side`), installs it in the CALLING instance's table and
+/// returns the slot, which the dispatcher then calls; a host that cannot traps with
+/// "unknown target from caller".
 pub const DISPATCH_MISS_NAME: &str = "dispatch_miss";
+
+/// Exported name of the main module's funcref table: the dense table the dispatcher calls
+/// through, growable so side modules can be installed above the main module's functions.
+pub const TABLE_EXPORT: &str = "table";
+
+/// Exported name of the main module's global `i`, for every global it has. A side module
+/// imports all of them, in index order, so the global indices its code is emitted with are the
+/// main module's own.
+pub fn global_export(i: u32) -> String {
+    format!("g{i}")
+}
+
+/// The import module a side module takes the main instance's exports from (its dispatcher,
+/// table and globals); its functions and memory come from [`IMPORT_MODULE`] like the main
+/// module's.
+pub const MAIN_MODULE: &str = "main";
 
 /// WASM page size in bytes.
 pub const PAGE_SIZE: u32 = 65536;
 
-/// Exported name of the module's own indirect dispatcher, `(i32 target) -> ()`: it finds
+/// Exported name of the module's own indirect dispatcher, `(i32 target, i32 caller) -> ()`: it finds
 /// the translated function for guest address `target` and calls it, exactly as an indirect
 /// branch in guest code does. Always exported. It is how a host that does not take the
 /// per-function exports ([`func_export`]) enters guest code - a thread's entry, a callback.

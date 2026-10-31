@@ -636,9 +636,27 @@ impl Program {
     /// container is not established here. The extent returned is the container's; see
     /// [`Self::default_uniform_overflows_its_container`], which is what lets a caller SAY the
     /// tail is not carried rather than leave it to be inferred from a wrong colour.
+    ///
+    /// # No container 14 AND a +0x78 entry for buffer 14: the buffer is NOT in the SA file
+    /// The fallback to `(0, default_uniform_regs)` is the shape of a program that has no
+    /// container table to say otherwise. A program that has no container 14 but whose +0x78
+    /// table points buffer 14 at a DATA slot keeps its WHOLE default buffer behind that pointer
+    /// ([`crate::module::resolve_mem_windows`] already reads it so) - and its SA file is the
+    /// DATA container and its literals. MEASURED on a shooter's Scaleform text program: 480
+    /// default registers, `sa_regs` 10, DATA at sa[0] x8 holding the buffer's pointer at sa[2]
+    /// and the literals 1, 2, 3, 4 and 0x10000 at sa[3..7]. Copying the buffer to sa[0] put
+    /// uniform values where the glyph-transform index scale and offset live, so every glyph's
+    /// transform was fetched from the wrong row and every string drew off-screen.
     pub fn default_uniform_sa_span(&self) -> (u32, u32) {
         match self.containers.iter().find(|c| c.index == CONTAINER_DEFAULT_UNIFORM) {
             Some(c) => (u32::from(c.base_sa), u32::from(c.size_regs)),
+            None if self
+                .uniform_buffer_bindings
+                .iter()
+                .any(|b| u32::from(b.buffer_index) == u32::from(CONTAINER_DEFAULT_UNIFORM)) =>
+            {
+                (0, 0)
+            }
             None => (0, self.default_uniform_regs),
         }
     }
@@ -1447,7 +1465,7 @@ const CLIP_PLANE_MASK: u32 = 0x000f;
 /// programs that carry it and declare COLOR0 + FOG + ten 4-wide texcoords write output lanes
 /// `4..8` (colour), `10..14` and `26..34` - every one of them exactly on a group boundary under
 /// "position, colour, fog, texcoords, then this lane", and every one of them one lane off under
-/// "…fog, this lane, texcoords". A misplacement here is not a missing output, it is every
+/// "...fog, this lane, texcoords". A misplacement here is not a missing output, it is every
 /// texture coordinate in the program shifted by one register.
 ///
 /// What the lane MEANS is not established and does not need to be: like a clip plane it is

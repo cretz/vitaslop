@@ -253,16 +253,123 @@ fn writeback_spec() -> &'static (
 /// have been freed and the memory handed to something else entirely; writing pixels over it
 /// would corrupt whatever the guest put there. Only a target this frame's own scenes name as a
 /// colour surface is written, which is also the only one whose stride and format are known.
+///
+/// The LAST scene's surface when several render into `addr`: its pixels are what the guest's
+/// memory holds once the frame is done.
 pub fn surface_for(scenes: &[Scene], addr: u32) -> Option<ColorSurface> {
     scenes
         .iter()
+        .rev()
         .filter_map(|s| s.color.as_ref())
         .find(|c| c.data_addr == addr)
         .copied()
 }
 
+/// Whether the renderer's target at `addr` of extent `w`x`h` is the one to write back.
+///
+/// >>> ONE ADDRESS CAN HOLD TWO TARGETS, keyed by the colour surface's extent (a title runs a
+/// 256x256 and a 512x1024 target through one address every frame). Only the target of the
+/// surface [`surface_for`] names is written: copying every target at the address put each one's
+/// pixels over the guest's in turn, and the last written - whichever sorted last - won.
+pub fn writes_back_target(scenes: &[Scene], addr: u32, w: u32, h: u32) -> bool {
+    surface_for(scenes, addr).is_some_and(|c| (c.width, c.height) == (w, h))
+}
+
+/// >>> WHICH PART OF A RENDER TARGET THE WRITEBACK COPIES: `(x, y, w, h, guest address of the
+/// region's first texel)`, or `None` for a target it does not copy at all.
+///
+/// A target within the texel cap is copied whole. One ABOVE it is copied only where the frame's
+/// LAST draw into it painted - its region clip, else its viewport - when that rectangle is
+/// within the cap. A CPU-read result is the end of a reduction chain, and a title that packs
+/// that chain into one atlas leaves its answer in the chain's last, smallest step. MEASURED on
+/// an action title: its exposure is computed on the CPU from a 32x16 luminance tile at (512,320)
+/// of a 768x384 bloom atlas (`U2U10U10U10`), the last of ten draws into it. The whole atlas is
+/// 4.5x the cap, so nothing was written back, the CPU read bytes no pass wrote, and the tone-map
+/// blew every frame out to near white. Painting every OTHER row of the atlas magenta changed
+/// not one pixel of the frame: the tile is all the CPU reads.
+///
+/// The region is written as a SURFACE OF ITS OWN - its first texel's address, the target's
+/// stride, its own extent - so every ownership and recycling check in [`apply_one`] applies to
+/// exactly the bytes written. [`apply_rtt_writebacks`] finds it again by that address through
+/// this same rule, so the engine and the apply cannot disagree about where it is.
+pub fn writeback_region(scenes: &[Scene], addr: u32, w: u32, h: u32, cap: u32) -> Option<(u32, u32, u32, u32, u32)> {
+    if w.max(1) * h.max(1) <= cap {
+        return Some((0, 0, w, h, addr));
+    }
+    let c = surface_for(scenes, addr)?;
+    let bpp = if vitaslop_platform::gpu::float_color_format(c.format) {
+        float_writeback_bytes_per_pixel(c.format)
+    } else {
+        writeback_bytes_per_pixel(c.format)
+    }? as u32;
+    let last = scenes
+        .iter()
+        .rev()
+        .find(|s| s.color.is_some_and(|sc| sc.data_addr == addr))?
+        .draws
+        .last()?;
+    let (x0, y0, x1, y1) = painted_rect(&last.render_state)?;
+    let (x1, y1) = (x1.min(w).min(c.width), y1.min(h).min(c.height));
+    if x0 >= x1 || y0 >= y1 || (x1 - x0) * (y1 - y0) > cap {
+        return None;
+    }
+    let stride = c.stride_pixels.max(c.width);
+    let at = addr.wrapping_add((y0 * stride + x0) * bpp);
+    report_region_writeback(addr, x0, y0, x1 - x0, y1 - y0);
+    Some((x0, y0, x1 - x0, y1 - y0, at))
+}
+
+/// The pixels a draw can paint, `(x0, y0, x1, y1)` exclusive at the far edge: its region clip
+/// when that keeps the INSIDE (`SCE_GXM_REGION_CLIP_OUTSIDE` - the corners are inclusive), else
+/// its viewport when that is enabled (`[x offset, x scale, y offset, y scale, ..]`, spanning
+/// offset +- |scale|). `None` when neither bounds it.
+fn painted_rect(rs: &crate::capture::RenderState) -> Option<(u32, u32, u32, u32)> {
+    if rs.region_clip_mode == 0x8000_0000 {
+        let [a, b, c, d] = rs.region_clip;
+        Some((a, b, c.saturating_add(1), d.saturating_add(1)))
+    } else if rs.viewport_enable == 0 {
+        let [xo, xs, yo, ys, ..] = rs.viewport;
+        let lo = |o: f32, s: f32| (o - s.abs()).max(0.0) as u32;
+        let hi = |o: f32, s: f32| (o + s.abs()).max(0.0).ceil() as u32;
+        Some((lo(xo, xs), lo(yo, ys), hi(xo, xs), hi(yo, ys)))
+    } else {
+        None
+    }
+}
+
+/// The colour surface a readback names: the scene's own surface at `addr`, or - for a region
+/// [`writeback_region`] chose - that region as a surface of its own (its first texel's address,
+/// the parent's stride and format, its own extent).
+fn readback_surface(scenes: &[Scene], addr: u32) -> Option<ColorSurface> {
+    surface_for(scenes, addr).or_else(|| {
+        let cap = rtt_writeback_texels();
+        scenes.iter().filter_map(|s| s.color.as_ref()).find_map(|p| {
+            let (_, _, w, h, at) = writeback_region(scenes, p.data_addr, p.width, p.height, cap)?;
+            (at == addr && at != p.data_addr).then_some(ColorSurface { data_addr: at, width: w, height: h, ..*p })
+        })
+    })
+}
+
+/// Say, once per target, that only a region of it is written back - see [`writeback_region`].
+fn report_region_writeback(addr: u32, x: u32, y: u32, w: u32, h: u32) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    if SEEN
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(addr)
+    {
+        tracing::info!(
+            target: "vitaslop::status",
+            "gxm rtt writeback: {addr:#x} is above the texel cap, so only the {w}x{h} region at ({x},{y}) the frame's last draw into it painted is written back - the end of a reduction chain, which is what a CPU reads"
+        );
+    }
+}
+
 /// Put the rendered pixels of every readback in `writebacks` - `(guest colour address, width,
-/// height, straight RGBA8)` - back into guest memory. Returns how many targets were written, so
+/// height, straight RGBA8)` - back into guest memory. The address is a scene's colour surface,
+/// or a region of one [`writeback_region`] chose. Returns how many targets were written, so
 /// a caller can report a run in which the writeback did nothing.
 pub fn apply_rtt_writebacks(
     writebacks: &[(u32, u32, u32, Vec<u8>)],
@@ -272,7 +379,7 @@ pub fn apply_rtt_writebacks(
 ) -> usize {
     let mut done = 0usize;
     for (addr, w, h, rgba) in writebacks {
-        let Some(c) = surface_for(scenes, *addr) else {
+        let Some(c) = readback_surface(scenes, *addr) else {
             continue;
         };
         // TEMPORARY TELEMETRY. WHERE in the target the guest asked its draws to paint. A CPU-
@@ -369,53 +476,57 @@ pub fn apply_one(
         report_writeback_unowned(addr, w, h);
         return false;
     }
+    let row_bytes = cols * bpp;
+    // >>> UNCHANGED SINCE THE GUEST SUBMITTED THE SCENE = THE GPU'S TO WRITE. On hardware the
+    // GPU writes the target when the scene runs, right after its submission, so the only bytes
+    // that may survive our write are ones the guest changed AFTER ending the scene. The checks
+    // below compare against OUR last write instead, and once the guest touched the memory a
+    // single time they refused every later frame for the rest of the run - MEASURED on a
+    // baseball title: its 32x32 exposure probe was dropped once, never written back again, and
+    // the auto-exposure loop read frozen bytes and washed every at-bat out. See
+    // [`note_scene_submitted`].
+    let (span, cur_hash, cur_uniform) = if whole_region_guard() {
+        let span = if rows == 0 { 0 } else { (rows - 1) * stride + row_bytes };
+        let cur = read(addr, span);
+        let (h, uniform) = region_hash(&cur, rows, stride, row_bytes);
+        (span, (cur.len() >= span).then_some(h), uniform)
+    } else {
+        (0, None, false)
+    };
+    let unchanged_since_submit = cur_hash.is_some_and(|h| {
+        submitted_hashes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&addr)
+            == Some(&(h, span))
+    });
     // >>> AND IT MUST STILL BE OURS. See `writeback_still_ours`: the latch above answers only
     // for the FIRST sight of an address, and a deferred write that lands after the title has
     // recycled a pooled target writes pixels over whatever the allocator has since put there.
     // The probe is the same 4096 bytes the latch read, so this costs one hash of one row.
     let fp_bytes = (cols * writeback_bytes_per_pixel(c.format).unwrap_or(4)).min(4096);
-    if fp_bytes > 0 && !writeback_still_ours(addr, &read(addr, fp_bytes), fp_bytes) {
-        report_writeback_recycled(addr, w, h);
+    if !unchanged_since_submit && fp_bytes > 0 && !writeback_still_ours(addr, &read(addr, fp_bytes), fp_bytes) {
+        report_writeback_recycled(addr, w, h, "first row differs from our last write");
         writeback_fingerprints()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&addr);
         return false;
     }
-    let row_bytes = cols * bpp;
     // The WHOLE region under the parallel scheduler - see [`set_whole_region_guard`].
-    if whole_region_guard() {
-        let span = if rows == 0 {
-            0
-        } else {
-            (rows - 1) * stride + row_bytes
-        };
-        let cur = read(addr, span);
-        let ok = cur.len() >= span && {
-            let mut h = FNV_BASIS;
-            let mut uniform = true;
-            let first = cur
-                .get(..4.min(row_bytes))
-                .map(<[u8]>::to_vec)
-                .unwrap_or_default();
-            for y in 0..rows {
-                let r = &cur[y * stride..y * stride + row_bytes];
-                h = fnv_extend(h, r);
-                uniform &= r.len().is_multiple_of(4)
-                    && first.len() == 4
-                    && r.chunks_exact(4).all(|w| w == first);
-            }
+    if whole_region_guard() && !unchanged_since_submit {
+        let ok = cur_hash.is_some_and(|h| {
             match region_hashes()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&addr)
             {
                 Some(&want) => h == want,
-                None => uniform,
+                None => cur_uniform,
             }
-        };
+        });
         if !ok {
-            report_writeback_recycled(addr, w, h);
+            report_writeback_recycled(addr, w, h, "whole region differs from our last write");
             writeback_fingerprints()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -645,6 +756,75 @@ mod whole_region_tests {
         TEST_WHOLE_REGION.with(|c| c.set(false));
     }
 
+    /// The baseball title's exposure probe: the guest writes into the target BEFORE submitting the
+    /// next scene into it (on hardware the GPU then overwrites those bytes), so that frame's
+    /// write-back must land - and keep landing on later frames, not latch a refusal for the run.
+    /// A write AFTER the submission is still the guest's.
+    #[test]
+    fn a_target_the_guest_wrote_before_resubmitting_is_written_back_again() {
+        TEST_WHOLE_REGION.with(|c| c.set(true));
+        let addr = 0x9f20_0000;
+        let mut mem = vec![0u8; 16 * 16 * 4];
+        assert!(write_back(&mut mem, addr, 0x35));
+        // The guest touches the target, THEN ends a scene into it.
+        mem[3 * 64..3 * 64 + 4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let snapshot = mem.clone();
+        note_scene_submitted(&[], &surface(addr), &mut |a, n| {
+            let o = (a - addr) as usize;
+            snapshot[o..(o + n).min(snapshot.len())].to_vec()
+        });
+        assert!(write_back(&mut mem, addr, 0x36), "unchanged since submission: the GPU's to write");
+        assert!(mem.iter().all(|&b| b == 0x36), "every byte is the scene's");
+        assert!(write_back(&mut mem, addr, 0x37), "and the next frame's lands too");
+        // A guest write AFTER the latest submission still wins.
+        mem[8 * 64..8 * 64 + 4].copy_from_slice(&0x8123_4567u32.to_le_bytes());
+        assert!(!write_back(&mut mem, addr, 0x38), "written after submission: the guest's");
+        TEST_WHOLE_REGION.with(|c| c.set(false));
+    }
+
+    /// A caller hands `apply_one` a SNAPSHOT of guest memory (the GPU-wait path cannot lend it
+    /// `ctx`), and under the guard that snapshot must cover the whole region, `probe_len` of it.
+    /// MEASURED on a baseball title: its GPU-wait path snapshotted 4096 bytes, so every target
+    /// over 4 KB - its 128x128 ambient probes - was refused at the very read the CPU then made,
+    /// and the stadium's first frame lit its ground map from the allocator's poison.
+    #[test]
+    fn a_target_over_four_kilobytes_is_written_back_from_a_probe_len_snapshot() {
+        TEST_WHOLE_REGION.with(|c| c.set(true));
+        let addr = 0x9f30_0000;
+        let c = ColorSurface { width: 64, height: 64, stride_pixels: 64, ..surface(addr) };
+        assert!(probe_len(64, 64, &c) >= 64 * 64 * 4, "the snapshot spans every row");
+        // The guest's own non-uniform bytes, there BEFORE it ends the scene (a first frame:
+        // never written back, and not a single repeated word either).
+        let mut mem: Vec<u8> = (0..64 * 64 * 4).map(|i| (i % 251) as u8).collect();
+        // Not a one-word fill, so the latch needs the address to have been ours before.
+        assert!(writeback_owns(addr, || true));
+        let submitted = mem.clone();
+        note_scene_submitted(&[], &c, &mut |a, n| {
+            let o = (a - addr) as usize;
+            submitted[o..(o + n).min(submitted.len())].to_vec()
+        });
+        let rgba = vec![0x44u8; 64 * 64 * 4];
+        let write = |mem: &mut Vec<u8>, len: usize| {
+            let snapshot = mem[..len.min(mem.len())].to_vec();
+            apply_one(
+                addr,
+                64,
+                64,
+                &rgba,
+                &c,
+                &mut |_, n| snapshot[..n.min(snapshot.len())].to_vec(),
+                &mut |a, b| {
+                    let o = (a - addr) as usize;
+                    mem[o..o + b.len()].copy_from_slice(b);
+                },
+            )
+        };
+        assert!(!write(&mut mem.clone(), 4096), "a 4 KB snapshot cannot vouch for 16 KB");
+        assert!(write(&mut mem, probe_len(64, 64, &c)), "unchanged since submission: the GPU's");
+        assert!(mem.iter().all(|&b| b == 0x44), "every byte is the scene's");
+        TEST_WHOLE_REGION.with(|c| c.set(false));
+    }
+
     /// The negative control: WITHOUT the guard the first-row fingerprint passes the same
     /// recycled region, and the write lands on the guest's pointer - the defect.
     #[test]
@@ -664,7 +844,13 @@ pub fn probe_len(w: u32, h: u32, c: &ColorSurface) -> usize {
     if !whole_region_guard() {
         return 4096;
     }
-    let bpp = writeback_bytes_per_pixel(c.format).unwrap_or(4);
+    // The width `apply_one` will write at: a float surface's own, not the 8-bit one.
+    let bpp = if vitaslop_platform::gpu::float_color_format(c.format) {
+        float_writeback_bytes_per_pixel(c.format)
+    } else {
+        writeback_bytes_per_pixel(c.format)
+    }
+    .unwrap_or(4);
     let stride = c.stride_pixels.max(w) as usize * bpp;
     let rows = h.min(c.height) as usize;
     let row_bytes = w.min(c.width) as usize * bpp;
@@ -681,6 +867,71 @@ fn region_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<u32, u
     static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u64>>> =
         std::sync::OnceLock::new();
     M.get_or_init(Default::default)
+}
+
+/// The whole-region hash of a small target's memory when the guest ENDED a scene into it, with
+/// the span it covers - see [`note_scene_submitted`].
+fn submitted_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<u32, (u64, usize)>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, (u64, usize)>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// The whole-region hash of `rows` rows of `row_bytes` at `stride` in `cur`, and whether every
+/// row is one repeated 4-byte word (memory nothing has written). `cur` shorter than the region
+/// hashes what it holds; the caller compares lengths.
+fn region_hash(cur: &[u8], rows: usize, stride: usize, row_bytes: usize) -> (u64, bool) {
+    let mut h = FNV_BASIS;
+    let mut uniform = true;
+    let first = cur.get(..4.min(row_bytes)).map(<[u8]>::to_vec).unwrap_or_default();
+    for y in 0..rows {
+        let Some(r) = cur.get(y * stride..y * stride + row_bytes) else { break };
+        h = fnv_extend(h, r);
+        uniform &= r.len().is_multiple_of(4) && first.len() == 4 && r.chunks_exact(4).all(|w| w == first);
+    }
+    (h, uniform)
+}
+
+/// Record what a small target's memory holds at the moment the guest ENDS a scene into it.
+///
+/// The write-back of that scene may then overwrite exactly those bytes: on hardware the GPU
+/// writes them when the scene runs, and only a byte the guest changes AFTER submitting survives
+/// the GPU's write. Without this record the write-back could only compare against its own last
+/// write, and a target the guest touched once between two of our writes was refused forever.
+/// Only under the parallel scheduler's whole-region guard, which is the check this feeds.
+///
+/// >>> A TARGET OVER THE CAP IS RECORDED OVER ITS WRITE-BACK REGION, the rectangle the frame's last
+/// draw painted ([`writeback_region`]) - that is the span its write-back checks, at the address it
+/// writes. MEASURED on a racer: a 1024x1024 target whose last draw paints ONE texel the CPU then
+/// polls before it starts a race; refused every frame, the race waited ~95 s of taps to begin.
+pub fn note_scene_submitted(scenes: &[Scene], c: &ColorSurface, read: &mut impl FnMut(u32, usize) -> Vec<u8>) {
+    if !whole_region_guard() {
+        return;
+    }
+    let cap = rtt_writeback_texels();
+    if cap == 0 || c.data_addr == 0 {
+        return;
+    }
+    let Some((_, _, rw, rh, at)) = writeback_region(scenes, c.data_addr, c.width, c.height, cap) else {
+        return;
+    };
+    let bpp = if vitaslop_platform::gpu::float_color_format(c.format) {
+        float_writeback_bytes_per_pixel(c.format)
+    } else {
+        writeback_bytes_per_pixel(c.format)
+    };
+    let Some(bpp) = bpp else { return };
+    let (rows, cols) = (rh as usize, rw as usize);
+    // The write-back's own stride: `apply_one` is handed the PARENT surface and takes its pitch.
+    let stride = c.stride_pixels.max(rw) as usize * bpp;
+    let row_bytes = cols * bpp;
+    let span = if rows == 0 { 0 } else { (rows - 1) * stride + row_bytes };
+    let cur = read(at, span);
+    if cur.len() < span {
+        return;
+    }
+    let (h, _) = region_hash(&cur, rows, stride, row_bytes);
+    submitted_hashes().lock().unwrap_or_else(|e| e.into_inner()).insert(at, (h, span));
 }
 
 const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -737,6 +988,7 @@ fn writeback_bytes_per_pixel(format: u32) -> Option<usize> {
         // can say what it holds.
         0x5000_0000 => Some(2), // U4U4U4U4
         0x4100_0000 => Some(4), // U2F10F10F10 - packed, and NOT the readback's
+        0x6080_0000 => Some(4), // U2U10U10U10 - packed 10-bit unorm, see `encode_row_u2u10`
         // >>> U8 AND U8U8 - the SINGLE-CHANNEL family, and leaving it out left a whole class of
         // >>> target with no write-back at all AND no way to look at one.
         //
@@ -857,6 +1109,10 @@ fn encode_row(format: u32, rgba: &[u8], out: &mut Vec<u8>) {
         encode_row_u2f10(swizzle, rgba, out);
         return;
     }
+    if format & 0xF180_0000 == 0x6080_0000 {
+        encode_row_u2u10(swizzle, rgba, out);
+        return;
+    }
     // The single-channel family: take the channels the format has, in memory order, starting at
     // RED. A one-component texture reads its texel out of the first channel here and out of the
     // first channel on the way in, which is what makes the round trip exact rather than a guess
@@ -940,6 +1196,24 @@ fn encode_row_u2f10(swizzle: u32, rgba: &[u8], out: &mut Vec<u8>) {
             | ((table[hi as usize] as u32) << 20)
             | ((table[mid as usize] as u32) << 10)
             | table[lo as usize] as u32;
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+}
+
+/// Pack one RGBA8 row into `U2U10U10U10`: three 10-bit UNORM lanes under a 2-bit alpha, in the
+/// lane order `render.rs`'s decoder (base format 0x0e) reads them - ARGB for swizzle 1, ABGR
+/// otherwise. Unlike the float sibling above there is an exact inverse: the decoder reads
+/// `round(w * 255 / 1023)`, a byte step spans more than four 10-bit steps, so
+/// `w = round(c * 1023 / 255)` decodes back to `c` for every byte.
+fn encode_row_u2u10(swizzle: u32, rgba: &[u8], out: &mut Vec<u8>) {
+    let ten = |c: u8| (c as u32 * 1023 + 127) / 255;
+    out.clear();
+    out.reserve(rgba.len());
+    for px in rgba.chunks_exact(4) {
+        let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
+        let (hi, mid, lo) = if swizzle == 1 { (r, g, b) } else { (b, g, r) };
+        let a2 = ((a as u32 * 3 + 127) / 255) & 3;
+        let w = (a2 << 30) | (ten(hi) << 20) | (ten(mid) << 10) | ten(lo);
         out.extend_from_slice(&w.to_le_bytes());
     }
 }
@@ -1170,17 +1444,28 @@ fn writeback_remember(addr: u32, row: &[u8], n: usize) {
 /// At `warn`, unconditionally, because both readings need a fix and they are opposite ones: a
 /// target a CPU-reading title still wants has silently lost its pixels, or a target it has
 /// recycled is one we were about to corrupt.
-fn report_writeback_recycled(addr: u32, w: u32, h: u32) {
-    use std::collections::HashSet;
+///
+/// Again at the 10th, 100th and 1000th drop of the same address: once per address could not tell
+/// a single recycled block from a CPU-read probe refused EVERY frame, and the second is a title
+/// reading frozen pixels for the rest of the run. `why` names the check that refused it.
+fn report_writeback_recycled(addr: u32, w: u32, h: u32, why: &str) {
+    use std::collections::HashMap;
     use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    static SEEN: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert(addr) {
+    let n = {
+        let c = g.get_or_insert_with(HashMap::new).entry(addr).or_insert(0);
+        *c += 1;
+        *c
+    };
+    if !matches!(n, 1 | 10 | 100 | 1000) {
         return;
     }
+    let submitted = submitted_hashes().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&addr);
     tracing::warn!(
         target: "vitaslop::gxm",
-        "gxm rtt writeback: DROPPED the readback of {addr:#010x} ({w}x{h}) - the bytes there are          neither the uniform fill this address started as nor the row this module last wrote, so          something else owns that memory now and writing pixels over it would corrupt it. A          pooled render target handed back to the title's allocator between the GPU copy and the          map landing is how that happens."
+        "gxm rtt writeback: DROPPED the readback of {addr:#010x} ({w}x{h}) [drop #{n}, {why}, submission hash {}] - the bytes there are          neither the uniform fill this address started as nor the row this module last wrote, so          something else owns that memory now and writing pixels over it would corrupt it. A          pooled render target handed back to the title's allocator between the GPU copy and the          map landing is how that happens.",
+        if submitted { "recorded but CHANGED since" } else { "NONE" }
     );
 }
 
@@ -1242,8 +1527,6 @@ fn report_writeback_target(
     );
 }
 
-/// Report - once per address - a render target whose guest format the writeback cannot
-/// express.
 /// Report - once per address - a rendered target the writeback REFUSED because its guest
 /// memory already holds something that is not a uniform fill.
 ///
@@ -1270,6 +1553,8 @@ fn report_writeback_unowned(addr: u32, w: u32, h: u32) {
     );
 }
 
+/// Report - once per address - a render target whose guest format the writeback cannot
+/// express.
 fn report_writeback_skipped(addr: u32, format: u32) {
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -1290,6 +1575,31 @@ fn report_writeback_skipped(addr: u32, format: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two targets at one address: only the one the frame's LAST scene there renders is written
+    /// back, and a target no scene of the frame names is not written at all.
+    #[test]
+    fn only_the_last_surfaces_target_at_an_address_is_written_back() {
+        let at = |w: u32, h: u32| Scene {
+            color: Some(ColorSurface {
+                format: 0,
+                surface_type: 0,
+                width: w,
+                height: h,
+                stride_pixels: w,
+                data_addr: 0x8e20_b030,
+                scale_mode: 0,
+                gamma: 0,
+            }),
+            ..Default::default()
+        };
+        let scenes = [at(512, 1024), at(256, 256)];
+        assert!(writes_back_target(&scenes, 0x8e20_b030, 256, 256));
+        assert!(!writes_back_target(&scenes, 0x8e20_b030, 512, 1024), "the earlier scene's target");
+        assert!(!writes_back_target(&scenes, 0x8e20_b030, 128, 128), "a held target no scene names");
+        assert!(!writes_back_target(&scenes, 0x8000_0000, 256, 256), "an address the frame did not render");
+        assert_eq!(surface_for(&scenes, 0x8e20_b030).map(|c| c.width), Some(256));
+    }
 
     /// What `encode_row` writes for a 16-bit surface is what the texture decoder reads back.
     ///
@@ -1355,6 +1665,44 @@ mod tests {
     /// The decoder is repeated here from `render.rs` for the reason the 16-bit test gives -
     /// different crates, and a shared copy could only fail when both sides were wrong the same
     /// way.
+    /// A draw paints inside its OUTSIDE-mode region clip (corners inclusive), else inside its
+    /// enabled viewport (offset +- |scale|, the y scale negative as GXM's is), and is unbounded
+    /// with neither. The values are a reduction tile's: 32x16 at (512,320).
+    #[test]
+    fn a_draws_painted_rect_is_its_clip_else_its_viewport() {
+        let mut rs = crate::capture::RenderState::default();
+        rs.viewport = [528.0, 16.0, 328.0, -8.0, 0.5, 0.5];
+        assert_eq!(painted_rect(&rs), Some((512, 320, 544, 336)), "the viewport");
+        rs.region_clip_mode = 0x8000_0000;
+        rs.region_clip = [512, 320, 543, 335];
+        assert_eq!(painted_rect(&rs), Some((512, 320, 544, 336)), "the clip, corners inclusive");
+        rs.region_clip_mode = 0;
+        rs.viewport_enable = 1;
+        assert_eq!(painted_rect(&rs), None, "neither bounds the draw");
+    }
+
+    /// `U2U10U10U10` has an exact inverse: every byte of every colour channel reads back as
+    /// itself through the decoder (repeated from `render.rs`, base format 0x0e), in both lane
+    /// orders, and alpha lands on the nearest of the four values two bits hold.
+    #[test]
+    fn a_u2u10u10u10_writeback_reads_back_every_byte_exactly() {
+        let decode_ten = |w: u32| ((w & 0x3ff) as f32 / 1023.0 * 255.0).round() as u8;
+        for (format, argb) in [(0x6080_0000u32, false), (0x6090_0000, true)] {
+            let src: Vec<u8> = (0..=255u8).flat_map(|c| [c, 255 - c, c / 2, c]).collect();
+            let mut out = Vec::new();
+            encode_row(format, &src, &mut out);
+            assert_eq!(out.len(), src.len(), "FOUR bytes a texel");
+            for (px, w) in src.chunks_exact(4).zip(out.chunks_exact(4)) {
+                let w = u32::from_le_bytes(w.try_into().unwrap());
+                let (hi, mid, lo) = (decode_ten(w >> 20), decode_ten(w >> 10), decode_ten(w));
+                let rgb = if argb { [hi, mid, lo] } else { [lo, mid, hi] };
+                assert_eq!(rgb, [px[0], px[1], px[2]], "format {format:#x}");
+                let a = (((w >> 30) & 3) as f32 / 3.0 * 255.0).round() as u8;
+                assert!(a.abs_diff(px[3]) <= 42, "alpha {} read back as {a}", px[3]);
+            }
+        }
+    }
+
     #[test]
     fn a_u2f10f10f10_writeback_reads_back_as_the_nearest_pixel_the_format_holds() {
         let decode_ten = |bits: u32| -> u8 {

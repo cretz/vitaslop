@@ -53,7 +53,30 @@ function summarize(rgba, w, h) {
     }
   }
   const cells = GX * GY;
-  return { hash: hsh.toString(16).padStart(8, "0"), mean: [tr / cells, tg / cells, tb / cells].map((v) => Math.round(v)), grid };
+  // ALPHA too: the cell means are colour only, and a target whose colour matches can still
+  // differ where a CPU reads it - an exposure tile whose alpha channel carries the state.
+  let ta = 0;
+  for (let i = 3; i < rgba.length; i += 4) ta += rgba[i];
+  const alphaMean = Math.round((ta / Math.max(1, rgba.length / 4)) * 10) / 10;
+  return { hash: hsh.toString(16).padStart(8, "0"), mean: [tr / cells, tg / cells, tb / cells].map((v) => Math.round(v)), alphaMean, grid };
+}
+
+// `params.region: [x, y, w, h]`: that rectangle's mean RGBA and its first texels, raw - the
+// one place a CPU-read result lives (a reduction chain's last tile) is a few dozen texels of a
+// large target, and a whole-image mean cannot see it.
+function region(rgba, w, h, [x, y, rw, rh]) {
+  const sum = [0, 0, 0, 0];
+  let n = 0;
+  const head = [];
+  for (let yy = y; yy < Math.min(h, y + rh); yy++) {
+    for (let xx = x; xx < Math.min(w, x + rw); xx++) {
+      const k = (yy * w + xx) * 4;
+      for (let c = 0; c < 4; c++) sum[c] += rgba[k + c];
+      if (head.length < 8) head.push([rgba[k], rgba[k + 1], rgba[k + 2], rgba[k + 3]]);
+      n++;
+    }
+  }
+  return { rect: [x, y, rw, rh], mean: sum.map((s) => Math.round((s / Math.max(1, n)) * 10) / 10), head };
 }
 
 async function png(rgba, w, h) {
@@ -110,7 +133,11 @@ export async function run(params, { progress, asset }) {
   let full = null;
   for (const r of res) {
     const s = summarize(r.rgba, r.width, r.height);
-    out.push({ limit: r.limit, passes: r.passes, draws: r.draws, ms: Math.round(r.ms), errors: r.errors, ...(r.gpu ? { gpu: r.gpu.slice(0, 1500) } : {}), ...s });
+    out.push({
+      limit: r.limit, passes: r.passes, draws: r.draws, ms: Math.round(r.ms), errors: r.errors,
+      ...(r.gpu ? { gpu: r.gpu.slice(0, 1500) } : {}), ...s,
+      ...(params.region ? { region: region(r.rgba, r.width, r.height, params.region) } : {}),
+    });
     if (params.png && r.limit === r.passes && !full) full = await png(r.rgba, r.width, r.height);
   }
   return {

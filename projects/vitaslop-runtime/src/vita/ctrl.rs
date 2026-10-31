@@ -70,6 +70,18 @@ fn buffer_count(count: i32) -> u32 {
 /// them: the pad state is the world's, observed at each read; the vblanks between two reads
 /// carry the state held before the later one (see `push`). A title that reads the pad several
 /// times inside a vblank is served the same sample each time, exactly as it is on hardware.
+/// What SceCtrl keeps between calls, owned here - `VitaState` holds one and nothing outside
+/// this module reaches into it.
+#[derive(Default)]
+pub(crate) struct CtrlState {
+    /// The controller samples this run has actually served, per port, newest last.
+    /// See [`CtrlHistory`] - a title that acts on a button EDGE reads its own past out of this
+    /// ring, and a ring that repeats the present has no edges in it.
+    history: CtrlHistory,
+    /// `sceCtrlSetSamplingMode` / `...Ext`: each starts DIGITAL (sticks not sampled).
+    sampling_mode: [u32; 2],
+}
+
 #[derive(Default)]
 pub(crate) struct CtrlHistory {
     /// One ring per port that has ever been read, newest last. A `Vec` rather than a fixed
@@ -223,13 +235,14 @@ fn fill_ctrl(
     // sampled at. Pushed here rather than on a timer because the world is polled here: asking
     // it for a sample the guest never requested would put a poll on the record/replay seam
     // that no title made.
-    st.ctrl_history
+    st.ctrl.history
         .push(port, u64::from(super::display::vcount(st)), ts, frame);
-    let depth = st.ctrl_history.depth(port);
+    let depth = st.ctrl.history.depth(port);
 
     let n = buffer_count(count);
     let analog = st
-        .ctrl_sampling_mode
+        .ctrl
+        .sampling_mode
         .iter()
         .any(|&m| m != SCE_CTRL_MODE_DIGITAL);
     if data != 0 {
@@ -239,12 +252,12 @@ fn fill_ctrl(
         // dedupes on. Extending the OLDEST rather than the newest is what keeps the ring
         // monotone: a run one frame old has one real sample, and the slots below it are the
         // pad as it was before anything was pressed.
-        let oldest = st.ctrl_history.sample(port, depth.saturating_sub(1));
+        let oldest = st.ctrl.history.sample(port, depth.saturating_sub(1));
         for i in 0..n {
             // Oldest first: slot i is (n - 1 - i) samples before now, and the last one
             // written is the current sample.
             let age = (n - 1 - i) as usize;
-            let (s_ts, pad) = match st.ctrl_history.sample(port, age) {
+            let (s_ts, pad) = match st.ctrl.history.sample(port, age) {
                 Some(s) => (s.ts, s.pad),
                 None => {
                     let base =
@@ -299,7 +312,7 @@ pub(super) fn set_sampling_mode(ctx: &mut GuestCtx, st: &mut VitaState, which: u
     let r = if mode > SCE_CTRL_MODE_ANALOG_WIDE {
         SCE_CTRL_ERROR_INVALID_ARG
     } else {
-        std::mem::replace(&mut st.ctrl_sampling_mode[which], mode) as i32
+        std::mem::replace(&mut st.ctrl.sampling_mode[which], mode) as i32
     };
     ctx.ret(r as u32);
 }
@@ -308,7 +321,7 @@ pub(super) fn set_sampling_mode(ctx: &mut GuestCtx, st: &mut VitaState, which: u
 /// answered.
 pub(super) fn get_sampling_mode(ctx: &mut GuestCtx, st: &mut VitaState, which: usize) {
     let out = ctx.arg(0);
-    let mode = st.ctrl_sampling_mode[which];
+    let mode = st.ctrl.sampling_mode[which];
     let r = if out == 0 {
         SCE_CTRL_ERROR_INVALID_ARG
     } else {
@@ -437,7 +450,7 @@ fn read_blocking(ctx: &mut GuestCtx, st: &mut VitaState, negative: bool, v2: boo
     let count = if read_all() {
         count
     } else {
-        let h = &mut st.ctrl_history;
+        let h = &mut st.ctrl.history;
         let new = match h.last_read.iter_mut().find(|(p, _)| *p == port) {
             Some((_, last)) => {
                 let n = vblank.saturating_sub(*last);

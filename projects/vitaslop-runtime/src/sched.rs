@@ -132,6 +132,18 @@ pub trait ThreadHandle {
     /// indices are stable for the whole run and the exit code has to outlive the thread.
     fn release(&mut self) {}
 
+    /// Drop everything the engine holds for a thread that is PARKED mid-call and will never
+    /// be resumed - the runtime ended it ([`crate::host::ImportDispatch::take_terminations`]).
+    ///
+    /// Distinct from [`Self::release`] because a finished thread's stack has already
+    /// unwound, and a terminated one's has not: an engine whose release would pool or reset
+    /// state the parked stack still references must first dispose of that stack. The default
+    /// is a plain release, which is right for an engine that frees a parked stack by dropping
+    /// it.
+    fn terminate(&mut self) {
+        self.release();
+    }
+
     /// Total engine FUEL this thread has burned since it started, or `None` from an
     /// engine with no fuel accounting.
     ///
@@ -777,6 +789,35 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         }
     }
 
+    /// The runtime ENDED thread `thid` while it was parked (see
+    /// [`ImportDispatch::take_terminations`]): drop it exactly as a `ThreadExit` would - its
+    /// slot finished and off the live list, its engine state handed back - without resuming
+    /// it. The host already recorded its end, so nothing is reported back.
+    ///
+    /// No thread runs during a drain on this one-baton core, so a terminated thread is never
+    /// mid-resume here: it is blocked in the svc that parked it. Any other live state is
+    /// dropped the same way rather than trusted - a thread nothing can name must not be picked.
+    fn terminate(&mut self, thid: i32) {
+        let Some(idx) = self
+            .live
+            .iter()
+            .copied()
+            .find(|&i| self.threads[i].thread.thid() == thid)
+        else {
+            return;
+        };
+        self.sched_trace(&format!("TERMINATE t{thid:#x} (parked; ended by the runtime)"));
+        tracing::debug!(
+            target: "vitaslop::thread",
+            "thread {thid:#x} TERMINATED at frame {} while parked",
+            self.frames
+        );
+        self.threads[idx].state = ThreadState::Finished(0);
+        self.retire_slot(idx);
+        self.wake_tokens.remove(&thid);
+        self.threads[idx].thread.terminate();
+    }
+
     /// The next thread to run, advancing the round-robin cursor past it: the
     /// highest-priority runnable thread (lowest priority number), round-robin among
     /// threads sharing that priority. This is the real SceKernel discipline - a strict
@@ -1314,14 +1355,18 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // its own, so it has to run ahead of the take below or they would sit until the
         // next drain, one whole scheduling round late.
         self.with_host_words(|host, words| host.resolve_deferred(words));
-        let (spawns, wakes, stat_writes) = {
+        let (spawns, wakes, terminations, stat_writes) = {
             let mut host = self.host.lock().unwrap();
             (
                 host.take_spawns(),
                 host.take_wakes(),
+                host.take_terminations(),
                 host.take_stat_writes(),
             )
         };
+        for thid in terminations {
+            self.terminate(thid);
+        }
         // Deliver any exit codes owed to a blocked `sceKernelWaitThreadEnd` joiner's
         // `stat` out-parameter. Done here (no thread runs during a drain) before the
         // woken joiner resumes.
@@ -1843,5 +1888,125 @@ mod exit_handler_run_tests {
         let mut run = ExitHandlerRun::default();
         assert!(!run.begin(7, Vec::new()));
         assert_eq!(run.code(), None);
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    //! A thread the runtime ENDS while it is parked (`ImportDispatch::take_terminations`) is
+    //! dropped by the core like a `ThreadExit`, without being resumed.
+    use super::*;
+    use crate::host::{GuestMemory, VFP_ARG_COUNT};
+    use crate::SvcOutcome;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    struct MockThread {
+        thid: i32,
+        /// Set by `terminate` - shared with the test, which no longer owns the thread.
+        terminated: Rc<Cell<bool>>,
+    }
+
+    impl ThreadHandle for MockThread {
+        fn thid(&self) -> i32 {
+            self.thid
+        }
+        fn priority(&self) -> i32 {
+            0x40
+        }
+        fn terminate(&mut self) {
+            self.terminated.set(true);
+        }
+    }
+
+    struct MockEngine {
+        terminated: Rc<Cell<bool>>,
+    }
+
+    impl GuestEngine for MockEngine {
+        type Thread = MockThread;
+        fn spawn(&mut self, r: &Reentry) -> Result<MockThread, ()> {
+            Ok(MockThread { thid: r.thid, terminated: self.terminated.clone() })
+        }
+        fn write_mem(&mut self, _addr: u32, _bytes: &[u8]) {}
+        fn read_mem(&self, _addr: u32, _out: &mut [u8]) -> bool {
+            false
+        }
+    }
+
+    #[derive(Default)]
+    struct MockHost {
+        spawns: Vec<Reentry>,
+        wakes: Vec<i32>,
+        terminations: Vec<i32>,
+        exits: Vec<i32>,
+    }
+
+    impl ImportDispatch for MockHost {
+        fn dispatch(
+            &mut self,
+            _index: u32,
+            _regs: &mut [u32; REG_COUNT],
+            _vfp: &mut [u32; VFP_ARG_COUNT],
+            _mem: &mut dyn GuestMemory,
+            _base: u32,
+        ) -> SvcOutcome {
+            SvcOutcome::Continue
+        }
+        fn take_spawns(&mut self) -> Vec<Reentry> {
+            std::mem::take(&mut self.spawns)
+        }
+        fn take_wakes(&mut self) -> Vec<i32> {
+            std::mem::take(&mut self.wakes)
+        }
+        fn take_terminations(&mut self) -> Vec<i32> {
+            std::mem::take(&mut self.terminations)
+        }
+        fn set_thread_exit(&mut self, thid: i32, _code: u32) {
+            self.exits.push(thid);
+        }
+    }
+
+    #[test]
+    fn a_parked_thread_the_runtime_ends_is_dropped_and_never_picked() {
+        const FIBER: i32 = 0x40_0010;
+        let terminated = Rc::new(Cell::new(false));
+        let host = Arc::new(Mutex::new(MockHost::default()));
+        let main = MockThread { thid: 0, terminated: Rc::new(Cell::new(false)) };
+        let mut core = SchedCore::new(MockEngine { terminated: terminated.clone() }, host.clone(), main);
+        host.lock().unwrap().spawns.push(Reentry {
+            entry: 0x8100_0000,
+            arg_len: 0,
+            arg_ptr: 0,
+            r2: 0,
+            r3: 0,
+            stack_top: 0x8400_4000,
+            thid: FIBER,
+            priority: 0x40,
+        });
+        core.drain();
+        assert_eq!(core.thread_census(), (2, 0));
+        // The fiber runs and parks (its svc returned Block).
+        let idx = core.threads.iter().position(|s| s.thread.thid() == FIBER).unwrap();
+        assert_eq!(core.on_suspended(idx, Stop::Blocked, u64::MAX), None);
+
+        // The runtime ends it - and a wake for it that raced in must not resurrect it.
+        host.lock().unwrap().terminations.push(FIBER);
+        host.lock().unwrap().wakes.push(FIBER);
+        core.drain();
+        assert!(terminated.get(), "its engine state is handed back");
+        assert_eq!(core.thread_census(), (1, 1), "finished, off the live list");
+        assert!(!core.wake_tokens.contains(&FIBER), "no token is banked for a dead thread");
+        assert!(host.lock().unwrap().exits.is_empty(), "the host already recorded its end");
+        // Only the main thread is ever picked from here on.
+        for _ in 0..4 {
+            assert_eq!(core.pick_next(), Some(0));
+            assert_eq!(core.on_suspended(0, Stop::Quantum, u64::MAX), None);
+        }
+        // A second termination of the same id is a no-op.
+        host.lock().unwrap().terminations.push(FIBER);
+        core.drain();
+        assert_eq!(core.thread_census(), (1, 1));
     }
 }

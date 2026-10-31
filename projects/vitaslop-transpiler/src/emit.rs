@@ -199,7 +199,8 @@ impl StmtKind {
             Stmt::SetThreadPtr(..) => StmtKind::SetThreadPtr,
             Stmt::Parallel { .. } => StmtKind::Parallel,
             Stmt::Sel { .. } => StmtKind::Sel,
-            Stmt::ShiftRegFlags { .. } => StmtKind::ShiftRegFlags,
+            Stmt::ShiftRegFlags { .. } | Stmt::Shifter { .. } => StmtKind::ShiftRegFlags,
+            Stmt::SetRet(..) => StmtKind::SetReg,
         }
     }
 
@@ -300,6 +301,13 @@ struct Body {
     /// [`emit_dirty_mark`]. A field rather than a parameter because the mark is emitted
     /// from five different lowerings, all of them several frames below the loop.
     dirty_covered: bool,
+    /// Whether the call statement now being emitted is the block's last and the block then
+    /// returns, so it is emitted as a tail call - see [`tail_calls`]. Set by the statement
+    /// loop for exactly that statement, the way [`Body::dirty_covered`] is.
+    tail_next: bool,
+    /// The constant the statement just emitted wrote to `lr`, if that is what it did: the
+    /// return address of the direct call that follows (see [`emit_return_check`]).
+    lr_set: Option<u32>,
     /// Operators charged to each [`StmtKind`], and how many statements of that kind were
     /// emitted. This is the answer to "which guest lowering is expensive", which no total
     /// can give: a 9.88 average over a corpus containing both `mov r0, r1` and a
@@ -429,6 +437,8 @@ impl Body {
             dirty_marks_elided: 0,
             dirty_sp_stores: 0,
             dirty_covered: false,
+            tail_next: false,
+            lr_set: None,
             stmt_ops: [0; StmtKind::COUNT],
             stmt_count: [0; StmtKind::COUNT],
             stmt_child_ops: 0,
@@ -1466,6 +1476,64 @@ fn emit_watch_store_inline(f: &mut Body, base: u32, addr_local: u32, at: u32, le
     f.instruction(&W::End);
 }
 
+/// `InlineLowering::BindState`'s PER-SLOT copy: `bytes / stride` slots from the arrays block
+/// (`L_T2` + `src_off`) to the context block (`L_T0` + `dst_off`), each copied only when its
+/// first word is non-zero - see `BindStateLayout::copy_slot_stride`. Uses `L_T3` as the slot
+/// cursor and `L_SLOT` for the destination, so the watchpoint names the one slot written.
+///
+/// >>> PER-SLOT, SKIPPING THE EMPTY ONES. The handlers (`bind_precomputed_*_state`) walk the
+/// same slots with the same test, because a slot of zeros is this engine's own default and not
+/// an unbind the guest asked for.
+///
+/// A LOOP rather than sixteen unrolled slots: this lowering is emitted at every call site of
+/// the bind, and a title binds states from many of them.
+fn emit_bind_state_slot_copy(f: &mut Body, base: u32, src_off: u32, dst_off: u32, bytes: u32, stride: u32, index: u32) {
+    // src = block + src_off + i. The add is left out at offset zero, so the first copy's
+    // emitted code is exactly what it was before a second per-slot copy existed.
+    let src = |f: &mut Body| {
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::LocalGet(L_T3));
+        f.instruction(&W::I32Add);
+        if src_off != 0 {
+            f.instruction(&W::I32Const(src_off as i32));
+            f.instruction(&W::I32Add);
+        }
+    };
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::LocalSet(L_T3));
+    f.instruction(&W::Loop(BlockType::Empty));
+    // The slot's FIRST WORD decides: it is the texture's (or buffer's) guest address, and zero
+    // there is what every reader already treats as "this unit is unbound".
+    src(f);
+    f.instruction(&W::I32Load(mem_arg()));
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::I32Ne);
+    f.instruction(&W::If(BlockType::Empty));
+    // dst = ctx + dst_off + i, kept in a local so the watchpoint names THIS slot.
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::LocalGet(L_T3));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::I32Const(dst_off as i32));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::LocalSet(L_SLOT));
+    emit_watch_store_inline(f, base, L_SLOT, 0, stride, index);
+    f.instruction(&W::LocalGet(L_SLOT));
+    emit_host_off(f);
+    src(f);
+    emit_host_off(f);
+    f.instruction(&W::I32Const(stride as i32));
+    f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    f.instruction(&W::End); // the non-empty test
+    f.instruction(&W::LocalGet(L_T3));
+    f.instruction(&W::I32Const(stride as i32));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::LocalTee(L_T3));
+    f.instruction(&W::I32Const(bytes as i32));
+    f.instruction(&W::I32LtU);
+    f.instruction(&W::BrIf(0));
+    f.instruction(&W::End); // the loop
+}
+
 /// The shared body of [`emit_watch_store_range`], with the written extent either constant or
 /// in a local. Expects the rebased destination offset in `L_T0`.
 ///
@@ -2264,7 +2332,12 @@ const L_PARK: u32 = 7;
 /// single instruction's lowering, and the copy loop's other three are all already spoken for
 /// (context, state struct, arrays block).
 const L_SLOT: u32 = 8;
-const L_I32_COUNT: u32 = 9;
+/// The operand and carry-out a [`Stmt::Shifter`] computed, read back as [`Value::ShifterOut`]
+/// and [`Value::ShifterCarry`] by the instruction that follows it. Their own locals because
+/// that instruction's lowering uses the `L_T*` scratches for its own flags.
+const L_SHV: u32 = 9;
+const L_SHC: u32 = 10;
+const L_I32_COUNT: u32 = 11;
 /// i64 scratch, used to split/merge a double register across its two aliased
 /// single-register halves. Index follows the i32 locals.
 const L_D64: u32 = L_I32_COUNT;
@@ -2318,6 +2391,8 @@ pub struct EmitOutput {
     /// See [`emit_dirty_mark`] for what the guest writes and why, and
     /// `TextureSnapshots` in the runtime for what reads it.
     pub dirty_off: Option<u64>,
+    /// Layout offset of the runtime entry table - see [`RUNTIME_ENTRY_PAIRS`].
+    pub runtime_off: u64,
     /// How many wasm operators this module emits per GUEST INSTRUCTION - see
     /// [`Expansion`].
     pub expansion: Expansion,
@@ -2623,48 +2698,219 @@ pub fn emit_module(
     )
 }
 
-/// [`emit_module`] for functions that are PRODUCED as they are emitted: `funcs` yields
-/// them one at a time, in the ascending order of `addrs` (which names every one up front,
-/// since the address table and the funcref table are sized before the code section), and
-/// `guest_instructions` is their total `arm_count`. A caller that lifts each function
-/// just before it is written holds ONE function's IR at a time instead of the program's -
-/// see `transpile_lenient`.
-#[allow(clippy::too_many_arguments)]
-pub fn emit_module_streamed(
-    addrs: Vec<u32>,
-    guest_instructions: u64,
-    funcs: impl Iterator<Item = Func>,
-    func_index: &BTreeMap<u32, u32>,
-    base: u32,
-    mem_bytes: u32,
-    inline_imports: &[crate::InlineImport],
-    import_memory: bool,
-    host_off: u32,
-) -> EmitOutput {
-    // Every emitted memory access on this thread is shifted by this from here on - see
-    // `Body::raw`. A host offset only makes sense for an imported memory: a self-contained
-    // module's memory starts where its layout starts.
-    assert!(host_off == 0 || import_memory, "a host offset needs an imported memory");
-    HOST_OFF.with(|c| c.set(host_off as u64));
-    // >>> THE FUNCTIONS ARE TAKEN BY VALUE AND DROPPED ONE BY ONE AS THEY ARE EMITTED.
-    //
-    // The lifted IR of one retail title is 7.5 million statements at 80 bytes each - about
-    // 605 MB of statement vectors before the blocks and maps that hold them - and its module
-    // is 369 MB. The old shape held all of the IR for the whole of emission and then held
-    // the module TWICE (the code section's own buffer, then the copy `Module::finish` made
-    // of everything), so the transpile worker of that title peaked at 3,884 MB against
-    // wasm32's 4,096 MB ceiling: 212 MB from failing on a desktop, and the first thing a
-    // phone hits. Emission now frees each function's IR as its body is written, and the
-    // bodies go straight into the final byte vector (see the code section below), so the
-    // peak is the IR alone and the module grows into the room the IR gives back.
-    let mut types = TypeSection::new();
-    types.ty().function([ValType::I32], []); // svc / import: (i32) -> ()
-    let host_ty = 0;
-    types.ty().function([], []); // guest function: () -> ()
-    let func_ty = 1;
-    types.ty().function([ValType::I32, ValType::I32], []); // dispatch / dispatch_miss
-    let dispatch_ty = 2;
+/// The module's STATE as exports: the memory, the table, and every global - by index
+/// (`abi::global_export`, which is how a side module links to them) and by the names the hosts
+/// read the guest's registers through. A side module exports the very same list, of the very
+/// same items it imported, so a host function that reads the CALLER's registers through its
+/// exports finds them whichever module's code made the call (see `emit_side_module`). A global
+/// exported under several names is still one global.
+fn state_exports(exports: &mut ExportSection, globals: u32) {
+    exports.export(abi::MEMORY_EXPORT, ExportKind::Memory, 0);
+    exports.export(abi::TABLE_EXPORT, ExportKind::Table, 0);
+    for i in 0..globals {
+        exports.export(&abi::global_export(i), ExportKind::Global, i);
+    }
+    for i in 0..abi::REG_COUNT {
+        exports.export(&abi::reg_export(i), ExportKind::Global, abi::reg_global(i));
+    }
+    for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
+        exports.export(abi::flag_export(f), ExportKind::Global, abi::flag_global(f));
+    }
+    // Export the VFP/NEON register file so the host can seed/read FP state (tests,
+    // GXM capture). S0..S31 (i32), Q8..Q15 (v128), and the FP flags. The host only
+    // marshals the low-bank S registers; the v128 quads are exported for
+    // completeness (JS cannot read them, but native hosts and tools can).
+    for n in 0..abi::VFP_S_COUNT as u8 {
+        exports.export(&abi::vfp_s_export(n), ExportKind::Global, abi::vfp_s_global(n));
+    }
+    for q in abi::VFP_Q_HI_FIRST as u8..(abi::VFP_Q_HI_FIRST + abi::VFP_Q_HI_COUNT) as u8 {
+        exports.export(&abi::vfp_qhi_export(q), ExportKind::Global, abi::vfp_qhi_global(q));
+    }
+    for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
+        exports.export(abi::fp_flag_export(f), ExportKind::Global, abi::fp_flag_global(f));
+    }
+    // The guest-PC tracker, so the host can read the faulting block address on a trap
+    // (zero unless `VITASLOP_TRACK_PC` is set at emit time; see `track_pc`).
+    exports.export(abi::GUEST_PC_EXPORT, ExportKind::Global, GUEST_PC_GLOBAL);
+    // The per-thread pointer, so the host seeds each thread's TLS base at instantiation.
+    exports.export(abi::TP_EXPORT, ExportKind::Global, abi::TP_GLOBAL);
+    // The software fuel counter, so a host can see how much of a thread's quantum is
+    // left. Always exported (like `guest_pc`) so the export list does not depend on a
+    // build option; it reads 0 and never moves unless fuel was asked for.
+    exports.export(abi::FUEL_EXPORT, ExportKind::Global, abi::WORK_GLOBAL);
+    if smp() {
+        exports.export(abi::PREEMPT_EXPORT, ExportKind::Global, PREEMPT_GLOBAL);
+        exports.export(abi::THREAD_ID_EXPORT, ExportKind::Global, THREAD_ID_GLOBAL);
+        exports.export(abi::CUR_THREAD_EXPORT, ExportKind::Global, CUR_THREAD_GLOBAL);
+        exports.export(abi::ELIDE_EXPORT, ExportKind::Global, ELIDE_GLOBAL);
+    }
+}
 
+/// The type indices every module this emitter makes declares, main or side, in this order.
+const HOST_TY: u32 = 0;
+const GUEST_TY: u32 = 1;
+const DISPATCH_TY: u32 = 2;
+const MISS_TY: u32 = 3;
+
+fn module_types() -> TypeSection {
+    let mut types = TypeSection::new();
+    types.ty().function([ValType::I32], []); // HOST_TY: svc / import: (i32) -> ()
+    types.ty().function([], []); // GUEST_TY: guest function: () -> ()
+    types.ty().function([ValType::I32, ValType::I32], []); // DISPATCH_TY: (target, caller) -> ()
+    types.ty().function([ValType::I32, ValType::I32], [ValType::I32]); // MISS_TY: -> slot
+    types
+}
+
+/// The host function imports, which take the low function indices of every module (main or
+/// side) in this order - `SVC_FUNC`, `IMPORT_FUNC`, `DISPATCH_MISS_FUNC`, `IMPORT_FAST_FUNC`.
+fn host_imports() -> ImportSection {
+    let mut imports = ImportSection::new();
+    imports.import(abi::IMPORT_MODULE, abi::SVC_NAME, wasm_encoder::EntityType::Function(HOST_TY));
+    imports.import(abi::IMPORT_MODULE, abi::IMPORT_NAME, wasm_encoder::EntityType::Function(HOST_TY));
+    // `env.dispatch_miss(target, caller) -> slot`: called when an indirect call resolves to
+    // no known function (see `emit_dispatch`).
+    imports.import(abi::IMPORT_MODULE, abi::DISPATCH_MISS_NAME, wasm_encoder::EntityType::Function(MISS_TY));
+    // `env.import_fast(selector)`: the same trap as `env.import` for a NID the host has
+    // named as never suspending - see `InlineOp::Fast`.
+    imports.import(abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME, wasm_encoder::EntityType::Function(HOST_TY));
+    imports
+}
+
+/// The linear memory a main module imports (`import_memory`) or defines, spanning
+/// `total_pages` of layout. A side module imports the same type.
+fn memory_type(import_memory: bool, host_off: u32, total_pages: u64) -> MemoryType {
+    if import_memory && host_off != 0 {
+        // >>> THE GUEST REGION INSIDE THE HOST'S OWN MEMORY (see `Program::host_off`).
+        // The memory is the host module's, so it is not fixed - it grows with the host's
+        // heap. The minimum declared is the end of the guest layout, so instantiation fails
+        // by name if the host has not reserved that far. An unshared host memory declares no
+        // maximum, so neither does the import; a SHARED one (the wasm-threads bundle) must
+        // declare one, and so must its import - see `SHARED_HOST_MEMORY`.
+        let end_pages = (host_off as u64 + total_pages * abi::PAGE_SIZE as u64).div_ceil(abi::PAGE_SIZE as u64);
+        let shared = shared_host_memory();
+        MemoryType {
+            minimum: end_pages,
+            maximum: shared.then_some(SHARED_MEMORY_MAX_PAGES),
+            memory64: false,
+            shared,
+            page_size_log2: None,
+        }
+    } else if import_memory {
+        // A shared memory must declare a maximum; the guest never grows memory, so
+        // pin max == min at the provisioned size (guest region + dispatch table).
+        MemoryType {
+            minimum: total_pages,
+            maximum: Some(total_pages),
+            memory64: false,
+            shared: true,
+            page_size_log2: None,
+        }
+    } else {
+        MemoryType { minimum: total_pages, maximum: None, memory64: false, shared: false, page_size_log2: None }
+    }
+}
+
+/// The main module's funcref table over its `n` functions; growable, for side modules.
+fn table_type(n: u32) -> TableType {
+    TableType { element_type: RefType::FUNCREF, table64: false, minimum: n as u64, maximum: None, shared: false }
+}
+
+/// Every global a module has, with its initial value, in index order. A side module imports
+/// them all by type, so the indices its code names are these.
+fn module_globals(mirror_off: Option<u64>) -> Vec<(GlobalType, ConstExpr)> {
+    let i32_global = GlobalType { val_type: ValType::I32, mutable: true, shared: false };
+    let v128_global = GlobalType { val_type: ValType::V128, mutable: true, shared: false };
+    let i64_global = GlobalType { val_type: ValType::I64, mutable: true, shared: false };
+    let zero = || (i32_global, ConstExpr::i32_const(0));
+    let mut g = Vec::new();
+    // Globals, in ABI order: 16 registers + 4 integer flags (i32), then the VFP/NEON
+    // register file - 32 single-precision S registers (raw-bit i32) and 8 upper
+    // quad registers Q8..Q15 (v128) - then 4 FP condition flags (i32).
+    g.extend((0..abi::GLOBAL_COUNT).map(|_| zero()));
+    g.extend((0..abi::VFP_S_COUNT).map(|_| zero()));
+    g.extend((0..abi::VFP_Q_HI_COUNT).map(|_| (v128_global, ConstExpr::v128_const(0))));
+    g.extend((0..abi::FP_FLAG_COUNT).map(|_| zero()));
+    // Three extra i32 globals, always present so their indices are stable and unused
+    // (zero, no runtime cost) in a normal build: the store watchpoint's "armed" latch
+    // (see `watch_store_addr`), the guest-PC tracker (see `track_pc`), and the
+    // read-watchpoint match counter (see `watch_read_skip`).
+    g.push(zero()); // WATCH_ARMED_GLOBAL
+    g.push(zero()); // GUEST_PC_GLOBAL
+    g.push(zero()); // WATCH_READ_COUNT_GLOBAL
+    // The per-thread pointer (TPIDRURO / TLS base). Per-instance, set by the host at
+    // thread instantiation; read by `MRC p15,0,Rt,c13,c0,3` (see `abi::TP_GLOBAL`).
+    g.push(zero()); // TP_GLOBAL
+    g.push(zero()); // WATCH_STORE_COUNT_GLOBAL
+    // The software WORK counter (see `emit_fuel_check` and `abi::WORK_GLOBAL`): guest
+    // instructions in its high half, operators since the last yield in its low half. Both
+    // start at zero - the operator half counts UP to the interval now, so a fresh thread
+    // is at the START of its quantum rather than needing to be seeded with one.
+    g.push((i64_global, ConstExpr::i64_const(0))); // WORK_GLOBAL
+    if smp() {
+        // The per-instance exclusive monitor - see `EXCL_ADDR_GLOBAL`.
+        g.push(zero()); // EXCL_ADDR_GLOBAL
+        g.push(zero()); // EXCL_VAL_GLOBAL
+        g.push((i64_global, ConstExpr::i64_const(0))); // EXCL_VAL64_GLOBAL
+        // The preempt word's layout offset - see `PREEMPT_GLOBAL`. The mirror page exists in
+        // every build, so the "never set" slot is always a real, zero word.
+        let never = mirror_off.map_or(0, |m| m + 4 * u64::from(abi::PREEMPT_SLOT_BASE - 1));
+        g.push((i32_global, ConstExpr::i32_const(never as i32))); // PREEMPT_GLOBAL
+        g.push(zero()); // THREAD_ID_GLOBAL
+        g.push(zero()); // CUR_THREAD_GLOBAL
+        g.push(zero()); // ELIDE_GLOBAL
+        g.push(zero()); // EXCL_VER_GLOBAL
+    }
+    g.push(zero()); // ret_global(): where the last guest return went - see `nonlocal_returns`
+    g
+}
+
+/// The RUNTIME ENTRY TABLE: guest code found at run time, by address - see
+/// [`crate::transpile_side`]. One page of open-addressed `(target, slot)` word pairs, keyed by
+/// the target with its Thumb bit cleared (0 = an empty pair); `slot` is the funcref table index
+/// the target's translation was installed at. The HOST writes it, value first and key last;
+/// the main module's dispatcher only reads it.
+pub const RUNTIME_ENTRY_PAIRS: u32 = abi::PAGE_SIZE / 8;
+/// How many runtime entries a run may make before it fails: half the table, so a probe always
+/// ends at an empty pair within a few steps. A title that wants more than this is not leaving
+/// a few entries undiscovered - it is generating code, or discovery is broken - and it is
+/// stopped by name rather than allowed to slow down without a word.
+pub const RUNTIME_ENTRY_LIMIT: u32 = RUNTIME_ENTRY_PAIRS / 2;
+
+/// The pair the probe for `target` (Thumb bit cleared) starts at. Shared by the dispatcher's
+/// emitted probe and the host's insert, which must agree.
+pub fn runtime_entry_hash(target: u32) -> u32 {
+    ((target >> 1).wrapping_mul(0x9E37_79B1)) >> (32 - RUNTIME_ENTRY_PAIRS.trailing_zeros())
+}
+
+/// Where a module's blocks sit in linear memory, in layout offsets. Computed by [`plan_layout`]
+/// for a main module and again, identically, for every side module made against it.
+struct Layout {
+    /// Translated functions in the main module.
+    n: u32,
+    /// The dispatcher's ascending address table.
+    addr_table_off: u64,
+    /// The dispatcher's bucket index over the address table (see [`dispatch_buckets`]).
+    buckets: Option<(u32, Vec<u32>)>,
+    /// The host mirror block.
+    mirror_off: Option<u64>,
+    /// The "diagnostics armed" word.
+    arm_word_off: Option<u64>,
+    /// The guest-store dirty map.
+    dirty_off: Option<u64>,
+    /// The runtime entry table (see [`RUNTIME_ENTRY_PAIRS`]).
+    runtime_off: u64,
+    /// Pages the whole layout spans.
+    total_pages: u32,
+    /// The inline imports, placed against the mirror block.
+    inline: InlineImports,
+}
+
+/// Lay out a module over `addrs` (the main module's ascending function addresses) and set this
+/// thread's layout cells (the armed word, the exclusive monitor, the dirty map, ...) for the
+/// emission that follows. A pure function of its inputs and this thread's emit settings, which
+/// is what lets a side module emitted later, on another thread, agree with its main module
+/// about every offset.
+fn plan_layout(addrs: &[u32], mem_bytes: u32, inline_imports: &[crate::InlineImport]) -> Layout {
     // The guest region occupies whole pages from offset 0; the dispatch address
     // table is appended immediately above it (page-aligned), so the module declares
     // more pages than the guest itself uses. `addr_table_off` is the byte offset of
@@ -2675,7 +2921,7 @@ pub fn emit_module_streamed(
     let addr_table_off = guest_pages * abi::PAGE_SIZE as u64;
     // The BUCKET INDEX rides directly behind the address table (see `dispatch_buckets`):
     // one u32 per `1 << DISPATCH_BUCKET_SHIFT` bytes of guest code, plus a sentinel.
-    let buckets = dispatch_buckets(&addrs);
+    let buckets = dispatch_buckets(addrs);
     let addr_table_bytes = n as u64 * 4 + buckets.as_ref().map_or(0, |(_, b)| b.len() as u64 * 4);
     let addr_table_pages = addr_table_bytes.div_ceil(abi::PAGE_SIZE as u64);
     // One more page above the dispatch table holds the "diagnostics armed" word
@@ -2726,8 +2972,13 @@ pub fn emit_module_streamed(
     WATCH_COUNT_OFF.with(|c| {
         c.set(if watch_store_addr().is_some() { diag_off.map_or(0, |o| o + 4) } else { 0 })
     });
+    // The runtime entry table's page, in every build: which titles reach code at run time
+    // that discovery never saw is exactly what cannot be known when the module is made.
+    let runtime_off =
+        (guest_pages + addr_table_pages + u64::from(mirror_off.is_some()) + u64::from(diag_page))
+            * abi::PAGE_SIZE as u64;
     let pages_below_dirty =
-        guest_pages + addr_table_pages + u64::from(mirror_off.is_some()) + u64::from(diag_page);
+        guest_pages + addr_table_pages + u64::from(mirror_off.is_some()) + u64::from(diag_page) + 1;
     // The GUEST-STORE DIRTY MAP tops the layout, one byte per 4 KB page - see
     // `emit_dirty_mark`. It covers the WHOLE linear memory, itself included, rather
     // than only the guest region: the mark is emitted before its store, so a store to
@@ -2760,6 +3011,60 @@ pub fn emit_module_streamed(
     // Built here rather than at the top of the function because an inline mirror read
     // needs the block's address, which is part of the layout just computed.
     let inline = InlineImports::new(inline_imports, mem_bytes, mirror_off);
+    Layout {
+        n,
+        addr_table_off,
+        buckets,
+        mirror_off,
+        arm_word_off,
+        dirty_off,
+        runtime_off,
+        total_pages: u32::try_from(total_pages).expect("a wasm32 layout is at most 65,536 pages"),
+        inline,
+    }
+}
+
+/// [`emit_module`] for functions that are PRODUCED as they are emitted: `funcs` yields
+/// them one at a time, in the ascending order of `addrs` (which names every one up front,
+/// since the address table and the funcref table are sized before the code section), and
+/// `guest_instructions` is their total `arm_count`. A caller that lifts each function
+/// just before it is written holds ONE function's IR at a time instead of the program's -
+/// see `transpile_lenient`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_module_streamed(
+    addrs: Vec<u32>,
+    guest_instructions: u64,
+    funcs: impl Iterator<Item = Func>,
+    func_index: &BTreeMap<u32, u32>,
+    base: u32,
+    mem_bytes: u32,
+    inline_imports: &[crate::InlineImport],
+    import_memory: bool,
+    host_off: u32,
+) -> EmitOutput {
+    // Every emitted memory access on this thread is shifted by this from here on - see
+    // `Body::raw`. A host offset only makes sense for an imported memory: a self-contained
+    // module's memory starts where its layout starts.
+    assert!(host_off == 0 || import_memory, "a host offset needs an imported memory");
+    HOST_OFF.with(|c| c.set(host_off as u64));
+    // >>> THE FUNCTIONS ARE TAKEN BY VALUE AND DROPPED ONE BY ONE AS THEY ARE EMITTED.
+    //
+    // The lifted IR of one retail title is 7.5 million statements at 80 bytes each - about
+    // 605 MB of statement vectors before the blocks and maps that hold them - and its module
+    // is 369 MB. The old shape held all of the IR for the whole of emission and then held
+    // the module TWICE (the code section's own buffer, then the copy `Module::finish` made
+    // of everything), so the transpile worker of that title peaked at 3,884 MB against
+    // wasm32's 4,096 MB ceiling: 212 MB from failing on a desktop, and the first thing a
+    // phone hits. Emission now frees each function's IR as its body is written, and the
+    // bodies go straight into the final byte vector (see the code section below), so the
+    // peak is the IR alone and the module grows into the room the IR gives back.
+    let types = module_types();
+    let func_ty = GUEST_TY;
+    let dispatch_ty = DISPATCH_TY;
+
+    let Layout { n, addr_table_off, buckets, mirror_off, arm_word_off, dirty_off, runtime_off, total_pages, inline } =
+        plan_layout(&addrs, mem_bytes, inline_imports);
+    let total_pages = total_pages as u64;
 
     // Preemptive multithreading (the native `ThreadedScheduler`) runs each guest
     // thread as its own instance so their register globals stay independent, but
@@ -2769,58 +3074,14 @@ pub fn emit_module_streamed(
     // defining its own; single-instance hosts leave it off and get the original
     // self-contained module unchanged. The memory index is 0 either way (it is the
     // only memory), so every load/store and the `memory` export are identical.
-    let mut imports = ImportSection::new();
-    imports.import(abi::IMPORT_MODULE, abi::SVC_NAME, wasm_encoder::EntityType::Function(host_ty));
-    imports.import(abi::IMPORT_MODULE, abi::IMPORT_NAME, wasm_encoder::EntityType::Function(host_ty));
-    // `env.dispatch_miss(target, caller)`: reported when an indirect call resolves to
-    // no known function (see `emit_dispatch`). Declared as a function import, so it
-    // takes function index `DISPATCH_MISS_FUNC` before any guest function.
-    imports.import(
-        abi::IMPORT_MODULE,
-        abi::DISPATCH_MISS_NAME,
-        wasm_encoder::EntityType::Function(dispatch_ty),
-    );
-    // `env.import_fast(selector)`: the same trap as `env.import` for a NID the host has
-    // named as never suspending - see `InlineOp::Fast`. Function index `IMPORT_FAST_FUNC`.
-    imports.import(abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME, wasm_encoder::EntityType::Function(host_ty));
+    let mut imports = host_imports();
     // An SMP module is still a valid module over an UNSHARED memory (wasm atomics are defined
     // on one), which is what lets the single-threaded ARM conformance corpus run it to prove the
     // exclusive forms equal to the oracle. Running it on several workers needs a shared memory,
     // and that is the web host's check to make, not the emitter's.
-    if import_memory && host_off != 0 {
-        // >>> THE GUEST REGION INSIDE THE HOST'S OWN MEMORY (see `Program::host_off`).
-        // The memory is the host module's, so it is not fixed - it grows with the host's
-        // heap. The minimum declared is the end of the guest layout, so instantiation fails
-        // by name if the host has not reserved that far. An unshared host memory declares no
-        // maximum, so neither does the import; a SHARED one (the wasm-threads bundle) must
-        // declare one, and so must its import - see `SHARED_HOST_MEMORY`.
-        let end_pages = (host_off as u64 + total_pages * abi::PAGE_SIZE as u64).div_ceil(abi::PAGE_SIZE as u64);
-        let shared = shared_host_memory();
-        imports.import(
-            abi::IMPORT_MODULE,
-            abi::MEMORY_EXPORT,
-            wasm_encoder::EntityType::Memory(MemoryType {
-                minimum: end_pages,
-                maximum: shared.then_some(SHARED_MEMORY_MAX_PAGES),
-                memory64: false,
-                shared,
-                page_size_log2: None,
-            }),
-        );
-    } else if import_memory {
-        // A shared memory must declare a maximum; the guest never grows memory, so
-        // pin max == min at the provisioned size (guest region + dispatch table).
-        imports.import(
-            abi::IMPORT_MODULE,
-            abi::MEMORY_EXPORT,
-            wasm_encoder::EntityType::Memory(MemoryType {
-                minimum: total_pages,
-                maximum: Some(total_pages),
-                memory64: false,
-                shared: true,
-                page_size_log2: None,
-            }),
-        );
+    let memory = memory_type(import_memory, host_off, total_pages);
+    if import_memory {
+        imports.import(abi::IMPORT_MODULE, abi::MEMORY_EXPORT, wasm_encoder::EntityType::Memory(memory));
     }
 
     let mut function_section = FunctionSection::new();
@@ -2838,116 +3099,25 @@ pub fn emit_module_streamed(
 
     // The dense funcref table the dispatcher's `call_indirect` jumps through:
     // `table[i]` is the i-th translated function in ascending-address order, so the
-    // index the binary search returns indexes it directly. Sized exactly to the
-    // function count (this is the only per-instance dispatch cost).
+    // index the binary search returns indexes it directly. Sized to the function count
+    // (this is the only per-instance dispatch cost) and growable: code found at run time
+    // is installed above the main module's functions (see `crate::transpile_side`).
     let mut tables = TableSection::new();
-    tables.table(TableType {
-        element_type: RefType::FUNCREF,
-        table64: false,
-        minimum: n as u64,
-        maximum: Some(n as u64),
-        shared: false,
-    });
+    tables.table(table_type(n));
 
     let mut mems = MemorySection::new();
     if !import_memory {
-        mems.memory(MemoryType {
-            minimum: total_pages,
-            maximum: None,
-            memory64: false,
-            shared: false,
-            page_size_log2: None,
-        });
+        mems.memory(memory);
     }
 
-    // Globals, in ABI order: 16 registers + 4 integer flags (i32), then the VFP/NEON
-    // register file - 32 single-precision S registers (raw-bit i32) and 8 upper
-    // quad registers Q8..Q15 (v128) - then 4 FP condition flags (i32).
+    let module_globals = module_globals(mirror_off);
     let mut globals = GlobalSection::new();
-    let i32_global =
-        GlobalType { val_type: ValType::I32, mutable: true, shared: false };
-    let v128_global =
-        GlobalType { val_type: ValType::V128, mutable: true, shared: false };
-    for _ in 0..abi::GLOBAL_COUNT {
-        globals.global(i32_global, &ConstExpr::i32_const(0));
-    }
-    for _ in 0..abi::VFP_S_COUNT {
-        globals.global(i32_global, &ConstExpr::i32_const(0));
-    }
-    for _ in 0..abi::VFP_Q_HI_COUNT {
-        globals.global(v128_global, &ConstExpr::v128_const(0));
-    }
-    for _ in 0..abi::FP_FLAG_COUNT {
-        globals.global(i32_global, &ConstExpr::i32_const(0));
-    }
-    // Three extra i32 globals, always present so their indices are stable and unused
-    // (zero, no runtime cost) in a normal build: the store watchpoint's "armed" latch
-    // (see `watch_store_addr`), the guest-PC tracker (see `track_pc`), and the
-    // read-watchpoint match counter (see `watch_read_skip`).
-    globals.global(i32_global, &ConstExpr::i32_const(0)); // WATCH_ARMED_GLOBAL
-    globals.global(i32_global, &ConstExpr::i32_const(0)); // GUEST_PC_GLOBAL
-    globals.global(i32_global, &ConstExpr::i32_const(0)); // WATCH_READ_COUNT_GLOBAL
-    // The per-thread pointer (TPIDRURO / TLS base). Per-instance, set by the host at
-    // thread instantiation; read by `MRC p15,0,Rt,c13,c0,3` (see `abi::TP_GLOBAL`).
-    globals.global(i32_global, &ConstExpr::i32_const(0)); // TP_GLOBAL
-    globals.global(i32_global, &ConstExpr::i32_const(0)); // WATCH_STORE_COUNT_GLOBAL
-    // The software WORK counter (see `emit_fuel_check` and `abi::WORK_GLOBAL`): guest
-    // instructions in its high half, operators since the last yield in its low half. Both
-    // start at zero - the operator half counts UP to the interval now, so a fresh thread
-    // is at the START of its quantum rather than needing to be seeded with one.
-    let i64_global = GlobalType { val_type: ValType::I64, mutable: true, shared: false };
-    globals.global(i64_global, &ConstExpr::i64_const(0)); // WORK_GLOBAL
-    if smp() {
-        // The per-instance exclusive monitor - see `EXCL_ADDR_GLOBAL`.
-        globals.global(i32_global, &ConstExpr::i32_const(0)); // EXCL_ADDR_GLOBAL
-        globals.global(i32_global, &ConstExpr::i32_const(0)); // EXCL_VAL_GLOBAL
-        globals.global(i64_global, &ConstExpr::i64_const(0)); // EXCL_VAL64_GLOBAL
-        // The preempt word's layout offset - see `PREEMPT_GLOBAL`. The mirror page exists in
-        // every build, so the "never set" slot is always a real, zero word.
-        let never = mirror_off.map_or(0, |m| m + 4 * u64::from(abi::PREEMPT_SLOT_BASE - 1));
-        globals.global(i32_global, &ConstExpr::i32_const(never as i32)); // PREEMPT_GLOBAL
-        globals.global(i32_global, &ConstExpr::i32_const(0)); // THREAD_ID_GLOBAL
-        globals.global(i32_global, &ConstExpr::i32_const(0)); // CUR_THREAD_GLOBAL
-        globals.global(i32_global, &ConstExpr::i32_const(0)); // ELIDE_GLOBAL
-        globals.global(i32_global, &ConstExpr::i32_const(0)); // EXCL_VER_GLOBAL
+    for (ty, init) in &module_globals {
+        globals.global(*ty, init);
     }
 
     let mut exports = ExportSection::new();
-    exports.export(abi::MEMORY_EXPORT, ExportKind::Memory, 0);
-    for i in 0..abi::REG_COUNT {
-        exports.export(&abi::reg_export(i), ExportKind::Global, abi::reg_global(i));
-    }
-    for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
-        exports.export(abi::flag_export(f), ExportKind::Global, abi::flag_global(f));
-    }
-    // Export the VFP/NEON register file so the host can seed/read FP state (tests,
-    // GXM capture). S0..S31 (i32), Q8..Q15 (v128), and the FP flags. The host only
-    // marshals the low-bank S registers; the v128 quads are exported for
-    // completeness (JS cannot read them, but native hosts and tools can).
-    for n in 0..abi::VFP_S_COUNT as u8 {
-        exports.export(&abi::vfp_s_export(n), ExportKind::Global, abi::vfp_s_global(n));
-    }
-    for q in abi::VFP_Q_HI_FIRST as u8..(abi::VFP_Q_HI_FIRST + abi::VFP_Q_HI_COUNT) as u8 {
-        exports.export(&abi::vfp_qhi_export(q), ExportKind::Global, abi::vfp_qhi_global(q));
-    }
-    for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
-        exports.export(abi::fp_flag_export(f), ExportKind::Global, abi::fp_flag_global(f));
-    }
-    // The guest-PC tracker, so the host can read the faulting block address on a trap
-    // (zero unless `VITASLOP_TRACK_PC` is set at emit time; see `track_pc`).
-    exports.export(abi::GUEST_PC_EXPORT, ExportKind::Global, GUEST_PC_GLOBAL);
-    // The per-thread pointer, so the host seeds each thread's TLS base at instantiation.
-    exports.export(abi::TP_EXPORT, ExportKind::Global, abi::TP_GLOBAL);
-    // The software fuel counter, so a host can see how much of a thread's quantum is
-    // left. Always exported (like `guest_pc`) so the export list does not depend on a
-    // build option; it reads 0 and never moves unless fuel was asked for.
-    exports.export(abi::FUEL_EXPORT, ExportKind::Global, abi::WORK_GLOBAL);
-    if smp() {
-        exports.export(abi::PREEMPT_EXPORT, ExportKind::Global, PREEMPT_GLOBAL);
-        exports.export(abi::THREAD_ID_EXPORT, ExportKind::Global, THREAD_ID_GLOBAL);
-        exports.export(abi::CUR_THREAD_EXPORT, ExportKind::Global, CUR_THREAD_GLOBAL);
-        exports.export(abi::ELIDE_EXPORT, ExportKind::Global, ELIDE_GLOBAL);
-    }
+    state_exports(&mut exports, module_globals.len() as u32);
 
     // Populate the dense funcref table: table[i] = the i-th translated function
     // (wasm index IMPORT_FUNCS + i), matching the ascending-address order of `funcs`
@@ -3022,7 +3192,8 @@ pub fn emit_module_streamed(
         // `func` drops here: its IR is not needed again.
     }
     assert_eq!(emitted, addrs.len(), "every function `addrs` names must be emitted");
-    emit_dispatch(n, addr_table_off, buckets.as_ref().map(|(base, b)| (*base, b.len() as u32 - 1))).encode(&mut wasm);
+    emit_dispatch(n, addr_table_off, buckets.as_ref().map(|(base, b)| (*base, b.len() as u32 - 1)), runtime_off)
+        .encode(&mut wasm);
     emit_reset().encode(&mut wasm);
     let contents_len = u32::try_from(wasm.len() - contents_at)
         .expect("a wasm code section is at most 4 GB");
@@ -3055,6 +3226,7 @@ pub fn emit_module_streamed(
         arm_word_off,
         mirror_off,
         dirty_off,
+        runtime_off,
         expansion,
     }
 }
@@ -3158,6 +3330,127 @@ fn emit_reset() -> Function {
     f
 }
 
+thread_local! {
+    /// While a SIDE module is emitted on this thread: the main module's ascending function
+    /// addresses, so a direct call to one of them goes through its slot in the shared table
+    /// (`table[i]` is the main module's i-th function).
+    static SIDE_MAIN: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The table slot of the main module's function at `target`, while a side module is emitted.
+fn side_main_slot(target: u32) -> Option<u32> {
+    SIDE_MAIN.with(|m| m.borrow().as_ref().and_then(|a| a.binary_search(&target).ok()).map(|i| i as u32))
+}
+
+/// Clears the side-emission cells when a side emission ends, however it ends, so a main
+/// module emitted later on the same thread is not emitted as a side module.
+struct SideScope;
+impl Drop for SideScope {
+    fn drop(&mut self) {
+        SIDE_DISPATCH.with(|c| c.set(None));
+        SIDE_MAIN.with(|m| *m.borrow_mut() = None);
+    }
+}
+
+/// >>> A SIDE MODULE: guest functions found at RUN time, emitted to link against a running
+/// main module - see [`crate::transpile_side`].
+///
+/// It shares everything with the main module except its own code. Its imports are the main
+/// module's host functions and memory, under the same names and in the same order, then the
+/// main instance's dispatcher, table and every global (`abi::MAIN_MODULE`), all in index order
+/// - so the function, global, memory and table indices its code is emitted with mean exactly
+/// what they mean in the main module, and the code is emitted by the very same `emit_func`.
+/// The layout is planned again from the main module's `main_addrs` with this thread's emit
+/// settings (which the caller must have made the main module's - see [`EmitSettings`]).
+///
+/// It exports the main module's state under the main module's names (see [`state_exports`]) and
+/// no function of its own. An active element segment writes its functions into the shared table at
+/// `slot_base..` when it is instantiated, so the host must have grown the table that far first;
+/// from then on the dispatcher reaches them through the runtime entry table.
+///
+/// Within the module, a direct call reaches another of its functions directly and a main
+/// module function through its table slot; anything else would be a callee discovery did not
+/// lift, and traps as it does in a main module.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_side_module(
+    main_addrs: &[u32],
+    funcs: Vec<Func>,
+    slot_base: u32,
+    base: u32,
+    mem_bytes: u32,
+    inline_imports: &[crate::InlineImport],
+    import_memory: bool,
+    host_off: u32,
+) -> Vec<u8> {
+    assert!(host_off == 0 || import_memory, "a host offset needs an imported memory");
+    HOST_OFF.with(|c| c.set(host_off as u64));
+    let Layout { n, mirror_off, total_pages, inline, .. } = plan_layout(main_addrs, mem_bytes, inline_imports);
+    let _scope = SideScope;
+    // The main module's dispatcher, imported right after the host functions.
+    let dispatch = IMPORT_FUNCS;
+    SIDE_DISPATCH.with(|c| c.set(Some(dispatch)));
+    SIDE_MAIN.with(|m| *m.borrow_mut() = Some(main_addrs.to_vec()));
+
+    let mut imports = host_imports();
+    imports.import(abi::MAIN_MODULE, abi::DISPATCH_EXPORT, wasm_encoder::EntityType::Function(DISPATCH_TY));
+    let memory = memory_type(import_memory, host_off, total_pages as u64);
+    if import_memory {
+        imports.import(abi::IMPORT_MODULE, abi::MEMORY_EXPORT, wasm_encoder::EntityType::Memory(memory));
+    } else {
+        imports.import(abi::MAIN_MODULE, abi::MEMORY_EXPORT, wasm_encoder::EntityType::Memory(memory));
+    }
+    imports.import(abi::MAIN_MODULE, abi::TABLE_EXPORT, wasm_encoder::EntityType::Table(table_type(n)));
+    let globals = module_globals(mirror_off);
+    for (i, (ty, _)) in globals.iter().enumerate() {
+        imports.import(abi::MAIN_MODULE, &abi::global_export(i as u32), wasm_encoder::EntityType::Global(*ty));
+    }
+    // ...and hands all of it back out under the main module's names, so a host function its code
+    // calls reads the registers through the caller's exports as it would from the main module.
+    let mut exports = ExportSection::new();
+    state_exports(&mut exports, globals.len() as u32);
+
+    let first = IMPORT_FUNCS + 1;
+    let func_index: BTreeMap<u32, u32> =
+        funcs.iter().enumerate().map(|(i, f)| (f.addr, first + i as u32)).collect();
+    let mut function_section = FunctionSection::new();
+    for _ in &funcs {
+        function_section.function(GUEST_TY);
+    }
+    let mut elements = ElementSection::new();
+    if !funcs.is_empty() {
+        let entries: Vec<u32> = (0..funcs.len() as u32).map(|i| first + i).collect();
+        elements.active(
+            Some(0),
+            &ConstExpr::i32_const(slot_base as i32),
+            Elements::Functions(Cow::Owned(entries)),
+        );
+    }
+    let mut code = wasm_encoder::CodeSection::new();
+    let mut expansion = Expansion::default();
+    for func in &funcs {
+        code.function(&emit_func(func, &func_index, base, &inline, &mut expansion));
+    }
+
+    let mut module = Module::new();
+    module
+        .section(&module_types())
+        .section(&imports)
+        .section(&function_section)
+        .section(&exports)
+        .section(&elements)
+        .section(&code);
+    if emit_wasm_names() {
+        let mut names = NameMap::new();
+        for (i, f) in funcs.iter().enumerate() {
+            names.append(first + i as u32, &format!("s_{:08x}", f.addr));
+        }
+        let mut name_section = NameSection::new();
+        name_section.functions(&names);
+        module.section(&name_section);
+    }
+    module.finish()
+}
+
 /// Emit the indirect-call dispatcher: `(target: i32, caller: i32) -> ()`. It masks
 /// the Thumb bit off the runtime function-pointer and binary-searches the ascending
 /// address table (a data segment at `addr_table_off`; see [`emit_module`]) for the
@@ -3200,18 +3493,30 @@ pub(crate) fn dispatch_buckets(addrs: &[u32]) -> Option<(u32, Vec<u32>)> {
     Some((base, buckets))
 }
 
-fn emit_dispatch(n: u32, addr_table_off: u64, buckets: Option<(u32, u32)>) -> Function {
-    // Locals beyond the two params: lo, hi, mid, v (the loaded table entry).
+fn emit_dispatch(n: u32, addr_table_off: u64, buckets: Option<(u32, u32)>, runtime_off: u64) -> Function {
+    // Locals beyond the two params: lo, hi, mid, v (the loaded table entry), and the target
+    // as the guest branched to it, Thumb bit and all - the mode a runtime entry is made in.
     const P_TARGET: u32 = 0;
     const P_CALLER: u32 = 1;
     const L_LO: u32 = 2;
     const L_HI: u32 = 3;
     const L_MID: u32 = 4;
     const L_V: u32 = 5;
+    const L_ORIG: u32 = 6;
     let mut f = Body::new();
+    // Every way out calls the found function last, so it is a tail call when they are on:
+    // the dispatcher's own frame is not left on the stack under every guest call.
+    let call = |table_index| {
+        if tail_calls() {
+            W::ReturnCallIndirect { type_index: GUEST_TY, table_index }
+        } else {
+            W::CallIndirect { type_index: GUEST_TY, table_index }
+        }
+    };
 
     // target &= ~1  (clear the Thumb bit; function addresses are even).
     f.instruction(&W::LocalGet(P_TARGET));
+    f.instruction(&W::LocalTee(L_ORIG));
     f.instruction(&W::I32Const(!1));
     f.instruction(&W::I32And);
     f.instruction(&W::LocalSet(P_TARGET));
@@ -3298,7 +3603,7 @@ fn emit_dispatch(n: u32, addr_table_off: u64, buckets: Option<(u32, u32)>) -> Fu
         f.instruction(&W::End);
     }
     f.instruction(&W::LocalGet(L_MID));
-    f.instruction(&W::CallIndirect { type_index: 1 /* guest () -> () */, table_index: 0 });
+    f.instruction(&call(0));
     f.instruction(&W::Return);
     f.instruction(&W::End);
 
@@ -3320,13 +3625,76 @@ fn emit_dispatch(n: u32, addr_table_off: u64, buckets: Option<(u32, u32)>) -> Fu
     f.instruction(&W::End); // loop
     f.instruction(&W::End); // block $done
 
-    // Not found: report the unmapped target (with its caller) and trap.
+    // Not one of the main module's functions. Code found at run time is in the RUNTIME ENTRY
+    // TABLE (see `RUNTIME_ENTRY_PAIRS`): probe it from the target's hash until its key or an
+    // empty pair. A slot found there is called only once THIS instance's table holds it -
+    // another instance may have made the entry, and installing it here is the host's.
+    //
+    //   h = hash(target)
+    //   block $slow { loop $probe {
+    //     v = key[h]
+    //     if v == target { mid = slot[h]; if mid < table.size && table[mid] != null { call mid } ; br $slow }
+    //     br_if $slow (v == 0)
+    //     h = (h + 1) & mask; br $probe } }
+    let pair = |f: &mut Body, offset: u64| {
+        f.instruction(&W::LocalGet(L_LO));
+        f.instruction(&W::I32Const(3));
+        f.instruction(&W::I32Shl);
+        f.instruction(&W::I32Load(MemArg { offset: runtime_off + offset, align: 2, memory_index: 0 }));
+    };
     f.instruction(&W::LocalGet(P_TARGET));
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::I32ShrU);
+    f.instruction(&W::I32Const(0x9E37_79B1_u32 as i32));
+    f.instruction(&W::I32Mul);
+    f.instruction(&W::I32Const((32 - RUNTIME_ENTRY_PAIRS.trailing_zeros()) as i32));
+    f.instruction(&W::I32ShrU);
+    f.instruction(&W::LocalSet(L_LO));
+    f.instruction(&W::Block(BlockType::Empty)); // $slow
+    f.instruction(&W::Loop(BlockType::Empty)); // $probe
+    pair(&mut f, 0);
+    f.instruction(&W::LocalTee(L_V));
+    f.instruction(&W::LocalGet(P_TARGET));
+    f.instruction(&W::I32Eq);
+    f.instruction(&W::If(BlockType::Empty));
+    pair(&mut f, 4);
+    f.instruction(&W::LocalTee(L_MID));
+    f.instruction(&W::TableSize(0));
+    f.instruction(&W::I32LtU);
+    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::LocalGet(L_MID));
+    f.instruction(&W::TableGet(0));
+    f.instruction(&W::RefIsNull);
+    f.instruction(&W::I32Eqz);
+    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::LocalGet(L_MID));
+    f.instruction(&call(0));
+    f.instruction(&W::Return);
+    f.instruction(&W::End);
+    f.instruction(&W::End);
+    f.instruction(&W::Br(2)); // -> $slow
+    f.instruction(&W::End);
+    f.instruction(&W::LocalGet(L_V));
+    f.instruction(&W::I32Eqz);
+    f.instruction(&W::BrIf(1)); // -> $slow
+    f.instruction(&W::LocalGet(L_LO));
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::I32Const((RUNTIME_ENTRY_PAIRS - 1) as i32));
+    f.instruction(&W::I32And);
+    f.instruction(&W::LocalSet(L_LO));
+    f.instruction(&W::Br(0)); // continue $probe
+    f.instruction(&W::End); // loop
+    f.instruction(&W::End); // block $slow
+
+    // New code, or code this instance has not installed: the host translates or installs it
+    // and says which slot it is in. The target goes as the guest branched to it.
+    f.instruction(&W::LocalGet(L_ORIG));
     f.instruction(&W::LocalGet(P_CALLER));
     f.instruction(&W::Call(DISPATCH_MISS_FUNC));
-    f.instruction(&W::Unreachable);
+    f.instruction(&call(0));
     f.instruction(&W::End); // function body
-    f.into_function([(4, ValType::I32)])
+    f.into_function([(5, ValType::I32)])
 }
 
 /// Emit one guest function as a wasm function: a dispatch loop over its blocks.
@@ -3440,6 +3808,36 @@ thread_local! {
     /// Per-thread override of the block-trace ranges - see [`set_trace_blocks`].
     static TRACE_BLOCKS: std::cell::RefCell<Option<Vec<(u32, u32)>>> =
         const { std::cell::RefCell::new(None) };
+    /// Per-thread override of the tail-call form - see [`set_tail_calls`].
+    static TAIL_CALLS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// >>> A CALL THAT IS IMMEDIATELY FOLLOWED BY A RETURN IS EMITTED AS A WASM TAIL CALL.
+///
+/// A guest tail jump - `bx rN`, `ldr pc, [..]`, `mov pc, rN`, or a `b` to another function -
+/// was lowered as "call the target, then return", which is the same thing except that the
+/// wasm stack keeps our frame until the callee returns. Code that never returns through such
+/// a chain grows the stack without bound: an INTERPRETER whose every opcode handler ends by
+/// jumping to the next one's address is exactly that, one frame (two, with the dispatcher)
+/// per guest instruction it interprets, and a loop of a million turns overflows. A tail call
+/// replaces our frame instead.
+///
+/// It also fixes the conditional form. `bxne r3` was `if ne { call }; return if ne` - and the
+/// second test reads the flags AFTER the callee ran, so a callee that cleared Z sent us on
+/// into the next instruction of a function the device had already left.
+///
+/// ON by default; `VITASLOP_TAIL_CALLS=0` is the arm that restores call-then-return.
+pub fn tail_calls() -> bool {
+    use std::sync::OnceLock;
+    static FROM_ENV: OnceLock<bool> = OnceLock::new();
+    TAIL_CALLS.with(|c| c.get()).unwrap_or_else(|| {
+        *FROM_ENV.get_or_init(|| std::env::var("VITASLOP_TAIL_CALLS").map(|v| v.trim() != "0").unwrap_or(true))
+    })
+}
+
+/// Choose the tail-call form for modules emitted on this thread, overriding the knob above.
+pub fn set_tail_calls(on: bool) {
+    TAIL_CALLS.with(|c| c.set(Some(on)));
 }
 
 /// Whether emitted modules hold the low NEON bank in locals across a run of vector
@@ -3511,6 +3909,12 @@ pub fn codegen_fingerprint() -> String {
         u8::from(promote_registers()),
         u8::from(function_exports()),
     );
+    if !tail_calls() {
+        s.push_str(";tail0");
+    }
+    if !nonlocal_returns() {
+        s.push_str(";nonlocal0");
+    }
     let blocks = trace_blocks_ranges();
     if !blocks.is_empty() {
         let _ = write!(s, ";trace{blocks:x?}");
@@ -3521,6 +3925,94 @@ pub fn codegen_fingerprint() -> String {
         }
     }
     s
+}
+
+/// >>> THE EMIT SETTINGS OF ONE THREAD, TAKEN SO ANOTHER THREAD CAN EMIT UNDER THEM.
+///
+/// Every setting above is thread-local, because a test binary emits several modules at once.
+/// Code found at RUN time (see `crate::transpile_side`) is emitted on whichever thread reached
+/// it - a guest worker, which never had the transpile thread's settings applied - and a side
+/// module emitted under different settings than its main module would disagree with it about
+/// the very layout they share. So the host takes these where it applied the main module's
+/// settings and applies them on the thread that emits a side module.
+///
+/// The RAW cells are copied, not their resolved values: a cell left unset still reads the
+/// environment there, which on the desktop is the same process-wide environment, and in the
+/// browser is no environment on either thread.
+#[derive(Clone, Debug, Default)]
+pub struct EmitSettings {
+    dirty_tracking: u8,
+    dirty_run_marks: u8,
+    dirty_mark_test: u8,
+    knobs: Vec<(String, String)>,
+    fuel_interval: u32,
+    shared_host_memory: bool,
+    smp: bool,
+    function_exports: bool,
+    promote: Option<bool>,
+    wide_c: Option<bool>,
+    dispatch_all: Option<bool>,
+    names: Option<bool>,
+    neon_cache: Option<bool>,
+    track_pc: Option<bool>,
+    guest_prof: bool,
+    trace_blocks: Option<Vec<(u32, u32)>>,
+    tail_calls: Option<bool>,
+    nonlocal_returns: Option<bool>,
+}
+
+impl EmitSettings {
+    /// This thread's settings, as they stand.
+    pub fn capture() -> EmitSettings {
+        let mut knobs: Vec<(String, String)> =
+            EMIT_KNOBS.with(|m| m.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        knobs.sort();
+        EmitSettings {
+            dirty_tracking: DIRTY_TRACKING.with(|c| c.get()),
+            dirty_run_marks: DIRTY_RUN_MARKS.with(|c| c.get()),
+            dirty_mark_test: DIRTY_MARK_TEST.with(|c| c.get()),
+            knobs,
+            fuel_interval: FUEL_INTERVAL.with(|c| c.get()),
+            shared_host_memory: SHARED_HOST_MEMORY.with(|c| c.get()),
+            smp: SMP.with(|c| c.get()),
+            function_exports: FUNCTION_EXPORTS.with(|c| c.get()),
+            promote: PROMOTE_REGS.with(|c| c.get()),
+            wide_c: FLAGS_WIDE_C.with(|c| c.get()),
+            dispatch_all: DISPATCH_ALL.with(|c| c.get()),
+            names: WASM_NAMES.with(|c| c.get()),
+            neon_cache: NEON_CACHE.with(|c| c.get()),
+            track_pc: TRACK_PC.with(|c| c.get()),
+            guest_prof: GUEST_PROF.with(|c| c.get()),
+            trace_blocks: TRACE_BLOCKS.with(|c| c.borrow().clone()),
+            tail_calls: TAIL_CALLS.with(|c| c.get()),
+            nonlocal_returns: NONLOCAL_RETURNS.with(|c| c.get()),
+        }
+    }
+
+    /// Make these this thread's settings.
+    pub fn apply(&self) {
+        DIRTY_TRACKING.with(|c| c.set(self.dirty_tracking));
+        DIRTY_RUN_MARKS.with(|c| c.set(self.dirty_run_marks));
+        DIRTY_MARK_TEST.with(|c| c.set(self.dirty_mark_test));
+        EMIT_KNOBS.with(|m| m.borrow_mut().clear());
+        for (k, v) in &self.knobs {
+            set_emit_knob(k, v);
+        }
+        FUEL_INTERVAL.with(|c| c.set(self.fuel_interval));
+        SHARED_HOST_MEMORY.with(|c| c.set(self.shared_host_memory));
+        SMP.with(|c| c.set(self.smp));
+        FUNCTION_EXPORTS.with(|c| c.set(self.function_exports));
+        PROMOTE_REGS.with(|c| c.set(self.promote));
+        FLAGS_WIDE_C.with(|c| c.set(self.wide_c));
+        DISPATCH_ALL.with(|c| c.set(self.dispatch_all));
+        WASM_NAMES.with(|c| c.set(self.names));
+        NEON_CACHE.with(|c| c.set(self.neon_cache));
+        TRACK_PC.with(|c| c.set(self.track_pc));
+        GUEST_PROF.with(|c| c.set(self.guest_prof));
+        TRACE_BLOCKS.with(|c| *c.borrow_mut() = self.trace_blocks.clone());
+        TAIL_CALLS.with(|c| c.set(self.tail_calls));
+        NONLOCAL_RETURNS.with(|c| c.set(self.nonlocal_returns));
+    }
 }
 
 /// `VITASLOP_PROMOTE_POISON=<n>` - the FALSIFIER for register promotion. While a
@@ -3711,6 +4203,7 @@ fn emit_block_body(
     // whole block up front because the decision for a statement depends on the ones BEFORE
     // it, which `emit_stmt` cannot see from inside.
     let dirty_covered = plan_dirty_run(f, &block.stmts);
+    let tail_at = tail_call_at(block);
     for (i, stmt) in block.stmts.iter().enumerate() {
         // The low-bank NEON cache (see `NqState`) lives across a run of statements that
         // reach low-bank state only through the cache-aware accessors: the vector ops, a
@@ -3728,13 +4221,49 @@ fn emit_block_body(
             f.nq_enabled = true;
         }
         f.dirty_covered = dirty_covered[i];
+        f.tail_next = tail_at == Some(i);
         emit_stmt(f, stmt, func_index, base, inline, func.addr);
+        f.tail_next = false;
         f.dirty_covered = false;
     }
     // The terminator can leave the block, the function or the thread: the globals are the
     // state it hands on.
     nq_flush(f);
     f.nq_enabled = false;
+}
+
+/// The index of `block`'s statement that is a call the block returns straight after - so it
+/// is emitted as a wasm tail call (see [`tail_calls`]) - or `None`.
+///
+/// A call is in tail position when it is the last statement and the block then returns,
+/// either unconditionally or under the very condition the call itself ran under (the guarded
+/// form of a conditional `bx`). Under any other condition the return may not happen, and the
+/// code after the call is still live.
+fn tail_call_at(block: &Block) -> Option<usize> {
+    if !tail_calls() {
+        return None;
+    }
+    let last = block.stmts.len().checked_sub(1)?;
+    let is_call = |s: &Stmt| matches!(s, Stmt::Call { .. } | Stmt::CallIndirect { .. });
+    match (&block.term, &block.stmts[last]) {
+        (Term::Return, s) if is_call(s) => Some(last),
+        (Term::Return, Stmt::Guard(_, body)) if body.last().is_some_and(is_call) => Some(last),
+        (Term::ReturnIf { cond }, Stmt::Guard(c, body)) if c == cond && body.last().is_some_and(is_call) => Some(last),
+        _ => None,
+    }
+}
+
+thread_local! {
+    /// The wasm function index of the dispatcher for the module being emitted on this thread,
+    /// when it is not this module's own last function - a SIDE module imports it from the
+    /// main module (see [`emit_side_module`]).
+    static SIDE_DISPATCH: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The dispatcher's function index: the main module defines it after every guest function; a
+/// side module imports it.
+fn dispatch_func(func_index: &BTreeMap<u32, u32>) -> u32 {
+    SIDE_DISPATCH.with(|c| c.get()).unwrap_or(IMPORT_FUNCS + func_index.len() as u32)
 }
 
 /// Re-dispatch to the block at `target` address: set `$bb`, branch to the loop.
@@ -3794,13 +4323,13 @@ fn emit_term(f: &mut Body, term: &Term, func: &Func, base: u32, loop_depth: u32,
                 }
         }
         Term::Return => {
-            f.instruction(&W::Return);
+            emit_return(f, sets_ret(func, from));
         }
         // Return when the condition holds; otherwise this is a fall-through (see above).
         Term::ReturnIf { cond } => {
             emit_cond(f, *cond);
             f.instruction(&W::If(BlockType::Empty));
-            f.instruction(&W::Return);
+            emit_return(f, sets_ret(func, from));
             f.instruction(&W::End);
             if dispatch_all()
                 && let Some(next) = func
@@ -3821,7 +4350,7 @@ fn emit_term(f: &mut Body, term: &Term, func: &Func, base: u32, loop_depth: u32,
             if trap_halt() {
                 f.instruction(&W::Unreachable);
             } else {
-                f.instruction(&W::Return);
+                emit_return(f, sets_ret(func, from));
             }
         }
         Term::Unreachable => {
@@ -4075,6 +4604,11 @@ fn emit_stmt(
     // parked for the duration so a nested guard cannot steal it.
     let parent_children = std::mem::take(&mut f.stmt_child_ops);
     emit_stmt_inner(f, stmt, func_index, base, inline, func_addr);
+    // A direct call's return address is the `lr` the statement before it set.
+    f.lr_set = match stmt {
+        Stmt::SetReg(14, Value::Imm(lr)) => Some(*lr),
+        _ => None,
+    };
     let total = (f.billed + f.unbilled) - before;
     let own = total - std::mem::replace(&mut f.stmt_child_ops, parent_children + total);
     f.stmt_ops[kind as usize] += own;
@@ -4343,26 +4877,50 @@ fn emit_stmt_inner(
             // `bl` to a bogus address that is not a real function; trap there rather
             // than fail the whole emit - the block is off the real execution path, and
             // if somehow reached it faults loudly.
+            let tail = std::mem::take(&mut f.tail_next);
+            let ret = f.lr_set;
             guard_snapshot(f);
             match func_index.get(target) {
+                Some(&idx) if tail => {
+                    f.instruction(&W::ReturnCall(idx));
+                }
                 Some(&idx) => {
                     f.instruction(&W::Call(idx));
                     emit_prof_mark(f, func_addr);
                 }
-                None => {
-                    f.instruction(&W::Unreachable);
+                // A side module calling into the main module: through its slot in the table
+                // they share (see `emit_side_module`).
+                None => match side_main_slot(*target) {
+                    Some(slot) => {
+                        f.instruction(&W::I32Const(slot as i32));
+                        if tail {
+                            f.instruction(&W::ReturnCallIndirect { type_index: GUEST_TY, table_index: 0 });
+                        } else {
+                            f.instruction(&W::CallIndirect { type_index: GUEST_TY, table_index: 0 });
+                            emit_prof_mark(f, func_addr);
+                        }
+                    }
+                    None => {
+                        f.instruction(&W::Unreachable);
+                    }
+                },
+            }
+            if !tail {
+                guard_check(f);
+                if let Some(ret) = ret {
+                    emit_return_check(f, ret);
                 }
             }
-            guard_check(f);
         }
         Stmt::CallIndirect { addr, set_lr } => {
+            let tail = std::mem::take(&mut f.tail_next);
             guard_snapshot(f);
             // Push the runtime target address and this function's own address (as the
             // caller, for a `dispatch_miss` report), then call the module dispatcher,
-            // which resolves the target to the matching translated function. The
-            // dispatcher is the last defined function: IMPORT_FUNCS + one per guest
-            // func. Its signature is `(target, caller)`, so both are on the stack.
-            let dispatch = IMPORT_FUNCS + func_index.len() as u32;
+            // which resolves the target to the matching translated function. Its
+            // signature is `(target, caller)`, so both are on the stack.
+            let dispatch = dispatch_func(func_index);
+            let call = if tail { W::ReturnCall(dispatch) } else { W::Call(dispatch) };
             match set_lr {
                 // `blx rN`: snapshot the target BEFORE writing lr, because the target
                 // register can be lr itself (a compiler using lr as call-target
@@ -4374,19 +4932,26 @@ fn emit_stmt_inner(
                     f.instruction(&W::GlobalSet(abi::reg_global(14)));
                     f.instruction(&W::LocalGet(L_T0)); // target
                     f.instruction(&W::I32Const(func_addr as i32)); // caller
-                    f.instruction(&W::Call(dispatch));
-                    emit_prof_mark(f, func_addr);
+                    f.instruction(&call);
+                    if !tail {
+                        emit_prof_mark(f, func_addr);
+                        emit_return_check(f, *lr);
+                    }
                 }
                 // `bx rN` tail call: lr is untouched.
                 None => {
                     emit_value(f, addr, base); // target
                     f.instruction(&W::I32Const(func_addr as i32)); // caller
-                    f.instruction(&W::Call(dispatch));
+                    f.instruction(&call);
                 }
             }
-            guard_check(f);
+            if !tail {
+                guard_check(f);
+            }
         }
         Stmt::Guard(cond, body) => {
+            // A tail call under a condition stays one: it is the guard's own last statement.
+            let tail = std::mem::take(&mut f.tail_next);
             emit_cond(f, *cond);
             f.instruction(&W::If(BlockType::Empty));
             // A guard body is its own run: every statement in it is predicated on the SAME
@@ -4395,7 +4960,9 @@ fn emit_stmt_inner(
             let covered = plan_dirty_run(f, body);
             for (i, s) in body.iter().enumerate() {
                 f.dirty_covered = covered[i];
+                f.tail_next = tail && i + 1 == body.len();
                 emit_stmt(f, s, func_index, base, inline, func_addr);
+                f.tail_next = false;
                 f.dirty_covered = false;
             }
             f.instruction(&W::End);
@@ -4412,7 +4979,216 @@ fn emit_stmt_inner(
         Stmt::ShiftRegFlags { kind, rd, rn, amount, set_flags, live } => {
             emit_shift_reg_flags(f, *kind, *rd, rn, amount, *set_flags, *live, base)
         }
+        Stmt::Shifter { kind, rm, amount } => emit_shifter(f, *kind, rm, amount, base),
+        Stmt::SetRet(v) => {
+            if nonlocal_returns() {
+                emit_value(f, v, base);
+                f.instruction(&W::GlobalSet(ret_global()));
+            }
+        }
     }
+}
+
+/// >>> A RETURN THAT DOES NOT GO TO ITS CALLER IS A NON-LOCAL TRANSFER, AND IS FOLLOWED THERE.
+///
+/// A guest function is a wasm function and its return is a wasm `return`: control goes back
+/// to the wasm caller. That is the device's behaviour only while the guest returns where its
+/// caller called from. `longjmp`, a C++ exception's unwinder and an interpreter's own error
+/// unwinder do not: they reset `sp` and jump into a frame further up - an interpreter catching
+/// an error it raised (`lua_pcall`) does it on every error. Lowered as a return, that resumed
+/// the frames the guest had just discarded, which ran code the device never runs (the
+/// instructions after a call to a function that does not return) and soon faulted on a stack
+/// pointer of zero.
+///
+/// So every return records the address it really goes to (`lr`, or the pc a `pop {.., pc}`
+/// loads - [`Stmt::SetRet`]) in the RET global, and every call site checks it when the callee
+/// returns. A frame whose own return address it is carries on; any other frame is one the
+/// guest discarded, and returns at once, so the transfer travels up the wasm stack until it
+/// reaches the frame it was meant for. A few operators per call; `VITASLOP_NONLOCAL_RETURNS=0`
+/// is the arm without them.
+pub fn nonlocal_returns() -> bool {
+    use std::sync::OnceLock;
+    static FROM_ENV: OnceLock<bool> = OnceLock::new();
+    NONLOCAL_RETURNS.with(|c| c.get()).unwrap_or_else(|| {
+        *FROM_ENV.get_or_init(|| std::env::var("VITASLOP_NONLOCAL_RETURNS").map(|v| v.trim() != "0").unwrap_or(true))
+    })
+}
+
+/// Choose whether emitted modules follow non-local returns, overriding the knob above.
+pub fn set_nonlocal_returns(on: bool) {
+    NONLOCAL_RETURNS.with(|c| c.set(Some(on)));
+}
+
+thread_local! {
+    /// Per-thread override of [`nonlocal_returns`].
+    static NONLOCAL_RETURNS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The RET global: where the last guest return went (see [`nonlocal_returns`]). The last
+/// global, after the SMP ones in an SMP build, so no other index moves.
+fn ret_global() -> u32 {
+    if smp() { EXCL_VER_GLOBAL + 1 } else { abi::WORK_GLOBAL + 1 }
+}
+
+/// Whether the block of `func` at `addr` records its own return address - see [`block_sets_ret`].
+pub(super) fn sets_ret(func: &Func, addr: u32) -> bool {
+    func.block_index(addr).is_some_and(|i| block_sets_ret(&func.blocks[i]))
+}
+
+/// Whether `block` records its own return address ([`Stmt::SetRet`]), at any depth of guard.
+fn block_sets_ret(block: &Block) -> bool {
+    fn any(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|s| match s {
+            Stmt::SetRet(_) => true,
+            Stmt::Guard(_, body) => any(body),
+            _ => false,
+        })
+    }
+    any(&block.stmts)
+}
+
+/// A guest return: record where it goes - `lr`, unless the block said otherwise - then leave.
+fn emit_return(f: &mut Body, block_sets_ret: bool) {
+    if nonlocal_returns() && !block_sets_ret {
+        // Through `instruction`, so a promoted `lr` is read from its local.
+        f.instruction(&W::GlobalGet(abi::reg_global(abi::LR)));
+        f.instruction(&W::GlobalSet(ret_global()));
+    }
+    f.instruction(&W::Return);
+}
+
+/// After a call that set `lr` to `ret`: unless the callee returned there, this frame is one a
+/// non-local transfer discarded, and it returns too (see [`nonlocal_returns`]).
+fn emit_return_check(f: &mut Body, ret: u32) {
+    if !nonlocal_returns() {
+        return;
+    }
+    f.untolled(&W::GlobalGet(ret_global()));
+    f.untolled(&W::I32Const(!1));
+    f.untolled(&W::I32And);
+    f.untolled(&W::I32Const((ret & !1) as i32));
+    f.untolled(&W::I32Ne);
+    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::Return);
+    f.instruction(&W::End);
+}
+
+/// [`Stmt::Shifter`]: the operand into [`L_SHV`], its carry-out into [`L_SHC`], both exact
+/// for every amount `rs[7:0]` can hold. Scratch: L_T0 = rm, L_T1 = amount.
+///
+/// wasm `select` is `a b c -> (c != 0 ? a : b)`; every shift below is guarded by one, because
+/// a wasm shift takes its count mod 32 and ARM's does not.
+fn emit_shifter(f: &mut Body, kind: crate::ir::ShifterKind, rm: &Value, amount: &Value, base: u32) {
+    use crate::ir::ShifterKind::*;
+    emit_value(f, rm, base);
+    f.instruction(&W::LocalSet(L_T0));
+    if kind == Rrx {
+        // (rm >> 1) | (C << 31), carry-out rm[0].
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Const(1));
+        f.instruction(&W::I32ShrU);
+        f.instruction(&W::GlobalGet(abi::flag_global(abi::Flag::C)));
+        f.instruction(&W::I32Const(31));
+        f.instruction(&W::I32Shl);
+        f.instruction(&W::I32Or);
+        f.instruction(&W::LocalSet(L_SHV));
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Const(1));
+        f.instruction(&W::I32And);
+        f.instruction(&W::LocalSet(L_SHC));
+        return;
+    }
+    emit_value(f, amount, base);
+    f.instruction(&W::I32Const(0xff));
+    f.instruction(&W::I32And);
+    f.instruction(&W::LocalSet(L_T1));
+    let bit = |f: &mut Body, shift_from: &dyn Fn(&mut Body)| {
+        // (rm >> shift) & 1, shift on the stack from `shift_from`.
+        f.instruction(&W::LocalGet(L_T0));
+        shift_from(f);
+        f.instruction(&W::I32ShrU);
+        f.instruction(&W::I32Const(1));
+        f.instruction(&W::I32And);
+    };
+    let amount_minus_one = |f: &mut Body| {
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Const(1));
+        f.instruction(&W::I32Sub);
+    };
+    let below = |f: &mut Body, n: i32| {
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Const(n));
+        f.instruction(&W::I32LtU);
+    };
+    // The operand.
+    match kind {
+        Lsl | Lsr => {
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(if kind == Lsl { &W::I32Shl } else { &W::I32ShrU });
+            f.instruction(&W::I32Const(0));
+            below(f, 32);
+            f.instruction(&W::Select);
+        }
+        Asr => {
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32ShrS);
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Const(31));
+            f.instruction(&W::I32ShrS);
+            below(f, 32);
+            f.instruction(&W::Select);
+        }
+        // A rotate by any amount is a rotate by it mod 32.
+        Ror | Rrx => {
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Rotr);
+        }
+    }
+    f.instruction(&W::LocalSet(L_SHV));
+    // The carry-out for a non-zero amount...
+    match kind {
+        // amount <= 32 ? rm[32 - amount] : 0
+        Lsl => {
+            bit(f, &|f: &mut Body| {
+                f.instruction(&W::I32Const(32));
+                f.instruction(&W::LocalGet(L_T1));
+                f.instruction(&W::I32Sub);
+            });
+            f.instruction(&W::I32Const(0));
+            below(f, 33);
+            f.instruction(&W::Select);
+        }
+        // amount <= 32 ? rm[amount - 1] : 0
+        Lsr => {
+            bit(f, &amount_minus_one);
+            f.instruction(&W::I32Const(0));
+            below(f, 33);
+            f.instruction(&W::Select);
+        }
+        // amount <= 32 ? rm[amount - 1] : rm[31]
+        Asr => {
+            bit(f, &amount_minus_one);
+            bit(f, &|f: &mut Body| {
+                f.instruction(&W::I32Const(31));
+            });
+            below(f, 33);
+            f.instruction(&W::Select);
+        }
+        // rm[(amount - 1) mod 32]: the top bit of the result.
+        Ror | Rrx => bit(f, &|f: &mut Body| {
+            amount_minus_one(f);
+            f.instruction(&W::I32Const(31));
+            f.instruction(&W::I32And);
+        }),
+    }
+    // ...and the old carry for a zero one.
+    f.instruction(&W::GlobalGet(abi::flag_global(abi::Flag::C)));
+    f.instruction(&W::LocalGet(L_T1));
+    f.instruction(&W::Select);
+    f.instruction(&W::LocalSet(L_SHC));
 }
 
 /// Push byte `i` (0..3) of register `r`, zero-extended: `(r >> 8i) & 0xff`.
@@ -7859,6 +8635,12 @@ fn emit_value(f: &mut Body, v: &Value, base: u32) {
             // `emit_flags_add` left `a + b + cin` in L_T2; reuse it (see the IR doc).
             f.instruction(&W::LocalGet(L_T2));
         }
+        Value::ShifterOut => {
+            f.instruction(&W::LocalGet(L_SHV));
+        }
+        Value::ShifterCarry => {
+            f.instruction(&W::LocalGet(L_SHC));
+        }
         Value::Clz(a) => {
             emit_value(f, a, base);
             f.instruction(&W::I32Clz);
@@ -8562,6 +9344,10 @@ fn emit_lock_take(
     layout: crate::LwMutexLayout,
     thread_off: u64,
     lock: bool,
+    // A release to zero writes `NO_OWNER` (the lightweight form, whose SMP inline take reads a
+    // stale owner as a recursive take); the kernel form has no parallel take and keeps the
+    // owner word as its definition (`kmutex::fast_unlock`) leaves it.
+    clear_owner: bool,
     base: u32,
     index: u32,
 ) {
@@ -8632,10 +9418,22 @@ fn emit_lock_take(
         f.instruction(&W::LocalGet(L_T0));
         f.instruction(&W::LocalGet(L_T2));
         f.instruction(&W::I32Store(word_at(layout.owner)));
+    } else if clear_owner {
+        // A release to zero clears the owner, as `lwwork::fast_unlock` does - see
+        // `lwwork::NO_OWNER` (-1; thid 0 is a real thread, so it cannot mean "nobody").
+        // The two forms are held against each other per arm, and the SMP form's inline
+        // take reads a stale owner as a recursive take.
+        emit_watch_store_inline(f, base, L_T0, layout.owner, 4, index);
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Const(1));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::If(BlockType::Empty));
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Const(-1));
+        f.instruction(&W::I32Store(word_at(layout.owner)));
+        f.instruction(&W::End);
     }
-    // count += 1 (take) or -= 1 (release). The release deliberately leaves `owner`
-    // alone: every reader tests `count` first, and thid 0 is a real thread, so
-    // there is no owner value that could mean "nobody".
+    // count += 1 (take) or -= 1 (release).
     f.instruction(&W::LocalGet(L_T0));
     f.instruction(&W::LocalGet(L_T1));
     f.instruction(&W::I32Const(1));
@@ -9292,13 +10090,13 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::I32Const(table_off as i32));
             f.instruction(&W::I32Add);
             f.instruction(&W::LocalSet(L_T0));
-            emit_lock_take(f, layout, thread_off, lock, base, index);
+            emit_lock_take(f, layout, thread_off, lock, false, base, index);
             f.instruction(&W::End); // the predicate's `if`
             return;
         }
         Some(InlineLowering::LwMutex { layout, thread_off, limit, lock }) => {
             emit_pointer_guard(f, base, limit, index);
-            emit_lock_take(f, layout, thread_off, lock, base, index);
+            emit_lock_take(f, layout, thread_off, lock, true, base, index);
             f.instruction(&W::End); // the predicate's `if`
             f.instruction(&W::End); // the pointer guard's `if`
             return;
@@ -9654,46 +10452,7 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
                 // because a slot of zeros is this engine's own default and not an unbind the
                 // guest asked for - see `BindStateLayout::copy_slot_stride`.
                 //
-                // A LOOP rather than sixteen unrolled slots: this lowering is emitted at every
-                // call site of the bind, and a title binds states from many of them.
-                let stride = l.copy_slot_stride;
-                f.instruction(&W::I32Const(0));
-                f.instruction(&W::LocalSet(L_T3));
-                f.instruction(&W::Loop(BlockType::Empty));
-                // The slot's FIRST WORD decides: it is the texture's guest address, and zero
-                // there is what every reader already treats as "this unit is unbound".
-                f.instruction(&W::LocalGet(L_T2));
-                f.instruction(&W::LocalGet(L_T3));
-                f.instruction(&W::I32Add);
-                f.instruction(&W::I32Load(mem_arg()));
-                f.instruction(&W::I32Const(0));
-                f.instruction(&W::I32Ne);
-                f.instruction(&W::If(BlockType::Empty));
-                // dst = ctx + copy_dst + i, kept in a local so the watchpoint names THIS slot.
-                f.instruction(&W::LocalGet(L_T0));
-                f.instruction(&W::LocalGet(L_T3));
-                f.instruction(&W::I32Add);
-                f.instruction(&W::I32Const(l.copy_dst as i32));
-                f.instruction(&W::I32Add);
-                f.instruction(&W::LocalSet(L_SLOT));
-                emit_watch_store_inline(f, base, L_SLOT, 0, stride, index);
-                f.instruction(&W::LocalGet(L_SLOT));
-                emit_host_off(f);
-                f.instruction(&W::LocalGet(L_T2));
-                f.instruction(&W::LocalGet(L_T3));
-                f.instruction(&W::I32Add);
-                emit_host_off(f);
-                f.instruction(&W::I32Const(stride as i32));
-                f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
-                f.instruction(&W::End); // the non-empty test
-                f.instruction(&W::LocalGet(L_T3));
-                f.instruction(&W::I32Const(stride as i32));
-                f.instruction(&W::I32Add);
-                f.instruction(&W::LocalTee(L_T3));
-                f.instruction(&W::I32Const(l.copy_bytes as i32));
-                f.instruction(&W::I32LtU);
-                f.instruction(&W::BrIf(0));
-                f.instruction(&W::End); // the loop
+                emit_bind_state_slot_copy(f, base, 0, l.copy_dst, l.copy_bytes, l.copy_slot_stride, index);
             }
             // The stage's three-word uniform record: buffer, memoised size, program header.
             emit_watch_store_inline(f, base, L_T0, l.ctx_record, 12, index);
@@ -9709,7 +10468,11 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::LocalGet(L_T1));
             f.instruction(&W::I32Load(word_at(l.st_header_at)));
             f.instruction(&W::I32Store(word_at(l.ctx_record + 8)));
-            if l.table_bytes != 0 {
+            if l.table_bytes != 0 && l.table_slot_stride != 0 {
+                // The second copy PER SLOT, skipping empty ones - the vertex state's texture
+                // array, see `BindStateLayout::table_slot_stride`.
+                emit_bind_state_slot_copy(f, base, l.table_src, l.table_dst, l.table_bytes, l.table_slot_stride, index);
+            } else if l.table_bytes != 0 {
                 // The non-default uniform-buffer table, WHOLESALE - see
                 // `BindStateLayout::table_src`: the handler writes it replace-not-merge.
                 emit_watch_store_inline(f, base, L_T0, l.table_dst, l.table_bytes, index);

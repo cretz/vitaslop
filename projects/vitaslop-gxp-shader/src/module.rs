@@ -157,6 +157,11 @@ pub struct BindingPlan {
     /// that loads memory reaches its buffer through `sceGxmSetFragmentUniformBuffer`, which is
     /// a different table from the vertex stage's, so the two windows are bound separately.
     pub mem_windows: Vec<MemWindow>,
+    /// The buffers THIS (fragment) program's 0xF0 guest-memory STORES write through - see
+    /// [`resolve_store_windows`]. Empty for every program that does not store; a program that
+    /// does binds them as one writable mirror of the guest bytes (`gxp_fst`) plus a header block
+    /// (`gxp_sthdr`) in group 3 - see [`store_window_decl`].
+    pub store_windows: Vec<MemWindow>,
 }
 
 impl BindingPlan {
@@ -283,6 +288,50 @@ fn color_output(shader: &Shader) -> ColorOutput {
 /// hardware emits. A shader that never writes it (so the module returns the register file's
 /// initial state) is reported as [`ColorPrecision::F32`], the raw-bit-pattern reading, which is
 /// what the zero-initialised registers mean either way.
+/// [`color_precision`] of the register [`color_output`] names - the precision of the colour a
+/// program leaves in the on-chip pixel data. See [`crate::fragment_blends_at_register_precision`].
+pub(crate) fn colour_precision_of(shader: &Shader) -> ColorPrecision {
+    color_precision(shader, color_output(shader))
+}
+
+/// The PRIMARY-ATTRIBUTE register the colour is a plain copy of, when NO instruction of the
+/// program writes that register - i.e. the hardware filled it (an interpolant or a texture
+/// prefetch) before the program ran. `None` when the colour is computed, or copied from a
+/// register the program writes.
+///
+/// [`color_precision`] follows copies back to the instruction that built the value; a
+/// register no instruction builds ends that walk at the COPY, whose own width (32 bits, no
+/// half flag) then reads as F32 - which is wrong whenever the register holds packed halves.
+/// The program cannot say what the hardware put there; the interface (the interpolant that
+/// lands there) can, so the linker asks it. See `link`'s use.
+pub(crate) fn colour_copied_from_unwritten_pa(shader: &Shader) -> Option<u32> {
+    let (bank, base) = match color_output(shader) {
+        ColorOutput::NativeO0 => (Bank::Output, 0),
+        ColorOutput::NonNativePa(base) => (Bank::PrimaryAttr, base),
+    };
+    let writer_of = |bank: Bank, index: u32, before: usize| -> Option<(usize, &crate::ir::Instr)> {
+        shader.instrs[..before].iter().enumerate().rev().find(|(_, i)| {
+            i.dest.as_ref().is_some_and(|d| d.bank == bank && d.index as u32 == index && i.write_mask.iter().any(|&m| m))
+        })
+    };
+    let mut found = writer_of(bank, base, shader.instrs.len());
+    for _ in 0..8 {
+        let (at, i) = found?;
+        if !matches!(i.op, Op::Mov) || i.half_precision {
+            return None;
+        }
+        let src = i.srcs.first()?;
+        if !matches!(src.bank, Bank::PrimaryAttr | Bank::Temp | Bank::Internal | Bank::Output) {
+            return None;
+        }
+        match writer_of(src.bank, u32::from(src.index), at) {
+            Some(next) => found = Some(next),
+            None => return (src.bank == Bank::PrimaryAttr).then_some(u32::from(src.index)),
+        }
+    }
+    None
+}
+
 fn color_precision(shader: &Shader, color: ColorOutput) -> ColorPrecision {
     let (bank, base) = match color {
         ColorOutput::NativeO0 => (Bank::Output, 0),
@@ -593,6 +642,7 @@ pub fn plan_bindings(shader: &Shader, uniform_regs: u32, is_cube: impl Fn(u8) ->
         // program's containers and parameter table - so it carries none, and
         // `link_programs` fills them in. Same shape as `VertexAttribute::surplus_fill`.
         mem_windows: Vec::new(),
+        store_windows: Vec::new(),
     }
 }
 
@@ -726,6 +776,12 @@ pub fn index_register_scale() -> i32 {
             .and_then(|s| s.trim().parse::<i32>().ok())
             .filter(|v| *v > 0)
             // >>> ONE, AND THE CENSUS IS WHY - see `which_index_scale_lands_inside_the_declared_layout`.
+            //
+            // >>> ...AT THE LOAD. The pair scale did not vanish, it moved to the READER: a
+            // six-bit (double-register) indexed operand reads `2 * idx + offset`, a seven-bit
+            // one `idx + offset` - see `crate::ir::indexed_index_scale`. The crowd closure below
+            // is a seven-bit reader, and the corner table that first fitted `* 2` is a six-bit
+            // one; both still close, at their own reader.
             //
             // The `* 2` PAIR SCALE was established on one title's corner table under the OLD
             // reading of the index load's SOURCE (a four-bit field with the bank hardcoded to
@@ -1179,7 +1235,7 @@ fn cross_channel_gates(shader: &Shader, uniform_regs: u32, literals: &[(u32, u32
 
 /// Whether the destination read is declared at all - [`DEST_COLOR_READ`] AND the program.
 pub fn declares_dest_color(shader: &Shader) -> bool {
-    DEST_COLOR_READ.load(core::sync::atomic::Ordering::Relaxed) && reads_output_bank(shader)
+    DEST_COLOR_READ.load(core::sync::atomic::Ordering::Relaxed) && reads_output_bank_seed(shader)
 }
 
 /// Recognise a blend the fragment program performs ITSELF over the destination colour, rewrite
@@ -1637,6 +1693,109 @@ pub fn first_dest_reader(shader: &Shader) -> Option<usize> {
     None
 }
 
+/// The instructions of `shader` that can affect output registers `outs` (`o{n}`, whole), in
+/// their original order - or `None` when the program is not one this can slice.
+///
+/// # Why
+/// Placing a draw's footprint (the renderer's destination-copy coalescing) runs the VERTEX
+/// program on the reference interpreter over every vertex, and reads nothing back but the
+/// position. Most of a vertex program is everything else - normals, texture coordinates,
+/// colours, fog - so most of that interpretation computes values nobody reads. MEASURED on a
+/// shooter's world pass: 12 ms of CPU a frame to bound 103 draws, enough that the footprints
+/// could not pay for the copies they saved.
+///
+/// # Why the slice computes the same outputs, bit for bit
+/// It is a backward liveness walk, and every approximation in it errs toward KEEPING:
+/// - registers are whole `(bank, index)` pairs, never lanes;
+/// - an instruction is kept when ANY register it may write is live, and what it may write is
+///   over-counted (eight registers from its destination, more for a load that says so);
+/// - a kept instruction makes every register its operands may read live (four from each
+///   operand of the plain per-channel ops, eight for anything else), and its predicate;
+/// - a register stops being live only below an UNPREDICATED, plain, full-precision write that
+///   covers it - anything else may leave part of the old value standing, so it stays live;
+/// - stores, discards and depth writes are always kept.
+///
+/// What it does not try: a program with a BRANCH (a slice would need the control flow too), an
+/// indirectly addressed operand or an index-register load (which register is read is a
+/// run-time value), or local memory (a load reads what an earlier store left). Those return
+/// `None` and are interpreted whole, as before.
+pub fn output_slice(shader: &Shader, outs: std::ops::Range<u8>) -> Option<Shader> {
+    let key = |op: &Operand, k: u32| (bank_id(op.bank), u32::from(op.index) + k);
+    for i in &shader.instrs {
+        let indexed = |o: &Operand| matches!(o.bank, Bank::Indexed | Bank::Index | Bank::Raw(_));
+        if matches!(
+            i.op,
+            Op::Branch { .. } | Op::LocalLoad { .. } | Op::LocalStore { .. } | Op::LoadIndex { to_index: true, .. }
+        ) || i.srcs.iter().any(indexed)
+            || i.dest.as_ref().is_some_and(indexed)
+        {
+            return None;
+        }
+    }
+    let plain = |op: &Op| {
+        matches!(
+            op,
+            Op::Mad | Op::Mul | Op::Add | Op::Min | Op::Max | Op::Frc | Op::Dot { .. } | Op::Rcp | Op::Rsq | Op::Log | Op::Exp | Op::Mov
+        )
+    };
+    let mut live: std::collections::HashSet<(u8, u32)> = outs.map(|o| (bank_id(Bank::Output), u32::from(o))).collect();
+    let mut live_p = [false; 4];
+    let mut keep = vec![false; shader.instrs.len()];
+    for (ix, i) in shader.instrs.iter().enumerate().rev() {
+        if matches!(i.op, Op::Nop) {
+            continue;
+        }
+        let pred = match i.pred {
+            Predicate::Always => None,
+            Predicate::IfP(n) | Predicate::IfNotP(n) => Some((n & 3) as usize),
+            Predicate::Raw(_) => return None,
+        };
+        let side_effect = matches!(i.op, Op::MemStore { .. } | Op::Kill | Op::DepthF);
+        let writes_p = match i.op {
+            Op::Test { pdst, .. } => Some((pdst & 3) as usize),
+            _ => None,
+        };
+        let span = match i.op {
+            Op::MemLoad { elements, .. } => u32::from(elements).max(8),
+            _ => 8,
+        };
+        let writes_reg = !matches!(i.op, Op::Test { write_back: false, .. });
+        let hits_reg = writes_reg && i.dest.as_ref().is_some_and(|d| (0..span).any(|k| live.contains(&key(d, k))));
+        let hits_p = writes_p.is_some_and(|p| live_p[p]);
+        if !(side_effect || hits_reg || hits_p) {
+            continue;
+        }
+        keep[ix] = true;
+        // Kill what this instruction certainly overwrites whole, before adding what it reads.
+        if pred.is_none() {
+            if let Some(p) = writes_p {
+                live_p[p] = false;
+            }
+            if let Some(d) = i.dest.as_ref()
+                && plain(&i.op)
+                && crate::wgsl::Prec::of(i) == crate::wgsl::Prec::F32
+            {
+                for c in (0..4).filter(|&c| i.write_mask[c]) {
+                    live.remove(&key(d, c as u32));
+                }
+            }
+        }
+        if let Some(p) = pred {
+            live_p[p] = true;
+        }
+        let reach = if plain(&i.op) { 4 } else { 8 };
+        for s in &i.srcs {
+            for k in 0..reach {
+                live.insert(key(s, k));
+            }
+        }
+    }
+    Some(Shader {
+        kind: shader.kind,
+        instrs: shader.instrs.iter().zip(&keep).filter(|(_, k)| **k).map(|(i, _)| i.clone()).collect(),
+    })
+}
+
 /// A small local id per [`Bank`], so the taint sets key on something `Hash`/`Ord` without the
 /// IR growing those derives for one analysis's scratch.
 fn bank_id(b: Bank) -> u8 {
@@ -1678,6 +1837,126 @@ pub fn reads_output_bank(shader: &Shader) -> bool {
         !matches!(i.op, Op::Sop2 { .. })
             && i.srcs.iter().any(|s| s.bank == Bank::Output)
     })
+}
+
+/// Whether the DESTINATION colour seeded into the O bank can reach anything: [`reads_output_bank`]
+/// narrowed to the reads that come BEFORE the program's own writes of what they read.
+///
+/// # Why
+/// A compiler is free to use an output register as a scratch temporary - write a dot product
+/// into `o0.x`, normalise it with an `rsq`, then overwrite the whole colour at the end. Every
+/// read of the output bank in such a program reads a value the program itself put there, and
+/// the destination seed is dead. Counting it as a destination read costs a render-pass split
+/// and a copy of the whole attachment per draw. MEASURED on a deferred title's G-buffer pass:
+/// 154 of 156 draws were such readers - 189 splits and 373 MB of copies a frame, half a phone
+/// GPU's frame time.
+///
+/// # Why the answer is exact, not a guess
+/// It answers "no" only when it can PROVE the seed is dead, and then dropping the seed changes
+/// no bit of the output:
+/// - every output-bank read is of bytes an earlier instruction of this program definitely
+///   wrote - unpredicated, before any branch, and of an op whose store layout is the plain
+///   per-channel one (`wgsl::Prec::of`: a whole register per channel at F32, one half at F16,
+///   one byte at Fx8). Anything else writes nothing as far as this is concerned;
+/// - every register the seed fills (four at an F32 colour, two otherwise - which covers a
+///   64-bit colour's pair) is wholly written by the end, so none of the seed survives into
+///   the colour either.
+///
+/// Reads are the emitter's own: the plain ops and the float-to-integer pack read source channel
+/// `c` for each channel `Instr::read_channels` names (the write mask, or a dot product's
+/// `components`), through `Instr::source_register`; any other op is charged the whole
+/// four-register span of an output-bank operand, and an indirectly addressed operand
+/// anywhere keeps the conservative answer. Erring that way only keeps a split.
+pub fn reads_output_bank_seed(shader: &Shader) -> bool {
+    if !reads_output_bank(shader) {
+        return false;
+    }
+    if !dest_seed_liveness() {
+        return true;
+    }
+    let indexed = |o: &Operand| o.bank == Bank::Indexed;
+    if shader.instrs.iter().any(|i| i.srcs.iter().any(indexed) || i.dest.as_ref().is_some_and(indexed)) {
+        return true;
+    }
+    // The ops whose destination store is the plain per-channel one at `Prec::of`.
+    let plain = |op: &Op| {
+        matches!(
+            op,
+            Op::Mad
+                | Op::Mul
+                | Op::Add
+                | Op::Min
+                | Op::Max
+                | Op::Frc
+                | Op::Dot { .. }
+                | Op::Rcp
+                | Op::Rsq
+                | Op::Log
+                | Op::Exp
+                | Op::Mov
+                | Op::Pack { .. }
+                | Op::PackUnorm8 { .. }
+                | Op::CopyFx8
+        )
+    };
+    // The ops whose sources the emitter reads channel by channel at the source precision
+    // `source_register` models: the plain ones, and the float-to-integer pack (which stores its
+    // own packed layout, so it is not plain on the write side).
+    let read_plain = |op: &Op| plain(op) || matches!(op, Op::PackToInt { .. });
+    let mut written = vec![false; BANK_REGS * 4];
+    let all_written = |w: &[bool], bytes: std::ops::Range<usize>| bytes.clone().all(|b| w.get(b).copied().unwrap_or(false));
+    let mut straight = true;
+    for i in &shader.instrs {
+        // An instruction reads all of its sources before it writes, so reads go first.
+        if !matches!(i.op, Op::Sop2 { .. }) {
+            for s in i.srcs.iter().filter(|s| s.bank == Bank::Output) {
+                let base = s.index as usize;
+                let unwritten = if read_plain(&i.op) {
+                    let read = i.read_channels();
+                    (0..4).filter(|&c| read[c]).filter_map(|c| i.source_register(s, c)).any(|(reg, halves)| {
+                        let r = reg as usize * 4;
+                        !all_written(&written, r + halves.start * 2..r + halves.end * 2)
+                    })
+                } else {
+                    !all_written(&written, base * 4..(base + 4) * 4)
+                };
+                if unwritten {
+                    return true;
+                }
+            }
+        }
+        if matches!(i.op, Op::Branch { .. }) {
+            straight = false;
+        }
+        let Some(d) = i.dest.as_ref().filter(|d| d.bank == Bank::Output) else { continue };
+        if !straight || i.pred != Predicate::Always || !plain(&i.op) {
+            continue;
+        }
+        let base = d.index as usize;
+        for c in (0..4).filter(|&c| i.write_mask[c]) {
+            let bytes = match crate::wgsl::Prec::of(i) {
+                crate::wgsl::Prec::F32 => (base + c) * 4..(base + c) * 4 + 4,
+                crate::wgsl::Prec::F16 => (base + c / 2) * 4 + (c & 1) * 2..(base + c / 2) * 4 + (c & 1) * 2 + 2,
+                crate::wgsl::Prec::Fx8 => base * 4 + c..base * 4 + c + 1,
+            };
+            for b in bytes {
+                if let Some(w) = written.get_mut(b) {
+                    *w = true;
+                }
+            }
+        }
+    }
+    let seeded = if colour_precision_of(shader) == ColorPrecision::F32 { 4 } else { 2 };
+    !all_written(&written, 0..seeded * 4)
+}
+
+/// `VITASLOP_GXP_DEST_SEED_LIVE=0`: the arm back to [`reads_output_bank`] alone - every program
+/// that reads its output bank at all is given the destination copy, as before
+/// [`reads_output_bank_seed`] existed.
+fn dest_seed_liveness() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| std::env::var("VITASLOP_GXP_DEST_SEED_LIVE").map(|v| v.trim() != "0").unwrap_or(true))
 }
 
 /// The WGSL that seeds the O bank with the DESTINATION colour, for a program that reads it.
@@ -1787,6 +2066,24 @@ pub(crate) const GXP_DEST_DECL: &str = "@group(3) @binding(1) var gxp_dst: textu
 pub(crate) const GXP_DEST_DECL_MS: &str = "@group(3) @binding(1) var gxp_dst: texture_multisampled_2d<f32>;
 ";
 
+/// [`GXP_DEST_DECL`] on a pass into a 64-bit surface: the copy is of the `Rg32Uint`
+/// attachment, so it holds the stored WORDS - see [`dest_raw_init`].
+pub(crate) const GXP_DEST_DECL_RAW: &str = "@group(3) @binding(1) var gxp_dst: texture_2d<u32>;
+";
+
+/// Seed the output pair from a 64-bit surface's stored words - the destination read of
+/// `link::LinkOptions::raw64_output`.
+///
+/// The hardware seeds a self-blending program's output registers with the tile's stored bits,
+/// and a 64-bit surface stores the register pair unconverted, so what the program reads back
+/// is exactly the two words the attachment holds: packed halves for an F16F16F16F16 image,
+/// packed bytes for a title that keeps bytes there. Nothing is decoded on the way, which makes
+/// this the one destination read that is bit-exact by construction.
+pub(crate) fn dest_raw_init() -> String {
+    "  let gxp_dstw = textureLoad(gxp_dst, vec2<i32>(in.frag_coord.xy), 0).xy;\n  o[0] = gxp_dstw.x;\n  o[1] = gxp_dstw.y;\n"
+        .to_string()
+}
+
 /// Assemble a complete, bindable WGSL fragment module from an emitted body + its binding
 /// plan. The body is the verbatim output of [`crate::wgsl::emit_fragment`]; this wraps it
 /// with the real resource bindings and the register-file locals, initialising `pa` from the
@@ -1806,6 +2103,12 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
     if plan.reads_dest_color {
         m.push_str(GXP_DEST_DECL);
     }
+    // The buffers a storing program writes through - see `resolve_store_windows`.
+    if !plan.store_windows.is_empty() {
+        m.push_str(&store_window_decl(&plan.store_windows));
+        m.push_str(&store_window_helper(&plan.store_windows));
+    }
+    let reads_tile = crate::wgsl::body_reads_tile_registers(body);
 
     // Sampled textures + samplers at group 1 (t{unit} = binding 2*i, s{unit} = 2*i+1).
     for (i, b) in plan.samplers.iter().enumerate() {
@@ -1834,7 +2137,7 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
     // A program that writes its own depth needs the interpolated one; a program that reads the
     // DESTINATION colour needs the pixel to read it AT. Either way it is the same builtin, and
     // declaring it unconditionally would defeat early-depth rejection on every other program.
-    if writes_depth || plan.reads_dest_color {
+    if writes_depth || plan.reads_dest_color || reads_tile {
         let _ = writeln!(m, "  @builtin(position) frag_coord: vec4<f32>,");
     }
     let _ = writeln!(m, "}};");
@@ -1848,6 +2151,9 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
     m.push_str(&probe_globals());
     let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> {ret_ty} {{");
     m.push_str(crate::wgsl::FRONT_FACING_DECL);
+    if reads_tile {
+        m.push_str(crate::wgsl::TILE_REGISTERS_DECL);
+    }
     if writes_depth {
         let _ = writeln!(m, "  let gxp_interp_depth = in.frag_coord.z;");
         let _ = writeln!(m, "  var gxp_frag_depth: f32 = gxp_interp_depth;");
@@ -1880,6 +2186,9 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
             "  for (var k: u32 = 0u; k < {}u; k = k + 1u) {{ sa[k] = sa_buf.data[k / 4u][k % 4u]; }}",
             plan.sa_lane_count
         );
+    }
+    for (i, w) in plan.store_windows.iter().enumerate() {
+        let _ = writeln!(m, "  sa[{}] = gxp_sthdr[{i}u].x;", w.base_sa);
     }
 
     m.push_str(body);
@@ -2066,6 +2375,14 @@ pub struct MemWindow {
     /// `g_Material.specular`/`g_TexCoordOffset`, which is how the golf title's menu came out
     /// with a red sky: `sunColor.x` was reading the projection matrix's `1.944`.
     pub base_offset: u32,
+    /// The window is sized PER DRAW: [`Self::bytes`] is only its upper bound (the declared
+    /// extent), and each draw binds as many bytes as [`crate::reach::DrawReach`] computes from
+    /// that draw's inputs. Set on EVERY window of a fragment program at least one of whose
+    /// windows no static reach bounds (see [`resolve_mem_windows`]); such a set is declared as
+    /// a runtime-sized storage array whose headers carry each window's per-draw placement (see
+    /// [`mem_window_helper_named`]). `false` for every other program, whose windows bind exactly
+    /// as they always did.
+    pub per_draw: bool,
 }
 
 impl MemWindow {
@@ -2105,6 +2422,59 @@ pub fn mem_window_vec4_count(windows: &[MemWindow]) -> u32 {
     windows.len() as u32 + windows.iter().map(MemWindow::data_vec4s).sum::<u32>()
 }
 
+/// The largest `gxp_mem` binding a program may ask for: WebGPU's guaranteed
+/// `maxUniformBufferBindingSize`, which every engine requests (`gpu::device_limits`).
+pub const MEM_WINDOW_BINDING_MAX: u64 = 65536;
+
+/// The largest `gxp_mem` binding a program may ask for once it has outgrown the uniform one:
+/// WebGPU's guaranteed `maxStorageBufferBindingSize` (128 MiB), which `wgpu`'s downlevel
+/// defaults - what `gpu::device_limits` starts from - grant too.
+pub const MEM_WINDOW_STORAGE_MAX: u64 = 128 << 20;
+
+/// Whether these windows bind as a READ-ONLY STORAGE buffer rather than a uniform one: exactly
+/// when they exceed [`MEM_WINDOW_BINDING_MAX`]. Everything that fits keeps the uniform binding
+/// it always had - which is the fast path on the mobile GPUs this targets, and the one every
+/// adapter offers in the vertex stage - and only a program that cannot fit pays for the other.
+/// The shader declaration ([`mem_window_decl`]) and the renderer's bind-group layout both read
+/// this one answer, so they cannot disagree.
+pub fn mem_window_storage(windows: &[MemWindow]) -> bool {
+    mem_window_per_draw(windows) || mem_window_bind_bytes(windows) > MEM_WINDOW_BINDING_MAX
+}
+
+/// Whether these windows are sized PER DRAW (see [`MemWindow::per_draw`]): the binding is then a
+/// runtime-sized storage array whose size the renderer chooses per draw, and
+/// [`mem_window_vec4_count`] / [`mem_window_bind_bytes`] give only its upper bound.
+pub fn mem_window_per_draw(windows: &[MemWindow]) -> bool {
+    windows.iter().any(|w| w.per_draw)
+}
+
+/// The module-scope declaration of a `gxp_mem`-style binding over `windows`: a uniform array,
+/// or a read-only storage array of the same element type and length when
+/// [`mem_window_storage`] says so. The helpers index it identically either way.
+pub fn mem_window_decl(group: u32, binding: u32, name: &str, windows: &[MemWindow]) -> String {
+    if mem_window_per_draw(windows) {
+        return format!("@group({group}) @binding({binding}) var<storage, read> {name}: array<vec4<u32>>;\n");
+    }
+    let space = if mem_window_storage(windows) { "storage, read" } else { "uniform" };
+    format!(
+        "@group({group}) @binding({binding}) var<{space}> {name}: array<vec4<u32>, {}>;\n",
+        mem_window_vec4_count(windows)
+    )
+}
+
+/// The `gxp_mem` binding's size in BYTES, headers included, counted WITHOUT wrapping - which is
+/// what a size check has to compare, and what [`mem_window_vec4_count`]` * 16` is not.
+///
+/// >>> A SATURATED WINDOW WRAPPED THE 64 KiB CHECK TO SIXTEEN BYTES. An open-array buffer whose
+/// declared size times its element reach saturates at `u32::MAX` is `0x1000_0000` vec4s; four
+/// of them plus their headers, times 16, is `0x4_0000_0040` - and in `u32` that is `0x40`. The
+/// program passed, the renderer sized the binding in `u64` (16 GiB), and the upload panicked on
+/// a slice index past 4 GiB. MEASURED: one title's first mission, four such windows in one
+/// vertex program.
+pub fn mem_window_bind_bytes(windows: &[MemWindow]) -> u64 {
+    windows.iter().map(|w| 1 + u64::from(w.bytes).div_ceil(16)).sum::<u64>() * 16
+}
+
 /// The WGSL helper every module with a memory window declares: resolve a guest ADDRESS to the
 /// word the bound windows hold at it.
 ///
@@ -2130,6 +2500,9 @@ pub fn mem_window_helper(windows: &[MemWindow]) -> String {
 /// emitting one would silently give the fragment the vertex's buffer.
 pub fn mem_window_helper_named(windows: &[MemWindow], binding: &str) -> String {
     use std::fmt::Write as _;
+    if windows.iter().any(|w| w.per_draw) {
+        return mem_window_helper_per_draw(windows.len(), binding);
+    }
     let mut s = String::new();
     let _ = writeln!(s, "fn {binding}_word(addr: u32) -> u32 {{");
     for (i, at) in mem_window_placements(windows).iter().enumerate() {
@@ -2157,6 +2530,56 @@ pub fn mem_window_helper_named(windows: &[MemWindow], binding: &str) -> String {
         let _ = writeln!(s, "      let w = (addr - b) >> 2u;");
         let _ = writeln!(s, "      if (w + 3u < {}u) {{", at.words);
         let _ = writeln!(s, "        let g = {}u + w;", at.first_word);
+        let _ = writeln!(
+            s,
+            "        return vec4<u32>({binding}[g >> 2u][g & 3u], {binding}[(g + 1u) >> 2u][(g + 1u) & 3u], \
+             {binding}[(g + 2u) >> 2u][(g + 2u) & 3u], {binding}[(g + 3u) >> 2u][(g + 3u) & 3u]);"
+        );
+        let _ = writeln!(s, "      }}");
+        let _ = writeln!(s, "    }}");
+        let _ = writeln!(s, "  }}");
+    }
+    let _ = writeln!(
+        s,
+        "  return vec4<u32>({binding}_word(addr), {binding}_word(addr + 4u), {binding}_word(addr + 8u), {binding}_word(addr + 12u));"
+    );
+    let _ = writeln!(s, "}}");
+    s
+}
+
+/// [`mem_window_helper_named`] for a PER-DRAW window set (see [`MemWindow::per_draw`]): the same
+/// first-window-that-holds-the-address dispatch, with each window's extent and placement read
+/// from its HEADER instead of baked in - lane x the guest base (as always), lane y how many words
+/// this draw bound, lane z the binding word they start at. The renderer writes those per draw
+/// from [`crate::reach::DrawReach::extents`], and may place windows that overlap in guest memory
+/// over ONE copy of the overlapping bytes - every window is a snapshot of the same memory at the
+/// same moment, so any window holding an address holds the same word there.
+fn mem_window_helper_per_draw(count: usize, binding: &str) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "fn {binding}_word(addr: u32) -> u32 {{");
+    for i in 0..count {
+        let _ = writeln!(s, "  {{");
+        let _ = writeln!(s, "    let h{i} = {binding}[{i}u];");
+        let _ = writeln!(s, "    if (addr >= h{i}.x) {{");
+        let _ = writeln!(s, "      let w{i} = (addr - h{i}.x) >> 2u;");
+        let _ = writeln!(s, "      if (w{i} < h{i}.y) {{");
+        let _ = writeln!(s, "        let g{i} = h{i}.z + w{i};");
+        let _ = writeln!(s, "        return {binding}[g{i} >> 2u][g{i} & 3u];");
+        let _ = writeln!(s, "      }}");
+        let _ = writeln!(s, "    }}");
+        let _ = writeln!(s, "  }}");
+    }
+    let _ = writeln!(s, "  return 0u;");
+    let _ = writeln!(s, "}}");
+    let _ = writeln!(s, "fn {binding}_quad(addr: u32) -> vec4<u32> {{");
+    for i in 0..count {
+        let _ = writeln!(s, "  {{");
+        let _ = writeln!(s, "    let h = {binding}[{i}u];");
+        let _ = writeln!(s, "    if (addr >= h.x) {{");
+        let _ = writeln!(s, "      let w = (addr - h.x) >> 2u;");
+        let _ = writeln!(s, "      if (w + 3u < h.y) {{");
+        let _ = writeln!(s, "        let g = h.z + w;");
         let _ = writeln!(
             s,
             "        return vec4<u32>({binding}[g >> 2u][g & 3u], {binding}[(g + 1u) >> 2u][(g + 1u) & 3u], \
@@ -2271,7 +2694,9 @@ pub fn quad_mem_reads(body: &str, binding: &str) -> String {
 /// body never writes `sa[base]` itself and never writes `sa` through a computed index; an
 /// out-of-window word keeps the helper. `VITASLOP_GXP_STATIC_MEM=0` is the arm back.
 pub fn resolve_static_mem_reads(body: &str, windows: &[MemWindow], binding: &str) -> String {
-    if windows.is_empty() || !crate::link::arm_on(crate::link::STATIC_MEM_ARM) {
+    // A PER-DRAW set has no placement until the draw: its windows' words sit wherever that
+    // draw's headers say, so no read can be resolved to a fixed subscript here.
+    if windows.is_empty() || mem_window_per_draw(windows) || !crate::link::arm_on(crate::link::STATIC_MEM_ARM) {
         return body.to_string();
     }
     // Every SA register the body assigns, and whether it assigns one through an index.
@@ -2471,27 +2896,123 @@ const OPEN_ARRAY_ELEMENTS: u32 = 256;
 /// vec4 rows a bone), then `imad(row, 16, sa[1])`. The reach is then 256 elements of the ROW
 /// index's range, not of the attribute's - see [`index_scale`] - or every bone past the 85th
 /// reads zero and the skinned mesh flies apart.
-fn indexed_reach(base_sa: u32, program: &Program, shader: &Shader, secondary: &Shader) -> Option<u32> {
+///
+/// # THE STRIDE CAN BE A LITERAL, AND THE INDEX CAN RIDE IN THE LOAD'S OFFSET
+/// Two more spellings of the same arithmetic, both MEASURED on a shooter's skinned and instanced
+/// vertex programs, whose every such buffer fell through to `declared * 256` - several MiB for
+/// a table the program declares whole - and was refused for exceeding the uniform binding:
+///
+/// * `imad(index, sa[k], base)` with `sa[k]` a CONTAINER LITERAL: the stride is as constant as
+///   an immediate, it just did not fit the seven-bit field. The multiplier sees the 16-bit half
+///   of the literal `src1_high` selects, exactly as it sees a register's.
+/// * `t = imad(index, stride, k)` then `mem[base + t]`: the pointer is the buffer's own SA
+///   register and the index arrives as the load's REGISTER offset. Its reach is the largest
+///   offset the IMAD forms plus the load's own extent - and a register offset is 16 bits wide
+///   (see `wgsl::emit_mem_load`), so it can never reach past `0xffff`.
+///
+/// A register-offset load whose offset is NOT one of these shapes contributes nothing.
+///
+/// >>> THESE TWO ARE READ ONLY WHEN `extended`, which [`resolve_mem_windows`] asks for only
+/// after the windows the immediate-stride rule alone resolves have FAILED to fit a uniform
+/// binding. On every program that bound before, the two spellings would only WIDEN windows
+/// (MEASURED over five other titles' corpora: 2,432 -> 4,096, 1,024 -> 4,088, 4,096 -> 16,384
+/// bytes), changing what pairs that already render upload and read - so they do not apply
+/// there, and those programs resolve exactly as they always did.
+fn indexed_reach(base_sa: u32, program: &Program, shader: &Shader, secondary: &Shader, extended: bool) -> Option<u32> {
+    use crate::ir::{Bank, Op};
     let mut reach: Option<u32> = None;
     for stream in [shader, secondary] {
         for (at, i) in stream.instrs.iter().enumerate() {
-            let crate::ir::Op::IntMad { .. } = i.op else { continue };
-            let [index, stride, addend] = i.srcs.as_slice() else { continue };
-            if addend.bank != crate::ir::Bank::SecondaryAttr || u32::from(addend.index) != base_sa {
-                continue;
-            }
-            if stride.bank != crate::ir::Bank::Immediate || stride.index == 0 {
-                continue;
-            }
-            let elements = match index_scale(program, &stream.instrs[..at], index) {
-                Some(scale) => ((OPEN_ARRAY_ELEMENTS - 1) * scale + 1).max(OPEN_ARRAY_ELEMENTS),
-                None => OPEN_ARRAY_ELEMENTS,
+            let r = match i.op {
+                Op::IntMad { signed, src1_high, .. } => {
+                    let [index, stride, addend] = i.srcs.as_slice() else { continue };
+                    if addend.bank != Bank::SecondaryAttr || u32::from(addend.index) != base_sa {
+                        continue;
+                    }
+                    if !extended && stride.bank != Bank::Immediate {
+                        continue;
+                    }
+                    let Some(stride) = imad_stride(program, stride, signed, src1_high) else { continue };
+                    stride.saturating_mul(index_elements(program, &stream.instrs[..at], index))
+                }
+                Op::MemLoad { elements, offset_bytes } if extended => {
+                    let Some(ptr) = i.srcs.first() else { continue };
+                    if ptr.bank != Bank::SecondaryAttr || u32::from(ptr.index) != base_sa {
+                        continue;
+                    }
+                    // No register offset is a constant extent, which the declared size already
+                    // answers; two are a sum no single IMAD bounds. Either says nothing here.
+                    let [_, offset] = i.srcs.as_slice() else { continue };
+                    let Some(largest) = indexed_offset_reach(program, &stream.instrs[..at], offset) else {
+                        continue;
+                    };
+                    largest.saturating_add(offset_bytes).saturating_add(u32::from(elements) * 4)
+                }
+                _ => continue,
             };
-            let r = u32::from(stride.index).saturating_mul(elements);
             reach = Some(reach.map_or(r, |x: u32| x.max(r)));
         }
     }
     reach
+}
+
+/// How many elements an index operand can name: [`OPEN_ARRAY_ELEMENTS`], or that many of the
+/// ROW index an [`index_scale`]d attribute becomes.
+fn index_elements(program: &Program, before: &[crate::ir::Instr], index: &crate::ir::Operand) -> u32 {
+    match index_scale(program, before, index) {
+        Some(scale) => ((OPEN_ARRAY_ELEMENTS - 1) * scale + 1).max(OPEN_ARRAY_ELEMENTS),
+        None => OPEN_ARRAY_ELEMENTS,
+    }
+}
+
+/// The CONSTANT stride an `IntMad`'s `src1` multiplies by: an inline immediate, or a container
+/// literal read through the same 16-bit half selection the multiplier applies to a register
+/// (`interp`'s `IntMad` arm). `None` for anything computed, and for a zero or negative stride,
+/// which indexes no table.
+fn imad_stride(program: &Program, o: &crate::ir::Operand, signed: bool, high: bool) -> Option<u32> {
+    let v = match o.bank {
+        crate::ir::Bank::Immediate => u32::from(o.index),
+        crate::ir::Bank::SecondaryAttr => {
+            let w = literal_word(program, o)?;
+            match (signed, high) {
+                (true, false) => (((w as i32) << 16) >> 16) as u32,
+                (true, true) => ((w as i32) >> 16) as u32,
+                (false, false) => w & 0xffff,
+                (false, true) => w >> 16,
+            }
+        }
+        _ => return None,
+    };
+    (v != 0 && (!signed || (v as i32) > 0)).then_some(v)
+}
+
+/// The container literal an SA operand's first lane reads, if it is one.
+fn literal_word(program: &Program, o: &crate::ir::Operand) -> Option<u32> {
+    let reg = u32::from(o.index) + u32::from(o.swizzle[0]);
+    program.literals.iter().find(|(sa, _)| *sa == reg).map(|&(_, w)| w)
+}
+
+/// The largest byte offset a memory load's REGISTER offset can carry when the instruction that
+/// last wrote it is `imad(index, stride, k)` with a constant stride and a constant `k`: the
+/// highest index times the stride, plus `k`. The offset is 16 bits wide under the default
+/// `VITASLOP_GXP_MEM_OFFSET16` reading, so it is the low half of that sum, and a sum that
+/// passes `0xffff` can land anywhere below it.
+fn indexed_offset_reach(program: &Program, before: &[crate::ir::Instr], offset: &crate::ir::Operand) -> Option<u32> {
+    use crate::ir::{Bank, Op};
+    let at = before.iter().rposition(|d| d.dest.as_ref().is_some_and(|x| x.bank == offset.bank && x.index == offset.index))?;
+    let def = &before[at];
+    let Op::IntMad { signed, src1_high, .. } = def.op else { return None };
+    let [index, stride, addend] = def.srcs.as_slice() else { return None };
+    let stride = imad_stride(program, stride, signed, src1_high)?;
+    let k = match addend.bank {
+        Bank::Immediate => u32::from(addend.index),
+        Bank::SecondaryAttr => literal_word(program, addend)?,
+        _ => return None,
+    };
+    let narrow = crate::link::arm_on(crate::link::MEM_OFFSET16_ARM);
+    let k = if narrow { k & 0xffff } else { k };
+    let largest = (index_elements(program, &before[..at], index) - 1).saturating_mul(stride).saturating_add(k);
+    Some(if narrow { largest.min(0xffff) } else { largest })
 }
 
 /// The integer factor an 8-bit index is scaled by before it reaches an `imad`, when the
@@ -2525,9 +3046,349 @@ fn index_scale(program: &Program, before: &[crate::ir::Instr], index: &crate::ir
     ((1.0..=64.0).contains(&whole) && (scale - whole).abs() < 0.01).then_some(whole as u32)
 }
 
+/// A HARD upper bound on the bytes past `sa[base_sa]` that ANY load through that pointer can
+/// address, from the program's own integer arithmetic - or `None` when some read of the
+/// register is not one of the shapes below, which is the honest answer and costs nothing but
+/// the tightening.
+///
+/// Every instruction in either stream that reads the register must be one of:
+///
+/// * a load straight through it: `offset + 4 * elements`, plus `0xffff` for each REGISTER
+///   offset (16 bits wide - see `wgsl::emit_mem_load`; no bound at all under the full-width
+///   `VITASLOP_GXP_MEM_OFFSET16=0` arm);
+/// * `d = c * (x & 0xffff) + ptr` - the low IMAD32 STEP (group 0x1a), whose 16-bit multiplier
+///   input (`src1`) sees 16 bits of `x` whatever the register holds - or `d = half(x) * c + ptr`
+///   (group 0x15), with
+///   `c` constant: the largest 16-bit index times `c`, plus the largest extent of every load
+///   that chases `d` before an unpredicated instruction overwrites it. `d` may feed nothing but
+///   loads, or what it feeds is unbounded.
+///
+/// A stream that BRANCHES answers `None`: the forward scan for `d`'s uses assumes straight-line
+/// code. An index the multiplier reads as NEGATIVE lands below the pointer, where no window
+/// reaches (it reads zero exactly as it always has) and which this bound therefore need not
+/// cover.
+///
+/// It was written for a shooter's depth-reconstruct fragment program: four buffers each declared
+/// 17 MiB (a 1024 x 544 grid of 32-byte cells), each read through `i * 32 + ptr`. Under the old
+/// reading of the step (`src0` halved) that was `(i & 0xffff) * 32` and bounded at 2 MiB here;
+/// with `src1` the 16-bit input it is not bounded by the program at all, and such a window is
+/// sized PER DRAW instead (see [`crate::reach::DrawReach`]).
+fn hard_reach(base_sa: u32, program: &Program, shader: &Shader, secondary: &Shader) -> Option<u32> {
+    use crate::ir::{Bank, Op, Predicate};
+    let narrow = crate::link::arm_on(crate::link::MEM_OFFSET16_ARM);
+    // The extent of one load from its pointer, register offsets included.
+    let load_extent = |i: &crate::ir::Instr| -> Option<u64> {
+        let Op::MemLoad { elements, offset_bytes } = i.op else { return None };
+        let regs = i.srcs.len().saturating_sub(1) as u64;
+        if regs > 0 && !narrow {
+            return None;
+        }
+        Some(u64::from(offset_bytes) + 4 * u64::from(elements) + regs * 0xffff)
+    };
+    let same = |o: &crate::ir::Operand, bank: Bank, index: u8| o.bank == bank && o.index == index;
+    let mut reach = 0u64;
+    let mut saw = false;
+    for stream in [shader, secondary] {
+        let instrs = &stream.instrs;
+        let reads_ptr = |i: &crate::ir::Instr| i.srcs.iter().any(|s| may_read_lane(i, s, Bank::SecondaryAttr, base_sa));
+        if !instrs.iter().any(reads_ptr) {
+            continue;
+        }
+        if instrs.iter().any(|i| matches!(i.op, Op::Branch { .. })) {
+            return None;
+        }
+        for (at, i) in instrs.iter().enumerate() {
+            if !reads_ptr(i) {
+                continue;
+            }
+            saw = true;
+            let is_ptr = |o: &crate::ir::Operand| o.bank == Bank::SecondaryAttr && u32::from(o.index) == base_sa;
+            // The pointer must be read ONLY in the slot each shape names.
+            let r = match i.op {
+                Op::MemLoad { .. } if is_ptr(&i.srcs[0]) && !i.srcs[1..].iter().any(is_ptr) => load_extent(i)?,
+                Op::IntMadStep { high_half: false, .. } | Op::IntMad { .. } => {
+                    let [index, stride, addend] = i.srcs.as_slice() else { return None };
+                    if !is_ptr(addend) || is_ptr(index) || is_ptr(stride) {
+                        return None;
+                    }
+                    let (largest_index, c) = match i.op {
+                        // Only the 16-bit multiplier input bounds the product: it is `src1`
+                        // (`decode_grp_imad32_step`), so the CONSTANT has to be `src0` here -
+                        // `index * #imm` with the index whole is unbounded. The old `src0`
+                        // reading (`VITASLOP_GXP_IMA32_STEP_SRC0=1`) bounds the other way round.
+                        Op::IntMadStep { .. } => {
+                            let constant = if crate::link::ima32_step_halves_src1() { index } else { stride };
+                            let c = match constant.bank {
+                                Bank::Immediate => u32::from(constant.index),
+                                Bank::SecondaryAttr => literal_word(program, constant)?,
+                                _ => return None,
+                            };
+                            (0xffffu64, c)
+                        }
+                        Op::IntMad { signed, src1_high, .. } => {
+                            (if signed { 0x7fff } else { 0xffff }, imad_stride(program, stride, signed, src1_high)?)
+                        }
+                        _ => return None,
+                    };
+                    let d = i.dest.as_ref()?;
+                    // The address register must stay in its own stream - a SECONDARY result is
+                    // read by the primary too, which this scan does not follow.
+                    if d.bank == Bank::SecondaryAttr {
+                        return None;
+                    }
+                    let mut chased = 0u64;
+                    let mut gone = [false; 2];
+                    for later in &instrs[at + 1..] {
+                        // Any read that can reach the lane - a vector operand below it whose
+                        // swizzle lands on it included - or the address escapes unseen.
+                        if later.srcs.iter().any(|s| may_read_lane(later, s, d.bank, u32::from(d.index))) {
+                            if !matches!(later.op, Op::MemLoad { .. })
+                                || !same(&later.srcs[0], d.bank, d.index)
+                                || later.srcs[1..].iter().any(|s| same(s, d.bank, d.index))
+                            {
+                                return None;
+                            }
+                            chased = chased.max(load_extent(later)?);
+                        }
+                        // Stop only once BOTH halves of the lane have been rewritten
+                        // unconditionally (two F16 writes can do it between them): stopping
+                        // early would hide a later load of the old address.
+                        if matches!(later.pred, Predicate::Always) {
+                            let h = overwritten_halves(later, d.bank, d.index);
+                            gone = [gone[0] || h[0], gone[1] || h[1]];
+                            if gone == [true; 2] {
+                                break;
+                            }
+                        }
+                    }
+                    largest_index * u64::from(c) + chased
+                }
+                _ => return None,
+            };
+            reach = reach.max(r);
+        }
+    }
+    (saw && reach <= u64::from(u32::MAX)).then_some(reach as u32)
+}
+
+/// Whether operand `o` of `i` can read the 32-bit lane `bank[lane]`. The integer multiply-adds
+/// and a load's address operands read exactly their register's own lane; anything else is
+/// answered from the swizzle over all four channels (a half-precision channel reading lane
+/// `index + swizzle / 2`) - a superset, which is the safe direction for a caller that refuses
+/// on a read it cannot explain.
+fn may_read_lane(i: &crate::ir::Instr, o: &crate::ir::Operand, bank: crate::ir::Bank, lane: u32) -> bool {
+    use crate::ir::Op;
+    if o.bank != bank {
+        return false;
+    }
+    let base = u32::from(o.index);
+    match i.op {
+        Op::IntMad { .. } | Op::IntMadStep { .. } | Op::MemLoad { .. } => base == lane,
+        _ => {
+            let shift = u32::from(i.half_precision);
+            o.swizzle.iter().any(|&s| base + (u32::from(s) >> shift) == lane)
+        }
+    }
+}
+
+/// Which 16-bit HALVES `[low, high]` of register `bank[index]` `i` rewrites: a memory load's
+/// `elements` consecutive registers and a scalar integer multiply-add's one lane whole, an F32
+/// channel `c` of the plain float ALU ops the whole of `dest + c`, and an F16 channel `c` half
+/// `c & 1` of `dest + c / 2`. Any other op answers neither - its lane addressing is not this
+/// simple, and a wrong answer would hide a later load of the old value.
+fn overwritten_halves(i: &crate::ir::Instr, bank: crate::ir::Bank, index: u8) -> [bool; 2] {
+    use crate::ir::Op;
+    let Some(w) = i.dest.as_ref() else { return [false; 2] };
+    if w.bank != bank || index < w.index {
+        return [false; 2];
+    }
+    let off = usize::from(index - w.index);
+    let whole = match i.op {
+        Op::MemLoad { elements, .. } => off < usize::from(elements),
+        Op::IntMad { .. } | Op::IntMadStep { .. } => off == 0,
+        Op::Add | Op::Mul | Op::Mad | Op::Min | Op::Max | Op::Mov if i.half_precision => {
+            return if off < 2 { [i.write_mask[2 * off], i.write_mask[2 * off + 1]] } else { [false; 2] };
+        }
+        Op::Add | Op::Mul | Op::Mad | Op::Min | Op::Max | Op::Mov => off < 4 && i.write_mask[off],
+        _ => false,
+    };
+    [whole; 2]
+}
+
 pub fn resolve_mem_windows(
     program: &Program,
     shader: &Shader,
+) -> Result<Vec<MemWindow>, &'static str> {
+    // The windows bind as ONE uniform buffer (present on every WebGPU tier) whenever they fit
+    // its guaranteed 64 KiB, headers included - and every program that bound before resolves
+    // here exactly as it always did, so none of them changes.
+    let windows = resolve_windows_reading(program, shader, false)?;
+    if mem_window_bind_bytes(&windows) <= MEM_WINDOW_BINDING_MAX {
+        return Ok(windows);
+    }
+    // Past that, first the tighter readings of an indexed table (see `indexed_reach`), which
+    // may bring the program back under the uniform binding; then, if it still does not fit,
+    // each window cut to what the program's own arithmetic can reach ([`hard_reach`] - bytes
+    // no load can address are not part of a window) and bound as one READ-ONLY STORAGE buffer
+    // instead (see [`mem_window_storage`]).
+    let mut windows = resolve_windows_reading(program, shader, true)?;
+    if mem_window_bind_bytes(&windows) > MEM_WINDOW_BINDING_MAX {
+        let secondary = crate::usse::decode_secondary_shader(program);
+        let mut unbounded = false;
+        for w in windows.iter_mut() {
+            match hard_reach(w.base_sa, program, shader, &secondary) {
+                Some(reach) => w.bytes = w.bytes.min(reach.max(4)),
+                None => unbounded = true,
+            }
+        }
+        // >>> AND A WINDOW NO STATIC REACH BOUNDS IS SIZED PER DRAW, when the program can be
+        // evaluated over a draw's inputs (a fragment program that runs straight through). Its
+        // `bytes` stay the declared extent - the upper bound - and each draw binds what
+        // `reach::DrawReach` says that draw can reach. A depth-reconstruct pass whose four
+        // windows are declared 17 MiB each binds ~4 MiB a draw this way instead of 68.
+        // `VITASLOP_GXP_MEM_WINDOW_PER_DRAW=0` keeps the declared extent.
+        if unbounded
+            && crate::link::arm_on(crate::link::MEM_WINDOW_PER_DRAW_ARM)
+            && crate::reach::DrawReach::build(program, shader, &windows).is_some()
+        {
+            for w in windows.iter_mut() {
+                w.per_draw = true;
+            }
+        }
+        // A per-draw set's `bytes` are only its upper bound; what a draw binds is checked
+        // against the storage limit by the renderer, draw by draw.
+        if !mem_window_per_draw(&windows) && mem_window_bind_bytes(&windows) > MEM_WINDOW_STORAGE_MAX {
+            return Err("the declared uniform buffers exceed a 128 MiB storage binding");
+        }
+    }
+    Ok(windows)
+}
+
+/// The buffers a FRAGMENT program's 0xF0 guest-memory STORES ([`crate::ir::Op::MemStore`])
+/// write through: each `+0x78` entry for a DECLARED ordinary uniform buffer (index below 14)
+/// whose pointer register the program reads, sized at the parameter's declared byte count. An
+/// empty list = the program stores nothing. `Err` names what is not modelled.
+///
+/// # What a store window is
+/// The SAME kind of guest range a load window is - a buffer whose bound address the driver puts
+/// in the DATA slot - but WRITTEN. The renderer binds the union of a draw's store windows as one
+/// writable mirror of those guest bytes (`gxp_fst`), seeded from the guest memory the capture
+/// read, kept on the GPU as the newest copy of that memory (later readers - a depth-stencil
+/// surface FORCE_LOADed from it - read the mirror), and each window's header (`gxp_sthdr`) says
+/// where its bytes sit in the mirror.
+///
+/// # What is relied on, and refused otherwise
+/// * The program never LOADS through a buffer it stores to: a load window is a snapshot taken
+///   before the draw, so a load after a store in the same invocation would read the old bytes.
+/// * A store's address lands in one of these windows - inside a buffer the program itself
+///   declares. That cannot be proved statically (the address is computed from a uniform and the
+///   fragment position, and a range analysis over the whole target overshoots a draw that
+///   covers part of it), so an address in no window writes nothing. A program storing outside
+///   its own declared buffers is outside its own contract with the driver.
+/// * Two fragments storing to the same word race, and WebGPU does not order fragment
+///   invocations: the last writer is unspecified, as it is on hardware for fragments of one
+///   primitive in different pipes. The one program that stores writes each word from exactly
+///   one fragment.
+pub fn resolve_store_windows(program: &Program, shader: &Shader) -> Result<Vec<MemWindow>, &'static str> {
+    let secondary = crate::usse::decode_secondary_shader(program);
+    let stores = |sh: &Shader| sh.instrs.iter().any(|i| matches!(i.op, crate::ir::Op::MemStore { .. }));
+    if !stores(shader) && !stores(&secondary) {
+        return Ok(Vec::new());
+    }
+    if program.kind != crate::container::ProgramKind::Fragment {
+        return Err("a VERTEX program stores to guest memory; only the fragment stage binds a store window");
+    }
+    let Some(data) = program.containers.iter().find(|c| c.index == 19) else {
+        return Err("memory stores with no DATA container to hold a buffer's address");
+    };
+    let reads_sa = |reg: u32| {
+        shader.instrs.iter().chain(secondary.instrs.iter()).flat_map(|i| i.srcs.iter()).any(|s| {
+            s.bank == crate::ir::Bank::SecondaryAttr && u32::from(s.index) == reg
+        })
+    };
+    let loaded: Vec<u32> = resolve_mem_windows(program, shader).unwrap_or_default().iter().map(|w| w.buffer_index).collect();
+    let mut windows: Vec<MemWindow> = Vec::new();
+    for binding in &program.uniform_buffer_bindings {
+        if binding.data_slot >= data.size_regs {
+            return Err("a buffer-address slot falls outside the DATA container");
+        }
+        let base_sa = u32::from(data.base_sa) + u32::from(binding.data_slot);
+        if !reads_sa(base_sa) {
+            continue;
+        }
+        if u32::from(binding.buffer_index) >= u32::from(DEFAULT_UNIFORM_BUFFER_INDEX) {
+            // The default buffer and the driver's own blocks are what a LOAD window reads; a
+            // store through one is nowhere in any corpus.
+            continue;
+        }
+        let Some(ub) = program.parameters.iter().find(|p| {
+            p.category == ParamCategory::UniformBuffer
+                && p.resource_index >= 0
+                && p.resource_index as u32 == u32::from(binding.buffer_index)
+        }) else {
+            continue;
+        };
+        if ub.array_size == 0 {
+            return Err("a stored-through uniform buffer declares a zero size");
+        }
+        if loaded.contains(&u32::from(binding.buffer_index)) {
+            return Err("one buffer is both loaded and stored by one program, and a load window is a snapshot taken before the draw");
+        }
+        windows.push(MemWindow {
+            buffer_index: u32::from(binding.buffer_index),
+            bytes: ub.array_size,
+            base_sa,
+            base_offset: 0,
+            per_draw: false,
+        });
+    }
+    if windows.is_empty() {
+        return Err("memory stores with no declared uniform buffer among the +0x78 entries to write through");
+    }
+    Ok(windows)
+}
+
+/// The group-3 bindings a storing fragment program declares: binding 2 the writable mirror of
+/// the guest bytes its store windows cover, as 32-bit words; binding 3 one header `vec4` per
+/// window - lane x its guest base address (which also seeds the program's pointer register),
+/// lane y how many words it covers, lane z the mirror word its first byte lands on.
+pub fn store_window_decl(windows: &[MemWindow]) -> String {
+    format!(
+        "@group(3) @binding(2) var<storage, read_write> gxp_fst: array<u32>;\n\
+         @group(3) @binding(3) var<uniform> gxp_sthdr: array<vec4<u32>, {}>;\n",
+        windows.len()
+    )
+}
+
+/// `fn gxp_store_word(addr, v)` over a program's store windows: the FIRST window holding the
+/// address takes the word - every window is a view of the one mirror, so any window holding an
+/// address maps it to the same mirror word - and an address in none writes nothing.
+pub fn store_window_helper(windows: &[MemWindow]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "fn {}(addr: u32, v: u32) {{", crate::wgsl::STORE_HELPER);
+    for i in 0..windows.len() {
+        let _ = writeln!(s, "  {{");
+        let _ = writeln!(s, "    let h = gxp_sthdr[{i}u];");
+        let _ = writeln!(s, "    if (addr >= h.x) {{");
+        let _ = writeln!(s, "      let w = (addr - h.x) >> 2u;");
+        let _ = writeln!(s, "      if (w < h.y) {{");
+        let _ = writeln!(s, "        gxp_fst[h.z + w] = v;");
+        let _ = writeln!(s, "        return;");
+        let _ = writeln!(s, "      }}");
+        let _ = writeln!(s, "    }}");
+        let _ = writeln!(s, "  }}");
+    }
+    let _ = writeln!(s, "}}");
+    s
+}
+
+/// [`resolve_mem_windows`]' whole reading of the program's windows, before their size is
+/// judged. `extended` reads the two later spellings of an indexed table (`indexed_reach`).
+fn resolve_windows_reading(
+    program: &Program,
+    shader: &Shader,
+    extended: bool,
 ) -> Result<Vec<MemWindow>, &'static str> {
     // >>> THE LOAD CAN BE IN EITHER STREAM, and looking only at the primary refused a
     // >>> whole retail title. A program that reads a bound uniform buffer by chasing its
@@ -2657,6 +3518,7 @@ pub fn resolve_mem_windows(
                         bytes: reach,
                         base_sa,
                         base_offset: 0,
+                        per_draw: false,
                     });
                     continue;
                 }
@@ -2685,14 +3547,14 @@ pub fn resolve_mem_windows(
                 // were absent. The index reach (`x * stride + pointer`, see `indexed_reach`) is
                 // what the shader's own arithmetic can address; for the one-element declaration
                 // it is the same 256 elements, so that title's windows are unchanged.
-                Some(ub) if ub.semantic == 1 => match indexed_reach(base_sa, program, shader, &secondary) {
+                Some(ub) if ub.semantic == 1 => match indexed_reach(base_sa, program, shader, &secondary, extended) {
                     Some(r) if indexed_reach_on() => ub.array_size.max(r),
                     _ => ub.array_size.saturating_mul(OPEN_ARRAY_ELEMENTS),
                 },
                 // A table the program indexes at run time reaches as far as its index does,
                 // not as far as its declaration - see `indexed_reach`. Never SMALLER than
                 // declared. `VITASLOP_GXP_INDEXED_REACH=0` is the arm back.
-                Some(ub) => match indexed_reach(base_sa, program, shader, &secondary) {
+                Some(ub) => match indexed_reach(base_sa, program, shader, &secondary, extended) {
                     Some(r) if indexed_reach_on() => ub.array_size.max(r),
                     _ => ub.array_size,
                 },
@@ -2744,6 +3606,7 @@ pub fn resolve_mem_windows(
             bytes,
             base_sa,
             base_offset,
+            per_draw: false,
         });
     }
     if windows.is_empty() {
@@ -2788,11 +3651,6 @@ pub fn resolve_mem_windows(
             continue;
         }
         return Err("the program reads a DATA-container register no +0x78 entry feeds");
-    }
-    // The windows bind as ONE uniform buffer (present on every WebGPU tier); the guaranteed
-    // minimum for a single binding is 64 KiB, headers included.
-    if mem_window_vec4_count(&windows) * 16 > 65536 {
-        return Err("the declared uniform buffers exceed a 64 KiB uniform binding");
     }
     Ok(windows)
 }
@@ -2954,11 +3812,7 @@ pub fn build_vertex_module(body: &str, plan: &VertexBindingPlan) -> VertexModule
     // The guest-memory windows the program's 0xE8 loads read through: one header vec4 per
     // window (lane x = its guest base address), then every window's words (see [`MemWindow`]).
     if !plan.mem_windows.is_empty() {
-        let _ = writeln!(
-            m,
-            "@group(0) @binding(1) var<uniform> gxp_mem: array<vec4<u32>, {}>;",
-            mem_window_vec4_count(&plan.mem_windows)
-        );
+        m.push_str(&mem_window_decl(0, 1, "gxp_mem", &plan.mem_windows));
         m.push_str(&mem_window_helper(&plan.mem_windows));
     }
 
@@ -3192,6 +4046,46 @@ mod tests {
     fn half(mut i: Instr) -> Instr {
         i.half_precision = true;
         i
+    }
+
+    /// An output register used as SCRATCH - written, read back, then the whole colour written -
+    /// never sees the destination, so it costs no copy; every way the seed could still reach
+    /// something keeps the copy. See [`reads_output_bank_seed`].
+    #[test]
+    fn an_output_register_used_as_scratch_does_not_read_the_destination() {
+        let o = |swizzle| Operand { swizzle, ..Operand::plain(Bank::Output, 0, 1) };
+        let pa = || Operand::plain(Bank::PrimaryAttr, 0, 2);
+        let pa4 = || Operand::plain(Bank::PrimaryAttr, 4, 2);
+        // `o0.x = dot(pa, pa); pa4.x = rsq(o0.x); o0..o1 = pa` - the normalise shape a G-buffer
+        // program was measured to compile to.
+        let scratch = |dot: Instr, last_mask| {
+            shader(vec![
+                dot,
+                half(instr(Op::Rsq, Some(pa4()), vec![o([0, 0, 0, 0])], [true, false, false, false])),
+                half(instr(Op::Mov, Some(o([0, 1, 2, 3])), vec![pa()], last_mask)),
+            ])
+        };
+        let dot = || half(instr(Op::Dot { components: 3 }, Some(o([0, 1, 2, 3])), vec![pa(), pa()], [true, false, false, false]));
+        let sh = scratch(dot(), [true; 4]);
+        assert!(reads_output_bank(&sh), "it does source the output bank");
+        assert!(!reads_output_bank_seed(&sh), "but only what it wrote itself");
+
+        // The colour's second register is never written: the seed survives into the colour.
+        assert!(reads_output_bank_seed(&scratch(dot(), [true, true, false, false])));
+        // A PREDICATED write may not happen, so the read after it may see the seed.
+        let mut pred = dot();
+        pred.pred = Predicate::IfP(0);
+        assert!(reads_output_bank_seed(&scratch(pred, [true; 4])));
+        // Past a BRANCH, straight-line order is not execution order.
+        let mut branched = scratch(dot(), [true; 4]);
+        branched.instrs.insert(0, instr(Op::Branch { rel: 2 }, None, vec![], [false; 4]));
+        assert!(reads_output_bank_seed(&branched));
+        // A read BEFORE any write is the destination, as a blend reads it.
+        let blend = shader(vec![
+            half(instr(Op::Mad, Some(pa4()), vec![pa(), pa(), o([0, 1, 2, 3])], [true; 4])),
+            half(instr(Op::Mov, Some(o([0, 1, 2, 3])), vec![pa4()], [true; 4])),
+        ]);
+        assert!(reads_output_bank_seed(&blend));
     }
 
     /// A source-over lerp written longhand IS a blend, and recovering it as pipeline state is
@@ -3473,6 +4367,7 @@ mod tests {
                 f1_complement: false,
                 f2: crate::ir::SopFactor::Zero,
                 f2_complement: false,
+                alpha_coeffs: None,
             },
             Some(Operand::plain(Bank::Output, 0, 1)),
             vec![Operand::plain(Bank::PrimaryAttr, 0, 2), Operand::plain(Bank::Output, 0, 1)],
@@ -3810,17 +4705,146 @@ mod quad_tests {
         assert_eq!(quad_mem_reads(other, "gxp_mem"), other);
     }
 
+    /// The binding-size check counts in `u64`: four saturated open-array windows are 16 GiB,
+    /// which `mem_window_vec4_count * 16` wraps to 64 bytes in `u32`.
+    #[test]
+    fn a_saturated_window_does_not_wrap_the_binding_size() {
+        let huge = |i: u32| MemWindow { buffer_index: i, bytes: u32::MAX, base_sa: 11 + i, base_offset: 0, per_draw: false };
+        let w: Vec<MemWindow> = (0..4).map(huge).collect();
+        assert_eq!(mem_window_vec4_count(&w).wrapping_mul(16), 0x40, "the wrap this guards");
+        assert_eq!(mem_window_bind_bytes(&w), 0x4_0000_0040);
+        assert!(mem_window_bind_bytes(&w) > MEM_WINDOW_BINDING_MAX);
+        let small = [
+            MemWindow { buffer_index: 0, bytes: 80, base_sa: 3, base_offset: 0, per_draw: false },
+            MemWindow { buffer_index: 1, bytes: 12288, base_sa: 4, base_offset: 0, per_draw: false },
+        ];
+        assert_eq!(mem_window_bind_bytes(&small), u64::from(mem_window_vec4_count(&small)) * 16);
+    }
+
     /// The quad helper is emitted beside the word helper for every window, with the word reads
     /// as its fallback, so a module that calls it always has it.
     #[test]
     fn the_quad_helper_rides_with_the_word_helper() {
         let w = [
-            MemWindow { buffer_index: 0, bytes: 80, base_sa: 3, base_offset: 0 },
-            MemWindow { buffer_index: 1, bytes: 12288, base_sa: 4, base_offset: 0 },
+            MemWindow { buffer_index: 0, bytes: 80, base_sa: 3, base_offset: 0, per_draw: false },
+            MemWindow { buffer_index: 1, bytes: 12288, base_sa: 4, base_offset: 0, per_draw: false },
         ];
         let h = mem_window_helper_named(&w, "gxp_mem");
         assert!(h.contains("fn gxp_mem_quad(addr: u32) -> vec4<u32>"), "{h}");
         assert!(h.contains("if (w + 3u < 20u)") && h.contains("if (w + 3u < 3072u)"), "{h}");
         assert!(h.contains("return vec4<u32>(gxp_mem_word(addr), gxp_mem_word(addr + 4u)"), "{h}");
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::gxpwrite::{self, ContainerSpec, ParamSpec, ProgramSpec, VertexOutputs};
+    use crate::ir::Bank;
+    use crate::usse::asm::{self, Dest, IntSrc};
+
+    /// A vertex program whose DATA container puts buffer 0's pointer at `sa[20]` and whose
+    /// literal container starts at `sa[16]`, declaring `buffer` and carrying `literals`.
+    fn blob(code: Vec<u64>, buffer: ParamSpec, literals: Vec<(u32, u32)>) -> Vec<u8> {
+        gxpwrite::write(
+            &ProgramSpec::vertex(code)
+                .with_parameters(vec![ParamSpec::attribute("IN.position", 0, 4), buffer])
+                .with_default_uniform_regs(16)
+                .with_containers(vec![
+                    ContainerSpec { index: 14, base_sa: 0, size_regs: 16 },
+                    ContainerSpec { index: 16, base_sa: 16, size_regs: 4 },
+                    ContainerSpec { index: 19, base_sa: 20, size_regs: 4 },
+                ])
+                .with_literals(literals)
+                .with_ub_bindings(vec![(0, 0)])
+                .with_registers(8, 24, 16)
+                .with_outputs(VertexOutputs { color0: false, texcoords: vec![(0, 4)] }),
+        )
+    }
+
+    fn open_array(bytes: u32) -> ParamSpec {
+        ParamSpec { semantic: 1, ..ParamSpec::uniform_buffer("g_Table", 0, bytes) }
+    }
+
+    fn windows(bytes: &[u8]) -> Result<Vec<MemWindow>, &'static str> {
+        let p = Program::parse(bytes).unwrap();
+        resolve_mem_windows(&p, &crate::usse::decode_shader(&p))
+    }
+
+    /// `imad(index, sa[k], base)` with `sa[k]` a container LITERAL is the same indexed table
+    /// as an immediate stride: the window is the declared table (it already covers 256
+    /// elements of the literal's stride), not the declared size times 256.
+    #[test]
+    fn a_literal_stride_indexes_like_an_immediate_one() {
+        let t = Bank::Temp;
+        let code = vec![
+            asm::imad(true, false, false, Dest::new(t, 8), (Bank::PrimaryAttr, 0), IntSrc::Reg(Bank::SecondaryAttr, 16), IntSrc::Reg(Bank::SecondaryAttr, 20))
+                .unwrap(),
+            asm::ldmem(Dest::new(t, 0), 16, (t, 8), IntSrc::Imm(0), IntSrc::Imm(0)).unwrap(),
+        ];
+        let w = windows(&blob(code, open_array(32768), vec![(0, 64)])).unwrap();
+        assert_eq!(w, vec![MemWindow { buffer_index: 0, bytes: 32768, base_sa: 20, base_offset: 0, per_draw: false }]);
+        assert!(!mem_window_storage(&w));
+    }
+
+    /// `t = imad(index, stride, k)` then `mem[base + t]`: the index rides in the load's
+    /// REGISTER offset, which is 16 bits wide - so `k`'s high half drops out and the reach is
+    /// `255 * stride + (k & 0xffff)` plus the load. Here that lands exactly on the declared
+    /// 8192 bytes; under the old rule it was 8192 * 256 and the program was refused.
+    #[test]
+    fn an_index_in_the_register_offset_reaches_its_imad_and_no_further() {
+        let t = Bank::Temp;
+        let code = vec![
+            asm::imad(true, false, false, Dest::new(t, 8), (Bank::PrimaryAttr, 0), IntSrc::Imm(32), IntSrc::Reg(Bank::SecondaryAttr, 16))
+                .unwrap(),
+            asm::ldmem(Dest::new(t, 0), 4, (Bank::SecondaryAttr, 20), IntSrc::Reg(t, 8), IntSrc::Imm(0)).unwrap(),
+        ];
+        let w = windows(&blob(code, open_array(8192), vec![(0, 0x0001_0010)])).unwrap();
+        assert_eq!(w, vec![MemWindow { buffer_index: 0, bytes: 8192, base_sa: 20, base_offset: 0, per_draw: false }]);
+    }
+
+    /// A buffer far past the uniform binding, read only through `16 * (i & 0xffff) + ptr` (the
+    /// step's 16-bit input is `src1`, the constant a literal in `src0`): the window is cut to the
+    /// 1 MiB that arithmetic can reach, binds as read-only STORAGE, and the module that declares
+    /// it validates. A program that fits keeps its uniform declaration byte for byte.
+    #[test]
+    fn an_oversized_window_is_cut_to_its_reach_and_bound_as_storage() {
+        let t = Bank::Temp;
+        let code = vec![
+            asm::imad_step(false, false, Dest::new(t, 8), (Bank::SecondaryAttr, 16), IntSrc::Reg(Bank::PrimaryAttr, 0), IntSrc::Reg(Bank::SecondaryAttr, 20))
+                .unwrap(),
+            asm::ldmem(Dest::new(t, 0), 4, (t, 8), IntSrc::Imm(0), IntSrc::Imm(0)).unwrap(),
+        ];
+        let bytes = blob(code, ParamSpec::uniform_buffer("g_Grid", 0, 4 << 20), vec![(0, 16)]);
+        let w = windows(&bytes).unwrap();
+        assert_eq!(w, vec![MemWindow { buffer_index: 0, bytes: 0xffff * 16 + 16, base_sa: 20, base_offset: 0, per_draw: false }]);
+        assert!(mem_window_storage(&w));
+        assert!(mem_window_decl(0, 1, "gxp_mem", &w).contains("var<storage, read> gxp_mem: array<vec4<u32>, 65537>;"));
+        let (_, module) = crate::recompile_vertex_module(&bytes).expect("recompiles");
+        assert!(module.wgsl.contains("var<storage, read> gxp_mem"), "{}", module.wgsl);
+        let parsed = naga::front::wgsl::parse_str(&module.wgsl).unwrap_or_else(|e| panic!("{e}\n{}", module.wgsl));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&parsed)
+            .unwrap_or_else(|e| panic!("{e:?}\n{}", module.wgsl));
+
+        let small = [MemWindow { buffer_index: 0, bytes: 80, base_sa: 3, base_offset: 0, per_draw: false }];
+        assert_eq!(mem_window_decl(0, 1, "gxp_mem", &small), "@group(0) @binding(1) var<uniform> gxp_mem: array<vec4<u32>, 6>;\n");
+    }
+
+    /// The cut is refused - the declared size stands - when anything else reads the pointer,
+    /// or the computed address feeds anything but a load. Here the address is also ADDED to,
+    /// so no bound is established and the 4 MiB window binds whole.
+    #[test]
+    fn an_address_that_escapes_into_arithmetic_is_not_bounded() {
+        let t = Bank::Temp;
+        let code = vec![
+            asm::imad_step(false, false, Dest::new(t, 8), (Bank::PrimaryAttr, 0), IntSrc::Imm(16), IntSrc::Reg(Bank::SecondaryAttr, 20))
+                .unwrap(),
+            asm::imad_step(false, false, Dest::new(t, 9), (t, 8), IntSrc::Imm(1), IntSrc::Imm(4)).unwrap(),
+            asm::ldmem(Dest::new(t, 0), 4, (t, 9), IntSrc::Imm(0), IntSrc::Imm(0)).unwrap(),
+        ];
+        let w = windows(&blob(code, ParamSpec::uniform_buffer("g_Grid", 0, 4 << 20), vec![])).unwrap();
+        assert_eq!(w[0].bytes, 4 << 20);
+        assert!(mem_window_storage(&w));
     }
 }

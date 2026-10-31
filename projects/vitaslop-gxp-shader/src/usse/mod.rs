@@ -624,9 +624,10 @@ fn validate_imad_step_pairs(instrs: &mut [crate::ir::Instr]) {
         // the decomposition is unique, and each half is as established as the whole.
         //
         // A football title emits two of them, both HIGH halves alone, directly after a branch -
-        // the low half is not missing, it is not wanted: `pa[19] = ((sa[105] >> 16) * sa[72])
-        // << 16 + sa[23]` is the value that block computes. Six of its skinned vertex programs
-        // were refused whole for it.
+        // the low half is not missing, it is not wanted: `pa[19] = (sa[105] * (sa[72] >> 16))
+        // << 16 + sa[23]` is the value that block computes (the 16-bit input is `src1` - see
+        // `decode_grp_imad32_step`; it read `(sa[105] >> 16) * sa[72]` before that was
+        // settled). Six of its skinned vertex programs were refused whole for it.
         //
         // What stays refused is a step this decoder cannot READ, not one that is alone.
         if instrs[at].srcs.len() != 3 {
@@ -800,10 +801,19 @@ pub fn decode_shader(program: &Program) -> Shader {
 }
 
 /// The bank an operand of the SECONDARY program really names - see [`decode_secondary_shader`].
+///
+/// >>> A GLOBAL (SPECIAL hardware) REGISTER STAYS ONE. The exemption list is the SPECIAL
+/// bank's, and FPCONSTANT is only half of that bank: the other half, selected by bit `0x40` of
+/// the same number, is the hardware register file. Forcing it to SA turned a read of `TILEXY`
+/// (`GLOBAL[43]`) in a shooter's edge-mask secondary into `SA[43]` - a register 29 past the 14
+/// its program declares - so the tile coordinate the program builds its store address from
+/// would have come out of whatever that slot held. As a GLOBAL it is settled (or refused, by
+/// name) where every other GLOBAL read is. Over the three corpora at hand no other blob's WGSL
+/// changes.
 fn secondary_bank(bank: crate::ir::Bank) -> crate::ir::Bank {
     use crate::ir::Bank;
     match bank {
-        Bank::Internal | Bank::Constant | Bank::Immediate | Bank::Index => bank,
+        Bank::Internal | Bank::Constant | Bank::Immediate | Bank::Index | Bank::Global => bank,
         _ => Bank::SecondaryAttr,
     }
 }
@@ -904,12 +914,24 @@ mod tests {
         assert_eq!(i.srcs[0].bank, Bank::Immediate);
         assert_eq!(secondary_bank(i.srcs[0].bank), Bank::Immediate, "#0 stays #0");
         assert_eq!(secondary_bank(i.dest.unwrap().bank), Bank::SecondaryAttr, "the destination is SA");
-        for keep in [Bank::Internal, Bank::Constant, Bank::Immediate, Bank::Index] {
+        for keep in [Bank::Internal, Bank::Constant, Bank::Immediate, Bank::Index, Bank::Global] {
             assert_eq!(secondary_bank(keep), keep);
         }
         for force in [Bank::Temp, Bank::PrimaryAttr, Bank::Output, Bank::SecondaryAttr] {
             assert_eq!(secondary_bank(force), Bank::SecondaryAttr);
         }
+    }
+
+    /// A secondary program's read of a GLOBAL register stays one: an edge-mask secondary's
+    /// `and sa[13] <- GLOBAL[43] & 0xff` (`TILEXY`'s low byte) must not become `SA[43]`, a
+    /// register far past the 14 its program declares.
+    #[test]
+    fn the_secondary_bank_rule_keeps_a_global_register() {
+        use crate::ir::Bank;
+        let i = decode::decode(0x5083_0002_61a0_75ff);
+        assert_eq!((i.srcs[0].bank, i.srcs[0].index), (Bank::Global, 43));
+        assert_eq!(secondary_bank(i.srcs[0].bank), Bank::Global);
+        assert_eq!(secondary_bank(i.dest.unwrap().bank), Bank::SecondaryAttr, "the destination is SA");
     }
 
     /// The two words of a golf title's address computation, which are a well-formed pair.

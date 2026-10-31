@@ -71,10 +71,10 @@ pub const VERTEX_BLOCK_TEXTURES: u32 = super::gxmctx::MAX_UNIFORM_BUFFERS as u32
 /// Bytes of the vertex state's arrays block: the non-default uniform-buffer table (one
 /// word per index, in the context block's own layout), then a 16-unit texture array.
 ///
-/// The texture array preserves what `sceGxmPrecomputedVertexStateSetTexture` records - the
-/// old host table recorded these too, and the vertex BIND has never applied them (only the
-/// fragment bind rebinds textures), so the bind's inline copy covers the table alone and
-/// the recorded textures keep exactly their old, unread fate.
+/// The texture array holds what `sceGxmPrecomputedVertexStateSetTexture` records, and the
+/// vertex BIND applies it slot by slot onto the context's vertex sampler block
+/// ([`super::gxmctx::off::VERTEX_TEXTURES`]) - the bind's inline form as its second copy. It
+/// used to be recorded and never read, which dropped every draw whose vertex program samples.
 pub const VERTEX_BLOCK_BYTES: u32 = VERTEX_BLOCK_TEXTURES + TEXTURE_ARRAY_BYTES;
 /// A 16-unit texture-binding array in the context block's own slot layout
 /// ([`super::gxmctx::TEXTURE_STRIDE`] each). This is exactly what the bind's WHOLESALE copy

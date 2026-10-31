@@ -847,14 +847,22 @@ impl RttWriteback {
         self.prune_idle();
         const ALIGN: u32 = 256;
         for &(addr, tex, w, h) in targets {
-            let (w, h) = (w.max(1), h.max(1));
-            if w * h > cap {
+            // Only a target this frame's scenes render into, and of the two an address can
+            // hold, the one the surface names - the same bound as native's.
+            if !vitaslop_runtime::rtt_writeback::writes_back_target(scenes, addr, w, h) {
                 continue;
             }
-            // Only a target this frame's scenes render into - the same bound as native's.
+            let (w, h) = (w.max(1), h.max(1));
             let Some(surface) = vitaslop_runtime::rtt_writeback::surface_for(scenes, addr) else {
                 continue;
             };
+            // The whole target within the cap; above it, only the region the frame's last draw
+            // into it painted, written as a surface of its own - see `writeback_region`.
+            let Some((x, y, w, h, addr)) = vitaslop_runtime::rtt_writeback::writeback_region(scenes, addr, w, h, cap)
+            else {
+                continue;
+            };
+            let surface = vitaslop_runtime::capture::ColorSurface { data_addr: addr, width: w, height: h, ..surface };
             // The bytes a texel of the TEXTURE copies as - which is what lands in the buffer, and is
             // not always what the guest's surface format implies (see `take`).
             let tex_texel = tex.format().block_copy_size(None).unwrap_or(4);
@@ -898,7 +906,7 @@ impl RttWriteback {
                 wgpu::TexelCopyTextureInfo {
                     texture: tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyBufferInfo {
@@ -3955,6 +3963,31 @@ impl LivePlayback {
             self.split.worst_enc_work = enc_work;
             self.split.worst_enc_phases = ph;
         }
+        // >>> A SLOW ENCODE NAMES ITS OWN PHASES, on the present it happened. The window's
+        // worst-encode line keeps only the last window's, and the lost-time list says only
+        // `encode 7235` - a load's first present of a new world was exactly that, with 479
+        // draws, and nothing said which half of `encode_chain` held it.
+        if t2 - t_acq > 500.0 {
+            logging::note(&format!(
+                "[slow-encode] f{} {:.0} ms over {} scene(s) / {draws} draws: prepare {:.0} + upload {:.0} [arena {:.0}] + pass {:.0} + CHAIN {:.0} (precompile {:.0}, retire {:.0}, resident {:.0}; head {:.0}, scene-loop {:.0}, passes-wall {:.0}, tail {:.0}) | {}",
+                guest_frame,
+                t2 - t_acq,
+                scenes.len(),
+                ph.prepare_ms,
+                ph.upload_ms,
+                ph.arena_ms,
+                ph.pass_ms,
+                (t2 - t_acq - (ph.prepare_ms + ph.upload_ms + ph.pass_ms)).max(0.0),
+                ph.precompile_ms,
+                ph.retire_ms,
+                ph.resident_ms,
+                ph.chain_head_ms,
+                ph.scene_loop_ms,
+                ph.pass_wall_ms,
+                ph.chain_tail_ms,
+                enc_work.line(1),
+            ));
+        }
         self.split.work.add_pub(&work);
         self.split.enc_work.add(&enc_work);
         // Taken every present whether or not the knob is on: `take_prepare_split` is a handful
@@ -4623,6 +4656,10 @@ struct Prebuilt {
     /// The guest region offset the module was emitted for (`Program::host_off`); 0 for a
     /// memory of its own. The run worker refuses a module built for another offset.
     host_off: u32,
+    /// Layout offset of the runtime entry table, for code found at run time - see
+    /// `vitaslop_runtime::runtime_code`. `None` from a worker that did not send it, which
+    /// leaves a dispatch miss the loud trap it was.
+    runtime_off: Option<u64>,
 }
 
 impl Prebuilt {
@@ -4667,7 +4704,8 @@ impl Prebuilt {
         let host_off = get("hostOff")?
             .as_f64()
             .ok_or_else(|| JsValue::from_str("prebuilt.hostOff missing"))? as u32;
-        Ok(Some(Prebuilt { module, mem_pages, mirror_off, dirty_off, func_addrs, host_off }))
+        let runtime_off = get("runtimeOff")?.as_f64().map(|v| v as u64);
+        Ok(Some(Prebuilt { module, mem_pages, mirror_off, dirty_off, func_addrs, host_off, runtime_off }))
     }
 }
 
@@ -4677,6 +4715,8 @@ struct Transpiled {
     mem_pages: u32,
     mirror_off: Option<u64>,
     dirty_off: Option<u64>,
+    /// Layout offset of the runtime entry table - see `vitaslop_runtime::runtime_code`.
+    runtime_off: u64,
     ms: f64,
     /// Guest address of each transpiled function - see [`Prebuilt::func_addrs`].
     func_addrs: Vec<u32>,
@@ -4734,6 +4774,17 @@ fn configure_transpiler() {
     // fix, `emit::dirty_mark_tested`). `=0` is the arm back to the unconditional store.
     vitaslop_transpiler::set_dirty_mark_tested(!matches!(
         vitaslop_runtime::knobs::var("VITASLOP_DIRTY_MARK_TEST").as_deref(),
+        Ok("0")
+    ));
+    // And the two control-flow forms code found at run time leans on: guest tail jumps as
+    // `return_call`, and following a return that does not land on its caller. Both on by
+    // default; `=0` is each one's arm back. Routed because a browser has no environment.
+    vitaslop_transpiler::set_tail_calls(!matches!(
+        vitaslop_runtime::knobs::var("VITASLOP_TAIL_CALLS").as_deref(),
+        Ok("0")
+    ));
+    vitaslop_transpiler::set_nonlocal_returns(!matches!(
+        vitaslop_runtime::knobs::var("VITASLOP_NONLOCAL_RETURNS").as_deref(),
         Ok("0")
     ));
     // Hand the engine-agnostic runtime this engine's clock, so its per-phase timers work
@@ -4854,9 +4905,37 @@ fn transpile_here(
         mem_pages: built.artifact.mem_pages,
         mirror_off: built.artifact.mirror_off,
         dirty_off: built.artifact.dirty_off,
+        runtime_off: built.artifact.runtime_off,
         ms,
         func_addrs,
     })
+}
+
+/// The record of code found at run time for this run (see `vitaslop_runtime::runtime_code`),
+/// made against the program the module was transpiled from, under this worker's transpile
+/// settings - the ones `configure_transpiler` selects, which named the module in the transpile
+/// cache - so a side module agrees with its main module about every offset.
+///
+/// `None`, and a dispatch miss the loud trap it was, when the module came without its entry
+/// table's offset, or when the guest has a memory of its own: the table is written from here,
+/// through this worker's memory, which is then not the guest's.
+fn runtime_code(
+    linked: &vitaslop_runtime::link::LinkedProgram,
+    host_off: u32,
+    func_addrs: Vec<u32>,
+    runtime_off: Option<u64>,
+) -> Option<std::sync::Arc<vitaslop_runtime::runtime_code::RuntimeCode>> {
+    let runtime_off = runtime_off?;
+    if host_off == 0 || func_addrs.is_empty() {
+        return None;
+    }
+    configure_transpiler();
+    Some(std::sync::Arc::new(vitaslop_runtime::runtime_code::RuntimeCode::new(
+        linked.shared_program_at(host_off).to_owned(),
+        func_addrs,
+        vitaslop_transpiler::EmitSettings::capture(),
+        runtime_off,
+    )))
 }
 
 /// Bytes reserved for the guest region inside the emulator's memory: the guest's own
@@ -4940,6 +5019,7 @@ pub async fn transpile_title(source: JsValue, host_off: u32) -> Result<JsValue, 
             None => JsValue::NULL,
         },
     )?;
+    js_sys::Reflect::set(&out, &JsValue::from_str("runtimeOff"), &JsValue::from_f64(built.runtime_off as f64))?;
     // The module's BYTES, for the transpile cache (transpile-worker.js stores them and drops
     // them before posting the result - they are tens of MB).
     js_sys::Reflect::set(&out, &JsValue::from_str("wasm"), &js_sys::Uint8Array::from(&built.wasm[..]))?;
@@ -4955,7 +5035,10 @@ pub async fn transpile_title(source: JsValue, host_off: u32) -> Result<JsValue, 
 pub fn transpile_settings_key() -> String {
     configure_transpiler();
     let mut s = 0xcbf2_9ce4_8422_2325u64;
-    for byte in vitaslop_transpiler::codegen_fingerprint().bytes() {
+    // The link's inline choices are baked into the module as well - see the runtime's
+    // `inline_settings_fingerprint` for the A/B that loaded the wrong module without them.
+    let settings = vitaslop_transpiler::codegen_fingerprint() + &vitaslop_runtime::vita::inline_settings_fingerprint();
+    for byte in settings.bytes() {
         s = (s ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{s:016x}")
@@ -5229,7 +5312,7 @@ async fn setup_game(
     //
     // Built in a throwaway worker instead, the peak dies with that worker and only the
     // compiled `WebAssembly.Module` crosses over (it is structured-cloneable).
-    let (module, mem_pages, mirror_off, dirty_off, host_off, transpile_ms) = match prebuilt {
+    let (module, mem_pages, mirror_off, dirty_off, host_off, transpile_ms, func_addrs, runtime_off) = match prebuilt {
         Some(p) => {
             logging::note(&format!(
                 "[setup] using a PREBUILT module (transpiled in a throwaway worker); \
@@ -5237,8 +5320,8 @@ async fn setup_game(
                 wasm_heap_mb(),
                 if p.host_off == 0 { "a memory of its own".to_string() } else { format!("inside the emulator's memory at {:#x}", p.host_off) }
             ));
-            browser_sched::record_function_addresses(p.func_addrs);
-            (p.module, p.mem_pages, p.mirror_off, p.dirty_off, p.host_off, 0.0)
+            browser_sched::record_function_addresses(p.func_addrs.clone());
+            (p.module, p.mem_pages, p.mirror_off, p.dirty_off, p.host_off, 0.0, p.func_addrs, p.runtime_off)
         }
         None => {
             // Transpiling here: reserve the region here too, so this path and the prebuilt
@@ -5246,9 +5329,11 @@ async fn setup_game(
             let host_off = reserve_guest_region()?;
             let built = transpile_here(&linked, &perf, host_off)?;
             let module = browser_sched::compile_module(&built.wasm).await?;
-            (module, built.mem_pages, built.mirror_off, built.dirty_off, host_off, built.ms)
+            let addrs = built.func_addrs;
+            (module, built.mem_pages, built.mirror_off, built.dirty_off, host_off, built.ms, addrs, Some(built.runtime_off))
         }
     };
+    let runtime = runtime_code(&linked, host_off, func_addrs, runtime_off);
 
     let main_sp = main_stack_top(linked.base, linked.mem_bytes);
     // `VITASLOP_SMP=1`: the guest's threads run in parallel on guest workers (`smp.rs`). The
@@ -5270,6 +5355,7 @@ async fn setup_game(
             main_sp,
             env,
             audio_ring,
+            runtime,
         )
         .await?
     } else {
@@ -5284,6 +5370,7 @@ async fn setup_game(
             &linked.module_inits,
             main_sp,
             env,
+            runtime,
         )?
     };
 
@@ -5334,6 +5421,10 @@ pub fn set_knob(name: &str, value: &str) {
     // Not latched by a reader: the allocator cannot read a knob, so the switch is thrown here.
     if name == "VITASLOP_HEAP_BIG_GROW" {
         vitaslop_platform::heap::route_all_allocations(value.trim() != "0");
+    }
+    // The owner ledger is armed here for the same reason: see `heap::owners`.
+    if name == "VITASLOP_HEAP_OWNERS" {
+        vitaslop_platform::heap::track_owners(value.trim().parse::<usize>().unwrap_or(0) * 1024);
     }
 }
 
@@ -5545,6 +5636,7 @@ pub async fn run_game_worker(
     playbook: JsValue,
 ) -> Result<String, JsValue> {
     crate::logging::install_panic_hook();
+    vitaslop_platform::heap::set_thread_owner(vitaslop_platform::heap::Owner::RunWorker);
     logging::init();
     // >>> BEFORE ANYTHING ALLOCATES A CACHE. Every memory budget in the engine is scaled by what
     // this reports, and a budget read before it lands would be the desktop-sized one.
@@ -6196,7 +6288,7 @@ async fn live_loop(
         // out this way. With a guest frame costing C and a present costing R, a tick that runs N
         // frames and presents once takes `N*C + R`, so
         //
-        //     speed  ∝  N / (N*C + R)      rises with N, towards a ceiling of 1/C
+        //     speed  ~  N / (N*C + R)      rises with N, towards a ceiling of 1/C (proportional)
         //     fps    =  1 / (N*C + R)      falls with N, in proportion
         //
         // Every point of speed catch-up buys is bought by amortising ONE present over more
@@ -7022,9 +7114,16 @@ async fn live_loop(
             }
             // What the guest did WHILE this present ran - the game time it moved, the sound it
             // made, how long the speakers went dry - named on a slow one.
+            // And what the capture retired of the frames it ran on (`Capture::retire_counts`):
+            // the scenes the NEXT present will not have to draw.
             let around = |sched: &browser_sched::BrowserSched| {
                 let st = &sched.host.lock().unwrap().state;
-                (st.now_us(), st.audio_produced_seconds(), audio::ring_underrun_frames().unwrap_or(0))
+                (
+                    st.now_us(),
+                    st.audio_produced_seconds(),
+                    audio::ring_underrun_frames().unwrap_or(0),
+                    st.capture.retire_counts,
+                )
             };
             let around0 = around(&sched);
             vitaslop_platform::gpu::set_guest_frame(sched.frames());
@@ -7036,12 +7135,18 @@ async fn live_loop(
             note_audio_gaps(sched.frames());
             if present_wall_ms > 100.0 {
                 let around1 = around(&sched);
+                let (ra, rb) = (around0.3, around1.3);
                 logging::note(&format!(
-                    "[late] f{} present {present_wall_ms:.0} ms: game {} ms, sound made {:.0} ms, dry {:.0} ms",
+                    "[late] f{} present {present_wall_ms:.0} ms of {} scene(s): game {} ms, sound made {:.0} ms, dry {:.0} ms; \
+                     retired meanwhile {} scene(s) a newer frame redraws ({} still pending), kept {}",
                     sched.frames(),
+                    scene.len(),
                     around1.0.saturating_sub(around0.0) / 1000,
                     (around1.1 - around0.1) * 1000.0,
                     f64::from(around1.2.saturating_sub(around0.2)) / 48.0,
+                    rb.0 - ra.0,
+                    rb.1 - ra.1,
+                    rb.2 - ra.2,
                 ));
             }
             stall_note("present", &stall_mark);
@@ -8249,6 +8354,10 @@ async fn live_loop(
                         },
                     ),
                 );
+                // WHO holds the Rust heap, when `VITASLOP_HEAP_OWNERS` armed the ledger.
+                if let Some(owners) = vitaslop_platform::heap::owners_report() {
+                    line(&mut diag, "MEMORY", &owners);
+                }
                 // ...and INSIDE `prepare`, when it was asked for. See `WindowSplit::prep`.
                 if !s.prep.is_empty() {
                     line(&mut diag, "PREPARE SPLIT, window mean", &s.prep.line(s.presents.max(1)));
@@ -8360,7 +8469,7 @@ async fn live_loop(
                     if !holders.is_empty() {
                         let h: Vec<String> = holders
                             .iter()
-                            .map(|(l, ms, n)| format!("host.rs:{l} {:.2} ms/frame over {:.1} waits", ms / np, *n as f64 / np))
+                            .map(|(l, ms, n)| format!("{l} {:.2} ms/frame over {:.1} waits", ms / np, *n as f64 / np))
                             .collect();
                         line(
                             &mut diag,

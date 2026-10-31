@@ -49,7 +49,7 @@
 
 use vitaslop_gxp_shader::gxpwrite::{self, ProgramSpec, VertexOutputs};
 use vitaslop_gxp_shader::interp::{self, RegFile};
-use vitaslop_gxp_shader::ir::{Bank, Op};
+use vitaslop_gxp_shader::ir::{Bank, BitwiseKind, Op};
 use vitaslop_gxp_shader::usse::asm::{self, Dest, Src, MAD_F32_XYZ};
 use vitaslop_gxp_shader::wgsl::{
     wrap_compute_module_for, wrap_render_case_module_ramped, CASE_BANK_LANES, CASE_RAMP_DX,
@@ -986,6 +986,48 @@ fn case_test_and_predicated_writes() -> Case {
     }
 }
 
+/// **A VDP TEST TESTS THE WHOLE DOT, WHICHEVER CHANNEL ITS REDUCTION SELECTS.**
+///
+/// The float family's `alu_op` 8 is a four-channel dot whose one sum is replicated to every
+/// channel, so a channel-select reduction on channel 2 tests the same value as one on channel 0
+/// - and a translation that tested the selected channel's own product (`a.z * b.z`) instead
+/// moves a whole register of the answer whenever the two disagree in sign.
+///
+/// `p0 = dot4(pa[0..4], pa[4..8]) > 0` (channel 2) and `p1 = dot4(pa[0..4], pa[4..8]) <= 0`
+/// (channel 0), then writes guarded by `p0` and `p1`. Exactly one of them fires.
+fn case_test_dot() -> Case {
+    use vitaslop_gxp_shader::ir::{Predicate, TestAlu, TestCmp, TestReduce};
+    let pa = Bank::PrimaryAttr;
+    let t0 = asm::vtst(TestAlu::Dot, TestCmp::Gt, TestReduce::Channel(2), 0, false, pa, 0, pa, 4).unwrap();
+    let t1 = asm::vtst(TestAlu::Dot, TestCmp::Le, TestReduce::Channel(0), 1, false, pa, 0, pa, 4).unwrap();
+    let guarded = |pred, dest: u8, src: u8| {
+        asm::alu_pred(
+            Op::Add,
+            false,
+            pred,
+            Dest::new(Bank::Temp, dest),
+            [true; 4],
+            Src::cnst(0).swz([4, 4, 4, 4]),
+            Src::reg(Bank::SecondaryAttr, src),
+        )
+        .unwrap()
+    };
+    Case {
+        name: "conf_a_dot_test_tests_the_replicated_sum",
+        checks: "vtst float alu_op 8 (VDP): dot4 replicated to every channel before the reduction",
+        spec: vertex_spec(vec![t0, t1, guarded(Predicate::IfP(0), 0, 0), guarded(Predicate::IfP(1), 4, 4)]),
+        intent: |regs| {
+            let mut d = 0.0f32;
+            for c in 0..4 {
+                d += regs.pa[c] * regs.pa[4 + c];
+            }
+            let base = if d > 0.0 { 0usize } else { 4 };
+            (0..4).map(|c| f32_lane(Bank::Temp, base + c, 0.0 + regs.sa[base + c])).collect()
+        },
+        fragment: None,
+    }
+}
+
 /// **THE FOUR TRANSCENDENTALS ARE SCALAR, READ ONE COMPONENT, AND BROADCAST.**
 ///
 /// Group 0x30 picks ONE source channel and writes `f(it)` to every channel its mask names. So
@@ -1334,6 +1376,71 @@ fn case_sop2() -> Case {
     }
 }
 
+/// **A GROUP-0x80 COMBINE OVER TWO ORDINARY REGISTERS READS ITS ALPHA FROM ITS OWN SELECTOR PAIR.**
+///
+/// The plain SOP2 carries two coefficient pairs where SOP2M carries one: colour `sel1`/`sel2`
+/// (three bits) and alpha `asel1`/`asel2` (two bits), each with its own complement. One title's
+/// bloom composite ends `sop2 o[0] <- pa[0], sa[0]` with the colour pair `(1, 0)` and the alpha
+/// pair `(0, 1)` - the colour of the first source and the alpha of the second, which its
+/// secondary program set to `0xff`. The first word here is that shape (with src2 in the SA bank,
+/// as there); a reading that applied the colour pair to alpha too takes `t0`'s alpha byte, and a
+/// copy reading takes all of `t0`. The second exercises every other field the table admits: the
+/// alpha-broadcast colour selectors, both complements, a SUBTRACT colour op and the src1-alpha
+/// entry of the alpha table.
+fn case_sop2_combine() -> Case {
+    use vitaslop_gxp_shader::ir::{SopFactor as F, SopOp};
+    let t = Bank::Temp;
+    Case {
+        name: "conf_a_group_80_combine_takes_its_alpha_from_the_alpha_selector_pair",
+        checks: "plain SOP2 over two non-output registers: colour sel/mod at 40:38/56 and 37:35/47, alpha asel/amod at 53:52/43 and 42:41/34, ops at 19:18 and 17:16",
+        spec: vertex_spec(vec![
+            asm::limm(Dest::new(t, 0), 0x10C0_8040).unwrap(),
+            asm::limm(Dest::new(t, 1), 0x8020_E010).unwrap(),
+            asm::sop2_combine(
+                SopOp::Add,
+                SopOp::Add,
+                [(F::Zero, true), (F::Zero, false)],
+                [(F::Zero, false), (F::Zero, true)],
+                Dest::new(t, 2),
+                (t, 0),
+                (Bank::SecondaryAttr, 3),
+            )
+            .unwrap(),
+            asm::sop2_combine(
+                SopOp::Sub,
+                SopOp::Add,
+                [(F::Src2Alpha, false), (F::Src1Color, true)],
+                [(F::Src2Alpha, true), (F::Src1Alpha, false)],
+                Dest::new(t, 3),
+                (t, 0),
+                (t, 1),
+            )
+            .unwrap(),
+        ]),
+        intent: |regs| {
+            let (a, b, s) = (0x10C0_8040u32, 0x8020_E010u32, regs.sa[3].to_bits());
+            let ch = |w: u32, c: usize| ((w >> (8 * c)) & 0xff) as f32 / 255.0;
+            let store = |v: f32| ((v.clamp(0.0, 1.0) * 255.0) + 0.5) as u32 & 0xff;
+            let pack = |f: &dyn Fn(usize) -> f32| -> u32 { (0..4).fold(0u32, |acc, c| acc | (store(f(c)) << (8 * c))) };
+            // rgb = 1 * a.rgb + 0 * s.rgb, alpha = 0 * a.a + 1 * s.a.
+            let opaque = pack(&|c| if c == 3 { 0.0 * ch(a, 3) + 1.0 * ch(s, 3) } else { 1.0 * ch(a, c) + 0.0 * ch(s, c) });
+            // rgb = b.a * a.rgb - (1 - a.rgb) * b.rgb, alpha = (1 - b.a) * a.a + a.a * b.a.
+            let mixed = pack(&|c| {
+                if c == 3 {
+                    (1.0 - ch(b, 3)) * ch(a, 3) + ch(a, 3) * ch(b, 3)
+                } else {
+                    ch(b, 3) * ch(a, c) - (1.0 - ch(a, c)) * ch(b, c)
+                }
+            });
+            [(0, a), (1, b), (2, opaque), (3, mixed)]
+                .into_iter()
+                .map(|(lane, bits)| Lane { bank: Bank::Temp, lane, bits })
+                .collect()
+        },
+        fragment: None,
+    }
+}
+
 /// **A GATHER WRITES FOUR TEXELS, THEN FOUR F16 BILINEAR COEFFICIENTS - COEFFICIENT `k` WEIGHTING
 /// TEXEL `3 - k`.**
 ///
@@ -1414,7 +1521,7 @@ fn case_mem_load() -> Case {
         .with_ub_bindings(vec![(0, 0)]),
         intent: |_| {
             // The window this program declares, stated here: 64 bytes, pointer at sa[20].
-            let win = vitaslop_gxp_shader::module::MemWindow { buffer_index: 0, bytes: 64, base_sa: 20, base_offset: 0 };
+            let win = vitaslop_gxp_shader::module::MemWindow { buffer_index: 0, bytes: 64, base_sa: 20, base_offset: 0, per_draw: false };
             let words = common::mem_words_for(SEED, std::slice::from_ref(&win));
             let at = |word: u32| common::mem_fetch(common::window_base(0) + 4 * word, std::slice::from_ref(&win), &words);
             let mut out: Vec<Lane> = (0..4).map(|c| Lane { bank: Bank::Temp, lane: c, bits: at(2 + c as u32) }).collect();
@@ -1558,7 +1665,7 @@ fn case_open_array_buffer_reaches_past_its_declared_element() -> Case {
         .with_ub_bindings(vec![(0, 0)]),
         intent: |_| {
             // The window stated here: 256 elements of 48 bytes, pointer at sa[20].
-            let win = vitaslop_gxp_shader::module::MemWindow { buffer_index: 0, bytes: 48 * 256, base_sa: 20, base_offset: 0 };
+            let win = vitaslop_gxp_shader::module::MemWindow { buffer_index: 0, bytes: 48 * 256, base_sa: 20, base_offset: 0, per_draw: false };
             let words = common::mem_words_for(SEED, std::slice::from_ref(&win));
             let at = |word: u32| common::mem_fetch(common::window_base(0) + 4 * word, std::slice::from_ref(&win), &words);
             let mut out: Vec<Lane> = (0..4).map(|c| Lane { bank: Bank::Temp, lane: c, bits: at(60 + c as u32) }).collect();
@@ -1628,7 +1735,12 @@ fn case_f16_alu() -> Case {
             out.extend(f16_vec(6, each(&|x, y| x + y)));
             out.extend(f16_vec(8, each(&|x, y| x.min(y))));
             out.extend(f16_vec(10, each(&|x, y| x.max(y))));
-            out.extend(f16_vec(12, each(&|x, _| x - x.floor())));
+            // FRC is TWO-source, `src1 - floor(src2)`; with different operands it floors the
+            // second (an RGBM encode's `0 - floor(-m)` is its `ceil(m)`). The emitter takes that
+            // reading only with `wgsl::frc_two_source` on (off by default, see there), and is
+            // `fract(src1)` otherwise - the intent follows the same switch.
+            let two = vitaslop_gxp_shader::wgsl::frc_two_source();
+            out.extend(f16_vec(12, each(&|x, y| if two { x - y.floor() } else { x - x.floor() })));
             out.extend(f16_vec(14, [d; 4]));
             out.extend(f16_vec(16, each(&|x, y| x * y + x)));
             out
@@ -1816,6 +1928,13 @@ fn case_bitwise() -> Case {
 /// Then the group-0x1a PAIR, which builds a full 32x32 product out of two 16x32 steps:
 /// `r[9] = r[0] * r[1] + r[2]` in wrapping arithmetic, the low step into `r[9]` and the high step
 /// adding its shifted product to it.
+///
+/// And each step ALONE, where the pair's indifference to which source is the 16-bit one is gone:
+/// the 16-bit multiplier input is `src1` and `src0` is read whole (see
+/// `usse::decode::decode_grp_imad32_step`), so `r[10] = r[0] * (r[1] & 0xffff) + r[2]`,
+/// `r[11] = (r[0] * (r[1] >> 16)) << 16 + r[2]`, and the corpus's own lone shape
+/// `r[12] = r[0] * #32 + r[2]` keeps every bit of an index past 16 bits. Both sources have
+/// distinct halves, so the old `src0`-halved reading moves all three lanes.
 fn case_imad() -> Case {
     use asm::IntSrc::{Imm, Reg};
     let t = Bank::Temp;
@@ -1832,6 +1951,9 @@ fn case_imad() -> Case {
             asm::imad(false, false, true, Dest::new(t, 7), (t, 0), Reg(t, 1), Imm(3)).unwrap(),
             asm::imad_step(false, false, Dest::new(t, 9), (t, 0), Reg(t, 1), Reg(t, 2)).unwrap(),
             asm::imad_step(true, false, Dest::new(t, 9), (t, 0), Reg(t, 1), Reg(t, 9)).unwrap(),
+            asm::imad_step(false, false, Dest::new(t, 10), (t, 0), Reg(t, 1), Reg(t, 2)).unwrap(),
+            asm::imad_step(true, false, Dest::new(t, 11), (t, 0), Reg(t, 1), Reg(t, 2)).unwrap(),
+            asm::imad_step(false, false, Dest::new(t, 12), (t, 0), Imm(32), Reg(t, 2)).unwrap(),
         ]),
         intent: |_| {
             let (a, b, d) = (0x0003_FFF9u32, 0x0005_03E8u32, 0x11u32);
@@ -1850,6 +1972,9 @@ fn case_imad() -> Case {
                 (6, (a >> 16).wrapping_mul(9).wrapping_add(d)),
                 (7, lo_u.wrapping_mul(b >> 16).wrapping_add(3)),
                 (9, a.wrapping_mul(b).wrapping_add(d)),
+                (10, a.wrapping_mul(b & 0xffff).wrapping_add(d)),
+                (11, (a.wrapping_mul(b >> 16) << 16).wrapping_add(d)),
+                (12, a.wrapping_mul(32).wrapping_add(d)),
             ]
             .into_iter()
             .map(|(lane, bits)| Lane { bank: Bank::Temp, lane, bits })
@@ -1925,6 +2050,35 @@ fn case_repeating_pack_steps_by_the_dest_byte() -> Case {
             .into_iter()
             .filter(|l| l.bits != 0)
             .collect()
+        },
+        fragment: None,
+    }
+}
+
+/// **A REPEATING F32 PACK STEPS ITS DESTINATION ONE REGISTER PER UNIT OF THE DEST BYTE.**
+///
+/// One title's particle program fills the vector a DOT4 reads at `pa[8..11]` with ONE
+/// two-channel F32 pack repeated twice under `SMLSI [2,1,1,1]`. The dest byte (2) at one
+/// register a unit lands the second pair on `r[10..11]` - the dot's last two lanes; the old
+/// multiplier of two for a 32-bit destination lands it on `r[12..13]` and leaves those lanes
+/// unwritten. The intent states the whole written set, so only one reading passes. (A second
+/// title's post-process secondary walks `-2` the same way into `sa[4]`, `sa[2]`, `sa[0]`, where
+/// the old multiplier steps off the bottom of the bank - see `pack_dest_stride`.)
+fn case_repeating_f32_pack_steps_one_register_per_unit() -> Case {
+    use asm::PackFmt;
+    use vitaslop_gxp_shader::usse::decode::SmlsiSlot::Increment;
+    let t = Bank::Temp;
+    let pack = asm::pack(Dest::new(t, 8), PackFmt::F32, Bank::PrimaryAttr, 0, PackFmt::F32, [0, 1, 0, 0], [true, true, false, false], false)
+        .unwrap();
+    Case {
+        name: "conf_a_repeating_f32_pack_steps_one_register_per_unit_of_the_dest_byte",
+        checks: "VPCK F32 repeat under SMLSI [2,1,1,1]: destination r8..9 then r10..11, source pa0..1 then pa2..3",
+        spec: vertex_spec(vec![
+            asm::smlsi([Increment(2), Increment(1), Increment(1), Increment(1)]).unwrap(),
+            asm::with_repeat_count(pack, 1).unwrap(),
+        ]),
+        intent: |regs| {
+            (0..4).map(|k| Lane { bank: Bank::Temp, lane: 8 + k, bits: regs.pa[k].to_bits() }).collect()
         },
         fragment: None,
     }
@@ -2102,18 +2256,18 @@ fn case_pack_to_int() -> Case {
 // the next regression costs five milliseconds instead.
 // ---------------------------------------------------------------------------------------
 
-/// **AN INDEXED UNIFORM READ IS `sa[i0 + offset]`, AT PAIR SCALE ONE.**
+/// **AN INDEXED UNIFORM READ THROUGH A SIX-BIT FIELD IS `sa[2 * i0 + offset]`.**
 ///
-/// This is the crowd-sprite idiom end to end: an index load computes a row, and the instruction
-/// after it reads a uniform ARRAY at that row. The scale between the index register's value and
-/// the register it selects is the number that was wrong - it defaulted to 2, fitted to one
-/// program under a source reading that is now refuted, and under that scale a title's six-vertex
-/// fan sprites read past every register anything writes, came back zero, and collapsed to a
-/// point: 23 draws and 59,202 indices that rasterised NOTHING every frame.
+/// The index load computes a row, and the instruction after it reads a uniform ARRAY at that
+/// row. The scale between the index register's value and the register it selects belongs to
+/// the READING operand's field (`ir::indexed_index_scale`): a six-bit field is double-register
+/// scaled, so its whole indirect address counts register PAIRS. This move is a six-bit reader.
+/// (It used to state scale ONE, from a crowd-sprite closure whose reader is a SEVEN-bit VBW -
+/// that one is `case_seven_bit_indexed_read`, and still reads at one.)
 ///
 /// The case is deliberately arithmetic rather than pictorial. `r[0]` is zero (nothing has
 /// written it), so the index is exactly the ADDEND, and the read lands on a register the intent
-/// can name outright. At scale 2 the same program reads a different set of lanes, so the two
+/// can name outright. At scale 1 the same program reads a different set of lanes, so the two
 /// readings cannot both pass.
 fn case_indexed_uniform_read() -> Case {
     // i0 = int(r[0]) + 5. Nothing has written r[0], so its integer value is 0 and the index is
@@ -2128,13 +2282,39 @@ fn case_indexed_uniform_read() -> Case {
     .unwrap();
     Case {
         name: "conf_an_indexed_uniform_read_selects_the_row_its_index_names",
-        checks: "sa[i0 + offset] reads register i0 + offset at pair scale ONE, not i0 * 2 + offset",
+        checks: "a six-bit sa[i0 + offset] reads register 2 * i0 + offset - the field counts register pairs",
         spec: vertex_spec(vec![load, read]),
         intent: |regs| {
-            // i0 = 5, offset = 10, so channel c reads sa[15 + c]. Under a pair scale of 2 the
-            // same program would read sa[20 + c] - four different lanes.
-            (0..4).map(|c| f32_lane(Bank::Output, c, regs.sa[15 + c])).collect()
+            // i0 = 5, offset = 10, so channel c reads sa[20 + c]. At scale 1 the same program
+            // would read sa[15 + c] - four different lanes.
+            (0..4).map(|c| f32_lane(Bank::Output, c, regs.sa[20 + c])).collect()
         },
+        fragment: None,
+    }
+}
+
+/// **...AND THROUGH A SEVEN-BIT FIELD IT IS `sa[i0 + offset]`.**
+///
+/// The VBW group's operand number is seven bits and DIRECT, so its indirect address counts
+/// single registers. A football title's crowd sprites read their six-entry corner table this
+/// way - `(2c + 49) + 15` walks `sa[64..75]` end to end - and so does another title's
+/// sample-offset table, `(2k + 8) + 14`. The same index under the six-bit rule would land 5 and
+/// 20 registers further on; the intent names the one register only scale 1 reaches.
+fn case_seven_bit_indexed_read() -> Case {
+    let load = asm::load_index(Bank::Temp, 0, 5).unwrap();
+    // `or o[0] <- <indexed sa, offset 15>, #0`: the VBW assembler builds the register form,
+    // and the source is moved onto the extension row's INDEXED1 (ext 49, selector 0) with the
+    // seven-bit number `0b11_01111` - sub-bank SA, offset 15.
+    let mut read = asm::bitwise(BitwiseKind::Or, false, Dest::new(Bank::Output, 0), (Bank::Temp, 0), asm::IntSrc::Imm(0))
+        .unwrap();
+    read |= 1 << 49;
+    read &= !(0b11 << 30);
+    read = (read & !(0x7f << 7)) | (0b110_1111 << 7);
+    Case {
+        name: "conf_a_seven_bit_indexed_read_counts_single_registers",
+        checks: "a VBW sa[i0 + offset] (seven-bit direct field) reads register i0 + offset",
+        spec: vertex_spec(vec![load, read]),
+        intent: |regs| vec![Lane { bank: Bank::Output, lane: 0, bits: regs.sa[20].to_bits() }],
         fragment: None,
     }
 }
@@ -2149,7 +2329,8 @@ fn case_indexed_uniform_read() -> Case {
 /// rows 0, 3, 6 instead and every bone matrix would be assembled out of three unrelated rows.
 ///
 /// Two loads with addends one apart, each feeding its own read, is that property stated
-/// directly: the two results must be one register apart, no more and no less.
+/// directly: the two results must be one index step apart, no more and no less. The reader is
+/// a six-bit move, so one step is one register PAIR (`case_indexed_uniform_read`).
 fn case_index_addend_steps_by_one() -> Case {
     let row0 = asm::load_index(Bank::Temp, 0, 3).unwrap();
     let read0 = asm::mov(
@@ -2169,14 +2350,14 @@ fn case_index_addend_steps_by_one() -> Case {
     .unwrap();
     Case {
         name: "conf_consecutive_index_addends_select_consecutive_rows",
-        checks: "addends one apart select registers one apart - no hidden multiplier in the encoding",
+        checks: "addends one apart select rows one index step (a register pair, for a six-bit reader) apart - no hidden multiplier in the load",
         spec: vertex_spec(vec![row0, read0, row1, read1]),
         intent: |regs| {
             vec![
-                f32_lane(Bank::Output, 0, regs.sa[3]),
-                f32_lane(Bank::Output, 1, regs.sa[4]),
-                f32_lane(Bank::Output, 4, regs.sa[4]),
-                f32_lane(Bank::Output, 5, regs.sa[5]),
+                f32_lane(Bank::Output, 0, regs.sa[6]),
+                f32_lane(Bank::Output, 1, regs.sa[7]),
+                f32_lane(Bank::Output, 4, regs.sa[8]),
+                f32_lane(Bank::Output, 5, regs.sa[9]),
             ]
         },
         fragment: None,
@@ -2215,12 +2396,13 @@ fn case_sprite_corner_expansion() -> Case {
         name: "conf_a_six_corner_sprite_reads_a_different_row_per_corner",
         checks: "two corners of one sprite read DIFFERENT table rows - a collapsed sprite is a lookup that does not move",
         spec: vertex_spec(code),
+        // A six-bit reader: index 8 and 12 address register pairs 8 and 12.
         intent: |regs| {
             vec![
-                f32_lane(Bank::Output, 0, regs.sa[8]),
-                f32_lane(Bank::Output, 1, regs.sa[9]),
-                f32_lane(Bank::Output, 4, regs.sa[12]),
-                f32_lane(Bank::Output, 5, regs.sa[13]),
+                f32_lane(Bank::Output, 0, regs.sa[16]),
+                f32_lane(Bank::Output, 1, regs.sa[17]),
+                f32_lane(Bank::Output, 4, regs.sa[24]),
+                f32_lane(Bank::Output, 5, regs.sa[25]),
             ]
         },
         fragment: None,
@@ -2843,6 +3025,7 @@ fn all_cases() -> Vec<Case> {
         case_tex_level(),
         case_tex_gradient(),
         case_test_and_predicated_writes(),
+        case_test_dot(),
         case_transcendentals(),
         case_moves(),
         case_limm(),
@@ -2850,6 +3033,7 @@ fn all_cases() -> Vec<Case> {
         case_loop(),
         case_derivatives(),
         case_sop2(),
+        case_sop2_combine(),
         case_gather(),
         case_mem_load(),
         case_open_array_buffer_reaches_past_its_declared_element(),
@@ -2862,12 +3046,14 @@ fn all_cases() -> Vec<Case> {
         case_imad(),
         case_index_add(),
         case_repeating_pack_steps_by_the_dest_byte(),
+        case_repeating_f32_pack_steps_one_register_per_unit(),
         case_repeating_index_add_walks_the_offset_table(),
         case_test_mask(),
         case_byte_mask_select(),
         case_pack_to_int(),
         case_indexed_uniform_read(),
         case_index_addend_steps_by_one(),
+        case_seven_bit_indexed_read(),
         case_sprite_corner_expansion(),
         case_fragment(),
         case_kill_discards_after_writing(),
@@ -3550,6 +3736,80 @@ fn conf_a_fragment_is_fed_by_the_layout_it_was_patched_against() {
     assert!(patched.wgsl.contains("o[8]"), "the TEXCOORD1 read must come from lane 8:\n{}", patched.wgsl);
 }
 
+/// A program that blends for itself on a 64-bit surface reads the surface's STORED WORDS: the
+/// output pair is seeded from a `texture_2d<u32>` copy of the `Rg32Uint` attachment with no
+/// conversion, and the pair it then writes is returned as words. The module validates. On a
+/// multisampled pass the same program is refused, naming why.
+#[test]
+fn conf_a_raw64_pass_seeds_the_destination_from_the_stored_words() {
+    use vitaslop_gxp_shader::link::{link_programs_with, LinkError, LinkOptions};
+    let (pa, o) = (Bank::PrimaryAttr, Bank::Output);
+    let mv = |dest: u8, src: u8| asm::mov(false, Dest::new(o, dest), [true; 4], Src::reg(pa, src)).unwrap();
+    let v = gxpwrite::write(
+        &vertex_spec(vec![mv(0, 0), mv(4, 4)]).with_outputs(VertexOutputs { color0: false, texcoords: vec![(0, 4)] }),
+    );
+    // `o0 = pa0 + o0`: an additive blend in ALU, sourcing the output bank.
+    let add = asm::alu(Op::Add, false, Dest::new(o, 0), [true; 4], Src::reg(pa, 0), Src::reg(o, 0)).unwrap();
+    let f = gxpwrite::write(
+        &ProgramSpec::fragment(vec![add])
+            .with_interpolants(vec![gxpwrite::InterpolantSpec::texcoord(0, 4)])
+            .with_default_uniform_regs(16)
+            .with_containers(vec![
+                gxpwrite::ContainerSpec { index: 14, base_sa: 0, size_regs: 16 },
+                gxpwrite::ContainerSpec { index: 16, base_sa: 16, size_regs: 4 },
+            ])
+            .with_registers(8, 20, 8),
+    );
+    let raw = LinkOptions { raw64_output: true, ..LinkOptions::default() };
+    let linked = link_programs_with(&v, &f, raw.clone()).expect("a raw64 destination reader links");
+    let w = &linked.wgsl;
+    assert!(linked.reads_dest_color, "the pair reads the destination");
+    assert!(w.contains("var gxp_dst: texture_2d<u32>;"), "{w}");
+    assert!(w.contains("o[0] = gxp_dstw.x;") && w.contains("o[1] = gxp_dstw.y;"), "{w}");
+    assert!(!w.contains("gxp_dstc"), "no converted destination on a raw pass:\n{w}");
+    assert!(w.contains("-> @location(0) vec2<u32>"), "{w}");
+    let module = naga::front::wgsl::parse_str(w).unwrap_or_else(|e| panic!("{}\n{w}", e.emit_to_string(w)));
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{e:?}\n{w}"));
+
+    let ms = LinkOptions { dest_multisampled: true, ..raw };
+    assert!(matches!(link_programs_with(&v, &f, ms), Err(LinkError::Raw64OutputUnsupported { .. })));
+}
+
+/// A 64-bit surface stores an ALIGNED register pair, whichever half the program wrote last.
+///
+/// One title's deferred G-buffer programs fill `(pa0, pa1)` in both orders; the ones that finish
+/// on `pa1` were returned as `(pa1, pa2)` - the high word plus a register past the colour (a
+/// scratch F16 value, or nothing at all in a two-register program) - and the lighting pass lit
+/// that. Here `pa0 = sa0`, then `pa1 = pa0`, the last write in `pa1`: the stored pair is
+/// `(pa0, pa1)`.
+#[test]
+fn conf_a_raw64_colour_is_the_aligned_pair_whichever_half_is_written_last() {
+    use vitaslop_gxp_shader::link::{link_programs_with, LinkOptions};
+    let (pa, o) = (Bank::PrimaryAttr, Bank::Output);
+    let mv = |dest: u8, src: u8| asm::mov(false, Dest::new(o, dest), [true; 4], Src::reg(pa, src)).unwrap();
+    let v = gxpwrite::write(
+        &vertex_spec(vec![mv(0, 0), mv(4, 4)]).with_outputs(VertexOutputs { color0: false, texcoords: vec![(0, 4)] }),
+    );
+    let or = |dest: u8, src: (Bank, u8)| {
+        asm::bitwise(BitwiseKind::Or, false, Dest::new(pa, dest), src, asm::IntSrc::Imm(0)).unwrap()
+    };
+    let f = gxpwrite::write(
+        &ProgramSpec::fragment(vec![or(0, (Bank::SecondaryAttr, 0)), or(1, (pa, 0))])
+            .with_interpolants(vec![gxpwrite::InterpolantSpec::texcoord(0, 4)])
+            .with_default_uniform_regs(16)
+            .with_containers(vec![
+                gxpwrite::ContainerSpec { index: 14, base_sa: 0, size_regs: 16 },
+                gxpwrite::ContainerSpec { index: 16, base_sa: 16, size_regs: 4 },
+            ])
+            .with_registers(8, 20, 8),
+    );
+    let raw = LinkOptions { raw64_output: true, ..LinkOptions::default() };
+    let w = link_programs_with(&v, &f, raw).expect("the pair links").wgsl;
+    assert!(w.contains("return vec2<u32>(pa[0], pa[1]);"), "the stored pair is (pa0, pa1):\n{w}");
+}
+
 // ---------------------------------------------------------------------------------------
 // THE GXMCONF PROGRAMS. `gxmconf.velf` (the GXM pipeline-state conformance app) draws its
 // real-shader scenes through these two containers, embedded in the app as
@@ -3796,4 +4056,69 @@ fn gxmconf_shader_header_is_current() {
     }
     let have = std::fs::read_to_string(&path).unwrap_or_default().replace("\r\n", "\n");
     assert_eq!(have, want, "gxmconf_shaders.h is stale - regenerate with VITASLOP_BLESS_GXMCONF=1");
+}
+
+/// **THE TILE REGISTERS AND A GUEST-MEMORY STORE: EACH FRAGMENT WRITES ITS OWN WORD.**
+///
+/// The authored edge-mask arithmetic (`common::tile_store_pair`) forms `Y * stride + X` from
+/// `TILEXY`, `QUADRANTX` and `TILEY` and stores it at `pointer + 4 * (Y * stride + X)`. The
+/// intent, stated here: the fragment at pixel `(x, y)` - on either side of a 16-pixel boundary,
+/// in both axes - writes exactly one word, `y * stride + x`, at that address. It checks:
+///
+/// * that the sum proof ADMITS this program (it reads the registers through their sums alone);
+/// * the reference's reading of the registers (`RegFile::tile_pixel`) and of the store (data
+///   from src2, the `moe_expand` immediate debiased to a zero offset, the address the pointer
+///   plus the byte offset);
+/// * that the reference REFUSES the registers when it is given no pixel, as the emitter refuses
+///   a program the proof does not admit;
+/// * that the emitted body reads the registers through the split and calls the store helper.
+#[test]
+fn the_tile_registers_address_each_fragment_store_at_its_pixel() {
+    let (stride, rows) = (40u32, 36u32);
+    let (_, fblob) = common::tile_store_pair(stride, rows);
+    let p = Program::parse(&fblob).expect("parses");
+    let primary = vitaslop_gxp_shader::usse::decode_shader(&p);
+    let shader = vitaslop_gxp_shader::module::with_secondary(&p, &primary);
+    assert_eq!(vitaslop_gxp_shader::tile::tile_sums_only(&shader, &p.literals), Ok(true));
+    let windows = vitaslop_gxp_shader::module::resolve_store_windows(&p, &primary).expect("store windows");
+    assert_eq!(windows.len(), 1, "{windows:?}");
+    assert_eq!((windows[0].base_sa, windows[0].bytes), (common::TILE_STORE_POINTER_SA as u32, stride * rows * 4));
+    let base = 0x8100_0000u32;
+    let fresh = |pixel: Option<(u32, u32)>| {
+        let mut regs = RegFile::with_lanes(CASE_BANK_LANES);
+        regs.sa[common::TILE_STORE_STRIDE_SA] = f32::from_bits(stride);
+        regs.sa[common::TILE_STORE_POINTER_SA] = f32::from_bits(base);
+        regs.sa[common::TILE_STORE_ONE_SA] = f32::from_bits(1);
+        regs.tile_pixel = pixel;
+        regs
+    };
+    for (x, y) in [(0u32, 0u32), (15, 3), (16, 15), (17, 16), (31, 16), (32, 33), (39, 35)] {
+        let mut regs = fresh(Some((x, y)));
+        interp::run(&shader, &mut regs).unwrap_or_else(|e| panic!("({x}, {y}): {e:?}"));
+        let word = y * stride + x;
+        assert_eq!(regs.stores, vec![(base + 4 * word, word)], "pixel ({x}, {y})");
+    }
+    assert!(interp::run(&shader, &mut fresh(None)).is_err(), "no pixel, no tile registers");
+    // The primary stream reads the two remainders and stores; the secondary (emitted into the
+    // linked module) reads TILEXY's bytes.
+    let rc = vitaslop_gxp_shader::recompile_fragment(&fblob).expect("recompiles");
+    for name in ["gxp_tile_qx", "gxp_tile_y", "gxp_store_word("] {
+        assert!(rc.wgsl_body.contains(name), "the body must name {name}:\n{}", rc.wgsl_body);
+    }
+    let (vblob, _) = common::tile_store_pair(stride, rows);
+    let linked = vitaslop_gxp_shader::link::link_programs(&vblob, &fblob).expect("links");
+    for name in ["let gxp_tile_xy", "(gxp_tile_xy & 255u)", "var<storage, read_write> gxp_fst", "gxp_sthdr[0u].x"] {
+        assert!(linked.wgsl.contains(name), "the linked module must carry {name}:\n{}", linked.wgsl);
+    }
+}
+
+/// The same program WITHOUT the instruction that takes `TILEXY`'s low byte: `X` is then a
+/// uniform times 16 plus `QUADRANTX` - the register's own value reaches the store, which is
+/// outside what is established, so the program stays refused, naming the register and why.
+#[test]
+fn a_tile_register_read_outside_its_sum_stays_refused() {
+    let fblob = common::tile_store_fragment(40, 36, &common::TILE_STORE_SECONDARY[..3]);
+    let e = vitaslop_gxp_shader::recompile_fragment(&fblob).expect_err("must refuse");
+    let msg = e.to_string();
+    assert!((msg.contains("QUADRANTX") || msg.contains("TILEY")) && msg.contains("proof"), "{msg}");
 }

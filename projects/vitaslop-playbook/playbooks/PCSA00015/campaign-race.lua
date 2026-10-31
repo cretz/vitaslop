@@ -43,8 +43,23 @@ local briefing = loads("trackscreens/Tower.gxt")
 local race_ld  = loads("environments/tower/track.rcsmodel")
 local live     = loads("audio/music/")
 
+-- The race HUD's white LAP/TOTAL block (top left) and POS block (top right), each in a band: the
+-- campaign map carries ~2,400 white pixels top right and the white race transition frame
+-- 5,000+, a live race 650-830 and 900-1,160 (every shot of two runs, 2026-10-22 and 10-28).
+local lap_white = cue.pixels{ x = 0, y = 0, w = 90, h = 60, rgb = { 240, 240, 240 }, tol = 25 }
+local pos_white = cue.pixels{ x = 860, y = 0, w = 100, h = 60, rgb = { 240, 240, 240 }, tol = 25 }
+local lap_lo, lap_hi = lap_white:above(550), lap_white:below(1000)
+local pos_lo, pos_hi = pos_white:above(800), pos_white:below(1400)
+local function racing()
+  return try_wait(lap_lo, 0.3) and try_wait(lap_hi, 0.01) and try_wait(pos_lo, 0.01)
+    and try_wait(pos_hi, 0.01)
+end
+
+-- Six frames down, as a finger taps. A frame is a PRESENT, not 1/60 s: the pre-race card and
+-- its flyby present at ~30 fps, where a 20-frame hold lasted ~600 ms - past the tap limit, so
+-- the checkmark never took it and the race waited on minutes of retries (2026-10-28).
 local function touch_tap(x, y)
-  touch(x, y); idle(20); untouch()
+  touch(x, y); idle(6); untouch()
 end
 
 -- Repeat `act()` until the top screen is no longer the one that was up when this began.
@@ -100,7 +115,10 @@ phase("event", { timeout = 180 }, function()
   wait(screen:isnt(loading))
   idle(60)
   shot("pre-race")
-  leave_screen(function() touch_tap(1762, 960) end)
+  -- The checkmark, tapped until the race HUD is up - as a player taps again when nothing
+  -- happened. A screen change alone is not the race: one taken during the card's own animation
+  -- changed the screen and left the card up (2026-10-28).
+  repeat touch_tap(1762, 960); idle(60) until racing()
   split("race")
 end)
 

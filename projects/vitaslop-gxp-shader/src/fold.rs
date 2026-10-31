@@ -361,7 +361,13 @@ fn eval_channel(st: &State, instr: &Instr, c: usize) -> Val {
         Op::Mov | Op::Pack { .. } => s(0, c),
         Op::Min => Some(s(0, c)?.min(s(1, c)?)),
         Op::Max => Some(s(0, c)?.max(s(1, c)?)),
-        Op::Frc => Some(s(0, c)?.fract()),
+        // `src1 - floor(src2)` (see `emit_frc`) - the GPU's floor, not Rust's sign-keeping
+        // `fract`, which differs by 1.0 for a negative operand.
+        Op::Frc => {
+            let v = s(0, c)?;
+            let f = if instr.srcs.len() > 1 && crate::wgsl::frc_two_source() { s(1, c)? } else { v };
+            Some(v - f.floor())
+        }
         Op::Dot { components } => {
             let n = usize::from(components).clamp(1, 4);
             let mut acc = Some(0.0f32);
@@ -708,6 +714,11 @@ impl FoldProgram {
         }
         let shader = crate::module::with_secondary(&rc.program, &rc.shader);
         if crate::module::dest_is_linear_or_why(&shader).is_err() {
+            return None;
+        }
+        // A program that STORES to guest memory has an effect besides its colour, so no draw of
+        // it is an identity the encoder may drop.
+        if shader.instrs.iter().any(|i| matches!(i.op, crate::ir::Op::MemStore { .. })) {
             return None;
         }
         let plan = crate::module::plan_bindings(&rc.shader, rc.program.sa_carried_extent(), |o| {

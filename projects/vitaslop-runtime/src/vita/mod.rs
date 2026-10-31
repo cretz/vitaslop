@@ -48,15 +48,15 @@ pub mod touch;
 pub mod video;
 pub mod voice;
 
-use crate::host::{GuestCtx, VitaState};
+use crate::host::{GuestCtx, HttpSwitch, VitaState};
 use crate::nid::{
     atomic as at_nid, audio as audio_nid, audiodec as ad_nid, audioin as audioin_nid,
     avplayer as avp_nid, ctrl as ctrl_nid, dbg as dbg_nid, display as display_nid,
     fiber as fiber_nid, fios2 as fios2_nid, gxm as gxm_nid, http as http_nid, ime as ime_nid,
     iofilemgr as io_nid, libkernel as lk_nid, livearea as livearea_nid, lwsync as lw_nid,
-    net as net_nid, ngs as ngs_nid, np as np_nid, pgf as pgf_nid, processmgr as pm_nid,
-    pvf as pvf_nid, services as sv_nid, sync as sync_nid, sysmem as sm_nid, threadmgr as tm_nid,
-    videodec as vd_nid, voice as voice_nid, xml as xml_nid,
+    net as net_nid, ngs as ngs_nid, np as np_nid, np_party as party_nid, pgf as pgf_nid,
+    processmgr as pm_nid, pvf as pvf_nid, rudp as rudp_nid, services as sv_nid, sync as sync_nid,
+    sysmem as sm_nid, threadmgr as tm_nid, videodec as vd_nid, voice as voice_nid, xml as xml_nid,
 };
 use crate::{SvcOutcome, nid};
 
@@ -664,6 +664,43 @@ fn no_fast_import() -> bool {
 /// withheld while their diagnostics are on: an instrument that reports nothing because the
 /// call it watches was inlined imitates its own subject
 /// [[vitaslop-instrument-failure-imitating-its-subject]].
+/// >>> THE CALLS WHOSE HANDLER READS OR WRITES THE VFP ARGUMENT FILE: a `float`/`double`
+/// parameter (AAPCS-VFP passes it in s0.., not r0..r3) or a float return (s0).
+///
+/// A frontend that marshals only the core argument registers across a host call - the
+/// browser's traps read r0..r3, sp, lr and pc and leave every other lane ZERO, because a
+/// getter per lane on every call is most of what a call costs there - has to widen the read
+/// for exactly these, or the handler sees 0.0 for every float it is passed. MEASURED on an
+/// action title in the desktop browser: `sceGxmDepthStencilSurfaceSetBackgroundDepth(1.0)`
+/// arrived as 0.0, every world pass cleared its depth to 0 under a LESS test, every draw
+/// failed it, and the picture was its sky alone and then black, forever - while the same
+/// module on the desktop, which passes the whole file, drew the world.
+///
+/// The return direction needs it too: a handler RETURNING 0.0 into a lane the frontend
+/// never read compares equal to the zero it started from, so the write-back skips it and the
+/// guest reads whatever s0 held before the call.
+///
+/// `every_float_handler_is_listed` (below) scans the handlers' signatures and fails when one
+/// takes or returns a float and its NID is missing here, so a new float handler cannot be
+/// added silently.
+pub fn float_abi(func_nid: u32) -> bool {
+    matches!(
+        func_nid,
+        gxm_nid::SET_VIEWPORT
+            | gxm_nid::SET_W_CLAMP_VALUE
+            | gxm_nid::DEPTH_STENCIL_SURFACE_SET_BACKGROUND_DEPTH
+            | gxm_nid::DEPTH_STENCIL_SURFACE_GET_BACKGROUND_DEPTH
+            | ngs_nid::VOICE_PATCH_SET_VOLUME
+            | pvf_nid::SET_EM
+            | pvf_nid::SET_RESOLUTION
+            | pvf_nid::SET_CHAR_SIZE
+            | pvf_nid::SET_SKEW_VALUE
+            | pvf_nid::PIXEL_TO_POINT_H
+            | pvf_nid::PIXEL_TO_POINT_V
+            | sv_nid::MOTION_ROTATE_YAW
+    )
+}
+
 fn stub_inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     use crate::nid::{ngs as n, sysmem as sm};
     let is_stub = matches!(
@@ -673,7 +710,6 @@ fn stub_inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
             | n::VOICE_GET_PARAMS_OUT_OF_RANGE
             | n::SYSTEM_LOCK
             | n::SYSTEM_UNLOCK
-            | n::AT9_GET_SECTION_DETAILS
     );
     if is_stub {
         return Some(vitaslop_transpiler::InlineOp::RetConst { value: 0 });
@@ -924,6 +960,30 @@ pub(crate) fn texture_slot_writers_are_host_routed() -> (bool, bool) {
 fn no_inline_imports() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_IMPORTS"))
+}
+
+/// >>> EVERY SETTING THAT DECIDES WHICH IMPORTS ARE EMITTED INLINE, as a short token for a
+/// compiled-module cache key. These choices are made here at LINK time and baked into the
+/// module, so a cache named only by the transpiler's own settings served the INLINED module
+/// to a run that had switched an inline family off - MEASURED: a lightweight-mutex A/B
+/// loaded the cached module in 68 ms and measured the very form it meant to remove. Every
+/// reader the link consults belongs in this list; a new one that is missing makes its own
+/// A/B silently void on any cached boot.
+pub fn inline_settings_fingerprint() -> String {
+    let bits = [
+        no_inline_imports(),
+        no_inline_stubs(),
+        no_inline_delay(),
+        no_inline_clib(),
+        no_inline_reserve(),
+        no_inline_uniform_data(),
+        no_inline_lwmutex(),
+        no_inline_mutex(),
+        no_inline_texture(),
+        smp_lwmutex_inline(),
+    ];
+    let word = bits.iter().enumerate().fold(0u32, |w, (i, &b)| w | (u32::from(b) << i));
+    format!(";inline{word:x}")
 }
 
 /// Diagnostic call-site profiler (`VITASLOP_DBG_CALLSITES`): counts host calls
@@ -1643,6 +1703,9 @@ fn dispatch_inner(
         lk_nid::GET_EVENT_FLAG_INFO => sync::get_event_flag_info(ctx, st),
         lk_nid::CREATE_MSG_PIPE => cont!(libkernel::msg_pipe_create(ctx, st)),
         tm_nid::DELETE_MSG_PIPE => cont!(libkernel::msg_pipe_delete(ctx, st)),
+        lk_nid::CANCEL_MSG_PIPE => cont!(libkernel::msg_pipe_cancel(ctx, st)),
+        lk_nid::BACKTRACE_SELF => cont!(libkernel::backtrace_self(ctx, st)),
+        lk_nid::GET_RW_LOCK_INFO => cont!(sync::get_rwlock_info(ctx, st)),
         lk_nid::SEND_MSG_PIPE | lk_nid::TRY_SEND_MSG_PIPE => cont!(libkernel::msg_pipe_send(ctx, st)),
         lk_nid::RECEIVE_MSG_PIPE => libkernel::msg_pipe_receive(ctx, st, false),
         lk_nid::TRY_RECEIVE_MSG_PIPE => libkernel::msg_pipe_receive(ctx, st, true),
@@ -1939,6 +2002,8 @@ fn dispatch_inner(
         http_nid::URI_BUILD => cont!(http::uri_build(ctx, st)),
         http_nid::DELETE_CONNECTION => cont!(http::delete_connection(ctx, st)),
         http_nid::CREATE_REQUEST_WITH_URL => cont!(http::create_request_with_url(ctx, st)),
+        http_nid::CREATE_REQUEST_WITH_URL2 => cont!(http::create_request_with_url2(ctx, st)),
+        http_nid::CREATE_REQUEST2 => cont!(http::create_request2(ctx, st)),
         http_nid::DELETE_REQUEST => cont!(http::delete_request(ctx, st)),
         // The timeout slot is named by the ARM, not read from the guest: the three NIDs
         // differ only in which of the three values they set.
@@ -1951,16 +2016,31 @@ fn dispatch_inner(
         http_nid::SET_REQUEST_CONTENT_LENGTH => cont!(http::set_request_content_length(ctx, st)),
         http_nid::URI_ESCAPE => cont!(http::uri_escape(ctx, st)),
         http_nid::ADD_REQUEST_HEADER => cont!(http::add_request_header(ctx, st)),
+        http_nid::REMOVE_REQUEST_HEADER => cont!(http::remove_request_header(ctx, st)),
         http_nid::SEND_REQUEST => cont!(http::send_request(ctx, st)),
         http_nid::ABORT_REQUEST => cont!(http::abort_request(ctx, st)),
         http_nid::GET_STATUS_CODE => cont!(http::get_status_code(ctx, st)),
         http_nid::GET_RESPONSE_CONTENT_LENGTH => cont!(http::get_response_content_length(ctx, st)),
         http_nid::READ_DATA => cont!(http::read_data(ctx, st)),
+        sv_nid::HTTP_INIT => cont!(http::http_init(ctx, st)),
+        sv_nid::HTTP_TERM => cont!(http::http_term(ctx, st)),
+        http_nid::GET_MEMORY_POOL_STATS => cont!(http::get_memory_pool_stats(ctx, st)),
+        sv_nid::SSL_INIT => cont!(http::ssl_init(ctx, st)),
+        sv_nid::SSL_TERM => cont!(http::ssl_term(ctx, st)),
+        http_nid::SSL_GET_MEMORY_POOL_STATS => cont!(http::ssl_get_memory_pool_stats(ctx, st)),
         http_nid::SSL_LOAD_CERT => cont!(http::ssl_load_cert(ctx, st)),
         http_nid::SSL_SET_SSL_CALLBACK => cont!(http::ssl_set_ssl_callback(ctx, st)),
         http_nid::SSL_GET_SSL_ERROR => cont!(http::ssl_get_ssl_error(ctx, st)),
-        http_nid::SET_COOKIE_ENABLED => cont!(http::set_cookie_enabled(ctx, st)),
-        http_nid::GET_COOKIE_ENABLED => cont!(http::get_cookie_enabled(ctx, st)),
+        http_nid::SSL_UNLOAD_CERT => cont!(http::ssl_unload_cert(ctx, st)),
+        http_nid::SSL_ENABLE_OPTION => cont!(http::ssl_set_option(ctx, st, true)),
+        http_nid::SSL_DISABLE_OPTION => cont!(http::ssl_set_option(ctx, st, false)),
+        http_nid::GET_LAST_ERRNO => cont!(http::get_last_errno(ctx, st)),
+        http_nid::SET_COOKIE_ENABLED => cont!(http::set_switch(ctx, st, HttpSwitch::Cookies)),
+        http_nid::GET_COOKIE_ENABLED => cont!(http::get_switch(ctx, st, HttpSwitch::Cookies)),
+        http_nid::SET_AUTH_ENABLED => cont!(http::set_switch(ctx, st, HttpSwitch::Auth)),
+        http_nid::GET_AUTH_ENABLED => cont!(http::get_switch(ctx, st, HttpSwitch::Auth)),
+        http_nid::SET_AUTO_REDIRECT => cont!(http::set_switch(ctx, st, HttpSwitch::AutoRedirect)),
+        http_nid::GET_AUTO_REDIRECT => cont!(http::get_switch(ctx, st, HttpSwitch::AutoRedirect)),
         http_nid::SET_COOKIE_RECV_CALLBACK => cont!(http::set_cookie_recv_callback(ctx, st)),
         http_nid::GET_COOKIE => cont!(http::get_cookie(ctx, st)),
 
@@ -1979,6 +2059,35 @@ fn dispatch_inner(
         net_nid::GETSOCKOPT => cont!(net::getsockopt(ctx, st)),
         net_nid::GET_SOCK_INFO => cont!(net::get_sock_info(ctx, st)),
         net_nid::SHOW_NETSTAT => cont!(net::show_netstat(ctx, st)),
+        net_nid::SHOW_IFCONFIG => cont!(net::show_ifconfig(ctx, st)),
+        net_nid::SHOW_ROUTE => cont!(net::show_route(ctx, st)),
+        sv_nid::NET_INIT => cont!(net::net_init(ctx, st)),
+        sv_nid::NET_TERM => cont!(net::net_term(ctx, st)),
+        net_nid::GET_STATISTICS_INFO => cont!(net::get_statistics_info(ctx, st)),
+        // SceLibRudp: local objects real, the network step reporting there is none - see
+        // `vita::net`'s RUDP section.
+        rudp_nid::INIT => cont!(net::rudp_init(ctx, st)),
+        rudp_nid::END => cont!(net::rudp_end(ctx, st)),
+        rudp_nid::ENABLE_INTERNAL_IO_THREAD => cont!(net::rudp_enable_internal_io_thread(ctx, st)),
+        rudp_nid::SET_EVENT_HANDLER => cont!(net::rudp_set_event_handler(ctx, st)),
+        rudp_nid::SET_OPTION => cont!(net::rudp_set_option(ctx, st)),
+        rudp_nid::GET_OPTION => cont!(net::rudp_get_option(ctx, st)),
+        rudp_nid::CREATE_CONTEXT => cont!(net::rudp_create_context(ctx, st)),
+        rudp_nid::BIND => cont!(net::rudp_bind(ctx, st)),
+        rudp_nid::INITIATE | rudp_nid::ACTIVATE => cont!(net::rudp_connect(ctx, st)),
+        rudp_nid::TERMINATE => cont!(net::rudp_terminate(ctx, st)),
+        rudp_nid::GET_CONTEXT_STATUS => cont!(net::rudp_get_context_status(ctx, st)),
+        rudp_nid::GET_STATUS => cont!(net::rudp_get_status(ctx, st)),
+        rudp_nid::GET_SIZE_READABLE | rudp_nid::GET_SIZE_WRITABLE => cont!(net::rudp_get_size(ctx, st)),
+        rudp_nid::READ => cont!(net::rudp_read(ctx, st)),
+        rudp_nid::WRITE => cont!(net::rudp_write(ctx, st)),
+        rudp_nid::FLUSH => cont!(net::rudp_flush(ctx, st)),
+        rudp_nid::PROCESS_EVENTS => cont!(net::rudp_process_events(ctx, st)),
+        rudp_nid::NET_RECEIVED => cont!(net::rudp_net_received(ctx, st)),
+        rudp_nid::POLL_CREATE => cont!(net::rudp_poll_create(ctx, st)),
+        rudp_nid::POLL_DESTROY => cont!(net::rudp_poll_destroy(ctx, st)),
+        rudp_nid::POLL_CONTROL => cont!(net::rudp_poll_control(ctx, st)),
+        rudp_nid::POLL_WAIT => net::rudp_poll_wait(ctx, st),
         net_nid::HTONL | net_nid::NTOHL => cont!(net::swap32(ctx, st)),
         net_nid::HTONS | net_nid::NTOHS => cont!(net::swap16(ctx, st)),
         net_nid::INET_PTON => cont!(net::inet_pton(ctx, st)),
@@ -2044,6 +2153,8 @@ fn dispatch_inner(
         }
         gxm_nid::TRANSFER_COPY => cont!(gxm::transfer_copy(ctx)),
         gxm_nid::TRANSFER_DOWNSCALE => cont!(gxm::transfer_downscale(ctx)),
+        gxm_nid::TRANSFER_FILL => cont!(gxm::transfer_fill(ctx)),
+        gxm_nid::PROGRAM_IS_NATIVE_COLOR_USED => cont!(gxm::program_is_native_color_used(ctx, st)),
         gxm_nid::SHADER_PATCHER_DESTROY
         | gxm_nid::SHADER_PATCHER_UNREGISTER_PROGRAM
         | gxm_nid::SHADER_PATCHER_FORCE_UNREGISTER_PROGRAM => {
@@ -2120,6 +2231,8 @@ fn dispatch_inner(
         gxm_nid::VERTEX_PROGRAM_GET_PROGRAM => cont!(gxm::vertex_program_get_program(ctx, st)),
         gxm_nid::FRAGMENT_PROGRAM_GET_PROGRAM => cont!(gxm::fragment_program_get_program(ctx, st)),
         gxm_nid::BEGIN_SCENE => cont!(gxm::begin_scene(ctx, st)),
+        gxm_nid::BEGIN_SCENE_EX => cont!(gxm::begin_scene_ex(ctx, st)),
+        gxm_nid::MID_SCENE_FLUSH => cont!(gxm::mid_scene_flush(ctx, st)),
         gxm_nid::END_SCENE => gxm::end_scene(ctx, st),
         gxm_nid::SET_VERTEX_PROGRAM => cont!(gxm::set_vertex_program(ctx, st)),
         gxm_nid::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER => cont!(gxm::reserve_vertex_uniforms(ctx, st)),
@@ -2325,6 +2438,10 @@ fn dispatch_inner(
         gxm_nid::SET_TWO_SIDED_ENABLE => cont!(gxm::set_two_sided_enable(ctx, st)),
         gxm_nid::SET_FRONT_DEPTH_FUNC => cont!(gxm::set_front_depth_func(ctx, st)),
         gxm_nid::SET_FRONT_DEPTH_BIAS => cont!(gxm::set_front_depth_bias(ctx, st)),
+        gxm_nid::SET_BACK_DEPTH_BIAS => cont!(gxm::set_back_depth_bias(ctx, st)),
+        gxm_nid::SET_W_CLAMP_ENABLE => cont!(gxm::set_w_clamp_enable(ctx, st)),
+        gxm_nid::SET_W_CLAMP_VALUE => cont!(gxm::set_w_clamp_value(ctx, st)),
+        gxm_nid::SET_W_BUFFER_ENABLE => cont!(gxm::set_w_buffer_enable(ctx, st)),
         gxm_nid::SET_BACK_DEPTH_FUNC => cont!(gxm::set_back_depth_func(ctx, st)),
         gxm_nid::SET_FRONT_DEPTH_WRITE_ENABLE => cont!(gxm::set_front_depth_write_enable(ctx, st)),
         gxm_nid::SET_FRONT_FRAGMENT_PROGRAM_ENABLE => {
@@ -2462,9 +2579,10 @@ fn dispatch_inner(
         sv_nid::FIOS_OVERLAY_MODIFY_FOR_PROCESS => cont!(fios2::overlay_modify_for_process(ctx, st)),
         sv_nid::FIOS_OVERLAY_REMOVE_FOR_PROCESS => cont!(fios2::overlay_remove_for_process(ctx, st)),
         sv_nid::FIOS_OVERLAY_GET_LIST => cont!(fios2::overlay_get_list(ctx, st)),
-        sv_nid::FIOS_OVERLAY_RESOLVE_SYNC => cont!(fios2::overlay_resolve_sync(ctx, st)),
+        // The two resolves are the exception: flat arguments, not the syscall args block.
+        sv_nid::FIOS_OVERLAY_RESOLVE_SYNC => cont!(fios2::overlay_resolve_sync02(ctx, st)),
         sv_nid::FIOS_OVERLAY_RESOLVE_WITH_RANGE_SYNC => {
-            cont!(fios2::overlay_resolve_with_range_sync(ctx, st))
+            cont!(fios2::overlay_resolve_with_range_sync02(ctx, st))
         }
         sv_nid::FIOS_OVERLAY_THREAD_IS_DISABLED => cont!(fios2::overlay_thread_is_disabled(ctx, st)),
         sv_nid::FIOS_OVERLAY_THREAD_SET_DISABLED => cont!(fios2::overlay_thread_set_disabled(ctx, st)),
@@ -2493,6 +2611,10 @@ fn dispatch_inner(
         sm_nid::GET_MEM_BLOCK_INFO_BY_RANGE => cont!(sysmem::get_mem_block_info_by_range(ctx, st)),
         sm_nid::GET_MODEL | sm_nid::GET_MODEL_FOR_CDIALOG => cont!(sysmem::get_model(ctx, st)),
         sm_nid::IS_PS_VITA_TV => cont!(sysmem::is_ps_vita_tv(ctx, st)),
+        sm_nid::GET_FREE_MEMORY_SIZE => cont!(sysmem::get_free_memory_size(ctx, st)),
+        sm_nid::ALLOC_MEM_BLOCK_FOR_VM => cont!(sysmem::alloc_mem_block_for_vm(ctx, st)),
+        sm_nid::OPEN_VM_DOMAIN | sm_nid::CLOSE_VM_DOMAIN => cont!(sysmem::switch_vm_domain(ctx, st)),
+        sm_nid::SYNC_VM_DOMAIN => cont!(sysmem::sync_vm_domain(ctx, st)),
 
         // --- display ------------------------------------------------------------
         display_nid::SET_FRAME_BUF => cont!(display::set_frame_buf(ctx, st)),
@@ -2562,7 +2684,8 @@ fn dispatch_inner(
         | ngs_nid::VOICE_DEF_GET_SCREAM_VOICE
         | ngs_nid::VOICE_DEF_GET_TEMPLATE1
         | ngs_nid::VOICE_DEF_GET_ATRAC9_VOICE
-        | ngs_nid::VOICE_DEF_GET_SAS_EMU_VOICE => {
+        | ngs_nid::VOICE_DEF_GET_SAS_EMU_VOICE
+        | ngs_nid::VOICE_DEF_GET_ENVELOPE_BUSS => {
             // One blob per definition, keyed by the NID this call arrived on - the pointer
             // is the only thing a rack description says about what it is made of.
             let addr = ngs::voice_def_get_for(st, func_nid);
@@ -2573,7 +2696,7 @@ fn dispatch_inner(
         ngs_nid::VOICE_GET_OUTPUT_PATCH => cont!(ngs::voice_get_output_patch(ctx, st)),
         // The remaining NGS calls are state transitions / per-frame pumps that
         // succeed silently: update/flags/release, voice play/keyoff/kill/pause/
-        // resume, param unlock, callbacks, bypass, patch info, AT9 details,
+        // resume, param unlock, callbacks, bypass, patch info,
         // out-of-range query (0 = in range).
         ngs_nid::SYSTEM_UPDATE => cont!(ngs::system_update(ctx, st)),
         ngs_nid::VOICE_UNLOCK_PARAMS => cont!(ngs::voice_unlock_params(ctx, st)),
@@ -2585,14 +2708,20 @@ fn dispatch_inner(
         // Releasing a rack (or the whole system) stops its voices - see `ngs::rack_release`.
         ngs_nid::RACK_RELEASE => cont!(ngs::rack_release(ctx, st)),
         ngs_nid::SYSTEM_RELEASE => cont!(ngs::system_release(ctx, st)),
+        // The callback is where a parameter block that FAILS VALIDATION is reported. This NGS
+        // applies what it can read and never range-checks a block into an error, so there is
+        // nothing to deliver and registering succeeds. If validation is ever added, this is
+        // the callback it must call.
+        ngs_nid::SYSTEM_SET_PARAM_ERROR_CALLBACK => cont!(ctx.ret(0)),
         ngs_nid::SYSTEM_SET_FLAGS
         | ngs_nid::VOICE_BYPASS_MODULE
         | ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE
         // System lock/unlock guard the mix graph; single-thread-of-control here, so
         // there is no contention - both succeed immediately.
         | ngs_nid::SYSTEM_LOCK
-        | ngs_nid::SYSTEM_UNLOCK
-        | ngs_nid::AT9_GET_SECTION_DETAILS => cont!(ctx.ret(0)),
+        | ngs_nid::SYSTEM_UNLOCK => cont!(ctx.ret(0)),
+        // Where a run of samples lies in an ATRAC9 stream - see `ngs::at9_get_section_details`.
+        ngs_nid::AT9_GET_SECTION_DETAILS => cont!(ngs::at9_get_section_details(ctx, st)),
         // Sizes the title's volume matrix - see `ngs::patch_get_info`.
         ngs_nid::PATCH_GET_INFO => cont!(ngs::patch_get_info(ctx, st)),
         // Takes a patch out of the mix graph - see `ngs::patch_remove_routing`.
@@ -2614,6 +2743,7 @@ fn dispatch_inner(
         audio_nid::OUT_SET_VOLUME => cont!(audio::out_set_volume(ctx, st)),
         audio_nid::OUT_RELEASE_PORT => cont!(audio::out_release_port(ctx, st)),
         audio_nid::OUT_GET_ADOPT => cont!(audio::out_get_adopt(ctx, st)),
+        audio_nid::OUT_GET_REST_SAMPLE => cont!(audio::out_get_rest_sample(ctx, st)),
 
         // --- pvf: font library --------------------------------------------------
         pvf_nid::NEW_LIB => cont!(pvf::new_lib(ctx, st)),
@@ -2758,6 +2888,9 @@ fn dispatch_inner(
             cont!(services::rtc_format_rfc3339_local_time(ctx, st))
         }
         sv_nid::RTC_PARSE_RFC3339 => cont!(services::rtc_parse_rfc3339(ctx, st)),
+        sv_nid::RTC_FORMAT_RFC2822_LOCAL_TIME => {
+            cont!(services::rtc_format_rfc2822_local_time(ctx, st))
+        }
         sv_nid::APPUTIL_SYSTEM_PARAM_GET_INT => cont!(services::apputil_system_param_get_int(ctx, st)),
         sv_nid::APPUTIL_APP_PARAM_GET_INT => cont!(services::apputil_app_param_get_int(ctx, st)),
         sv_nid::LIVE_AREA_GET_STATUS => cont!(services::live_area_get_status(ctx, st)),
@@ -2919,9 +3052,10 @@ fn dispatch_inner(
         // The trophy-setup dialog's result read (zeroed result = OK), like the other
         // dialog GetResult calls.
         sv_nid::NP_TROPHY_SETUP_DIALOG_GET_RESULT => cont!(services::dialog_ok(ctx, st)),
-        // SceSystemGesture. No published prototype anywhere - see `vita::gesture` for
-        // where each argument shape comes from. The rest of the family is deliberately
-        // left to the hard-fail below until its call is observed.
+        // SceSystemGesture: all 17 functions of the library - a primitive layer fed the
+        // title's own SceTouchData, and tap / drag / hold / pinch recognizers whose state
+        // lives in the guest's recognizer blocks. See `vita::gesture` for where each
+        // argument shape and layout comes from, and which model values are not established.
         sv_nid::SYSTEM_GESTURE_INIT_PRIMITIVE_TOUCH_RECOGNIZER => {
             cont!(gesture::init_primitive_touch_recognizer(ctx, st))
         }
@@ -2953,6 +3087,10 @@ fn dispatch_inner(
         sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_INDEX => {
             cont!(gesture::get_touch_event_by_index(ctx, st))
         }
+        sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENTS => cont!(gesture::get_touch_events(ctx, st)),
+        sv_nid::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER_RECTANGLE => {
+            cont!(gesture::update_touch_recognizer_rectangle(ctx, st))
+        }
         sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_EVENT_ID => {
             cont!(gesture::get_touch_event_by_event_id(ctx, st))
         }
@@ -2974,6 +3112,7 @@ fn dispatch_inner(
         sv_nid::JPEG_FINISH_MJPEG => cont!(jpeg::finish_mjpeg(ctx, st)),
         sv_nid::JPEG_GET_OUTPUT_INFO => cont!(jpeg::get_output_info(ctx, st)),
         sv_nid::JPEG_DECODE_MJPEG_YCBCR => cont!(jpeg::decode_mjpeg_ycbcr(ctx, st)),
+        sv_nid::JPEG_DECODE_MJPEG => cont!(jpeg::decode_mjpeg(ctx, st)),
         sv_nid::JPEG_MJPEG_CSC => cont!(jpeg::mjpeg_csc(ctx, st)),
         sv_nid::JPEG_CSC => cont!(jpeg::plain_csc(ctx, st)),
         sv_nid::JPEGENC_GET_CONTEXT_SIZE => cont!(jpegenc::get_context_size(ctx, st)),
@@ -3098,12 +3237,42 @@ fn dispatch_inner(
         | sv_nid::NP_MATCHING2_SEARCH_ROOM
         | sv_nid::NP_MATCHING2_CREATE_JOIN_ROOM
         | sv_nid::NP_MATCHING2_JOIN_ROOM
-        | sv_nid::NP_MATCHING2_SEND_ROOM_MESSAGE => {
+        | sv_nid::NP_MATCHING2_SEND_ROOM_MESSAGE
+        // The rest of the room surface: each names a room, and most a member of it, that only
+        // a context bound to an account could have joined - LEAVE included, since it is a
+        // request to the server like the join it undoes, not a local release.
+        | sv_nid::NP_MATCHING2_LEAVE_ROOM
+        | sv_nid::NP_MATCHING2_GRANT_ROOM_OWNER
+        | sv_nid::NP_MATCHING2_KICKOUT_ROOM_MEMBER
+        | sv_nid::NP_MATCHING2_GET_ROOM_DATA_EXTERNAL_LIST
+        | sv_nid::NP_MATCHING2_SET_ROOM_DATA_EXTERNAL
+        | sv_nid::NP_MATCHING2_SET_ROOM_DATA_INTERNAL
+        | sv_nid::NP_MATCHING2_SET_ROOM_MEMBER_DATA_INTERNAL
+        // Signaling over a context: its callback is registered against the context, and a
+        // connection's status or info is asked of a member of a room - neither exists.
+        | sv_nid::NP_MATCHING2_REGISTER_SIGNALING_CALLBACK
+        | sv_nid::NP_MATCHING2_SIGNALING_GET_CONNECTION_STATUS
+        | sv_nid::NP_MATCHING2_SIGNALING_GET_CONNECTION_INFO => {
             cont!(ctx.ret(services::NP_MATCHING2_ERROR_NOT_NP_SIGN_IN as u32))
+        }
+        // The two matching2 calls that need NO context: the pool `Init` was handed, and this
+        // console's own signaling addresses - the second needing a network that is down.
+        sv_nid::NP_MATCHING2_INIT => cont!(np::matching2_init(ctx, st)),
+        sv_nid::NP_MATCHING2_TERM => cont!(np::matching2_term(ctx, st)),
+        sv_nid::NP_MATCHING2_GET_MEMORY_INFO => cont!(np::matching2_get_memory_info(ctx, st)),
+        sv_nid::NP_MATCHING2_SIGNALING_GET_LOCAL_NET_INFO => {
+            cont!(np::matching2_signaling_get_local_net_info(ctx, st))
         }
         // SceNpScore's and SceNpTus's request surface: the community libraries, whose block's
         // one sign-in code is NO_LOGIN. Same context reasoning as matching2 above.
         sv_nid::NP_TUS_CREATE_REQUEST
+        // A TUS title context is bound to the signed-in user's own NpId, as NpScore's is;
+        // the data reads and writes go to the server, and the poll has no accepted request
+        // to report on.
+        | sv_nid::NP_TUS_CREATE_TITLE_CTX
+        | sv_nid::NP_TUS_GET_DATA_ASYNC
+        | sv_nid::NP_TUS_SET_DATA_ASYNC
+        | sv_nid::NP_TUS_POLL_ASYNC
         | sv_nid::NP_SCORE_CREATE_TITLE_CTX
         | sv_nid::NP_SCORE_CREATE_REQUEST
         | sv_nid::NP_SCORE_RECORD_SCORE
@@ -3118,6 +3287,31 @@ fn dispatch_inner(
         // `SendInGameDataMessage` needs a session to send over: the basic library's own
         // SIGNED_OUT.
         sv_nid::NP_BASIC_SEND_IN_GAME_DATA_MESSAGE => cont!(ctx.ret(np::BASIC_ERROR_SIGNED_OUT as u32)),
+        // ...as does answering a friend's request to join: the response goes to that friend
+        // over PSN. (No request can ever arrive for it to answer - see the handler below.)
+        np_nid::NP_BASIC_JOIN_GAME_ACK_RESPONSE_SEND => {
+            cont!(ctx.ret(np::BASIC_ERROR_SIGNED_OUT as u32))
+        }
+        // SceNpPartyGameUtil: the system voice party, which runs over PSN. Signed out the
+        // console is in no party, so every query about one - its state, its members, a
+        // member's details or voice - answers the library's no-party code, the one the
+        // calling titles themselves test for.
+        party_nid::GET_STATE
+        | party_nid::GET_MEMBERS
+        | party_nid::GET_MEMBER_INFO
+        | party_nid::GET_MEMBER_VOICE_INFO => cont!(ctx.ret(np::PARTY_ERROR_NOT_IN_PARTY as u32)),
+        // ...while bringing the library up and down, registering the event handlers and
+        // pumping them are local and succeed: the handlers are simply never called, because
+        // no party event can happen to a console that is in no party.
+        party_nid::INIT | party_nid::TERM | party_nid::REGISTER_HANDLER | party_nid::CHECK_CALLBACK => {
+            cont!(ctx.ret(0))
+        }
+        np_nid::NP_BASIC_REGISTER_JOIN_GAME_ACK_HANDLER => {
+            cont!(np::basic_register_join_game_ack_handler(ctx, st))
+        }
+        np_nid::NP_BASIC_UNREGISTER_JOIN_GAME_ACK_HANDLER => {
+            cont!(np::basic_unregister_join_game_ack_handler(ctx, st))
+        }
         // SceNpMessage has no error block of its own. Syncing needs the account's inbox, and a
         // message's ATTACHMENT can only exist on a message, of which there are none: what is
         // missing is the account, so the answer is the manager's.
@@ -3150,10 +3344,7 @@ fn dispatch_inner(
         => cont!(ctx.ret(np::COMMERCE2_ERROR_NOT_SIGNIN as u32)),
         sv_nid::NET_GET_MAC_ADDRESS => cont!(services::net_get_mac_address(ctx, st)),
         // Everything else here is an init/register that simply succeeds offline.
-        sv_nid::NET_INIT
-        | sv_nid::NET_CTL_INIT
-        | sv_nid::HTTP_INIT
-        | sv_nid::SSL_INIT
+        sv_nid::NET_CTL_INIT
         | sv_nid::NP_INIT
         | sv_nid::NP_BASIC_INIT
         | sv_nid::NP_BASIC_REGISTER_HANDLER
@@ -3220,7 +3411,6 @@ fn dispatch_inner(
         | sv_nid::NP_COMMERCE2_DESTROY_CTX
         | sv_nid::NP_COMMERCE2_DESTROY_REQ
         | sv_nid::NP_COMMERCE2_DESTROY_GET_PRODUCT_INFO_RESULT
-        | sv_nid::NP_MATCHING2_INIT
         // Matching2 / NpScore TEARDOWN, for the same reason the rest of the online stack's
         // teardown succeeds: nothing was created, so there is nothing that can fail to be
         // released, and a title unwinding after its offline path found no service must not
@@ -3229,6 +3419,14 @@ fn dispatch_inner(
         | sv_nid::NP_MATCHING2_CONTEXT_STOP
         | sv_nid::NP_MATCHING2_ABORT_CONTEXT_START
         | sv_nid::NP_SCORE_DELETE_REQUEST
+        // NpTus's request teardown, for the same reason as NpScore's beside it.
+        | sv_nid::NP_TUS_DELETE_REQUEST
+        | sv_nid::NP_TUS_ABORT_REQUEST
+        // SceAppMgr: whether the SYSTEM may warn the player when the network drops during this
+        // title. A permission handed to the system's own UI, with no getter and nothing the
+        // title can read back; the network never comes up here, so there is no disconnection
+        // for any warning to report either way.
+        | sv_nid::APP_MGR_SET_NETWORK_DISCONNECTION_WARNING_DIALOG_STATE
         // Aborting a request is teardown too: no operation was ever accepted, so there is
         // nothing outstanding to cancel, and the abort a title issues while unwinding succeeds.
         | sv_nid::NP_SCORE_ABORT_REQUEST
@@ -3243,10 +3441,6 @@ fn dispatch_inner(
         | sv_nid::NP_TUS_TERM
         | sv_nid::NP_TUS_DELETE_TITLE_CTX
         | sv_nid::NP_SCORE_DELETE_TITLE_CTX
-        | sv_nid::NP_MATCHING2_TERM
-        | sv_nid::HTTP_TERM
-        | sv_nid::SSL_TERM
-        | sv_nid::NET_TERM
         | sv_nid::NET_CTL_TERM
         | sv_nid::NET_CTL_INET_UNREGISTER_CALLBACK
         | sv_nid::NETCTL_ADHOC_UNREGISTER_CALLBACK
@@ -3368,6 +3562,7 @@ fn dispatch_inner(
         | sv_nid::MSG_DIALOG_CLOSE
         | sv_nid::SAVEDATA_DIALOG_ABORT => cont!(ctx.ret(0)),
         sv_nid::MSG_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::Msg)),
+        sv_nid::COMMON_DIALOG_IS_RUNNING => cont!(services::common_dialog_is_running(ctx, st)),
         sv_nid::MSG_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::Msg)),
         sv_nid::MSG_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::Msg)),
         sv_nid::NET_CHECK_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::NetCheck)),
@@ -3391,6 +3586,23 @@ fn dispatch_inner(
         sv_nid::STORE_CHECKOUT_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::StoreCheckout)),
         sv_nid::NP_SNS_FACEBOOK_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::NpSnsFacebook)),
         sv_nid::NP_SNS_FACEBOOK_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NpSnsFacebook)),
+        // The unnamed terms-acceptance family (see `services::DialogFamily::UnnamedTerms`).
+        // Its ABORT does not close it: the caller keeps polling for FINISHED after aborting
+        // and treats every other status as "poll again", so a close would read as NONE
+        // forever. An abort of a dialog that completes on its own has nothing to cut short.
+        sv_nid::COMMON_DIALOG_UNNAMED_TERMS_INIT => {
+            cont!(services::dialog_init(ctx, st, services::DialogFamily::UnnamedTerms))
+        }
+        sv_nid::COMMON_DIALOG_UNNAMED_TERMS_GET_STATUS => {
+            cont!(services::dialog_get_status(ctx, st, services::DialogFamily::UnnamedTerms))
+        }
+        sv_nid::COMMON_DIALOG_UNNAMED_TERMS_GET_RESULT => {
+            cont!(services::unnamed_terms_dialog_get_result(ctx, st))
+        }
+        sv_nid::COMMON_DIALOG_UNNAMED_TERMS_TERM => {
+            cont!(services::dialog_term(ctx, st, services::DialogFamily::UnnamedTerms))
+        }
+        sv_nid::COMMON_DIALOG_UNNAMED_TERMS_ABORT => cont!(services::dialog_ok(ctx, st)),
         sv_nid::IME_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::Ime)),
         sv_nid::IME_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::Ime)),
         sv_nid::IME_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::Ime)),
@@ -3572,6 +3784,7 @@ mod frame_boundary_tests {
             (audio_nid::OUT_OUTPUT, "parks when the port's queue is full"),
             (audioin_nid::INPUT, "parks for the capture period"),
             (fiber_nid::RUN, "switches stacks"),
+            (rudp_nid::POLL_WAIT, "parks for its timeout"),
         ];
         for (nid_fn, why) in parks {
             // Against the DERIVED rule, not against `fast_nid`: which SET is in use is a knob,
@@ -3716,7 +3929,6 @@ mod frame_boundary_tests {
             ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE,
             ngs_nid::SYSTEM_LOCK,
             ngs_nid::SYSTEM_UNLOCK,
-            ngs_nid::AT9_GET_SECTION_DETAILS,
         ] {
             assert!(
                 super::stub_inline_op(nid_fn).is_some(),
@@ -4221,11 +4433,145 @@ mod np_identity_tests {
                 sv_nid::NP_MATCHING2_SEND_ROOM_MESSAGE,
                 MATCHING2_NOT_NP_SIGN_IN,
             ),
+            (sv_nid::NP_MATCHING2_LEAVE_ROOM, MATCHING2_NOT_NP_SIGN_IN),
+            (sv_nid::NP_MATCHING2_GRANT_ROOM_OWNER, MATCHING2_NOT_NP_SIGN_IN),
+            (sv_nid::NP_MATCHING2_KICKOUT_ROOM_MEMBER, MATCHING2_NOT_NP_SIGN_IN),
+            (
+                sv_nid::NP_MATCHING2_GET_ROOM_DATA_EXTERNAL_LIST,
+                MATCHING2_NOT_NP_SIGN_IN,
+            ),
+            (sv_nid::NP_MATCHING2_SET_ROOM_DATA_EXTERNAL, MATCHING2_NOT_NP_SIGN_IN),
+            (sv_nid::NP_MATCHING2_SET_ROOM_DATA_INTERNAL, MATCHING2_NOT_NP_SIGN_IN),
+            (
+                sv_nid::NP_MATCHING2_SET_ROOM_MEMBER_DATA_INTERNAL,
+                MATCHING2_NOT_NP_SIGN_IN,
+            ),
+            (
+                sv_nid::NP_MATCHING2_REGISTER_SIGNALING_CALLBACK,
+                MATCHING2_NOT_NP_SIGN_IN,
+            ),
+            (
+                sv_nid::NP_MATCHING2_SIGNALING_GET_CONNECTION_STATUS,
+                MATCHING2_NOT_NP_SIGN_IN,
+            ),
+            (
+                sv_nid::NP_MATCHING2_SIGNALING_GET_CONNECTION_INFO,
+                MATCHING2_NOT_NP_SIGN_IN,
+            ),
+            (sv_nid::NP_TUS_CREATE_TITLE_CTX, COMMUNITY_NO_LOGIN),
+            (sv_nid::NP_TUS_GET_DATA_ASYNC, COMMUNITY_NO_LOGIN),
+            (sv_nid::NP_TUS_SET_DATA_ASYNC, COMMUNITY_NO_LOGIN),
+            (sv_nid::NP_TUS_POLL_ASYNC, COMMUNITY_NO_LOGIN),
+            (crate::nid::np::NP_BASIC_JOIN_GAME_ACK_RESPONSE_SEND, BASIC_SIGNED_OUT),
         ];
         for &(nid, want) in table {
             assert_eq!(call(nid), want, "{}", crate::nid::name(nid));
         }
         // Tearing down what was never created still succeeds (no cleanup loops).
         assert_eq!(call(sv_nid::NP_AUTH_DESTROY_REQUEST), 0);
+        assert_eq!(call(sv_nid::NP_TUS_DELETE_REQUEST), 0);
+        assert_eq!(call(sv_nid::NP_TUS_ABORT_REQUEST), 0);
+        // The party library comes up and down locally; every question about a party is the
+        // no-party answer.
+        for nid in [
+            party_nid::INIT,
+            party_nid::REGISTER_HANDLER,
+            party_nid::CHECK_CALLBACK,
+            party_nid::TERM,
+        ] {
+            assert_eq!(call(nid), 0, "{}", crate::nid::name(nid));
+        }
+        for nid in [
+            party_nid::GET_STATE,
+            party_nid::GET_MEMBERS,
+            party_nid::GET_MEMBER_INFO,
+            party_nid::GET_MEMBER_VOICE_INFO,
+        ] {
+            assert_eq!(call(nid), 0x8055_2506, "{}", crate::nid::name(nid));
+        }
+    }
+}
+
+#[cfg(test)]
+mod float_abi_tests {
+    /// Every `#[hostcall]` handler with an `f32`/`f64` parameter or return, as
+    /// `(module, function)`, found by reading the handlers' own source. A textual scan rather
+    /// than a list, because the list is the thing under test.
+    fn float_handlers() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vita");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read src/vita") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let module = path.file_stem().unwrap().to_string_lossy().to_string();
+            let src = std::fs::read_to_string(&path).expect("read a handler module");
+            let mut rest = src.as_str();
+            while let Some(at) = rest.find("#[hostcall]") {
+                rest = &rest[at + "#[hostcall]".len()..];
+                let Some(fn_at) = rest.find("fn ") else { break };
+                let sig_end = rest[fn_at..].find('{').map_or(rest.len(), |e| fn_at + e);
+                let sig = &rest[fn_at..sig_end];
+                let name: String = sig[3..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                let floats = sig
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(|w| w == "f32" || w == "f64");
+                if floats {
+                    out.push((module.clone(), name));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The NID constant(s) whose dispatch arm in this file calls `module::function(`.
+    fn arms_calling(dispatch: &str, module: &str, function: &str) -> Vec<String> {
+        let needle = format!("{module}::{function}(");
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = dispatch[from..].find(&needle) {
+            let at = from + at;
+            from = at + needle.len();
+            let head = &dispatch[..at];
+            let Some(arrow) = head.rfind("=>") else { continue };
+            let pattern = head[..arrow].trim_end();
+            let start = pattern.rfind(['\n', '|']).map_or(0, |i| i + 1);
+            out.push(pattern[start..].trim().to_string());
+        }
+        out
+    }
+
+    /// A handler that takes or returns a float, missing from [`super::float_abi`], is a
+    /// handler a narrow-marshalling frontend (the browser) calls with 0.0 for every float.
+    #[test]
+    fn every_float_handler_is_listed() {
+        let dispatch = include_str!("mod.rs");
+        let list_at = dispatch.find("pub fn float_abi(").expect("float_abi is in this file");
+        // A Windows checkout carries CRLF, so the function's closing line is found either way.
+        let tail = &dispatch[list_at..];
+        let end = tail.find("\n}\n").or_else(|| tail.find("\n}\r\n")).expect("its end");
+        let list = &tail[..end];
+        let handlers = float_handlers();
+        assert!(
+            handlers.iter().any(|(m, f)| m == "gxm" && f == "set_viewport"),
+            "the scan found no float handler at all - it is broken, not passing: {handlers:?}"
+        );
+        for (module, function) in &handlers {
+            let arms = arms_calling(dispatch, module, function);
+            assert!(!arms.is_empty(), "{module}::{function} takes or returns a float but no dispatch arm here calls it");
+            for arm in arms {
+                // As a whole word: `SET_VIEWPORT` must not pass on `SET_VIEWPORT_ENABLE`.
+                let listed = list.match_indices(arm.as_str()).any(|(i, _)| {
+                    !list[i + arm.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                });
+                assert!(
+                    listed,
+                    "{module}::{function} takes or returns a float, and its NID {arm} is not in `float_abi` - \
+                     a frontend that marshals only the core registers would pass it 0.0"
+                );
+            }
+        }
     }
 }

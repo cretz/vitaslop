@@ -160,6 +160,22 @@ fn w_f32s(o: &mut impl Write, v: &[f32]) -> io::Result<()> {
     Ok(())
 }
 
+/// Split a draw's STORE windows off the end of its fragment window list, where the writer put
+/// them (see `capture::Draw::frag_store_windows`). The program says how many of each it has; a
+/// list that is not exactly that long is a capsule written before store windows were captured,
+/// and keeps everything as load windows - which is all it ever held.
+fn split_store_windows(fprog: &[u8], windows: &mut Vec<(u32, Arc<[u8]>)>) -> Vec<(u32, Arc<[u8]>)> {
+    let stores = vitaslop_gxp_shader::store_windows_for_fragment_blob(fprog).len();
+    if stores == 0 {
+        return Vec::new();
+    }
+    let loads = vitaslop_gxp_shader::mem_windows_for_fragment_blob(fprog).len();
+    if windows.len() != loads + stores {
+        return Vec::new();
+    }
+    windows.split_off(loads)
+}
+
 fn r_u8(i: &mut impl Read) -> io::Result<u8> {
     let mut b = [0u8; 1];
     i.read_exact(&mut b)?;
@@ -469,8 +485,10 @@ impl Capsule {
             w_u32(o, *addr)?;
             w_bytes(o, bytes)?;
         }
-        w_u32(o, d.frag_mem_windows.len() as u32)?;
-        for (addr, bytes) in &d.frag_mem_windows {
+        // The STORE windows ride appended to the fragment load windows, so the format is
+        // unchanged - see `capture::Draw::frag_store_windows` and the reader's split.
+        w_u32(o, (d.frag_mem_windows.len() + d.frag_store_windows.len()) as u32)?;
+        for (addr, bytes) in d.frag_mem_windows.iter().chain(&d.frag_store_windows) {
             w_u32(o, *addr)?;
             w_bytes(o, bytes)?;
         }
@@ -566,6 +584,9 @@ impl Capsule {
             let addr = r_u32(i)?;
             frag_mem_windows.push((addr, Arc::<[u8]>::from(r_bytes(i)?)));
         }
+        // Split the STORE windows back off the end: the program's own load-window count says
+        // where (a capsule written before store windows were captured has none to split).
+        let frag_store_windows = split_store_windows(&fprog, &mut frag_mem_windows);
         let shader_expanded = r_u8(i)? != 0;
 
         Ok(Capsule {
@@ -594,6 +615,7 @@ impl Capsule {
                 frag_sa_addr,
                 mem_windows,
                 frag_mem_windows,
+                frag_store_windows,
                 shader_expanded,
             },
             width,
@@ -629,10 +651,14 @@ impl Capsule {
 
 /// Frame-capsule magic + version. Bump on any field-order change.
 /// Version 2: the draw record grew with `VSCAPS` version 4; 4 (slim 5) with version 5.
-/// 6 (slim 7) with version 6.
-const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x06";
+/// 6 (slim 7) with version 6. 8 (slim 9): a depth surface carries its split LOAD address.
+const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x08";
 /// The same frame body with every large byte field deduplicated - see [`SLIM_MIN`].
-const FRAME_MAGIC_SLIM: &[u8; 8] = b"VSFRAM\x00\x07";
+const FRAME_MAGIC_SLIM: &[u8; 8] = b"VSFRAM\x00\x09";
+/// Versions 6 and 7: the same body without the depth load address, still read (as zero - the
+/// scene loads depth from where it stores it).
+const FRAME_MAGIC_V6: &[u8; 8] = b"VSFRAM\x00\x06";
+const FRAME_MAGIC_V6_SLIM: &[u8; 8] = b"VSFRAM\x00\x07";
 
 /// Clears the slim context when a slim write or read ends, however it ends.
 struct SlimReset;
@@ -703,6 +729,7 @@ pub fn write_frame(
                     d.stencil_addr,
                     d.background_depth,
                     d.background_control,
+                    d.load_addr,
                 ] {
                     w_u32(o, v)?;
                 }
@@ -746,12 +773,14 @@ pub struct FrameCapsule {
     pub frame: u64,
 }
 
-/// Read a [`write_frame`] stream. A different version is REFUSED, as for a draw capsule.
+/// Read a [`write_frame`] stream. A different version is REFUSED, as for a draw capsule -
+/// except version 6/7, whose body differs only by the missing depth load address.
 pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
     let mut magic = [0u8; 8];
     i.read_exact(&mut magic)?;
-    let slim = &magic == FRAME_MAGIC_SLIM;
-    if &magic != FRAME_MAGIC && !slim {
+    let slim = &magic == FRAME_MAGIC_SLIM || &magic == FRAME_MAGIC_V6_SLIM;
+    let has_load = &magic == FRAME_MAGIC || &magic == FRAME_MAGIC_SLIM;
+    if !has_load && &magic != FRAME_MAGIC_V6 && !slim {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -788,8 +817,8 @@ pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
             });
         }
         if r_u8(i)? == 1 {
-            let mut v = [0u32; 5];
-            for x in &mut v {
+            let mut v = [0u32; 6];
+            for x in &mut v[..if has_load { 6 } else { 5 }] {
                 *x = r_u32(i)?;
             }
             s.depth = Some(crate::capture::DepthSurface {
@@ -798,6 +827,7 @@ pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
                 stencil_addr: v[2],
                 background_depth: v[3],
                 background_control: v[4],
+                load_addr: v[5],
             });
         }
         s.multisample = r_u32(i)?;
@@ -994,6 +1024,9 @@ mod tests {
                 (0x8e1d_2fb0, Arc::from(&[5u8, 6][..])),
             ],
             frag_mem_windows: vec![(0x8b40_0000, Arc::from(&[9u8, 8, 7, 6][..]))],
+            // The program bytes here are not a storing program, so a store window would not
+            // survive the reader's split - that path has its own test.
+            frag_store_windows: Vec::new(),
             shader_expanded: true,
         };
         let c = Capsule {
@@ -1043,6 +1076,59 @@ mod tests {
         // `Draw` derives PartialEq, so this compares EVERY field - including any added later,
         // which is exactly the failure this test exists to catch.
         assert_eq!(back.draw, c.draw);
+    }
+
+    /// A frame's depth surface round-trips WHOLE, the split load address included: a scene
+    /// that loads depth from one surface and stores to another must replay loading from the
+    /// first, not from the store surface.
+    #[test]
+    fn a_frame_round_trips_a_split_depth_load() {
+        let depth = crate::capture::DepthSurface {
+            zls_control: 0x1234,
+            depth_addr: 0x8100_0000,
+            stencil_addr: 0x8110_0000,
+            background_depth: 0x3f80_0000,
+            background_control: 7,
+            load_addr: 0x8200_0000,
+        };
+        let scene = crate::capture::Scene { depth: Some(depth), ..Default::default() };
+        let scenes = vec![scene];
+        for slim in [false, true] {
+            let mut bytes = Vec::new();
+            if slim {
+                write_frame_slim(&mut bytes, &scenes, 960, 544, [0; 4], 3).unwrap();
+            } else {
+                write_frame(&mut bytes, &scenes, 960, 544, [0; 4], 3).unwrap();
+            }
+            let back = read_frame(&mut &bytes[..]).unwrap();
+            assert_eq!(back.scenes[0].depth, Some(depth), "slim {slim}");
+        }
+    }
+
+    /// A version-6 frame (no load address) still reads, as a scene that loads depth from where
+    /// it stores it.
+    #[test]
+    fn a_version_6_frame_reads_with_no_split_depth_load() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FRAME_MAGIC_V6);
+        for v in [960u32, 544] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(1);
+        for v in [0x1234u32, 0x8100_0000, 0x8110_0000, 0x3f80_0000, 7] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(0);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let back = read_frame(&mut &bytes[..]).unwrap();
+        let d = back.scenes[0].depth.unwrap();
+        assert_eq!((d.depth_addr, d.background_control, d.load_addr), (0x8100_0000, 7, 0));
     }
 
     /// A capsule from a different format version must be refused, not misread.
@@ -1185,6 +1271,7 @@ pub fn maybe_capture(d: &Draw) {
     d.frag_sa.hash(&mut h);
     d.mem_windows.hash(&mut h);
     d.frag_mem_windows.hash(&mut h);
+    d.frag_store_windows.hash(&mut h);
     d.vertices.hash(&mut h);
     let inputs = h.finish();
 

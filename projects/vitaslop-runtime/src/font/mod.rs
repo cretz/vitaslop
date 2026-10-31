@@ -424,7 +424,7 @@ impl FontLibrary {
         // The console's face has no gap here either: a fixed-cell font's box IS its em, so
         // reporting the stand-in's real INK box is again part of standing in rather than a
         // fudge of the numbers. Measured over [`FILL_PROBE_ASCII`] plus the accented capitals
-        // and the deep shapes ASCII does not carry, so a title that draws `Á`, `(` or `j`
+        // and the deep shapes ASCII does not carry, so a title that draws `A` with an acute accent, `(` or `j`
         // still gets a cell those fit in.
         if substitute {
             m.max_advance = size.h.max(1.0);

@@ -2,10 +2,11 @@
 -- Network notice, play the opening story level - the monochrome paper stage into the carnival -
 -- to its end, then walk on through the story of Carnivalia and the train ride to La Marionetta
 -- until the game hands over the POD, the hub every later level starts from, and its narration ends
--- on a lit planet and "Tap the Planet to Begin".
--- last verified: 2026-10-22, uncommitted next-work tree (desktop headless SMP, to the lit planet; up
--- to the Pod also phone browser SMP, runner job 20261022203442-004: DONE, 99.2% speed, 0.2% audio
--- underrun, shots viewed)
+-- on a lit planet and "Tap the Planet to Begin". Then tap into La Marionetta's first level ("First
+-- Lessons In Loco-Motion"), close Colonel Flounder's briefing and play it.
+-- last verified: 2026-10-27, uncommitted next-work tree (desktop headless SMP, all phases DONE into
+-- the first Pod level, shots viewed); to the Pod also phone browser SMP on 2026-10-22, runner job
+-- 20261022203442-004: DONE, 99.2% speed, 0.2% audio underrun, shots viewed
 --
 -- HOW THE CUES WERE FOUND: `--discover` next to a shot every 100 input frames (frames from one
 -- run that walked from the start):
@@ -26,11 +27,12 @@
 -- >>> HANDS OFF AT THE POD. Input during its narration cuts it short, and the planet is then left
 -- DARK and padlocked under the same prompt, refusing every tap (MEASURED: 300 s of taps).
 --
--- >>> NOT YET PAST THIS POINT IN ONE SESSION. Lit, the planet still refuses taps in the session that
--- reached it - with Sackboy anywhere in the room, and with a valid local identity (MEASURED) - but a
--- reboot onto that session's own save takes the first tap. From such a save the route on is, in
--- PANEL coordinates (the screen doubled): planet (970,570) -> world badge (950,590) -> the first
--- level's "Tap to Play" (960,490) -> Colonel Flounder's briefing, closed with CIRCLE.
+-- >>> THE PLANET WAITS FOR THE WELCOME LINE TO END. Taps are ignored while the Pod's introduction
+-- is still "playing", and it ends when the voice-over stream reaches its end. (It once never did in
+-- the session that reached the Pod: the audio middleware stopped advancing its streams when
+-- `sceNgsVoiceGetInfo` left the voice's update count unwritten.) The route on is, in PANEL
+-- coordinates (the screen doubled): planet (970,570) -> world badge (950,590) -> the first level's
+-- "Tap to Play" (960,490) -> Colonel Flounder's briefing, closed with CIRCLE.
 --
 -- The notice is the faithful offline answer ("A problem occurred when attempting to connect to
 -- the PlayStation Network"); CROSS is its Close.
@@ -100,4 +102,38 @@ phase("pod narration", { timeout = 240 }, function()
   wait(planet_lit)
   idle(60)
   shot("planet-lit")
+end)
+
+-- A tap in PANEL coordinates: press, hold six frames, let go.
+local function tap_panel(x, y)
+  touch(x, y)
+  idle(6)
+  untouch()
+end
+
+phase("into the first level", { timeout = 300 }, function()
+  -- The planet, the world badge, the first level's "Tap to Play", then Colonel Flounder's
+  -- briefing, closed with CIRCLE. Each screen takes a moment to come up, so each tap is followed
+  -- by a wait and a shot.
+  tap_panel(970, 570)
+  idle(240)
+  shot("planet")
+  tap_panel(950, 590)
+  idle(240)
+  shot("world")
+  tap_panel(960, 490)
+  idle(300)
+  shot("level-card")
+  for _ = 1, 4 do
+    tap("circle", 4, 60)
+  end
+  idle(120)
+  shot("briefing-closed")
+end)
+
+phase("play", { timeout = 300 }, function()
+  for i = 1, 12 do
+    step()
+    if i % 4 == 0 then shot("play-" .. i) end
+  end
 end)

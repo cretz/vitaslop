@@ -81,6 +81,46 @@ pub fn indexed_offset(number: u8) -> u32 {
     (number & 0x1f) as u32
 }
 
+/// The flag an [`Bank::Indexed`] operand carries in [`Operand::bank_sel`] (above the two bits
+/// that name the index register) when it was decoded from a SIX-bit, double-register-scaled
+/// field - see [`indexed_index_scale`].
+pub const INDEXED_PAIRS: u8 = 4;
+
+/// Which index register an [`Bank::Indexed`] operand reads: 0 for INDEXED1 (`idx[0]`), 1 for
+/// INDEXED2.
+pub fn indexed_register(o: &Operand) -> usize {
+    usize::from(o.bank_sel & 3 != 0)
+}
+
+/// How many registers ONE count of the index register spans for this [`Bank::Indexed`]
+/// operand: 2 when its field is a six-bit, double-register-scaled number, 1 for a seven-bit
+/// direct one. The element read is `bank[idx * scale + offset]`.
+///
+/// >>> THE PAIR SCALE BELONGS TO THE READING OPERAND'S FIELD, NOT TO THE INDEX LOAD.
+///
+/// A six-bit operand field names REGISTER PAIRS - its number is doubled to a register - and
+/// the indirect address it forms is in the same units: `2 * (idx + field_offset)`. A seven-bit
+/// field names registers directly, and so does its indirect address. One global scale cannot be
+/// right, and the corpus shows both:
+///
+///  * SEVEN-BIT readers (group 0x50 VBW) close at ONE: a football title's crowd reads its
+///    six-entry corner table `sa[64..75]` as `(2c + 49) + 15`, and another title's sample
+///    offsets `sa[22 + 2k]` as `(2k + 8) + 14`. At two both land past every register written.
+///  * SIX-BIT readers close at TWO, in every program whose arithmetic can be followed: a
+///    cascaded-shadow program indexes `sa[2 * (8c + 2) + 14]` and three MAD rows at `+2/+6/+10`
+///    - rows 3, 0, 1, 2 of cascade `c`'s matrix in an array at `sa[6]`; a particle program's
+///    `2 * (2k + 30) + 12` is `g_ParticleOffsets[k]` at `sa[72 + 4k]`; a sprite program's
+///    `2 * (2k + 11) + 14` walks a six-corner literal table `sa[36..59]` that ends exactly on
+///    its container; a team-palette and a cluster-number lookup land exactly on their arrays'
+///    first registers. At one, each of those reads lands inside an unrelated matrix uniform.
+///
+/// `VITASLOP_GXP_IDX_PAIRS=0` is the arm back to one count = one register everywhere.
+pub fn indexed_index_scale(o: &Operand) -> i32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("VITASLOP_GXP_IDX_PAIRS").as_deref() != Ok("0"));
+    if on && o.bank_sel & INDEXED_PAIRS != 0 { 2 } else { 1 }
+}
+
 /// One decoded source or destination operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Operand {
@@ -157,6 +197,11 @@ pub enum TestAlu {
     Sub,
     /// `src1' * src2` (VMUL).
     Mul,
+    /// `dot4(src1', src2)` (VDP, the float family's `alu_op` 8), the one sum REPLICATED to all
+    /// four channels - so a channel-select reduction tests the dot itself, whichever channel
+    /// it names. The vendor's own compiler describes the instruction as "the hardware's VDP
+    /// instruction (which does dot4)" and marks its result vector-replicated.
+    Dot,
     /// `src1 & src2` on the raw 32-bit lane (the BITWISE family's AND).
     BitAnd,
     /// `src1 << src2` on the raw 32-bit lane (the BITWISE family's SHIFT LEFT, `alu_op` 3).
@@ -325,6 +370,13 @@ pub enum Op {
     /// The RGB channels and the alpha channel carry INDEPENDENT operations over the SAME two
     /// terms, which is what makes this one instruction rather than two. See [`SopFactor`] for
     /// why the coefficient is not the operand.
+    ///
+    /// The plain group-0x80 SOP2 is the same combiner with a SECOND coefficient pair: its field
+    /// table carries separate colour selectors (`sel1`/`sel2`, three bits) and alpha selectors
+    /// (`asel1`/`asel2`, two bits), each with its own complement, so the alpha channel's terms
+    /// are `coeff(a1) * src1.a` and `coeff(a2) * src2.a` rather than the colour coefficients
+    /// applied to channel 3. `alpha_coeffs` carries that pair; `None` is SOP2M, which has one
+    /// pair for all four channels.
     Sop2 {
         color: SopOp,
         alpha: SopOp,
@@ -333,6 +385,9 @@ pub enum Op {
         f1_complement: bool,
         f2: SopFactor,
         f2_complement: bool,
+        /// The ALPHA channel's own `[(factor, complement); 2]` for terms 1 and 2, or `None` when
+        /// channel 3 uses `f1`/`f2` like the colour channels (SOP2M).
+        alpha_coeffs: Option<[(SopFactor, bool); 2]>,
     },
     /// Format pack/convert (group 0x40, VPCK). A float<->float repack (F16<->F32) preserves
     /// the NUMBER while changing its STORAGE width, so it is emitted like a move - but the
@@ -391,6 +446,33 @@ pub enum Op {
     /// title's vertex programs unpacking S8 normals (every draw of its main scene dropped while
     /// it was blocked).
     PackFromInt { bits: u8, signed: bool, norm: bool },
+    /// VPCK converting a C10 source (format 7) to a FLOAT destination with `scale` set.
+    ///
+    /// # THE LAYOUT IS THREE 10-BIT FIELDS IN ONE REGISTER - MEASURED
+    /// A C10 operand is NOT a register per component. A shooter's world vertex programs declare
+    /// their normal, tangent and binormal as `Attribute/C10` three components each at
+    /// `resource_index` 4, 5 and 6 - ONE PA register apiece - and the guest binds each as a
+    /// single `UNTYPED x1` word, which the vertex fetch hands the shader unconverted. The code
+    /// then reads all three components off that one register (`pack i0.xyz <- pa4.[0,1,2]`), and
+    /// one program copies the tangent's word into `pa0` with an OR and unpacks it from there.
+    /// Component `c` is bits `[10c, 10c+10)`, and the top two bits are clear in every word.
+    ///
+    /// # THE VALUE IS TWO'S COMPLEMENT WITH 1.0 = 256 - MEASURED
+    /// Over 1,270 vertices of each of those three attributes in one frame, every word read as
+    /// signed 10-bit components gives a vector of length 254.6..257.3, mean 255.83..255.96, with
+    /// the mode at 256; the normal of a flat floor is the word `0x10000000` = `(0, 0, 256)`. A
+    /// unit vector quantised as `round(v * 256)` has exactly that spread, and one quantised by
+    /// 255 would centre on 255. Read UNSIGNED the same tangents have lengths near 950, so the
+    /// sign is not in question either. That is the SGX `fixed` type: 2 integer and 8 fraction
+    /// bits, range [-2, 2).
+    ///
+    /// Only the three components one register holds are decoded: a selector of 3 (a C10 vec4's
+    /// fourth component, whose home is not established) stays BLOCKED in the decoder, as does
+    /// `scale` clear, which no corpus word uses.
+    ///
+    /// MEASURED need: blocked, 331 of a 423-draw world scene's draws were dropped and the
+    /// shooter's first mission rendered as its HUD over the loading backdrop.
+    PackFromC10,
     /// LIMM (group 0xF8, `op2 = 100`, `opcat = 10`): `dest = <32-bit immediate>`.
     ///
     /// The value is a RAW 32-bit pattern, typed by whoever reads it - the corpus carries it
@@ -522,13 +604,15 @@ pub enum Op {
     /// is a different operation.
     IntMad8 { sat: bool },
     /// One STEP of a 32-bit integer multiply-add (group 0x1a, the second 32-bit form):
-    /// `dest = half(src0) * src1 + src2`, where `high_half` selects which 16-bit half of
-    /// `src0` feeds the multiplier and whether its product is shifted back up:
+    /// `dest = src0 * half(src1) + src2`, where `high_half` selects which 16-bit half of
+    /// `src1` feeds the multiplier and whether its product is shifted back up:
     ///
     /// ```text
-    ///   high_half = false:  dest = (src0 & 0xffff) * src1 + src2
-    ///   high_half = true:   dest = ((src0 >> 16) * src1) << 16 + src2
+    ///   high_half = false:  dest = src0 * (src1 & 0xffff) + src2
+    ///   high_half = true:   dest = (src0 * (src1 >> 16)) << 16 + src2
     /// ```
+    ///
+    /// (`VITASLOP_GXP_IMA32_STEP_SRC0=1` halves `src0` instead - the old reading.)
     ///
     /// The two steps therefore SUM to the full `src0 * src1 + src2` in 32-bit wrapping
     /// arithmetic, which is how the hardware's 16x32 multiplier builds a 32x32 product. See
@@ -646,6 +730,15 @@ pub enum Op {
     /// DATA register (the format's src2 on a store); any further `srcs` are register offsets,
     /// low 16 bits each, added to `offset_bytes`. Writes no register.
     LocalStore { offset_bytes: u32 },
+    /// A MEMORY STORE of one 32-bit word to GUEST MEMORY: the 0x1e format with `addr_mode = 0`
+    /// (ABSOLUTE). `srcs[0]` is the DATA register (the format's src2), `srcs[1]` the base
+    /// POINTER, and any further `srcs` register byte offsets; the word lands at
+    /// `srcs[1] + offset_bytes + offsets`. Writes no register.
+    ///
+    /// The emitter writes it through the draw's bound STORE window - a writable mirror of the
+    /// guest bytes the program's declared buffers cover (see `module::resolve_store_windows`) -
+    /// because WGSL has no raw pointers. A store outside every window is dropped.
+    MemStore { offset_bytes: u32 },
     /// A documented operation that is not yet wired for WGSL emit (tex, pack, the u32
     /// bitwise ops, fx8/u8 integer ops, loads/stores, complex flow). Carries a static
     /// mnemonic so an emit attempt hard-fails naming exactly what to implement next. This
@@ -671,6 +764,7 @@ impl Op {
                 | Op::Rcp | Op::Rsq | Op::Log | Op::Exp | Op::Mov | Op::Cmov { .. }
                 | Op::Nop | Op::Tex { .. } | Op::TexGather { .. }
                 | Op::Pack { .. } | Op::PackToInt { .. } | Op::PackFromInt { .. }
+                | Op::PackFromC10
                 | Op::PackIntCopy { .. }
                 | Op::Limm { .. }
                 | Op::CmovU8 { .. }
@@ -686,6 +780,7 @@ impl Op {
                 | Op::MemLoad { .. }
                 | Op::LocalLoad { .. }
                 | Op::LocalStore { .. }
+                | Op::MemStore { .. }
                 // A branch is translated by the emitter's STRUCTURING pass rather than by
                 // `emit_instr`, so it counts as wired here. Reaching `emit_instr` with one is a
                 // bug in that pass and hard-fails there, naming itself.
@@ -723,6 +818,7 @@ impl Op {
             Op::Pack { .. } => "pack",
             Op::PackToInt { .. } => "pack.int",
             Op::PackFromInt { .. } => "unpack.int",
+            Op::PackFromC10 => "unpack.c10",
             Op::PackIntCopy { .. } => "pack.int.copy",
             Op::Limm { .. } => "limm",
             Op::CmovU8 { .. } => "cmov.u8",
@@ -756,6 +852,7 @@ impl Op {
             Op::MemLoad { .. } => "ldmem",
             Op::LocalLoad { .. } => "ldl32",
             Op::LocalStore { .. } => "stl32",
+            Op::MemStore { .. } => "stmem",
             Op::Bitwise { .. } => "bitwise",
             Op::Sop2 { .. } => "sop2.fx8",
             Op::Test { .. } => "vtst",
@@ -848,6 +945,10 @@ impl Instr {
             // pair: `source_packed_bytes` is what describes it, and reporting F16 here would
             // size the read two registers wide where it is one.
             Op::PackFromInt { bits, .. } => bits == 16,
+            // A C10 source is three fields in ONE register - neither of the two widths this
+            // flag can say; `source_packed_bytes` describes its span. An F16 DESTINATION sets
+            // `half_precision`, so falling through to it would size the read as half pairs.
+            Op::PackFromC10 => false,
             // Both ends are 16-bit halves, so the packed width is the right span at both ends -
             // the same reason the integer->float convert reports it. The byte form is packed
             // bytes at both ends instead, and answers below.
@@ -886,7 +987,16 @@ impl Instr {
                 // register. Their `f32(byte)` is a numeric cast rather than `fx8`'s
                 // `byte/255`, but that is the VALUE, and this asks about the SPAN.
                 | Op::PackFromInt { bits: 8, .. }
+                // C10: three 10-bit components in one register - the same one-register SPAN.
+                | Op::PackFromC10
                 | Op::PackIntCopy { bits: 8, .. }
+                // The 8-bit COMBINER and the 8-bit TEST read their operands through `Prec::Fx8`
+                // too (`emit_sop2`, and `emit_test`'s `Fx8Sub` override). Left out, a group-0x80
+                // combine reading `pa[0]` - one title's bloom epilogue, in a program that
+                // allocates TWO primary registers - read as spanning `pa[0..4)`, and the linker
+                // refused every pairing for "reading PA register 3".
+                | Op::Sop2 { .. }
+                | Op::Test { alu: TestAlu::Fx8Sub, .. }
         )
     }
 
@@ -958,7 +1068,9 @@ impl Instr {
             // is `elements` consecutive registers), so taking the mask as the read count claims
             // the three registers ABOVE the pointer are read too. That is how a pointer sitting
             // near the top of the SA bank made a program look like it read past its buffer.
-            Op::MemLoad { .. } | Op::LocalLoad { .. } | Op::LocalStore { .. } => [true, false, false, false],
+            Op::MemLoad { .. } | Op::LocalLoad { .. } | Op::LocalStore { .. } | Op::MemStore { .. } => {
+                [true, false, false, false]
+            }
             // A PREDICATE-ONLY test (`write_back = false`) has an all-false write mask, and
             // taking the mask as the read set therefore says it reads NOTHING. It reads two
             // operands and compares them; what it does not do is write a register. The channels
@@ -994,6 +1106,37 @@ impl Instr {
         } else {
             (u32::from(src.index) + sel as u32, 0..2)
         })
+    }
+
+    /// True when this instruction WRITES packed bytes - four channels in ONE register, channel
+    /// `c` in byte `c`. The destination half of [`Self::source_packed_bytes`]; the emitter
+    /// writes these through `Prec::Fx8` or `store_raw_byte` (see [`Self::dest_raw_packed_bits`]).
+    pub fn dest_packed_bytes(&self) -> bool {
+        matches!(
+            self.op,
+            Op::PackUnorm8 { to_unorm8: true, .. }
+                | Op::CopyFx8
+                | Op::Sop2 { .. }
+                | Op::Test { alu: TestAlu::Fx8Sub, .. }
+        ) || self.dest_raw_packed_bits() == Some(8)
+    }
+
+    /// The register destination `d`'s channel `c` writes, and which 16-bit HALVES of it - the
+    /// destination half of [`Self::source_register`].
+    ///
+    /// A packed-byte destination keeps all four channels in ONE register. Read as one register
+    /// per channel, the 8-bit normal pack of a deferred title's G-buffer material (`PackToInt`
+    /// into `pa[1]`, xy then zw) claimed `pa[2..4]` as written - the registers its diffuse
+    /// prefetch lands in - so the linker judged the prefetch unread, dropped the sample, and the
+    /// whole scene's albedo was zero.
+    pub fn dest_register(&self, d: &Operand, c: usize) -> (u32, std::ops::Range<usize>) {
+        if self.dest_packed_bytes() {
+            (u32::from(d.index), (c >> 1)..(c >> 1) + 1)
+        } else if self.dest_raw_packed_bits() == Some(16) || self.half_precision {
+            (u32::from(d.index) + (c >> 1) as u32, (c & 1)..(c & 1) + 1)
+        } else {
+            (u32::from(d.index) + c as u32, 0..2)
+        }
     }
 }
 
@@ -1082,6 +1225,30 @@ mod tests {
         let regs: Vec<_> =
             (0..4).filter_map(|c| fx8.source_register(&fx8.srcs[0], c).map(|(r, _)| r)).collect();
         assert_eq!(regs, vec![4, 4, 4, 4], "four bytes of ONE register");
+    }
+
+    /// The destination spans the same three ways. An 8-bit pack writes all four channels into
+    /// the bytes of ONE register; counted as one register per channel, a normal packed into
+    /// `pa[1]` claimed `pa[2..4]` and hid the prefetched sample that lands there.
+    #[test]
+    fn each_destination_width_spans_its_own_number_of_registers() {
+        let d = Operand::plain(Bank::PrimaryAttr, 1, 2);
+        let regs = |i: &Instr| -> Vec<(u32, std::ops::Range<usize>)> { (0..4).map(|c| i.dest_register(&d, c)).collect() };
+
+        let f32_ = instr(Op::Mad, [true; 4], vec![], false);
+        assert_eq!(regs(&f32_), vec![(1, 0..2), (2, 0..2), (3, 0..2), (4, 0..2)]);
+
+        let f16 = instr(Op::Mad, [true; 4], vec![], true);
+        assert_eq!(regs(&f16), vec![(1, 0..1), (1, 1..2), (2, 0..1), (2, 1..2)]);
+
+        let bytes = instr(Op::PackToInt { bits: 8, signed: true, src_half: true, norm: true }, [true; 4], vec![], false);
+        assert_eq!(regs(&bytes), vec![(1, 0..1), (1, 0..1), (1, 1..2), (1, 1..2)], "four bytes of ONE register");
+
+        let unorm = instr(Op::PackUnorm8 { to_unorm8: true, float_half: true }, [true; 4], vec![], false);
+        assert!(regs(&unorm).iter().all(|(r, _)| *r == 1), "a unorm8 pack writes one register");
+
+        let shorts = instr(Op::PackToInt { bits: 16, signed: false, src_half: false, norm: false }, [true; 4], vec![], false);
+        assert_eq!(regs(&shorts), vec![(1, 0..1), (1, 1..2), (2, 0..1), (2, 1..2)], "16-bit lanes pair up");
     }
 
     /// A swizzle CONSTANT (selector 4..7 - the 0.0/1.0/2.0/0.5 literals) names no register, so

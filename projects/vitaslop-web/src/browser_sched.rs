@@ -46,6 +46,7 @@ use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array, WebAssembly}
 use vitaslop_runtime::sched::{
     FiberEnd, GuestEngine, IdleStep, RunReport, SchedCore, Stop, ThreadHandle, ThreadStep,
 };
+use vitaslop_runtime::runtime_code::RuntimeCode;
 use vitaslop_runtime::{GuestMemory, ImportDispatch, Reentry, SvcOutcome, VitaEnv, VFP_ARG_COUNT};
 use vitaslop_transpiler::abi;
 use wasm_bindgen::prelude::*;
@@ -1985,7 +1986,27 @@ extern "C" {
 /// straight back unchanged, ~630 times a frame on a race. They are r4..r11 (callee-saved, so a
 /// host call must not touch them) and the VFP argument file (which only a handler with a FLOAT
 /// parameter reads, and the GXM/kernel calls a race makes have none).
+///
+/// >>> BUT A HANDLER WITH A FLOAT PARAMETER MUST GET ITS FLOAT. The calls that have one are
+/// read [`WIDE_REGS`] instead - see `vitaslop_runtime::vita::float_abi` for the MEASURED
+/// failure (a depth clear of 1.0 arriving as 0.0 drew a whole world as its sky, then black).
 const NARROW_REGS: [u32; 7] = [0, 1, 2, 3, abi::SP as u32, 14, 15];
+
+/// [`NARROW_REGS`] plus every VFP argument lane - the read for a call whose handler takes or
+/// returns a float (`ThreadRt::float_sel`).
+const WIDE_REGS: [u32; NARROW_REGS.len() + VFP_ARG_COUNT] = {
+    let mut v = [0u32; NARROW_REGS.len() + VFP_ARG_COUNT];
+    let mut i = 0;
+    while i < NARROW_REGS.len() {
+        v[i] = NARROW_REGS[i];
+        i += 1;
+    }
+    while i < v.len() {
+        v[i] = (abi::REG_COUNT + i - NARROW_REGS.len()) as u32;
+        i += 1;
+    }
+    v
+};
 
 
 // >>> BULK GUEST-MEMORY MOVES AND THE DIRTY SCAN, EACH AS ONE CROSSING.
@@ -2047,6 +2068,11 @@ struct ThreadRt {
     /// [`NARROW_REGS`] as a `Uint32Array`, built once per thread so the per-call read does
     /// not allocate one.
     narrow: js_sys::Uint32Array,
+    /// [`WIDE_REGS`] as a `Uint32Array`, for the calls [`ThreadRt::float_sel`] names.
+    wide: js_sys::Uint32Array,
+    /// Per import selector, whether its handler reads or writes the VFP argument file
+    /// (`VitaEnv::import_float_abi`). A selector past its end reads wide - the safe direction.
+    float_sel: Rc<[bool]>,
     /// The diagnostic guest-PC global (`VITASLOP_TRACK_PC`), when the module carries one.
     /// `None` on an ordinary build, which does not export it - and that is the ONLY reason
     /// a browser trap could ever say `pc=0`: the ARM `pc` register a translated module keeps
@@ -2067,8 +2093,13 @@ impl ThreadRt {
     /// A register value is a `u32` carried as an `f64`, which is exact (an `f64` holds
     /// every integer up to 2^53), so nothing is lost in the round trip - the per-register
     /// path this replaced used the same representation.
-    fn read_file(&self) -> ([u32; abi::REG_COUNT], [u32; VFP_ARG_COUNT]) {
+    fn read_file(&self, selector: u32) -> ([u32; abi::REG_COUNT], [u32; VFP_ARG_COUNT]) {
         let mut buf = [0u32; FILE_LEN];
+        let lanes = if self.float_sel.get(selector as usize).copied().unwrap_or(true) {
+            &self.wide
+        } else {
+            &self.narrow
+        };
         // SAFETY: the view borrows this module's linear memory for the duration of the call
         // below. `save_some` is synchronous JS that allocates nothing, so the memory cannot
         // grow and the view cannot be detached while it is live, and nothing else holds a
@@ -2078,7 +2109,7 @@ impl ThreadRt {
         // if the handler CHANGED it, which the write-back's diff already decides.
         unsafe {
             let view = js_sys::Uint32Array::view_mut_raw(buf.as_mut_ptr(), FILE_LEN);
-            save_some(&self.file, &self.narrow, &view);
+            save_some(&self.file, lanes, &view);
         }
         let mut regs = [0u32; abi::REG_COUNT];
         let mut vfp = [0u32; VFP_ARG_COUNT];
@@ -2285,9 +2316,10 @@ struct ThreadEngine {
     /// block/yield) or an entry's completion fills it with the encoded event; the
     /// scheduler awaits the matching Promise. Reset each loop turn.
     signal: Rc<RefCell<Option<Function>>>,
-    /// The resolver of the Promise a suspended thread is parked on; the scheduler calls
-    /// it to un-park (resume) the thread.
-    cont: Rc<RefCell<Option<Function>>>,
+    /// The `(resolve, reject)` pair of the Promise a suspended thread is parked on: the
+    /// scheduler calls `resolve` to un-park (resume) the thread, and `reject` to UNWIND a
+    /// parked stack that will never be resumed (see [`BrowserThread::terminate`]).
+    cont: ParkCell,
     /// The import closure must outlive every call the instance can make into it.
     _import: Closure<dyn FnMut(i32) -> JsValue>,
     /// The non-suspending trap's closure - see `abi::IMPORT_FAST_NAME`. Kept for the same
@@ -2297,6 +2329,9 @@ struct ThreadEngine {
     /// asked for one. `None` on an ordinary run, which then uses the engine's shared
     /// no-op stub and pays nothing.
     _trace: Option<Closure<dyn FnMut(i32)>>,
+    /// This instance's `env.dispatch_miss`: per instance because installing code found at run
+    /// time grows THIS instance's table against THIS instance's exports - see [`runtime_miss`].
+    _dispatch_miss: Closure<dyn FnMut(i32, i32) -> i32>,
     /// This instance's SOFTWARE FUEL counter (`abi::FUEL_EXPORT`), or `None` in a build
     /// with fuel switched off. Read to price this thread's guest work - see
     /// [`BrowserThread::fuel_used`].
@@ -2591,6 +2626,34 @@ impl ThreadHandle for BrowserThread {
     /// A pooled instance is made indistinguishable from a fresh one by the module's own
     /// `reset` export, which is the only thing that CAN do it completely - see
     /// [`abi::RESET_EXPORT`].
+    /// A thread the runtime ENDED while it was parked: its JSPI stack is suspended in a host
+    /// call and will never be resumed. It is UNWOUND the way an exiting thread's is (see
+    /// [`exit_unwinds`]) - the parked Promise is rejected with the exit sentinel, so the stack
+    /// resumes into a throw that runs no guest code and the entry's rejection handler ignores
+    /// it - and then released, which can POOL the instance.
+    ///
+    /// >>> DROPPING IT INSTEAD WOULD BE THE INSTANTIATION STORM AGAIN. A title that finalizes
+    /// suspended fibers does it per job, every frame, and each fiber's thread is a pooled
+    /// instance: an abandoned stack makes `release` discard its instance, so every fiber after
+    /// would build a new one - exactly the pattern `exit_unwinds` measured at 141 -> 784
+    /// instantiations in 850 frames and ~8% speed. With the knob off, or with no park to
+    /// reject, the stack is abandoned and the instance dropped, as an exit's is.
+    fn terminate(&mut self) {
+        if let Some(engine) = self.engine.as_ref() {
+            let parked = engine.cont.borrow_mut().take();
+            match parked {
+                Some((_, reject)) if exit_unwinds() => {
+                    let _ = reject.call1(&JsValue::UNDEFINED, &JsValue::from_str(EXIT_UNWIND_SENTINEL));
+                }
+                _ => {
+                    engine.abandoned.set(true);
+                    hostcalls::note_abandoned_stack();
+                }
+            }
+        }
+        self.release();
+    }
+
     fn release(&mut self) {
         let Some(mut engine) = self.engine.take() else { return };
         // Break the closure -> register-file reference before dropping or pooling, so
@@ -2719,16 +2782,21 @@ pub struct BrowserEngine {
     /// call. See [`GuestMem`].
     view: GuestMem,
     host: Host,
+    /// Per import selector, whether the call's handler takes or returns a float - see
+    /// `ThreadRt::float_sel`. Fixed for the module, so computed once per engine.
+    float_sel: Rc<[bool]>,
     base: u32,
     /// `WebAssembly.promising` (not in the wasm-bindgen bindings; fetched by name).
     promising: Function,
     /// `WebAssembly.Suspending` constructor.
     suspending: Function,
-    /// Shared, non-suspending env stubs (`env.svc`, `env.dispatch_miss`), kept alive.
+    /// The shared, non-suspending `env.svc` stub, kept alive.
     _svc: Closure<dyn FnMut(i32)>,
     svc_fn: JsValue,
-    _dispatch_miss: Closure<dyn FnMut(i32, i32)>,
-    dispatch_miss_fn: JsValue,
+    /// The run's record of code found at run time, which every instance's `env.dispatch_miss`
+    /// resolves through. `None` when the module cannot take side modules (see the web
+    /// crate's `runtime_code`): a miss is then the loud trap it always was.
+    runtime: Option<Arc<RuntimeCode>>,
     /// Linear-memory offset of the host-mirror block, when this build inlined any read
     /// of it (`vitaslop_transpiler::Artifact::mirror_off`). The scheduler refreshes it
     /// before every resume.
@@ -2877,7 +2945,7 @@ impl BrowserEngine {
     /// is in [`make_thread`].
     fn new_instance(&self) -> Result<ThreadEngine, JsValue> {
         let signal: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
-        let cont: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
+        let cont: ParkCell = Rc::new(RefCell::new(None));
         // The import closure needs the instance's globals, which only exist after
         // instantiation - the chicken-and-egg the runtime cell resolves (imports fire
         // only during execution, by when the cell is filled).
@@ -2953,7 +3021,7 @@ impl BrowserEngine {
                 let acc0 = if sampling { vitaslop_runtime::perf::guest_accesses() } else { (0, 0) };
                 let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
-                let (mut regs, mut vfp) = rt.read_file();
+                let (mut regs, mut vfp) = rt.read_file(selector as u32);
                 // >>> SMP: a call this worker may not run is parked and FORWARDED - the thread
                 // suspends as if blocked, and the run worker dispatches it and sends the
                 // registers back (`crate::smp`). Never reached on the one-baton engine.
@@ -3174,7 +3242,7 @@ impl BrowserEngine {
                 let acc0 = if sampling { vitaslop_runtime::perf::guest_accesses() } else { (0, 0) };
                 let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
-                let (mut regs, mut vfp) = rt.read_file();
+                let (mut regs, mut vfp) = rt.read_file(selector as u32);
                 let before = (regs, vfp);
                 let d0 = clock();
                 let outcome = {
@@ -3312,13 +3380,33 @@ impl BrowserEngine {
             }
             None => Reflect::set(&env, &JsValue::from_str(abi::SVC_NAME), &self.svc_fn)?,
         };
-        Reflect::set(&env, &JsValue::from_str(abi::DISPATCH_MISS_NAME), &self.dispatch_miss_fn)?;
+        // The miss reaches the instance's exports through a cell filled once it exists, and
+        // imports a side module against the same `env` - the same suspending trap, so a host
+        // call made from code found at run time suspends this thread like any other.
+        let miss_exports: Rc<RefCell<Option<Object>>> = Rc::new(RefCell::new(None));
+        let dispatch_miss = {
+            let runtime = self.runtime.clone();
+            let exports = miss_exports.clone();
+            let env = env.clone();
+            Closure::wrap(Box::new(move |target: i32, from: i32| -> i32 {
+                let found = exports.borrow().clone();
+                let slot = found
+                    .ok_or_else(|| JsValue::from_str("dispatch miss before the instance existed"))
+                    .and_then(|exports| runtime_miss(runtime.as_deref(), &env, &exports, target as u32, from as u32));
+                match slot {
+                    Ok(slot) => slot,
+                    Err(e) => wasm_bindgen::throw_val(e),
+                }
+            }) as Box<dyn FnMut(i32, i32) -> i32>)
+        };
+        Reflect::set(&env, &JsValue::from_str(abi::DISPATCH_MISS_NAME), dispatch_miss.as_ref().unchecked_ref())?;
         let imports = Object::new();
         Reflect::set(&imports, &JsValue::from_str(abi::IMPORT_MODULE), &env)?;
 
         let instance = WebAssembly::Instance::new(&self.module, &imports)?;
         hostcalls::note_instance_created();
         let exports = instance.exports();
+        *miss_exports.borrow_mut() = Some(exports.clone());
 
         let regs = read_globals(&exports, abi::reg_export, abi::REG_COUNT)?;
         let vfp = read_globals(&exports, |i| abi::vfp_s_export(i as u8), VFP_ARG_COUNT)?;
@@ -3333,6 +3421,8 @@ impl BrowserEngine {
         let globals: Vec<WebAssembly::Global> = regs.into_iter().chain(vfp).collect();
         let narrow = js_sys::Uint32Array::new_with_length(NARROW_REGS.len() as u32);
         narrow.copy_from(&NARROW_REGS);
+        let wide = js_sys::Uint32Array::new_with_length(WIDE_REGS.len() as u32);
+        wide.copy_from(&WIDE_REGS);
         // Absent on an ordinary build - `VITASLOP_TRACK_PC` is what exports it - so a lookup
         // failure is the normal case and must not fail the instantiation.
         let guest_pc = Reflect::get(&exports, &JsValue::from_str(abi::GUEST_PC_EXPORT))
@@ -3342,6 +3432,8 @@ impl BrowserEngine {
             regs: globals,
             file,
             narrow,
+            wide,
+            float_sel: self.float_sel.clone(),
             guest_pc,
             view: self.view.clone(),
             base: self.base,
@@ -3387,6 +3479,7 @@ impl BrowserEngine {
             _import: import_closure,
             _import_fast: fast_closure,
             _trace: trace_closure,
+            _dispatch_miss: dispatch_miss,
             // Absent in a build with `VITASLOP_BROWSER_FUEL=0`, which is exactly the
             // build that has no fuel to report; the clock then falls back to advancing
             // on flips and idles alone, as it did before fuel existed.
@@ -3536,14 +3629,17 @@ fn guest_call_chain(g: GuestCallCtx, selector: i32) -> JsValue {
     .into()
 }
 
+/// The `(resolve, reject)` pair of a parked thread's Promise - see `ThreadEngine::cont`.
+type ParkCell = Rc<RefCell<Option<(Function, Function)>>>;
+
 fn suspend(
     signal: &Rc<RefCell<Option<Function>>>,
-    cont: &Rc<RefCell<Option<Function>>>,
+    cont: &ParkCell,
     stop: Stop,
 ) -> JsValue {
     let cont = cont.clone();
-    let park = Promise::new(&mut |resolve, _reject| {
-        *cont.borrow_mut() = Some(resolve);
+    let park = Promise::new(&mut |resolve, reject| {
+        *cont.borrow_mut() = Some((resolve, reject));
     });
     hostcalls::note_suspend();
     deliver(signal, &Ev::Suspend(stop));
@@ -3851,7 +3947,7 @@ pub(crate) async fn resume(t: &mut BrowserThread) -> ThreadStep {
                 "resume of thid {thid:#x} with no parked continuation and its entry \
                  already started: nothing to run"
             );
-        } else if let Some(res) = t.cont.borrow_mut().take() {
+        } else if let Some((res, _)) = t.cont.borrow_mut().take() {
             // SMP: the registers a FORWARDED call produced on the run worker, written before
             // anything else - a timed wait's code below must still win over them, exactly as
             // it would over a call this worker had dispatched itself.
@@ -4287,9 +4383,10 @@ impl BrowserSched {
         main_sp: u32,
         env: VitaEnv,
         audio_ring: &JsValue,
+        runtime: Option<Arc<RuntimeCode>>,
     ) -> Result<BrowserSched, JsValue> {
         let (engine, host) =
-            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env)?;
+            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env, runtime)?;
         let smp = crate::smp::SmpRun::start(engine, mem_pages, dirty_off, host_off, entries, main_sp, audio_ring)
             .await?;
         Ok(BrowserSched { core: None, host, smp: Some(smp) })
@@ -4312,7 +4409,7 @@ impl BrowserSched {
     ) -> Result<BrowserSched, JsValue> {
         let main_prio = env.state.main_thread_priority();
         let (engine, host) =
-            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env)?;
+            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env, None)?;
         let main = engine.make_thread(
             vitaslop_runtime::host::MAIN_THID,
             &[entry & !1],
@@ -4343,10 +4440,11 @@ impl BrowserSched {
         entries: &[u32],
         main_sp: u32,
         env: VitaEnv,
+        runtime: Option<Arc<RuntimeCode>>,
     ) -> Result<BrowserSched, JsValue> {
         let main_prio = env.state.main_thread_priority();
         let (engine, host) =
-            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env)?;
+            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, host_off, env, runtime)?;
         let main = engine.make_thread(
             vitaslop_runtime::host::MAIN_THID,
             entries,
@@ -4405,6 +4503,66 @@ pub fn reserved_region() -> Option<(usize, usize)> {
     RESERVED_REGION.get().copied()
 }
 
+thread_local! {
+    /// Side module `i`'s compiled form on THIS worker, made the first time one of its instances
+    /// needs it. Per worker because a `WebAssembly.Module` is a JavaScript object; the
+    /// translation it is compiled from is shared by the whole run.
+    static SIDE_MODULES: RefCell<Vec<Option<WebAssembly::Module>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// >>> `env.dispatch_miss` on the browser: translate or find the code at `target` (the shared
+/// record writes the entry table, in the memory every worker sees) and install it into the
+/// CALLING instance - grow its table, then instantiate the side module against that instance's
+/// `env` and its exports as `main`, which writes the module's functions into the table. Returns
+/// the slot to call. With no record the miss is the old loud trap.
+///
+/// Native's twin is `vitaslop_native::runtime_code::dispatch_miss`; the two differ only in how
+/// a module is compiled and instantiated.
+fn runtime_miss(
+    runtime: Option<&RuntimeCode>,
+    env: &Object,
+    exports: &Object,
+    target: u32,
+    from: u32,
+) -> Result<i32, JsValue> {
+    let Some(runtime) = runtime else {
+        return Err(JsValue::from_str(&format!(
+            "indirect dispatch to unknown target {target:#010x} from f_{from:x}"
+        )));
+    };
+    // SAFETY: the guest region lives inside THIS module's memory (`runtime_code` is `None`
+    // otherwise), so a layout offset is a pointer here, and the entry table lies inside it.
+    let resolved = unsafe { runtime.resolve(target, from, runtime.table_off() as usize as *mut u8) }
+        .map_err(|e| JsValue::from_str(&e))?;
+    let table: WebAssembly::Table = Reflect::get(exports, &JsValue::from_str(abi::TABLE_EXPORT))?
+        .dyn_into()
+        .map_err(|_| JsValue::from_str("the main module exports no table"))?;
+    let size = table.length();
+    if size > resolved.slot && !JsValue::from(table.get(resolved.slot)?).is_null() {
+        return Ok(resolved.slot as i32);
+    }
+    if size < resolved.slot_end {
+        table.grow(resolved.slot_end - size)?;
+    }
+    let module = SIDE_MODULES.with(|cell| -> Result<WebAssembly::Module, JsValue> {
+        let mut modules = cell.borrow_mut();
+        if modules.len() <= resolved.side {
+            modules.resize(resolved.side + 1, None);
+        }
+        if let Some(m) = &modules[resolved.side] {
+            return Ok(m.clone());
+        }
+        let m = WebAssembly::Module::new(&Uint8Array::from(&resolved.wasm[..]))?;
+        modules[resolved.side] = Some(m.clone());
+        Ok(m)
+    })?;
+    let imports = Object::new();
+    Reflect::set(&imports, &JsValue::from_str(abi::IMPORT_MODULE), env)?;
+    Reflect::set(&imports, &JsValue::from_str(abi::MAIN_MODULE), exports)?;
+    WebAssembly::Instance::new(&module, &imports)?;
+    Ok(resolved.slot as i32)
+}
+
 /// Build the browser engine (JSPI primitives, module, a fresh seeded shared memory) and
 /// the shared host - the common setup both [`BrowserSched`] constructors share.
 fn build_engine(
@@ -4416,6 +4574,7 @@ fn build_engine(
     dirty_off: Option<u64>,
     host_off: u32,
     env: VitaEnv,
+    runtime: Option<Arc<RuntimeCode>>,
 ) -> Result<(BrowserEngine, Host), JsValue> {
     {
         // A module transpiled for a host offset runs ONLY in the region reserved at that
@@ -4492,36 +4651,28 @@ fn build_engine(
             (shared_mem, GuestMem::Js(view))
         };
 
-        // Shared non-suspending env stubs. svc is unused on the Vita path; a dispatch
-        // miss (an indirect call to an untranslated target) throws a clear error.
+        // The shared non-suspending `env.svc` stub, unused on the Vita path.
         let svc = Closure::wrap(Box::new(|_sel: i32| {}) as Box<dyn FnMut(i32)>);
         let svc_fn: JsValue = svc.as_ref().clone();
-        let dispatch_miss = Closure::wrap(Box::new(|target: i32, caller: i32| -> () {
-            let msg = format!(
-                "indirect dispatch to unknown target {:#010x} from f_{:x}",
-                target as u32, caller as u32
-            );
-            wasm_bindgen::throw_str(&msg)
-        }) as Box<dyn FnMut(i32, i32)>);
-        let dispatch_miss_fn: JsValue = dispatch_miss.as_ref().clone();
 
         // Say how this run preempts before any guest code runs, so the one behavioural
         // difference from native is on the record rather than inferred from timings.
         preempt_note();
 
+        let float_sel: Rc<[bool]> = env.import_float_abi().into();
         let host: Host = Arc::new(Mutex::new(env));
         let engine = BrowserEngine {
             module,
             shared_mem,
             view,
             host: host.clone(),
+            float_sel,
             base,
             promising,
             suspending,
             _svc: svc,
             svc_fn,
-            _dispatch_miss: dispatch_miss,
-            dispatch_miss_fn,
+            runtime,
             mirror_off,
             pool: Rc::new(RefCell::new(Vec::new())),
             smp: None,
@@ -4550,6 +4701,7 @@ impl BrowserEngine {
         dirty_off: Option<u64>,
         host_off: u32,
         hooks: SmpHooks,
+        runtime: Option<Arc<RuntimeCode>>,
     ) -> Result<BrowserEngine, JsValue> {
         if host_off == 0 {
             return Err(JsValue::from_str(
@@ -4571,26 +4723,19 @@ impl BrowserEngine {
             .map_err(|_| JsValue::from_str("wasm_bindgen::memory() is not a WebAssembly.Memory"))?;
         let svc = Closure::wrap(Box::new(|_sel: i32| {}) as Box<dyn FnMut(i32)>);
         let svc_fn: JsValue = svc.as_ref().clone();
-        let dispatch_miss = Closure::wrap(Box::new(|target: i32, caller: i32| -> () {
-            let msg = format!(
-                "indirect dispatch to unknown target {:#010x} from f_{:x}",
-                target as u32, caller as u32
-            );
-            wasm_bindgen::throw_str(&msg)
-        }) as Box<dyn FnMut(i32, i32)>);
-        let dispatch_miss_fn: JsValue = dispatch_miss.as_ref().clone();
+        let float_sel: Rc<[bool]> = crate::smp::lock_host(&host).import_float_abi().into();
         Ok(BrowserEngine {
             module,
             shared_mem,
             view: GuestMem::Host(region),
             host,
+            float_sel,
             base,
             promising,
             suspending,
             _svc: svc,
             svc_fn,
-            _dispatch_miss: dispatch_miss,
-            dispatch_miss_fn,
+            runtime,
             mirror_off,
             pool: Rc::new(RefCell::new(Vec::new())),
             smp: Some(Rc::new(hooks)),
@@ -4600,6 +4745,11 @@ impl BrowserEngine {
     /// The shared host this engine dispatches to.
     pub(crate) fn host(&self) -> &Host {
         &self.host
+    }
+
+    /// The run's record of code found at run time, for the guest workers to resolve through.
+    pub(crate) fn runtime(&self) -> Option<Arc<RuntimeCode>> {
+        self.runtime.clone()
     }
 
     /// Dispatch one host call on THIS worker, for a thread that is not running here - the

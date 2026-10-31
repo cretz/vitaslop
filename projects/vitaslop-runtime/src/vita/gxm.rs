@@ -530,6 +530,31 @@ pub(super) fn program_is_depth_replace_used(ctx: &mut GuestCtx, st: &mut VitaSta
     ctx.ret(vitaslop_gxp_shader::fragment_replaces_depth(&blob) as u32);
 }
 
+/// Byte offset, in a GXP program header, of the program TYPE byte (bit 0: fragment), and the
+/// bit of it that says the fragment colour is emitted through the OUTPUT bank in the surface's
+/// native format rather than through a primary-attribute register.
+const GXP_TYPE_OFF: usize = 0x14;
+const GXP_TYPE_NATIVE_COLOR: u8 = 0x40;
+
+/// SceBool sceGxmProgramIsNativeColorUsed(const SceGxmProgram *program)
+///
+/// Answered from the program's own header, as the hardware library reads it: bit 6 of the
+/// type byte at +0x14. ESTABLISHED, not assumed: over 1,362 retail fragment programs taken
+/// from the titles in this tree, every program whose instructions write the OUTPUT bank has
+/// that bit set, and no program with it clear ever writes that bank - the native/non-native
+/// split `vitaslop_gxp_shader` infers from the instruction stream. The one program with the
+/// bit set that does not write the bank writes no colour register at all, the case the
+/// inference cannot classify and the header can. A blob that is not a GXP answers false.
+pub(super) fn program_is_native_color_used(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let program = ctx.arg(0);
+    let blob = st.program_blob(ctx, program);
+    let native = blob.starts_with(b"GXP\0")
+        && blob
+            .get(GXP_TYPE_OFF)
+            .is_some_and(|t| t & GXP_TYPE_NATIVE_COLOR != 0);
+    ctx.ret(native as u32);
+}
+
 /// int sceGxmInitialize(const SceGxmInitializeParams *params)
 pub(super) fn initialize(ctx: &mut GuestCtx, st: &mut VitaState) {
     let params = ctx.arg(0);
@@ -1083,8 +1108,8 @@ fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
             // the handler's own loop rather than by this copy.
             gxmstate::TEXTURE_ARRAY_BYTES
         } else {
-            // The vertex block's TABLE half only - the recorded (never-applied) textures
-            // behind it stay behind, see `gxmstate::VERTEX_BLOCK_BYTES`.
+            // The vertex block's TABLE half only - its texture array behind it is the second
+            // copy below, see `gxmstate::VERTEX_BLOCK_BYTES`.
             gxmstate::VERTEX_BLOCK_TEXTURES
         },
         // An empty slot is this engine's own zero rather than the guest's in BOTH stages, so
@@ -1101,22 +1126,24 @@ fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
         },
         // The fragment block's NON-DEFAULT UNIFORM-BUFFER table, wholesale, where the handler
         // (`bind_precomputed_fragment_state`) writes it. The vertex stage's table IS its copy
-        // above, so it has no second one.
+        // above; its second copy is the state's TEXTURE array onto the context's vertex
+        // sampler block, per slot, as `bind_precomputed_vertex_state` writes it.
         table_src: if fragment {
             gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS
         } else {
-            0
+            gxmstate::VERTEX_BLOCK_TEXTURES
         },
         table_dst: if fragment {
             gxmctx::off::FRAGMENT_UNIFORM_BUFFERS
         } else {
-            0
+            gxmctx::off::VERTEX_TEXTURES
         },
         table_bytes: if fragment {
             gxmctx::MAX_UNIFORM_BUFFERS as u32 * 4
         } else {
-            0
+            gxmctx::TEXTURE_ARRAY_BYTES
         },
+        table_slot_stride: if fragment { 0 } else { gxmctx::TEXTURE_STRIDE },
         ctx_prog: gxmctx::off::FRAGMENT_PROGRAM,
         has_prog: fragment,
     }
@@ -1906,11 +1933,6 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     ctx.ret(0);
 }
 
-/// int sceGxmShaderPatcherCreateFragmentProgram(patcher, programId, outputFormat,
-///     multisampleMode, blendInfo, vertexProgram, fragmentProgram)  -- 7 args.
-/// Hand back a fresh handle (as the generic `out_handle` did) and additionally record
-/// the handle -> `SceGxmProgram*` mapping, so a precomputed fragment state built from
-/// this fragment program can size its default uniform buffer.
 /// Report each DISTINCT `SceGxmBlendInfo` a title creates a fragment program with.
 ///
 /// The blend equation is baked in here and never mentioned again, so this is the only place
@@ -1968,15 +1990,7 @@ fn program_rop_blend(
     program_header: u32,
 ) -> Option<crate::capture::BlendState> {
     use vitaslop_gxp_shader::RopDstFactor;
-    let rop = match st.rop_blend_memo.get(&program_header) {
-        Some(r) => (*r)?,
-        None => {
-            let blob = st.program_blob(ctx, program_header);
-            let r = vitaslop_gxp_shader::rop_blend(&blob);
-            st.rop_blend_memo.insert(program_header, r);
-            r?
-        }
-    };
+    let rop = st.program_rop_blend(ctx, program_header)?;
     // `SceGxmBlendFactor`: 1 = ONE, 4 = SRC_ALPHA, 5 = ONE_MINUS_SRC_ALPHA.
     // `SceGxmBlendFunc`: 0 = NONE, 1 = ADD, 3 = REVERSE_SUBTRACT.
     let blend = match rop.factors {
@@ -2027,6 +2041,11 @@ fn report_rop_blend(
     );
 }
 
+/// int sceGxmShaderPatcherCreateFragmentProgram(patcher, programId, outputFormat,
+///     multisampleMode, blendInfo, vertexProgram, fragmentProgram)  -- 7 args.
+/// Hand back a fresh handle (as the generic `out_handle` did) and additionally record
+/// the handle -> `SceGxmProgram*` mapping, so a precomputed fragment state built from
+/// this fragment program can size its default uniform buffer.
 pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     let program_id = ctx.arg(1);
     let blend_info = ctx.arg(4);
@@ -2189,10 +2208,100 @@ pub(super) fn shader_patcher_get_program_ref_count(ctx: &mut GuestCtx, st: &mut 
 /// int sceGxmBeginScene(context, flags, renderTarget, validRegion,
 ///     vertexSyncObject, fragmentSyncObject, colorSurface, depthStencil) -- 8 args.
 pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let depth_stencil = ctx.arg(7);
+    let depth = read_depth_stencil_surface(ctx, depth_stencil);
+    begin_scene_with_depth(ctx, st, depth_stencil, depth);
+}
+
+/// int sceGxmBeginSceneEx(context, flags, renderTarget, validRegion, vertexSyncObject,
+///     fragmentSyncObject, colorSurface, loadDepthStencilSurface, storeDepthStencilSurface)
+///     -- 9 args, 5 of them on the stack.
+///
+/// [`begin_scene`] with the depth/stencil surface split in two: the scene LOADS from one and
+/// STORES to the other. Everything else - the arguments it shares with `sceGxmBeginScene`, at
+/// the same positions, and every per-scene reset - is that call's, run through the same body.
+///
+/// The scene carries ONE depth surface (a later pass that samples this scene's depth names
+/// the address it was stored to), so the two are folded into the one they describe:
+/// - Only one given: that surface, with the force bit of the half that was NOT given cleared
+///   - no load surface means nothing is loaded, no store surface means nothing is kept.
+/// - Both given over the same depth/stencil memory: the store surface (it is where the result
+///   lands), with the load surface's FORCE_LOAD in place of its own.
+/// - Both given over DIFFERENT memory: still the store surface, with the load surface's
+///   FORCE_LOAD - and the scene then loads from the STORE surface's memory, not the load
+///   surface's, which is not what the console does. The renderer has one depth address per
+///   scene; [`report_split_depth_load`] says so out loud whenever a scene asks for it.
+pub(super) fn begin_scene_ex(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let (load_ptr, store_ptr) = (ctx.arg(7), ctx.arg(8));
+    let load = read_depth_stencil_surface(ctx, load_ptr);
+    let store = read_depth_stencil_surface(ctx, store_ptr);
+    let (depth, named) = merge_load_store_depth(load, store);
+    if let (Some(l), Some(s)) = (load, store)
+        && l.zls_control & DS_FORCE_LOAD_MASK != 0
+        && (l.depth_addr, l.stencil_addr) != (s.depth_addr, s.stencil_addr)
+    {
+        report_split_depth_load(l.depth_addr, s.depth_addr);
+    }
+    begin_scene_with_depth(ctx, st, if named { store_ptr } else { load_ptr }, depth);
+}
+
+/// The one depth surface a `sceGxmBeginSceneEx` scene carries, from its load and store
+/// surfaces (see [`begin_scene_ex`]), and whether it is the STORE surface's.
+fn merge_load_store_depth(
+    load: Option<crate::capture::DepthSurface>,
+    store: Option<crate::capture::DepthSurface>,
+) -> (Option<crate::capture::DepthSurface>, bool) {
+    match (load, store) {
+        (None, None) => (None, false),
+        (Some(mut l), None) => {
+            l.zls_control &= !DS_FORCE_STORE_MASK;
+            (Some(l), false)
+        }
+        (None, Some(mut s)) => {
+            s.zls_control &= !DS_FORCE_LOAD_MASK;
+            (Some(s), true)
+        }
+        (Some(l), Some(mut s)) => {
+            s.zls_control =
+                (s.zls_control & !DS_FORCE_LOAD_MASK) | (l.zls_control & DS_FORCE_LOAD_MASK);
+            // Over different memory the scene starts from the LOAD surface's depth and leaves
+            // its own in the store surface's - the renderer loads from `load_addr`.
+            if l.depth_addr != s.depth_addr {
+                s.load_addr = l.depth_addr;
+            }
+            (Some(s), true)
+        }
+    }
+}
+
+/// Say - once per pair of addresses - that a `sceGxmBeginSceneEx` scene loads its depth from
+/// one surface and stores it to another (see [`begin_scene_ex`]). A status line: the renderer
+/// serves it (`RenderScene::depth_load_addr`).
+fn report_split_depth_load(load_addr: u32, store_addr: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if g.get_or_insert_with(HashSet::new).insert((load_addr, store_addr)) {
+        tracing::info!(
+            target: "vitaslop::status",
+            "sceGxmBeginSceneEx: the scene LOADS depth from {load_addr:#x} and STORES it to \
+             {store_addr:#x}"
+        );
+    }
+}
+
+/// The body [`begin_scene`] and [`begin_scene_ex`] share: everything after the depth surface
+/// is decided. `depth_stencil` is the guest pointer that surface was read from, for reports.
+fn begin_scene_with_depth(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    depth_stencil: u32,
+    depth: Option<crate::capture::DepthSurface>,
+) {
     let render_target = ctx.arg(2);
     let valid_region = ctx.arg(3);
     let color_surface = ctx.arg(6);
-    let depth_stencil = ctx.arg(7);
     // Resolve from the struct's own contents first (survives a copy), then from the
     // address table (covers a surface whose bytes a title has since overwritten).
     // `resolve_color_surface` also merges in the sticky gamma mode, which the 32-byte guest
@@ -2249,7 +2358,6 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
         read_valid_region(ctx, valid_region),
         color.as_ref().map(|c| (c.width, c.height)),
     );
-    let depth = read_depth_stencil_surface(ctx, depth_stencil);
     report_scene_depth(
         color.as_ref().map(|c| c.data_addr).unwrap_or(0),
         color_surface,
@@ -2315,13 +2423,12 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
     if *VIEWPORT_SCENE
         .get_or_init(|| crate::knobs::var("VITASLOP_VIEWPORT_SCENE").ok().as_deref() != Some("0"))
     {
-        let region_max = (valid_region != 0)
-            .then(|| {
-                (
-                    ctx.read_u32(valid_region + 8),
-                    ctx.read_u32(valid_region + 12),
-                )
-            })
+        // The region is `{ xMax, yMax }` - EIGHT bytes (see `read_valid_region`). This read
+        // used to take words 2 and 3 of a sixteen-byte `{ xMin, yMin, xMax, yMax }` that does not
+        // exist, i.e. whatever followed the struct in the guest's memory. MEASURED on a racing
+        // title's campaign map: the words past its region were zero, every scene drawn without
+        // a viewport of its own got a 1x1 one, and the whole 3D map behind the menu was black.
+        let region_max = read_valid_region(ctx, valid_region)
             .filter(|&(x, y)| x < 4096 && y < 4096)
             .map(|(x, y)| (x + 1, y + 1));
         if let Some((w, h)) = region_max
@@ -2369,6 +2476,7 @@ fn read_depth_stencil_surface(
         stencil_addr: ctx.read_u32(surface + DS_STENCIL_DATA),
         background_depth: ctx.read_u32(surface + DS_BACKGROUND_DEPTH),
         background_control: ctx.read_u32(surface + DS_BACKGROUND_CONTROL),
+        load_addr: 0,
     })
 }
 
@@ -2554,6 +2662,11 @@ pub(super) fn end_scene(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOut
     // bytes are taken at the guest's GPU wait or at its flip, whichever comes first - see
     // `VitaState::resolve_deferred_geometry` for the crowd that made EndScene too early.
     st.end_scene();
+    // What the target's memory holds NOW, at submission: the bytes its write-back may replace.
+    // See `rtt_writeback::note_scene_submitted`.
+    if let Some(c) = st.capture.scenes.last().and_then(|s| s.color) {
+        crate::rtt_writeback::note_scene_submitted(&st.capture.scenes, &c, &mut |a, n| ctx.read_bytes(a, n));
+    }
     st.flush_visibility(ctx);
     let (vertex_notification, fragment_notification) = (ctx.arg(1), ctx.arg(2));
     // The scene remembers its notifications: a `sceGxmNotificationWait` on one of them is
@@ -2587,6 +2700,27 @@ fn signal_notification(ctx: &mut GuestCtx, notification: u32) {
     let value = ctx.read_u32(notification + 4);
     if address != 0 {
         ctx.write_u32(address, value);
+    }
+}
+
+/// int sceGxmMidSceneFlush(SceGxmContext *context, unsigned int flags,
+///     SceGxmSyncObject *vertexSyncObject, const SceGxmNotification *vertexNotification)
+///
+/// Kicks the vertex processing of every draw made so far in the open scene, so the title can
+/// reuse that vertex memory once `vertexNotification` fires - the scene itself carries on.
+/// Here the promise is kept literally: the scene is split where it stands
+/// (`VitaState::split_open_scene`), the half already drawn has its geometry READ now, and
+/// only then is the notification signalled - so a title that waits on it and rewrites its
+/// vertex buffers cannot reach draws whose bytes are still to be taken. Outside a scene it is
+/// `SCE_GXM_ERROR_NOT_WITHIN_SCENE`, the error a draw outside one gets.
+pub(super) fn mid_scene_flush(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let notification = ctx.arg(3);
+    if st.split_open_scene() {
+        st.resolve_deferred_geometry(ctx);
+        signal_notification(ctx, notification);
+        ctx.ret(0);
+    } else {
+        ctx.ret(SCE_GXM_ERROR_NOT_WITHIN_SCENE as u32);
     }
 }
 
@@ -3418,6 +3552,64 @@ pub(super) fn set_front_depth_func(
     0
 }
 
+/// void sceGxmSetBackDepthBias(SceGxmContext *context, int factor, int units)
+///
+/// The two-sided counterpart of [`set_front_depth_bias`], recorded like the rest of the
+/// back-face state. The renderer draws every face with the FRONT depth state today (see
+/// `render.rs`'s `depth_bias`), two-sided or not.
+#[hostcall]
+pub(super) fn set_back_depth_bias(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, factor: i32, units: i32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::BACK_DEPTH_BIAS_FACTOR, factor as u32);
+    gxmctx::set(ctx, context, gxmctx::off::BACK_DEPTH_BIAS_UNITS, units as u32);
+    0
+}
+
+/// Once per run: a title turned on W-buffering or the W clamp, which this renderer records but
+/// does not apply - a depth or near-plane defect on that title starts here.
+fn report_w_state_unapplied(what: &'static str, key: u64) {
+    if crate::rtt_writeback::report_once(0x5700_0000_0000_0000 ^ key) {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            "gxm: the title ENABLED {what}; it is recorded in the context but the renderer does \
+             not apply it (no published source gives the hardware's exact rule), so depth or \
+             near-plane geometry may differ from the console"
+        );
+    }
+}
+
+/// void sceGxmSetWClampEnable(SceGxmContext *context, SceGxmWClampMode enable)
+///
+/// `SCE_GXM_WCLAMP_MODE_ENABLED` (0x8000) turns on the rasteriser's W clamp; its value comes
+/// from [`set_w_clamp_value`]. Recorded, not applied - see [`report_w_state_unapplied`].
+#[hostcall]
+pub(super) fn set_w_clamp_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::W_CLAMP_ENABLE, enable);
+    if enable != 0 {
+        report_w_state_unapplied("the W clamp (sceGxmSetWClampEnable)", 1);
+    }
+    0
+}
+
+/// void sceGxmSetWClampValue(SceGxmContext *context, float clampValue)
+#[hostcall]
+pub(super) fn set_w_clamp_value(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, value: f32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::W_CLAMP_VALUE, value.to_bits());
+    0
+}
+
+/// void sceGxmSetWBufferEnable(SceGxmContext *context, SceGxmWBufferMode enable)
+///
+/// `SCE_GXM_WBUFFER_ENABLED` (0x4000) makes the depth test and depth buffer use W instead of Z.
+/// Recorded, not applied - see [`report_w_state_unapplied`].
+#[hostcall]
+pub(super) fn set_w_buffer_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::W_BUFFER_ENABLE, enable);
+    if enable != 0 {
+        report_w_state_unapplied("W-buffering (sceGxmSetWBufferEnable)", 2);
+    }
+    0
+}
+
 /// void sceGxmSetFrontDepthBias(SceGxmContext *context, int factor, int units)
 ///
 /// The polygon offset applied to front faces: the depth of every fragment is nudged by
@@ -3707,8 +3899,8 @@ fn resolve_color_surface(ctx: &mut GuestCtx, st: &VitaState, addr: u32) -> Optio
     // The gamma mode is sticky host-side state, because the 32-byte guest struct has nowhere
     // to hold it. Merge it back in here so every consumer - the getter, and the scene's render
     // target - sees a complete surface. The surface POINTER is the first key and the surface's
-    // own DATA address is the fallback; see `VitaState::color_surface_gamma` for why a title
-    // that sets the mode through one pointer can describe the same surface through another.
+    // own DATA address is the fallback; see `host::ColorSurfaces` for why a title that sets
+    // the mode through one pointer can describe the same surface through another.
     s.gamma = st.color_surface_gamma_mode(addr, s.data_addr);
     Some(s)
 }
@@ -3730,7 +3922,7 @@ pub(super) fn color_surface_get_type(ctx: &mut GuestCtx, st: &mut VitaState, sur
 pub(super) fn color_surface_set_clip(ctx: &mut GuestCtx, st: &mut VitaState) {
     let surface = ctx.arg(0);
     let rect = (ctx.arg(1), ctx.arg(2), ctx.arg(3), ctx.arg(4));
-    st.color_surface_clip.insert(surface, rect);
+    st.set_color_surface_clip(surface, rect);
     ctx.ret(0);
 }
 
@@ -3740,7 +3932,7 @@ pub(super) fn color_surface_set_clip(ctx: &mut GuestCtx, st: &mut VitaState) {
 pub(super) fn color_surface_get_clip(ctx: &mut GuestCtx, st: &mut VitaState) {
     let surface = ctx.arg(0);
     let outs = [ctx.arg(1), ctx.arg(2), ctx.arg(3), ctx.arg(4)];
-    let rect = st.color_surface_clip.get(&surface).copied().or_else(|| {
+    let rect = st.color_surface_clip(surface).or_else(|| {
         resolve_color_surface(ctx, st, surface)
             .map(|s| (0, 0, s.width.saturating_sub(1), s.height.saturating_sub(1)))
     });
@@ -3796,7 +3988,7 @@ pub(super) fn color_surface_set_dither_mode(
     surface: u32,
     mode: u32,
 ) -> i32 {
-    st.color_surface_dither.insert(surface, mode);
+    st.set_color_surface_dither(surface, mode);
     0
 }
 
@@ -3807,7 +3999,7 @@ pub(super) fn color_surface_get_dither_mode(
     st: &mut VitaState,
     surface: u32,
 ) -> u32 {
-    st.color_surface_dither.get(&surface).copied().unwrap_or(0)
+    st.color_surface_dither(surface)
 }
 
 /// SceGxmTextureType sceGxmTextureGetType(const SceGxmTexture *texture)
@@ -4430,7 +4622,7 @@ pub(super) fn color_surface_set_gamma_mode(
 ) -> i32 {
     // The buffer this surface writes, recorded beside the pointer so the mode survives the
     // guest describing the same surface through a different struct - see
-    // `VitaState::color_surface_gamma`. Read from the struct's own contents first, exactly as
+    // `host::ColorSurfaces`. Read from the struct's own contents first, exactly as
     // `resolve_color_surface` does, so a surface the guest initialised but this table has
     // never seen still contributes its data address.
     //
@@ -5010,6 +5202,18 @@ pub(super) fn depth_stencil_surface_set_background_depth(
     surface: u32,
     background_depth: f32,
 ) -> i32 {
+    // Once per distinct value: the depth a scene CLEARS to is a float ARGUMENT (s0), and a
+    // wrong one is silent - cleared to 0.0 under a LESS test, every draw of the pass fails and
+    // the world renders as its sky alone. `r1` beside it says whether the caller passed the
+    // value in a core register instead.
+    if crate::rtt_writeback::report_once(0x6c00_0000_0000_0000 ^ background_depth.to_bits() as u64) {
+        tracing::info!(
+            target: "vitaslop::status",
+            "gxm depth: sceGxmDepthStencilSurfaceSetBackgroundDepth({surface:#x}, {background_depth}) - s0 {:#010x}, r1 {:#010x}",
+            ctx.vfp[0],
+            ctx.regs[1]
+        );
+    }
     ctx.write_u32(surface + DS_BACKGROUND_DEPTH, background_depth.to_bits());
     0
 }
@@ -5160,12 +5364,12 @@ pub(super) fn set_front_visibility_test_op(
 
 /// void sceGxmSetBackVisibilityTest{Enable,Index,Op}(SceGxmContext *context, unsigned int v)
 ///
-/// The back-face twins of the three front setters. Kept in [`VitaState::back_visibility`] per
-/// context rather than in the context block, whose layout is fixed and shared with the inline
-/// forms. `field`: 0 enable, 1 index, 2 op. First called by a 2011 adventure title at boot.
+/// The back-face twins of the three front setters. Kept on the host per context rather than in
+/// the context block, whose layout is fixed and shared with the inline forms. `field`: 0 enable,
+/// 1 index, 2 op. First called by a 2011 adventure title at boot.
 pub(super) fn set_back_visibility_test(ctx: &mut GuestCtx, st: &mut VitaState, field: usize) {
     let (context, value) = (ctx.arg(0), ctx.arg(1));
-    st.back_visibility.entry(context).or_insert([0; 3])[field] = value;
+    st.set_back_visibility_test(context, field, value);
     ctx.ret(0);
 }
 
@@ -6674,6 +6878,23 @@ mod precomputed_state_binds {
         }
     }
 
+    /// `sceGxmBeginScene` resets the viewport to the VALID REGION, which is the eight-byte
+    /// `{ xMax, yMax }` - not two words past it. With zeros after the region (what a racing
+    /// title's campaign map had there) the old sixteen-byte read made a 1x1 viewport.
+    #[test]
+    fn begin_scene_takes_the_viewport_from_the_eight_byte_valid_region() {
+        const REGION: u32 = 0x1000;
+        let mut r = Rig::new();
+        r.bytes[REGION as usize..REGION as usize + 4].copy_from_slice(&479u32.to_le_bytes());
+        r.bytes[REGION as usize + 4..REGION as usize + 8].copy_from_slice(&271u32.to_le_bytes());
+        // The words after the struct stay zero.
+        r.call(g::BEGIN_SCENE, &[CTX, 0, 0, REGION]);
+        let vp: Vec<f32> = (0..6)
+            .map(|i| f32::from_bits(r.word(CTX + gxmctx::off::VIEWPORT + i * 4)))
+            .collect();
+        assert_eq!(vp, [240.0, 240.0, 136.0, -136.0, 0.5, 0.5]);
+    }
+
     /// The swizzled upload's placement must be a PERMUTATION of the destination: every texel of
     /// a `w x w` square lands at a distinct offset and together they cover exactly `[0, w*w)`.
     ///
@@ -6864,6 +7085,60 @@ mod precomputed_state_binds {
             r.word(VSTATE + gxmstate::off::HEADER),
             "record: header comes from the struct"
         );
+    }
+
+    /// The vertex bind APPLIES the textures the state carries: a vertex program that samples
+    /// a texture finds it on the context's vertex sampler block, copied by value and marked
+    /// precomputed - and a direct `sceGxmSetVertexTexture` on a unit the state does not carry
+    /// survives, for the same unwritten-zero reason the fragment bind's does. This bind used to
+    /// record the state's textures and never apply them, and every draw whose vertex program
+    /// samples was dropped for an empty unit.
+    #[test]
+    fn vertex_bind_applies_the_states_vertex_textures() {
+        let mut r = Rig::new();
+        for (k, w) in [0x1111_2222u32, 0x3333_4444, 0x5555_6666, 0x7777_0004]
+            .iter()
+            .enumerate()
+        {
+            let at = (TEXTURE as usize) + k * 4;
+            r.bytes[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        r.call(g::PRECOMPUTED_VERTEX_STATE_INIT, &[VSTATE, 0, 0]);
+        r.call(
+            g::PRECOMPUTED_VERTEX_STATE_SET_TEXTURE,
+            &[VSTATE, 0, TEXTURE],
+        );
+        {
+            let mut mem = SliceMemory(&mut r.bytes);
+            let mut ctx = crate::host::GuestCtx::new(&mut r.regs, &mut r.vfp, &mut mem, 0);
+            gxmctx::set_vertex_texture_binding(
+                &mut ctx,
+                CTX,
+                3,
+                gxmctx::TexBinding {
+                    addr: 0x1234,
+                    words: [1, 2, 3, 4],
+                    from_precomputed: false,
+                },
+            );
+        }
+        r.call(g::SET_PRECOMPUTED_VERTEX_STATE, &[CTX, VSTATE]);
+        let slot = CTX + gxmctx::off::VERTEX_TEXTURES;
+        assert_eq!(r.word(slot), TEXTURE, "unit 0: the state's texture address");
+        assert_eq!(r.word(slot + 4), 0x1111_2222, "unit 0: control word 0, BY VALUE");
+        assert_eq!(r.word(slot + 16), 0x7777_0004, "unit 0: control word 3, BY VALUE");
+        assert_eq!(r.word(slot + 20), 1, "unit 0: marked from_precomputed");
+        let direct = CTX + gxmctx::off::VERTEX_TEXTURES + 3 * gxmctx::TEXTURE_STRIDE;
+        assert_eq!(
+            r.word(direct),
+            0x1234,
+            "unit 3: the state carries nothing here, so the DIRECT bind must survive"
+        );
+        // And the FRAGMENT sampler block is not where it went.
+        assert_eq!(r.word(CTX + gxmctx::off::TEXTURES), 0, "fragment unit 0 untouched");
+        // A null state unbinds nothing: the handler copies no slot from a missing block.
+        r.call(g::SET_PRECOMPUTED_VERTEX_STATE, &[CTX, 0]);
+        assert_eq!(r.word(slot), TEXTURE, "a null bind leaves the vertex textures alone");
     }
 
     /// The fragment bind: the 16-slot texture array lands wholesale (a unit bound directly
@@ -7090,6 +7365,18 @@ mod precomputed_state_binds {
                 assert_eq!(l.st_magic, gxmstate::MAGIC_VERTEX);
                 assert_eq!(l.copy_dst, gxmctx::off::VERTEX_UNIFORM_BUFFERS);
                 assert_eq!(l.copy_bytes, gxmstate::VERTEX_BLOCK_TEXTURES);
+                // The second copy is the state's texture array onto the vertex sampler block,
+                // slot by slot - the bind applies the textures the state carries.
+                assert_eq!(
+                    (l.table_src, l.table_dst, l.table_bytes, l.table_slot_stride),
+                    (
+                        gxmstate::VERTEX_BLOCK_TEXTURES,
+                        gxmctx::off::VERTEX_TEXTURES,
+                        gxmctx::TEXTURE_ARRAY_BYTES,
+                        gxmctx::TEXTURE_STRIDE
+                    )
+                );
+                assert_eq!(gxmstate::VERTEX_BLOCK_BYTES, gxmstate::VERTEX_BLOCK_TEXTURES + gxmctx::TEXTURE_ARRAY_BYTES);
                 assert!(
                     !l.has_prog,
                     "the vertex bind leaves the bound program alone"
@@ -8097,17 +8384,24 @@ fn complete_scenes_through(ctx: &mut GuestCtx, st: &mut VitaState, through: usiz
             if *addr != c.data_addr {
                 continue;
             }
-            let mut probe = ctx.read_bytes(*addr, 4096);
+            // >>> THE WHOLE TARGET, NOT ITS FIRST 4 KB. `apply_one` reads its region at `addr`
+            // (the latch's 4096-byte prefix, then under SMP the whole span it hashes against
+            // the submission), and the write closure holds `ctx`, so the bytes are taken here
+            // once, `probe_len` of them as the frame-end path does. MEASURED on a baseball
+            // title: a 4 KB snapshot let only targets of at most 4 KB through (its 32x32
+            // exposure probe); every 128x128 ambient probe was refused at the guest's GPU wait,
+            // the stadium's first frame read its allocator's poison as a 50x ambient, and the
+            // ground map baked from it washed out the whole at-bat.
+            let probe = ctx.read_bytes(*addr, crate::rtt_writeback::probe_len(*w, *h, &c));
             let ok = crate::rtt_writeback::apply_one(
                 *addr,
                 *w,
                 *h,
                 rgba,
                 &c,
-                &mut |_, n| {
-                    probe.truncate(n.min(probe.len()));
-                    probe.clone()
-                },
+                // A prefix per request - never shrinking the snapshot, which the latch's 4096-byte
+                // read used to do before the whole-region read came.
+                &mut |_, n| probe[..n.min(probe.len())].to_vec(),
                 &mut |a, b| ctx.write_bytes(a, b),
             );
             if ok {
@@ -8417,6 +8711,60 @@ pub(super) fn transfer_copy(ctx: &mut GuestCtx) {
     ctx.ret(0);
 }
 
+/// int sceGxmTransferFill(uint32_t color, SceGxmTransferFormat destFormat, void *destAddress,
+///     destX, destY, destWidth, destHeight, int32_t destStride, syncObject, syncFlags,
+///     notification)  -- 11 args, 7 of them on the stack.
+///
+/// Fills a rectangle of a LINEAR surface with one texel value. The call takes no layout type
+/// (unlike [`transfer_copy`]), so the destination is addressed row by row through its stride,
+/// as `sceGxmTransferCopy` addresses a linear one. `color` is the texel AS STORED in
+/// `destFormat`: its low `bpp` bytes, little-endian, are written to every texel, which is the
+/// only reading under which one 32-bit word can fill every format - a 16-bit format takes the
+/// low halfword, the 24-bit BGR format the low three bytes. A format wider than the word
+/// (RAW64/RAW128) has no such reading and is refused by name, as an unsized one is, rather
+/// than filled with a guessed replication. The notification is signalled at once, for the
+/// reason [`transfer_notify`] gives.
+pub(super) fn transfer_fill(ctx: &mut GuestCtx) {
+    let (color, dst_format, dst_addr) = (ctx.arg(0), ctx.arg(1), ctx.arg(2));
+    let (dst_x, dst_y) = (ctx.arg(3), ctx.arg(4));
+    let (width, height, dst_stride) = (ctx.arg(5), ctx.arg(6), ctx.arg(7) as i32);
+    let notification = ctx.arg(10);
+    match transfer_bpp(dst_format) {
+        Some(bpp) if bpp <= 4 => {
+            if width != 0 && height != 0 {
+                let texel = &color.to_le_bytes()[..bpp];
+                let row: Vec<u8> = texel
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(width as usize * bpp)
+                    .collect();
+                let d = dst_addr
+                    .wrapping_add(dst_y.wrapping_mul(dst_stride as u32))
+                    .wrapping_add(dst_x * bpp as u32);
+                for y in 0..height {
+                    let to = d.wrapping_add(dst_stride.wrapping_mul(y as i32) as u32);
+                    ctx.write_bytes(to, &row);
+                }
+            }
+            transfer_notify(ctx, notification);
+        }
+        Some(_) => report_transfer_unsupported(
+            "sceGxmTransferFill",
+            "a format wider than the 32-bit fill value",
+            dst_format,
+            dst_format,
+        ),
+        None => report_transfer_unsupported(
+            "sceGxmTransferFill",
+            "a format it cannot size",
+            dst_format,
+            dst_format,
+        ),
+    }
+    ctx.ret(0);
+}
+
 /// int sceGxmTransferDownscale(srcFormat, srcAddress, srcX, srcY, srcWidth, srcHeight,
 ///     srcStride, destFormat, destAddress, destX, destY, destStride,
 ///     syncObject, syncFlags, notification)  -- 15 args, 11 of them on the stack.
@@ -8646,5 +8994,176 @@ fn report_transfer_unsupported_typed(
              move - the destination is left UNTOUCHED and the call reports success, so \
              whatever reads that rectangle next sees STALE pixels rather than scrambled ones"
         );
+    }
+}
+
+#[cfg(test)]
+mod scene_ex_fill_native_tests {
+    //! `sceGxmTransferFill`, `sceGxmProgramIsNativeColorUsed`, `sceGxmMidSceneFlush` and the
+    //! depth folding of `sceGxmBeginSceneEx`, through their handlers over guest memory.
+    use super::*;
+    use crate::capture::DepthSurface;
+    use crate::{DeterministicWorld, SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::{REG_COUNT, SP};
+
+    const STACK: u32 = 0x800;
+    const DST: u32 = 0x100;
+    const NOTE: u32 = 0x40; // a SceGxmNotification { address, value }
+    const NOTE_WORD: u32 = 0x48;
+
+    struct Rig {
+        bytes: Vec<u8>,
+        st: VitaState,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            Rig {
+                bytes: vec![0u8; 4096],
+                st: VitaState::new(0, 4096, Box::new(DeterministicWorld::default())),
+            }
+        }
+
+        fn call(&mut self, f: impl FnOnce(&mut GuestCtx, &mut VitaState), args: &[u32]) -> u32 {
+            let mut regs = [0u32; REG_COUNT];
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            for (i, a) in args.iter().enumerate() {
+                if i < 4 {
+                    regs[i] = *a;
+                } else {
+                    let at = STACK as usize + 4 * (i - 4);
+                    self.bytes[at..at + 4].copy_from_slice(&a.to_le_bytes());
+                }
+            }
+            regs[SP] = STACK;
+            let mut mem = SliceMemory(&mut self.bytes);
+            let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            f(&mut ctx, &mut self.st);
+            ctx.regs[0]
+        }
+
+        fn word(&self, a: u32) -> u32 {
+            u32::from_le_bytes(self.bytes[a as usize..a as usize + 4].try_into().unwrap())
+        }
+
+        fn set_word(&mut self, a: u32, v: u32) {
+            self.bytes[a as usize..a as usize + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// A fill writes the colour's low `bpp` bytes over exactly the rectangle, row by row at the
+    /// stride, and signals the notification; a format wider than the word writes nothing.
+    #[test]
+    fn transfer_fill_writes_the_rectangle_at_the_format_width() {
+        let mut r = Rig::new();
+        r.set_word(NOTE, NOTE_WORD);
+        r.set_word(NOTE + 4, 0x55);
+        // U8U8U8U8_ABGR, 2x2 at (1, 1) of a surface with a 16-byte stride.
+        let fmt32 = 0x0006_0000;
+        let args = [0xAABB_CCDD, fmt32, DST, 1, 1, 2, 2, 16, 0, 0, NOTE];
+        assert_eq!(r.call(|c, _| transfer_fill(c), &args), 0);
+        assert_eq!(r.word(DST + 16 + 4), 0xAABB_CCDD);
+        assert_eq!(r.word(DST + 16 + 8), 0xAABB_CCDD);
+        assert_eq!(r.word(DST + 32 + 4), 0xAABB_CCDD);
+        assert_eq!(r.word(DST + 16), 0, "left of the rectangle");
+        assert_eq!(r.word(DST + 16 + 12), 0, "right of the rectangle");
+        assert_eq!(r.word(DST + 48 + 4), 0, "below the rectangle");
+        assert_eq!(r.word(NOTE_WORD), 0x55, "the notification fired");
+
+        // U5U6U5: the low halfword, three texels from the origin.
+        let mut r = Rig::new();
+        let args = [0x1234_ABCD, 0x0003_0000, DST, 0, 0, 3, 1, 8, 0, 0, 0];
+        r.call(|c, _| transfer_fill(c), &args);
+        assert_eq!(r.word(DST), 0xABCD_ABCD);
+        assert_eq!(r.word(DST + 4), 0x0000_ABCD);
+
+        // RAW64 cannot be filled from one word: refused, nothing written.
+        let mut r = Rig::new();
+        let args = [0xFFFF_FFFF, 0x0012_0000, DST, 0, 0, 1, 1, 8, 0, 0, 0];
+        r.call(|c, _| transfer_fill(c), &args);
+        assert_eq!(r.word(DST), 0);
+    }
+
+    /// Bit 6 of the header's type byte decides, and only for a GXP blob.
+    #[test]
+    fn native_color_is_the_header_bit() {
+        for (ty, want) in [(0x41u8, 1), (0xC5, 1), (0x05, 0), (0x01, 0)] {
+            let mut r = Rig::new();
+            r.bytes[0x200..0x204].copy_from_slice(b"GXP\0");
+            r.set_word(0x208, 0x40);
+            r.bytes[0x200 + GXP_TYPE_OFF] = ty;
+            assert_eq!(
+                r.call(program_is_native_color_used, &[0x200]),
+                want,
+                "type {ty:#x}"
+            );
+        }
+        let mut r = Rig::new();
+        r.bytes[0x200 + GXP_TYPE_OFF] = 0x41;
+        assert_eq!(r.call(program_is_native_color_used, &[0x200]), 0, "not a GXP");
+    }
+
+    /// The load and store surfaces fold into one: a missing half clears its force bit, and with
+    /// both the store surface carries the load surface's FORCE_LOAD.
+    #[test]
+    fn begin_scene_ex_folds_load_and_store_depth() {
+        let surface = |addr: u32, zls: u32| DepthSurface {
+            zls_control: zls,
+            depth_addr: addr,
+            ..Default::default()
+        };
+        let both = DS_FORCE_LOAD_MASK | DS_FORCE_STORE_MASK;
+        assert_eq!(merge_load_store_depth(None, None), (None, false));
+        let (d, named) = merge_load_store_depth(Some(surface(0x10, both)), None);
+        assert_eq!(d.unwrap().zls_control, DS_FORCE_LOAD_MASK);
+        assert!(!named);
+        let (d, named) = merge_load_store_depth(None, Some(surface(0x20, both)));
+        assert_eq!(d.unwrap().zls_control, DS_FORCE_STORE_MASK);
+        assert!(named);
+        let (d, _) = merge_load_store_depth(
+            Some(surface(0x20, DS_FORCE_LOAD_MASK)),
+            Some(surface(0x20, DS_FORCE_STORE_MASK)),
+        );
+        let d = d.unwrap();
+        assert_eq!((d.depth_addr, d.zls_control), (0x20, both));
+        let (d, _) = merge_load_store_depth(
+            Some(surface(0x20, 0)),
+            Some(surface(0x20, DS_FORCE_LOAD_MASK | DS_FORCE_STORE_MASK)),
+        );
+        assert_eq!(d.unwrap().zls_control, DS_FORCE_STORE_MASK, "the LOAD half decides");
+    }
+
+    /// Outside a scene the flush is refused; inside one it splits the scene so the half
+    /// already drawn stores its depth and the continuation loads it, and only then signals.
+    #[test]
+    fn mid_scene_flush_splits_the_scene_and_signals() {
+        let mut r = Rig::new();
+        r.set_word(NOTE, NOTE_WORD);
+        r.set_word(NOTE + 4, 7);
+        assert_eq!(
+            r.call(mid_scene_flush, &[0, 0, 0, NOTE]),
+            SCE_GXM_ERROR_NOT_WITHIN_SCENE as u32
+        );
+        assert_eq!(r.word(NOTE_WORD), 0, "no scene, no signal");
+
+        let depth = DepthSurface {
+            depth_addr: 0x300,
+            ..Default::default()
+        };
+        r.call(
+            |c, s| s.begin_scene(c, None, Some(depth), 0, Some((64, 32))),
+            &[],
+        );
+        assert_eq!(r.call(mid_scene_flush, &[0, 0, 0, NOTE]), 0);
+        assert_eq!(r.word(NOTE_WORD), 7);
+        assert!(r.st.scene_open(), "the scene carries on");
+        r.st.end_scene();
+        let scenes = &r.st.capture.scenes;
+        assert_eq!(scenes.len(), 2);
+        let (first, second) = (scenes[0].depth.unwrap(), scenes[1].depth.unwrap());
+        assert_eq!(first.zls_control & DS_FORCE_STORE_MASK, DS_FORCE_STORE_MASK);
+        assert_eq!(second.zls_control & DS_FORCE_LOAD_MASK, DS_FORCE_LOAD_MASK);
+        assert_eq!(second.depth_addr, 0x300);
+        assert_eq!(scenes[1].target_extent, Some((64, 32)));
     }
 }

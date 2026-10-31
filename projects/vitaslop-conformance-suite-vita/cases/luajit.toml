@@ -1,0 +1,50 @@
+category = "vita"
+description = "Embedded LuaJIT 2.1, interpreter only, running a fixed script - RUNNABLE"
+
+# Source: ../luajit-src/luajit.c, linked against newlib and the vitasdk LuaJIT package. The
+# interpreter's opcode handlers are reached only through a dispatch table LuaJIT builds at
+# start-up, so no static pass discovers them: the run translates them as they are first reached
+# (vitaslop-native's runtime_code), and they tail-jump to one another for the whole script. The
+# golden is the same program built for a desktop against LuaJIT 2.1 with its JIT off.
+# Executable form: tests/vita_luajit.rs.
+[out]
+output = """
+start
+ok 0
+ok 1
+ok 2
+ok 3
+ok 4
+ok 5
+ok 6
+rung
+ok 7
+ok 8
+55
+ok 9
+42
+ok 10
+7
+ok 11
+-1	16777216	5
+ok 12
+12	8	3	16
+ok 13
+loop	1399991
+float	10548.727944
+fib	17711
+closure	3	2
+ipairs	1000	333833500
+pairs	500	125250
+string	ababababab|LUA	14	11	xbxbxbxbxb|LUA
+format	42  3.14 ok ff
+sort	984	512	0
+meta	7
+coroutine	2	20
+pcall	false	boom
+varargs	3	1	nil	3
+bit	240	3	1024	0000dead
+goto	25
+concat	291
+done
+"""

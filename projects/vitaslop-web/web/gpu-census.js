@@ -176,6 +176,14 @@ export function installGpuCensus(log, everyMs = 10000) {
       .slice(0, 10)
       .map(([l, e]) => `${l} ${e.n}/${MB(e.bytes)} MB`)
       .join(", ");
+    // ...and by COUNT: thousands of small objects under one label are invisible in a list
+    // ranked by bytes, and a count is what a per-object driver cost scales with.
+    const many = [...byLabel.entries()]
+      .filter(([, e]) => e.n > 0)
+      .sort((x, y) => y[1].n - x[1].n)
+      .slice(0, 6)
+      .map(([l, e]) => `${l} ${e.n}/${MB(e.bytes)} MB`)
+      .join(", ");
     const churn = [...byLabel.entries()]
       .filter(([, e]) => e.collected > 0)
       .sort((x, y) => y[1].made - x[1].made)
@@ -183,7 +191,7 @@ export function installGpuCensus(log, everyMs = 10000) {
       .map(([l, e]) => `${l} made ${e.made}, collected ${e.collected}`)
       .join(", ");
     log(
-      `[gpu-census] t=${((performance.now() - t0) / 1000).toFixed(0)}s ${parts.join(" | ")} | mapped now ${mapped.now} (${MB(mapped.bytes)} MB, ${mapped.maps} maps ever)${heap} | live by label: ${top} | LEFT TO THE COLLECTOR by label: ${churn || "none"}`
+      `[gpu-census] t=${((performance.now() - t0) / 1000).toFixed(0)}s ${parts.join(" | ")} | mapped now ${mapped.now} (${MB(mapped.bytes)} MB, ${mapped.maps} maps ever)${heap} | live by label: ${top} | most numerous: ${many} | LEFT TO THE COLLECTOR by label: ${churn || "none"}`
     );
   };
   setInterval(line, everyMs);

@@ -46,6 +46,11 @@ pub enum Value {
     /// `Flag(C)` again would fold in the wrong carry. Valid only right after a
     /// `FlagsAdd`.
     CarryAddResult,
+    /// The operand the preceding [`Stmt::Shifter`] computed.
+    ShifterOut,
+    /// The carry-out (0 or 1) the preceding [`Stmt::Shifter`] computed: the old C when its
+    /// amount was zero.
+    ShifterCarry,
     /// Count leading zeros of the inner value (ARM `clz`, wasm `i32.clz`).
     Clz(Box<Value>),
     /// The per-thread pointer (ARM `TPIDRURO`, read by `MRC p15,0,Rt,c13,c0,3`): the
@@ -650,6 +655,20 @@ pub enum Stmt {
         set_flags: bool,
         live: FlagMask,
     },
+    /// The flexible second operand of a data-processing instruction, computed ONCE, before
+    /// the instruction, into scratch the instruction then reads as [`Value::ShifterOut`] and
+    /// (its flag-setting logical forms) [`Value::ShifterCarry`].
+    ///
+    /// For the operand forms no expression can carry: a shift by a REGISTER (`rm, lsl rs`),
+    /// whose amount is `rs[7:0]` - so 32 and beyond are real amounts (0, or the sign fill),
+    /// not wasm's mod-32 - and whose carry-out for a zero amount is the OLD carry; and `rrx`,
+    /// which rotates the old carry in. Computing it first is also what keeps it right when
+    /// the instruction then writes the carry, or a register the operand reads.
+    Shifter { kind: ShifterKind, rm: Value, amount: Value },
+    /// The address the block's return goes back to, when it is not `lr`: the pc a `pop {.., pc}`
+    /// or `ldr pc, [sp], #4` loads. Every return records where it really goes (see
+    /// `emit::nonlocal_returns`); one with no `SetRet` goes to `lr`.
+    SetRet(Value),
 }
 
 /// Which register-controlled shift [`Stmt::ShiftRegFlags`] performs.
@@ -658,6 +677,17 @@ pub enum ShiftKind {
     Lsl,
     Lsr,
     Asr,
+}
+
+/// Which shift a [`Stmt::Shifter`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShifterKind {
+    Lsl,
+    Lsr,
+    Asr,
+    Ror,
+    /// Rotate right by one THROUGH the carry: `(rm >> 1) | (C << 31)`, carry-out `rm[0]`.
+    Rrx,
 }
 
 /// How a basic block hands control to the next. The not-taken side of a branch

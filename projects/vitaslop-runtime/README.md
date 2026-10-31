@@ -25,7 +25,7 @@ point here.
   Rust type and pulled from the right register file - integer/pointer from the core
   registers (r0..r3 then stack), `f32`/`f64` from the VFP registers (s0.. / d0..).
   The VFP argument registers (s0..s15) are read at the NID trap alongside the core
-  registers; a float return goes to s0/d0. Verified in `host.rs`'s hostcall tests.
+  registers; a float return goes to s0/d0. Verified in `host/hostcall_tests.rs`.
 - **Type taxonomy across the boundary** (both directions):
   - Scalars: `u32`/`i32`/`bool` in core registers, `f32`/`f64` in VFP. Direct.
   - Guest pointers: the `Ptr` wrapper (integer class), used for in-params and

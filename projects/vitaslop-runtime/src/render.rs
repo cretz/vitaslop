@@ -1590,6 +1590,18 @@ fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
 /// and the power-of-two padding a swizzled level's Morton order runs over. A second
 /// implementation of that addressing is exactly the kind of duplicate that drifts, and its
 /// failure mode is a texture read plausibly out of the wrong bytes.
+/// How many levels the GPU expansion builds for `t`: a full chain, EXCEPT for a texture the guest
+/// gave ONE level - the device has no level 1 for it and reads level 0 whatever the derivatives
+/// say. The same rule the CPU upload applies (`mips_for_texture` in the platform's GXM caches,
+/// whose comment carries the measurement); `VITASLOP_GXP_MIPS_GUEST_LEVELS=0` is the arm back
+/// for both.
+fn expanded_levels(t: &BoundTexture, w: u32, h: u32) -> u32 {
+    static GUEST_LEVELS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let rule = *GUEST_LEVELS
+        .get_or_init(|| crate::knobs::var("VITASLOP_GXP_MIPS_GUEST_LEVELS").ok().as_deref() != Some("0"));
+    if rule && t.levels <= 1 { 1 } else { max_mip_levels(w, h) }
+}
+
 pub fn raw_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpand> {
     // Byte-permutation formats only. These are the arms `decode_uncompressed_at` answers with a
     // bare `swizzle4(byte(0), byte(1), byte(2), byte(3), swizzle)` - the specials inside the
@@ -1653,7 +1665,7 @@ pub fn raw_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpa
         src: t.pixels.clone(),
         width: w,
         height: h,
-        levels: max_mip_levels(w, h),
+        levels: expanded_levels(t, w, h),
         swizzle: (t.swizzle >> 12) & 0x7,
         src_levels,
         codec: None,
@@ -1741,7 +1753,7 @@ pub fn block_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawEx
         src: t.pixels.clone(),
         width: w,
         height: h,
-        levels: max_mip_levels(w, h),
+        levels: expanded_levels(t, w, h),
         // Unused by the block decoder - see the refusal above.
         swizzle: 0,
         src_levels,
@@ -4048,7 +4060,6 @@ fn report_once(latch: &std::sync::atomic::AtomicBool, msg: &str) {
     }
 }
 
-/// Recover a draw's [`DrawInterp`] the same way for both render paths.
 /// Whether a non-MVP draw's positions are already in NORMALIZED DEVICE coordinates: the
 /// whole position bounding box lies inside [-1, 1] and spans a real area.
 ///
@@ -4086,6 +4097,7 @@ fn positions_are_ndc(d: &Draw, layout: &Layout) -> bool {
     inside && spans
 }
 
+/// Recover a draw's [`DrawInterp`] the same way for both render paths.
 fn interpret_draw(d: &Draw) -> DrawInterp {
     interpret_draw_for(d, false)
 }
@@ -7722,7 +7734,8 @@ fn tex_unwritten_samples_prefix_only() -> bool {
 ///
 /// An entry is bounded by what it costs to REBUILD (a decode) and by what it holds (the
 /// decoded pixels), and only the second is measurable here, so that is the budget.
-/// `VITASLOP_DECODE_CACHE_MB` overrides. 256 MB matches the view cache it feeds.
+/// `VITASLOP_DECODE_CACHE_MB` overrides. The default was 256 MB, matching the view cache it
+/// feeds; it is now 96 MB - see [`decode_cache_budget_bytes`].
 /// Report - once per (address, format) - the GUEST PIXEL FORMAT of a scene's colour surface,
 /// and say plainly when it is one this renderer cannot reproduce.
 ///
@@ -7818,13 +7831,27 @@ fn report_color_surface_format(c: &crate::capture::ColorSurface) {
     }
 }
 
+/// The decode cache's byte budget. `VITASLOP_DECODE_CACHE_MB` overrides it; `=256` is the arm
+/// back to the old default.
+///
+/// # >>> 96 MB: EVERY ENTRY HOLDS ITS BYTES TWICE, AND THE GPU ALREADY HAS A THIRD COPY
+/// An entry pins its SOURCE snapshot (the key's identity) and its `GxmTexture`, whose
+/// passthrough blocks are a re-packed COPY of those bytes (`passthrough_source`). On the
+/// recompiler path the texture is already on the GPU under a content key, so past one frame's
+/// working set this cache mostly holds a second and third copy of what a view has. MEASURED on
+/// a first-person shooter's level in the desktop browser, heap owner ledger: the run worker held
+/// **240 MB** outside every tagged owner and the snapshots 232 MB; with this at 96 (and the
+/// snapshot budget at 96) they read 84 and 83 MB, Rust heap live 1,248 -> 940 MB, renderer
+/// working set peak 2.71 -> 2.33 GB, `RE-decoded after eviction` 0.0 a frame in the steady
+/// window. The one-frame floor (`decode_frame_high`) is unchanged, so no frame re-decodes its own
+/// textures; a re-decode is only work, never a different texel - the key folds the source.
 fn decode_cache_budget_bytes() -> usize {
     static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let base = *CELL.get_or_init(|| {
         crate::knobs::var("VITASLOP_DECODE_CACHE_MB")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(256)
+            .unwrap_or(96)
             * 1024
             * 1024
     });
@@ -8981,6 +9008,7 @@ impl RenderSceneBuilder {
                     frag_sa_addr: d.frag_sa_addr,
                     mem_windows: d.mem_windows.clone(),
                     frag_mem_windows: d.frag_mem_windows.clone(),
+                    frag_store_windows: d.frag_store_windows.clone(),
                     vertices: d.vertices.clone(),
                     vertex_stride: d.vertex_stride,
                     attributes,
@@ -9217,6 +9245,16 @@ impl RenderSceneBuilder {
             depth_min,
             depth_scale,
             depth_addr,
+            depth_load_addr: scene
+                .depth
+                .map(|d| d.load_addr)
+                .filter(|&a| a != 0)
+                .unwrap_or(depth_addr),
+            stencil_addr: scene
+                .depth
+                .map(|d| d.stencil_addr)
+                .filter(|&s| s != depth_addr)
+                .unwrap_or(0),
             stencil_clear: scene
                 .depth
                 .map(|d| (d.background_control & 0xff) as u8)
@@ -9271,6 +9309,7 @@ mod geometry_tests {
             frag_sa_addr: 0,
             mem_windows: Vec::new(),
             frag_mem_windows: Vec::new(),
+            frag_store_windows: Vec::new(),
             shader_expanded: false,
         }
     }
@@ -10670,6 +10709,7 @@ mod supersample_tests {
             frag_sa_addr: 0,
             mem_windows: Vec::new(),
             frag_mem_windows: Vec::new(),
+            frag_store_windows: Vec::new(),
             shader_expanded: false,
         };
         let scene = Scene {
@@ -10794,6 +10834,7 @@ mod supersample_tests {
             frag_sa_addr: 0,
             mem_windows: Vec::new(),
             frag_mem_windows: Vec::new(),
+            frag_store_windows: Vec::new(),
             shader_expanded: false,
         };
         let s = Scene {

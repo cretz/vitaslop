@@ -49,3 +49,8 @@ js-sys = "0.3"
 # A second allocator heap with its own lock, for the shader translator in the threads bundle -
 # see `heap::PrivateHeap`. The same crate std's own wasm allocator is.
 dlmalloc = "0.2"
+
+# A headless device for the GPU unit tests (the stencil plane copies in `store_mirror`), which
+# skip cleanly where there is no adapter.
+[dev-dependencies]
+pollster = { workspace = true }

@@ -741,6 +741,7 @@ fn bind_layout() -> vitaslop_transpiler::BindStateLayout {
         table_src: 0,
         table_dst: 0,
         table_bytes: 0,
+        table_slot_stride: 0,
         ctx_prog: 28,
         has_prog: true,
     }
@@ -820,6 +821,41 @@ fn bind_state_copies_the_table_too() {
     let b = vm.read_mem(OUT_PTR + 32, 8).expect("read back");
     assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 0x7AB1_E001, "table word 0");
     assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 0, "a ZERO table word lands too");
+}
+
+/// >>> THE SECOND COPY PER SLOT: A CARRIED SLOT LANDS, AN EMPTY ONE LEAVES WHAT WAS THERE.
+///
+/// The vertex bind's texture array onto the context's vertex sampler block - the emitted
+/// counterpart of the texture loop in `bind_precomputed_vertex_state`. Its zero slots are this
+/// engine's fill, so a direct vertex-texture bind on a unit the state does not carry survives.
+#[test]
+fn bind_state_copies_a_per_slot_table_skipping_empty_slots() {
+    let l = vitaslop_transpiler::BindStateLayout {
+        table_src: 12,
+        table_dst: 32,
+        table_bytes: 8,
+        table_slot_stride: 4,
+        has_prog: false,
+        ..bind_layout_per_slot()
+    };
+    let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+    seed_bind(&mut vm, l.ctx_magic, l.st_magic);
+    let tbl: [u32; 2] = [0x7AB1_E001, 0];
+    vm.write_mem(BLK_PTR + 12, &tbl.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).expect("table");
+    vm.write_mem(OUT_PTR + 32, &[0xEEu8; 8]).expect("sentinels");
+    let crossed = run(&mut vm);
+    assert!(!crossed, "both magics hold - the inline arm must serve this");
+    let b = vm.read_mem(OUT_PTR + 32, 8).expect("read back");
+    assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 0x7AB1_E001, "slot 0 is carried and lands");
+    assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 0xEEEE_EEEE, "slot 1 is EMPTY and must survive");
+    // A NULL state copies no slot at all, as the handler's missing block copies none.
+    let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+    seed_bind(&mut vm, l.ctx_magic, l.st_magic);
+    vm.write_mem(OUT_PTR + 32, &[0xEEu8; 8]).expect("sentinels");
+    vm.set_reg(1, 0);
+    assert!(!run(&mut vm), "the null unbind must not reach the host");
+    let b = vm.read_mem(OUT_PTR + 32, 8).expect("read back");
+    assert_eq!(b, vec![0xEEu8; 8], "a null bind leaves the second copy's slots alone");
 }
 
 /// >>> A SLOT THE STATE DOES NOT CARRY MUST SURVIVE THE BIND.
@@ -1289,8 +1325,9 @@ fn lw_mutex_unlock_matches_lwwork_on_every_arm() {
         // a copy, a work area never created.
         State::free(),
         // A DOUBLE unlock by the last owner, which is the case the owner word alone
-        // cannot see: releasing leaves `owner` stale, so this reads as "mine" and is
-        // refused only by the count. Inline, `count - 1` would wrap it to four billion
+        // cannot see: an owner word left naming this thread at count zero (a work area
+        // the guest itself initialised that way) reads as "mine" and is refused only by
+        // the count. Inline, `count - 1` would wrap it to four billion
         // and the mutex would be permanently, invisibly held.
         State::held_by(CUR, 0),
         State::held_by(OTHER, 1),

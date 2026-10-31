@@ -140,8 +140,11 @@ than expected.
 - Dead or Alive 5 Plus
 - Dead or Alive Xtreme 3: Venus (Asian release)
 - FIFA Soccer 13
+- Gravity Rush
+- Helldivers
 - Hot Shots Golf: World Invitational
 - Hustle Kings
+- Killzone: Mercenary
 - LIMBO
 - LittleBigPlanet
 - Madden NFL 13
@@ -150,6 +153,7 @@ than expected.
 - MotorStorm RC
 - OlliOlli
 - Persona 4 Golden
+- Resistance: Burning Skies
 - Ridge Racer
 - Tales from Space: Mutant Blobs Attack
 - Ultimate Marvel vs. Capcom 3

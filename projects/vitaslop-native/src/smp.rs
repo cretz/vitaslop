@@ -358,6 +358,9 @@ struct State {
     wake_tokens: HashSet<i32>,
     /// Threads TIME released whose next wake is `cooled`.
     yield_next: HashSet<i32>,
+    /// Threads the runtime ended while their worker was still folding the resume that parked
+    /// them (`Running` here) - dropped by that fold. See [`State::terminate`].
+    doomed: HashSet<i32>,
     cursor: Vec<usize>,
     frames: u64,
     /// Guest threads run while `frames < gate`.
@@ -514,6 +517,7 @@ impl State {
             live: Vec::new(),
             wake_tokens: HashSet::new(),
             yield_next: HashSet::new(),
+            doomed: HashSet::new(),
             cursor: vec![0; workers + 1],
             frames: 0,
             gate: 0,
@@ -715,6 +719,42 @@ impl State {
         }
     }
 
+    /// The runtime ENDED thread `thid` while it was parked (`ImportDispatch::take_terminations`):
+    /// drop it as `finish` drops a `ThreadExit`, without resuming it. The host already recorded
+    /// its end, so nothing is reported back.
+    ///
+    /// >>> ITS WORKER MAY NOT HAVE FOLDED THE PARK YET. The svc that parked it returned `Block`
+    /// under the host lock, and the runner it handed the baton to can run on another worker,
+    /// finalize it and have this drained before the parked thread's own worker takes the state
+    /// lock to fold that resume - so it can still read `Running` here. Marking it finished now
+    /// would let that fold overwrite the state and leave a dead thread live; it is `doomed`
+    /// instead, and the fold drops it.
+    fn terminate(&mut self, sh: &Shared, thid: i32) {
+        let Some(idx) = self.live.iter().copied().find(|&i| self.threads[i].thid == thid) else {
+            return;
+        };
+        if self.threads[idx].state == SState::Running {
+            self.doomed.insert(thid);
+        } else {
+            self.drop_terminated(sh, idx);
+        }
+    }
+
+    /// Finish terminated thread `idx`: off the live list, nothing owed to it kept, and its
+    /// instance (a fiber suspended in its host call) dropped by the worker that holds it - see
+    /// `WasmtimeThread::release` for what that drop does.
+    fn drop_terminated(&mut self, sh: &Shared, idx: usize) {
+        let thid = self.threads[idx].thid;
+        tracing::debug!(target: "vitaslop::thread", "thread {thid:#x} TERMINATED at frame {} while parked", self.frames);
+        self.threads[idx].state = SState::Finished(0);
+        self.threads[idx].release = true;
+        self.threads[idx].birth = None;
+        self.retire(idx);
+        self.wake_tokens.remove(&thid);
+        self.yield_next.remove(&thid);
+        sh.ring(self.threads[idx].home);
+    }
+
     fn block_or_consume_token(&mut self, idx: usize) {
         let thid = self.threads[idx].thid;
         if self.wake_tokens.remove(&thid) {
@@ -841,11 +881,16 @@ impl State {
                 }
             }
         }
+        // Ended by the runtime while this resume was still being folded - see `terminate`.
+        let thid = self.threads[idx].thid;
+        if self.doomed.remove(&thid) && !matches!(self.threads[idx].state, SState::Finished(_)) {
+            self.drop_terminated(sh, idx);
+        }
     }
 
     /// Start the threads the host spawned and wake the ones it released.
     fn drain(&mut self, sh: &Shared) {
-        let (spawns, wakes, stat_writes, masks, rt_woke, timed_out) = {
+        let (spawns, wakes, terminations, stat_writes, masks, rt_woke, timed_out) = {
             let mut host = sh.lock_host();
             let held = self.frames >= self.gate;
             if wall_floor() && host.state.wall_floor_tick(abs_ms(), held) {
@@ -863,8 +908,11 @@ impl State {
                 spawns.iter().map(|s| (host.state.thread_cpu_affinity(s.thid), host.state.spawn_near(s.thid))).collect();
             let _ = host.state.take_wake_causes();
             let timed_out = host.state.take_timeout_wakes();
-            (spawns, host.take_wakes(), host.take_stat_writes(), masks, rt_woke, timed_out)
+            (spawns, host.take_wakes(), host.take_terminations(), host.take_stat_writes(), masks, rt_woke, timed_out)
         };
+        for thid in terminations {
+            self.terminate(sh, thid);
+        }
         for thid in rt_woke {
             if let Some(i) = self.live.iter().copied().find(|&i| self.threads[i].thid == thid) {
                 self.threads[i].rt = true;
@@ -1470,6 +1518,9 @@ impl Drop for SmpRun {
 impl crate::threaded::SmpOps<VitaEnv> for SmpRun {
     fn host(&self) -> MutexGuard<'_, VitaEnv> {
         self.sh.lock_host()
+    }
+    fn runtime_stats(&self) -> crate::RuntimeStats {
+        self.sh.engine.runtime_stats()
     }
     fn engine_read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
         let mut out = vec![0u8; len];

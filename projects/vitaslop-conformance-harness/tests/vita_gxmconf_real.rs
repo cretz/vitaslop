@@ -16,6 +16,7 @@ use std::rc::Rc;
 
 use vitaslop_loader as loader;
 use vitaslop_native::{DeterministicWorld, GeneralRenderer, HostAbi, VitaEnv, Vm};
+use vitaslop_runtime::capture::Scene;
 use vitaslop_runtime::render::Framebuffer;
 
 const GXMCONF: &[u8] =
@@ -36,6 +37,36 @@ fn render_on_gpu(index: usize) -> Option<Framebuffer> {
 /// scenes needs when the second samples a target only the first rendered (on the GPU, never in
 /// guest memory). Returns the frame's final framebuffer, or `None` without an adapter.
 fn render_frame_on_gpu(range: std::ops::Range<usize>) -> Option<Framebuffer> {
+    let all = captured_scenes(&format!("scenes {range:?}"))?;
+    let scenes = &all[range.clone()];
+    assert!(
+        scenes.iter().flat_map(|s| s.draws.iter()).all(|d| !d.vprog.is_empty() && !d.fprog.is_empty()),
+        "scenes {range:?} carry draws with no program bytes - the recompiled path is not on"
+    );
+    let mut gpu = GeneralRenderer::new()?;
+    Some(if scenes.len() == 1 {
+        gpu.render_scene(&scenes[0], W, H, CLEAR)
+    } else {
+        gpu.render_frame(scenes, W, H, CLEAR)
+    })
+}
+
+/// Render each entry of `frames` as one FRAME, in order, through ONE renderer - what a scene
+/// needs when it samples a target only an EARLIER frame rendered. Returns the last frame's
+/// framebuffer, or `None` without an adapter.
+fn render_frames_on_gpu(frames: &[Vec<Scene>]) -> Option<Framebuffer> {
+    let mut gpu = GeneralRenderer::new()?;
+    let mut last = None;
+    for scenes in frames {
+        last = Some(gpu.render_frame(scenes, W, H, CLEAR));
+    }
+    last
+}
+
+/// Run the app with the recompiled path on and return every scene it captured, or `None` where
+/// these scenes are not checked (no adapter, or Windows' software one). `what` names the
+/// scenes for that message.
+fn captured_scenes(what: &str) -> Option<Vec<Scene>> {
     // >>> NOT ON WINDOWS' SOFTWARE ADAPTER, AND DECIDED BEFORE ANYTHING IS BUILT. The Windows CI
     // runner's only adapter is the Microsoft Basic Render Driver (its `gpu_probe` step says so),
     // where D3D12 compiles in software with FXC: MEASURED 1,058 s for this one test binary against
@@ -45,7 +76,7 @@ fn render_frame_on_gpu(range: std::ops::Range<usize>) -> Option<Framebuffer> {
     // software Vulkan, macOS's Metal and any Windows machine with a GPU.
     let (adapter, software) = vitaslop_native::wgpu_render::general_adapter()?;
     if cfg!(windows) && software {
-        eprintln!("software adapter on Windows ({adapter}): scenes {range:?} not checked here");
+        eprintln!("software adapter on Windows ({adapter}): {what} not checked here");
         return None;
     }
     vitaslop_runtime::knobs::set_override("VITASLOP_GXP_LIVE", "1");
@@ -70,17 +101,7 @@ fn render_frame_on_gpu(range: std::ops::Range<usize>) -> Option<Framebuffer> {
     let cap = &env.state.capture;
     assert!(cap.unimplemented.is_empty(), "unimplemented NIDs: {:?}", cap.unimplemented);
     assert_eq!(cap.scenes.len(), 21, "gxmconf emits 21 scenes");
-    let scenes = &cap.scenes[range.clone()];
-    assert!(
-        scenes.iter().flat_map(|s| s.draws.iter()).all(|d| !d.vprog.is_empty() && !d.fprog.is_empty()),
-        "scenes {range:?} carry draws with no program bytes - the recompiled path is not on"
-    );
-    let mut gpu = GeneralRenderer::new()?;
-    Some(if scenes.len() == 1 {
-        gpu.render_scene(&scenes[0], W, H, CLEAR)
-    } else {
-        gpu.render_frame(scenes, W, H, CLEAR)
-    })
+    Some(cap.scenes.clone())
 }
 
 /// **SCENE 9 - A REVERSED DEPTH RANGE, THROUGH REAL SHADERS.**
@@ -236,6 +257,81 @@ fn a_texture_naming_a_sub_rectangle_of_a_target_samples_that_rectangle() {
     };
     let p = fb.pixel(W / 2, H / 2);
     assert!(p[0] > 200 && p[1] > 200 && p[2] < 60, "expected the bottom-right quadrant's yellow, got {p:?}");
+}
+
+/// Scenes 16 and 17 as captured, plus a scene drawing into the display - so a frame holding
+/// scene 16 alone still ends on the display and leaves the quadrant target an ordinary target.
+fn quadrant_scenes() -> Option<(Scene, Scene, Scene)> {
+    let all = captured_scenes("scenes 16-18")?;
+    Some((all[16].clone(), all[17].clone(), all[18].clone()))
+}
+
+/// Scene 17 moved to the quadrant target's BASE address - its 32x32 top-left window, at the
+/// target's pitch - and sampled at uv (0.75, 0.75) instead of (0.25, 0.25): the window's texel
+/// (24, 24), inside the top-left RED quadrant. The whole 64x64 target at that uv is (48, 48),
+/// the bottom-right YELLOW one, so the two readings cannot agree.
+fn sample_the_base_window(mut s17: Scene) -> Scene {
+    // The bottom-right quadrant's offset from the base: 32 rows of 64 texels, then 32 texels.
+    const QUADRANT: u32 = (32 * 64 + 32) * 4;
+    let d = &mut s17.draws[0];
+    let mut textures = d.textures.to_vec();
+    textures[0].data_addr -= QUADRANT;
+    d.textures = textures.into();
+    // The uv is the colour attribute's red and green bytes (0x40 = 0.25 in the app).
+    let colour = d.attributes.iter().find(|a| a.format == 4 && a.component_count == 4).expect("a U8N colour attribute").offset;
+    let mut v = d.vertices.to_vec();
+    for rec in v.chunks_mut(d.vertex_stride as usize) {
+        let o = colour as usize;
+        if rec.len() >= o + 2 {
+            rec[o] = 0xc0;
+            rec[o + 1] = 0xc0;
+        }
+    }
+    d.vertices = v.into();
+    s17
+}
+
+/// **SCENES 16 + 17, AT THE BASE - A TEXTURE AT A TARGET'S OWN ADDRESS, SMALLER THAN IT, IS ITS
+/// TOP-LEFT WINDOW.** Scene 17's texture moved to the base address and sampled at uv (0.75,
+/// 0.75), in one frame with scene 16: every pixel must be the top-left quadrant's red. Binding
+/// the whole target reads the bottom-right yellow - an action title's sky pass, reading the
+/// top-left level of a bloom atlas, painted every level of it instead. Run with
+/// `VITASLOP_RTT_SUBRECT_HELD=0` it must fail.
+#[test]
+fn a_texture_at_a_targets_base_smaller_than_it_samples_its_top_left_window() {
+    let Some((s16, s17, _)) = quadrant_scenes() else {
+        eprintln!("no GPU adapter; scenes 16-17 at the base not checked");
+        return;
+    };
+    let Some(fb) = render_frames_on_gpu(&[vec![s16, sample_the_base_window(s17)]]) else { return };
+    let p = fb.pixel(W / 2, H / 2);
+    assert!(p[0] > 200 && p[1] < 60 && p[2] < 60, "expected the top-left quadrant's red, got {p:?}");
+}
+
+/// **SCENES 16 + 17, ACROSS FRAMES - A SUB-RECTANGLE OF A TARGET AN EARLIER FRAME RENDERED IS
+/// STILL THAT RECTANGLE.** Scene 16 renders the quadrants on one frame (ending on a display
+/// scene); the next frame's scene 17 samples the bottom-right window, and then the base window
+/// as above. The target is held on the GPU from the earlier frame; its window must be read
+/// exactly as one this frame rendered: yellow, then red. Binding the whole held target reads
+/// red, then yellow - the action title's sky pass fed every bloom level back into the frame,
+/// smaller each time. Run with `VITASLOP_RTT_SUBRECT_HELD=0` it must fail. The INTERIOR window
+/// of a held target is checked only with `VITASLOP_RTT_SUBRECT_HELD_INTERIOR=1` - off by
+/// default, see `subrect_held_interior`.
+#[test]
+fn a_sub_rectangle_of_a_target_held_from_an_earlier_frame_samples_that_rectangle() {
+    let Some((s16, s17, s18)) = quadrant_scenes() else {
+        eprintln!("no GPU adapter; scenes 16-17 across frames not checked");
+        return;
+    };
+    let base = sample_the_base_window(s17.clone());
+    if std::env::var("VITASLOP_RTT_SUBRECT_HELD_INTERIOR").is_ok_and(|v| v.trim() == "1") {
+        let Some(interior) = render_frames_on_gpu(&[vec![s16.clone(), s18.clone()], vec![s17]]) else { return };
+        let p = interior.pixel(W / 2, H / 2);
+        assert!(p[0] > 200 && p[1] > 200 && p[2] < 60, "interior window: expected the bottom-right quadrant's yellow, got {p:?}");
+    }
+    let Some(at_base) = render_frames_on_gpu(&[vec![s16, s18], vec![base]]) else { return };
+    let p = at_base.pixel(W / 2, H / 2);
+    assert!(p[0] > 200 && p[1] < 60 && p[2] < 60, "base window: expected the top-left quadrant's red, got {p:?}");
 }
 
 /// **SCENE 18 - A DEFAULT UNIFORM BUFFER IS CONTEXT STATE, READ AT THE DRAWING PROGRAM'S SIZE.**

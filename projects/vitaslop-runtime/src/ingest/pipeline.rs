@@ -186,9 +186,6 @@ pub fn dump_entries(game: &Game) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Mount a decrypted-dump tree rooted at `root` inside `vfs` (the inverse of
-/// [`dump_entries`]): parse the manifest, read the plaintext files and the
-/// unwrapped modules back, preserving the manifest's module load order.
 /// A decrypted dump mounted WITHOUT reading its data files: the manifest and the
 /// loadable modules only, plus the app-relative paths the caller must serve lazily.
 ///
@@ -280,6 +277,9 @@ fn read_manifest(vfs: &dyn Vfs, root: &str) -> Result<(String, Vec<String>, Vec<
     Ok((content_id, module_paths, exec_paths))
 }
 
+/// Mount a decrypted-dump tree rooted at `root` inside `vfs` (the inverse of
+/// [`dump_entries`]): parse the manifest, read the plaintext files and the
+/// unwrapped modules back, preserving the manifest's module load order.
 fn load_dump(vfs: &mut dyn Vfs, root: &str) -> Result<Game, Error> {
     let (content_id, module_paths, exec_paths) = read_manifest(&*vfs, root)?;
 
