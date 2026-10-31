@@ -165,21 +165,28 @@ pub struct GeneralRenderer {
     pub software: bool,
     /// Where the last [`GeneralRenderer::render_scene`] went. See [`RenderSplit`].
     last_split: RenderSplit,
-    /// Which part of each target the last frame encoded asks [`Self::rtt_writebacks`] to copy,
-    /// by colour address - `rtt_writeback::writeback_region`'s answer, taken while the scenes
-    /// are in hand (the write-back comes after and is not handed them).
-    wb_regions: std::collections::HashMap<u32, (u32, u32, u32, u32, u32)>,
+    /// For each colour address the last frame encoded rendered into: the extent of the target
+    /// [`Self::rtt_writebacks`] copies there (`rtt_writeback::writes_back_target` - an address
+    /// can hold two) and which part of it (`rtt_writeback::writeback_region`), taken while the
+    /// scenes are in hand (the write-back comes after and is not handed them).
+    wb_regions: std::collections::HashMap<u32, WritebackTarget>,
 }
 
+/// One entry of [`GeneralRenderer::wb_regions`]: the target's extent, and the region of it to
+/// copy, or `None` when the target is copied whole or not at all.
+type WritebackTarget = ((u32, u32), Option<(u32, u32, u32, u32, u32)>);
+
 /// [`GeneralRenderer::wb_regions`] for a frame's scenes.
-fn writeback_regions(scenes: &[Scene]) -> std::collections::HashMap<u32, (u32, u32, u32, u32, u32)> {
+fn writeback_regions(scenes: &[Scene]) -> std::collections::HashMap<u32, WritebackTarget> {
     let cap = rtt_writeback_texels();
     scenes
         .iter()
         .filter_map(|s| s.color.as_ref())
-        .filter_map(|c| {
-            vitaslop_runtime::rtt_writeback::writeback_region(scenes, c.data_addr, c.width, c.height, cap)
-                .map(|r| (c.data_addr, r))
+        .filter_map(|c| vitaslop_runtime::rtt_writeback::surface_for(scenes, c.data_addr))
+        .map(|c| {
+            let region =
+                vitaslop_runtime::rtt_writeback::writeback_region(scenes, c.data_addr, c.width, c.height, cap);
+            (c.data_addr, ((c.width, c.height), region))
         })
         .collect()
 }
@@ -653,12 +660,20 @@ impl GeneralRenderer {
             if skip_sampled && self.gxm.frame_samples(addr) {
                 continue;
             }
+            // Only a target this frame's scenes render into, and of the two an address can
+            // hold, the one the surface names - see `rtt_writeback::writes_back_target`.
+            let Some(&(extent, region)) = self.wb_regions.get(&addr) else {
+                continue;
+            };
+            if extent != (w, h) {
+                continue;
+            }
             let (w, h) = (w.max(1), h.max(1));
             // The whole target within the cap; above it, only the region the frame's last draw
             // into it painted - see `rtt_writeback::writeback_region`. `addr` becomes the
             // region's own guest address, which is how the apply finds it again.
-            let (x, y, w, h, addr) = match self.wb_regions.get(&addr) {
-                Some(&(x, y, rw, rh, at)) if x + rw <= tex.width() && y + rh <= tex.height() => (x, y, rw, rh, at),
+            let (x, y, w, h, addr) = match region {
+                Some((x, y, rw, rh, at)) if x + rw <= tex.width() && y + rh <= tex.height() => (x, y, rw, rh, at),
                 _ if w * h <= cap => (0, 0, w, h, addr),
                 _ => continue,
             };

@@ -253,12 +253,26 @@ fn writeback_spec() -> &'static (
 /// have been freed and the memory handed to something else entirely; writing pixels over it
 /// would corrupt whatever the guest put there. Only a target this frame's own scenes name as a
 /// colour surface is written, which is also the only one whose stride and format are known.
+///
+/// The LAST scene's surface when several render into `addr`: its pixels are what the guest's
+/// memory holds once the frame is done.
 pub fn surface_for(scenes: &[Scene], addr: u32) -> Option<ColorSurface> {
     scenes
         .iter()
+        .rev()
         .filter_map(|s| s.color.as_ref())
         .find(|c| c.data_addr == addr)
         .copied()
+}
+
+/// Whether the renderer's target at `addr` of extent `w`x`h` is the one to write back.
+///
+/// >>> ONE ADDRESS CAN HOLD TWO TARGETS, keyed by the colour surface's extent (a title runs a
+/// 256x256 and a 512x1024 target through one address every frame). Only the target of the
+/// surface [`surface_for`] names is written: copying every target at the address put each one's
+/// pixels over the guest's in turn, and the last written - whichever sorted last - won.
+pub fn writes_back_target(scenes: &[Scene], addr: u32, w: u32, h: u32) -> bool {
+    surface_for(scenes, addr).is_some_and(|c| (c.width, c.height) == (w, h))
 }
 
 /// >>> WHICH PART OF A RENDER TARGET THE WRITEBACK COPIES: `(x, y, w, h, guest address of the
@@ -1561,6 +1575,31 @@ fn report_writeback_skipped(addr: u32, format: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two targets at one address: only the one the frame's LAST scene there renders is written
+    /// back, and a target no scene of the frame names is not written at all.
+    #[test]
+    fn only_the_last_surfaces_target_at_an_address_is_written_back() {
+        let at = |w: u32, h: u32| Scene {
+            color: Some(ColorSurface {
+                format: 0,
+                surface_type: 0,
+                width: w,
+                height: h,
+                stride_pixels: w,
+                data_addr: 0x8e20_b030,
+                scale_mode: 0,
+                gamma: 0,
+            }),
+            ..Default::default()
+        };
+        let scenes = [at(512, 1024), at(256, 256)];
+        assert!(writes_back_target(&scenes, 0x8e20_b030, 256, 256));
+        assert!(!writes_back_target(&scenes, 0x8e20_b030, 512, 1024), "the earlier scene's target");
+        assert!(!writes_back_target(&scenes, 0x8e20_b030, 128, 128), "a held target no scene names");
+        assert!(!writes_back_target(&scenes, 0x8000_0000, 256, 256), "an address the frame did not render");
+        assert_eq!(surface_for(&scenes, 0x8e20_b030).map(|c| c.width), Some(256));
+    }
 
     /// What `encode_row` writes for a 16-bit surface is what the texture decoder reads back.
     ///

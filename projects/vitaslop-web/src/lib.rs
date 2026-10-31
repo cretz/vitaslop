@@ -847,8 +847,12 @@ impl RttWriteback {
         self.prune_idle();
         const ALIGN: u32 = 256;
         for &(addr, tex, w, h) in targets {
+            // Only a target this frame's scenes render into, and of the two an address can
+            // hold, the one the surface names - the same bound as native's.
+            if !vitaslop_runtime::rtt_writeback::writes_back_target(scenes, addr, w, h) {
+                continue;
+            }
             let (w, h) = (w.max(1), h.max(1));
-            // Only a target this frame's scenes render into - the same bound as native's.
             let Some(surface) = vitaslop_runtime::rtt_writeback::surface_for(scenes, addr) else {
                 continue;
             };

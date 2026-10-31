@@ -651,10 +651,14 @@ impl Capsule {
 
 /// Frame-capsule magic + version. Bump on any field-order change.
 /// Version 2: the draw record grew with `VSCAPS` version 4; 4 (slim 5) with version 5.
-/// 6 (slim 7) with version 6.
-const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x06";
+/// 6 (slim 7) with version 6. 8 (slim 9): a depth surface carries its split LOAD address.
+const FRAME_MAGIC: &[u8; 8] = b"VSFRAM\x00\x08";
 /// The same frame body with every large byte field deduplicated - see [`SLIM_MIN`].
-const FRAME_MAGIC_SLIM: &[u8; 8] = b"VSFRAM\x00\x07";
+const FRAME_MAGIC_SLIM: &[u8; 8] = b"VSFRAM\x00\x09";
+/// Versions 6 and 7: the same body without the depth load address, still read (as zero - the
+/// scene loads depth from where it stores it).
+const FRAME_MAGIC_V6: &[u8; 8] = b"VSFRAM\x00\x06";
+const FRAME_MAGIC_V6_SLIM: &[u8; 8] = b"VSFRAM\x00\x07";
 
 /// Clears the slim context when a slim write or read ends, however it ends.
 struct SlimReset;
@@ -725,6 +729,7 @@ pub fn write_frame(
                     d.stencil_addr,
                     d.background_depth,
                     d.background_control,
+                    d.load_addr,
                 ] {
                     w_u32(o, v)?;
                 }
@@ -768,12 +773,14 @@ pub struct FrameCapsule {
     pub frame: u64,
 }
 
-/// Read a [`write_frame`] stream. A different version is REFUSED, as for a draw capsule.
+/// Read a [`write_frame`] stream. A different version is REFUSED, as for a draw capsule -
+/// except version 6/7, whose body differs only by the missing depth load address.
 pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
     let mut magic = [0u8; 8];
     i.read_exact(&mut magic)?;
-    let slim = &magic == FRAME_MAGIC_SLIM;
-    if &magic != FRAME_MAGIC && !slim {
+    let slim = &magic == FRAME_MAGIC_SLIM || &magic == FRAME_MAGIC_V6_SLIM;
+    let has_load = &magic == FRAME_MAGIC || &magic == FRAME_MAGIC_SLIM;
+    if !has_load && &magic != FRAME_MAGIC_V6 && !slim {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -810,8 +817,8 @@ pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
             });
         }
         if r_u8(i)? == 1 {
-            let mut v = [0u32; 5];
-            for x in &mut v {
+            let mut v = [0u32; 6];
+            for x in &mut v[..if has_load { 6 } else { 5 }] {
                 *x = r_u32(i)?;
             }
             s.depth = Some(crate::capture::DepthSurface {
@@ -820,7 +827,7 @@ pub fn read_frame(i: &mut impl Read) -> io::Result<FrameCapsule> {
                 stencil_addr: v[2],
                 background_depth: v[3],
                 background_control: v[4],
-                load_addr: 0,
+                load_addr: v[5],
             });
         }
         s.multisample = r_u32(i)?;
@@ -1069,6 +1076,59 @@ mod tests {
         // `Draw` derives PartialEq, so this compares EVERY field - including any added later,
         // which is exactly the failure this test exists to catch.
         assert_eq!(back.draw, c.draw);
+    }
+
+    /// A frame's depth surface round-trips WHOLE, the split load address included: a scene
+    /// that loads depth from one surface and stores to another must replay loading from the
+    /// first, not from the store surface.
+    #[test]
+    fn a_frame_round_trips_a_split_depth_load() {
+        let depth = crate::capture::DepthSurface {
+            zls_control: 0x1234,
+            depth_addr: 0x8100_0000,
+            stencil_addr: 0x8110_0000,
+            background_depth: 0x3f80_0000,
+            background_control: 7,
+            load_addr: 0x8200_0000,
+        };
+        let scene = crate::capture::Scene { depth: Some(depth), ..Default::default() };
+        let scenes = vec![scene];
+        for slim in [false, true] {
+            let mut bytes = Vec::new();
+            if slim {
+                write_frame_slim(&mut bytes, &scenes, 960, 544, [0; 4], 3).unwrap();
+            } else {
+                write_frame(&mut bytes, &scenes, 960, 544, [0; 4], 3).unwrap();
+            }
+            let back = read_frame(&mut &bytes[..]).unwrap();
+            assert_eq!(back.scenes[0].depth, Some(depth), "slim {slim}");
+        }
+    }
+
+    /// A version-6 frame (no load address) still reads, as a scene that loads depth from where
+    /// it stores it.
+    #[test]
+    fn a_version_6_frame_reads_with_no_split_depth_load() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FRAME_MAGIC_V6);
+        for v in [960u32, 544] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(1);
+        for v in [0x1234u32, 0x8100_0000, 0x8110_0000, 0x3f80_0000, 7] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(0);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let back = read_frame(&mut &bytes[..]).unwrap();
+        let d = back.scenes[0].depth.unwrap();
+        assert_eq!((d.depth_addr, d.background_control, d.load_addr), (0x8100_0000, 7, 0));
     }
 
     /// A capsule from a different format version must be refused, not misread.
